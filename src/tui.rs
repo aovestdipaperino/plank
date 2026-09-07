@@ -578,6 +578,32 @@ impl SubPane {
         changed
     }
 
+    /// Handles a mouse click on roster row `i` (`0` is `main`): moves the
+    /// cursor there and, on a sub-agent row, expands its output — a click is
+    /// select-and-open in one gesture. On `main` the transcript comes back.
+    /// Returns `false` (changing nothing) when `i` names no row.
+    pub fn click_row(&mut self, i: usize) -> bool {
+        if self.runs.is_empty() || i > self.runs.len() {
+            return false;
+        }
+        self.selecting = true;
+        self.cursor = i;
+        self.active = i > 0;
+        true
+    }
+
+    /// Tab: moves focus between the prompt and the roster. Entering the roster
+    /// reveals its cursor; leaving it hides the cursor but keeps an expanded
+    /// pane on screen, so the user can type while watching an agent. Returns
+    /// `false` when no sub-agent has ever run, so there is nothing to focus.
+    pub fn toggle_focus(&mut self) -> bool {
+        if self.runs.is_empty() {
+            return false;
+        }
+        self.selecting = !self.selecting;
+        true
+    }
+
     /// Re-pins every run's view to its newest output. Called when the user acts
     /// on the main conversation, so a run they had scrolled back through is not
     /// still frozen mid-buffer the next time they look at it.
@@ -1512,6 +1538,7 @@ fn frame_rows(
     if let Some(strip_area) = strip_area {
         render_task_strip(frame, strip_area, strip);
     }
+    set_roster_rect(roster_area);
     if let Some(roster_area) = roster_area {
         if crate::uiremote::recording_enabled() {
             crate::uiremote::region("roster", roster_area, &[]);
@@ -1646,8 +1673,10 @@ fn render_agent_roster(frame: &mut Frame, area: Rect, roster: &RosterView) {
         if row.running {
             name = name.add_modifier(Modifier::BOLD);
         }
+        // Yellow marks the agent whose output is on screen; green is reserved
+        // for the filled bullet of a finished run, so the two never compete.
         if row.expanded {
-            name = name.fg(THEME_GREEN);
+            name = name.fg(Color::Yellow);
         }
         let mut spans = vec![
             Span::styled(
@@ -1655,8 +1684,12 @@ fn render_agent_roster(frame: &mut Frame, area: Rect, roster: &RosterView) {
                 Style::default().fg(THEME_GREEN),
             ),
             Span::styled(
-                if row.running { "● " } else { "○ " },
-                if row.running { name } else { dim },
+                if row.running { "○ " } else { "● " },
+                if row.running {
+                    name
+                } else {
+                    Style::default().fg(THEME_GREEN)
+                },
             ),
             Span::styled(row.label.clone(), name),
         ];
@@ -1806,6 +1839,37 @@ struct FrameGeom {
 /// `/subagent:<name>` splits further — see [`subagent_spans`] — because the
 /// command being known says nothing about the name being known.
 fn input_spans(input: &str) -> Vec<Span<'static>> {
+    mark_image_placeholders(input_spans_bare(input))
+}
+
+/// Re-inks every `[Image #n]` token cyan inside otherwise-unstyled spans, so an
+/// attached image reads as a reference rather than as typed text. Styled spans
+/// (a command token, a shell marker) are left as they are.
+fn mark_image_placeholders(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let tag = Style::default().fg(Color::Cyan);
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+        if span.style != Style::default() {
+            out.push(span);
+            continue;
+        }
+        let text = span.content.as_ref();
+        let mut at = 0;
+        for (start, end, _) in crate::imagepaste::placeholders(text) {
+            if start > at {
+                out.push(Span::raw(text[at..start].to_string()));
+            }
+            out.push(Span::styled(text[start..end].to_string(), tag));
+            at = end;
+        }
+        if at < text.len() {
+            out.push(Span::raw(text[at..].to_string()));
+        }
+    }
+    out
+}
+
+fn input_spans_bare(input: &str) -> Vec<Span<'static>> {
     // Shell escape: the marker is colored by consequence, which is the one
     // thing the two forms differ in and the one thing that is invisible once
     // typed. Red `!` feeds the command and its output to the model as history;
@@ -2323,6 +2387,36 @@ fn set_input_rect(rect: Option<Rect>) {
     if let Ok(mut slot) = INPUT_TEXT_RECT.lock() {
         *slot = rect;
     }
+}
+
+/// Screen rect the sub-agent roster last occupied (separator row included), so
+/// a click can be mapped to a roster row. `None` while no roster is drawn.
+static ROSTER_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// The roster rect from the last drawn frame, for mouse hit-testing.
+#[must_use]
+pub fn last_roster_rect() -> Option<Rect> {
+    ROSTER_RECT.lock().ok().and_then(|r| *r)
+}
+
+/// Records (or, with `None`, forgets) where the roster was drawn.
+fn set_roster_rect(rect: Option<Rect>) {
+    if let Ok(mut slot) = ROSTER_RECT.lock() {
+        *slot = rect;
+    }
+}
+
+/// Maps a screen cell to a roster row index (`0` is `main`) given the rect the
+/// roster was drawn in. The rect's first row is the blank separator, so it maps
+/// to nothing; `rows` is how many rows were drawn, so the blank space below a
+/// short roster maps to nothing either.
+#[must_use]
+pub fn roster_row_at(rect: Rect, rows: usize, column: u16, row: u16) -> Option<usize> {
+    if !rect.contains(Position::new(column, row)) {
+        return None;
+    }
+    let i = usize::from(row.checked_sub(rect.y)?.checked_sub(1)?);
+    (i < rows).then_some(i)
 }
 
 /// Maps a screen cell to a char index into `input`, using the same word wrap
@@ -4564,9 +4658,9 @@ mod tests {
         assert!(row_of("main") < row_of("Committing malformed_dsml fix"));
         assert!(row_of("Committing malformed_dsml fix") < row_of("Discovering"));
 
-        // Finished runs take the hollow bullet, the live one the filled bullet.
-        assert!(rows[row_of("Committing")].contains('○'), "{screen}");
-        assert!(rows[row_of("Discovering")].contains('●'), "{screen}");
+        // Finished runs take the filled (green) bullet, the live one the hollow.
+        assert!(rows[row_of("Committing")].contains('●'), "{screen}");
+        assert!(rows[row_of("Discovering")].contains('○'), "{screen}");
         // And each carries its own right-aligned tally.
         assert!(rows[row_of("Committing")].contains("3m 28s · ↓ 51.9k tokens"));
         assert!(rows[row_of("Discovering")].contains("1m 12s · ↓ 39.9k tokens"));
@@ -4725,6 +4819,48 @@ mod tests {
             "a paragraph task cannot be allowed to break the row"
         );
         assert_eq!(one_line(""), "");
+    }
+
+    #[test]
+    fn a_click_selects_and_opens_a_row_and_main_brings_the_transcript_back() {
+        let mut pane = SubPane::default();
+        assert!(!pane.click_row(0), "nothing to click before any run");
+        pane.begin("alpha".to_string(), "", 0);
+        pane.begin("beta".to_string(), "", 0);
+        assert!(pane.click_row(2));
+        assert!(pane.selecting && pane.active && pane.cursor == 2);
+        assert_eq!(pane.selected().map(|r| r.label.as_str()), Some("beta"));
+        assert!(pane.click_row(0));
+        assert!(pane.selecting && !pane.active && pane.cursor == 0);
+        assert!(!pane.click_row(3), "past the last row");
+        assert_eq!(pane.cursor, 0);
+    }
+
+    #[test]
+    fn tab_moves_focus_in_and_out_of_the_roster_keeping_the_pane_open() {
+        let mut pane = SubPane::default();
+        assert!(!pane.toggle_focus(), "nothing to focus before any run");
+        pane.begin("alpha".to_string(), "", 0);
+        assert!(pane.toggle_focus());
+        assert!(pane.selecting);
+        pane.cursor = 1;
+        assert!(pane.expand());
+        assert!(pane.toggle_focus());
+        assert!(!pane.selecting, "focus is back on the prompt");
+        assert!(pane.active, "the expanded pane stays on screen");
+        assert!(pane.toggle_focus());
+        assert!(pane.selecting && pane.active);
+    }
+
+    #[test]
+    fn roster_hit_test_skips_the_separator_and_the_blank_tail() {
+        let rect = Rect::new(0, 20, 80, 5); // separator + up to 4 rows
+        assert_eq!(roster_row_at(rect, 3, 10, 20), None, "separator row");
+        assert_eq!(roster_row_at(rect, 3, 10, 21), Some(0), "main");
+        assert_eq!(roster_row_at(rect, 3, 79, 23), Some(2));
+        assert_eq!(roster_row_at(rect, 3, 10, 24), None, "no row drawn there");
+        assert_eq!(roster_row_at(rect, 3, 10, 19), None, "above the roster");
+        assert_eq!(roster_row_at(rect, 3, 80, 21), None, "right of the roster");
     }
 
     #[test]
@@ -5303,6 +5439,19 @@ mod tests {
         );
         // A lone `!` still colors the marker.
         assert_eq!(parts("!"), vec![("!".to_owned(), Some(Color::Red))]);
+    }
+
+    #[test]
+    fn input_spans_inks_image_placeholders_cyan() {
+        let spans = input_spans("look at [Image #1] and [Image #2]");
+        let tagged: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(Color::Cyan))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(tagged, vec!["[Image #1]", "[Image #2]"]);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "look at [Image #1] and [Image #2]", "nothing lost");
     }
 
     #[test]

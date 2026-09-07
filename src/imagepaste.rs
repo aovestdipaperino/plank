@@ -43,6 +43,73 @@ impl PastedImage {
     }
 }
 
+/// The token pasted into the prompt for the `n`th attached image (1-based):
+/// `[Image #n]`. The user can move it, repeat it, or write around it, and the
+/// submitted message resolves each token against the attachment list.
+#[must_use]
+pub fn placeholder(n: usize) -> String {
+    format!("[Image #{n}]")
+}
+
+/// Finds every `[Image #n]` token in `text` as `(byte_start, byte_end, n)`.
+#[must_use]
+pub fn placeholders(text: &str) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = text[from..].find("[Image #") {
+        let start = from + i;
+        let digits = start + "[Image #".len();
+        let len = text[digits..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        let end = digits + len;
+        if len > 0 && text[end..].starts_with(']') {
+            if let Ok(n) = text[digits..end].parse::<usize>() {
+                out.push((start, end + 1, n));
+            }
+            from = end + 1;
+        } else {
+            from = digits;
+        }
+    }
+    out
+}
+
+/// The number of the `[Image #n]` token under char index `at`, if any.
+#[must_use]
+pub fn placeholder_at(text: &str, at: usize) -> Option<usize> {
+    let byte = text.char_indices().nth(at).map(|(b, _)| b)?;
+    placeholders(text)
+        .into_iter()
+        .find(|&(s, e, _)| (s..e).contains(&byte))
+        .map(|(_, _, n)| n)
+}
+
+impl PastedImage {
+    /// Opens the image in the desktop's default viewer: the original file when
+    /// it came from disk, otherwise the cached copy. Detached and best-effort —
+    /// a failed launch is reported by the returned error, nothing else.
+    ///
+    /// # Errors
+    /// When the opener (`open` on macOS, `xdg-open` elsewhere) cannot be spawned.
+    pub fn open_externally(&self) -> std::io::Result<()> {
+        let path = self.source_path.as_deref().unwrap_or(&self.path);
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        std::process::Command::new(opener)
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(drop)
+    }
+}
+
 /// Detects the media type from magic bytes; `None` when not a supported image.
 #[must_use]
 pub fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
@@ -242,6 +309,20 @@ fn prune_cache(dir: &Path) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn placeholders_are_found_by_number_and_junk_is_skipped() {
+        let t = "see [Image #1] and [Image #12], not [Image #] or [Image #x]";
+        let found = super::placeholders(t);
+        assert_eq!(found.iter().map(|p| p.2).collect::<Vec<_>>(), vec![1, 12]);
+        assert_eq!(&t[found[0].0..found[0].1], "[Image #1]");
+        assert_eq!(super::placeholder(3), "[Image #3]");
+        assert_eq!(super::placeholder_at(t, 4), Some(1), "on the `[`");
+        assert_eq!(super::placeholder_at(t, 13), Some(1), "on the `]`");
+        assert_eq!(super::placeholder_at(t, 14), None, "the space after");
+        assert_eq!(super::placeholder_at(t, 25), Some(12));
+        assert_eq!(super::placeholder_at(t, 999), None);
+    }
+
     use super::*;
 
     /// Hashing a path and hashing its bytes must agree, and a missing file

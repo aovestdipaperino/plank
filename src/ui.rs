@@ -1429,7 +1429,27 @@ fn single_call_activity(call: &ToolCall) -> Option<String> {
             }
             format!("Ran {shown}")
         }
-        "read" | "more" | "view_image" => format!("Read {}", arg("path")?),
+        // A partial read names its line range (`Read src/a.rs:40-79`), so the
+        // banner says how much of the file the model actually looked at.
+        "read" => {
+            let path = arg("path")?;
+            let start = arg("start_line").and_then(|v| v.parse::<u64>().ok());
+            let count = arg("max_lines").and_then(|v| v.parse::<u64>().ok());
+            match (start, count) {
+                (None, None) => format!("Read {path}"),
+                (start, count) => {
+                    let start = start.unwrap_or(1).max(1);
+                    match count {
+                        Some(n) => {
+                            let end = start.saturating_add(n.max(1)).saturating_sub(1);
+                            format!("Read {path}:{start}-{end}")
+                        }
+                        None => format!("Read {path}:{start}-"),
+                    }
+                }
+            }
+        }
+        "more" | "view_image" => format!("Read {}", arg("path")?),
         "edit" => format!("Edited {}", arg("path")?),
         "write" => format!("Wrote {}", arg("path")?),
         _ => return None,
@@ -1521,6 +1541,69 @@ fn append_advisories(nudges: &[crate::guard::Nudge], mut observations: String) -
         }
     }
     observations
+}
+
+/// Records a pasted image: it joins the attachment list and its `[Image #n]`
+/// placeholder is typed into the prompt at the caret, so the text can refer to
+/// it (and to several at once) the way it would to a quoted file.
+fn attach_image(
+    input: &mut TuiInput,
+    attachments: &mut Vec<crate::imagepaste::PastedImage>,
+    log: &mut OutputLog,
+    img: crate::imagepaste::PastedImage,
+) {
+    let n = attachments.len() + 1;
+    let text = input.buf.text();
+    // Space the token off whatever precedes it, and leave a space to type on.
+    let lead = if text.is_empty() || text.ends_with(char::is_whitespace) {
+        ""
+    } else {
+        " "
+    };
+    input
+        .buf
+        .insert(format!("{lead}{} ", crate::imagepaste::placeholder(n)));
+    input.sync_popup();
+    log.push_dim(format!("[image #{n} attached: {}]", img.describe()));
+    attachments.push(img);
+}
+
+/// Builds the user message for a prompt with images attached. The engine is
+/// text-only, so each image the prompt still references by its `[Image #n]`
+/// placeholder is appended as a cached-file line the model can open with its
+/// tools; an image whose placeholder was deleted is dropped and said so.
+fn attach_message(
+    line: &str,
+    attachments: impl Iterator<Item = crate::imagepaste::PastedImage>,
+    log: &mut OutputLog,
+) -> String {
+    use std::fmt::Write as _;
+    let referenced: std::collections::HashSet<usize> = crate::imagepaste::placeholders(line)
+        .into_iter()
+        .map(|(_, _, n)| n)
+        .collect();
+    let mut message = line.to_owned();
+    // An empty prompt cannot reference anything, so every image rides along —
+    // pasting and pressing Enter still sends the picture.
+    let bare = referenced.is_empty();
+    for (i, img) in attachments.enumerate() {
+        let n = i + 1;
+        if !bare && !referenced.contains(&n) {
+            log.push_dim(format!(
+                "[image #{n} dropped: no [Image #{n}] in the prompt]"
+            ));
+            continue;
+        }
+        let _ = write!(
+            message,
+            "\n[Image #{n}: {}{}. Use your tools to view it.]",
+            img.describe(),
+            img.source_path.as_deref().map_or(String::new(), |p| {
+                format!(", original: {}", p.display())
+            })
+        );
+    }
+    message
 }
 
 fn session_to_messages(session: &Session) -> Vec<crate::engine::ChatMessage> {
@@ -9741,6 +9824,11 @@ impl Agent<'_> {
                         // belongs to, so a release lost off-window cannot leave
                         // the next drag stuck on the prompt.
                         input_drag = false;
+                        // A click on a roster row selects it and opens its
+                        // output (or brings the transcript back on `main`).
+                        let roster_hit = tui::last_roster_rect().and_then(|r| {
+                            tui::roster_row_at(r, sub_pane.runs.len() + 1, m.column, m.row)
+                        });
                         // A click on the jump-to-bottom hint resumes follow mode
                         // (same as End) instead of starting a text selection.
                         let v = sub_pane.active_view(&mut view);
@@ -9748,6 +9836,20 @@ impl Agent<'_> {
                             r.contains(ratatui::layout::Position::new(m.column, m.row))
                         }) {
                             v.follow = true;
+                            selection = None;
+                        } else if let Some(i) = roster_hit {
+                            sub_pane.click_row(i);
+                            selection = None;
+                        } else if let Some(img) = tui::last_input_rect()
+                            .and_then(|r| tui::input_hit(r, input.buf.text(), m.column, m.row))
+                            .and_then(|at| crate::imagepaste::placeholder_at(input.buf.text(), at))
+                            .and_then(|n| attachments.get(n - 1))
+                        {
+                            // A click on an `[Image #n]` placeholder opens that
+                            // image in the desktop's default viewer.
+                            if let Err(e) = img.open_externally() {
+                                log.push_dim(format!("[could not open image: {e}]"));
+                            }
                             selection = None;
                         } else if tui::last_input_rect()
                             .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false))
@@ -9831,25 +9933,13 @@ impl Agent<'_> {
                 if IMAGES_ENABLED {
                     if pasted.trim().is_empty() {
                         match crate::imagepaste::from_clipboard() {
-                            Some(img) => {
-                                log.push_dim(format!(
-                                    "[image #{} attached: {}]",
-                                    attachments.len() + 1,
-                                    img.describe()
-                                ));
-                                attachments.push(img);
-                            }
+                            Some(img) => attach_image(&mut input, &mut attachments, &mut log, img),
                             None => log.push_dim("[clipboard has no image to paste]"),
                         }
                         continue;
                     }
                     if let Some(img) = crate::imagepaste::from_path_text(pasted) {
-                        log.push_dim(format!(
-                            "[image #{} attached: {}]",
-                            attachments.len() + 1,
-                            img.describe()
-                        ));
-                        attachments.push(img);
+                        attach_image(&mut input, &mut attachments, &mut log, img);
                         continue;
                     }
                 }
@@ -10047,9 +10137,23 @@ impl Agent<'_> {
                     }
                     selection = None;
                 }
+                // Tab moves focus between the prompt and the roster (the
+                // completion popup, when open, has already taken it above).
+                KeyCode::Tab if !word_mod => {
+                    if !sub_pane.toggle_focus() {
+                        log.push_dim("[no sub-agent has run yet]");
+                    }
+                    selection = None;
+                }
                 KeyCode::Char('c') if ctrl => {
                     if !input.buf.text().is_empty() {
                         input.buf.clear();
+                        // The placeholders went with the text, so the images
+                        // they referred to go too.
+                        if !attachments.is_empty() {
+                            attachments.clear();
+                            log.push_dim("[image attachments removed]");
+                        }
                     } else if attachments.is_empty() {
                         log.push_spans(quit_hint_spans());
                     } else {
@@ -10304,19 +10408,7 @@ impl Agent<'_> {
                         // The engine is text-only: attach pasted images as
                         // cached-file references the model can open with its
                         // read/bash tools instead of inline content blocks.
-                        let mut message = line.clone();
-                        for (i, img) in attachments.drain(..).enumerate() {
-                            use std::fmt::Write as _;
-                            let _ = write!(
-                                message,
-                                "\n[Attached image #{}: {}{}. Use your tools to view it.]",
-                                i + 1,
-                                img.describe(),
-                                img.source_path.as_deref().map_or(String::new(), |p| {
-                                    format!(", original: {}", p.display())
-                                })
-                            );
-                        }
+                        let message = attach_message(&line, attachments.drain(..), &mut log);
                         let echo = if line.is_empty() { &message } else { &line };
                         log.push_user_echo(echo);
                         self.session.push(Message::user(&message));
@@ -13800,6 +13892,11 @@ fn busy_ui_loop(
                             sub.collapse();
                         }
                     }
+                    KeyCode::Tab if !word_mod => {
+                        if !sub.toggle_focus() {
+                            log.push_dim("[no sub-agent has run yet]");
+                        }
+                    }
                     // Esc leaves the roster before it interrupts the turn: the
                     // roster is what the user is looking at, and an accidental
                     // interrupt here would be expensive.
@@ -14018,6 +14115,14 @@ fn busy_ui_loop(
                 // click-and-drag has to place and select in it here too.
                 // Every press decides afresh which surface the gesture belongs
                 // to, so a release lost off-window cannot strand the next drag.
+                // A click on a roster row selects it and opens its output.
+                MouseEventKind::Down(MouseButton::Left)
+                    if let Some(i) = tui::last_roster_rect().and_then(|r| {
+                        tui::roster_row_at(r, sub.runs.len() + 1, m.column, m.row)
+                    }) =>
+                {
+                    sub.click_row(i);
+                }
                 MouseEventKind::Down(MouseButton::Left) => {
                     input_drag = tui::last_input_rect()
                         .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false));
@@ -14829,6 +14934,22 @@ mod tests {
             tool_activity_summary(&[call("read", "path", "src/main.rs")]),
             "Read src/main.rs"
         );
+        let ranged = |start: Option<&str>, count: Option<&str>| {
+            let mut c = call("read", "path", "src/main.rs");
+            for (k, v) in [("start_line", start), ("max_lines", count)] {
+                if let Some(v) = v {
+                    c.args.push(crate::dsml::ToolArg {
+                        name: k.to_string(),
+                        value: v.to_string(),
+                        is_string: false,
+                    });
+                }
+            }
+            tool_activity_summary(&[c])
+        };
+        assert_eq!(ranged(Some("40"), Some("40")), "Read src/main.rs:40-79");
+        assert_eq!(ranged(None, Some("10")), "Read src/main.rs:1-10");
+        assert_eq!(ranged(Some("7"), None), "Read src/main.rs:7-");
         assert_eq!(
             tool_activity_summary(&[call("bash", "command", "cargo test --lib")]),
             "Ran cargo test --lib"

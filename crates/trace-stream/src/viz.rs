@@ -807,7 +807,10 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// sentence of each `<think>` block — up to the first `.`, `!` or `?`
     /// followed by whitespace, or the first newline, capped at
     /// [`THINK_STATUS_CAP`] characters — is emitted once through
-    /// [`RenderSink::think_text`] as soon as it completes. The model's own
+    /// [`RenderSink::visible_text`] as soon as it completes, so it is styled
+    /// like an answer (bullet, indent, normal color) rather than as dim
+    /// thinking: it stands in for the answer the user is not seeing. The
+    /// model's own
     /// opening thought after a tool result is the best status line there is
     /// ("The test still fails on the second case."), and it costs no prompt
     /// text and no extra generation.
@@ -1066,7 +1069,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             return;
         }
         self.viz_newline_if_open();
-        self.sink.think_text(&format!("{line}\n"));
+        self.sink.visible_text(&format!("{line}\n"));
         self.last_output_newline = true;
     }
 
@@ -2347,7 +2350,9 @@ mod tests {
         quiet.finish();
         assert_eq!(quiet.sink().think, "");
 
-        // On: exactly the first sentence, once, dim, then the answer as usual.
+        // On: exactly the first sentence, once, as ordinary visible output
+        // (so the TUI gives it the same bullet and indent as an answer), then
+        // the answer as usual. Nothing reaches the dim thinking channel.
         let mut sr = StreamRenderer::new(Cap::default());
         sr.set_show_thinking(false);
         sr.set_think_status(true);
@@ -2355,11 +2360,11 @@ mod tests {
             sr.push(ch.to_string());
         }
         sr.finish();
+        assert_eq!(sr.sink().think, "");
         assert_eq!(
-            sr.sink().think,
-            "The read shows the trait is missing idle.\n"
+            sr.sink().visible,
+            "The read shows the trait is missing idle.\n\nAnswer"
         );
-        assert_eq!(sr.sink().visible.trim(), "Answer");
 
         // A block that ends before any terminator shows what it had.
         let mut cut = StreamRenderer::new(Cap::default());
@@ -2368,7 +2373,8 @@ mod tests {
         cut.begin_in_think();
         cut.push("Checking the fixture");
         cut.finish();
-        assert_eq!(cut.sink().think, "Checking the fixture\n");
+        assert_eq!(cut.sink().think, "");
+        assert_eq!(cut.sink().visible, "Checking the fixture\n");
 
         // With thinking shown, the status peek is inert: the full text streams.
         let mut shown = StreamRenderer::new(Cap::default());
