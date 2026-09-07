@@ -295,6 +295,18 @@ pub struct LiveTokens {
 }
 
 impl AgentRun {
+    /// Whether this run's roster row has outlived [`ROSTER_LINGER_MS`] at `now`
+    /// (monotonic ms). A run still in flight never expires, however long it
+    /// takes; a finished one whose `ended_ms` never landed is treated as fresh
+    /// rather than silently dropped.
+    #[must_use]
+    pub fn row_expired(&self, now: u64) -> bool {
+        !self.running
+            && self
+                .ended_ms
+                .is_some_and(|end| now.saturating_sub(end) >= ROSTER_LINGER_MS)
+    }
+
     /// Wall-clock milliseconds the run has been going, or took: live against
     /// `now` while running, frozen at [`Self::ended_ms`] once finished.
     #[must_use]
@@ -333,6 +345,14 @@ impl AgentRun {
 /// being written to. Eight is well past what fits on screen while still letting
 /// the user look back at the earlier agents of a fan-out.
 const ROSTER_MAX: usize = 8;
+
+/// How long a finished run's row stays on the roster after it ends. The roster
+/// is a readout of what is happening *now*: a completed agent is worth a moment
+/// on screen so the user sees it land and what it cost, and then it is history
+/// the transcript already records. Without this, a fan-out left eight dead rows
+/// pinned under the status bar, and a pane left expanded over the transcript sat
+/// there for the rest of the session.
+pub const ROSTER_LINGER_MS: u64 = 60_000;
 
 /// The sub-agent roster: every run of the session (capped at [`ROSTER_MAX`]),
 /// the cursor the user moves over it, and whether the selected run's output is
@@ -581,17 +601,22 @@ impl SubPane {
         changed
     }
 
-    /// Handles a mouse click on roster row `i` (`0` is `main`): moves the
-    /// cursor there and, on a sub-agent row, expands its output — a click is
-    /// select-and-open in one gesture. On `main` the transcript comes back.
-    /// Returns `false` (changing nothing) when `i` names no row.
-    pub fn click_row(&mut self, i: usize) -> bool {
-        if self.runs.is_empty() || i > self.runs.len() {
+    /// Handles a mouse click on a roster row: `run` is the run the clicked row
+    /// belongs to, or `None` for the `main` row. Moves the cursor there and, on
+    /// a sub-agent row, expands its output — a click is select-and-open in one
+    /// gesture; on `main` the transcript comes back. Returns `false` (changing
+    /// nothing) when `run` names no run.
+    ///
+    /// Takes the run rather than the drawn row index because the two differ
+    /// once a finished row has expired out of the roster; [`roster_click`] does
+    /// the mapping, against the rows the clicked frame actually drew.
+    pub fn click_run(&mut self, run: Option<usize>) -> bool {
+        if run.is_some_and(|i| i >= self.runs.len()) {
             return false;
         }
         self.selecting = true;
-        self.cursor = i;
-        self.active = i > 0;
+        self.cursor = run.map_or(0, |i| i + 1);
+        self.active = run.is_some();
         true
     }
 
@@ -616,6 +641,55 @@ impl SubPane {
         }
     }
 
+    /// Run indices the roster draws at `now` (monotonic ms), in row order:
+    /// drawn row `n + 1` is `visible_runs(now)[n]`, row `0` being `main`.
+    ///
+    /// A finished run's row is dropped once it has outlived
+    /// [`ROSTER_LINGER_MS`]. The roster is a readout of what is happening now,
+    /// not a growing pile of completed agents: a fan-out otherwise left eight
+    /// dead rows pinned under the status bar, and a pane left expanded sat over
+    /// the transcript for the rest of the session.
+    ///
+    /// The run itself is kept, only its row goes. Its output is the whole point
+    /// of having delegated, and the main log holds just a one-line signpost, so
+    /// a delegated report must stay reachable — which is why, while the user is
+    /// *in* the roster (`selecting`), every row is shown however long ago it
+    /// finished. That is both what the left arrow brings back and what stops a
+    /// row vanishing from under the cursor mid-read. An expanded pane with
+    /// focus back on the prompt is deliberately not exempt: the user is typing,
+    /// not reading, and that is the case the linger exists for.
+    #[must_use]
+    pub fn visible_runs(&self, now: u64) -> Vec<usize> {
+        (0..self.runs.len())
+            .filter(|&i| self.selecting || !self.runs[i].row_expired(now))
+            .collect()
+    }
+
+    /// Retires the roster state for a frame drawn at `now`: when the row the
+    /// cursor sits on is no longer shown, the cursor returns to `main` and any
+    /// expanded pane collapses.
+    ///
+    /// Without this the screen and the input routing
+    /// ([`Self::active_log`], [`Self::active_view`]) would keep pointing at a
+    /// run whose row is not on screen — an expanded pane with no row under it,
+    /// covering the transcript it should have handed back. Called from the draw
+    /// paths, so a row goes on its own clock instead of waiting for the next
+    /// keystroke.
+    pub fn expire_rows(&mut self, now: u64) {
+        if self.selecting {
+            return;
+        }
+        let gone = self
+            .cursor
+            .checked_sub(1)
+            .and_then(|i| self.runs.get(i))
+            .is_some_and(|run| run.row_expired(now));
+        if gone {
+            self.cursor = 0;
+            self.active = false;
+        }
+    }
+
     /// Snapshots the roster for drawing at `now` (monotonic ms).
     ///
     /// Owned strings rather than borrows: the draw site has already borrowed a
@@ -623,12 +697,13 @@ impl SubPane {
     /// pane too could not be passed alongside them.
     #[must_use]
     pub fn roster_view(&self, now: u64) -> RosterView {
-        // The roster is a live readout, so it goes away once the last agent
-        // finishes rather than leaving stale rows pinned under the status bar.
-        // The exception is a user who is *in* it — the rows must not vanish from
-        // under the cursor mid-read, and an expanded pane needs its row to stay
-        // on screen for as long as it is being read.
-        if self.runs.is_empty() || !(self.running() || self.selecting || self.active) {
+        // The roster is a live readout: on screen while an agent works and for
+        // [`ROSTER_LINGER_MS`] after the last one finishes, so the user sees it
+        // land and what it cost. Once no sub-agent row is left to draw, `main`
+        // would be the only row — and a panel that says nothing but "main" is
+        // worse than no panel, so the whole thing goes.
+        let visible = self.visible_runs(now);
+        if visible.is_empty() {
             return RosterView::default();
         }
         // `main` is the live transcript: never "finished", so it keeps the
@@ -639,16 +714,21 @@ impl SubPane {
             running: true,
             cursor: self.selecting && self.cursor == 0,
             expanded: !self.active,
+            run: None,
             ..RosterRow::default()
         }];
-        rows.extend(self.runs.iter().enumerate().map(|(i, run)| RosterRow {
-            label: run.label.clone(),
-            activity: run.task.clone(),
-            running: run.running,
-            elapsed: fmt_elapsed(run.elapsed_ms(now)),
-            tokens: run.tokens_text(),
-            cursor: self.selecting && self.cursor == i + 1,
-            expanded: self.active && self.cursor == i + 1,
+        rows.extend(visible.iter().map(|&i| {
+            let run = &self.runs[i];
+            RosterRow {
+                label: run.label.clone(),
+                activity: run.task.clone(),
+                running: run.running,
+                elapsed: fmt_elapsed(run.elapsed_ms(now)),
+                tokens: run.tokens_text(),
+                cursor: self.selecting && self.cursor == i + 1,
+                expanded: self.active && self.cursor == i + 1,
+                run: Some(i),
+            }
         }));
         RosterView { rows }
     }
@@ -672,6 +752,11 @@ pub struct RosterRow {
     pub cursor: bool,
     /// Whether this row's output is the one expanded over the transcript.
     pub expanded: bool,
+    /// Index into [`SubPane::runs`] this row draws, or `None` for the `main`
+    /// row. Rows are a filtered view of `runs` (see
+    /// [`SubPane::visible_runs`]), so a drawn row's position is *not* its run's
+    /// index; this is what a click resolves through.
+    pub run: Option<usize>,
 }
 
 /// The roster as the draw pass sees it: rows, or empty before any sub-agent has
@@ -1547,6 +1632,11 @@ fn frame_rows(
         render_task_strip(frame, strip_area, strip);
     }
     set_roster_rect(roster_area);
+    set_roster_rows(if roster_area.is_some() {
+        &roster.rows
+    } else {
+        &[]
+    });
     if let Some(roster_area) = roster_area {
         if crate::uiremote::recording_enabled() {
             crate::uiremote::region("roster", roster_area, &[]);
@@ -2412,6 +2502,35 @@ fn set_roster_rect(rect: Option<Rect>) {
     if let Ok(mut slot) = ROSTER_RECT.lock() {
         *slot = rect;
     }
+}
+
+/// The run behind each roster row of the last drawn frame, in row order
+/// (`None` for the `main` row). Rows are a filtered view of
+/// [`SubPane::runs`] — a finished row expires out of the roster after
+/// [`ROSTER_LINGER_MS`] — so a click cannot infer its run from the row's
+/// position, and re-deriving the filter at click time could disagree with the
+/// frame the user actually clicked on (a row may expire in between). Recording
+/// what was drawn removes the race.
+static ROSTER_ROWS: std::sync::Mutex<Vec<Option<usize>>> = std::sync::Mutex::new(Vec::new());
+
+/// Records the row→run mapping of the frame just drawn.
+fn set_roster_rows(rows: &[RosterRow]) {
+    if let Ok(mut slot) = ROSTER_ROWS.lock() {
+        slot.clear();
+        slot.extend(rows.iter().map(|r| r.run));
+    }
+}
+
+/// Maps a click to the run whose roster row it landed on: `Some(None)` for the
+/// `main` row, `Some(Some(i))` for `runs[i]`, and `None` when the click missed
+/// the roster entirely. Resolved against the last drawn frame, so it agrees
+/// with what the user was looking at.
+#[must_use]
+pub fn roster_click(column: u16, row: u16) -> Option<Option<usize>> {
+    let rect = last_roster_rect()?;
+    let rows = ROSTER_ROWS.lock().ok()?;
+    let i = roster_row_at(rect, rows.len(), column, row)?;
+    rows.get(i).copied()
 }
 
 /// Maps a screen cell to a roster row index (`0` is `main`) given the rect the
@@ -4623,7 +4742,8 @@ mod tests {
             208_000,
         );
         pane.add_tokens(None, 0, 39_900);
-        let roster = pane.roster_view(280_000);
+        // Inside the finished row's linger window, so both rows are drawn.
+        let roster = pane.roster_view(250_000);
 
         let mut log = OutputLog::new();
         log.push_plain("transcript");
@@ -4671,7 +4791,7 @@ mod tests {
         assert!(rows[row_of("Discovering")].contains('○'), "{screen}");
         // And each carries its own right-aligned tally.
         assert!(rows[row_of("Committing")].contains("3m 28s · ↓ 51.9k tokens"));
-        assert!(rows[row_of("Discovering")].contains("1m 12s · ↓ 39.9k tokens"));
+        assert!(rows[row_of("Discovering")].contains("42s · ↓ 39.9k tokens"));
         assert!(
             rows[row_of("Committing")].trim_end().ends_with("tokens"),
             "the tally is flush right: {:?}",
@@ -4762,7 +4882,7 @@ mod tests {
         assert!(rows[1].expanded);
 
         // Selecting main again (or clicking it) brings the transcript back.
-        assert!(pane.click_row(0));
+        assert!(pane.click_run(None));
         let rows = pane.roster_view(2_000).rows;
         assert!(rows[0].cursor);
         assert!(rows[0].expanded);
@@ -4860,15 +4980,15 @@ mod tests {
     #[test]
     fn a_click_selects_and_opens_a_row_and_main_brings_the_transcript_back() {
         let mut pane = SubPane::default();
-        assert!(!pane.click_row(0), "nothing to click before any run");
+        assert!(pane.click_run(None), "the `main` row is always clickable");
         pane.begin("alpha".to_string(), "", 0);
         pane.begin("beta".to_string(), "", 0);
-        assert!(pane.click_row(2));
+        assert!(pane.click_run(Some(1)));
         assert!(pane.selecting && pane.active && pane.cursor == 2);
         assert_eq!(pane.selected().map(|r| r.label.as_str()), Some("beta"));
-        assert!(pane.click_row(0));
+        assert!(pane.click_run(None));
         assert!(pane.selecting && !pane.active && pane.cursor == 0);
-        assert!(!pane.click_row(3), "past the last row");
+        assert!(!pane.click_run(Some(2)), "past the last run");
         assert_eq!(pane.cursor, 0);
     }
 
@@ -4900,7 +5020,7 @@ mod tests {
     }
 
     #[test]
-    fn the_roster_goes_away_once_the_last_agent_is_done() {
+    fn the_roster_goes_away_a_minute_after_the_last_agent_is_done() {
         let mut pane = SubPane::default();
         pane.begin("alpha".to_string(), "", 0);
         pane.begin("beta".to_string(), "", 0);
@@ -4913,11 +5033,18 @@ mod tests {
 
         pane.current = 1;
         pane.end(6_000);
-        assert!(
-            pane.roster_view(9_000).rows.is_empty(),
-            "the last agent finishing takes the roster with it"
+        assert_eq!(
+            pane.roster_view(9_000).rows.len(),
+            3,
+            "both rows linger a moment so the user sees them land"
         );
-        assert_eq!(pane.roster_view(9_000).height(), 0, "and its screen rows");
+
+        let late = 6_000 + ROSTER_LINGER_MS;
+        assert!(
+            pane.roster_view(late).rows.is_empty(),
+            "the last row expiring takes the roster with it"
+        );
+        assert_eq!(pane.roster_view(late).height(), 0, "and its screen rows");
     }
 
     #[test]
@@ -4927,10 +5054,12 @@ mod tests {
         let mut pane = SubPane::default();
         pane.begin("alpha".to_string(), "", 0);
         pane.end(1_000);
-        assert!(pane.roster_view(2_000).rows.is_empty());
+        let late = 1_000 + ROSTER_LINGER_MS;
+        assert_eq!(pane.roster_view(2_000).rows.len(), 2, "a moment to land");
+        assert!(pane.roster_view(late).rows.is_empty(), "then it expires");
 
         assert!(pane.move_cursor(-1), "still reachable after it hid");
-        assert_eq!(pane.roster_view(2_000).rows.len(), 2);
+        assert_eq!(pane.roster_view(late).rows.len(), 2);
 
         pane.move_cursor(1);
         assert!(pane.expand());
@@ -4942,7 +5071,180 @@ mod tests {
         );
 
         pane.collapse();
-        assert!(pane.roster_view(2_000).rows.is_empty(), "Esc puts it away");
+        assert!(pane.roster_view(late).rows.is_empty(), "Esc puts it away");
+    }
+
+    #[test]
+    fn a_finished_row_leaves_the_roster_a_minute_after_it_ended() {
+        // The roster is a readout of what is happening now, so a completed
+        // agent must not sit on it for the rest of the session while its
+        // siblings work.
+        let mut pane = SubPane::default();
+        pane.begin("alpha".to_string(), "", 0);
+        pane.begin("beta".to_string(), "", 0);
+        pane.current = 0;
+        pane.end(1_000);
+
+        assert_eq!(pane.roster_view(2_000).rows.len(), 3, "still fresh");
+        assert_eq!(
+            pane.roster_view(1_000 + ROSTER_LINGER_MS - 1).rows.len(),
+            3,
+            "just inside the minute"
+        );
+
+        let rows = pane.roster_view(1_000 + ROSTER_LINGER_MS).rows;
+        assert_eq!(rows.len(), 2, "alpha's row expired; beta still works");
+        assert_eq!(rows[1].label, "beta");
+        assert_eq!(
+            rows[1].run,
+            Some(1),
+            "and the row it drew still names its own run, not its position"
+        );
+        assert_eq!(
+            pane.runs.len(),
+            2,
+            "the run itself is kept: its output is why it was delegated"
+        );
+    }
+
+    #[test]
+    fn the_panel_goes_away_when_the_last_row_expires() {
+        // An expanded pane with focus back on the prompt is the case that
+        // would otherwise cover the transcript for the rest of the session:
+        // the user is typing, not reading.
+        let mut pane = SubPane::default();
+        pane.begin("alpha".to_string(), "", 0);
+        pane.end(1_000);
+        assert!(pane.click_run(Some(0)));
+        pane.selecting = false;
+        assert_eq!(pane.roster_view(2_000).rows.len(), 2, "up while it lasts");
+
+        let late = 1_000 + ROSTER_LINGER_MS;
+        pane.expire_rows(late);
+        assert!(!pane.active, "the transcript is back on screen");
+        assert_eq!(pane.cursor, 0);
+        assert!(
+            pane.roster_view(late).rows.is_empty(),
+            "only `main` would be left, so the whole panel goes"
+        );
+        assert_eq!(pane.roster_view(late).height(), 0);
+
+        // Hidden, not destroyed: the delegated report is still reachable.
+        assert!(pane.move_cursor(-1));
+        assert_eq!(
+            pane.roster_view(late).rows.len(),
+            2,
+            "`←` brings a finished roster back"
+        );
+    }
+
+    #[test]
+    fn a_row_being_read_never_expires_from_under_the_cursor() {
+        // While the user is in the roster every row shows, however long ago it
+        // finished — that is both what makes a report reachable again and what
+        // keeps rows from moving under the cursor mid-read.
+        let mut pane = SubPane::default();
+        pane.begin("alpha".to_string(), "", 0);
+        pane.begin("beta".to_string(), "", 0);
+        pane.current = 0;
+        pane.end(1_000);
+        pane.current = 1;
+        pane.end(1_000);
+        pane.move_cursor(-1);
+        pane.move_cursor(1);
+        assert_eq!(pane.cursor, 1, "on alpha");
+
+        let late = 1_000 + ROSTER_LINGER_MS;
+        pane.expire_rows(late);
+        assert_eq!(pane.cursor, 1, "still on alpha");
+        assert_eq!(pane.roster_view(late).rows.len(), 3, "and every row shows");
+
+        // Leaving the roster releases them.
+        pane.collapse();
+        pane.expire_rows(late);
+        assert!(pane.roster_view(late).rows.is_empty());
+    }
+
+    #[test]
+    fn an_expired_expanded_row_hands_the_screen_back_to_the_transcript() {
+        // Two finished runs, the first expanded with focus on the prompt. Its
+        // row going must not silently promote its neighbour's output into the
+        // pane the user was looking at.
+        let mut pane = SubPane::default();
+        pane.begin("alpha".to_string(), "", 0);
+        pane.begin("beta".to_string(), "", 0);
+        pane.current = 0;
+        pane.end(1_000);
+        let late = 1_000 + ROSTER_LINGER_MS;
+        pane.current = 1;
+        pane.end(late);
+        assert!(pane.click_run(Some(0)));
+        pane.selecting = false;
+
+        pane.expire_rows(late);
+        assert!(
+            !pane.active,
+            "the row being shown is gone, so the transcript comes back"
+        );
+        assert_eq!(pane.cursor, 0);
+        let rows = pane.roster_view(late).rows;
+        assert_eq!(rows.len(), 2, "alpha expired, beta is still fresh");
+        assert_eq!(rows[1].label, "beta");
+        assert_eq!(rows[1].run, Some(1));
+    }
+
+    #[test]
+    fn a_click_resolves_through_the_rows_the_frame_actually_drew() {
+        // With an expired row hidden, drawn row 1 is *not* run 0. A click that
+        // assumed the row's position was its run index opened the wrong
+        // agent's output.
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pane = SubPane::default();
+        pane.begin("alpha".to_string(), "a", 0);
+        pane.begin("beta".to_string(), "b", 0);
+        pane.current = 0;
+        pane.end(1_000);
+        let late = 1_000 + ROSTER_LINGER_MS;
+        let roster = pane.roster_view(late);
+        assert_eq!(roster.rows.len(), 2, "main plus beta");
+
+        let log = OutputLog::new();
+        let mut view = OutputView::default();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &log,
+                Some(InputState::new("", 0)),
+                "idle",
+                &mut view,
+                None,
+                &TaskView::default(),
+                None,
+                &roster,
+            );
+        })
+        .unwrap();
+
+        let rect = last_roster_rect().expect("a roster rect");
+        // Row 0 of the rect is the blank separator.
+        assert_eq!(roster_click(rect.x, rect.y), None, "the separator");
+        assert_eq!(roster_click(rect.x, rect.y + 1), Some(None), "`main`");
+        assert_eq!(
+            roster_click(rect.x, rect.y + 2),
+            Some(Some(1)),
+            "the second drawn row is run 1, not run 0"
+        );
+        assert_eq!(
+            roster_click(rect.x, rect.y + 3),
+            None,
+            "no row was drawn there"
+        );
+
+        assert!(pane.click_run(Some(1)));
+        assert_eq!(pane.selected().map(|r| r.label.as_str()), Some("beta"));
     }
 
     #[test]

@@ -233,13 +233,19 @@ fn repaint_idle(
     wasm_frame: Option<&crate::wasmreg::OpenFrame>,
     rem: Option<&Mutex<UiRemote>>,
 ) -> Result<ratatui::buffer::Buffer, String> {
+    // First thing on the frame: a row that has outlived its linger window is
+    // retired now, on the draw clock, so it goes without the user having to
+    // press anything. Before `active` is read, so an expanded pane this
+    // collapses does not keep the pane title for one more frame.
+    let now = tui::roster_clock_ms();
+    sub_pane.expire_rows(now);
     let sub_active = sub_pane.active;
     let sub_title: Option<String> = if sub_active {
         sub_pane.label().map(str::to_owned)
     } else {
         None
     };
-    let roster = sub_pane.roster_view(tui::roster_clock_ms());
+    let roster = sub_pane.roster_view(now);
     let roster_rows = roster.height();
     let selected_row = sub_pane.cursor.checked_sub(1).filter(|_| sub_active);
     let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) =
@@ -9832,6 +9838,10 @@ impl Agent<'_> {
             let task_view = tui::TaskView::from(&self.session.tasks);
             // Same pane selection as the busy loop, hoisted out of the draw
             // closure: a Ctrl-O pressed while idle has to be visible here too.
+            // Retired first (`repaint_idle` does it too, and it is idempotent)
+            // so the status line and the frame agree about the pane on the very
+            // frame a finished row expires.
+            sub_pane.expire_rows(tui::roster_clock_ms());
             let sub_active = sub_pane.active;
             // Owned so the draw closure does not hold a borrow of `sub_pane`
             // alongside the mutable borrow of its view. The roster is snapshotted
@@ -10101,9 +10111,10 @@ impl Agent<'_> {
                         input_drag = false;
                         // A click on a roster row selects it and opens its
                         // output (or brings the transcript back on `main`).
-                        let roster_hit = tui::last_roster_rect().and_then(|r| {
-                            tui::roster_row_at(r, sub_pane.runs.len() + 1, m.column, m.row)
-                        });
+                        // `Some(None)` is the `main` row, `Some(Some(i))` a
+                        // run: rows are a filtered view of `runs`, so the
+                        // clicked frame's own mapping resolves it.
+                        let roster_hit = tui::roster_click(m.column, m.row);
                         // A click on the jump-to-bottom hint resumes follow mode
                         // (same as End) instead of starting a text selection.
                         let v = sub_pane.active_view(&mut view);
@@ -10112,8 +10123,8 @@ impl Agent<'_> {
                         }) {
                             v.follow = true;
                             selection = None;
-                        } else if let Some(i) = roster_hit {
-                            sub_pane.click_row(i);
+                        } else if let Some(run) = roster_hit {
+                            sub_pane.click_run(run);
                             selection = None;
                         } else if let Some(img) = tui::last_input_rect()
                             .and_then(|r| tui::input_hit(r, input.buf.text(), m.column, m.row))
@@ -14000,6 +14011,11 @@ fn busy_ui_loop(
         } else {
             std::borrow::Cow::Borrowed(status_line.as_str())
         };
+        // Same retirement as the idle draw path, and for the same reason it
+        // comes first: a fan-out finishes its slots one by one, and their rows
+        // must clear while the turn is still running.
+        let now = tui::roster_clock_ms();
+        sub.expire_rows(now);
         let sub_active = sub.active;
         // Owned for the same reason: the selected run's view is borrowed mutably
         // below, so nothing else may hold a borrow of the pane across the draw.
@@ -14008,7 +14024,7 @@ fn busy_ui_loop(
         } else {
             None
         };
-        let roster = sub.roster_view(tui::roster_clock_ms());
+        let roster = sub.roster_view(now);
         let roster_rows = roster.height();
         let selected_row = sub.cursor.checked_sub(1).filter(|_| sub_active);
         let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) =
@@ -14400,11 +14416,9 @@ fn busy_ui_loop(
                 // to, so a release lost off-window cannot strand the next drag.
                 // A click on a roster row selects it and opens its output.
                 MouseEventKind::Down(MouseButton::Left)
-                    if let Some(i) = tui::last_roster_rect().and_then(|r| {
-                        tui::roster_row_at(r, sub.runs.len() + 1, m.column, m.row)
-                    }) =>
+                    if let Some(run) = tui::roster_click(m.column, m.row) =>
                 {
-                    sub.click_row(i);
+                    sub.click_run(run);
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
                     input_drag = tui::last_input_rect()

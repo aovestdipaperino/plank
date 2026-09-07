@@ -2216,6 +2216,23 @@ Method for measuring the effect: re-run the counts above on dumps recorded
 after the change and compare. Source and full proposal:
 `local/PROMPT-IMPROVEMENTS.md`.
 
+## A drawn roster row's position is not its run's index
+
+Roster rows are a *filtered* view of `SubPane::runs`: a finished run's row
+expires off the roster a minute after it ends (`ROSTER_LINGER_MS`), while the
+run itself is kept, because a sub-agent's output lives only in its pane — the
+main log gets a one-line signpost — and `←` must still bring a finished roster
+back. So with one row hidden, drawn row 1 is `main` and drawn row 2 is
+`runs[1]`, not `runs[0]`. The mouse path used to treat the drawn index as the
+cursor position (`runs.len() + 1` rows, `click_row(i)`), which silently opened
+the wrong agent once anything had expired. The frame therefore records its own
+row→run map (`set_roster_rows`, read by `roster_click`) instead of re-deriving
+the filter at click time: a row can expire between the frame the user clicked
+and the click being handled, and only the drawn frame knows what they aimed at.
+Anything else that addresses rows by position — the cursor, `move_cursor`,
+`current` — is only ever exercised while `selecting` is set, which is exactly
+when every row is shown, so those stay index-for-index with `runs`.
+
 ## Loops live in `docs/LOOP-FINDINGS.md`
 
 Every finding about the model repeating itself — the reasoning repeat guard,
