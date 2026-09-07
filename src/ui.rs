@@ -10343,16 +10343,24 @@ impl Agent<'_> {
             let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
             match key.code {
                 // `←` on an empty prompt reaches into the sub-agent roster below
-                // the status bar: it reveals the cursor, then walks up the rows
-                // (toward `main`). `→` walks back down, Enter expands the
-                // selected agent's output, Esc leaves. With text in the prompt
-                // the arrows stay cursor motion, so typing is never hijacked.
-                KeyCode::Left | KeyCode::Right
-                    if input.buf.text().is_empty()
-                        && !word_mod
-                        && (sub_pane.selecting || key.code == KeyCode::Left) =>
+                // the status bar and reveals its cursor. Once the roster is
+                // selected, `↑`/`↓` walk the rows the way they are drawn (`↑`
+                // toward `main`): the roster owns those keys only while it is
+                // selected, so prompt history is never hijacked, and with text
+                // in the prompt `←` stays cursor motion. Enter expands the
+                // selected agent's output, Esc leaves.
+                KeyCode::Left
+                    if input.buf.text().is_empty() && !word_mod && !sub_pane.selecting =>
                 {
-                    let delta = if key.code == KeyCode::Left { -1 } else { 1 };
+                    if !sub_pane.move_cursor(0) {
+                        log.push_dim("[no sub-agent has run yet]");
+                    }
+                    selection = None;
+                }
+                KeyCode::Up | KeyCode::Down
+                    if sub_pane.selecting && input.buf.text().is_empty() && !word_mod =>
+                {
+                    let delta = if key.code == KeyCode::Up { -1 } else { 1 };
                     if !sub_pane.move_cursor(delta) {
                         log.push_dim("[no sub-agent has run yet]");
                     }

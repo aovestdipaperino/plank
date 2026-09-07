@@ -351,7 +351,8 @@ pub struct SubPane {
     current: usize,
     /// Roster cursor: `0` is the `main` row, `n` is `runs[n - 1]`.
     pub cursor: usize,
-    /// Whether the cursor is being moved — set by `←`, cleared by `Esc`. Only
+    /// Whether the cursor is being moved — set by `←`, walked with `↑`/`↓`,
+    /// cleared by `Esc`. Only
     /// then is the cursor drawn, so the roster is a quiet status readout until
     /// the user reaches for it.
     pub selecting: bool,
@@ -539,7 +540,9 @@ impl SubPane {
     /// entering selection mode. Returns `false` (changing nothing) when no
     /// sub-agent has ever run, so there is nothing to select.
     ///
-    /// Moving off a row that was expanded collapses back to the transcript: the
+    /// The first call only reveals the cursor where it rests, whatever `delta`
+    /// says — that is how `←` enters the roster; `↑`/`↓` then walk it. Moving
+    /// off a row that was expanded collapses back to the transcript: the
     /// cursor and what is on screen never disagree.
     pub fn move_cursor(&mut self, delta: isize) -> bool {
         if self.runs.is_empty() {
@@ -628,9 +631,14 @@ impl SubPane {
         if self.runs.is_empty() || !(self.running() || self.selecting || self.active) {
             return RosterView::default();
         }
+        // `main` is the live transcript: never "finished", so it keeps the
+        // hollow bullet, and it is the row on screen whenever no sub-agent
+        // pane is expanded, so it takes the highlight in that case.
         let mut rows = vec![RosterRow {
             label: "main".to_owned(),
+            running: true,
             cursor: self.selecting && self.cursor == 0,
+            expanded: !self.active,
             ..RosterRow::default()
         }];
         rows.extend(self.runs.iter().enumerate().map(|(i, run)| RosterRow {
@@ -4731,6 +4739,34 @@ mod tests {
         // The `main` row carries no telemetry of its own.
         assert_eq!(roster.rows[0].elapsed, "");
         assert_eq!(roster.rows[0].tokens, "");
+    }
+
+    /// `main` is the live transcript, never a finished run: it must not wear the
+    /// green "done" bullet, and while no sub-agent pane is expanded it is the
+    /// row whose output is on screen, so it takes the highlight the expanded
+    /// row otherwise takes.
+    #[test]
+    fn the_main_row_is_live_and_highlighted_while_the_transcript_is_shown() {
+        let mut pane = SubPane::default();
+        pane.begin("research".to_string(), "Committing the fix", 1_000);
+        let main = pane.roster_view(2_000).rows[0].clone();
+        assert!(main.running, "main is never drawn as finished");
+        assert!(main.expanded, "the transcript is what is on screen");
+
+        // Expanding the sub-agent hands the highlight over to it.
+        assert!(pane.move_cursor(0));
+        assert!(pane.move_cursor(1));
+        assert!(pane.expand());
+        let rows = pane.roster_view(2_000).rows;
+        assert!(!rows[0].expanded);
+        assert!(rows[1].expanded);
+
+        // Selecting main again (or clicking it) brings the transcript back.
+        assert!(pane.click_row(0));
+        let rows = pane.roster_view(2_000).rows;
+        assert!(rows[0].cursor);
+        assert!(rows[0].expanded);
+        assert!(!rows[1].expanded);
     }
 
     #[test]

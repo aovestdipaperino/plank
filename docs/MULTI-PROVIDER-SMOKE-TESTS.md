@@ -116,7 +116,7 @@ the *model*, not from you.
 
 **Expect:**
 - A `[sub-agent: remote-reviewer — ← for agents]` line.
-- A roster row for `remote-reviewer` below the status bar, ticking; `←` then
+- A roster row for `remote-reviewer` below the status bar, ticking; `←`, `↓`, then
   Enter expands it, and its text reads like the remote model, not the local one.
 - Only the framed report enters the main conversation.
 - The footer's engine-origin indicator still shows the **main** engine
