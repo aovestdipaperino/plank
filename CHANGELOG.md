@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A main turn that loops twice in a row is stopped**, the same way a
+  sub-agent already was. At temperature 0 the pass after the repeat guard's
+  error is the same prompt plus one line, so `repro-loop-1788708943` and
+  `-1788709421` were one session looping, stopping, and looping again until
+  the user quit. The second stop now ends the turn with a red
+  `guard: turn stopped…` line; the guard's error stays in the transcript so
+  the next prompt sees why.
+- **Test loop dumps no longer land in `~/.plank/repro`.** The looping-pass
+  unit tests wrote real `repro-loop-*` files under `$HOME`; the agent now
+  carries its repro folder and tests point it at a temp directory. Loop
+  findings are collected in `docs/LOOP-FINDINGS.md`.
 - **A sub-agent's pass now reports live progress.** The roster row and the
   footer took their live token count from the main pass's status snapshots
   only, so a long local sub-agent pass sat on a frozen `↓ n tokens` and a

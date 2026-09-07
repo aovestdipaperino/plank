@@ -620,6 +620,19 @@ const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating
 /// the report, so the parent keeps the work done so far.
 const SUBAGENT_REPEAT_TRIP_CAP: usize = 2;
 
+/// Consecutive repeat-guard stops the main turn takes before it ends the
+/// turn instead of retrying. Same arithmetic as the sub-agent cap: at
+/// temperature 0 the pass after [`REPEAT_LOOP_ERROR`] is the same prompt plus
+/// one message, and `repro-loop-1788708943`/`-1788709421` (one session, eight
+/// minutes apart) show the main turn looping, stopping, looping again the
+/// same way, until the user quit on the third pass. Ending the turn hands the
+/// prompt back to the one party who can change it materially.
+const MAIN_REPEAT_TRIP_CAP: usize = 2;
+
+/// Shown when [`MAIN_REPEAT_TRIP_CAP`] ends a turn. The transcript keeps the
+/// guard's tool error as its last message, so the next prompt sees why.
+const MAIN_REPEAT_TRIPS_NOTICE: &str = "turn stopped: the model's reasoning looped twice in a row. Rephrase the request, narrow it, or give it what it is missing.";
+
 /// Reported to the parent when the forced report pass looped as well.
 const REPEAT_TRIPS_NOTICE: &str =
     "sub-agent stopped: its reasoning looped on every pass, including the final report pass";
@@ -1657,6 +1670,10 @@ struct Agent<'a> {
     /// so nothing captured against it — payload, rung, micro-compaction — may
     /// be written as if it were the session's own (see [`Agent::in_sidechain`]).
     sidechain_depth: usize,
+    /// Where `/repro` and the automatic loop dumps are written. Resolved once
+    /// at construction (`repro::repro_dir`, under `$HOME/.plank`), so a test
+    /// agent can point it at a scratch directory instead of the real folder.
+    repro_dir: std::path::PathBuf,
     /// True while `/init` runs its generation turn: tool banners, the `write`
     /// content preview and tool results are all suppressed regardless of the
     /// `ui.show*` settings, so the AGENTS.md draft never scrolls past.
@@ -3305,6 +3322,8 @@ impl Agent<'_> {
         // Stop hooks run at most once per turn, so a hook that always exits 2
         // cannot loop the model forever.
         let mut stop_hook_ran = false;
+        // Passes in a row the repeat guard stopped; see `MAIN_REPEAT_TRIP_CAP`.
+        let mut repeat_trips = 0usize;
         let mut round = 0usize;
         loop {
             round += 1;
@@ -3347,10 +3366,13 @@ impl Agent<'_> {
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
             if preflight_error.as_deref() == Some(REPEAT_LOOP_ERROR) {
-                self.report_guard(&repeat_trip_text(1));
+                repeat_trips += 1;
+                self.report_guard(&repeat_trip_text(repeat_trips));
                 if let Some(line) = self.loop_repro_line() {
                     println!("{}", self.debug_line(&line));
                 }
+            } else {
+                repeat_trips = 0;
             }
             let st = Status {
                 state: if stats.interrupted {
@@ -3398,6 +3420,10 @@ impl Agent<'_> {
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
                 )));
+                if repeat_trips >= MAIN_REPEAT_TRIP_CAP {
+                    self.report_guard(MAIN_REPEAT_TRIPS_NOTICE);
+                    return Ok(());
+                }
                 continue;
             }
             if !finished.calls.is_empty() {
@@ -7119,7 +7145,7 @@ the original is frozen and listed in /tree"
     /// pointer, so a bare `/open` opens the dump that was just generated (the
     /// file the user most likely wants to read or annotate next).
     fn write_repro(&mut self, note: &str) -> Result<(std::path::PathBuf, usize), String> {
-        self.write_repro_with(note, crate::repro::save)
+        self.write_repro_with(note, "repro")
     }
 
     /// The automatic dump taken the moment the repetition guard stops a pass
@@ -7134,20 +7160,18 @@ the original is frozen and listed in /tree"
             return None;
         }
         Some(
-            match self.write_repro_with(
-                "model looped; repro saved automatically",
-                crate::repro::save_loop,
-            ) {
+            match self.write_repro_with("model looped; repro saved automatically", "repro-loop") {
                 Ok((path, sidecars)) => Self::repro_written_line(&path, sidecars),
                 Err(e) => format!("[loop repro not written: {e}]"),
             },
         )
     }
 
+    /// Writes the dump as `<prefix>-<secs>.md` into `self.repro_dir`.
     fn write_repro_with(
         &mut self,
         note: &str,
-        save: fn(&std::path::Path, u64, &str) -> Result<std::path::PathBuf, String>,
+        prefix: &str,
     ) -> Result<(std::path::PathBuf, usize), String> {
         // `rendered` is the exact engine input (no timestamp markers) — used
         // for the token count so that figure stays accurate. `rendered_for_repro`
@@ -7179,7 +7203,7 @@ the original is frozen and listed in /tree"
             note: note.trim(),
         };
         let report = crate::repro::build_report(&meta, self.cfg, &rendered_for_repro);
-        let path = save(&self.tool_ctx.cwd, now_secs(), &report)?;
+        let path = crate::repro::save_in(&self.repro_dir, prefix, now_secs(), &report)?;
         // Sub-agent sidechains are gone from the transcript by now; the
         // remembered dumps go beside the main file, oldest first.
         let main_file = path
@@ -7194,8 +7218,8 @@ the original is frozen and listed in /tree"
             crate::repro::save_sidecar(&path, i + 1, &side)?;
             sidecars += 1;
         }
-        // `repro::save` builds its path from `$HOME` (or the already-absolute
-        // cwd), so unlike `openfile::note_edited` there is nothing to resolve.
+        // `self.repro_dir` is already absolute, so unlike
+        // `openfile::note_edited` there is nothing to resolve.
         self.last_edited = Some(path.clone());
         Ok((path, sidecars))
     }
@@ -11338,6 +11362,8 @@ impl Agent<'_> {
         // Stop hooks run at most once per turn, so a hook that always exits 2
         // cannot loop the model forever.
         let mut stop_hook_ran = false;
+        // Passes in a row the repeat guard stopped; see `MAIN_REPEAT_TRIP_CAP`.
+        let mut repeat_trips = 0usize;
         let mut round = 0usize;
         loop {
             round += 1;
@@ -11427,10 +11453,13 @@ impl Agent<'_> {
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
             if out.error.as_ref().is_some_and(|e| e.looped) {
-                self.report_guard(&repeat_trip_text(1));
+                repeat_trips += 1;
+                self.report_guard(&repeat_trip_text(repeat_trips));
                 if let Some(line) = self.loop_repro_line() {
                     let _ = tx.send(UiEvent::Dim(line));
                 }
+            } else {
+                repeat_trips = 0;
             }
             if out.interrupted {
                 crate::interrupt::clear();
@@ -11449,6 +11478,10 @@ impl Agent<'_> {
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
                 )));
+                if repeat_trips >= MAIN_REPEAT_TRIP_CAP {
+                    self.report_guard(MAIN_REPEAT_TRIPS_NOTICE);
+                    return Ok(());
+                }
                 self.drain_queued(shared, tx);
                 continue;
             }
@@ -14247,6 +14280,7 @@ fn new_agent(
     // The `skill` tool resolves names against the same set the slash command
     // uses; hand the dispatch context its own copy.
     tool_ctx.skills.clone_from(&skills);
+    let repro_dir = crate::repro::repro_dir(&tool_ctx.cwd);
     Ok(Agent {
         engine,
         cfg,
@@ -14261,6 +14295,7 @@ fn new_agent(
         payload_dirty: false,
         ladder: crate::kvladder::KvLadder::new(),
         sidechain_depth: 0,
+        repro_dir,
         quiet_tools: false,
         pending_images: Vec::new(),
         btw_diverged_engine: false,
@@ -16071,6 +16106,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
@@ -16153,6 +16189,13 @@ mod tests {
         for ev in [Event::FocusGained, Event::FocusLost, Event::Resize(80, 24)] {
             assert!(!is_user_activity(&ev), "{ev:?} is not the user");
         }
+    }
+
+    /// A repro folder under the temp dir, never `$HOME/.plank/repro`: the
+    /// looping-pass tests write real `repro-loop-*` dumps, and two of them
+    /// once landed among the genuine ones (`docs/LOOP-FINDINGS.md`).
+    fn test_repro_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("plank-ui-repro-{}", std::process::id()))
     }
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {
@@ -19672,6 +19715,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
@@ -19784,6 +19828,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
@@ -20899,6 +20944,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
@@ -21091,6 +21137,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
@@ -21188,6 +21235,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
@@ -21272,6 +21320,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
@@ -21379,6 +21428,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
@@ -21668,6 +21718,65 @@ mod tests {
             vec!["guard: stopped a reasoning loop"],
             "{events:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_main_turn_that_loops_twice_in_a_row_is_stopped() {
+        // `repro-loop-1788708943` / `-1788709421`: one session, the guard
+        // stopped the same loop twice eight minutes apart, and the user quit
+        // during the third pass. The cap ends the turn instead.
+        let dir = scratch_dir("main-repeat-cap");
+        let mut cfg = test_cfg();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Low;
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec![
+                looping_reasoning(),
+                looping_reasoning(),
+                "</think>Done.\n".to_string(),
+            ],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert_eq!(
+            error_lines(&events),
+            vec![
+                "guard: stopped a reasoning loop".to_string(),
+                "guard: stopped a reasoning loop (2 in a row)".to_string(),
+                format!("guard: {MAIN_REPEAT_TRIPS_NOTICE}"),
+            ],
+            "{events:?}"
+        );
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            2,
+            "the turn ended after the second loop; the third reply was never asked for"
+        );
+        // The guard's error stays as the last message, so the next prompt
+        // sees why the turn ended.
+        let last = agent.session.transcript.last().expect("transcript");
+        assert_eq!(last.role, crate::session::Role::User);
+        assert!(last.text.contains(REPEAT_LOOP_ERROR), "{}", last.text);
+        // Both dumps went to the test folder, never `$HOME/.plank/repro`.
+        let dumps = std::fs::read_dir(test_repro_dir())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("repro-loop-")
+            })
+            .count();
+        assert!(dumps >= 2, "{dumps} loop dumps");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -23196,6 +23305,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
@@ -23322,6 +23432,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
@@ -23482,6 +23593,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
@@ -23564,6 +23676,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,

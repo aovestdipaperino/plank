@@ -2062,43 +2062,6 @@ name is coloured — can overwrite the caret a concurrent test is asserting on.
 it at the top of the `#[test]` function and never inside a shared helper, or
 the non-reentrant mutex deadlocks the suite instead of failing it.
 
-## An hour-long turn was one thinking loop, not a hundred tool calls
-
-A session that took plank two hours on a request Claude Code finished in
-minutes had 46 tool calls and no edit to the project. The time was one
-assistant message: 149K characters of `<think>` in which three paragraphs
-("Need maybe add `MF_AUTO_DISMISS` to...") repeated 263 times, until the 50K
-token `n_predict` cap stopped it. At 25 tokens per second that is about 50
-minutes of silence, and the reply after the cap was empty.
-
-`insights::RepeatGuard` already detected exactly this, but was wired only into
-the insights sections. It now runs on every generation site (`stream_generation`,
-the quiet sub-agent pass, `worker_generate_kind`) through
-`ui::stream_chunk_must_stop`, with three rules that are easy to break:
-
-- **Watch reasoning only.** The guard is fed while `stream.in_think()`.
-  Visible output and tool arguments repeat legitimately — a `write` of a table
-  with identical rows is four cycles of a 12-byte period — and would trip it.
-- **The window must hold four cycles of a paragraph loop.** The observed
-  period was about 600 bytes; the insights default of 1 KiB can never see it.
-  The turn loop uses `RepeatGuard::with_window(8192)`, and the check interval
-  scales with the window so the scan stays bounded on fast provider streams.
-- **Stop through the preflight-error channel.** `StreamRenderer::fail_preflight`
-  records the model-facing text, so the existing "engine interrupted but it is
-  a tool error, not a user abort" path feeds it back as `Tool error:` and the
-  turn continues. A new stop reason would have needed its own plumbing at all
-  three consumers.
-
-The guard also has a *warning* level: `RepeatGuard::repeating()` turns true at
-two identical cycles (`REPEAT_WARN_CYCLES`) and stays true for the pass, while
-the stop still waits for four. The TUI status snapshot copies it into
-`Status::looping`, which the footer renders as `🔁 looping` after the ctx
-gauge. Two consequences worth remembering: the flag is sticky on purpose, since
-the tail drifts in and out of alignment between checks and a flickering marker
-reads as a bug; and the plain REPL never shows it, because its status bar is
-cleared the moment output starts streaming, so there is no generating footer to
-carry it.
-
 ## `edit` on a CRLF file: multi-line `old` never matches, single-line `old` corrupts
 
 `src/helpers/msgbox.rs` in turbo-vision is CRLF on 242 of 265 lines. The model
@@ -2194,58 +2157,9 @@ reconstructed from the prompt text.
   reasoning in answer style. Provider engines emit both tags and must not get
   the prefix.
 
-## A refused tool call is not a stopped loop
+## Loops live in `docs/LOOP-FINDINGS.md`
 
-`repro-1788676865`: the loop guard blocked the model's three-read stanza at
-the sixth repeat, as designed, and the model then re-emitted the identical
-stanza every pass for six more minutes until the user pressed Ctrl-C. Two
-things conspired. At temperature 0 the pass is a pure function of the prompt,
-and a refusal changes the prompt by one digit, so the model has no reason to
-behave differently. And the digit stopped changing: refused calls were pushed
-into the 32-call window, so once it was full every new call aged out one
-identical old call, the per-signature count went down one and up one, and
-"11 times" was reported forever, making the prompt *exactly* identical across
-passes. The fix keeps refused calls out of the window with their own
-monotonic counter, and adds the rung the guard was missing: three stanzas in a
-row refused in full end the turn (`LoopGuard::tripped`), after the automatic
-loop dump. The general lesson: a guard that only refuses an action leaves a
-deterministic model exactly where it was; something has to change the
-prompt materially or stop the turn.
-
-## A sub-agent that publishes no status looks hung
-
-`repro-1788690439`: a `fanout` sub-agent looped in its reasoning for ten
-minutes until the repeat guard stopped it, then generated for thirteen more
-with nothing on screen moving but the roster row's clock, and the user pressed
-Esc. Three separate gaps, each of which had to be closed at its own layer:
-
-- **Only the main pass published `Status`.** The roster row's live token count
-  comes from `UiEvent::Status` snapshots (`SubPane::note_status`), but those
-  were built only in `worker_turn`'s engine callback; the quiet sub-agent pass
-  (`generate_pass`) handled `EngineEvent::Text` alone. A row credited only by
-  the per-pass `SubTokens` tally froze for the whole pass, exactly the failure
-  the earlier "record_usage fires at pass completion" entry describes — that
-  fix wired the row to snapshots without making the sub-agent pass emit any.
-  Both passes now build their snapshots through one `LiveStatus`, so they
-  cannot drift apart again; the fan-out leaves it off (several passes, no
-  honest single row).
-- **The guard's error was fed back and nothing else changed.** Same lesson as
-  the refused-tool-call entry above: at temperature 0 the pass after
-  `REPEAT_LOOP_ERROR` is the same prompt plus one message, and the sub-agent
-  loop let that repeat for up to 40 rounds. Two stops in a row now push the
-  final-round reminder (`SUBAGENT_REPEAT_TRIP_CAP`), which changes the prompt
-  materially and turns the next pass into the report; a third loop fails the
-  sub-agent with `REPEAT_TRIPS_NOTICE` rather than retrying.
-- **The interrupted pass was discarded.** `generate_pass` returned a bare
-  `Err("interrupted")`, so the sidechain dump ended on the guard's tool result
-  and could not show what the model was doing for those thirteen minutes. The
-  abort now carries the partial text (`QuietAbort`), pushed into the sidechain
-  before the fork end truncates it out of the parent transcript. The main loop
-  had always kept its partial text; the sidechain path was written separately
-  and missed it.
-
-Guard stops are also red `UiEvent::Error` lines on the main window now
-(`Agent::report_guard`), naming the sub-agent (`ToolContext::subagent_label`,
-set around the delegated run so nesting restores the outer name). The sub-agent
-pane already showed the tool error, but nobody watching the parent could see
-it, which is the difference between "stuck" and "looping, being handled".
+Every finding about the model repeating itself — the reasoning repeat guard,
+the tool-call loop guard, the sub-agent trip cap, and the analysis of each
+`repro-loop-*` dump — is collected in `docs/LOOP-FINDINGS.md`. Add new loop
+findings there, not here.

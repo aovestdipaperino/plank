@@ -254,33 +254,12 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     out
 }
 
-/// Writes `report` to a fresh file in [`repro_dir`], returning its path. The
-/// name is `repro-<secs>.md`, disambiguated with a `-<n>` suffix if that name
-/// is already taken (two dumps within one second).
-///
-/// # Errors
-///
-/// Returns a message when the directory or file cannot be created.
-pub fn save(cwd: &Path, secs: u64, report: &str) -> Result<PathBuf, String> {
-    save_in(&repro_dir(cwd), "repro", secs, report)
-}
-
-/// Like [`save`], but named `repro-loop-<secs>.md`: the dump written
-/// automatically the moment the repetition guard stops a looping pass, so a
-/// stall is captured without the user having to notice it and type `/repro`.
-///
-/// # Errors
-///
-/// Returns a message when the directory or file cannot be created.
-pub fn save_loop(cwd: &Path, secs: u64, report: &str) -> Result<PathBuf, String> {
-    save_in(&repro_dir(cwd), "repro-loop", secs, report)
-}
-
 /// Writes `report` into an explicit directory as `<prefix>-<secs>.md`,
 /// disambiguating same-second filenames with a `-N` suffix.
 ///
-/// Split out from [`save`] so tests can exercise the naming rule against a
-/// scratch directory without reaching for the process-global `HOME`.
+/// The agent resolves the directory once ([`repro_dir`]) and passes it in, so
+/// a test agent can aim its dumps at a scratch directory instead of `$HOME`.
+/// `prefix` is `repro` for `/repro` and `repro-loop` for the automatic dump.
 ///
 /// # Errors
 /// Returns the OS error message when the directory cannot be created or the
