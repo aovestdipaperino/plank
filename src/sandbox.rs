@@ -309,6 +309,11 @@ pub fn is_read_only_command(cmd: &str) -> bool {
         "env",
         "printenv",
     ];
+    // `2>/dev/null` and `2>&1` only route stderr; they cannot create a file
+    // outside `/dev`, so they are removed before the redirect check rather than
+    // counted as a write. Every other `>` still counts.
+    let cmd = strip_stderr_redirects(cmd);
+    let cmd = cmd.as_str();
     if cmd.contains('>') || cmd.contains('`') || cmd.contains("$(") {
         return false;
     }
@@ -334,11 +339,47 @@ pub fn is_read_only_command(cmd: &str) -> bool {
             first
         };
         let name = head.rsplit('/').next().unwrap_or(head);
+        if name == "find" {
+            // `find` only reads unless asked to act on what it finds.
+            if words.any(|w| FIND_MUTATORS.contains(&w)) {
+                return false;
+            }
+            continue;
+        }
         if !READERS.contains(&name) {
             return false;
         }
     }
     any
+}
+
+/// `find` primaries that run a program or remove a file; a `find` carrying
+/// any of them is not read-only.
+const FIND_MUTATORS: &[&str] = &[
+    "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
+];
+
+/// Removes `2>/dev/null` and `2>&1` (with or without a space before the
+/// target) from `cmd`, leaving every other redirect in place.
+fn strip_stderr_redirects(cmd: &str) -> String {
+    let mut out = String::with_capacity(cmd.len());
+    let mut rest = cmd;
+    while let Some(i) = rest.find("2>") {
+        let (before, after) = rest.split_at(i);
+        out.push_str(before);
+        let tail = after[2..].trim_start();
+        if let Some(t) = tail.strip_prefix("&1") {
+            rest = t;
+        } else if let Some(t) = tail.strip_prefix("/dev/null") {
+            rest = t;
+        } else {
+            // Some other stderr target: keep the `>` so the caller sees it.
+            out.push_str("2>");
+            rest = &after[2..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// True when `needle` occurs in `text` as a whole path component prefix, so
@@ -584,7 +625,18 @@ mod tests {
         assert!(is_read_only_command("LC_ALL=C sort ~/.plank/x"));
         // Redirects, substitutions and anything unrecognised keep the prompt.
         assert!(!is_read_only_command("cat x > ~/.plank/y"));
-        assert!(!is_read_only_command("cat ~/.plank/x 2>/dev/null"));
+        // Stderr-only redirects cannot create a file; every other `>` can.
+        assert!(is_read_only_command("cat ~/.plank/x 2>/dev/null"));
+        assert!(is_read_only_command("ls ~/.plank 2>&1 | head"));
+        assert!(is_read_only_command("ls ~/.plank 2> /dev/null"));
+        assert!(!is_read_only_command("cat ~/.plank/x 2>~/.plank/err"));
+        assert!(!is_read_only_command("cat ~/.plank/x >/dev/null"));
+        assert!(!is_read_only_command("cat ~/.plank/x &>/dev/null"));
+        // `find` reads unless it acts on its matches.
+        assert!(is_read_only_command("find ~/.plank -name '*.gguf'"));
+        assert!(is_read_only_command("find ~/.plank -type f | wc -l"));
+        assert!(!is_read_only_command("find ~/.plank -name x -exec rm {} +"));
+        assert!(!is_read_only_command("find ~/.plank -fprint ~/.plank/list"));
         assert!(!is_read_only_command("echo $(rm -rf ~/.plank)"));
         assert!(!is_read_only_command("rm -rf ~/.plank"));
         assert!(!is_read_only_command("sed -i s/a/b/ ~/.plank/x"));

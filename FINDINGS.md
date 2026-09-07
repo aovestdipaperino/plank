@@ -2169,11 +2169,21 @@ That meant `cat ~/.plank/settings.json` asked "Allow it to write there?" during
 an AGENTS.md pass (repro `repro-1788602110`), and denying changed nothing since
 the read was allowed anyway. The fix is not to parse shell: `is_read_only_command`
 accepts a line only when every simple command starts with a listed reader and
-there is no `>`, backtick or `$(`, and everything else keeps prompting. Note
-`2>/dev/null` contains `>` and still prompts; that is deliberate, because telling
-fd redirects from output redirects is exactly the parsing the allowlist avoids.
-The profile stays the boundary, so the classifier can only over-ask, never
+there is no `>`, backtick or `$(`, and everything else keeps prompting. The
+profile stays the boundary, so the classifier can only over-ask, never
 over-grant.
+
+That first cut kept prompting on `2>/dev/null`, on the theory that telling fd
+redirects from output redirects is shell parsing. It recurred the next day
+(`repro-1788705593`): the finanze `AGENTS.md` names `~/.plank/ds4flash.gguf`, so
+the model's first probe of the model file, with the usual `2>/dev/null` tail,
+asked for write access on a session that had done nothing. The two stderr-only
+spellings, `2>/dev/null` and `2>&1`, are now stripped before the `>` check
+(`strip_stderr_redirects`), and `find` counts as a reader unless it carries
+`-delete`, `-exec` or another acting primary (`FIND_MUTATORS`). Any other `2>`
+target keeps the prompt. A repro taken mid-turn cannot show the offending call,
+because only committed messages are dumped, which is why this one had to be
+reconstructed from the prompt text.
 
 - **The transcript stores local-engine thinking without its opening tag.** The
   local chat template pre-opens `<think>` in the prefill, so the raw stream
