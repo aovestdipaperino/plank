@@ -742,21 +742,30 @@ pub fn parse_bool_default(s: Option<&str>, def: bool) -> bool {
 /// (`tools.recall`); when off, the tool is not advertised and dispatches as
 /// unknown. Results are bounded through the M4 spill policy like any other
 /// tool result.
-/// `view_image` — parity stub for the C's visual-observation tool.
+/// The refusal `view_image` gives when no vision encoder is available.
+///
+/// The C reference prints "`view_image` requires `ds4-agent` --vision FILE" here,
+/// but that text is a lie in plank: vision is in-process through the engine
+/// FFI, there is no CLI vision mode, and no subprocess is ever spawned. A model
+/// that reads the C's wording dutifully shells out to `ds4-agent --vision`,
+/// fails, and concludes vision is broken — so this string is deliberately
+/// *not* byte-for-byte with the C. Nothing in the frozen prompt depends on it;
+/// tool error text is not part of the wire format `tests/c_parity.rs` pins.
+pub const VIEW_IMAGE_NO_ENCODER: &str = "Tool error: view_image is unavailable: this plank build has no vision encoder loaded. Vision is in-process; there is no command-line vision mode, so do not shell out to retry.\n";
+
+/// `view_image` — stub for the C's visual-observation tool.
 ///
 /// This is only reached when `view_image` is dispatched through the generic
 /// `dispatch` path (which has no engine access). The agent's `run_tool_calls`
 /// intercepts `view_image` and routes it through [`Agent::run_view_image`],
 /// which has the engine and can encode the image. This stub remains as a
-/// safety net for any path that calls `dispatch` directly, returning the C's
-/// own refusal byte-for-byte — the same string `ds4-agent` prints when run
-/// without `--vision`.
+/// safety net for any path that calls `dispatch` directly.
 fn tool_view_image(call: &ToolCall) -> String {
     let path = call.arg_value("path").unwrap_or("").trim();
     if path.is_empty() {
         return "Tool error: view_image requires path\n".to_string();
     }
-    "Tool error: view_image requires ds4-agent --vision FILE\n".to_string()
+    VIEW_IMAGE_NO_ENCODER.to_string()
 }
 
 fn tool_recall(ctx: &mut ToolContext, call: &ToolCall) -> String {
@@ -989,19 +998,20 @@ mod tests {
     }
 
     /// `view_image` is advertised in the frozen prompt, so dispatch must route
-    /// it rather than answer "unknown tool" — and the refusal it gives without
-    /// a vision encoder is the C's string byte-for-byte, since that is exactly
-    /// what `ds4-agent` prints when run without `--vision`.
+    /// it rather than answer "unknown tool". The refusal deliberately does not
+    /// name a `ds4-agent --vision` CLI: vision is in-process, and the C's
+    /// wording sends the model off shelling out for a flag that cannot exist.
     #[test]
-    fn view_image_is_routable_and_refuses_with_the_c_string() {
+    fn view_image_is_routable_and_refuses_without_an_encoder() {
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(
             &test_call("view_image", &[("path", "/tmp/x.png")]),
             &mut ctx,
         );
-        assert_eq!(
-            res.output,
-            "Tool error: view_image requires ds4-agent --vision FILE\n"
+        assert_eq!(res.output, VIEW_IMAGE_NO_ENCODER);
+        assert!(
+            !res.output.contains("ds4-agent"),
+            "the refusal must not point the model at a nonexistent CLI"
         );
         // A missing path is refused before the encoder is even considered.
         let res = dispatch(&test_call("view_image", &[]), &mut ctx);

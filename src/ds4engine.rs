@@ -264,6 +264,17 @@ impl Ds4Model {
             }
             return Err(EngineError::new(msg));
         }
+        // The engine loads the vision encoder best-effort: a missing or
+        // unreadable GGUF leaves it text-only without failing the open. Say so
+        // now, at the one place that knows, instead of letting the first
+        // `view_image` call be the only symptom several turns into a session.
+        // SAFETY: `engine` is non-null and valid, checked just above.
+        if !unsafe { ffi::ds4_engine_has_vision(engine) } {
+            eprintln!(
+                "warning: vision encoder not loaded from {}; view_image will be refused",
+                vision_path.display()
+            );
+        }
         Ok(Self {
             engine,
             ctx_size,
@@ -1113,7 +1124,27 @@ impl Ds4Session {
             key.strip_prefix("[user]\n")
                 .and_then(|k| k.strip_suffix('\n'))
                 .is_some_and(|k| k == section_text)
-        })?;
+        });
+        // A miss used to be silent, and silence is the worst possible outcome
+        // here: the section is tokenized as plain text, the observation still
+        // reads "Image observation attached", and the model — told it can see
+        // an image it was never given — falls back to shelling out to OCR.
+        // `parse_sections` trims each section's trailing whitespace while the
+        // key carries the message text verbatim, so any message ending in
+        // whitespace misses; log enough to tell that apart from a real absence.
+        let Some(pos) = pos else {
+            crate::errlog::log_error(
+                "vision",
+                &format!(
+                    "no pending image matched section (len={}, head={:?}); \
+                     {} image(s) still pending: the observation will be text-only",
+                    section_text.len(),
+                    section_text.chars().take(80).collect::<String>(),
+                    self.pending_images.len(),
+                ),
+            );
+            return None;
+        };
         let (_, img) = self.pending_images.remove(pos);
         // Split the section text at the image boundary: the `[tool:view_image]`
         // line ends with `\n`, and the image follows immediately after. The
@@ -1162,6 +1193,18 @@ impl Ds4Session {
         }
         self.vision_spans
             .retain(|span| span.token_start < token_start);
+    }
+
+    /// How many vision spans this session currently holds — the number of
+    /// image blocks actually grounded in the live token buffer.
+    ///
+    /// Exists for the vision integration test: every other signal that an
+    /// image reached the model (the tool observation, the encode result) is
+    /// produced before the append, so only this distinguishes "grounded" from
+    /// "silently tokenized as text".
+    #[must_use]
+    pub fn vision_span_count(&self) -> usize {
+        self.vision_spans.len()
     }
 
     /// Reconciles the transcript and builds this turn's live prompt: the token

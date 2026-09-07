@@ -2798,16 +2798,23 @@ impl Agent<'_> {
     /// message.
     ///
     /// Mirrors `agent_tool_view_image` in the C reference. When the engine has
-    /// no vision encoder (`EchoEngine`, or a text-only model), returns the C's
-    /// refusal string — but since plank assumes vision is always on, the real
-    /// engine always has one.
+    /// no vision encoder (`EchoEngine`, or a real engine whose encoder GGUF
+    /// failed to load), refuses with [`VIEW_IMAGE_NO_ENCODER`] plus the path
+    /// the encoder was expected at. The refusal deliberately departs from the
+    /// C's text, which names a `ds4-agent --vision` CLI flag that does not
+    /// exist here — vision is in-process FFI, and the C wording only teaches
+    /// the model to shell out and give up.
     fn run_view_image(&mut self, call: &ToolCall) -> String {
         let path = call.arg_value("path").unwrap_or("").trim();
         if path.is_empty() {
             return "Tool error: view_image requires path\n".to_string();
         }
         if !self.engine.has_vision() {
-            return "Tool error: view_image requires ds4-agent --vision FILE\n".to_string();
+            return format!(
+                "{}Expected the encoder at {}.\n",
+                crate::tools::VIEW_IMAGE_NO_ENCODER,
+                crate::download::default_vision_path().display()
+            );
         }
         match self.engine.vision_encode_file(path) {
             Ok(emb) => {

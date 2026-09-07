@@ -8,6 +8,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`view_image` no longer tells the model to shell out to a CLI that does not
+  exist.** When no vision encoder was loaded, the tool returned the C
+  reference's own refusal, "view_image requires ds4-agent --vision FILE".
+  plank's vision is in-process FFI: there is no `--vision` flag and no
+  subprocess, so the model dutifully ran `ds4-agent --vision`, got "unknown
+  option", hunted `plank --help` for the flag, and concluded the feature was
+  broken. The refusal now says vision is in-process, tells the model not to
+  retry by shelling out, and names the path the encoder was expected at. Tool
+  error text is not parity surface — only the prompts, the DSML syntax and the
+  tool-result framing are.
+- **A vision encoder that fails to load is reported at startup.** The engine
+  loads it best-effort and stays text-only rather than failing the open, so
+  the first symptom used to be a refused `view_image` several turns into a
+  session. `Ds4Engine::open` now warns, naming the path.
+- **An image observation that misses its section is no longer silent.** The
+  embedding is matched to its transcript section by exact text; a miss left
+  the section tokenized as plain text while the observation still read "Image
+  observation attached", so the model was told it could see an image it never
+  received and fell back to OCR. A miss is now logged to `~/.plank/errors.log`
+  with the section head and the pending count.
+
 - **A main turn that loops twice in a row is stopped**, the same way a
   sub-agent already was. At temperature 0 the pass after the repeat guard's
   error is the same prompt plus one line, so `repro-loop-1788708943` and

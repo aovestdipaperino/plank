@@ -122,10 +122,88 @@ fn two_turns_over_an_image_message_do_not_double_free_the_embedding() {
         session
             .generate(Prompt::Flat(&transcript), &opts, &no, &no, &mut |_event| {})
             .unwrap_or_else(|e| panic!("turn {turn} failed: {e}"));
+        // The append is best-effort by construction: a key that does not match
+        // the parsed section, or a rejected embedding, leaves the section
+        // tokenized as plain text and the turn succeeds anyway. Only the span
+        // count tells the two apart.
+        assert_eq!(
+            session.vision_span_count(),
+            1,
+            "turn {turn}: the image was not grounded in the token buffer",
+        );
     }
 
     // Dropping the session frees every live span. Under the bug this is the
     // second free of a buffer Rust already released.
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The shape a real `view_image` observation takes: the image hangs off a
+/// *tool result* message, whose text is `<tool_result>…</tool_result>` with a
+/// `[tool:view_image] {path}` marker the split keys on. This is the path a
+/// user actually exercises, and it differs from the bare user message above in
+/// every way that could break the section match — so assert the image lands.
+#[test]
+fn a_view_image_tool_result_grounds_its_image() {
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let model = home.join(".plank/ds4flash.gguf");
+    let vision = home.join(".plank/ds4flash.vision.gguf");
+    if !model.exists() || !vision.exists() {
+        eprintln!("skipping: no model at {} (+ vision)", model.display());
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("plank-vision-obs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let png = dir.join("gradient.png");
+    write_test_png(&png);
+
+    let tuning = plank::config::EngineTuning {
+        dspark: false,
+        ..plank::config::EngineTuning::default()
+    };
+    let mut session = plank::ds4engine::Ds4Session::open(
+        &model,
+        plank::ffi::Ds4Backend::Metal,
+        8192,
+        0,
+        100,
+        &tuning,
+    )
+    .expect("open engine");
+    assert!(session.has_vision(), "vision encoder should be loaded");
+
+    let path = png.to_string_lossy().into_owned();
+    let embedding = session
+        .vision_encode_file(&path)
+        .expect("encode the test image");
+    let meta = format!(
+        "\nImage observation attached ({}x{}, {} visual tokens).\n",
+        embedding.width, embedding.height, embedding.token_count
+    );
+    // Byte-for-byte what `Agent::run_view_image` + `format_tool_results` build.
+    let observation = format!("\n[tool:view_image] {path}\n{meta}");
+    let text = format!("<tool_result>Tool result 1 (view_image):\n{observation}</tool_result>");
+    let transcript = format!("[user]\n{text}\n");
+
+    let opts = GenerationOptions {
+        n_predict: 1,
+        ctx_size: 8192,
+        ..GenerationOptions::default()
+    };
+    let no = || false;
+    session.set_pending_images(vec![(transcript.clone(), VisionImage { path, embedding })]);
+    session
+        .generate(Prompt::Flat(&transcript), &opts, &no, &no, &mut |_event| {})
+        .expect("generate over the observation");
+    assert_eq!(
+        session.vision_span_count(),
+        1,
+        "the view_image observation was tokenized as text: the model saw the \
+         \"Image observation attached\" line and no image",
+    );
+
     drop(session);
     let _ = std::fs::remove_dir_all(&dir);
 }

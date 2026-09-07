@@ -2276,6 +2276,29 @@ Anything else that addresses rows by position — the cursor, `move_cursor`,
 `current` — is only ever exercised while `selecting` is set, which is exactly
 when every row is shown, so those stay index-for-index with `runs`.
 
+## C parity stops at the wire format: tool error text is ours
+
+`view_image`'s refusal used to be the C's string byte-for-byte —
+"view_image requires ds4-agent --vision FILE" — on the reflex that anything the
+C prints is parity surface. It is not. Parity covers what the model was trained
+on: the system prompt, the tools prompt, the DSML syntax, tool-result framing.
+`tests/c_parity.rs` pins exactly those and says nothing about error strings.
+
+Copying that one cost a whole session. plank's vision is in-process FFI
+(`Agent::run_view_image` → `ds4_engine_vision_encode_file`); there is no
+`ds4-agent --vision` flag and no subprocess anywhere. The model read the
+refusal as an instruction, ran `bash ds4-agent --vision …`, got "unknown
+option", hunted `plank --help` for a vision flag, and concluded the feature was
+broken. The refusal now lives in one place
+(`tools::VIEW_IMAGE_NO_ENCODER`) and says vision is in-process and not to shell
+out; the agent path appends the encoder path it expected.
+
+The underlying condition is real and separate: the C engine loads the vision
+GGUF best-effort and stays text-only when it cannot, without failing
+`ds4_engine_open`. `Ds4Engine::open` now warns at that point, so a failed
+encoder load is visible at startup instead of surfacing as a confusing tool
+error many turns later.
+
 ## Loops live in `docs/LOOP-FINDINGS.md`
 
 Every finding about the model repeating itself — the reasoning repeat guard,
