@@ -2167,6 +2167,19 @@ The pass runs on a spawned thread in the fan-out, where `settings::active()`
 is not safe to read (thread-local in tests), so the flag rides on `PassCtx`
 like `thinking_tool_calls` does. Any further renderer construction outside
 `configure_stream` (`/btw` asides already do this) must set it explicitly.
+
+The same gap bit again with `show_tool_calls` and `think_status`: the pane
+showed a sub-agent's edit as the raw `🛠️ edit path=…` banner followed by
+uncoloured `- ` / `+ ` lines, because the renderer defaults banners on while
+the main log hides them (`ui.showToolCalls` is off by default) and shows the
+post-edit diff card instead — and the sub-agent round loop *cleared*
+`edit_previews`, `task_completions` and `hook_warnings` rather than routing
+them, so the card never existed. The display flags now travel together as
+`PassDisplay` on `PassCtx`, and the serial loop emits what the main loop emits
+after a dispatch (activity line, diff cards, completions, warnings) wrapped in
+`UiEvent::Sub`. Rule: whatever `configure_stream` sets, and whatever the main
+turn loop sends after `run_tool_calls`, the sidechain must mirror or the pane
+silently drifts from the main log.
 The switches in effect are now recorded in the `/repro` header (`show
 thinking`, `show tool calls`) and in the session file's `render` record, so a
 dump says what the user was actually looking at.

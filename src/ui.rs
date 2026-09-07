@@ -3132,11 +3132,23 @@ impl Agent<'_> {
             }
             let observations = self.run_tool_calls(&pass.calls);
             self.sync_tasks_after_dispatch();
-            // The sidechain has no UI to drain these into; discard so they never
-            // leak onto the parent turn's screen.
-            self.tool_ctx.edit_previews.clear();
-            self.tool_ctx.task_completions.clear();
-            self.tool_ctx.hook_warnings.clear();
+            // What the main turn loop shows after a dispatch — the activity
+            // line, the diff cards, task completions, hook warnings — goes to
+            // the sub-agent pane when there is one (`emit_sub` drops them
+            // otherwise), and never onto the parent turn's screen. Without the
+            // card the pane's only trace of an edit was the raw streamed markup.
+            if let Some(line) = self.tool_activity_line(&pass.calls) {
+                self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(line))));
+            }
+            for preview in std::mem::take(&mut self.tool_ctx.edit_previews) {
+                self.emit_sub(UiEvent::Sub(Box::new(UiEvent::EditCard(preview))));
+            }
+            for line in std::mem::take(&mut self.tool_ctx.task_completions) {
+                self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(format!("✓ {line}")))));
+            }
+            for warning in std::mem::take(&mut self.tool_ctx.hook_warnings) {
+                self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(warning))));
+            }
             let images = std::mem::take(&mut self.pending_images);
             self.session.push(
                 Message::user(format!("<tool_result>{observations}</tool_result>"))
@@ -3179,7 +3191,14 @@ impl Agent<'_> {
             // Read here, not inside the pass: `settings::install_for_test` is
             // thread-local, so a spawned pass would silently see defaults.
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
-            show_thinking: crate::settings::active().ui.show_thinking,
+            display: PassDisplay {
+                show_thinking: crate::settings::active().ui.show_thinking,
+                show_tool_calls: crate::settings::active().ui.show_tool_calls,
+                think_status: !crate::settings::active().ui.show_thinking
+                    && self.session.transcript.last().is_some_and(|m| {
+                        m.role == crate::session::Role::User && m.text.starts_with("<tool_result>")
+                    }),
+            },
             tool_names: sysprompt::tool_names(&self.tool_ctx.mcp),
             // The serial path has exactly one sub-agent in flight, so its pass
             // is the one the footer and its roster row describe.
@@ -3272,17 +3291,33 @@ struct PassCtx<'a> {
     opts: &'a crate::engine::GenerationOptions,
     think_off: bool,
     thinking_tool_calls: bool,
-    /// `ui.showThinking` at pass start. The renderer shows thinking unless
-    /// told otherwise, and a sub-agent pass builds its own renderer, so the
-    /// setting has to be carried here or the sidechain pane shows reasoning
-    /// the main log hides. Read on the main thread like the other fields.
-    show_thinking: bool,
+    /// What the pass's renderer shows, read on the main thread like the other
+    /// fields (`settings::install_for_test` is thread-local).
+    display: PassDisplay,
     tool_names: Vec<String>,
     /// Where to publish live [`Status`] snapshots, or `None` to run silently.
     /// Set for a lone sub-agent, whose pass is the one the footer and its
     /// roster row describe; left `None` by the parallel fan-out, whose several
     /// passes have no honest single row to land on (`SubPane::note_status`).
     status: Option<PassStatusCtx>,
+}
+
+/// The display settings a quiet pass's renderer runs under. A sub-agent pass
+/// builds its own [`StreamRenderer`], which shows everything unless told
+/// otherwise, so these have to be carried in or the sidechain pane shows what
+/// the main log hides: reasoning, and the raw `🛠️` banners plus streamed diff
+/// lines that the main path replaces with the post-edit diff card.
+#[derive(Debug, Clone, Copy)]
+struct PassDisplay {
+    /// `ui.showThinking` at pass start.
+    show_thinking: bool,
+    /// `ui.showToolCalls` at pass start.
+    show_tool_calls: bool,
+    /// Whether hidden thinking still yields a one-line status, mirroring the
+    /// main path's `configure_stream`: on when thinking is hidden and the pass
+    /// follows a tool result. Always off for the fan-out, whose passes buffer
+    /// into one block per slot.
+    think_status: bool,
 }
 
 /// The footer plumbing for a quiet pass's live status: the channel and the
@@ -3438,7 +3473,9 @@ fn generate_pass(
     stream.set_freeze_on_error(true);
     stream.set_preflight(preflight);
     stream.set_thinking_tool_calls(ctx.thinking_tool_calls);
-    stream.set_show_thinking(ctx.show_thinking);
+    stream.set_show_thinking(ctx.display.show_thinking);
+    stream.set_show_tool_calls(ctx.display.show_tool_calls);
+    stream.set_think_status(ctx.display.think_status);
     stream.set_tool_names(ctx.tool_names.clone());
     if !ctx.think_off && !engine.wants_structured() {
         stream.begin_in_think();
@@ -8146,7 +8183,11 @@ the original is frozen and listed in /tree"
             opts: &opts,
             think_off: matches!(self.think, crate::engine::ThinkMode::Off),
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
-            show_thinking: crate::settings::active().ui.show_thinking,
+            display: PassDisplay {
+                show_thinking: crate::settings::active().ui.show_thinking,
+                show_tool_calls: crate::settings::active().ui.show_tool_calls,
+                think_status: false,
+            },
             tool_names: sysprompt::tool_names(&self.tool_ctx.mcp),
             // Several passes in flight: no single row for a snapshot to land on.
             status: None,
@@ -22032,6 +22073,71 @@ mod tests {
     }
 
     #[test]
+    fn a_sub_agent_edit_reaches_its_pane_as_a_diff_card_not_a_raw_banner() {
+        // The roster pane showed a sub-agent's edit as the raw `🛠️ edit path=…`
+        // banner followed by uncoloured `- ` lines, and never the diff card the
+        // main log gets: the quiet pass left the renderer at its defaults
+        // (banners on, main hides them per `ui.showToolCalls`) and the round
+        // loop cleared `edit_previews` instead of routing them to the pane.
+        let dir = scratch_dir("subagent-edit-card");
+        std::fs::write(dir.join("a.txt"), "alpha\nbeta\n").unwrap();
+        let cfg = test_cfg();
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name=\"edit\">\n",
+            "<｜DSML｜parameter name=\"path\" string=\"true\">a.txt</｜DSML｜parameter>\n",
+            "<｜DSML｜parameter name=\"old\" string=\"true\">beta</｜DSML｜parameter>\n",
+            "<｜DSML｜parameter name=\"new\" string=\"true\">gamma</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>\n",
+        );
+        let engine = ScriptedEngine {
+            replies: vec![stanza.to_string(), "Edited it.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.tool_ctx = ToolContext::new(dir.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        let out = agent.run_agent_tool(&agent_call("edit a.txt", None));
+        agent.sub_sink = SubSinkTarget::Null;
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(out.contains("Edited it."), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "alpha\ngamma\n"
+        );
+
+        let card = events.iter().any(|e| {
+            matches!(e, UiEvent::Sub(inner) if matches!(**inner, UiEvent::EditCard(ref p) if p.path == "a.txt"))
+        });
+        assert!(card, "the diff card is routed into the pane: {events:?}");
+        let activity = events.iter().any(|e| {
+            matches!(e, UiEvent::Sub(inner) if matches!(**inner, UiEvent::Dim(ref t) if t.contains("a.txt")))
+        });
+        assert!(
+            activity,
+            "the activity line is routed into the pane: {events:?}"
+        );
+        let raw_banner = events.iter().any(|e| {
+            matches!(e, UiEvent::Sub(inner) if matches!(**inner, UiEvent::Tool(ref t) if t.contains("🛠️")))
+        });
+        assert!(
+            !raw_banner,
+            "with ui.showToolCalls off the pane hides the raw banner like the main log: {events:?}"
+        );
+        assert!(
+            self::edit_previews_empty(&agent),
+            "nothing leaks to the parent turn"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn edit_previews_empty(agent: &Agent<'_>) -> bool {
+        agent.tool_ctx.edit_previews.is_empty()
+    }
+
+    #[test]
     fn a_looping_sub_agent_is_flagged_in_red_and_asked_for_its_report() {
         let dir = scratch_dir("subagent-repeat-cap");
         let mut cfg = test_cfg();
@@ -22371,7 +22477,11 @@ mod tests {
             opts: &opts,
             think_off: true,
             thinking_tool_calls: false,
-            show_thinking: true,
+            display: PassDisplay {
+                show_thinking: true,
+                show_tool_calls: true,
+                think_status: false,
+            },
             tool_names: Vec::new(),
             status: None,
         };
@@ -22417,7 +22527,11 @@ mod tests {
             opts: &opts,
             think_off: true,
             thinking_tool_calls: false,
-            show_thinking: true,
+            display: PassDisplay {
+                show_thinking: true,
+                show_tool_calls: true,
+                think_status: false,
+            },
             tool_names: Vec::new(),
             status: None,
         };
