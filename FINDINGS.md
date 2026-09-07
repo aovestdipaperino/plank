@@ -2299,6 +2299,29 @@ GGUF best-effort and stays text-only when it cannot, without failing
 encoder load is visible at startup instead of surfacing as a confusing tool
 error many turns later.
 
+## A frame must not re-wrap the whole conversation
+
+Mouse selection went sticky in long sessions because every frame was O(entire
+transcript): `render_output` called `OutputLog::to_text()` (a deep clone of
+every line), cloned that again for `Paragraph::line_count`, and then handed the
+whole thing to `window_rows`, which re-wrapped and cloned each line above the
+viewport one at a time. A drag emits a mouse event per pixel of movement and
+each one redraws, so the cost showed up as lag on the one interaction that
+redraws fastest — scrolling had the same problem, less visibly.
+
+`OutputLog` now caches per-line wrapped heights (`row_cache`, keyed by width,
+extended lazily, cut back by `invalidate_rows_from` wherever `lines` is
+truncated), and `total_rows`/`window` serve rendering from it, cloning only the
+lines at or below the viewport. Warm frame cost went from growing without
+bound (release: 40k lines was seconds of re-wrapping per frame; debug measured
+26 ms → 1.07 s per frame between 1k and 40k lines) to flat: 144 µs at 1k lines,
+191 µs at 40k.
+
+The rule: every truncation of `lines` must call `invalidate_rows_from`. A stale
+height silently scrolls the pane to the wrong row rather than crashing, so
+`row_cache_matches_a_full_rewrap_after_edits` pins the cache against
+`window_rows`, which survives as the test-only naive reference.
+
 ## Loops live in `docs/LOOP-FINDINGS.md`
 
 Every finding about the model repeating itself — the reasoning repeat guard,

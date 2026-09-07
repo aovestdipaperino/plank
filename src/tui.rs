@@ -46,6 +46,13 @@ pub fn done_style() -> Style {
     Style::default().fg(THEME_GREEN)
 }
 
+/// Theme red, for the note that a `!` command finished *unsuccessfully*: a
+/// non-zero exit must not read as a green "done." (issue: misleading status).
+#[must_use]
+pub fn failed_style() -> Style {
+    Style::default().fg(Color::Red)
+}
+
 /// Bold grey, for the turn's closing "Planked for …" line: present enough to
 /// find when scrolling back to a turn boundary, quiet enough not to compete
 /// with the model's own output.
@@ -838,6 +845,13 @@ pub fn subagents_signpost(labels: &[&str]) -> String {
 #[derive(Debug, Default)]
 pub struct OutputLog {
     lines: Vec<Line<'static>>,
+    /// Wrapped-row heights for a prefix of `lines` at width `width`, so a
+    /// frame need not re-wrap the whole conversation to learn where the
+    /// viewport starts. Rebuilt from scratch when the width changes, extended
+    /// lazily as lines are appended, and cut back by
+    /// [`invalidate_rows_from`](OutputLog::invalidate_rows_from) wherever
+    /// `lines` is truncated. `RefCell` because rendering takes `&self`.
+    row_cache: std::cell::RefCell<RowCache>,
     /// Rendered fenced code blocks, each carrying its raw text and the screen
     /// columns of its header's `⧉ copy` control, so a click on that control
     /// copies the block verbatim. Rebuilt alongside `lines` in `md_render`.
@@ -863,6 +877,21 @@ pub struct OutputLog {
     /// no text is streaming. Not part of the persistent `lines`; cleared when
     /// the turn ends.
     progress: Option<Line<'static>>,
+}
+
+/// Cached wrapped-row heights for [`OutputLog::lines`]; see the field.
+#[derive(Debug, Default)]
+struct RowCache {
+    width: u16,
+    rows: Vec<usize>,
+}
+
+/// Wrapped rows one logical line occupies at `width`. Ratatui wraps each line
+/// independently, so a whole-text row count is the sum of these.
+fn line_rows(line: &Line<'static>, width: u16) -> usize {
+    Paragraph::new(Text::from(line.clone()))
+        .wrap(Wrap { trim: false })
+        .line_count(width)
 }
 
 impl OutputLog {
@@ -928,6 +957,7 @@ impl OutputLog {
     /// Re-renders the whole in-progress markdown segment in place.
     fn md_render(&mut self) {
         let Some(start) = self.md_start else { return };
+        self.invalidate_rows_from(start);
         self.lines.truncate(start);
         let md_buf = std::mem::take(&mut self.md_buf);
         let regions = render_markdown_at(&mut self.lines, start, &md_buf);
@@ -1024,6 +1054,7 @@ impl OutputLog {
     /// Removes the most recent completed line (e.g. a transient status note).
     pub fn pop_line(&mut self) {
         self.md_close();
+        self.invalidate_rows_from(self.lines.len().saturating_sub(1));
         self.lines.pop();
     }
 
@@ -1050,6 +1081,7 @@ impl OutputLog {
     pub fn truncate_to(&mut self, len: usize) {
         self.md_close();
         self.current.clear();
+        self.invalidate_rows_from(len);
         self.lines.truncate(len);
         self.code_blocks.retain(|r| r.header < len);
     }
@@ -1064,6 +1096,94 @@ impl OutputLog {
     /// Sets (or clears) the transient progress line pinned below the output.
     pub fn set_progress(&mut self, line: Option<Line<'static>>) {
         self.progress = line;
+    }
+
+    /// Drops cached row heights for `lines[from..]`, which are about to change.
+    /// Every truncation of `lines` must call this: a stale entry would leave
+    /// the viewport scrolled to the wrong row.
+    fn invalidate_rows_from(&mut self, from: usize) {
+        let cache = self.row_cache.get_mut();
+        if cache.rows.len() > from {
+            cache.rows.truncate(from);
+        }
+    }
+
+    /// Brings the row-height cache up to date with `lines` at `width`.
+    fn ensure_rows(&self, width: u16) {
+        let mut cache = self.row_cache.borrow_mut();
+        if cache.width != width {
+            cache.width = width;
+            cache.rows.clear();
+        }
+        for line in &self.lines[cache.rows.len().min(self.lines.len())..] {
+            let rows = line_rows(line, width);
+            cache.rows.push(rows);
+        }
+    }
+
+    /// The uncommitted lines rendered after `lines`: the in-progress streamed
+    /// line and the pinned progress line. Not cached — they change every
+    /// frame, and there are at most two.
+    fn tail_lines(&self) -> Vec<Line<'static>> {
+        let mut tail = Vec::new();
+        if !self.current.is_empty() {
+            tail.push(Line::from(self.current.clone()));
+        }
+        if let Some(progress) = &self.progress {
+            tail.push(progress.clone());
+        }
+        tail
+    }
+
+    /// Total wrapped rows the log occupies at `width`, from the cache — the
+    /// scroll clamp needs this every frame, and re-wrapping the whole
+    /// conversation for it made frame cost grow with session length.
+    #[must_use]
+    pub fn total_rows(&self, width: u16) -> usize {
+        let width = width.max(1);
+        self.ensure_rows(width);
+        let committed: usize = self.row_cache.borrow().rows.iter().sum();
+        committed
+            + self
+                .tail_lines()
+                .iter()
+                .map(|l| line_rows(l, width))
+                .sum::<usize>()
+    }
+
+    /// The text to render when the first visible wrapped row is `top`, with
+    /// the residual row offset into its first logical line — the cached
+    /// counterpart of [`window_rows`], cloning only the lines at or below the
+    /// viewport instead of the whole log.
+    #[must_use]
+    pub fn window(&self, width: u16, top: usize) -> (Text<'static>, u16) {
+        let width = width.max(1);
+        self.ensure_rows(width);
+        let tail = self.tail_lines();
+        let tail_rows: Vec<usize> = tail.iter().map(|l| line_rows(l, width)).collect();
+        let mut skipped = 0usize;
+        let mut skip = 0usize;
+        {
+            let cache = self.row_cache.borrow();
+            for rows in cache.rows.iter().chain(tail_rows.iter()) {
+                if skipped + rows > top {
+                    break;
+                }
+                skipped += rows;
+                skip += 1;
+            }
+        }
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if skip < self.lines.len() {
+            lines.extend_from_slice(&self.lines[skip..]);
+            lines.extend(tail);
+        } else {
+            lines.extend(tail.into_iter().skip(skip - self.lines.len()));
+        }
+        (
+            Text::from(lines),
+            u16::try_from(top - skipped).unwrap_or(u16::MAX),
+        )
     }
 
     /// Renders the log (including the in-progress line and any pinned progress
@@ -1391,6 +1511,66 @@ pub fn selection_screen(sel: ContentSelection, top: usize, height: u16) -> Optio
     Some((start, end))
 }
 
+/// A left-button gesture over the output pane, in content space.
+///
+/// Owned by both the idle loop and the mid-turn loop — selecting transcript
+/// text must work while the model is generating, and the two paths would
+/// otherwise drift — so the press/drag/release decisions live here rather than
+/// in either event match.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DragSelect {
+    sel: Option<ContentSelection>,
+}
+
+/// What a left-button release turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Release {
+    /// The pointer moved: `sel` is the text to copy.
+    Drag(ContentSelection),
+    /// Press and release on one cell — a click at this content-space `(x, row)`.
+    Click((u16, usize)),
+    /// No gesture was in progress (the press belonged to another surface).
+    None,
+}
+
+impl DragSelect {
+    /// Starts a gesture at screen cell (`col`, `row`) with the pane scrolled to
+    /// `top`, anchoring it to the content row so it stays on its text as output
+    /// streams in underneath.
+    pub fn press(&mut self, top: usize, col: u16, row: u16) {
+        let at = (col, top.saturating_add(usize::from(row)));
+        self.sel = Some((at, at));
+    }
+
+    /// Abandons any gesture: the press belonged to another surface (the prompt,
+    /// a roster row, the jump hint).
+    pub fn cancel(&mut self) {
+        self.sel = None;
+    }
+
+    /// Extends a gesture in progress; a no-op when none is.
+    pub fn drag(&mut self, top: usize, col: u16, row: u16) {
+        if let Some((_, end)) = &mut self.sel {
+            *end = (col, top.saturating_add(usize::from(row)));
+        }
+    }
+
+    /// Ends the gesture, classifying it.
+    pub fn release(&mut self) -> Release {
+        match self.sel.take() {
+            Some((a, b)) if a != b => Release::Drag((a, b)),
+            Some((a, _)) => Release::Click(a),
+            None => Release::None,
+        }
+    }
+
+    /// The selection to highlight on this frame, if any.
+    #[must_use]
+    pub fn current(self) -> Option<ContentSelection> {
+        self.sel
+    }
+}
+
 /// Extracts the selected text for a [`ContentSelection`] by rendering just the
 /// selected wrapped-row range into an off-screen buffer (reusing ratatui's own
 /// wrapping) and reading it back — so a selection spanning more than the
@@ -1400,8 +1580,7 @@ pub fn selection_text_content(log: &OutputLog, width: u16, sel: ContentSelection
     use ratatui::widgets::Widget as _;
     let width = width.max(1);
     let ((sx, sy), (ex, ey)) = order_content(sel);
-    let para = Paragraph::new(log.to_text()).wrap(Wrap { trim: false });
-    let total = para.line_count(width);
+    let total = log.total_rows(width);
     if total == 0 || sy >= total {
         return String::new();
     }
@@ -1409,7 +1588,7 @@ pub fn selection_text_content(log: &OutputLog, width: u16, sel: ContentSelection
     let height = u16::try_from(ey - sy + 1).unwrap_or(u16::MAX);
     let rect = Rect::new(0, 0, width, height);
     let mut buf = Buffer::empty(rect);
-    let (text, scroll) = window_rows(log.to_text(), width, sy);
+    let (text, scroll) = log.window(width, sy);
     Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
@@ -1419,12 +1598,16 @@ pub fn selection_text_content(log: &OutputLog, width: u16, sel: ContentSelection
     selection_text(&buf, rect, local)
 }
 
-/// Drops the logical lines of `text` that wrap entirely above row `top`, and
+/// The naive reference for [`OutputLog::window`]: drops the logical lines of
+/// `text` that wrap entirely above row `top`, and
 /// returns the remaining text with the residual row offset into its first
 /// line. `Paragraph::scroll` takes a `u16`, so handing it the absolute row
 /// froze the pane once a session passed 65 535 wrapped rows (and
 /// `area.height + scroll.y` overflowed inside ratatui); after windowing, the
 /// residual is below the first kept line's own row count.
+/// Kept as a test-only reference: rendering itself uses the cache, and these
+/// two must never disagree (`row_cache_matches_a_full_rewrap_after_edits`).
+#[cfg(test)]
 fn window_rows(mut text: Text<'static>, width: u16, top: usize) -> (Text<'static>, u16) {
     let mut skipped_rows = 0usize;
     let mut skip = 0usize;
@@ -2051,6 +2234,109 @@ pub fn popup_rect(output: Rect, input: Rect, rows: u16) -> Rect {
     } else {
         Rect::new(output.x, input.y.saturating_sub(h), output.width, h)
     }
+}
+
+/// A dismissable report pinned to the bottom of the output pane: a bordered
+/// box holding the rendered text of a read-only slash command (`/usage`).
+///
+/// Reports like these are *status*, not conversation. Pushing them into the
+/// scrollback interleaves them with the model's output, where they scroll away
+/// and stay there forever; a panel keeps the report in one place, lets it
+/// scroll on its own, and disappears on Esc without leaving a trace in the log.
+#[derive(Debug)]
+pub struct ReportPanel {
+    /// Shown in the border title, before the ` · Esc closes ` hint.
+    title: String,
+    /// The report text, parsed once into styled lines.
+    log: OutputLog,
+    view: OutputView,
+}
+
+impl ReportPanel {
+    /// Builds a panel from a rendered, possibly ANSI-colored report.
+    #[must_use]
+    pub fn new(title: impl Into<String>, report: &str) -> Self {
+        let mut log = OutputLog::new();
+        log.push_ansi(report);
+        Self {
+            title: title.into(),
+            log,
+            // Reports read top-down, so start at the top instead of following
+            // the tail the way a streaming log does.
+            view: OutputView {
+                top: 0,
+                follow: false,
+                jump_hint_rect: None,
+            },
+        }
+    }
+
+    /// Scrolls the report by `delta` rows (negative scrolls up).
+    pub fn scroll(&mut self, delta: isize) {
+        self.view.follow = false;
+        self.view.top = self.view.top.saturating_add_signed(delta);
+    }
+}
+
+/// Rows the report panel occupies, borders included: as tall as its content
+/// needs, but never more than half the frame — the conversation above it stays
+/// readable, which is the whole reason for not dumping the report into it.
+fn report_rows(content_rows: usize, output_height: u16) -> u16 {
+    let content = u16::try_from(content_rows).unwrap_or(u16::MAX);
+    content
+        .saturating_add(2)
+        .min((output_height / 2).max(3))
+        .min(output_height)
+}
+
+/// Draws the report panel flush against the top of the input, over the output
+/// pane — the same anchoring as [`draw_popup`], for the same reason.
+///
+/// `input_text` must be the prompt text passed to the draw call (`None` when
+/// that frame had no resting prompt), so the anchor matches the input's height.
+pub fn draw_report(
+    frame: &mut Frame,
+    input_text: Option<&str>,
+    panel: &mut ReportPanel,
+    roster_rows: u16,
+) {
+    use ratatui::widgets::{Block, Borders, Clear};
+
+    let area = frame.area();
+    let tw = input_text_width(area.width);
+    let g = frame_geom(
+        area,
+        input_text.is_some(),
+        input_text.map_or(1, |t| input_height(t, tw)),
+        0,
+        roster_rows,
+    );
+    if g.output.height < 3 {
+        return;
+    }
+    let rows = report_rows(panel.log.total_rows(g.output.width), g.output.height);
+    let rect = Rect::new(
+        g.output.x,
+        g.input.y.saturating_sub(rows).max(g.output.y),
+        g.output.width,
+        rows,
+    );
+    if crate::uiremote::recording_enabled() {
+        crate::uiremote::region("report", rect, &[]);
+    }
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Indexed(238)))
+        .title(Span::styled(
+            format!(" {} · Esc closes ", panel.title),
+            Style::default()
+                .fg(THEME_GREEN)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    render_output(frame, inner, &panel.log, &mut panel.view, None);
 }
 
 /// Draws the `@` suggestion popup over the output pane.
@@ -3786,21 +4072,20 @@ fn render_output(
     view: &mut OutputView,
     selection: Option<ContentSelection>,
 ) {
-    let text = log.to_text();
     let width = area.width.max(1);
-    // Exact wrapped-line count from ratatui itself: a char-packing estimate
+    // Exact wrapped-line count from ratatui itself (a char-packing estimate
     // undercounts word-wrapped rows, leaving the view unable to reach the
-    // bottom (e.g. the long `/context` report).
-    let total = Paragraph::new(text.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(width);
+    // bottom), but summed from the log's per-line cache: measuring the whole
+    // text every frame made frame cost — and so mouse-drag latency — grow
+    // with the length of the conversation.
+    let total = log.total_rows(width);
     let max_top = total.saturating_sub(area.height as usize);
     if view.follow || view.top >= max_top {
         view.top = max_top;
         view.follow = true;
     }
     // Skip whole lines above the viewport so the `u16` scroll stays small.
-    let (text, scroll) = window_rows(text, width, view.top);
+    let (text, scroll) = log.window(width, view.top);
     let para = Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
@@ -5576,6 +5861,60 @@ mod tests {
         );
     }
 
+    /// A `/usage`-style report lands in a bordered panel above the prompt
+    /// rather than in the scrollback, is titled with its Esc hint, and never
+    /// takes more than half the screen even when the report is long.
+    #[test]
+    fn report_panel_sits_above_the_prompt_and_is_capped() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::fmt::Write as _;
+        let mut long = String::new();
+        for i in 0..80 {
+            let _ = writeln!(long, "row {i}");
+        }
+        let mut panel = ReportPanel::new("usage", &long);
+        let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &OutputLog::new(),
+                Some(InputState::new("", 0)),
+                "idle",
+                &mut OutputView::default(),
+                None,
+                &TaskView::default(),
+                None,
+                &RosterView::default(),
+            );
+            draw_report(f, Some(""), &mut panel, 0);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..24)
+            .map(|y| (0..40).map(|x| buf[(x, y)].symbol().to_owned()).collect())
+            .collect();
+        let top = rows
+            .iter()
+            .position(|r| r.contains("usage \u{b7} Esc closes"))
+            .expect("the panel title is drawn");
+        let bottom = rows
+            .iter()
+            .rposition(|r| r.starts_with('\u{2514}'))
+            .expect("the panel is closed by a bottom border");
+        // Capped at half the frame, and flush against the prompt above it.
+        assert!(bottom - top < 12, "panel spans rows {top}..={bottom}");
+        // The bottom border overlays the prompt's top rule, so the panel sits
+        // flush against the input line — the same anchoring as the `@` popup.
+        assert!(
+            rows[bottom + 1].contains('>'),
+            "the prompt follows the panel: {:?}",
+            rows[bottom + 1]
+        );
+        // The report reads from its first line, not from its tail.
+        assert!(rows[top + 1].contains("row 0"), "got {:?}", rows[top + 1]);
+    }
+
     /// The colours that actually reach the screen for `input`, as
     /// `(char, fg)` for the drawn input row.
     ///
@@ -6023,6 +6362,88 @@ mod tests {
         // Entirely above or below the viewport yields nothing.
         assert_eq!(selection_screen(((0, 0), (2, 2)), 10, 5), None);
         assert_eq!(selection_screen(((0, 20), (2, 22)), 0, 10), None);
+    }
+
+    #[test]
+    fn a_drag_selects_in_content_space_and_a_click_stays_a_click() {
+        let mut d = DragSelect::default();
+        assert_eq!(d.release(), Release::None);
+        // Rows are anchored to the scrolled content, not the screen.
+        d.press(120, 4, 2);
+        assert_eq!(d.current(), Some(((4, 122), (4, 122))));
+        d.drag(120, 9, 5);
+        assert_eq!(d.current(), Some(((4, 122), (9, 125))));
+        // A scroll between press and drag moves the endpoint with the text.
+        d.drag(130, 9, 5);
+        assert_eq!(d.release(), Release::Drag(((4, 122), (9, 135))));
+        // Released state is empty: nothing stays highlighted after the copy.
+        assert_eq!(d.current(), None);
+
+        // Press and release on one cell is a click, not an empty selection —
+        // that is what the code-block `⧉ copy` control is hit by.
+        d.press(10, 3, 1);
+        d.drag(10, 3, 1);
+        assert_eq!(d.release(), Release::Click((3, 11)));
+
+        // A press claimed by another surface abandons the gesture, and a drag
+        // with no press in progress changes nothing.
+        d.press(0, 1, 1);
+        d.cancel();
+        d.drag(0, 5, 5);
+        assert_eq!(d.current(), None);
+        assert_eq!(d.release(), Release::None);
+    }
+
+    #[test]
+    fn row_cache_matches_a_full_rewrap_after_edits() {
+        // The cached row heights must agree with measuring the whole text,
+        // through every path that truncates `lines` — a stale entry would
+        // scroll the pane to the wrong row.
+        let full = |log: &OutputLog, width: u16| {
+            Paragraph::new(log.to_text())
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+        };
+        let width = 24;
+        let mut log = OutputLog::new();
+        for i in 0..40 {
+            log.push_plain(format!(
+                "line {i} with enough words in it to wrap at this width"
+            ));
+        }
+        let check = |log: &OutputLog| {
+            assert_eq!(log.total_rows(width), full(log, width));
+            for top in [0usize, 1, 5, 37, full(log, width).saturating_sub(1)] {
+                assert_eq!(
+                    log.window(width, top),
+                    window_rows(log.to_text(), width, top)
+                );
+            }
+        };
+        check(&log);
+        // A different width rebuilds the cache rather than reusing it.
+        assert_eq!(log.total_rows(60), full(&log, 60));
+        check(&log);
+        // Truncations: rollback, a popped line, and a streaming markdown
+        // re-render (which rewrites the tail of `lines` in place).
+        log.truncate_to(20);
+        check(&log);
+        log.push_plain("after the rollback, a longer line that wraps more than once here");
+        log.pop_line();
+        check(&log);
+        RenderSink::visible_text(&mut log, "**bold** and some more streamed text that wraps");
+        log.end_line();
+        check(&log);
+        RenderSink::visible_text(
+            &mut log,
+            " — and a continuation re-rendering the same segment",
+        );
+        log.end_line();
+        check(&log);
+        // The in-progress line and the pinned progress line count too.
+        RenderSink::visible_text(&mut log, "tail without a newline");
+        log.set_progress(Some(Line::from("working…")));
+        check(&log);
     }
 
     #[test]

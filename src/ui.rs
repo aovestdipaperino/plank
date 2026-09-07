@@ -222,6 +222,7 @@ fn repaint_idle(
     view: &mut tui::OutputView,
     sub_pane: &mut tui::SubPane,
     btw_panel: &mut BtwPanel,
+    report: &mut Option<tui::ReportPanel>,
     input: &TuiInput,
     idle_status: &str,
     selection: Option<tui::ContentSelection>,
@@ -291,6 +292,9 @@ fn repaint_idle(
             }
             if let Some(p) = &input.popup {
                 tui::draw_popup(f, input.buf.text(), p, roster_rows);
+            }
+            if let Some(panel) = report.as_mut() {
+                tui::draw_report(f, Some(input.buf.text()), panel, roster_rows);
             }
             if let Some(form) = config_form {
                 tui::draw_config(f, form);
@@ -9735,6 +9739,10 @@ impl Agent<'_> {
         // once opened it stays until the user presses Esc, even after the main
         // task finishes and control returns to this idle loop.
         let mut btw_panel: BtwPanel = None;
+        // A read-only report (`/usage`) parked at the bottom of the screen.
+        // Owned here for the same reason as the btw panel: it outlives the
+        // command that opened it and closes only when the user presses Esc.
+        let mut report: Option<tui::ReportPanel> = None;
         // An open easter egg (`/pelota`, …) or the screensaver, same modal
         // contract as the
         // `/config` form: while it is Some it owns the screen and every key.
@@ -9804,7 +9812,7 @@ impl Agent<'_> {
         // space: `(column, absolute-wrapped-row)`. Anchoring the row to content
         // (not the screen) lets the selection survive scrolling. Copied to the
         // clipboard on button release.
-        let mut selection: Option<tui::ContentSelection> = None;
+        let mut selection = tui::DragSelect::default();
         // True between press and release of a drag that started inside the
         // prompt: that drag selects input text (tracked on the `LineBuffer`)
         // rather than transcript text, so the two never fight over one gesture.
@@ -9935,9 +9943,10 @@ impl Agent<'_> {
                 &mut view,
                 &mut sub_pane,
                 &mut btw_panel,
+                &mut report,
                 &input,
                 &idle_status,
-                selection,
+                selection.current(),
                 &task_view,
                 config_form.as_ref(),
                 kv_pane.as_ref(),
@@ -10052,6 +10061,7 @@ impl Agent<'_> {
                                 &mut resume_pane,
                                 &mut arcade,
                                 &mut sub_pane,
+                                &mut report,
                             ) {
                                 input.history.save(&hist_path).ok();
                                 remote_abandon(rem);
@@ -10196,10 +10206,10 @@ impl Agent<'_> {
                             r.contains(ratatui::layout::Position::new(m.column, m.row))
                         }) {
                             v.follow = true;
-                            selection = None;
+                            selection.cancel();
                         } else if let Some(run) = roster_hit {
                             sub_pane.click_run(run);
-                            selection = None;
+                            selection.cancel();
                         } else if let Some(img) = tui::last_input_rect()
                             .and_then(|r| tui::input_hit(r, input.buf.text(), m.column, m.row))
                             .and_then(|at| crate::imagepaste::placeholder_at(input.buf.text(), at))
@@ -10210,7 +10220,7 @@ impl Agent<'_> {
                             if let Err(e) = img.open_externally() {
                                 log.push_dim(format!("[could not open image: {e}]"));
                             }
-                            selection = None;
+                            selection.cancel();
                         } else if tui::last_input_rect()
                             .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false))
                         {
@@ -10218,10 +10228,9 @@ impl Agent<'_> {
                             // arms an input-text drag, leaving the output
                             // pane's own selection alone.
                             input_drag = true;
-                            selection = None;
+                            selection.cancel();
                         } else {
-                            let row = v.top.saturating_add(usize::from(m.row));
-                            selection = Some(((m.column, row), (m.column, row)));
+                            selection.press(v.top, m.column, m.row);
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) if input_drag => {
@@ -10231,9 +10240,7 @@ impl Agent<'_> {
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         let top = sub_pane.active_view(&mut view).top;
-                        if let Some((_, end)) = &mut selection {
-                            *end = (m.column, top.saturating_add(usize::from(m.row)));
-                        }
+                        selection.drag(top, m.column, m.row);
                     }
                     MouseEventKind::Up(MouseButton::Left) if input_drag => {
                         // Releasing an input drag copies what it selected, the
@@ -10244,41 +10251,35 @@ impl Agent<'_> {
                     MouseEventKind::Up(MouseButton::Left) => {
                         let size = terminal.size().unwrap_or_default();
                         let top = sub_pane.active_view(&mut view).top;
-                        if let Some(sel) = selection.filter(|(a, b)| a != b) {
+                        match selection.release() {
                             // A drag: extract from the content model (not the
                             // screen buffer) so a selection larger than the
                             // viewport still copies in full — from whichever
                             // pane is on screen, so the copy matches the pixels.
-                            let text = tui::selection_text_content(
-                                sub_pane.active_log(&log),
-                                size.width,
-                                sel,
-                            );
-                            if !text.trim().is_empty() {
-                                tui::copy_to_clipboard(&text);
-                                let chars = text.chars().count();
-                                crate::status::set_flash_tip(format!("📋 Copied {chars} chars"));
+                            tui::Release::Drag(sel) => {
+                                copy_selection_text(sub_pane.active_log(&log), size.width, sel);
                             }
-                        } else if let Some((col, row)) = selection.map(|(a, _)| a) {
-                            // A plain click (no drag): copy a fenced code block
-                            // when its header `⧉ copy` control was clicked. The
-                            // stored row is absolute, so map it back to a screen
-                            // row for the click test.
-                            let out_h = size.height.saturating_sub(2);
-                            let screen_row =
-                                u16::try_from(row.saturating_sub(top)).unwrap_or(u16::MAX);
-                            if screen_row < out_h
-                                && let Some(code) = sub_pane
-                                    .active_log(&log)
-                                    .code_copy_at(size.width, top, col, screen_row)
-                            {
-                                tui::copy_to_clipboard(&code);
-                                let chars = code.chars().count();
-                                crate::status::set_flash_tip(format!("📋 Copied {chars} chars"));
+                            tui::Release::Click((col, row)) => {
+                                // A plain click (no drag): copy a fenced code block
+                                // when its header `⧉ copy` control was clicked. The
+                                // stored row is absolute, so map it back to a screen
+                                // row for the click test.
+                                let out_h = size.height.saturating_sub(2);
+                                let screen_row =
+                                    u16::try_from(row.saturating_sub(top)).unwrap_or(u16::MAX);
+                                if screen_row < out_h
+                                    && let Some(code) = sub_pane
+                                        .active_log(&log)
+                                        .code_copy_at(size.width, top, col, screen_row)
+                                {
+                                    tui::copy_to_clipboard(&code);
+                                    let chars = code.chars().count();
+                                    crate::status::set_flash_tip(format!(
+                                        "📋 Copied {chars} chars"
+                                    ));
+                                }
                             }
-                            selection = None;
-                        } else {
-                            selection = None;
+                            tui::Release::None => {}
                         }
                     }
                     _ => {}
@@ -10451,7 +10452,7 @@ impl Agent<'_> {
             }
             // Any keystroke dismisses the mouse selection highlight (the text
             // was already copied on mouse release).
-            selection = None;
+            selection.cancel();
             // The popup sees keys first: Esc closes it before the `/btw`
             // panel, and Tab/Enter/Up/Down drive the suggestion list.
             if input.popup_key(key) {
@@ -10481,7 +10482,7 @@ impl Agent<'_> {
                     if !sub_pane.move_cursor(0) {
                         log.push_dim("[no sub-agent has run yet]");
                     }
-                    selection = None;
+                    selection.cancel();
                 }
                 KeyCode::Up | KeyCode::Down
                     if sub_pane.selecting && input.buf.text().is_empty() && !word_mod =>
@@ -10495,7 +10496,7 @@ impl Agent<'_> {
                     // would be painted over the other pane's text. (Every key
                     // already clears it above; kept here so the invariant is
                     // stated where the switch happens.)
-                    selection = None;
+                    selection.cancel();
                 }
                 KeyCode::Enter if sub_pane.selecting && input.buf.text().is_empty() => {
                     // On the `main` row there is nothing to expand: leave the
@@ -10503,7 +10504,7 @@ impl Agent<'_> {
                     if !sub_pane.expand() {
                         sub_pane.collapse();
                     }
-                    selection = None;
+                    selection.cancel();
                 }
                 // Tab moves focus between the prompt and the roster (the
                 // completion popup, when open, has already taken it above).
@@ -10511,7 +10512,7 @@ impl Agent<'_> {
                     if !sub_pane.toggle_focus() {
                         log.push_dim("[no sub-agent has run yet]");
                     }
-                    selection = None;
+                    selection.cancel();
                 }
                 KeyCode::Char('c') if ctrl => {
                     if !input.buf.text().is_empty() {
@@ -10547,9 +10548,10 @@ impl Agent<'_> {
                                 &mut view,
                                 &mut sub_pane,
                                 &mut btw_panel,
+                                &mut report,
                                 &input,
                                 &idle_status,
-                                selection,
+                                selection.current(),
                                 &task_view,
                                 config_form.as_ref(),
                                 kv_pane.as_ref(),
@@ -10620,9 +10622,10 @@ impl Agent<'_> {
                         &mut view,
                         &mut sub_pane,
                         &mut btw_panel,
+                        &mut report,
                         &input,
                         &idle_status,
-                        selection,
+                        selection.current(),
                         &task_view,
                         config_form.as_ref(),
                         kv_pane.as_ref(),
@@ -10658,8 +10661,24 @@ impl Agent<'_> {
                 // earlier turn (the only way it ever closes).
                 // Esc leaves the roster before it closes a `/btw` panel: the
                 // roster is the thing the user is looking at when both are up.
+                // A `/usage` report panel is the newest thing on screen and
+                // the most modal-feeling, so Esc dismisses it first.
+                KeyCode::Esc if report.is_some() => report = None,
                 KeyCode::Esc if sub_pane.collapse() => {}
                 KeyCode::Esc if btw_panel.is_some() => btw_panel = None,
+                // While a report is up, the page keys scroll it: it is short
+                // enough to fit in half the screen only some of the time.
+                // Up/Down stay with the prompt history.
+                KeyCode::PageUp if report.is_some() => {
+                    if let Some(panel) = report.as_mut() {
+                        panel.scroll(-5);
+                    }
+                }
+                KeyCode::PageDown if report.is_some() => {
+                    if let Some(panel) = report.as_mut() {
+                        panel.scroll(5);
+                    }
+                }
                 // Shift+Enter inserts a newline instead of submitting.
                 // Terminals without the kitty keyboard protocol cannot
                 // report it, so Alt+Enter and Ctrl-J work everywhere.
@@ -10702,6 +10721,10 @@ impl Agent<'_> {
                     // the roster and re-pin every pane to its newest output.
                     sub_pane.collapse();
                     sub_pane.follow_all();
+                    // A submitted prompt also retires a `/usage` report: it is
+                    // a snapshot of a session state the turn is about to
+                    // change, and it does not survive into the answer.
+                    report = None;
                     if line.is_empty() && attachments.is_empty() {
                         continue;
                     }
@@ -10753,6 +10776,7 @@ impl Agent<'_> {
                             &mut resume_pane,
                             &mut arcade,
                             &mut sub_pane,
+                            &mut report,
                         ) {
                             break;
                         }
@@ -10901,16 +10925,21 @@ impl Agent<'_> {
             Ok(out) => {
                 if out.interrupted {
                     log.push_dim("[interrupted]");
-                } else {
-                    if out.exit_code != 0 {
-                        log.push_dim(format!("[exit code: {}]", out.exit_code));
-                    }
+                } else if out.exit_code == 0 {
                     // A command that prints nothing is otherwise indis-
                     // tinguishable from one still running, so say it finished.
                     // Only when it did: an interrupted command did not.
                     log.push_spans(vec![ratatui::text::Span::styled(
                         "done.",
                         crate::tui::done_style(),
+                    )]);
+                } else {
+                    // A failing command finished too, but saying "done." in
+                    // green next to a non-zero exit reads as success. One red
+                    // line carrying the code is the whole outcome.
+                    log.push_spans(vec![ratatui::text::Span::styled(
+                        format!("failed (exit code {}).", out.exit_code),
+                        crate::tui::failed_style(),
                     )]);
                 }
             }
@@ -12678,6 +12707,7 @@ impl Agent<'_> {
         resume_pane: &mut Option<crate::resumepane::ResumePane>,
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
+        report: &mut Option<tui::ReportPanel>,
     ) -> bool {
         let mut parts = line.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(line);
@@ -12790,7 +12820,15 @@ impl Agent<'_> {
             "/version" => log.push_plain(format!("plank {}", crate::logo::version_label())),
             "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
             "/context" => log.push_ansi(&self.render_context_report(true)),
-            "/usage" => log.push_ansi(&self.render_usage_report(true)),
+            // A report, not conversation: it goes in a dismissable panel at
+            // the bottom instead of into the scrollback, where it would
+            // interleave with the model's output and scroll away for good.
+            "/usage" => {
+                *report = Some(tui::ReportPanel::new(
+                    "usage",
+                    &self.render_usage_report(true),
+                ));
+            }
             "/init" => self.tui_run_init(log, terminal, view, input, btw, arcade, sub),
             "/compact" => {
                 let result = {
@@ -13911,6 +13949,12 @@ fn busy_ui_loop(
     // True between press and release of a drag that started inside the prompt;
     // the twin of `tui_loop`'s flag, for the mid-turn prompt.
     let mut input_drag = false;
+    // The in-progress output-pane selection, in content space, so text can be
+    // selected and copied while the model is still generating: waiting for the
+    // turn to end to copy a line that scrolled past is exactly when you want
+    // it. Rows are absolute wrapped-row indices, so the selection stays on its
+    // text as new output arrives underneath it.
+    let mut selection = tui::DragSelect::default();
     // True while the progress line is showing the compaction bar, so it is
     // cleared exactly once when the pass ends.
     let mut compacting_line = false;
@@ -14136,7 +14180,7 @@ fn busy_ui_loop(
                         Some(input.state()),
                         &status_line,
                         draw_view,
-                        None,
+                        selection.current(),
                         &task_view,
                         sub_title.as_deref(),
                         &roster,
@@ -14241,6 +14285,9 @@ fn busy_ui_loop(
         }
         match ev {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // Any keystroke dismisses the mouse selection highlight, as at
+                // idle (the text was already copied on release).
+                selection.cancel();
                 // Same precedence as `tui_loop`: the popup sees keys first, so
                 // Esc closes it before it can interrupt the worker, then the
                 // shared selection keymap.
@@ -14487,6 +14534,7 @@ fn busy_ui_loop(
                     }) =>
                 {
                     sub.active_view(view).follow = true;
+                    selection.cancel();
                 }
                 // The prompt stays live mid-turn (queued lines, `/btw`), so
                 // click-and-drag has to place and select in it here too.
@@ -14497,24 +14545,79 @@ fn busy_ui_loop(
                     if let Some(run) = tui::roster_click(m.column, m.row) =>
                 {
                     sub.click_run(run);
+                    selection.cancel();
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
                     input_drag = tui::last_input_rect()
                         .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false));
+                    // A press outside the prompt starts an output-pane
+                    // selection instead, exactly as at idle.
+                    if input_drag {
+                        selection.cancel();
+                    } else {
+                        selection.press(sub.active_view(view).top, m.column, m.row);
+                    }
                 }
                 MouseEventKind::Drag(MouseButton::Left) if input_drag => {
                     if let Some(r) = tui::last_input_rect() {
                         input.mouse_to_cursor(r, m.column, m.row, true);
                     }
                 }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    selection.drag(sub.active_view(view).top, m.column, m.row);
+                }
                 MouseEventKind::Up(MouseButton::Left) if input_drag => {
                     input_drag = false;
                     input.copy_selection(false);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    // Copy from the content model, from whichever pane is on
+                    // screen, so the copy matches the pixels — the same bargain
+                    // the idle loop makes. A press with no drag selects
+                    // nothing and copies nothing.
+                    let size = terminal.size().unwrap_or_default();
+                    let top = sub.active_view(view).top;
+                    match selection.release() {
+                        tui::Release::Drag(sel) => {
+                            copy_selection_text(sub.active_log(log), size.width, sel);
+                        }
+                        // A plain click on a fenced block's `⧉ copy` control
+                        // copies the block, mid-turn as at idle — a block the
+                        // model just printed is exactly one you want to grab.
+                        tui::Release::Click((col, row)) => {
+                            let out_h = size.height.saturating_sub(2);
+                            let screen_row =
+                                u16::try_from(row.saturating_sub(top)).unwrap_or(u16::MAX);
+                            if screen_row < out_h
+                                && let Some(code) = sub
+                                    .active_log(log)
+                                    .code_copy_at(size.width, top, col, screen_row)
+                            {
+                                tui::copy_to_clipboard(&code);
+                                let chars = code.chars().count();
+                                crate::status::set_flash_tip(format!("📋 Copied {chars} chars"));
+                            }
+                        }
+                        tui::Release::None => {}
+                    }
                 }
                 _ => {}
             },
             _ => {}
         }
+    }
+}
+
+/// Copies the text a drag selected to the clipboard and flashes how much was
+/// taken. Shared by the idle and mid-turn loops so a selection copies the same
+/// way whether or not the model is generating; a selection covering only blank
+/// cells copies nothing rather than clearing the clipboard.
+fn copy_selection_text(log: &OutputLog, width: u16, sel: tui::ContentSelection) {
+    let text = tui::selection_text_content(log, width, sel);
+    if !text.trim().is_empty() {
+        tui::copy_to_clipboard(&text);
+        let chars = text.chars().count();
+        crate::status::set_flash_tip(format!("📋 Copied {chars} chars"));
     }
 }
 
