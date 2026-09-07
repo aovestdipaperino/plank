@@ -5887,7 +5887,9 @@ impl Agent<'_> {
     /// Replays a just-resumed session's recent history into the TUI output log,
     /// rendering each message the way the live stream does: assistant text
     /// through the markdown renderer (with thinking dimmed and tool-call banners
-    /// restored), user turns as prompt echoes, and tool results in gray. The
+    /// restored), user turns as prompt echoes, and tool results in gray when
+    /// the saved settings had tool calls shown (they are hidden otherwise, as
+    /// they are during a live turn). The
     /// plain REPL uses [`resumed_history`] instead; the TUI needs structured
     /// spans, not an ANSI string.
     fn replay_history_into_log(&self, log: &mut OutputLog) {
@@ -5922,10 +5924,20 @@ impl Agent<'_> {
                 continue;
             }
             match m.role {
+                // Tool results are never shown during a live turn: the only
+                // things that reach the log are the model's own stream (see
+                // `ChannelSink`). Replaying them unconditionally made a
+                // resumed window a wall of gray payload that no live turn
+                // would ever have produced -- and with tool calls hidden it
+                // showed the results of calls whose banners were suppressed.
+                // Follow the same switch the banners follow, and let the
+                // payload's own `Tool result K (name):` header stand rather
+                // than prefixing a second one.
                 Role::User if m.is_tool_user() => {
-                    log.push_dim("Tool result:");
-                    for line in m.tool_result_payload().lines().take(12) {
-                        log.push_dim(line.to_string());
+                    if show_tool_calls {
+                        for line in m.tool_result_payload().lines().take(12) {
+                            log.push_dim(line.to_string());
+                        }
                     }
                 }
                 Role::User => {
@@ -19467,6 +19479,71 @@ mod tests {
     /// default settings `show_tool_calls` is off, so this asserts what is
     /// actually observable rather than the banner text (see
     /// `bash_stanza_hides_dsml_and_shows_banner` in `viz.rs` for that case).
+    #[test]
+    fn replay_history_shows_tool_results_only_when_tool_calls_are_shown() {
+        // A live turn never puts a tool-result payload on screen, so replay
+        // must not either unless the user has asked to see tool activity.
+        let line_text = |l: &ratatui::text::Line| -> String {
+            l.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let replay = |show_tool_calls: bool| -> String {
+            let dir = scratch_dir(if show_tool_calls {
+                "resume-replay-tools-on"
+            } else {
+                "resume-replay-tools-off"
+            });
+            let cfg = test_cfg();
+            let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+            agent.session.id = "deadbeef".repeat(5);
+            agent.session.created_at = 1;
+            agent.session.render = Some(crate::session::RenderState {
+                show_thinking: false,
+                show_tool_calls,
+            });
+            agent.session.push(Message::user("hi"));
+            agent.session.push(Message::assistant("looking\n"));
+            agent.session.push(Message::user(
+                "<tool_result>Tool result 1 (bash):\nPAYLOAD-LINE\n</tool_result>",
+            ));
+            let mut log = OutputLog::new();
+            agent.replay_history_into_log(&mut log);
+            let joined = log
+                .to_text()
+                .lines
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::remove_dir_all(&dir).ok();
+            joined
+        };
+
+        let off = replay(false);
+        assert!(
+            !off.contains("PAYLOAD-LINE"),
+            "tool results must stay hidden when tool calls are: {off:?}"
+        );
+        assert!(
+            !off.contains("Tool result"),
+            "no tool-result header either: {off:?}"
+        );
+        assert!(
+            off.contains("looking"),
+            "the assistant text still replays: {off:?}"
+        );
+
+        let on = replay(true);
+        assert!(
+            on.contains("PAYLOAD-LINE"),
+            "tool results replay when tool calls are shown: {on:?}"
+        );
+        assert_eq!(
+            on.matches("Tool result").count(),
+            1,
+            "the payload's own header stands alone, no duplicate: {on:?}"
+        );
+    }
+
     #[test]
     fn replay_history_consumes_in_think_tool_call_instead_of_ignoring_it() {
         // Opt this thread into in-think dispatch; the shipped default is off.
