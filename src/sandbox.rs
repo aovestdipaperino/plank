@@ -152,6 +152,7 @@ impl Sandbox {
             std::env::temp_dir(),
         ];
         roots.extend(self.writable_paths.iter().cloned());
+        roots.extend(worktree_git_roots(cwd));
         if let Some(home) = plank_home {
             roots.push(home.to_path_buf());
         }
@@ -178,6 +179,37 @@ impl Sandbox {
         let real = realpath_for_write(target);
         self.write_roots(cwd).iter().any(|r| real.starts_with(r))
     }
+}
+
+/// The git metadata directories a checkout at `cwd` needs to be writable for
+/// ordinary git commands to work.
+///
+/// In a normal clone `.git` sits inside the working directory and is already
+/// covered by the cwd root. In a **linked worktree** it does not: `.git` is a
+/// pointer file at `<repo>/.git/worktrees/<name>`, and the objects and refs a
+/// commit writes live in the shared `<repo>/.git`. Without these roots a
+/// sandboxed `git commit` inside a worktree fails on the worktree metadata,
+/// which is not a containment win — the model was pointed at that checkout, so
+/// its repository is part of what it was told to work on.
+///
+/// Returns nothing when `cwd` is not in a repository, or when the git
+/// directory is already inside `cwd`.
+fn worktree_git_roots(cwd: &Path) -> Vec<PathBuf> {
+    let Some(root) = crate::worktree::find_git_root(cwd) else {
+        return Vec::new();
+    };
+    let Some(git_dir) = crate::worktree::resolve_git_dir(&root) else {
+        return Vec::new();
+    };
+    let mut roots = vec![git_dir.clone()];
+    if let Some(common) = crate::worktree::common_dir(&git_dir) {
+        roots.push(common);
+    }
+    roots
+        .into_iter()
+        .map(|r| r.canonicalize().unwrap_or(r))
+        .filter(|r| !r.starts_with(cwd.canonicalize().as_deref().unwrap_or(cwd)))
+        .collect()
 }
 
 /// The real location a write to `target` would land at. An existing target
@@ -506,6 +538,49 @@ mod tests {
     fn enabled_by_default_on_macos_only() {
         let sb = Sandbox::default();
         assert_eq!(sb.should_sandbox("rm -rf /"), cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn worktree_git_metadata_is_writable() {
+        let tmp = std::env::temp_dir().join(format!("plank-sbwt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str], dir: &Path| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"], &repo);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        git(&["add", "f"], &repo);
+        git(&["commit", "-qm", "init"], &repo);
+        let wt = tmp.join("wt");
+        git(&["worktree", "add", "-q", wt.to_str().unwrap()], &repo);
+
+        // The per-worktree metadata and the shared object store both sit
+        // outside the worktree; a commit writes to both. (The whole tree here
+        // is under the temp root, so assert on the extra roots themselves
+        // rather than on `contains_write_target`, which temp alone satisfies.)
+        let real = |p: &Path| p.canonicalize().unwrap();
+        let roots = worktree_git_roots(&wt);
+        assert!(
+            roots.contains(&real(&repo.join(".git/worktrees/wt"))),
+            "{roots:?}"
+        );
+        assert!(roots.contains(&real(&repo.join(".git"))), "{roots:?}");
+        // A normal clone keeps `.git` inside the cwd and needs no extra root.
+        assert!(worktree_git_roots(&repo).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
