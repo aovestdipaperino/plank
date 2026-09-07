@@ -22,6 +22,37 @@ The guards, for orientation:
 - **Sub-agent trip cap** — `SUBAGENT_REPEAT_TRIP_CAP = 2`: a sidechain stopped
   twice running is pushed to its report; a third loop fails it.
 
+## Timeline: how the guards got here
+
+Every commit that touched loop detection, from `git log`. Each rung was cut
+by a dump that showed the previous rung was not enough, so the order is the
+argument for the design.
+
+| date | commit | what it added | driven by |
+|---|---|---|---|
+| 2026-08-26 | `3bab717` | `guard::LoopGuard`: advisory on the Nth identical tool call (name + SHA-1 of normalized args) in a bounded window; `tools.repeatAdvisory` setting; `tools.callTimeoutSec` wall-clock deadline on a single tool dispatch (off by default) | dsh.md milestone M1 |
+| 2026-08-31 | `7ddb566` | `insights::RepeatGuard`: exact-cycle detector on the streamed tail (1 KiB window, checked every 64 bytes, period at least 12 bytes, 4 cycles), wired into the insights report sections only | recommendation sections repeating one clause until the section budget ran out |
+| 2026-08-31 | `bbebf6a` | context-pressure precondition on the opportunistic microcompact gate | `repro-1788613069`: eight identical tool calls for two hours after every turn rewrote just-read files into stubs (see "Other findings", below) |
+| 2026-09-05 | `1bb07c0` | `RepeatGuard` on every generation pass (REPL, TUI, quiet sub-agent) through `ui::stream_chunk_must_stop`, `<think>` text only, 8 KiB window, stop via `fail_preflight` and `REPEAT_LOOP_ERROR`; "Working style" prompt rules; `--think-low` as default | the two-hour session that was one 149 K-character think block cycling three paragraphs 263 times |
+| 2026-09-05 | `59f0e8e`, `ef163d6` | `LoopGuard` hard block (`Nudge::Block` from the 6th identical call, refused calls get a `Tool error:` instead of running); `repeated_period` sequence detection; `[timestamp]` markers in repro dumps | `repro-1788619030`: 52 iterations of a stanza the model kept re-issuing through every advisory |
+| 2026-09-05 | `dbfca93` | warn level at 2 cycles (`REPEAT_WARN_CYCLES`, `RepeatGuard::repeating`) rendered as `🔁 looping` in the TUI footer; automatic `repro-loop-<secs>.md` dump with sub-agent sidecars; per-round tool activity line; prompt asks the model to narrate | a stopped pass left no evidence unless the user typed `/repro` |
+| 2026-09-06 | `6e3bc2b` | refused calls kept out of the guard window with their own monotonic counter; three stanzas in a row refused in full end the turn (`LoopGuard::tripped`, `LOOP_TRIPPED_NOTICE`) | `repro-1788676865`: the refused count plateaued at 11 and the model re-emitted the identical stanza for six minutes |
+| 2026-09-06 | `966b55d` | `[status]` reminder appended when a pass emits tool calls with no visible text | long turns whose only output was tool summary lines |
+| 2026-09-06 | `5d5508a` | `SUBAGENT_REPEAT_TRIP_CAP = 2` (second stop pushes the final-round reminder, third fails the sub-agent with `REPEAT_TRIPS_NOTICE`); guard stops as red `guard:` lines on the main window; live status from the quiet pass; interrupted pass keeps its partial text | `repro-1788690439`: a fan-out sub-agent looped ten minutes, was stopped, then generated thirteen more with nothing moving |
+| 2026-09-07 | `aaf0f3d` | `MAIN_REPEAT_TRIP_CAP = 2` on both main-turn paths (`MAIN_REPEAT_TRIPS_NOTICE`); `Agent::repro_dir` so test dumps stay out of `~/.plank/repro`; this document | `repro-loop-1788708943`/`-1788709421`: the main turn looped, stopped, looped again, and the user quit |
+
+Two patterns run through the table. First, every detector started advisory
+or per-pass and had to grow a rung that *ends the turn*: at temperature 0 a
+guard that only refuses or only feeds back an error leaves the prompt
+effectively unchanged, so the next pass is the same pass. Second, each new
+guard shipped with its own evidence channel (timestamps, the auto-dump, the
+red lines, the footer marker), because the previous stall had been
+undiagnosable from what was on disk.
+
+Not a guard, but worth knowing: `tools.callTimeoutSec` from `3bab717` is a
+per-dispatch deadline and is off by default; a hung tool is a different
+failure from a looping model and is not covered by anything above.
+
 ## How to read a loop dump
 
 The last `[assistant]` block before `</think>` is the stopped pass. Its tail is
