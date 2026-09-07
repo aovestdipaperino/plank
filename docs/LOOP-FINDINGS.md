@@ -14,7 +14,10 @@ The guards, for orientation:
   least 12 bytes, stop at 4 cycles (`REPEAT_CYCLES`), footer marker at 2, checked
   every window/16 bytes over an 8 KiB window (`REPEAT_LOOP_WINDOW`). Stops the
   pass through the preflight-error channel with `REPEAT_LOOP_ERROR` and writes
-  a `repro-loop` dump.
+  a `repro-loop` dump. A cycle too long for four copies to fit the window is
+  *latched* at the warn rung and then tracked forward copy by copy
+  (`RepeatGuard::extend_latched`), so the period a stop can see is not capped
+  by the window — see "The stop rung saw a quarter of the window", below.
 - **Tool-call loop guard** — `guard::LoopGuard`: advisory on the 3rd identical
   call, refusal from the 6th, turn ended after three stanzas in a row refused
   in full (`tripped`). Also detects a repeated *sequence* of calls
@@ -39,6 +42,7 @@ argument for the design.
 | 2026-09-06 | `6e3bc2b` | refused calls kept out of the guard window with their own monotonic counter; three stanzas in a row refused in full end the turn (`LoopGuard::tripped`, `LOOP_TRIPPED_NOTICE`) | `repro-1788676865`: the refused count plateaued at 11 and the model re-emitted the identical stanza for six minutes |
 | 2026-09-06 | `966b55d` | `[status]` reminder appended when a pass emits tool calls with no visible text | long turns whose only output was tool summary lines |
 | 2026-09-06 | `5d5508a` | `SUBAGENT_REPEAT_TRIP_CAP = 2` (second stop pushes the final-round reminder, third fails the sub-agent with `REPEAT_TRIPS_NOTICE`); guard stops as red `guard:` lines on the main window; live status from the quiet pass; interrupted pass keeps its partial text | `repro-1788690439`: a fan-out sub-agent looped ten minutes, was stopped, then generated thirteen more with nothing moving |
+| 2026-09-07 | *(this change)* | `RepeatGuard` latches the period the warn rung matched and counts further copies forward (`Latched`, `extend_latched`, `cycle_period` replacing `has_cycles`), removing the window's cap on the period a stop can see | `repro-1788788326`: a 2434-byte cycle ran 17 times, warned in the footer the whole way, and could never be stopped |
 | 2026-09-07 | `aaf0f3d` | `MAIN_REPEAT_TRIP_CAP = 2` on both main-turn paths (`MAIN_REPEAT_TRIPS_NOTICE`); `Agent::repro_dir` so test dumps stay out of `~/.plank/repro`; this document | `repro-loop-1788708943`/`-1788709421`: the main turn looped, stopped, looped again, and the user quit |
 
 Two patterns run through the table. First, every detector started advisory
@@ -71,6 +75,67 @@ Measured on the dumps to date (2026-09-07):
 Every real dump stopped at the designed four cycles: a stop costs about four
 periods, 0.6 to 3 KB, some 150 to 800 tokens, well under a minute at 25 t/s.
 The latency of the guard is no longer the problem. The paragraphs below are.
+
+## The stop rung saw a quarter of the window, the warn rung a half
+
+`repro-1788788326` (loopy-napoleon, saved by hand at 15:38 on 2026-09-07 —
+`note: (none)`, because nothing auto-saved it) is the cleanest loop on record
+and the one the guard could not stop. The final `[assistant]` pass is 46 692
+bytes of think text with no DSML stanza at all:
+
+| | |
+|---|---|
+| pre-loop reasoning | 3 466 B |
+| cycle | **2 434 B, byte-exact** |
+| cycles | **17** (18 occurrences, every delta exactly 2434, no drift) |
+| repeated span | 41 378 B, 89% of the pass |
+
+It also skips the fuzzy stutter phase described in the section below: seven
+paragraphs — "Wait, maybe the script's `out.append(line)`…", "Let's not debug;
+the script is flawed…", "Given the repeated failures, I think we should stop
+and report…", a fenced excerpt of the script, "Actually, the user explicitly
+chose 'first option'…" — locked byte-exact from the first copy.
+
+The user reported `🔁 looping` in the status bar, and that is the whole
+diagnosis. `has_cycles` searched `REPEAT_MIN_PERIOD..=len / cycles`, so the
+two rungs had *different period ceilings* off the same window:
+
+| rung | cycles | max period at 8 KiB | 2434 B? |
+|---|---|---|---|
+| `repeating` → footer marker | `REPEAT_WARN_CYCLES` = 2 | 4096 | ✅ |
+| `feed` → `REPEAT_LOOP_ERROR` | `REPEAT_CYCLES` = 4 | 2048 | ❌ never |
+
+Any period in `(window/4, window/2]` lands in that gap, and the gap is not a
+latency problem that more cycles eventually close: the stop condition is
+*unreachable* there. The footer latches, the model runs to `n_predict`, and
+the only thing that ends the turn is the user. Note how this inverts the
+reassurance in "How to read a loop dump": every dump in that table stopped at
+the designed four cycles because every one of them had a period under 2048.
+The table was measuring the loops the guard could see.
+
+Fixed 2026-09-07 by making the stop rung independent of the window instead of
+widening it. Widening is the obvious move and it is the wrong one: at a 32 KiB
+window a stop still costs four full periods (~10 KB of reasoning here) and the
+ceiling merely moves, so the next loop with a longer period repeats this
+finding. Instead the block the warn rung matched is kept (`Latched { block,
+end, cycles }`) and each further copy is verified as it arrives
+(`extend_latched`), which needs two periods of window rather than four and
+caps nothing. A copy that does not match — or one that scrolled out of the
+window before it could be checked — drops the latch, and the same check is
+free to re-latch onto whatever is cycling now, so a loop that breaks and is
+replaced by a different loop is still caught
+(`a_second_long_cycle_relatches_after_the_first_one_broke`). Counting forward
+without verifying each copy would turn ordinary prose after a broken cycle
+into a false stop; that is what
+`a_latched_cycle_that_breaks_does_not_count_toward_a_stop` pins, and it fails
+if the mismatch branch is made to increment the count.
+
+Replayed against the dump, the fixed guard stops at **12 925 of 46 692 bytes**
+— the latched rung firing at its 4th cycle, ~9.5 KB into the loop — leaving
+33.8 KB, some 8 500 tokens, ungenerated. The `has_cycles` in-window fast path
+is unchanged and still handles short periods, and
+`wide_window_catches_paragraph_loops_the_default_misses` (600-byte period)
+still passes through it.
 
 ## A stopped pass is regenerated verbatim: the main turn has no trip cap
 

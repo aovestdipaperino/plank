@@ -1650,6 +1650,13 @@ impl ThinkTicker {
 pub struct RepeatGuard {
     tail: String,
     since_check: usize,
+    /// Bytes fed since the guard was created. The tail is a sliding view of
+    /// this stream, so an offset into the stream plus `total - tail.len()`
+    /// locates a byte inside the tail.
+    total: usize,
+    /// The cycle the warn rung found, tracked forward copy by copy. See
+    /// [`RepeatGuard::extend_latched`].
+    latched: Option<Latched>,
     /// Bytes of trailing output examined for a cycle.
     window: usize,
     /// Bytes generated between checks.
@@ -1660,11 +1667,33 @@ pub struct RepeatGuard {
     repeating: bool,
 }
 
+/// A cycle the warn rung has confirmed, followed forward through the stream.
+///
+/// Confirming [`REPEAT_CYCLES`] copies by searching the window requires
+/// `cycles * period` bytes of tail at once, which caps the period the stop
+/// rung can see at `window / cycles` — a quarter of what the warn rung sees
+/// at `window / REPEAT_WARN_CYCLES`. Periods in between used to warn forever
+/// and never stop (`repro-1788788326`, a 2434-byte cycle 17 times over). So
+/// the block the warn rung matched is kept and each further copy is checked
+/// as it arrives: two bytes of window per period, whatever the period.
+#[derive(Debug)]
+struct Latched {
+    /// The repeating block, as bytes: a period can split a multi-byte
+    /// character, so this is never treated as text.
+    block: Vec<u8>,
+    /// Stream offset just past the last confirmed copy.
+    end: usize,
+    /// Copies confirmed so far, counting the ones the warn rung matched.
+    cycles: usize,
+}
+
 impl Default for RepeatGuard {
     fn default() -> Self {
         Self {
             tail: String::new(),
             since_check: 0,
+            total: 0,
+            latched: None,
             window: REPEAT_WINDOW,
             check_every: REPEAT_CHECK_EVERY,
             repeating: false,
@@ -1713,6 +1742,7 @@ impl RepeatGuard {
     /// repeating itself for [`REPEAT_CYCLES`] cycles.
     pub fn feed(&mut self, chunk: &str) -> bool {
         self.tail.push_str(chunk);
+        self.total += chunk.len();
         if self.tail.len() > self.window {
             // Trim from the front to a char boundary: the window is a byte
             // budget, and slicing mid-character would panic.
@@ -1727,14 +1757,66 @@ impl RepeatGuard {
             return false;
         }
         self.since_check = 0;
-        if self.has_cycles(REPEAT_CYCLES) {
+        if self.cycle_period(REPEAT_CYCLES).is_some() {
             self.repeating = true;
             return true;
         }
-        if !self.repeating && self.has_cycles(REPEAT_WARN_CYCLES) {
+        // Advance an already-latched cycle before looking for a new one: a
+        // broken cycle drops its latch here and is free to re-latch below on
+        // the same check.
+        if self.extend_latched() >= REPEAT_CYCLES {
             self.repeating = true;
+            return true;
+        }
+        if let Some(period) = self.cycle_period(REPEAT_WARN_CYCLES) {
+            self.repeating = true;
+            if self.latched.is_none() {
+                let bytes = self.tail.as_bytes();
+                self.latched = Some(Latched {
+                    block: bytes[bytes.len() - period..].to_vec(),
+                    end: self.total,
+                    cycles: REPEAT_WARN_CYCLES,
+                });
+            }
         }
         false
+    }
+
+    /// Checks the copies that arrived since the last check against the
+    /// latched block, and returns the running cycle count. A copy that does
+    /// not match — or one that scrolled out of the window before it could be
+    /// checked — drops the latch and returns 0.
+    fn extend_latched(&mut self) -> usize {
+        let Some(mut l) = self.latched.take() else {
+            return 0;
+        };
+        let total = self.total;
+        let keep = {
+            let bytes = self.tail.as_bytes();
+            let win_start = total - bytes.len();
+            let period = l.block.len();
+            let mut keep = true;
+            while total >= l.end + period {
+                if l.end < win_start {
+                    keep = false;
+                    break;
+                }
+                let at = l.end - win_start;
+                if bytes[at..at + period] != l.block[..] {
+                    keep = false;
+                    break;
+                }
+                l.end += period;
+                l.cycles += 1;
+            }
+            keep
+        };
+        if !keep {
+            return 0;
+        }
+        let cycles = l.cycles;
+        self.latched = Some(l);
+        cycles
     }
 
     /// Whether the stream has been seen repeating itself — at least
@@ -1746,20 +1828,17 @@ impl RepeatGuard {
         self.repeating
     }
 
-    /// Whether the tail ends in the same block repeated `cycles` times back
-    /// to back.
-    fn has_cycles(&self, cycles: usize) -> bool {
+    /// The shortest period whose block the tail ends in `cycles` times back
+    /// to back, if any. Bounded by `len / cycles`, since that many copies
+    /// have to fit in the window at once — which is why the stop rung needs
+    /// [`Latched`] for anything longer.
+    fn cycle_period(&self, cycles: usize) -> Option<usize> {
         let bytes = self.tail.as_bytes();
         let len = bytes.len();
-        for period in REPEAT_MIN_PERIOD..=len / cycles {
+        (REPEAT_MIN_PERIOD..=len / cycles).find(|&period| {
             let block = &bytes[len - period..];
-            if (1..cycles)
-                .all(|back| &bytes[len - period * (back + 1)..len - period * back] == block)
-            {
-                return true;
-            }
-        }
-        false
+            (1..cycles).all(|back| &bytes[len - period * (back + 1)..len - period * back] == block)
+        })
     }
 }
 
@@ -2983,6 +3062,128 @@ Tool result 3 (read):\nfine\n</tool_result>",
             "the narrow window should not see a 600-byte period"
         );
         assert!(wide_hit, "the wide window should catch the paragraph loop");
+    }
+
+    #[test]
+    fn a_period_over_a_quarter_of_the_window_still_stops_the_pass() {
+        // `repro-1788788326` (loopy-napoleon): seven paragraphs of reasoning
+        // cycling byte-exact with a 2434-byte period, 17 times, 41 KB of the
+        // pass. `has_cycles(REPEAT_CYCLES)` searches periods up to
+        // `window / cycles` — 2048 at the 8 KiB window — so the stop rung
+        // could never see it, while `has_cycles(REPEAT_WARN_CYCLES)` reaches
+        // 4096 and did: the footer showed `🔁 looping` for seventeen cycles
+        // and the pass was never stopped. Anything with a period in
+        // (window/4, window/2] falls in that gap.
+        let para = |n: u8| {
+            format!(
+                "Wait, maybe the script's `out.append(line)` for the `Self {{` \
+                 line is at the top, but the `continue` after inserting core \
+                 line {n} skips the rest, and the next iteration processes the \
+                 next line. So order should be Self then core. Unless the \
+                 struct field insertion inserted `core: ViewCore,` first.\n\n"
+            )
+        };
+        let mut cycle = String::new();
+        for n in 1..=8 {
+            cycle.push_str(&para(n));
+        }
+        assert!(
+            cycle.len() > 8192 / 4 && cycle.len() <= 8192 / 2,
+            "the period must land in the gap between the two rungs, got {}",
+            cycle.len()
+        );
+        let mut guard = RepeatGuard::with_window(8192);
+        let mut hit = false;
+        for _ in 0..6 {
+            for chunk in cycle.as_bytes().chunks(11) {
+                hit |= guard.feed(std::str::from_utf8(chunk).unwrap());
+            }
+        }
+        assert!(
+            hit,
+            "a cycle wider than window/4 must still stop the pass, not just warn"
+        );
+    }
+
+    #[test]
+    fn a_latched_cycle_that_breaks_does_not_count_toward_a_stop() {
+        // Two copies of a long block latch the cycle, then the reasoning
+        // moves on. The latch must be dropped rather than carried until some
+        // later, unrelated repetition tops it up to four.
+        let para = |n: u8| {
+            format!(
+                "Step {n}: the bounds accessor has to exist on every leaf view \
+                 before the group can forward to it, so the field moves into \
+                 the core and the old accessor becomes a one-line delegate. \
+                 That is forty files, and the tree does not compile in \
+                 between.\n\n"
+            )
+        };
+        // One long block that is not itself periodic, so the only cycle on
+        // offer is the whole block — and only the latch can see it.
+        let mut block = String::new();
+        for n in 1..=10 {
+            block.push_str(&para(n));
+        }
+        assert!(block.len() > 8192 / 4, "period must need the latch");
+        let mut guard = RepeatGuard::with_window(8192);
+        let mut hit = false;
+        for _ in 0..3 {
+            for chunk in block.as_bytes().chunks(11) {
+                hit |= guard.feed(std::str::from_utf8(chunk).unwrap());
+            }
+        }
+        assert!(!hit, "three cycles must warn, not stop");
+        assert!(guard.repeating(), "three cycles must set the loop marker");
+        for i in 0..400 {
+            let line = format!(
+                "Now editing src/views/file_{i}.rs: add the core field, thread bounds through the constructor, and drop the shadowed accessor.\n"
+            );
+            hit |= guard.feed(&line);
+        }
+        assert!(
+            !hit,
+            "prose after a broken cycle must not be counted as more copies"
+        );
+    }
+
+    #[test]
+    fn a_second_long_cycle_relatches_after_the_first_one_broke() {
+        // A loop that breaks and is replaced by a *different* long block.
+        // A latch that survived its own broken cycle would still be tracking
+        // the stale block, so the new loop could never be confirmed.
+        let long_block = |tag: &str| {
+            let mut out = String::new();
+            for n in 1..=10 {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    out,
+                    "{tag} step {n}: the accessor has to exist on every \
+                         leaf view before the group can forward to it, so the \
+                         field moves into the core and the old accessor \
+                         becomes a delegate. Forty files, no compile in \
+                         between.\n\n"
+                );
+            }
+            out
+        };
+        let mut guard = RepeatGuard::with_window(8192);
+        let mut hit = false;
+        let feed = |guard: &mut RepeatGuard, text: &str, hit: &mut bool| {
+            for chunk in text.as_bytes().chunks(11) {
+                *hit |= guard.feed(std::str::from_utf8(chunk).unwrap());
+            }
+        };
+        let first = long_block("ViewCore");
+        for _ in 0..3 {
+            feed(&mut guard, &first, &mut hit);
+        }
+        assert!(!hit, "three cycles of the first block must not stop");
+        let second = long_block("Shared");
+        for _ in 0..6 {
+            feed(&mut guard, &second, &mut hit);
+        }
+        assert!(hit, "the second block's loop must be latched and stopped");
     }
 
     #[test]
