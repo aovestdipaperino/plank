@@ -8,6 +8,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A long reasoning cycle can now actually be stopped.** Confirming repeated
+  copies by re-searching the window needed `cycles * period` bytes of tail at
+  once, so the stop rung only ever saw periods up to a quarter of the window
+  while the warn rung reached half of it. A cycle in that gap warned forever
+  and never stopped: `repro-1788788326` ran a 2434-byte cycle 17 times across
+  41 KB with the footer flagging a loop the whole way. The guard now latches
+  the block the warn rung matched and verifies each further copy as it
+  arrives, which needs two periods of window instead of four and caps no
+  period at all. A copy that mismatches, or scrolls out of the window
+  unchecked, drops the latch so the check re-latches onto whatever is cycling
+  now. Replayed against that dump, the guard stops at 12925 bytes instead of
+  running to 46692.
+- **A queued prompt is no longer stranded when a turn errors.** Four exits
+  from a TUI turn — the worker's error, a worker-thread panic, the `/btw`-only
+  drain, and goal adjudication — returned before the queued input was
+  reconciled, leaving a row parked in the pending region while its text was
+  dropped with the turn's shared state. The next queued prompt then committed
+  that stale row instead of its own, so the screen and the transcript
+  disagreed; with a remote controller attached, where the queue is the
+  bridge's persistent state, remotely queued lines were lost outright. All
+  four exits now go through one `reconcile_and_fail` step that commits the
+  rows and pushes their text together, then propagates the error unchanged.
+- **Resume replay no longer prints tool-result payloads.** A live turn puts
+  only the model's own stream on screen, but replay dumped up to twelve lines
+  of every tool result in the dim thinking style, so a resumed window was a
+  wall of gray no live turn would have produced — and with `showToolCalls`
+  off it was backwards, showing results whose calls were suppressed. Replay
+  now follows the same saved setting the banners do, and drops a redundant
+  "Tool result:" header the payload already carried.
+- **A linked worktree's git metadata is writable under the sandbox.** A
+  worktree keeps its git state outside the checkout, so the Seatbelt profile
+  denied the writes git itself needs there.
+
 - **`view_image` no longer tells the model to shell out to a CLI that does not
   exist.** When no vision encoder was loaded, the tool returned the C
   reference's own refusal, "view_image requires ds4-agent --vision FILE".
@@ -60,6 +93,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Queued prompts sit in a pinned region below the status bar.** Type while a
+  turn is running and the line used to land in the scrollback behind a prose
+  notice, then scroll away while it waited. It now holds still in a region of
+  its own directly under the status bar until the turn absorbs it, joined by a
+  payload-free event rather than a notice, and it survives a resize.
+- **The `ask` panel offers "Chat about this".** Every row used to be one of
+  the model's own options, so a question you thought was wrong left only `Esc`
+  (which tells the model to use its judgment) or `Ctrl-C`. A built-in row now
+  says "none of these, talk to me first": it is a decision rather than a
+  selection, never ticks in a multi-select, wins over anything ticked with it,
+  and the tool result tells the model to stop and wait. plank's own
+  confirmation panels — leaving plan mode, the write and web-fetch grants, the
+  yes/no panel — do not offer it, because that is not an answer they can act
+  on.
+- **A frame no longer re-wraps the whole transcript.** Wrapped row heights are
+  cached and invalidated by width and by edit, so scrolling a long session
+  stops paying to re-wrap every line it is not showing.
 - **Hidden thinking shows its first sentence after a tool round.** With
   `ui.showThinking` off, a pass that follows a tool result prints the first
   sentence of its thinking as an output block of its own ("● The trait is

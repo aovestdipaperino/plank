@@ -7,8 +7,46 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v4.3.0 is out**, and the beta channel is on 4.3.1. The patch number is still
-the channel: `.0` is stable, anything above it is beta.
+**v4.4.0 is out**, and the beta channel has reopened on 4.4.1. The patch number
+is still the channel: `.0` is stable, anything above it is beta.
+
+**A reasoning loop can finally be stopped at any length.** Confirming that a
+block of text is repeating meant re-searching the tail for several copies at
+once, which needed four periods of window — so the check that *stops* a pass
+only ever saw cycles up to a quarter of the window, while the check that warns
+reached half of it. A cycle in that gap warned forever and could never be
+stopped: one saved dump ran a 2.4 KB cycle seventeen times over 41 KB with the
+footer flagging a loop the whole way. The guard now holds on to the block it
+first matched and checks each new copy as it arrives, which needs two periods
+instead of four and puts no ceiling on the period. Replayed against that dump,
+it stops at 12.9 KB rather than running to 46.7 KB.
+
+**What you type during a turn stays where you can see it.** A prompt typed
+while the model is working used to be announced in the scrollback and then
+scroll away while it waited its turn. It now sits in a small region pinned
+directly under the status bar until the turn takes it, and it survives a window
+resize. It also survives a failure: several ways out of a turn used to throw
+the queued text away while leaving its row on screen, so the next queued prompt
+adopted the stale row and the transcript no longer matched what you had read —
+and when a remote controller was attached, remotely queued lines were dropped
+outright.
+
+**The question panel has a way out.** When the model asks you a multiple-choice
+question, every row used to be one of its own options; if you thought the
+question itself was wrong, your only exits were `Esc`, which tells the model to
+carry on using its own judgment, and `Ctrl-C`. There is now a **Chat about
+this** row under the options, and choosing it tells the model to stop and wait
+for you. plank's own confirmation prompts — leaving plan mode, granting a write
+or a web fetch — do not offer it, since talking it over is not an answer they
+can act on.
+
+**Sub-agents report while they work.** A long sub-agent pass used to sit on a
+frozen token count and a climbing clock, which read as a hang; it publishes the
+same progress the main pass does now. Its pane shows diff cards and activity
+lines instead of raw tool banners and follows your thinking setting, and the
+roster highlights the live row, walks with the arrow keys, and lets a finished
+row leave a minute after it ends. `/usage` draws a session usage panel for
+local engines, in the shape the hosted providers use.
 
 **Looking at an image no longer sends the model hunting for a command-line
 flag.** plank reads images through the model itself, in process — there is no

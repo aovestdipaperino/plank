@@ -10,37 +10,156 @@ it.
 
 ## In the betas
 
-Riding the beta channel today, on top of the newest stable release. Install with
+The beta channel has just been reopened at 4.4.1 on the same code as stable
+4.4.0, so there is nothing riding ahead of stable at the moment. Install with
 `brew install aovestdipaperino/tap/plank-agent-beta`.
 
-### 3.6.3
+## Stable releases
+
+### 4.4.0
+
+The 4.3.1 beta series became stable here. Most of it is about a turn that will
+not end and a window that will not hold still.
+
+🔁 **A reasoning loop can now actually be stopped, at any period.** Confirming
+repeated copies by re-searching the tail needed four periods of window at once,
+so the rung that stops a pass only ever saw cycles up to a quarter of the
+window while the rung that warns reached half of it. A cycle in that gap warned
+forever and never stopped: one saved dump ran a 2.4 KB cycle seventeen times
+across 41 KB with the footer flagging a loop the whole way. The guard latches
+the block it first matched and checks each further copy as it arrives, which
+needs two periods instead of four and caps nothing. On that same dump it now
+stops at 12.9 KB instead of running to 46.7 KB. A main turn that loops twice in
+a row is also ended outright, the way a sub-agent already was, and a sub-agent
+that loops twice is asked for its report rather than retrying forty rounds.
+Guard stops are red lines on the main window whichever pass they happened in.
+
+⌨️ **What you type during a turn holds still.** A queued prompt used to land in
+the scrollback behind a prose notice and then scroll away while it waited. It
+now sits in a region pinned directly under the status bar until the turn
+absorbs it, and survives a resize. It also survives a *failure*: four ways out
+of a turn used to drop the queued text while leaving its row on screen, so the
+next queued prompt committed the stale row and the transcript disagreed with
+the screen — and with a remote controller attached, remotely queued lines were
+lost outright.
+
+💬 **The question panel has a way out.** Every row in an `ask` panel used to be
+one of the model's own options, so a question you thought was wrong left only
+`Esc` — which tells the model to use its own judgment — or `Ctrl-C`. A
+built-in **Chat about this** row now says "none of these, talk to me first",
+and the model is told to stop and wait. plank's own confirmation panels do not
+offer it, because that is not an answer they can act on.
+
+👁️ **Looking at an image stopped sending the model after a flag that does not
+exist.** plank reads images through the model in process, but with no encoder
+loaded the `view_image` tool answered in the C reference's words, naming a
+`ds4-agent --vision` flag. The model took that as an instruction, ran it,
+failed, searched `plank --help`, and concluded vision was broken. An encoder
+that fails to load is now reported at startup, and an image observation that
+misses its transcript section is logged instead of passing silently as text
+claiming a picture is attached.
+
+📊 **`/usage` renders a session usage panel for local engines**, in the shape
+the hosted providers use. Sub-agent panes hide raw tool banners in favour of
+diff cards and activity lines, honour `showThinking`, and report live progress
+instead of a frozen token count; the roster highlights the live main row, walks
+with the arrow keys, and lets a finished row leave a minute after it ends.
+
+🧹 Smaller, but each one bit: a DSML stanza whose opener ends at its bar parses,
+and a pass emitting several stanzas stops at the first; a resumed window no
+longer replays tool-result payloads no live turn would have printed; a frame
+caches wrapped row heights instead of re-wrapping the whole transcript; a
+linked worktree's git metadata is writable under the sandbox; and the system
+prompt routes shell work to the native tools and carries guidance on how to
+conduct itself in a git repository.
+
+### 4.3.0
+
+📉 **`/repro` grew up.** The dump names the session file it came from, copies
+its own path to your clipboard, writes a sidecar per sub-agent sidechain, and
+records each sidechain's console window. The debug console mirror became
+opt-in behind `--debug` (with `/debug on|off` to toggle it mid-session), and a
+console attached late is backfilled with the session and sub-agent streams so
+far, including compacted and stashed transcripts.
+
+🔴 **The status bar says when the model is looping**, a looping pass is dumped
+automatically, and a turn ends after three fully refused tool stanzas — a
+blocked tool call used to be unable to end a loop at all. With thinking hidden,
+each tool round leaves a one-line record of what it ran, and the prefill
+readout shows the time left.
+
+### 4.2.0
+
+🗒️ **`/init` runs quietly** — no tool banners, no `write` content preview, no
+screen wipe — and reading `~/.plank` no longer raises a write-permission
+question: a bash command made only of known read-only utilities, with no
+redirect, runs without asking. The system prompt asks the model to narrate
+between tool rounds, so a long tool-calling turn reads as progress.
+
+### 4.1.0
+
+⏱️ **A turn can no longer spend an hour repeating one thought.** This release
+started from a measurement: a small feature request that finishes in minutes
+elsewhere took plank two hours, and the transcript showed one thinking block of
+149K characters in which three paragraphs repeated 263 times until the token
+cap. The repetition guard that protected `/insights` now watches every
+generation pass. Rerunning the same request after each fix took it from no
+result in two hours to a tested change in 16 minutes; the numbers are in
+`FINDINGS.md`.
+
+Three fixes did most of that. Reasoning defaults to low effort now
+(`--think` gives the old medium level back), which turned stuttering "maybe"
+thoughts into numbered plans. `edit` understands CRLF files, so a
+Windows-style source no longer fails every multi-line edit. And `search` skips
+build output, so a search over `.` stops returning the `target/package/` copy
+of every file ahead of the real matches.
+
+📝 **`/memory` edits every memory file at once.** One buffer, each file between
+markers naming its scope and path; on save it splits back along the markers and
+writes only what changed.
+
+📄 **`AGENTS.md` is the only instructions file plank reads.** `CLAUDE.md` is no
+longer a silent fallback: an interactive start in a project with a `CLAUDE.md`
+and no `AGENTS.md` links the one to the other and says so, and a project with
+neither is offered `/init`. Headless runs do neither, and now save their
+transcript (`--no-session` opts out).
+
+🧭 **The system prompt gained a working style** — a plank-owned section outside
+the byte-for-byte C parity base — telling the model to batch independent tool
+calls, explore briefly then act, prefer the smaller of two plausible designs,
+edit straight from search context, and stay inside the requested scope.
+
+### 4.0.0
+
+🖱️ **The prompt's phase cursor is drawn into the frame** instead of sent as an
+OSC 12 escape, so it finally appears in Warp and every other terminal that
+ignored the recolouring, and the terminal cursor comes back when you suspend to
+a shell.
+
+📦 **Model upgrades are driven by a versioned `ds4.manifest`.** It covers the
+whole artifact set and is compared by one monotonic version, replacing the
+Hugging Face tree scan. A newer version asks first, then a detached helper —
+one per machine — streams each artifact into staging, verifying SHA-256 as it
+goes and resuming a partial fetch; the set is installed at the *next* launch,
+because a running plank has the model memory-mapped. Downloads show in the
+status bar and can be cancelled from there.
+
+🔢 **`--ctx` and `--session-ctx-size` accept a `k`/`m` suffix**, which is how a
+context window is quoted everywhere else.
+
+The 3.6 betas became stable here too:
 
 🧮 **Context pressure is checked between tool rounds, not only between turns.**
 A turn that reads, edits and tests its way through a dozen rounds fills the
 window as it goes, and plank only asked whether it should compact *before* the
-turn started. Cross the soft limit halfway through and the next generation went
-out against an over-full context. The check now runs at the top of every
-continuation round, on both front ends, which is what the C reference does and
-what the port had quietly dropped.
+turn started. The check now runs at the top of every continuation round, on
+both front ends, which is what the C reference does and what the port had
+quietly dropped.
 
-### 3.6.2
-
-👁️ **Plank can see, and this time it is true.** The vision encoder has shipped
+👁️ **Plank can see, and this time it is true.** The vision encoder had shipped
 beside the model for a while, but the image path never actually worked: four
-faults sat on top of each other, and between them a pasted screenshot either
-aborted the process with `malloc: pointer being freed was not allocated` or came
-back described as something that was never in the picture. The engine now gets a
-buffer it can own and free; an image already in the conversation keeps the span
-the engine built for it instead of having one rebuilt that could never match; the
-encoder's metadata is read before the free that zeroes it, so an image no longer
-arrives with an empty layout and takes the surrounding message down with it; and
-the prefill chunk sits above the 384-token image-block cap the engine refuses to
-split. Paste a stack trace, a failing UI, a diagram or a photo of a whiteboard
-and the model looks at the picture. The encoder lives at
-`~/.plank/ds4flash.vision.gguf`, is fetched on first launch, and runs on the same
-Metal device, so no pixels leave the Mac.
-
-## Stable releases
+faults sat on top of each other. The Metal kernels for the vision model are
+registered, the image path works, and it no longer double-frees.
 
 ### 3.6.0
 

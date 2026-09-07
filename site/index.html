@@ -322,8 +322,8 @@
       <p class="kicker">Since you were last here</p>
       <h2 class="rounded">The plank has been busy.</h2>
       <p style="color:var(--bark-soft);margin:0 0 18px;max-width:640px">A few of the
-      newest arrivals. Turns that used to wander now finish, your memory files edit as one,
-      and the instructions file is the one named for the job.</p>
+      newest arrivals. Turns that used to wander now finish, what you type mid-turn stays
+      where you can see it, and a question you disagree with is no longer a forced choice.</p>
       <div class="cards">
         <div class="card">
           <div class="ico">⏱️</div>
@@ -331,14 +331,14 @@
           <p>A repetition guard stops a turn the moment its reasoning starts looping, and low-effort thinking is the default. Measured on one real request: from two hours with nothing to show, to a tested change in 16 minutes.</p>
         </div>
         <div class="card">
-          <div class="ico">🗂️</div>
-          <h3 class="rounded">One buffer for all your memory</h3>
-          <p><span class="mono">/memory</span> opens user and project memory together in the built-in editor, each between markers naming its file. Save, and every edit goes back to the file it came from.</p>
+          <div class="ico">⌨️</div>
+          <h3 class="rounded">Type while it works</h3>
+          <p>A prompt you write mid-turn waits in a region pinned under the status bar, in view until the turn takes it. It survives a resize — and a turn that errors out hands it back to you instead of dropping it.</p>
         </div>
         <div class="card">
-          <div class="ico">📎</div>
-          <h3 class="rounded">AGENTS.md, and only that</h3>
-          <p>Start plank in a project with a <span class="mono">CLAUDE.md</span> and no <span class="mono">AGENTS.md</span> and it links the one to the other. A project with neither is offered <span class="mono">/init</span>. Headless runs touch nothing.</p>
+          <div class="ico">💬</div>
+          <h3 class="rounded">&ldquo;Chat about this&rdquo;</h3>
+          <p>When the model asks you a multiple-choice question, one row is always yours: none of these, talk to me first. It stops and waits instead of picking for you.</p>
         </div>
       </div>
       <p style="margin:16px 0 0"><a class="ghost" href="/whats-new">Everything new since v2.5 →</a></p>
@@ -431,11 +431,11 @@
   var CHAN = {
     stable: {
       cmd: "brew install aovestdipaperino/tap/plank-agent",
-      note: 'Seasoned lumber — the stable channel. Currently <span class="mono">v4.3.0</span>; <span class="mono">brew upgrade</span> keeps you steady.'
+      note: 'Seasoned lumber — the stable channel. Currently <span class="mono">v4.4.0</span>; <span class="mono">brew upgrade</span> keeps you steady.'
     },
     beta: {
       cmd: "brew install aovestdipaperino/tap/plank-agent-beta",
-      note: 'Fresh-cut and still curing — newest features first. Currently <span class="mono">v4.3.1</span>.'
+      note: 'Fresh-cut and still curing — newest features first. Currently <span class="mono">v4.4.1</span>.'
     }
   };
   function setChan(c){

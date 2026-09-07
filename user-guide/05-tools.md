@@ -154,6 +154,8 @@ Two settings tune it, both under `worktree` in `settings.json`: `sparsePaths` na
 
 When a turn is genuinely ambiguous, the model can call `ask` instead of guessing: a multiple-choice question with a short header and two to seven options, shown as a panel in the TUI or a numbered list in the REPL. It blocks until you answer, and degrades cleanly when there is nobody to ask (headless mode).
 
+Every question also carries a **Chat about this** row beneath the model's options, so a question you think is wrong does not have to be answered as asked — see [The interface](03-the-interface.md#in-a-question-panel).
+
 `ask.maxOptions` caps how many options one question may offer (default 7; the minimum of 2 is fixed).
 
 ## Task lists

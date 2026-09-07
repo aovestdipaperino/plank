@@ -135,6 +135,13 @@
 <p>The TUI is three regions: <strong>scrollback</strong> (the
 conversation), the <strong>prompt</strong>, and the <strong>status
 bar</strong> along the bottom.</p>
+<p>Type while a turn is running and your message is not lost: it is held
+in a <strong>queued-prompt region</strong> pinned directly below the
+status bar, where it stays visible until the turn absorbs it. Queued
+lines never scroll away into the conversation while they are waiting,
+and they survive a resize. When the turn takes them they join your next
+prompt; when the turn ends in an error they come back to the input line
+rather than vanishing.</p>
 <p>Assistant replies render as markdown — headings, lists, tables, and
 fenced code blocks with tree-sitter syntax highlighting. The model's
 thinking appears dimmed above its answer (turn it off with
@@ -307,6 +314,14 @@ closes.</p>
 an option when the question is multi-select, <code>Enter</code> to
 answer, <code>Esc</code> to decline, and <code>Ctrl-C</code> to
 interrupt.</p>
+<p>Below the model's own options sits a built-in <strong>Chat about
+this</strong> row, for when the question itself is the problem. It is a
+decision rather than a selection: it never ticks in a multi-select, and
+picking it wins over anything else you had ticked. The model is told to
+stop and wait for you instead of acting. plank's own confirmation panels
+— leaving plan mode, the write and web-fetch grants, plain yes/no — do
+not offer it, because talking it over is not an answer they can act
+on.</p>
 <h2 id="the-agent-roster">The agent roster</h2>
 <p>The moment anything is delegated — by you with
 <code>/subagent</code>, or by the model with the <code>agent</code> tool

@@ -6,6 +6,8 @@
 
 The TUI is three regions: **scrollback** (the conversation), the **prompt**, and the **status bar** along the bottom.
 
+Type while a turn is running and your message is not lost: it is held in a **queued-prompt region** pinned directly below the status bar, where it stays visible until the turn absorbs it. Queued lines never scroll away into the conversation while they are waiting, and they survive a resize. When the turn takes them they join your next prompt; when the turn ends in an error they come back to the input line rather than vanishing.
+
 Assistant replies render as markdown — headings, lists, tables, and fenced code blocks with tree-sitter syntax highlighting. The model's thinking appears dimmed above its answer (turn it off with `ui.showThinking`). File edits render as git-style **diff cards**: an `Update(path)` header, an added/removed summary, and red/green `@@` hunks. A brand-new file streams its contents dimmed as it is written.
 
 The status bar is two rows. The top one answers "which tree am I in" and holds still: the working directory, the git branch, and a summary of what you have changed in that tree (`📄 3 · +128 -41` — files touched, then lines added in green and lines deleted in red, staged and unstaged together, untracked files included; a clean tree shows nothing). The bottom one carries everything that churns — where inference is running, the reasoning level, a context-usage gauge, an activity throbber, what the model is doing, generation stats, the task counter, and the remote marker. When a tool is running its name sits in the notification slot and blinks; otherwise a rotating tip appears there.
@@ -80,6 +82,8 @@ With an arcade game open, the first `Ctrl-C` closes the game and a second interr
 ### In a question panel
 
 The `ask` tool's panel takes `Up`/`Down` to move, `Space` to toggle an option when the question is multi-select, `Enter` to answer, `Esc` to decline, and `Ctrl-C` to interrupt.
+
+Below the model's own options sits a built-in **Chat about this** row, for when the question itself is the problem. It is a decision rather than a selection: it never ticks in a multi-select, and picking it wins over anything else you had ticked. The model is told to stop and wait for you instead of acting. plank's own confirmation panels — leaving plan mode, the write and web-fetch grants, plain yes/no — do not offer it, because talking it over is not an answer they can act on.
 
 ## The agent roster
 

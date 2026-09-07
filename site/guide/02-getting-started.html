@@ -177,7 +177,8 @@ token?" rather than explaining where you are.</p>
 <ul>
 <li><strong>You can keep typing while it works.</strong> Each turn runs
 on a worker thread; the prompt stays live during generation and your
-next message queues.</li>
+next message queues, held in a pinned region under the status bar until
+the turn picks it up.</li>
 <li><strong>Ctrl-C interrupts the turn</strong>, it does not kill plank.
 At an empty prompt it clears the input line.</li>
 <li><strong>Esc also interrupts</strong> a running generation.</li>

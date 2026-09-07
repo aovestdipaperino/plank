@@ -33,7 +33,7 @@ At startup plank gathers session context — git status, the date, any `AGENTS.m
 
 Then type. A few things to know immediately:
 
-- **You can keep typing while it works.** Each turn runs on a worker thread; the prompt stays live during generation and your next message queues.
+- **You can keep typing while it works.** Each turn runs on a worker thread; the prompt stays live during generation and your next message queues, held in a pinned region under the status bar until the turn picks it up.
 - **Ctrl-C interrupts the turn**, it does not kill plank. At an empty prompt it clears the input line.
 - **Esc also interrupts** a running generation.
 - **The turn ends when the model stops calling tools.** plank runs generate → dispatch tools → feed results back → generate again, until a generation asks for nothing.
