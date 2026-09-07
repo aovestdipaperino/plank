@@ -11397,15 +11397,17 @@ impl Agent<'_> {
             // while the worker owns the engine for this turn.
             let live = LiveCommands::capture(self);
             if run_main {
-                // Capture the worker's own `Result` instead of `?`-propagating
-                // it immediately: an `Err` here (e.g. `worker_generate`
-                // failing) must not skip the leftover/commit reconciliation
-                // below, or a queued prompt strands in `pending` forever and
-                // then mislabels whatever the user queues next (FINDINGS.md).
-                // `run_worker_ui`'s own outer `?` still bails immediately — a
-                // UI-side error there means the terminal is gone and there is
-                // nothing left to reconcile.
-                let worker_result = run_worker_ui(
+                // Capture both `run_worker_ui`'s own outer error and the
+                // worker's inner `Result` instead of `?`-propagating either
+                // immediately: `run_worker_ui` returns a UI-side error
+                // through that outer position too when the worker thread
+                // panics (`handle.join()` -> `ui?; out`), and that leaves the
+                // terminal alive with a row still stranded in `pending`. So
+                // reconcile before propagating either error, not just the
+                // inner one — otherwise a queued prompt is lost for good and
+                // the next commit mislabels whatever the user queues next
+                // (FINDINGS.md).
+                let run_result = run_worker_ui(
                     terminal,
                     log,
                     view,
@@ -11419,16 +11421,27 @@ impl Agent<'_> {
                     ask_bridge.as_ref(),
                     &live,
                     |tx| self.worker_turn(&tx, shared),
-                )?;
-                if let Err(e) = worker_result {
-                    // The turn never reached the leftover loop, so drain the
-                    // queue here: each pending row moves into the scrollback
-                    // as the honest record that the user did type it, keeping
-                    // `pending` and `shared.queued` empty together instead of
-                    // leaving a stale row to mislabel a future commit.
-                    for _ in shared.take_queued() {
-                        log.commit_pending();
+                );
+                let worker_result = match run_result {
+                    Ok(inner) => inner,
+                    Err(outer_err) => {
+                        // The turn never reached the leftover loop, so the
+                        // queued text must be reconciled here or it is
+                        // dropped for good: commit each row into the
+                        // scrollback *and* push its text into the transcript
+                        // so screen and session agree, instead of only
+                        // moving the row and discarding what the user typed.
+                        self.absorb_leftover(log, shared.take_queued());
+                        return Err(outer_err);
                     }
+                };
+                if let Err(e) = worker_result {
+                    // The turn never reached the leftover loop, so reconcile
+                    // here for the same reason as the outer-error branch
+                    // above: commit each row and push its text, keeping
+                    // `pending` and `shared.queued` empty together instead of
+                    // losing the user's input.
+                    self.absorb_leftover(log, shared.take_queued());
                     return Err(e);
                 }
             } else {
