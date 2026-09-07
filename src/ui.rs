@@ -621,6 +621,79 @@ const LOOP_TRIPPED_NOTICE: &str = "turn stopped: the model re-issued the same re
 
 const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating the same text over and over. Do not resume that reasoning. Decide now and act: emit the tool calls for the change you already planned, or answer the user.";
 
+/// Reasoning bytes one pass may generate before it is stopped whatever its
+/// tail looks like ([`crate::insights::RepeatGuard::with_think_budget`]).
+///
+/// Sized from the 32 dumps in `~/.plank/repro`: 939 passes, 16 of them
+/// looping. 923 passes are genuinely healthy and exactly one of those exceeds
+/// 16 KiB (18 029 B, 1.6 KB over). Five looping passes exceed it that the
+/// cycle rungs either miss outright — the 9042-byte cycle and a 45 KB drifting
+/// loop with no byte-exact period — or reach later, at 481, 257 and 224
+/// seconds against this rung's 204. Five loops caught per healthy pass
+/// tripped.
+///
+/// Do not lower it to buy latency. The same corpus puts a 7 KiB budget at 89
+/// seconds, which catches two more loops and trips 27 healthy passes: the
+/// ratio inverts from 5:1 to 1:3.9, and a rung that fires on 3% of good
+/// reasoning is one the user turns off. The loops worth catching are enormous,
+/// so latency is the cheap axis here.
+const REPEAT_THINK_BUDGET: usize = 16384;
+
+/// Model-facing text for a [`REPEAT_THINK_BUDGET`] stop. Deliberately not
+/// [`REPEAT_LOOP_ERROR`]: the guard has *not* proven a loop, only that the
+/// reasoning outran its budget, and telling a model that was thinking hard
+/// that it was repeating itself is a lie it then has to reconcile.
+const THINK_BUDGET_ERROR: &str = "generation stopped: the reasoning ran past its budget without reaching a decision. Do not restate the options. Pick the one you were leaning towards, say it in one sentence, and emit the tool calls for it now.";
+
+/// Tools whose success means the turn moved the world, resetting
+/// [`NO_PROGRESS_BYTE_BUDGET`]. The same three the plan-mode gate blocks
+/// (`PLAN_MODE_BLOCKED_TOOLS`), for the same reason: they are the ones with
+/// effects. Reads, searches and listings are deliberately absent — a turn can
+/// read all day and still be going nowhere, which is the case this rung is
+/// for.
+const PROGRESS_TOOLS: &[&str] = &["write", "edit", "bash", "bash_stop"];
+
+/// Bytes a turn may generate without any [`PROGRESS_TOOLS`] call before the
+/// turn is ended. Bytes rather than tokens because that is the unit the
+/// corpus was measured in, and the only one both front ends have to hand.
+///
+/// The rung the per-pass budget cannot be: `repro-1788796284`'s main turn ran
+/// four passes of 435, 1690, 2768 and 4328 reasoning bytes, none cyclic and
+/// every one far under [`REPEAT_THINK_BUDGET`], then spent fifty minutes and
+/// edited nothing. Every per-pass check passes it. What is wrong with that
+/// turn is only visible at turn scale, and only as an absence.
+///
+/// Sized from the same 32 dumps: of 575 runs that do end in a state change,
+/// the 99th percentile generates 18.7 KB first and exactly one exceeds 32 KiB
+/// (~8K tokens, about seven minutes of decode), so this trips 0.17% of turns
+/// that were getting somewhere.
+/// Note the interaction with [`MAIN_REPEAT_TRIP_CAP`], which counts only
+/// *consecutive* reasoning stops: a turn that alternates between a stopped
+/// pass and a real tool round resets that counter every other round and can
+/// run forever. This budget does not reset on tool calls that change nothing,
+/// so it is the backstop for exactly that alternation.
+const NO_PROGRESS_BYTE_BUDGET: usize = 32768;
+
+/// Shown when [`NO_PROGRESS_BYTE_BUDGET`] ends a turn. Names the absence,
+/// because "stopped" without "and nothing was written" sends the reader
+/// looking for a crash.
+const NO_PROGRESS_NOTICE: &str = "turn stopped: the model generated 32KB of output without writing a file, editing one, or running a command. Nothing was changed. Narrow the request, or tell it which file to start with.";
+
+/// Whether a dispatched round did anything with an effect; see
+/// [`PROGRESS_TOOLS`].
+fn calls_made_progress(calls: &[ToolCall]) -> bool {
+    calls
+        .iter()
+        .any(|c| PROGRESS_TOOLS.contains(&c.name.as_str()))
+}
+
+/// Whether a preflight error is one of the reasoning rungs, and so counts
+/// towards [`MAIN_REPEAT_TRIP_CAP`]. Both stops leave the prompt materially
+/// unchanged at temperature 0, so both need the cap for the same reason.
+fn is_reasoning_stop(err: Option<&str>) -> bool {
+    matches!(err, Some(REPEAT_LOOP_ERROR | THINK_BUDGET_ERROR))
+}
+
 /// Consecutive repeat-guard stops a sub-agent may take before it is asked for
 /// its report instead of another attempt. At temperature 0 a pass is a pure
 /// function of the prompt, and the guard's error changes that prompt by one
@@ -641,7 +714,7 @@ const MAIN_REPEAT_TRIP_CAP: usize = 2;
 
 /// Shown when [`MAIN_REPEAT_TRIP_CAP`] ends a turn. The transcript keeps the
 /// guard's tool error as its last message, so the next prompt sees why.
-const MAIN_REPEAT_TRIPS_NOTICE: &str = "turn stopped: the model's reasoning looped twice in a row. Rephrase the request, narrow it, or give it what it is missing.";
+const MAIN_REPEAT_TRIPS_NOTICE: &str = "turn stopped: the model's reasoning was cut short twice in a row, for looping or for running past its budget. Rephrase the request, narrow it, or give it what it is missing.";
 
 /// Reported to the parent when the forced report pass looped as well.
 const REPEAT_TRIPS_NOTICE: &str =
@@ -657,13 +730,21 @@ fn guard_notice(what: &str, label: Option<&str>) -> String {
     }
 }
 
-/// What the repeat guard did, worded for [`guard_notice`]: the count matters
-/// once it is more than one, because that is when the cap is closing in.
-fn repeat_trip_text(trips: usize) -> String {
-    if trips > 1 {
-        format!("stopped a reasoning loop ({trips} in a row)")
+/// What the reasoning guard did, worded for [`guard_notice`]: the count
+/// matters once it is more than one, because that is when the cap is closing
+/// in. A budget stop is named as one, because it is a weaker claim — the
+/// pass was long, not provably circular — and reporting it as a loop would
+/// send whoever reads the dump looking for a cycle that is not there.
+fn repeat_trip_text(over_budget: bool, trips: usize) -> String {
+    let what = if over_budget {
+        "stopped an over-budget pass"
     } else {
-        "stopped a reasoning loop".to_owned()
+        "stopped a reasoning loop"
+    };
+    if trips > 1 {
+        format!("{what} ({trips} in a row)")
+    } else {
+        what.to_owned()
     }
 }
 
@@ -672,8 +753,9 @@ fn repeat_trip_text(trips: usize) -> String {
 /// the model is thinking, and reports whether the pass must stop — because
 /// the guard saw the tail cycling, or because a mid-stream preflight failed.
 ///
-/// A tripped guard records [`REPEAT_LOOP_ERROR`] on the renderer, so the
-/// ordinary preflight-error path feeds it back to the model. Only reasoning
+/// A tripped guard records [`REPEAT_LOOP_ERROR`] — or [`THINK_BUDGET_ERROR`],
+/// when the pass outran [`REPEAT_THINK_BUDGET`] without a provable cycle — on
+/// the renderer, so the ordinary preflight-error path feeds it back. Only reasoning
 /// is watched: visible output and tool arguments legitimately repeat — a
 /// `write` of a table with identical rows would trip the guard — and the
 /// observed hour-long stall was a `<think>` block that cycled three
@@ -685,8 +767,15 @@ fn stream_chunk_must_stop<S: RenderSink>(
     greedy: &AtomicBool,
 ) -> Option<PassStop> {
     greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
-    if stream.in_think() && guard.feed(chunk) {
-        stream.fail_preflight(REPEAT_LOOP_ERROR);
+    if stream.in_think() {
+        // Ordered so a proven cycle is reported as one: both stops end the
+        // pass, but only the cycle rung has evidence, and its message tells
+        // the model something the budget's cannot.
+        if guard.feed(chunk) {
+            stream.fail_preflight(REPEAT_LOOP_ERROR);
+        } else if guard.over_budget() {
+            stream.fail_preflight(THINK_BUDGET_ERROR);
+        }
     }
     if stream.preflight_error().is_some() {
         return Some(PassStop::Failed);
@@ -2576,7 +2665,8 @@ impl Agent<'_> {
         // Mirrors the C's worker greedy flag: argmax sampling while the
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
-        let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW);
+        let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
+            .with_think_budget(REPEAT_THINK_BUDGET);
         // Provider engines take a structured turn; local engines keep the flat
         // rendered transcript (byte parity, §4.4). `bufs`/`st` outlive the call.
         let bufs = self
@@ -3153,7 +3243,11 @@ impl Agent<'_> {
             self.session.push(Message::assistant(pass.assistant_text));
             if pass.looped {
                 trips += 1;
-                self.report_guard(&repeat_trip_text(trips));
+                let over = pass
+                    .tool_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains(THINK_BUDGET_ERROR));
+                self.report_guard(&repeat_trip_text(over, trips));
             } else {
                 trips = 0;
             }
@@ -3310,8 +3404,10 @@ struct QuietPass {
     assistant_text: String,
     /// A preflight or parse error to feed back as a tool result.
     tool_error: Option<String>,
-    /// The repetition guard stopped this pass ([`REPEAT_LOOP_ERROR`]); the
-    /// sub-agent loops count these to know when to stop retrying.
+    /// A reasoning rung stopped this pass — a proven cycle
+    /// ([`REPEAT_LOOP_ERROR`]) or a spent budget ([`THINK_BUDGET_ERROR`]).
+    /// The sub-agent loops count these to know when to stop retrying; both
+    /// count, because both leave the prompt materially unchanged.
     looped: bool,
     /// Returned rather than recorded, because usage accounting lives on the
     /// `Agent` and a pass may run on a thread that cannot touch it.
@@ -3540,7 +3636,8 @@ fn generate_pass(
     let mut assistant_text = String::new();
     let preflight_stop = AtomicBool::new(false);
     let greedy = AtomicBool::new(false);
-    let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW);
+    let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
+        .with_think_budget(REPEAT_THINK_BUDGET);
     // Counting the prompt only when someone is listening: it tokenizes the
     // whole rendered transcript.
     let mut live = ctx.status.as_ref().map(|sc| {
@@ -3641,7 +3738,7 @@ fn finish_quiet_pass<S: RenderSink>(
             calls: Vec::new(),
             assistant_text,
             tool_error: Some(payload),
-            looped: preflight_error.as_deref() == Some(REPEAT_LOOP_ERROR),
+            looped: is_reasoning_stop(preflight_error.as_deref()),
             stats,
         });
     }
@@ -3700,6 +3797,9 @@ impl Agent<'_> {
         let mut stop_hook_ran = false;
         // Passes in a row the repeat guard stopped; see `MAIN_REPEAT_TRIP_CAP`.
         let mut repeat_trips = 0usize;
+        // Bytes generated since the last tool call with an effect; see
+        // `NO_PROGRESS_BYTE_BUDGET`.
+        let mut ungrounded = 0usize;
         let mut round = 0usize;
         loop {
             round += 1;
@@ -3738,6 +3838,7 @@ impl Agent<'_> {
                 &mut assistant_text,
                 finished.ended_in_think && turn_continues,
             );
+            ungrounded += assistant_text.len();
             self.session.push(Message::assistant(assistant_text));
             // Streamed live to the parent window, so the console has seen it:
             // it must not be replayed to a window that connects later.
@@ -3745,9 +3846,10 @@ impl Agent<'_> {
             self.payload_dirty = true;
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
-            if preflight_error.as_deref() == Some(REPEAT_LOOP_ERROR) {
+            if is_reasoning_stop(preflight_error.as_deref()) {
                 repeat_trips += 1;
-                self.report_guard(&repeat_trip_text(repeat_trips));
+                let over = preflight_error.as_deref() == Some(THINK_BUDGET_ERROR);
+                self.report_guard(&repeat_trip_text(over, repeat_trips));
                 if let Some(line) = self.loop_repro_line() {
                     println!("{}", self.debug_line(&line));
                 }
@@ -3857,6 +3959,14 @@ impl Agent<'_> {
                         println!("{}", self.debug_line(&line));
                     }
                     self.report_guard(LOOP_TRIPPED_NOTICE);
+                    return Ok(());
+                }
+                // Checked after the results are in the transcript, so the
+                // dump and the next prompt both show what the turn did have.
+                if calls_made_progress(&calls) {
+                    ungrounded = 0;
+                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET {
+                    self.report_guard(NO_PROGRESS_NOTICE);
                     return Ok(());
                 }
                 continue;
@@ -8385,7 +8495,11 @@ the original is frozen and listed in /tree"
         slot.session.push(Message::assistant(pass.assistant_text));
         if pass.looped {
             slot.trips += 1;
-            self.report_guard_for(Some(&slot.label), &repeat_trip_text(slot.trips));
+            let over = pass
+                .tool_error
+                .as_deref()
+                .is_some_and(|e| e.contains(THINK_BUDGET_ERROR));
+            self.report_guard_for(Some(&slot.label), &repeat_trip_text(over, slot.trips));
         } else {
             slot.trips = 0;
         }
@@ -9088,9 +9202,10 @@ struct TurnOutput {
 struct PassFailure {
     /// The framed `<tool_result>` body fed back to the model.
     payload: String,
-    /// The repetition guard stopped this pass ([`REPEAT_LOOP_ERROR`]); the
-    /// turn loop writes the automatic `repro-loop-*` dump once the text is in
-    /// the transcript.
+    /// A reasoning rung stopped this pass — a proven cycle
+    /// ([`REPEAT_LOOP_ERROR`]) or a spent budget ([`THINK_BUDGET_ERROR`]);
+    /// the turn loop writes the automatic `repro-loop-*` dump once the text
+    /// is in the transcript.
     looped: bool,
 }
 
@@ -11908,6 +12023,9 @@ impl Agent<'_> {
         let mut stop_hook_ran = false;
         // Passes in a row the repeat guard stopped; see `MAIN_REPEAT_TRIP_CAP`.
         let mut repeat_trips = 0usize;
+        // Bytes generated since the last tool call with an effect; see
+        // `NO_PROGRESS_BYTE_BUDGET`.
+        let mut ungrounded = 0usize;
         let mut round = 0usize;
         loop {
             round += 1;
@@ -11988,6 +12106,7 @@ impl Agent<'_> {
             // when the partial stanza it cut off reads as a parse error.
             let turn_continues = !out.interrupted && (!out.calls.is_empty() || out.error.is_some());
             close_open_think(&mut assistant_text, out.ended_in_think && turn_continues);
+            ungrounded += assistant_text.len();
             self.session.push(Message::assistant(assistant_text));
             // Streamed live to the parent window, so the console has seen it:
             // it must not be replayed to a window that connects later.
@@ -11996,9 +12115,10 @@ impl Agent<'_> {
             let _ = tx.send(UiEvent::EndLine);
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
-            if out.error.as_ref().is_some_and(|e| e.looped) {
+            if let Some(f) = out.error.as_ref().filter(|e| e.looped) {
                 repeat_trips += 1;
-                self.report_guard(&repeat_trip_text(repeat_trips));
+                let over = f.payload.contains(THINK_BUDGET_ERROR);
+                self.report_guard(&repeat_trip_text(over, repeat_trips));
                 if let Some(line) = self.loop_repro_line() {
                     let _ = tx.send(UiEvent::Dim(line));
                 }
@@ -12073,6 +12193,14 @@ impl Agent<'_> {
                         let _ = tx.send(UiEvent::Dim(line));
                     }
                     self.report_guard(LOOP_TRIPPED_NOTICE);
+                    return Ok(());
+                }
+                // Checked after the results are in the transcript, so the
+                // dump and the next prompt both show what the turn did have.
+                if calls_made_progress(&out.calls) {
+                    ungrounded = 0;
+                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET {
+                    self.report_guard(NO_PROGRESS_NOTICE);
                     return Ok(());
                 }
                 self.drain_queued(shared, tx);
@@ -12377,7 +12505,8 @@ impl Agent<'_> {
         // Mirrors the C's worker greedy flag: argmax sampling while the
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
-        let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW);
+        let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
+            .with_think_budget(REPEAT_THINK_BUDGET);
         // Bound before the event closure, which cannot borrow `self` while
         // `self.engine` is generating. The elapsed clock is the turn's, so the
         // footer's seconds accumulate across the generate → tools → generate
@@ -12540,7 +12669,7 @@ impl Agent<'_> {
             calls,
             error: error.map(|payload| PassFailure {
                 payload,
-                looped: preflight_error == Some(REPEAT_LOOP_ERROR),
+                looped: is_reasoning_stop(preflight_error),
             }),
         })
     }
@@ -21909,7 +22038,8 @@ mod tests {
             "</｜DSML｜tool_calls>",
         );
         let mut stream = StreamRenderer::new(NullSink);
-        let mut guard = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW);
+        let mut guard = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
+            .with_think_budget(REPEAT_THINK_BUDGET);
         let greedy = AtomicBool::new(false);
         let mut feed = |stream: &mut StreamRenderer<NullSink>, chunk: &str| {
             stream.push(chunk);
@@ -22460,6 +22590,14 @@ mod tests {
         }
     }
 
+    /// A bare call to `name`, for the argument-free progress check.
+    fn test_tool_call(name: &str) -> ToolCall {
+        ToolCall {
+            name: name.to_string(),
+            args: Vec::new(),
+        }
+    }
+
     /// A reply that is one short paragraph of reasoning repeated far past the
     /// repeat guard's four cycles, never closing its `<think>`.
     fn looping_reasoning() -> String {
@@ -22723,6 +22861,153 @@ mod tests {
             "{events:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Reasoning that never repeats a thing and runs well past
+    /// `REPEAT_THINK_BUDGET`, as `repro-1788796284`'s sub-agent did.
+    fn unbounded_reasoning() -> String {
+        use std::fmt::Write as _;
+        (0..600).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(
+                acc,
+                "Considering approach {i}, which differs from the last."
+            );
+            acc
+        })
+    }
+
+    #[test]
+    fn a_pass_whose_reasoning_outruns_its_budget_is_stopped() {
+        // `repro-1788796284.sub-1`: a 9042-byte cycle, longer than the whole
+        // guard window, so neither cycle rung could ever name it and the pass
+        // ran 190 KB to `n_predict`. The budget needs no cycle to stop it.
+        let dir = scratch_dir("think-budget");
+        let mut cfg = test_cfg();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Low;
+        let engine = ScriptedEngine {
+            replies: vec![unbounded_reasoning(), "</think>Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert_eq!(
+            error_lines(&events),
+            vec!["guard: stopped an over-budget pass"],
+            "a budget stop is not reported as a loop: {events:?}"
+        );
+        // The model is told to decide, not that it was repeating itself.
+        let fed = agent
+            .session
+            .transcript
+            .iter()
+            .any(|m| m.text.contains(THINK_BUDGET_ERROR));
+        assert!(fed, "the budget error must reach the model");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_turn_that_changes_nothing_is_stopped() {
+        // `repro-1788796284`'s main turn: four passes, none cyclic, every one
+        // far under the per-pass budget, fifty minutes, nothing edited. Only
+        // a turn-scale rung sees it, and only as an absence.
+        let dir = scratch_dir("no-progress");
+        let cfg = test_cfg();
+        let read_call = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"list\">",
+            "<｜DSML｜parameter name=\"path\">.</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        // Each pass reads, changes nothing, and generates 12 KB doing it, so
+        // the third crosses the 32 KiB budget.
+        let pass = format!("{}{read_call}", "x".repeat(12 * 1024));
+        let engine = ScriptedEngine {
+            replies: vec![pass.clone(), pass.clone(), pass, "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert_eq!(
+            error_lines(&events),
+            vec![format!("guard: {NO_PROGRESS_NOTICE}")],
+            "{events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_turn_that_keeps_writing_is_never_stopped_for_lack_of_progress() {
+        // The other half of the rung: a long turn that is getting somewhere
+        // must not be cut off. `write` resets the budget every round.
+        let dir = scratch_dir("no-progress-ok");
+        let cfg = test_cfg();
+        let write_call = |i: usize| {
+            format!(
+                concat!(
+                    "<｜DSML｜tool_calls>",
+                    "<｜DSML｜invoke name=\"write\">",
+                    "<｜DSML｜parameter name=\"path\">out{}.txt</｜DSML｜parameter>",
+                    "<｜DSML｜parameter name=\"content\">hi</｜DSML｜parameter>",
+                    "</｜DSML｜invoke>",
+                    "</｜DSML｜tool_calls>",
+                ),
+                i
+            )
+        };
+        let replies: Vec<String> = (0..5)
+            .map(|i| format!("{}{}", "x".repeat(12 * 1024), write_call(i)))
+            .chain(std::iter::once("Done.\n".to_string()))
+            .collect();
+        let engine = ScriptedEngine {
+            replies,
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            error_lines(&events).is_empty(),
+            "60 KB of output, but every round wrote a file: {events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_tools_with_effects_count_as_progress() {
+        for name in PROGRESS_TOOLS {
+            assert!(calls_made_progress(&[test_tool_call(name)]), "{name}");
+        }
+        for name in ["read", "search", "list", "glob", "agent", "task"] {
+            assert!(!calls_made_progress(&[test_tool_call(name)]), "{name}");
+        }
+        assert!(
+            calls_made_progress(&[test_tool_call("read"), test_tool_call("edit")]),
+            "one effect in the round is enough"
+        );
+        assert!(!calls_made_progress(&[]));
+    }
+
+    #[test]
+    fn both_reasoning_rungs_count_towards_the_cap() {
+        assert!(is_reasoning_stop(Some(REPEAT_LOOP_ERROR)));
+        assert!(is_reasoning_stop(Some(THINK_BUDGET_ERROR)));
+        assert!(!is_reasoning_stop(Some("edit failed: no match")));
+        assert!(!is_reasoning_stop(None));
     }
 
     #[test]

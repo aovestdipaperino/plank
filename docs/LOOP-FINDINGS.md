@@ -22,6 +22,15 @@ The guards, for orientation:
   call, refusal from the 6th, turn ended after three stanzas in a row refused
   in full (`tripped`). Also detects a repeated *sequence* of calls
   (`repeated_period`).
+- **Think budget** — `REPEAT_THINK_BUDGET` = 16 KiB of reasoning per pass,
+  whatever the tail looks like. Recognises nothing, so unlike the cycle rungs
+  it has no `2p` latency floor and no period ceiling, and it is the only rung
+  that catches a drifting loop. Stops through the same preflight channel with
+  `THINK_BUDGET_ERROR`, and counts towards `MAIN_REPEAT_TRIP_CAP`.
+- **No-progress budget** — `NO_PROGRESS_BYTE_BUDGET` = 32 KiB generated in one
+  turn with no `PROGRESS_TOOLS` call (`write`, `edit`, `bash`, `bash_stop`).
+  Turn-scale, so it is the only rung that sees a turn whose every pass is
+  individually reasonable and which still changes nothing.
 - **Sub-agent trip cap** — `SUBAGENT_REPEAT_TRIP_CAP = 2`: a sidechain stopped
   twice running is pushed to its report; a third loop fails it.
 
@@ -43,6 +52,7 @@ argument for the design.
 | 2026-09-06 | `966b55d` | `[status]` reminder appended when a pass emits tool calls with no visible text | long turns whose only output was tool summary lines |
 | 2026-09-06 | `5d5508a` | `SUBAGENT_REPEAT_TRIP_CAP = 2` (second stop pushes the final-round reminder, third fails the sub-agent with `REPEAT_TRIPS_NOTICE`); guard stops as red `guard:` lines on the main window; live status from the quiet pass; interrupted pass keeps its partial text | `repro-1788690439`: a fan-out sub-agent looped ten minutes, was stopped, then generated thirteen more with nothing moving |
 | 2026-09-07 | *(this change)* | `RepeatGuard` latches the period the warn rung matched and counts further copies forward (`Latched`, `extend_latched`, `cycle_period` replacing `has_cycles`), removing the window's cap on the period a stop can see | `repro-1788788326`: a 2434-byte cycle ran 17 times, warned in the footer the whole way, and could never be stopped |
+| 2026-09-07 | *(this change)* | `REPEAT_THINK_BUDGET = 16 KiB` per-pass reasoning cap (`RepeatGuard::with_think_budget`, `THINK_BUDGET_ERROR`, counted towards `MAIN_REPEAT_TRIP_CAP`); `NO_PROGRESS_BYTE_BUDGET = 32 KiB` per-turn cap on output with no `PROGRESS_TOOLS` call | `repro-1788796284`: a 9042-byte cycle 20 times over in a sub-agent, longer than the whole window so no rung could see it, and a parent turn that looped no text at all yet edited nothing in fifty minutes |
 | 2026-09-07 | `aaf0f3d` | `MAIN_REPEAT_TRIP_CAP = 2` on both main-turn paths (`MAIN_REPEAT_TRIPS_NOTICE`); `Agent::repro_dir` so test dumps stay out of `~/.plank/repro`; this document | `repro-loop-1788708943`/`-1788709421`: the main turn looped, stopped, looped again, and the user quit |
 
 Two patterns run through the table. First, every detector started advisory
@@ -71,6 +81,7 @@ Measured on the dumps to date (2026-09-07):
 | `repro-loop-1788708943` | bumbling-einstein | 3 700 | 123 B × 5 | 615 | 3.1 K |
 | `repro-loop-1788709421` | bumbling-einstein | 20 676 | 714 B × 4 (8 lines) | 2 856 | 17.8 K |
 | `repro-loop-1788693586/649` | *(test artifact)* | 18 091 | 45 B × 400 | 18 000 | 0 |
+| `repro-1788796284.sub-1` | cranky-watt *(sub-agent)* | 189 744 | 9 042 B × 20 | 180 840 | 8.9 K |
 
 Every real dump stopped at the designed four cycles: a stop costs about four
 periods, 0.6 to 3 KB, some 150 to 800 tokens, well under a minute at 25 t/s.
@@ -136,6 +147,111 @@ Replayed against the dump, the fixed guard stops at **12 925 of 46 692 bytes**
 is unchanged and still handles short periods, and
 `wide_window_catches_paragraph_loops_the_default_misses` (600-byte period)
 still passes through it.
+
+## A cycle can be longer than the whole window, and then nothing fires
+
+`repro-1788796284` (cranky-watt, saved by hand — the parent dump shows no loop
+at all, and that is the trap). The parent's four passes are 435, 1690, 2768 and
+4328 bytes of think text, all well under the 8 KiB window and none of them
+cyclic; the turn ends with a 48-byte assistant message after
+`Tool error: sub-agent failed: interrupted`. Fifty minutes, no edit, and by
+every signal the guard publishes the model never looped.
+
+The loop is entirely in the sidecar, `repro-1788796284.sub-1.md`. Thirteen
+ordinary passes, then a fourteenth of **189 744 bytes** that is one cycle
+repeated twenty times:
+
+| | |
+|---|---|
+| pre-loop reasoning | 8 904 B |
+| cycle | **9 042 B, byte-exact** |
+| cycles | **20** (21 occurrences, no drift) |
+| repeated span | 180 840 B, 95% of the pass |
+
+The cycle is a whole deliberation, not a paragraph: "This is getting complex.
+Let's step back. We can use a subagent? We are already a subagent…", a
+partition of the 32 leaf files into three lettered sub-agent batches, a
+Python-script plan, an argument that the script breaks builder structs, and
+back to "This is getting complex. Let's step back." It ran to the 50 000-token
+`n_predict` cap — 189 744 bytes is about 47 K tokens — which is what the parent
+saw as `interrupted`.
+
+Both rungs are blind here, and it is one inequality:
+
+| rung | cycles | window needed for period `p` | 9 042 B at 8 KiB? |
+|---|---|---|---|
+| `repeating` → footer marker | 2 | `2p` = 18 084 | ❌ |
+| latched stop (`extend_latched`) | 2 to latch, then forward | `2p` = 18 084 | ❌ |
+
+The latch fix from the section above removed the *stop* rung's dependence on
+the window, but the warn rung is still `cycle_period(2)`, so it needs two
+copies resident and caps the detectable period at `window / 2` = 4096. Nothing
+can latch onto a 9 042-byte cycle, so nothing counts forward from it either.
+The previous finding closed the gap `(window/4, window/2]`; this one is simply
+`p > window/2`, and the fix that closed the first gap does not touch it.
+
+Two lessons that generalize past this dump:
+
+- **A sidecar loop is invisible in the parent.** The parent transcript is the
+  sub-agent's *task string and final tool result*, so a sidechain that burns
+  47 K tokens cycling shows up as one tool error. `Agent::report_guard` prints
+  red guard lines on the main window for stops, but nothing fired here, so
+  there was nothing to print. Reading only the top-level dump and concluding
+  "not a loop" is the failure mode; check every `.sub-N.md` sidecar first,
+  and note that a hand-saved `repro-<secs>` (rather than `repro-loop-<secs>`)
+  is itself evidence that no guard fired.
+- **Cycle length scales with the size of the decision, not the prose.** Every
+  earlier dump cycled a paragraph (123 B to 2.4 KB). This one cycles a
+  *plan*: enumerate an approach, enumerate its objection, abandon it, restart.
+  A guard sized for repeated sentences is structurally the wrong size for
+  repeated plans, and the request that produces repeated plans — "use
+  sub-agents for the independent tasks" over a 32-file refactor — is exactly
+  the kind plank is for. Expect the period to keep growing; a detector whose
+  ceiling is any fixed multiple of a fixed window will keep being outrun.
+
+Fixed 2026-09-07 by two rungs that recognise nothing, because recognition is
+what has the floor. Cycle detection needs two copies before it can name a
+cycle, so its latency floor is `2p` — 18 KB here, and unreachable anyway when
+`2p` exceeds the window. A budget has no floor: it just stops counting.
+
+- **`REPEAT_THINK_BUDGET` = 16 KiB**, a per-pass cap on reasoning bytes
+  (`RepeatGuard::with_think_budget`), fed back as `THINK_BUDGET_ERROR` and
+  counted towards `MAIN_REPEAT_TRIP_CAP` alongside a real loop, since both
+  leave the prompt materially unchanged at temperature 0.
+- **`NO_PROGRESS_BYTE_BUDGET` = 32 KiB**, a per-*turn* cap on output generated
+  without a `PROGRESS_TOOLS` call (`write`, `edit`, `bash`, `bash_stop` — the
+  same set plan mode blocks). This is the rung the per-pass budget cannot be:
+  the parent turn above passes every per-pass check ever written.
+
+Both were sized against the 32 dumps in `~/.plank/repro`, 939 passes, and the
+numbers are the argument:
+
+| rung | wall clock | loops caught | healthy tripped |
+|---|---|---|---|
+| think budget @ 7 KiB | 89 s | 7 | 27 of 923 (2.93%) |
+| **think budget @ 16 KiB** | **204 s** | **5** | **1 of 923 (0.11%)** |
+| no-progress @ 32 KiB | ~7 min | the non-cyclic turn | 1 of 575 runs (0.17%) |
+
+Do not lower the think budget to buy latency. 7 KiB inverts the ratio from 5:1
+to 1:3.9, and a rung that fires on 3% of good reasoning is one the user turns
+off. The loops worth catching here are enormous — 190 KB, 46 KB, 45 KB — so
+latency is the cheap axis and false positives are the expensive one. The
+corpus is also thin in its healthy tail and drawn from two projects, so treat
+0.11% as an order of magnitude, not a rate.
+
+Two deliberate choices in the wording. A budget stop is reported as
+`stopped an over-budget pass`, never as a loop: it is a weaker claim, and
+sending whoever reads the dump looking for a cycle that is not there is how
+the next finding gets misdiagnosed. And `THINK_BUDGET_ERROR` tells the model
+to pick the option it was leaning towards rather than accusing it of
+repeating itself, which would be a false statement it then has to reconcile.
+
+Still open: five looping passes sit below 12 KB where neither rung reaches
+them, and four of those are *drifting* loops with no byte-exact period (the
+"stutter" section below). Lowering a budget is the wrong instrument for them,
+at 27 healthy passes to catch 2. A duplicate-line ratio is the right one, and
+the corpus separates on it cleanly: healthy passes sit at zero duplicate
+lines, those four at 15 to 25 percent.
 
 ## A stopped pass is regenerated verbatim: the main turn has no trip cap
 

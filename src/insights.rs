@@ -1665,6 +1665,10 @@ pub struct RepeatGuard {
     /// kept for the rest of the pass so the footer's loop marker does not
     /// flicker while the tail drifts in and out of alignment.
     repeating: bool,
+    /// Reasoning bytes this pass may generate before it is stopped whatever
+    /// the tail looks like; see [`RepeatGuard::with_think_budget`]. `None`
+    /// for the insights sections, whose passes are short by construction.
+    budget: Option<usize>,
 }
 
 /// A cycle the warn rung has confirmed, followed forward through the stream.
@@ -1697,6 +1701,7 @@ impl Default for RepeatGuard {
             window: REPEAT_WINDOW,
             check_every: REPEAT_CHECK_EVERY,
             repeating: false,
+            budget: None,
         }
     }
 }
@@ -1736,6 +1741,39 @@ impl RepeatGuard {
             check_every: (window / 16).max(REPEAT_CHECK_EVERY),
             ..Self::default()
         }
+    }
+
+    /// Caps the reasoning one pass may generate, whatever its tail looks
+    /// like. Cycle detection needs two copies of a block before it can call
+    /// it a cycle, so its floor is twice the period: a 9 KB cycle cannot be
+    /// named until 18 KB have been generated, and one longer than half the
+    /// window can never be named at all (`repro-1788796284.sub-1`, a 9042-byte
+    /// cycle 20 times over, 190 KB, invisible to both rungs). A budget has no
+    /// such floor because it recognises nothing — it just stops counting.
+    ///
+    /// It is therefore the only rung whose latency is bounded, and the only
+    /// one that catches a *drifting* loop, where no two copies are byte-equal.
+    /// The price is that it cannot tell a loop from hard thinking, so the
+    /// caller must treat a budget stop as a nudge rather than a verdict.
+    #[must_use]
+    pub fn with_think_budget(mut self, budget: usize) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// Whether this pass has spent its reasoning budget. Sticky once true,
+    /// since [`total`](Self::total) only grows.
+    #[must_use]
+    pub fn over_budget(&self) -> bool {
+        self.budget.is_some_and(|b| self.total > b)
+    }
+
+    /// Reasoning bytes fed to the guard this pass, for the message a budget
+    /// stop shows: a number the reader can compare against the budget beats
+    /// "it went on too long".
+    #[must_use]
+    pub fn fed(&self) -> usize {
+        self.total
     }
 
     /// Feeds one streamed chunk. Returns true once the output has been
@@ -3062,6 +3100,50 @@ Tool result 3 (read):\nfine\n</tool_result>",
             "the narrow window should not see a 600-byte period"
         );
         assert!(wide_hit, "the wide window should catch the paragraph loop");
+    }
+
+    #[test]
+    fn a_think_budget_stops_reasoning_that_never_repeats() {
+        // The rung cycle detection cannot be: `repro-1788796284.sub-1` cycled
+        // 9042 bytes, more than the whole window, so neither rung ever fired
+        // and the pass ran to `n_predict` — 190 KB, forty minutes.
+        let mut guard = RepeatGuard::with_window(8192).with_think_budget(4096);
+        let mut cycled = false;
+        for i in 0..200 {
+            cycled |= guard.feed(&format!("a wholly distinct sentence, number {i}, here.\n"));
+        }
+        assert!(
+            !cycled,
+            "nothing repeated, so the cycle rungs must stay quiet"
+        );
+        assert!(!guard.repeating(), "and the footer marker must stay off");
+        assert!(
+            guard.over_budget(),
+            "but the budget is spent: {} B",
+            guard.fed()
+        );
+    }
+
+    #[test]
+    fn a_think_budget_leaves_reasoning_under_it_alone() {
+        let mut guard = RepeatGuard::with_window(8192).with_think_budget(4096);
+        for i in 0..20 {
+            let _ = guard.feed(&format!("a wholly distinct sentence, number {i}, here.\n"));
+        }
+        assert!(guard.fed() < 4096, "test is only meaningful under budget");
+        assert!(!guard.over_budget());
+    }
+
+    #[test]
+    fn the_insights_guard_has_no_think_budget() {
+        // The sections are short by construction and a budget there would
+        // stop honest prose; only the turn guards opt in.
+        let mut guard = RepeatGuard::new();
+        for i in 0..2000 {
+            let _ = guard.feed(&format!("a wholly distinct sentence, number {i}, here.\n"));
+        }
+        assert!(guard.fed() > 65536, "fed {} B", guard.fed());
+        assert!(!guard.over_budget());
     }
 
     #[test]
