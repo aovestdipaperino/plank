@@ -2328,3 +2328,19 @@ Every finding about the model repeating itself — the reasoning repeat guard,
 the tool-call loop guard, the sub-agent trip cap, and the analysis of each
 `repro-loop-*` dump — is collected in `docs/LOOP-FINDINGS.md`. Add new loop
 findings there, not here.
+
+## A queued prompt joins the conversation at two sites, not one
+
+`OutputLog.pending` holds prompts typed while the worker is busy, rendered
+indented below the status reporter line. Two places move a queued line into
+the transcript, and both must call `commit_pending()`:
+
+- `Agent::drain_queued` (`src/ui.rs`), between tool rounds, on the worker
+  thread — it sends `UiEvent::QueuedJoined`, which `worker::apply` turns into
+  the call.
+- the leftover loop at the bottom of `tui_turn_inner` (`src/ui.rs`), for lines
+  no tool round absorbed, on the main thread — it calls the method directly.
+
+Wire only the first and an interrupted turn leaves the prompt indented under
+the status line forever while its text is already in the transcript: the
+screen and the session disagree, with nothing logged.
