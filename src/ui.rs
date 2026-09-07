@@ -1951,61 +1951,252 @@ fn fmt_int(n: i32) -> String {
 /// mistaken for a charge.
 ///
 /// Pure: usage numbers in, rendered block out — no engine, no terminal.
-fn render_local_invoice(model: &str, input_tokens: u64, output_tokens: u64, color: bool) -> String {
+/// Everything the local `/usage` report is built from, gathered by the agent
+/// and handed to [`render_local_usage`] so the layout can be tested without
+/// an engine.
+#[derive(Debug, Clone, Default)]
+struct LocalUsage {
+    /// Model name of the main engine, or empty when unknown.
+    model: String,
+    /// Tokens ingested across every pass.
+    input_tokens: u64,
+    /// Tokens generated across every pass.
+    output_tokens: u64,
+    /// Per-engine rows: label, input, output, and the engine's speed record
+    /// when it reported one.
+    by_engine: Vec<(String, u64, u64, Option<crate::speeds::Record>)>,
+    /// Wall-clock time since the session started.
+    wall: std::time::Duration,
+    /// Context tokens in use after the last pass.
+    ctx_used: i32,
+    /// Context window size in tokens.
+    ctx_size: i32,
+    /// Working-tree line changes, when inside a git repository.
+    git: Option<crate::status::GitStats>,
+    /// Speculative-decoding counters from the last speculating pass.
+    spec: crate::engine::SpecStats,
+}
+
+/// Renders `/usage` for a local engine: the shape of a hosted agent's usage
+/// panel, with real figures wherever the machine has them (tokens, phase
+/// durations, throughput, context fill, code changes) and a straight face
+/// wherever it does not (the bill, the weekly quota, the reset time).
+#[allow(clippy::too_many_lines)]
+fn render_local_usage(u: &LocalUsage, color: bool) -> String {
     use std::fmt::Write as _;
-    let dim = |s: &str| {
-        if color {
-            format!("\x1b[38;5;238m{s}{ANSI_RESET}")
-        } else {
-            s.to_owned()
-        }
+    let (bold, dim, fill, empty, warn, reset) = if color {
+        (
+            "\x1b[1m",
+            "\x1b[38;5;238m",
+            "\x1b[38;5;147m",
+            "\x1b[38;5;60m",
+            "\x1b[38;5;173m",
+            ANSI_RESET,
+        )
+    } else {
+        ("", "", "", "", "", "")
     };
-    let total = input_tokens.saturating_add(output_tokens);
+    let model = if u.model.is_empty() {
+        "local model"
+    } else {
+        u.model.as_str()
+    };
+    let total = u.input_tokens.saturating_add(u.output_tokens);
     // Entirely made-up conversion factors. Do not cite these anywhere.
     // Integer math only: milli-watt-hours and thousandths of an espresso.
     let milli_wh = total / 5;
     let milli_espresso = total / 100;
     let fan_revs = total.saturating_mul(11);
     let knee_minutes = total / 900;
-    let gpu_tears = output_tokens / 1_000;
+    let gpu_tears = u.output_tokens / 1_000;
 
-    let model = if model.is_empty() {
-        "local model"
-    } else {
-        model
-    };
+    let mut prefill_secs = 0.0;
+    let mut gen_secs = 0.0;
+    let mut tool_secs = 0.0;
+    for (_, _, _, rec) in &u.by_engine {
+        if let Some(r) = rec {
+            prefill_secs += r.prefill_secs;
+            gen_secs += r.gen_secs;
+            tool_secs += r.tool_secs;
+        }
+    }
+    let model_secs = prefill_secs + gen_secs;
+
     let mut out = String::new();
+    let _ = writeln!(out, "{bold}Session{reset} {dim}— {model} (local){reset}");
+    let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "{}",
-        dim(&format!("Local Inference Invoice — {model}"))
+        "Total cost:              $0.00 {dim}(your electricity bill and your knees disagree){reset}"
     );
-    let _ = writeln!(out, "  tokens in     {}", fmt_u64(input_tokens));
-    let _ = writeln!(out, "  tokens out    {}", fmt_u64(output_tokens));
+    if model_secs > 0.0 {
+        let _ = writeln!(
+            out,
+            "Total duration (model):  {} {dim}(prefill {} · generation {}){reset}",
+            fmt_hms(model_secs),
+            fmt_hms(prefill_secs),
+            fmt_hms(gen_secs),
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "Total duration (model):  0s {dim}(the GPU is still waiting for its cue){reset}"
+        );
+    }
+    if tool_secs > 0.0 {
+        let _ = writeln!(out, "Total duration (tools):  {}", fmt_hms(tool_secs));
+    }
     let _ = writeln!(
         out,
-        "  electricity   {}.{:03} Wh ({}.{:03} espressos)",
+        "Total duration (wall):   {}",
+        fmt_hms(u.wall.as_secs_f64())
+    );
+    match &u.git {
+        Some(g) if !g.is_clean() => {
+            let _ = writeln!(
+                out,
+                "Total code changes:      {} lines added, {} lines removed",
+                g.added, g.deleted
+            );
+        }
+        Some(_) => {
+            let _ = writeln!(
+                out,
+                "Total code changes:      0 lines added, 0 lines removed {dim}(a clean tree; suspicious){reset}"
+            );
+        }
+        None => {}
+    }
+    let _ = writeln!(out, "Usage by model:");
+    if u.by_engine.is_empty() {
+        let _ = writeln!(
+            out,
+            "    {model}:  0 input, 0 output {dim}(nobody has said anything yet){reset}"
+        );
+    }
+    let width = u
+        .by_engine
+        .iter()
+        .map(|r| r.0.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (label, input, output, rec) in &u.by_engine {
+        let speed = match rec {
+            Some(r) if r.prefill_tps() > 0.0 || r.gen_tps() > 0.0 => format!(
+                " {dim}(avg {:.1} tok/s prefill · {:.1} tok/s generation){reset}",
+                r.prefill_tps(),
+                r.gen_tps()
+            ),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "    {label:>width$}:  {} input, {} output{speed}",
+            fmt_compact(*input),
+            fmt_compact(*output),
+        );
+    }
+    let ctx_size = u.ctx_size.max(1);
+    let ctx_used = u.ctx_used.clamp(0, ctx_size);
+    let ctx_pct = i64::from(ctx_used) * 100 / i64::from(ctx_size);
+    let _ = writeln!(
+        out,
+        "Prompt cache (local):    KV cache · {} of {} context in use ({ctx_pct}%) · 100% of prefix tokens from cache, when the fingerprint agrees · warm (no TTL, it's your RAM)",
+        fmt_compact(u64::try_from(ctx_used).unwrap_or(0)),
+        fmt_compact(u64::try_from(ctx_size).unwrap_or(0)),
+    );
+    if u.spec.active() {
+        let _ = writeln!(
+            out,
+            "Speculative decoding:    {:.2} tokens per step {dim}(block fill {:.0}%){reset}",
+            u.spec.tokens_per_step(),
+            u.spec.block_fill() * 100.0,
+        );
+    }
+    let _ = writeln!(
+        out,
+        "Invoice, itemized:       {}.{:03} Wh ({}.{:03} espressos) · {} fan revolutions of quiet dignity · {knee_minutes} toasty-knee-minutes · {gpu_tears} GPU tears, shed silently in Metal",
         milli_wh / 1_000,
         milli_wh % 1_000,
         milli_espresso / 1_000,
-        milli_espresso % 1_000
+        milli_espresso % 1_000,
+        fmt_u64(fan_revs),
+    );
+
+    let bar = |pct: i64| -> String {
+        const COLS: i64 = 40;
+        let filled = usize::try_from((pct.clamp(0, 100) * COLS + 50) / 100).unwrap_or(0);
+        let mut b = String::new();
+        let _ = write!(b, "{fill}{}{reset}", "█".repeat(filled));
+        let _ = write!(
+            b,
+            "{empty}{}{reset}",
+            "░".repeat(usize::try_from(COLS).unwrap_or(40).saturating_sub(filled))
+        );
+        b
+    };
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{bold}Current session{reset} {dim}(context window){reset}"
+    );
+    let _ = writeln!(out, "{} {ctx_pct}% used", bar(ctx_pct));
+    let _ = writeln!(
+        out,
+        "{dim}Resets on /clear, /compact, or when you close the lid.{reset}"
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{bold}Current week (all models){reset}");
+    let _ = writeln!(out, "{} 0% used", bar(0));
+    let _ = writeln!(
+        out,
+        "{dim}Resets never. Local models don't have a week; they have a fan.{reset}"
     );
     let _ = writeln!(
         out,
-        "  fan service   {} revolutions of quiet dignity",
-        fmt_u64(fan_revs)
+        "{warn}+0% weekly limits promo through the heat death of the universe · no link, no code, no catch{reset}"
     );
-    let _ = writeln!(out, "  lap heat      {knee_minutes} toasty-knee-minutes");
-    let _ = writeln!(out, "  GPU tears     {gpu_tears} (shed silently, in Metal)");
-    let _ = writeln!(out, "  amount due    0 (zero) dollars");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{bold}Current week ({model}){reset}");
+    let _ = writeln!(out, "{} 0% used", bar(0));
     let _ = writeln!(
         out,
-        "{}",
-        dim(
-            "This invoice is a joke. Real cost is $0.00 — inference ran locally on your own hardware, so nobody is billing you."
-        )
+        "{dim}Rate limit: the clock speed of your GPU. Overage: a slightly warmer lap.{reset}"
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{dim}The tokens, durations, throughput and code changes are real. The bill and the quotas are a joke: real cost is zero, because inference ran locally on your own hardware and nobody is billing you.{reset}"
     );
     out
+}
+
+/// Formats seconds as `1h 6m 38s` / `55m 53s` / `12s`, the usage panel's
+/// style, rounding to whole seconds.
+fn fmt_hms(secs: f64) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let total = secs.max(0.0).round() as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Formats a token count the way usage panels do: `266`, `8.2k`, `20.0m`.
+fn fmt_compact(n: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let f = n as f64;
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", f / 1_000.0)
+    } else {
+        format!("{:.1}m", f / 1_000_000.0)
+    }
 }
 
 /// Formats a `u64` token count with thousands separators, for the run stats.
@@ -4502,6 +4693,40 @@ impl Agent<'_> {
     /// Renders the `/usage` report: cumulative billed token usage for online
     /// (provider) models this session. Prints a short note when no provider
     /// turn has run (local engine, or nothing generated yet).
+    /// Gathers the figures behind the local `/usage` report: the session
+    /// token tally per engine joined with that engine's speed record, wall
+    /// time, context fill, working-tree changes and speculation counters.
+    fn local_usage(&self) -> LocalUsage {
+        let by_engine = self
+            .stats
+            .by_engine
+            .iter()
+            .map(|(label, input, output)| {
+                // Speed records are keyed by bare model name; the tally label
+                // carries the `(local)` mark, so strip it to join the two.
+                let model = label.strip_suffix(" (local)").unwrap_or(label);
+                let rec = crate::speeds::session_totals(model);
+                (
+                    label.clone(),
+                    *input,
+                    *output,
+                    (!rec.is_empty()).then_some(rec),
+                )
+            })
+            .collect();
+        LocalUsage {
+            model: self.engine.model_name(),
+            input_tokens: self.stats.input_tokens,
+            output_tokens: self.stats.output_tokens,
+            by_engine,
+            wall: self.session_start.elapsed(),
+            ctx_used: self.last_ctx_used,
+            ctx_size: self.engine.ctx_size(),
+            git: crate::status::git_stats(),
+            spec: self.last_spec,
+        }
+    }
+
     fn render_usage_report(&self, color: bool) -> String {
         use std::fmt::Write as _;
         let dim = |s: &str| {
@@ -4513,13 +4738,9 @@ impl Agent<'_> {
         };
         if self.usage.turns == 0 {
             if self.cfg.provider.is_none() {
-                // Local engine: there is no bill, so bill the user in nonsense.
-                return render_local_invoice(
-                    &self.engine.model_name(),
-                    self.stats.input_tokens,
-                    self.stats.output_tokens,
-                    color,
-                );
+                // Local engine: there is no bill, so report what the machine
+                // actually did, and bill the user in nonsense for the rest.
+                return render_local_usage(&self.local_usage(), color);
             }
             return format!(
                 "{}\n",
@@ -19757,50 +19978,130 @@ mod tests {
         assert_eq!(fmt_int(-5), "0");
     }
 
+    fn sample_local_usage() -> super::LocalUsage {
+        super::LocalUsage {
+            model: "deepseek-v4-flash".into(),
+            input_tokens: 12_345,
+            output_tokens: 6_789,
+            by_engine: vec![(
+                "deepseek-v4-flash (local)".into(),
+                12_345,
+                6_789,
+                Some(crate::speeds::Record {
+                    prefill_tokens: 12_000,
+                    prefill_secs: 30.0,
+                    gen_tokens: 6_000,
+                    gen_secs: 150.0,
+                    tool_secs: 12.5,
+                }),
+            )],
+            wall: std::time::Duration::from_secs(3_998),
+            ctx_used: 93_000,
+            ctx_size: 128_000,
+            git: Some(crate::status::GitStats {
+                files: 3,
+                added: 1_746,
+                deleted: 212,
+            }),
+            spec: crate::engine::SpecStats::default(),
+        }
+    }
+
     #[test]
-    fn local_invoice_states_real_cost_is_zero() {
-        let out = super::render_local_invoice("deepseek-v4-flash", 12_345, 6_789, false);
+    fn local_usage_states_real_cost_is_zero() {
+        let out = super::render_local_usage(&sample_local_usage(), false);
         // The gag must never be mistakable for a real charge.
-        assert!(
-            out.contains("Real cost is $0.00"),
-            "missing real-cost disclaimer:\n{out}"
-        );
-        assert!(out.contains("This invoice is a joke"), "{out}");
+        assert!(out.contains("Total cost:              $0.00"), "{out}");
+        assert!(out.contains("real cost is zero"), "{out}");
         assert!(out.contains("ran locally"), "{out}");
         // No other dollar figure may appear anywhere in the block.
         assert_eq!(out.matches('$').count(), 1, "{out}");
     }
 
     #[test]
-    fn local_invoice_reports_real_token_counts() {
-        let out = super::render_local_invoice("m", 12_345, 6_789, false);
-        assert!(out.contains("tokens in     12,345"), "{out}");
-        assert!(out.contains("tokens out    6,789"), "{out}");
-        assert!(out.starts_with("Local Inference Invoice — m\n"), "{out}");
+    fn local_usage_reports_real_figures() {
+        let out = super::render_local_usage(&sample_local_usage(), false);
+        assert!(
+            out.starts_with("Session — deepseek-v4-flash (local)\n"),
+            "{out}"
+        );
+        // Phase durations come from the speed record: 30s + 2m30s = 3m 0s.
+        assert!(
+            out.contains("Total duration (model):  3m 0s (prefill 30s · generation 2m 30s)"),
+            "{out}"
+        );
+        assert!(out.contains("Total duration (tools):  13s"), "{out}");
+        assert!(out.contains("Total duration (wall):   1h 6m 38s"), "{out}");
+        assert!(
+            out.contains("Total code changes:      1746 lines added, 212 lines removed"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "deepseek-v4-flash (local):  12.3k input, 6.8k output (avg 400.0 tok/s prefill · 40.0 tok/s generation)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("93.0k of 128.0k context in use (72%)"),
+            "{out}"
+        );
+        assert!(out.contains("72% used"), "{out}");
+        // Speculation was off: no row for it.
+        assert!(!out.contains("Speculative decoding"), "{out}");
     }
 
     #[test]
-    fn local_invoice_units_are_absurd_and_deterministic() {
-        let out = super::render_local_invoice("m", 4_000, 1_000, false);
+    fn local_usage_units_are_absurd_and_deterministic() {
+        let mut u = sample_local_usage();
+        u.input_tokens = 4_000;
+        u.output_tokens = 1_000;
+        let out = super::render_local_usage(&u, false);
         // 5,000 tokens: 1.000 Wh, 0.050 espressos, 55,000 revs, 5 knee-min.
-        assert!(
-            out.contains("electricity   1.000 Wh (0.050 espressos)"),
-            "{out}"
-        );
-        assert!(out.contains("fan service   55,000 revolutions"), "{out}");
-        assert!(out.contains("lap heat      5 toasty-knee-minutes"), "{out}");
-        assert!(out.contains("GPU tears     1 "), "{out}");
+        assert!(out.contains("1.000 Wh (0.050 espressos)"), "{out}");
+        assert!(out.contains("55,000 fan revolutions"), "{out}");
+        assert!(out.contains("5 toasty-knee-minutes"), "{out}");
+        assert!(out.contains("1 GPU tears"), "{out}");
+        // The quota bars are the joke: always empty, never resetting.
+        assert!(out.contains("Current week (all models)\n"), "{out}");
+        assert_eq!(out.matches("0% used").count(), 2, "{out}");
+        assert!(out.contains("Resets never"), "{out}");
     }
 
     #[test]
-    fn local_invoice_handles_empty_model_and_zero_usage() {
-        let out = super::render_local_invoice("", 0, 0, false);
+    fn local_usage_handles_empty_model_and_zero_usage() {
+        let out = super::render_local_usage(&super::LocalUsage::default(), false);
+        assert!(out.starts_with("Session — local model (local)\n"), "{out}");
+        assert!(out.contains("0.000 Wh"), "{out}");
+        assert!(out.contains("Total duration (model):  0s"), "{out}");
+        assert!(out.contains("nobody has said anything yet"), "{out}");
+        assert!(!out.contains("Total code changes"), "{out}");
+        assert!(out.contains("$0.00"), "{out}");
+    }
+
+    #[test]
+    fn local_usage_shows_speculation_when_active() {
+        let mut u = sample_local_usage();
+        u.spec = crate::engine::SpecStats {
+            steps: 100,
+            committed: 210,
+            drafted: 400,
+        };
+        let out = super::render_local_usage(&u, false);
         assert!(
-            out.contains("Local Inference Invoice — local model"),
+            out.contains("Speculative decoding:    2.10 tokens per step"),
             "{out}"
         );
-        assert!(out.contains("0.000 Wh"), "{out}");
-        assert!(out.contains("Real cost is $0.00"), "{out}");
+    }
+
+    #[test]
+    fn fmt_hms_and_compact_match_usage_panel_style() {
+        assert_eq!(super::fmt_hms(3_998.0), "1h 6m 38s");
+        assert_eq!(super::fmt_hms(3_353.0), "55m 53s");
+        assert_eq!(super::fmt_hms(12.4), "12s");
+        assert_eq!(super::fmt_compact(266), "266");
+        assert_eq!(super::fmt_compact(8_200), "8.2k");
+        assert_eq!(super::fmt_compact(20_000_000), "20.0m");
     }
 
     #[test]
