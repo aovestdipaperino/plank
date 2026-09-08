@@ -313,6 +313,17 @@ fn tools_prompt_matches_c_source() {
     // literal decoder below cannot see through; expand it first.
     let src = expand_string_macros(&src);
     let mut expected = extract_c_string_constant(&src, "agent_tools_prompt_intro");
+    // The intro ends with AGENT_TOOL_CONTRACTS, which plank does not adopt:
+    // two of its sentences are false of plank — a 128 KiB read cap it does not
+    // have (that is the C's `AGENT_TOOL_MAX_BYTES` buffer limit) and hard-link
+    // rejection it never checks. Here the block is the intro's tail, so the
+    // subtraction is a truncation; the Qwen prompt cuts the same block out of
+    // the middle. Everything before it still has to match byte for byte, so
+    // upstream rewording of the rest still surfaces.
+    let contracts_at = expected
+        .find(CONTRACTS_HEAD)
+        .expect("intro still ends with the contracts block plank omits");
+    expected.truncate(contracts_at);
     // plank ships the `[upto]` variant: its edit tool implements the anchor,
     // so it takes the prompt that teaches it. The C's `_edit_exact` sibling
     // (its default since `--edit-upto` became opt-in) is deliberately not the
@@ -321,10 +332,20 @@ fn tools_prompt_matches_c_source() {
         &src,
         "agent_tools_prompt_edit_upto",
     ));
-    expected.push_str(&extract_c_string_constant(
-        &src,
-        "agent_tools_prompt_after_edit",
-    ));
+    // `agent_build_dsml_tools_prompt` splices the vision schema in just before
+    // `\n# Rules\n` rather than carrying it in the after-edit block, so the
+    // assembly here has to do the same. plank's base prompt is the vision=true
+    // variant: the encoder is always offered on the DeepSeek path, and it is a
+    // Qwen run that goes without (which uses `TOOLS_PROMPT_QWEN` instead).
+    let after_edit = extract_c_string_constant(&src, "agent_tools_prompt_after_edit");
+    let rules_at = after_edit
+        .find("\n# Rules\n")
+        .expect("after-edit block still has a Rules section to splice before");
+    expected.push_str(&after_edit[..rules_at]);
+    expected.push_str("\n{\"type\":\"function\",\"function\":");
+    expected.push_str(&extract_c_string_constant(&src, "agent_vision_tool_schema"));
+    expected.push_str("}\n");
+    expected.push_str(&after_edit[rules_at..]);
     // The base is what must match C byte-for-byte. Native plank tools (glob)
     // and MCP tools are layered on top by `build_tools_prompt`, outside the
     // trained table — see `append_native_extra_schemas`.
@@ -467,5 +488,80 @@ fn metal_kernels_match_the_c_reference() {
     assert!(
         extra.is_empty(),
         "plank points at kernels the C no longer requires: {extra:?}"
+    );
+}
+
+/// The C sentence that opens `AGENT_TOOL_CONTRACTS`, which plank omits.
+const CONTRACTS_HEAD: &str = "Read output is limited to 128 KiB.";
+/// The sentence that follows that block, marking where plank resumes.
+const AFTER_CONTRACTS: &str = "Inside string values only,";
+
+/// plank's Qwen tools prompt against the C's, assembled the same way.
+///
+/// `agent_build_qwen_tools_prompt` concatenates the intro, each line of
+/// `agent_glm_tool_schemas` wrapped as a `{"type": "function", ...}` object,
+/// the after-schemas block, the `[upto]` edit line, and the rules tail. This
+/// rebuilds exactly that from the C source, with the one documented
+/// subtraction: `AGENT_TOOL_CONTRACTS` is not adopted, because two of its
+/// sentences are false of plank (a 128 KiB read cap it does not have, and
+/// hard-link rejection it never checks). Everything else must match byte for
+/// byte, so upstream wording changes still surface here.
+#[test]
+fn qwen_tools_prompt_matches_c_source() {
+    let Some(src) = c_source() else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    let src = expand_string_macros(&src);
+    let intro = extract_c_string_constant(&src, "agent_qwen_tools_prompt_intro");
+    let schemas = extract_c_string_constant(&src, "agent_glm_tool_schemas");
+    let after = extract_c_string_constant(&src, "agent_qwen_tools_prompt_after_schemas");
+    let edit = extract_c_string_constant(&src, "agent_glm_tools_prompt_edit_upto");
+    let tail = extract_c_string_constant(&src, "agent_glm_tools_prompt_rules_tail");
+
+    let mut expected = intro;
+    for line in schemas.split('\n').filter(|l| !l.is_empty()) {
+        expected.push_str("\n{\"type\": \"function\", \"function\": ");
+        expected.push_str(line);
+        expected.push('}');
+    }
+    // `expand_string_macros` has already inlined AGENT_TOOL_CONTRACTS into the
+    // after-schemas block, so the subtraction is by span. The markers are the
+    // block's first sentence and the sentence that follows it; if upstream
+    // reshapes either, this fails loudly rather than silently comparing the
+    // wrong text.
+    let start = after
+        .find(CONTRACTS_HEAD)
+        .expect("contracts block still opens with the read-cap claim plank omits");
+    let end = after
+        .find(AFTER_CONTRACTS)
+        .expect("the sentence after the contracts block moved");
+    assert!(
+        start < end,
+        "contracts block is no longer where plank cuts it"
+    );
+    let mut trimmed = after.clone();
+    trimmed.replace_range(start..end, "");
+    expected.push_str(&trimmed);
+    expected.push_str(&edit);
+    expected.push_str(&tail);
+
+    assert_identical(
+        &expected,
+        plank::sysprompt::TOOLS_PROMPT_QWEN,
+        "qwen tools prompt vs C",
+    );
+}
+
+#[test]
+fn qwen_syntax_reminder_matches_c_source() {
+    let Some(src) = c_source() else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    assert_identical(
+        &extract_c_string_constant(&expand_string_macros(&src), "agent_qwen_syntax_reminder"),
+        plank::sysprompt::qwen_syntax_reminder(),
+        "qwen syntax reminder vs C",
     );
 }

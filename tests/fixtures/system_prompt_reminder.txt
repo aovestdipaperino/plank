@@ -51,7 +51,7 @@ Example anchored edit:
 </｜DSML｜invoke>
 </｜DSML｜tool_calls>
 To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.
-Use read raw=true only when you need plain file text without line numbers or read annotations.
+Use read raw=true only when you need plain file text without line numbers.
 
 For long-running bash commands, pass refresh_sec. If a bash job is still running, use bash_status to check it early or bash_stop to terminate it.
 
@@ -98,8 +98,8 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
       "type": "object",
       "properties": {
         "command": {"type": "string"},
-        "timeout_sec": {"type": "number"},
-        "refresh_sec": {"type": "number"}
+        "timeout_sec": {"type": "integer"},
+        "refresh_sec": {"type": "integer"}
       },
       "required": ["command"]
     }
@@ -110,13 +110,13 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
   "type": "function",
   "function": {
     "name": "bash_status",
-    "description": "Report current status and new output for a bash job.",
+    "description": "Report current status and recent output for a bash job.",
     "parameters": {
       "type": "object",
       "properties": {
-        "job": {"type": "number"},
-        "pid": {"type": "number"},
-        "refresh_sec": {"type": "number"}
+        "job": {"type": "integer"},
+        "pid": {"type": "integer"},
+        "refresh_sec": {"type": "integer"}
       },
       "required": ["job"]
     }
@@ -131,9 +131,9 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
     "parameters": {
       "type": "object",
       "properties": {
-        "job": {"type": "number"},
-        "pid": {"type": "number"},
-        "refresh_sec": {"type": "number"}
+        "job": {"type": "integer"},
+        "pid": {"type": "integer"},
+        "refresh_sec": {"type": "integer"}
       },
       "required": ["job"]
     }
@@ -149,8 +149,8 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
       "type": "object",
       "properties": {
         "path": {"type": "string"},
-        "start_line": {"type": "number"},
-        "max_lines": {"type": "number"},
+        "start_line": {"type": "integer"},
+        "max_lines": {"type": "integer"},
         "whole": {"type": "boolean"},
         "raw": {"type": "boolean"}
       },
@@ -162,27 +162,12 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
 {
   "type": "function",
   "function": {
-    "name": "view_image",
-    "description": "Open a local PNG or JPEG as a visual observation.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "path": {"type": "string"}
-      },
-      "required": ["path"]
-    }
-  }
-}
-
-{
-  "type": "function",
-  "function": {
     "name": "more",
-    "description": "Continue the previous read-like output.",
+    "description": "Continue the previous read.",
     "parameters": {
       "type": "object",
       "properties": {
-        "count": {"type": "number"}
+        "count": {"type": "integer"}
       }
     }
   }
@@ -231,10 +216,10 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
       "properties": {
         "query": {"type": "string"},
         "path": {"type": "string"},
-        "mode": {"type": "string"},
+        "mode": {"type": "string", "enum": ["literal", "regex"]},
         "glob": {"type": "string"},
-        "context": {"type": "number"},
-        "max_results": {"type": "number"},
+        "context": {"type": "integer"},
+        "max_results": {"type": "integer"},
         "case_sensitive": {"type": "boolean"}
       },
       "required": ["query"]
@@ -256,6 +241,8 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
     }
   }
 }
+
+{"type":"function","function":{"name":"view_image","description":"Open a local PNG or JPEG as a visual observation.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}
 
 # Rules
 
