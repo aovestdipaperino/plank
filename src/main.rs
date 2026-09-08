@@ -54,6 +54,14 @@ fn resolve_and_activate_profile(
     match plank::profile::resolve_profile(requested, plugins) {
         plank::profile::Resolution::None => None,
         plank::profile::Resolution::Activate(active) => {
+            if let Err(e) = std::fs::read_to_string(&active.spec.system_prompt) {
+                eprintln!(
+                    "plank: profile {}: cannot read {}: {e}",
+                    active.name,
+                    active.spec.system_prompt.display()
+                );
+                return Some(ExitCode::from(2));
+            }
             plank::profile::install(active);
             None
         }

@@ -505,12 +505,19 @@ fn build_tools_prompt_parts_with_wasm(
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
 ) -> (String, usize) {
-    let mut out = build_tools_prompt_base(parity);
-    insert_marker_spelling_note(&mut out);
-    insert_document_read_note(&mut out);
-    append_native_extra_schemas(&mut out);
-    append_working_style(&mut out);
-    let trusted_len = out.len();
+    // A profile replaces the whole prose prompt; the schema block is still
+    // generated, from the allow-listed builtins.
+    let (mut out, trusted_len) = if let Some((text, spec)) = profile_prompt_source() {
+        compose_profile_prompt(&text, &spec)
+    } else {
+        let mut out = build_tools_prompt_base(parity);
+        insert_marker_spelling_note(&mut out);
+        insert_document_read_note(&mut out);
+        append_native_extra_schemas(&mut out);
+        append_working_style(&mut out);
+        let trusted_len = out.len();
+        (out, trusted_len)
+    };
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
@@ -605,6 +612,105 @@ fn append_wasm_tool_schemas(out: &mut String, tools: &[&crate::wasmreg::WasmTool
         );
         crate::tools::mcp::json_escape(out, &t.description);
         let _ = write!(out, ",\n    \"parameters\": {}\n  }}\n}}\n", t.schema);
+    }
+}
+
+/// The token a profile prompt may use to pull in the trained DSML call-syntax
+/// text instead of retyping it.
+pub const TOOL_PROTOCOL_TOKEN: &str = "{{plank:tool-protocol}}";
+
+/// The DSML call-syntax section of the C prompt: everything from the top of
+/// the base prompt down to (not including) the schema block.
+///
+/// A profile that replaces the whole prompt still needs this text verbatim —
+/// the model was trained on it, and paraphrasing it degrades tool calling in
+/// ways that read as model bugs. Computed from the parity base rather than
+/// duplicated, so it can never drift from it.
+#[must_use]
+pub fn tool_protocol_fragment() -> &'static str {
+    static FRAGMENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    FRAGMENT.get_or_init(|| {
+        let base = build_tools_prompt_base(true);
+        match base.find("### Available Tool Schemas") {
+            Some(at) => base[..at].to_string(),
+            None => base,
+        }
+    })
+}
+
+/// Renders `specs` as the `### Available Tool Schemas` block, in the same
+/// `OpenAI` function shape the C prompt uses.
+///
+/// Pretty-printed with two-space indentation because that is what
+/// `resources/tools_prompt_after_edit.txt` does, and the model saw that
+/// formatting in training.
+#[must_use]
+pub fn render_schema_block(specs: &[crate::engine::ToolSpec]) -> String {
+    let mut out = String::from("### Available Tool Schemas\n\n");
+    for spec in specs {
+        let value = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            }
+        });
+        // A spec that will not serialize is dropped rather than allowed to
+        // truncate the block: the model is then simply not told about it,
+        // which the dispatch guard already agrees with.
+        if let Ok(text) = serde_json::to_string_pretty(&value) {
+            out.push_str(&text);
+            out.push_str("\n\n");
+        }
+    }
+    out
+}
+
+/// Composes a profile's prompt: the profile text with
+/// [`TOOL_PROTOCOL_TOKEN`] expanded, followed by the schema block for the
+/// builtins the profile allows.
+///
+/// Returns the text and its trusted length, matching
+/// [`SplitSystemPrompt::trusted_len`]: all of it is plank-side text the user
+/// installed, so the whole span is trusted. MCP and WASM schemas are appended
+/// after it by the caller and stay outside.
+fn compose_profile_prompt(
+    profile_text: &str,
+    spec: &crate::profile::ProfileSpec,
+) -> (String, usize) {
+    let mut out = profile_text.replace(TOOL_PROTOCOL_TOKEN, tool_protocol_fragment());
+    if !out.ends_with("\n\n") {
+        out.push_str(if out.ends_with('\n') { "\n" } else { "\n\n" });
+    }
+    let specs: Vec<crate::engine::ToolSpec> = parse_builtin_tool_schemas()
+        .into_iter()
+        .filter(|s| spec.builtin_enabled(&s.name))
+        .collect();
+    out.push_str(&render_schema_block(&specs));
+    let trusted = out.len();
+    (out, trusted)
+}
+
+/// The active profile's prompt text and spec, or `None` for a plain run.
+///
+/// An unreadable prompt file is fatal at startup (`main.rs` checks it before
+/// anything is composed), so a read failure here can only mean the file was
+/// deleted mid-session; falling back to the built-in prompt would silently
+/// change the agent's identity, so the process aborts with a clear message
+/// instead.
+fn profile_prompt_source() -> Option<(String, crate::profile::ProfileSpec)> {
+    let active = crate::profile::active()?;
+    match std::fs::read_to_string(&active.spec.system_prompt) {
+        Ok(text) => Some((text, active.spec.clone())),
+        Err(e) => {
+            eprintln!(
+                "plank: profile {}: cannot read {}: {e}",
+                active.name,
+                active.spec.system_prompt.display()
+            );
+            std::process::exit(2);
+        }
     }
 }
 
@@ -1809,5 +1915,113 @@ mod tests {
         assert_eq!(&bytes[10..11], b" ");
         assert_eq!(&bytes[13..14], b":");
         assert_eq!(&bytes[16..17], b":");
+    }
+
+    #[test]
+    fn the_tool_protocol_fragment_is_the_base_prompt_up_to_the_schemas() {
+        let base = build_tools_prompt_base(true);
+        let frag = tool_protocol_fragment();
+        assert!(
+            base.starts_with(frag),
+            "the fragment must be a prefix of the C base"
+        );
+        assert!(
+            frag.contains("｜DSML｜"),
+            "the fragment teaches the call syntax"
+        );
+        assert!(
+            !frag.contains("### Available Tool Schemas"),
+            "schemas are generated, not part of the protocol fragment"
+        );
+    }
+
+    #[test]
+    fn the_schema_block_renders_the_named_tools_only() {
+        let specs = vec![crate::engine::ToolSpec {
+            name: "bash".to_string(),
+            description: "Run a shell command.".to_string(),
+            parameters: serde_json::json!({"type":"object","properties":{}}),
+        }];
+        let block = render_schema_block(&specs);
+        assert!(block.starts_with("### Available Tool Schemas\n"));
+        assert!(block.contains("\"name\": \"bash\""));
+        assert!(!block.contains("\"name\": \"read\""));
+    }
+
+    #[test]
+    fn the_schema_block_is_valid_json_objects() {
+        let specs = parse_builtin_tool_schemas();
+        assert!(!specs.is_empty(), "the C prompt carries schemas");
+        let block = render_schema_block(&specs);
+        let body = block.split_once('\n').expect("has a header line").1;
+        let count = serde_json::Deserializer::from_str(body)
+            .into_iter::<serde_json::Value>()
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(
+            count,
+            specs.len(),
+            "every spec round-trips as one JSON object"
+        );
+    }
+
+    #[test]
+    fn the_default_prompt_is_unchanged_by_the_profile_code_path() {
+        // The guard on parity: with no profile installed, composition must go
+        // through exactly the pre-existing path.
+        let a = build_system_prompt("", &[], true);
+        let b = build_tools_prompt(&[], true);
+        assert!(
+            a.starts_with(&b),
+            "no profile means the C base leads the prompt"
+        );
+        assert!(!a.contains(TOOL_PROTOCOL_TOKEN));
+    }
+
+    #[test]
+    fn a_profile_prompt_replaces_the_base_and_keeps_generated_schemas() {
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(vec!["bash".to_string()]),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = format!("You are ChatBGT.\n\n{TOOL_PROTOCOL_TOKEN}\n");
+        let (out, trusted) = compose_profile_prompt(&text, &spec);
+        assert!(out.starts_with("You are ChatBGT."));
+        assert!(!out.contains(TOOL_PROTOCOL_TOKEN), "the token is expanded");
+        assert!(out.contains("｜DSML｜"), "the protocol fragment landed");
+        assert!(out.contains("\"name\": \"bash\""));
+        assert!(
+            !out.contains("\"name\": \"read\""),
+            "read is not allowed here"
+        );
+        assert_eq!(
+            trusted,
+            out.len(),
+            "no MCP text yet, so all of it is trusted"
+        );
+    }
+
+    #[test]
+    fn a_profile_prompt_without_the_token_gets_no_protocol_text() {
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: None,
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let (out, _) = compose_profile_prompt("Just prose.\n", &spec);
+        assert!(out.starts_with("Just prose."));
+        assert!(
+            out.contains("### Available Tool Schemas"),
+            "schemas are never optional"
+        );
     }
 }
