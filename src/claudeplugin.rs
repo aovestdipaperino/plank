@@ -516,6 +516,20 @@ pub fn install_profile_staged(
 ) -> Result<Installed, String> {
     let root = resolve_in_tree(staged, want)?;
     let name = plugin_name(&root)?;
+    // `plugin_name`'s grammar is looser than `--profile` will later demand:
+    // once installed, this same name (the directory `install_staged` creates
+    // under `crate::profiles::dir`) becomes the plugin's namespace prefix in
+    // `plugins::splice_profile`, which gates it with `plugins::valid_name`.
+    // Refusing here, rather than letting `plugin_name` wave it through, is
+    // what keeps `/install-profile` from reporting success for a name that
+    // `--profile` would then refuse to load — the refusal belongs where the
+    // user can still pick a different name.
+    if !crate::plugins::valid_name(&name) {
+        return Err(format!(
+            "'{name}' is not usable as a profile name: it would make an ambiguous or unroutable \
+             namespace prefix (no ':', '/', '\\', or '__' allowed); rename it in plugin.json"
+        ));
+    }
     let manifest = crate::plugins::manifest_path(&root)
         .ok_or_else(|| format!("no plugin.json in {}", root.display()))?;
     let text = std::fs::read_to_string(&manifest)
@@ -2198,6 +2212,31 @@ mod tests {
         let staged = staged_profile(&tmp, Some(GOOD_BLOCK), Some("   \n\n"));
         let err = install_profile_staged(&staged, None, &tmp, false).expect_err("refused");
         assert!(err.contains("is empty"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// N1: a name `plugin_name` admits but `plugins::valid_name` refuses
+    /// (double underscore, which mints an unroutable MCP server namespace)
+    /// must be caught here, at install time, rather than installed
+    /// successfully only to be refused later by `--profile`.
+    #[test]
+    fn a_profile_whose_name_fails_the_namespace_grammar_is_refused() {
+        let tmp = tmpdir("gate-bad-namespace-name");
+        let staged = tmp.join("staged");
+        std::fs::create_dir_all(staged.join(".plank-plugin")).expect("mkdir");
+        std::fs::write(staged.join("prompt.md"), "You are HAL.\n").expect("write");
+        std::fs::write(
+            staged.join(".plank-plugin").join("plugin.json"),
+            r#"{"name":"a__b","profile":{"systemPrompt":"prompt.md"}}"#,
+        )
+        .expect("write");
+        let home = tmp.join("home");
+        let err = install_profile_staged(&staged, None, &home, false).expect_err("refused");
+        assert!(err.contains("a__b"), "{err}");
+        assert!(
+            !crate::profiles::dir(&home).join("a__b").exists(),
+            "a refused name must leave nothing installed"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

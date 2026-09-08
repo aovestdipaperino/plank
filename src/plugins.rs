@@ -129,7 +129,12 @@ fn json_string_field(text: &str, key: &str) -> Option<String> {
 }
 
 /// Whether `name` is usable as a namespace prefix.
-fn valid_name(name: &str) -> bool {
+///
+/// `pub(crate)` rather than private: `claudeplugin::install_profile_staged`
+/// gates a profile's name against this same rule at install time, so an
+/// unusable name is refused where the user can still do something about it
+/// instead of only at `--profile` launch (see [`splice_profile`]).
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.contains(':')
         && !name.contains('/')
@@ -602,7 +607,23 @@ pub fn profile_names(set: &PluginSet) -> Vec<String> {
 /// fails this gate pushes a warning onto `set` explaining why, exactly as a
 /// rejected scanned plugin does.
 pub fn splice_profile(set: &mut PluginSet, dir: &Path) -> Option<String> {
-    let plugin = load_plugin(dir, Origin::Profile)?;
+    let mut plugin = load_plugin(dir, Origin::Profile)?;
+    // The directory name is authoritative for an installed profile, not
+    // whatever `plugin.json` claims as its `"name"`. `crate::profiles::find`
+    // and `crate::profiles::names` both key on the directory (they never
+    // parse out a manifest name), and `install_profile_staged` names the
+    // directory after the manifest in the first place — so the two agree in
+    // the overwhelming common case. Overriding here, rather than trusting the
+    // manifest, is what keeps a hand-placed or hand-edited mismatch (a
+    // directory called `hal` whose manifest says `"name": "opus"`) from
+    // reopening the exact "found by one name, listed under another" confusion
+    // fixed for the `valid_name` gate below: without this, `--profile hal`
+    // would splice in a plugin named `opus`, and the subsequent lookup for
+    // `hal` would fail with "no such plugin" while `hal` still appears in the
+    // listing.
+    if let Some(dir_name) = dir.file_name() {
+        plugin.name = dir_name.to_string_lossy().into_owned();
+    }
     if !valid_name(&plugin.name) {
         set.warnings.push(format!(
             "profile directory {}: unusable plugin name {:?}; skipped (give it a plugin.json with a valid \"name\")",
@@ -617,23 +638,13 @@ pub fn splice_profile(set: &mut PluginSet, dir: &Path) -> Option<String> {
     Some(name)
 }
 
-/// The profile names `--profile` accepts: those in the scanned set, plus those
-/// installed under `~/.plank/profiles/`, sorted and deduplicated.
+/// Merges an already-computed list of scanned profile names with `installed`
+/// (from [`crate::profiles::names`]), sorted and deduplicated.
 ///
-/// `installed` comes from [`crate::profiles::names`]. Passed in rather than
-/// read here so this stays a pure function testable without a home directory.
-#[must_use]
-pub fn profile_names_with(set: &PluginSet, installed: &[String]) -> Vec<String> {
-    merge_profile_names(profile_names(set), installed)
-}
-
-/// Merges an already-computed list of scanned profile names with `installed`,
-/// sorted and deduplicated.
-///
-/// Split out of [`profile_names_with`] so a caller that already has the
-/// scanned names in hand (e.g. from a [`crate::profile::Resolution::List`] or
-/// [`crate::profile::Resolution::NoSuchPlugin`] payload) can merge them
-/// without recomputing `profile_names(set)`.
+/// Takes the scanned names rather than a `&PluginSet` so a caller that
+/// already has them in hand (e.g. from a [`crate::profile::Resolution::List`]
+/// or [`crate::profile::Resolution::NoSuchPlugin`] payload) can merge without
+/// recomputing [`profile_names`].
 #[must_use]
 pub fn merge_profile_names(mut names: Vec<String>, installed: &[String]) -> Vec<String> {
     names.extend(installed.iter().cloned());
@@ -2991,7 +3002,7 @@ mod tests {
         let set = PluginSet::default();
         let installed = vec!["hal".to_string(), "zeta".to_string()];
         assert_eq!(
-            profile_names_with(&set, &installed),
+            merge_profile_names(profile_names(&set), &installed),
             vec!["hal".to_string(), "zeta".to_string()]
         );
     }
@@ -3005,7 +3016,7 @@ mod tests {
             .push(load_plugin(&dir, Origin::UserScan).expect("loads"));
         let installed = vec!["hal".to_string()];
         assert_eq!(
-            profile_names_with(&set, &installed),
+            merge_profile_names(profile_names(&set), &installed),
             vec!["hal".to_string()]
         );
     }
@@ -3041,6 +3052,35 @@ mod tests {
             "rejection must be reported: {:?}",
             set.warnings
         );
+    }
+
+    /// N2: `splice_profile` must key the entry it inserts on the *directory*
+    /// name, not whatever the manifest claims as its own `"name"`.
+    /// `crate::profiles::find`/`crate::profiles::names` only ever key on the
+    /// directory, so a mismatch would let `--profile hal` find the directory,
+    /// splice it in under `opus`, and then have the subsequent lookup for
+    /// `hal` fail with "no such plugin" even though `hal` still appears in
+    /// the listing — the exact confusion the `valid_name` gate above was
+    /// added to remove, reopened through a different door.
+    #[test]
+    fn splice_profile_keys_on_the_directory_name_not_the_manifest_name() {
+        let tmp = SpliceScratch::new("dir-vs-manifest");
+        let dir = tmp.join("hal");
+        std::fs::create_dir_all(dir.join(".plank-plugin")).expect("mkdir");
+        std::fs::write(dir.join("prompt.md"), "You are a test profile.\n").expect("write");
+        std::fs::write(
+            dir.join(".plank-plugin").join("plugin.json"),
+            r#"{"name":"opus","profile":{"systemPrompt":"prompt.md"}}"#,
+        )
+        .expect("write");
+        let mut set = PluginSet::default();
+        let name = splice_profile(&mut set, &dir).expect("splices");
+        assert_eq!(
+            name, "hal",
+            "the directory name must win over the manifest name"
+        );
+        assert!(set.plugins.iter().any(|p| p.name == "hal"));
+        assert!(!set.plugins.iter().any(|p| p.name == "opus"));
     }
 
     /// Finding 2 (data side): a spliced profile's own warnings must reach
