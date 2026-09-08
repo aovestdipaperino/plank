@@ -50,6 +50,9 @@ pub struct AgentConfig {
     pub mcp_config_path: Option<PathBuf>,
     /// Directories named by `--plugin-dir`, loaded as session-only plugins.
     pub plugin_dirs: Vec<PathBuf>,
+    /// The profile named by `--profile`. `Some("")` means the flag was given
+    /// with no name, which lists the available profiles and exits.
+    pub profile: Option<String>,
     /// True when `--non-interactive` was given.
     pub non_interactive: bool,
     /// True when `--debug` was given: the only case in which plank looks for
@@ -333,6 +336,7 @@ impl Default for AgentConfig {
             worktree_pr: None,
             mcp_config_path: None,
             plugin_dirs: Vec::new(),
+            profile: None,
             non_interactive: false,
             debug: false,
             save_session: true,
@@ -531,6 +535,7 @@ Options:
       --mcp-config FILE    local MCP server config (default: ./.mcp.json);
                            overlays the global ~/.plank/.mcp.json by name
       --plugin-dir PATH    load a plugin directory for this session (repeatable)
+      --profile NAME       run as the profile declared by plugin NAME (bare: list them)
       --sandbox            run model bash commands under sandbox-exec
                            (writes limited to cwd/temp; see sandbox.json).
                            On by default on macOS
@@ -1367,6 +1372,19 @@ pub fn parse_options_with(
             }
             "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--plugin-dir" => c.plugin_dirs.push(PathBuf::from(need_arg(&mut i)?)),
+            "--profile" => {
+                // A bare `--profile`, or one followed by another flag, is the
+                // listing request rather than an error: the name is what the
+                // user is trying to look up.
+                let next = args.get(i + 1).filter(|a| !a.starts_with('-'));
+                c.profile = Some(match next {
+                    Some(name) => {
+                        i += 1;
+                        name.clone()
+                    }
+                    None => String::new(),
+                });
+            }
             "--sandbox" => {
                 c.sandbox_override = Some(true);
                 c.cli_set("safety.sandbox");
@@ -1632,6 +1650,31 @@ mod tests {
             c.plugin_dirs,
             vec![PathBuf::from("/a"), PathBuf::from("/b")]
         );
+    }
+
+    #[test]
+    fn profile_takes_a_name() {
+        let c = parse_options(&args(&["--profile", "hal"])).expect("parses");
+        assert_eq!(c.profile.as_deref(), Some("hal"));
+    }
+
+    #[test]
+    fn a_bare_profile_flag_is_the_listing_request() {
+        let c = parse_options(&args(&["--profile"])).expect("parses");
+        assert_eq!(c.profile.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn no_profile_flag_leaves_it_unset() {
+        let c = parse_options(&args(&[])).expect("parses");
+        assert!(c.profile.is_none());
+    }
+
+    #[test]
+    fn a_flag_after_profile_is_not_swallowed_as_its_name() {
+        let c = parse_options(&args(&["--profile", "--debug"])).expect("parses");
+        assert_eq!(c.profile.as_deref(), Some(""));
+        assert!(c.debug);
     }
 
     #[test]
