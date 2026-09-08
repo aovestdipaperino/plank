@@ -560,8 +560,39 @@ pub fn set_local_power(percent: i32) {
     LOCAL_POWER.store(percent, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The local engine's origin label, carrying its power share: `(local ⚡100%)`,
-/// or `(local ⚡60%)` under a cap.
+/// Which model family the local engine loaded, for the origin label.
+///
+/// Process-global like the power share, and for the same reason: the footer is
+/// drawn from places that hold no engine handle, including a remote client
+/// rendering this session's bar.
+static LOCAL_FAMILY_IS_QWEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Records the local engine's model family, once the model is open.
+pub fn set_local_family(family: crate::gguf::ModelFamily) {
+    LOCAL_FAMILY_IS_QWEN.store(
+        family == crate::gguf::ModelFamily::Qwen,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The family tag the origin label carries: `ds` or `qwen`.
+///
+/// Short on purpose. It sits in the footer's tightest segment, and the point
+/// is to answer "which model is this" at a glance, not to name the release.
+fn local_family_tag() -> &'static str {
+    if LOCAL_FAMILY_IS_QWEN.load(std::sync::atomic::Ordering::Relaxed) {
+        "qwen"
+    } else {
+        "ds"
+    }
+}
+
+/// The local engine's origin label, naming the model family and carrying the
+/// power share: `(local:ds ⚡100%)`, or `(local:qwen ⚡60%)` under a cap.
+///
+/// The family tag is what tells two local runs apart at a glance — the same
+/// footer, the same directory, a different model.
 ///
 /// Always shown, never hidden at 100%. The reading answers "how much of the GPU
 /// is this engine allowed", and "all of it" is an answer — a badge that appears
@@ -575,14 +606,17 @@ pub fn set_local_power(percent: i32) {
 ///
 /// Derived from `LOCAL_ORIGIN` rather than spelled out again, so the two cannot
 /// drift apart — and if it ever stops being parenthesized, this degrades to
-/// appending rather than producing a stray bracket.
+/// appending rather than producing a stray bracket. `LOCAL_ORIGIN` itself stays
+/// the bare `(local)`, because it is also the key registered origins are
+/// matched against; only the rendering carries the tag.
 #[must_use]
 fn local_origin_label() -> String {
     let pct = LOCAL_POWER.load(std::sync::atomic::Ordering::Relaxed);
     let pct = if pct <= 0 { 100 } else { pct.min(100) };
+    let tag = local_family_tag();
     LOCAL_ORIGIN.strip_suffix(')').map_or_else(
-        || format!("{LOCAL_ORIGIN} ⚡{pct}%"),
-        |head| format!("{head} ⚡{pct}%)"),
+        || format!("{LOCAL_ORIGIN}:{tag} ⚡{pct}%"),
+        |head| format!("{head}:{tag} ⚡{pct}%)"),
     )
 }
 
@@ -2998,6 +3032,33 @@ mod tests {
         );
     }
 
+    /// The origin label names the family, which is the point: two local runs
+    /// in the same directory look identical in the footer otherwise.
+    #[test]
+    fn the_origin_label_names_the_model_family() {
+        let _guard = origin_test_guard();
+        reset_engine_origins();
+        let st = Status {
+            ctx_size: 100,
+            ..Status::default()
+        };
+
+        set_local_family(crate::gguf::ModelFamily::Qwen);
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("(local:qwen"), "{line}");
+        assert!(!line.contains("(local:ds"), "one tag only: {line}");
+
+        set_local_family(crate::gguf::ModelFamily::Ds4);
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("(local:ds"), "{line}");
+        assert!(!line.contains("(local:qwen"), "one tag only: {line}");
+
+        // The bare form is the registration key, not a rendering: it must
+        // never reach the bar, or the tag would be silently missing.
+        assert!(!line.contains("(local )"), "{line}");
+        assert!(!line.contains("(local ⚡"), "{line}");
+    }
+
     /// The power cap rides with the local origin, not the bar's tail: it caps
     /// that engine and no other, so beside a provider a trailing badge would
     /// read as a property of the session. Shown only when actually limiting.
@@ -3013,7 +3074,7 @@ mod tests {
         set_local_power(50);
         let line = build_status_text(&st, false, true);
         // Inside the parentheses, so it reads as one label for one engine.
-        assert!(line.contains("(local ⚡50%)"), "{line}");
+        assert!(line.contains("(local:ds ⚡50%)"), "{line}");
         assert!(!line.contains("(local)"), "not left bare: {line}");
         assert!(!line.ends_with('%'), "not in the tail slot: {line}");
 
@@ -3022,17 +3083,17 @@ mod tests {
         set_engine_origin("regolo.ai");
         set_engine_origin(LOCAL_ORIGIN);
         let line = build_status_text(&st, false, true);
-        assert!(line.contains("regolo.ai, (local ⚡50%)"), "{line}");
+        assert!(line.contains("regolo.ai, (local:ds ⚡50%)"), "{line}");
 
         // Uncapped still reads: "all of it" is an answer, and a badge that
         // vanished at 100% would make its absence ambiguous between unlimited
         // and unsupported.
         set_local_power(100);
-        assert!(build_status_text(&st, false, true).contains("(local ⚡100%)"));
+        assert!(build_status_text(&st, false, true).contains("(local:ds ⚡100%)"));
         // Unset is the default and means uncapped, so it reads the same.
         set_local_power(0);
         let line = build_status_text(&st, false, true);
-        assert!(line.contains("(local ⚡100%)"), "{line}");
+        assert!(line.contains("(local:ds ⚡100%)"), "{line}");
         assert!(!line.contains("(local)"), "never the bare label: {line}");
         set_local_power(0);
         reset_engine_origins();

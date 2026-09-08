@@ -27,6 +27,20 @@ pub enum ModelFamily {
     Qwen,
 }
 
+impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
+    /// The two enums answer the same question from different sides — the
+    /// dialect is read from the engine's reported shape name after opening,
+    /// the family from the file's metadata before it — and they live in
+    /// different crates, so they cannot be one type. This is the single place
+    /// they are reconciled, rather than a second string matcher.
+    fn from(syntax: trace_stream::syntax::ToolSyntax) -> Self {
+        match syntax {
+            trace_stream::syntax::ToolSyntax::Qwen => Self::Qwen,
+            trace_stream::syntax::ToolSyntax::Dsml => Self::Ds4,
+        }
+    }
+}
+
 /// The `general.architecture` value the C matches for Qwen3.8-Flash-Next.
 const QWEN_ARCH: &str = "qwen4exp";
 
@@ -223,6 +237,23 @@ mod tests {
             f.write_all(&self.kv).unwrap();
             path
         }
+    }
+
+    /// The probe and the dialect selector must agree, or the footer would
+    /// name one family while the parser used the other's syntax.
+    #[test]
+    fn the_dialect_and_the_family_agree() {
+        use trace_stream::syntax::ToolSyntax;
+        assert_eq!(ModelFamily::from(ToolSyntax::Qwen), ModelFamily::Qwen);
+        assert_eq!(ModelFamily::from(ToolSyntax::Dsml), ModelFamily::Ds4);
+        assert_eq!(
+            ModelFamily::from(ToolSyntax::for_model_name("Qwen3.8 Flash Next")),
+            ModelFamily::Qwen
+        );
+        assert_eq!(
+            ModelFamily::from(ToolSyntax::for_model_name("DeepSeek V4 Flash")),
+            ModelFamily::Ds4
+        );
     }
 
     #[test]

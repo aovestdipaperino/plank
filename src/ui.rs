@@ -15423,6 +15423,10 @@ fn new_agent(
     // between the key and the tokens rather than between two keys.
     engine.set_think_mode(cfg.generation.think_mode);
     crate::status::set_local_power(cfg.power_percent);
+    // Which model this local engine is, for the footer's origin label. Taken
+    // from the dialect already resolved above, so the tag can never disagree
+    // with the syntax the parser is using.
+    crate::status::set_local_family(syntax.into());
     // The footer's mtp/temperature slot, seeded the same way: `/mtp` and
     // `/temp` publish to it later, but the first frame is drawn before either
     // can be typed. An engine with no support model reads as off however the
