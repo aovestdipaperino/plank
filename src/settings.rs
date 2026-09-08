@@ -1365,13 +1365,35 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Makes [`active`] return `settings` for the current thread only.
+/// RAII guard that installs a [`Settings`] override into [`TEST_OVERRIDE`]
+/// for the life of a test and restores the previous override on drop —
+/// including an unwinding drop from a panicking test, so a failing test can
+/// never leak its override into the next test on the same thread.
+#[cfg(test)]
+#[derive(Debug)]
+#[must_use = "dropping this guard immediately restores the previous settings override; bind it to a variable for the duration of the test"]
+pub struct TestSettingsGuard {
+    previous: Option<&'static Settings>,
+}
+
+#[cfg(test)]
+impl Drop for TestSettingsGuard {
+    fn drop(&mut self) {
+        TEST_OVERRIDE.with(|c| c.set(self.previous));
+    }
+}
+
+/// Makes [`active`] return `settings` for the current thread until the
+/// returned guard is dropped, then restores whatever override (if any) was
+/// active before this call.
 ///
 /// The payload is leaked to keep [`active`]'s `&'static` contract; that is
 /// bounded and harmless in a test process.
 #[cfg(test)]
-pub fn install_for_test(settings: Settings) {
-    TEST_OVERRIDE.with(|c| c.set(Some(Box::leak(Box::new(settings)))));
+pub fn install_for_test(settings: Settings) -> TestSettingsGuard {
+    let leaked: &'static Settings = Box::leak(Box::new(settings));
+    let previous = TEST_OVERRIDE.with(|c| c.replace(Some(leaked)));
+    TestSettingsGuard { previous }
 }
 
 /// The process-wide settings, or the built-in defaults before [`install`].

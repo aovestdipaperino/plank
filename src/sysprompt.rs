@@ -1503,7 +1503,7 @@ mod tests {
         );
         let mut s = crate::settings::Settings::default();
         s.tools.recall = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         let mut text = String::new();
         append_native_extra_schemas(&mut text);
         assert!(
@@ -1525,7 +1525,7 @@ mod tests {
         assert!(text.contains("deterministic"), "{text}");
         let mut s = crate::settings::Settings::default();
         s.tools.fanout = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         let mut text = String::new();
         append_native_extra_schemas(&mut text);
         assert!(
@@ -1544,7 +1544,7 @@ mod tests {
         );
         let mut s = crate::settings::Settings::default();
         s.tools.run_code = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         let mut text = String::new();
         append_native_extra_schemas(&mut text);
         assert!(
@@ -2259,7 +2259,7 @@ mod tests {
         // the setting has turned it off.
         let mut settings = crate::settings::Settings::default();
         settings.tools.recall = false;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let spec = crate::profile::ProfileSpec {
             display_name: None,
             logo: None,
@@ -2274,6 +2274,33 @@ mod tests {
         assert!(
             !out.contains("\"name\": \"recall\""),
             "tools.recall = false must withhold recall even though the profile allow-lists it"
+        );
+    }
+
+    // Regression test for the settings test-seam guard's `Drop`: libtest
+    // spawns a fresh OS thread per test even under `--test-threads=1` (that
+    // flag bounds concurrency, not thread reuse), so relying on scheduling
+    // order across two `#[test]` functions to land on the same thread is not
+    // reliable. Instead this drives both halves — install, then an explicit
+    // drop — on the one thread running this test, which is exactly the
+    // scenario `TestSettingsGuard` exists for.
+    #[test]
+    fn a_settings_guard_clears_the_override_on_drop() {
+        assert!(
+            crate::settings::active().tools.recall,
+            "recall must be at its default before the override is installed"
+        );
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.recall = false;
+        let guard = crate::settings::install_for_test(settings);
+        assert!(
+            !crate::settings::active().tools.recall,
+            "the override must be visible while the guard is alive"
+        );
+        drop(guard);
+        assert!(
+            crate::settings::active().tools.recall,
+            "dropping the guard must restore the previous (default) settings on this thread"
         );
     }
 

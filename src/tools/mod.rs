@@ -1335,7 +1335,7 @@ mod tests {
         // dispatch as unknown, matching the prompt where it is unadvertised.
         let mut off = crate::settings::Settings::default();
         off.tools.run_code = false;
-        crate::settings::install_for_test(off);
+        let _settings_guard = crate::settings::install_for_test(off);
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(
             &test_call("run_code", &[("script", "read x.txt")]),
@@ -1346,7 +1346,8 @@ mod tests {
         // At the default, a script of named operations executes through the
         // existing dispatch path (so consent/sandbox checks apply) and collects
         // outputs.
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         let (mut ctx, dir2) = test_ctx();
         let f = dir2.join("x.txt");
         std::fs::write(&f, "hello").expect("write");
@@ -1400,7 +1401,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_bash_step_inside_run_code_is_sandboxed_like_a_bare_call() {
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
 
         // The escape target lives under `$HOME` (outside cwd and temp), and
         // `sandbox-exec` can't apply a profile from inside a nested sandbox —
@@ -1459,13 +1461,14 @@ mod tests {
         // call dispatch as unknown, matching the prompt where it is unadvertised.
         let mut off = crate::settings::Settings::default();
         off.tools.recall = false;
-        crate::settings::install_for_test(off);
+        let _settings_guard = crate::settings::install_for_test(off);
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(&test_call("recall", &[("query", "needle")]), &mut ctx);
         assert!(res.is_error);
         assert!(res.output.contains("unknown tool: recall"));
         // Back at the default, it dispatches.
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         let (mut ctx, dir2) = test_ctx();
         ctx.current_transcript = vec![crate::session::Message::user("a needle here")];
         let res = dispatch(&test_call("recall", &[("query", "needle")]), &mut ctx);
@@ -1483,7 +1486,8 @@ mod tests {
     fn recall_snippet_window_snaps_to_char_boundaries() {
         // An em dash and an emoji sit inside the 40-byte context window on
         // both sides of the match; the snippet must not slice mid-character.
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         let (mut ctx, dir) = test_ctx();
         let text = format!(
             "{}\u{2014}\u{1F600}{}needle{}\u{2014}\u{1F600}{}",
@@ -1505,7 +1509,8 @@ mod tests {
         // the model: the request itself quotes the query, so the current
         // transcript always self-matches and `No sessions match` never fires
         // in a live session.
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
 
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(&test_call("recall", &[("query", "   ")]), &mut ctx);
@@ -1545,7 +1550,7 @@ mod tests {
         let mut s = crate::settings::Settings::default();
         s.tools.spill_max_bytes = 100;
         s.tools.spill_preview_bytes = 50;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         let (mut ctx, dir) = test_ctx();
         // Dispatch spills through the real `~/.plank/spill`, so use a session
         // id unique to this test run: a fixed one collides with other tests and

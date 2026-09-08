@@ -1755,7 +1755,7 @@ mod tests {
     fn live_history_tracks_history_size_setting_changes() {
         let mut s = crate::settings::Settings::default();
         s.ui.history_size = 2;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         let mut h = History::live();
         h.add("a");
@@ -1767,7 +1767,7 @@ mod tests {
         // Lower the cap live, with no new `History` constructed.
         let mut s = crate::settings::Settings::default();
         s.ui.history_size = 1;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         h.add("d");
         assert_eq!(
             h.len(),

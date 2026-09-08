@@ -2208,19 +2208,22 @@ mod tests {
     ///
     /// Returns the origin guard: the slots are process-global, so a test that
     /// sets them has to hold the same lock the power-cap tests do.
-    fn quiet_footer() -> std::sync::MutexGuard<'static, ()> {
+    fn quiet_footer() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::settings::TestSettingsGuard,
+    ) {
         let guard = origin_test_guard();
         set_dspark(false);
         set_temperature(0.0);
         let mut settings = crate::settings::Settings::default();
         settings.tools.loop_guards = false;
-        crate::settings::install_for_test(settings);
-        guard
+        let settings_guard = crate::settings::install_for_test(settings);
+        (guard, settings_guard)
     }
 
     #[test]
     fn idle_status_line() {
-        let _lock = quiet_footer();
+        let (_lock, _settings_guard) = quiet_footer();
         let st = Status {
             ctx_used: 1000,
             ctx_size: 8000,
@@ -2235,7 +2238,7 @@ mod tests {
 
     #[test]
     fn the_footer_shows_the_temperature_while_dspark_is_off() {
-        let _lock = quiet_footer();
+        let (_lock, _settings_guard) = quiet_footer();
         set_temperature(0.6);
         let st = Status {
             ctx_used: 1000,
@@ -2250,14 +2253,15 @@ mod tests {
 
     #[test]
     fn the_footer_marks_the_loop_guards_while_they_are_armed() {
-        let _lock = quiet_footer();
+        let (_lock, _settings_guard) = quiet_footer();
         let st = Status {
             ctx_used: 1000,
             ctx_size: 8000,
             ..Status::default()
         };
         assert!(!build_status_text(&st, false, true).contains(GUARD_MARK));
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         let line = build_status_text(&st, false, true);
         assert!(line.contains(GUARD_MARK), "{line}");
         // Armed is not the same news as caught: the tripped marker is its own
@@ -2267,7 +2271,7 @@ mod tests {
 
     #[test]
     fn dspark_shows_its_mark_before_a_pass_has_speculated() {
-        let _lock = quiet_footer();
+        let (_lock, _settings_guard) = quiet_footer();
         set_dspark(true);
         let plain = Status {
             ctx_used: 1000,
@@ -2303,7 +2307,7 @@ mod tests {
     fn dspark_segment_survives_into_the_idle_footer() {
         // The figures are only readable after the answer lands, so an idle
         // footer carrying them is the point of the feature, not an artefact.
-        let _lock = quiet_footer();
+        let (_lock, _settings_guard) = quiet_footer();
         set_dspark(true);
         let st = Status {
             state: WorkerState::Idle,

@@ -1281,7 +1281,7 @@ mod tests {
         let dir = temp_repo(&["src/ui.rs"]);
         let mut settings = crate::settings::Settings::default();
         settings.ui.respect_gitignore = true;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
 
         let mut index = FileIndex::build(&dir, true);
         index.mark_refreshed(Instant::now(), None);
@@ -1292,7 +1292,7 @@ mod tests {
 
         let mut settings = crate::settings::Settings::default();
         settings.ui.respect_gitignore = false;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         assert!(
             index.needs_refresh(Instant::now(), None),
             "the live setting no longer matches what the index was built with"

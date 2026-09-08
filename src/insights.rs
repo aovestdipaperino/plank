@@ -3146,7 +3146,7 @@ Tool result 3 (read):\nfine\n</tool_result>",
 
         let mut settings = crate::settings::Settings::default();
         settings.tools.loop_guards = false;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let mut off_hit = false;
         let mut plain_hit = false;
         for _ in 0..40 {
@@ -3162,7 +3162,8 @@ Tool result 3 (read):\nfine\n</tool_result>",
 
         // Re-armed mid-stream: the tail it kept while quiet is what it answers
         // from, so the very next check reports the cycle.
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         assert!(
             off.repeating(),
             "the quiet guard had seen the cycle all along"
@@ -3181,11 +3182,12 @@ Tool result 3 (read):\nfine\n</tool_result>",
         let mut guard = RepeatGuard::with_window(8192).with_think_budget(64).gated();
         let mut settings = crate::settings::Settings::default();
         settings.tools.loop_guards = false;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         guard.feed(&"unrepeating prose. ".repeat(40));
         assert!(guard.fed() > 64, "the budget was spent");
         assert!(!guard.over_budget(), "but the switch is off");
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         assert!(guard.over_budget());
     }
 

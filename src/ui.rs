@@ -16137,11 +16137,12 @@ mod tests {
         // it is unadvertised.
         let mut off = crate::settings::Settings::default();
         off.tools.fanout = false;
-        crate::settings::install_for_test(off);
+        let _settings_guard = crate::settings::install_for_test(off);
         let out = agent.run_fanout_tool(&call);
         assert!(out.contains("unknown tool: fanout"), "{out}");
         // At the default an empty subtasks array is rejected.
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         let empty = ToolCall {
             name: "fanout".to_string(),
             args: vec![crate::dsml::ToolArg {
@@ -18162,7 +18163,7 @@ mod tests {
 
         let mut off = crate::settings::Settings::default();
         off.context.microcompact = false;
-        crate::settings::install_for_test(off);
+        let _settings_guard = crate::settings::install_for_test(off);
 
         let before = agent.session.transcript.clone();
         assert_eq!(
@@ -18175,7 +18176,8 @@ mod tests {
             "transcript must be byte-identical: no in-place rewrite at all"
         );
 
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
     /// Context pressure that builds up *inside* a turn must still compact.
@@ -18278,7 +18280,7 @@ mod tests {
 
         let mut off = crate::settings::Settings::default();
         off.context.microcompact = false;
-        crate::settings::install_for_test(off);
+        let _settings_guard = crate::settings::install_for_test(off);
 
         events.lock().unwrap().clear();
         let before = agent.session.transcript.clone();
@@ -18301,7 +18303,8 @@ mod tests {
             events.lock().unwrap()
         );
 
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
     /// Replacing the session must clear the ladder and take its blobs with it.
@@ -19862,7 +19865,7 @@ mod tests {
         dm::reset();
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = false;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let dir = scratch_dir("console-backfill");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -19901,7 +19904,7 @@ mod tests {
         dm::reset();
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = false;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let dir = scratch_dir("console-toggle");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -19925,11 +19928,11 @@ mod tests {
         // Flip: on drops the socket, off re-dials.
         let mut on = crate::settings::Settings::default();
         on.ui.show_thinking = true;
-        crate::settings::install_for_test(on);
+        let _settings_guard = crate::settings::install_for_test(on);
         crate::debugmirror::reconcile();
         let mut off = crate::settings::Settings::default();
         off.ui.show_thinking = false;
-        crate::settings::install_for_test(off);
+        let _settings_guard = crate::settings::install_for_test(off);
         let r = crate::debugmirror::reconcile();
         assert!(r.parent_new);
         agent.backfill_console(&r);
@@ -19951,7 +19954,7 @@ mod tests {
         dm::reset();
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = false;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let dir = scratch_dir("console-subdumps");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -20007,7 +20010,7 @@ mod tests {
         dm::reset();
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = false;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let dir = scratch_dir("console-live-sidechain");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -20051,7 +20054,7 @@ mod tests {
         dm::reset();
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = false;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let dir = scratch_dir("console-stashed-parent");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -20093,7 +20096,7 @@ mod tests {
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = false;
         let settings_show_tool_calls = settings.ui.show_tool_calls;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let dir = scratch_dir("resume-replay-saved-render");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -20146,7 +20149,7 @@ mod tests {
         // the test is exercising the thinking-rendered case.
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = true;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let dir = scratch_dir("resume-replay");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -20289,7 +20292,7 @@ mod tests {
         let mut settings = crate::settings::Settings::default();
         settings.engine.thinking_tool_calls = true;
         settings.ui.show_thinking = true;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let dir = scratch_dir("resume-replay-in-think");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22283,7 +22286,7 @@ mod tests {
         let dir = scratch_dir("tui-config-set");
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = true;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         let dest = dir.join("settings.json");
@@ -22779,7 +22782,7 @@ mod tests {
         // Opt this thread into in-think dispatch; the shipped default is off.
         let mut settings = crate::settings::Settings::default();
         settings.engine.thinking_tool_calls = true;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let dir = std::env::temp_dir().join(format!("plank-ui-think-tool-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let engine = ScriptedEngine {
@@ -24331,7 +24334,7 @@ mod tests {
         let _dm = crate::debugmirror::test_support::lock();
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = show_thinking;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let dir = scratch_dir(&format!("agent-tool-show-thinking-{show_thinking}"));
         let cfg = test_cfg();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -24546,14 +24549,15 @@ mod tests {
         );
         let mut settings = crate::settings::Settings::default();
         settings.agents.max_parallel = 1;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         let calls = vec![agent_call("a", Some("a0")), agent_call("b", Some("a1"))];
         assert!(
             agent.run_agent_fanout(&calls).is_none(),
             "width 1 is the serial path"
         );
         assert_eq!(agent.alt_engines.len(), 2, "no engine left removed");
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         clear_vars(&vars);
     }
 
@@ -25237,7 +25241,8 @@ or the user's next message aborts before its first token"
     #[test]
     fn the_tool_schema_carries_no_roster() {
         let defs = vec![named_def("reviewer", true)];
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
 
         let specs = crate::sysprompt::provider_tool_registry(&[]);
         let agent_spec = specs.iter().find(|s| s.name == "agent").expect("agent");
@@ -25260,12 +25265,13 @@ or the user's next message aborts before its first token"
         assert!(roster.contains("reviewer"), "{roster}");
         let mut settings = crate::settings::Settings::default();
         settings.agents.auto_route = false;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         assert!(
             crate::context::agent_roster_context(&defs).is_none(),
             "autoRoute off withholds the roster"
         );
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
     #[test]
