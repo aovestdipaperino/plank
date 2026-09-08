@@ -17,7 +17,7 @@
 //! state enum with [`crate::dsml`] exactly as the C shares one
 //! `agent_dsml_parser` across all three dialects.
 
-use crate::dsml::{DsmlState, ToolArg, ToolCall, unescape_close_delimiter};
+use crate::dsml::{DsmlState, ToolArg, ToolCall};
 
 const START: &[u8] = b"<tool_call>";
 const CLOSE: &[u8] = b"</tool_call>";
@@ -198,7 +198,7 @@ impl QwenParser {
         let raw_value = &self.raw[vs..ve];
         let is_string = !value_is_json(raw_value);
         let value_bytes = if is_string {
-            unescape_close_delimiter(raw_value, &PARAM_CLOSE[1..])
+            decode_entities(raw_value)
         } else {
             raw_value.to_vec()
         };
@@ -321,6 +321,41 @@ struct TagOperand {
     consumed: usize,
 }
 
+/// Decodes `&lt;`, `&gt;` and `&amp;` in a string parameter value.
+///
+/// A deliberate divergence from the C, which unescapes only its own closing
+/// delimiter and leaves "other HTML entities unchanged"
+/// (`ds4_tool_text_unescape`). Qwen3.8 does not respect that boundary: it is
+/// taught to spell a literal `</parameter>` as `&lt;/parameter>`, generalizes
+/// the rule, and escapes every `<` it writes. Under the C's rule a task named
+/// `Shared<T>` renders as `Shared&lt;T&gt;` — and far worse, `write` puts
+/// those six characters into the source file.
+///
+/// One level comes off per pass, so escaping the escape still works and is
+/// the way to keep a literal entity: the model writes `&amp;lt;` and gets
+/// back `&lt;`. That is the same mechanism the prompt already teaches for the
+/// delimiter, applied consistently.
+///
+/// DSML is untouched: `DeepSeek` does not over-escape, and its parity with
+/// the C reference is worth more than symmetry between the two dialects.
+fn decode_entities(value: &[u8]) -> Vec<u8> {
+    // Longest first: `&amp;` must win over a bare `&`, or `&amp;lt;` would
+    // decode two levels at once and lose the escaped-escape spelling.
+    const ENTITIES: [(&[u8], u8); 3] = [(b"&amp;", b'&'), (b"&lt;", b'<'), (b"&gt;", b'>')];
+    let mut out = Vec::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        if let Some((pat, ch)) = ENTITIES.iter().find(|(pat, _)| value[i..].starts_with(pat)) {
+            out.push(*ch);
+            i += pat.len();
+            continue;
+        }
+        out.push(value[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Outcome of reading an opening tag's operand. The three cases are genuinely
 /// different actions: keep waiting, fail, or proceed.
 enum Operand {
@@ -422,14 +457,20 @@ mod tests {
     }
 
     /// The C's `test_agent_tool_argument_literal_markup` fixture for this
-    /// dialect (the `qwen`/`expected` arrays), byte for byte. Also pins that
-    /// the value keeps its inner newlines while losing exactly the one
-    /// newline each side of it that the syntax contributes.
+    /// dialect (the `qwen` array), with plank's expected value rather than the
+    /// C's. Also pins that the value keeps its inner newlines while losing
+    /// exactly the one newline each side of it that the syntax contributes.
+    ///
+    /// The two delimiter cases are unchanged from the C and are the ones that
+    /// matter: `&lt;/parameter>` becomes the literal delimiter, and
+    /// `&amp;lt;/parameter>` loses one level to keep the escaped spelling.
+    /// What differs is the standalone `&amp;` and `&lt;`, which the C leaves
+    /// alone and plank decodes — see `decode_entities` for why.
     const C_LITERAL_MARKUP: &str = concat!(
         "<tool_call>\n<function=write>\n<parameter=content>\n<p>&amp; &lt;</p> ",
         "&lt;/parameter> &amp;lt;/parameter>\n</parameter>\n</function>\n</tool_call>",
     );
-    const C_LITERAL_MARKUP_EXPECTED: &str = "<p>&amp; &lt;</p> </parameter> &lt;/parameter>";
+    const C_LITERAL_MARKUP_EXPECTED: &str = "<p>& <</p> </parameter> &lt;/parameter>";
 
     #[test]
     fn parses_the_c_literal_markup_fixture() {
@@ -561,6 +602,64 @@ mod tests {
         );
         assert_eq!(p.state(), DsmlState::Error);
         assert!(p.error().unwrap().contains("unterminated"));
+    }
+
+    /// The reported bug: Qwen escapes every `<` it writes, so a generic type
+    /// in a task name arrived as `Shared&lt;T&gt;` and was shown — and
+    /// written to files — with the entities intact.
+    #[test]
+    fn over_escaped_angle_brackets_are_decoded() {
+        let mut p = QwenParser::new();
+        feed_all(
+            &mut p,
+            concat!(
+                "<tool_call>\n<function=task>\n<parameter=active_form>\n",
+                "Doing Task 1 (Shared&lt;T&gt;)\n</parameter>\n</function>\n</tool_call>",
+            ),
+        );
+        assert_eq!(
+            p.calls()[0].arg_value("active_form"),
+            Some("Doing Task 1 (Shared<T>)")
+        );
+    }
+
+    /// The same over-escaping reaches file content, which is the worse half:
+    /// under the C's rule these six characters land in the source file.
+    #[test]
+    fn over_escaped_code_is_decoded_before_it_reaches_a_file() {
+        let mut p = QwenParser::new();
+        feed_all(
+            &mut p,
+            concat!(
+                "<tool_call>\n<function=write>\n<parameter=content>\n",
+                "fn f(x: &amp;Shared&lt;T&gt;) -&gt; bool { a &amp;&amp; b }\n",
+                "</parameter>\n</function>\n</tool_call>",
+            ),
+        );
+        assert_eq!(
+            p.calls()[0].arg_value("content"),
+            Some("fn f(x: &Shared<T>) -> bool { a && b }")
+        );
+    }
+
+    /// Escaping the escape still works, which is how a literal entity
+    /// survives: one level comes off per pass.
+    #[test]
+    fn an_escaped_entity_keeps_its_literal_spelling() {
+        let mut p = QwenParser::new();
+        feed_all(
+            &mut p,
+            concat!(
+                "<tool_call>\n<function=write>\n<parameter=content>\n",
+                "write &amp;lt; and &amp;amp; verbatim\n",
+                "</parameter>\n</function>\n</tool_call>",
+            ),
+        );
+        assert_eq!(
+            p.calls()[0].arg_value("content"),
+            Some("write &lt; and &amp; verbatim"),
+            "one level off, so the entity spelling survives"
+        );
     }
 
     #[test]
