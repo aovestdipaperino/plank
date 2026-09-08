@@ -68,7 +68,6 @@ fn resolve_and_activate_profile(
     explicit_empty: bool,
     plugins: &mut plank::plugins::PluginSet,
     home: Option<&std::path::Path>,
-    cfg: &plank::config::AgentConfig,
 ) -> Option<ExitCode> {
     // An installed profile is loaded only now, because `--profile` named it:
     // `plugins::load_in` never scans the profiles root, so nothing there has
@@ -99,19 +98,6 @@ fn resolve_and_activate_profile(
             Some(ExitCode::from(2))
         }
         plank::profile::Resolution::Activate(active) => {
-            // Resolved the same way `select_session_family` resolves it, so
-            // the two agree about which model is loading. The Qwen prompt is
-            // a different document built whole elsewhere; a profile's prose
-            // never reaches it, so running under Qwen is refused outright
-            // rather than silently dropping the profile's system prompt.
-            let model = cfg
-                .model_path
-                .clone()
-                .unwrap_or_else(plank::download::default_model_path);
-            if plank::gguf::family_of(&model) == plank::gguf::ModelFamily::Qwen {
-                eprintln!("{}", plank::profile::refuse_under_qwen(&active.name));
-                return Some(ExitCode::from(2));
-            }
             let prompt = match std::fs::read_to_string(&active.spec.system_prompt) {
                 Ok(text) => text,
                 Err(e) => {
@@ -210,20 +196,56 @@ fn report_kvcache_migration() {
     }
 }
 
+/// Resolves the model path that will actually load, from the real `cfg`
+/// (parsed against the fully-loaded settings, not the CLI-only provisional
+/// parse). Shared by every consumer that needs to know which model family is
+/// loading, so none of them can resolve it a different way and disagree.
+///
+/// A path that does not exist yet — a first run, before the download — is
+/// left for the caller's `family_of` to probe; that resolves to `Ds4`, which
+/// is the right default.
+fn resolve_model_path(cfg: &plank::config::AgentConfig) -> std::path::PathBuf {
+    cfg.model_path
+        .clone()
+        .unwrap_or_else(plank::download::default_model_path)
+}
+
 /// Records the live model family for the session store.
 ///
 /// Must run before anything opens the store, which both startup paths do
 /// within a few lines: the family decides the transcript extension, and a
 /// store opened before it would name files for the wrong one.
 fn select_session_family(cfg: &plank::config::AgentConfig) {
-    // Resolved the same way the engine will resolve it, so the tag matches the
-    // model that actually loads. A path that does not exist yet — a first run,
-    // before the download — probes as `Ds4`, which is the right default.
-    let model = cfg
-        .model_path
-        .clone()
-        .unwrap_or_else(plank::download::default_model_path);
-    plank::session::set_family(plank::gguf::family_of(&model));
+    plank::session::set_family(plank::gguf::family_of(&resolve_model_path(cfg)));
+}
+
+/// Decides whether an active profile must refuse to start under `model`.
+///
+/// Pure and independent of `main`'s flow so the decision can be tested
+/// directly: a profile REPLACES the system prompt, but the Qwen prompt is a
+/// different document built whole elsewhere (`sysprompt::build_qwen_tools_prompt_parts`),
+/// so a profile's prose never reaches it. `active_profile_name` is `Some` only
+/// once a profile has actually been spliced in and activated; `model` must be
+/// resolved the same way the engine resolves it (see `resolve_model_path`),
+/// so this can't disagree with what actually loads — including the case
+/// where the model comes from `~/.plank/settings.json`'s `engine.model` with
+/// no CLI flag at all.
+fn qwen_profile_conflict(active_profile_name: Option<&str>, model: &std::path::Path) -> bool {
+    active_profile_name.is_some() && plank::gguf::family_of(model) == plank::gguf::ModelFamily::Qwen
+}
+
+/// Refuses startup here, before any engine load or terminal setup, if the
+/// profile activated earlier turns out to be running under a Qwen model once
+/// the real settings-and-CLI `cfg` is known. Common to both startup paths
+/// (`main` and `run_serve`) so neither can activate a profile against Qwen
+/// through a route the other didn't think to check.
+fn refuse_if_profile_conflicts_with_qwen(cfg: &plank::config::AgentConfig) -> Option<ExitCode> {
+    let name = plank::profile::active_name()?;
+    if qwen_profile_conflict(Some(name), &resolve_model_path(cfg)) {
+        eprintln!("{}", plank::profile::refuse_under_qwen(name));
+        return Some(ExitCode::from(2));
+    }
+    None
 }
 
 /// The detached downloader's entry point.
@@ -235,6 +257,45 @@ fn run_model_downloader(args: &[String]) -> i32 {
     let set =
         plank::manifest::ModelSet::from_str_or_default(args.get(1).map_or("", String::as_str));
     plank::downloader::run_helper(set)
+}
+
+/// The checks that fire once the real `cfg` (settings + CLI, not the
+/// CLI-only `provisional` parse) is known, before anything user-visible:
+/// the profile-vs-Qwen guard, then the `--help`/`--version`/`--dump-config`
+/// backstops that the provisional parse already answers in practice but must
+/// be re-decided here against the layered settings.
+///
+/// Factored out of `main` (and reused by nothing else — `run_serve` has no
+/// help/version/dump-config surface) purely to keep `main` under the
+/// 100-line cap; it owns no state of its own.
+fn post_cfg_early_exit(
+    cfg: &plank::config::AgentConfig,
+    settings: &plank::settings::Settings,
+) -> Option<ExitCode> {
+    // A profile REPLACES the system prompt; the Qwen prompt is a different
+    // document built whole elsewhere, so a profile can't reach it. Checked
+    // against the real `cfg` so a Qwen model set only via
+    // `~/.plank/settings.json`'s `engine.model` (no CLI flag) is caught too —
+    // see `refuse_if_profile_conflicts_with_qwen`'s doc.
+    if let Some(code) = refuse_if_profile_conflicts_with_qwen(cfg) {
+        return Some(code);
+    }
+    if cfg.show_help {
+        print!("{}", usage());
+        return Some(ExitCode::SUCCESS);
+    }
+    if cfg.show_version {
+        println!("{}", plank::logo::version_line());
+        return Some(ExitCode::SUCCESS);
+    }
+    // `--dump-config` prints the resolved configuration (every effective key
+    // with the layer it came from) and exits, without starting a session. It
+    // works under `--non-interactive` because it needs no UI.
+    if cfg.dump_config {
+        print!("{}", plank::provenance::render_resolved(settings, cfg));
+        return Some(ExitCode::SUCCESS);
+    }
+    None
 }
 
 fn main() -> ExitCode {
@@ -329,7 +390,6 @@ fn main() -> ExitCode {
         provisional.profile_explicit_empty,
         &mut plugins,
         home_dir().as_deref(),
-        &provisional,
     );
     print_plugin_warnings(&plugins);
     if let Some(code) = code {
@@ -348,23 +408,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // Backstop: the provisional parse above answers `--help` in practice, but
-    // it falls back to defaults when the argument list does not parse, and the
-    // real parse is the one that decides with the layered settings in hand.
-    if cfg.show_help {
-        print!("{}", usage());
-        return ExitCode::SUCCESS;
-    }
-    if cfg.show_version {
-        println!("{}", plank::logo::version_line());
-        return ExitCode::SUCCESS;
-    }
-    // `--dump-config` prints the resolved configuration (every effective key
-    // with the layer it came from) and exits, without starting a session. It
-    // works under `--non-interactive` because it needs no UI.
-    if cfg.dump_config {
-        print!("{}", plank::provenance::render_resolved(&settings, &cfg));
-        return ExitCode::SUCCESS;
+    if let Some(code) = post_cfg_early_exit(&cfg, &settings) {
+        return code;
     }
     // Settings can move plank off Metal or shrink the context, and both are
     // invisible once the UI is up — you just notice it got slow. Say so.
@@ -865,7 +910,6 @@ fn run_serve(args: &[String]) -> ExitCode {
         provisional.profile_explicit_empty,
         &mut plugins,
         home.as_deref(),
-        &provisional,
     );
     print_plugin_warnings(&plugins);
     if let Some(code) = code {
@@ -884,6 +928,10 @@ fn run_serve(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // See `main`'s matching call; the function doc has the full reasoning.
+    if let Some(code) = refuse_if_profile_conflicts_with_qwen(&cfg) {
+        return code;
+    }
     plank::interrupt::install();
 
     select_session_family(&cfg);
@@ -1035,4 +1083,97 @@ fn run(
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
     plank::ui::run_interactive(engine, cfg, local_engine, plugins)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes a minimal GGUF file whose only metadata key is
+    /// `general.architecture` = `arch`, matching the layout `gguf::Gguf`'s
+    /// test helper builds (magic, version, tensor count, kv count, then one
+    /// string-valued key). Just enough for `family_of` to classify it.
+    fn write_fake_gguf(name: &str, arch: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "plank-main-gguf-{}-{name}-{arch}",
+            std::process::id()
+        ));
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(b"GGUF").unwrap();
+        f.write_all(&3u32.to_le_bytes()).unwrap(); // version
+        f.write_all(&0u64.to_le_bytes()).unwrap(); // tensor count
+        f.write_all(&1u64.to_le_bytes()).unwrap(); // kv count
+        let key = "general.architecture";
+        f.write_all(&(key.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(key.as_bytes()).unwrap();
+        f.write_all(&8u32.to_le_bytes()).unwrap(); // string type
+        f.write_all(&(arch.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(arch.as_bytes()).unwrap();
+        path
+    }
+
+    /// No active profile: never refuses, regardless of model family. Covers
+    /// plain (non-profile) startup on a Qwen model, which is legitimate.
+    #[test]
+    fn no_active_profile_never_conflicts() {
+        let qwen = write_fake_gguf("no-profile", "qwen4exp");
+        assert!(!qwen_profile_conflict(None, &qwen));
+        let _ = std::fs::remove_file(qwen);
+    }
+
+    /// A profile active, model resolves to Qwen: this is exactly the failure
+    /// mode the guard exists to prevent, including the settings.json-only
+    /// case this fix addresses — `qwen_profile_conflict` takes only the
+    /// already-resolved model path, so it can't tell (and doesn't need to)
+    /// whether that path came from `-m`, `--qwen`, or `engine.model` in
+    /// `~/.plank/settings.json`.
+    #[test]
+    fn active_profile_on_qwen_model_conflicts() {
+        let qwen = write_fake_gguf("profile-active", "qwen4exp");
+        assert!(qwen_profile_conflict(Some("my-profile"), &qwen));
+        let _ = std::fs::remove_file(qwen);
+    }
+
+    /// A profile active, model resolves to `DeepSeek`: no conflict.
+    #[test]
+    fn active_profile_on_ds4_model_does_not_conflict() {
+        let ds4 = write_fake_gguf("profile-active-ds4", "deepseek2");
+        assert!(!qwen_profile_conflict(Some("my-profile"), &ds4));
+        let _ = std::fs::remove_file(ds4);
+    }
+
+    /// A first run, before any model has been downloaded: the path does not
+    /// exist, `family_of` reads that as `Ds4` (the documented fallthrough),
+    /// so an active profile must not be wrongly refused.
+    #[test]
+    fn active_profile_on_missing_model_path_does_not_conflict() {
+        let missing = std::env::temp_dir().join(format!(
+            "plank-main-gguf-missing-{}-no-such-file",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing); // ensure absence
+        assert!(!qwen_profile_conflict(Some("my-profile"), &missing));
+    }
+
+    /// `resolve_model_path` falls back to the default `DeepSeek` path when
+    /// `cfg.model_path` is unset, exactly like `select_session_family` did
+    /// before this refactor, and returns the configured path unchanged when
+    /// one is set — including one that only ever came from a settings file
+    /// (`AgentConfig::from_settings`/`parse_options_with` do not distinguish
+    /// CLI from settings-file origin once parsed, which is the point: the
+    /// guard reads the same resolved value the engine will).
+    #[test]
+    fn resolve_model_path_matches_configured_or_falls_back_to_default() {
+        let mut cfg =
+            plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
+        cfg.model_path = None;
+        assert_eq!(
+            resolve_model_path(&cfg),
+            plank::download::default_model_path()
+        );
+
+        let configured = std::path::PathBuf::from("/from/settings.gguf");
+        cfg.model_path = Some(configured.clone());
+        assert_eq!(resolve_model_path(&cfg), configured);
+    }
 }
