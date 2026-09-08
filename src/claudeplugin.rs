@@ -606,10 +606,15 @@ fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Whether `dir` itself carries a Claude Code manifest — either spelling,
-/// since a tarball of a marketplace repository must resolve here too.
+/// Whether `dir` is the root of an installable tree: a plugin manifest in
+/// either spelling, or a marketplace manifest.
+///
+/// Both spellings, because `/install-profile` fetches profiles authored in
+/// plank's own `.plank-plugin/` layout and `/install-claude-plugin` had no
+/// reason to refuse them either — a plank-spelling plugin was previously
+/// unfetchable by any command.
 fn is_claude_manifest_root(dir: &Path) -> bool {
-    dir.join(".claude-plugin").join("plugin.json").is_file()
+    crate::plugins::manifest_path(dir).is_some()
         || dir
             .join(".claude-plugin")
             .join("marketplace.json")
@@ -714,7 +719,8 @@ fn resolve_subpath(dest: &Path, subpath: &str) -> Result<PathBuf, String> {
 /// parent), and whitespace-only strings. A plugin calling itself `../x` or `.`
 /// is not a naming style to accommodate.
 fn plugin_name(root: &Path) -> Result<String, String> {
-    let manifest = root.join(".claude-plugin").join("plugin.json");
+    let manifest = crate::plugins::manifest_path(root)
+        .ok_or_else(|| format!("no plugin.json in {}", root.display()))?;
     let text = std::fs::read_to_string(&manifest)
         .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
     let from_manifest = match json_parse(&text).as_ref().and_then(|j| j.get("name")) {
@@ -854,6 +860,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
+    }
+
+    #[test]
+    fn a_plank_spelling_tree_is_found_and_named() {
+        let dir = tmpdir("plank-spelling");
+        let root = dir.join("thing");
+        std::fs::create_dir_all(root.join(".plank-plugin")).expect("mkdir");
+        std::fs::write(
+            root.join(".plank-plugin").join("plugin.json"),
+            r#"{"name":"thing"}"#,
+        )
+        .expect("write");
+        // Found one level in, exactly as the Claude spelling is.
+        assert_eq!(find_claude_root(&dir), Some(root.clone()));
+        // And named from the plank manifest rather than falling back to the
+        // directory name, which would silently differ when the two disagree.
+        assert_eq!(plugin_name(&root).as_deref(), Ok("thing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_plank_manifest_wins_when_a_tree_carries_both() {
+        let dir = tmpdir("both-spellings");
+        std::fs::create_dir_all(dir.join(".plank-plugin")).expect("mkdir");
+        std::fs::create_dir_all(dir.join(".claude-plugin")).expect("mkdir");
+        std::fs::write(
+            dir.join(".plank-plugin").join("plugin.json"),
+            r#"{"name":"plank-name"}"#,
+        )
+        .expect("write");
+        std::fs::write(
+            dir.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"claude-name"}"#,
+        )
+        .expect("write");
+        // Same precedence `plugins::manifest_path` already uses everywhere else,
+        // so a tree with both spellings loads under one name, not two.
+        assert_eq!(plugin_name(&dir).as_deref(), Ok("plank-name"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
