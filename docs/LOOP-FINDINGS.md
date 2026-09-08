@@ -54,6 +54,7 @@ argument for the design.
 | 2026-09-07 | *(this change)* | `RepeatGuard` latches the period the warn rung matched and counts further copies forward (`Latched`, `extend_latched`, `cycle_period` replacing `has_cycles`), removing the window's cap on the period a stop can see | `repro-1788788326`: a 2434-byte cycle ran 17 times, warned in the footer the whole way, and could never be stopped |
 | 2026-09-07 | *(this change)* | `REPEAT_THINK_BUDGET = 16 KiB` per-pass reasoning cap (`RepeatGuard::with_think_budget`, `THINK_BUDGET_ERROR`, counted towards `MAIN_REPEAT_TRIP_CAP`); `NO_PROGRESS_BYTE_BUDGET = 32 KiB` per-turn cap on output with no `PROGRESS_TOOLS` call | `repro-1788796284`: a 9042-byte cycle 20 times over in a sub-agent, longer than the whole window so no rung could see it, and a parent turn that looped no text at all yet edited nothing in fifty minutes |
 | 2026-09-07 | `aaf0f3d` | `MAIN_REPEAT_TRIP_CAP = 2` on both main-turn paths (`MAIN_REPEAT_TRIPS_NOTICE`); `Agent::repro_dir` so test dumps stay out of `~/.plank/repro`; this document | `repro-loop-1788708943`/`-1788709421`: the main turn looped, stopped, looped again, and the user quit |
+| 2026-09-08 | *(this change)* | no-progress budget resets only after a successful direct `write` or `edit`, not an attempted `edit` or arbitrary `bash` call | `repro-loop-1788833715`: 5h7m of failed edits, builds, and repeated reads kept resetting the budget |
 
 Two patterns run through the table. First, every detector started advisory
 or per-pass and had to grow a rung that *ends the turn*: at temperature 0 a
@@ -252,6 +253,31 @@ them, and four of those are *drifting* loops with no byte-exact period (the
 at 27 healthy passes to catch 2. A duplicate-line ratio is the right one, and
 the corpus separates on it cleanly: healthy passes sit at zero duplicate
 lines, those four at 15 to 25 percent.
+
+## An attempted mutation is not progress
+
+`repro-loop-1788833715` (cuddly-columbus, auto-saved 2026-09-08) ran for
+5h7m and reached 635K transcript tokens. It made 153 `bash`, 305 `edit`, and
+201 `read` calls. Late in the turn, the model repeatedly read the same three
+lines containing `popup.bounds()()` and reasoned verbatim about why its own
+mechanical replacement was correct. The exact-call guard eventually refused
+the identical reads and ended the turn, but only after the work had already
+stalled for hours.
+
+The no-progress budget existed but did not apply: it reset from the parsed
+call name, treating every `edit`, `bash`, and `bash_stop` as a world-changing
+action. Many edits had returned an anchor error, while the shell calls were
+builds, searches, or other read-only commands. Invocation and exit status do
+not prove that a task advanced.
+
+Fixed by sampling `ToolContext::last_written` after each dispatch, before the
+UI consumes it for `/open`. The field is assigned by `write` and `edit` only
+after a successful file write, so only that evidence resets the budget. The
+plain REPL and TUI paths use the same rule. Shell commands are deliberately
+not assumed to have made progress: detecting arbitrary shell mutations
+reliably would require a separate workspace-mutation witness, rather than an
+exit-status heuristic. Regression tests cover a failed `edit`, a successful
+read-only `bash`, and repeated successful writes.
 
 ## A stopped pass is regenerated verbatim: the main turn has no trip cap
 

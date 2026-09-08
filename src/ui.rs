@@ -645,17 +645,9 @@ const REPEAT_THINK_BUDGET: usize = 16384;
 /// that it was repeating itself is a lie it then has to reconcile.
 const THINK_BUDGET_ERROR: &str = "generation stopped: the reasoning ran past its budget without reaching a decision. Do not restate the options. Pick the one you were leaning towards, say it in one sentence, and emit the tool calls for it now.";
 
-/// Tools whose success means the turn moved the world, resetting
-/// [`NO_PROGRESS_BYTE_BUDGET`]. The same three the plan-mode gate blocks
-/// (`PLAN_MODE_BLOCKED_TOOLS`), for the same reason: they are the ones with
-/// effects. Reads, searches and listings are deliberately absent — a turn can
-/// read all day and still be going nowhere, which is the case this rung is
-/// for.
-const PROGRESS_TOOLS: &[&str] = &["write", "edit", "bash", "bash_stop"];
-
-/// Bytes a turn may generate without any [`PROGRESS_TOOLS`] call before the
-/// turn is ended. Bytes rather than tokens because that is the unit the
-/// corpus was measured in, and the only one both front ends have to hand.
+/// Bytes a turn may generate without a successful direct file mutation before
+/// it is ended. Bytes rather than tokens because that is the unit the corpus
+/// was measured in, and the only one both front ends have to hand.
 ///
 /// The rung the per-pass budget cannot be: `repro-1788796284`'s main turn ran
 /// four passes of 435, 1690, 2768 and 4328 reasoning bytes, none cyclic and
@@ -678,14 +670,6 @@ const NO_PROGRESS_BYTE_BUDGET: usize = 32768;
 /// because "stopped" without "and nothing was written" sends the reader
 /// looking for a crash.
 const NO_PROGRESS_NOTICE: &str = "turn stopped: the model generated 32KB of output without writing a file, editing one, or running a command. Nothing was changed. Narrow the request, or tell it which file to start with.";
-
-/// Whether a dispatched round did anything with an effect; see
-/// [`PROGRESS_TOOLS`].
-fn calls_made_progress(calls: &[ToolCall]) -> bool {
-    calls
-        .iter()
-        .any(|c| PROGRESS_TOOLS.contains(&c.name.as_str()))
-}
 
 /// Whether a preflight error is one of the reasoning rungs, and so counts
 /// towards [`MAIN_REPEAT_TRIP_CAP`]. Both stops leave the prompt materially
@@ -3921,6 +3905,11 @@ impl Agent<'_> {
                 if let Some(line) = self.tool_activity_line(&calls) {
                     println!("{}", self.debug_line(&line));
                 }
+                // `last_written` is set by `write` and `edit` only after the
+                // file operation succeeds. A call-shaped check would let a
+                // failed edit, or a read-only `bash`, reset the no-progress
+                // budget forever (repro-loop-1788833715).
+                let made_progress = self.tool_ctx.last_written.is_some();
                 let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
                 crate::openfile::note_written(
                     &mut self.last_edited,
@@ -3963,7 +3952,7 @@ impl Agent<'_> {
                 }
                 // Checked after the results are in the transcript, so the
                 // dump and the next prompt both show what the turn did have.
-                if calls_made_progress(&calls) {
+                if made_progress {
                     ungrounded = 0;
                 } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET {
                     self.report_guard(NO_PROGRESS_NOTICE);
@@ -12155,6 +12144,9 @@ impl Agent<'_> {
                 if let Some(line) = self.tool_activity_line(&out.calls) {
                     let _ = tx.send(UiEvent::Dim(line));
                 }
+                // Keep this exactly in step with the plain-stdout path: only
+                // a successful direct file mutation resets the budget.
+                let made_progress = self.tool_ctx.last_written.is_some();
                 let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
                 crate::openfile::note_written(
                     &mut self.last_edited,
@@ -12197,7 +12189,7 @@ impl Agent<'_> {
                 }
                 // Checked after the results are in the transcript, so the
                 // dump and the next prompt both show what the turn did have.
-                if calls_made_progress(&out.calls) {
+                if made_progress {
                     ungrounded = 0;
                 } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET {
                     self.report_guard(NO_PROGRESS_NOTICE);
@@ -22590,14 +22582,6 @@ mod tests {
         }
     }
 
-    /// A bare call to `name`, for the argument-free progress check.
-    fn test_tool_call(name: &str) -> ToolCall {
-        ToolCall {
-            name: name.to_string(),
-            args: Vec::new(),
-        }
-    }
-
     /// A reply that is one short paragraph of reasoning repeated far past the
     /// repeat guard's four cycles, never closing its `<think>`.
     fn looping_reasoning() -> String {
@@ -22947,6 +22931,74 @@ mod tests {
     }
 
     #[test]
+    fn failed_edits_do_not_reset_the_no_progress_budget() {
+        // A failed edit used to count by its name alone, so it could reset the
+        // budget forever. `last_written` stays empty on failure.
+        let dir = scratch_dir("no-progress-failed-edit");
+        let cfg = test_cfg();
+        std::fs::write(dir.join("target.rs"), "present\n").unwrap();
+        let edit_call = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"edit\">",
+            "<｜DSML｜parameter name=\"path\" string=\"true\">target.rs</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let pass = format!("{}{edit_call}", "x".repeat(12 * 1024));
+        let engine = ScriptedEngine {
+            replies: vec![pass.clone(), pass.clone(), pass, "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert_eq!(
+            error_lines(&events),
+            vec![format!("guard: {NO_PROGRESS_NOTICE}")],
+            "{events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_only_bash_does_not_reset_the_no_progress_budget() {
+        // Exit status says only that a command ran. It does not establish that
+        // the task advanced; in particular it must not excuse repeated builds
+        // and searches such as repro-loop-1788833715.
+        let dir = scratch_dir("no-progress-bash");
+        let cfg = test_cfg();
+        let bash_call = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">printf checked</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let pass = format!("{}{bash_call}", "x".repeat(12 * 1024));
+        let engine = ScriptedEngine {
+            replies: vec![pass.clone(), pass.clone(), pass, "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert_eq!(
+            error_lines(&events),
+            vec![format!("guard: {NO_PROGRESS_NOTICE}")],
+            "{events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_turn_that_keeps_writing_is_never_stopped_for_lack_of_progress() {
         // The other half of the rung: a long turn that is getting somewhere
         // must not be cut off. `write` resets the budget every round.
@@ -22985,21 +23037,6 @@ mod tests {
             "60 KB of output, but every round wrote a file: {events:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn only_tools_with_effects_count_as_progress() {
-        for name in PROGRESS_TOOLS {
-            assert!(calls_made_progress(&[test_tool_call(name)]), "{name}");
-        }
-        for name in ["read", "search", "list", "glob", "agent", "task"] {
-            assert!(!calls_made_progress(&[test_tool_call(name)]), "{name}");
-        }
-        assert!(
-            calls_made_progress(&[test_tool_call("read"), test_tool_call("edit")]),
-            "one effect in the round is enough"
-        );
-        assert!(!calls_made_progress(&[]));
     }
 
     #[test]
