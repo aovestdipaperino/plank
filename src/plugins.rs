@@ -50,6 +50,11 @@ pub struct Plugin {
     pub origin: Origin,
     /// Non-fatal complaints raised while loading this plugin.
     pub warnings: Vec<String>,
+    /// The manifest's `profile` block, when it declares one. Present whether
+    /// or not `--profile` selected this plugin: activation is decided in
+    /// `main.rs`, and a profile-bearing plugin still contributes normally
+    /// when it is not the active one.
+    pub profile: Option<crate::profile::ProfileSpec>,
 }
 
 /// Component subdirectory spellings, plank name first, Claude Code name
@@ -223,6 +228,7 @@ fn load_plugin_fields(dir: &Path, origin: Origin) -> Option<Plugin> {
         root,
         origin,
         warnings: Vec::new(),
+        profile: None,
     };
     let Some(manifest) = manifest else {
         plugin.warnings.push(format!(
@@ -255,6 +261,13 @@ fn load_plugin_fields(dir: &Path, origin: Origin) -> Option<Plugin> {
     plugin.description = json_string_field(&text, "description").unwrap_or_default();
     plugin.version = json_string_field(&text, "version").unwrap_or_default();
     plugin.author = json_string_field(&text, "author").unwrap_or_default();
+    if let Some(mut spec) = crate::profile::parse(&text, &plugin.root) {
+        let name = plugin.name.clone();
+        plugin
+            .warnings
+            .extend(spec.warnings.drain(..).map(|w| format!("{name}: {w}")));
+        plugin.profile = Some(spec);
+    }
     Some(plugin)
 }
 
@@ -542,6 +555,19 @@ fn contributions(plugin: &Plugin) -> Vec<&'static str> {
         }
     }
     out
+}
+
+/// The plugin names `--profile` accepts, sorted.
+#[must_use]
+pub fn profile_names(set: &PluginSet) -> Vec<String> {
+    let mut names: Vec<String> = set
+        .plugins
+        .iter()
+        .filter(|p| p.profile.is_some())
+        .map(|p| p.name.clone())
+        .collect();
+    names.sort();
+    names
 }
 
 /// Renders the `/plugins` listing: one block per plugin, then every warning.
@@ -2740,5 +2766,49 @@ mod tests {
         let out = render_list(&set);
         assert!(out.contains("no plugins"));
         assert!(out.contains("--plugin-dir"));
+    }
+
+    #[test]
+    fn a_manifest_profile_block_is_parsed_onto_the_plugin() {
+        let root = scratch("profile-block");
+        let dir = root.join("hal");
+        write(
+            &dir,
+            ".plank-plugin/plugin.json",
+            r#"{"name":"hal","profile":{"systemPrompt":"prompt.md","displayName":"HAL"}}"#,
+        );
+        let p = load_plugin(&dir, Origin::UserScan).expect("loads");
+        let spec = p.profile.expect("has a profile");
+        assert_eq!(spec.display_name.as_deref(), Some("HAL"));
+        assert_eq!(spec.system_prompt, p.root.join("prompt.md"));
+    }
+
+    #[test]
+    fn a_plugin_without_a_profile_block_loads_as_before() {
+        let root = scratch("profile-block-absent");
+        let dir = root.join("plain");
+        write(
+            &dir,
+            ".plank-plugin/plugin.json",
+            r#"{"name":"plain","description":"d"}"#,
+        );
+        let p = load_plugin(&dir, Origin::UserScan).expect("loads");
+        assert!(p.profile.is_none());
+        assert_eq!(p.name, "plain");
+        assert_eq!(p.description, "d");
+    }
+
+    #[test]
+    fn a_malformed_profile_field_warns_without_failing_the_load() {
+        let root = scratch("profile-block-malformed");
+        let dir = root.join("hal");
+        write(
+            &dir,
+            ".plank-plugin/plugin.json",
+            r#"{"name":"hal","profile":{"systemPrompt":"p.md","accent":"nope"}}"#,
+        );
+        let p = load_plugin(&dir, Origin::UserScan).expect("loads");
+        assert!(p.profile.is_some());
+        assert!(p.warnings.iter().any(|w| w.contains("accent")));
     }
 }
