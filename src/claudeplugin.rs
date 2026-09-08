@@ -492,6 +492,77 @@ pub fn install_staged(
     })
 }
 
+/// Refuses a staged tree that is not an installable profile, then installs it
+/// into the profiles root.
+///
+/// Split from [`install_profile`] so the gate is testable without fetching:
+/// every refusal below is reachable from a directory on disk.
+///
+/// The prompt is validated *here*, at install time, rather than left to
+/// startup. `main.rs` treats an unreadable or blank profile prompt as fatal —
+/// deliberately, because silently running as plain plank when the user asked
+/// for HAL is worse than not running — and a fatal launch is a bad place to
+/// discover a bad download.
+///
+/// # Errors
+/// Returns a message when the tree has no manifest, its manifest declares no
+/// `profile` block, its `systemPrompt` is missing, unreadable or blank, or
+/// [`install_staged`]'s own checks refuse it.
+pub fn install_profile_staged(
+    staged: &Path,
+    want: Option<&str>,
+    home: &Path,
+    force: bool,
+) -> Result<Installed, String> {
+    let root = resolve_in_tree(staged, want)?;
+    let name = plugin_name(&root)?;
+    let manifest = crate::plugins::manifest_path(&root)
+        .ok_or_else(|| format!("no plugin.json in {}", root.display()))?;
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
+    let spec = crate::profile::parse(&text, &root).ok_or_else(|| {
+        format!(
+            "plugin '{name}' declares no profile block; install it with \
+             /install-claude-plugin instead"
+        )
+    })?;
+    let prompt = std::fs::read_to_string(&spec.system_prompt).map_err(|e| {
+        format!(
+            "profile '{name}': cannot read {}: {e}",
+            spec.system_prompt.display()
+        )
+    })?;
+    if prompt.trim().is_empty() {
+        return Err(format!(
+            "profile '{name}': {} is empty",
+            spec.system_prompt.display()
+        ));
+    }
+    install_staged(staged, want, &crate::profiles::dir(home), force)
+}
+
+/// Fetches the profile `arg` names, validates it, and installs it.
+///
+/// The `/install-profile` counterpart of [`install`], sharing its staging
+/// discipline: everything happens in a directory outside every scan root, and
+/// that directory is removed on every exit path.
+///
+/// # Errors
+/// Returns a message when the argument names nothing fetchable, the fetch
+/// fails, or the tree does not pass [`install_profile_staged`]'s checks.
+pub fn install_profile(
+    arg: &str,
+    want: Option<&str>,
+    home: &Path,
+    force: bool,
+) -> Result<Installed, String> {
+    let staging = staging_dir(home)?;
+    let result =
+        fetch(arg, &staging).and_then(|tree| install_profile_staged(&tree, want, home, force));
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
 /// Fetches the plugin `arg` names, validates it, and installs it.
 ///
 /// The one entry point the slash command calls. Everything it does happens in
@@ -738,6 +809,26 @@ fn plugin_name(root: &Path) -> Result<String, String> {
     Ok(name)
 }
 
+/// Splits an install command's argument line into the `--force` flag and the
+/// positional words, in order.
+///
+/// Shared by [`render_install`] and [`render_install_profile`]: the two render
+/// different text but take the same argument shape, and a flag one of them
+/// learned to accept and the other did not would be a silent divergence
+/// between two commands users expect to behave alike.
+fn split_force_flag(arg: &str) -> (bool, Vec<&str>) {
+    let mut force = false;
+    let mut words: Vec<&str> = Vec::new();
+    for word in arg.split_whitespace() {
+        if word == "--force" {
+            force = true;
+        } else {
+            words.push(word);
+        }
+    }
+    (force, words)
+}
+
 /// The whole `/install-claude-plugin` command: parses its argument line, runs
 /// the install, and renders the outcome — success or refusal — as the text
 /// both front ends print.
@@ -757,15 +848,7 @@ pub fn render_install(arg: &str, home: Option<&Path>) -> String {
         "usage: /install-claude-plugin <url|owner/repo> [plugin-name] [--force]\n",
         "a url may be a git repository, a marketplace repository, or a .tar.gz\n"
     );
-    let mut force = false;
-    let mut words: Vec<&str> = Vec::new();
-    for word in arg.split_whitespace() {
-        if word == "--force" {
-            force = true;
-        } else {
-            words.push(word);
-        }
-    }
+    let (force, words) = split_force_flag(arg);
     let Some(target) = words.first() else {
         return USAGE.to_string();
     };
@@ -775,6 +858,40 @@ pub fn render_install(arg: &str, home: Option<&Path>) -> String {
     match install(target, words.get(1).copied(), home, force) {
         Ok(out) => render_installed(&out),
         Err(e) => format!("{e}\n"),
+    }
+}
+
+/// The whole `/install-profile` command: parses its argument line, runs the
+/// install, and renders the outcome as the text both front ends print.
+///
+/// Mirrors [`render_install`] rather than sharing its body: the two differ in
+/// their usage line, in the closing hint (a profile is launched with
+/// `--profile`, not merely loaded), and in how they are removed. Sharing would
+/// mean threading three flags through one function to save a dozen lines.
+#[must_use]
+pub fn render_install_profile(arg: &str, home: Option<&Path>) -> String {
+    // `concat!`, not a `\`-continued literal: continuation strips the next
+    // line's leading whitespace.
+    const USAGE: &str = concat!(
+        "usage: /install-profile <url|owner/repo|path> [name] [--force]\n",
+        "a url may be a git repository, a marketplace repository, or a .tar.gz\n"
+    );
+    let (force, words) = split_force_flag(arg);
+    let Some(source) = words.first() else {
+        return USAGE.to_string();
+    };
+    let Some(home) = home else {
+        return "plank: no home directory; nowhere to install a profile\n".to_string();
+    };
+    match install_profile(source, words.get(1).copied(), home, force) {
+        Ok(installed) => format!(
+            "installed profile '{}' into {}\nrun it with: plank --profile {}\nremove it with: rm -rf {}\n",
+            installed.name,
+            installed.dest.display(),
+            installed.name,
+            installed.dest.display()
+        ),
+        Err(e) => format!("plank: {e}\n"),
     }
 }
 
@@ -2036,5 +2153,81 @@ mod tests {
     fn render_without_a_home_says_so() {
         let out = render_install("owner/repo", None);
         assert!(out.contains("HOME"), "{out}");
+    }
+
+    /// Builds a staged tree at `<tmp>/staged` and returns it. `block` is the
+    /// `profile` member's JSON text, or `None` for no profile block. `prompt` is
+    /// the prompt file's contents, or `None` to write no prompt file at all.
+    fn staged_profile(tmp: &Path, block: Option<&str>, prompt: Option<&str>) -> PathBuf {
+        let staged = tmp.join("staged");
+        std::fs::create_dir_all(staged.join(".plank-plugin")).expect("mkdir");
+        if let Some(p) = prompt {
+            std::fs::write(staged.join("prompt.md"), p).expect("write");
+        }
+        let manifest = match block {
+            Some(b) => format!("{{\"name\":\"hal\",\"profile\":{b}}}"),
+            None => "{\"name\":\"hal\"}".to_string(),
+        };
+        std::fs::write(staged.join(".plank-plugin").join("plugin.json"), manifest).expect("write");
+        staged
+    }
+
+    const GOOD_BLOCK: &str = r#"{"systemPrompt":"prompt.md"}"#;
+
+    #[test]
+    fn a_tree_with_no_profile_block_is_refused() {
+        let tmp = tmpdir("gate-no-block");
+        let staged = staged_profile(&tmp, None, Some("hi\n"));
+        let err = install_profile_staged(&staged, None, &tmp, false).expect_err("refused");
+        assert!(err.contains("declares no profile block"), "{err}");
+        assert!(err.contains("/install-claude-plugin"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_profile_whose_prompt_file_is_missing_is_refused() {
+        let tmp = tmpdir("gate-no-prompt");
+        let staged = staged_profile(&tmp, Some(GOOD_BLOCK), None);
+        let err = install_profile_staged(&staged, None, &tmp, false).expect_err("refused");
+        assert!(err.contains("cannot read"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_profile_whose_prompt_file_is_blank_is_refused() {
+        let tmp = tmpdir("gate-blank-prompt");
+        let staged = staged_profile(&tmp, Some(GOOD_BLOCK), Some("   \n\n"));
+        let err = install_profile_staged(&staged, None, &tmp, false).expect_err("refused");
+        assert!(err.contains("is empty"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_good_profile_lands_in_the_profiles_root() {
+        let tmp = tmpdir("gate-good");
+        let home = tmp.join("home");
+        let staged = staged_profile(&tmp, Some(GOOD_BLOCK), Some("You are HAL.\n"));
+        let installed = install_profile_staged(&staged, None, &home, false).expect("installs");
+        assert_eq!(installed.dest, crate::profiles::dir(&home).join("hal"));
+        assert!(installed.dest.join("prompt.md").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The gate runs before the copy: a refused profile leaves nothing behind for
+    /// the next `--profile` listing to find.
+    #[test]
+    fn a_refused_profile_is_not_partially_installed() {
+        let tmp = tmpdir("gate-atomic");
+        let home = tmp.join("home");
+        let staged = staged_profile(&tmp, None, Some("hi\n"));
+        let _ = install_profile_staged(&staged, None, &home, false);
+        assert!(!crate::profiles::dir(&home).join("hal").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_profile_usage_line_names_its_own_command() {
+        let out = render_install_profile("", Some(Path::new("/tmp/h")));
+        assert!(out.contains("usage: /install-profile"), "{out}");
     }
 }
