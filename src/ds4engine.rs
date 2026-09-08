@@ -209,23 +209,25 @@ impl Ds4Model {
             })
             .transpose()
         };
-        let c_mtp = c_opt_path(tuning.mtp_path.as_deref(), "mtp model")?;
+        let family = crate::gguf::family_of(path);
+        let (mtp_path, ple_path) = companion_slots(family, tuning.mtp_path.as_deref());
+        let c_mtp = c_opt_path(mtp_path, "mtp model")?;
+        let c_ple = c_opt_path(ple_path, "ple sidecar")?;
         let c_steering = c_opt_path(tuning.dir_steering_file.as_deref(), "dir-steering file")?;
         // Vision is always on: the encoder GGUF sits beside the main model at
         // `~/.plank/ds4flash.vision.gguf` and is downloaded at startup when
         // absent. A null path would keep the engine text-only, but plank never
         // passes one — the `view_image` tool is served unconditionally.
-        // ...except under `--ple`, which means a Qwen3.8-Flash-Next main model.
-        // The DS4 encoder is not a Qwen encoder, and handing it over fails the
-        // load outright, so a Qwen run is text-only until a Qwen encoder is
-        // wired up (the C branch ships a separate `qwen38-vision` target).
+        // ...except for a Qwen3.8-Flash-Next model. The DS4 encoder is not a
+        // Qwen encoder, and handing it over fails the load outright, so a Qwen
+        // run is text-only until a Qwen encoder is wired up (the C branch
+        // ships a separate `qwen38-vision` target).
         let vision_path = crate::download::default_vision_path();
-        let c_vision = if tuning.ple_path.is_some() {
+        let c_vision = if family == crate::gguf::ModelFamily::Qwen {
             None
         } else {
             c_opt_path(Some(&vision_path), "vision encoder")?
         };
-        let c_ple = c_opt_path(tuning.ple_path.as_deref(), "ple sidecar")?;
         let as_ptr = |c: &Option<CString>| c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let opts = ffi::Ds4EngineOptions {
             model_path: c_path.as_ptr(),
@@ -241,7 +243,7 @@ impl Ds4Model {
             // Ignored by the engine unless `_set` below is true, in which case
             // it picks its own backend-dependent default. Passing a placeholder
             // beats mirroring a number that upstream retunes.
-            dspark_confidence_threshold: tuning.dspark_confidence.unwrap_or(0.0),
+            dspark_confidence_threshold: tuning.mtp_confidence.unwrap_or(0.0),
             directional_steering_file: as_ptr(&c_steering),
             expert_profile_path: std::ptr::null(),
             directional_steering_attn: tuning.dir_steering_attn,
@@ -254,14 +256,25 @@ impl Ds4Model {
             simulate_used_memory_bytes: tuning.simulate_used_memory_bytes,
             warm_weights: tuning.warm_weights,
             quality: tuning.quality,
-            glm_mtp: false,
+            // One switch, two mechanisms. `--mtp` means "predict more than
+            // one token per step", and the engine option that does it differs
+            // by family: DeepSeek speculates from a separate DSpark draft
+            // checkpoint (`dspark`), Qwen3.8 from the MTP block inside its own
+            // main GGUF (`glm_mtp`, which `qwen4_graph_alloc` reads at open).
+            //
+            // Gating matters, it is not tidiness: `dspark` with no `mtp_path`
+            // is a hard error in the C ("--dspark requires --mtp-model FILE"),
+            // and a Qwen run has no `mtp_path` by construction — its companion
+            // went to `ple_path`. Leaving both ungated meant Qwen could not
+            // load at all with speculation at its default-on.
+            glm_mtp: tuning.mtp && family == crate::gguf::ModelFamily::Qwen,
             glm_mtp_timing: false,
-            dspark: tuning.dspark,
-            dspark_strict: tuning.dspark_strict,
+            dspark: tuning.mtp && family == crate::gguf::ModelFamily::Ds4,
+            dspark_strict: tuning.mtp_strict && family == crate::gguf::ModelFamily::Ds4,
             // Keep the C's default: greedily verified draft commits, not exact
             // stochastic p/q acceptance.
             dspark_exact_sampling: false,
-            dspark_confidence_threshold_set: tuning.dspark_confidence.is_some(),
+            dspark_confidence_threshold_set: tuning.mtp_confidence.is_some(),
             cuda_tensor_parallel: false,
             ssd_streaming: tuning.ssd_streaming,
             ssd_streaming_cold: tuning.ssd_streaming_cold,
@@ -303,7 +316,7 @@ impl Ds4Model {
         // it gets its own line: naming the DeepSeek path there would report a
         // failure to read a file plank deliberately never passed.
         if !unsafe { ffi::ds4_engine_has_vision(engine) } {
-            if tuning.ple_path.is_some() {
+            if family == crate::gguf::ModelFamily::Qwen {
                 eprintln!("note: Qwen3.8 runs text-only in plank; view_image will be refused");
             } else {
                 eprintln!(
@@ -1457,11 +1470,11 @@ impl Engine for Ds4Session {
         // sampled stream only when the whole generation is greedy anyway.
         // Same gate the C CLI uses: temperature at or below zero, and a
         // support model that proposes blocks rather than single tokens, plus
-        // plank's own `/dspark` switch — which is why temperature 0 with
+        // plank's own `/mtp` switch — which is why temperature 0 with
         // speculation off is a state this engine can be in and the C cannot.
         // `greedy()` flipping per token inside a DSML stanza is irrelevant
         // here — at this temperature both branches sample argmax.
-        let draft_block = if opts.dspark && opts.temperature <= 0.0 {
+        let draft_block = if opts.mtp && opts.temperature <= 0.0 {
             // SAFETY: engine valid for the life of the model.
             unsafe { ffi::ds4_engine_mtp_draft_tokens(self.model.engine) }
         } else {
@@ -2029,7 +2042,7 @@ impl Engine for Ds4Session {
     fn spec_capable(&self) -> bool {
         // The same reading the draft gate takes: a support model that proposes
         // blocks rather than single tokens. Asking the engine beats trusting
-        // the config — `--dspark` is on by default, and a run whose support
+        // the config — `--mtp` is on by default, and a run whose support
         // GGUF never loaded would otherwise claim speculation it cannot do.
         // SAFETY: engine pointer is valid for the life of the model.
         unsafe { ffi::ds4_engine_mtp_draft_tokens(self.model.engine) > 1 }
@@ -2509,6 +2522,51 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     ("DS4_METAL_QWEN4_SOURCE", "qwen4.metal"),
     ("DS4_METAL_QWEN4_VISION_SOURCE", "qwen4_vision.metal"),
 ];
+
+/// Which of the engine's two companion slots `--mtp-model` fills.
+///
+/// Decided by the family of the *main* model, read from its own GGUF metadata.
+/// The engine cannot be asked: it detects the family while opening, and both
+/// paths have to be in the options struct before that call — and a `ple_path`
+/// handed to a non-Qwen model is a hard error there, not a warning.
+fn companion_slots(
+    family: crate::gguf::ModelFamily,
+    companion: Option<&Path>,
+) -> (Option<&Path>, Option<&Path>) {
+    if let Some(c) = companion {
+        warn_on_companion_mismatch(family, c);
+    }
+    match family {
+        crate::gguf::ModelFamily::Qwen => (None, companion),
+        crate::gguf::ModelFamily::Ds4 => (companion, None),
+    }
+}
+
+/// Warns when the `--mtp-model` companion is not the kind this family wants.
+///
+/// The companion GGUFs name themselves: `deepseek4-dspark` for a `DSpark`
+/// draft checkpoint, `qwen4-exp-ple` for a Qwen n-gram sidecar. Passing the
+/// wrong one otherwise surfaces as the engine refusing a tensor it cannot
+/// find, several hundred lines from the flag that caused it.
+///
+/// A warning rather than an error: the check is a heuristic on a metadata
+/// string, and the engine's own validation is the authority. It must never be
+/// what stops a load the engine would have accepted.
+fn warn_on_companion_mismatch(family: crate::gguf::ModelFamily, companion: &Path) {
+    let Some(arch) = crate::gguf::architecture(companion) else {
+        return;
+    };
+    let expected = match family {
+        crate::gguf::ModelFamily::Qwen => "qwen4-exp-ple",
+        crate::gguf::ModelFamily::Ds4 => "deepseek4-dspark",
+    };
+    if arch != expected {
+        eprintln!(
+            "warning: --mtp {} reports architecture {arch:?}, but this model wants {expected:?}",
+            companion.display()
+        );
+    }
+}
 
 fn set_metal_source_env() {
     let dir = metal_source_dir();

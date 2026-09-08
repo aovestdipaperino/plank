@@ -375,7 +375,7 @@ pub fn ensure_dspark(path: &Path) -> Result<(), String> {
 /// Propagates [`ensure_dspark`] failures: declined prompt, no terminal to
 /// prompt on, or a failed download.
 pub fn ensure_dspark_support(engine: &mut crate::config::EngineTuning) -> Result<(), String> {
-    if !engine.dspark || engine.mtp_path.is_some() {
+    if !engine.mtp || engine.mtp_path.is_some() {
         return Ok(());
     }
     let path = default_dspark_path();
@@ -385,21 +385,24 @@ pub fn ensure_dspark_support(engine: &mut crate::config::EngineTuning) -> Result
 }
 
 /// Fetches the DS4 side artifacts (vision encoder, `DSpark` support) unless the
-/// run is a Qwen3.8-Flash-Next one.
+/// model is a Qwen3.8-Flash-Next one.
 ///
-/// `--ple` is the Qwen marker. Both side artifacts are `DeepSeek` V4 files: the
-/// engine is not handed the vision encoder for a Qwen model, and the `DSpark`
-/// support GGUF is a DS4 draft model that a Qwen target cannot verify against
-/// (Qwen speculates from the MTP block embedded in its own main GGUF). Fetching
-/// either would cost ~7 GB for files this run never opens, so `DSpark` is also
-/// switched off rather than left at its default-on.
+/// Both are `DeepSeek` V4 files, and a Qwen run opens neither: the engine is
+/// not handed the vision encoder, and Qwen speculates from the MTP block
+/// embedded in its own main GGUF rather than from a draft checkpoint. Fetching
+/// them would cost ~7 GB for files this run never reads.
+///
+/// Speculation is *not* switched off here. Under the unified `--mtp` it stays
+/// meaningful for Qwen — it just runs off the embedded block, which needs no
+/// download and no companion file.
 ///
 /// # Errors
 /// Propagates the underlying ensure failures for non-Qwen runs.
-pub fn ensure_side_artifacts(engine: &mut crate::config::EngineTuning) -> Result<(), String> {
-    if engine.ple_path.is_some() {
-        engine.dspark = false;
-        engine.dspark_strict = false;
+pub fn ensure_side_artifacts(
+    model_path: &Path,
+    engine: &mut crate::config::EngineTuning,
+) -> Result<(), String> {
+    if crate::gguf::family_of(model_path) == crate::gguf::ModelFamily::Qwen {
         return Ok(());
     }
     ensure_vision_encoder()?;
@@ -1714,11 +1717,11 @@ mod tests {
     }
 
     #[test]
-    fn support_resolution_is_skipped_unless_dspark_was_asked_for() {
+    fn support_resolution_is_skipped_unless_mtp_was_asked_for() {
         // --dspark-off: the resolver must not touch mtp_path, and so must never
         // reach the filesystem or a prompt.
         let mut e = crate::config::EngineTuning {
-            dspark: false,
+            mtp: false,
             ..crate::config::EngineTuning::default()
         };
         assert!(ensure_dspark_support(&mut e).is_ok());
@@ -1731,7 +1734,7 @@ mod tests {
         // must survive --dspark untouched rather than being replaced by the
         // DSpark default.
         let mut e = crate::config::EngineTuning {
-            dspark: true,
+            mtp: true,
             mtp_path: Some(PathBuf::from("/somewhere/custom-drafter.gguf")),
             ..crate::config::EngineTuning::default()
         };
@@ -1742,22 +1745,46 @@ mod tests {
         );
     }
 
-    /// A Qwen run must not reach for either `DeepSeek` side artifact, and must
-    /// leave `DSpark` off: the support GGUF is a DS4 draft a Qwen target cannot
-    /// verify against. No download is stubbed here on purpose — if the gate
-    /// regressed, the ensure calls would try to prompt or fetch and fail.
+    /// Writes a GGUF header declaring `arch`, which is all `gguf::family_of`
+    /// reads.
+    fn stub_model(name: &str, arch: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("plank-side-{}-{name}", std::process::id()));
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensors
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one kv pair
+        let key = "general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // STRING
+        bytes.extend_from_slice(&(arch.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(arch.as_bytes());
+        std::fs::write(&path, bytes).expect("write stub");
+        path
+    }
+
+    /// A Qwen model must not reach for either `DeepSeek` side artifact: it
+    /// opens neither the DS4 vision encoder nor a DS4 draft checkpoint. No
+    /// download is stubbed here on purpose — if the gate regressed, the ensure
+    /// calls would try to prompt or fetch and fail.
     #[test]
-    fn a_qwen_run_skips_the_ds4_side_artifacts_and_disables_dspark() {
+    fn a_qwen_model_skips_the_ds4_side_artifacts() {
+        let model = stub_model("qwen", "qwen4exp");
         let mut e = crate::config::EngineTuning {
-            ple_path: Some(PathBuf::from("ple.gguf")),
-            dspark: true,
-            dspark_strict: true,
+            mtp: true,
+            mtp_strict: true,
             ..Default::default()
         };
-        assert!(ensure_side_artifacts(&mut e).is_ok());
-        assert!(!e.dspark, "DSpark must be off for a Qwen target");
-        assert!(!e.dspark_strict);
-        assert!(e.mtp_path.is_none(), "no DS4 support model resolved");
+        assert!(ensure_side_artifacts(&model, &mut e).is_ok());
+        // Speculation stays on: under the unified `--mtp` a Qwen run
+        // speculates from the block embedded in its own main GGUF, which needs
+        // neither a download nor a companion file.
+        assert!(e.mtp, "speculation is still meaningful for Qwen");
+        assert!(
+            e.mtp_path.is_none(),
+            "no DeepSeek support model resolved for a Qwen run"
+        );
+        let _ = std::fs::remove_file(model);
     }
 
     #[test]

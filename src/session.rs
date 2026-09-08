@@ -562,19 +562,17 @@ fn cache_leaf() -> &'static str {
     CACHE_LEAF.get().map_or(DEFAULT_CACHE_LEAF, String::as_str)
 }
 
-/// Which cache leaf a run with this `--ple` setting belongs in.
+/// Which cache leaf a model of this family belongs in.
 ///
-/// `--ple` is the Qwen marker (only a Qwen3.8 model accepts a PLE sidecar), so
-/// it is also what separates the two models' caches. Kept here, beside the
-/// leaves themselves, rather than inline at each startup path: both the
-/// interactive and `serve` entry points have to agree, and a run that picked
-/// the wrong leaf would silently sweep the other model's checkpoints.
+/// Kept here, beside the leaves themselves, rather than inline at each startup
+/// path: both the interactive and `serve` entry points have to agree, and a run
+/// that picked the wrong leaf would silently sweep the other model's
+/// checkpoints.
 #[must_use]
-pub fn cache_leaf_for(ple_path: Option<&Path>) -> &'static str {
-    if ple_path.is_some() {
-        QWEN_CACHE_LEAF
-    } else {
-        DEFAULT_CACHE_LEAF
+pub fn cache_leaf_for(family: crate::gguf::ModelFamily) -> &'static str {
+    match family {
+        crate::gguf::ModelFamily::Qwen => QWEN_CACHE_LEAF,
+        crate::gguf::ModelFamily::Ds4 => DEFAULT_CACHE_LEAF,
     }
 }
 
@@ -3382,13 +3380,19 @@ hello\n";
     /// one. What changed is *why* a checkpoint dies — expiry rather than
     /// fingerprint inequality — so the clock is wound past the tier TTL to make
     /// the superseded ones collectable.
-    /// The whole point of the split: a Qwen run and a `DeepSeek` run must not
-    /// land in the same directory, or each launch's sweep would evict the
+    /// The whole point of the split: a Qwen model and a `DeepSeek` one must
+    /// not land in the same directory, or each launch's sweep would evict the
     /// other's checkpoints under one shared byte budget.
     #[test]
-    fn a_ple_run_gets_its_own_cache_leaf() {
-        assert_eq!(cache_leaf_for(None), DEFAULT_CACHE_LEAF);
-        assert_eq!(cache_leaf_for(Some(Path::new("ple.gguf"))), QWEN_CACHE_LEAF);
+    fn a_qwen_model_gets_its_own_cache_leaf() {
+        assert_eq!(
+            cache_leaf_for(crate::gguf::ModelFamily::Ds4),
+            DEFAULT_CACHE_LEAF
+        );
+        assert_eq!(
+            cache_leaf_for(crate::gguf::ModelFamily::Qwen),
+            QWEN_CACHE_LEAF
+        );
         assert_ne!(DEFAULT_CACHE_LEAF, QWEN_CACHE_LEAF);
     }
 

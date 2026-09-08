@@ -47,8 +47,15 @@ fn arm_panic_dump() {
 /// within a few lines. See [`plank::session::cache_leaf_for`] for why a Qwen
 /// run is kept out of the `DeepSeek` cache.
 fn select_cache_dir(cfg: &plank::config::AgentConfig) {
+    // Resolved the same way the engine will resolve it, so the leaf matches
+    // the model that actually loads. A path that does not exist yet — a first
+    // run, before the download — probes as `Ds4`, which is the right default.
+    let model = cfg
+        .model_path
+        .clone()
+        .unwrap_or_else(plank::download::default_model_path);
     plank::session::SessionStore::set_cache_leaf(plank::session::cache_leaf_for(
-        cfg.engine.ple_path.as_deref(),
+        plank::gguf::family_of(&model),
     ));
 }
 
@@ -520,12 +527,13 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         plank::download::ensure_model(&model)?;
         // Vision is always on: the encoder GGUF sits beside the main model and
         // is fetched on demand when missing, the same as the main model.
-        // DSpark is on by default; without `--mtp` it resolves to the default
-        // support model, fetched on demand (`--dspark-off` skips this). Kept
-        // local rather than written back into `cfg`: only the engine open
-        // needs it. Both are skipped for a Qwen run (`--ple`).
+        // Speculation is on by default; without `--mtp-model` a DeepSeek run
+        // resolves the default support GGUF and fetches it on demand
+        // (`--mtp-off` skips that). Kept local rather than written back into
+        // `cfg`: only the engine open needs it. A Qwen model skips both side
+        // artifacts, since it opens neither.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&mut tuning)?;
+        plank::download::ensure_side_artifacts(&model, &mut tuning)?;
 
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
@@ -763,7 +771,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         // is fetched on demand when missing, the same as the main model.
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&mut tuning)?;
+        plank::download::ensure_side_artifacts(&model_path, &mut tuning)?;
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,

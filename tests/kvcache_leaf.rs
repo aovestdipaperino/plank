@@ -7,7 +7,6 @@
 //! which is the only place the override can be exercised end to end.
 
 use plank::session::{QWEN_CACHE_LEAF, SessionStore, cache_leaf_for};
-use std::path::Path;
 
 #[test]
 fn setting_the_qwen_leaf_moves_the_default_cache_dir() {
@@ -18,7 +17,7 @@ fn setting_the_qwen_leaf_moves_the_default_cache_dir() {
         "an unset leaf must resolve to the DeepSeek default"
     );
 
-    SessionStore::set_cache_leaf(cache_leaf_for(Some(Path::new("ple.gguf"))));
+    SessionStore::set_cache_leaf(cache_leaf_for(plank::gguf::ModelFamily::Qwen));
 
     let after = SessionStore::default_dir();
     assert_eq!(

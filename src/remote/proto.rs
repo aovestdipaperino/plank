@@ -181,8 +181,11 @@ pub struct WireOptions {
     /// Defaulted to `true` — an older client that omits the field means the
     /// behavior from before `/dspark` existed, where the temperature gate
     /// alone decided whether the host speculated.
-    #[serde(default = "dspark_default")]
-    pub dspark: bool,
+    /// Kept spelled `dspark` on the wire even though plank now calls the
+    /// concept `mtp`: a remote peer may be any other plank build, and renaming
+    /// a serde field silently turns a peer's value into the default.
+    #[serde(default = "dspark_default", rename = "dspark")]
+    pub mtp: bool,
 }
 
 /// `serde` default for [`WireOptions::dspark`]: the pre-`/dspark` behavior.
@@ -201,7 +204,7 @@ impl From<&GenerationOptions> for WireOptions {
             seed: o.seed,
             think_mode: o.think_mode.into(),
             think_tool_recovery: o.think_tool_recovery,
-            dspark: o.dspark,
+            mtp: o.mtp,
         }
     }
 }
@@ -217,7 +220,7 @@ impl From<&WireOptions> for GenerationOptions {
             seed: o.seed,
             think_mode: o.think_mode.into(),
             think_tool_recovery: o.think_tool_recovery,
-            dspark: o.dspark,
+            mtp: o.mtp,
         }
     }
 }

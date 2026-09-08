@@ -218,35 +218,45 @@ pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineTuning {
-    /// Multi-token-prediction draft model from `--mtp`.
+    /// The model's companion GGUF, from `--mtp PATH`.
+    ///
+    /// One flag, two destinations, chosen by the family of the *main* model:
+    /// a `DeepSeek` run passes it as the engine's `mtp_path` (its `DSpark`
+    /// draft checkpoint), a Qwen run as `ple_path` (its required n-gram
+    /// sidecar). `Ds4Model::open` does the routing, because the engine cannot:
+    /// it detects the family while opening, and the path has to be in the
+    /// options struct before that.
     pub mtp_path: Option<PathBuf>,
-    /// Qwen3.8-Flash-Next external PLE n-gram sidecar from `--ple`. Required
-    /// by the Qwen Q4 release, rejected by the engine for any other model.
-    pub ple_path: Option<PathBuf>,
     /// Draft tokens per MTP step from `--mtp-draft` (C default: 1).
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
     pub mtp_margin: f32,
-    /// Use a `DSpark` draft model. On by default; `--dspark-off` turns it off.
+    /// Speculative decoding. On by default; `--mtp-off` turns it off.
     ///
-    /// The support GGUF comes from `--mtp` when given; otherwise it is
-    /// resolved to `~/.plank/ds4flash.dspark.gguf` at startup and downloaded
-    /// if absent (`download::ensure_dspark_support`).
+    /// One name, one meaning — "predict more than one token per step" — and a
+    /// different mechanism per family. A `DeepSeek` run speculates with its
+    /// `DSpark` draft checkpoint, taken from `--mtp` when given and otherwise
+    /// resolved to `~/.plank/ds4flash.dspark.gguf` and downloaded if absent. A
+    /// Qwen run speculates with the MTP block embedded in its own main GGUF,
+    /// so it needs no companion for this at all — its `--mtp` path is the PLE
+    /// sidecar, which is required whether speculation is on or off.
     ///
-    /// `DSpark` is `DeepSeek`'s auxiliary draft checkpoint for V4 Flash; it
-    /// replaces the legacy one-stage MTP path. `--dspark-confidence` and
-    /// `--dspark-strict` also imply it, mirroring the C CLI.
-    pub dspark: bool,
-    /// Load `DSpark` support but keep target-only decode, from `--dspark-strict`.
-    pub dspark_strict: bool,
-    /// Confidence-pruning threshold from `--dspark-confidence F`, `0..=1`.
+    /// That asymmetry is why the flag governs speculation rather than the
+    /// companion file: `--mtp-off` has to stay harmless, and for Qwen
+    /// "no sidecar" means the model cannot load.
+    ///
+    /// `--mtp-confidence` and `--mtp-strict` also imply it, mirroring the C.
+    pub mtp: bool,
+    /// Load draft support but keep target-only decode, from `--mtp-strict`.
+    pub mtp_strict: bool,
+    /// Confidence-pruning threshold from `--mtp-confidence F`, `0..=1`.
     ///
     /// `None` leaves the engine's own default in force, which is
     /// backend-dependent (Metal 0.6, CUDA/ROCm 0.7) and has changed with
     /// tuning — so plank does not keep a copy of the number to go stale.
     /// The engine is told explicitly whether the flag was set, because `0`
     /// means "fixed five-token blocks", not "unset".
-    pub dspark_confidence: Option<f32>,
+    pub mtp_confidence: Option<f32>,
     /// Prefill chunk size in tokens, fixed at [`DEFAULT_PREFILL_CHUNK`]. Chunked
     /// so Ctrl-C is observed at chunk boundaries instead of only after the whole
     /// prompt is prefilled. Not user-configurable (no CLI flag), and it must
@@ -281,12 +291,11 @@ impl Default for EngineTuning {
     fn default() -> Self {
         Self {
             mtp_path: None,
-            ple_path: None,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
-            dspark: true,
-            dspark_strict: false,
-            dspark_confidence: None,
+            mtp: true,
+            mtp_strict: false,
+            mtp_confidence: None,
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
             quality: false,
             warm_weights: false,
@@ -445,19 +454,22 @@ Options:
       --cuda               use the CUDA backend
       --cpu                use the CPU backend
       --power N            GPU power cap percent (1..100)
-      --mtp PATH           multi-token-prediction draft model (GGUF)
-      --ple PATH           Qwen3.8-Flash-Next external PLE n-gram sidecar (GGUF);
-                           required by the Qwen release, and a Qwen run is
-                           text-only (the DS4 vision encoder is not loaded)
+      --mtp                multi-token prediction, i.e. speculative decoding
+                           (on by default; defaults --temp to 0 unless --temp
+                           is given). DeepSeek speculates with its DSpark draft
+                           model, downloaded to ~/.plank/ds4flash.dspark.gguf
+                           unless --mtp-model names one; Qwen3.8 speculates with
+                           the MTP block inside its own main GGUF
+      --mtp-off            disable speculative decoding (target-only decode)
+      --mtp-model PATH     this model's companion GGUF: the DSpark draft model
+                           for DeepSeek, the required PLE n-gram sidecar for
+                           Qwen3.8 (a Qwen run is text-only, so the DS4 vision
+                           encoder is not loaded)
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
-      --dspark             DSpark speculative decoding (on by default); downloads
-                           the support model to ~/.plank/ds4flash.dspark.gguf unless
-                           --mtp names one (defaults --temp to 0 unless --temp is given)
-      --dspark-off         disable DSpark speculative decoding (target-only decode)
-      --dspark-confidence F  DSpark confidence pruning threshold 0..1
+      --mtp-confidence F   confidence pruning threshold 0..1
                            (engine default: Metal 0.6, CUDA/ROCm 0.7; 0 = fixed blocks)
-      --dspark-strict      load DSpark support but keep target-only decode
+      --mtp-strict         load draft support but keep target-only decode
       --quality            enable quality mode
       --warm-weights       touch all weights at load
       --ssd-streaming      stream experts from SSD instead of loading resident
@@ -896,14 +908,14 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "set the GPU power cap percentage",
     },
     SlashCommand {
-        name: "/dspark",
+        name: "/mtp",
         args: "[on|off]",
-        desc: "turn speculative decoding on or off",
+        desc: "turn speculative decoding (multi-token prediction) on or off",
     },
     SlashCommand {
         name: "/temp",
         args: "[0..100]",
-        desc: "set the sampling temperature (not while dspark is on)",
+        desc: "set the sampling temperature (not while mtp is on)",
     },
     SlashCommand {
         name: "/loopguard",
@@ -1075,7 +1087,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/remember")
         || slash_command_with_args(cmd, "/repro")
         || slash_command_with_args(cmd, "/debug")
-        || slash_command_with_args(cmd, "/dspark")
+        || slash_command_with_args(cmd, "/mtp")
         || slash_command_with_args(cmd, "/temp")
         || slash_command_with_args(cmd, "/loopguard")
         || slash_command_with_args(cmd, "/lg")
@@ -1147,15 +1159,14 @@ fn parse_engine_option(
     steering_scale_set: &mut bool,
 ) -> Result<(), String> {
     match arg {
-        "--mtp" => e.mtp_path = Some(PathBuf::from(v)),
-        "--ple" => e.ple_path = Some(PathBuf::from(v)),
+        "--mtp-model" => e.mtp_path = Some(PathBuf::from(v)),
         "--mtp-draft" => e.mtp_draft_tokens = parse_int(v, arg)?,
         "--mtp-margin" => e.mtp_margin = parse_float_range(v, arg, 0.0, 1000.0)?,
         // The C turns DSpark on for any of its three flags, so the threshold
         // flag alone is enough to select the DSpark runtime.
-        "--dspark-confidence" => {
-            e.dspark = true;
-            e.dspark_confidence = Some(parse_float_range(v, arg, 0.0, 1.0)?);
+        "--mtp-confidence" => {
+            e.mtp = true;
+            e.mtp_confidence = Some(parse_float_range(v, arg, 0.0, 1.0)?);
         }
         "--ssd-streaming-cache-experts" => {
             let (experts, bytes) = parse_streaming_cache_experts_arg(v)
@@ -1395,17 +1406,16 @@ pub fn parse_options_with(
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
             "--ssd-streaming-cold" => c.engine.ssd_streaming_cold = true,
-            "--dspark" => c.engine.dspark = true,
-            "--dspark-off" => c.engine.dspark = false,
-            "--dspark-strict" => {
-                c.engine.dspark = true;
-                c.engine.dspark_strict = true;
+            "--mtp" => c.engine.mtp = true,
+            "--mtp-off" => c.engine.mtp = false,
+            "--mtp-strict" => {
+                c.engine.mtp = true;
+                c.engine.mtp_strict = true;
             }
-            "--mtp"
-            | "--ple"
+            "--mtp-model"
             | "--mtp-draft"
             | "--mtp-margin"
-            | "--dspark-confidence"
+            | "--mtp-confidence"
             | "--ssd-streaming-cache-experts"
             | "--ssd-streaming-preload-experts"
             | "--simulate-used-memory"
@@ -1427,7 +1437,7 @@ pub fn parse_options_with(
     Ok(c)
 }
 
-/// Post-parse fixups: the steering-scale default, the `--dspark` temperature
+/// Post-parse fixups: the steering-scale default, the `--mtp` temperature
 /// default, and `--remote` validation.
 fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Result<(), String> {
     if c.engine.dir_steering_file.is_some() && !steering_scale_set {
@@ -1436,14 +1446,14 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
     // Speculative decoding only engages at temperature 0 (see `ds4engine`'s
     // draft gate), so DSpark defaults the temperature to 0. Done here rather
     // than at the flag because `--temp` may follow it; an explicit `--temp` in
-    // either order still wins. `--dspark-off` leaves the 0.6 default in force.
-    if c.engine.dspark && !temp_set {
+    // either order still wins. `--mtp-off` leaves the 0.6 default in force.
+    if c.engine.mtp && !temp_set {
         c.generation.temperature = 0.0;
     }
-    // The runtime switch `/dspark` flips starts where the flag left it, so a
-    // run started with `--dspark-off` shows the thermometer from the first
+    // The runtime switch `/mtp` flips starts where the flag left it, so a
+    // run started with `--mtp-off` shows the thermometer from the first
     // frame rather than claiming speculation it was told not to do.
-    c.generation.dspark = c.engine.dspark;
+    c.generation.mtp = c.engine.mtp;
     // The same context floor `/think max` enforces, applied to `--think-max`.
     // Checked here rather than at the flag because `--ctx` may follow it.
     if c.generation.think_mode == ThinkMode::Max
@@ -2051,76 +2061,76 @@ mod tests {
     }
 
     #[test]
-    fn dspark_flags_select_the_runtime() {
-        let c = parse_options(&args(&["--dspark"])).unwrap();
-        assert!(c.engine.dspark);
-        assert!(!c.engine.dspark_strict);
+    fn mtp_flags_select_the_runtime() {
+        let c = parse_options(&args(&["--mtp"])).unwrap();
+        assert!(c.engine.mtp);
+        assert!(!c.engine.mtp_strict);
         // Left unset, so the engine keeps its own default rather than 0.
-        assert_eq!(c.engine.dspark_confidence, None);
+        assert_eq!(c.engine.mtp_confidence, None);
 
-        // Either of the other two flags implies --dspark, like the C CLI.
-        let c = parse_options(&args(&["--dspark-strict"])).unwrap();
-        assert!(c.engine.dspark);
-        assert!(c.engine.dspark_strict);
+        // Either of the other two flags implies --mtp, like the C CLI.
+        let c = parse_options(&args(&["--mtp-strict"])).unwrap();
+        assert!(c.engine.mtp);
+        assert!(c.engine.mtp_strict);
 
-        let c = parse_options(&args(&["--dspark-confidence", "0.35"])).unwrap();
-        assert!(c.engine.dspark);
-        assert!((c.engine.dspark_confidence.unwrap() - 0.35).abs() < 1e-6);
+        let c = parse_options(&args(&["--mtp-confidence", "0.35"])).unwrap();
+        assert!(c.engine.mtp);
+        assert!((c.engine.mtp_confidence.unwrap() - 0.35).abs() < 1e-6);
     }
 
     #[test]
-    fn dspark_confidence_zero_is_set_not_absent() {
+    fn mtp_confidence_zero_is_set_not_absent() {
         // 0 means "fixed draft length", which is why the C carries a separate
         // `_set` bool; it must not be confused with the flag being omitted.
-        let c = parse_options(&args(&["--dspark-confidence", "0"])).unwrap();
-        assert_eq!(c.engine.dspark_confidence, Some(0.0));
+        let c = parse_options(&args(&["--mtp-confidence", "0"])).unwrap();
+        assert_eq!(c.engine.mtp_confidence, Some(0.0));
     }
 
     #[test]
-    fn dspark_confidence_is_bounded_to_a_probability() {
-        let err = parse_options(&args(&["--dspark-confidence", "1.5"])).unwrap_err();
-        assert!(err.contains("--dspark-confidence"));
+    fn mtp_confidence_is_bounded_to_a_probability() {
+        let err = parse_options(&args(&["--mtp-confidence", "1.5"])).unwrap_err();
+        assert!(err.contains("--mtp-confidence"));
     }
 
     #[test]
-    fn dspark_defaults_the_temperature_to_zero() {
+    fn mtp_defaults_the_temperature_to_zero() {
         // DSpark is on by default, so a bare run samples argmax.
         let c = parse_options(&args(&[])).unwrap();
         assert!((c.generation.temperature - 0.0).abs() < 1e-6);
 
         // The implying flags carry the same default.
-        let c = parse_options(&args(&["--dspark-strict"])).unwrap();
+        let c = parse_options(&args(&["--mtp-strict"])).unwrap();
         assert!((c.generation.temperature - 0.0).abs() < 1e-6);
-        let c = parse_options(&args(&["--dspark-confidence", "0.3"])).unwrap();
+        let c = parse_options(&args(&["--mtp-confidence", "0.3"])).unwrap();
         assert!((c.generation.temperature - 0.0).abs() < 1e-6);
     }
 
     #[test]
-    fn dspark_off_keeps_the_sampling_default() {
-        // --dspark-off turns speculation off, so the 0.6 temperature default
+    fn mtp_off_keeps_the_sampling_default() {
+        // --mtp-off turns speculation off, so the 0.6 temperature default
         // stays in force rather than being forced to 0.
-        let c = parse_options(&args(&["--dspark-off"])).unwrap();
-        assert!(!c.engine.dspark);
+        let c = parse_options(&args(&["--mtp-off"])).unwrap();
+        assert!(!c.engine.mtp);
         assert!((c.generation.temperature - 0.6).abs() < 1e-6);
     }
 
     #[test]
-    fn an_explicit_temp_beats_the_dspark_default_in_either_order() {
-        let c = parse_options(&args(&["--dspark", "--temp", "0.9"])).unwrap();
+    fn an_explicit_temp_beats_the_mtp_default_in_either_order() {
+        let c = parse_options(&args(&["--mtp", "--temp", "0.9"])).unwrap();
         assert!((c.generation.temperature - 0.9).abs() < 1e-6);
-        let c = parse_options(&args(&["--temp", "0.9", "--dspark"])).unwrap();
+        let c = parse_options(&args(&["--temp", "0.9", "--mtp"])).unwrap();
         assert!((c.generation.temperature - 0.9).abs() < 1e-6);
-        // --dspark-off with an explicit --temp also keeps the explicit value.
-        let c = parse_options(&args(&["--dspark-off", "--temp", "0.9"])).unwrap();
+        // --mtp-off with an explicit --temp also keeps the explicit value.
+        let c = parse_options(&args(&["--mtp-off", "--temp", "0.9"])).unwrap();
         assert!((c.generation.temperature - 0.9).abs() < 1e-6);
     }
 
     #[test]
-    fn dspark_is_on_by_default() {
+    fn mtp_is_on_by_default() {
         let c = parse_options(&args(&[])).unwrap();
-        assert!(c.engine.dspark);
-        assert!(!c.engine.dspark_strict);
-        assert_eq!(c.engine.dspark_confidence, None);
+        assert!(c.engine.mtp);
+        assert!(!c.engine.mtp_strict);
+        assert_eq!(c.engine.mtp_confidence, None);
     }
 
     #[test]
@@ -2132,7 +2142,7 @@ mod tests {
     #[test]
     fn engine_tuning_flags() {
         let c = parse_options(&args(&[
-            "--mtp",
+            "--mtp-model",
             "draft.gguf",
             "--mtp-draft",
             "2",
@@ -2160,19 +2170,32 @@ mod tests {
         assert_eq!(c.engine.simulate_used_memory_bytes, 64 << 30);
     }
 
-    /// `--ple` selects the Qwen3.8 sidecar and nothing else; it is only the
-    /// Qwen marker, so it must not disturb the DS4 knobs around it.
+    /// One companion flag for both families. Which engine slot it lands in is
+    /// decided at open time from the model's own architecture, not here — this
+    /// only pins that the flag carries a path and disturbs nothing else.
     #[test]
-    fn ple_flag_sets_the_qwen_sidecar_path() {
-        let c = parse_options(&args(&["--ple", "ple.gguf"])).unwrap();
-        assert_eq!(c.engine.ple_path, Some(PathBuf::from("ple.gguf")));
-        assert!(c.engine.mtp_path.is_none());
+    fn mtp_model_flag_sets_the_companion_path() {
+        let c = parse_options(&args(&["--mtp-model", "ple.gguf"])).unwrap();
+        assert_eq!(c.engine.mtp_path, Some(PathBuf::from("ple.gguf")));
         assert!(c.model_path.is_none());
+        assert!(c.engine.mtp, "speculation is still on by default");
+    }
+
+    /// Bare `--mtp` is the speculation toggle, not the path — the same split
+    /// the C makes between `--mtp` and `--mtp-model`. If these ever merged
+    /// again, `--mtp x.gguf` would silently parse the path as a prompt.
+    #[test]
+    fn bare_mtp_toggles_speculation_without_taking_a_path() {
+        let c = parse_options(&args(&["--mtp"])).unwrap();
+        assert!(c.engine.mtp);
+        assert!(c.engine.mtp_path.is_none());
+        let off = parse_options(&args(&["--mtp-off"])).unwrap();
+        assert!(!off.engine.mtp);
     }
 
     #[test]
-    fn ple_defaults_to_unset() {
-        assert!(parse_options(&[]).unwrap().engine.ple_path.is_none());
+    fn the_companion_path_defaults_to_unset() {
+        assert!(parse_options(&[]).unwrap().engine.mtp_path.is_none());
     }
 
     #[test]
@@ -2368,7 +2391,7 @@ mod tests {
         assert!(!slash_command_known("/kvcaches"));
         assert!(slash_command_known("/history 10"));
         assert!(slash_command_known("/repro"));
-        assert!(slash_command_known("/dspark off"));
+        assert!(slash_command_known("/mtp off"));
         assert!(slash_command_known("/temp 0.6"));
         assert!(slash_command_known("/loopguard"));
         assert!(slash_command_known("/lg on"));

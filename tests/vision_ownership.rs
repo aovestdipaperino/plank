@@ -51,7 +51,7 @@ fn two_turns_over_an_image_message_do_not_double_free_the_embedding() {
     // DSpark is on by default and needs its support GGUF wired up; this test
     // is about ownership, not decode speed, so keep the plain target path.
     let tuning = plank::config::EngineTuning {
-        dspark: false,
+        mtp: false,
         ..plank::config::EngineTuning::default()
     };
     let mut session = plank::ds4engine::Ds4Session::open(
@@ -160,7 +160,7 @@ fn a_view_image_tool_result_grounds_its_image() {
     write_test_png(&png);
 
     let tuning = plank::config::EngineTuning {
-        dspark: false,
+        mtp: false,
         ..plank::config::EngineTuning::default()
     };
     let mut session = plank::ds4engine::Ds4Session::open(

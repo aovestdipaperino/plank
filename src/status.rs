@@ -265,8 +265,8 @@ pub struct Status {
     pub think: crate::engine::ThinkMode,
     /// Error text for the `Error` state.
     pub error: String,
-    /// Speculative-decoding counters (`--dspark`). Only the counters are
-    /// conditional now: with [`dspark`](Self::dspark) on the segment is drawn
+    /// Speculative-decoding counters (`--mtp`). Only the counters are
+    /// conditional now: with [`mtp`](Self::mtp) on the segment is drawn
     /// whether or not a pass has speculated yet.
     pub spec: crate::engine::SpecStats,
 }
@@ -277,10 +277,10 @@ pub struct Status {
 /// Deliberately not `⚡`: the power suffix already owns that glyph (`local
 /// ⚡100%`), and two different meanings for one mark in a single footer is
 /// exactly the sort of thing nobody notices until they misread it.
-const SPEC_MARK: &str = "✨";
+const MTP_MARK: &str = "✨";
 
-/// Marks the footer's temperature reading, shown in [`SPEC_MARK`]'s place
-/// while `/dspark` is off — the two are mutually exclusive by construction,
+/// Marks the footer's temperature reading, shown in [`MTP_MARK`]'s place
+/// while `/mtp` is off — the two are mutually exclusive by construction,
 /// since speculation only runs at temperature 0.
 ///
 /// The bare codepoint, deliberately without the U+FE0F variation selector:
@@ -527,21 +527,21 @@ fn elide_cells_styled(cells: &[Cell], keep: usize, color: bool) -> String {
 /// the same reason: [`build_status_text`] is a pure function called from a
 /// dozen snapshot sites, and every one of them would have to learn to copy two
 /// more fields forward or the marker would blink out on whichever frame forgot.
-/// `/dspark` and `/temp` publish here; the bar only reads.
+/// `/mtp` and `/temp` publish here; the bar only reads.
 static DSPARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// The sampling temperature, as `f32` bits — `AtomicF32` does not exist.
 static TEMPERATURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f19_999a); // 0.6
 
 /// Records whether speculative decoding is on, from startup config or
-/// `/dspark`.
-pub fn set_dspark(on: bool) {
+/// `/mtp`.
+pub fn set_mtp(on: bool) {
     DSPARK.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether the footer should claim speculative decoding.
 #[must_use]
-pub fn dspark() -> bool {
+pub fn mtp() -> bool {
     DSPARK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -550,7 +550,7 @@ pub fn set_temperature(temp: f32) {
     TEMPERATURE.store(temp.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The sampling temperature the footer shows while `/dspark` is off.
+/// The sampling temperature the footer shows while `/mtp` is off.
 #[must_use]
 pub fn temperature() -> f32 {
     f32::from_bits(TEMPERATURE.load(std::sync::atomic::Ordering::Relaxed))
@@ -1765,7 +1765,7 @@ fn build_status_text_with_cells(
         format!("{} | {origin}", theme(&cwd))
     };
     let ctx = format!("{think}{ctx}");
-    // The dspark segment sits with the ctx gauge rather than in the state word:
+    // The MTP segment sits with the ctx gauge rather than in the state word:
     // it describes the whole turn, and keeping it left of the state keeps the
     // power suffix anchored on the right.
     let ctx = match spec_segment(st) {
@@ -1777,7 +1777,7 @@ fn build_status_text_with_cells(
         None => ctx,
     };
     // The download segment rides with the ctx gauge for the same reason the
-    // dspark segment does: it describes the whole session rather than this
+    // MTP segment does: it describes the whole session rather than this
     // turn, and keeping it left of the state word keeps the power suffix
     // anchored on the right.
     let ctx = splice_download_segment(ctx, download_segment().as_deref(), theme);
@@ -1812,7 +1812,7 @@ fn build_status_text_with_cells(
     format!("{dir}{body}")
 }
 
-/// The `--dspark` segment: mean tokens committed per speculative step, then the
+/// The `--mtp` segment: mean tokens committed per speculative step, then the
 /// share of the offered draft capacity that survived verification.
 ///
 /// `None` when the pass never speculated, so a plain run's footer is unchanged.
@@ -1822,19 +1822,19 @@ fn build_status_text_with_cells(
 /// [`SpecStats::tokens_per_step`](crate::engine::SpecStats::tokens_per_step).
 #[must_use]
 pub fn spec_segment(st: &Status) -> Option<String> {
-    if !dspark() {
+    if !mtp() {
         // Speculation off: the temperature is back in play, so show it. It is
-        // the same slot because the two states are exclusive — under dspark
+        // the same slot because the two states are exclusive — under MTP
         // the temperature is pinned at 0 and says nothing.
         return Some(format!("{TEMP_MARK} {:.2}", temperature()));
     }
     if !st.spec.active() {
         // On, but nothing to count yet (idle, or a pass that has not reached
-        // its first block): the mark alone still answers "is dspark on?".
-        return Some(SPEC_MARK.to_owned());
+        // its first block): the mark alone still answers "is MTP on?".
+        return Some(MTP_MARK.to_owned());
     }
     Some(format!(
-        "{SPEC_MARK} {:.1}t/step {:.0}%",
+        "{MTP_MARK} {:.1}t/step {:.0}%",
         st.spec.tokens_per_step(),
         100.0 * st.spec.block_fill()
     ))
@@ -2202,7 +2202,7 @@ mod tests {
         assert_eq!(format_ctx_size(1_048_576), "1.0M");
     }
 
-    /// Puts the footer's two process-global slots — the dspark switch and the
+    /// Puts the footer's two process-global slots — the MTP switch and the
     /// temperature — in a known state, and silences the loop guards through
     /// the thread-local test settings, so a test can assert an exact line.
     ///
@@ -2210,7 +2210,7 @@ mod tests {
     /// sets them has to hold the same lock the power-cap tests do.
     fn quiet_footer() -> std::sync::MutexGuard<'static, ()> {
         let guard = origin_test_guard();
-        set_dspark(false);
+        set_mtp(false);
         set_temperature(0.0);
         let mut settings = crate::settings::Settings::default();
         settings.tools.loop_guards = false;
@@ -2234,7 +2234,7 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_shows_the_temperature_while_dspark_is_off() {
+    fn the_footer_shows_the_temperature_while_mtp_is_off() {
         let _lock = quiet_footer();
         set_temperature(0.6);
         let st = Status {
@@ -2245,7 +2245,7 @@ mod tests {
         let line = build_status_text(&st, false, true);
         assert!(line.contains(&format!("{TEMP_MARK} 0.60")), "{line}");
         // The two states of one slot: never both at once.
-        assert!(!line.contains(SPEC_MARK), "{line}");
+        assert!(!line.contains(MTP_MARK), "{line}");
     }
 
     #[test]
@@ -2266,9 +2266,9 @@ mod tests {
     }
 
     #[test]
-    fn dspark_shows_its_mark_before_a_pass_has_speculated() {
+    fn mtp_shows_its_mark_before_a_pass_has_speculated() {
         let _lock = quiet_footer();
-        set_dspark(true);
+        set_mtp(true);
         let plain = Status {
             ctx_used: 1000,
             ctx_size: 8000,
@@ -2278,7 +2278,7 @@ mod tests {
         // question the slot exists to answer.
         let line = build_status_text(&plain, false, true);
         assert!(
-            line.ends_with(&format!("ctx 12% | {SPEC_MARK} | idle")),
+            line.ends_with(&format!("ctx 12% | {MTP_MARK} | idle")),
             "{line}"
         );
         assert!(!line.contains(TEMP_MARK), "{line}");
@@ -2294,17 +2294,17 @@ mod tests {
         };
         let line = build_status_text(&spark, false, true);
         assert!(
-            line.ends_with(&format!("ctx 12% | {SPEC_MARK} 3.0t/step 50% | idle")),
+            line.ends_with(&format!("ctx 12% | {MTP_MARK} 3.0t/step 50% | idle")),
             "{line}"
         );
     }
 
     #[test]
-    fn dspark_segment_survives_into_the_idle_footer() {
+    fn mtp_segment_survives_into_the_idle_footer() {
         // The figures are only readable after the answer lands, so an idle
         // footer carrying them is the point of the feature, not an artefact.
         let _lock = quiet_footer();
-        set_dspark(true);
+        set_mtp(true);
         let st = Status {
             state: WorkerState::Idle,
             ctx_used: 10,
@@ -2319,10 +2319,7 @@ mod tests {
         let line = build_status_text(&st, false, true);
         // Every draft rejected: 1.0 per step and 0%, still shown — "speculation is on
         // and buying nothing" is exactly what a user needs to see.
-        assert!(
-            line.contains(&format!("{SPEC_MARK} 1.0t/step 0%")),
-            "{line}"
-        );
+        assert!(line.contains(&format!("{MTP_MARK} 1.0t/step 0%")), "{line}");
     }
 
     #[test]
