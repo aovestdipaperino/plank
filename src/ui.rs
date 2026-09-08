@@ -948,6 +948,53 @@ fn close_open_think(text: &mut String, ended_in_think: bool) {
     }
 }
 
+/// Replaces the reasoning of a guard-stopped pass in the transcript.
+///
+/// The rungs above stop the pass and feed an error back, and
+/// `repro-loop-1788862078`/`-1788862135` show why that is not enough on its
+/// own: the pass after [`REPEAT_LOOP_ERROR`] reproduced the poisoned reasoning
+/// *byte for byte*, truncating at the same point. At temperature 0 the next
+/// pass is a pure function of a prompt whose tail *is* the degenerate cycle,
+/// and no appended instruction outranks 8 KiB of "Let me look at the docs.
+/// Let me also look at the docs." So the transcript, not the wording, is what
+/// has to change: the looping reasoning is removed and the model is told, in
+/// the place the reasoning used to be, not to rebuild it.
+///
+/// Only the reasoning goes. Anything the pass emitted *after* leaving
+/// `<think>` is visible output the user has already been shown, and is kept.
+const STOPPED_REASONING_STUB: &str =
+    "[Previous reasoning was cut short for looping and has been removed. Do not reconstruct it.]";
+
+/// Rewrites `text` so its final `<think>` block holds only
+/// [`STOPPED_REASONING_STUB`], keeping everything before the block and after
+/// its close tag. A pass with no `</think>` at all is left alone: there is no
+/// reasoning to excise and nothing to gain from guessing where it ended.
+///
+/// The opening tag is absent in the ordinary case, the model's reply beginning
+/// inside `<think>` from the prefix the template supplies, so an implicit open
+/// at byte 0 is a normal shape rather than a malformed one and the stub
+/// reproduces it (stub, then `</think>`) rather than inventing a tag the
+/// transcript never had.
+fn stub_stopped_reasoning(text: &mut String) {
+    const CLOSE: &str = "</think>";
+    let Some(close) = text.rfind(CLOSE) else {
+        return;
+    };
+    // A think block re-entered after visible output carries a real open tag;
+    // the first block of a reply does not. Cutting from the last open tag
+    // before the close keeps that visible output out of the excision.
+    let (cut, open_tag) = match text[..close].rfind("<think>") {
+        Some(i) => (i, "<think>"),
+        None => (0, ""),
+    };
+    let rebuilt = format!(
+        "{}{open_tag}{STOPPED_REASONING_STUB}{CLOSE}{}",
+        &text[..cut],
+        &text[close + CLOSE.len()..]
+    );
+    *text = rebuilt;
+}
+
 /// Builds the mid-stream edit preflight hook for a [`StreamRenderer`]: it
 /// validates an `edit` call's `old` selector against the file on disk the
 /// moment that parameter closes (the C's `agent_stream_preflight_closed_param`).
@@ -3837,6 +3884,8 @@ impl Agent<'_> {
                 if let Some(line) = self.loop_repro_line() {
                     println!("{}", self.debug_line(&line));
                 }
+                // Dump first, then take the cycle out of the model's copy.
+                self.stub_last_reasoning();
             } else {
                 repeat_trips = 0;
             }
@@ -4483,6 +4532,42 @@ impl Agent<'_> {
                 engine.count_tokens(s)
             });
         cleared
+    }
+
+    /// Excises the looping reasoning from the assistant message a reasoning
+    /// guard has just stopped ([`stub_stopped_reasoning`]), so the pass that
+    /// follows is not asked to continue the cycle it was stopped for.
+    ///
+    /// Call order matters: the repro dump runs first and reads the session, so
+    /// the dump keeps the reasoning verbatim and only the model's copy loses
+    /// it. Diagnosis is why the text was retained in the first place.
+    ///
+    /// Cheap by construction, unlike the mid-transcript rewrite
+    /// [`Agent::try_microcompact_opportunistic`] has to pay a rung restore
+    /// for: this message is the transcript's *last*, so every earlier section
+    /// is untouched, `ds4_session_common_prefix` reuses the whole prefix, and
+    /// the next pass prefills the stub plus the guard's tool result and
+    /// nothing else. For the same reason no rung is invalidated — every rung
+    /// sits at a shallower depth and still describes an intact prefix — so
+    /// neither [`Agent::discard_ladder`] nor
+    /// [`Agent::truncate_ladder_to`] is called here.
+    fn stub_last_reasoning(&mut self) {
+        let Some(last) = self.session.transcript.last_mut() else {
+            return;
+        };
+        if last.role != crate::session::Role::Assistant {
+            return;
+        }
+        let before = last.text.len();
+        stub_stopped_reasoning(&mut last.text);
+        let after = last.text.len();
+        if after == before {
+            return;
+        }
+        self.payload_dirty = true;
+        crate::engine::kv_debug(|| {
+            format!("guard: stubbed {before}B of stopped reasoning down to {after}B")
+        });
     }
 
     /// The durable goal *only while it is being worked*. Model-facing
@@ -12111,6 +12196,8 @@ impl Agent<'_> {
                 if let Some(line) = self.loop_repro_line() {
                     let _ = tx.send(UiEvent::Dim(line));
                 }
+                // Dump first, then take the cycle out of the model's copy.
+                self.stub_last_reasoning();
             } else {
                 repeat_trips = 0;
             }
@@ -23045,6 +23132,72 @@ mod tests {
         assert!(is_reasoning_stop(Some(THINK_BUDGET_ERROR)));
         assert!(!is_reasoning_stop(Some("edit failed: no match")));
         assert!(!is_reasoning_stop(None));
+    }
+
+    #[test]
+    fn stubbing_replaces_the_reasoning_and_keeps_the_visible_tail() {
+        // The ordinary shape: the reply begins inside `<think>` with no open
+        // tag, and `close_open_think` has appended the close.
+        let mut implicit = format!("{}</think>", looping_reasoning());
+        stub_stopped_reasoning(&mut implicit);
+        assert_eq!(implicit, format!("{STOPPED_REASONING_STUB}</think>"));
+
+        // Visible output after the close is the user's answer already on
+        // screen: it stays, and stays outside the think block.
+        let mut with_tail = "circling</think>Here is the answer.".to_string();
+        stub_stopped_reasoning(&mut with_tail);
+        assert_eq!(
+            with_tail,
+            format!("{STOPPED_REASONING_STUB}</think>Here is the answer.")
+        );
+
+        // A block re-entered after visible output carries a real open tag,
+        // and the visible run before it must survive the excision.
+        let mut reentered = "first</think>Visible.<think>circling again</think>".to_string();
+        stub_stopped_reasoning(&mut reentered);
+        assert_eq!(
+            reentered,
+            format!("first</think>Visible.<think>{STOPPED_REASONING_STUB}</think>")
+        );
+
+        // No close tag: nothing is known about where reasoning ended, so
+        // nothing is touched.
+        let mut no_think = "plain answer".to_string();
+        stub_stopped_reasoning(&mut no_think);
+        assert_eq!(no_think, "plain answer");
+    }
+
+    #[test]
+    fn the_pass_after_a_reasoning_stop_is_not_shown_the_loop() {
+        // `repro-loop-1788862078` / `-1788862135`: with the looping reasoning
+        // left in the transcript, the pass after `REPEAT_LOOP_ERROR`
+        // reproduced it byte for byte. The prompt, not the wording, is what
+        // has to change.
+        let dir = scratch_dir("main-repeat-stub");
+        let mut cfg = test_cfg();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Low;
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec![looping_reasoning(), "</think>Done.\n".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+
+        let seen = prompts.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one stopped pass, then the recovery pass");
+        let recovery = &seen[1];
+        assert!(
+            !recovery.contains("`WindowLike::window(self).frame`? Yes."),
+            "the recovery pass was shown the cycle it was stopped for"
+        );
+        assert!(recovery.contains(STOPPED_REASONING_STUB), "{recovery}");
+        assert!(recovery.contains(REPEAT_LOOP_ERROR), "{recovery}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

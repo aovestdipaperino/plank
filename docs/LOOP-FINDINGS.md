@@ -446,3 +446,97 @@ Guard stops are also red `UiEvent::Error` lines on the main window now
 set around the delegated run so nesting restores the outer name). The sub-agent
 pane already showed the tool error, but nobody watching the parent could see
 it, which is the difference between "stuck" and "looping, being handled".
+
+
+## The trip cap stops the bleeding; it does not stop the loop
+
+`repro-loop-1788862078` and `repro-loop-1788862135` are one session
+(`zany-magellan`, 2026-09-08, 57 seconds apart) surveying an unfamiliar repo:
+40 messages, 57 KB of transcript, `--think-low`, temperature 0. The two dumps
+are the same transcript one guard round apart, so they read as a controlled
+experiment on the recovery path fixed the day before.
+
+What they show:
+
+- **`MAIN_REPEAT_TRIP_CAP` works as designed.** Trip 1 stopped a pass and put
+  `REPEAT_LOOP_ERROR` back as a tool result; trip 2 stopped the next pass and
+  ended the turn. Two dumps, no third pass, no user Ctrl-C. That is the
+  entry above ("A stopped pass is regenerated verbatim") behaving correctly.
+- **The regeneration is now byte-identical.** In the `bumbling-einstein` pair
+  the pass after the error at least opened differently ("Need stop repeating.
+  We have enough."). Here the assistant message after the guard's error
+  reproduces the poisoned reasoning *character for character*, including the
+  point where it truncates. The guard's instruction not to resume that
+  reasoning is in the prompt, and it loses to the 8 KiB of repetition sitting
+  in front of it.
+
+That is the sharper form of the temperature-0 lesson: it is not that the
+one-line error is too weak a nudge, it is that we ask the model to continue a
+context whose tail *is* the degenerate cycle. "Let me look at the docs for the
+SSH section. Let me also look at the docs for the SSH section." has exactly one
+likely continuation, and no appended instruction outranks it. Retaining the
+looping assistant turn verbatim is what makes the next pass deterministic in
+the wrong direction.
+
+The fix is therefore to change the transcript, not the wording. Fixed
+2026-09-08: after the dump is written (`loop_repro_line` runs first, so the
+dump keeps the reasoning verbatim and only the model's copy loses it), the
+guard rewrites the final `<think>` block of the message it just stopped down to
+`STOPPED_REASONING_STUB` (`Agent::stub_last_reasoning`, both turn paths). The
+cap stays as the backstop, unchanged. Anything the pass emitted *after* leaving
+`<think>` is visible output the user has already been shown and is kept, so a
+partial answer is not silently withdrawn from the model's own context.
+
+The KV cost is the part that turned out to be free, and it is worth recording
+why, because the obvious reading is that this is microcompact's mid-transcript
+rewrite and has to pay microcompact's rung restore. It is not: the rewritten
+message is the transcript's *last*, so every earlier section still matches
+byte for byte, `ds4_session_common_prefix` reuses the whole prefix, and the
+recovery pass prefills the stub plus the guard's tool result and nothing else.
+No rung is invalidated either — every rung sits at a shallower depth and still
+describes an intact prefix — so neither `discard_ladder` nor
+`truncate_ladder_to` is called. A tail rewrite is cheap by construction; the
+expensive rewrites are the ones with transcript behind them.
+
+What it trades is the property that the recovery prompt can see what looped.
+The guard's tool result still says *that* the reasoning was stopped and why, so
+the model is not left guessing at the reason, only at the text — which is the
+text we are trying to keep it from rebuilding. The regression test is
+`the_pass_after_a_reasoning_stop_is_not_shown_the_loop`, which asserts the
+second prompt carries the stub and the error but not the cycle; it fails with
+the call to `stub_last_reasoning` commented out.
+
+Two secondary observations from the same pair:
+
+- **The stall was visible eight messages earlier, at the level of intent.**
+  From roughly message 30 the reasoning repeats the same *plan* while the text
+  varies: "let me check the docs for the SSH section and the `ssh` feature"
+  recurs across four passes, three of them *after* the model has already read
+  `## SSH Integration` and gotten its answer, and "let me verify the build/test
+  commands work" is announced in three consecutive passes without a single
+  `bash` call ever being emitted. An intent that is restated and never executed
+  looks like a cheaper trip-wire than character-level repetition. **Measured
+  against the corpus, it is not**, and the negative result is worth keeping so
+  nobody re-derives it. Scored over the 39 dumps in `~/.plank/repro` (loop
+  dumps against ordinary ones, normalized reasoning sentences of at least 25
+  characters, `Agent` passes split on the transcript's role tags): a sentence
+  recurring in every pass of a 3-pass window fires on 4 of 13 loop dumps and 3
+  of 26 ordinary ones. Restricting it to intent phrasings (`let me`, `i need
+  to`, `i will`, …), which is the shape actually observed here, makes it
+  *worse* rather than better: 5/13 against 3/28 at a 2-pass window, and 2/13
+  against 2/26 at three. A rung that fires as often on good turns as on bad
+  ones is not a rung. It also buys almost no latency — in this session's own
+  dump the first hit is at pass 19 of 22, three passes before the exact guard
+  already stopped it.
+
+  The half that would discriminate is the one the script cannot cheaply check:
+  whether the announced action was ever *executed*. Every non-final pass in
+  these dumps does emit some tool call, so "announced and never acted on"
+  needs the announcement matched against the calls, which is semantic matching
+  and not a guard rung. Left unshipped, like the fuzzy line detector in "The
+  loop is preceded by a stutter the exact-match guard cannot see", and for the
+  same reason.
+- **Nineteen minutes bought nothing.** The turn ran 9m40s to trip 1 and ended
+  at 12:08:55 having read three doc chunks and listed two directories, with no
+  edit and no answer. The cap is the floor on the damage, not a fix; the cost
+  of a loop is still the whole turn.
