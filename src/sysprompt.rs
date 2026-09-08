@@ -508,7 +508,7 @@ fn build_tools_prompt_parts_with_wasm(
     // A profile replaces the whole prose prompt; the schema block is still
     // generated, from the allow-listed builtins.
     let (mut out, trusted_len) = if let Some((text, spec)) = profile_prompt_source() {
-        compose_profile_prompt(text, &spec, parity)
+        compose_profile_prompt(text, spec, parity)
     } else {
         let mut out = build_tools_prompt_base(parity);
         insert_marker_spelling_note(&mut out);
@@ -659,28 +659,27 @@ pub fn tool_protocol_fragment(parity: bool) -> &'static str {
 /// Renders `specs` as the `### Available Tool Schemas` block, in the same
 /// `OpenAI` function shape the C prompt uses.
 ///
-/// Hand-formatted rather than run through `serde_json::to_string_pretty`:
-/// this crate's `serde_json` is built without the `preserve_order` feature,
-/// so a `serde_json::Value`'s object keys are a `BTreeMap` and serialize
-/// alphabetically — `description` before `name`, `function` before `type` —
-/// which is not the shape `resources/tools_prompt_after_edit.txt` has and not
-/// what the model saw in training. This function instead writes the fields in
-/// the fixed order the C prompt uses (`type`, then `function` with `name`,
-/// `description`, `parameters` in that order), two-space indented, matching
-/// [`append_wasm_tool_schemas`]'s approach. Only the guarantee that changed:
-/// this is the exact byte shape of the C examples, not merely valid JSON in
-/// some order.
+/// Hand-formatted rather than run through `serde_json::to_string_pretty` (or
+/// `serde_json::Value`'s own key order) so the emitted shape does not depend
+/// on how `serde_json` happens to order object keys at all: this crate does
+/// not itself request the `preserve_order` feature, but it ends up enabled
+/// anyway through feature unification with transitive dependencies (notably
+/// `extism` and `deno_core`, see `cargo tree -e features -i serde_json`) —
+/// pinning byte-for-byte shape to that incidental, transitively-controlled
+/// setting would be fragile, and is exactly why this function writes the
+/// fields itself in the fixed order the C prompt uses (`type`, then
+/// `function` with `name`, `description`, `parameters` in that order),
+/// two-space indented, matching [`append_wasm_tool_schemas`]'s approach. This
+/// is the exact byte shape of the C examples, not merely valid JSON in some
+/// order — and `name` and `description` are both escaped through
+/// [`crate::tools::mcp::json_escape`], not interpolated raw.
 #[must_use]
 pub fn render_schema_block(specs: &[crate::engine::ToolSpec]) -> String {
-    use std::fmt::Write as _;
-
     let mut out = String::from("### Available Tool Schemas\n\n");
     for spec in specs {
-        let _ = write!(
-            out,
-            "{{\n  \"type\": \"function\",\n  \"function\": {{\n    \"name\": \"{}\",\n    \"description\": ",
-            spec.name
-        );
+        out.push_str("{\n  \"type\": \"function\",\n  \"function\": {\n    \"name\": ");
+        crate::tools::mcp::json_escape(&mut out, &spec.name);
+        out.push_str(",\n    \"description\": ");
         crate::tools::mcp::json_escape(&mut out, &spec.description);
         out.push_str(",\n    \"parameters\": ");
         render_parameters(&mut out, &spec.parameters);
@@ -730,10 +729,41 @@ fn render_parameters(out: &mut String, params: &serde_json::Value) {
     out.push_str("\n    }");
 }
 
-/// `serde_json`'s compact single-line rendering of `value`, or `{}` if it
-/// somehow fails to serialize (it cannot, for a `Value` already in memory).
+/// Single-line rendering of `value` in the C prompt's compact-leaf style:
+/// like `serde_json`'s compact formatter, but with a space after every `:`
+/// and `,`, matching `{"type": "string"}` and `["path", "content"]` in
+/// `resources/tools_prompt_after_edit.txt` rather than `serde_json`'s
+/// `{"type":"string"}`/`["path","content"]`. Recurses so a nested object or
+/// array (an `enum` list, say) gets the same spacing throughout.
 fn compact(value: &serde_json::Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+    use std::fmt::Write as _;
+
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = String::from("{");
+            for (i, (key, v)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                crate::tools::mcp::json_escape(&mut out, key);
+                let _ = write!(out, ": {}", compact(v));
+            }
+            out.push('}');
+            out
+        }
+        serde_json::Value::Array(items) => {
+            let mut out = String::from("[");
+            for (i, v) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&compact(v));
+            }
+            out.push(']');
+            out
+        }
+        other => serde_json::to_string(other).unwrap_or_else(|_| "null".to_string()),
+    }
 }
 
 /// Composes a profile's prompt: the profile text with
@@ -779,9 +809,9 @@ fn compose_profile_prompt(
 /// this is infallible and safe to call mid-session (MCP reload, compaction,
 /// sub-agent spawn) — unlike a re-read, which could fail or race a mid-run
 /// edit of the file after a TUI already exists to corrupt.
-fn profile_prompt_source() -> Option<(&'static str, crate::profile::ProfileSpec)> {
+fn profile_prompt_source() -> Option<(&'static str, &'static crate::profile::ProfileSpec)> {
     let active = crate::profile::active()?;
-    Some((active.prompt.as_str(), active.spec.clone()))
+    Some((active.prompt.as_str(), &active.spec))
 }
 
 /// The C-derived tools prompt with nothing appended.
@@ -2083,6 +2113,36 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_allow_list_starves_the_composed_profile_prompt_too() {
+        // Same fail-closed property as
+        // `an_empty_allow_list_renders_zero_builtin_schemas`, but exercised
+        // through `compose_profile_prompt` itself — the actual security-shaped
+        // path a profile's prompt is built on — rather than through the
+        // filter expression re-typed inline. A regression that dropped the
+        // filter from the composer would slip past the sibling test but not
+        // this one.
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(Vec::new()),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = "You are ChatBGT.\n".to_string();
+        let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
+        assert!(
+            out.contains("### Available Tool Schemas\n\n"),
+            "the header is still emitted"
+        );
+        assert!(
+            !out.contains("\"type\": \"function\""),
+            "an empty allow-list must admit no builtin schema through the composer"
+        );
+    }
+
+    #[test]
     fn the_schema_block_round_trips_through_the_builtin_parser() {
         let specs = parse_builtin_tool_schemas();
         assert!(!specs.is_empty(), "the C prompt carries schemas");
@@ -2101,10 +2161,26 @@ mod tests {
 
     #[test]
     fn the_schema_block_matches_the_c_key_order_and_leaf_shape() {
-        // Pins the hand-formatted shape against the literal C example from
-        // `resources/tools_prompt_after_edit.txt` (`google_search`): `type`
-        // before `function`, `name`/`description`/`parameters` in that
-        // order, and a leaf property collapsed onto one line.
+        // Pins the hand-formatted shape byte-for-byte against the literal C
+        // text in `resources/tools_prompt_after_edit.txt`: the
+        // `### Available Tool Schemas` header through the closing brace and
+        // blank line of the `google_search` example. The expected string is
+        // sliced straight out of that file (not retyped) so this test pins
+        // the real C bytes, including the space after every `:` and `,` in
+        // the compact leaves (`{"type": "string"}`, `["query"]`), rather
+        // than the emitter's own output. No deliberate difference remains:
+        // this is a full byte match.
+        let c_prompt = include_str!("resources/tools_prompt_after_edit.txt");
+        let start = c_prompt
+            .find("### Available Tool Schemas")
+            .expect("C prompt has the schema header");
+        let after_header = &c_prompt[start..];
+        let end = after_header
+            .find("\n}\n\n")
+            .expect("google_search example closes with a blank line")
+            + "\n}\n\n".len();
+        let expected = &after_header[..end];
+
         let specs = vec![crate::engine::ToolSpec {
             name: "google_search".to_string(),
             description: "Search Google in a visible browser and return compact Markdown links."
@@ -2116,8 +2192,7 @@ mod tests {
             }),
         }];
         let block = render_schema_block(&specs);
-        let expected = "{\n  \"type\": \"function\",\n  \"function\": {\n    \"name\": \"google_search\",\n    \"description\": \"Search Google in a visible browser and return compact Markdown links.\",\n    \"parameters\": {\n      \"type\": \"object\",\n      \"properties\": {\n        \"query\": {\"type\":\"string\"}\n      },\n      \"required\": [\"query\"]\n    }\n  }\n}\n\n";
-        assert_eq!(block, format!("### Available Tool Schemas\n\n{expected}"));
+        assert_eq!(block, expected);
     }
 
     #[test]
