@@ -682,8 +682,21 @@ impl SubPane {
     /// covering the transcript it should have handed back. Called from the draw
     /// paths, so a row goes on its own clock instead of waiting for the next
     /// keystroke.
+    ///
+    /// Being *in* the roster exempts its rows from the linger — that is what
+    /// stops a row vanishing from under the cursor mid-read — but the `main`
+    /// row is not a run being read. A cursor left resting there (a click on
+    /// `main`, or a `←` never followed by `Esc`) would otherwise pin every
+    /// finished row on screen for the rest of the session, which is exactly the
+    /// pile the linger exists to clear. So once nothing is left to read — the
+    /// cursor is on `main` and every run has outlived its linger — the roster
+    /// leaves selection mode and retires as it would have with the cursor
+    /// hidden.
     pub fn expire_rows(&mut self, now: u64) {
         if self.selecting {
+            if self.cursor == 0 && self.runs.iter().all(|r| r.row_expired(now)) {
+                self.selecting = false;
+            }
             return;
         }
         let gone = self
@@ -5428,6 +5441,51 @@ mod tests {
             2,
             "the run itself is kept: its output is why it was delegated"
         );
+    }
+
+    #[test]
+    fn a_cursor_left_on_main_does_not_pin_finished_rows_forever() {
+        // Sitting on `main` is not reading a run. A click on the `main` row —
+        // or a `←` never followed by `Esc` — used to leave `selecting` set,
+        // which exempted every row from the linger and left completed agents on
+        // the roster for the rest of the session.
+        let mut pane = SubPane::default();
+        pane.begin("alpha".to_string(), "", 0);
+        pane.begin("beta".to_string(), "", 0);
+        pane.current = 1;
+        pane.end(1_000);
+        pane.current = 0;
+        pane.end(1_000);
+        assert!(pane.click_run(None), "the user clicks back to `main`");
+        assert!(pane.selecting);
+
+        let mid = 1_000 + ROSTER_LINGER_MS - 1;
+        pane.expire_rows(mid);
+        assert!(pane.selecting, "still inside the linger");
+        assert_eq!(pane.roster_view(mid).rows.len(), 3);
+
+        let late = 1_000 + ROSTER_LINGER_MS;
+        pane.expire_rows(late);
+        assert!(!pane.selecting, "nothing left to read: the roster retires");
+        assert!(
+            pane.roster_view(late).rows.is_empty(),
+            "only `main` would be left, so the whole panel goes"
+        );
+    }
+
+    #[test]
+    fn a_cursor_on_a_row_still_holds_the_roster_open() {
+        // The exemption the linger owes a reader: a row must not vanish from
+        // under the cursor mid-read, however long ago it finished.
+        let mut pane = SubPane::default();
+        pane.begin("alpha".to_string(), "", 0);
+        pane.end(1_000);
+        assert!(pane.click_run(Some(0)));
+
+        let late = 1_000 + ROSTER_LINGER_MS;
+        pane.expire_rows(late);
+        assert!(pane.selecting && pane.active && pane.cursor == 1);
+        assert_eq!(pane.roster_view(late).rows.len(), 2);
     }
 
     #[test]
