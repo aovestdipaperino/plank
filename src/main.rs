@@ -59,6 +59,17 @@ fn select_cache_dir(cfg: &plank::config::AgentConfig) {
     ));
 }
 
+/// The detached downloader's entry point.
+///
+/// Its model set is the second argument. A helper spawned by a plank that
+/// predates two sets passes none, which reads as `ds4` — the set plank managed
+/// when there was only one.
+fn run_model_downloader(args: &[String]) -> i32 {
+    let set =
+        plank::manifest::ModelSet::from_str_or_default(args.get(1).map_or("", String::as_str));
+    plank::downloader::run_helper(set)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -69,7 +80,7 @@ fn main() -> ExitCode {
     // through `~/.plank/downloads/job.json`, and exits. Handled before every
     // other dispatch so nothing above can print to a stream that is /dev/null.
     if args.first().map(String::as_str) == Some("--model-downloader") {
-        return ExitCode::from(u8::try_from(plank::downloader::run_helper()).unwrap_or(1));
+        return ExitCode::from(u8::try_from(run_model_downloader(&args)).unwrap_or(1));
     }
 
     // `plank serve ...` runs the flavor-(a) host instead of the interactive

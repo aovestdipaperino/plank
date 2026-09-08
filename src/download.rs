@@ -1162,9 +1162,10 @@ pub(crate) fn gb(bytes: u64) -> f64 {
 
 /// The manifest URL. Kept in the repo rather than on a release asset so the
 /// artifact set is reviewed in a pull request like any other change.
+/// Where the manifests live. Each set has its own file at the same base, so
+/// adding a set is a new file rather than a new hosting arrangement.
 #[cfg(not(test))]
-const MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/aovestdipaperino/plank/main/ds4.manifest";
+const MANIFEST_BASE_URL: &str = "https://raw.githubusercontent.com/aovestdipaperino/plank/main";
 /// Bounded timeout for the manifest fetch. Startup must never hang on the
 /// network.
 #[cfg(not(test))]
@@ -1177,13 +1178,14 @@ const MANIFEST_CHECK_FILE: &str = "manifest-check";
 /// Fetches the manifest, bounded by [`MANIFEST_TIMEOUT_SECS`]. `None` on any
 /// failure — offline, timeout, HTTP error — so the caller stays quiet.
 #[cfg(not(test))]
-fn fetch_manifest() -> Option<String> {
+fn fetch_manifest(set: crate::manifest::ModelSet) -> Option<String> {
+    let url = format!("{MANIFEST_BASE_URL}/{}", set.manifest_name());
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(MANIFEST_TIMEOUT_SECS)))
         .build()
         .new_agent();
     let mut resp = agent
-        .get(MANIFEST_URL)
+        .get(&url)
         .header("User-Agent", concat!("plank/", env!("CARGO_PKG_VERSION")))
         .call()
         .ok()?;
@@ -1195,7 +1197,7 @@ fn fetch_manifest() -> Option<String> {
 
 /// Test builds never touch the network.
 #[cfg(test)]
-fn fetch_manifest() -> Option<String> {
+fn fetch_manifest(_set: crate::manifest::ModelSet) -> Option<String> {
     None
 }
 
@@ -1279,8 +1281,8 @@ fn note_last_run_outcome_in(root: &Path) {
 }
 
 /// Whether an artifact of `kind` is present on disk under `root`.
-fn artifact_installed_in(root: &Path, kind: &str) -> bool {
-    crate::manifest::local_path_for_in(root, kind).is_some_and(|p| p.exists())
+fn artifact_installed_in(root: &Path, set: crate::manifest::ModelSet, kind: &str) -> bool {
+    crate::manifest::local_path_for_in(root, set, kind).is_some_and(|p| p.exists())
 }
 
 /// Prints the manifest's version transition and notes, then blocks for a
@@ -1325,13 +1327,14 @@ fn confirm_background_download(manifest: &crate::manifest::Manifest, from: u32) 
 /// staging directory — leaves the existing model in place and returns.
 fn check_manifest_at_startup_in(
     root: &Path,
-    fetch: &dyn Fn() -> Option<String>,
-    spawn: &dyn Fn(&crate::manifest::Manifest) -> Result<(), String>,
+    set: crate::manifest::ModelSet,
+    fetch: &dyn Fn(crate::manifest::ModelSet) -> Option<String>,
+    spawn: &dyn Fn(crate::manifest::ModelSet, &crate::manifest::Manifest) -> Result<(), String>,
     confirm: &dyn Fn(&crate::manifest::Manifest, u32) -> Option<bool>,
 ) {
     // Anything a previous run verified gets installed first, before the engine
     // maps the model.
-    match crate::downloader::swap_staged_in(root) {
+    match crate::downloader::swap_staged_in(root, set) {
         Ok(Some(version)) => eprintln!("plank: installed model manifest version {version}."),
         Ok(None) => {}
         Err(e) => eprintln!("plank: could not install the downloaded model: {e}"),
@@ -1345,21 +1348,21 @@ fn check_manifest_at_startup_in(
         return;
     }
     note_last_run_outcome_in(root);
-    let Some(remote) = fetch().and_then(|t| crate::manifest::parse(&t).ok()) else {
+    let Some(remote) = fetch(set).and_then(|t| crate::manifest::parse(&t).ok()) else {
         return;
     };
-    let installed = crate::manifest::read_at(&crate::manifest::installed_path_in(root));
+    let installed = crate::manifest::read_at(&crate::manifest::installed_path_in(root, set));
     let size_of = |kind: &str| {
-        let path = crate::manifest::local_path_for_in(root, kind)?;
+        let path = crate::manifest::local_path_for_in(root, set, kind)?;
         std::fs::metadata(path).map(|m| m.len()).ok()
     };
-    match crate::manifest::decide(remote, installed.as_ref(), &size_of) {
+    match crate::manifest::decide(remote, installed.as_ref(), set.kinds(), &size_of) {
         crate::manifest::Decision::UpToDate => {}
         crate::manifest::Decision::Adopt(m) => {
             // The files on disk are already this release; record that and say
             // nothing. Without this, every existing user is offered an 87 GB
             // re-download the day the manifest ships.
-            let _ = std::fs::write(crate::manifest::installed_path_in(root), &m.raw);
+            let _ = std::fs::write(crate::manifest::installed_path_in(root, set), &m.raw);
         }
         crate::manifest::Decision::Offer { manifest, from } => {
             // First-run acquisition belongs to `ensure_model`, not the
@@ -1377,7 +1380,7 @@ fn check_manifest_at_startup_in(
             // download just obtained (harmless once finished — it stages,
             // verifies and renames identical content — but exactly the race
             // this gate exists to avoid).
-            if from == 0 && !artifact_installed_in(root, "main") {
+            if from == 0 && !artifact_installed_in(root, set, "main") {
                 return;
             }
             // Recorded unconditionally from here on, before any further early
@@ -1389,7 +1392,7 @@ fn check_manifest_at_startup_in(
             // model download is pending" forever — the version becomes
             // permanently unreachable even though the user asked for it
             // explicitly.
-            if let Err(e) = crate::downloader::write_job_in(root, &manifest) {
+            if let Err(e) = crate::downloader::write_job_in(root, set, &manifest) {
                 eprintln!("plank: could not record the download job: {e}");
             }
             // Already declined (or the last attempt was cancelled or failed a
@@ -1407,7 +1410,7 @@ fn check_manifest_at_startup_in(
                 record_declined_in(root, manifest.version);
                 return;
             }
-            match spawn(&manifest) {
+            match spawn(set, &manifest) {
                 Ok(()) => {
                     eprintln!(
                         "plank: downloading it in the background. Alt-M or /model to cancel."
@@ -1429,6 +1432,24 @@ fn check_manifest_at_startup_in(
 ///
 /// Never fatal, and never blocking except on the interactive download prompt
 /// (itself gated on a real terminal).
+/// The manifest set plank manages for this model path, or `None` for a path it
+/// does not manage.
+///
+/// A custom `-m` is the user's own file: plank neither upgrades nor replaces
+/// it, which is why the check used to skip whenever `-m` was given at all.
+/// That skip is now by *path* rather than by presence, because `--qwen`
+/// resolves to a default path — without this, selecting Qwen would silently
+/// opt out of Qwen upgrades.
+#[must_use]
+pub fn manifest_set_for_model(model_path: Option<&Path>) -> Option<crate::manifest::ModelSet> {
+    match model_path {
+        None => Some(crate::manifest::ModelSet::Ds4),
+        Some(p) if p == default_model_path() => Some(crate::manifest::ModelSet::Ds4),
+        Some(p) if p == default_qwen_path() => Some(crate::manifest::ModelSet::Qwen),
+        Some(_) => None,
+    }
+}
+
 pub fn check_manifest_at_startup(model_path: Option<&Path>) {
     check_manifest_at_startup_with(
         model_path,
@@ -1445,14 +1466,14 @@ pub fn check_manifest_at_startup(model_path: Option<&Path>) {
 fn check_manifest_at_startup_with(
     model_path: Option<&Path>,
     root: &Path,
-    fetch: &dyn Fn() -> Option<String>,
-    spawn: &dyn Fn(&crate::manifest::Manifest) -> Result<(), String>,
+    fetch: &dyn Fn(crate::manifest::ModelSet) -> Option<String>,
+    spawn: &dyn Fn(crate::manifest::ModelSet, &crate::manifest::Manifest) -> Result<(), String>,
     confirm: &dyn Fn(&crate::manifest::Manifest, u32) -> Option<bool>,
 ) {
-    if model_path.is_some() {
+    let Some(set) = manifest_set_for_model(model_path) else {
         return;
-    }
-    check_manifest_at_startup_in(root, fetch, spawn, confirm);
+    };
+    check_manifest_at_startup_in(root, set, fetch, spawn, confirm);
 }
 
 /// The real confirmation: `None` when there is no controlling terminal to ask
@@ -1827,6 +1848,29 @@ mod tests {
     /// the `DeepSeek` download offer. `--qwen` with an unlinked
     /// `~/.plank/qwen.gguf` used to propose fetching 87 GB of `DeepSeek` into
     /// the Qwen slot, and so did a mistyped `-m`.
+    /// Which set a model path belongs to. The skip used to be "any `-m` at
+    /// all", which would have opted `--qwen` out of Qwen upgrades entirely,
+    /// since the flag resolves to a default path.
+    #[test]
+    fn the_managed_paths_map_to_their_set() {
+        use crate::manifest::ModelSet;
+        assert_eq!(manifest_set_for_model(None), Some(ModelSet::Ds4));
+        assert_eq!(
+            manifest_set_for_model(Some(&default_model_path())),
+            Some(ModelSet::Ds4)
+        );
+        assert_eq!(
+            manifest_set_for_model(Some(&default_qwen_path())),
+            Some(ModelSet::Qwen)
+        );
+        // A path plank does not manage gets no manifest check at all: it is
+        // the user's file, and plank must never propose replacing it.
+        assert_eq!(
+            manifest_set_for_model(Some(Path::new("/models/mine.gguf"))),
+            None
+        );
+    }
+
     #[test]
     fn a_missing_non_default_model_is_an_error_not_a_download_offer() {
         let missing =
@@ -1859,11 +1903,11 @@ mod tests {
     /// never reaches the background download.
     fn spy_spawn() -> (
         std::sync::Arc<std::sync::atomic::AtomicBool>,
-        impl Fn(&crate::manifest::Manifest) -> Result<(), String>,
+        impl Fn(crate::manifest::ModelSet, &crate::manifest::Manifest) -> Result<(), String>,
     ) {
         let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = called.clone();
-        let spawn = move |_: &crate::manifest::Manifest| {
+        let spawn = move |_: crate::manifest::ModelSet, _: &crate::manifest::Manifest| {
             flag.store(true, Ordering::Relaxed);
             Ok(())
         };
@@ -1882,15 +1926,19 @@ mod tests {
         let text = manifest_text(5, 100);
         // `from == 0` must return before ever consulting `confirm`, so a
         // confirm stub that panics if called doubles as proof of that.
-        check_manifest_at_startup_in(&root, &|| Some(text.clone()), &spawn, &|_, _| {
-            panic!("must not even ask on a bare first run")
-        });
+        check_manifest_at_startup_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &|_| Some(text.clone()),
+            &spawn,
+            &|_, _| panic!("must not even ask on a bare first run"),
+        );
         assert!(
             !called.load(Ordering::Relaxed),
             "must not spawn a background download on a bare first run"
         );
         assert!(
-            crate::downloader::read_job_in(&root).is_none(),
+            crate::downloader::read_job_in(&root, crate::manifest::ModelSet::Ds4).is_none(),
             "finding 4: a bare first run must not plant a job either — \
              `/model download` right after would trigger a redundant full \
              background re-fetch of the file `ensure_model` is about to get \
@@ -1913,8 +1961,8 @@ mod tests {
         check_manifest_at_startup_with(
             Some(Path::new("/some/custom/model.gguf")),
             &root,
-            &|| panic!("must not fetch the manifest when -m is set"),
-            &|_| panic!("must not spawn a download when -m is set"),
+            &|_| panic!("must not fetch the manifest when -m is set"),
+            &|_, _| panic!("must not spawn a download when -m is set"),
             &|_, _| panic!("must not prompt when -m is set"),
         );
     }
@@ -1931,15 +1979,23 @@ mod tests {
         // which would mask that exact regression.
         let root = crate::downloader::tests::tempdir();
         let installed = manifest_text(3, 100);
-        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            &installed,
+        )
+        .expect("installed");
         let remote_text = manifest_text(4, 200);
         std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
         std::fs::write(declined_path_in(&root), "4\n").expect("declined marker");
 
         let (called, spawn) = spy_spawn();
-        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
-            panic!("a declined version must not even reach the confirm prompt")
-        });
+        check_manifest_at_startup_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &|_| Some(remote_text.clone()),
+            &spawn,
+            &|_, _| panic!("a declined version must not even reach the confirm prompt"),
+        );
         assert!(
             !called.load(Ordering::Relaxed),
             "a declined version must not be re-offered"
@@ -2006,13 +2062,21 @@ mod tests {
         // download is pending" forever.
         let root = crate::downloader::tests::tempdir();
         let installed = manifest_text(3, 100);
-        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            &installed,
+        )
+        .expect("installed");
         let remote_text = manifest_text(4, 200);
         let (called, spawn) = spy_spawn();
         // `confirm` returns `Some(false)`: the user is asked and says no.
-        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
-            Some(false)
-        });
+        check_manifest_at_startup_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &|_| Some(remote_text.clone()),
+            &spawn,
+            &|_, _| Some(false),
+        );
         assert!(
             !called.load(Ordering::Relaxed),
             "a decline must not itself start the download"
@@ -2031,10 +2095,20 @@ mod tests {
         // terminal) must not, by itself, leave the job unrecorded either.
         let root = crate::downloader::tests::tempdir();
         let installed = manifest_text(3, 100);
-        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            &installed,
+        )
+        .expect("installed");
         let remote_text = manifest_text(4, 200);
         let (called, spawn) = spy_spawn();
-        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| None);
+        check_manifest_at_startup_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &|_| Some(remote_text.clone()),
+            &spawn,
+            &|_, _| None,
+        );
         assert!(
             !called.load(Ordering::Relaxed),
             "a headless run must not itself start the download"
@@ -2056,6 +2130,7 @@ mod tests {
         error: Option<&str>,
     ) -> crate::downloader::State {
         crate::downloader::State {
+            set: crate::manifest::ModelSet::Ds4.as_str().to_string(),
             pid: std::process::id(),
             version,
             current: String::new(),
@@ -2077,7 +2152,11 @@ mod tests {
         // not be recorded as a decline, unlike a Delete cancel (next test).
         let root = crate::downloader::tests::tempdir();
         let installed = manifest_text(3, 100);
-        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            &installed,
+        )
+        .expect("installed");
         let remote_text = manifest_text(4, 200);
         std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
         crate::downloader::write_state_in(
@@ -2087,9 +2166,13 @@ mod tests {
         .expect("seed a Keep-cancelled state");
 
         let (called, spawn) = spy_spawn();
-        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
-            Some(true)
-        });
+        check_manifest_at_startup_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &|_| Some(remote_text.clone()),
+            &spawn,
+            &|_, _| Some(true),
+        );
         assert!(
             called.load(Ordering::Relaxed),
             "a Keep-cancelled version must still be offered on the next run"
@@ -2100,7 +2183,11 @@ mod tests {
     fn a_delete_cancelled_version_is_not_re_offered() {
         let root = crate::downloader::tests::tempdir();
         let installed = manifest_text(3, 100);
-        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            &installed,
+        )
+        .expect("installed");
         let remote_text = manifest_text(4, 200);
         std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
         crate::downloader::write_state_in(
@@ -2110,9 +2197,13 @@ mod tests {
         .expect("seed a Delete-cancelled state");
 
         let (called, spawn) = spy_spawn();
-        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
-            panic!("a Delete-cancelled version must not even reach the confirm prompt")
-        });
+        check_manifest_at_startup_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &|_| Some(remote_text.clone()),
+            &spawn,
+            &|_, _| panic!("a Delete-cancelled version must not even reach the confirm prompt"),
+        );
         assert!(
             !called.load(Ordering::Relaxed),
             "a Delete-cancelled version must not be re-offered"
@@ -2127,19 +2218,27 @@ mod tests {
         let root = crate::downloader::tests::tempdir();
         std::fs::create_dir_all(&root).expect("root");
         std::fs::write(
-            crate::manifest::local_path_for_in(&root, "main").expect("main path"),
+            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds4, "main")
+                .expect("main path"),
             vec![0u8; 100],
         )
         .expect("pre-existing model file");
         let text = manifest_text(3, 100);
 
         let (called, spawn) = spy_spawn();
-        check_manifest_at_startup_in(&root, &|| Some(text.clone()), &spawn, &|_, _| {
-            panic!("an adopt must not reach the confirm prompt")
-        });
+        check_manifest_at_startup_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &|_| Some(text.clone()),
+            &spawn,
+            &|_, _| panic!("an adopt must not reach the confirm prompt"),
+        );
         assert!(!called.load(Ordering::Relaxed), "an adopt must not spawn");
-        let recorded = crate::manifest::read_at(&crate::manifest::installed_path_in(&root))
-            .expect("installed manifest recorded");
+        let recorded = crate::manifest::read_at(&crate::manifest::installed_path_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("installed manifest recorded");
         assert_eq!(recorded.version, 3);
     }
 }

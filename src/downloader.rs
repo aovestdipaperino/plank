@@ -52,6 +52,10 @@ pub enum Phase {
 /// The helper's published progress.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct State {
+    /// Which model set is being installed. Defaulted for states written by a
+    /// plank that predates two sets.
+    #[serde(default)]
+    pub set: String,
     /// The helper's pid, so a reader can tell a stalled helper from a dead one.
     pub pid: u32,
     /// Manifest version being installed.
@@ -280,20 +284,20 @@ const PUBLISH_EVERY: std::time::Duration = std::time::Duration::from_millis(500)
 
 /// In-flight bytes for `kind`, under `root`.
 #[must_use]
-pub fn part_path_in(root: &Path, kind: &str) -> PathBuf {
-    crate::manifest::staging_dir_in(root).join(format!("{kind}.part"))
+pub fn part_path_in(root: &Path, set: crate::manifest::ModelSet, kind: &str) -> PathBuf {
+    crate::manifest::staging_dir_in(root, set).join(format!("{kind}.part"))
 }
 
 /// In-flight bytes for `kind`.
 #[must_use]
-pub fn part_path(kind: &str) -> PathBuf {
-    part_path_in(&crate::manifest::plank_dir(), kind)
+pub fn part_path(set: crate::manifest::ModelSet, kind: &str) -> PathBuf {
+    part_path_in(&crate::manifest::plank_dir(), set, kind)
 }
 
 /// Verified-but-not-yet-installed bytes for `kind`, under `root`.
 #[must_use]
-pub fn staged_path_in(root: &Path, kind: &str) -> PathBuf {
-    crate::manifest::staging_dir_in(root).join(format!("{kind}.gguf"))
+pub fn staged_path_in(root: &Path, set: crate::manifest::ModelSet, kind: &str) -> PathBuf {
+    crate::manifest::staging_dir_in(root, set).join(format!("{kind}.gguf"))
 }
 
 /// The SHA-256 (as verified at staging time) that `staged_path_in` is proven
@@ -307,14 +311,14 @@ pub fn staged_path_in(root: &Path, kind: &str) -> PathBuf {
 /// written once, right after the real SHA-256 check passes, so trusting it
 /// later costs nothing beyond reading a few bytes.
 #[must_use]
-pub fn staged_sha_path_in(root: &Path, kind: &str) -> PathBuf {
-    crate::manifest::staging_dir_in(root).join(format!("{kind}.gguf.sha256"))
+pub fn staged_sha_path_in(root: &Path, set: crate::manifest::ModelSet, kind: &str) -> PathBuf {
+    crate::manifest::staging_dir_in(root, set).join(format!("{kind}.gguf.sha256"))
 }
 
 /// Verified-but-not-yet-installed bytes for `kind`.
 #[must_use]
-pub fn staged_path(kind: &str) -> PathBuf {
-    staged_path_in(&crate::manifest::plank_dir(), kind)
+pub fn staged_path(set: crate::manifest::ModelSet, kind: &str) -> PathBuf {
+    staged_path_in(&crate::manifest::plank_dir(), set, kind)
 }
 
 /// Lowercase hex.
@@ -422,8 +426,13 @@ pub fn http_fetch(url: &str, offset: u64) -> Result<Box<dyn Read + Send>, String
 /// staged, the manifest itself is written into staging *last*, which is what
 /// makes the set self-describing for the swap in Task 6.
 #[must_use]
-pub fn run_job(root: &Path, manifest: &crate::manifest::Manifest, fetch: &Fetcher) -> Outcome {
-    let staging = crate::manifest::staging_dir_in(root);
+pub fn run_job(
+    root: &Path,
+    set: crate::manifest::ModelSet,
+    manifest: &crate::manifest::Manifest,
+    fetch: &Fetcher,
+) -> Outcome {
+    let staging = crate::manifest::staging_dir_in(root, set);
     if let Err(e) = std::fs::create_dir_all(&staging) {
         return Outcome::Failed(format!("cannot create {}: {e}", staging.display()));
     }
@@ -443,9 +452,9 @@ pub fn run_job(root: &Path, manifest: &crate::manifest::Manifest, fetch: &Fetche
 
     for (index, (kind, entry)) in jobs.iter().enumerate() {
         if let Some(how) = read_cancel_in(root) {
-            return finish_cancel(root, how, manifest, &jobs);
+            return finish_cancel(root, set, how, manifest, &jobs);
         }
-        if staged_is_current(root, kind, entry) {
+        if staged_is_current(root, set, kind, entry) {
             continue;
         }
         // Stale: either wrong size, or right size but from a manifest version
@@ -453,14 +462,15 @@ pub fn run_job(root: &Path, manifest: &crate::manifest::Manifest, fetch: &Fetche
         // `staged_sha_path_in`). Either way it is not proof of anything for
         // *this* manifest, so it must not be installed as it: clear it and
         // fall through to a normal download-and-verify.
-        let _ = std::fs::remove_file(staged_path_in(root, kind));
-        let _ = std::fs::remove_file(staged_sha_path_in(root, kind));
-        match one_artifact(root, manifest, kind, entry, index + 1, of, fetch) {
+        let _ = std::fs::remove_file(staged_path_in(root, set, kind));
+        let _ = std::fs::remove_file(staged_sha_path_in(root, set, kind));
+        match one_artifact(root, set, manifest, kind, entry, index + 1, of, fetch) {
             Ok(None) => {}
-            Ok(Some(how)) => return finish_cancel(root, how, manifest, &jobs),
+            Ok(Some(how)) => return finish_cancel(root, set, how, manifest, &jobs),
             Err(e) => {
                 publish(
                     root,
+                    set,
                     manifest,
                     kind,
                     index + 1,
@@ -477,10 +487,22 @@ pub fn run_job(root: &Path, manifest: &crate::manifest::Manifest, fetch: &Fetche
     }
 
     // Written last: its presence is the swap's proof that the whole set landed.
-    if let Err(e) = std::fs::write(staging.join("ds4.manifest"), &manifest.raw) {
+    if let Err(e) = std::fs::write(staging.join(set.manifest_name()), &manifest.raw) {
         return Outcome::Failed(format!("cannot stage the manifest: {e}"));
     }
-    publish(root, manifest, "", of, of, 0, 0, 0, Phase::Staged, None);
+    publish(
+        root,
+        set,
+        manifest,
+        "",
+        of,
+        of,
+        0,
+        0,
+        0,
+        Phase::Staged,
+        None,
+    );
     Outcome::Verified
 }
 
@@ -495,15 +517,21 @@ pub fn run_job(root: &Path, manifest: &crate::manifest::Manifest, fetch: &Fetche
 /// (`staged_sha_path_in`) must also match the manifest's. A missing sidecar
 /// (an artifact staged by an older build of this code, or one whose sidecar
 /// write failed) is treated as unproven, not as trusted.
-fn staged_is_current(root: &Path, kind: &str, entry: &crate::manifest::FileEntry) -> bool {
-    let staged = staged_path_in(root, kind);
+fn staged_is_current(
+    root: &Path,
+    set: crate::manifest::ModelSet,
+    kind: &str,
+    entry: &crate::manifest::FileEntry,
+) -> bool {
+    let staged = staged_path_in(root, set, kind);
     let Ok(meta) = std::fs::metadata(&staged) else {
         return false;
     };
     if meta.len() != entry.bytes {
         return false;
     }
-    std::fs::read_to_string(staged_sha_path_in(root, kind)).is_ok_and(|s| s.trim() == entry.sha256)
+    std::fs::read_to_string(staged_sha_path_in(root, set, kind))
+        .is_ok_and(|s| s.trim() == entry.sha256)
 }
 
 /// Downloads and verifies one artifact. `Ok(Some(how))` means a cancel was
@@ -511,6 +539,7 @@ fn staged_is_current(root: &Path, kind: &str, entry: &crate::manifest::FileEntry
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn one_artifact(
     root: &Path,
+    set: crate::manifest::ModelSet,
     manifest: &crate::manifest::Manifest,
     kind: &str,
     entry: &crate::manifest::FileEntry,
@@ -518,11 +547,12 @@ fn one_artifact(
     of: usize,
     fetch: &Fetcher,
 ) -> Result<Option<Cancel>, String> {
-    let part = part_path_in(root, kind);
+    let part = part_path_in(root, set, kind);
     let mut hasher = Sha256::new();
 
     publish(
         root,
+        set,
         manifest,
         kind,
         index,
@@ -577,6 +607,7 @@ fn one_artifact(
 
     publish(
         root,
+        set,
         manifest,
         kind,
         index,
@@ -622,6 +653,7 @@ fn one_artifact(
             last_publish = Instant::now();
             publish(
                 root,
+                set,
                 manifest,
                 kind,
                 index,
@@ -647,6 +679,7 @@ fn one_artifact(
 
     publish(
         root,
+        set,
         manifest,
         kind,
         index,
@@ -667,20 +700,21 @@ fn one_artifact(
             entry.sha256
         ));
     }
-    std::fs::rename(&part, staged_path_in(root, kind)).map_err(|e| e.to_string())?;
+    std::fs::rename(&part, staged_path_in(root, set, kind)).map_err(|e| e.to_string())?;
     // The sidecar proves this artifact belongs to *this* manifest, not a
     // leftover from an older version: without it, `staged_is_current` returns
     // false and the next check re-downloads the artifact from scratch. If the
     // sidecar write fails, losing ~87 GB to a retry is exactly the downside we
     // guard against. Rehashing the staged file to rebuild the sidecar would be
     // the cheaper repair, but that is a deliberate follow-up, not an oversight.
-    let _ = std::fs::write(staged_sha_path_in(root, kind), &entry.sha256);
+    let _ = std::fs::write(staged_sha_path_in(root, set, kind), &entry.sha256);
     Ok(None)
 }
 
 /// Clears the flag, optionally removes partial work, and publishes the stop.
 fn finish_cancel(
     root: &Path,
+    set: crate::manifest::ModelSet,
     how: Cancel,
     manifest: &crate::manifest::Manifest,
     jobs: &[(&str, &crate::manifest::FileEntry)],
@@ -690,7 +724,7 @@ fn finish_cancel(
         // and will be installed at the next launch, so deleting it here would
         // throw away tens of gigabytes of already-good data for nothing.
         for (kind, _) in jobs {
-            let _ = std::fs::remove_file(part_path_in(root, kind));
+            let _ = std::fs::remove_file(part_path_in(root, set, kind));
         }
     }
     clear_cancel_in(root);
@@ -701,6 +735,7 @@ fn finish_cancel(
     // are gone, declining is correct) apart.
     publish(
         root,
+        set,
         manifest,
         "",
         0,
@@ -737,6 +772,7 @@ pub fn cancelled_kept(state: &State) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn publish(
     root: &Path,
+    set: crate::manifest::ModelSet,
     manifest: &crate::manifest::Manifest,
     current: &str,
     index: usize,
@@ -750,6 +786,7 @@ fn publish(
     let _ = write_state_in(
         root,
         &State {
+            set: set.as_str().to_string(),
             pid: std::process::id(),
             version: manifest.version,
             current: current.to_string(),
@@ -783,14 +820,18 @@ pub fn lock_path() -> PathBuf {
 
 /// The manifest the running (or next) helper is installing.
 #[must_use]
-pub fn job_path_in(root: &Path) -> PathBuf {
-    crate::manifest::downloads_dir_in(root).join("job.json")
+pub fn job_path_in(root: &Path, set: crate::manifest::ModelSet) -> PathBuf {
+    let name = match set {
+        crate::manifest::ModelSet::Ds4 => "job.json",
+        crate::manifest::ModelSet::Qwen => "job-qwen.json",
+    };
+    crate::manifest::downloads_dir_in(root).join(name)
 }
 
-/// `~/.plank/downloads/job.json`.
+/// The set's job file under `~/.plank/downloads`.
 #[must_use]
-pub fn job_path() -> PathBuf {
-    job_path_in(&crate::manifest::plank_dir())
+pub fn job_path(set: crate::manifest::ModelSet) -> PathBuf {
+    job_path_in(&crate::manifest::plank_dir(), set)
 }
 
 /// Where a detached helper's stderr goes, since it has no terminal.
@@ -813,8 +854,12 @@ pub fn log_path() -> PathBuf {
 ///
 /// # Errors
 /// Propagates filesystem errors.
-pub fn write_job_in(root: &Path, manifest: &crate::manifest::Manifest) -> std::io::Result<()> {
-    let path = job_path_in(root);
+pub fn write_job_in(
+    root: &Path,
+    set: crate::manifest::ModelSet,
+    manifest: &crate::manifest::Manifest,
+) -> std::io::Result<()> {
+    let path = job_path_in(root, set);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -825,20 +870,43 @@ pub fn write_job_in(root: &Path, manifest: &crate::manifest::Manifest) -> std::i
 ///
 /// # Errors
 /// Propagates filesystem errors.
-pub fn write_job(manifest: &crate::manifest::Manifest) -> std::io::Result<()> {
-    write_job_in(&crate::manifest::plank_dir(), manifest)
+pub fn write_job(
+    set: crate::manifest::ModelSet,
+    manifest: &crate::manifest::Manifest,
+) -> std::io::Result<()> {
+    write_job_in(&crate::manifest::plank_dir(), set, manifest)
 }
 
 /// The pending job, if one is recorded and still parses.
 #[must_use]
-pub fn read_job_in(root: &Path) -> Option<crate::manifest::Manifest> {
-    crate::manifest::read_at(&job_path_in(root))
+pub fn read_job_in(
+    root: &Path,
+    set: crate::manifest::ModelSet,
+) -> Option<crate::manifest::Manifest> {
+    crate::manifest::read_at(&job_path_in(root, set))
+}
+
+/// The one pending job under `root`, and which set it belongs to.
+///
+/// At most one download runs at a time, so at most one job file normally
+/// exists. Qwen is checked first only to make the scan deterministic; if both
+/// somehow exist, the helper each was written for still reads its own.
+#[must_use]
+pub fn pending_job_in(
+    root: &Path,
+) -> Option<(crate::manifest::ModelSet, crate::manifest::Manifest)> {
+    [
+        crate::manifest::ModelSet::Qwen,
+        crate::manifest::ModelSet::Ds4,
+    ]
+    .into_iter()
+    .find_map(|set| read_job_in(root, set).map(|m| (set, m)))
 }
 
 /// The pending job under `~/.plank`, if one is recorded and still parses.
 #[must_use]
-pub fn read_job() -> Option<crate::manifest::Manifest> {
-    read_job_in(&crate::manifest::plank_dir())
+pub fn read_job(set: crate::manifest::ModelSet) -> Option<crate::manifest::Manifest> {
+    read_job_in(&crate::manifest::plank_dir(), set)
 }
 
 /// Whether a helper currently holds the lock at `root`.
@@ -870,15 +938,22 @@ pub fn running() -> bool {
 /// download is exactly what this whole feature exists to avoid — so callers
 /// report the error and nothing downloads; `/model download` is how the user
 /// retries.
-pub fn spawn_detached(manifest: &crate::manifest::Manifest) -> Result<(), String> {
+pub fn spawn_detached(
+    set: crate::manifest::ModelSet,
+    manifest: &crate::manifest::Manifest,
+) -> Result<(), String> {
     if running() {
         return Ok(());
     }
-    write_job(manifest).map_err(|e| format!("cannot record the download job: {e}"))?;
+    write_job(set, manifest).map_err(|e| format!("cannot record the download job: {e}"))?;
     clear_cancel();
     let exe = std::env::current_exe().map_err(|e| format!("cannot find plank's own path: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
+    // The set travels in argv rather than in the job file: the helper needs it
+    // before it reads anything, to know which staging area it owns, and a
+    // helper spawned by an older plank passes nothing and defaults to ds4.
     cmd.arg("--model-downloader")
+        .arg(set.as_str())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -918,7 +993,7 @@ fn detach(_cmd: &mut std::process::Command) {}
 /// Takes the lock for its whole life, so a second helper started by another
 /// plank exits immediately instead of fighting over the same `.part` files.
 #[must_use]
-pub fn run_helper() -> i32 {
+pub fn run_helper(set: crate::manifest::ModelSet) -> i32 {
     let root = crate::manifest::plank_dir();
     let path = lock_path_in(&root);
     if let Some(parent) = path.parent() {
@@ -942,14 +1017,14 @@ pub fn run_helper() -> i32 {
             return 0;
         }
     }
-    let Some(manifest) = read_job_in(&root) else {
+    let Some(manifest) = read_job_in(&root, set) else {
         log_line("no job recorded; nothing to download");
         return 1;
     };
     // A cancel flag left over from a previous run must not stop this one before
     // it starts.
     clear_cancel();
-    let outcome = run_job(&root, &manifest, &http_fetch);
+    let outcome = run_job(&root, set, &manifest, &http_fetch);
     log_line(&format!(
         "job for version {} ended: {outcome:?}",
         manifest.version
@@ -995,18 +1070,19 @@ fn log_line(msg: &str) {
 /// # Errors
 /// Returns a message only when a rename of a verified artifact fails — a real
 /// filesystem problem the user needs to hear about.
-pub fn swap_staged_in(root: &Path) -> Result<Option<u32>, String> {
-    let staged_manifest = crate::manifest::staging_dir_in(root).join("ds4.manifest");
+pub fn swap_staged_in(root: &Path, set: crate::manifest::ModelSet) -> Result<Option<u32>, String> {
+    let staged_manifest = crate::manifest::staging_dir_in(root, set).join(set.manifest_name());
     let Some(manifest) = crate::manifest::read_at(&staged_manifest) else {
         return Ok(None);
     };
 
     // Everything this build installs, paired with where it goes.
-    let jobs: Vec<(&str, &crate::manifest::FileEntry, PathBuf)> = crate::manifest::KINDS
+    let jobs: Vec<(&str, &crate::manifest::FileEntry, PathBuf)> = set
+        .kinds()
         .iter()
         .filter_map(|kind| {
             let entry = manifest.files.get(*kind)?;
-            let dest = crate::manifest::local_path_for_in(root, kind)?;
+            let dest = crate::manifest::local_path_for_in(root, set, kind)?;
             Some((*kind, entry, dest))
         })
         .collect();
@@ -1021,7 +1097,7 @@ pub fn swap_staged_in(root: &Path) -> Result<Option<u32>, String> {
     // mismatched trio on disk.
     let complete = jobs.iter().all(|(kind, entry, dest)| {
         let dest_size_matches = std::fs::metadata(dest).map(|m| m.len()).ok() == Some(entry.bytes);
-        dest_size_matches || staged_is_current(root, kind, entry)
+        dest_size_matches || staged_is_current(root, set, kind, entry)
     });
     if !complete {
         return Ok(None);
@@ -1031,26 +1107,29 @@ pub fn swap_staged_in(root: &Path) -> Result<Option<u32>, String> {
         return Err(format!("cannot create the plank directory: {e}"));
     }
     for (kind, entry, dest) in &jobs {
-        let from = staged_path_in(root, kind);
-        if !staged_is_current(root, kind, entry) {
+        let from = staged_path_in(root, set, kind);
+        if !staged_is_current(root, set, kind, entry) {
             // Either already moved by an interrupted earlier swap (nothing
             // left in staging), or the destination already satisfies this
             // manifest's entry and whatever sits in staging is unproven for
             // it — either way, nothing to rename here. Clean up any leftover
             // sidecar (e.g., from a crash after renaming but before removing it).
-            let _ = std::fs::remove_file(staged_sha_path_in(root, kind));
+            let _ = std::fs::remove_file(staged_sha_path_in(root, set, kind));
             continue;
         }
         std::fs::rename(&from, dest)
             .map_err(|e| format!("cannot install {kind} at {}: {e}", dest.display()))?;
         // No longer needed once the artifact it describes is gone; leaving it
         // behind would only stop `staging/` from being cleaned up below.
-        let _ = std::fs::remove_file(staged_sha_path_in(root, kind));
+        let _ = std::fs::remove_file(staged_sha_path_in(root, set, kind));
     }
     // Last, and only now: this file is the claim that the set is installed.
-    std::fs::rename(&staged_manifest, crate::manifest::installed_path_in(root))
-        .map_err(|e| format!("cannot record the installed manifest: {e}"))?;
-    let _ = std::fs::remove_dir(crate::manifest::staging_dir_in(root));
+    std::fs::rename(
+        &staged_manifest,
+        crate::manifest::installed_path_in(root, set),
+    )
+    .map_err(|e| format!("cannot record the installed manifest: {e}"))?;
+    let _ = std::fs::remove_dir(crate::manifest::staging_dir_in(root, set));
     let _ = std::fs::remove_file(state_path_in(root));
     Ok(Some(manifest.version))
 }
@@ -1060,8 +1139,8 @@ pub fn swap_staged_in(root: &Path) -> Result<Option<u32>, String> {
 /// # Errors
 /// Returns a message only when a rename of a verified artifact fails — a real
 /// filesystem problem the user needs to hear about.
-pub fn swap_staged() -> Result<Option<u32>, String> {
-    swap_staged_in(&crate::manifest::plank_dir())
+pub fn swap_staged(set: crate::manifest::ModelSet) -> Result<Option<u32>, String> {
+    swap_staged_in(&crate::manifest::plank_dir(), set)
 }
 
 /// The status-bar text for `state`, or the empty-ish forms for the phases that
@@ -1202,10 +1281,10 @@ pub fn quit_warning() -> Option<String> {
 /// is on disk. It also never counts a verified `<kind>.gguf`, since `Delete`
 /// leaves those alone.
 #[must_use]
-fn part_bytes_on_disk(root: &Path) -> u64 {
-    crate::manifest::KINDS
+fn part_bytes_on_disk(root: &Path, set: crate::manifest::ModelSet) -> u64 {
+    set.kinds()
         .iter()
-        .filter_map(|kind| std::fs::metadata(part_path_in(root, kind)).ok())
+        .filter_map(|kind| std::fs::metadata(part_path_in(root, set, kind)).ok())
         .map(|m| m.len())
         .sum()
 }
@@ -1215,13 +1294,14 @@ fn part_bytes_on_disk(root: &Path) -> u64 {
 #[must_use]
 pub fn cancel_prompt_in(root: &Path) -> Option<String> {
     let state = live_state_in(root)?;
+    let set = crate::manifest::ModelSet::from_str_or_default(&state.set);
     in_flight(state.phase).then(|| {
         format!(
             "Cancel the model download? {:.1} GB on disk in partial files.\n\
              [k] cancel, keep the partial files (resume via /model download, or the next offer)\n\
              [d] cancel and delete the partial files (verified artifacts are kept)\n\
              [Esc] keep downloading",
-            crate::download::gb(part_bytes_on_disk(root))
+            crate::download::gb(part_bytes_on_disk(root, set))
         )
     })
 }
@@ -1239,11 +1319,11 @@ pub fn start_from_manifest_in(root: &Path) -> String {
     if running_in(root) {
         return "A model download is already running.".to_string();
     }
-    let Some(manifest) = read_job_in(root) else {
+    let Some((set, manifest)) = pending_job_in(root) else {
         return "No model download is pending. plank checks for one at startup, once a day."
             .to_string();
     };
-    match spawn_detached(&manifest) {
+    match spawn_detached(set, &manifest) {
         Ok(()) => format!(
             "Downloading model manifest version {} in the background.",
             manifest.version
@@ -1316,6 +1396,7 @@ pub(crate) mod tests {
 
     pub(crate) fn a_state() -> State {
         State {
+            set: crate::manifest::ModelSet::Ds4.as_str().to_string(),
             pid: 4711,
             version: 3,
             current: "main".to_string(),
@@ -1552,18 +1633,28 @@ pub(crate) mod tests {
     fn run_job_verifies_stages_and_reports_done() {
         let root = tempdir();
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
-        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &m,
+            &serving(&[("main", b"abc".to_vec())]),
+        );
         assert_eq!(outcome, Outcome::Verified);
         assert_eq!(
-            std::fs::read(staged_path_in(&root, "main")).expect("staged file"),
+            std::fs::read(staged_path_in(
+                &root,
+                crate::manifest::ModelSet::Ds4,
+                "main"
+            ))
+            .expect("staged file"),
             b"abc"
         );
         assert!(
-            !part_path_in(&root, "main").exists(),
+            !part_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
             "the .part is consumed"
         );
         assert!(
-            crate::manifest::staging_dir_in(&root)
+            crate::manifest::staging_dir_in(&root, crate::manifest::ModelSet::Ds4)
                 .join("ds4.manifest")
                 .exists(),
             "the manifest is staged alongside the artifacts"
@@ -1576,13 +1667,21 @@ pub(crate) mod tests {
         // to be resumed on the next launch.
         let root = tempdir();
         let m = manifest_for(&[("main", b"abc".as_slice(), EMPTY_SHA)]);
-        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &m,
+            &serving(&[("main", b"abc".to_vec())]),
+        );
         assert!(matches!(outcome, Outcome::Failed(_)), "got {outcome:?}");
         assert!(
-            !part_path_in(&root, "main").exists(),
+            !part_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
             "bad bytes are discarded"
         );
-        assert!(!staged_path_in(&root, "main").exists(), "nothing is staged");
+        assert!(
+            !staged_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
+            "nothing is staged"
+        );
     }
 
     #[test]
@@ -1592,10 +1691,16 @@ pub(crate) mod tests {
         let root = tempdir();
         let mut m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
         m.files.get_mut("main").expect("main").bytes = 10;
-        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &m,
+            &serving(&[("main", b"abc".to_vec())]),
+        );
         assert!(matches!(outcome, Outcome::Failed(_)), "got {outcome:?}");
         assert_eq!(
-            std::fs::read(part_path_in(&root, "main")).expect("part survives"),
+            std::fs::read(part_path_in(&root, crate::manifest::ModelSet::Ds4, "main"))
+                .expect("part survives"),
             b"abc"
         );
     }
@@ -1603,13 +1708,29 @@ pub(crate) mod tests {
     #[test]
     fn a_pending_cancel_stops_before_any_bytes_and_keep_preserves_partials() {
         let root = tempdir();
-        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
-        std::fs::write(part_path_in(&root, "main"), b"a").expect("seed a partial");
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
+        std::fs::write(
+            part_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            b"a",
+        )
+        .expect("seed a partial");
         request_cancel_in(&root, Cancel::Keep).expect("flag");
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
-        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &m,
+            &serving(&[("main", b"abc".to_vec())]),
+        );
         assert_eq!(outcome, Outcome::Cancelled);
-        assert!(part_path_in(&root, "main").exists(), "keep means keep");
+        assert!(
+            part_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
+            "keep means keep"
+        );
         // Fix C: a Keep cancel's whole point is "stop now, resume later", so
         // `note_last_run_outcome_in` must be able to tell it apart from a
         // Delete cancel and not treat it as a decline.
@@ -1622,13 +1743,29 @@ pub(crate) mod tests {
     #[test]
     fn cancel_with_delete_removes_the_partials() {
         let root = tempdir();
-        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
-        std::fs::write(part_path_in(&root, "main"), b"a").expect("seed a partial");
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
+        std::fs::write(
+            part_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            b"a",
+        )
+        .expect("seed a partial");
         request_cancel_in(&root, Cancel::Delete).expect("flag");
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
-        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &m,
+            &serving(&[("main", b"abc".to_vec())]),
+        );
         assert_eq!(outcome, Outcome::Cancelled);
-        assert!(!part_path_in(&root, "main").exists(), "delete means delete");
+        assert!(
+            !part_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
+            "delete means delete"
+        );
         assert!(
             !cancelled_kept(&read_state_in(&root).expect("state published")),
             "a Delete cancel must not record as kept"
@@ -1640,15 +1777,30 @@ pub(crate) mod tests {
         // Resuming a job that got through two of three files must not restart the
         // two that are done.
         let root = tempdir();
-        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
-        std::fs::write(staged_path_in(&root, "main"), b"abc").expect("pre-staged");
-        std::fs::write(staged_sha_path_in(&root, "main"), ABC_SHA).expect("sidecar");
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
+        std::fs::write(
+            staged_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            b"abc",
+        )
+        .expect("pre-staged");
+        std::fs::write(
+            staged_sha_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            ABC_SHA,
+        )
+        .expect("sidecar");
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
         // A fetcher that would panic if called proves nothing was refetched.
         let never = |_: &str, _: u64| -> Result<Box<dyn Read + Send>, String> {
             panic!("must not refetch a staged artifact")
         };
-        assert_eq!(run_job(&root, &m, &never), Outcome::Verified);
+        assert_eq!(
+            run_job(&root, crate::manifest::ModelSet::Ds4, &m, &never),
+            Outcome::Verified
+        );
     }
 
     #[test]
@@ -1659,15 +1811,37 @@ pub(crate) mod tests {
         // mismatch is the cheapest proof that it is stale: it must be
         // replaced, not trusted by existence.
         let root = tempdir();
-        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
         // A same-named artifact from an older, shorter manifest version.
-        std::fs::write(staged_path_in(&root, "main"), b"ab").expect("stale, wrong size");
-        std::fs::write(staged_sha_path_in(&root, "main"), ABC_SHA).expect("stale sidecar");
+        std::fs::write(
+            staged_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            b"ab",
+        )
+        .expect("stale, wrong size");
+        std::fs::write(
+            staged_sha_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            ABC_SHA,
+        )
+        .expect("stale sidecar");
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
-        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &m,
+            &serving(&[("main", b"abc".to_vec())]),
+        );
         assert_eq!(outcome, Outcome::Verified);
         assert_eq!(
-            std::fs::read(staged_path_in(&root, "main")).expect("re-staged"),
+            std::fs::read(staged_path_in(
+                &root,
+                crate::manifest::ModelSet::Ds4,
+                "main"
+            ))
+            .expect("re-staged"),
             b"abc",
             "the stale, wrong-size artifact must be replaced with the current one"
         );
@@ -1682,18 +1856,40 @@ pub(crate) mod tests {
         // recorded when the artifact was actually verified is what closes
         // this gap without re-hashing tens of gigabytes on every check.
         let root = tempdir();
-        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
         // Same length as "abc" (3 bytes), different content and a sidecar
         // that still names the OLD manifest's hash — exactly what a real
         // stale artifact looks like after `one_artifact` staged it honestly
         // for a different version.
-        std::fs::write(staged_path_in(&root, "main"), b"xyz").expect("stale, same size");
-        std::fs::write(staged_sha_path_in(&root, "main"), EMPTY_SHA).expect("stale sidecar");
+        std::fs::write(
+            staged_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            b"xyz",
+        )
+        .expect("stale, same size");
+        std::fs::write(
+            staged_sha_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            EMPTY_SHA,
+        )
+        .expect("stale sidecar");
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
-        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &m,
+            &serving(&[("main", b"abc".to_vec())]),
+        );
         assert_eq!(outcome, Outcome::Verified);
         assert_eq!(
-            std::fs::read(staged_path_in(&root, "main")).expect("re-staged"),
+            std::fs::read(staged_path_in(
+                &root,
+                crate::manifest::ModelSet::Ds4,
+                "main"
+            ))
+            .expect("re-staged"),
             b"abc",
             "a same-size artifact from a different version must be re-verified, \
              not installed as the current one"
@@ -1719,11 +1915,15 @@ pub(crate) mod tests {
         // not an error) so the .part is left behind for resume.
         let half = full.len() / 2;
         let first = serving(&[("main", full[..half].to_vec())]);
-        let outcome1 = run_job(&root, &m, &first);
+        let outcome1 = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &first);
         assert!(matches!(outcome1, Outcome::Failed(_)), "got {outcome1:?}");
-        assert!(part_path_in(&root, "main").exists(), "partial is kept");
+        assert!(
+            part_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
+            "partial is kept"
+        );
         assert_eq!(
-            std::fs::read(part_path_in(&root, "main")).expect("part"),
+            std::fs::read(part_path_in(&root, crate::manifest::ModelSet::Ds4, "main"))
+                .expect("part"),
             full[..half]
         );
 
@@ -1745,14 +1945,19 @@ pub(crate) mod tests {
                 full_owned[offset..].to_vec(),
             )))
         };
-        let outcome2 = run_job(&root, &m, &resume_only);
+        let outcome2 = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &resume_only);
         assert_eq!(outcome2, Outcome::Verified);
         assert_eq!(
-            std::fs::read(staged_path_in(&root, "main")).expect("staged"),
+            std::fs::read(staged_path_in(
+                &root,
+                crate::manifest::ModelSet::Ds4,
+                "main"
+            ))
+            .expect("staged"),
             full
         );
         assert!(
-            !part_path_in(&root, "main").exists(),
+            !part_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
             "the .part is consumed"
         );
     }
@@ -1793,7 +1998,11 @@ pub(crate) mod tests {
         // artifacts. This drives one set from inside the fetcher's reader,
         // partway through the byte stream itself.
         let root = tempdir();
-        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
         let m = manifest_for(&[("main", b"abcdefghij".as_slice(), EMPTY_SHA)]);
 
         let root_for_reader = root.clone();
@@ -1807,14 +2016,15 @@ pub(crate) mod tests {
             }) as Box<dyn Read + Send>)
         };
 
-        let outcome = run_job(&root, &m, &fetcher);
+        let outcome = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &fetcher);
         assert_eq!(outcome, Outcome::Cancelled);
         assert!(
-            part_path_in(&root, "main").exists(),
+            part_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
             "Keep leaves the .part in place"
         );
         assert_eq!(
-            std::fs::read(part_path_in(&root, "main")).expect("partial bytes"),
+            std::fs::read(part_path_in(&root, crate::manifest::ModelSet::Ds4, "main"))
+                .expect("partial bytes"),
             b"abc",
             "only the bytes received before the cancel was observed are kept"
         );
@@ -1936,7 +2146,10 @@ pub(crate) mod tests {
     fn helper_paths_sit_under_the_downloads_directory() {
         let root = tempdir();
         assert_eq!(lock_path_in(&root), root.join("downloads").join("lock"));
-        assert_eq!(job_path_in(&root), root.join("downloads").join("job.json"));
+        assert_eq!(
+            job_path_in(&root, crate::manifest::ModelSet::Ds4),
+            root.join("downloads").join("job.json")
+        );
         assert_eq!(log_path_in(&root), root.join("downloads").join("log"));
     }
 
@@ -1944,8 +2157,8 @@ pub(crate) mod tests {
     fn a_job_written_is_a_job_read_back() {
         let root = tempdir();
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
-        write_job_in(&root, &m).expect("write job");
-        let back = read_job_in(&root).expect("read job");
+        write_job_in(&root, crate::manifest::ModelSet::Ds4, &m).expect("write job");
+        let back = read_job_in(&root, crate::manifest::ModelSet::Ds4).expect("read job");
         assert_eq!(back.version, m.version);
         assert_eq!(back.raw, m.raw, "the job is the manifest bytes, verbatim");
     }
@@ -1953,7 +2166,7 @@ pub(crate) mod tests {
     #[test]
     fn an_absent_job_reads_as_none() {
         let root = tempdir();
-        assert!(read_job_in(&root).is_none());
+        assert!(read_job_in(&root, crate::manifest::ModelSet::Ds4).is_none());
     }
 
     #[test]
@@ -1967,16 +2180,28 @@ pub(crate) mod tests {
     /// — taken from the manifest's own entry, matching what `run_job` writes
     /// after a real verification.
     fn stage(root: &Path, manifest: &crate::manifest::Manifest, bodies: &[(&str, &[u8])]) {
-        std::fs::create_dir_all(crate::manifest::staging_dir_in(root)).expect("staging");
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
         for (kind, body) in bodies {
-            std::fs::write(staged_path_in(root, kind), body).expect("stage artifact");
+            std::fs::write(
+                staged_path_in(root, crate::manifest::ModelSet::Ds4, kind),
+                body,
+            )
+            .expect("stage artifact");
             if let Some(entry) = manifest.files.get(*kind) {
-                std::fs::write(staged_sha_path_in(root, kind), &entry.sha256)
-                    .expect("stage sidecar");
+                std::fs::write(
+                    staged_sha_path_in(root, crate::manifest::ModelSet::Ds4, kind),
+                    &entry.sha256,
+                )
+                .expect("stage sidecar");
             }
         }
         std::fs::write(
-            crate::manifest::staging_dir_in(root).join("ds4.manifest"),
+            crate::manifest::staging_dir_in(root, crate::manifest::ModelSet::Ds4)
+                .join("ds4.manifest"),
             &manifest.raw,
         )
         .expect("stage manifest");
@@ -1990,12 +2215,21 @@ pub(crate) mod tests {
         manifest: &crate::manifest::Manifest,
         bodies: &[(&str, &[u8])],
     ) {
-        std::fs::create_dir_all(crate::manifest::staging_dir_in(root)).expect("staging");
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
         for (kind, body) in bodies {
-            std::fs::write(staged_path_in(root, kind), body).expect("stage artifact");
+            std::fs::write(
+                staged_path_in(root, crate::manifest::ModelSet::Ds4, kind),
+                body,
+            )
+            .expect("stage artifact");
         }
         std::fs::write(
-            crate::manifest::staging_dir_in(root).join("ds4.manifest"),
+            crate::manifest::staging_dir_in(root, crate::manifest::ModelSet::Ds4)
+                .join("ds4.manifest"),
             &manifest.raw,
         )
         .expect("stage manifest");
@@ -2007,24 +2241,34 @@ pub(crate) mod tests {
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
         stage(&root, &m, &[("main", b"abc")]);
 
-        let swapped = swap_staged_in(&root).expect("swap succeeds");
+        let swapped = swap_staged_in(&root, crate::manifest::ModelSet::Ds4).expect("swap succeeds");
         assert_eq!(swapped, Some(3));
-        let installed = crate::manifest::local_path_for_in(&root, "main").expect("main path");
+        let installed =
+            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds4, "main")
+                .expect("main path");
         assert_eq!(std::fs::read(installed).expect("installed"), b"abc");
         assert!(
-            !staged_path_in(&root, "main").exists(),
+            !staged_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
             "staging is drained"
         );
-        let recorded = crate::manifest::read_at(&crate::manifest::installed_path_in(&root))
-            .expect("installed manifest");
+        let recorded = crate::manifest::read_at(&crate::manifest::installed_path_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("installed manifest");
         assert_eq!(recorded.version, 3);
     }
 
     #[test]
     fn swap_with_nothing_staged_is_a_no_op() {
         let root = tempdir();
-        assert_eq!(swap_staged_in(&root).expect("no-op"), None);
-        assert!(!crate::manifest::installed_path_in(&root).exists());
+        assert_eq!(
+            swap_staged_in(&root, crate::manifest::ModelSet::Ds4).expect("no-op"),
+            None
+        );
+        assert!(
+            !crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4).exists()
+        );
     }
 
     #[test]
@@ -2038,13 +2282,16 @@ pub(crate) mod tests {
         ]);
         stage(&root, &m, &[("main", b"abc")]);
 
-        assert_eq!(swap_staged_in(&root).expect("no-op"), None);
+        assert_eq!(
+            swap_staged_in(&root, crate::manifest::ModelSet::Ds4).expect("no-op"),
+            None
+        );
         assert!(
-            !crate::manifest::installed_path_in(&root).exists(),
+            !crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4).exists(),
             "nothing recorded"
         );
         assert!(
-            staged_path_in(&root, "main").exists(),
+            staged_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
             "staging is left intact for a retry"
         );
     }
@@ -2054,8 +2301,13 @@ pub(crate) mod tests {
         let root = tempdir();
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
         stage(&root, &m, &[("main", b"ab")]);
-        assert_eq!(swap_staged_in(&root).expect("no-op"), None);
-        assert!(!crate::manifest::installed_path_in(&root).exists());
+        assert_eq!(
+            swap_staged_in(&root, crate::manifest::ModelSet::Ds4).expect("no-op"),
+            None
+        );
+        assert!(
+            !crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4).exists()
+        );
     }
 
     #[test]
@@ -2073,21 +2325,28 @@ pub(crate) mod tests {
         // Perform the "already happened" half by hand.
         std::fs::create_dir_all(&root).expect("root");
         std::fs::rename(
-            staged_path_in(&root, "main"),
-            crate::manifest::local_path_for_in(&root, "main").expect("main path"),
+            staged_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds4, "main")
+                .expect("main path"),
         )
         .expect("first rename");
 
-        assert_eq!(swap_staged_in(&root).expect("completes"), Some(3));
+        assert_eq!(
+            swap_staged_in(&root, crate::manifest::ModelSet::Ds4).expect("completes"),
+            Some(3)
+        );
         assert!(
-            crate::manifest::local_path_for_in(&root, "vision")
+            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds4, "vision")
                 .expect("v")
                 .exists()
         );
         assert_eq!(
-            crate::manifest::read_at(&crate::manifest::installed_path_in(&root))
-                .expect("installed")
-                .version,
+            crate::manifest::read_at(&crate::manifest::installed_path_in(
+                &root,
+                crate::manifest::ModelSet::Ds4
+            ))
+            .expect("installed")
+            .version,
             3
         );
     }
@@ -2109,21 +2368,29 @@ pub(crate) mod tests {
         // v6's run_job overwrites the staged artifact and its sidecar, but
         // never gets to (re)write `ds4.manifest` — v5's is still the one on
         // disk.
-        std::fs::write(staged_path_in(&root, "main"), b"xyz").expect("overwrite artifact");
-        std::fs::write(staged_sha_path_in(&root, "main"), XYZ_SHA).expect("overwrite sidecar");
+        std::fs::write(
+            staged_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            b"xyz",
+        )
+        .expect("overwrite artifact");
+        std::fs::write(
+            staged_sha_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            XYZ_SHA,
+        )
+        .expect("overwrite sidecar");
 
         assert_eq!(
-            swap_staged_in(&root).expect("no-op"),
+            swap_staged_in(&root, crate::manifest::ModelSet::Ds4).expect("no-op"),
             None,
             "a staged artifact whose sidecar does not match the staged manifest's \
              entry must never be installed under that manifest's version"
         );
         assert!(
-            !crate::manifest::installed_path_in(&root).exists(),
+            !crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4).exists(),
             "nothing recorded"
         );
         assert!(
-            staged_path_in(&root, "main").exists(),
+            staged_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
             "the mismatched artifact is left in staging, not installed"
         );
     }
@@ -2138,19 +2405,21 @@ pub(crate) mod tests {
         let old = manifest_for_version(5, &[("main", b"abc".as_slice(), ABC_SHA)]);
         stage(&root, &old, &[("main", b"abc")]);
         assert!(
-            crate::manifest::staging_dir_in(&root)
+            crate::manifest::staging_dir_in(&root, crate::manifest::ModelSet::Ds4)
                 .join("ds4.manifest")
                 .exists()
         );
 
         let new = manifest_for_version(6, &[("main", b"xyz".as_slice(), XYZ_SHA)]);
         let fetch = serving(&[("main", b"xyz".to_vec())]);
-        let outcome = run_job(&root, &new, &fetch);
+        let outcome = run_job(&root, crate::manifest::ModelSet::Ds4, &new, &fetch);
         assert!(matches!(outcome, Outcome::Verified), "{outcome:?}");
 
-        let recorded =
-            crate::manifest::read_at(&crate::manifest::staging_dir_in(&root).join("ds4.manifest"))
-                .expect("a manifest is staged");
+        let recorded = crate::manifest::read_at(
+            &crate::manifest::staging_dir_in(&root, crate::manifest::ModelSet::Ds4)
+                .join("ds4.manifest"),
+        )
+        .expect("a manifest is staged");
         assert_eq!(
             recorded.version, 6,
             "the stale v5 manifest must not survive"
@@ -2166,18 +2435,23 @@ pub(crate) mod tests {
         let root = tempdir();
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
         stage_without_sidecar(&root, &m, &[("main", b"abc")]);
-        assert!(!staged_sha_path_in(&root, "main").exists());
+        assert!(!staged_sha_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists());
 
         assert!(
-            !staged_is_current(&root, "main", m.files.get("main").expect("entry")),
+            !staged_is_current(
+                &root,
+                crate::manifest::ModelSet::Ds4,
+                "main",
+                m.files.get("main").expect("entry")
+            ),
             "a sidecar-less artifact must not be trusted, even at the right size"
         );
 
         let fetch = serving(&[("main", b"abc".to_vec())]);
-        let outcome = run_job(&root, &m, &fetch);
+        let outcome = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &fetch);
         assert!(matches!(outcome, Outcome::Verified), "{outcome:?}");
         assert!(
-            staged_sha_path_in(&root, "main").exists(),
+            staged_sha_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
             "run_job re-verified the artifact and wrote a fresh sidecar for it"
         );
     }
@@ -2187,11 +2461,14 @@ pub(crate) mod tests {
         let root = tempdir();
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
         stage(&root, &m, &[("main", b"abc")]);
-        assert!(staged_sha_path_in(&root, "main").exists());
+        assert!(staged_sha_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists());
 
-        assert_eq!(swap_staged_in(&root).expect("swap succeeds"), Some(3));
+        assert_eq!(
+            swap_staged_in(&root, crate::manifest::ModelSet::Ds4).expect("swap succeeds"),
+            Some(3)
+        );
         assert!(
-            !staged_sha_path_in(&root, "main").exists(),
+            !staged_sha_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
             "the sidecar is consumed along with the artifact it describes"
         );
     }
@@ -2268,18 +2545,22 @@ pub(crate) mod tests {
         // (which is only the current artifact's progress) — otherwise the
         // popup could understate what [d] is about to erase.
         let dir = tempdir();
-        std::fs::create_dir_all(crate::manifest::staging_dir_in(&dir)).expect("staging");
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            &dir,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
         // Sparse, not real bytes: `part_bytes_on_disk` reads `metadata().len()`,
         // which `set_len` satisfies without writing a single block. Writing
         // real 20 GB + 16.2 GB vecs here once measured 17.4s wall, 34 GB
         // actually written to disk, and 20 GB held live on the heap until
         // process exit — enough to fail outright on a CI runner with ~14 GB
         // free.
-        File::create(part_path_in(&dir, "main"))
+        File::create(part_path_in(&dir, crate::manifest::ModelSet::Ds4, "main"))
             .expect("create main part")
             .set_len(20_000_000_000)
             .expect("size main part");
-        File::create(part_path_in(&dir, "vision"))
+        File::create(part_path_in(&dir, crate::manifest::ModelSet::Ds4, "vision"))
             .expect("create vision part")
             .set_len(16_200_000_000)
             .expect("size vision part");
@@ -2298,22 +2579,39 @@ pub(crate) mod tests {
         // verified, staged `<kind>.gguf` — those are hash-proven and cost
         // nothing to keep.
         let root = tempdir();
-        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
-        std::fs::write(staged_path_in(&root, "main"), b"abc").expect("pre-staged, verified");
-        std::fs::write(part_path_in(&root, "vision"), b"partial").expect("in-flight partial");
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
+        std::fs::write(
+            staged_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            b"abc",
+        )
+        .expect("pre-staged, verified");
+        std::fs::write(
+            part_path_in(&root, crate::manifest::ModelSet::Ds4, "vision"),
+            b"partial",
+        )
+        .expect("in-flight partial");
         request_cancel_in(&root, Cancel::Delete).expect("flag");
         let m = manifest_for(&[
             ("main", b"abc".as_slice(), ABC_SHA),
             ("vision", b"abcdefg".as_slice(), ABC_SHA),
         ]);
-        let outcome = run_job(&root, &m, &serving(&[("vision", b"abcdefg".to_vec())]));
+        let outcome = run_job(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &m,
+            &serving(&[("vision", b"abcdefg".to_vec())]),
+        );
         assert_eq!(outcome, Outcome::Cancelled);
         assert!(
-            staged_path_in(&root, "main").exists(),
+            staged_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists(),
             "a verified artifact must survive a delete cancel"
         );
         assert!(
-            !part_path_in(&root, "vision").exists(),
+            !part_path_in(&root, crate::manifest::ModelSet::Ds4, "vision").exists(),
             "the in-flight .part is still deleted"
         );
     }

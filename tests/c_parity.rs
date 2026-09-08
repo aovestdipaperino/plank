@@ -565,3 +565,40 @@ fn qwen_syntax_reminder_matches_c_source() {
         "qwen syntax reminder vs C",
     );
 }
+
+/// Both committed manifests must parse with plank's own parser.
+///
+/// They are data files, so nothing else compiles them: a typo in a URL, a
+/// truncated hash, or a kind this build cannot install would otherwise only
+/// surface as a failed download on a user's machine.
+#[test]
+fn the_committed_manifests_parse_and_name_installable_kinds() {
+    for (set, name) in [
+        (plank::manifest::ModelSet::Ds4, "ds4.manifest"),
+        (plank::manifest::ModelSet::Qwen, "qwen.manifest"),
+    ] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let m = plank::manifest::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(set.manifest_name(), name, "set names its own file");
+
+        // Every kind this build installs for the set must be present, or a
+        // swap would never find the set complete and would silently install
+        // nothing at all.
+        for kind in set.kinds() {
+            let entry = m
+                .files
+                .get(*kind)
+                .unwrap_or_else(|| panic!("{name} omits the {kind} artifact"));
+            assert!(entry.bytes > 0, "{name}: {kind} has no size");
+            assert!(
+                entry.url.starts_with("https://"),
+                "{name}: {kind} url is not https"
+            );
+            assert!(
+                plank::manifest::local_path_for(set, kind).is_some(),
+                "{name}: {kind} has nowhere to install"
+            );
+        }
+    }
+}
