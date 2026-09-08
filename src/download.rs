@@ -284,6 +284,37 @@ pub fn default_dspark_path() -> PathBuf {
     home.join(".plank").join("ds4flash.dspark.gguf")
 }
 
+/// Default Qwen3.8-Flash-Next model location, selected by `--qwen`.
+///
+/// plank never downloads this one — the Qwen release is not in `ds4.manifest`
+/// — so it is expected to be a symlink the user points at whichever build they
+/// want:
+///
+/// ```text
+/// ln -sfn ~/models/qwen38-ds4-q4/Qwen3.8-...-MTP.gguf  ~/.plank/qwen.gguf
+/// ln -sfn ~/models/qwen38-ds4-q4/Qwen3.8-...-PLE-Q4_1.gguf ~/.plank/qwen.mtp.gguf
+/// ```
+///
+/// Deliberately outside the `ds4flash.*` family, which the manifest owns: a
+/// staged upgrade moves those three names into place, and a name it recognized
+/// would be replaced under the user's feet.
+#[must_use]
+pub fn default_qwen_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("qwen.gguf")
+}
+
+/// Default companion for [`default_qwen_path`] — the required PLE sidecar.
+///
+/// Named for the flag that carries it (`--mtp-model`) rather than for the
+/// tensor inside it, so the pairing reads the same way `ds4flash.dspark.gguf`
+/// pairs with `ds4flash.gguf`.
+#[must_use]
+pub fn default_qwen_mtp_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("qwen.mtp.gguf")
+}
+
 /// Default vision-encoder location. plank assumes vision is always on, so this
 /// is loaded alongside the main model whenever the native engine is used.
 ///
@@ -471,7 +502,12 @@ pub fn ensure_model(path: &Path) -> Result<(), String> {
         // before the engine loads.
         return Ok(());
     }
-    if !std::io::stdin().is_terminal() {
+    if !std::io::stdin().is_terminal() || path != default_model_path() {
+        // Only the DeepSeek default is offered for download, because that is
+        // the only model `ds4.manifest` describes. Offering it for any missing
+        // path meant `--qwen` with an unlinked `~/.plank/qwen.gguf` proposed
+        // fetching 87 GB of DeepSeek *into the Qwen slot* — and so did a
+        // mistyped `-m`.
         return Err(format!(
             "no model at {}; pass -m <path> or download it first",
             path.display()
@@ -1785,6 +1821,23 @@ mod tests {
             "no DeepSeek support model resolved for a Qwen run"
         );
         let _ = std::fs::remove_file(model);
+    }
+
+    /// A missing model that is *not* the `DeepSeek` default must never trigger
+    /// the `DeepSeek` download offer. `--qwen` with an unlinked
+    /// `~/.plank/qwen.gguf` used to propose fetching 87 GB of `DeepSeek` into
+    /// the Qwen slot, and so did a mistyped `-m`.
+    #[test]
+    fn a_missing_non_default_model_is_an_error_not_a_download_offer() {
+        let missing =
+            std::env::temp_dir().join(format!("plank-absent-{}-qwen.gguf", std::process::id()));
+        assert!(!missing.exists());
+        let err = ensure_model(&missing).expect_err("a missing model is an error");
+        assert!(err.contains("no model at"), "{err}");
+        assert!(
+            !err.contains("DeepSeek"),
+            "must not offer the DeepSeek download for a non-default path: {err}"
+        );
     }
 
     #[test]

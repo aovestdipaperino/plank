@@ -27,6 +27,16 @@ pub const DEFAULT_CTX_SIZE: i32 = 1_048_576;
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // flat CLI flags, not a state machine
 pub struct AgentConfig {
+    /// Run the Qwen3.8-Flash-Next model instead of `DeepSeek` V4, from
+    /// `--qwen`. Off by default.
+    ///
+    /// A shorthand, not a mode: it only fills in the two default paths
+    /// (`~/.plank/qwen.gguf` and its `qwen.mtp.gguf` companion), and an
+    /// explicit `-m` or `--mtp-model` still wins. Everything that actually
+    /// behaves differently for Qwen — the tools prompt, the tool-call parser,
+    /// the companion slot, the cache leaf — is decided from the loaded model's
+    /// own architecture, never from this flag.
+    pub qwen: bool,
     /// Sampling and length options for generation.
     pub generation: GenerationOptions,
     /// One-shot prompt supplied with `-p`/`--prompt`.
@@ -354,6 +364,7 @@ impl Default for AgentConfig {
             show_help: false,
             show_version: false,
             help_topic: None,
+            qwen: false,
             model_path: None,
             backend: None,
             n_threads: 0,
@@ -448,6 +459,11 @@ Options:
       --debug              look for a running turbo-debug-console and mirror the
                            raw model stream to it while ui.showThinking is off
   -m, --model PATH         load a ds4 GGUF model (real inference)
+      --qwen               run Qwen3.8-Flash-Next instead of DeepSeek V4 (off by
+                           default): shorthand for -m ~/.plank/qwen.gguf
+                           --mtp-model ~/.plank/qwen.mtp.gguf, both expected to be
+                           symlinks you point at your own build. An explicit -m or
+                           --mtp-model wins.
   -t, --threads N          worker thread count (backend default when unset)
       --backend NAME       select backend by name: metal, cuda, cpu
       --metal              use the Metal backend
@@ -1406,6 +1422,7 @@ pub fn parse_options_with(
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
             "--ssd-streaming-cold" => c.engine.ssd_streaming_cold = true,
+            "--qwen" => c.qwen = true,
             "--mtp" => c.engine.mtp = true,
             "--mtp-off" => c.engine.mtp = false,
             "--mtp-strict" => {
@@ -1442,6 +1459,16 @@ pub fn parse_options_with(
 fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Result<(), String> {
     if c.engine.dir_steering_file.is_some() && !steering_scale_set {
         c.engine.dir_steering_ffn = 1.0;
+    }
+    // `--qwen` is applied here, not at the flag, so it cannot depend on
+    // argument order: an explicit `-m` or `--mtp-model` wins whichever side of
+    // `--qwen` it appears on.
+    if c.qwen {
+        c.model_path
+            .get_or_insert_with(crate::download::default_qwen_path);
+        c.engine
+            .mtp_path
+            .get_or_insert_with(crate::download::default_qwen_mtp_path);
     }
     // Speculative decoding only engages at temperature 0 (see `ds4engine`'s
     // draft gate), so DSpark defaults the temperature to 0. Done here rather
@@ -2173,6 +2200,71 @@ mod tests {
     /// One companion flag for both families. Which engine slot it lands in is
     /// decided at open time from the model's own architecture, not here — this
     /// only pins that the flag carries a path and disturbs nothing else.
+    /// `--qwen` fills in both default paths, and nothing else: the flag is a
+    /// shorthand, so it must not touch the knobs around it.
+    #[test]
+    fn qwen_flag_fills_in_both_default_paths() {
+        let c = parse_options(&args(&["--qwen"])).unwrap();
+        assert!(c.qwen);
+        assert_eq!(c.model_path, Some(crate::download::default_qwen_path()));
+        assert_eq!(
+            c.engine.mtp_path,
+            Some(crate::download::default_qwen_mtp_path())
+        );
+        assert!(c.engine.mtp, "speculation still defaults on");
+    }
+
+    #[test]
+    fn qwen_is_off_by_default() {
+        let c = parse_options(&[]).unwrap();
+        assert!(!c.qwen);
+        assert!(c.model_path.is_none());
+        assert!(c.engine.mtp_path.is_none());
+    }
+
+    /// An explicit path wins on either side of `--qwen`, which is the whole
+    /// reason the flag is applied after parsing rather than at the flag.
+    #[test]
+    fn an_explicit_model_beats_qwen_in_either_order() {
+        for order in [
+            vec!["--qwen", "-m", "/custom.gguf"],
+            vec!["-m", "/custom.gguf", "--qwen"],
+        ] {
+            let c = parse_options(&args(&order)).unwrap();
+            assert_eq!(
+                c.model_path,
+                Some(PathBuf::from("/custom.gguf")),
+                "{order:?}"
+            );
+            // The companion still defaults, since only `-m` was overridden.
+            assert_eq!(
+                c.engine.mtp_path,
+                Some(crate::download::default_qwen_mtp_path()),
+                "{order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_companion_beats_qwen_in_either_order() {
+        for order in [
+            vec!["--qwen", "--mtp-model", "/c.gguf"],
+            vec!["--mtp-model", "/c.gguf", "--qwen"],
+        ] {
+            let c = parse_options(&args(&order)).unwrap();
+            assert_eq!(
+                c.engine.mtp_path,
+                Some(PathBuf::from("/c.gguf")),
+                "{order:?}"
+            );
+            assert_eq!(
+                c.model_path,
+                Some(crate::download::default_qwen_path()),
+                "{order:?}"
+            );
+        }
+    }
+
     #[test]
     fn mtp_model_flag_sets_the_companion_path() {
         let c = parse_options(&args(&["--mtp-model", "ple.gguf"])).unwrap();
