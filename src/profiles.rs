@@ -28,11 +28,7 @@ pub fn dir(home: &Path) -> PathBuf {
 /// plugin. Checked here rather than at the call site because every caller
 /// joins, and one that forgets is a path traversal.
 fn is_one_segment(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\')
 }
 
 /// Whether `dir` holds a manifest declaring a `profile` block.
@@ -93,10 +89,8 @@ mod tests {
     fn tmpdir(tag: &str) -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "plank-profiles-{tag}-{}-{seq}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("plank-profiles-{tag}-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
