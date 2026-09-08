@@ -167,3 +167,61 @@ profile: a household-budget assistant restricted to reading files and
 running `bash`, with no logo, so it also exercises the fallback path. Its
 `README.md` shows how to run it directly with `--plugin-dir` or install it
 permanently under `~/.plank/plugins/dev/`.
+
+`examples/profiles/hal` is a second worked example, this one installable and
+with a logo: a mail-and-calendar profile whose tools arrive over MCP from a
+server that does not exist yet. See its own `README.md` for what that means in
+practice, the exact allow-list it ships, and the auth methods it deliberately
+does not support.
+
+## Installing a profile
+
+`--profile` reads two places: the plugins already loaded for this session, and
+a second root, `~/.plank/profiles/`, that exists only for this. That root is
+never scanned — `plugins::load_in` does not visit it, so installing a profile
+into it contributes nothing to an ordinary session: no skills, no agents, no
+hooks, and in particular no MCP server starting behind the user's back. It is
+read in exactly two situations: listing the names `--profile` accepts, and
+loading the one profile `--profile` named.
+
+`/install-profile <url|owner/repo|path> [name] [--force]` fetches from a git
+repository, a marketplace repository, a `.tar.gz`, or a local directory, and
+copies the result into `~/.plank/profiles/<name>/`. It is refused when:
+
+- the manifest declares no `profile` block (install it with
+  `/install-claude-plugin` instead — it just isn't a profile);
+- `systemPrompt` is missing, unreadable, or blank — validated at install time
+  rather than left to the launch that treats the same failure as fatal, so a
+  broken download is caught before it can strand `--profile`;
+- a profile of the same name is already installed — remove it first.
+
+`--force` waives only the unimplemented-hook refusal (hooks that name an event
+plank does not fire); the structural refusals above are never waivable.
+
+Both manifest spellings are accepted (`.plank-plugin/plugin.json` and
+`.claude-plugin/plugin.json`), which as a side effect makes a plank-spelled
+plugin fetchable by `/install-claude-plugin` for the first time.
+
+Removal is manual: `rm -rf ~/.plank/profiles/<name>`. There is no uninstall
+command.
+
+### Precedence when a name exists in both places
+
+If a plugin already loaded for this session (from any scan root) has the same
+`name` as an installed profile, the scanned plugin wins and the profiles root
+is not even consulted — a profile bundled with an installed plugin behaves
+like any other plugin unless `--profile` explicitly wants the one in
+`~/.plank/profiles/`.
+
+Once `--profile` does resolve to a profile — scanned or installed — it splices
+into the plugin set at the highest precedence: its settings layer, its
+allow-list and its prompt all take effect as though it were the last (and
+therefore winning) plugin loaded.
+
+### Refused on Qwen
+
+`--profile` is refused outright when the active model is Qwen. Qwen's prompt
+is built by an entirely separate path (`sysprompt.rs`'s Qwen branch) that has
+no notion of a profile's own `systemPrompt`; running `--profile` there would
+silently ignore the very prompt the flag exists to install, so it is refused
+up front instead, naming the profile and pointing back at `--profile`.
