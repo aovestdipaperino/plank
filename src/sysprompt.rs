@@ -2232,7 +2232,10 @@ mod tests {
         };
         let text = "You are ChatBGT.\n".to_string();
         let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
-        assert!(out.contains("\"name\": \"glob\""), "glob must be advertised");
+        assert!(
+            out.contains("\"name\": \"glob\""),
+            "glob must be advertised"
+        );
         assert!(out.contains("\"name\": \"ask\""), "ask must be advertised");
         let names: Vec<&str> = out
             .match_indices("\"name\": \"")
