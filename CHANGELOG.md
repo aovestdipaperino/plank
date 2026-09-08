@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--profile <name>` launches plank as a named agent declared in a
+  plugin's `profile` block**, with its own system prompt, builtin-tool
+  allow-list, settings layer and banner logo, display name and accent; see
+  `docs/PROFILES.md` for the manifest reference and `examples/profiles/chatbgt`
+  for a worked example.
 - **`/dspark [on|off]` turns speculative decoding on and off mid-session.**
   Speculation verifies its drafts by argmax, so it only runs at temperature 0;
   the switch pins the temperature there and gives back the one you were

@@ -49,6 +49,7 @@ flowchart TD
     engine[engine::Engine trait]
     ds4[ds4engine + ffi<br/>real ds4 model]
     echo[EchoEngine<br/>stub]
+    profile[profile.rs<br/>active --profile spec]
 
     main --> frontend
     frontend --> agent
@@ -59,6 +60,9 @@ flowchart TD
     engine --> ds4
     engine --> echo
     ds4 --> cengine[(refs/ds4 C engine<br/>Metal)]
+    profile -.-> session
+    profile -.-> tools
+    profile -.-> agent
 ```
 
 ## The turn lifecycle
@@ -298,6 +302,19 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   root. It is a separate module because it owns a different
   set of questions than `plugins.rs` — network, subprocess and trust decisions
   that only matter once, at install time, not on every scan.
+
+### Profiles (`profile.rs`)
+A leaf module: it parses the `profile` block of a plugin manifest into a
+`ProfileSpec` and holds the one process-global `ActiveProfile` that
+`--profile <name>` installs at startup (see `docs/PROFILES.md` for the
+manifest reference). Everything else that needs to know whether a profile is
+running, and which one, reads this module rather than reaching into
+`plugins.rs` directly: `sysprompt` composes the profile's own prompt text and
+expands `{{plank:tool-protocol}}` into it, `tools::dispatch` consults the
+builtin allow-list before running a tool, `settings` overlays the profile's
+`settings` layer, `tui` and `logo` paint the accent and banner, `title` sets
+the window title, and `session` records which profile a saved session was
+started under and refuses to resume it under another.
 
 ### Terminal front-ends (`tui.rs`, `status.rs`, `statusbar.rs`, `editor.rs`, `configform.rs`, `miniedit/`)
 - `tui.rs` — the Ratatui presentation layer: a styled scrollback `OutputLog`

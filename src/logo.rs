@@ -142,18 +142,34 @@ fn is_beta(version: &str, patch: &str) -> bool {
     patch != "0" || version.contains("beta")
 }
 
-/// The banner: the active profile's logo and name when one is running, else
-/// plank's own art at [`DEFAULT_WIDTH`] and its version line.
+/// The banner: the active profile's logo, name and plank's version when a
+/// profile is running, else plank's own art at [`DEFAULT_WIDTH`] and its
+/// version line alone.
+///
+/// A profiled build still needs its plank version visible for bug reports,
+/// so the label carries both rather than the display name replacing the
+/// version outright.
 #[must_use]
 pub fn banner() -> String {
     let (logo, label) = match crate::profile::active() {
         Some(a) => (
             art_from_path(a.spec.logo.as_deref(), DEFAULT_WIDTH),
-            crate::profile::display_name().to_string(),
+            banner_label(Some(crate::profile::display_name())),
         ),
-        None => (art(DEFAULT_WIDTH), version_label()),
+        None => (art(DEFAULT_WIDTH), banner_label(None)),
     };
     format!("{logo}      {label}\n")
+}
+
+/// The banner's text label: the version alone for plain plank, or the
+/// profile's display name followed by the version when `profile_name` is
+/// `Some`. Split out from [`banner`] so the name+version composition can be
+/// tested without touching the process-global active profile.
+fn banner_label(profile_name: Option<&str>) -> String {
+    match profile_name {
+        Some(name) => format!("{name}  {}", version_label()),
+        None => version_label(),
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +234,23 @@ mod tests {
     #[test]
     fn banner_has_version() {
         assert!(super::banner().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    // The no-profile banner label must stay exactly the version line: a
+    // regression here would change the byte-identical no-profile banner.
+    #[test]
+    fn banner_label_without_a_profile_is_just_the_version() {
+        assert_eq!(super::banner_label(None), super::version_label());
+    }
+
+    // A profiled banner must carry both the display name and the version,
+    // not one instead of the other: version_label() alone is the thing that
+    // must never be silently dropped from a profiled build's banner.
+    #[test]
+    fn banner_label_with_a_profile_has_both_name_and_version() {
+        let label = super::banner_label(Some("HAL"));
+        assert!(label.contains("HAL"), "{label}");
+        assert!(label.contains(&super::version_label()), "{label}");
     }
 
     // Channel-by-patch: X.Y.0 is stable, any higher patch is a beta build.
