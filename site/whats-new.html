@@ -138,9 +138,49 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v4.4.0 is out</strong>, and the beta channel has reopened on
-4.4.1. The patch number is still the channel: <code>.0</code> is stable,
+<p><strong>v5.0.0 is out</strong>, and the beta channel has reopened on
+5.0.1. The patch number is still the channel: <code>.0</code> is stable,
 anything above it is beta.</p>
+<p><strong>Plank runs two models now.</strong> Qwen3.8-Flash-Next joins
+DeepSeek V4 Flash: <code>--qwen</code> reads
+<code>~/.plank/qwen.gguf</code> and the PLE sidecar it requires from
+<code>~/.plank/qwen.mtp.gguf</code>, both expected to be symlinks
+pointing at whichever build you keep. The flag is only a shorthand for
+those two paths — everything that actually differs for Qwen is read from
+the model's own architecture, so <code>-m some-qwen.gguf</code> behaves
+the same way.</p>
+<p><strong>Qwen speaks a different tool-call dialect, and plank now
+understands it.</strong> It does not write DSML; it writes
+<code>&lt;tool_call&gt;</code> / <code>&lt;function=…&gt;</code> /
+<code>&lt;parameter=…&gt;</code> and expects JSON schemas inside
+<code>&lt;tools&gt;</code>. Before this every tool call it made came
+back as <code>invalid DSML tool call</code> — one recorded session tried
+four times and then told the user the harness was broken, which it
+was.</p>
+<p><strong>Speculative decoding has one name:
+<code>--mtp</code>.</strong> Multi-token prediction is one idea with two
+mechanisms — DeepSeek speculates from its DSpark draft checkpoint, Qwen
+from the MTP block inside its own main GGUF — so it is one flag and one
+switch now. <strong>This is a breaking change</strong>:
+<code>/dspark</code> is <code>/mtp</code>, <code>--dspark*</code> are
+<code>--mtp*</code>, and both the old <code>--mtp PATH</code> and
+<code>--ple PATH</code> are <code>--mtp-model PATH</code>. The old
+spellings are gone rather than deprecated, so a stale
+<code>--mtp x.gguf</code> fails loudly instead of quietly misreading the
+path.</p>
+<p><strong>The footer says which model you are talking to</strong>,
+<code>(local:ds ⚡100%)</code> or <code>(local:qwen ⚡100%)</code>. Two
+local runs in the same directory used to look identical in the one place
+that answers that question.</p>
+<p><strong>Qwen upgrades on its own manifest.</strong>
+<code>qwen.manifest</code> sits beside <code>ds4.manifest</code> with
+its own staging area, and an install already on disk at the manifest's
+sizes is adopted rather than re-downloaded — nobody re-fetches 107 GB
+they already have.</p>
+<p><strong>The model can ask to compact.</strong> A <code>compact</code>
+tool lets it summarize the conversation and carry on from the summary.
+It is told not to reach for it unprompted: only you know whether the
+detail a summary drops still matters.</p>
 <p><strong>A reasoning loop can finally be stopped at any
 length.</strong> Confirming that a block of text is repeating meant
 re-searching the tail for several copies at once, which needed four
