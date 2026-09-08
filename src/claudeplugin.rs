@@ -440,10 +440,15 @@ pub struct Installed {
     pub skipped_hook_events: Vec<String>,
 }
 
-/// Validates the staged tree and copies it into `~/.plank/plugins/claude/`.
+/// Validates a staged tree and copies it into `dest_root`.
+///
+/// `dest_root` is the install root, not the plugin directory: the plugin's own
+/// name is appended here, from its manifest. `/install-claude-plugin` passes
+/// [`install_dir`]; `/install-profile` passes [`crate::profiles::dir`].
 ///
 /// The order matters: everything that can refuse happens before anything is
-/// written under `home`, so a refusal never leaves a partial install behind.
+/// written under `dest_root`, so a refusal never leaves a partial install
+/// behind.
 ///
 /// `force` waives only the unimplemented-hook refusal, in which case those
 /// hooks are installed and simply never fire. The structural refusals — no
@@ -451,13 +456,13 @@ pub struct Installed {
 /// of them describes a plugin the user could still want as it is.
 ///
 /// # Errors
-/// Returns a message when the tree is not a Claude Code plugin, contains a
-/// symlink, names a hook event plank does not implement (without `force`), is
-/// already installed, or cannot be copied.
+/// Returns a message when the tree holds an escaping symlink, hooks an event
+/// plank does not implement (unless `force`), has no usable name, or names
+/// something already installed.
 pub fn install_staged(
     staged: &Path,
     want: Option<&str>,
-    home: &Path,
+    dest_root: &Path,
     force: bool,
 ) -> Result<Installed, String> {
     let root = resolve_in_tree(staged, want)?;
@@ -477,10 +482,10 @@ pub fn install_staged(
         ));
     }
     let name = plugin_name(&root)?;
-    let dest = install_dir(home).join(&name);
+    let dest = dest_root.join(&name);
     if dest.exists() {
         return Err(format!(
-            "'{name}' is already installed at {}; remove it first with /plugins remove {name}",
+            "'{name}' is already installed at {}; remove it first",
             dest.display()
         ));
     }
@@ -514,7 +519,8 @@ pub fn install(
     force: bool,
 ) -> Result<Installed, String> {
     let staging = staging_dir(home)?;
-    let result = fetch(arg, &staging).and_then(|tree| install_staged(&tree, want, home, force));
+    let result = fetch(arg, &staging)
+        .and_then(|tree| install_staged(&tree, want, &install_dir(home), force));
     let _ = std::fs::remove_dir_all(&staging);
     result
 }
@@ -1396,11 +1402,28 @@ mod tests {
     }
 
     #[test]
+    fn install_staged_copies_into_the_destination_it_is_given() {
+        let tmp = tmpdir("dest-root");
+        let staged = tmp.join("staged");
+        std::fs::create_dir_all(staged.join(".claude-plugin")).expect("mkdir");
+        std::fs::write(
+            staged.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"thing"}"#,
+        )
+        .expect("write");
+        let dest_root = tmp.join("somewhere-else");
+        let installed = install_staged(&staged, None, &dest_root, false).expect("installs");
+        assert_eq!(installed.dest, dest_root.join("thing"));
+        assert!(dest_root.join("thing").join(".claude-plugin").is_dir());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn a_valid_tree_installs_under_the_claude_root() {
         let staged = staged_plugin("install-ok", "demo");
         write(&staged, "commands/note.md", "hi\n");
         let home = tmpdir("install-ok-home");
-        let out = install_staged(&staged, None, &home, false).expect("installs");
+        let out = install_staged(&staged, None, &install_dir(&home), false).expect("installs");
         assert_eq!(out.name, "demo");
         assert_eq!(out.dest, install_dir(&home).join("demo"));
         assert!(out.dest.join(".claude-plugin/plugin.json").is_file());
@@ -1414,7 +1437,7 @@ mod tests {
         let staged = staged_plugin("install-hook", "demo");
         write(&staged, "hooks/hooks.json", r#"{"SubagentStop":[]}"#);
         let home = tmpdir("install-hook-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("SubagentStop"), "{err}");
         assert!(err.contains("--force"), "{err}");
         assert!(
@@ -1428,7 +1451,7 @@ mod tests {
         let staged = staged_plugin("install-force", "demo");
         write(&staged, "hooks/hooks.json", r#"{"SubagentStop":[]}"#);
         let home = tmpdir("install-force-home");
-        let out = install_staged(&staged, None, &home, true).expect("installs");
+        let out = install_staged(&staged, None, &install_dir(&home), true).expect("installs");
         assert_eq!(out.skipped_hook_events, vec!["SubagentStop".to_string()]);
         assert!(out.dest.join("hooks/hooks.json").is_file());
     }
@@ -1438,7 +1461,7 @@ mod tests {
         let staged = staged_plugin("install-symlink", "demo");
         std::os::unix::fs::symlink("/etc/hosts", staged.join("link")).expect("symlink");
         let home = tmpdir("install-symlink-home");
-        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), true).expect_err("refused");
         assert!(err.contains("symlink"), "{err}");
         assert!(
             !install_dir(&home).join("demo").exists(),
@@ -1455,7 +1478,7 @@ mod tests {
         write(&staged, "CLAUDE.md", "the real content\n");
         std::os::unix::fs::symlink("CLAUDE.md", staged.join("AGENTS.md")).expect("symlink");
         let home = tmpdir("install-contained-symlink-home");
-        let out = install_staged(&staged, None, &home, false).expect("installs");
+        let out = install_staged(&staged, None, &install_dir(&home), false).expect("installs");
         let installed = std::fs::read_to_string(out.dest.join("AGENTS.md")).expect("read");
         assert_eq!(installed, "the real content\n");
     }
@@ -1465,7 +1488,7 @@ mod tests {
         let staged = staged_plugin("install-escape-absolute", "demo");
         std::os::unix::fs::symlink("/etc/hosts", staged.join("link")).expect("symlink");
         let home = tmpdir("install-escape-absolute-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("symlink"), "{err}");
         assert!(!install_dir(&home).join("demo").exists());
     }
@@ -1490,7 +1513,7 @@ mod tests {
             .join("secret.txt");
         std::os::unix::fs::symlink(&rel, staged.join("link")).expect("symlink");
         let home = tmpdir("install-escape-relative-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("symlink"), "{err}");
         assert!(!install_dir(&home).join("demo").exists());
         assert!(
@@ -1521,7 +1544,7 @@ mod tests {
         std::fs::write(staged.join("real_dir/f.txt"), "hi\n").expect("write");
         std::os::unix::fs::symlink("real_dir", staged.join("link_dir")).expect("symlink");
         let home = tmpdir("install-dir-symlink-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("symlink"), "{err}");
         assert!(err.contains("directory"), "{err}");
         assert!(!install_dir(&home).join("demo").exists());
@@ -1586,7 +1609,7 @@ mod tests {
             "demo/.claude-plugin/plugin.json",
             r#"{"name":"demo","description":"the one already there"}"#,
         );
-        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), true).expect_err("refused");
         assert!(err.contains("already installed"), "{err}");
         let kept =
             std::fs::read_to_string(install_dir(&home).join("demo/.claude-plugin/plugin.json"))
@@ -1599,7 +1622,7 @@ mod tests {
         let staged = tmpdir("install-nomanifest");
         write(&staged, ".plank-plugin/plugin.json", r#"{"name":"native"}"#);
         let home = tmpdir("install-nomanifest-home");
-        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), true).expect_err("refused");
         assert!(err.contains(".claude-plugin/plugin.json"), "{err}");
     }
 
@@ -1612,7 +1635,7 @@ mod tests {
             r#"{"mcpServers":{"s":{"command":"${CLAUDE_PLUGIN_ROOT}/bin/s"}}}"#,
         );
         let home = tmpdir("install-rewrite-home");
-        let out = install_staged(&staged, None, &home, false).expect("installs");
+        let out = install_staged(&staged, None, &install_dir(&home), false).expect("installs");
         assert!(out.rewrote_plugin_root);
         let mcp = std::fs::read_to_string(out.dest.join(".mcp.json")).expect("read");
         assert!(mcp.contains(&out.dest.display().to_string()), "{mcp}");
@@ -1622,7 +1645,7 @@ mod tests {
     fn an_installed_plugin_is_found_by_the_loader() {
         let staged = staged_plugin("install-loads", "demo");
         let home = tmpdir("install-loads-home");
-        let out = install_staged(&staged, None, &home, false).expect("installs");
+        let out = install_staged(&staged, None, &install_dir(&home), false).expect("installs");
         let set = crate::plugins::load_in(Some(&home), &tmpdir("install-loads-cwd"), &[]);
         let found = set
             .plugins
@@ -1637,7 +1660,7 @@ mod tests {
     fn plugin_named_dot_is_refused() {
         let staged = staged_plugin("install-dot-name", ".");
         let home = tmpdir("install-dot-name-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("not a usable plugin name"), "{err}");
         assert!(
             !install_dir(&home).exists(),
@@ -1649,7 +1672,7 @@ mod tests {
     fn plugin_named_dot_is_refused_with_force() {
         let staged = staged_plugin("install-dot-force", ".");
         let home = tmpdir("install-dot-force-home");
-        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), true).expect_err("refused");
         assert!(err.contains("not a usable plugin name"), "{err}");
     }
 
@@ -1657,7 +1680,7 @@ mod tests {
     fn plugin_with_whitespace_only_name_is_refused() {
         let staged = staged_plugin("install-whitespace", "   ");
         let home = tmpdir("install-whitespace-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("not a usable plugin name"), "{err}");
     }
 
