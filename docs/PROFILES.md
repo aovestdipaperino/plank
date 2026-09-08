@@ -5,7 +5,9 @@ Nothing about the plugin format changes: the same directory, the same
 `plugin.json`, the same scan roots. What the `profile` block adds is a way
 for `--profile <name>` to launch plank as a different agent entirely, with
 its own system prompt, its own set of usable builtin tools, its own settings,
-and its own logo, display name and accent color. Without the flag the plugin
+and its own logo, display name and accent color in the interactive TUI (see
+"What actually changes on screen" below for the exact reach of the last two).
+Without the flag the plugin
 contributes exactly as it would otherwise, so a plugin author can ship a
 profile and a set of ordinary hooks or skills from the same directory without
 one affecting the other.
@@ -121,6 +123,18 @@ Everything else described in this document — a bad accent, a missing or
 broken logo, a malformed allow-list, an unusable settings object, a missing
 display name — warns and falls back rather than refusing to start.
 
+## What actually changes on screen
+
+`displayName` is read in two places: the startup banner (`logo.rs`) and the
+terminal window title (`title.rs`). It does not currently reach the Ratatui
+status bar footer, despite what the introduction above might suggest — the
+footer still shows plank's own segments regardless of the active profile.
+
+`accent` only paints anything on the interactive Ratatui TUI. The
+plain-stdout path (used when output is piped, or under `--non-interactive`)
+keeps plank's own colors; it does not read a profile's accent at all. A
+profile's visual identity is therefore TUI-only today.
+
 ## Sessions are bound to their profile
 
 A saved session records which profile, if any, it was started under, and
@@ -128,6 +142,17 @@ refuses to resume under a different one. Resuming plank's own session under
 a profile, or a profile's session as plain plank, or one profile's session
 under another, are all refused rather than silently mixing an agent's
 transcript and tool history with a different agent's identity and allow-list.
+
+This binding is not isolation, though. The `recall` tool searches prior
+sessions scoped to the current project, not to the current profile, so a
+profile can surface text from a plain-plank session (or another profile's)
+that it could never resume directly. Treat the binding as a resume guard,
+not a guarantee that one profile's history stays out of another's context.
+
+Session-start context is not profile-aware either: `context.rs` still
+prepends the repository's git status and `AGENTS.md` on every run, so a
+profile with nothing to do with this codebase's conventions still receives
+them.
 
 ## Listing profiles
 
