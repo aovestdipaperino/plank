@@ -575,20 +575,42 @@ pub fn profile_names(set: &PluginSet) -> Vec<String> {
     names
 }
 
-/// Loads the profile directory at `dir` and puts it at the top of `set`'s
-/// precedence order, returning its name.
+/// Loads the profile directory at `dir` and puts it at the end of `set`'s
+/// plugin Vec, returning its name.
 ///
-/// Top, not bottom: an activated profile is the identity the user asked for,
-/// and it should not lose a bare-name contribution to an ambient plugin that
-/// merely happens to be installed. A scanned plugin of the same name is
-/// replaced rather than shadowed — two entries under one name would make every
-/// namespaced lookup ambiguous.
+/// End, not start: `load_in`'s own "later source wins" is an in-place
+/// replacement (`*slot = plugin`) that preserves the original position, so
+/// "last in the Vec is highest precedence" is a convention this function
+/// introduces, not one it follows. It matters for two order-sensitive
+/// consumers: [`settings_paths`], where a later path overlays
+/// (and can override) an earlier one, and `hooks_in`, which runs plugin hook
+/// files in Vec order. Splicing at the end makes the activated profile's
+/// `settings.json` outrank an ambient plugin's, and its hooks run last.
+/// It buys nothing for bare-name ownership: `reconcile` (skills/agents/
+/// templates) and `mcp_servers` both decide contested bare names without
+/// regard to position — a contested name is either refused to everyone or
+/// renamed on both sides. A scanned plugin of the same name is replaced
+/// rather than shadowed regardless — two entries under one name would make
+/// every namespaced lookup ambiguous.
 ///
-/// `None` when `dir` is not loadable as a plugin at all, which
+/// `None` when `dir` is not loadable as a plugin at all (which
 /// [`crate::profiles::find`] has already ruled out for every caller that goes
-/// through it.
+/// through it), or when the loaded plugin's name fails [`valid_name`] — the
+/// same gate `load_in` applies to every scanned plugin, because the name
+/// becomes a namespace prefix even when it only ever came from the directory
+/// name (no `plugin.json`, or one with no `"name"` field). A profile that
+/// fails this gate pushes a warning onto `set` explaining why, exactly as a
+/// rejected scanned plugin does.
 pub fn splice_profile(set: &mut PluginSet, dir: &Path) -> Option<String> {
     let plugin = load_plugin(dir, Origin::Profile)?;
+    if !valid_name(&plugin.name) {
+        set.warnings.push(format!(
+            "profile directory {}: unusable plugin name {:?}; skipped (give it a plugin.json with a valid \"name\")",
+            dir.display(),
+            plugin.name
+        ));
+        return None;
+    }
     let name = plugin.name.clone();
     set.plugins.retain(|p| p.name != name);
     set.plugins.push(plugin);
@@ -602,7 +624,18 @@ pub fn splice_profile(set: &mut PluginSet, dir: &Path) -> Option<String> {
 /// read here so this stays a pure function testable without a home directory.
 #[must_use]
 pub fn profile_names_with(set: &PluginSet, installed: &[String]) -> Vec<String> {
-    let mut names = profile_names(set);
+    merge_profile_names(profile_names(set), installed)
+}
+
+/// Merges an already-computed list of scanned profile names with `installed`,
+/// sorted and deduplicated.
+///
+/// Split out of [`profile_names_with`] so a caller that already has the
+/// scanned names in hand (e.g. from a [`crate::profile::Resolution::List`] or
+/// [`crate::profile::Resolution::NoSuchPlugin`] payload) can merge them
+/// without recomputing `profile_names(set)`.
+#[must_use]
+pub fn merge_profile_names(mut names: Vec<String>, installed: &[String]) -> Vec<String> {
     names.extend(installed.iter().cloned());
     names.sort();
     names.dedup();
@@ -2851,6 +2884,35 @@ mod tests {
         assert!(p.warnings.iter().any(|w| w.contains("accent")));
     }
 
+    /// A scratch directory that removes itself on drop, panic included —
+    /// unlike the bare `remove_dir_all` calls the splice tests used to make
+    /// only on their happy path, which left the directory behind when an
+    /// earlier assertion in the same test panicked.
+    struct SpliceScratch(PathBuf);
+
+    impl SpliceScratch {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("plank-splice-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            Self(dir)
+        }
+    }
+
+    impl std::ops::Deref for SpliceScratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for SpliceScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A directory holding a minimal profile plugin, for the splice tests.
     fn seed_profile_dir(parent: &Path, name: &str) -> PathBuf {
         let root = parent.join(name);
@@ -2866,9 +2928,7 @@ mod tests {
 
     #[test]
     fn a_spliced_profile_sits_at_the_top_of_the_precedence_order() {
-        let tmp = std::env::temp_dir().join(format!("plank-splice-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let tmp = SpliceScratch::new("top");
         let dir = seed_profile_dir(&tmp, "hal");
         let mut set = PluginSet::default();
         // A plugin that already claims the top slot; the profile must outrank it.
@@ -2879,25 +2939,31 @@ mod tests {
         assert_eq!(name, "hal");
         assert_eq!(set.plugins.last().map(|p| p.name.as_str()), Some("hal"));
         assert_eq!(set.plugins.last().map(|p| p.origin), Some(Origin::Profile));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A scanned plugin of the same name is replaced, not duplicated: two entries
-    /// with one name would make every namespaced lookup ambiguous.
+    /// with one name would make every namespaced lookup ambiguous. A second,
+    /// untouched plugin pins the placement claim: with only one plugin in the
+    /// set, `set.plugins[0]` would trivially be the spliced one regardless of
+    /// where `splice_profile` actually puts it.
     #[test]
     fn splicing_replaces_a_scanned_plugin_of_the_same_name() {
-        let tmp = std::env::temp_dir().join(format!("plank-splice-dup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let tmp = SpliceScratch::new("dup");
+        let bystander = seed_profile_dir(&tmp.join("bystander"), "zzz");
         let scanned = seed_profile_dir(&tmp.join("scanned"), "hal");
         let installed = seed_profile_dir(&tmp.join("installed"), "hal");
         let mut set = PluginSet::default();
         set.plugins
+            .push(load_plugin(&bystander, Origin::UserScan).expect("loads"));
+        set.plugins
             .push(load_plugin(&scanned, Origin::UserScan).expect("loads"));
         splice_profile(&mut set, &installed).expect("splices");
         assert_eq!(set.plugins.iter().filter(|p| p.name == "hal").count(), 1);
-        assert_eq!(set.plugins[0].origin, Origin::Profile);
-        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(set.plugins.len(), 2);
+        assert_eq!(set.plugins[0].name, "zzz");
+        assert_eq!(set.plugins[0].origin, Origin::UserScan);
+        assert_eq!(set.plugins[1].name, "hal");
+        assert_eq!(set.plugins[1].origin, Origin::Profile);
     }
 
     /// The whole point of a separate root: installing a profile must not make it
@@ -2905,8 +2971,7 @@ mod tests {
     /// was installed under and must not see it.
     #[test]
     fn an_installed_profile_does_not_load_in_an_ordinary_session() {
-        let tmp = std::env::temp_dir().join(format!("plank-not-scanned-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = SpliceScratch::new("not-scanned");
         let profiles = tmp.join(".plank").join("profiles");
         std::fs::create_dir_all(&profiles).expect("mkdir");
         seed_profile_dir(&profiles, "hal");
@@ -2914,7 +2979,6 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("mkdir");
         let set = load_in(Some(&tmp), &cwd, &[]);
         assert!(!set.plugins.iter().any(|p| p.name == "hal"), "hal loaded");
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -2934,9 +2998,7 @@ mod tests {
 
     #[test]
     fn a_name_in_both_the_scan_and_the_profiles_root_is_listed_once() {
-        let tmp = std::env::temp_dir().join(format!("plank-list-dup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let tmp = SpliceScratch::new("list-dup");
         let dir = seed_profile_dir(&tmp, "hal");
         let mut set = PluginSet::default();
         set.plugins
@@ -2946,6 +3008,64 @@ mod tests {
             profile_names_with(&set, &installed),
             vec!["hal".to_string()]
         );
-        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Finding 1: `splice_profile` must apply the same `valid_name` gate
+    /// `load_in` applies to every scanned plugin. A directory named `a__b`
+    /// falls back to that as its plugin name (no `plugin.json` at all), which
+    /// would mint an unroutable MCP server name `a__b-<tool>` — `load_in`
+    /// refuses this; `splice_profile` must refuse it too.
+    #[test]
+    fn splice_profile_rejects_a_directory_name_that_fails_valid_name() {
+        let tmp = SpliceScratch::new("invalid-name");
+        let dir = tmp.join("a__b");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // No plugin.json and no recognizable component: give it one component
+        // (a skill) so `load_plugin` treats it as a plugin at all, named
+        // after its directory since there is no manifest to override it.
+        std::fs::create_dir_all(dir.join("skills").join("greet")).expect("mkdir");
+        std::fs::write(
+            dir.join("skills").join("greet").join("SKILL.md"),
+            "---\nname: greet\ndescription: test\n---\nhi\n",
+        )
+        .expect("write");
+        let mut set = PluginSet::default();
+        let result = splice_profile(&mut set, &dir);
+        assert_eq!(result, None, "an unusable name must not splice in");
+        assert!(
+            set.plugins.is_empty(),
+            "a rejected profile must not appear in the set"
+        );
+        assert!(
+            set.warnings.iter().any(|w| w.contains("a__b")),
+            "rejection must be reported: {:?}",
+            set.warnings
+        );
+    }
+
+    /// Finding 2 (data side): a spliced profile's own warnings must reach
+    /// `all_warnings()` so a caller draining warnings *after* the splice sees
+    /// them — including the `PLUGIN_REFUSED_SECTIONS` settings-audit warning,
+    /// which is how a user learns a profile's `settings.json` tried to set a
+    /// key it may not.
+    #[test]
+    fn a_spliced_profiles_settings_audit_warning_reaches_all_warnings() {
+        let tmp = SpliceScratch::new("settings-audit");
+        let dir = tmp.join("hal");
+        std::fs::create_dir_all(dir.join(".plank-plugin")).expect("mkdir");
+        std::fs::write(dir.join("prompt.md"), "You are a test profile.\n").expect("write");
+        std::fs::write(
+            dir.join(".plank-plugin").join("plugin.json"),
+            r#"{"name":"hal","profile":{"systemPrompt":"prompt.md"}}"#,
+        )
+        .expect("write");
+        std::fs::write(dir.join("settings.json"), r#"{"engine":{"model":"nope"}}"#).expect("write");
+        let mut set = PluginSet::default();
+        splice_profile(&mut set, &dir).expect("splices");
+        assert!(
+            set.all_warnings().iter().any(|w| w.contains("engine")),
+            "settings-audit warning missing from all_warnings: {:?}",
+            set.all_warnings()
+        );
     }
 }

@@ -46,6 +46,17 @@ fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
+/// Prints every warning in `plugins` to stderr, one per line.
+///
+/// Factored out so both startup call sites can drain warnings *after*
+/// resolving `--profile` (a spliced profile can push its own) without each
+/// repeating the loop inline and blowing the 100-line function cap.
+fn print_plugin_warnings(plugins: &plank::plugins::PluginSet) {
+    for w in plugins.all_warnings() {
+        eprintln!("plugin warning: {w}");
+    }
+}
+
 /// Resolves `--profile`'s argument against the loaded plugins and installs
 /// it, or reports what to do instead.
 ///
@@ -64,8 +75,20 @@ fn resolve_and_activate_profile(
     if let (Some(name), Some(home)) = (requested.filter(|n| !n.is_empty()), home)
         && !plugins.plugins.iter().any(|p| p.name == name)
         && let Some(dir) = plank::profiles::find(home, name)
+        && plank::plugins::splice_profile(plugins, &dir).is_none()
     {
-        plank::plugins::splice_profile(plugins, &dir);
+        // `profiles::find` already parsed the manifest, so this means the
+        // plugin's name (directory-name fallback included) failed the same
+        // `valid_name` gate `load_in` applies to every scanned plugin; the
+        // reason is in the warning `splice_profile` just pushed onto
+        // `plugins`. Reporting it as a distinct failure instead of falling
+        // through to `NoSuchPlugin` matters because `name` genuinely does
+        // appear in the profile listing.
+        eprintln!(
+            "plank: profile {name:?} at {}: could not be loaded",
+            dir.display()
+        );
+        return Some(ExitCode::from(2));
     }
     let installed = home.map(plank::profiles::names).unwrap_or_default();
     match plank::profile::resolve_profile(requested, explicit_empty, plugins) {
@@ -104,8 +127,8 @@ fn resolve_and_activate_profile(
             plank::profile::install(plank::profile::ActiveProfile { prompt, ..active });
             None
         }
-        plank::profile::Resolution::List(_) => {
-            let names = plank::plugins::profile_names_with(plugins, &installed);
+        plank::profile::Resolution::List(names) => {
+            let names = plank::plugins::merge_profile_names(names, &installed);
             if names.is_empty() {
                 println!("no profiles installed");
             } else {
@@ -115,8 +138,8 @@ fn resolve_and_activate_profile(
             }
             Some(ExitCode::SUCCESS)
         }
-        plank::profile::Resolution::NoSuchPlugin(name, _) => {
-            let available = plank::plugins::profile_names_with(plugins, &installed);
+        plank::profile::Resolution::NoSuchPlugin(name, names) => {
+            let available = plank::plugins::merge_profile_names(names, &installed);
             eprintln!("plank: no plugin named {name:?}");
             if available.is_empty() {
                 eprintln!("plank: no profiles are installed");
@@ -282,19 +305,19 @@ fn main() -> ExitCode {
     // warnings) purely to observe a directory that is a checkout of the same
     // repo, so the pre-worktree set is reused for the rest of startup.
     let mut plugins = plank::plugins::load_default(&cwd, &provisional.plugin_dirs);
-    for w in plugins.all_warnings() {
-        eprintln!("plugin warning: {w}");
-    }
     // The profile is resolved from the provisional parse because everything
     // downstream — the settings layer, the system prompt, the tool table —
     // needs it, and the real parse at `parse_options_with` happens after the
-    // settings it would feed.
-    if let Some(code) = resolve_and_activate_profile(
+    // settings it would feed. Warnings drain *after*, not before: a spliced
+    // profile can push its own, and draining first would lose them silently.
+    let code = resolve_and_activate_profile(
         provisional.profile.as_deref(),
         provisional.profile_explicit_empty,
         &mut plugins,
         home_dir().as_deref(),
-    ) {
+    );
+    print_plugin_warnings(&plugins);
+    if let Some(code) = code {
         return code;
     }
     let settings = load_settings_with_profile(&plugins, &cwd);
@@ -816,20 +839,20 @@ fn run_serve(args: &[String]) -> ExitCode {
             });
     let launch_cwd = std::env::current_dir().unwrap_or_default();
     let mut plugins = plank::plugins::load_default(&launch_cwd, &provisional.plugin_dirs);
-    for w in plugins.all_warnings() {
-        eprintln!("plugin warning: {w}");
-    }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     // The profile is resolved from the provisional parse because everything
     // downstream — the settings layer, the system prompt, the tool table —
     // needs it, and the real parse at `parse_options_with` happens after the
-    // settings it would feed.
-    if let Some(code) = resolve_and_activate_profile(
+    // settings it would feed. Warnings are drained *after* this call; see the
+    // matching comment in `main`.
+    let code = resolve_and_activate_profile(
         provisional.profile.as_deref(),
         provisional.profile_explicit_empty,
         &mut plugins,
         home.as_deref(),
-    ) {
+    );
+    print_plugin_warnings(&plugins);
+    if let Some(code) = code {
         return code;
     }
     let settings = load_settings_with_profile(&plugins, &launch_cwd);
