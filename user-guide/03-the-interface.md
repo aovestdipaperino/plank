@@ -178,7 +178,7 @@ Leaving prints the session's token totals and, per model, the fastest sustained 
 peak DeepSeek V4 Flash  prefill 167.1 tok/s  ·  generation 16.8 tok/s
 ```
 
-Both figures are scoped to this session and never persisted — a peak from last week was a different engine build on a differently loaded machine. They are the quickest way to see what a flag like `--dspark` actually did on your hardware.
+Both figures are scoped to this session and never persisted — a peak from last week was a different engine build on a differently loaded machine. They are the quickest way to see what a flag like `--mtp` actually did on your hardware.
 
 ## Quieting the display
 

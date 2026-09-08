@@ -2354,3 +2354,68 @@ it committed stays in the transcript: no row anywhere, screen and session
 disagree again. The old Enter-time echo had the same exposure (it also sat
 inside the rolled-back range), so this is not a regression and rollback
 behaviour is intentionally left alone here.
+
+## Qwen3.8-Flash-Next — the traps that cost the most
+
+Every one of these was found by running the model, not by reading the C.
+
+**The engine compiles one combined Metal source for every model.**
+`ds4_gpu_full_source` treats each entry of its `required_sources` array as
+mandatory, so a submodule bump that ships a new kernel produces a build that
+cannot open *any* model — DeepSeek included — with only
+`metal backend unavailable; aborting startup` to go on. The C's own fallback
+search paths resolve relative to the submodule root, so plank must name each
+file explicitly. `metal_kernels_match_the_c_reference` now parses that array
+out of `ds4_metal.m` and fails on drift; the comment saying "keep this in
+lockstep" was not enough.
+
+**The two families disagree about which prefill hook to use.** The DeepSeek
+graph paths emit fine-grained `prefill_display` events on `display_progress`;
+the Qwen path in `ds4_session_sync` reports only `prefill_chunk`, on
+`progress`. plank installed just the display hook, so a Qwen prefill drove no
+rate, no bar and no `/usage` sample. Both are installed now, which is safe
+because the callback is *position*-based — a repeated report of the same
+absolute offset restates it rather than adding to it — and the event name is
+required explicitly, since a value measured in anything else would silently
+drive the bar from the wrong number.
+
+**`--dspark` with no `mtp_path` is a hard error, and a Qwen run has no
+`mtp_path` by construction.** Its companion went to `ple_path`. Under the
+unified `--mtp` the toggle therefore has to map to a *different* engine option
+per family: `dspark` for DeepSeek, `glm_mtp` for Qwen (the embedded-block path
+its graph allocator reads at open). Left ungated, Qwen could not load at all
+with speculation at its default-on: `ds4: --dspark requires --mtp-model FILE`.
+
+**The Qwen dialect has no terminator that ends a *run* of stanzas.** After
+`</tool_call>` another `<tool_call>` may follow, so the C sits in its structural
+state waiting to find out and reaches `DONE` only when trailing content rules a
+second call out. At end of generation there is no trailing content, so the
+caller has to say so — hence `QwenParser::finish`. Asserting `Done` right after
+the closing tag looks correct and is not.
+
+**A parser that starts in `Structural` makes every prose turn look like an open
+stanza.** The renderer reads that state as "a stanza is open and unfinished"
+and reports an incomplete tool call, so plain answers fed a phantom error back
+to a model that had done nothing wrong, and it looped politely for dozens of
+turns. `Search` is the correct initial state, as `DsmlParser` already had. The
+whole suite was green throughout; only a live run showed it.
+
+**`agent_skip_ascii_space` skips `\r` and `\n` despite its name**, and has to:
+the syntax puts a newline between `</function>` and `</tool_call>`. Reading it
+as "spaces and tabs" rejects every well-formed call.
+
+**Qwen over-escapes.** It is taught to spell a literal `</parameter>` as
+`&lt;/parameter>`, generalizes the rule, and escapes every `<` it writes. The C
+unescapes only its own delimiter and leaves other entities alone, so a task
+named `Shared<T>` displays as `Shared&lt;T&gt;` and `write` puts those six
+characters into the source file. plank decodes `&lt;`, `&gt;` and `&amp;` for
+this dialect only — a deliberate divergence — one level per pass, so
+`&amp;lt;` still keeps a literal entity. DSML is untouched.
+
+**`AGENT_TOOL_CONTRACTS` is not adopted.** Two of its four sentences are false
+of plank: "Read output is limited to 128 KiB" is the C's `AGENT_TOOL_MAX_BYTES`
+buffer limit where plank bounds a read by context, and write/edit "reject
+hard-linked files", which plank never checks. Its other claims do hold, so the
+block is adoptable sentence by sentence once those two are settled. The parity
+tests subtract exactly that span, with markers that fail loudly if upstream
+reshapes it.

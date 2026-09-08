@@ -6,18 +6,96 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-09-08
+
 ### Added
 
-- **`/dspark [on|off]` turns speculative decoding on and off mid-session.**
+- **Qwen3.8-Flash-Next runs as a first-class model.** `--qwen` selects it,
+  reading `~/.plank/qwen.gguf` and its required PLE sidecar from
+  `~/.plank/qwen.mtp.gguf`; both are expected to be symlinks pointing at
+  whichever build you keep. Everything that differs for Qwen is decided from
+  the model's own `general.architecture`, not from the flag, so `-m
+  some-qwen.gguf` behaves identically and `--qwen -m a-deepseek.gguf` gets
+  DeepSeek behaviour.
+- **Qwen's tool-call dialect is parsed and taught.** Qwen does not speak DSML;
+  it writes `<tool_call>` / `<function=…>` / `<parameter=…>` and is handed JSON
+  function schemas inside `<tools>`. Both the prompt and the parser are ports
+  of the C reference for that dialect, and the dialect is selected from the
+  model the engine actually loaded, so tool calls now dispatch instead of
+  coming back as "invalid DSML tool call".
+- **Qwen has its own download and upgrade manifest**, `qwen.manifest`, with its
+  own staging area and installed record. The two model sets share nothing on
+  disk, because the invariant that makes a swap safe is per-set: the manifest
+  moves last, so its presence proves that set landed. An install already on
+  disk at the manifest's sizes is adopted rather than re-downloaded.
+- **A `compact` tool.** The model can ask for compaction and carries on from
+  the summary. Both the tool description and the prompt tell it not to reach
+  for the tool unprompted: only the user knows whether the detail a summary
+  drops still matters, and plank still compacts on its own when it has to.
+- **The footer names the loaded model**: `(local:ds ⚡100%)` or
+  `(local:qwen ⚡100%)`. Two local runs in the same directory were otherwise
+  indistinguishable in the one place that answers "what am I talking to".
+
+### Changed
+
+- **BREAKING: `--dspark*` and `--ple` are now `--mtp*`.** One concept — predict
+  more than one token per step — with a different mechanism per model family:
+  DeepSeek speculates from its DSpark draft checkpoint, Qwen3.8 from the MTP
+  block inside its own main GGUF. `--dspark` → `--mtp`, `--dspark-off` →
+  `--mtp-off`, `--dspark-strict` → `--mtp-strict`, `--dspark-confidence` →
+  `--mtp-confidence`, and both the old `--mtp PATH` and `--ple PATH` are now
+  `--mtp-model PATH`, the companion GGUF for whichever family is loaded. The
+  split between a bare `--mtp` toggle and `--mtp-model PATH` follows the C's
+  own CLI. `/dspark` is `/mtp`. The old spellings are gone rather than
+  deprecated, so `--mtp x.gguf` now fails with "unknown option" instead of
+  silently misparsing the path.
+- **One `~/.plank/kvcache` for every model**, with the family in the transcript
+  extension (`.ds4.kv` / `.qwn.kv`). Existing untagged `.kv` transcripts are
+  renamed to `.ds4.kv` at first launch, at the top level only. The GC is scoped
+  to the live family via each blob's recorded model, so neither model's launch
+  evicts the other's checkpoints under the shared byte budget.
+- **Session name pools are 25% larger** — 62 adjectives and 94 in each
+  celebrity pool, taking the name space from 3,750 to 5,828. On a collision the
+  name is now reclaimed when the session holding it is already past the session
+  TTL, instead of growing a hex suffix; a live session is never deleted to free
+  a name, and neither is one whose age cannot be read.
+- **The prompt discourages scripted multi-file edits.** A regex that matches in
+  one file matches somewhere unread in another, and the damage is silent and
+  spread out; the exception is a uniform replacement of one exact string across
+  files already inspected.
+
+### Fixed
+
+- **Over-escaped HTML entities in Qwen tool arguments are decoded.** Qwen is
+  taught to spell a literal `</parameter>` as `&lt;/parameter>`, generalizes
+  the rule, and escapes every `<` it writes — so a task named `Shared<T>`
+  displayed as `Shared&lt;T&gt;`, and `write` put those six characters into the
+  source file. `&lt;`, `&gt;` and `&amp;` now decode for this dialect, one
+  level per pass, so `&amp;lt;` still keeps a literal entity. DSML is
+  untouched.
+- **Qwen prefill speed is reported.** The C has two prefill hooks and the
+  families disagree on which they use; plank listened only on the one DeepSeek
+  uses, so a Qwen prefill drove no rate, no bar and no `/usage` sample.
+- **A missing model that is not the DeepSeek default no longer offers the
+  DeepSeek download.** `--qwen` with an unlinked `~/.plank/qwen.gguf` proposed
+  fetching 87 GB of DeepSeek into the Qwen slot, and so did a mistyped `-m`.
+- **The Metal kernel list is checked against the C reference.** A submodule
+  bump that ships a new kernel used to produce a build that could not open any
+  model at all, because the engine compiles one combined Metal source and
+  treats every entry as mandatory. A parity test now fails on drift instead.
+
+### Added
+
+- **`/mtp [on|off]` turns speculative decoding on and off mid-session.**
   Speculation verifies its drafts by argmax, so it only runs at temperature 0;
   the switch pins the temperature there and gives back the one you were
   sampling at when you turn it off. `on` is refused without a loaded support
-  model — that is chosen at startup (`--dspark`, `--mtp`) and cannot be loaded
+  model — that is chosen at startup (`--mtp`, `--mtp-model`) and cannot be loaded
   into a running engine, so the alternative is a footer marker promising
   speculation no pass will do. The gate in `ds4engine` is now
-  `dspark && temperature <= 0`, which makes "temperature 0 with speculation
+  `mtp && temperature <= 0`, which makes "temperature 0 with speculation
   off" a state plank can be in and the C reference cannot.
-- **`/temp [0..100]` sets the sampling temperature.** Refused while `/dspark`
+- **`/temp [0..100]` sets the sampling temperature.** Refused while `/mtp`
   is on rather than silently disabling speculation: any temperature above 0
   turns the draft gate off, so the obliging reading of `/temp 0.6` would be
   "quietly stop doing the thing the footer still claims".

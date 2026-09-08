@@ -10,8 +10,75 @@ it.
 
 ## In the betas
 
-Riding ahead of stable 4.4.0 in the 4.4.1 beta. Install with `brew install
+Riding ahead of stable 5.0.0 in the 5.0.1 beta. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
+
+Nothing new here yet — 5.0.1 opens where 5.0.0 landed.
+
+## Stable releases
+
+### 5.0.0
+
+Two models instead of one. plank now runs Qwen3.8-Flash-Next beside DeepSeek V4
+Flash, which meant teaching it a second tool-call dialect, a second manifest,
+and one honest name for the thing both models do differently.
+
+🐦 **Qwen3.8-Flash-Next is a first-class model.** `--qwen` runs it: it reads
+`~/.plank/qwen.gguf` and the PLE sidecar it requires from
+`~/.plank/qwen.mtp.gguf`, both expected to be symlinks pointing at whichever
+build you keep. The flag is only a shorthand for those two paths — everything
+that actually differs for Qwen is decided from the model's own
+`general.architecture`, so `-m some-qwen.gguf` behaves identically and an
+explicit `-m` always wins.
+
+🗣️ **It speaks its own dialect, and plank now understands it.** Qwen does not
+write DSML. It writes `<tool_call>` / `<function=…>` / `<parameter=…>`, and it
+expects JSON function schemas inside `<tools>`. Before this, every tool call it
+made came back as `invalid DSML tool call` — a recorded session tried four
+times and then told the user the harness was broken, which it was. Both the
+prompt and the parser are ports of the C reference for that dialect, chosen
+from the model the engine actually loaded.
+
+⚡ **One name for speculative decoding: `--mtp`.** Multi-token prediction is one
+idea with two mechanisms — DeepSeek speculates from its DSpark draft
+checkpoint, Qwen from the MTP block inside its own main GGUF — so it is now one
+flag and one switch. `/dspark` is `/mtp`, `--dspark*` are `--mtp*`, and both
+the old `--mtp PATH` and `--ple PATH` are `--mtp-model PATH`, the companion
+GGUF for whichever family is loaded. **This is a breaking change**: the old
+spellings are gone rather than deprecated, so a stale `--mtp x.gguf` now fails
+loudly with "unknown option" instead of quietly misreading the path.
+
+🏷️ **The footer says which model you are talking to**: `(local:ds ⚡100%)` or
+`(local:qwen ⚡100%)`. Two local runs in the same directory used to look
+identical in the one place that answers that question.
+
+📦 **Qwen has its own download and upgrade manifest.** `qwen.manifest` sits
+beside `ds4.manifest`, with its own staging area and installed record; the two
+sets share nothing on disk, because the invariant that makes an upgrade safe is
+per-set — the manifest moves last, so its presence proves that set landed. An
+install already on disk at the manifest's sizes is adopted rather than
+re-downloaded, so nobody re-fetches 107 GB they already have.
+
+🗂️ **One cache directory, two families.** Transcripts carry the family in their
+extension (`.ds4.kv`, `.qwn.kv`) and share `~/.plank/kvcache`; existing `.kv`
+files are renamed to `.ds4.kv` on first launch. The garbage collector is scoped
+to the family you are running, so switching models no longer has each launch
+evicting the other's KV checkpoints under one shared byte budget.
+
+🗜️ **The model can ask to compact.** A `compact` tool lets it summarize the
+conversation and carry on from the summary. It is told not to reach for it
+unprompted — only you know whether the detail a summary drops still matters —
+and plank still compacts on its own when the window gets tight.
+
+🏷️ **Session names collide less.** The adjective and celebrity pools are 25%
+larger, taking the name space from 3,750 to 5,828. When a name is taken, plank
+now reclaims it if the session holding it is already past its TTL, instead of
+appending a hex suffix. A live session is never deleted to free a name.
+
+🔤 **Qwen's over-escaped angle brackets are decoded.** Qwen is taught to spell a
+literal `</parameter>` as `&lt;/parameter>`, generalizes the rule, and escapes
+every `<` it writes — so a task named `Shared<T>` showed as `Shared&lt;T&gt;`,
+and worse, `write` put those six characters into your source file.
 
 🔁 **The loop guards have a switch, and it works mid-turn.** `/loopguard off`
 (or `/lg off`) silences every rung at once — the reasoning-cycle detector, the
@@ -25,11 +92,11 @@ footer shows `🔁` while they are armed, and `♻ looping` when one has actuall
 caught something.
 
 ✨ **Speculative decoding is a switch too, and the footer says which state you
-are in.** `/dspark on|off` turns DSpark on and off between turns. Speculation
+are in.** `/mtp on|off` turns speculation on and off between turns. Speculation
 verifies its drafts by argmax, so it only runs at temperature 0: turning it on
 pins the temperature there, and turning it off hands back the temperature you
 were sampling at. `/temp 0.9` sets that temperature directly, and is refused
-while dspark is on rather than quietly switching speculation off behind the
+while `/mtp` is on rather than quietly switching speculation off behind the
 marker that says it is running. The footer's slot shows `✨` with the live
 tokens-per-step figures, or `🌡 0.60` when speculation is off.
 
@@ -38,8 +105,6 @@ type `/debug on`) and quitting writes `repro-quit-<timestamp>.md` by itself;
 a panic writes `repro-panic-<timestamp>.md` with the last transcript the
 session rendered. The state that triggered a bug is on disk whether or not
 anyone remembered to type `/repro` first.
-
-## Stable releases
 
 ### 4.4.0
 

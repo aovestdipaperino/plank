@@ -97,6 +97,32 @@ sequenceDiagram
 
 ## Module reference
 
+### Model families (`gguf.rs`, `manifest::ModelSet`, `trace_stream::syntax`)
+plank supports two model families and tells them apart three times, from three
+different sources, because each answer is needed at a different moment.
+
+`gguf::family_of` reads a model's own `general.architecture` — matching
+`qwen4exp` exactly as the C's `config_validate_model` does — and is the only
+answer available *before* `ds4_engine_open`. It has to be: the companion GGUF
+goes in a different options field per family (`mtp_path` for a DeepSeek draft
+checkpoint, `ple_path` for a Qwen sidecar), both fields must be populated
+before that call, and a `ple_path` handed to a non-Qwen model is a hard error
+in the C. Opening twice to ask the engine is not an option — the first open
+pays the whole residency cost. It also decides the vision skip, the side-artifact
+downloads, and the transcript extension.
+
+`ToolSyntax::for_model_name` reads the shape name the engine reports *after*
+opening, and selects the tool-call dialect: the tools prompt, the parser, the
+syntax reminder, and the model-visible error text. It lives in `trace-stream`
+because the renderer needs it and that crate cannot depend on plank; `From` is
+the single place the two enums are reconciled.
+
+`manifest::ModelSet` scopes everything on disk: manifest file, staging
+directory, install slots, artifact kinds, remote URL. The sets share nothing,
+because the invariant that makes a swap safe is per-set — the manifest moves
+last, so its presence proves that set landed, and one shared staging area would
+let a half-staged download of one family read as proof about the other.
+
 ### Agent core (`ui.rs`, `worker.rs`)
 Owns the `Agent` struct (engine, session, tools, system prompt, trace) and the
 turn loop (`run_turn` / `worker_turn`). Hosts the two interactive front-ends and
@@ -140,10 +166,10 @@ loop — with piped stdin there is no live input to multiplex.
   FFI session, its KV suffix + cursor, implements `Engine`). The single-owner
   path is a `Ds4Session` over a solely-owned `Ds4Model`; it keeps one live session
   across turns so `ds4_session_sync` reuses the cached KV prefix and only prefills
-  the new suffix. With DSpark enabled and greedy sampling, the decode loop drives
+  the new suffix. With speculation enabled (`--mtp`) and greedy sampling, the decode loop drives
   `ds4_session_eval_speculative_argmax` instead of one `ds4_session_eval` per
   token — the only entry point that consumes drafts, and the reason configuring
-  the engine for DSpark is not on its own enough to get any benefit from it.
+  the engine for speculation is not on its own enough to get any benefit from it.
 - `snapshot.rs` — the safe KV snapshot primitive: `SessionSnapshot`
   (`capture`/`restore`/`as_bytes`/`restore_bytes`) over the FFI, plus an
   unconditional-restore `RestoreOnDrop` guard. Shared by `generate_aside`,
