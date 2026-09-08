@@ -2917,7 +2917,11 @@ impl Agent<'_> {
             self.tool_ctx.edit_previews.clear();
             let mut results: Vec<(String, String)> = Vec::with_capacity(calls.len());
             for call in calls {
-                let out = if call.name == "agent" {
+                let out = if let Some(msg) =
+                    crate::tools::withheld_before_dispatch(&self.tool_ctx.wasm, &call.name)
+                {
+                    msg
+                } else if call.name == "agent" {
                     self.run_agent_tool(call)
                 } else if call.name == "fanout" {
                     self.run_fanout_tool(call)
@@ -8510,6 +8514,14 @@ the original is frozen and listed in /tree"
         // reading it inside a spawned pass would silently see defaults.
         let budget = crate::settings::active().agents.max_parallel;
         if calls.len() < 2 || budget < 2 || !calls.iter().all(|c| c.name == "agent") {
+            return None;
+        }
+        // A withheld `agent` call falls through to the serial per-call path,
+        // which applies the same guard and produces the refusal text.
+        if calls
+            .iter()
+            .any(|c| crate::tools::withheld_before_dispatch(&self.tool_ctx.wasm, &c.name).is_some())
+        {
             return None;
         }
         if self.tool_ctx.subagent_depth >= crate::tools::SUBAGENT_DEPTH_CAP {
@@ -17569,6 +17581,61 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-ui-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Builds a `ProfileSpec` whose builtin allow-list is exactly `allowed`.
+    fn allow_list_spec(allowed: &[&str]) -> crate::profile::ProfileSpec {
+        crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(allowed.iter().map(|s| (*s).to_string()).collect()),
+            settings_json: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Finding 1: `agent`, `fanout` and `view_image` are routed around
+    /// `dispatch` (they need `&mut self.engine`), so the allow-list guard
+    /// has to be checked ahead of that interception in `dispatch_stanza`
+    /// too, not only in `dispatch` itself. This exercises the real path the
+    /// interactive UI takes — `run_tool_calls` — for all three names under a
+    /// profile that allows none of them.
+    #[test]
+    fn run_tool_calls_refuses_agent_fanout_and_view_image_under_a_restrictive_profile() {
+        for name in ["agent", "fanout", "view_image"] {
+            let _guard = crate::profile::TestProfileGuard::install(allow_list_spec(&["read"]));
+            let dir = scratch_dir(&format!("withhold-{name}"));
+            let cfg = test_cfg();
+            let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+            let call = crate::tools::test_call(name, &[("task", "do it")]);
+            let out = agent.run_tool_calls(std::slice::from_ref(&call));
+            assert!(
+                out.contains(&format!("Tool error: unknown tool: {name}\n")),
+                "expected {name} to be refused as unknown under a restrictive profile, got: {out}"
+            );
+        }
+    }
+
+    /// Companion to the refusal test: the same three names still reach their
+    /// real handlers when the profile allows them, so the guard
+    /// discriminates rather than blanket-refusing once any profile is active.
+    #[test]
+    fn run_tool_calls_still_runs_agent_fanout_and_view_image_under_a_permissive_profile() {
+        for name in ["agent", "fanout", "view_image"] {
+            let _guard =
+                crate::profile::TestProfileGuard::install(allow_list_spec(&[name, "read"]));
+            let dir = scratch_dir(&format!("allow-{name}"));
+            let cfg = test_cfg();
+            let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+            let call = crate::tools::test_call(name, &[("task", "do it")]);
+            let out = agent.run_tool_calls(std::slice::from_ref(&call));
+            assert!(
+                !out.contains(&format!("Tool error: unknown tool: {name}\n")),
+                "expected {name} to reach its real handler under a permissive profile, got: {out}"
+            );
+        }
     }
 
     /// `ScriptedEngine::default()` leaves `kv_events` unset, so `get_kv`

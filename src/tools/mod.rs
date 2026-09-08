@@ -346,8 +346,23 @@ fn is_component_tool(wasm: &crate::wasmreg::Session, name: &str) -> bool {
 /// The response to send back, if any, when the active profile withholds
 /// `call`'s builtin. `None` means dispatch should proceed as normal.
 fn withheld_tool_response(ctx: &ToolContext, call: &ToolCall) -> Option<ToolResult> {
-    (!is_component_tool(&ctx.wasm, &call.name) && !crate::profile::builtin_enabled(&call.name))
-        .then(|| ToolResult::from_output(disabled_tool_error(&call.name)))
+    withheld_before_dispatch(&ctx.wasm, &call.name).map(ToolResult::from_output)
+}
+
+/// The model-visible refusal text, if any, when the active profile withholds
+/// builtin `name`. `None` means the call may proceed.
+///
+/// This is the single predicate both `dispatch` (via `withheld_tool_response`)
+/// and `src/ui.rs`'s per-call executors for `agent`, `fanout` and
+/// `view_image` consult. Those three tools need `&mut self.engine` and so are
+/// routed around `dispatch` entirely; without this shared check called ahead
+/// of that routing, a restrictive profile's allow-list could be bypassed by
+/// asking the model for one of them. Keeping the check as one function used
+/// from both call sites is what keeps them from drifting apart.
+#[must_use]
+pub fn withheld_before_dispatch(wasm: &crate::wasmreg::Session, name: &str) -> Option<String> {
+    (!is_component_tool(wasm, name) && !crate::profile::builtin_enabled(name))
+        .then(|| disabled_tool_error(name))
 }
 
 #[allow(clippy::too_many_lines)]
