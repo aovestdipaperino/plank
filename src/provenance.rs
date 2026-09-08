@@ -27,6 +27,9 @@ pub enum Origin {
     /// A plugin's `settings.json` (or a plugin-contributed entry). The string
     /// is the plugin name when known, empty for a generic plugin layer.
     Plugin(String),
+    /// The active profile's inline `settings` block. The string is the
+    /// profile's plugin name.
+    Profile(String),
     /// A CLI flag.
     Cli,
     /// An environment variable.
@@ -48,6 +51,7 @@ impl Origin {
                     format!("plugin {name}")
                 }
             }
+            Origin::Profile(name) => format!("profile:{name}"),
             Origin::Cli => "CLI flag".to_string(),
             Origin::Env => "environment".to_string(),
         }

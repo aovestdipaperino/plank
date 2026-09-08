@@ -561,6 +561,15 @@ impl Settings {
         {
             members.retain(|(k, _)| !crate::plugins::PLUGIN_REFUSED_SECTIONS.contains(&k.as_str()));
         }
+        // A profile is a persona, not machine configuration: it may set tools,
+        // ui, safety and the rest, but never which model runs. `engine` is the
+        // one section where a bad value costs a multi-minute reload or a
+        // singleton-lock conflict, so it is dropped the way a plugin's is.
+        if matches!(origin, crate::provenance::Origin::Profile(_))
+            && let Json::Obj(members) = &mut root
+        {
+            members.retain(|(k, _)| k != "engine");
+        }
         let engine = root.get("engine");
         if let Some(v) = string(engine, "model") {
             self.engine.model = Some(expand_tilde(&v));
@@ -815,24 +824,66 @@ impl Settings {
     /// the user and project files.
     #[must_use]
     pub fn load_from_paths(low: &[PathBuf], high: &[PathBuf]) -> Self {
+        Self::load_from_paths_with_profile(low, None, high)
+    }
+
+    /// [`load_from_paths`](Self::load_from_paths) with the active profile's
+    /// inline `settings` block (`(profile_name, settings_json_text)`) layered
+    /// between `low` (plugins) and `high` (user, then project), as
+    /// `defaults < plugins < profile < high[0] < high[1] < ...`.
+    ///
+    /// This is the one overlay loop in the module: `load_from_paths` and
+    /// [`load_with_plugins_and_profile_in`](Self::load_with_plugins_and_profile_in)
+    /// both delegate here rather than each walking their own copy of it. The
+    /// profile layer is text, not a path, because it lives inside
+    /// `plugin.json` rather than in a settings file of its own.
+    #[must_use]
+    pub fn load_from_paths_with_profile(
+        low: &[PathBuf],
+        profile: Option<(&str, &str)>,
+        high: &[PathBuf],
+    ) -> Self {
+        /// One settings layer's origin: a file to read, or (for the profile)
+        /// inline text that has no file of its own.
+        enum Source<'a> {
+            /// A settings file to read from disk.
+            Path(&'a Path),
+            /// Inline JSON text, already in hand.
+            Text(&'a str),
+        }
         let mut s = Self::default();
-        // Provenance per file: `low` is the plugin layer, `high` is the user
-        // file then the project file (see `paths_in`). Overlay runs low-to-high,
-        // so a later layer demotes the earlier one to shadowed.
-        let low_origins = low
-            .iter()
-            .map(|p| (p, crate::provenance::Origin::Plugin(String::new())));
-        let high_origins = high.iter().enumerate().map(|(i, p)| {
+        // Provenance per layer: `low` is the plugin layer, `profile` is the
+        // active profile's inline block, `high` is the user file then the
+        // project file (see `paths_in`). Overlay runs low-to-high, so a later
+        // layer demotes an earlier one to shadowed.
+        let low_layers = low.iter().map(|p| {
+            (
+                Source::Path(p.as_path()),
+                crate::provenance::Origin::Plugin(String::new()),
+            )
+        });
+        let profile_layer = profile.into_iter().map(|(name, text)| {
+            (
+                Source::Text(text),
+                crate::provenance::Origin::Profile(name.to_string()),
+            )
+        });
+        let high_layers = high.iter().enumerate().map(|(i, p)| {
             let origin = if i == 0 {
                 crate::provenance::Origin::UserSettings
             } else {
                 crate::provenance::Origin::ProjectSettings
             };
-            (p, origin)
+            (Source::Path(p.as_path()), origin)
         });
-        for (p, origin) in low_origins.chain(high_origins) {
-            if let Ok(text) = std::fs::read_to_string(p) {
-                s.overlay_from(&text, &origin);
+        for (source, origin) in low_layers.chain(profile_layer).chain(high_layers) {
+            match source {
+                Source::Path(p) => {
+                    if let Ok(text) = std::fs::read_to_string(p) {
+                        s.overlay_from(&text, &origin);
+                    }
+                }
+                Source::Text(text) => s.overlay_from(text, &origin),
             }
         }
         s
@@ -853,6 +904,22 @@ impl Settings {
     #[must_use]
     pub fn load_with_plugins_in(home: Option<&Path>, cwd: &Path, plugin_paths: &[PathBuf]) -> Self {
         Self::load_from_paths(plugin_paths, &Self::paths_in(home, cwd))
+    }
+
+    /// [`load_with_plugins_in`](Self::load_with_plugins_in) with the active
+    /// profile's inline `settings` block layered between the plugins and the
+    /// user, as `defaults < plugins < profile < ~/.plank < ./.plank`.
+    ///
+    /// The profile layer is text rather than a path because it lives inside
+    /// `plugin.json`, not in a settings file of its own.
+    #[must_use]
+    pub fn load_with_plugins_and_profile_in(
+        home: Option<&Path>,
+        cwd: &Path,
+        plugin_paths: &[PathBuf],
+        profile: Option<(&str, &str)>,
+    ) -> Self {
+        Self::load_from_paths_with_profile(plugin_paths, profile, &Self::paths_in(home, cwd))
     }
 
     /// Loads `~/.plank/settings.json` then `<cwd>/.plank/settings.json`.
@@ -2017,6 +2084,88 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Creates a temp home with `.plank/settings.json` holding `user_json`, an
+    /// empty temp cwd, and a plugin settings file holding `plugin_json`,
+    /// returning `(home, cwd, plugin_settings_path)`. Modeled on
+    /// `load_with_plugins_in_never_lets_a_plugin_beat_the_user`'s layout.
+    fn three_layer_fixture(plugin_json: &str, user_json: &str) -> (PathBuf, PathBuf, PathBuf) {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("plank-settings-profile-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(home.join(".plank")).expect("mkdir home");
+        std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+
+        let user = home.join(".plank").join("settings.json");
+        std::fs::write(&user, user_json).expect("write user");
+
+        let plugin = dir.join("plugin-settings.json");
+        std::fs::write(&plugin, plugin_json).expect("write plugin");
+
+        (home, cwd, plugin)
+    }
+
+    #[test]
+    fn a_profile_beats_a_plugin_but_loses_to_the_user() {
+        let (home, cwd, plugin) = three_layer_fixture(
+            r#"{"ui":{"popupRows":3}}"#, // plugin
+            r#"{"ui":{"popupRows":9}}"#, // user (~/.plank)
+        );
+        let s = Settings::load_with_plugins_and_profile_in(
+            Some(&home),
+            &cwd,
+            &[plugin],
+            Some(("hal", r#"{"ui":{"popupRows":6}}"#)),
+        );
+        assert_eq!(s.ui.popup_rows, 9);
+    }
+
+    #[test]
+    fn a_profile_beats_a_plugin_when_the_user_is_silent() {
+        let (home, cwd, plugin) = three_layer_fixture(r#"{"ui":{"popupRows":3}}"#, "{}");
+        let s = Settings::load_with_plugins_and_profile_in(
+            Some(&home),
+            &cwd,
+            &[plugin],
+            Some(("hal", r#"{"ui":{"popupRows":6}}"#)),
+        );
+        assert_eq!(s.ui.popup_rows, 6);
+        assert_eq!(
+            s.provenance.get("ui.popupRows").map(|p| &p.origin),
+            Some(&crate::provenance::Origin::Profile("hal".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_profile_may_set_tools_but_never_engine() {
+        // `Settings::engine` (`EngineSettings`) has no `quality` field — that
+        // knob lives on `AgentConfig`'s engine tuning, a different struct —
+        // so this deviates from the brief's literal `"engine":{"quality":true}`
+        // / `s.engine.quality` text, which does not compile against
+        // `Settings`. `engine.model` exercises the same guarantee (a profile
+        // must never move the effective model) with a field that exists here,
+        // and mirrors `a_plugin_settings_file_does_not_change_the_effective_model`.
+        let (home, cwd, plugin) = three_layer_fixture("{}", "{}");
+        let s = Settings::load_with_plugins_and_profile_in(
+            Some(&home),
+            &cwd,
+            &[plugin],
+            Some((
+                "hal",
+                r#"{"tools":{"loopGuards":false},"engine":{"model":"/evil.gguf"}}"#,
+            )),
+        );
+        assert!(!s.tools.loop_guards, "tools.* is a profile's to set");
+        assert_eq!(
+            s.engine.model,
+            Settings::default().engine.model,
+            "engine.* is never a profile's to set"
+        );
     }
 
     #[test]

@@ -83,6 +83,31 @@ fn resolve_and_activate_profile(
     }
 }
 
+/// Loads settings with the plugin and (if one is active) profile layers, as
+/// `defaults < plugins < profile < ~/.plank < ./.plank`.
+///
+/// Both interactive-startup call sites need this after loading plugins and
+/// resolving the profile; factored out so line count doesn't force one of
+/// them to duplicate the other's logic instead.
+fn load_settings_with_profile(
+    plugins: &plank::plugins::PluginSet,
+    cwd: &std::path::Path,
+) -> plank::settings::Settings {
+    let profile_settings = plank::profile::active().and_then(|a| {
+        a.spec
+            .settings_json
+            .as_deref()
+            .map(|t| (a.name.as_str(), t))
+    });
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    plank::settings::Settings::load_with_plugins_and_profile_in(
+        home.as_deref(),
+        cwd,
+        &plank::plugins::settings_paths(plugins),
+        profile_settings,
+    )
+}
+
 /// Reports the result of the KV cache migration performed by
 /// `SessionStore::migrate_kvcache_if_present`. The associated function performs
 /// the one-shot wipe of pre-`.kv_raw` KV blobs; this function is best-effort
@@ -191,8 +216,7 @@ fn main() -> ExitCode {
     if let Some(code) = resolve_and_activate_profile(provisional.profile.as_deref(), &plugins) {
         return code;
     }
-    let settings =
-        plank::settings::Settings::load_with_plugins(&plank::plugins::settings_paths(&plugins));
+    let settings = load_settings_with_profile(&plugins, &cwd);
     // `--debug` is a pure CLI flag, so the provisional parse agrees with the
     // real one; it must be set before `install`, whose reconcile is the first
     // chance to dial the console.
@@ -720,8 +744,7 @@ fn run_serve(args: &[String]) -> ExitCode {
     if let Some(code) = resolve_and_activate_profile(provisional.profile.as_deref(), &plugins) {
         return code;
     }
-    let settings =
-        plank::settings::Settings::load_with_plugins(&plank::plugins::settings_paths(&plugins));
+    let settings = load_settings_with_profile(&plugins, &launch_cwd);
     // `--debug` is a pure CLI flag, so the provisional parse agrees with the
     // real one; it must be set before `install`, whose reconcile is the first
     // chance to dial the console.
