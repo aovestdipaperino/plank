@@ -202,6 +202,54 @@ fn resolve(root: &Path, p: &str) -> PathBuf {
     }
 }
 
+/// The profile a run is operating under: the plugin name that selected it and
+/// its parsed spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveProfile {
+    /// The plugin name `--profile` named.
+    pub name: String,
+    /// The parsed block.
+    pub spec: ProfileSpec,
+}
+
+/// The active profile, set once at startup.
+static ACTIVE: std::sync::OnceLock<ActiveProfile> = std::sync::OnceLock::new();
+
+/// Installs the active profile. The first call wins; later calls are ignored,
+/// which is what makes every reader below infallible.
+pub fn install(active: ActiveProfile) {
+    let _ = ACTIVE.set(active);
+}
+
+/// The active profile, or `None` for a plain plank run.
+#[must_use]
+pub fn active() -> Option<&'static ActiveProfile> {
+    ACTIVE.get()
+}
+
+/// The active profile's plugin name, or `None`.
+#[must_use]
+pub fn active_name() -> Option<&'static str> {
+    ACTIVE.get().map(|a| a.name.as_str())
+}
+
+/// What to call the agent in the banner, window title and status bar:
+/// the profile's `displayName`, else its plugin name, else `plank`.
+#[must_use]
+pub fn display_name() -> &'static str {
+    match ACTIVE.get() {
+        Some(a) => a.spec.display_name.as_deref().unwrap_or(&a.name),
+        None => "plank",
+    }
+}
+
+/// Whether builtin tool `name` is offered under the active profile.
+/// True for every tool when no profile is active.
+#[must_use]
+pub fn builtin_enabled(name: &str) -> bool {
+    ACTIVE.get().is_none_or(|a| a.spec.builtin_enabled(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +473,26 @@ mod tests {
         assert!(spec.warnings.iter().any(|w| w.contains("displayName")));
         assert!(spec.warnings.iter().any(|w| w.contains("tools.builtin")));
         assert_eq!(spec.warnings.len(), 3);
+    }
+
+    fn spec_named(tools: Option<Vec<String>>) -> ProfileSpec {
+        ProfileSpec {
+            display_name: Some("HAL".to_string()),
+            logo: None,
+            accent: None,
+            system_prompt: PathBuf::from("/p/prompt.md"),
+            builtin_tools: tools,
+            settings_json: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_predicate_follows_the_installed_spec() {
+        // Exercised directly on the spec rather than through the global, so it
+        // does not depend on test ordering within the process.
+        let spec = spec_named(Some(vec!["bash".to_string()]));
+        assert!(spec.builtin_enabled("bash"));
+        assert!(!spec.builtin_enabled("read"));
     }
 }
