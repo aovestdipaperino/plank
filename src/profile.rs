@@ -251,10 +251,59 @@ pub fn display_name() -> &'static str {
     }
 }
 
+// Test-only override for the active profile, consulted before the process
+// global `ACTIVE` `OnceLock`.
+//
+// `ACTIVE` can only be set once per process, which makes it useless for
+// testing the `dispatch` guard's wiring across multiple cases in the same
+// test binary: whichever test runs first would poison every test after it.
+// This thread-local lets a test install (and, on drop, remove) its own
+// `ProfileSpec` without touching `ACTIVE` at all. Thread-local rather than
+// process-global so tests running on different threads never see each
+// other's override.
+#[cfg(test)]
+thread_local! {
+    static TEST_OVERRIDE: std::cell::RefCell<Option<ProfileSpec>> = const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard that installs a `ProfileSpec` into [`TEST_OVERRIDE`] for the
+/// life of a test and clears it on drop — including an unwinding drop from a
+/// panicking test, so a failing test can never leak its override into the
+/// next test on the same thread.
+#[cfg(test)]
+pub(crate) struct TestProfileGuard;
+
+#[cfg(test)]
+impl TestProfileGuard {
+    /// Installs `spec` as the active profile for the current thread until
+    /// the returned guard is dropped.
+    pub(crate) fn install(spec: ProfileSpec) -> Self {
+        TEST_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(spec));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestProfileGuard {
+    fn drop(&mut self) {
+        TEST_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
 /// Whether builtin tool `name` is offered under the active profile.
 /// True for every tool when no profile is active.
 #[must_use]
 pub fn builtin_enabled(name: &str) -> bool {
+    #[cfg(test)]
+    {
+        if let Some(enabled) = TEST_OVERRIDE.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|spec| spec.builtin_enabled(name))
+        }) {
+            return enabled;
+        }
+    }
     ACTIVE.get().is_none_or(|a| a.spec.builtin_enabled(name))
 }
 
