@@ -83,9 +83,12 @@ fn resolve_and_activate_profile(
     }
 }
 
-/// One-shot wipe of pre-`.kv_raw` KV blobs. Best-effort: a store that fails
-/// to open is skipped silently, and the next launch retries.
-fn migrate_kvcache_if_present() {
+/// Reports the result of the KV cache migration performed by
+/// `SessionStore::migrate_kvcache_if_present`. The associated function performs
+/// the one-shot wipe of pre-`.kv_raw` KV blobs; this function is best-effort
+/// reporting only: a store that fails to open is skipped silently, and the next
+/// launch retries.
+fn report_kvcache_migration() {
     let kv_dir = plank::session::SessionStore::default_dir();
     if let Some(bytes) = plank::session::SessionStore::migrate_kvcache_if_present(&kv_dir)
         && bytes > 0
@@ -240,7 +243,7 @@ fn main() -> ExitCode {
     // the live alternate screen garbled the warm-progress frame), so the gate
     // is the fix rather than a reorder. Nothing to migrate exists before the
     // directory does, so skipping is exact rather than merely cheap.
-    migrate_kvcache_if_present();
+    report_kvcache_migration();
     // `--worktree` runs before anything reads the working directory, because
     // the whole session — its hooks, agent definitions, and every tool's cwd —
     // is meant to live inside the worktree rather than the original checkout.
