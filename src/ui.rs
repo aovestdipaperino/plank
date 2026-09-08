@@ -5798,6 +5798,7 @@ impl Agent<'_> {
             ),
             "/plugins" => print!("{}", self.plugins_command(arg)),
             "/install-claude-plugin" => print!("{}", self.install_claude_plugin_command(arg)),
+            "/install-profile" => print!("{}", self.install_profile_command(arg)),
             "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
             "/tasks" => print!(
                 "{}",
@@ -9276,6 +9277,15 @@ the original is frozen and listed in /tree"
     fn install_claude_plugin_command(&self, arg: &str) -> String {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         crate::claudeplugin::render_install(arg, home.as_deref())
+    }
+
+    /// `/install-profile`, shared by both front ends. The same thin wrapper as
+    /// `install_claude_plugin_command`: the work and the wording both live in
+    /// `claudeplugin`, so the two front ends cannot drift.
+    #[allow(clippy::unused_self)]
+    fn install_profile_command(&self, arg: &str) -> String {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        crate::claudeplugin::render_install_profile(arg, home.as_deref())
     }
 
     fn plugins_command(&mut self, arg: &str) -> String {
@@ -13564,6 +13574,11 @@ impl Agent<'_> {
             }
             "/install-claude-plugin" => {
                 for line in self.install_claude_plugin_command(arg).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
+            "/install-profile" => {
+                for line in self.install_profile_command(arg).lines() {
                     log.push_plain(line.to_owned());
                 }
             }
