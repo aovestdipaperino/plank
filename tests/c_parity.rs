@@ -408,3 +408,64 @@ fn think_max_min_context_matches_c_source() {
         "think-max minimum context vs C"
     );
 }
+
+/// plank's Metal kernel table must list exactly what the C engine requires.
+///
+/// `ds4_gpu_full_source` treats every entry in its `required_sources` array as
+/// mandatory and aborts the whole startup ("metal backend unavailable") when
+/// one cannot be found. plank has to name each file explicitly, because the
+/// C's fallback search paths only resolve relative to the submodule root. So a
+/// submodule bump that ships a new kernel silently produces a build that
+/// cannot open any model — which is exactly what the Qwen3.8 bump did, adding
+/// `qwen4.metal` and `qwen4_vision.metal`.
+///
+/// Order matters as documentation, not to the engine, so this compares the
+/// pairs as sets and reports each side's surplus.
+#[test]
+fn metal_kernels_match_the_c_reference() {
+    let Some(src) = c_file("ds4_metal.m") else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    let table = src
+        .split_once("required_sources = @[")
+        .expect("required_sources table")
+        .1
+        .split_once("];")
+        .expect("end of required_sources table")
+        .0;
+
+    // Each row is `@[@"VAR", @"metal/file.metal"]`; take the quoted pairs.
+    let mut from_c: Vec<(String, String)> = Vec::new();
+    for row in table.split("@[").skip(1) {
+        let mut quoted = row.split('"').skip(1).step_by(2);
+        let (Some(var), Some(path)) = (quoted.next(), quoted.next()) else {
+            continue;
+        };
+        let file = path.rsplit('/').next().unwrap_or(path);
+        from_c.push((var.to_owned(), file.to_owned()));
+    }
+    assert!(
+        from_c.len() > 20,
+        "parsed only {} rows out of the C table; the parser drifted from the \
+         source layout rather than the table shrinking",
+        from_c.len()
+    );
+
+    let ours: Vec<(String, String)> = plank::ds4engine::METAL_KERNEL_SOURCES
+        .iter()
+        .map(|(v, f)| ((*v).to_owned(), (*f).to_owned()))
+        .collect();
+
+    let missing: Vec<_> = from_c.iter().filter(|e| !ours.contains(e)).collect();
+    let extra: Vec<_> = ours.iter().filter(|e| !from_c.contains(e)).collect();
+    assert!(
+        missing.is_empty(),
+        "the C requires kernels plank never points at, so startup aborts with \
+         \"metal backend unavailable\": {missing:?}"
+    );
+    assert!(
+        extra.is_empty(),
+        "plank points at kernels the C no longer requires: {extra:?}"
+    );
+}

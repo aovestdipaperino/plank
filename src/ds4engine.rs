@@ -279,11 +279,18 @@ impl Ds4Model {
         // now, at the one place that knows, instead of letting the first
         // `view_image` call be the only symptom several turns into a session.
         // SAFETY: `engine` is non-null and valid, checked just above.
+        // A Qwen run is the one case where no encoder was offered at all, so
+        // it gets its own line: naming the DeepSeek path there would report a
+        // failure to read a file plank deliberately never passed.
         if !unsafe { ffi::ds4_engine_has_vision(engine) } {
-            eprintln!(
-                "warning: vision encoder not loaded from {}; view_image will be refused",
-                vision_path.display()
-            );
+            if tuning.ple_path.is_some() {
+                eprintln!("note: Qwen3.8 runs text-only in plank; view_image will be refused");
+            } else {
+                eprintln!(
+                    "warning: vision encoder not loaded from {}; view_image will be refused",
+                    vision_path.display()
+                );
+            }
         }
         Ok(Self {
             engine,
@@ -2422,44 +2429,64 @@ impl Drop for Ds4TokensGuard {
 /// Points the ds4 Metal kernel loader at the `.metal` files bundled with the
 /// build, unless the caller already set the overrides. Without this the loader
 /// only searches the current directory and aborts.
+/// Metal kernel sources the C engine requires, as `(env var, file name)`.
+///
+/// Must stay in lockstep with the `required_sources` table in
+/// `refs/ds4/ds4_metal.m` (`ds4_gpu_full_source`): every entry there is
+/// mandatory, so a kernel shipped upstream but missing here aborts startup
+/// with "metal backend unavailable". The C's own fallback search paths
+/// (relative `metal/...` and `./metal/...`) only resolve from the submodule
+/// root, so plank has to point at each one explicitly.
+///
+/// `metal_kernels_match_the_c_reference` in `tests/c_parity.rs` parses that
+/// table out of the C and fails on any drift — the comment alone was not
+/// enough, and a submodule bump that added two Qwen kernels shipped a build
+/// that could not open a model at all.
+pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
+    // Keep this in lockstep with the C `required_sources` table in
+    // `ds4_metal.m` (`ds4_gpu_full_source`): every entry there is
+    // mandatory, so a kernel shipped upstream but not listed here aborts
+    // startup with "metal backend unavailable". The GLM 5.3 and vision
+    // kernels landed in the antirez/main sync and must be pointed at
+    // explicitly, since the C engine's fallback search paths (relative
+    // `metal/...` and `./metal/...`) only work from the submodule root.
+    ("DS4_METAL_FLASH_ATTN_SOURCE", "flash_attn.metal"),
+    ("DS4_METAL_DENSE_SOURCE", "dense.metal"),
+    ("DS4_METAL_GLM53_BF16_SOURCE", "glm53_bf16.metal"),
+    ("DS4_METAL_GLM53_VISION_SOURCE", "glm53_vision.metal"),
+    (
+        "DS4_METAL_DEEPSEEK4_VISION_SOURCE",
+        "deepseek4_vision.metal",
+    ),
+    ("DS4_METAL_GLM53_KDA_SOURCE", "glm53_kda.metal"),
+    ("DS4_METAL_MOE_SOURCE", "moe.metal"),
+    ("DS4_METAL_DSV4_HC_SOURCE", "dsv4_hc.metal"),
+    ("DS4_METAL_UNARY_SOURCE", "unary.metal"),
+    ("DS4_METAL_DSV4_KV_SOURCE", "dsv4_kv.metal"),
+    ("DS4_METAL_DSV4_ROPE_SOURCE", "dsv4_rope.metal"),
+    ("DS4_METAL_DSV4_MISC_SOURCE", "dsv4_misc.metal"),
+    ("DS4_METAL_ARGSORT_SOURCE", "argsort.metal"),
+    ("DS4_METAL_CPY_SOURCE", "cpy.metal"),
+    ("DS4_METAL_CONCAT_SOURCE", "concat.metal"),
+    ("DS4_METAL_GET_ROWS_SOURCE", "get_rows.metal"),
+    ("DS4_METAL_SUM_ROWS_SOURCE", "sum_rows.metal"),
+    ("DS4_METAL_SOFTMAX_SOURCE", "softmax.metal"),
+    ("DS4_METAL_REPEAT_SOURCE", "repeat.metal"),
+    ("DS4_METAL_GLU_SOURCE", "glu.metal"),
+    ("DS4_METAL_NORM_SOURCE", "norm.metal"),
+    ("DS4_METAL_BIN_SOURCE", "bin.metal"),
+    ("DS4_METAL_SET_ROWS_SOURCE", "set_rows.metal"),
+    // Added by the Qwen3.8-Flash-Next bump. Required unconditionally,
+    // not only for a Qwen run: the C compiles one combined Metal source
+    // for every model, so a missing Qwen kernel aborts a DeepSeek
+    // startup too.
+    ("DS4_METAL_QWEN4_SOURCE", "qwen4.metal"),
+    ("DS4_METAL_QWEN4_VISION_SOURCE", "qwen4_vision.metal"),
+];
+
 fn set_metal_source_env() {
-    const KERNELS: [(&str, &str); 23] = [
-        // Keep this in lockstep with the C `required_sources` table in
-        // `ds4_metal.m` (`ds4_gpu_full_source`): every entry there is
-        // mandatory, so a kernel shipped upstream but not listed here aborts
-        // startup with "metal backend unavailable". The GLM 5.3 and vision
-        // kernels landed in the antirez/main sync and must be pointed at
-        // explicitly, since the C engine's fallback search paths (relative
-        // `metal/...` and `./metal/...`) only work from the submodule root.
-        ("DS4_METAL_FLASH_ATTN_SOURCE", "flash_attn.metal"),
-        ("DS4_METAL_DENSE_SOURCE", "dense.metal"),
-        ("DS4_METAL_GLM53_BF16_SOURCE", "glm53_bf16.metal"),
-        ("DS4_METAL_GLM53_VISION_SOURCE", "glm53_vision.metal"),
-        (
-            "DS4_METAL_DEEPSEEK4_VISION_SOURCE",
-            "deepseek4_vision.metal",
-        ),
-        ("DS4_METAL_GLM53_KDA_SOURCE", "glm53_kda.metal"),
-        ("DS4_METAL_MOE_SOURCE", "moe.metal"),
-        ("DS4_METAL_DSV4_HC_SOURCE", "dsv4_hc.metal"),
-        ("DS4_METAL_UNARY_SOURCE", "unary.metal"),
-        ("DS4_METAL_DSV4_KV_SOURCE", "dsv4_kv.metal"),
-        ("DS4_METAL_DSV4_ROPE_SOURCE", "dsv4_rope.metal"),
-        ("DS4_METAL_DSV4_MISC_SOURCE", "dsv4_misc.metal"),
-        ("DS4_METAL_ARGSORT_SOURCE", "argsort.metal"),
-        ("DS4_METAL_CPY_SOURCE", "cpy.metal"),
-        ("DS4_METAL_CONCAT_SOURCE", "concat.metal"),
-        ("DS4_METAL_GET_ROWS_SOURCE", "get_rows.metal"),
-        ("DS4_METAL_SUM_ROWS_SOURCE", "sum_rows.metal"),
-        ("DS4_METAL_SOFTMAX_SOURCE", "softmax.metal"),
-        ("DS4_METAL_REPEAT_SOURCE", "repeat.metal"),
-        ("DS4_METAL_GLU_SOURCE", "glu.metal"),
-        ("DS4_METAL_NORM_SOURCE", "norm.metal"),
-        ("DS4_METAL_BIN_SOURCE", "bin.metal"),
-        ("DS4_METAL_SET_ROWS_SOURCE", "set_rows.metal"),
-    ];
     let dir = metal_source_dir();
-    for (var, file) in KERNELS {
+    for &(var, file) in METAL_KERNEL_SOURCES {
         if std::env::var_os(var).is_none() {
             // SAFETY: called once at startup before any threads are spawned.
             unsafe { std::env::set_var(var, dir.join(file)) };
