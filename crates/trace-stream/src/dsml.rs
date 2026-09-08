@@ -704,7 +704,7 @@ enum EscapedClose {
 /// what keeps the accepted variants (`｜>` spellings, the shorthand closed by
 /// `invoke`) each unescaping only their own delimiter, as the C does by
 /// passing the end tag it scanned for.
-fn unescape_close_delimiter(value: &[u8], close_tail: &[u8]) -> Vec<u8> {
+pub(crate) fn unescape_close_delimiter(value: &[u8], close_tail: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(value.len());
     let mut i = 0;
     while i < value.len() {
