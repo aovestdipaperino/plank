@@ -126,6 +126,18 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
                         .to_string(),
                 );
             }
+            // An entry matching no known builtin is a warning, not an error:
+            // a profile written against a newer plank (one that added a
+            // builtin this binary does not have yet) must still run, just
+            // with that entry silently inert.
+            let known = crate::sysprompt::known_builtin_names();
+            for name in &names {
+                if !known.contains(name) {
+                    warnings.push(format!(
+                        "profile: tools.builtin names {name:?}, which matches no known builtin tool"
+                    ));
+                }
+            }
             Some(names)
         }
         Some(_) => {
@@ -404,6 +416,52 @@ mod tests {
     #[test]
     fn unparseable_json_is_not_a_profile() {
         assert!(parse("{ not json", Path::new("/p")).is_none());
+    }
+
+    #[test]
+    fn an_allow_list_entry_matching_no_builtin_warns_but_still_loads() {
+        // Finding 3: a name a newer plank added (or a plain typo) must not
+        // fail the whole profile — the design spec requires it to run, just
+        // with that entry inert, and to say so through the warning channel.
+        let text = r#"{
+          "profile": {
+            "systemPrompt": "prompt.md",
+            "tools": { "builtin": ["bash", "not_a_real_tool"] }
+          }
+        }"#;
+        let spec = parse(text, Path::new("/p")).expect("still parses as a profile");
+        assert_eq!(
+            spec.builtin_tools.as_deref(),
+            Some(&["bash".to_string(), "not_a_real_tool".to_string()][..]),
+            "the unknown entry stays in the allow-list, it is not dropped"
+        );
+        assert!(
+            spec.warnings
+                .iter()
+                .any(|w| w.contains("not_a_real_tool")),
+            "expected a warning naming the unknown entry, got: {:?}",
+            spec.warnings
+        );
+        assert!(spec.builtin_enabled("bash"));
+    }
+
+    #[test]
+    fn a_recognized_native_extra_in_the_allow_list_warns_about_nothing() {
+        // Companion: `glob` is a real builtin (a native extra, not one of
+        // the twelve C-parsed schemas) so it must not trip the finding-3
+        // warning the way a genuinely unknown name does.
+        let text = r#"{
+          "profile": {
+            "systemPrompt": "prompt.md",
+            "tools": { "builtin": ["glob", "ask"] }
+          }
+        }"#;
+        let spec = parse(text, Path::new("/p")).expect("still parses as a profile");
+        assert!(
+            spec.warnings.is_empty(),
+            "glob and ask are real builtins; got warnings: {:?}",
+            spec.warnings
+        );
     }
 
     #[test]

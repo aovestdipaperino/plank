@@ -441,6 +441,18 @@ fn parse_builtin_tool_schemas() -> Vec<crate::engine::ToolSpec> {
     let region = rest.split("# Rules").next().unwrap_or(rest);
     // Skip the header line itself.
     let region = region.split_once('\n').map_or(region, |(_, body)| body);
+    parse_tool_schema_stream(region)
+}
+
+/// Parses a run of blank-line-separated `{"type": "function", "function":
+/// {...}}` JSON objects (the shape every hand-written schema block in this
+/// file uses) into structured [`crate::engine::ToolSpec`]s.
+///
+/// Shared by [`parse_builtin_tool_schemas`] (the C-derived text) and
+/// [`native_extra_specs`] (plank's own native-only tools), so both the
+/// C-parsed and native schema text can be filtered by a profile's allow-list
+/// as data instead of pre-rendered text.
+fn parse_tool_schema_stream(region: &str) -> Vec<crate::engine::ToolSpec> {
     let mut specs = Vec::new();
     // Consecutive JSON objects, blank-line separated; a streaming deserializer
     // tolerates the interspersed whitespace and stops cleanly at the tail.
@@ -793,8 +805,13 @@ fn compose_profile_prompt(
     if !out.ends_with("\n\n") {
         out.push_str(if out.ends_with('\n') { "\n" } else { "\n\n" });
     }
+    // Every dispatchable builtin, not just the C-trained twelve: a profile's
+    // allow-list governs the whole table (see the controller decision in the
+    // finding-1/2 fix), so the schema block must offer everything dispatch
+    // would actually run under this profile.
     let specs: Vec<crate::engine::ToolSpec> = parse_builtin_tool_schemas()
         .into_iter()
+        .chain(native_extra_specs(true))
         .filter(|s| spec.builtin_enabled(&s.name))
         .collect();
     out.push_str(&render_schema_block(&specs));
@@ -923,6 +940,31 @@ const TASK_SCHEMA: &str = "{\n\
      }\n";
 
 fn append_native_extra_schemas(out: &mut String) {
+    append_native_extra_schemas_ungated_core(out);
+    // The `recall` (M8), `fanout` (M9) and `run_code` (M10) tools are
+    // deliberate deviations from the C reference: the C agent has none of them.
+    // They are advertised by default and can be switched off individually
+    // (`tools.recall` / `tools.fanout` / `tools.runCode`). Because they are in
+    // the prompt, `fp1` differs from the C agent's fingerprint — the versioned
+    // deviation documented in docs/SYSTEM-PROMPT-OVERRIDES.md. What parity
+    // still holds byte-for-byte is the C-*derived* text, which
+    // `tools_prompt_matches_c_source` checks independently of this list.
+    if crate::settings::active().tools.recall {
+        append_recall_schema(out);
+    }
+    if crate::settings::active().tools.fanout {
+        append_fanout_schema(out);
+    }
+    if crate::settings::active().tools.run_code {
+        append_run_code_schema(out);
+    }
+}
+
+/// The always-advertised native extras: [`append_native_extra_schemas`]
+/// minus the `recall`/`fanout`/`run_code` tail, which is settings-gated.
+/// Split out so [`native_extra_specs`] can build the same text with or
+/// without those gates without duplicating the schema bodies.
+fn append_native_extra_schemas_ungated_core(out: &mut String) {
     out.push_str(
         "\n{\n\
          \x20 \"type\": \"function\",\n\
@@ -975,23 +1017,53 @@ fn append_native_extra_schemas(out: &mut String) {
          }\n",
     );
     append_agent_and_plan_schemas(out);
-    // The `recall` (M8), `fanout` (M9) and `run_code` (M10) tools are
-    // deliberate deviations from the C reference: the C agent has none of them.
-    // They are advertised by default and can be switched off individually
-    // (`tools.recall` / `tools.fanout` / `tools.runCode`). Because they are in
-    // the prompt, `fp1` differs from the C agent's fingerprint — the versioned
-    // deviation documented in docs/SYSTEM-PROMPT-OVERRIDES.md. What parity
-    // still holds byte-for-byte is the C-*derived* text, which
-    // `tools_prompt_matches_c_source` checks independently of this list.
-    if crate::settings::active().tools.recall {
-        append_recall_schema(out);
+}
+
+/// Every native tool beyond the C-trained table, as filterable
+/// [`crate::engine::ToolSpec`]s rather than the pre-rendered text
+/// [`append_native_extra_schemas`] produces.
+///
+/// `respect_settings_gates` selects whether `recall`, `fanout` and
+/// `run_code` are included only when their `tools.*` setting is on (the
+/// same gating `append_native_extra_schemas` applies to the default prompt)
+/// or unconditionally. A profile's schema block wants the gated view — a
+/// tool a setting disabled must stay absent regardless of the allow-list.
+/// Enumerating every known builtin name (finding 3's warning check) wants
+/// the ungated view, since a name is "known" independent of whether this
+/// run's settings currently expose it.
+///
+/// Parses the same hand-written schema text `append_native_extra_schemas`
+/// emits, through [`parse_tool_schema_stream`], so there is exactly one
+/// place that spells out each native tool's schema; this only reads it back
+/// as data.
+fn native_extra_specs(respect_settings_gates: bool) -> Vec<crate::engine::ToolSpec> {
+    let mut text = String::new();
+    append_native_extra_schemas_ungated_core(&mut text);
+    let gates = &crate::settings::active().tools;
+    if !respect_settings_gates || gates.recall {
+        append_recall_schema(&mut text);
     }
-    if crate::settings::active().tools.fanout {
-        append_fanout_schema(out);
+    if !respect_settings_gates || gates.fanout {
+        append_fanout_schema(&mut text);
     }
-    if crate::settings::active().tools.run_code {
-        append_run_code_schema(out);
+    if !respect_settings_gates || gates.run_code {
+        append_run_code_schema(&mut text);
     }
+    parse_tool_schema_stream(&text)
+}
+
+/// The full set of builtin tool names plank knows how to dispatch: the
+/// C-trained table plus every native extra, independent of the current
+/// run's `tools.*` settings gates. Feeds finding 3's allow-list-name
+/// warning, so a gate being off in this run does not make a profile that
+/// names the gated tool look like it typo'd a nonexistent one.
+#[must_use]
+pub fn known_builtin_names() -> std::collections::HashSet<String> {
+    parse_builtin_tool_schemas()
+        .into_iter()
+        .chain(native_extra_specs(false))
+        .map(|spec| spec.name)
+        .collect()
 }
 
 /// Appends the `recall` tool schema (M8): search prior sessions and the
@@ -2139,6 +2211,66 @@ mod tests {
         assert!(
             !out.contains("\"type\": \"function\""),
             "an empty allow-list must admit no builtin schema through the composer"
+        );
+    }
+
+    #[test]
+    fn a_profile_allow_listing_native_extras_gets_exactly_those_in_its_schema_block() {
+        // Finding 2: "builtin" means every dispatchable builtin, not just the
+        // twelve the C reference parses out of the resource file. `glob` and
+        // `ask` are native extras (`append_native_extra_schemas`), never in
+        // `parse_builtin_tool_schemas`'s output, so this fails unless the
+        // composer folds native extras into the filtered set too.
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(vec!["glob".to_string(), "ask".to_string()]),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = "You are ChatBGT.\n".to_string();
+        let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
+        assert!(out.contains("\"name\": \"glob\""), "glob must be advertised");
+        assert!(out.contains("\"name\": \"ask\""), "ask must be advertised");
+        let names: Vec<&str> = out
+            .match_indices("\"name\": \"")
+            .map(|(i, _)| {
+                let rest = &out[i + "\"name\": \"".len()..];
+                rest.split('"').next().unwrap_or("")
+            })
+            .collect();
+        for name in &names {
+            assert!(
+                *name == "glob" || *name == "ask",
+                "only the allow-listed tools may appear in the schema block, found {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_gated_native_extra_stays_absent_even_when_allow_listed() {
+        // recall/fanout/run_code are additionally gated by `tools.*`
+        // settings; a profile allow-listing one must not resurrect it once
+        // the setting has turned it off.
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.recall = false;
+        crate::settings::install_for_test(settings);
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(vec!["recall".to_string()]),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = "You are ChatBGT.\n".to_string();
+        let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
+        assert!(
+            !out.contains("\"name\": \"recall\""),
+            "tools.recall = false must withhold recall even though the profile allow-lists it"
         );
     }
 
