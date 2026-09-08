@@ -174,7 +174,28 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
 
     let settings_json = match block.get("settings") {
         None => None,
-        Some(s @ Json::Obj(_)) => {
+        Some(s @ Json::Obj(members)) => {
+            // `crate::settings::Settings::overlay_from` drops `engine.*` from
+            // a profile's settings layer the same way it drops it from a
+            // plugin's, but silently — the caller there has no per-key
+            // warning channel to surface it on. This is that surfacing: a
+            // per-key warning here, at parse time, the same shape plugins.rs
+            // emits for its own refused sections.
+            if let Some((_, engine_value)) = members.iter().find(|(k, _)| k == "engine") {
+                match engine_value {
+                    Json::Obj(engine_keys) if !engine_keys.is_empty() => {
+                        for (key, _) in engine_keys {
+                            warnings.push(format!(
+                                "profile: settings.engine.{key} is refused (a profile may not set engine.*); set it yourself in ~/.plank/settings.json if you want it"
+                            ));
+                        }
+                    }
+                    _ => warnings.push(
+                        "profile: settings.engine is refused (a profile may not set engine.*); set it yourself in ~/.plank/settings.json if you want it"
+                            .to_string(),
+                    ),
+                }
+            }
             let mut out = String::new();
             json_write(&mut out, s);
             Some(out)
@@ -411,6 +432,55 @@ mod tests {
         );
         assert!(spec.settings_json.is_some());
         assert!(spec.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_profiles_engine_settings_are_dropped_loudly() {
+        // Finding 5: `Settings::overlay_from` drops `engine.*` from a
+        // profile's settings layer the same way it drops a plugin's, but
+        // silently. This is where that becomes audible: one warning per
+        // dropped key, mirroring `settings_audit_warnings`'s per-key shape
+        // for a plugin's refused sections.
+        let text = r#"{
+          "profile": {
+            "systemPrompt": "prompt.md",
+            "settings": { "engine": { "model": "evil.gguf", "threads": 99 }, "ui": { "showThinking": false } }
+          }
+        }"#;
+        let spec = parse(text, Path::new("/p")).expect("still parses as a profile");
+        assert!(
+            spec.warnings
+                .iter()
+                .any(|w| w.contains("engine.model") && w.contains("refused")),
+            "expected a warning naming engine.model, got: {:?}",
+            spec.warnings
+        );
+        assert!(
+            spec.warnings
+                .iter()
+                .any(|w| w.contains("engine.threads") && w.contains("refused")),
+            "expected a warning naming engine.threads, got: {:?}",
+            spec.warnings
+        );
+        // The refusal itself (dropping the key) is `settings.rs`'s job, not
+        // this parser's — it still serializes the block as given.
+        assert!(spec.settings_json.unwrap().contains("\"engine\""));
+    }
+
+    #[test]
+    fn settings_without_an_engine_block_warns_about_nothing() {
+        let text = r#"{
+          "profile": {
+            "systemPrompt": "prompt.md",
+            "settings": { "ui": { "showThinking": false } }
+          }
+        }"#;
+        let spec = parse(text, Path::new("/p")).expect("still parses as a profile");
+        assert!(
+            spec.warnings.is_empty(),
+            "no engine block, no warnings expected: {:?}",
+            spec.warnings
+        );
     }
 
     #[test]
