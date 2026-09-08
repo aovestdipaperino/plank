@@ -1417,10 +1417,12 @@ impl Engine for Ds4Session {
         // Speculative decode verifies drafts by argmax, so it reproduces the
         // sampled stream only when the whole generation is greedy anyway.
         // Same gate the C CLI uses: temperature at or below zero, and a
-        // support model that proposes blocks rather than single tokens.
+        // support model that proposes blocks rather than single tokens, plus
+        // plank's own `/dspark` switch — which is why temperature 0 with
+        // speculation off is a state this engine can be in and the C cannot.
         // `greedy()` flipping per token inside a DSML stanza is irrelevant
         // here — at this temperature both branches sample argmax.
-        let draft_block = if opts.temperature <= 0.0 {
+        let draft_block = if opts.dspark && opts.temperature <= 0.0 {
             // SAFETY: engine valid for the life of the model.
             unsafe { ffi::ds4_engine_mtp_draft_tokens(self.model.engine) }
         } else {
@@ -1981,6 +1983,15 @@ impl Engine for Ds4Session {
     fn has_vision(&self) -> bool {
         // SAFETY: engine pointer is valid for the life of the model.
         unsafe { ffi::ds4_engine_has_vision(self.model.engine) }
+    }
+
+    fn spec_capable(&self) -> bool {
+        // The same reading the draft gate takes: a support model that proposes
+        // blocks rather than single tokens. Asking the engine beats trusting
+        // the config — `--dspark` is on by default, and a run whose support
+        // GGUF never loaded would otherwise claim speculation it cannot do.
+        // SAFETY: engine pointer is valid for the life of the model.
+        unsafe { ffi::ds4_engine_mtp_draft_tokens(self.model.engine) > 1 }
     }
 
     fn vision_encode_file(

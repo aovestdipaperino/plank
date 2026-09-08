@@ -55,6 +55,7 @@ argument for the design.
 | 2026-09-07 | *(this change)* | `REPEAT_THINK_BUDGET = 16 KiB` per-pass reasoning cap (`RepeatGuard::with_think_budget`, `THINK_BUDGET_ERROR`, counted towards `MAIN_REPEAT_TRIP_CAP`); `NO_PROGRESS_BYTE_BUDGET = 32 KiB` per-turn cap on output with no `PROGRESS_TOOLS` call | `repro-1788796284`: a 9042-byte cycle 20 times over in a sub-agent, longer than the whole window so no rung could see it, and a parent turn that looped no text at all yet edited nothing in fifty minutes |
 | 2026-09-07 | `aaf0f3d` | `MAIN_REPEAT_TRIP_CAP = 2` on both main-turn paths (`MAIN_REPEAT_TRIPS_NOTICE`); `Agent::repro_dir` so test dumps stay out of `~/.plank/repro`; this document | `repro-loop-1788708943`/`-1788709421`: the main turn looped, stopped, looped again, and the user quit |
 | 2026-09-08 | *(this change)* | no-progress budget resets only after a successful direct `write` or `edit`, not an attempted `edit` or arbitrary `bash` call | `repro-loop-1788833715`: 5h7m of failed edits, builds, and repeated reads kept resetting the budget |
+| 2026-09-08 | *(this change)* | `tools.loopGuards` and `/loopguard` (alias `/lg`): one switch over every rung — `LoopGuard::observe`/`tripped`, the gated `RepeatGuard` (cycles and think budget), the no-progress budget. Read through `guard::guards_enabled()` at each check, never captured at turn start, so the switch lands on a generation already streaming; `🔁` in the footer while armed, and the tripped marker moved to `♻ looping` | diagnosing the guards themselves, where every rung fires before the behaviour under study can be observed |
 
 Two patterns run through the table. First, every detector started advisory
 or per-pass and had to grow a rung that *ends the turn*: at temperature 0 a
@@ -63,6 +64,12 @@ effectively unchanged, so the next pass is the same pass. Second, each new
 guard shipped with its own evidence channel (timestamps, the auto-dump, the
 red lines, the footer marker), because the previous stall had been
 undiagnosable from what was on disk.
+
+One consequence of the switch worth stating: a silenced guard keeps *feeding*.
+`RepeatGuard::feed` still eats every chunk while `gated` and off, so the tail
+and the byte count stay honest and `/loopguard on` mid-pass answers from real
+history instead of a fresh allowance. A switch that stopped the bookkeeping
+would hand a looping model a clean slate every time it was flicked.
 
 Not a guard, but worth knowing: `tools.callTimeoutSec` from `3bab717` is a
 per-dispatch deadline and is off by default; a hung tool is a different

@@ -49,6 +49,7 @@ pub enum FieldId {
     AgentsMaxParallel,
     GitSignCommits,
     ToolsRepeatAdvisory,
+    ToolsLoopGuards,
     ToolsCallTimeoutSec,
     ToolsSpillMaxBytes,
     ToolsSpillPreviewBytes,
@@ -294,6 +295,13 @@ pub static FIELDS: &[Field] = &[
         Kind::Bool,
     ),
     f(
+        FieldId::ToolsLoopGuards,
+        "tools",
+        "loopGuards",
+        "stop the model when it loops",
+        Kind::Bool,
+    ),
+    f(
         FieldId::ToolsCallTimeoutSec,
         "tools",
         "callTimeoutSec",
@@ -412,6 +420,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::AgentsMaxParallel => s.agents.max_parallel.to_string(),
         FieldId::GitSignCommits => s.git.sign_commits.to_string(),
         FieldId::ToolsRepeatAdvisory => s.tools.repeat_advisory.to_string(),
+        FieldId::ToolsLoopGuards => s.tools.loop_guards.to_string(),
         FieldId::ToolsCallTimeoutSec => s.tools.call_timeout_sec.to_string(),
         FieldId::ToolsSpillMaxBytes => s.tools.spill_max_bytes.to_string(),
         FieldId::ToolsSpillPreviewBytes => s.tools.spill_preview_bytes.to_string(),
@@ -577,6 +586,7 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::AgentsAutoRoute
         | FieldId::GitSignCommits
         | FieldId::ToolsRepeatAdvisory
+        | FieldId::ToolsLoopGuards
         | FieldId::ToolsRecall
         | FieldId::ToolsFanout
         | FieldId::ToolsRunCode
@@ -612,6 +622,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::AgentsAutoRoute => s.agents.auto_route = b,
         FieldId::GitSignCommits => s.git.sign_commits = b,
         FieldId::ToolsRepeatAdvisory => s.tools.repeat_advisory = b,
+        FieldId::ToolsLoopGuards => s.tools.loop_guards = b,
         FieldId::ToolsRecall => s.tools.recall = b,
         FieldId::ToolsFanout => s.tools.fanout = b,
         FieldId::ToolsRunCode => s.tools.run_code = b,

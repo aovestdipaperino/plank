@@ -31,6 +31,16 @@ use plank::engine::EchoEngine;
 use plank::engine::Engine;
 use plank::status;
 
+/// Arms the panic repro dump for the rest of the run.
+///
+/// It dumps only while the debug mirror is on, so `/debug on` mid-session arms
+/// it and an ordinary run pays nothing for having the hook installed.
+fn arm_panic_dump() {
+    plank::repro::install_panic_hook(plank::repro::repro_dir(
+        &std::env::current_dir().unwrap_or_default(),
+    ));
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -202,6 +212,7 @@ fn main() -> ExitCode {
     }
 
     plank::interrupt::install();
+    arm_panic_dump();
     let engine = match make_engine(&cfg, &plugins) {
         Ok(engine) => engine,
         Err(e) => {

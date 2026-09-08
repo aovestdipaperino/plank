@@ -175,6 +175,14 @@ pub struct GenerationOptions {
     pub seed: u64,
     /// Reasoning mode.
     pub think_mode: ThinkMode,
+    /// Whether speculative decoding may run this pass (`--dspark`,
+    /// `/dspark on|off`).
+    ///
+    /// Seeded from `engine.dspark` at startup and flipped by `/dspark`. The
+    /// engine still needs a loaded support model and a temperature of 0 to
+    /// speculate — this is the third condition, and the only one the user can
+    /// change without restarting.
+    pub dspark: bool,
     /// Recover from a tool call the model starts inside an unclosed `<think>`
     /// by force-feeding `</think>` and letting it continue (the C server's
     /// `chat_think_tool_recovery`).
@@ -195,6 +203,7 @@ impl Default for GenerationOptions {
             min_p: 0.0,
             seed: 0,
             think_mode: ThinkMode::Medium,
+            dspark: true,
             think_tool_recovery: false,
         }
     }
@@ -994,6 +1003,17 @@ pub trait Engine: Debug + Send {
     /// (C parity), but only served when this returns `true`. Without a vision
     /// encoder, `view_image` returns the C's refusal string at call time.
     fn has_vision(&self) -> bool {
+        false
+    }
+
+    /// Whether this engine has a loaded `DSpark` support model, so
+    /// speculative decoding is available at all.
+    ///
+    /// `/dspark on` refuses when this is false: the support model is chosen at
+    /// startup (`--dspark`, `--mtp`) and cannot be loaded into a running
+    /// engine, so promising speculation here would be a lie the footer then
+    /// repeats.
+    fn spec_capable(&self) -> bool {
         false
     }
 

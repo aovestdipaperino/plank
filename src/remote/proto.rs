@@ -178,6 +178,16 @@ pub struct WireOptions {
     /// simply gets the pre-recovery behavior.
     #[serde(default)]
     pub think_tool_recovery: bool,
+    /// Defaulted to `true` — an older client that omits the field means the
+    /// behavior from before `/dspark` existed, where the temperature gate
+    /// alone decided whether the host speculated.
+    #[serde(default = "dspark_default")]
+    pub dspark: bool,
+}
+
+/// `serde` default for [`WireOptions::dspark`]: the pre-`/dspark` behavior.
+fn dspark_default() -> bool {
+    true
 }
 
 impl From<&GenerationOptions> for WireOptions {
@@ -191,6 +201,7 @@ impl From<&GenerationOptions> for WireOptions {
             seed: o.seed,
             think_mode: o.think_mode.into(),
             think_tool_recovery: o.think_tool_recovery,
+            dspark: o.dspark,
         }
     }
 }
@@ -206,6 +217,7 @@ impl From<&WireOptions> for GenerationOptions {
             seed: o.seed,
             think_mode: o.think_mode.into(),
             think_tool_recovery: o.think_tool_recovery,
+            dspark: o.dspark,
         }
     }
 }

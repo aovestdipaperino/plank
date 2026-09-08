@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`/dspark [on|off]` turns speculative decoding on and off mid-session.**
+  Speculation verifies its drafts by argmax, so it only runs at temperature 0;
+  the switch pins the temperature there and gives back the one you were
+  sampling at when you turn it off. `on` is refused without a loaded support
+  model — that is chosen at startup (`--dspark`, `--mtp`) and cannot be loaded
+  into a running engine, so the alternative is a footer marker promising
+  speculation no pass will do. The gate in `ds4engine` is now
+  `dspark && temperature <= 0`, which makes "temperature 0 with speculation
+  off" a state plank can be in and the C reference cannot.
+- **`/temp [0..100]` sets the sampling temperature.** Refused while `/dspark`
+  is on rather than silently disabling speculation: any temperature above 0
+  turns the draft gate off, so the obliging reading of `/temp 0.6` would be
+  "quietly stop doing the thing the footer still claims".
+- **`/loopguard [on|off]` (alias `/lg`) arms or silences every loop guard** —
+  the repetition guard and its think budget, the repeated-call guard and its
+  no-progress budget, and the repeat advisory — behind one
+  `tools.loopGuards` setting, on by default. Every rung reads the switch at
+  each check rather than capturing it at turn start, so it is the one mutating
+  command that also works *mid-turn*: the moment you want the guards out of
+  the way is usually while they are firing. A silenced guard keeps feeding, so
+  turning it back on mid-pass answers from real history instead of handing a
+  looping model a clean slate. The switch is session-only and never written to
+  disk.
+- **Two new footer segments.** `✨` while speculation is on, carrying its
+  per-step figures (retiring `⏩`), or `🌡 0.60` while it is off — one slot,
+  two exclusive states. `🔁` while the loop guards are armed; the tripped
+  marker moved to `♻ looping`, because "watching" and "caught something"
+  should not read as the same news.
+- **Debug runs dump a repro on the way out.** Under `--debug` (or after
+  `/debug on`) a clean exit writes `repro-quit-<secs>.md` and a panic writes
+  `repro-panic-<secs>.md`, the latter from the transcript the last pass
+  rendered — a panic hook cannot borrow the agent, so the one thing it can do
+  is write bytes somebody else prepared. Neither needs anyone to remember
+  `/repro` before the session ends, and an ordinary run pays nothing for
+  having the hook installed.
+
 ### Fixed
 
 - **A long reasoning cycle can now actually be stopped.** Confirming repeated

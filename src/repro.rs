@@ -260,6 +260,116 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     out
 }
 
+/// The last rendered transcript, kept for the panic dump.
+///
+/// Only written while the debug mirror is on ([`stash_transcript`]), because
+/// that is the only case in which a dump is taken at all and the copy is not
+/// free. A panic hook cannot borrow the agent — it runs with the stack already
+/// unwinding, from whatever thread failed — so the one thing it can do is
+/// write bytes somebody else prepared.
+static PANIC_TRANSCRIPT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Records the rendered transcript for a possible panic dump. Cheap to call
+/// unconditionally: it returns immediately unless the debug mirror is on.
+pub fn stash_transcript(rendered: &str) {
+    if !crate::debugmirror::enabled() {
+        return;
+    }
+    if let Ok(mut slot) = PANIC_TRANSCRIPT.lock() {
+        *slot = Some(rendered.to_owned());
+    }
+}
+
+/// The stashed transcript, or `None` if nothing was ever stashed.
+#[must_use]
+pub fn stashed_transcript() -> Option<String> {
+    PANIC_TRANSCRIPT.lock().ok().and_then(|s| s.clone())
+}
+
+/// The panic dump's text: what [`build_report`] can still say once the agent
+/// is gone — the version, the time, the panic itself, and the last transcript
+/// the session rendered.
+///
+/// A separate builder rather than a [`Meta`] with holes in it: everything
+/// [`build_report`] reports beyond this comes from the engine or the config,
+/// and a hook has neither. Same transcript fences, so the two dumps read
+/// alike and the same tooling parses both.
+#[must_use]
+pub fn build_panic_report(
+    version: &str,
+    date: &str,
+    panic: &str,
+    transcript: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# plank repro {version} (panic)");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- date: {date}");
+    let _ = writeln!(out, "- note: plank panicked");
+    let _ = writeln!(out, "- panic: {}", panic.trim());
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Rendered transcript (exact engine input)");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "----- BEGIN TRANSCRIPT -----");
+    match transcript {
+        Some(t) => {
+            out.push_str(t);
+            if !t.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        // A panic before the first pass, or with the mirror off until now.
+        None => {
+            let _ = writeln!(out, "(no transcript was captured before the panic)");
+        }
+    }
+    let _ = writeln!(out, "----- END TRANSCRIPT -----");
+    out
+}
+
+/// The panic payload as text: the two payload types `panic!` produces, and a
+/// placeholder for anything else.
+#[must_use]
+pub fn panic_text(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = info.payload();
+    let msg = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "(non-string panic payload)".to_owned());
+    match info.location() {
+        Some(loc) => format!("{msg} (at {}:{})", loc.file(), loc.line()),
+        None => msg,
+    }
+}
+
+/// Installs the panic dump hook, chaining to whatever hook is already set.
+///
+/// Armed for the whole run but *decides at panic time*: it dumps only when the
+/// debug mirror is on, so `/debug on` mid-session arms it and a normal run
+/// pays nothing. Failures are swallowed — a panic that also cannot write its
+/// dump must still reach the default hook and print its message.
+pub fn install_panic_hook(dir: PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if crate::debugmirror::enabled() {
+            let report = build_panic_report(
+                &crate::logo::version_label(),
+                &crate::context::current_local_iso_date(),
+                &panic_text(info),
+                stashed_transcript().as_deref(),
+            );
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            if let Ok(path) = save_in(&dir, "repro-panic", secs, &report) {
+                eprintln!("[panic repro written to {}]", path.display());
+            }
+        }
+        previous(info);
+    }));
+}
+
 /// Writes `report` into an explicit directory as `<prefix>-<secs>.md`,
 /// disambiguating same-second filenames with a `-N` suffix.
 ///
@@ -304,6 +414,31 @@ mod tests {
             session_path: "/home/u/.plank/kvcache/abc123.kv",
             note: "model looped on edit",
         }
+    }
+
+    #[test]
+    fn a_panic_report_carries_the_panic_and_the_stashed_transcript() {
+        let text = build_panic_report(
+            "9.9.9",
+            "2026-09-08T10:00:00",
+            "index out of bounds (at src/x.rs:12)",
+            Some("[system]\nsys\n[user]\nhi"),
+        );
+        assert!(text.starts_with("# plank repro 9.9.9 (panic)"), "{text}");
+        assert!(text.contains("- panic: index out of bounds (at src/x.rs:12)"));
+        // Same fences as `build_report`, so one parser reads both, and the
+        // transcript is newline-terminated even when the input was not.
+        assert!(text.contains(
+            "----- BEGIN TRANSCRIPT -----\n[system]\nsys\n[user]\nhi\n----- END TRANSCRIPT -----"
+        ));
+    }
+
+    /// A panic before the first pass has nothing stashed; the dump still has
+    /// to be written, because the panic is the news.
+    #[test]
+    fn a_panic_report_with_no_transcript_says_so() {
+        let text = build_panic_report("9.9.9", "d", "boom", None);
+        assert!(text.contains("(no transcript was captured before the panic)"));
     }
 
     #[test]

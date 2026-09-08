@@ -1669,6 +1669,8 @@ pub struct RepeatGuard {
     /// the tail looks like; see [`RepeatGuard::with_think_budget`]. `None`
     /// for the insights sections, whose passes are short by construction.
     budget: Option<usize>,
+    /// Whether this guard answers to `tools.loopGuards`; see [`Self::gated`].
+    gated: bool,
 }
 
 /// A cycle the warn rung has confirmed, followed forward through the stream.
@@ -1702,6 +1704,7 @@ impl Default for RepeatGuard {
             check_every: REPEAT_CHECK_EVERY,
             repeating: false,
             budget: None,
+            gated: false,
         }
     }
 }
@@ -1761,11 +1764,30 @@ impl RepeatGuard {
         self
     }
 
+    /// Puts this guard under the `tools.loopGuards` switch, so `/loopguard
+    /// off` silences it — including mid-pass, since the setting is read at
+    /// every check rather than here.
+    ///
+    /// Opt-in rather than the default because the insights sections drive a
+    /// guard of their own to bound their own generation; that one is plank's
+    /// business, not a loop the user asked to stop watching for.
+    #[must_use]
+    pub fn gated(mut self) -> Self {
+        self.gated = true;
+        self
+    }
+
+    /// Whether this guard's rungs are live: always, unless it is
+    /// [`gated`](Self::gated) and the switch is off.
+    fn live(&self) -> bool {
+        !self.gated || crate::guard::guards_enabled()
+    }
+
     /// Whether this pass has spent its reasoning budget. Sticky once true,
     /// since [`total`](Self::total) only grows.
     #[must_use]
     pub fn over_budget(&self) -> bool {
-        self.budget.is_some_and(|b| self.total > b)
+        self.live() && self.budget.is_some_and(|b| self.total > b)
     }
 
     /// Reasoning bytes fed to the guard this pass, for the message a budget
@@ -1778,7 +1800,18 @@ impl RepeatGuard {
 
     /// Feeds one streamed chunk. Returns true once the output has been
     /// repeating itself for [`REPEAT_CYCLES`] cycles.
+    ///
+    /// A [`gated`](Self::gated) guard with the switch off still eats the chunk
+    /// — the tail and the byte count stay honest, so `/loopguard on` mid-pass
+    /// resumes from real history rather than from an empty window — it just
+    /// never answers true.
     pub fn feed(&mut self, chunk: &str) -> bool {
+        let cycling = self.feed_tail(chunk);
+        cycling && self.live()
+    }
+
+    /// [`feed`](Self::feed) without the switch: the detection itself.
+    fn feed_tail(&mut self, chunk: &str) -> bool {
         self.tail.push_str(chunk);
         self.total += chunk.len();
         if self.tail.len() > self.window {
@@ -1863,7 +1896,7 @@ impl RepeatGuard {
     /// life of the guard.
     #[must_use]
     pub fn repeating(&self) -> bool {
-        self.repeating
+        self.live() && self.repeating
     }
 
     /// The shortest period whose block the tail ends in `cycles` times back
@@ -3100,6 +3133,60 @@ Tool result 3 (read):\nfine\n</tool_result>",
             "the narrow window should not see a 600-byte period"
         );
         assert!(wide_hit, "the wide window should catch the paragraph loop");
+    }
+
+    /// The gated rungs answer to `tools.loopGuards`; the insights guard, which
+    /// bounds plank's own report generation, does not.
+    #[test]
+    fn the_switch_silences_a_gated_repeat_guard_but_not_an_ungated_one() {
+        let cycle = "the same paragraph of reasoning, again and again. ".repeat(3);
+        let mut on = RepeatGuard::with_window(8192).gated();
+        let mut plain = RepeatGuard::with_window(8192);
+        let mut off = RepeatGuard::with_window(8192).gated();
+
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = false;
+        crate::settings::install_for_test(settings);
+        let mut off_hit = false;
+        let mut plain_hit = false;
+        for _ in 0..40 {
+            off_hit |= off.feed(&cycle);
+            plain_hit |= plain.feed(&cycle);
+        }
+        assert!(
+            !off_hit,
+            "a gated guard must stay quiet while the switch is off"
+        );
+        assert!(!off.repeating());
+        assert!(plain_hit, "an ungated guard is plank's own business");
+
+        // Re-armed mid-stream: the tail it kept while quiet is what it answers
+        // from, so the very next check reports the cycle.
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        assert!(
+            off.repeating(),
+            "the quiet guard had seen the cycle all along"
+        );
+
+        let mut on_hit = false;
+        for _ in 0..40 {
+            on_hit |= on.feed(&cycle);
+        }
+        assert!(on_hit);
+    }
+
+    /// The budget rung is under the same switch as the cycle rung.
+    #[test]
+    fn the_switch_silences_the_think_budget() {
+        let mut guard = RepeatGuard::with_window(8192).with_think_budget(64).gated();
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = false;
+        crate::settings::install_for_test(settings);
+        guard.feed(&"unrepeating prose. ".repeat(40));
+        assert!(guard.fed() > 64, "the budget was spent");
+        assert!(!guard.over_budget(), "but the switch is off");
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        assert!(guard.over_budget());
     }
 
     #[test]

@@ -265,9 +265,9 @@ pub struct Status {
     pub think: crate::engine::ThinkMode,
     /// Error text for the `Error` state.
     pub error: String,
-    /// Speculative-decoding counters (`--dspark`). Rendered only when
-    /// [`active`](crate::engine::SpecStats::active); a run without a support
-    /// model never shows the segment.
+    /// Speculative-decoding counters (`--dspark`). Only the counters are
+    /// conditional now: with [`dspark`](Self::dspark) on the segment is drawn
+    /// whether or not a pass has speculated yet.
     pub spec: crate::engine::SpecStats,
 }
 
@@ -277,11 +277,28 @@ pub struct Status {
 /// Deliberately not `⚡`: the power suffix already owns that glyph (`local
 /// ⚡100%`), and two different meanings for one mark in a single footer is
 /// exactly the sort of thing nobody notices until they misread it.
-const SPEC_MARK: &str = "⏩";
+const SPEC_MARK: &str = "✨";
+
+/// Marks the footer's temperature reading, shown in [`SPEC_MARK`]'s place
+/// while `/dspark` is off — the two are mutually exclusive by construction,
+/// since speculation only runs at temperature 0.
+///
+/// The bare codepoint, deliberately without the U+FE0F variation selector:
+/// the footer is width-sensitive and the emoji-presentation form measures
+/// differently across terminals.
+const TEMP_MARK: &str = "🌡";
+
+/// Marks the footer's loop-guard segment: the guards are armed and watching.
+/// Distinct from [`LOOP_MARK`], which says a guard has actually seen a cycle.
+const GUARD_MARK: &str = "🔁";
 
 /// Marks the footer's loop segment, shown while the repetition guard sees the
-/// reasoning cycling (`🔁 looping`).
-const LOOP_MARK: &str = "🔁";
+/// reasoning cycling (`♻ looping`).
+///
+/// Deliberately not [`GUARD_MARK`]: that one means the guards are armed, which
+/// is the resting state of every session, and one glyph for "watching" and
+/// "caught something" would be read as the same news twice.
+const LOOP_MARK: &str = "♻";
 
 /// The loop segment: ` | 🔁 looping` while `st.looping`, empty otherwise. Rides
 /// after the ctx gauge in the generating footer, whether or not the progress
@@ -501,6 +518,42 @@ fn elide_cells_styled(cells: &[Cell], keep: usize, color: bool) -> String {
         return String::new();
     }
     format!(" | {}", kept.join(" | "))
+}
+
+/// Whether speculative decoding is on, and the temperature to show when it
+/// is not: the two states of one footer slot (see [`spec_segment`]).
+///
+/// Process-global beside the power cap rather than carried on [`Status`], for
+/// the same reason: [`build_status_text`] is a pure function called from a
+/// dozen snapshot sites, and every one of them would have to learn to copy two
+/// more fields forward or the marker would blink out on whichever frame forgot.
+/// `/dspark` and `/temp` publish here; the bar only reads.
+static DSPARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The sampling temperature, as `f32` bits — `AtomicF32` does not exist.
+static TEMPERATURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f19_999a); // 0.6
+
+/// Records whether speculative decoding is on, from startup config or
+/// `/dspark`.
+pub fn set_dspark(on: bool) {
+    DSPARK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the footer should claim speculative decoding.
+#[must_use]
+pub fn dspark() -> bool {
+    DSPARK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Records the sampling temperature, from startup config or `/temp`.
+pub fn set_temperature(temp: f32) {
+    TEMPERATURE.store(temp.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The sampling temperature the footer shows while `/dspark` is off.
+#[must_use]
+pub fn temperature() -> f32 {
+    f32::from_bits(TEMPERATURE.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 pub fn set_local_power(percent: i32) {
@@ -1719,6 +1772,10 @@ fn build_status_text_with_cells(
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
     };
+    let ctx = match guard_segment() {
+        Some(seg) => format!("{ctx} | {}", theme(&seg)),
+        None => ctx,
+    };
     // The download segment rides with the ctx gauge for the same reason the
     // dspark segment does: it describes the whole session rather than this
     // turn, and keeping it left of the state word keeps the power suffix
@@ -1765,14 +1822,33 @@ fn build_status_text_with_cells(
 /// [`SpecStats::tokens_per_step`](crate::engine::SpecStats::tokens_per_step).
 #[must_use]
 pub fn spec_segment(st: &Status) -> Option<String> {
+    if !dspark() {
+        // Speculation off: the temperature is back in play, so show it. It is
+        // the same slot because the two states are exclusive — under dspark
+        // the temperature is pinned at 0 and says nothing.
+        return Some(format!("{TEMP_MARK} {:.2}", temperature()));
+    }
     if !st.spec.active() {
-        return None;
+        // On, but nothing to count yet (idle, or a pass that has not reached
+        // its first block): the mark alone still answers "is dspark on?".
+        return Some(SPEC_MARK.to_owned());
     }
     Some(format!(
-        "{SPEC_MARK}{:.1}t/step {:.0}%",
+        "{SPEC_MARK} {:.1}t/step {:.0}%",
         st.spec.tokens_per_step(),
         100.0 * st.spec.block_fill()
     ))
+}
+
+/// The loop-guard segment: [`GUARD_MARK`] while the guards are armed, empty
+/// when `/loopguard off` has silenced them.
+///
+/// Rides with the ctx gauge rather than in the state word, so it is visible in
+/// every worker state — the switch is a property of the session, not of the
+/// turn, and `/loopguard` can be typed at idle.
+#[must_use]
+pub fn guard_segment() -> Option<String> {
+    crate::guard::guards_enabled().then(|| GUARD_MARK.to_owned())
 }
 
 /// Appends `seg` (already themed) to `ctx`, or returns `ctx` unchanged.
@@ -2126,31 +2202,86 @@ mod tests {
         assert_eq!(format_ctx_size(1_048_576), "1.0M");
     }
 
+    /// Puts the footer's two process-global slots — the dspark switch and the
+    /// temperature — in a known state, and silences the loop guards through
+    /// the thread-local test settings, so a test can assert an exact line.
+    ///
+    /// Returns the origin guard: the slots are process-global, so a test that
+    /// sets them has to hold the same lock the power-cap tests do.
+    fn quiet_footer() -> std::sync::MutexGuard<'static, ()> {
+        let guard = origin_test_guard();
+        set_dspark(false);
+        set_temperature(0.0);
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = false;
+        crate::settings::install_for_test(settings);
+        guard
+    }
+
     #[test]
     fn idle_status_line() {
+        let _lock = quiet_footer();
         let st = Status {
             ctx_used: 1000,
             ctx_size: 8000,
             ..Status::default()
         };
         assert!(
-            build_status_text(&st, false, true).ends_with("ctx 12% | idle"),
+            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡 0.00 | idle"),
             "{}",
             build_status_text(&st, false, true)
         );
     }
 
     #[test]
-    fn dspark_segment_appears_only_when_a_pass_speculated() {
-        // A run without a support model must look exactly as it did before.
+    fn the_footer_shows_the_temperature_while_dspark_is_off() {
+        let _lock = quiet_footer();
+        set_temperature(0.6);
+        let st = Status {
+            ctx_used: 1000,
+            ctx_size: 8000,
+            ..Status::default()
+        };
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains(&format!("{TEMP_MARK} 0.60")), "{line}");
+        // The two states of one slot: never both at once.
+        assert!(!line.contains(SPEC_MARK), "{line}");
+    }
+
+    #[test]
+    fn the_footer_marks_the_loop_guards_while_they_are_armed() {
+        let _lock = quiet_footer();
+        let st = Status {
+            ctx_used: 1000,
+            ctx_size: 8000,
+            ..Status::default()
+        };
+        assert!(!build_status_text(&st, false, true).contains(GUARD_MARK));
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains(GUARD_MARK), "{line}");
+        // Armed is not the same news as caught: the tripped marker is its own
+        // glyph and appears only while a guard has actually seen a cycle.
+        assert!(!line.contains(LOOP_MARK), "{line}");
+    }
+
+    #[test]
+    fn dspark_shows_its_mark_before_a_pass_has_speculated() {
+        let _lock = quiet_footer();
+        set_dspark(true);
         let plain = Status {
             ctx_used: 1000,
             ctx_size: 8000,
             ..Status::default()
         };
+        // On, but nothing counted yet: the mark alone still answers the
+        // question the slot exists to answer.
         let line = build_status_text(&plain, false, true);
-        assert!(line.ends_with("ctx 12% | idle"), "{line}");
-        assert!(!line.contains(SPEC_MARK), "{line}");
+        assert!(
+            line.ends_with(&format!("ctx 12% | {SPEC_MARK} | idle")),
+            "{line}"
+        );
+        assert!(!line.contains(TEMP_MARK), "{line}");
 
         // 10 steps of a 4-token block, 30 committed: 3.0 per step, 50% fill.
         let spark = Status {
@@ -2163,7 +2294,7 @@ mod tests {
         };
         let line = build_status_text(&spark, false, true);
         assert!(
-            line.ends_with("ctx 12% | \u{23e9}3.0t/step 50% | idle"),
+            line.ends_with(&format!("ctx 12% | {SPEC_MARK} 3.0t/step 50% | idle")),
             "{line}"
         );
     }
@@ -2172,6 +2303,8 @@ mod tests {
     fn dspark_segment_survives_into_the_idle_footer() {
         // The figures are only readable after the answer lands, so an idle
         // footer carrying them is the point of the feature, not an artefact.
+        let _lock = quiet_footer();
+        set_dspark(true);
         let st = Status {
             state: WorkerState::Idle,
             ctx_used: 10,
@@ -2186,7 +2319,10 @@ mod tests {
         let line = build_status_text(&st, false, true);
         // Every draft rejected: 1.0 per step and 0%, still shown — "speculation is on
         // and buying nothing" is exactly what a user needs to see.
-        assert!(line.contains("\u{23e9}1.0t/step 0%"), "{line}");
+        assert!(
+            line.contains(&format!("{SPEC_MARK} 1.0t/step 0%")),
+            "{line}"
+        );
     }
 
     #[test]

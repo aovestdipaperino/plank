@@ -317,6 +317,18 @@ pub struct ToolsSettings {
     /// deviation from the C reference, documented in
     /// `docs/SYSTEM-PROMPT-OVERRIDES.md`.
     pub repeat_advisory: bool,
+    /// Whether the loop guards run at all. Default on.
+    ///
+    /// One switch over all three: the repetition guard (byte window and think
+    /// budget), the tool-call loop guard (identical-call cycles and the
+    /// no-progress budget), and the repeat advisory that rides on it. Turning
+    /// it off lets a generation cycle forever, which is occasionally what you
+    /// want while diagnosing the cycle itself.
+    ///
+    /// Read through [`crate::guard::guards_enabled`] at every check rather than
+    /// captured at turn start, so `/loopguard` takes effect on the generation
+    /// already running.
+    pub loop_guards: bool,
     /// Dispatch-level wall-clock deadline in seconds for a single tool call.
     /// `0` (the default) is off — parity is untouched until a user opts in.
     /// Bash keeps its own model-supplied timeout; this is the outer bound.
@@ -351,6 +363,7 @@ impl Default for ToolsSettings {
     fn default() -> Self {
         Self {
             repeat_advisory: true,
+            loop_guards: true,
             call_timeout_sec: 0,
             spill_max_bytes: 1_048_576,
             spill_preview_bytes: 4096,
@@ -692,6 +705,10 @@ impl Settings {
         if let Some(v) = boolean(tools, "repeatAdvisory") {
             self.tools.repeat_advisory = v;
             self.note("tools.repeatAdvisory", origin);
+        }
+        if let Some(v) = boolean(tools, "loopGuards") {
+            self.tools.loop_guards = v;
+            self.note("tools.loopGuards", origin);
         }
         if let Some(v) = num::<u64>(tools, "callTimeoutSec") {
             self.tools.call_timeout_sec = v;

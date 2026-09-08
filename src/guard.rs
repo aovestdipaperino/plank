@@ -45,6 +45,19 @@ const MAX_WINDOW: usize = 32;
 /// identical-call check.
 const MIN_PERIOD: usize = 2;
 
+/// Whether the loop guards run at all (`tools.loopGuards`, `/loopguard`).
+///
+/// Read at every check rather than captured when a guard is built, so
+/// `/loopguard off` typed mid-turn takes effect on the generation already
+/// running. Off, every rung of every guard answers as if it had seen nothing:
+/// [`LoopGuard::observe`] returns [`Nudge::None`], [`LoopGuard::tripped`] is
+/// false, and the repetition guard's gated rungs
+/// ([`crate::insights::RepeatGuard::gated`]) go quiet too.
+#[must_use]
+pub fn guards_enabled() -> bool {
+    crate::settings::active().tools.loop_guards
+}
+
 /// A tool call signature: the tool name plus a digest of its normalised args.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CallSig(String, String);
@@ -99,6 +112,9 @@ impl LoopGuard {
     /// sequence of calls immediately before them; older calls age out of the
     /// window.
     pub fn observe(&mut self, tool: &str, args_digest: String) -> Nudge {
+        if !guards_enabled() {
+            return Nudge::None;
+        }
         let sig = CallSig(tool.to_string(), args_digest);
         // Already at the block threshold: refuse without touching the window.
         if let Some(&dispatched) = self.repeats.get(&sig)
@@ -156,7 +172,7 @@ impl LoopGuard {
     /// the outcome.
     #[must_use]
     pub fn tripped(&self) -> bool {
-        self.blocked_stanzas >= STANZA_TRIP
+        guards_enabled() && self.blocked_stanzas >= STANZA_TRIP
     }
 
     /// The period of the cycle the window ends in, if its last `2 * period`
@@ -204,6 +220,40 @@ mod tests {
 
     fn digest(s: &str) -> String {
         crate::session::sha1_hex(s.as_bytes())
+    }
+
+    /// Settings with the loop guards off, thread-local so this cannot leak
+    /// into a parallel test (`settings::install_for_test`).
+    fn guards_off() {
+        let mut s = crate::settings::Settings::default();
+        s.tools.loop_guards = false;
+        crate::settings::install_for_test(s);
+    }
+
+    #[test]
+    fn the_switch_silences_every_rung_and_re_arming_answers_from_real_history() {
+        let mut g = LoopGuard::new();
+        // Past the block threshold and three fully-refused stanzas: with the
+        // guards armed this is a tripped turn.
+        for _ in 0..=BLOCK_THRESHOLD {
+            let _ = g.observe("read", digest("a"));
+        }
+        for _ in 0..STANZA_TRIP {
+            let _ = g.observe("read", digest("a"));
+            g.note_stanza(true);
+        }
+        assert!(g.tripped());
+
+        guards_off();
+        // Nothing to say and nothing to end: the same guard, mid-loop.
+        assert_eq!(g.observe("read", digest("a")), Nudge::None);
+        assert!(!g.tripped());
+
+        // Back on: the history the guard kept while it was quiet still counts,
+        // so re-arming does not hand the model a fresh allowance.
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        assert!(g.tripped());
+        assert!(g.observe("read", digest("a")).as_block().is_some());
     }
 
     #[test]

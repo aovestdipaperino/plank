@@ -1205,6 +1205,10 @@ pub fn render_transcript(session: &Session, system: &str) -> String {
         };
         let _ = write!(out, "[{tag}]\n{}\n", m.text);
     }
+    // The per-pass choke point both front-ends go through, so it is where the
+    // panic dump's copy of the transcript comes from. A no-op unless the debug
+    // mirror is on.
+    crate::repro::stash_transcript(&out);
     out
 }
 
@@ -1946,6 +1950,17 @@ struct Agent<'a> {
     /// changed by `/think`. Owned here rather than read from `cfg` on each
     /// turn because `cfg` is shared immutably for the agent's lifetime.
     think: crate::engine::ThinkMode,
+    /// Live generation options, seeded from `cfg.generation` and changed by
+    /// `/temp` and `/dspark`. Owned here for the same reason [`Self::think`]
+    /// is: `cfg` is borrowed immutably for the agent's lifetime, so a runtime
+    /// switch has nowhere else to write. `think_mode` inside it is *not* the
+    /// live level — that is still `self.think`, which every prompt-building
+    /// path already reads.
+    gen_opts: crate::engine::GenerationOptions,
+    /// The temperature `/dspark off` returns to. Seeded from the startup
+    /// config, or the built-in default when that was 0 — which it is for every
+    /// session started under `--dspark`, since speculation pins it there.
+    resume_temp: f32,
     color: bool,
     show_footer: bool,
     /// True when the line editor renders its own resting footer, so the turn
@@ -2697,7 +2712,8 @@ impl Agent<'_> {
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
         let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-            .with_think_budget(REPEAT_THINK_BUDGET);
+            .with_think_budget(REPEAT_THINK_BUDGET)
+            .gated();
         // Provider engines take a structured turn; local engines keep the flat
         // rendered transcript (byte parity, §4.4). `bufs`/`st` outlive the call.
         let bufs = self
@@ -2725,7 +2741,7 @@ impl Agent<'_> {
             .engine
             .generate(
                 prompt,
-                &self.cfg.generation,
+                &self.gen_opts,
                 &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
                 &|| greedy.load(Ordering::Relaxed),
                 &mut |ev| match ev {
@@ -3363,8 +3379,12 @@ impl Agent<'_> {
             .engine
             .wants_structured()
             .then(|| self.build_structured(prompt_text));
+        // Cloned rather than borrowed: the live options are `self`'s now (they
+        // used to hang off the immutably-shared `cfg`), and this function goes
+        // on to touch `self` mutably.
+        let live_opts = self.gen_opts.clone();
         let ctx = PassCtx {
-            opts: &self.cfg.generation,
+            opts: &live_opts,
             think_off: matches!(self.think, crate::engine::ThinkMode::Off),
             // Read here, not inside the pass: `settings::install_for_test` is
             // thread-local, so a spawned pass would silently see defaults.
@@ -3668,7 +3688,8 @@ fn generate_pass(
     let preflight_stop = AtomicBool::new(false);
     let greedy = AtomicBool::new(false);
     let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-        .with_think_budget(REPEAT_THINK_BUDGET);
+        .with_think_budget(REPEAT_THINK_BUDGET)
+        .gated();
     // Counting the prompt only when someone is listening: it tokenizes the
     // whole rendered transcript.
     let mut live = ctx.status.as_ref().map(|sc| {
@@ -4003,7 +4024,7 @@ impl Agent<'_> {
                 // dump and the next prompt both show what the turn did have.
                 if made_progress {
                     ungrounded = 0;
-                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET {
+                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET && crate::guard::guards_enabled() {
                     self.report_guard(NO_PROGRESS_NOTICE);
                     return Ok(());
                 }
@@ -4804,7 +4825,7 @@ impl Agent<'_> {
             .engine
             .generate(
                 crate::engine::Prompt::Flat(&prompt_text),
-                &self.cfg.generation,
+                &self.gen_opts,
                 &|| crate::interrupt::pending(),
                 &|| false,
                 &mut |ev| match ev {
@@ -5623,6 +5644,9 @@ impl Agent<'_> {
                 }
                 None => println!("usage: /power <1..100>"),
             },
+            "/dspark" => println!("{}", self.dspark_command(arg)),
+            "/temp" => println!("{}", self.temp_command(arg)),
+            "/loopguard" | "/lg" => println!("{}", loopguard_command(arg)),
             "/think" => {
                 // A level change that moves the effort preamble re-warms the KV
                 // before returning. The plain REPL has no persistent prompt to
@@ -7096,6 +7120,110 @@ the original is frozen and listed in /tree"
     /// front-end passes the same indicator it uses for `/clear`.
     ///
     /// [`THINK_MAX_MIN_CONTEXT`]: crate::engine::THINK_MAX_MIN_CONTEXT
+    /// Whether speculative decoding is really on for this session.
+    ///
+    /// Both halves matter: the switch `/dspark` sets, and a support model the
+    /// engine actually loaded. A run whose support GGUF never loaded (the
+    /// `EchoEngine`, a provider engine, `--dspark` with a missing file) is off
+    /// however the flag reads, and every message and marker follows this
+    /// answer rather than the flag alone.
+    fn dspark_on(&self) -> bool {
+        self.gen_opts.dspark && self.engine.spec_capable()
+    }
+
+    /// `/dspark [on|off]` — turn speculative decoding on or off for the rest
+    /// of the session, reporting the state with no argument.
+    ///
+    /// Speculation verifies drafts by argmax, so it can only run at
+    /// temperature 0: turning it on pins the temperature there and turning it
+    /// off restores the one the session was sampling at before. That is also
+    /// why `/temp` is refused while this is on — see [`Self::temp_command`].
+    ///
+    /// `on` is refused outright without a loaded support model: it is chosen
+    /// at startup (`--dspark`, `--mtp`) and cannot be loaded into a running
+    /// engine, so the alternative is a footer marker that promises speculation
+    /// no pass will do.
+    fn dspark_command(&mut self, arg: &str) -> String {
+        let arg = arg.trim();
+        let on = self.dspark_on();
+        if arg.is_empty() {
+            return if on {
+                "dspark: on (temperature pinned at 0)".to_owned()
+            } else if self.engine.spec_capable() {
+                format!("dspark: off (temperature {:.2})", self.gen_opts.temperature)
+            } else {
+                "dspark: off — no support model loaded; restart with --dspark".to_owned()
+            };
+        }
+        let want = match arg {
+            "on" => true,
+            "off" => false,
+            _ => return format!("/dspark: expected on|off, got `{arg}`"),
+        };
+        if want && !self.engine.spec_capable() {
+            return "/dspark on: no DSpark support model is loaded; restart with --dspark"
+                .to_owned();
+        }
+        if want == on {
+            return format!("dspark already {arg}");
+        }
+        if want {
+            // Remembered so `/dspark off` returns to the temperature the user
+            // was actually sampling at, not to whatever the startup config
+            // said — a session started under `--dspark` recorded 0 there.
+            if self.gen_opts.temperature > 0.0 {
+                self.resume_temp = self.gen_opts.temperature;
+            }
+            self.gen_opts.temperature = 0.0;
+        } else {
+            self.gen_opts.temperature = self.resume_temp;
+        }
+        self.gen_opts.dspark = want;
+        crate::status::set_dspark(self.dspark_on());
+        crate::status::set_temperature(self.gen_opts.temperature);
+        if want {
+            "dspark on; temperature pinned at 0".to_owned()
+        } else {
+            format!("dspark off; temperature {:.2}", self.gen_opts.temperature)
+        }
+    }
+
+    /// `/temp [0..100]` — set the sampling temperature, reporting it with no
+    /// argument.
+    ///
+    /// Refused while `/dspark` is on rather than silently disabling
+    /// speculation: any temperature above 0 turns the draft gate off, so the
+    /// obliging reading of `/temp 0.6` would be "quietly stop doing the thing
+    /// the footer still claims". The user is told which switch to throw first.
+    fn temp_command(&mut self, arg: &str) -> String {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            return if self.dspark_on() {
+                "temperature: 0 (pinned by dspark)".to_owned()
+            } else {
+                format!("temperature: {:.2}", self.gen_opts.temperature)
+            };
+        }
+        if self.dspark_on() {
+            return "/temp: the temperature is pinned at 0 while dspark is on;                     /dspark off first"
+                .to_owned();
+        }
+        let Ok(temp) = arg.parse::<f32>() else {
+            return format!("/temp: expected a number 0..100, got `{arg}`");
+        };
+        if !(0.0..=100.0).contains(&temp) || !temp.is_finite() {
+            return format!("/temp: expected a number 0..100, got `{arg}`");
+        }
+        self.gen_opts.temperature = temp;
+        self.resume_temp = if temp > 0.0 {
+            temp
+        } else {
+            crate::engine::GenerationOptions::default().temperature
+        };
+        crate::status::set_temperature(temp);
+        format!("temperature {temp:.2}")
+    }
+
     fn think_command(&mut self, arg: &str, on_progress: &mut dyn FnMut()) -> String {
         use crate::engine::{THINK_MAX_MIN_CONTEXT, ThinkMode};
 
@@ -7419,7 +7547,7 @@ the original is frozen and listed in /tree"
                         // write and then write it.
                         n_predict: spec.budget,
                         think_mode,
-                        ..self.cfg.generation.clone()
+                        ..self.gen_opts.clone()
                     };
                     let stop = AtomicBool::new(false);
                     let generated = self.generate_aside_best(
@@ -7799,6 +7927,28 @@ the original is frozen and listed in /tree"
         )
     }
 
+    /// The dump taken on the way out under `--debug` (`repro-quit-<secs>.md`),
+    /// so the session that was being debugged is on disk without anyone having
+    /// to remember `/repro` before quitting. Returns the line to print, or
+    /// `None` when debug is off — which is every ordinary run.
+    ///
+    /// The debug mirror's own switch decides, not the startup flag, so
+    /// `/debug on` mid-session arms this too and `/debug off` disarms it.
+    fn quit_repro_line(&mut self) -> Option<String> {
+        if !crate::debugmirror::enabled() || self.in_sidechain() {
+            return None;
+        }
+        Some(
+            match self.write_repro_with(
+                "quitting under --debug; repro saved automatically",
+                "repro-quit",
+            ) {
+                Ok((path, sidecars)) => Self::repro_written_line(&path, sidecars),
+                Err(e) => format!("[quit repro not written: {e}]"),
+            },
+        )
+    }
+
     /// Writes the dump as `<prefix>-<secs>.md` into `self.repro_dir`.
     fn write_repro_with(
         &mut self,
@@ -7835,7 +7985,13 @@ the original is frozen and listed in /tree"
             session_path: &session_path,
             note: note.trim(),
         };
-        let report = crate::repro::build_report(&meta, self.cfg, &rendered_for_repro);
+        // The live options, not the startup ones: `/temp` and `/dspark` change
+        // how the very next pass samples, and a dump that reported the
+        // command-line temperature would send someone chasing a difference
+        // that is not there.
+        let mut cfg = self.cfg.clone();
+        cfg.generation = self.gen_opts.clone();
+        let report = crate::repro::build_report(&meta, &cfg, &rendered_for_repro);
         let path = crate::repro::save_in(&self.repro_dir, prefix, now_secs(), &report)?;
         // Sub-agent sidechains are gone from the transcript by now; the
         // remembered dumps go beside the main file, oldest first.
@@ -8458,7 +8614,7 @@ the original is frozen and listed in /tree"
     fn run_fanout_rounds(&mut self, slots: &mut [FanoutSlot], width: usize) {
         const MAX_ROUNDS: usize = 40;
         let system = self.system.clone();
-        let opts = self.cfg.generation.clone();
+        let opts = self.gen_opts.clone();
         let ctx = PassCtx {
             opts: &opts,
             think_off: matches!(self.think, crate::engine::ThinkMode::Off),
@@ -9799,6 +9955,9 @@ impl Agent<'_> {
         // appears, and only flips the title to Idle once it accepts input.
         crate::title::set(crate::title::State::Loading);
         let result = self.tui_loop(&mut terminal, offer_init);
+        // Taken before the terminal is restored but after the UI is done with
+        // it, so the line lands on the console the user is left looking at.
+        let quit_repro = self.quit_repro_line();
         // Retro CRT power-off of the final frame on a clean exit. Best-effort:
         // any error is swallowed so the terminal is always restored and the
         // real turn outcome (`result`) is what we return. `tui_loop` hands back
@@ -9830,6 +9989,11 @@ impl Agent<'_> {
             DisableMouseCapture
         );
         ratatui::restore();
+        // Printed after the screen is restored: inside the alternate screen it
+        // would be wiped by the teardown it is meant to outlive.
+        if let Some(line) = quit_repro {
+            println!("{line}");
+        }
         result.map(|_| ())
     }
 
@@ -12278,7 +12442,7 @@ impl Agent<'_> {
                 // dump and the next prompt both show what the turn did have.
                 if made_progress {
                     ungrounded = 0;
-                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET {
+                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET && crate::guard::guards_enabled() {
                     self.report_guard(NO_PROGRESS_NOTICE);
                     return Ok(());
                 }
@@ -12585,7 +12749,8 @@ impl Agent<'_> {
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
         let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-            .with_think_budget(REPEAT_THINK_BUDGET);
+            .with_think_budget(REPEAT_THINK_BUDGET)
+            .gated();
         // Bound before the event closure, which cannot borrow `self` while
         // `self.engine` is generating. The elapsed clock is the turn's, so the
         // footer's seconds accumulate across the generate → tools → generate
@@ -12648,7 +12813,7 @@ impl Agent<'_> {
             // The aside keeps the main KV intact itself — by forking it, or by
             // snapshot/restore — and forces greedy off internally, so no
             // greedy sampler is passed.
-            self.generate_aside_best(prompt, &self.cfg.generation, &interrupt, &mut on_event)
+            self.generate_aside_best(prompt, &self.gen_opts.clone(), &interrupt, &mut on_event)
         } else if let Some(aside_prompt) = self.pending_aside.take() {
             // A `/btw` arrived during the previous pass. Rather than freezing
             // the main task for the whole answer, run both: this continuation
@@ -12672,7 +12837,7 @@ impl Agent<'_> {
                 .generate_multiplexed(
                     prompt,
                     &aside_prompt,
-                    &self.cfg.generation,
+                    &self.gen_opts,
                     &interrupt,
                     &mut |which, ev| match which {
                         crate::engine::AsideStream::Main => on_event(ev),
@@ -12697,7 +12862,7 @@ impl Agent<'_> {
         } else {
             self.engine.generate(
                 engine_prompt,
-                &self.cfg.generation,
+                &self.gen_opts,
                 &interrupt,
                 &greedy_fn,
                 &mut on_event,
@@ -12853,7 +13018,7 @@ impl Agent<'_> {
             .engine
             .generate(
                 crate::engine::Prompt::Flat(&prompt),
-                &self.cfg.generation,
+                &self.gen_opts,
                 interrupt,
                 &|| false,
                 &mut |ev| {
@@ -13244,6 +13409,9 @@ impl Agent<'_> {
                 }
                 None => log.push_plain("usage: /power <1..100>"),
             },
+            "/dspark" => log.push_plain(self.dspark_command(arg)),
+            "/temp" => log.push_plain(self.temp_command(arg)),
+            "/loopguard" | "/lg" => log.push_plain(loopguard_command(arg)),
             "/think" => {
                 // Moving to (or off) `max` changes the effort preamble, which
                 // re-warms the KV inline — long enough to notice. Pin a throbber
@@ -14018,6 +14186,61 @@ fn await_yes_default() -> Result<bool, String> {
     }
 }
 
+/// `/loopguard [on|off]` — arm or silence every loop guard, reporting the
+/// state with no argument.
+///
+/// Written to the live settings rather than to a field on `self`, and not
+/// saved to disk: the guards are checked from several threads and from
+/// code that has no agent to ask ([`crate::guard::guards_enabled`]), and a
+/// switch thrown to watch one runaway turn is not a preference. Because
+/// every rung re-reads the setting at each check, this also takes effect
+/// on a turn that is already generating — which is the point: the moment
+/// you want the guards out of the way is while they are firing.
+#[must_use]
+pub fn loopguard_command(arg: &str) -> String {
+    let (want, reply) = loopguard_reply(arg, crate::guard::guards_enabled());
+    if let Some(want) = want {
+        let mut settings = crate::settings::active().clone();
+        settings.tools.loop_guards = want;
+        crate::settings::reinstall(settings);
+    }
+    reply
+}
+
+/// [`loopguard_command`]'s decision: the new setting to install (`None` to
+/// leave it alone) and the line to show, given the current state.
+///
+/// Split out so the wording and the state machine are testable without
+/// reinstalling the process-wide settings — a global set mid-run leaks into
+/// every test running in parallel, exactly as `FINDINGS.md` warns.
+fn loopguard_reply(arg: &str, on: bool) -> (Option<bool>, String) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return (
+            None,
+            format!("loop guards: {}", if on { "on" } else { "off" }),
+        );
+    }
+    let want = match arg {
+        "on" => true,
+        "off" => false,
+        _ => {
+            return (None, format!("/loopguard: expected on|off, got `{arg}`"));
+        }
+    };
+    if want == on {
+        return (None, format!("loop guards already {arg}"));
+    }
+    (
+        Some(want),
+        if want {
+            "loop guards on".to_owned()
+        } else {
+            "loop guards off — nothing will stop a repeating turn but you".to_owned()
+        },
+    )
+}
+
 /// Pre-rendered output for the read-only slash commands that stay usable while
 /// the worker owns the engine (`/context`, `/usage`, `/mcp`, `/help`).
 ///
@@ -14728,6 +14951,22 @@ fn busy_ui_loop(
                             log.push_ansi(&out);
                             view.follow = true;
                             sub.follow_all();
+                        } else if let Some(arg) = line
+                            .strip_prefix("/loopguard")
+                            .or_else(|| line.strip_prefix("/lg"))
+                            .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+                        {
+                            // The one *mutating* command that runs mid-turn.
+                            // Every rung of every guard re-reads the setting at
+                            // each check, so this lands on the generation
+                            // already streaming — which is the whole point:
+                            // the moment you want the guards out of the way is
+                            // while they are firing.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            log.push_plain(loopguard_command(arg));
+                            view.follow = true;
+                            sub.follow_all();
                         } else if let Some(cmd) = arcade_command(&line) {
                             // The whole point of these is the waiting, so they
                             // are the commands that *do* run mid-turn.
@@ -15147,6 +15386,13 @@ fn new_agent(
     // between the key and the tokens rather than between two keys.
     engine.set_think_mode(cfg.generation.think_mode);
     crate::status::set_local_power(cfg.power_percent);
+    // The footer's dspark/temperature slot, seeded the same way: `/dspark` and
+    // `/temp` publish to it later, but the first frame is drawn before either
+    // can be typed. An engine with no support model reads as off however the
+    // flags were set — the footer must not promise speculation the engine
+    // cannot do.
+    crate::status::set_dspark(cfg.generation.dspark && engine.spec_capable());
+    crate::status::set_temperature(cfg.generation.temperature);
     // The alt local engine needs both for the same reasons, and it cannot be
     // skipped as an optimization: `warm_reset` builds its system tokens from
     // these two fields, so an unconfigured engine tokenizes the *same* system
@@ -15176,6 +15422,12 @@ fn new_agent(
     tool_ctx.skills.clone_from(&skills);
     let repro_dir = crate::repro::repro_dir(&tool_ctx.cwd);
     Ok(Agent {
+        gen_opts: cfg.generation.clone(),
+        resume_temp: if cfg.generation.temperature > 0.0 {
+            cfg.generation.temperature
+        } else {
+            crate::engine::GenerationOptions::default().temperature
+        },
         engine,
         cfg,
         session,
@@ -15371,7 +15623,14 @@ fn run_plain_flow(
         agent.session.push(Message::user(initial));
         agent.run_turn()?;
     }
-    run_repl_plain_local(agent)
+    let result = run_repl_plain_local(agent);
+    // The plain path's mirror of the TUI quit dump (CLAUDE.md: a change to one
+    // front-end needs the same change in the other). Taken even when the REPL
+    // ends in an error — that is the session most worth having on disk.
+    if let Some(line) = agent.quit_repro_line() {
+        println!("{line}");
+    }
+    result
 }
 
 /// Yellow hint shown when Ctrl-C is pressed on an empty idle prompt.
@@ -16826,6 +17085,9 @@ mod tests {
         /// When true the engine claims to run on this machine's weights, which is
         /// what `generate_pass` keys the status bar's blinking brain off.
         local: bool,
+        /// When true the engine claims a loaded `DSpark` support model, which is
+        /// what `/dspark on` refuses without.
+        spec: bool,
         /// Records `status::local_pass_active()` as observed from *inside*
         /// `generate`, so a test can assert the pass marked itself while it was
         /// actually generating rather than merely before or after.
@@ -16889,6 +17151,9 @@ mod tests {
     impl Engine for ScriptedEngine {
         fn is_local(&self) -> bool {
             self.local
+        }
+        fn spec_capable(&self) -> bool {
+            self.spec
         }
         fn generate(
             &mut self,
@@ -17004,6 +17269,8 @@ mod tests {
         Agent {
             engine: Box::new(engine),
             cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store: SessionStore::open(dir).unwrap(),
             pending_aside: None,
@@ -17072,6 +17339,180 @@ mod tests {
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
         cfg
+    }
+
+    /// An agent whose engine reports a loaded `DSpark` support model, so the
+    /// `/dspark on` path is reachable without a Metal box.
+    fn spark_agent<'a>(dir: &std::path::Path, cfg: &'a crate::config::AgentConfig) -> Agent<'a> {
+        test_agent(
+            dir,
+            ScriptedEngine {
+                spec: true,
+                ..ScriptedEngine::default()
+            },
+            cfg,
+        )
+    }
+
+    #[test]
+    fn dspark_off_restores_the_temperature_it_was_turned_on_at() {
+        // `/dspark` and `/temp` publish to the footer's process-global slots,
+        // so this shares the lock the status-bar tests hold.
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("dspark-temp");
+        let mut cfg = test_cfg();
+        cfg.generation.dspark = false;
+        cfg.generation.temperature = 0.6;
+        let mut agent = spark_agent(&dir, &cfg);
+
+        assert_eq!(agent.temp_command("0.9"), "temperature 0.90");
+        let msg = agent.dspark_command("on");
+        assert!(msg.contains("dspark on"), "{msg}");
+        // Pinned at 0 while on: the draft gate is a temperature gate.
+        assert!(agent.dspark_on());
+        assert!(agent.gen_opts.temperature.abs() < 1e-6);
+
+        let msg = agent.dspark_command("off");
+        assert!(msg.contains("0.90"), "{msg}");
+        assert!((agent.gen_opts.temperature - 0.9).abs() < 1e-6);
+    }
+
+    /// A session started under `--dspark` recorded temperature 0 in its
+    /// config, so "restore what the config said" would leave it at 0 with
+    /// speculation off — sampling greedily with nothing to show for it.
+    #[test]
+    fn dspark_off_falls_back_to_the_default_temperature_not_to_zero() {
+        // `/dspark` and `/temp` publish to the footer's process-global slots,
+        // so this shares the lock the status-bar tests hold.
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("dspark-default-temp");
+        let mut cfg = test_cfg();
+        cfg.generation.dspark = true;
+        cfg.generation.temperature = 0.0;
+        let mut agent = spark_agent(&dir, &cfg);
+
+        assert!(agent.dspark_on());
+        agent.dspark_command("off");
+        let default = crate::engine::GenerationOptions::default().temperature;
+        assert!((agent.gen_opts.temperature - default).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_temperature_cannot_be_set_while_dspark_is_on() {
+        // `/dspark` and `/temp` publish to the footer's process-global slots,
+        // so this shares the lock the status-bar tests hold.
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("dspark-refuses-temp");
+        let mut cfg = test_cfg();
+        cfg.generation.dspark = true;
+        cfg.generation.temperature = 0.0;
+        let mut agent = spark_agent(&dir, &cfg);
+
+        let msg = agent.temp_command("0.7");
+        assert!(msg.contains("/dspark off first"), "{msg}");
+        // Refused, not applied: the report still reads 0.
+        assert!(agent.gen_opts.temperature.abs() < 1e-6);
+        assert!(agent.temp_command("").contains("pinned by dspark"));
+    }
+
+    /// The support model is chosen at startup and cannot be loaded into a
+    /// running engine, so `on` is refused rather than setting a flag that
+    /// would only ever show a marker.
+    #[test]
+    fn dspark_on_is_refused_without_a_support_model() {
+        // `/dspark` and `/temp` publish to the footer's process-global slots,
+        // so this shares the lock the status-bar tests hold.
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("dspark-no-support");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        let msg = agent.dspark_command("on");
+        assert!(msg.contains("no DSpark support model"), "{msg}");
+        assert!(!agent.dspark_on());
+        // And with no support model the temperature is the user's again.
+        assert_eq!(agent.temp_command("0.5"), "temperature 0.50");
+    }
+
+    #[test]
+    fn dspark_rejects_anything_but_on_and_off() {
+        // `/dspark` and `/temp` publish to the footer's process-global slots,
+        // so this shares the lock the status-bar tests hold.
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("dspark-bad-arg");
+        let mut cfg = test_cfg();
+        // Off, so `/temp` gets as far as parsing its argument.
+        cfg.generation.dspark = false;
+        let mut agent = spark_agent(&dir, &cfg);
+        assert!(agent.dspark_command("maybe").contains("expected on|off"));
+        assert!(agent.temp_command("hot").contains("expected a number"));
+        assert!(agent.temp_command("101").contains("expected a number"));
+    }
+
+    /// Under `--debug`, quitting leaves the dump on disk without anyone having
+    /// to remember `/repro` first; with debug off it writes nothing.
+    #[test]
+    fn quitting_under_debug_writes_a_repro_and_otherwise_writes_nothing() {
+        // `set_enabled` is process-wide (it defaults to on under `cfg(test)`),
+        // so this holds the debug-mirror test lock.
+        let _console = crate::debugmirror::test_support::lock();
+        let dir = scratch_dir("quit-repro");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+
+        crate::debugmirror::set_enabled(true);
+        let line = agent.quit_repro_line().expect("debug is on");
+        assert!(line.contains("repro written to"), "{line}");
+        let written = std::fs::read_dir(test_repro_dir())
+            .expect("repro dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("repro-quit-"))
+            .count();
+        assert!(written >= 1, "a repro-quit dump should exist");
+
+        crate::debugmirror::set_enabled(false);
+        assert!(
+            agent.quit_repro_line().is_none(),
+            "debug off writes nothing"
+        );
+        crate::debugmirror::set_enabled(true);
+    }
+
+    /// The dump reports the temperature the *next pass* would use, not the one
+    /// the command line asked for: `/temp` and `/dspark` move it.
+    #[test]
+    fn a_repro_reports_the_live_temperature_not_the_startup_one() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("repro-live-temp");
+        let mut cfg = test_cfg();
+        cfg.generation.dspark = false;
+        cfg.generation.temperature = 0.6;
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.temp_command("0.25");
+
+        let (path, _) = agent.write_repro("").expect("dump written");
+        let text = std::fs::read_to_string(path).expect("dump readable");
+        assert!(text.contains("- temperature: 0.25"), "{text}");
+    }
+
+    #[test]
+    fn loopguard_reports_toggles_and_refuses_nonsense() {
+        // Pure form (see `loopguard_reply`): the process-wide settings are
+        // never touched, so this cannot leak into a parallel test.
+        assert_eq!(loopguard_reply("", true).1, "loop guards: on");
+        assert_eq!(loopguard_reply("", false).1, "loop guards: off");
+        assert_eq!(loopguard_reply("off", true).0, Some(false));
+        assert_eq!(loopguard_reply("on", false).0, Some(true));
+        // Already there: nothing to install, and the reply says so.
+        assert_eq!(loopguard_reply("on", true).0, None);
+        assert!(loopguard_reply("on", true).1.contains("already on"));
+        assert_eq!(loopguard_reply("sometimes", true).0, None);
+        assert!(
+            loopguard_reply("sometimes", true)
+                .1
+                .contains("expected on|off")
+        );
     }
 
     /// Regression: the screensaver's idle clock must not be reset by focus or
@@ -20810,6 +21251,8 @@ mod tests {
         let mut agent = Agent {
             engine: Box::new(crate::engine::EchoEngine::new(64)),
             cfg: &cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store,
             pending_aside: None,
@@ -20923,6 +21366,8 @@ mod tests {
         let mut agent = Agent {
             engine: Box::new(crate::engine::EchoEngine::new(64)),
             cfg: &cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store,
             pending_aside: None,
@@ -22039,6 +22484,8 @@ mod tests {
         let mut agent = Agent {
             engine: Box::new(engine),
             cfg: &cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store,
             pending_aside: None,
@@ -22118,7 +22565,8 @@ mod tests {
         );
         let mut stream = StreamRenderer::new(NullSink);
         let mut guard = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-            .with_think_budget(REPEAT_THINK_BUDGET);
+            .with_think_budget(REPEAT_THINK_BUDGET)
+            .gated();
         let greedy = AtomicBool::new(false);
         let mut feed = |stream: &mut StreamRenderer<NullSink>, chunk: &str| {
             stream.push(chunk);
@@ -22273,6 +22721,8 @@ mod tests {
         let mut agent = Agent {
             engine: Box::new(engine),
             cfg: &cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store,
             pending_aside: None,
@@ -22371,6 +22821,8 @@ mod tests {
         let mut agent = Agent {
             engine: Box::new(engine),
             cfg: &cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store,
             pending_aside: None,
@@ -22456,6 +22908,8 @@ mod tests {
         let mut agent = Agent {
             engine: Box::new(engine),
             cfg: &cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store,
             pending_aside: None,
@@ -22564,6 +23018,8 @@ mod tests {
         let mut agent = Agent {
             engine: Box::new(KvEngine),
             cfg: &cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store,
             pending_aside: None,
@@ -24838,6 +25294,8 @@ or the user's next message aborts before its first token"
         let mut agent = Agent {
             engine: Box::new(engine),
             cfg: &cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store,
             pending_aside: None,
@@ -24965,6 +25423,8 @@ or the user's next message aborts before its first token"
         let mut agent = Agent {
             engine: Box::new(engine),
             cfg: &cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store,
             pending_aside: None,
@@ -25126,6 +25586,8 @@ or the user's next message aborts before its first token"
         let mut agent = Agent {
             engine: Box::new(engine),
             cfg: &cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store,
             pending_aside: None,

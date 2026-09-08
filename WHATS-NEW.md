@@ -10,9 +10,34 @@ it.
 
 ## In the betas
 
-The beta channel has just been reopened at 4.4.1 on the same code as stable
-4.4.0, so there is nothing riding ahead of stable at the moment. Install with
-`brew install aovestdipaperino/tap/plank-agent-beta`.
+Riding ahead of stable 4.4.0 in the 4.4.1 beta. Install with `brew install
+aovestdipaperino/tap/plank-agent-beta`.
+
+🔁 **The loop guards have a switch, and it works mid-turn.** `/loopguard off`
+(or `/lg off`) silences every rung at once — the reasoning-cycle detector, the
+think budget, the repeated-call guard, the no-progress budget, the advisory —
+and unlike every other settings command it lands on the turn that is already
+running, because the moment you want the guards out of the way is usually while
+they are firing. The switch is session-only; it never touches your settings
+file. A silenced guard keeps watching in the background, so turning it back on
+mid-pass picks up the loop it had been counting rather than starting over. The
+footer shows `🔁` while they are armed, and `♻ looping` when one has actually
+caught something.
+
+✨ **Speculative decoding is a switch too, and the footer says which state you
+are in.** `/dspark on|off` turns DSpark on and off between turns. Speculation
+verifies its drafts by argmax, so it only runs at temperature 0: turning it on
+pins the temperature there, and turning it off hands back the temperature you
+were sampling at. `/temp 0.9` sets that temperature directly, and is refused
+while dspark is on rather than quietly switching speculation off behind the
+marker that says it is running. The footer's slot shows `✨` with the live
+tokens-per-step figures, or `🌡 0.60` when speculation is off.
+
+🪵 **A debug session dumps a repro on the way out.** Run with `--debug` (or
+type `/debug on`) and quitting writes `repro-quit-<timestamp>.md` by itself;
+a panic writes `repro-panic-<timestamp>.md` with the last transcript the
+session rendered. The state that triggered a bug is on disk whether or not
+anyone remembered to type `/repro` first.
 
 ## Stable releases
 

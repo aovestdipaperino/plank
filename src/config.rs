@@ -889,6 +889,26 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "set the GPU power cap percentage",
     },
     SlashCommand {
+        name: "/dspark",
+        args: "[on|off]",
+        desc: "turn speculative decoding on or off",
+    },
+    SlashCommand {
+        name: "/temp",
+        args: "[0..100]",
+        desc: "set the sampling temperature (not while dspark is on)",
+    },
+    SlashCommand {
+        name: "/loopguard",
+        args: "[on|off]",
+        desc: "arm or silence the loop guards, even mid-turn",
+    },
+    SlashCommand {
+        name: "/lg",
+        args: "[on|off]",
+        desc: "alias for /loopguard",
+    },
+    SlashCommand {
         name: "/notify",
         args: "[mode]",
         desc: "choose when a finished turn notifies you",
@@ -1048,6 +1068,10 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/remember")
         || slash_command_with_args(cmd, "/repro")
         || slash_command_with_args(cmd, "/debug")
+        || slash_command_with_args(cmd, "/dspark")
+        || slash_command_with_args(cmd, "/temp")
+        || slash_command_with_args(cmd, "/loopguard")
+        || slash_command_with_args(cmd, "/lg")
         || slash_command_with_args(cmd, "/export")
         || slash_command_with_args(cmd, "/open")
         || slash_command_with_args(cmd, "/insights")
@@ -1407,6 +1431,10 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
     if c.engine.dspark && !temp_set {
         c.generation.temperature = 0.0;
     }
+    // The runtime switch `/dspark` flips starts where the flag left it, so a
+    // run started with `--dspark-off` shows the thermometer from the first
+    // frame rather than claiming speculation it was told not to do.
+    c.generation.dspark = c.engine.dspark;
     // The same context floor `/think max` enforces, applied to `--think-max`.
     // Checked here rather than at the flag because `--ctx` may follow it.
     if c.generation.think_mode == ThinkMode::Max
@@ -2316,6 +2344,11 @@ mod tests {
         assert!(!slash_command_known("/kvcaches"));
         assert!(slash_command_known("/history 10"));
         assert!(slash_command_known("/repro"));
+        assert!(slash_command_known("/dspark off"));
+        assert!(slash_command_known("/temp 0.6"));
+        assert!(slash_command_known("/loopguard"));
+        assert!(slash_command_known("/lg on"));
+        assert!(!slash_command_known("/lgx"));
         assert!(slash_command_known("/repro looping bug"));
         assert!(!slash_command_known("/reprox"));
         assert!(slash_command_known("/export"));
