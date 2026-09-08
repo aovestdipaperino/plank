@@ -60,10 +60,18 @@ impl ProfileSpec {
 #[must_use]
 pub fn parse_accent(s: &str) -> Option<Accent> {
     if let Some(hex) = s.strip_prefix('#') {
-        if hex.len() != 6 {
+        // Count and index by chars, not bytes: a non-ASCII manifest value
+        // (e.g. a euro sign) can be 6 bytes without being 6 hex digits, and
+        // slicing by byte offset into such a string panics on a non-char
+        // boundary. Collecting to a Vec<char> keeps every index valid.
+        let chars: Vec<char> = hex.chars().collect();
+        if chars.len() != 6 {
             return None;
         }
-        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        let byte = |i: usize| -> Option<u8> {
+            let pair: String = chars[i..i + 2].iter().collect();
+            u8::from_str_radix(&pair, 16).ok()
+        };
         return Some(Accent::Rgb(byte(0)?, byte(2)?, byte(4)?));
     }
     s.parse::<u8>().ok().map(Accent::Indexed)
@@ -98,34 +106,76 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
         }
     };
 
-    let builtin_tools = block
-        .get("tools")
-        .and_then(|t| t.get("builtin"))
-        .and_then(|b| match b {
-            Json::Arr(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|v| match v {
-                        Json::Str(s) if !s.is_empty() => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            _ => None,
-        });
+    let builtin_tools = match block.get("tools").and_then(|t| t.get("builtin")) {
+        None => None,
+        Some(Json::Arr(items)) => {
+            let mut bad = false;
+            let names: Vec<String> = items
+                .iter()
+                .filter_map(|v| match v {
+                    Json::Str(s) if !s.is_empty() => Some(s.clone()),
+                    _ => {
+                        bad = true;
+                        None
+                    }
+                })
+                .collect();
+            if bad {
+                warnings.push(
+                    "profile: tools.builtin has a non-string or empty entry; skipping it"
+                        .to_string(),
+                );
+            }
+            Some(names)
+        }
+        Some(_) => {
+            // Fails closed, not open: `None` means "every builtin allowed",
+            // so a malformed restriction must not silently widen access to
+            // everything — an empty allow-list is the safe default here.
+            warnings.push(
+                "profile: tools.builtin is not an array of strings; allowing no builtins"
+                    .to_string(),
+            );
+            Some(Vec::new())
+        }
+    };
 
-    let settings_json = block
-        .get("settings")
-        .filter(|s| matches!(s, Json::Obj(_)))
-        .map(|s| {
+    let display_name = match block.get("displayName") {
+        None => None,
+        Some(Json::Str(s)) if !s.is_empty() => Some(s.clone()),
+        Some(_) => {
+            warnings.push(
+                "profile: displayName is not a non-empty string; using the default".to_string(),
+            );
+            None
+        }
+    };
+
+    let logo = match block.get("logo") {
+        None => None,
+        Some(Json::Str(s)) if !s.is_empty() => Some(resolve(root, s)),
+        Some(_) => {
+            warnings.push("profile: logo is not a non-empty string; using the default".to_string());
+            None
+        }
+    };
+
+    let settings_json = match block.get("settings") {
+        None => None,
+        Some(s @ Json::Obj(_)) => {
             let mut out = String::new();
             json_write(&mut out, s);
-            out
-        });
+            Some(out)
+        }
+        Some(_) => {
+            warnings.push("profile: settings is not an object; using the default".to_string());
+            None
+        }
+    };
 
     Some(ProfileSpec {
-        display_name: str_field(block, "displayName"),
-        logo: str_field(block, "logo").map(|p| resolve(root, &p)),
+        display_name,
+        logo,
         accent,
         system_prompt: resolve(root, &system_prompt),
         builtin_tools,
@@ -254,5 +304,126 @@ mod tests {
         let text = r#"{ "profile": { "systemPrompt": "/etc/p.md" } }"#;
         let spec = parse(text, Path::new("/p")).expect("a profile");
         assert_eq!(spec.system_prompt, Path::new("/etc/p.md"));
+    }
+
+    // FINDING 1: parse_accent must never panic, no matter the byte/char shape
+    // of its input.
+
+    #[test]
+    fn accent_does_not_panic_on_a_six_byte_non_ascii_string() {
+        // "#\u{20ac}000" is a '#' followed by 6 bytes (the euro sign is 3
+        // bytes, "000" is 3 more), so the old byte-length check let a
+        // char-boundary slice through.
+        assert_eq!(parse_accent("#\u{20ac}000"), None);
+    }
+
+    #[test]
+    fn accent_does_not_panic_on_a_multi_byte_char_of_non_six_byte_length() {
+        assert_eq!(parse_accent("#\u{1f600}"), None);
+        assert_eq!(parse_accent("#\u{1f600}\u{1f600}"), None);
+    }
+
+    #[test]
+    fn accent_does_not_panic_on_an_empty_string() {
+        assert_eq!(parse_accent(""), None);
+        assert_eq!(parse_accent("#"), None);
+    }
+
+    // FINDING 2: malformed-but-present optional fields warn instead of
+    // silently defaulting; absent fields stay silent.
+
+    #[test]
+    fn a_wrong_type_display_name_warns_and_defaults() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md", "displayName": 3 } }"#;
+        let spec = parse(text, Path::new("/p")).expect("still a profile");
+        assert_eq!(spec.display_name, None);
+        assert!(spec.warnings.iter().any(|w| w.contains("displayName")));
+    }
+
+    #[test]
+    fn an_absent_display_name_is_silent() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md" } }"#;
+        let spec = parse(text, Path::new("/p")).expect("a profile");
+        assert_eq!(spec.display_name, None);
+        assert!(spec.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_wrong_type_logo_warns_and_defaults() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md", "logo": 3 } }"#;
+        let spec = parse(text, Path::new("/p")).expect("still a profile");
+        assert_eq!(spec.logo, None);
+        assert!(spec.warnings.iter().any(|w| w.contains("logo")));
+    }
+
+    #[test]
+    fn an_absent_logo_is_silent() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md" } }"#;
+        let spec = parse(text, Path::new("/p")).expect("a profile");
+        assert!(spec.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_wrong_type_settings_warns_and_defaults() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md", "settings": "nope" } }"#;
+        let spec = parse(text, Path::new("/p")).expect("still a profile");
+        assert_eq!(spec.settings_json, None);
+        assert!(spec.warnings.iter().any(|w| w.contains("settings")));
+    }
+
+    #[test]
+    fn an_absent_settings_is_silent() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md" } }"#;
+        let spec = parse(text, Path::new("/p")).expect("a profile");
+        assert!(spec.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_wrong_type_tools_builtin_warns_and_fails_closed() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md", "tools": { "builtin": "bash" } } }"#;
+        let spec = parse(text, Path::new("/p")).expect("still a profile");
+        // Fails closed: an empty allow-list, not None (which would mean
+        // "everything allowed") — a malformed restriction must restrict.
+        assert_eq!(spec.builtin_tools.as_deref(), Some(&[][..]));
+        assert!(!spec.builtin_enabled("bash"));
+        assert!(!spec.builtin_enabled("read"));
+        assert!(spec.warnings.iter().any(|w| w.contains("tools.builtin")));
+    }
+
+    #[test]
+    fn an_absent_tools_builtin_is_silent() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md" } }"#;
+        let spec = parse(text, Path::new("/p")).expect("a profile");
+        assert_eq!(spec.builtin_tools, None);
+        assert!(spec.warnings.is_empty());
+    }
+
+    #[test]
+    fn tools_builtin_array_with_bad_elements_warns_and_skips_them() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md",
+            "tools": { "builtin": ["bash", 3, "", "read"] } } }"#;
+        let spec = parse(text, Path::new("/p")).expect("still a profile");
+        assert_eq!(
+            spec.builtin_tools.as_deref(),
+            Some(&["bash".to_string(), "read".to_string()][..])
+        );
+        assert!(spec.warnings.iter().any(|w| w.contains("tools.builtin")));
+    }
+
+    // FINDING 3: warnings from independent malformed fields all accumulate.
+
+    #[test]
+    fn multiple_malformed_fields_accumulate_warnings_and_parse_still_succeeds() {
+        let text = r#"{ "profile": {
+            "systemPrompt": "p.md",
+            "accent": "chartreuse",
+            "displayName": 3,
+            "tools": { "builtin": "bash" }
+        } }"#;
+        let spec = parse(text, Path::new("/p")).expect("still a profile");
+        assert!(spec.warnings.iter().any(|w| w.contains("accent")));
+        assert!(spec.warnings.iter().any(|w| w.contains("displayName")));
+        assert!(spec.warnings.iter().any(|w| w.contains("tools.builtin")));
+        assert_eq!(spec.warnings.len(), 3);
     }
 }
