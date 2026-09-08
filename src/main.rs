@@ -41,22 +41,20 @@ fn arm_panic_dump() {
     ));
 }
 
-/// Points the session store at this run's cache directory.
+/// Records the live model family for the session store.
 ///
 /// Must run before anything opens the store, which both startup paths do
-/// within a few lines. See [`plank::session::cache_leaf_for`] for why a Qwen
-/// run is kept out of the `DeepSeek` cache.
-fn select_cache_dir(cfg: &plank::config::AgentConfig) {
-    // Resolved the same way the engine will resolve it, so the leaf matches
-    // the model that actually loads. A path that does not exist yet — a first
-    // run, before the download — probes as `Ds4`, which is the right default.
+/// within a few lines: the family decides the transcript extension, and a
+/// store opened before it would name files for the wrong one.
+fn select_session_family(cfg: &plank::config::AgentConfig) {
+    // Resolved the same way the engine will resolve it, so the tag matches the
+    // model that actually loads. A path that does not exist yet — a first run,
+    // before the download — probes as `Ds4`, which is the right default.
     let model = cfg
         .model_path
         .clone()
         .unwrap_or_else(plank::download::default_model_path);
-    plank::session::SessionStore::set_cache_leaf(plank::session::cache_leaf_for(
-        plank::gguf::family_of(&model),
-    ));
+    plank::session::set_family(plank::gguf::family_of(&model));
 }
 
 /// The detached downloader's entry point.
@@ -207,7 +205,7 @@ fn main() -> ExitCode {
     // the live alternate screen garbled the warm-progress frame), so the gate
     // is the fix rather than a reorder. Nothing to migrate exists before the
     // directory does, so skipping is exact rather than merely cheap.
-    select_cache_dir(&cfg);
+    select_session_family(&cfg);
     let kv_dir = plank::session::SessionStore::default_dir();
     if let Some(bytes) = plank::session::SessionStore::migrate_kvcache_if_present(&kv_dir)
         && bytes > 0
@@ -701,7 +699,7 @@ fn run_serve(args: &[String]) -> ExitCode {
     };
     plank::interrupt::install();
 
-    select_cache_dir(&cfg);
+    select_session_family(&cfg);
 
     // Shared-engine mode (issue #28): host one model for many concurrent
     // per-session_id clients. Off by default; the local single-tenant path is
