@@ -1223,19 +1223,63 @@ impl SessionStore {
     }
 
     /// Mints a fresh memorable `adjective-celebrity` session name (e.g.
-    /// `deadly-einstein`), unused by any file in the store. On the rare
-    /// collision a short guid is appended.
+    /// `deadly-einstein`), unused by any file in the store.
+    ///
+    /// On a collision the name is *reclaimed* when the session holding it has
+    /// already outlived the session TTL — the GC was going to delete it on some
+    /// later launch anyway, and taking the name now keeps the id memorable.
+    /// Only when the occupant is still live does a short guid get appended,
+    /// which is the ugly outcome the larger pools and this reclaim exist to
+    /// make rare.
     ///
     /// Called when a session starts, so its name can be shown in the UI long
     /// before the transcript is written.
     #[must_use]
     pub fn mint_id(&self) -> String {
         let base = crate::names::session_slug();
-        let mut id = base.clone();
+        if !self.path_for_id(&base).exists() || self.reclaim_expired(&base) {
+            return base;
+        }
+        let mut id = format!("{base}-{}", crate::names::guid8());
         while self.path_for_id(&id).exists() {
             id = format!("{base}-{}", crate::names::guid8());
         }
         id
+    }
+
+    /// Deletes the session holding `id` when it is past the session TTL,
+    /// freeing the name. Returns whether the name is now free.
+    ///
+    /// Judged by the transcript's own mtime rather than by a sidecar, because
+    /// the transcript is the thing being replaced and it is the one file that
+    /// always exists. A file whose age cannot be read is treated as live: the
+    /// cost of guessing wrong is a deleted conversation, and the cost of being
+    /// cautious is a guid suffix.
+    fn reclaim_expired(&self, id: &str) -> bool {
+        let ttl = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache)
+            .session_ttl_secs();
+        // A zero TTL means "collect immediately", which must not turn minting
+        // a name into deleting whatever session was most recently saved.
+        if ttl == 0 {
+            return false;
+        }
+        let path = self.path_for_id(id);
+        let Some(age) = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+        else {
+            return false;
+        };
+        if age.as_secs() < ttl {
+            return false;
+        }
+        // The blobs go with it, the same pairing `sweep` maintains: a payload
+        // left behind would be keyed to a transcript that no longer exists.
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(self.payload_path(id));
+        let _ = fs::remove_file(crate::kvmeta::sidecar_path(&self.payload_path(id)));
+        !path.exists()
     }
 
     /// Saves the session, assigning title, creation time, and id if missing.
@@ -3456,6 +3500,63 @@ hello\n";
     /// one. What changed is *why* a checkpoint dies — expiry rather than
     /// fingerprint inequality — so the clock is wound past the tier TTL to make
     /// the superseded ones collectable.
+    /// Just past the configured session TTL, so the test tracks the policy
+    /// rather than a hardcoded age that a settings change would silently
+    /// invalidate.
+    fn past_session_ttl() -> std::time::Duration {
+        let ttl = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache)
+            .session_ttl_secs();
+        std::time::Duration::from_secs(ttl.saturating_add(60))
+    }
+
+    /// Backdates a file's mtime, which is what `reclaim_expired` reads.
+    fn set_file_mtime(path: &Path, when: std::time::SystemTime) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(when))
+            .expect("set mtime");
+    }
+
+    /// A colliding name held by a session past the TTL is reclaimed, which
+    /// keeps the id memorable instead of growing a guid suffix.
+    #[test]
+    fn a_collision_reclaims_an_expired_session() {
+        let dir = temp_dir("reclaim-expired");
+        let store = SessionStore::open(&dir).unwrap();
+        let taken = store.path_for_id("deadly-einstein");
+        fs::write(&taken, b"plank-session 1\n").unwrap();
+        fs::write(store.payload_path("deadly-einstein"), b"blob").unwrap();
+
+        // Older than the session TTL, so the GC would collect it anyway.
+        let long_ago = std::time::SystemTime::now() - past_session_ttl();
+        set_file_mtime(&taken, long_ago);
+
+        assert!(store.reclaim_expired("deadly-einstein"));
+        assert!(!taken.exists(), "the expired transcript is gone");
+        assert!(
+            !store.payload_path("deadly-einstein").exists(),
+            "its payload goes with it, or the blob outlives its transcript"
+        );
+    }
+
+    /// The opposite case, and the one that matters: a live session must never
+    /// be deleted to free a name. Losing a conversation to make an id prettier
+    /// is not a trade worth making.
+    #[test]
+    fn a_collision_never_touches_a_live_session() {
+        let dir = temp_dir("reclaim-live");
+        let store = SessionStore::open(&dir).unwrap();
+        let taken = store.path_for_id("deadly-einstein");
+        fs::write(&taken, b"plank-session 1\n").unwrap();
+
+        assert!(!store.reclaim_expired("deadly-einstein"));
+        assert!(taken.exists(), "a fresh session survives");
+
+        // And a transcript whose age cannot be read is treated as live.
+        assert!(!store.reclaim_expired("no-such-session"));
+    }
+
     /// The families share one directory and are told apart by the extension,
     /// so the two must never produce the same name for one id.
     #[test]

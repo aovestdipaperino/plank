@@ -147,6 +147,9 @@ pub struct ToolContext {
     /// True while a read-only plan-mode gate is active (issue #50). Mutating
     /// tools refuse until `ExitPlanMode` clears it.
     pub plan_mode: bool,
+    /// The model called `compact`. The turn loop compacts before its next
+    /// generation, so the model carries on from the summary.
+    pub compact_requested: bool,
     /// Set by a tool hook's `{"continue": false}` response envelope; the turn
     /// driver halts the turn after the dispatch that produced it.
     pub hook_stop: Option<String>,
@@ -244,6 +247,7 @@ impl ToolContext {
             subagent_label: None,
             worktree: None,
             plan_mode: false,
+            compact_requested: false,
             hook_stop: None,
             tasks: crate::tasks::TaskList::new(),
             task_completions: Vec::new(),
@@ -405,6 +409,7 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     let output = match call.name.as_str() {
         "EnterWorktree" => worktree::tool_enter_worktree(ctx, call),
         "ExitWorktree" => worktree::tool_exit_worktree(ctx, call),
+        "compact" => tool_compact(ctx),
         "EnterPlanMode" => tool_enter_plan_mode(ctx),
         "ExitPlanMode" => tool_exit_plan_mode(ctx, call),
         "read" => files::tool_read(ctx, call),
@@ -577,6 +582,19 @@ fn fire_post_tool_failure(
 /// Handles `EnterPlanMode`: turns on the read-only plan gate (issue #50).
 ///
 /// Idempotent — entering plan mode when already in it just reaffirms the gate.
+/// Handles `compact`: asks the turn loop to summarize the transcript.
+///
+/// Nothing happens here beyond the flag. Compaction rewrites the transcript
+/// this very turn is generating from, so it has to happen between rounds, not
+/// inside a dispatch — the loop already checks for it at the top of every
+/// continuation round.
+fn tool_compact(ctx: &mut ToolContext) -> String {
+    ctx.compact_requested = true;
+    "Compacting the conversation. Your next turn starts from the summary, so \
+     do not repeat work you have already done — the summary carries it.\n"
+        .to_string()
+}
+
 fn tool_enter_plan_mode(ctx: &mut ToolContext) -> String {
     ctx.plan_mode = true;
     "Plan mode is on. You are now read-only: research with read/list/glob/search \
@@ -975,6 +993,34 @@ pub(crate) fn home_writable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `compact` tool does nothing but ask: compaction rewrites the
+    /// transcript the turn is generating from, so it has to happen between
+    /// rounds, and the flag is the whole mechanism.
+    #[test]
+    fn the_compact_tool_only_raises_the_request_flag() {
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        assert!(!ctx.compact_requested, "off until asked");
+        let out = dispatch(&test_call("compact", &[]), &mut ctx);
+        assert!(ctx.compact_requested, "the turn loop reads this");
+        assert!(!out.is_error, "asking is not an error: {}", out.output);
+        assert!(
+            out.output.to_lowercase().contains("compact"),
+            "the model is told what happened: {}",
+            out.output
+        );
+    }
+
+    /// It changes no files, so plan mode must not refuse it — plan mode is a
+    /// write gate, and summarizing is not a write.
+    #[test]
+    fn the_compact_tool_survives_plan_mode() {
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        ctx.plan_mode = true;
+        let out = dispatch(&test_call("compact", &[]), &mut ctx);
+        assert!(!out.is_error, "{}", out.output);
+        assert!(ctx.compact_requested);
+    }
 
     #[test]
     fn parse_helpers_defaults() {

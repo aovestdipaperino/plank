@@ -93,6 +93,15 @@ impl SweepPolicy {
         }
     }
 
+    /// The session TTL, for callers outside the sweep.
+    ///
+    /// `mint_id` uses it to decide whether a colliding name is held by a
+    /// session the GC would already have collected.
+    #[must_use]
+    pub fn session_ttl_secs(&self) -> u64 {
+        self.ttl_session_secs
+    }
+
     /// TTL for `role`.
     fn ttl(&self, role: KvRole) -> u64 {
         match role {

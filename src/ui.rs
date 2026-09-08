@@ -3875,6 +3875,14 @@ impl Agent<'_> {
             // The C checks this at the top of every continuation round
             // ("soft limit before tool continuation", `worker_run_turn`);
             // round 0 is already covered by the pre-turn check above.
+            // The model can also ask for it outright, with the `compact`
+            // tool. Taken here rather than in the dispatch because compaction
+            // rewrites the very transcript this turn generates from.
+            if std::mem::take(&mut self.tool_ctx.compact_requested)
+                && self.compact("model request", "")?.aborted()
+            {
+                return Ok(());
+            }
             if round > 1 && self.maybe_compact()?.aborted() {
                 return Ok(());
             }

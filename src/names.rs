@@ -8,17 +8,18 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Funny adjectives (50).
+/// Funny adjectives (62).
 const ADJECTIVES: &[&str] = &[
     "deadly", "sneaky", "wobbly", "grumpy", "sparkly", "dizzy", "cranky", "jolly", "snazzy",
     "bumbling", "cheeky", "zesty", "quirky", "feisty", "dapper", "goofy", "plucky", "sassy",
     "nifty", "rowdy", "spunky", "witty", "breezy", "cosmic", "turbo", "funky", "groovy", "mellow",
     "peppy", "zippy", "salty", "crispy", "fluffy", "sleepy", "sneezy", "bouncy", "cuddly", "wacky",
     "zany", "giddy", "snappy", "chunky", "spicy", "dorky", "loopy", "perky", "goopy", "wiggly",
-    "squishy", "jazzy",
+    "squishy", "jazzy", "wonky", "chirpy", "swanky", "nimble", "scrappy", "peppery", "bubbly",
+    "kooky", "twirly", "gutsy", "wistful", "chipper",
 ];
 
-/// Scientists (75) — half the celebrity pool.
+/// Scientists (94) — half the celebrity pool.
 const SCIENTISTS: &[&str] = &[
     "einstein",
     "curie",
@@ -95,9 +96,28 @@ const SCIENTISTS: &[&str] = &[
     "chadwick",
     "pauli",
     "hahn",
+    "lamarck",
+    "cuvier",
+    "banting",
+    "ehrlich",
+    "koch",
+    "virchow",
+    "harvey",
+    "vesalius",
+    "paracelsus",
+    "torricelli",
+    "bernoulli",
+    "laplace",
+    "lagrange",
+    "poincare",
+    "riemann",
+    "hilbert",
+    "cantor",
+    "godel",
+    "shannon",
 ];
 
-/// Historical / pop / sport figures (75) — the other half of the pool.
+/// Historical / pop / sport figures (94) — the other half of the pool.
 const OTHERS: &[&str] = &[
     "caesar",
     "napoleon",
@@ -174,6 +194,25 @@ const OTHERS: &[&str] = &[
     "senna",
     "biles",
     "hamilton",
+    "kahlo",
+    "monet",
+    "rodin",
+    "vivaldi",
+    "chopin",
+    "bach",
+    "orwell",
+    "austen",
+    "borges",
+    "calvino",
+    "kurosawa",
+    "fellini",
+    "armstrong",
+    "gagarin",
+    "curry",
+    "brady",
+    "navratilova",
+    "gretzky",
+    "panenka",
 ];
 
 /// A random-ish 64-bit value seeded from wall clock, pid, and a per-process
@@ -265,9 +304,13 @@ mod tests {
 
     #[test]
     fn pools_are_sized_and_unique() {
-        assert_eq!(ADJECTIVES.len(), 50);
-        assert_eq!(SCIENTISTS.len(), 75);
-        assert_eq!(OTHERS.len(), 75); // 150 celebrities total, 50% science
+        assert_eq!(ADJECTIVES.len(), 62);
+        assert_eq!(SCIENTISTS.len(), 94);
+        assert_eq!(OTHERS.len(), 94); // 188 celebrities total, 50% science
+        // The two celebrity pools must stay equal in size. The picker chooses
+        // between them on a coin flip, so unequal pools would make the smaller
+        // one's names disproportionately likely and cost the name space.
+        assert_eq!(SCIENTISTS.len(), OTHERS.len());
         let mut all: Vec<&str> = ADJECTIVES
             .iter()
             .chain(SCIENTISTS)

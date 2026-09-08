@@ -475,6 +475,12 @@ fn push_agent_and_plan_specs(specs: &mut Vec<crate::engine::ToolSpec>) {
         }),
     });
     specs.push(crate::engine::ToolSpec {
+        name: "compact".to_string(),
+        description: "Summarize the conversation so far and continue from the summary. Only when the user asks for it, in so many words or by saying the context is too full; never on your own initiative."
+            .to_string(),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    });
+    specs.push(crate::engine::ToolSpec {
         name: "EnterPlanMode".to_string(),
         description: "Enter read-only plan mode: research and design without changing anything. While it is active, write/edit/bash are refused; only read-only tools work. Use it when a task is risky or ambiguous and the user should approve an approach before you edit. Exit with ExitPlanMode.".to_string(),
         parameters: serde_json::json!({
@@ -678,6 +684,8 @@ const WORKING_STYLE: &str = "# Working style
 - Keep reasoning short and forward-moving. Each thought must add a fact or a decision. If you notice yourself restating an earlier thought, stop thinking and emit the tool calls you have already planned.
 - Narrate progress outside your thinking. After </think> and before every <｜DSML｜tool_calls> stanza, write one or two plain sentences for the user: what the last results told you and what you are about to do. Your thinking is hidden from the user by default, so this line is the only status they see between tool rounds; without it a long thinking block looks like a stall.
 - Edit from search output. Call search with context=5 to see the exact lines around a match, then edit directly from them; do not follow a search with a read of the same lines.
+- Edit files with the edit tool, not with a script. Do not pipe a change through sed, awk, perl or a throwaway Python script to touch several files at once: a regex that matches in one file matches somewhere you did not read in another, and the damage is silent and spread out. Make the edits one call at a time, batching independent ones into a single stanza. The exception is a change that is genuinely a simple, uniform replacement of one exact string across files you have already inspected — then say what you are running and check the result.
+- Do not compact unless the user asks you to. The compact tool replaces the conversation with a summary, and only the user knows whether the detail it drops still matters. Asking for it outright is an instruction, and so is saying the context is too full and to carry on from a summary; merely running low on room is not. plank compacts on its own when it has to.
 - Stay in scope. Change the code the user asked about and its tests. Do not touch docs, changelogs, READMEs or examples unless the user asks.
 - Review changes per file with git diff -- <path>, or summarize with git diff --stat. A whole-repository diff is truncated and costs several turns to page through.
 - Delegate isolatable work to a sub-agent. When part of a task has a result you need but steps you do not (locate where X is handled, run a test suite and summarize the failures, audit a module for Y), call the agent tool with a fully specified task and continue from its report; for several independent parts use fanout. Your own context then holds the conclusions, not the file dumps.
@@ -1024,6 +1032,19 @@ fn append_agent_and_plan_schemas(out: &mut String) {
     out.push_str(
         "\x20     },\n\
          \x20     \"required\": [\"task\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"compact\",\n\
+         \x20   \"description\": \"Summarize the conversation so far and continue from the summary. Only when the user asks for it, in so many words or by saying the context is too full; never on your own initiative.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {}\n\
          \x20   }\n\
          \x20 }\n\
          }\n",
