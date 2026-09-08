@@ -50,9 +50,17 @@ pub struct AgentConfig {
     pub mcp_config_path: Option<PathBuf>,
     /// Directories named by `--plugin-dir`, loaded as session-only plugins.
     pub plugin_dirs: Vec<PathBuf>,
-    /// The profile named by `--profile`. `Some("")` means the flag was given
-    /// with no name, which lists the available profiles and exits.
+    /// The profile named by `--profile`. `Some("")` means either a bare
+    /// `--profile` (lists the available profiles and exits) or an explicit
+    /// `--profile ""` (a fatal error) — `profile_explicit_empty`
+    /// disambiguates the two, since both parse to the same empty string.
     pub profile: Option<String>,
+    /// True when `--profile` was given an explicit empty-string argument
+    /// (`--profile ""`), as opposed to a bare `--profile` with no argument
+    /// at all. Both leave `profile` as `Some(String::new())`; this is what
+    /// tells `--profile ""` apart from the listing request so it fails
+    /// instead of silently succeeding as a no-op run.
+    pub profile_explicit_empty: bool,
     /// True when `--non-interactive` was given.
     pub non_interactive: bool,
     /// True when `--debug` was given: the only case in which plank looks for
@@ -337,6 +345,7 @@ impl Default for AgentConfig {
             mcp_config_path: None,
             plugin_dirs: Vec::new(),
             profile: None,
+            profile_explicit_empty: false,
             non_interactive: false,
             debug: false,
             save_session: true,
@@ -1375,15 +1384,22 @@ pub fn parse_options_with(
             "--profile" => {
                 // A bare `--profile`, or one followed by another flag, is the
                 // listing request rather than an error: the name is what the
-                // user is trying to look up.
+                // user is trying to look up. An explicit empty argument
+                // (`--profile ""`) is different: the user supplied a name,
+                // it happened to be empty, and that must fail loudly rather
+                // than collide with the listing sentinel (finding 4).
                 let next = args.get(i + 1).filter(|a| !a.starts_with('-'));
-                c.profile = Some(match next {
+                match next {
                     Some(name) => {
                         i += 1;
-                        name.clone()
+                        c.profile_explicit_empty = name.is_empty();
+                        c.profile = Some(name.clone());
                     }
-                    None => String::new(),
-                });
+                    None => {
+                        c.profile_explicit_empty = false;
+                        c.profile = Some(String::new());
+                    }
+                }
             }
             "--sandbox" => {
                 c.sandbox_override = Some(true);
@@ -1662,6 +1678,16 @@ mod tests {
     fn a_bare_profile_flag_is_the_listing_request() {
         let c = parse_options(&args(&["--profile"])).expect("parses");
         assert_eq!(c.profile.as_deref(), Some(""));
+        assert!(!c.profile_explicit_empty);
+    }
+
+    #[test]
+    fn an_explicit_empty_profile_argument_is_distinguished_from_the_bare_flag() {
+        // Finding 4: `--profile ""` must be told apart from a bare
+        // `--profile`, even though both leave `c.profile` at `Some("")`.
+        let c = parse_options(&args(&["--profile", ""])).expect("parses");
+        assert_eq!(c.profile.as_deref(), Some(""));
+        assert!(c.profile_explicit_empty);
     }
 
     #[test]

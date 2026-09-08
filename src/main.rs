@@ -49,10 +49,15 @@ fn arm_panic_dump() {
 /// "no `--profile` given") and startup should continue.
 fn resolve_and_activate_profile(
     requested: Option<&str>,
+    explicit_empty: bool,
     plugins: &plank::plugins::PluginSet,
 ) -> Option<ExitCode> {
-    match plank::profile::resolve_profile(requested, plugins) {
+    match plank::profile::resolve_profile(requested, explicit_empty, plugins) {
         plank::profile::Resolution::None => None,
+        plank::profile::Resolution::EmptyName => {
+            eprintln!("plank: --profile requires a non-empty name");
+            Some(ExitCode::from(2))
+        }
         plank::profile::Resolution::Activate(active) => {
             let prompt = match std::fs::read_to_string(&active.spec.system_prompt) {
                 Ok(text) => text,
@@ -65,6 +70,18 @@ fn resolve_and_activate_profile(
                     return Some(ExitCode::from(2));
                 }
             };
+            // An empty or whitespace-only prompt file is the same failure as
+            // an unreadable one: the docs call an unreadable prompt fatal,
+            // and a profile whose prompt is nothing but the generated schema
+            // block is not a valid identity either (finding 7).
+            if prompt.trim().is_empty() {
+                eprintln!(
+                    "plank: profile {}: {} is empty",
+                    active.name,
+                    active.spec.system_prompt.display()
+                );
+                return Some(ExitCode::from(2));
+            }
             // The one read of the prompt file for the whole run: stored on
             // the `ActiveProfile` so composition (`sysprompt.rs`) is
             // infallible and never re-reads the file mid-session.
@@ -227,7 +244,11 @@ fn main() -> ExitCode {
     // downstream — the settings layer, the system prompt, the tool table —
     // needs it, and the real parse at `parse_options_with` happens after the
     // settings it would feed.
-    if let Some(code) = resolve_and_activate_profile(provisional.profile.as_deref(), &plugins) {
+    if let Some(code) = resolve_and_activate_profile(
+        provisional.profile.as_deref(),
+        provisional.profile_explicit_empty,
+        &plugins,
+    ) {
         return code;
     }
     let settings = load_settings_with_profile(&plugins, &cwd);
@@ -755,7 +776,11 @@ fn run_serve(args: &[String]) -> ExitCode {
     // downstream — the settings layer, the system prompt, the tool table —
     // needs it, and the real parse at `parse_options_with` happens after the
     // settings it would feed.
-    if let Some(code) = resolve_and_activate_profile(provisional.profile.as_deref(), &plugins) {
+    if let Some(code) = resolve_and_activate_profile(
+        provisional.profile.as_deref(),
+        provisional.profile_explicit_empty,
+        &plugins,
+    ) {
         return code;
     }
     let settings = load_settings_with_profile(&plugins, &launch_cwd);

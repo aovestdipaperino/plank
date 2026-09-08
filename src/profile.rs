@@ -333,19 +333,33 @@ pub enum Resolution {
     NoSuchPlugin(String, Vec<String>),
     /// The name matched a plugin that declares no `profile` block.
     NotAProfile(String),
+    /// `--profile ""`: an explicit empty name, distinct from the bare-flag
+    /// listing request. Fatal — see finding 4 in the profile cleanup notes.
+    EmptyName,
 }
 
 /// Resolves `--profile`'s argument against the loaded plugins.
+///
+/// `explicit_empty` distinguishes `--profile ""` (a fatal error: the user
+/// supplied an empty name) from a bare `--profile` (the listing request) —
+/// both otherwise parse to `requested == Some("")`.
 ///
 /// Failure is deliberately not silent: running as plain plank when the user
 /// asked for HAL is worse than not running, so every miss is a distinct
 /// variant the caller turns into a fatal message.
 #[must_use]
-pub fn resolve_profile(requested: Option<&str>, set: &crate::plugins::PluginSet) -> Resolution {
+pub fn resolve_profile(
+    requested: Option<&str>,
+    explicit_empty: bool,
+    set: &crate::plugins::PluginSet,
+) -> Resolution {
     let Some(name) = requested else {
         return Resolution::None;
     };
     if name.is_empty() {
+        if explicit_empty {
+            return Resolution::EmptyName;
+        }
         return Resolution::List(crate::plugins::profile_names(set));
     }
     let Some(plugin) = set.plugins.iter().find(|p| p.name == name) else {
@@ -659,22 +673,34 @@ mod tests {
     #[test]
     fn no_flag_resolves_to_no_profile() {
         let set = crate::plugins::PluginSet::default();
-        assert!(matches!(resolve_profile(None, &set), Resolution::None));
+        assert!(matches!(resolve_profile(None, false, &set), Resolution::None));
     }
 
     #[test]
     fn a_bare_flag_lists_the_available_profiles() {
         let set = crate::plugins::PluginSet::default();
-        match resolve_profile(Some(""), &set) {
+        match resolve_profile(Some(""), false, &set) {
             Resolution::List(names) => assert!(names.is_empty()),
             other => panic!("expected a listing, got {other:?}"),
         }
     }
 
     #[test]
+    fn an_explicit_empty_name_is_fatal_not_a_listing() {
+        // Finding 4: `--profile ""` must not collide with the bare-flag
+        // listing sentinel — both parse `requested` to `Some("")`, so only
+        // `explicit_empty` tells them apart.
+        let set = crate::plugins::PluginSet::default();
+        assert!(matches!(
+            resolve_profile(Some(""), true, &set),
+            Resolution::EmptyName
+        ));
+    }
+
+    #[test]
     fn an_unknown_name_reports_what_is_available() {
         let set = crate::plugins::PluginSet::default();
-        match resolve_profile(Some("nope"), &set) {
+        match resolve_profile(Some("nope"), false, &set) {
             Resolution::NoSuchPlugin(name, available) => {
                 assert_eq!(name, "nope");
                 assert!(available.is_empty());
@@ -687,7 +713,7 @@ mod tests {
     fn a_plugin_without_a_profile_block_is_refused_by_name() {
         let (dir, set) = set_with_plugin("plain", r#"{"name":"plain"}"#);
         let _ = &dir;
-        match resolve_profile(Some("plain"), &set) {
+        match resolve_profile(Some("plain"), false, &set) {
             Resolution::NotAProfile(name) => assert_eq!(name, "plain"),
             other => panic!("expected NotAProfile, got {other:?}"),
         }
@@ -700,7 +726,7 @@ mod tests {
             r#"{"name":"hal","profile":{"systemPrompt":"prompt.md","displayName":"HAL"}}"#,
         );
         let _ = &dir;
-        match resolve_profile(Some("hal"), &set) {
+        match resolve_profile(Some("hal"), false, &set) {
             Resolution::Activate(a) => {
                 assert_eq!(a.name, "hal");
                 assert_eq!(a.spec.display_name.as_deref(), Some("HAL"));
