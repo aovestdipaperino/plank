@@ -41,6 +41,11 @@ fn arm_panic_dump() {
     ));
 }
 
+/// The user's home directory, if `HOME` is set.
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
 /// Resolves `--profile`'s argument against the loaded plugins and installs
 /// it, or reports what to do instead.
 ///
@@ -50,8 +55,19 @@ fn arm_panic_dump() {
 fn resolve_and_activate_profile(
     requested: Option<&str>,
     explicit_empty: bool,
-    plugins: &plank::plugins::PluginSet,
+    plugins: &mut plank::plugins::PluginSet,
+    home: Option<&std::path::Path>,
 ) -> Option<ExitCode> {
+    // An installed profile is loaded only now, because `--profile` named it:
+    // `plugins::load_in` never scans the profiles root, so nothing there has
+    // contributed anything to this session yet.
+    if let (Some(name), Some(home)) = (requested.filter(|n| !n.is_empty()), home)
+        && !plugins.plugins.iter().any(|p| p.name == name)
+        && let Some(dir) = plank::profiles::find(home, name)
+    {
+        plank::plugins::splice_profile(plugins, &dir);
+    }
+    let installed = home.map(plank::profiles::names).unwrap_or_default();
     match plank::profile::resolve_profile(requested, explicit_empty, plugins) {
         plank::profile::Resolution::None => None,
         plank::profile::Resolution::EmptyName => {
@@ -88,7 +104,8 @@ fn resolve_and_activate_profile(
             plank::profile::install(plank::profile::ActiveProfile { prompt, ..active });
             None
         }
-        plank::profile::Resolution::List(names) => {
+        plank::profile::Resolution::List(_) => {
+            let names = plank::plugins::profile_names_with(plugins, &installed);
             if names.is_empty() {
                 println!("no profiles installed");
             } else {
@@ -98,7 +115,8 @@ fn resolve_and_activate_profile(
             }
             Some(ExitCode::SUCCESS)
         }
-        plank::profile::Resolution::NoSuchPlugin(name, available) => {
+        plank::profile::Resolution::NoSuchPlugin(name, _) => {
+            let available = plank::plugins::profile_names_with(plugins, &installed);
             eprintln!("plank: no plugin named {name:?}");
             if available.is_empty() {
                 eprintln!("plank: no profiles are installed");
@@ -130,7 +148,7 @@ fn load_settings_with_profile(
             .as_deref()
             .map(|t| (a.name.as_str(), t))
     });
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = home_dir();
     plank::settings::Settings::load_with_plugins_and_profile_in(
         home.as_deref(),
         cwd,
@@ -263,7 +281,7 @@ fn main() -> ExitCode {
     // worktree move would mean a second full plugin scan (and a second round of
     // warnings) purely to observe a directory that is a checkout of the same
     // repo, so the pre-worktree set is reused for the rest of startup.
-    let plugins = plank::plugins::load_default(&cwd, &provisional.plugin_dirs);
+    let mut plugins = plank::plugins::load_default(&cwd, &provisional.plugin_dirs);
     for w in plugins.all_warnings() {
         eprintln!("plugin warning: {w}");
     }
@@ -274,7 +292,8 @@ fn main() -> ExitCode {
     if let Some(code) = resolve_and_activate_profile(
         provisional.profile.as_deref(),
         provisional.profile_explicit_empty,
-        &plugins,
+        &mut plugins,
+        home_dir().as_deref(),
     ) {
         return code;
     }
@@ -796,10 +815,11 @@ fn run_serve(args: &[String]) -> ExitCode {
                 plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
             });
     let launch_cwd = std::env::current_dir().unwrap_or_default();
-    let plugins = plank::plugins::load_default(&launch_cwd, &provisional.plugin_dirs);
+    let mut plugins = plank::plugins::load_default(&launch_cwd, &provisional.plugin_dirs);
     for w in plugins.all_warnings() {
         eprintln!("plugin warning: {w}");
     }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     // The profile is resolved from the provisional parse because everything
     // downstream — the settings layer, the system prompt, the tool table —
     // needs it, and the real parse at `parse_options_with` happens after the
@@ -807,7 +827,8 @@ fn run_serve(args: &[String]) -> ExitCode {
     if let Some(code) = resolve_and_activate_profile(
         provisional.profile.as_deref(),
         provisional.profile_explicit_empty,
-        &plugins,
+        &mut plugins,
+        home.as_deref(),
     ) {
         return code;
     }

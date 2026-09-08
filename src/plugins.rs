@@ -18,6 +18,10 @@ pub enum Origin {
     ProjectScan,
     /// Named explicitly by `--plugin-dir`.
     CliDir,
+    /// Loaded from `~/.plank/profiles/` because `--profile` named it.
+    ///
+    /// Never produced by a scan: [`load_in`] does not visit the profiles root.
+    Profile,
 }
 
 impl Origin {
@@ -29,6 +33,7 @@ impl Origin {
             Origin::UserClaude => "claude",
             Origin::ProjectScan => "project",
             Origin::CliDir => "--plugin-dir",
+            Origin::Profile => "profile",
         }
     }
 }
@@ -567,6 +572,40 @@ pub fn profile_names(set: &PluginSet) -> Vec<String> {
         .map(|p| p.name.clone())
         .collect();
     names.sort();
+    names
+}
+
+/// Loads the profile directory at `dir` and puts it at the top of `set`'s
+/// precedence order, returning its name.
+///
+/// Top, not bottom: an activated profile is the identity the user asked for,
+/// and it should not lose a bare-name contribution to an ambient plugin that
+/// merely happens to be installed. A scanned plugin of the same name is
+/// replaced rather than shadowed — two entries under one name would make every
+/// namespaced lookup ambiguous.
+///
+/// `None` when `dir` is not loadable as a plugin at all, which
+/// [`crate::profiles::find`] has already ruled out for every caller that goes
+/// through it.
+pub fn splice_profile(set: &mut PluginSet, dir: &Path) -> Option<String> {
+    let plugin = load_plugin(dir, Origin::Profile)?;
+    let name = plugin.name.clone();
+    set.plugins.retain(|p| p.name != name);
+    set.plugins.push(plugin);
+    Some(name)
+}
+
+/// The profile names `--profile` accepts: those in the scanned set, plus those
+/// installed under `~/.plank/profiles/`, sorted and deduplicated.
+///
+/// `installed` comes from [`crate::profiles::names`]. Passed in rather than
+/// read here so this stays a pure function testable without a home directory.
+#[must_use]
+pub fn profile_names_with(set: &PluginSet, installed: &[String]) -> Vec<String> {
+    let mut names = profile_names(set);
+    names.extend(installed.iter().cloned());
+    names.sort();
+    names.dedup();
     names
 }
 
@@ -2810,5 +2849,103 @@ mod tests {
         let p = load_plugin(&dir, Origin::UserScan).expect("loads");
         assert!(p.profile.is_some());
         assert!(p.warnings.iter().any(|w| w.contains("accent")));
+    }
+
+    /// A directory holding a minimal profile plugin, for the splice tests.
+    fn seed_profile_dir(parent: &Path, name: &str) -> PathBuf {
+        let root = parent.join(name);
+        std::fs::create_dir_all(root.join(".plank-plugin")).expect("mkdir");
+        std::fs::write(root.join("prompt.md"), "You are a test profile.\n").expect("write");
+        std::fs::write(
+            root.join(".plank-plugin").join("plugin.json"),
+            format!(r#"{{"name":"{name}","profile":{{"systemPrompt":"prompt.md"}}}}"#),
+        )
+        .expect("write");
+        root
+    }
+
+    #[test]
+    fn a_spliced_profile_sits_at_the_top_of_the_precedence_order() {
+        let tmp = std::env::temp_dir().join(format!("plank-splice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let dir = seed_profile_dir(&tmp, "hal");
+        let mut set = PluginSet::default();
+        // A plugin that already claims the top slot; the profile must outrank it.
+        let other = seed_profile_dir(&tmp, "other");
+        set.plugins
+            .push(load_plugin(&other, Origin::UserScan).expect("loads"));
+        let name = splice_profile(&mut set, &dir).expect("splices");
+        assert_eq!(name, "hal");
+        assert_eq!(set.plugins.last().map(|p| p.name.as_str()), Some("hal"));
+        assert_eq!(set.plugins.last().map(|p| p.origin), Some(Origin::Profile));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A scanned plugin of the same name is replaced, not duplicated: two entries
+    /// with one name would make every namespaced lookup ambiguous.
+    #[test]
+    fn splicing_replaces_a_scanned_plugin_of_the_same_name() {
+        let tmp = std::env::temp_dir().join(format!("plank-splice-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let scanned = seed_profile_dir(&tmp.join("scanned"), "hal");
+        let installed = seed_profile_dir(&tmp.join("installed"), "hal");
+        let mut set = PluginSet::default();
+        set.plugins
+            .push(load_plugin(&scanned, Origin::UserScan).expect("loads"));
+        splice_profile(&mut set, &installed).expect("splices");
+        assert_eq!(set.plugins.iter().filter(|p| p.name == "hal").count(), 1);
+        assert_eq!(set.plugins[0].origin, Origin::Profile);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The whole point of a separate root: installing a profile must not make it
+    /// load in an ordinary session. `load_in` is given the same home the profile
+    /// was installed under and must not see it.
+    #[test]
+    fn an_installed_profile_does_not_load_in_an_ordinary_session() {
+        let tmp = std::env::temp_dir().join(format!("plank-not-scanned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let profiles = tmp.join(".plank").join("profiles");
+        std::fs::create_dir_all(&profiles).expect("mkdir");
+        seed_profile_dir(&profiles, "hal");
+        let cwd = tmp.join("project");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let set = load_in(Some(&tmp), &cwd, &[]);
+        assert!(!set.plugins.iter().any(|p| p.name == "hal"), "hal loaded");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_profile_origin_has_its_own_label() {
+        assert_eq!(Origin::Profile.label(), "profile");
+    }
+
+    #[test]
+    fn listing_merges_scanned_and_installed_profiles_without_duplicates() {
+        let set = PluginSet::default();
+        let installed = vec!["hal".to_string(), "zeta".to_string()];
+        assert_eq!(
+            profile_names_with(&set, &installed),
+            vec!["hal".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_name_in_both_the_scan_and_the_profiles_root_is_listed_once() {
+        let tmp = std::env::temp_dir().join(format!("plank-list-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let dir = seed_profile_dir(&tmp, "hal");
+        let mut set = PluginSet::default();
+        set.plugins
+            .push(load_plugin(&dir, Origin::UserScan).expect("loads"));
+        let installed = vec!["hal".to_string()];
+        assert_eq!(
+            profile_names_with(&set, &installed),
+            vec!["hal".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
