@@ -327,6 +327,29 @@ impl ToolContext {
 ///
 /// Mirrors `agent_execute_tool_call`: the same tool names the C agent
 /// registers, minus the browser web tools.
+/// What the model is told when it calls a builtin the active profile withheld.
+///
+/// Byte-identical to the unknown-tool arm of `dispatch`: the profile's prompt
+/// never advertised the tool, so "unknown" is both the honest answer and the
+/// one the model already knows how to recover from.
+fn disabled_tool_error(name: &str) -> String {
+    format!("Tool error: unknown tool: {name}\n")
+}
+
+/// True when `name` is dispatched by a profile's own components (an MCP
+/// server or a WASM component) rather than the builtin table, and so is
+/// exempt from the profile's builtin allow-list.
+fn is_component_tool(wasm: &crate::wasmreg::Session, name: &str) -> bool {
+    name.starts_with("mcp__") || wasm.registry.tools().iter().any(|t| t.exposed == name)
+}
+
+/// The response to send back, if any, when the active profile withholds
+/// `call`'s builtin. `None` means dispatch should proceed as normal.
+fn withheld_tool_response(ctx: &ToolContext, call: &ToolCall) -> Option<ToolResult> {
+    (!is_component_tool(&ctx.wasm, &call.name) && !crate::profile::builtin_enabled(&call.name))
+        .then(|| ToolResult::from_output(disabled_tool_error(&call.name)))
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     if call.name.is_empty() {
@@ -402,6 +425,9 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     // around the tool body only, so hooks still see the full output.
     let deadline = crate::settings::active().tools.call_timeout_sec;
     let start = std::time::Instant::now();
+    if let Some(res) = withheld_tool_response(ctx, call) {
+        return res;
+    }
     let output = match call.name.as_str() {
         "EnterWorktree" => worktree::tool_enter_worktree(ctx, call),
         "ExitWorktree" => worktree::tool_exit_worktree(ctx, call),
@@ -987,6 +1013,27 @@ mod tests {
         assert!(parse_bool_default(Some("YES"), false));
         assert!(!parse_bool_default(Some("0"), true));
         assert!(parse_bool_default(Some("maybe"), true));
+    }
+
+    #[test]
+    fn a_disabled_builtin_is_reported_as_unknown() {
+        // The model was never told the tool exists, so "unknown" is the honest
+        // answer and matches what the prompt claimed.
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(vec!["bash".to_string()]),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        assert!(spec.builtin_enabled("bash"));
+        assert!(!spec.builtin_enabled("read"));
+        assert_eq!(
+            disabled_tool_error("read"),
+            "Tool error: unknown tool: read\n"
+        );
     }
 
     #[test]
