@@ -68,6 +68,7 @@ fn resolve_and_activate_profile(
     explicit_empty: bool,
     plugins: &mut plank::plugins::PluginSet,
     home: Option<&std::path::Path>,
+    cfg: &plank::config::AgentConfig,
 ) -> Option<ExitCode> {
     // An installed profile is loaded only now, because `--profile` named it:
     // `plugins::load_in` never scans the profiles root, so nothing there has
@@ -98,6 +99,19 @@ fn resolve_and_activate_profile(
             Some(ExitCode::from(2))
         }
         plank::profile::Resolution::Activate(active) => {
+            // Resolved the same way `select_session_family` resolves it, so
+            // the two agree about which model is loading. The Qwen prompt is
+            // a different document built whole elsewhere; a profile's prose
+            // never reaches it, so running under Qwen is refused outright
+            // rather than silently dropping the profile's system prompt.
+            let model = cfg
+                .model_path
+                .clone()
+                .unwrap_or_else(plank::download::default_model_path);
+            if plank::gguf::family_of(&model) == plank::gguf::ModelFamily::Qwen {
+                eprintln!("{}", plank::profile::refuse_under_qwen(&active.name));
+                return Some(ExitCode::from(2));
+            }
             let prompt = match std::fs::read_to_string(&active.spec.system_prompt) {
                 Ok(text) => text,
                 Err(e) => {
@@ -315,6 +329,7 @@ fn main() -> ExitCode {
         provisional.profile_explicit_empty,
         &mut plugins,
         home_dir().as_deref(),
+        &provisional,
     );
     print_plugin_warnings(&plugins);
     if let Some(code) = code {
@@ -850,6 +865,7 @@ fn run_serve(args: &[String]) -> ExitCode {
         provisional.profile_explicit_empty,
         &mut plugins,
         home.as_deref(),
+        &provisional,
     );
     print_plugin_warnings(&plugins);
     if let Some(code) = code {
