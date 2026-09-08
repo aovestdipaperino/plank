@@ -522,8 +522,7 @@ pub fn install_profile_staged(
         .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
     let spec = crate::profile::parse(&text, &root).ok_or_else(|| {
         format!(
-            "plugin '{name}' declares no profile block; install it with \
-             /install-claude-plugin instead"
+            "plugin '{name}' declares no profile block; install it with /install-claude-plugin instead"
         )
     })?;
     let prompt = std::fs::read_to_string(&spec.system_prompt).map_err(|e| {
