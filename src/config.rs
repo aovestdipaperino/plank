@@ -1389,16 +1389,13 @@ pub fn parse_options_with(
                 // it happened to be empty, and that must fail loudly rather
                 // than collide with the listing sentinel (finding 4).
                 let next = args.get(i + 1).filter(|a| !a.starts_with('-'));
-                match next {
-                    Some(name) => {
-                        i += 1;
-                        c.profile_explicit_empty = name.is_empty();
-                        c.profile = Some(name.clone());
-                    }
-                    None => {
-                        c.profile_explicit_empty = false;
-                        c.profile = Some(String::new());
-                    }
+                if let Some(name) = next {
+                    i += 1;
+                    c.profile_explicit_empty = name.is_empty();
+                    c.profile = Some(name.clone());
+                } else {
+                    c.profile_explicit_empty = false;
+                    c.profile = Some(String::new());
                 }
             }
             "--sandbox" => {

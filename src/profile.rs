@@ -126,18 +126,7 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
                         .to_string(),
                 );
             }
-            // An entry matching no known builtin is a warning, not an error:
-            // a profile written against a newer plank (one that added a
-            // builtin this binary does not have yet) must still run, just
-            // with that entry silently inert.
-            let known = crate::sysprompt::known_builtin_names();
-            for name in &names {
-                if !known.contains(name) {
-                    warnings.push(format!(
-                        "profile: tools.builtin names {name:?}, which matches no known builtin tool"
-                    ));
-                }
-            }
+            warn_unknown_builtin_names(&names, &mut warnings);
             Some(names)
         }
         Some(_) => {
@@ -175,27 +164,7 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
     let settings_json = match block.get("settings") {
         None => None,
         Some(s @ Json::Obj(members)) => {
-            // `crate::settings::Settings::overlay_from` drops `engine.*` from
-            // a profile's settings layer the same way it drops it from a
-            // plugin's, but silently — the caller there has no per-key
-            // warning channel to surface it on. This is that surfacing: a
-            // per-key warning here, at parse time, the same shape plugins.rs
-            // emits for its own refused sections.
-            if let Some((_, engine_value)) = members.iter().find(|(k, _)| k == "engine") {
-                match engine_value {
-                    Json::Obj(engine_keys) if !engine_keys.is_empty() => {
-                        for (key, _) in engine_keys {
-                            warnings.push(format!(
-                                "profile: settings.engine.{key} is refused (a profile may not set engine.*); set it yourself in ~/.plank/settings.json if you want it"
-                            ));
-                        }
-                    }
-                    _ => warnings.push(
-                        "profile: settings.engine is refused (a profile may not set engine.*); set it yourself in ~/.plank/settings.json if you want it"
-                            .to_string(),
-                    ),
-                }
-            }
+            warn_refused_engine_settings(members, &mut warnings);
             let mut out = String::new();
             json_write(&mut out, s);
             Some(out)
@@ -215,6 +184,49 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
         settings_json,
         warnings,
     })
+}
+
+/// Pushes a warning for each `names` entry that matches no known builtin.
+///
+/// An entry matching nothing is a warning, not an error: a profile written
+/// against a newer plank (one that added a builtin this binary does not have
+/// yet) must still run, just with that entry silently inert.
+fn warn_unknown_builtin_names(names: &[String], warnings: &mut Vec<String>) {
+    let known = crate::sysprompt::known_builtin_names();
+    for name in names {
+        if !known.contains(name) {
+            warnings.push(format!(
+                "profile: tools.builtin names {name:?}, which matches no known builtin tool"
+            ));
+        }
+    }
+}
+
+/// Pushes a warning for each `engine.*` key a profile's `settings` block
+/// tries to set.
+///
+/// `crate::settings::Settings::overlay_from` drops `engine.*` from a
+/// profile's settings layer the same way it drops it from a plugin's, but
+/// silently — the caller there has no per-key warning channel to surface it
+/// on. This is that surfacing: one warning per dropped key, at parse time,
+/// the same shape `plugins.rs` emits for its own refused sections.
+fn warn_refused_engine_settings(members: &[(String, Json)], warnings: &mut Vec<String>) {
+    let Some((_, engine_value)) = members.iter().find(|(k, _)| k == "engine") else {
+        return;
+    };
+    match engine_value {
+        Json::Obj(engine_keys) if !engine_keys.is_empty() => {
+            for (key, _) in engine_keys {
+                warnings.push(format!(
+                    "profile: settings.engine.{key} is refused (a profile may not set engine.*); set it yourself in ~/.plank/settings.json if you want it"
+                ));
+            }
+        }
+        _ => warnings.push(
+            "profile: settings.engine is refused (a profile may not set engine.*); set it yourself in ~/.plank/settings.json if you want it"
+                .to_string(),
+        ),
+    }
 }
 
 /// A non-empty string member, or `None`.
@@ -520,9 +532,7 @@ mod tests {
             "the unknown entry stays in the allow-list, it is not dropped"
         );
         assert!(
-            spec.warnings
-                .iter()
-                .any(|w| w.contains("not_a_real_tool")),
+            spec.warnings.iter().any(|w| w.contains("not_a_real_tool")),
             "expected a warning naming the unknown entry, got: {:?}",
             spec.warnings
         );
@@ -743,7 +753,10 @@ mod tests {
     #[test]
     fn no_flag_resolves_to_no_profile() {
         let set = crate::plugins::PluginSet::default();
-        assert!(matches!(resolve_profile(None, false, &set), Resolution::None));
+        assert!(matches!(
+            resolve_profile(None, false, &set),
+            Resolution::None
+        ));
     }
 
     #[test]
