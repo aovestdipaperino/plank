@@ -41,6 +41,61 @@ fn arm_panic_dump() {
     ));
 }
 
+/// Resolves `--profile`'s argument against the loaded plugins and installs
+/// it, or reports what to do instead.
+///
+/// Returns `Some(code)` when startup must stop here (a bare-flag listing, or
+/// a fatal resolution error); `None` means resolution succeeded (including
+/// "no `--profile` given") and startup should continue.
+fn resolve_and_activate_profile(
+    requested: Option<&str>,
+    plugins: &plank::plugins::PluginSet,
+) -> Option<ExitCode> {
+    match plank::profile::resolve_profile(requested, plugins) {
+        plank::profile::Resolution::None => None,
+        plank::profile::Resolution::Activate(active) => {
+            plank::profile::install(active);
+            None
+        }
+        plank::profile::Resolution::List(names) => {
+            if names.is_empty() {
+                println!("no profiles installed");
+            } else {
+                for n in names {
+                    println!("{n}");
+                }
+            }
+            Some(ExitCode::SUCCESS)
+        }
+        plank::profile::Resolution::NoSuchPlugin(name, available) => {
+            eprintln!("plank: no plugin named {name:?}");
+            if available.is_empty() {
+                eprintln!("plank: no profiles are installed");
+            } else {
+                eprintln!("plank: available profiles: {}", available.join(", "));
+            }
+            Some(ExitCode::from(2))
+        }
+        plank::profile::Resolution::NotAProfile(name) => {
+            eprintln!("plank: plugin {name:?} declares no profile block");
+            Some(ExitCode::from(2))
+        }
+    }
+}
+
+/// One-shot wipe of pre-`.kv_raw` KV blobs. Best-effort: a store that fails
+/// to open is skipped silently, and the next launch retries.
+fn migrate_kvcache_if_present() {
+    let kv_dir = plank::session::SessionStore::default_dir();
+    if let Some(bytes) = plank::session::SessionStore::migrate_kvcache_if_present(&kv_dir)
+        && bytes > 0
+    {
+        #[allow(clippy::cast_precision_loss)] // GB display only; loses no meaningful precision
+        let gb = bytes as f64 / 1_073_741_824.0;
+        eprintln!("kvcache: migrated to the .kv_raw format, reclaimed {gb:.1} GB");
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -126,6 +181,13 @@ fn main() -> ExitCode {
     for w in plugins.all_warnings() {
         eprintln!("plugin warning: {w}");
     }
+    // The profile is resolved from the provisional parse because everything
+    // downstream — the settings layer, the system prompt, the tool table —
+    // needs it, and the real parse at `parse_options_with` happens after the
+    // settings it would feed.
+    if let Some(code) = resolve_and_activate_profile(provisional.profile.as_deref(), &plugins) {
+        return code;
+    }
     let settings =
         plank::settings::Settings::load_with_plugins(&plank::plugins::settings_paths(&plugins));
     // `--debug` is a pure CLI flag, so the provisional parse agrees with the
@@ -178,14 +240,7 @@ fn main() -> ExitCode {
     // the live alternate screen garbled the warm-progress frame), so the gate
     // is the fix rather than a reorder. Nothing to migrate exists before the
     // directory does, so skipping is exact rather than merely cheap.
-    let kv_dir = plank::session::SessionStore::default_dir();
-    if let Some(bytes) = plank::session::SessionStore::migrate_kvcache_if_present(&kv_dir)
-        && bytes > 0
-    {
-        #[allow(clippy::cast_precision_loss)] // GB display only; loses no meaningful precision
-        let gb = bytes as f64 / 1_073_741_824.0;
-        eprintln!("kvcache: migrated to the .kv_raw format, reclaimed {gb:.1} GB");
-    }
+    migrate_kvcache_if_present();
     // `--worktree` runs before anything reads the working directory, because
     // the whole session — its hooks, agent definitions, and every tool's cwd —
     // is meant to live inside the worktree rather than the original checkout.
@@ -654,6 +709,13 @@ fn run_serve(args: &[String]) -> ExitCode {
     let plugins = plank::plugins::load_default(&launch_cwd, &provisional.plugin_dirs);
     for w in plugins.all_warnings() {
         eprintln!("plugin warning: {w}");
+    }
+    // The profile is resolved from the provisional parse because everything
+    // downstream — the settings layer, the system prompt, the tool table —
+    // needs it, and the real parse at `parse_options_with` happens after the
+    // settings it would feed.
+    if let Some(code) = resolve_and_activate_profile(provisional.profile.as_deref(), &plugins) {
+        return code;
     }
     let settings =
         plank::settings::Settings::load_with_plugins(&plank::plugins::settings_paths(&plugins));

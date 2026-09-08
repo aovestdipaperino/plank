@@ -250,6 +250,47 @@ pub fn builtin_enabled(name: &str) -> bool {
     ACTIVE.get().is_none_or(|a| a.spec.builtin_enabled(name))
 }
 
+/// What `--profile NAME` came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// No `--profile` was given; run as plain plank.
+    None,
+    /// Activate this profile.
+    Activate(ActiveProfile),
+    /// A bare `--profile`: list these names and exit successfully.
+    List(Vec<String>),
+    /// The name matched no plugin. Carries the available profile names so the
+    /// error can show them.
+    NoSuchPlugin(String, Vec<String>),
+    /// The name matched a plugin that declares no `profile` block.
+    NotAProfile(String),
+}
+
+/// Resolves `--profile`'s argument against the loaded plugins.
+///
+/// Failure is deliberately not silent: running as plain plank when the user
+/// asked for HAL is worse than not running, so every miss is a distinct
+/// variant the caller turns into a fatal message.
+#[must_use]
+pub fn resolve_profile(requested: Option<&str>, set: &crate::plugins::PluginSet) -> Resolution {
+    let Some(name) = requested else {
+        return Resolution::None;
+    };
+    if name.is_empty() {
+        return Resolution::List(crate::plugins::profile_names(set));
+    }
+    let Some(plugin) = set.plugins.iter().find(|p| p.name == name) else {
+        return Resolution::NoSuchPlugin(name.to_string(), crate::plugins::profile_names(set));
+    };
+    match &plugin.profile {
+        Some(spec) => Resolution::Activate(ActiveProfile {
+            name: plugin.name.clone(),
+            spec: spec.clone(),
+        }),
+        None => Resolution::NotAProfile(name.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +535,77 @@ mod tests {
         let spec = spec_named(Some(vec!["bash".to_string()]));
         assert!(spec.builtin_enabled("bash"));
         assert!(!spec.builtin_enabled("read"));
+    }
+
+    #[test]
+    fn no_flag_resolves_to_no_profile() {
+        let set = crate::plugins::PluginSet::default();
+        assert!(matches!(resolve_profile(None, &set), Resolution::None));
+    }
+
+    #[test]
+    fn a_bare_flag_lists_the_available_profiles() {
+        let set = crate::plugins::PluginSet::default();
+        match resolve_profile(Some(""), &set) {
+            Resolution::List(names) => assert!(names.is_empty()),
+            other => panic!("expected a listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_name_reports_what_is_available() {
+        let set = crate::plugins::PluginSet::default();
+        match resolve_profile(Some("nope"), &set) {
+            Resolution::NoSuchPlugin(name, available) => {
+                assert_eq!(name, "nope");
+                assert!(available.is_empty());
+            }
+            other => panic!("expected NoSuchPlugin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plugin_without_a_profile_block_is_refused_by_name() {
+        let (dir, set) = set_with_plugin("plain", r#"{"name":"plain"}"#);
+        let _ = &dir;
+        match resolve_profile(Some("plain"), &set) {
+            Resolution::NotAProfile(name) => assert_eq!(name, "plain"),
+            other => panic!("expected NotAProfile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_profile_bearing_plugin_activates() {
+        let (dir, set) = set_with_plugin(
+            "hal",
+            r#"{"name":"hal","profile":{"systemPrompt":"prompt.md","displayName":"HAL"}}"#,
+        );
+        let _ = &dir;
+        match resolve_profile(Some("hal"), &set) {
+            Resolution::Activate(a) => {
+                assert_eq!(a.name, "hal");
+                assert_eq!(a.spec.display_name.as_deref(), Some("HAL"));
+            }
+            other => panic!("expected Activate, got {other:?}"),
+        }
+    }
+
+    /// A one-plugin `PluginSet` on disk, in a unique scratch directory under
+    /// the OS temp dir (mirroring `src/plugins.rs`'s own test helper, since
+    /// this project has no `tempfile` dev-dependency). The directory is
+    /// returned so the caller can keep it alive for the duration of the
+    /// assertion, though nothing here deletes it early.
+    fn set_with_plugin(name: &str, manifest: &str) -> (PathBuf, crate::plugins::PluginSet) {
+        let base = std::env::temp_dir().join(format!(
+            "plank-profile-resolve-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join(name);
+        std::fs::create_dir_all(dir.join(".plank-plugin")).expect("mkdir");
+        std::fs::write(dir.join(".plank-plugin").join("plugin.json"), manifest).expect("write");
+        std::fs::write(dir.join("prompt.md"), "You are a test agent.\n").expect("write prompt");
+        let set = crate::plugins::load_in(None, &base, std::slice::from_ref(&dir));
+        (base, set)
     }
 }
