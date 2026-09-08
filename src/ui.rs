@@ -586,7 +586,7 @@ enum PassError {
 /// model to fix something that was never broken, so it gets the placement rule
 /// verbatim — the same sentence the tools prompt already gave it — and no
 /// syntax reminder at all.
-fn tool_error_payload(kind: PassError, err: &str) -> String {
+fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax) -> String {
     match kind {
         PassError::Preflight => format!("Tool error: {err}\n"),
         // Written without a `\`-continued literal on purpose: continuations
@@ -600,10 +600,20 @@ fn tool_error_payload(kind: PassError, err: &str) -> String {
             ),
             sysprompt::IN_THINK_PROHIBITION
         ),
-        PassError::Dsml => format!(
-            "Tool error: invalid DSML tool call: {err}\n{}",
-            sysprompt::dsml_syntax_reminder()
-        ),
+        // Named for the dialect the model actually speaks. Telling a Qwen
+        // model its "DSML" was invalid, and handing it DSML to copy, is how a
+        // recorded session ended with the model insisting the harness was
+        // broken rather than fixing its markup.
+        PassError::Dsml => match syntax {
+            sysprompt::ToolSyntax::Dsml => format!(
+                "Tool error: invalid DSML tool call: {err}\n{}",
+                sysprompt::dsml_syntax_reminder()
+            ),
+            sysprompt::ToolSyntax::Qwen => format!(
+                "Tool error: invalid tool call: {err}\n{}",
+                sysprompt::qwen_syntax_reminder()
+            ),
+        },
     }
 }
 
@@ -2672,7 +2682,7 @@ impl Agent<'_> {
         // no blinking brain to drive, but the flag is process-global and a
         // remote client attached to this session renders off it.
         let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
-        let mut stream = StreamRenderer::new(sink);
+        let mut stream = StreamRenderer::with_syntax(sink, self.tool_syntax());
         stream.set_freeze_on_error(true);
         self.configure_stream(&mut stream);
         // Defensive retry point: picks up a console that started after plank
@@ -3669,7 +3679,10 @@ fn generate_pass(
     // on a `provider: local` definition swaps the engine before getting here, so
     // this reports the engine actually generating rather than the session's.
     let _local = engine.is_local().then(crate::status::LocalPass::begin);
-    let mut stream = StreamRenderer::new(sink);
+    let mut stream = StreamRenderer::with_syntax(
+        sink,
+        crate::sysprompt::ToolSyntax::for_model_name(&engine.model_name()),
+    );
     stream.set_freeze_on_error(true);
     stream.set_preflight(preflight);
     stream.set_thinking_tool_calls(ctx.thinking_tool_calls);
@@ -3784,6 +3797,7 @@ fn finish_quiet_pass<S: RenderSink>(
         let payload = tool_error_payload(
             pass_error_kind(preflight_error.is_some(), finished.in_think_rejected),
             err,
+            stream.syntax(),
         );
         close_open_think(&mut assistant_text, ended_in_think);
         return Ok(QuietPass {
@@ -3956,6 +3970,7 @@ impl Agent<'_> {
                 let payload = tool_error_payload(
                     pass_error_kind(preflight_error.is_some(), finished.in_think_rejected),
                     err,
+                    self.tool_syntax(),
                 );
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
@@ -6162,7 +6177,11 @@ impl Agent<'_> {
                     // Stream the stored text through the same renderer the live
                     // turn uses, so markdown, thinking gray, and tool-call
                     // banners come back exactly as they were shown.
-                    let mut stream = StreamRenderer::new(std::mem::take(log));
+                    // Replayed with the live model's dialect: a transcript
+                    // does not record which one wrote it, and the banners only
+                    // come back right if the markup is read the same way.
+                    let mut stream =
+                        StreamRenderer::with_syntax(std::mem::take(log), self.tool_syntax());
                     stream.set_replay(true);
                     stream.set_show_tool_calls(show_tool_calls);
                     stream.set_show_thinking(show_thinking);
@@ -11335,6 +11354,15 @@ impl Agent<'_> {
     /// its KV. Keying it correctly is also what lets it share Tier 1 with an
     /// ordinary local-main session — which is where most of those checkpoints
     /// get written.
+    /// The tool-call dialect the loaded model speaks.
+    ///
+    /// Asked of the engine rather than stored, so a turn that swapped the
+    /// engine (a `provider: local` sub-agent, say) reads the dialect of the
+    /// model actually generating.
+    fn tool_syntax(&self) -> crate::sysprompt::ToolSyntax {
+        crate::sysprompt::ToolSyntax::for_model_name(&self.engine.model_name())
+    }
+
     fn kv_tiers_for(&self, model: &str) -> Vec<crate::kvtier::TierSpec> {
         let fp1 = crate::kvtier::system_fingerprint(
             model,
@@ -12725,7 +12753,7 @@ impl Agent<'_> {
         // the deepest ladder rung below the divergence first. This is the
         // path every ordinary TUI turn runs through, so it needs its own call.
         self.rescue_prefix_before_rebuild(prompt);
-        let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
+        let mut stream = StreamRenderer::with_syntax(ChannelSink(tx.clone()), self.tool_syntax());
         stream.set_freeze_on_error(true);
         self.configure_stream(&mut stream);
         // See the matching comment in `stream_generation`: a defensive retry
@@ -12880,10 +12908,14 @@ impl Agent<'_> {
         // error to feed back to the model, not a user abort.
         let preflight_error = stream.preflight_error();
         let error = preflight_error
-            .map(|e| tool_error_payload(PassError::Preflight, e))
+            .map(|e| tool_error_payload(PassError::Preflight, e, stream.syntax()))
             .or_else(|| {
                 finished.error.map(|e| {
-                    tool_error_payload(pass_error_kind(false, finished.in_think_rejected), e)
+                    tool_error_payload(
+                        pass_error_kind(false, finished.in_think_rejected),
+                        e,
+                        stream.syntax(),
+                    )
                 })
             });
         let user_interrupt = shared.interrupt.load(Ordering::Relaxed);
@@ -15368,11 +15400,16 @@ fn new_agent(
         contribution_warnings.extend(warnings);
     }
     let wasm_tools = tool_ctx.wasm.registry.tools();
+    // The dialect the loaded model speaks decides which tools prompt it gets,
+    // and later which parser reads its output back. Taken from the name the
+    // engine reports after detecting the file, not from the path.
+    let syntax = sysprompt::ToolSyntax::for_model_name(&engine.model_name());
     let system = sysprompt::build_system_prompt_parts_with_wasm(
         &cfg.system,
         &tool_ctx.mcp,
         &wasm_tools,
         !crate::settings::active().engine.thinking_tool_calls,
+        syntax,
     );
     drop(wasm_tools);
     // Tell the engine where the trusted control text ends before it tokenizes
@@ -22657,7 +22694,11 @@ mod tests {
     /// with no syntax reminder attached.
     #[test]
     fn the_in_think_payload_talks_about_placement_not_syntax() {
-        let payload = tool_error_payload(PassError::InThink, "incomplete DSML tool call");
+        let payload = tool_error_payload(
+            PassError::InThink,
+            "incomplete DSML tool call",
+            sysprompt::ToolSyntax::Dsml,
+        );
         assert!(
             payload.contains(crate::sysprompt::IN_THINK_PROHIBITION),
             "{payload:?}"
@@ -22680,13 +22721,21 @@ mod tests {
         );
 
         // A genuine syntax failure is untouched: prefix and reminder both.
-        let dsml = tool_error_payload(PassError::Dsml, "unclosed parameter");
+        let dsml = tool_error_payload(
+            PassError::Dsml,
+            "unclosed parameter",
+            sysprompt::ToolSyntax::Dsml,
+        );
         assert!(dsml.contains("invalid DSML tool call: unclosed parameter"));
         assert!(dsml.contains("DSML syntax reminder"));
 
         // A preflight failure is still fed back verbatim.
         assert_eq!(
-            tool_error_payload(PassError::Preflight, "old not found"),
+            tool_error_payload(
+                PassError::Preflight,
+                "old not found",
+                sysprompt::ToolSyntax::Dsml
+            ),
             "Tool error: old not found\n"
         );
     }

@@ -10,6 +10,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use trace_stream::syntax::ToolSyntax;
+
 /// The tools-prompt line forbidding tool calls inside thinking, verbatim from
 /// the C (`ds4_agent.c:718`) and a substring of [`TOOLS_PROMPT_INTRO`].
 ///
@@ -585,7 +587,7 @@ fn build_tools_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> (String, usize) {
-    build_tools_prompt_parts_with_wasm(mcp_servers, &[], parity)
+    build_tools_prompt_parts_with_wasm(mcp_servers, &[], parity, ToolSyntax::Dsml)
 }
 
 /// [`build_tools_prompt_parts`] with WASM component tools folded in.
@@ -597,7 +599,11 @@ fn build_tools_prompt_parts_with_wasm(
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
+    syntax: ToolSyntax,
 ) -> (String, usize) {
+    if syntax == ToolSyntax::Qwen {
+        return build_qwen_tools_prompt_parts(mcp_servers, wasm_tools);
+    }
     let mut out = build_tools_prompt_base(parity);
     insert_marker_spelling_note(&mut out);
     insert_document_read_note(&mut out);
@@ -609,6 +615,48 @@ fn build_tools_prompt_parts_with_wasm(
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     append_wasm_tool_schemas(&mut out, wasm_tools);
     (out, trusted_len)
+}
+
+/// [`TOOLS_PROMPT_QWEN`] with plank's own tools spliced into its schema list.
+///
+/// The dialects differ in shape here, not just in wording. The DSML prompt is
+/// a run of schemas that plank can append to, so its extras go on the end; the
+/// Qwen prompt fences its schemas inside `<tools>` … `</tools>` and puts the
+/// call-format instructions and rules *after* that, so appending would advertise
+/// tools below the rules that describe how to call them. They are inserted
+/// instead. The schema shape is the same `{"type": "function", …}` object in
+/// both, which is what makes the splice possible at all.
+///
+/// The trusted span is empty, unlike the DSML path. That span exists so the
+/// literal `｜DSML｜` in the prompt's examples tokenizes as the model's own
+/// marker token rather than as spelled-out BPE pieces; this prompt contains no
+/// DSML, so there is nothing to preserve, and the C agrees — it hands an
+/// XML-dialect tools prompt over as an ordinary system message rather than as
+/// rendered chat (`agent_syntax_is_xml_tool_call`).
+const QWEN_SCHEMA_FENCE: &str = "\n</tools>";
+
+fn build_qwen_tools_prompt_parts(
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    wasm_tools: &[&crate::wasmreg::WasmTool],
+) -> (String, usize) {
+    // Schemas belong inside the fence; server *instructions* are prose and
+    // belong after it, with the rest of the guidance.
+    let mut schemas = String::new();
+    append_native_extra_schemas(&mut schemas);
+    crate::tools::mcp::append_tool_schemas(&mut schemas, mcp_servers);
+    crate::tools::mcp::append_resource_tool_schemas(&mut schemas, mcp_servers);
+    append_wasm_tool_schemas(&mut schemas, wasm_tools);
+
+    let at = TOOLS_PROMPT_QWEN
+        .find(QWEN_SCHEMA_FENCE)
+        .expect("the Qwen tools prompt fences its schemas with </tools>");
+    let mut out = String::with_capacity(TOOLS_PROMPT_QWEN.len() + schemas.len());
+    out.push_str(&TOOLS_PROMPT_QWEN[..at]);
+    out.push_str(&schemas);
+    out.push_str(&TOOLS_PROMPT_QWEN[at..]);
+    crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
+    append_working_style(&mut out);
+    (out, 0)
 }
 
 /// Plank-owned guidance on how to spend turns, appended after the native tool
@@ -1158,7 +1206,7 @@ pub fn build_system_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> SplitSystemPrompt {
-    build_system_prompt_parts_with_wasm(user_system, mcp_servers, &[], parity)
+    build_system_prompt_parts_with_wasm(user_system, mcp_servers, &[], parity, ToolSyntax::Dsml)
 }
 
 /// [`build_system_prompt_parts`] with WASM component tools folded in.
@@ -1173,9 +1221,10 @@ pub fn build_system_prompt_parts_with_wasm(
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
+    syntax: ToolSyntax,
 ) -> SplitSystemPrompt {
     let (mut text, trusted_len) =
-        build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity);
+        build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity, syntax);
     if crate::settings::active().git.sign_commits {
         text.push_str("\n\n");
         text.push_str(COMMIT_SIGNATURE_INSTRUCTION);

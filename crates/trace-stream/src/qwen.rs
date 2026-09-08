@@ -43,12 +43,16 @@ pub struct QwenParser {
 
 impl QwenParser {
     /// A parser waiting for the first byte.
+    ///
+    /// Starts in `Search`, like `DsmlParser`, and *must*: the renderer reads
+    /// `Structural` as "a stanza is open and unfinished" and reports an
+    /// incomplete tool call for it. Starting there made every plain-prose
+    /// generation report a phantom incomplete call, which fed an error back to
+    /// a model that had done nothing wrong — and it answered, was told again,
+    /// and looped.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            state: DsmlState::Structural,
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// Parser progress.
@@ -69,12 +73,50 @@ impl QwenParser {
         self.error.as_deref()
     }
 
+    /// Snapshot of the call being parsed, for mid-stream preflight.
+    #[must_use]
+    pub fn pending_call(&self) -> Option<ToolCall> {
+        self.current.clone()
+    }
+
+    /// Raw bytes of the stanza accumulated so far, for diagnostics.
+    #[must_use]
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// True while the tail of the open value is a partial `</parameter>`.
+    ///
+    /// Derived rather than tracked: the renderer uses it to force greedy
+    /// sampling through a close tag, and the tail is cheap to re-check from
+    /// the last `<` in the value.
+    #[must_use]
+    pub fn param_close_prefix(&self) -> bool {
+        if self.state != DsmlState::ParamValue {
+            return false;
+        }
+        let value = &self.raw[self.param_value_start.min(self.raw.len())..];
+        let Some(lt) = value.iter().rposition(|&b| b == b'<') else {
+            return false;
+        };
+        is_partial_prefix(&value[lt..], PARAM_CLOSE)
+    }
+
+    /// Resets to a fresh parser, discarding all results.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     /// Feeds streamed bytes. Safe to call a byte at a time.
     ///
     /// Incomplete input leaves the state alone until enough bytes arrive;
     /// input that cannot become a valid stanza switches to
-    /// [`DsmlState::Error`] so the model gets a retryable tool error.
+    /// [`DsmlState::Error`] so the model gets a retryable tool error. A no-op
+    /// once terminal, matching `DsmlParser::feed`.
     pub fn feed(&mut self, bytes: impl AsRef<[u8]>) {
+        if matches!(self.state, DsmlState::Done | DsmlState::Error) {
+            return;
+        }
         self.raw.extend_from_slice(bytes.as_ref());
         self.parse();
     }
@@ -103,15 +145,16 @@ impl QwenParser {
     fn parse(&mut self) {
         // The C refuses to parse until the buffer opens with the marker, which
         // is also what keeps ordinary prose from being read as a call.
-        if self.raw.len() < START.len() {
+        if !self.raw.starts_with(START) {
+            // Still short enough to become the opener: keep waiting. Anything
+            // else is prose, and stays prose.
             if !START.starts_with(&self.raw) {
                 self.state = DsmlState::Search;
             }
             return;
         }
-        if !self.raw.starts_with(START) {
-            self.state = DsmlState::Search;
-            return;
+        if self.state == DsmlState::Search {
+            self.state = DsmlState::Structural;
         }
         if self.parse_pos == 0 {
             self.parse_pos = START.len();
@@ -520,6 +563,58 @@ mod tests {
         assert!(p.error().unwrap().contains("unterminated"));
     }
 
+    #[test]
+    fn param_close_prefix_tracks_a_partial_close_tag() {
+        let mut p = QwenParser::new();
+        feed_all(
+            &mut p,
+            "<tool_call>\n<function=write>\n<parameter=path>\nsrc/a",
+        );
+        assert!(!p.param_close_prefix(), "plain value text");
+        feed_all(&mut p, "\n</para");
+        assert!(p.param_close_prefix(), "partial close tag");
+        feed_all(&mut p, "meter>");
+        assert!(!p.param_close_prefix(), "close tag consumed");
+    }
+
+    /// An angle bracket in the value is not a close-tag prefix, or greedy
+    /// sampling would latch on ordinary code.
+    #[test]
+    fn a_lone_angle_bracket_is_not_a_close_prefix() {
+        let mut p = QwenParser::new();
+        feed_all(
+            &mut p,
+            "<tool_call>\n<function=write>\n<parameter=c>\nif a < b",
+        );
+        assert!(!p.param_close_prefix());
+    }
+
+    #[test]
+    fn feeding_after_a_terminal_state_is_a_no_op() {
+        let mut p = QwenParser::new();
+        feed_all(&mut p, C_LITERAL_MARKUP);
+        p.finish();
+        assert_eq!(p.state(), DsmlState::Done);
+        feed_all(
+            &mut p,
+            "<tool_call>\n<function=rm>\n</function>\n</tool_call>",
+        );
+        assert_eq!(p.calls().len(), 1, "a second stanza must not sneak in");
+    }
+
+    #[test]
+    fn pending_call_exposes_the_call_mid_stream() {
+        let mut p = QwenParser::new();
+        feed_all(
+            &mut p,
+            "<tool_call>\n<function=read>\n<parameter=path>\na\n</parameter>\n",
+        );
+        let pending = p.pending_call().expect("a call is open");
+        assert_eq!(pending.name, "read");
+        assert_eq!(pending.arg_value("path"), Some("a"));
+        assert!(p.calls().is_empty(), "not pushed until the stanza closes");
+    }
+
     /// The C's own route to `DONE`: content after a stanza that cannot start
     /// another call settles the question without waiting for end of stream.
     #[test]
@@ -546,6 +641,24 @@ mod tests {
         p.finish();
         assert_eq!(p.state(), DsmlState::Error);
         assert!(p.error().unwrap().contains("unterminated"));
+    }
+
+    /// The regression that made a working port loop: a generation with no
+    /// tool call at all must not look like an open stanza.
+    #[test]
+    fn a_fresh_parser_is_searching_not_mid_stanza() {
+        let p = QwenParser::new();
+        assert_eq!(p.state(), DsmlState::Search);
+        let mut p = QwenParser::new();
+        feed_all(&mut p, "Here is my answer, no tools needed.");
+        assert_eq!(p.state(), DsmlState::Search);
+        p.finish();
+        assert_eq!(
+            p.state(),
+            DsmlState::Search,
+            "finish must not invent a call"
+        );
+        assert!(p.calls().is_empty());
     }
 
     #[test]
