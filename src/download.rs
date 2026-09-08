@@ -384,6 +384,28 @@ pub fn ensure_dspark_support(engine: &mut crate::config::EngineTuning) -> Result
     Ok(())
 }
 
+/// Fetches the DS4 side artifacts (vision encoder, `DSpark` support) unless the
+/// run is a Qwen3.8-Flash-Next one.
+///
+/// `--ple` is the Qwen marker. Both side artifacts are `DeepSeek` V4 files: the
+/// engine is not handed the vision encoder for a Qwen model, and the `DSpark`
+/// support GGUF is a DS4 draft model that a Qwen target cannot verify against
+/// (Qwen speculates from the MTP block embedded in its own main GGUF). Fetching
+/// either would cost ~7 GB for files this run never opens, so `DSpark` is also
+/// switched off rather than left at its default-on.
+///
+/// # Errors
+/// Propagates the underlying ensure failures for non-Qwen runs.
+pub fn ensure_side_artifacts(engine: &mut crate::config::EngineTuning) -> Result<(), String> {
+    if engine.ple_path.is_some() {
+        engine.dspark = false;
+        engine.dspark_strict = false;
+        return Ok(());
+    }
+    ensure_vision_encoder()?;
+    ensure_dspark_support(engine)
+}
+
 /// Ensures the vision-encoder GGUF exists at its default path, offering to
 /// download it if missing.
 ///
@@ -1718,6 +1740,24 @@ mod tests {
             e.mtp_path,
             Some(PathBuf::from("/somewhere/custom-drafter.gguf"))
         );
+    }
+
+    /// A Qwen run must not reach for either `DeepSeek` side artifact, and must
+    /// leave `DSpark` off: the support GGUF is a DS4 draft a Qwen target cannot
+    /// verify against. No download is stubbed here on purpose — if the gate
+    /// regressed, the ensure calls would try to prompt or fetch and fail.
+    #[test]
+    fn a_qwen_run_skips_the_ds4_side_artifacts_and_disables_dspark() {
+        let mut e = crate::config::EngineTuning {
+            ple_path: Some(PathBuf::from("ple.gguf")),
+            dspark: true,
+            dspark_strict: true,
+            ..Default::default()
+        };
+        assert!(ensure_side_artifacts(&mut e).is_ok());
+        assert!(!e.dspark, "DSpark must be off for a Qwen target");
+        assert!(!e.dspark_strict);
+        assert!(e.mtp_path.is_none(), "no DS4 support model resolved");
     }
 
     #[test]

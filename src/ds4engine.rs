@@ -195,13 +195,23 @@ impl Ds4Model {
         // `~/.plank/ds4flash.vision.gguf` and is downloaded at startup when
         // absent. A null path would keep the engine text-only, but plank never
         // passes one — the `view_image` tool is served unconditionally.
+        // ...except under `--ple`, which means a Qwen3.8-Flash-Next main model.
+        // The DS4 encoder is not a Qwen encoder, and handing it over fails the
+        // load outright, so a Qwen run is text-only until a Qwen encoder is
+        // wired up (the C branch ships a separate `qwen38-vision` target).
         let vision_path = crate::download::default_vision_path();
-        let c_vision = c_opt_path(Some(&vision_path), "vision encoder")?;
+        let c_vision = if tuning.ple_path.is_some() {
+            None
+        } else {
+            c_opt_path(Some(&vision_path), "vision encoder")?
+        };
+        let c_ple = c_opt_path(tuning.ple_path.as_deref(), "ple sidecar")?;
         let as_ptr = |c: &Option<CString>| c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let opts = ffi::Ds4EngineOptions {
             model_path: c_path.as_ptr(),
             mtp_path: as_ptr(&c_mtp),
             vision_path: as_ptr(&c_vision),
+            ple_path: as_ptr(&c_ple),
             backend,
             n_threads,
             context_size: ctx_size,

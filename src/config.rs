@@ -220,6 +220,9 @@ pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 pub struct EngineTuning {
     /// Multi-token-prediction draft model from `--mtp`.
     pub mtp_path: Option<PathBuf>,
+    /// Qwen3.8-Flash-Next external PLE n-gram sidecar from `--ple`. Required
+    /// by the Qwen Q4 release, rejected by the engine for any other model.
+    pub ple_path: Option<PathBuf>,
     /// Draft tokens per MTP step from `--mtp-draft` (C default: 1).
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
@@ -278,6 +281,7 @@ impl Default for EngineTuning {
     fn default() -> Self {
         Self {
             mtp_path: None,
+            ple_path: None,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
             dspark: true,
@@ -442,6 +446,9 @@ Options:
       --cpu                use the CPU backend
       --power N            GPU power cap percent (1..100)
       --mtp PATH           multi-token-prediction draft model (GGUF)
+      --ple PATH           Qwen3.8-Flash-Next external PLE n-gram sidecar (GGUF);
+                           required by the Qwen release, and a Qwen run is
+                           text-only (the DS4 vision encoder is not loaded)
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
       --dspark             DSpark speculative decoding (on by default); downloads
@@ -1141,6 +1148,7 @@ fn parse_engine_option(
 ) -> Result<(), String> {
     match arg {
         "--mtp" => e.mtp_path = Some(PathBuf::from(v)),
+        "--ple" => e.ple_path = Some(PathBuf::from(v)),
         "--mtp-draft" => e.mtp_draft_tokens = parse_int(v, arg)?,
         "--mtp-margin" => e.mtp_margin = parse_float_range(v, arg, 0.0, 1000.0)?,
         // The C turns DSpark on for any of its three flags, so the threshold
@@ -1394,6 +1402,7 @@ pub fn parse_options_with(
                 c.engine.dspark_strict = true;
             }
             "--mtp"
+            | "--ple"
             | "--mtp-draft"
             | "--mtp-margin"
             | "--dspark-confidence"
@@ -2149,6 +2158,21 @@ mod tests {
         assert!(c.engine.ssd_streaming_cold);
         assert_eq!(c.engine.ssd_streaming_preload_experts, 8);
         assert_eq!(c.engine.simulate_used_memory_bytes, 64 << 30);
+    }
+
+    /// `--ple` selects the Qwen3.8 sidecar and nothing else; it is only the
+    /// Qwen marker, so it must not disturb the DS4 knobs around it.
+    #[test]
+    fn ple_flag_sets_the_qwen_sidecar_path() {
+        let c = parse_options(&args(&["--ple", "ple.gguf"])).unwrap();
+        assert_eq!(c.engine.ple_path, Some(PathBuf::from("ple.gguf")));
+        assert!(c.engine.mtp_path.is_none());
+        assert!(c.model_path.is_none());
+    }
+
+    #[test]
+    fn ple_defaults_to_unset() {
+        assert!(parse_options(&[]).unwrap().engine.ple_path.is_none());
     }
 
     #[test]
