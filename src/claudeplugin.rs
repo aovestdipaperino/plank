@@ -412,8 +412,7 @@ fn resolve_marketplace(
     }
     if crate::plugins::manifest_path(&canon_dir).is_none() {
         return Err(format!(
-            "marketplace entry '{want}' has no .plank-plugin/plugin.json or \
-             .claude-plugin/plugin.json at {source}"
+            "marketplace entry '{want}' has no .plank-plugin/plugin.json or .claude-plugin/plugin.json at {source}"
         ));
     }
     Ok(canon_dir)
