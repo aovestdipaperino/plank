@@ -54,15 +54,21 @@ fn resolve_and_activate_profile(
     match plank::profile::resolve_profile(requested, plugins) {
         plank::profile::Resolution::None => None,
         plank::profile::Resolution::Activate(active) => {
-            if let Err(e) = std::fs::read_to_string(&active.spec.system_prompt) {
-                eprintln!(
-                    "plank: profile {}: cannot read {}: {e}",
-                    active.name,
-                    active.spec.system_prompt.display()
-                );
-                return Some(ExitCode::from(2));
-            }
-            plank::profile::install(active);
+            let prompt = match std::fs::read_to_string(&active.spec.system_prompt) {
+                Ok(text) => text,
+                Err(e) => {
+                    eprintln!(
+                        "plank: profile {}: cannot read {}: {e}",
+                        active.name,
+                        active.spec.system_prompt.display()
+                    );
+                    return Some(ExitCode::from(2));
+                }
+            };
+            // The one read of the prompt file for the whole run: stored on
+            // the `ActiveProfile` so composition (`sysprompt.rs`) is
+            // infallible and never re-reads the file mid-session.
+            plank::profile::install(plank::profile::ActiveProfile { prompt, ..active });
             None
         }
         plank::profile::Resolution::List(names) => {

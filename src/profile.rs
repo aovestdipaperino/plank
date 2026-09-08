@@ -210,6 +210,14 @@ pub struct ActiveProfile {
     pub name: String,
     /// The parsed block.
     pub spec: ProfileSpec,
+    /// The contents of `spec.system_prompt`, read exactly once at
+    /// activation (`resolve_and_activate_profile` in `main.rs`).
+    ///
+    /// Composition (`sysprompt.rs`) then uses this text and never touches
+    /// the filesystem itself, so a prompt file that is deleted or edited
+    /// mid-session cannot make composition fail or drift: the process reads
+    /// it once, before there is a TUI to corrupt.
+    pub prompt: String,
 }
 
 /// The active profile, set once at startup.
@@ -286,6 +294,10 @@ pub fn resolve_profile(requested: Option<&str>, set: &crate::plugins::PluginSet)
         Some(spec) => Resolution::Activate(ActiveProfile {
             name: plugin.name.clone(),
             spec: spec.clone(),
+            // Filled in by `resolve_and_activate_profile` (main.rs) once it
+            // has confirmed the file is readable; this function has no
+            // filesystem access and stays pure.
+            prompt: String::new(),
         }),
         None => Resolution::NotAProfile(name.to_string()),
     }

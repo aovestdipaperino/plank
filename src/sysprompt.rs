@@ -508,7 +508,7 @@ fn build_tools_prompt_parts_with_wasm(
     // A profile replaces the whole prose prompt; the schema block is still
     // generated, from the allow-listed builtins.
     let (mut out, trusted_len) = if let Some((text, spec)) = profile_prompt_source() {
-        compose_profile_prompt(&text, &spec)
+        compose_profile_prompt(text, &spec, parity)
     } else {
         let mut out = build_tools_prompt_base(parity);
         insert_marker_spelling_note(&mut out);
@@ -617,6 +617,13 @@ fn append_wasm_tool_schemas(out: &mut String, tools: &[&crate::wasmreg::WasmTool
 
 /// The token a profile prompt may use to pull in the trained DSML call-syntax
 /// text instead of retyping it.
+///
+/// Expands to everything the base prompt says before `### Available Tool
+/// Schemas` — not just the call-shape grammar, but also its surrounding
+/// prose about specific builtins (`bash_status`, `bash_stop`, `google_search`,
+/// `visit_page`, the read/edit guidance). A profile that allow-lists only
+/// some builtins still receives all of this prose, including sentences about
+/// tools it does not have; there is no per-tool filtering of it.
 pub const TOOL_PROTOCOL_TOKEN: &str = "{{plank:tool-protocol}}";
 
 /// The DSML call-syntax section of the C prompt: everything from the top of
@@ -626,11 +633,22 @@ pub const TOOL_PROTOCOL_TOKEN: &str = "{{plank:tool-protocol}}";
 /// the model was trained on it, and paraphrasing it degrades tool calling in
 /// ways that read as model bugs. Computed from the parity base rather than
 /// duplicated, so it can never drift from it.
+///
+/// Like [`TOOL_PROTOCOL_TOKEN`], the returned text is the *whole* prefix
+/// before the schema block, prose about specific builtins included, not only
+/// the call-syntax grammar; there is no per-tool filtering.
+///
+/// `parity` selects which base to draw from ([`build_tools_prompt_base`]):
+/// with `parity` false the [`IN_THINK_PROHIBITION`] line is stripped, same as
+/// for a plain run, so a profile under a permissive engine is not told to
+/// avoid something plank will in fact dispatch.
 #[must_use]
-pub fn tool_protocol_fragment() -> &'static str {
-    static FRAGMENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    FRAGMENT.get_or_init(|| {
-        let base = build_tools_prompt_base(true);
+pub fn tool_protocol_fragment(parity: bool) -> &'static str {
+    static PARITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static PERMISSIVE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let cell = if parity { &PARITY } else { &PERMISSIVE };
+    cell.get_or_init(|| {
+        let base = build_tools_prompt_base(parity);
         match base.find("### Available Tool Schemas") {
             Some(at) => base[..at].to_string(),
             None => base,
@@ -641,35 +659,96 @@ pub fn tool_protocol_fragment() -> &'static str {
 /// Renders `specs` as the `### Available Tool Schemas` block, in the same
 /// `OpenAI` function shape the C prompt uses.
 ///
-/// Pretty-printed with two-space indentation because that is what
-/// `resources/tools_prompt_after_edit.txt` does, and the model saw that
-/// formatting in training.
+/// Hand-formatted rather than run through `serde_json::to_string_pretty`:
+/// this crate's `serde_json` is built without the `preserve_order` feature,
+/// so a `serde_json::Value`'s object keys are a `BTreeMap` and serialize
+/// alphabetically — `description` before `name`, `function` before `type` —
+/// which is not the shape `resources/tools_prompt_after_edit.txt` has and not
+/// what the model saw in training. This function instead writes the fields in
+/// the fixed order the C prompt uses (`type`, then `function` with `name`,
+/// `description`, `parameters` in that order), two-space indented, matching
+/// [`append_wasm_tool_schemas`]'s approach. Only the guarantee that changed:
+/// this is the exact byte shape of the C examples, not merely valid JSON in
+/// some order.
 #[must_use]
 pub fn render_schema_block(specs: &[crate::engine::ToolSpec]) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::from("### Available Tool Schemas\n\n");
     for spec in specs {
-        let value = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": spec.parameters,
-            }
-        });
-        // A spec that will not serialize is dropped rather than allowed to
-        // truncate the block: the model is then simply not told about it,
-        // which the dispatch guard already agrees with.
-        if let Ok(text) = serde_json::to_string_pretty(&value) {
-            out.push_str(&text);
-            out.push_str("\n\n");
-        }
+        let _ = write!(
+            out,
+            "{{\n  \"type\": \"function\",\n  \"function\": {{\n    \"name\": \"{}\",\n    \"description\": ",
+            spec.name
+        );
+        crate::tools::mcp::json_escape(&mut out, &spec.description);
+        out.push_str(",\n    \"parameters\": ");
+        render_parameters(&mut out, &spec.parameters);
+        out.push_str("\n  }\n}\n\n");
     }
     out
+}
+
+/// Renders a `parameters` value in the C shape: `type`, then `properties`
+/// (each property compact on one line), then `required` when present — in
+/// that fixed order, rather than the alphabetical order a `BTreeMap`-backed
+/// `serde_json::Value` would otherwise serialize in.
+///
+/// Falls back to `serde_json`'s compact formatter for anything that is not
+/// shaped like the builtins' `{"type": "object", "properties": {...},
+/// "required": [...]}` — still valid JSON, just not guaranteed to match the
+/// C byte order, which only matters for the schemas the model trained on.
+fn render_parameters(out: &mut String, params: &serde_json::Value) {
+    use std::fmt::Write as _;
+
+    let Some(obj) = params.as_object() else {
+        let _ = write!(out, "{}", compact(params));
+        return;
+    };
+    let (Some(ty), Some(props)) = (
+        obj.get("type"),
+        obj.get("properties").and_then(|p| p.as_object()),
+    ) else {
+        let _ = write!(out, "{}", compact(params));
+        return;
+    };
+    out.push_str("{\n      \"type\": ");
+    out.push_str(&compact(ty));
+    out.push_str(",\n      \"properties\": {");
+    let mut first = true;
+    for (key, value) in props {
+        out.push_str(if first { "\n        " } else { ",\n        " });
+        first = false;
+        crate::tools::mcp::json_escape(out, key);
+        let _ = write!(out, ": {}", compact(value));
+    }
+    out.push_str(if first { "}" } else { "\n      }" });
+    if let Some(required) = obj.get("required") {
+        out.push_str(",\n      \"required\": ");
+        out.push_str(&compact(required));
+    }
+    out.push_str("\n    }");
+}
+
+/// `serde_json`'s compact single-line rendering of `value`, or `{}` if it
+/// somehow fails to serialize (it cannot, for a `Value` already in memory).
+fn compact(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Composes a profile's prompt: the profile text with
 /// [`TOOL_PROTOCOL_TOKEN`] expanded, followed by the schema block for the
 /// builtins the profile allows.
+///
+/// `parity` is threaded to [`tool_protocol_fragment`] so a profile under a
+/// permissive engine gets the matching in-think guidance instead of always
+/// the strict-parity text.
+///
+/// Note the omission: [`MARKER_SPELLING_NOTE`] is inserted into this same
+/// region of the default prompt (see [`insert_marker_spelling_note`]) but is
+/// deliberately not added here — a profile replaces the prompt wholesale, and
+/// `dsml.rs` already recovers the `SSML` misspelling via an alias, so the
+/// note would be advisory twice over. Not an oversight.
 ///
 /// Returns the text and its trusted length, matching
 /// [`SplitSystemPrompt::trusted_len`]: all of it is plank-side text the user
@@ -678,8 +757,9 @@ pub fn render_schema_block(specs: &[crate::engine::ToolSpec]) -> String {
 fn compose_profile_prompt(
     profile_text: &str,
     spec: &crate::profile::ProfileSpec,
+    parity: bool,
 ) -> (String, usize) {
-    let mut out = profile_text.replace(TOOL_PROTOCOL_TOKEN, tool_protocol_fragment());
+    let mut out = profile_text.replace(TOOL_PROTOCOL_TOKEN, tool_protocol_fragment(parity));
     if !out.ends_with("\n\n") {
         out.push_str(if out.ends_with('\n') { "\n" } else { "\n\n" });
     }
@@ -694,24 +774,14 @@ fn compose_profile_prompt(
 
 /// The active profile's prompt text and spec, or `None` for a plain run.
 ///
-/// An unreadable prompt file is fatal at startup (`main.rs` checks it before
-/// anything is composed), so a read failure here can only mean the file was
-/// deleted mid-session; falling back to the built-in prompt would silently
-/// change the agent's identity, so the process aborts with a clear message
-/// instead.
-fn profile_prompt_source() -> Option<(String, crate::profile::ProfileSpec)> {
+/// The text is a borrow of what `main.rs` read once at activation
+/// (`ActiveProfile::prompt`); composition never touches the filesystem, so
+/// this is infallible and safe to call mid-session (MCP reload, compaction,
+/// sub-agent spawn) — unlike a re-read, which could fail or race a mid-run
+/// edit of the file after a TUI already exists to corrupt.
+fn profile_prompt_source() -> Option<(&'static str, crate::profile::ProfileSpec)> {
     let active = crate::profile::active()?;
-    match std::fs::read_to_string(&active.spec.system_prompt) {
-        Ok(text) => Some((text, active.spec.clone())),
-        Err(e) => {
-            eprintln!(
-                "plank: profile {}: cannot read {}: {e}",
-                active.name,
-                active.spec.system_prompt.display()
-            );
-            std::process::exit(2);
-        }
-    }
+    Some((active.prompt.as_str(), active.spec.clone()))
 }
 
 /// The C-derived tools prompt with nothing appended.
@@ -1920,7 +1990,7 @@ mod tests {
     #[test]
     fn the_tool_protocol_fragment_is_the_base_prompt_up_to_the_schemas() {
         let base = build_tools_prompt_base(true);
-        let frag = tool_protocol_fragment();
+        let frag = tool_protocol_fragment(true);
         assert!(
             base.starts_with(frag),
             "the fragment must be a prefix of the C base"
@@ -1936,20 +2006,84 @@ mod tests {
     }
 
     #[test]
-    fn the_schema_block_renders_the_named_tools_only() {
-        let specs = vec![crate::engine::ToolSpec {
-            name: "bash".to_string(),
-            description: "Run a shell command.".to_string(),
-            parameters: serde_json::json!({"type":"object","properties":{}}),
-        }];
-        let block = render_schema_block(&specs);
-        assert!(block.starts_with("### Available Tool Schemas\n"));
-        assert!(block.contains("\"name\": \"bash\""));
-        assert!(!block.contains("\"name\": \"read\""));
+    fn the_tool_protocol_fragment_respects_parity() {
+        let strict = tool_protocol_fragment(true);
+        let permissive = tool_protocol_fragment(false);
+        assert!(
+            strict.contains(IN_THINK_PROHIBITION),
+            "parity text keeps the in-think prohibition"
+        );
+        assert!(
+            !permissive.contains(IN_THINK_PROHIBITION),
+            "permissive text drops it, matching engine.thinkingToolCalls"
+        );
+        assert_ne!(strict, permissive);
     }
 
     #[test]
-    fn the_schema_block_is_valid_json_objects() {
+    fn the_schema_block_filters_out_disallowed_tools() {
+        let specs = vec![
+            crate::engine::ToolSpec {
+                name: "bash".to_string(),
+                description: "Run a shell command.".to_string(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            },
+            crate::engine::ToolSpec {
+                name: "read".to_string(),
+                description: "Read a text file.".to_string(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            },
+            crate::engine::ToolSpec {
+                name: "write".to_string(),
+                description: "Create or overwrite a text file.".to_string(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            },
+        ];
+        let named_only: Vec<_> = specs.into_iter().filter(|s| s.name == "bash").collect();
+        let block = render_schema_block(&named_only);
+        assert!(block.starts_with("### Available Tool Schemas\n"));
+        assert!(block.contains("\"name\": \"bash\""));
+        assert!(
+            !block.contains("\"name\": \"read\""),
+            "read was filtered out before rendering, not merely never emitted"
+        );
+        assert!(
+            !block.contains("\"name\": \"write\""),
+            "write was filtered out before rendering, not merely never emitted"
+        );
+    }
+
+    #[test]
+    fn an_empty_allow_list_renders_zero_builtin_schemas() {
+        // The fail-closed property: `builtin_tools: Some(vec![])` must starve
+        // the schema block completely, not silently fall back to "all of
+        // them" the way `None` does.
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(Vec::new()),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let specs: Vec<crate::engine::ToolSpec> = parse_builtin_tool_schemas()
+            .into_iter()
+            .filter(|s| spec.builtin_enabled(&s.name))
+            .collect();
+        assert!(
+            specs.is_empty(),
+            "an empty allow-list must admit no builtins"
+        );
+        let block = render_schema_block(&specs);
+        assert_eq!(
+            block, "### Available Tool Schemas\n\n",
+            "the block is header-only with nothing after it"
+        );
+    }
+
+    #[test]
+    fn the_schema_block_round_trips_through_the_builtin_parser() {
         let specs = parse_builtin_tool_schemas();
         assert!(!specs.is_empty(), "the C prompt carries schemas");
         let block = render_schema_block(&specs);
@@ -1966,16 +2100,24 @@ mod tests {
     }
 
     #[test]
-    fn the_default_prompt_is_unchanged_by_the_profile_code_path() {
-        // The guard on parity: with no profile installed, composition must go
-        // through exactly the pre-existing path.
-        let a = build_system_prompt("", &[], true);
-        let b = build_tools_prompt(&[], true);
-        assert!(
-            a.starts_with(&b),
-            "no profile means the C base leads the prompt"
-        );
-        assert!(!a.contains(TOOL_PROTOCOL_TOKEN));
+    fn the_schema_block_matches_the_c_key_order_and_leaf_shape() {
+        // Pins the hand-formatted shape against the literal C example from
+        // `resources/tools_prompt_after_edit.txt` (`google_search`): `type`
+        // before `function`, `name`/`description`/`parameters` in that
+        // order, and a leaf property collapsed onto one line.
+        let specs = vec![crate::engine::ToolSpec {
+            name: "google_search".to_string(),
+            description: "Search Google in a visible browser and return compact Markdown links."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+        }];
+        let block = render_schema_block(&specs);
+        let expected = "{\n  \"type\": \"function\",\n  \"function\": {\n    \"name\": \"google_search\",\n    \"description\": \"Search Google in a visible browser and return compact Markdown links.\",\n    \"parameters\": {\n      \"type\": \"object\",\n      \"properties\": {\n        \"query\": {\"type\":\"string\"}\n      },\n      \"required\": [\"query\"]\n    }\n  }\n}\n\n";
+        assert_eq!(block, format!("### Available Tool Schemas\n\n{expected}"));
     }
 
     #[test]
@@ -1990,7 +2132,7 @@ mod tests {
             warnings: Vec::new(),
         };
         let text = format!("You are ChatBGT.\n\n{TOOL_PROTOCOL_TOKEN}\n");
-        let (out, trusted) = compose_profile_prompt(&text, &spec);
+        let (out, trusted) = compose_profile_prompt(&text, &spec, true);
         assert!(out.starts_with("You are ChatBGT."));
         assert!(!out.contains(TOOL_PROTOCOL_TOKEN), "the token is expanded");
         assert!(out.contains("｜DSML｜"), "the protocol fragment landed");
@@ -2007,6 +2149,24 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_prompt_respects_parity_too() {
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: None,
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = TOOL_PROTOCOL_TOKEN.to_string();
+        let (strict, _) = compose_profile_prompt(&text, &spec, true);
+        let (permissive, _) = compose_profile_prompt(&text, &spec, false);
+        assert!(strict.contains(IN_THINK_PROHIBITION));
+        assert!(!permissive.contains(IN_THINK_PROHIBITION));
+    }
+
+    #[test]
     fn a_profile_prompt_without_the_token_gets_no_protocol_text() {
         let spec = crate::profile::ProfileSpec {
             display_name: None,
@@ -2017,7 +2177,7 @@ mod tests {
             settings_json: None,
             warnings: Vec::new(),
         };
-        let (out, _) = compose_profile_prompt("Just prose.\n", &spec);
+        let (out, _) = compose_profile_prompt("Just prose.\n", &spec, true);
         assert!(out.starts_with("Just prose."));
         assert!(
             out.contains("### Available Tool Schemas"),
