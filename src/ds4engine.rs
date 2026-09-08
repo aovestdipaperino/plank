@@ -124,14 +124,34 @@ struct ProgressCtx<'a> {
     total: i32,
 }
 
+/// Whether a C progress event reports a prefill position.
+///
+/// The two hooks plank installs carry different event names — `prefill_chunk`
+/// on the chunk hook, `prefill_display` on the display one — and both report an
+/// *absolute* prompt position, which is what makes listening to both safe: a
+/// duplicate report re-states a position rather than adding to one. Anything
+/// else is filtered rather than trusted, because these callbacks are read as
+/// positions and a future event with different units would silently drive the
+/// prefill bar and its tok/s from the wrong number.
+fn is_prefill_event(event: &str) -> bool {
+    matches!(event, "prefill_chunk" | "prefill_display")
+}
+
 unsafe extern "C" fn progress_cb(
     ud: *mut std::os::raw::c_void,
-    _event: *const std::os::raw::c_char,
+    event: *const std::os::raw::c_char,
     cur: std::os::raw::c_int,
     _total: std::os::raw::c_int,
 ) {
     if ud.is_null() {
         return;
+    }
+    if !event.is_null() {
+        // SAFETY: the C passes a static NUL-terminated event name.
+        let name = unsafe { std::ffi::CStr::from_ptr(event) };
+        if !name.to_str().is_ok_and(is_prefill_event) {
+            return;
+        }
     }
     // SAFETY: ud is the ProgressCtx pointer we installed for this sync call.
     let ctx = unsafe { &mut *ud.cast::<ProgressCtx>() };
@@ -1363,6 +1383,8 @@ impl Engine for Ds4Session {
         // which outlives the sync call, and the callback is cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
+            // Qwen3.8 prefill reports only on the chunk hook.
+            ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         // SAFETY: session, tokens, and err buffer are valid for the call.
         // When the prompt carries image tokens, use the multimodal sync so the
@@ -1901,6 +1923,8 @@ impl Engine for Ds4Session {
         // cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
+            // Qwen3.8 prefill reports only on the chunk hook.
+            ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         let mut err = [0_i8; 512];
         // SAFETY: session, tokens, and err buffer are valid.
@@ -2187,6 +2211,8 @@ impl Ds4HostSession {
         // SAFETY: session valid; progress outlives the sync; cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
+            // Qwen3.8 prefill reports only on the chunk hook.
+            ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         // SAFETY: session, tokens, and err buffer valid.
         let sync_rc =
@@ -2616,7 +2642,28 @@ fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sections, spec_block_rewind_target, strip_legacy, think_close_suffix};
+    /// The filter that keeps a position-based callback honest. Both hooks are
+    /// installed, so both names must pass; anything else must not be read as a
+    /// prompt position.
+    #[test]
+    fn only_prefill_events_drive_the_prefill_bar() {
+        assert!(is_prefill_event("prefill_chunk"), "the Qwen3.8 hook");
+        assert!(
+            is_prefill_event("prefill_display"),
+            "the DeepSeek graph hook"
+        );
+        for other in ["", "kv_save", "decode", "prefill", "warmup"] {
+            assert!(
+                !is_prefill_event(other),
+                "{other} is not a prefill position"
+            );
+        }
+    }
+
+    use super::{
+        is_prefill_event, parse_sections, spec_block_rewind_target, strip_legacy,
+        think_close_suffix,
+    };
 
     /// Regression for the 56k-token rebuild in `turbo-vision-debug-2.log`: the
     /// incoming assistant section was the held reply plus exactly `</think>`

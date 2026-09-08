@@ -321,6 +321,19 @@ unsafe extern "C" {
     /// when the prompt *prefix* changes under it (the reasoning-effort preamble
     /// moving in or out), which a common-prefix probe alone cannot recover from.
     pub fn ds4_session_invalidate(s: *mut Ds4Session);
+    /// The chunk-level prefill hook, distinct from `set_display_progress`.
+    ///
+    /// Both report an absolute prompt position. The `DeepSeek` graph paths emit
+    /// the finer `prefill_display` events; the Qwen3.8 path emits only
+    /// `prefill_chunk` on this one, so a Qwen run shows no prefill rate at all
+    /// unless plank listens here too.
+    pub fn ds4_session_set_progress(
+        s: *mut Ds4Session,
+        f: Option<
+            unsafe extern "C" fn(ud: *mut c_void, event: *const c_char, cur: c_int, total: c_int),
+        >,
+        ud: *mut c_void,
+    );
     pub fn ds4_session_set_display_progress(
         s: *mut Ds4Session,
         f: Option<
