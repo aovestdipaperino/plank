@@ -89,6 +89,26 @@ pub fn art(width: u32) -> String {
     logo_art::image_to_ansi_with(transparent_png(), width.max(1), cell())
 }
 
+/// Renders the logo at `path`, falling back to plank's own art.
+///
+/// A profile's identity may fail to be pretty but must not fail to launch: an
+/// absent, unreadable or undecodable PNG degrades to the built-in logo. The
+/// warning is printed once by the caller, not here, so this stays pure enough
+/// to test.
+#[must_use]
+pub fn art_from_path(path: Option<&std::path::Path>, width: u32) -> String {
+    let Some(path) = path else {
+        return art(width);
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return art(width);
+    };
+    if image::load_from_memory(&bytes).is_err() {
+        return art(width);
+    }
+    logo_art::image_to_ansi_with(&bytes, width.max(1), cell())
+}
+
 /// Version label like `v2.5.0`, with ` BETA` appended for beta builds.
 ///
 /// Channel-by-patch scheme (see VERSIONING.md): a `X.Y.0` version is a stable
@@ -122,10 +142,18 @@ fn is_beta(version: &str, patch: &str) -> bool {
     patch != "0" || version.contains("beta")
 }
 
-/// The logo art at [`DEFAULT_WIDTH`] followed by a version line.
+/// The banner: the active profile's logo and name when one is running, else
+/// plank's own art at [`DEFAULT_WIDTH`] and its version line.
 #[must_use]
 pub fn banner() -> String {
-    format!("{}      {}\n", art(DEFAULT_WIDTH), version_label())
+    let (logo, label) = match crate::profile::active() {
+        Some(a) => (
+            art_from_path(a.spec.logo.as_deref(), DEFAULT_WIDTH),
+            crate::profile::display_name().to_string(),
+        ),
+        None => (art(DEFAULT_WIDTH), version_label()),
+    };
+    format!("{logo}      {label}\n")
 }
 
 #[cfg(test)]
@@ -206,5 +234,37 @@ mod tests {
         let label = super::version_label();
         assert!(label.starts_with('v'));
         assert!(label.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn an_unreadable_profile_logo_falls_back_to_the_plank_art() {
+        let missing = std::path::Path::new("/nonexistent/hal.png");
+        let art = super::art_from_path(Some(missing), super::DEFAULT_WIDTH);
+        assert_eq!(
+            art,
+            super::art(super::DEFAULT_WIDTH),
+            "a missing PNG must not change the banner"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_profile_logo_falls_back_to_the_plank_art() {
+        let dir = std::env::temp_dir().join(format!("plank-logo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("bad.png");
+        std::fs::write(&path, b"not a png").expect("write");
+        assert_eq!(
+            super::art_from_path(Some(&path), super::DEFAULT_WIDTH),
+            super::art(super::DEFAULT_WIDTH)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_profile_logo_is_the_plank_art() {
+        assert_eq!(
+            super::art_from_path(None, super::DEFAULT_WIDTH),
+            super::art(super::DEFAULT_WIDTH)
+        );
     }
 }

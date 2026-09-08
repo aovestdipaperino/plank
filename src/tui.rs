@@ -43,7 +43,7 @@ fn visible_style() -> Style {
 /// Theme green, for the note that a `!` command finished.
 #[must_use]
 pub fn done_style() -> Style {
-    Style::default().fg(THEME_GREEN)
+    Style::default().fg(theme_accent())
 }
 
 /// Theme red, for the note that a `!` command finished *unsuccessfully*: a
@@ -1033,7 +1033,7 @@ impl OutputLog {
         self.md_close();
         self.end_line();
         self.lines.push(Line::from(vec![
-            Span::styled(OUTPUT_BULLET, Style::default().fg(THEME_GREEN)),
+            Span::styled(OUTPUT_BULLET, Style::default().fg(theme_accent())),
             Span::styled("Skill", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!("({name})")),
         ]));
@@ -1772,8 +1772,20 @@ impl Default for OutputView {
     }
 }
 
-/// Theme green, used for the prompt separator rule and panel accents.
-const THEME_GREEN: Color = Color::Indexed(114);
+/// Theme accent, used for the prompt separator rule and panel accents.
+///
+/// The active profile's `accent` when it declares one, else the built-in
+/// green. Resolved once: a profile never changes mid-process.
+fn theme_accent() -> Color {
+    static ACCENT: std::sync::OnceLock<Color> = std::sync::OnceLock::new();
+    *ACCENT.get_or_init(
+        || match crate::profile::active().and_then(|a| a.spec.accent) {
+            Some(crate::profile::Accent::Indexed(i)) => Color::Indexed(i),
+            Some(crate::profile::Accent::Rgb(r, g, b)) => Color::Rgb(r, g, b),
+            None => Color::Indexed(114),
+        },
+    )
+}
 
 /// A cheap, cloneable snapshot of the task list for rendering (issue #35): the
 /// status-bar counter plus the strip rows. Sent worker→UI over
@@ -1879,7 +1891,7 @@ fn frame_rows(
     for rule in [rule_top, rule_bottom].into_iter().flatten() {
         let text = "─".repeat(rule.width as usize);
         frame.render_widget(
-            Paragraph::new(Span::styled(text, Style::default().fg(THEME_GREEN))),
+            Paragraph::new(Span::styled(text, Style::default().fg(theme_accent()))),
             rule,
         );
     }
@@ -1961,7 +1973,7 @@ fn render_task_strip(frame: &mut Frame, area: Rect, rows: &[(String, bool)]) {
             break;
         }
         let style = if *is_active {
-            Style::default().fg(THEME_GREEN)
+            Style::default().fg(theme_accent())
         } else {
             Style::default().fg(Color::Indexed(238))
         };
@@ -2011,14 +2023,14 @@ fn render_agent_roster(frame: &mut Frame, area: Rect, roster: &RosterView) {
         let mut spans = vec![
             Span::styled(
                 if row.cursor { "› " } else { "  " },
-                Style::default().fg(THEME_GREEN),
+                Style::default().fg(theme_accent()),
             ),
             Span::styled(
                 if row.running { "○ " } else { "● " },
                 if row.running {
                     name
                 } else {
-                    Style::default().fg(THEME_GREEN)
+                    Style::default().fg(theme_accent())
                 },
             ),
             Span::styled(row.label.clone(), name),
@@ -2208,7 +2220,7 @@ fn input_spans_bare(input: &str) -> Vec<Span<'static>> {
     // plain.
     if let Some(rest) = input.strip_prefix('!') {
         let (marker, color, rest) = match rest.strip_prefix('!') {
-            Some(rest) => ("!!", THEME_GREEN, rest),
+            Some(rest) => ("!!", theme_accent(), rest),
             None => ("!", Color::Red, rest),
         };
         let mut spans = vec![Span::styled(marker.to_string(), Style::default().fg(color))];
@@ -2225,7 +2237,7 @@ fn input_spans_bare(input: &str) -> Vec<Span<'static>> {
         let mut spans = subagent_spans(cmd).unwrap_or_else(|| {
             vec![Span::styled(
                 cmd.to_string(),
-                Style::default().fg(THEME_GREEN),
+                Style::default().fg(theme_accent()),
             )]
         });
         if !rest.is_empty() {
@@ -2247,14 +2259,14 @@ fn input_spans_bare(input: &str) -> Vec<Span<'static>> {
 fn subagent_spans(cmd: &str) -> Option<Vec<Span<'static>>> {
     let name = crate::agents::command_name(cmd)?;
     let color = if crate::agents::is_known(name) {
-        THEME_GREEN
+        theme_accent()
     } else {
         Color::Red
     };
     Some(vec![
         Span::styled(
             crate::agents::SUBAGENT_COMMAND.to_string(),
-            Style::default().fg(THEME_GREEN),
+            Style::default().fg(theme_accent()),
         ),
         Span::styled(format!(":{name}"), Style::default().fg(color)),
     ])
@@ -2380,7 +2392,7 @@ pub fn draw_report(
         .title(Span::styled(
             format!(" {} · Esc closes ", panel.title),
             Style::default()
-                .fg(THEME_GREEN)
+                .fg(theme_accent())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(rect);
@@ -2465,7 +2477,7 @@ fn render_popup(frame: &mut Frame, area: Rect, popup: &crate::complete::Popup) {
         })
         .collect();
     let list = List::new(items)
-        .highlight_style(Style::default().fg(THEME_GREEN))
+        .highlight_style(Style::default().fg(theme_accent()))
         .highlight_symbol("> ");
     let mut state = ListState::default();
     state.select(Some(popup.selected()));
@@ -2560,7 +2572,7 @@ fn render_slash_menu(frame: &mut Frame, area: Rect, menu: &crate::slashmenu::Sla
             let name_color = if e.source.is_plugin() {
                 Color::Yellow
             } else {
-                THEME_GREEN
+                theme_accent()
             };
             ListItem::new(Line::from(vec![
                 Span::styled(
@@ -3004,7 +3016,7 @@ pub fn render_diff_card(log: &mut OutputLog, p: &crate::tools::diff::EditPreview
     use crate::tools::diff::{DiffRow, gutter, human_size, plural};
     let verb = if p.created { "Create" } else { "Update" };
     let mut head = vec![
-        Span::styled("● ", Style::default().fg(THEME_GREEN)),
+        Span::styled("● ", Style::default().fg(theme_accent())),
         Span::styled(
             format!("{verb}({})", p.path),
             Style::default().add_modifier(Modifier::BOLD),
@@ -4062,7 +4074,7 @@ fn render_ask_panel(
             Span::styled(
                 chip.clone(),
                 Style::default()
-                    .bg(THEME_GREEN)
+                    .bg(theme_accent())
                     .fg(Color::Black)
                     .add_modifier(Modifier::BOLD),
             )
@@ -4091,7 +4103,7 @@ fn render_ask_panel(
         };
         let mut style = Style::default();
         if is_cursor {
-            style = style.fg(THEME_GREEN).add_modifier(Modifier::BOLD);
+            style = style.fg(theme_accent()).add_modifier(Modifier::BOLD);
         }
         let mut spans = vec![Span::styled(format!("{marker}{}", opt.label), style)];
         if !opt.description.is_empty() {
@@ -4194,7 +4206,7 @@ pub fn draw_btw_split(
         .title(Span::styled(
             " btw · Esc closes ",
             Style::default()
-                .fg(THEME_GREEN)
+                .fg(theme_accent())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(cols[1]);
@@ -4248,7 +4260,7 @@ fn draw_sub_header(frame: &mut Frame, area: Rect, label: &str) {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 title,
-                bar.fg(THEME_GREEN).add_modifier(Modifier::BOLD),
+                bar.fg(theme_accent()).add_modifier(Modifier::BOLD),
             )),
             Rect::new(area.x, area.y, title_width, 1),
         );
@@ -4437,7 +4449,7 @@ fn push_git_stat(spans: &mut Vec<Span<'static>>, stat: &str, base: Style) {
 #[must_use]
 pub fn progress_line(text: &str) -> Line<'static> {
     let base = Style::default();
-    let theme = base.fg(THEME_GREEN).add_modifier(Modifier::BOLD);
+    let theme = base.fg(theme_accent()).add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
     push_accented(&mut spans, text, anim_tick_ms(), base, theme);
     Line::from(spans)
@@ -4680,7 +4692,7 @@ mod tests {
 
     #[test]
     fn a_skill_load_shows_a_green_bullet_and_an_indented_status() {
-        use super::{Line, OutputLog, THEME_GREEN};
+        use super::{Line, OutputLog, theme_accent};
         let mut log = OutputLog::new();
         log.push_skill_loaded("superpowers:brainstorming");
         let rows: Vec<String> = log.to_text().lines.iter().map(Line::to_string).collect();
@@ -4692,7 +4704,7 @@ mod tests {
                 "",
             ]
         );
-        assert_eq!(log.lines[0].spans[0].style.fg, Some(THEME_GREEN));
+        assert_eq!(log.lines[0].spans[0].style.fg, Some(theme_accent()));
     }
 
     #[test]
@@ -5885,20 +5897,20 @@ mod tests {
         // A bare known command: whole token green.
         assert_eq!(
             parts("/help"),
-            vec![("/help".to_owned(), Some(THEME_GREEN))]
+            vec![("/help".to_owned(), Some(theme_accent()))]
         );
         // Known command with args: only the token is green, the rest plain.
         assert_eq!(
             parts("/btw what is this"),
             vec![
-                ("/btw".to_owned(), Some(THEME_GREEN)),
+                ("/btw".to_owned(), Some(theme_accent())),
                 (" what is this".to_owned(), None),
             ]
         );
         assert_eq!(
             parts("/checkpoint before-refactor"),
             vec![
-                ("/checkpoint".to_owned(), Some(THEME_GREEN)),
+                ("/checkpoint".to_owned(), Some(theme_accent())),
                 (" before-refactor".to_owned(), None),
             ]
         );
@@ -5923,8 +5935,8 @@ mod tests {
         assert_eq!(
             parts("/subagent:spanreviewer check the diff"),
             vec![
-                ("/subagent".to_owned(), Some(THEME_GREEN)),
-                (":spanreviewer".to_owned(), Some(THEME_GREEN)),
+                ("/subagent".to_owned(), Some(theme_accent())),
+                (":spanreviewer".to_owned(), Some(theme_accent())),
                 (" check the diff".to_owned(), None),
             ]
         );
@@ -5933,7 +5945,7 @@ mod tests {
         assert_eq!(
             parts("/subagent:nosuchagent check the diff"),
             vec![
-                ("/subagent".to_owned(), Some(THEME_GREEN)),
+                ("/subagent".to_owned(), Some(theme_accent())),
                 (":nosuchagent".to_owned(), Some(Color::Red)),
                 (" check the diff".to_owned(), None),
             ]
@@ -5943,7 +5955,7 @@ mod tests {
         assert_eq!(
             parts("/subagent:nosuchagent"),
             vec![
-                ("/subagent".to_owned(), Some(THEME_GREEN)),
+                ("/subagent".to_owned(), Some(theme_accent())),
                 (":nosuchagent".to_owned(), Some(Color::Red)),
             ]
         );
@@ -5951,7 +5963,7 @@ mod tests {
         assert_eq!(
             parts("/subagent check the diff"),
             vec![
-                ("/subagent".to_owned(), Some(THEME_GREEN)),
+                ("/subagent".to_owned(), Some(theme_accent())),
                 (" check the diff".to_owned(), None),
             ]
         );
@@ -6178,12 +6190,12 @@ mod tests {
             let at = text.find(name).expect("the name is drawn");
             cells[at].1
         };
-        assert_eq!(name_cell(&known, "drawnreviewer"), THEME_GREEN);
+        assert_eq!(name_cell(&known, "drawnreviewer"), theme_accent());
         assert_eq!(name_cell(&unknown, "nosuchagent"), Color::Red);
         // The command half stays green in both cases: the command is valid
         // either way, and only the name is in question.
-        assert_eq!(name_cell(&known, "subagent"), THEME_GREEN);
-        assert_eq!(name_cell(&unknown, "subagent"), THEME_GREEN);
+        assert_eq!(name_cell(&known, "subagent"), theme_accent());
+        assert_eq!(name_cell(&unknown, "subagent"), theme_accent());
         // The task text is not coloured at all.
         assert_eq!(name_cell(&known, "check"), Color::Reset);
     }
@@ -6198,7 +6210,7 @@ mod tests {
         let cells = drawn_input_colors("/btw what is this");
         let text: String = cells.iter().map(|&(c, _)| c).collect();
         let at = text.find("/btw").expect("the command is drawn");
-        assert_eq!(cells[at].1, THEME_GREEN, "drawn as: {text:?}");
+        assert_eq!(cells[at].1, theme_accent(), "drawn as: {text:?}");
     }
 
     #[test]
@@ -6296,7 +6308,7 @@ mod tests {
         let (lines, _, _) = wrap_input("/help", 20, 0, Some((0, 5)));
         for span in &lines[0].spans {
             assert!(span.style.add_modifier.contains(Modifier::REVERSED));
-            assert_eq!(span.style.fg, Some(THEME_GREEN));
+            assert_eq!(span.style.fg, Some(theme_accent()));
         }
     }
 
@@ -7036,14 +7048,17 @@ mod tests {
         assert_eq!(
             colored("!!ls -la"),
             vec![
-                ("!!".to_string(), Some(THEME_GREEN)),
+                ("!!".to_string(), Some(theme_accent())),
                 ("ls -la".to_string(), None),
             ],
             "a double bang stays local"
         );
         // Bare markers still color, so the cue appears on the first keystroke.
         assert_eq!(colored("!"), vec![("!".to_string(), Some(Color::Red))]);
-        assert_eq!(colored("!!"), vec![("!!".to_string(), Some(THEME_GREEN))]);
+        assert_eq!(
+            colored("!!"),
+            vec![("!!".to_string(), Some(theme_accent()))]
+        );
     }
 
     /// The turn footer always shows all three units, so consecutive turns line
@@ -7847,7 +7862,7 @@ mod tests {
         let rule_y = prompt_y - 1;
         let rule = &buf[(0, rule_y)];
         assert_eq!(rule.symbol(), "─");
-        assert_eq!(rule.style().fg, Some(THEME_GREEN));
+        assert_eq!(rule.style().fg, Some(theme_accent()));
 
         // Prompt hidden (agent busy): no rule — the row above the (empty)
         // input line is ordinary output, never the green ─.
@@ -7869,7 +7884,7 @@ mod tests {
         let buf = term.backend().buffer();
         let has_rule = (0..buf.area.height).any(|y| {
             let c = &buf[(0, y)];
-            c.symbol() == "─" && c.style().fg == Some(THEME_GREEN)
+            c.symbol() == "─" && c.style().fg == Some(theme_accent())
         });
         assert!(!has_rule, "no separator while the prompt is hidden");
     }
