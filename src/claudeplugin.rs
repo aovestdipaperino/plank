@@ -339,14 +339,10 @@ pub fn resolve_in_tree(staged: &Path, want: Option<&str>) -> Result<PathBuf, Str
     if market.is_file() {
         return resolve_marketplace(staged, &market, want);
     }
-    if staged.join(".claude-plugin").join("plugin.json").is_file() {
+    if crate::plugins::manifest_path(staged).is_some() {
         return Ok(staged.to_path_buf());
     }
-    Err(
-        "this is not a Claude Code plugin: no .claude-plugin/plugin.json and no \
-         .claude-plugin/marketplace.json at its root"
-            .to_string(),
-    )
+    Err("this is not a plank or Claude Code plugin: no .plank-plugin/plugin.json, no .claude-plugin/plugin.json and no .claude-plugin/marketplace.json at its root".to_string())
 }
 
 /// Picks `want` out of a marketplace manifest. Split out to keep
@@ -414,13 +410,10 @@ fn resolve_marketplace(
             "marketplace entry '{want}' points outside the repository, at {source}"
         ));
     }
-    if !canon_dir
-        .join(".claude-plugin")
-        .join("plugin.json")
-        .is_file()
-    {
+    if crate::plugins::manifest_path(&canon_dir).is_none() {
         return Err(format!(
-            "marketplace entry '{want}' has no .claude-plugin/plugin.json at {source}"
+            "marketplace entry '{want}' has no .plank-plugin/plugin.json or \
+             .claude-plugin/plugin.json at {source}"
         ));
     }
     Ok(canon_dir)
@@ -604,9 +597,7 @@ fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
             // would make a git clone of a directory-of-directories resolve
             // somewhere it never has before.
             find_claude_root(staging).ok_or_else(|| {
-                "this is not a Claude Code plugin: no .claude-plugin/plugin.json and no \
-                 .claude-plugin/marketplace.json at its root or one level in"
-                    .to_string()
+                "this is not a plank or Claude Code plugin: no .plank-plugin/plugin.json, no .claude-plugin/plugin.json and no .claude-plugin/marketplace.json at its root or one level in".to_string()
             })
         }
     }
@@ -1618,12 +1609,29 @@ mod tests {
     }
 
     #[test]
-    fn a_tree_with_no_claude_manifest_refuses() {
-        let staged = tmpdir("install-nomanifest");
+    fn a_plank_spelling_only_tree_installs() {
+        let staged = tmpdir("install-plankspelling");
         write(&staged, ".plank-plugin/plugin.json", r#"{"name":"native"}"#);
+        let home = tmpdir("install-plankspelling-home");
+        let installed = install_staged(&staged, None, &install_dir(&home), true).expect("installs");
+        assert!(
+            installed
+                .dest
+                .join(".plank-plugin")
+                .join("plugin.json")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn a_tree_with_no_manifest_at_all_refuses() {
+        let staged = tmpdir("install-nomanifest");
+        write(&staged, "README.md", "nothing here\n");
         let home = tmpdir("install-nomanifest-home");
         let err = install_staged(&staged, None, &install_dir(&home), true).expect_err("refused");
+        assert!(err.contains(".plank-plugin/plugin.json"), "{err}");
         assert!(err.contains(".claude-plugin/plugin.json"), "{err}");
+        assert!(err.contains(".claude-plugin/marketplace.json"), "{err}");
     }
 
     #[test]
