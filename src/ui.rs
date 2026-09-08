@@ -5314,6 +5314,7 @@ impl Agent<'_> {
         // A new session, a new name — minted here for the same reason
         // `new_agent` mints one at launch (see `SessionStore::mint_id`).
         self.session.id = self.store.mint_id();
+        self.session.profile = crate::profile::active_name().map(str::to_string);
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
@@ -5566,7 +5567,10 @@ impl Agent<'_> {
                 ),
                 Err(e) => println!("list failed: {e}"),
             },
-            "/switch" => match self.store.load(arg) {
+            "/switch" => match self
+                .store
+                .load_for_profile(arg, crate::profile::active_name())
+            {
                 Ok(s) => {
                     print!(
                         "{}",
@@ -6022,11 +6026,14 @@ impl Agent<'_> {
                 .ok_or_else(|| format!("no session number {n} (see /resume)"))?;
             return self
                 .store
-                .load(&entry.id)
+                .load_for_profile(&entry.id, crate::profile::active_name())
                 .map(Some)
                 .map_err(|e| e.to_string());
         }
-        self.store.load(arg).map(Some).map_err(|e| e.to_string())
+        self.store
+            .load_for_profile(arg, crate::profile::active_name())
+            .map(Some)
+            .map_err(|e| e.to_string())
     }
 
     /// Resumes a session named on the command line (`plank /resume [prefix]`)
@@ -6041,7 +6048,9 @@ impl Agent<'_> {
             let entry = entries
                 .first()
                 .ok_or_else(|| "no saved sessions to resume".to_string())?;
-            self.store.load(&entry.id).map_err(|e| e.to_string())?
+            self.store
+                .load_for_profile(&entry.id, crate::profile::active_name())
+                .map_err(|e| e.to_string())?
         } else {
             self.resume_pick(arg)?
                 .ok_or_else(|| "no such session".to_string())?
@@ -10777,7 +10786,10 @@ impl Agent<'_> {
                     crate::resumepane::Outcome::Close => resume_pane = None,
                     crate::resumepane::Outcome::Resume(id) => {
                         resume_pane = None;
-                        match self.store.load(&id) {
+                        match self
+                            .store
+                            .load_for_profile(&id, crate::profile::active_name())
+                        {
                             Ok(s) => self.adopt_session(s, &mut log, &mut sub_pane),
                             Err(e) => log.push_plain(format!("resume failed: {e}")),
                         }
@@ -13354,7 +13366,10 @@ impl Agent<'_> {
                 }
                 Err(e) => log.push_plain(format!("list failed: {e}")),
             },
-            "/switch" => match self.store.load(arg) {
+            "/switch" => match self
+                .store
+                .load_for_profile(arg, crate::profile::active_name())
+            {
                 Ok(s) => self.adopt_session(s, log, sub),
                 Err(e) => log.push_plain(format!("switch failed: {e}")),
             },
@@ -15232,6 +15247,7 @@ fn new_agent(
     // the rule above the prompt from the first frame, and the name it shows has
     // to be the one the file ends up under.
     session.id = store.mint_id();
+    session.profile = crate::profile::active_name().map(str::to_string);
     crate::debugmirror::set_session_id(&session.id);
     // Loaded before the session context because the model-visible roster rides
     // in it: the roster the model sees has to be the same merged list
