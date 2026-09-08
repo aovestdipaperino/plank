@@ -547,6 +547,37 @@ pub struct SessionStore {
     dir: PathBuf,
 }
 
+/// Leaf name of the cache directory under `~/.plank`, set at most once at
+/// startup by [`SessionStore::set_cache_leaf`].
+static CACHE_LEAF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The default leaf, used when startup never set one.
+pub const DEFAULT_CACHE_LEAF: &str = "kvcache";
+
+/// The leaf a Qwen run uses instead.
+pub const QWEN_CACHE_LEAF: &str = "kvcache-qwen";
+
+/// The configured cache-directory leaf, or [`DEFAULT_CACHE_LEAF`] when unset.
+fn cache_leaf() -> &'static str {
+    CACHE_LEAF.get().map_or(DEFAULT_CACHE_LEAF, String::as_str)
+}
+
+/// Which cache leaf a run with this `--ple` setting belongs in.
+///
+/// `--ple` is the Qwen marker (only a Qwen3.8 model accepts a PLE sidecar), so
+/// it is also what separates the two models' caches. Kept here, beside the
+/// leaves themselves, rather than inline at each startup path: both the
+/// interactive and `serve` entry points have to agree, and a run that picked
+/// the wrong leaf would silently sweep the other model's checkpoints.
+#[must_use]
+pub fn cache_leaf_for(ple_path: Option<&Path>) -> &'static str {
+    if ple_path.is_some() {
+        QWEN_CACHE_LEAF
+    } else {
+        DEFAULT_CACHE_LEAF
+    }
+}
+
 impl SessionStore {
     /// Opens (creating if needed) a session store at `dir`.
     ///
@@ -560,13 +591,35 @@ impl SessionStore {
         Ok(Self { dir })
     }
 
-    /// Default cache directory: `$HOME/.plank/kvcache` (`.` if HOME unset).
+    /// Default cache directory: `$HOME/.plank/<leaf>` (`.` if HOME unset),
+    /// where `<leaf>` is `kvcache` unless [`Self::set_cache_leaf`] renamed it.
     #[must_use]
     pub fn default_dir() -> PathBuf {
         let home = std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
             .map_or_else(|| PathBuf::from("."), PathBuf::from);
-        home.join(".plank").join("kvcache")
+        home.join(".plank").join(cache_leaf())
+    }
+
+    /// Points [`Self::default_dir`] at a different leaf for the rest of the
+    /// process. Only the first call takes effect.
+    ///
+    /// This is what keeps a second model off the `DeepSeek` cache. The two
+    /// models' blobs are already mutually unreadable — every `KvKey`
+    /// signature is a fingerprint over the model name, so neither can ever
+    /// load the other's — but sharing one directory still shares the GC:
+    /// startup sweeps a single byte budget, and only the fingerprints of the
+    /// *live* launch are `active`, so each model's launch is free to evict the
+    /// other's checkpoints. Separate leaves give each its own budget and its
+    /// own sweep, so the cost of switching models is nothing rather than a
+    /// re-prefill.
+    pub fn set_cache_leaf(leaf: &str) {
+        // Deliberately ignores a second call rather than panicking: the leaf is
+        // read on the very next line of startup, so a late or repeated set is a
+        // programming error the caller cannot recover from anyway, and a
+        // process that already opened the store must not have the path move
+        // under it.
+        drop(CACHE_LEAF.set(leaf.to_owned()));
     }
 
     /// Directory this store persists sessions in.
@@ -3329,6 +3382,35 @@ hello\n";
     /// one. What changed is *why* a checkpoint dies — expiry rather than
     /// fingerprint inequality — so the clock is wound past the tier TTL to make
     /// the superseded ones collectable.
+    /// The whole point of the split: a Qwen run and a `DeepSeek` run must not
+    /// land in the same directory, or each launch's sweep would evict the
+    /// other's checkpoints under one shared byte budget.
+    #[test]
+    fn a_ple_run_gets_its_own_cache_leaf() {
+        assert_eq!(cache_leaf_for(None), DEFAULT_CACHE_LEAF);
+        assert_eq!(cache_leaf_for(Some(Path::new("ple.gguf"))), QWEN_CACHE_LEAF);
+        assert_ne!(DEFAULT_CACHE_LEAF, QWEN_CACHE_LEAF);
+    }
+
+    /// `default_dir` must keep resolving under `~/.plank` with the plain leaf
+    /// when startup never overrode it — the override is a `OnceLock`, so this
+    /// also pins that an unset lock reads as the `DeepSeek` default rather than
+    /// as empty.
+    #[test]
+    fn default_dir_uses_the_plain_leaf_until_overridden() {
+        let dir = SessionStore::default_dir();
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some(DEFAULT_CACHE_LEAF)
+        );
+        assert_eq!(
+            dir.parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str()),
+            Some(".plank")
+        );
+    }
+
     #[test]
     fn sweep_collects_superseded_system_checkpoints_and_spares_the_live_ones() {
         let dir = temp_dir("sys-gc");

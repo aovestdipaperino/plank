@@ -41,6 +41,17 @@ fn arm_panic_dump() {
     ));
 }
 
+/// Points the session store at this run's cache directory.
+///
+/// Must run before anything opens the store, which both startup paths do
+/// within a few lines. See [`plank::session::cache_leaf_for`] for why a Qwen
+/// run is kept out of the `DeepSeek` cache.
+fn select_cache_dir(cfg: &plank::config::AgentConfig) {
+    plank::session::SessionStore::set_cache_leaf(plank::session::cache_leaf_for(
+        cfg.engine.ple_path.as_deref(),
+    ));
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -178,6 +189,7 @@ fn main() -> ExitCode {
     // the live alternate screen garbled the warm-progress frame), so the gate
     // is the fix rather than a reorder. Nothing to migrate exists before the
     // directory does, so skipping is exact rather than merely cheap.
+    select_cache_dir(&cfg);
     let kv_dir = plank::session::SessionStore::default_dir();
     if let Some(bytes) = plank::session::SessionStore::migrate_kvcache_if_present(&kv_dir)
         && bytes > 0
@@ -669,6 +681,8 @@ fn run_serve(args: &[String]) -> ExitCode {
         }
     };
     plank::interrupt::install();
+
+    select_cache_dir(&cfg);
 
     // Shared-engine mode (issue #28): host one model for many concurrent
     // per-session_id clients. Off by default; the local single-tenant path is
