@@ -313,6 +313,17 @@ fn tools_prompt_matches_c_source() {
     // literal decoder below cannot see through; expand it first.
     let src = expand_string_macros(&src);
     let mut expected = extract_c_string_constant(&src, "agent_tools_prompt_intro");
+    // The intro ends with AGENT_TOOL_CONTRACTS, which plank does not adopt:
+    // two of its sentences are false of plank — a 128 KiB read cap it does not
+    // have (that is the C's `AGENT_TOOL_MAX_BYTES` buffer limit) and hard-link
+    // rejection it never checks. Here the block is the intro's tail, so the
+    // subtraction is a truncation; the Qwen prompt cuts the same block out of
+    // the middle. Everything before it still has to match byte for byte, so
+    // upstream rewording of the rest still surfaces.
+    let contracts_at = expected
+        .find(CONTRACTS_HEAD)
+        .expect("intro still ends with the contracts block plank omits");
+    expected.truncate(contracts_at);
     // plank ships the `[upto]` variant: its edit tool implements the anchor,
     // so it takes the prompt that teaches it. The C's `_edit_exact` sibling
     // (its default since `--edit-upto` became opt-in) is deliberately not the
@@ -321,10 +332,20 @@ fn tools_prompt_matches_c_source() {
         &src,
         "agent_tools_prompt_edit_upto",
     ));
-    expected.push_str(&extract_c_string_constant(
-        &src,
-        "agent_tools_prompt_after_edit",
-    ));
+    // `agent_build_dsml_tools_prompt` splices the vision schema in just before
+    // `\n# Rules\n` rather than carrying it in the after-edit block, so the
+    // assembly here has to do the same. plank's base prompt is the vision=true
+    // variant: the encoder is always offered on the DeepSeek path, and it is a
+    // Qwen run that goes without (which uses `TOOLS_PROMPT_QWEN` instead).
+    let after_edit = extract_c_string_constant(&src, "agent_tools_prompt_after_edit");
+    let rules_at = after_edit
+        .find("\n# Rules\n")
+        .expect("after-edit block still has a Rules section to splice before");
+    expected.push_str(&after_edit[..rules_at]);
+    expected.push_str("\n{\"type\":\"function\",\"function\":");
+    expected.push_str(&extract_c_string_constant(&src, "agent_vision_tool_schema"));
+    expected.push_str("}\n");
+    expected.push_str(&after_edit[rules_at..]);
     // The base is what must match C byte-for-byte. Native plank tools (glob)
     // and MCP tools are layered on top by `build_tools_prompt`, outside the
     // trained table — see `append_native_extra_schemas`.
@@ -407,4 +428,177 @@ fn think_max_min_context_matches_c_source() {
         plank::engine::THINK_MAX_MIN_CONTEXT,
         "think-max minimum context vs C"
     );
+}
+
+/// plank's Metal kernel table must list exactly what the C engine requires.
+///
+/// `ds4_gpu_full_source` treats every entry in its `required_sources` array as
+/// mandatory and aborts the whole startup ("metal backend unavailable") when
+/// one cannot be found. plank has to name each file explicitly, because the
+/// C's fallback search paths only resolve relative to the submodule root. So a
+/// submodule bump that ships a new kernel silently produces a build that
+/// cannot open any model — which is exactly what the Qwen3.8 bump did, adding
+/// `qwen4.metal` and `qwen4_vision.metal`.
+///
+/// Order matters as documentation, not to the engine, so this compares the
+/// pairs as sets and reports each side's surplus.
+#[test]
+fn metal_kernels_match_the_c_reference() {
+    let Some(src) = c_file("ds4_metal.m") else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    let table = src
+        .split_once("required_sources = @[")
+        .expect("required_sources table")
+        .1
+        .split_once("];")
+        .expect("end of required_sources table")
+        .0;
+
+    // Each row is `@[@"VAR", @"metal/file.metal"]`; take the quoted pairs.
+    let mut from_c: Vec<(String, String)> = Vec::new();
+    for row in table.split("@[").skip(1) {
+        let mut quoted = row.split('"').skip(1).step_by(2);
+        let (Some(var), Some(path)) = (quoted.next(), quoted.next()) else {
+            continue;
+        };
+        let file = path.rsplit('/').next().unwrap_or(path);
+        from_c.push((var.to_owned(), file.to_owned()));
+    }
+    assert!(
+        from_c.len() > 20,
+        "parsed only {} rows out of the C table; the parser drifted from the \
+         source layout rather than the table shrinking",
+        from_c.len()
+    );
+
+    let ours: Vec<(String, String)> = plank::ds4engine::METAL_KERNEL_SOURCES
+        .iter()
+        .map(|(v, f)| ((*v).to_owned(), (*f).to_owned()))
+        .collect();
+
+    let missing: Vec<_> = from_c.iter().filter(|e| !ours.contains(e)).collect();
+    let extra: Vec<_> = ours.iter().filter(|e| !from_c.contains(e)).collect();
+    assert!(
+        missing.is_empty(),
+        "the C requires kernels plank never points at, so startup aborts with \
+         \"metal backend unavailable\": {missing:?}"
+    );
+    assert!(
+        extra.is_empty(),
+        "plank points at kernels the C no longer requires: {extra:?}"
+    );
+}
+
+/// The C sentence that opens `AGENT_TOOL_CONTRACTS`, which plank omits.
+const CONTRACTS_HEAD: &str = "Read output is limited to 128 KiB.";
+/// The sentence that follows that block, marking where plank resumes.
+const AFTER_CONTRACTS: &str = "Inside string values only,";
+
+/// plank's Qwen tools prompt against the C's, assembled the same way.
+///
+/// `agent_build_qwen_tools_prompt` concatenates the intro, each line of
+/// `agent_glm_tool_schemas` wrapped as a `{"type": "function", ...}` object,
+/// the after-schemas block, the `[upto]` edit line, and the rules tail. This
+/// rebuilds exactly that from the C source, with the one documented
+/// subtraction: `AGENT_TOOL_CONTRACTS` is not adopted, because two of its
+/// sentences are false of plank (a 128 KiB read cap it does not have, and
+/// hard-link rejection it never checks). Everything else must match byte for
+/// byte, so upstream wording changes still surface here.
+#[test]
+fn qwen_tools_prompt_matches_c_source() {
+    let Some(src) = c_source() else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    let src = expand_string_macros(&src);
+    let intro = extract_c_string_constant(&src, "agent_qwen_tools_prompt_intro");
+    let schemas = extract_c_string_constant(&src, "agent_glm_tool_schemas");
+    let after = extract_c_string_constant(&src, "agent_qwen_tools_prompt_after_schemas");
+    let edit = extract_c_string_constant(&src, "agent_glm_tools_prompt_edit_upto");
+    let tail = extract_c_string_constant(&src, "agent_glm_tools_prompt_rules_tail");
+
+    let mut expected = intro;
+    for line in schemas.split('\n').filter(|l| !l.is_empty()) {
+        expected.push_str("\n{\"type\": \"function\", \"function\": ");
+        expected.push_str(line);
+        expected.push('}');
+    }
+    // `expand_string_macros` has already inlined AGENT_TOOL_CONTRACTS into the
+    // after-schemas block, so the subtraction is by span. The markers are the
+    // block's first sentence and the sentence that follows it; if upstream
+    // reshapes either, this fails loudly rather than silently comparing the
+    // wrong text.
+    let start = after
+        .find(CONTRACTS_HEAD)
+        .expect("contracts block still opens with the read-cap claim plank omits");
+    let end = after
+        .find(AFTER_CONTRACTS)
+        .expect("the sentence after the contracts block moved");
+    assert!(
+        start < end,
+        "contracts block is no longer where plank cuts it"
+    );
+    let mut trimmed = after.clone();
+    trimmed.replace_range(start..end, "");
+    expected.push_str(&trimmed);
+    expected.push_str(&edit);
+    expected.push_str(&tail);
+
+    assert_identical(
+        &expected,
+        plank::sysprompt::TOOLS_PROMPT_QWEN,
+        "qwen tools prompt vs C",
+    );
+}
+
+#[test]
+fn qwen_syntax_reminder_matches_c_source() {
+    let Some(src) = c_source() else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    assert_identical(
+        &extract_c_string_constant(&expand_string_macros(&src), "agent_qwen_syntax_reminder"),
+        plank::sysprompt::qwen_syntax_reminder(),
+        "qwen syntax reminder vs C",
+    );
+}
+
+/// Both committed manifests must parse with plank's own parser.
+///
+/// They are data files, so nothing else compiles them: a typo in a URL, a
+/// truncated hash, or a kind this build cannot install would otherwise only
+/// surface as a failed download on a user's machine.
+#[test]
+fn the_committed_manifests_parse_and_name_installable_kinds() {
+    for (set, name) in [
+        (plank::manifest::ModelSet::Ds4, "ds4.manifest"),
+        (plank::manifest::ModelSet::Qwen, "qwen.manifest"),
+    ] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let m = plank::manifest::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(set.manifest_name(), name, "set names its own file");
+
+        // Every kind this build installs for the set must be present, or a
+        // swap would never find the set complete and would silently install
+        // nothing at all.
+        for kind in set.kinds() {
+            let entry = m
+                .files
+                .get(*kind)
+                .unwrap_or_else(|| panic!("{name} omits the {kind} artifact"));
+            assert!(entry.bytes > 0, "{name}: {kind} has no size");
+            assert!(
+                entry.url.starts_with("https://"),
+                "{name}: {kind} url is not https"
+            );
+            assert!(
+                plank::manifest::local_path_for(set, kind).is_some(),
+                "{name}: {kind} has nowhere to install"
+            );
+        }
+    }
 }

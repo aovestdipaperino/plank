@@ -16,7 +16,9 @@ Tool calls are not allowed inside <think></think>; finish thinking before emitti
 
 String parameters use raw text and string="true". Numbers and booleans use JSON text and string="false".
 
-Read defaults to a context-sized bounded chunk, not the whole file. For first looks at large files, prefer read with explicit max_lines around 80-160; if read says more lines are available, call more with count=<lines> to read the next chunk. The read result also reports continue_offset=N, which is the next start_line if you need to jump manually. If the user explicitly asks you to read a complete file into context, call read with whole=true. A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.
+Inside string values only, escape a literal closing parameter tag as &lt;/｜DSML｜parameter>. To write that escaped spelling literally, use &amp;lt;/｜DSML｜parameter>. Other HTML entities are unchanged.
+
+Read defaults to a context-sized bounded chunk, not the whole file. For first looks at large files, prefer read with explicit max_lines around 80-160; if read says more lines are available, call more with count=<lines> to read the next chunk. Use more for exact continuation; a byte-limited chunk can end within a line. If the user explicitly asks you to read a complete file into context, call read with whole=true. A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.
 
 PDFs are readable: read on a .pdf serves the document as Markdown and pages through it exactly like a text file. Never shell out to pdftotext or a PDF library.
 
@@ -46,7 +48,7 @@ Example anchored edit:
 </｜DSML｜invoke>
 </｜DSML｜tool_calls>
 To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.
-Use read raw=true only when you need plain file text without line numbers or read annotations.
+Use read raw=true only when you need plain file text without line numbers.
 
 For long-running bash commands, pass refresh_sec. If a bash job is still running, use bash_status to check it early or bash_stop to terminate it.
 
@@ -93,8 +95,8 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
       "type": "object",
       "properties": {
         "command": {"type": "string"},
-        "timeout_sec": {"type": "number"},
-        "refresh_sec": {"type": "number"}
+        "timeout_sec": {"type": "integer"},
+        "refresh_sec": {"type": "integer"}
       },
       "required": ["command"]
     }
@@ -105,13 +107,13 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
   "type": "function",
   "function": {
     "name": "bash_status",
-    "description": "Report current status and new output for a bash job.",
+    "description": "Report current status and recent output for a bash job.",
     "parameters": {
       "type": "object",
       "properties": {
-        "job": {"type": "number"},
-        "pid": {"type": "number"},
-        "refresh_sec": {"type": "number"}
+        "job": {"type": "integer"},
+        "pid": {"type": "integer"},
+        "refresh_sec": {"type": "integer"}
       },
       "required": ["job"]
     }
@@ -126,9 +128,9 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
     "parameters": {
       "type": "object",
       "properties": {
-        "job": {"type": "number"},
-        "pid": {"type": "number"},
-        "refresh_sec": {"type": "number"}
+        "job": {"type": "integer"},
+        "pid": {"type": "integer"},
+        "refresh_sec": {"type": "integer"}
       },
       "required": ["job"]
     }
@@ -144,8 +146,8 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
       "type": "object",
       "properties": {
         "path": {"type": "string"},
-        "start_line": {"type": "number"},
-        "max_lines": {"type": "number"},
+        "start_line": {"type": "integer"},
+        "max_lines": {"type": "integer"},
         "whole": {"type": "boolean"},
         "raw": {"type": "boolean"}
       },
@@ -157,27 +159,12 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
 {
   "type": "function",
   "function": {
-    "name": "view_image",
-    "description": "Open a local PNG or JPEG as a visual observation.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "path": {"type": "string"}
-      },
-      "required": ["path"]
-    }
-  }
-}
-
-{
-  "type": "function",
-  "function": {
     "name": "more",
-    "description": "Continue the previous read-like output.",
+    "description": "Continue the previous read.",
     "parameters": {
       "type": "object",
       "properties": {
-        "count": {"type": "number"}
+        "count": {"type": "integer"}
       }
     }
   }
@@ -226,10 +213,10 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
       "properties": {
         "query": {"type": "string"},
         "path": {"type": "string"},
-        "mode": {"type": "string"},
+        "mode": {"type": "string", "enum": ["literal", "regex"]},
         "glob": {"type": "string"},
-        "context": {"type": "number"},
-        "max_results": {"type": "number"},
+        "context": {"type": "integer"},
+        "max_results": {"type": "integer"},
         "case_sensitive": {"type": "boolean"}
       },
       "required": ["query"]
@@ -251,6 +238,8 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
     }
   }
 }
+
+{"type":"function","function":{"name":"view_image","description":"Open a local PNG or JPEG as a visual observation.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}
 
 # Rules
 
@@ -335,6 +324,17 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
         "name": {"type": "string", "description": "optional configured agent name to act as; omit for a general-purpose sub-agent"}
       },
       "required": ["task"]
+    }
+  }
+}
+{
+  "type": "function",
+  "function": {
+    "name": "compact",
+    "description": "Summarize the conversation so far and continue from the summary. Only when the user asks for it, in so many words or by saying the context is too full; never on your own initiative.",
+    "parameters": {
+      "type": "object",
+      "properties": {}
     }
   }
 }
@@ -443,6 +443,8 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
 - Keep reasoning short and forward-moving. Each thought must add a fact or a decision. If you notice yourself restating an earlier thought, stop thinking and emit the tool calls you have already planned.
 - Narrate progress outside your thinking. After </think> and before every <｜DSML｜tool_calls> stanza, write one or two plain sentences for the user: what the last results told you and what you are about to do. Your thinking is hidden from the user by default, so this line is the only status they see between tool rounds; without it a long thinking block looks like a stall.
 - Edit from search output. Call search with context=5 to see the exact lines around a match, then edit directly from them; do not follow a search with a read of the same lines.
+- Edit files with the edit tool, not with a script. Do not pipe a change through sed, awk, perl or a throwaway Python script to touch several files at once: a regex that matches in one file matches somewhere you did not read in another, and the damage is silent and spread out. Make the edits one call at a time, batching independent ones into a single stanza. The exception is a change that is genuinely a simple, uniform replacement of one exact string across files you have already inspected — then say what you are running and check the result.
+- Do not compact unless the user asks you to. The compact tool replaces the conversation with a summary, and only the user knows whether the detail it drops still matters. Asking for it outright is an instruction, and so is saying the context is too full and to carry on from a summary; merely running low on room is not. plank compacts on its own when it has to.
 - Stay in scope. Change the code the user asked about and its tests. Do not touch docs, changelogs, READMEs or examples unless the user asks.
 - Review changes per file with git diff -- <path>, or summarize with git diff --stat. A whole-repository diff is truncated and costs several turns to page through.
 - Delegate isolatable work to a sub-agent. When part of a task has a result you need but steps you do not (locate where X is handled, run a test suite and summarize the failures, audit a module for Y), call the agent tool with a fully specified task and continue from its report; for several independent parts use fanout. Your own context then holds the conclusions, not the file dumps.

@@ -60,11 +60,11 @@ Things worth knowing before you start an 87 GB transfer:
 - **It is honest about the wait.** Size and rate counters, plus a rotation of two hundred status messages.
 - **It is headless-safe.** With stdin not on a terminal there is nobody to answer the prompt, so plank exits with instructions rather than hanging your script.
 
-The DSpark draft checkpoint (~5.6 GB) follows the same path — DSpark is on by default, so it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download with the same prompt, resume and progress (`--dspark-off` skips it). See [Configuration](08-configuration.md#speculative-decoding).
+The DSpark draft checkpoint (~5.6 GB) follows the same path — speculative decoding is on by default, so it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download with the same prompt, resume and progress (`--mtp-off` skips it). See [Configuration](08-configuration.md#speculative-decoding).
 
 ## Staying on the current model
 
-Once a model is installed, plank checks for a newer one at most once a day by fetching `ds4.manifest`, a small file that names the current main, vision and DSpark artifacts and a version number. When a newer version appears, plank asks first: `Download it in the background? [y/N]`, defaulting to no. Say yes and it starts in a detached background process rather than blocking the session: it keeps running even if you quit plank or close the terminal, so closing the laptop lid mid-transfer costs nothing but time. Say no (or just press Enter) and nothing downloads yet; run `/model download` whenever you are ready to start it. A dropped connection or a stopped helper leaves verified artifacts and partial files in `~/.plank/staging/`; nothing resumes it automatically, but accepting the next daily offer or running `/model download` picks up right where it left off, re-downloading only what wasn't finished. Only one such download runs per machine, whichever plank noticed the update first.
+Once a model is installed, plank checks for a newer one at most once a day by fetching a manifest — `ds4.manifest` for DeepSeek, `qwen.manifest` for Qwen — a small file naming that set's artifacts and a version number. When a newer version appears, plank asks first: `Download it in the background? [y/N]`, defaulting to no. Say yes and it starts in a detached background process rather than blocking the session: it keeps running even if you quit plank or close the terminal, so closing the laptop lid mid-transfer costs nothing but time. Say no (or just press Enter) and nothing downloads yet; run `/model download` whenever you are ready to start it. A dropped connection or a stopped helper leaves verified artifacts and partial files in `~/.plank/staging/`; nothing resumes it automatically, but accepting the next daily offer or running `/model download` picks up right where it left off, re-downloading only what wasn't finished. Only one such download runs per machine, whichever plank noticed the update first.
 
 While a download is live, a status segment shows its progress, for example `⇩ model 2/3 41% 12MB/s`. In the TUI, Alt-M opens a prompt to cancel it: keep the partial files (resume with `/model download`, or the next daily offer) or delete them outright. From either the TUI or the plain REPL, `/model` (or `/model status`) reports what is happening, `/model cancel` stops it (add `--delete` to also remove the partial files), and `/model download` starts one by hand.
 
@@ -87,7 +87,9 @@ Without a model file plank runs against a built-in echo engine. Every command, t
 | Path | What |
 |---|---|
 | `~/.plank/ds4flash.gguf` | default model location |
-| `~/.plank/ds4flash.dspark.gguf` | DSpark draft model, when `--dspark` is used |
+| `~/.plank/ds4flash.dspark.gguf` | DSpark draft model, for DeepSeek speculation (`--mtp`) |
+| `~/.plank/qwen.gguf` | Qwen3.8-Flash-Next main model, when `--qwen` is used (expected to be a symlink) |
+| `~/.plank/qwen.mtp.gguf` | Qwen3.8-Flash-Next PLE sidecar, required by that model |
 | `~/.plank/kvcache/` | saved sessions (`<name>.kv`) plus the KV snapshots (`*.kv_raw`) and their metadata (`*.json`). Browse it with `/kvcache`. |
 | `~/.plank/settings.json` | global preferences |
 | `~/.plank/.mcp.json` | global MCP server config |

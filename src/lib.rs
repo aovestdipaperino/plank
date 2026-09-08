@@ -43,8 +43,9 @@ pub mod errlog;
 pub mod experts;
 pub mod export;
 pub mod feedback;
-#[cfg(ds4_engine)]
 pub mod ffi;
+#[cfg(ds4_engine)]
+pub mod gguf;
 pub mod goal;
 pub mod guard;
 pub mod hooks;

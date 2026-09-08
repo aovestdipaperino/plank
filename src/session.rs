@@ -84,7 +84,62 @@ const HISTORY_TOOL_MAX_LINES: usize = 12;
 const HISTORY_TOOL_MAX_BYTES: usize = 3000;
 
 const MAGIC: &str = "plank-session 1";
-const FILE_EXT: &str = ".kv";
+/// Transcript extension for a `DeepSeek` session.
+const DS4_FILE_EXT: &str = ".ds4.kv";
+/// Transcript extension for a Qwen session.
+const QWEN_FILE_EXT: &str = ".qwn.kv";
+/// The untagged extension every transcript used before the families split.
+///
+/// Migrated to [`DS4_FILE_EXT`] on first launch; nothing writes it any more.
+const LEGACY_FILE_EXT: &str = ".kv";
+
+/// The live model family, for the transcript extension.
+///
+/// Process-global, like the footer's copy in `status`, and for the same
+/// reason: a `SessionStore` is opened from places that hold no engine handle
+/// (the `/kvcache` browser, the insights reader), and threading a family
+/// through every one of them to name a file extension is not worth it.
+static FAMILY_IS_QWEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records the live model family. Called once at startup, before any store is
+/// opened; unset means `Ds4`, which is what every transcript written before
+/// the families split was.
+pub fn set_family(family: crate::gguf::ModelFamily) {
+    FAMILY_IS_QWEN.store(
+        family == crate::gguf::ModelFamily::Qwen,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The live model family.
+#[must_use]
+pub fn family() -> crate::gguf::ModelFamily {
+    if FAMILY_IS_QWEN.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::gguf::ModelFamily::Qwen
+    } else {
+        crate::gguf::ModelFamily::Ds4
+    }
+}
+
+/// The live family's transcript extension.
+#[must_use]
+fn current_ext() -> &'static str {
+    family_ext(family())
+}
+
+/// Transcript extension for a model of this family.
+///
+/// The families share one directory and are told apart here. The tag sits
+/// *before* the extension so a name still ends in `.kv`, and the id remains
+/// the part before the first dot — `validate_name` rejects `.`, so a tag can
+/// never be mistaken for part of an id.
+#[must_use]
+pub fn family_ext(family: crate::gguf::ModelFamily) -> &'static str {
+    match family {
+        crate::gguf::ModelFamily::Ds4 => DS4_FILE_EXT,
+        crate::gguf::ModelFamily::Qwen => QWEN_FILE_EXT,
+    }
+}
 /// Extension of the engine KV payload written beside a transcript.
 ///
 /// The C agent stores the engine payload inside the same `.kv` file as the
@@ -566,6 +621,10 @@ impl SessionStore {
     }
 
     /// Default cache directory: `$HOME/.plank/kvcache` (`.` if HOME unset).
+    ///
+    /// One directory for every model. The families are told apart by the
+    /// transcript extension ([`family_ext`]) rather than by living in separate
+    /// trees, so `/resume` and the GC both stay a single-directory scan.
     #[must_use]
     pub fn default_dir() -> PathBuf {
         let home = std::env::var_os("HOME")
@@ -584,7 +643,7 @@ impl SessionStore {
     /// to ask whether a name is taken — `/rename` before it reassigns one.
     #[must_use]
     pub fn path_for_id(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}{FILE_EXT}"))
+        self.dir.join(format!("{id}{}", current_ext()))
     }
 
     /// Path of the engine KV payload sidecar for a session id.
@@ -675,6 +734,7 @@ impl SessionStore {
                 let meta = Self::kv_node_at(&path, &fp);
                 (path, meta)
             })
+            .filter(|(_, meta)| blob_family(meta) == family())
             .collect()
     }
 
@@ -1034,7 +1094,7 @@ impl SessionStore {
             return None;
         }
         let mut reclaimed = 0u64;
-        let legacy_sysprompt = format!("{SYSPROMPT_STEM}{FILE_EXT}");
+        let legacy_sysprompt = format!("{SYSPROMPT_STEM}{LEGACY_FILE_EXT}");
         let mut sweep = |dir: &Path, stems: &[&str]| {
             let Ok(entries) = fs::read_dir(dir) else {
                 return;
@@ -1054,7 +1114,8 @@ impl SessionStore {
                 }
                 let doomed = name == legacy_sysprompt
                     || name.ends_with(LEGACY_PAYLOAD_EXT)
-                    || (name.ends_with(FILE_EXT) && stems.iter().any(|s| name.starts_with(s)));
+                    || (name.ends_with(LEGACY_FILE_EXT)
+                        && stems.iter().any(|s| name.starts_with(s)));
                 if !doomed {
                     continue;
                 }
@@ -1077,6 +1138,51 @@ impl SessionStore {
         Some(reclaimed)
     }
 
+    /// Renames untagged `<id>.kv` transcripts to `<id>.ds4.kv`, once.
+    ///
+    /// Every transcript written before the families split was a `DeepSeek`
+    /// one, so the tag is not a guess. Returns how many were renamed.
+    ///
+    /// Deliberately **not** recursive. Transcripts only ever live at the top
+    /// level; the subdirectories are per-project checkpoint trees full of
+    /// `project-<fp>.kv_raw` blobs, and walking them would be scanning
+    /// hundreds of large-file directories at every launch to find nothing.
+    /// A file already carrying a family tag is skipped, which is what makes
+    /// this idempotent without a marker file — a second launch simply finds
+    /// nothing left to rename.
+    ///
+    /// A rename that cannot happen (a name already taken, a permission
+    /// problem) is left alone and not counted, so the transcript stays
+    /// readable under its old name rather than disappearing.
+    #[must_use]
+    pub fn migrate_untagged_transcripts(&self) -> usize {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        let mut renamed = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(stem) = name.strip_suffix(LEGACY_FILE_EXT) else {
+                continue;
+            };
+            // `.ds4.kv` and `.qwn.kv` both end in `.kv`, so the tagged files
+            // reach here too; their "stem" still carries the tag, and a stem
+            // containing a dot is never a valid id.
+            if !is_valid_id_prefix(stem) {
+                continue;
+            }
+            let to = self.dir.join(format!("{stem}{DS4_FILE_EXT}"));
+            if to.exists() {
+                continue;
+            }
+            if fs::rename(entry.path(), &to).is_ok() {
+                renamed += 1;
+            }
+        }
+        renamed
+    }
+
     /// Runs [`Self::migrate_legacy_blobs`] only when `dir` already exists,
     /// returning the bytes reclaimed (`Some(0)` or more) or `None`.
     ///
@@ -1093,6 +1199,10 @@ impl SessionStore {
             return None;
         }
         let store = Self::open(dir).ok()?;
+        let renamed = store.migrate_untagged_transcripts();
+        if renamed > 0 {
+            eprintln!("kvcache: tagged {renamed} existing transcripts as .ds4.kv");
+        }
         store.migrate_legacy_blobs()
     }
 
@@ -1118,19 +1228,63 @@ impl SessionStore {
     }
 
     /// Mints a fresh memorable `adjective-celebrity` session name (e.g.
-    /// `deadly-einstein`), unused by any file in the store. On the rare
-    /// collision a short guid is appended.
+    /// `deadly-einstein`), unused by any file in the store.
+    ///
+    /// On a collision the name is *reclaimed* when the session holding it has
+    /// already outlived the session TTL — the GC was going to delete it on some
+    /// later launch anyway, and taking the name now keeps the id memorable.
+    /// Only when the occupant is still live does a short guid get appended,
+    /// which is the ugly outcome the larger pools and this reclaim exist to
+    /// make rare.
     ///
     /// Called when a session starts, so its name can be shown in the UI long
     /// before the transcript is written.
     #[must_use]
     pub fn mint_id(&self) -> String {
         let base = crate::names::session_slug();
-        let mut id = base.clone();
+        if !self.path_for_id(&base).exists() || self.reclaim_expired(&base) {
+            return base;
+        }
+        let mut id = format!("{base}-{}", crate::names::guid8());
         while self.path_for_id(&id).exists() {
             id = format!("{base}-{}", crate::names::guid8());
         }
         id
+    }
+
+    /// Deletes the session holding `id` when it is past the session TTL,
+    /// freeing the name. Returns whether the name is now free.
+    ///
+    /// Judged by the transcript's own mtime rather than by a sidecar, because
+    /// the transcript is the thing being replaced and it is the one file that
+    /// always exists. A file whose age cannot be read is treated as live: the
+    /// cost of guessing wrong is a deleted conversation, and the cost of being
+    /// cautious is a guid suffix.
+    fn reclaim_expired(&self, id: &str) -> bool {
+        let ttl = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache)
+            .session_ttl_secs();
+        // A zero TTL means "collect immediately", which must not turn minting
+        // a name into deleting whatever session was most recently saved.
+        if ttl == 0 {
+            return false;
+        }
+        let path = self.path_for_id(id);
+        let Some(age) = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+        else {
+            return false;
+        };
+        if age.as_secs() < ttl {
+            return false;
+        }
+        // The blobs go with it, the same pairing `sweep` maintains: a payload
+        // left behind would be keyed to a transcript that no longer exists.
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(self.payload_path(id));
+        let _ = fs::remove_file(crate::kvmeta::sidecar_path(&self.payload_path(id)));
+        !path.exists()
     }
 
     /// Saves the session, assigning title, creation time, and id if missing.
@@ -1273,7 +1427,7 @@ impl SessionStore {
         let path = self.path_for_id(&id);
         let tmp = self
             .dir
-            .join(format!("{id}{FILE_EXT}.tmp.{}", std::process::id()));
+            .join(format!("{id}{}.tmp.{}", current_ext(), std::process::id()));
         // Write, fsync, then rename: a rename over the old transcript is only
         // atomic on disk once the new bytes are durable, otherwise a crash can
         // leave the name pointing at an empty or half-written file.
@@ -1323,7 +1477,7 @@ impl SessionStore {
             };
             let tmp = self
                 .dir
-                .join(format!("{id}{FILE_EXT}.tmp.{}", std::process::id()));
+                .join(format!("{id}{}.tmp.{}", current_ext(), std::process::id()));
             fs::write(&tmp, &spliced)?;
             if let Err(e) = fs::rename(&tmp, &path) {
                 let _ = fs::remove_file(&tmp);
@@ -1596,7 +1750,7 @@ impl SessionStore {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(stem) = name.strip_suffix(FILE_EXT) else {
+            let Some(stem) = name.strip_suffix(current_ext()) else {
                 continue;
             };
             // The `sysprompt` guard is belt-and-braces against a legacy file:
@@ -1610,6 +1764,23 @@ impl SessionStore {
         }
         Ok(out)
     }
+}
+
+/// The family a blob was captured under.
+///
+/// The two families share one cache directory, so the sweep would otherwise
+/// see the other family's blobs as inactive — none of their fingerprints are
+/// in this launch's `active` set — and evict them under the shared byte
+/// budget. Every model's checkpoints would then be destroyed by the next
+/// launch of the other, which is the whole cost the tag exists to avoid.
+///
+/// Judged from the model name the sidecar recorded at capture time. An empty
+/// or unreadable model reads as `Ds4`, matching the `.kv` to `.ds4.kv`
+/// migration: anything written before the split was a `DeepSeek` blob.
+fn blob_family(meta: &crate::kvmeta::KvMeta) -> crate::gguf::ModelFamily {
+    crate::gguf::ModelFamily::from(trace_stream::syntax::ToolSyntax::for_model_name(
+        &meta.model,
+    ))
 }
 
 /// How long a `*.tmp.<pid>` staging file must sit untouched before
@@ -2849,7 +3020,7 @@ mod tests {
         std::fs::write(proj.join("project-7c02.kv_raw"), vec![0u8; 50]).unwrap();
         std::fs::write(dir.join("cheeky-bell.kv_raw"), vec![0u8; 200]).unwrap();
         // Neither a transcript nor an in-flight temp file is a node.
-        std::fs::write(dir.join("cheeky-bell.kv"), b"plank-session 1\n").unwrap();
+        std::fs::write(dir.join("cheeky-bell.ds4.kv"), b"plank-session 1\n").unwrap();
         std::fs::write(dir.join("cheeky-bell.kv_raw.tmp.99"), b"x").unwrap();
 
         let mut nodes = store.kv_nodes();
@@ -2934,7 +3105,7 @@ mod tests {
         std::fs::write(dir.join("cheeky-bell.payload"), vec![0u8; 200]).unwrap();
         std::fs::write(proj.join("project-7c02.kv"), vec![0u8; 50]).unwrap();
         std::fs::write(dir.join("sysprompt-last.prompt"), b"old prompt").unwrap();
-        std::fs::write(dir.join("cheeky-bell.kv"), b"plank-session 1\n").unwrap();
+        std::fs::write(dir.join("cheeky-bell.ds4.kv"), b"plank-session 1\n").unwrap();
 
         // Nested one level below the project directory: the sweep must not
         // recurse into it, so this legacy-named file must survive untouched.
@@ -2951,7 +3122,7 @@ mod tests {
         assert!(!proj.join("project-7c02.kv").exists());
         assert!(!dir.join("sysprompt-last.prompt").exists());
         assert!(
-            dir.join("cheeky-bell.kv").exists(),
+            dir.join("cheeky-bell.ds4.kv").exists(),
             "transcripts must survive: resuming pays one re-prefill, it does not lose the conversation"
         );
         assert!(
@@ -3006,7 +3177,7 @@ mod tests {
             project_checkpoint_name("7c02"),
         ] {
             assert!(
-                !n.ends_with(FILE_EXT),
+                !n.ends_with(current_ext()),
                 "{n} must not look like a transcript"
             );
         }
@@ -3043,7 +3214,7 @@ hello\n";
     fn a_pre_branching_session_file_loads_as_a_single_branch_tree() {
         let dir = temp_dir("legacyload");
         let store = SessionStore::open(&dir).unwrap();
-        fs::write(dir.join("old-session.kv"), LEGACY_SESSION).unwrap();
+        fs::write(dir.join("old-session.ds4.kv"), LEGACY_SESSION).unwrap();
 
         let s = store.load("old-session").unwrap();
         assert_eq!(s.title, "hello");
@@ -3071,7 +3242,7 @@ hello\n";
         s.push(Message::user("hello"));
         s.push(Message::assistant("hi"));
         let id = store.save(&mut s).unwrap();
-        let bytes = fs::read(dir.join(format!("{id}.kv"))).unwrap();
+        let bytes = fs::read(dir.join(format!("{id}.ds4.kv"))).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains("\nnode "), "{text}");
         let _ = fs::remove_dir_all(&dir);
@@ -3115,7 +3286,7 @@ hello\n";
         let dir = temp_dir("badnode");
         let store = SessionStore::open(&dir).unwrap();
         fs::write(
-            dir.join("bad-session.kv"),
+            dir.join("bad-session.ds4.kv"),
             b"plank-session 1\ncreated 1\nused 2\ntitle 2\nhi\nmsg user 2\nhi\nnode 2 - bogus 1\nx\n",
         )
         .unwrap();
@@ -3200,7 +3371,7 @@ hello\n";
         let dir = temp_dir("danglingnode");
         let store = SessionStore::open(&dir).unwrap();
         fs::write(
-            dir.join("dangle-session.kv"),
+            dir.join("dangle-session.ds4.kv"),
             b"plank-session 1\ncreated 1\nused 2\ntitle 2\nhi\nmsg user 2\nhi\nnode 9 7 user 4\nlost\n",
         )
         .unwrap();
@@ -3218,7 +3389,7 @@ hello\n";
         s.push(Message::user("hi"));
         store.save(&mut s).unwrap();
         fs::write(dir.join("sysprompt.kv"), b"legacy").unwrap();
-        fs::write(dir.join("sysprompt-0123456789ab.kv"), b"kv").unwrap();
+        fs::write(dir.join("sysprompt-0123456789ab.ds4.kv"), b"kv").unwrap();
         let entries = store.list().unwrap();
         assert_eq!(entries.len(), 1, "checkpoints must be skipped: {entries:?}");
         assert_eq!(entries[0].id, s.id);
@@ -3389,6 +3560,155 @@ hello\n";
     /// one. What changed is *why* a checkpoint dies — expiry rather than
     /// fingerprint inequality — so the clock is wound past the tier TTL to make
     /// the superseded ones collectable.
+    /// Just past the configured session TTL, so the test tracks the policy
+    /// rather than a hardcoded age that a settings change would silently
+    /// invalidate.
+    fn past_session_ttl() -> std::time::Duration {
+        let ttl = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache)
+            .session_ttl_secs();
+        std::time::Duration::from_secs(ttl.saturating_add(60))
+    }
+
+    /// Backdates a file's mtime, which is what `reclaim_expired` reads.
+    fn set_file_mtime(path: &Path, when: std::time::SystemTime) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(when))
+            .expect("set mtime");
+    }
+
+    /// A colliding name held by a session past the TTL is reclaimed, which
+    /// keeps the id memorable instead of growing a guid suffix.
+    #[test]
+    fn a_collision_reclaims_an_expired_session() {
+        let dir = temp_dir("reclaim-expired");
+        let store = SessionStore::open(&dir).unwrap();
+        let taken = store.path_for_id("deadly-einstein");
+        fs::write(&taken, b"plank-session 1\n").unwrap();
+        fs::write(store.payload_path("deadly-einstein"), b"blob").unwrap();
+
+        // Older than the session TTL, so the GC would collect it anyway.
+        let long_ago = std::time::SystemTime::now() - past_session_ttl();
+        set_file_mtime(&taken, long_ago);
+
+        assert!(store.reclaim_expired("deadly-einstein"));
+        assert!(!taken.exists(), "the expired transcript is gone");
+        assert!(
+            !store.payload_path("deadly-einstein").exists(),
+            "its payload goes with it, or the blob outlives its transcript"
+        );
+    }
+
+    /// The opposite case, and the one that matters: a live session must never
+    /// be deleted to free a name. Losing a conversation to make an id prettier
+    /// is not a trade worth making.
+    #[test]
+    fn a_collision_never_touches_a_live_session() {
+        let dir = temp_dir("reclaim-live");
+        let store = SessionStore::open(&dir).unwrap();
+        let taken = store.path_for_id("deadly-einstein");
+        fs::write(&taken, b"plank-session 1\n").unwrap();
+
+        assert!(!store.reclaim_expired("deadly-einstein"));
+        assert!(taken.exists(), "a fresh session survives");
+
+        // And a transcript whose age cannot be read is treated as live.
+        assert!(!store.reclaim_expired("no-such-session"));
+    }
+
+    /// The families share one directory and are told apart by the extension,
+    /// so the two must never produce the same name for one id.
+    #[test]
+    fn the_families_tag_their_transcripts_differently() {
+        use crate::gguf::ModelFamily;
+        assert_eq!(family_ext(ModelFamily::Ds4), ".ds4.kv");
+        assert_eq!(family_ext(ModelFamily::Qwen), ".qwn.kv");
+        assert_ne!(family_ext(ModelFamily::Ds4), family_ext(ModelFamily::Qwen));
+        // Both still end in `.kv`, so anything matching on that keeps working.
+        for f in [ModelFamily::Ds4, ModelFamily::Qwen] {
+            assert!(family_ext(f).ends_with(LEGACY_FILE_EXT));
+        }
+    }
+
+    /// Untagged transcripts are renamed once, at the top level only.
+    #[test]
+    fn the_migration_tags_untagged_transcripts_without_recursing() {
+        let dir = temp_dir("tag-migrate");
+        let store = SessionStore::open(&dir).unwrap();
+        fs::write(dir.join("cheeky-bell.kv"), b"plank-session 1\n").unwrap();
+        fs::write(dir.join("zippy-kennedy.kv"), b"plank-session 1\n").unwrap();
+        // Already tagged: must be left exactly as it is.
+        fs::write(dir.join("wily-curie.qwn.kv"), b"plank-session 1\n").unwrap();
+        // A per-project checkpoint tree. Transcripts never live here, and
+        // walking it at every launch would be scanning for nothing.
+        let proj = dir.join("abcdef123456");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("project-7c02.kv"), b"blob").unwrap();
+
+        assert_eq!(store.migrate_untagged_transcripts(), 2);
+        assert!(dir.join("cheeky-bell.ds4.kv").exists());
+        assert!(dir.join("zippy-kennedy.ds4.kv").exists());
+        assert!(
+            !dir.join("cheeky-bell.kv").exists(),
+            "untagged name is gone"
+        );
+        assert!(
+            dir.join("wily-curie.qwn.kv").exists(),
+            "tagged file untouched"
+        );
+        assert!(
+            proj.join("project-7c02.kv").exists(),
+            "the subdirectory must not be walked"
+        );
+
+        // Idempotent with no marker file: a second launch finds nothing left.
+        assert_eq!(store.migrate_untagged_transcripts(), 0);
+    }
+
+    /// A rename that cannot happen must leave the transcript readable under
+    /// its old name rather than losing it.
+    #[test]
+    fn a_blocked_rename_keeps_the_original() {
+        let dir = temp_dir("tag-collide");
+        let store = SessionStore::open(&dir).unwrap();
+        fs::write(dir.join("cheeky-bell.kv"), b"old\n").unwrap();
+        fs::write(dir.join("cheeky-bell.ds4.kv"), b"new\n").unwrap();
+        assert_eq!(store.migrate_untagged_transcripts(), 0);
+        assert!(dir.join("cheeky-bell.ds4.kv").exists(), "original kept");
+        assert_eq!(
+            fs::read_to_string(dir.join("cheeky-bell.ds4.kv")).unwrap(),
+            "new\n",
+            "the tagged file was not overwritten"
+        );
+    }
+
+    /// One directory, but the sweep must still only consider its own
+    /// family's blobs — otherwise each launch evicts the other model's
+    /// checkpoints under the shared byte budget, which is exactly what the
+    /// tag prevents. Kept a pure check on the metadata rather than a test that
+    /// flips the process-global family, which parallel tests read.
+    #[test]
+    fn a_blobs_family_comes_from_the_model_it_was_captured_under() {
+        use crate::gguf::ModelFamily;
+        use crate::kvmeta::{KvMeta, KvRole};
+        let with_model = |m: &str| KvMeta {
+            model: m.into(),
+            ..KvMeta::synthesized(KvRole::Session, "fp", 1, 0)
+        };
+        assert_eq!(
+            blob_family(&with_model("Qwen3.8 Flash Next")),
+            ModelFamily::Qwen
+        );
+        assert_eq!(
+            blob_family(&with_model("DeepSeek V4 Flash")),
+            ModelFamily::Ds4
+        );
+        // Unknown or absent reads as ds4, matching the `.kv` -> `.ds4.kv`
+        // migration: anything written before the split was DeepSeek.
+        assert_eq!(blob_family(&with_model("")), ModelFamily::Ds4);
+    }
+
     #[test]
     fn sweep_collects_superseded_system_checkpoints_and_spares_the_live_ones() {
         let dir = temp_dir("sys-gc");
@@ -4067,7 +4387,7 @@ hello\n";
         }
         // Force distinct last_used ordering by rewriting the "used" header.
         for (i, id) in ids.iter().enumerate() {
-            let path = dir.join(format!("{id}.kv"));
+            let path = dir.join(format!("{id}.ds4.kv"));
             let text = fs::read_to_string(&path).unwrap();
             let text = text
                 .lines()
@@ -4331,7 +4651,7 @@ hello\n";
             "\n",
             "hi\n",
         );
-        let path = dir.join("legacy-one.kv");
+        let path = dir.join("legacy-one.ds4.kv");
         fs::write(&path, legacy).unwrap();
 
         let mut loaded = store.load("legacy-one").unwrap();
@@ -4421,7 +4741,7 @@ hello\n";
 
         // A malformed record is corruption, not a silent default.
         let bad = text.replace("showThinking=true", "showThinking=yes!");
-        fs::write(dir.join("bad-render.kv"), bad).unwrap();
+        fs::write(dir.join("bad-render.ds4.kv"), bad).unwrap();
         assert!(store.load("bad-render").is_err());
         let _ = fs::remove_dir_all(&dir);
     }

@@ -124,14 +124,34 @@ struct ProgressCtx<'a> {
     total: i32,
 }
 
+/// Whether a C progress event reports a prefill position.
+///
+/// The two hooks plank installs carry different event names — `prefill_chunk`
+/// on the chunk hook, `prefill_display` on the display one — and both report an
+/// *absolute* prompt position, which is what makes listening to both safe: a
+/// duplicate report re-states a position rather than adding to one. Anything
+/// else is filtered rather than trusted, because these callbacks are read as
+/// positions and a future event with different units would silently drive the
+/// prefill bar and its tok/s from the wrong number.
+fn is_prefill_event(event: &str) -> bool {
+    matches!(event, "prefill_chunk" | "prefill_display")
+}
+
 unsafe extern "C" fn progress_cb(
     ud: *mut std::os::raw::c_void,
-    _event: *const std::os::raw::c_char,
+    event: *const std::os::raw::c_char,
     cur: std::os::raw::c_int,
     _total: std::os::raw::c_int,
 ) {
     if ud.is_null() {
         return;
+    }
+    if !event.is_null() {
+        // SAFETY: the C passes a static NUL-terminated event name.
+        let name = unsafe { std::ffi::CStr::from_ptr(event) };
+        if !name.to_str().is_ok_and(is_prefill_event) {
+            return;
+        }
     }
     // SAFETY: ud is the ProgressCtx pointer we installed for this sync call.
     let ctx = unsafe { &mut *ud.cast::<ProgressCtx>() };
@@ -189,19 +209,31 @@ impl Ds4Model {
             })
             .transpose()
         };
-        let c_mtp = c_opt_path(tuning.mtp_path.as_deref(), "mtp model")?;
+        let family = crate::gguf::family_of(path);
+        let (mtp_path, ple_path) = companion_slots(family, tuning.mtp_path.as_deref());
+        let c_mtp = c_opt_path(mtp_path, "mtp model")?;
+        let c_ple = c_opt_path(ple_path, "ple sidecar")?;
         let c_steering = c_opt_path(tuning.dir_steering_file.as_deref(), "dir-steering file")?;
         // Vision is always on: the encoder GGUF sits beside the main model at
         // `~/.plank/ds4flash.vision.gguf` and is downloaded at startup when
         // absent. A null path would keep the engine text-only, but plank never
         // passes one — the `view_image` tool is served unconditionally.
+        // ...except for a Qwen3.8-Flash-Next model. The DS4 encoder is not a
+        // Qwen encoder, and handing it over fails the load outright, so a Qwen
+        // run is text-only until a Qwen encoder is wired up (the C branch
+        // ships a separate `qwen38-vision` target).
         let vision_path = crate::download::default_vision_path();
-        let c_vision = c_opt_path(Some(&vision_path), "vision encoder")?;
+        let c_vision = if family == crate::gguf::ModelFamily::Qwen {
+            None
+        } else {
+            c_opt_path(Some(&vision_path), "vision encoder")?
+        };
         let as_ptr = |c: &Option<CString>| c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let opts = ffi::Ds4EngineOptions {
             model_path: c_path.as_ptr(),
             mtp_path: as_ptr(&c_mtp),
             vision_path: as_ptr(&c_vision),
+            ple_path: as_ptr(&c_ple),
             backend,
             n_threads,
             context_size: ctx_size,
@@ -211,7 +243,7 @@ impl Ds4Model {
             // Ignored by the engine unless `_set` below is true, in which case
             // it picks its own backend-dependent default. Passing a placeholder
             // beats mirroring a number that upstream retunes.
-            dspark_confidence_threshold: tuning.dspark_confidence.unwrap_or(0.0),
+            dspark_confidence_threshold: tuning.mtp_confidence.unwrap_or(0.0),
             directional_steering_file: as_ptr(&c_steering),
             expert_profile_path: std::ptr::null(),
             directional_steering_attn: tuning.dir_steering_attn,
@@ -224,14 +256,25 @@ impl Ds4Model {
             simulate_used_memory_bytes: tuning.simulate_used_memory_bytes,
             warm_weights: tuning.warm_weights,
             quality: tuning.quality,
-            glm_mtp: false,
+            // One switch, two mechanisms. `--mtp` means "predict more than
+            // one token per step", and the engine option that does it differs
+            // by family: DeepSeek speculates from a separate DSpark draft
+            // checkpoint (`dspark`), Qwen3.8 from the MTP block inside its own
+            // main GGUF (`glm_mtp`, which `qwen4_graph_alloc` reads at open).
+            //
+            // Gating matters, it is not tidiness: `dspark` with no `mtp_path`
+            // is a hard error in the C ("--dspark requires --mtp-model FILE"),
+            // and a Qwen run has no `mtp_path` by construction — its companion
+            // went to `ple_path`. Leaving both ungated meant Qwen could not
+            // load at all with speculation at its default-on.
+            glm_mtp: tuning.mtp && family == crate::gguf::ModelFamily::Qwen,
             glm_mtp_timing: false,
-            dspark: tuning.dspark,
-            dspark_strict: tuning.dspark_strict,
+            dspark: tuning.mtp && family == crate::gguf::ModelFamily::Ds4,
+            dspark_strict: tuning.mtp_strict && family == crate::gguf::ModelFamily::Ds4,
             // Keep the C's default: greedily verified draft commits, not exact
             // stochastic p/q acceptance.
             dspark_exact_sampling: false,
-            dspark_confidence_threshold_set: tuning.dspark_confidence.is_some(),
+            dspark_confidence_threshold_set: tuning.mtp_confidence.is_some(),
             cuda_tensor_parallel: false,
             ssd_streaming: tuning.ssd_streaming,
             ssd_streaming_cold: tuning.ssd_streaming_cold,
@@ -269,11 +312,18 @@ impl Ds4Model {
         // now, at the one place that knows, instead of letting the first
         // `view_image` call be the only symptom several turns into a session.
         // SAFETY: `engine` is non-null and valid, checked just above.
+        // A Qwen run is the one case where no encoder was offered at all, so
+        // it gets its own line: naming the DeepSeek path there would report a
+        // failure to read a file plank deliberately never passed.
         if !unsafe { ffi::ds4_engine_has_vision(engine) } {
-            eprintln!(
-                "warning: vision encoder not loaded from {}; view_image will be refused",
-                vision_path.display()
-            );
+            if family == crate::gguf::ModelFamily::Qwen {
+                eprintln!("note: Qwen3.8 runs text-only in plank; view_image will be refused");
+            } else {
+                eprintln!(
+                    "warning: vision encoder not loaded from {}; view_image will be refused",
+                    vision_path.display()
+                );
+            }
         }
         Ok(Self {
             engine,
@@ -1346,6 +1396,8 @@ impl Engine for Ds4Session {
         // which outlives the sync call, and the callback is cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
+            // Qwen3.8 prefill reports only on the chunk hook.
+            ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         // SAFETY: session, tokens, and err buffer are valid for the call.
         // When the prompt carries image tokens, use the multimodal sync so the
@@ -1418,11 +1470,11 @@ impl Engine for Ds4Session {
         // sampled stream only when the whole generation is greedy anyway.
         // Same gate the C CLI uses: temperature at or below zero, and a
         // support model that proposes blocks rather than single tokens, plus
-        // plank's own `/dspark` switch — which is why temperature 0 with
+        // plank's own `/mtp` switch — which is why temperature 0 with
         // speculation off is a state this engine can be in and the C cannot.
         // `greedy()` flipping per token inside a DSML stanza is irrelevant
         // here — at this temperature both branches sample argmax.
-        let draft_block = if opts.dspark && opts.temperature <= 0.0 {
+        let draft_block = if opts.mtp && opts.temperature <= 0.0 {
             // SAFETY: engine valid for the life of the model.
             unsafe { ffi::ds4_engine_mtp_draft_tokens(self.model.engine) }
         } else {
@@ -1884,6 +1936,8 @@ impl Engine for Ds4Session {
         // cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
+            // Qwen3.8 prefill reports only on the chunk hook.
+            ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         let mut err = [0_i8; 512];
         // SAFETY: session, tokens, and err buffer are valid.
@@ -1988,7 +2042,7 @@ impl Engine for Ds4Session {
     fn spec_capable(&self) -> bool {
         // The same reading the draft gate takes: a support model that proposes
         // blocks rather than single tokens. Asking the engine beats trusting
-        // the config — `--dspark` is on by default, and a run whose support
+        // the config — `--mtp` is on by default, and a run whose support
         // GGUF never loaded would otherwise claim speculation it cannot do.
         // SAFETY: engine pointer is valid for the life of the model.
         unsafe { ffi::ds4_engine_mtp_draft_tokens(self.model.engine) > 1 }
@@ -2170,6 +2224,8 @@ impl Ds4HostSession {
         // SAFETY: session valid; progress outlives the sync; cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
+            // Qwen3.8 prefill reports only on the chunk hook.
+            ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         // SAFETY: session, tokens, and err buffer valid.
         let sync_rc =
@@ -2412,44 +2468,109 @@ impl Drop for Ds4TokensGuard {
 /// Points the ds4 Metal kernel loader at the `.metal` files bundled with the
 /// build, unless the caller already set the overrides. Without this the loader
 /// only searches the current directory and aborts.
+/// Metal kernel sources the C engine requires, as `(env var, file name)`.
+///
+/// Must stay in lockstep with the `required_sources` table in
+/// `refs/ds4/ds4_metal.m` (`ds4_gpu_full_source`): every entry there is
+/// mandatory, so a kernel shipped upstream but missing here aborts startup
+/// with "metal backend unavailable". The C's own fallback search paths
+/// (relative `metal/...` and `./metal/...`) only resolve from the submodule
+/// root, so plank has to point at each one explicitly.
+///
+/// `metal_kernels_match_the_c_reference` in `tests/c_parity.rs` parses that
+/// table out of the C and fails on any drift — the comment alone was not
+/// enough, and a submodule bump that added two Qwen kernels shipped a build
+/// that could not open a model at all.
+pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
+    // Keep this in lockstep with the C `required_sources` table in
+    // `ds4_metal.m` (`ds4_gpu_full_source`): every entry there is
+    // mandatory, so a kernel shipped upstream but not listed here aborts
+    // startup with "metal backend unavailable". The GLM 5.3 and vision
+    // kernels landed in the antirez/main sync and must be pointed at
+    // explicitly, since the C engine's fallback search paths (relative
+    // `metal/...` and `./metal/...`) only work from the submodule root.
+    ("DS4_METAL_FLASH_ATTN_SOURCE", "flash_attn.metal"),
+    ("DS4_METAL_DENSE_SOURCE", "dense.metal"),
+    ("DS4_METAL_GLM53_BF16_SOURCE", "glm53_bf16.metal"),
+    ("DS4_METAL_GLM53_VISION_SOURCE", "glm53_vision.metal"),
+    (
+        "DS4_METAL_DEEPSEEK4_VISION_SOURCE",
+        "deepseek4_vision.metal",
+    ),
+    ("DS4_METAL_GLM53_KDA_SOURCE", "glm53_kda.metal"),
+    ("DS4_METAL_MOE_SOURCE", "moe.metal"),
+    ("DS4_METAL_DSV4_HC_SOURCE", "dsv4_hc.metal"),
+    ("DS4_METAL_UNARY_SOURCE", "unary.metal"),
+    ("DS4_METAL_DSV4_KV_SOURCE", "dsv4_kv.metal"),
+    ("DS4_METAL_DSV4_ROPE_SOURCE", "dsv4_rope.metal"),
+    ("DS4_METAL_DSV4_MISC_SOURCE", "dsv4_misc.metal"),
+    ("DS4_METAL_ARGSORT_SOURCE", "argsort.metal"),
+    ("DS4_METAL_CPY_SOURCE", "cpy.metal"),
+    ("DS4_METAL_CONCAT_SOURCE", "concat.metal"),
+    ("DS4_METAL_GET_ROWS_SOURCE", "get_rows.metal"),
+    ("DS4_METAL_SUM_ROWS_SOURCE", "sum_rows.metal"),
+    ("DS4_METAL_SOFTMAX_SOURCE", "softmax.metal"),
+    ("DS4_METAL_REPEAT_SOURCE", "repeat.metal"),
+    ("DS4_METAL_GLU_SOURCE", "glu.metal"),
+    ("DS4_METAL_NORM_SOURCE", "norm.metal"),
+    ("DS4_METAL_BIN_SOURCE", "bin.metal"),
+    ("DS4_METAL_SET_ROWS_SOURCE", "set_rows.metal"),
+    // Added by the Qwen3.8-Flash-Next bump. Required unconditionally,
+    // not only for a Qwen run: the C compiles one combined Metal source
+    // for every model, so a missing Qwen kernel aborts a DeepSeek
+    // startup too.
+    ("DS4_METAL_QWEN4_SOURCE", "qwen4.metal"),
+    ("DS4_METAL_QWEN4_VISION_SOURCE", "qwen4_vision.metal"),
+];
+
+/// Which of the engine's two companion slots `--mtp-model` fills.
+///
+/// Decided by the family of the *main* model, read from its own GGUF metadata.
+/// The engine cannot be asked: it detects the family while opening, and both
+/// paths have to be in the options struct before that call — and a `ple_path`
+/// handed to a non-Qwen model is a hard error there, not a warning.
+fn companion_slots(
+    family: crate::gguf::ModelFamily,
+    companion: Option<&Path>,
+) -> (Option<&Path>, Option<&Path>) {
+    if let Some(c) = companion {
+        warn_on_companion_mismatch(family, c);
+    }
+    match family {
+        crate::gguf::ModelFamily::Qwen => (None, companion),
+        crate::gguf::ModelFamily::Ds4 => (companion, None),
+    }
+}
+
+/// Warns when the `--mtp-model` companion is not the kind this family wants.
+///
+/// The companion GGUFs name themselves: `deepseek4-dspark` for a `DSpark`
+/// draft checkpoint, `qwen4-exp-ple` for a Qwen n-gram sidecar. Passing the
+/// wrong one otherwise surfaces as the engine refusing a tensor it cannot
+/// find, several hundred lines from the flag that caused it.
+///
+/// A warning rather than an error: the check is a heuristic on a metadata
+/// string, and the engine's own validation is the authority. It must never be
+/// what stops a load the engine would have accepted.
+fn warn_on_companion_mismatch(family: crate::gguf::ModelFamily, companion: &Path) {
+    let Some(arch) = crate::gguf::architecture(companion) else {
+        return;
+    };
+    let expected = match family {
+        crate::gguf::ModelFamily::Qwen => "qwen4-exp-ple",
+        crate::gguf::ModelFamily::Ds4 => "deepseek4-dspark",
+    };
+    if arch != expected {
+        eprintln!(
+            "warning: --mtp {} reports architecture {arch:?}, but this model wants {expected:?}",
+            companion.display()
+        );
+    }
+}
+
 fn set_metal_source_env() {
-    const KERNELS: [(&str, &str); 23] = [
-        // Keep this in lockstep with the C `required_sources` table in
-        // `ds4_metal.m` (`ds4_gpu_full_source`): every entry there is
-        // mandatory, so a kernel shipped upstream but not listed here aborts
-        // startup with "metal backend unavailable". The GLM 5.3 and vision
-        // kernels landed in the antirez/main sync and must be pointed at
-        // explicitly, since the C engine's fallback search paths (relative
-        // `metal/...` and `./metal/...`) only work from the submodule root.
-        ("DS4_METAL_FLASH_ATTN_SOURCE", "flash_attn.metal"),
-        ("DS4_METAL_DENSE_SOURCE", "dense.metal"),
-        ("DS4_METAL_GLM53_BF16_SOURCE", "glm53_bf16.metal"),
-        ("DS4_METAL_GLM53_VISION_SOURCE", "glm53_vision.metal"),
-        (
-            "DS4_METAL_DEEPSEEK4_VISION_SOURCE",
-            "deepseek4_vision.metal",
-        ),
-        ("DS4_METAL_GLM53_KDA_SOURCE", "glm53_kda.metal"),
-        ("DS4_METAL_MOE_SOURCE", "moe.metal"),
-        ("DS4_METAL_DSV4_HC_SOURCE", "dsv4_hc.metal"),
-        ("DS4_METAL_UNARY_SOURCE", "unary.metal"),
-        ("DS4_METAL_DSV4_KV_SOURCE", "dsv4_kv.metal"),
-        ("DS4_METAL_DSV4_ROPE_SOURCE", "dsv4_rope.metal"),
-        ("DS4_METAL_DSV4_MISC_SOURCE", "dsv4_misc.metal"),
-        ("DS4_METAL_ARGSORT_SOURCE", "argsort.metal"),
-        ("DS4_METAL_CPY_SOURCE", "cpy.metal"),
-        ("DS4_METAL_CONCAT_SOURCE", "concat.metal"),
-        ("DS4_METAL_GET_ROWS_SOURCE", "get_rows.metal"),
-        ("DS4_METAL_SUM_ROWS_SOURCE", "sum_rows.metal"),
-        ("DS4_METAL_SOFTMAX_SOURCE", "softmax.metal"),
-        ("DS4_METAL_REPEAT_SOURCE", "repeat.metal"),
-        ("DS4_METAL_GLU_SOURCE", "glu.metal"),
-        ("DS4_METAL_NORM_SOURCE", "norm.metal"),
-        ("DS4_METAL_BIN_SOURCE", "bin.metal"),
-        ("DS4_METAL_SET_ROWS_SOURCE", "set_rows.metal"),
-    ];
     let dir = metal_source_dir();
-    for (var, file) in KERNELS {
+    for &(var, file) in METAL_KERNEL_SOURCES {
         if std::env::var_os(var).is_none() {
             // SAFETY: called once at startup before any threads are spawned.
             unsafe { std::env::set_var(var, dir.join(file)) };
@@ -2579,7 +2700,28 @@ fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sections, spec_block_rewind_target, strip_legacy, think_close_suffix};
+    /// The filter that keeps a position-based callback honest. Both hooks are
+    /// installed, so both names must pass; anything else must not be read as a
+    /// prompt position.
+    #[test]
+    fn only_prefill_events_drive_the_prefill_bar() {
+        assert!(is_prefill_event("prefill_chunk"), "the Qwen3.8 hook");
+        assert!(
+            is_prefill_event("prefill_display"),
+            "the DeepSeek graph hook"
+        );
+        for other in ["", "kv_save", "decode", "prefill", "warmup"] {
+            assert!(
+                !is_prefill_event(other),
+                "{other} is not a prefill position"
+            );
+        }
+    }
+
+    use super::{
+        is_prefill_event, parse_sections, spec_block_rewind_target, strip_legacy,
+        think_close_suffix,
+    };
 
     /// Regression for the 56k-token rebuild in `turbo-vision-debug-2.log`: the
     /// incoming assistant section was the held reply plus exactly `</think>`

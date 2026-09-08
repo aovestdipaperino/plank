@@ -651,33 +651,49 @@ suspending</td>
 </thead>
 <tbody>
 <tr>
-<td><code>--dspark</code></td>
-<td>DSpark speculative decoding, on by default</td>
+<td><code>--mtp</code></td>
+<td>speculative decoding (multi-token prediction), on by default</td>
 </tr>
 <tr>
-<td><code>--dspark-off</code></td>
-<td>disable DSpark speculative decoding (target-only decode)</td>
+<td><code>--mtp-off</code></td>
+<td>disable speculative decoding (target-only decode)</td>
 </tr>
 <tr>
-<td><code>--dspark-confidence F</code></td>
+<td><code>--mtp-model PATH</code></td>
+<td>the loaded model's companion GGUF: the DSpark drafter for DeepSeek,
+the required PLE sidecar for Qwen3.8</td>
+</tr>
+<tr>
+<td><code>--mtp-confidence F</code></td>
 <td>pruning threshold, <code>0..1</code> (<code>0</code> forces fixed
 five-token blocks)</td>
 </tr>
 <tr>
-<td><code>--dspark-strict</code></td>
+<td><code>--mtp-strict</code></td>
 <td>load the drafter but keep target-only decode, for comparisons</td>
+</tr>
+<tr>
+<td><code>--qwen</code></td>
+<td>run Qwen3.8-Flash-Next: shorthand for
+<code>-m ~/.plank/qwen.gguf --mtp-model ~/.plank/qwen.mtp.gguf</code></td>
 </tr>
 </tbody>
 </table>
-<p>DSpark speculative decoding is <strong>on by default</strong>:
-DeepSeek's auxiliary draft checkpoint for V4 Flash proposes up to five
-tokens ahead and the main model verifies them, committing only the
-prefix it agrees with, so one verification pass can advance the stream
-by several tokens. <code>--dspark-off</code> turns it off for
-target-only decode. The support model (~5.6 GB) needs no flag of its own
-— it resolves to <code>~/.plank/ds4flash.dspark.gguf</code> and is
-offered for download through the same resumable path as the main model,
-unless <code>--mtp</code> names one.</p>
+<p>Speculative decoding is <strong>on by default</strong> under one
+name, <code>--mtp</code>, with a different mechanism per model family.
+DeepSeek uses its auxiliary DSpark draft checkpoint for V4 Flash: it
+proposes up to five tokens ahead and the main model verifies them,
+committing only the prefix it agrees with, so one verification pass can
+advance the stream by several tokens. Qwen3.8-Flash-Next speculates from
+the MTP block inside its own main GGUF and needs no drafter.
+<code>--mtp-off</code> turns it off for target-only decode.</p>
+<p>On DeepSeek the support model (~5.6 GB) needs no flag of its own — it
+resolves to <code>~/.plank/ds4flash.dspark.gguf</code> and is offered
+for download through the same resumable path as the main model, unless
+<code>--mtp-model</code> names one. On Qwen the same
+<code>--mtp-model</code> flag carries the PLE sidecar, which is required
+rather than optional; <code>--qwen</code> fills in both default paths
+for you.</p>
 <p>Verification is argmax, so proposals are only used at
 <code>--temp 0</code>; sampled decoding ignores them. Whether it pays
 depends on the engine build, the quant and the machine: on an M5 Max it

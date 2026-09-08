@@ -380,6 +380,21 @@ backfills at once); bare <code>/debug</code> reports the state</td>
 in the status bar</td>
 </tr>
 <tr>
+<td><code>/mtp [on|off]</code></td>
+<td>turn speculative decoding (multi-token prediction) on or off for
+this session; bare <code>/mtp</code> reports the state</td>
+</tr>
+<tr>
+<td><code>/temp [0..100]</code></td>
+<td>set the sampling temperature; refused while <code>/mtp</code> is on,
+which pins it at 0</td>
+</tr>
+<tr>
+<td><code>/loopguard [on|off]</code>, <code>/lg</code></td>
+<td>arm or silence the loop guards. The one mutating command that also
+works mid-turn</td>
+</tr>
+<tr>
 <td><code>/notify &lt;mode&gt;</code></td>
 <td>change notification mode for this session</td>
 </tr>
@@ -393,6 +408,28 @@ in the status bar</td>
 </tr>
 </tbody>
 </table>
+<p>The model can also ask for a compaction itself, with the
+<code>compact</code> tool, and carries on from the summary. It is told
+not to reach for it unprompted: only you know whether the detail a
+summary drops still matters, and plank compacts on its own when the
+window gets tight.</p>
+<p>Speculative decoding verifies its drafts by argmax, so it only runs
+at temperature 0: <code>/mtp on</code> pins the temperature there and
+<code>/mtp off</code> gives you back the one you were sampling at.
+<code>/mtp on</code> is refused without loaded draft support — that is
+chosen at startup (<code>--mtp</code>, <code>--mtp-model</code>) and
+cannot be loaded into a running engine. The status bar shows
+<code>✨</code> while speculation is on, with its per-step figures
+beside it, and <code>🌡 0.60</code> while it is off.</p>
+<p><code>/loopguard off</code> silences every rung of every guard: the
+repetition guard and its think budget, the repeated-tool-call guard and
+its no-progress budget, and the repeat advisory. Unlike other settings
+commands it takes effect on a turn that is already generating, because
+the moment you want the guards out of the way is usually while they are
+firing. <code>🔁</code> in the status bar means they are armed;
+<code>♻ looping</code> means one has actually seen a cycle. The switch
+is session-only and is never written to disk (the underlying setting is
+<code>tools.loopGuards</code>).</p>
 <p><code>/config</code> changes write to
 <code>./.plank/settings.json</code> and apply immediately. In the TUI, a
 bare <code>/config</code> opens the form and
@@ -442,6 +479,12 @@ to the clipboard</td>
 problem: it captures the rendered prompt the engine would see plus the
 model, backend, context size, sampling settings and think mode, in a
 single self-contained file. It never touches the live session.</p>
+<p>Under <code>--debug</code> (or after <code>/debug on</code>) plank
+dumps on its own as well: quitting writes
+<code>repro-quit-&lt;timestamp&gt;.md</code>, and a panic writes
+<code>repro-panic-&lt;timestamp&gt;.md</code> with whatever transcript
+the session had last rendered. Neither needs you to remember
+<code>/repro</code> before the session ends.</p>
 <p><code>/insights</code> computes <strong>every number in code</strong>
 and uses the model only for prose it cannot replace — a failed or
 skipped model call costs the report its narrative, never its

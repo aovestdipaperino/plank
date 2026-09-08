@@ -15,12 +15,89 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// The artifact kinds plank knows how to install.
+/// The artifact kinds plank knows how to install for `DeepSeek` V4.
 ///
 /// A manifest may name others (see [`parse`]); those are carried through and
 /// ignored, so a future release can add a fourth artifact without breaking
 /// every client that predates it.
 pub const KINDS: [&str; 3] = ["main", "vision", "dspark"];
+
+/// The artifact kinds a Qwen3.8-Flash-Next release has.
+///
+/// Two, not three: the PLE sidecar under the unified `mtp` name, and no vision
+/// encoder, because plank does not load one for Qwen.
+pub const QWEN_KINDS: [&str; 2] = ["main", "mtp"];
+
+/// Which model set a manifest, staging area, and install location belong to.
+///
+/// Every artifact path in this module is scoped by one of these. The two sets
+/// are kept wholly separate on disk — separate manifest files, separate
+/// staging directories — because the invariant that makes a swap safe is
+/// per-set: the manifest moves *last*, so its presence proves that set landed.
+/// Sharing one staging area would let a half-staged Qwen download be read as
+/// proof about the `DeepSeek` set, or the reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelSet {
+    /// `DeepSeek` V4 Flash: main model, vision encoder, `DSpark` drafter.
+    #[default]
+    Ds4,
+    /// Qwen3.8-Flash-Next: main model and its PLE sidecar.
+    Qwen,
+}
+
+impl ModelSet {
+    /// The set a model of this family belongs to.
+    #[must_use]
+    pub fn for_family(family: crate::gguf::ModelFamily) -> Self {
+        match family {
+            crate::gguf::ModelFamily::Qwen => Self::Qwen,
+            crate::gguf::ModelFamily::Ds4 => Self::Ds4,
+        }
+    }
+
+    /// The artifact kinds this build installs for the set.
+    #[must_use]
+    pub fn kinds(self) -> &'static [&'static str] {
+        match self {
+            Self::Ds4 => &KINDS,
+            Self::Qwen => &QWEN_KINDS,
+        }
+    }
+
+    /// Filename of the set's manifest, both remote and installed.
+    #[must_use]
+    pub fn manifest_name(self) -> &'static str {
+        match self {
+            Self::Ds4 => "ds4.manifest",
+            Self::Qwen => "qwen.manifest",
+        }
+    }
+
+    /// Leaf of the set's staging directory under `~/.plank`.
+    #[must_use]
+    pub fn staging_leaf(self) -> &'static str {
+        match self {
+            Self::Ds4 => "staging",
+            Self::Qwen => "staging-qwen",
+        }
+    }
+
+    /// The set's name as the CLI spells it, for the detached helper's argv.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ds4 => "ds4",
+            Self::Qwen => "qwen",
+        }
+    }
+
+    /// Parses [`Self::as_str`]. Anything unrecognized reads as `Ds4`, which is
+    /// what a helper spawned by an older plank passes: nothing.
+    #[must_use]
+    pub fn from_str_or_default(s: &str) -> Self {
+        if s == "qwen" { Self::Qwen } else { Self::Ds4 }
+    }
+}
 
 /// One artifact in a manifest.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -126,8 +203,8 @@ pub fn plank_dir() -> PathBuf {
 
 /// The installed manifest: what the files currently under `root` are.
 #[must_use]
-pub fn installed_path_in(root: &Path) -> PathBuf {
-    root.join("ds4.manifest")
+pub fn installed_path_in(root: &Path, set: ModelSet) -> PathBuf {
+    root.join(set.manifest_name())
 }
 
 /// The installed manifest: what the files currently in `~/.plank` are.
@@ -135,21 +212,21 @@ pub fn installed_path_in(root: &Path) -> PathBuf {
 /// Written only by a successful swap, and written *last*, so its presence is
 /// proof the whole set landed.
 #[must_use]
-pub fn installed_path() -> PathBuf {
-    installed_path_in(&plank_dir())
+pub fn installed_path(set: ModelSet) -> PathBuf {
+    installed_path_in(&plank_dir(), set)
 }
 
 /// Where in-flight and verified-but-not-yet-installed artifacts live, under
 /// `root`.
 #[must_use]
-pub fn staging_dir_in(root: &Path) -> PathBuf {
-    root.join("staging")
+pub fn staging_dir_in(root: &Path, set: ModelSet) -> PathBuf {
+    root.join(set.staging_leaf())
 }
 
 /// Where in-flight and verified-but-not-yet-installed artifacts live.
 #[must_use]
-pub fn staging_dir() -> PathBuf {
-    staging_dir_in(&plank_dir())
+pub fn staging_dir(set: ModelSet) -> PathBuf {
+    staging_dir_in(&plank_dir(), set)
 }
 
 /// Helper-process bookkeeping under `root`: lock, job, state, cancel flag, log.
@@ -171,11 +248,16 @@ pub fn downloads_dir() -> PathBuf {
 /// filenames (`ds4flash.gguf`, `ds4flash.vision.gguf`, `ds4flash.dspark.gguf`)
 /// are mirrored here so a test can pass an explicit root.
 #[must_use]
-pub fn local_path_for_in(root: &Path, kind: &str) -> Option<PathBuf> {
-    match kind {
-        "main" => Some(root.join("ds4flash.gguf")),
-        "vision" => Some(root.join("ds4flash.vision.gguf")),
-        "dspark" => Some(root.join("ds4flash.dspark.gguf")),
+pub fn local_path_for_in(root: &Path, set: ModelSet, kind: &str) -> Option<PathBuf> {
+    match (set, kind) {
+        (ModelSet::Ds4, "main") => Some(root.join("ds4flash.gguf")),
+        (ModelSet::Ds4, "vision") => Some(root.join("ds4flash.vision.gguf")),
+        (ModelSet::Ds4, "dspark") => Some(root.join("ds4flash.dspark.gguf")),
+        // The same two names `--qwen` defaults to, so a download installs
+        // exactly where the flag looks — and a user's existing symlinks there
+        // are adopted by size rather than replaced.
+        (ModelSet::Qwen, "main") => Some(root.join("qwen.gguf")),
+        (ModelSet::Qwen, "mtp") => Some(root.join("qwen.mtp.gguf")),
         _ => None,
     }
 }
@@ -186,11 +268,13 @@ pub fn local_path_for_in(root: &Path, kind: &str) -> Option<PathBuf> {
 /// could name its own destination path would be a manifest that could write
 /// anywhere on disk.
 #[must_use]
-pub fn local_path_for(kind: &str) -> Option<PathBuf> {
-    match kind {
-        "main" => Some(crate::download::default_model_path()),
-        "vision" => Some(crate::download::default_vision_path()),
-        "dspark" => Some(crate::download::default_dspark_path()),
+pub fn local_path_for(set: ModelSet, kind: &str) -> Option<PathBuf> {
+    match (set, kind) {
+        (ModelSet::Ds4, "main") => Some(crate::download::default_model_path()),
+        (ModelSet::Ds4, "vision") => Some(crate::download::default_vision_path()),
+        (ModelSet::Ds4, "dspark") => Some(crate::download::default_dspark_path()),
+        (ModelSet::Qwen, "main") => Some(crate::download::default_qwen_path()),
+        (ModelSet::Qwen, "mtp") => Some(crate::download::default_qwen_mtp_path()),
         _ => None,
     }
 }
@@ -233,6 +317,7 @@ pub enum Decision {
 pub fn decide(
     remote: Manifest,
     installed: Option<&Manifest>,
+    kinds: &[&str],
     size_of: &dyn Fn(&str) -> Option<u64>,
 ) -> Decision {
     if let Some(installed) = installed {
@@ -253,7 +338,7 @@ pub fn decide(
     // almost certainly already this release — recorded by a plank that predates
     // manifests. Silently adopt rather than offering a re-download of bytes the
     // user already has.
-    let intersection: Vec<_> = KINDS
+    let intersection: Vec<_> = kinds
         .iter()
         .filter_map(|kind| remote.files.get(*kind).map(|e| (*kind, e)))
         .collect();
@@ -371,22 +456,31 @@ mod tests {
     #[test]
     fn in_variants_nest_under_the_given_root() {
         let root = Path::new("/tmp/some-root");
-        assert_eq!(installed_path_in(root), root.join("ds4.manifest"));
-        assert_eq!(staging_dir_in(root), root.join("staging"));
+        assert_eq!(
+            installed_path_in(root, crate::manifest::ModelSet::Ds4),
+            root.join("ds4.manifest")
+        );
+        assert_eq!(
+            staging_dir_in(root, crate::manifest::ModelSet::Ds4),
+            root.join("staging")
+        );
         assert_eq!(downloads_dir_in(root), root.join("downloads"));
         assert_eq!(
-            local_path_for_in(root, "main"),
+            local_path_for_in(root, crate::manifest::ModelSet::Ds4, "main"),
             Some(root.join("ds4flash.gguf"))
         );
         assert_eq!(
-            local_path_for_in(root, "vision"),
+            local_path_for_in(root, crate::manifest::ModelSet::Ds4, "vision"),
             Some(root.join("ds4flash.vision.gguf"))
         );
         assert_eq!(
-            local_path_for_in(root, "dspark"),
+            local_path_for_in(root, crate::manifest::ModelSet::Ds4, "dspark"),
             Some(root.join("ds4flash.dspark.gguf"))
         );
-        assert_eq!(local_path_for_in(root, "bogus"), None);
+        assert_eq!(
+            local_path_for_in(root, crate::manifest::ModelSet::Ds4, "bogus"),
+            None
+        );
     }
 
     #[test]
@@ -397,8 +491,8 @@ mod tests {
     #[test]
     fn paths_nest_under_the_plank_directory() {
         let root = plank_dir();
-        assert_eq!(installed_path(), root.join("ds4.manifest"));
-        assert_eq!(staging_dir(), root.join("staging"));
+        assert_eq!(installed_path(ModelSet::Ds4), root.join("ds4.manifest"));
+        assert_eq!(staging_dir(ModelSet::Ds4), root.join("staging"));
         assert_eq!(downloads_dir(), root.join("downloads"));
     }
 
@@ -422,7 +516,7 @@ mod tests {
         let remote = parse(&sample()).expect("parses");
         let installed = parse(&sample()).expect("parses");
         assert!(matches!(
-            decide(remote, Some(&installed), &all_present),
+            decide(remote, Some(&installed), &KINDS, &all_present),
             Decision::UpToDate
         ));
     }
@@ -431,7 +525,7 @@ mod tests {
     fn a_newer_remote_is_offered() {
         let remote = parse(&sample_at(4)).expect("parses");
         let installed = parse(&sample()).expect("parses");
-        match decide(remote, Some(&installed), &all_present) {
+        match decide(remote, Some(&installed), &KINDS, &all_present) {
             Decision::Offer { manifest, from } => {
                 assert_eq!(manifest.version, 4);
                 assert_eq!(from, 3);
@@ -446,9 +540,81 @@ mod tests {
         let remote = parse(&sample_at(2)).expect("parses");
         let installed = parse(&sample()).expect("parses");
         assert!(matches!(
-            decide(remote, Some(&installed), &all_present),
+            decide(remote, Some(&installed), &KINDS, &all_present),
             Decision::UpToDate
         ));
+    }
+
+    /// The two sets must not share a single byte of disk state. A swap is
+    /// only safe because the manifest moves last within its own staging area;
+    /// one shared area would let a half-staged Qwen download read as proof
+    /// about the `DeepSeek` set.
+    #[test]
+    fn the_two_sets_never_share_a_path() {
+        let root = Path::new("/tmp/plank-set-test");
+        for (a, b) in [
+            (
+                installed_path_in(root, ModelSet::Ds4),
+                installed_path_in(root, ModelSet::Qwen),
+            ),
+            (
+                staging_dir_in(root, ModelSet::Ds4),
+                staging_dir_in(root, ModelSet::Qwen),
+            ),
+        ] {
+            assert_ne!(a, b);
+        }
+        assert_ne!(
+            local_path_for_in(root, ModelSet::Ds4, "main"),
+            local_path_for_in(root, ModelSet::Qwen, "main"),
+        );
+    }
+
+    /// Each set installs only its own kinds. A `vision` entry in a Qwen
+    /// manifest must not resolve to a path, or a swap would try to install a
+    /// `DeepSeek` encoder for a model that never loads one.
+    #[test]
+    fn a_set_resolves_only_its_own_kinds() {
+        let root = Path::new("/tmp/plank-set-test");
+        assert_eq!(ModelSet::Ds4.kinds(), &["main", "vision", "dspark"]);
+        assert_eq!(ModelSet::Qwen.kinds(), &["main", "mtp"]);
+        assert!(local_path_for_in(root, ModelSet::Qwen, "vision").is_none());
+        assert!(local_path_for_in(root, ModelSet::Qwen, "dspark").is_none());
+        assert!(local_path_for_in(root, ModelSet::Ds4, "mtp").is_none());
+    }
+
+    /// The helper is handed its set in argv, and one spawned by a plank that
+    /// predates two sets passes nothing.
+    #[test]
+    fn the_set_round_trips_through_argv() {
+        for set in [ModelSet::Ds4, ModelSet::Qwen] {
+            assert_eq!(ModelSet::from_str_or_default(set.as_str()), set);
+        }
+        assert_eq!(ModelSet::from_str_or_default(""), ModelSet::Ds4);
+        assert_eq!(ModelSet::from_str_or_default("glm"), ModelSet::Ds4);
+    }
+
+    /// Adoption is per-set, so a Qwen manifest is adopted on the two files it
+    /// names without a `DeepSeek` artifact in sight.
+    #[test]
+    fn a_qwen_manifest_adopts_on_its_own_two_kinds() {
+        let remote = parse(
+            r#"{"version":1,"released":"t","notes":"","files":{
+                "main": {"name":"q.gguf","url":"https://example.invalid/q","bytes":10,
+                         "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                "mtp":  {"name":"p.gguf","url":"https://example.invalid/p","bytes":20,
+                         "sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}"#,
+        )
+        .expect("parse");
+        let size_of = |kind: &str| match kind {
+            "main" => Some(10),
+            "mtp" => Some(20),
+            _ => None,
+        };
+        match decide(remote, None, ModelSet::Qwen.kinds(), &size_of) {
+            Decision::Adopt(m) => assert_eq!(m.version, 1),
+            other => panic!("expected adoption, got {other:?}"),
+        }
     }
 
     #[test]
@@ -456,7 +622,7 @@ mod tests {
         // Adopt-on-first-sight. Without this rule, every existing user is offered
         // an 87 GB re-download the day this ships.
         let remote = parse(&sample()).expect("parses");
-        match decide(remote, None, &all_present) {
+        match decide(remote, None, &KINDS, &all_present) {
             Decision::Adopt(m) => assert_eq!(m.version, 3),
             other => panic!("expected adoption, got {other:?}"),
         }
@@ -472,7 +638,7 @@ mod tests {
                 all_present(kind)
             }
         };
-        match decide(remote, None, &sizes) {
+        match decide(remote, None, &KINDS, &sizes) {
             Decision::Offer { from, .. } => assert_eq!(from, 0),
             other => panic!("expected an offer, got {other:?}"),
         }
@@ -488,7 +654,7 @@ mod tests {
                 all_present(kind)
             }
         };
-        match decide(remote, None, &sizes) {
+        match decide(remote, None, &KINDS, &sizes) {
             Decision::Offer { from, .. } => assert_eq!(from, 0),
             other => panic!("expected an offer, got {other:?}"),
         }
@@ -504,7 +670,10 @@ mod tests {
         );
         let remote = parse(&text).expect("parses");
         let sizes = |kind: &str| (kind == "main").then_some(100);
-        assert!(matches!(decide(remote, None, &sizes), Decision::Adopt(_)));
+        assert!(matches!(
+            decide(remote, None, &KINDS, &sizes),
+            Decision::Adopt(_)
+        ));
     }
 
     #[test]
@@ -519,7 +688,7 @@ mod tests {
         );
         let remote = parse(&text).expect("parses");
         assert!(matches!(
-            decide(remote, None, &all_present),
+            decide(remote, None, &KINDS, &all_present),
             Decision::Adopt(_)
         ));
     }
@@ -532,7 +701,7 @@ mod tests {
         // release at the same version as "up to date".
         let text = r#"{"version":5,"released":"x","notes":"","files":{}}"#;
         let remote = parse(text).expect("parses");
-        match decide(remote, None, &|_| None) {
+        match decide(remote, None, &KINDS, &|_| None) {
             Decision::Offer { from, .. } => assert_eq!(from, 0),
             other => panic!("expected an offer, got {other:?}"),
         }

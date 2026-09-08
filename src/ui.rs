@@ -586,7 +586,7 @@ enum PassError {
 /// model to fix something that was never broken, so it gets the placement rule
 /// verbatim — the same sentence the tools prompt already gave it — and no
 /// syntax reminder at all.
-fn tool_error_payload(kind: PassError, err: &str) -> String {
+fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax) -> String {
     match kind {
         PassError::Preflight => format!("Tool error: {err}\n"),
         // Written without a `\`-continued literal on purpose: continuations
@@ -600,10 +600,20 @@ fn tool_error_payload(kind: PassError, err: &str) -> String {
             ),
             sysprompt::IN_THINK_PROHIBITION
         ),
-        PassError::Dsml => format!(
-            "Tool error: invalid DSML tool call: {err}\n{}",
-            sysprompt::dsml_syntax_reminder()
-        ),
+        // Named for the dialect the model actually speaks. Telling a Qwen
+        // model its "DSML" was invalid, and handing it DSML to copy, is how a
+        // recorded session ended with the model insisting the harness was
+        // broken rather than fixing its markup.
+        PassError::Dsml => match syntax {
+            sysprompt::ToolSyntax::Dsml => format!(
+                "Tool error: invalid DSML tool call: {err}\n{}",
+                sysprompt::dsml_syntax_reminder()
+            ),
+            sysprompt::ToolSyntax::Qwen => format!(
+                "Tool error: invalid tool call: {err}\n{}",
+                sysprompt::qwen_syntax_reminder()
+            ),
+        },
     }
 }
 
@@ -1951,15 +1961,15 @@ struct Agent<'a> {
     /// turn because `cfg` is shared immutably for the agent's lifetime.
     think: crate::engine::ThinkMode,
     /// Live generation options, seeded from `cfg.generation` and changed by
-    /// `/temp` and `/dspark`. Owned here for the same reason [`Self::think`]
+    /// `/temp` and `/mtp`. Owned here for the same reason [`Self::think`]
     /// is: `cfg` is borrowed immutably for the agent's lifetime, so a runtime
     /// switch has nowhere else to write. `think_mode` inside it is *not* the
     /// live level — that is still `self.think`, which every prompt-building
     /// path already reads.
     gen_opts: crate::engine::GenerationOptions,
-    /// The temperature `/dspark off` returns to. Seeded from the startup
+    /// The temperature `/mtp off` returns to. Seeded from the startup
     /// config, or the built-in default when that was 0 — which it is for every
-    /// session started under `--dspark`, since speculation pins it there.
+    /// session started under `--mtp`, since speculation pins it there.
     resume_temp: f32,
     color: bool,
     show_footer: bool,
@@ -2672,7 +2682,7 @@ impl Agent<'_> {
         // no blinking brain to drive, but the flag is process-global and a
         // remote client attached to this session renders off it.
         let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
-        let mut stream = StreamRenderer::new(sink);
+        let mut stream = StreamRenderer::with_syntax(sink, self.tool_syntax());
         stream.set_freeze_on_error(true);
         self.configure_stream(&mut stream);
         // Defensive retry point: picks up a console that started after plank
@@ -3673,7 +3683,10 @@ fn generate_pass(
     // on a `provider: local` definition swaps the engine before getting here, so
     // this reports the engine actually generating rather than the session's.
     let _local = engine.is_local().then(crate::status::LocalPass::begin);
-    let mut stream = StreamRenderer::new(sink);
+    let mut stream = StreamRenderer::with_syntax(
+        sink,
+        crate::sysprompt::ToolSyntax::for_model_name(&engine.model_name()),
+    );
     stream.set_freeze_on_error(true);
     stream.set_preflight(preflight);
     stream.set_thinking_tool_calls(ctx.thinking_tool_calls);
@@ -3788,6 +3801,7 @@ fn finish_quiet_pass<S: RenderSink>(
         let payload = tool_error_payload(
             pass_error_kind(preflight_error.is_some(), finished.in_think_rejected),
             err,
+            stream.syntax(),
         );
         close_open_think(&mut assistant_text, ended_in_think);
         return Ok(QuietPass {
@@ -3865,6 +3879,14 @@ impl Agent<'_> {
             // The C checks this at the top of every continuation round
             // ("soft limit before tool continuation", `worker_run_turn`);
             // round 0 is already covered by the pre-turn check above.
+            // The model can also ask for it outright, with the `compact`
+            // tool. Taken here rather than in the dispatch because compaction
+            // rewrites the very transcript this turn generates from.
+            if std::mem::take(&mut self.tool_ctx.compact_requested)
+                && self.compact("model request", "")?.aborted()
+            {
+                return Ok(());
+            }
             if round > 1 && self.maybe_compact()?.aborted() {
                 return Ok(());
             }
@@ -3960,6 +3982,7 @@ impl Agent<'_> {
                 let payload = tool_error_payload(
                     pass_error_kind(preflight_error.is_some(), finished.in_think_rejected),
                     err,
+                    self.tool_syntax(),
                 );
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
@@ -5652,7 +5675,7 @@ impl Agent<'_> {
                 }
                 None => println!("usage: /power <1..100>"),
             },
-            "/dspark" => println!("{}", self.dspark_command(arg)),
+            "/mtp" => println!("{}", self.mtp_command(arg)),
             "/temp" => println!("{}", self.temp_command(arg)),
             "/loopguard" | "/lg" => println!("{}", loopguard_command(arg)),
             "/think" => {
@@ -6175,7 +6198,11 @@ impl Agent<'_> {
                     // Stream the stored text through the same renderer the live
                     // turn uses, so markdown, thinking gray, and tool-call
                     // banners come back exactly as they were shown.
-                    let mut stream = StreamRenderer::new(std::mem::take(log));
+                    // Replayed with the live model's dialect: a transcript
+                    // does not record which one wrote it, and the banners only
+                    // come back right if the markup is read the same way.
+                    let mut stream =
+                        StreamRenderer::with_syntax(std::mem::take(log), self.tool_syntax());
                     stream.set_replay(true);
                     stream.set_show_tool_calls(show_tool_calls);
                     stream.set_show_thinking(show_thinking);
@@ -7135,16 +7162,16 @@ the original is frozen and listed in /tree"
     /// [`THINK_MAX_MIN_CONTEXT`]: crate::engine::THINK_MAX_MIN_CONTEXT
     /// Whether speculative decoding is really on for this session.
     ///
-    /// Both halves matter: the switch `/dspark` sets, and a support model the
+    /// Both halves matter: the switch `/mtp` sets, and a support model the
     /// engine actually loaded. A run whose support GGUF never loaded (the
-    /// `EchoEngine`, a provider engine, `--dspark` with a missing file) is off
+    /// `EchoEngine`, a provider engine, `--mtp` with a missing file) is off
     /// however the flag reads, and every message and marker follows this
     /// answer rather than the flag alone.
-    fn dspark_on(&self) -> bool {
-        self.gen_opts.dspark && self.engine.spec_capable()
+    fn mtp_on(&self) -> bool {
+        self.gen_opts.mtp && self.engine.spec_capable()
     }
 
-    /// `/dspark [on|off]` — turn speculative decoding on or off for the rest
+    /// `/mtp [on|off]` — turn speculative decoding on or off for the rest
     /// of the session, reporting the state with no argument.
     ///
     /// Speculation verifies drafts by argmax, so it can only run at
@@ -7153,37 +7180,36 @@ the original is frozen and listed in /tree"
     /// why `/temp` is refused while this is on — see [`Self::temp_command`].
     ///
     /// `on` is refused outright without a loaded support model: it is chosen
-    /// at startup (`--dspark`, `--mtp`) and cannot be loaded into a running
+    /// at startup (`--mtp`, `--mtp`) and cannot be loaded into a running
     /// engine, so the alternative is a footer marker that promises speculation
     /// no pass will do.
-    fn dspark_command(&mut self, arg: &str) -> String {
+    fn mtp_command(&mut self, arg: &str) -> String {
         let arg = arg.trim();
-        let on = self.dspark_on();
+        let on = self.mtp_on();
         if arg.is_empty() {
             return if on {
-                "dspark: on (temperature pinned at 0)".to_owned()
+                "mtp: on (temperature pinned at 0)".to_owned()
             } else if self.engine.spec_capable() {
-                format!("dspark: off (temperature {:.2})", self.gen_opts.temperature)
+                format!("mtp: off (temperature {:.2})", self.gen_opts.temperature)
             } else {
-                "dspark: off — no support model loaded; restart with --dspark".to_owned()
+                "mtp: off — no support model loaded; restart with --mtp".to_owned()
             };
         }
         let want = match arg {
             "on" => true,
             "off" => false,
-            _ => return format!("/dspark: expected on|off, got `{arg}`"),
+            _ => return format!("/mtp: expected on|off, got `{arg}`"),
         };
         if want && !self.engine.spec_capable() {
-            return "/dspark on: no DSpark support model is loaded; restart with --dspark"
-                .to_owned();
+            return "/mtp on: no MTP support model is loaded; restart with --mtp".to_owned();
         }
         if want == on {
-            return format!("dspark already {arg}");
+            return format!("mtp already {arg}");
         }
         if want {
-            // Remembered so `/dspark off` returns to the temperature the user
+            // Remembered so `/mtp off` returns to the temperature the user
             // was actually sampling at, not to whatever the startup config
-            // said — a session started under `--dspark` recorded 0 there.
+            // said — a session started under `--mtp` recorded 0 there.
             if self.gen_opts.temperature > 0.0 {
                 self.resume_temp = self.gen_opts.temperature;
             }
@@ -7191,34 +7217,35 @@ the original is frozen and listed in /tree"
         } else {
             self.gen_opts.temperature = self.resume_temp;
         }
-        self.gen_opts.dspark = want;
-        crate::status::set_dspark(self.dspark_on());
+        self.gen_opts.mtp = want;
+        crate::status::set_mtp(self.mtp_on());
         crate::status::set_temperature(self.gen_opts.temperature);
         if want {
-            "dspark on; temperature pinned at 0".to_owned()
+            "mtp on; temperature pinned at 0".to_owned()
         } else {
-            format!("dspark off; temperature {:.2}", self.gen_opts.temperature)
+            format!("mtp off; temperature {:.2}", self.gen_opts.temperature)
         }
     }
 
     /// `/temp [0..100]` — set the sampling temperature, reporting it with no
     /// argument.
     ///
-    /// Refused while `/dspark` is on rather than silently disabling
+    /// Refused while `/mtp` is on rather than silently disabling
     /// speculation: any temperature above 0 turns the draft gate off, so the
     /// obliging reading of `/temp 0.6` would be "quietly stop doing the thing
     /// the footer still claims". The user is told which switch to throw first.
     fn temp_command(&mut self, arg: &str) -> String {
         let arg = arg.trim();
         if arg.is_empty() {
-            return if self.dspark_on() {
-                "temperature: 0 (pinned by dspark)".to_owned()
+            return if self.mtp_on() {
+                "temperature: 0 (pinned by mtp)".to_owned()
             } else {
                 format!("temperature: {:.2}", self.gen_opts.temperature)
             };
         }
-        if self.dspark_on() {
-            return "/temp: the temperature is pinned at 0 while dspark is on;                     /dspark off first"
+        if self.mtp_on() {
+            return "/temp: the temperature is pinned at 0 while mtp is on; \
+                    /mtp off first"
                 .to_owned();
         }
         let Ok(temp) = arg.parse::<f32>() else {
@@ -7998,7 +8025,7 @@ the original is frozen and listed in /tree"
             session_path: &session_path,
             note: note.trim(),
         };
-        // The live options, not the startup ones: `/temp` and `/dspark` change
+        // The live options, not the startup ones: `/temp` and `/mtp` change
         // how the very next pass samples, and a dump that reported the
         // command-line temperature would send someone chasing a difference
         // that is not there.
@@ -11359,6 +11386,15 @@ impl Agent<'_> {
     /// its KV. Keying it correctly is also what lets it share Tier 1 with an
     /// ordinary local-main session — which is where most of those checkpoints
     /// get written.
+    /// The tool-call dialect the loaded model speaks.
+    ///
+    /// Asked of the engine rather than stored, so a turn that swapped the
+    /// engine (a `provider: local` sub-agent, say) reads the dialect of the
+    /// model actually generating.
+    fn tool_syntax(&self) -> crate::sysprompt::ToolSyntax {
+        crate::sysprompt::ToolSyntax::for_model_name(&self.engine.model_name())
+    }
+
     fn kv_tiers_for(&self, model: &str) -> Vec<crate::kvtier::TierSpec> {
         let fp1 = crate::kvtier::system_fingerprint(
             model,
@@ -12749,7 +12785,7 @@ impl Agent<'_> {
         // the deepest ladder rung below the divergence first. This is the
         // path every ordinary TUI turn runs through, so it needs its own call.
         self.rescue_prefix_before_rebuild(prompt);
-        let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
+        let mut stream = StreamRenderer::with_syntax(ChannelSink(tx.clone()), self.tool_syntax());
         stream.set_freeze_on_error(true);
         self.configure_stream(&mut stream);
         // See the matching comment in `stream_generation`: a defensive retry
@@ -12904,10 +12940,14 @@ impl Agent<'_> {
         // error to feed back to the model, not a user abort.
         let preflight_error = stream.preflight_error();
         let error = preflight_error
-            .map(|e| tool_error_payload(PassError::Preflight, e))
+            .map(|e| tool_error_payload(PassError::Preflight, e, stream.syntax()))
             .or_else(|| {
                 finished.error.map(|e| {
-                    tool_error_payload(pass_error_kind(false, finished.in_think_rejected), e)
+                    tool_error_payload(
+                        pass_error_kind(false, finished.in_think_rejected),
+                        e,
+                        stream.syntax(),
+                    )
                 })
             });
         let user_interrupt = shared.interrupt.load(Ordering::Relaxed);
@@ -13436,7 +13476,7 @@ impl Agent<'_> {
                 }
                 None => log.push_plain("usage: /power <1..100>"),
             },
-            "/dspark" => log.push_plain(self.dspark_command(arg)),
+            "/mtp" => log.push_plain(self.mtp_command(arg)),
             "/temp" => log.push_plain(self.temp_command(arg)),
             "/loopguard" | "/lg" => log.push_plain(loopguard_command(arg)),
             "/think" => {
@@ -15396,11 +15436,16 @@ fn new_agent(
         contribution_warnings.extend(warnings);
     }
     let wasm_tools = tool_ctx.wasm.registry.tools();
+    // The dialect the loaded model speaks decides which tools prompt it gets,
+    // and later which parser reads its output back. Taken from the name the
+    // engine reports after detecting the file, not from the path.
+    let syntax = sysprompt::ToolSyntax::for_model_name(&engine.model_name());
     let system = sysprompt::build_system_prompt_parts_with_wasm(
         &cfg.system,
         &tool_ctx.mcp,
         &wasm_tools,
         !crate::settings::active().engine.thinking_tool_calls,
+        syntax,
     );
     drop(wasm_tools);
     // Tell the engine where the trusted control text ends before it tokenizes
@@ -15414,12 +15459,16 @@ fn new_agent(
     // between the key and the tokens rather than between two keys.
     engine.set_think_mode(cfg.generation.think_mode);
     crate::status::set_local_power(cfg.power_percent);
-    // The footer's dspark/temperature slot, seeded the same way: `/dspark` and
+    // Which model this local engine is, for the footer's origin label. Taken
+    // from the dialect already resolved above, so the tag can never disagree
+    // with the syntax the parser is using.
+    crate::status::set_local_family(syntax.into());
+    // The footer's mtp/temperature slot, seeded the same way: `/mtp` and
     // `/temp` publish to it later, but the first frame is drawn before either
     // can be typed. An engine with no support model reads as off however the
     // flags were set — the footer must not promise speculation the engine
     // cannot do.
-    crate::status::set_dspark(cfg.generation.dspark && engine.spec_capable());
+    crate::status::set_mtp(cfg.generation.mtp && engine.spec_capable());
     crate::status::set_temperature(cfg.generation.temperature);
     // The alt local engine needs both for the same reasons, and it cannot be
     // skipped as an optimization: `warm_reset` builds its system tokens from
@@ -17114,8 +17163,8 @@ mod tests {
         /// When true the engine claims to run on this machine's weights, which is
         /// what `generate_pass` keys the status bar's blinking brain off.
         local: bool,
-        /// When true the engine claims a loaded `DSpark` support model, which is
-        /// what `/dspark on` refuses without.
+        /// When true the engine claims a loaded `MTP` support model, which is
+        /// what `/mtp on` refuses without.
         spec: bool,
         /// Records `status::local_pass_active()` as observed from *inside*
         /// `generate`, so a test can assert the pass marked itself while it was
@@ -17370,8 +17419,8 @@ mod tests {
         cfg
     }
 
-    /// An agent whose engine reports a loaded `DSpark` support model, so the
-    /// `/dspark on` path is reachable without a Metal box.
+    /// An agent whose engine reports a loaded `MTP` support model, so the
+    /// `/mtp on` path is reachable without a Metal box.
     fn spark_agent<'a>(dir: &std::path::Path, cfg: &'a crate::config::AgentConfig) -> Agent<'a> {
         test_agent(
             dir,
@@ -17384,96 +17433,96 @@ mod tests {
     }
 
     #[test]
-    fn dspark_off_restores_the_temperature_it_was_turned_on_at() {
-        // `/dspark` and `/temp` publish to the footer's process-global slots,
+    fn mtp_off_restores_the_temperature_it_was_turned_on_at() {
+        // `/mtp` and `/temp` publish to the footer's process-global slots,
         // so this shares the lock the status-bar tests hold.
         let _lock = crate::status::origin_test_guard();
-        let dir = scratch_dir("dspark-temp");
+        let dir = scratch_dir("mtp-temp");
         let mut cfg = test_cfg();
-        cfg.generation.dspark = false;
+        cfg.generation.mtp = false;
         cfg.generation.temperature = 0.6;
         let mut agent = spark_agent(&dir, &cfg);
 
         assert_eq!(agent.temp_command("0.9"), "temperature 0.90");
-        let msg = agent.dspark_command("on");
-        assert!(msg.contains("dspark on"), "{msg}");
+        let msg = agent.mtp_command("on");
+        assert!(msg.contains("mtp on"), "{msg}");
         // Pinned at 0 while on: the draft gate is a temperature gate.
-        assert!(agent.dspark_on());
+        assert!(agent.mtp_on());
         assert!(agent.gen_opts.temperature.abs() < 1e-6);
 
-        let msg = agent.dspark_command("off");
+        let msg = agent.mtp_command("off");
         assert!(msg.contains("0.90"), "{msg}");
         assert!((agent.gen_opts.temperature - 0.9).abs() < 1e-6);
     }
 
-    /// A session started under `--dspark` recorded temperature 0 in its
+    /// A session started under `--mtp` recorded temperature 0 in its
     /// config, so "restore what the config said" would leave it at 0 with
     /// speculation off — sampling greedily with nothing to show for it.
     #[test]
-    fn dspark_off_falls_back_to_the_default_temperature_not_to_zero() {
-        // `/dspark` and `/temp` publish to the footer's process-global slots,
+    fn mtp_off_falls_back_to_the_default_temperature_not_to_zero() {
+        // `/mtp` and `/temp` publish to the footer's process-global slots,
         // so this shares the lock the status-bar tests hold.
         let _lock = crate::status::origin_test_guard();
-        let dir = scratch_dir("dspark-default-temp");
+        let dir = scratch_dir("mtp-default-temp");
         let mut cfg = test_cfg();
-        cfg.generation.dspark = true;
+        cfg.generation.mtp = true;
         cfg.generation.temperature = 0.0;
         let mut agent = spark_agent(&dir, &cfg);
 
-        assert!(agent.dspark_on());
-        agent.dspark_command("off");
+        assert!(agent.mtp_on());
+        agent.mtp_command("off");
         let default = crate::engine::GenerationOptions::default().temperature;
         assert!((agent.gen_opts.temperature - default).abs() < 1e-6);
     }
 
     #[test]
-    fn the_temperature_cannot_be_set_while_dspark_is_on() {
-        // `/dspark` and `/temp` publish to the footer's process-global slots,
+    fn the_temperature_cannot_be_set_while_mtp_is_on() {
+        // `/mtp` and `/temp` publish to the footer's process-global slots,
         // so this shares the lock the status-bar tests hold.
         let _lock = crate::status::origin_test_guard();
-        let dir = scratch_dir("dspark-refuses-temp");
+        let dir = scratch_dir("mtp-refuses-temp");
         let mut cfg = test_cfg();
-        cfg.generation.dspark = true;
+        cfg.generation.mtp = true;
         cfg.generation.temperature = 0.0;
         let mut agent = spark_agent(&dir, &cfg);
 
         let msg = agent.temp_command("0.7");
-        assert!(msg.contains("/dspark off first"), "{msg}");
+        assert!(msg.contains("/mtp off first"), "{msg}");
         // Refused, not applied: the report still reads 0.
         assert!(agent.gen_opts.temperature.abs() < 1e-6);
-        assert!(agent.temp_command("").contains("pinned by dspark"));
+        assert!(agent.temp_command("").contains("pinned by mtp"));
     }
 
     /// The support model is chosen at startup and cannot be loaded into a
     /// running engine, so `on` is refused rather than setting a flag that
     /// would only ever show a marker.
     #[test]
-    fn dspark_on_is_refused_without_a_support_model() {
-        // `/dspark` and `/temp` publish to the footer's process-global slots,
+    fn mtp_on_is_refused_without_a_support_model() {
+        // `/mtp` and `/temp` publish to the footer's process-global slots,
         // so this shares the lock the status-bar tests hold.
         let _lock = crate::status::origin_test_guard();
-        let dir = scratch_dir("dspark-no-support");
+        let dir = scratch_dir("mtp-no-support");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
 
-        let msg = agent.dspark_command("on");
-        assert!(msg.contains("no DSpark support model"), "{msg}");
-        assert!(!agent.dspark_on());
+        let msg = agent.mtp_command("on");
+        assert!(msg.contains("no MTP support model"), "{msg}");
+        assert!(!agent.mtp_on());
         // And with no support model the temperature is the user's again.
         assert_eq!(agent.temp_command("0.5"), "temperature 0.50");
     }
 
     #[test]
-    fn dspark_rejects_anything_but_on_and_off() {
-        // `/dspark` and `/temp` publish to the footer's process-global slots,
+    fn mtp_rejects_anything_but_on_and_off() {
+        // `/mtp` and `/temp` publish to the footer's process-global slots,
         // so this shares the lock the status-bar tests hold.
         let _lock = crate::status::origin_test_guard();
-        let dir = scratch_dir("dspark-bad-arg");
+        let dir = scratch_dir("mtp-bad-arg");
         let mut cfg = test_cfg();
         // Off, so `/temp` gets as far as parsing its argument.
-        cfg.generation.dspark = false;
+        cfg.generation.mtp = false;
         let mut agent = spark_agent(&dir, &cfg);
-        assert!(agent.dspark_command("maybe").contains("expected on|off"));
+        assert!(agent.mtp_command("maybe").contains("expected on|off"));
         assert!(agent.temp_command("hot").contains("expected a number"));
         assert!(agent.temp_command("101").contains("expected a number"));
     }
@@ -17509,13 +17558,13 @@ mod tests {
     }
 
     /// The dump reports the temperature the *next pass* would use, not the one
-    /// the command line asked for: `/temp` and `/dspark` move it.
+    /// the command line asked for: `/temp` and `/mtp` move it.
     #[test]
     fn a_repro_reports_the_live_temperature_not_the_startup_one() {
         let _lock = crate::status::origin_test_guard();
         let dir = scratch_dir("repro-live-temp");
         let mut cfg = test_cfg();
-        cfg.generation.dspark = false;
+        cfg.generation.mtp = false;
         cfg.generation.temperature = 0.6;
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         agent.temp_command("0.25");
@@ -21404,7 +21453,7 @@ mod tests {
     fn record_usage_is_where_the_footer_learns_the_speculation_figures() {
         // Regression: the update lived beside two of the three
         // `last_ctx_used` assignments, and the TUI worker — the one front-end
-        // with a footer to render it — was the path left out, so `--dspark`
+        // with a footer to render it — was the path left out, so `--mtp`
         // showed nothing. `record_usage` is the only call all three paths
         // share, so the invariant is pinned here.
         let dir = std::env::temp_dir().join(format!("plank-spec-test-{}", std::process::id()));
@@ -22743,7 +22792,11 @@ mod tests {
     /// with no syntax reminder attached.
     #[test]
     fn the_in_think_payload_talks_about_placement_not_syntax() {
-        let payload = tool_error_payload(PassError::InThink, "incomplete DSML tool call");
+        let payload = tool_error_payload(
+            PassError::InThink,
+            "incomplete DSML tool call",
+            sysprompt::ToolSyntax::Dsml,
+        );
         assert!(
             payload.contains(crate::sysprompt::IN_THINK_PROHIBITION),
             "{payload:?}"
@@ -22766,13 +22819,21 @@ mod tests {
         );
 
         // A genuine syntax failure is untouched: prefix and reminder both.
-        let dsml = tool_error_payload(PassError::Dsml, "unclosed parameter");
+        let dsml = tool_error_payload(
+            PassError::Dsml,
+            "unclosed parameter",
+            sysprompt::ToolSyntax::Dsml,
+        );
         assert!(dsml.contains("invalid DSML tool call: unclosed parameter"));
         assert!(dsml.contains("DSML syntax reminder"));
 
         // A preflight failure is still fed back verbatim.
         assert_eq!(
-            tool_error_payload(PassError::Preflight, "old not found"),
+            tool_error_payload(
+                PassError::Preflight,
+                "old not found",
+                sysprompt::ToolSyntax::Dsml
+            ),
             "Tool error: old not found\n"
         );
     }

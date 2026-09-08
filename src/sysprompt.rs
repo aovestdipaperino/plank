@@ -10,6 +10,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use trace_stream::syntax::ToolSyntax;
+
 /// The tools-prompt line forbidding tool calls inside thinking, verbatim from
 /// the C (`ds4_agent.c:718`) and a substring of [`TOOLS_PROMPT_INTRO`].
 ///
@@ -31,12 +33,105 @@ You have access to native DSML tools. Invoke tools by writing exactly this shape
 </｜DSML｜tool_calls>\n\n\
 Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.\n\n\
 String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n\
+Inside string values only, escape a literal closing parameter tag as &lt;/｜DSML｜parameter>. \
+To write that escaped spelling literally, use &amp;lt;/｜DSML｜parameter>. Other HTML entities are unchanged.\n\n\
 Read defaults to a context-sized bounded chunk, not the whole file. \
 For first looks at large files, prefer read with explicit max_lines around 80-160; \
 if read says more lines are available, call more with count=<lines> to read the next chunk. \
-The read result also reports continue_offset=N, which is the next start_line if you need to jump manually. \
+Use more for exact continuation; a byte-limited chunk can end within a line. \
 If the user explicitly asks you to read a complete file into context, call read with whole=true. \
 A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n";
+
+/// Tools prompt for the Qwen3.8-Flash-Next dialect (`ds4_agent.c`,
+/// `agent_build_qwen_tools_prompt` with `edit_upto`).
+///
+/// Qwen3.8 does not speak DSML. It is taught its own `<tool_call>` syntax and
+/// is handed JSON function schemas inside `<tools>`, which is why this is a
+/// separate prompt rather than a variation on [`TOOLS_PROMPT`]. Assembled from
+/// the C by decoding its string literals rather than retyping them, since
+/// every byte here is model-facing.
+///
+/// Two deliberate omissions from the C, both because the text would be false
+/// of plank rather than merely different:
+///
+/// - `AGENT_TOOL_CONTRACTS` is left out whole, exactly as the DSML prompt
+///   leaves it out. It asserts "Read output is limited to 128 KiB", which is
+///   the C's `AGENT_TOOL_MAX_BYTES` buffer limit and not plank's behaviour —
+///   plank bounds a read by context, as the rules below still say — and that
+///   write and edit "reject hard-linked files", which plank never checks.
+///   Its other claims do hold (bash `timeout_sec` 3600, `refresh_sec` 60,
+///   search `max_results` 50 in 1-500, `context` 0 in 0-5), so the block is a
+///   candidate for adoption sentence by sentence once those two are settled.
+/// - The vision schema, because a Qwen run is text-only here (see
+///   `Ds4Model::open`).
+pub const TOOLS_PROMPT_QWEN: &str = r#"You are a coding agent running in a local workspace. Use tools for local file and system work. Avoid printing large file contents or large code blocks as answers; create or edit files with tools, then summarize results briefly.
+
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name":"google_search","description":"Search web pages.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}
+{"type": "function", "function": {"name":"visit_page","description":"Read a URL in browser.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}
+{"type": "function", "function": {"name":"bash","description":"Run a shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_sec":{"type":"integer"},"refresh_sec":{"type":"integer"}},"required":["command"]}}}
+{"type": "function", "function": {"name":"bash_status","description":"Check a bash job.","parameters":{"type":"object","properties":{"job":{"type":"integer"},"pid":{"type":"integer"},"refresh_sec":{"type":"integer"}},"required":["job"]}}}
+{"type": "function", "function": {"name":"bash_stop","description":"Stop a bash job.","parameters":{"type":"object","properties":{"job":{"type":"integer"},"pid":{"type":"integer"},"refresh_sec":{"type":"integer"}},"required":["job"]}}}
+{"type": "function", "function": {"name":"read","description":"Read a text file/range.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"max_lines":{"type":"integer"},"whole":{"type":"boolean"},"raw":{"type":"boolean"}},"required":["path"]}}}
+{"type": "function", "function": {"name":"more","description":"Continue previous read-like output.","parameters":{"type":"object","properties":{"count":{"type":"integer"}}}}}
+{"type": "function", "function": {"name":"write","description":"Create or overwrite a file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}
+{"type": "function", "function": {"name":"edit","description":"Replace one exact old text match.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}}}
+{"type": "function", "function": {"name":"search","description":"Search files.","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"mode":{"type":"string","enum":["literal","regex"]},"glob":{"type":"string"},"context":{"type":"integer"},"max_results":{"type":"integer"},"case_sensitive":{"type":"boolean"}},"required":["query"]}}}
+{"type": "function", "function": {"name":"list","description":"List one directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}
+</tools>
+
+Inside string values only, escape a literal </parameter> as &lt;/parameter>. To write that escaped spelling literally, use &amp;lt;/parameter>. Other HTML entities are unchanged.
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+Tool calls are not allowed inside <think></think>; finish thinking before emitting <tool_call>.
+
+# Rules
+
+- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.
+- If read says more lines are available, call more with count=<lines> to read the next chunk.
+- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient for the task; add raw=true only when line numbers would corrupt the payload.
+- When editing files, state the target filename before the edit; for the edit tool, put path first.
+- Use edit with exact old text and replacement new text; old may contain one [upto] marker between unique anchors.
+- For long bash jobs, pass refresh_sec and then poll with bash_status or stop with bash_stop.
+- Preserve the current system configuration unless the user explicitly asks otherwise.
+"#;
+
+/// Returns the short Qwen tool-call syntax reminder (verbatim from C).
+///
+/// The counterpart of [`dsml_syntax_reminder`]: re-shown after a malformed
+/// call so the model has the shape in front of it.
+#[must_use]
+pub fn qwen_syntax_reminder() -> &'static str {
+    "Tool-call syntax reminder:\n\
+<tool_call>\n<function=$TOOL_NAME>\n<parameter=$PARAMETER_NAME>\n\
+$PARAMETER_VALUE\n</parameter>\n</function>\n</tool_call>\n"
+}
 
 /// Editing-instructions section of the tools prompt (verbatim from C).
 ///
@@ -69,7 +164,7 @@ Example anchored edit:\n\
 </｜DSML｜invoke>\n\
 </｜DSML｜tool_calls>\n\
 To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n\
-Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
+Use read raw=true only when you need plain file text without line numbers.\n\n";
 
 /// Trailing section of the tools prompt: web tools, schemas, rules.
 ///
@@ -380,6 +475,12 @@ fn push_agent_and_plan_specs(specs: &mut Vec<crate::engine::ToolSpec>) {
         }),
     });
     specs.push(crate::engine::ToolSpec {
+        name: "compact".to_string(),
+        description: "Summarize the conversation so far and continue from the summary. Only when the user asks for it, in so many words or by saying the context is too full; never on your own initiative."
+            .to_string(),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    });
+    specs.push(crate::engine::ToolSpec {
         name: "EnterPlanMode".to_string(),
         description: "Enter read-only plan mode: research and design without changing anything. While it is active, write/edit/bash are refused; only read-only tools work. Use it when a task is risky or ambiguous and the user should approve an approach before you edit. Exit with ExitPlanMode.".to_string(),
         parameters: serde_json::json!({
@@ -504,7 +605,7 @@ fn build_tools_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> (String, usize) {
-    build_tools_prompt_parts_with_wasm(mcp_servers, &[], parity)
+    build_tools_prompt_parts_with_wasm(mcp_servers, &[], parity, ToolSyntax::Dsml)
 }
 
 /// [`build_tools_prompt_parts`] with WASM component tools folded in.
@@ -516,7 +617,14 @@ fn build_tools_prompt_parts_with_wasm(
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
+    syntax: ToolSyntax,
 ) -> (String, usize) {
+    // Qwen's prompt is a different document with a different schema fence, so
+    // it is built whole by its own builder. A profile's replacement prose is
+    // composed for the DSML prompt only and does not reach this path yet.
+    if syntax == ToolSyntax::Qwen {
+        return build_qwen_tools_prompt_parts(mcp_servers, wasm_tools);
+    }
     // A profile replaces the whole prose prompt; the schema block is still
     // generated, from the allow-listed builtins.
     let (mut out, trusted_len) = if let Some((text, spec)) = profile_prompt_source() {
@@ -535,6 +643,48 @@ fn build_tools_prompt_parts_with_wasm(
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     append_wasm_tool_schemas(&mut out, wasm_tools);
     (out, trusted_len)
+}
+
+/// [`TOOLS_PROMPT_QWEN`] with plank's own tools spliced into its schema list.
+///
+/// The dialects differ in shape here, not just in wording. The DSML prompt is
+/// a run of schemas that plank can append to, so its extras go on the end; the
+/// Qwen prompt fences its schemas inside `<tools>` … `</tools>` and puts the
+/// call-format instructions and rules *after* that, so appending would advertise
+/// tools below the rules that describe how to call them. They are inserted
+/// instead. The schema shape is the same `{"type": "function", …}` object in
+/// both, which is what makes the splice possible at all.
+///
+/// The trusted span is empty, unlike the DSML path. That span exists so the
+/// literal `｜DSML｜` in the prompt's examples tokenizes as the model's own
+/// marker token rather than as spelled-out BPE pieces; this prompt contains no
+/// DSML, so there is nothing to preserve, and the C agrees — it hands an
+/// XML-dialect tools prompt over as an ordinary system message rather than as
+/// rendered chat (`agent_syntax_is_xml_tool_call`).
+const QWEN_SCHEMA_FENCE: &str = "\n</tools>";
+
+fn build_qwen_tools_prompt_parts(
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    wasm_tools: &[&crate::wasmreg::WasmTool],
+) -> (String, usize) {
+    // Schemas belong inside the fence; server *instructions* are prose and
+    // belong after it, with the rest of the guidance.
+    let mut schemas = String::new();
+    append_native_extra_schemas(&mut schemas);
+    crate::tools::mcp::append_tool_schemas(&mut schemas, mcp_servers);
+    crate::tools::mcp::append_resource_tool_schemas(&mut schemas, mcp_servers);
+    append_wasm_tool_schemas(&mut schemas, wasm_tools);
+
+    let at = TOOLS_PROMPT_QWEN
+        .find(QWEN_SCHEMA_FENCE)
+        .expect("the Qwen tools prompt fences its schemas with </tools>");
+    let mut out = String::with_capacity(TOOLS_PROMPT_QWEN.len() + schemas.len());
+    out.push_str(&TOOLS_PROMPT_QWEN[..at]);
+    out.push_str(&schemas);
+    out.push_str(&TOOLS_PROMPT_QWEN[at..]);
+    crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
+    append_working_style(&mut out);
+    (out, 0)
 }
 
 /// Plank-owned guidance on how to spend turns, appended after the native tool
@@ -556,6 +706,8 @@ const WORKING_STYLE: &str = "# Working style
 - Keep reasoning short and forward-moving. Each thought must add a fact or a decision. If you notice yourself restating an earlier thought, stop thinking and emit the tool calls you have already planned.
 - Narrate progress outside your thinking. After </think> and before every <｜DSML｜tool_calls> stanza, write one or two plain sentences for the user: what the last results told you and what you are about to do. Your thinking is hidden from the user by default, so this line is the only status they see between tool rounds; without it a long thinking block looks like a stall.
 - Edit from search output. Call search with context=5 to see the exact lines around a match, then edit directly from them; do not follow a search with a read of the same lines.
+- Edit files with the edit tool, not with a script. Do not pipe a change through sed, awk, perl or a throwaway Python script to touch several files at once: a regex that matches in one file matches somewhere you did not read in another, and the damage is silent and spread out. Make the edits one call at a time, batching independent ones into a single stanza. The exception is a change that is genuinely a simple, uniform replacement of one exact string across files you have already inspected — then say what you are running and check the result.
+- Do not compact unless the user asks you to. The compact tool replaces the conversation with a summary, and only the user knows whether the detail it drops still matters. Asking for it outright is an instruction, and so is saying the context is too full and to carry on from a summary; merely running low on room is not. plank compacts on its own when it has to.
 - Stay in scope. Change the code the user asked about and its tests. Do not touch docs, changelogs, READMEs or examples unless the user asks.
 - Review changes per file with git diff -- <path>, or summarize with git diff --stat. A whole-repository diff is truncated and costs several turns to page through.
 - Delegate isolatable work to a sub-agent. When part of a task has a result you need but steps you do not (locate where X is handled, run a test suite and summarize the failures, audit a module for Y), call the agent tool with a fully specified task and continue from its report; for several independent parts use fanout. Your own context then holds the conclusions, not the file dumps.
@@ -1169,6 +1321,19 @@ fn append_agent_and_plan_schemas(out: &mut String) {
         "{\n\
          \x20 \"type\": \"function\",\n\
          \x20 \"function\": {\n\
+         \x20   \"name\": \"compact\",\n\
+         \x20   \"description\": \"Summarize the conversation so far and continue from the summary. Only when the user asks for it, in so many words or by saying the context is too full; never on your own initiative.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {}\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
          \x20   \"name\": \"EnterPlanMode\",\n\
          \x20   \"description\": \"Enter read-only plan mode: research and design without changing anything. While it is active, write/edit/bash are refused; only read-only tools work. Use it when a task is risky or ambiguous and the user should approve an approach before you edit. Exit with ExitPlanMode.\",\n\
          \x20   \"parameters\": {\n\
@@ -1343,7 +1508,7 @@ pub fn build_system_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> SplitSystemPrompt {
-    build_system_prompt_parts_with_wasm(user_system, mcp_servers, &[], parity)
+    build_system_prompt_parts_with_wasm(user_system, mcp_servers, &[], parity, ToolSyntax::Dsml)
 }
 
 /// [`build_system_prompt_parts`] with WASM component tools folded in.
@@ -1358,9 +1523,10 @@ pub fn build_system_prompt_parts_with_wasm(
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
+    syntax: ToolSyntax,
 ) -> SplitSystemPrompt {
     let (mut text, trusted_len) =
-        build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity);
+        build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity, syntax);
     if crate::settings::active().git.sign_commits {
         text.push_str("\n\n");
         text.push_str(COMMIT_SIGNATURE_INSTRUCTION);
@@ -1701,6 +1867,18 @@ mod tests {
         assert!(p.ends_with("Be terse."));
     }
 
+    /// The one `"enum"` the trained schema table legitimately carries: the C
+    /// gave `search.mode` an explicit `["literal", "regex"]` list. The roster
+    /// tests below assert on enums, so they have to know about this one — an
+    /// unqualified "no enum anywhere" silently starts testing the wrong thing
+    /// the moment upstream adds a static one, which is exactly what happened.
+    const STATIC_MODE_ENUM: &str = r#""enum": ["literal", "regex"]"#;
+
+    /// Occurrences of an `"enum"` key that are not [`STATIC_MODE_ENUM`].
+    fn unexpected_enums(text: &str) -> usize {
+        text.matches("\"enum\"").count() - text.matches(STATIC_MODE_ENUM).count()
+    }
+
     /// The C-parity fixtures depend on this: an empty roster must not perturb a
     /// single byte of either schema path. If this fails, the fix is in the code,
     /// never `PLANK_REGEN_FIXTURES=1`.
@@ -1708,9 +1886,10 @@ mod tests {
     fn empty_roster_emits_todays_bytes_exactly() {
         let text = build_tools_prompt(&[], true);
         assert!(text.contains("\"name\": \"agent\""), "agent schema present");
-        assert!(
-            !text.contains("\"enum\""),
-            "no enum key with an empty roster: {text}"
+        assert_eq!(
+            unexpected_enums(&text),
+            0,
+            "no enum key beyond the static search mode with an empty roster: {text}"
         );
         let specs = provider_tool_registry(&[]);
         let agent = specs
@@ -1732,7 +1911,11 @@ mod tests {
     #[test]
     fn no_roster_reaches_either_prompt_shape() {
         let (text, trusted) = build_tools_prompt_parts(&[], true);
-        assert!(!text.contains("\"enum\""), "no enum key at all: {text}");
+        assert_eq!(
+            unexpected_enums(&text),
+            0,
+            "no enum key beyond the static search mode: {text}"
+        );
         assert!(
             text.contains("\"name\": {\"type\": \"string\", \"description\":"),
             "`name` is a plain string: {text}"

@@ -80,14 +80,16 @@ See [Extending plank](09-extending.md).
 | `/config <section>.<key> <value>` | set one setting, e.g. `/config ui.showThinking false` |
 | `/debug [on\|off]` | override the `--debug` switch: mirror the raw model stream to a running `turbo-debug-console` (on connects and backfills at once); bare `/debug` reports the state |
 | `/power <1..100>` | cap GPU power draw for this run; shown as `(local ⚡60%)` in the status bar |
-| `/dspark [on\|off]` | turn DSpark speculative decoding on or off for this session; bare `/dspark` reports the state |
-| `/temp [0..100]` | set the sampling temperature; refused while `/dspark` is on, which pins it at 0 |
+| `/mtp [on\|off]` | turn speculative decoding (multi-token prediction) on or off for this session; bare `/mtp` reports the state |
+| `/temp [0..100]` | set the sampling temperature; refused while `/mtp` is on, which pins it at 0 |
 | `/loopguard [on\|off]`, `/lg` | arm or silence the loop guards. The one mutating command that also works mid-turn |
 | `/notify <mode>` | change notification mode for this session |
 | `/version` | the running version |
 | `/help` | full command and flag reference |
 
-Speculative decoding verifies its drafts by argmax, so it only runs at temperature 0: `/dspark on` pins the temperature there and `/dspark off` gives you back the one you were sampling at. `/dspark on` is refused without a loaded support model — that is chosen at startup (`--dspark`, `--mtp`) and cannot be loaded into a running engine. The status bar shows `✨` while speculation is on, with its per-step figures beside it, and `🌡 0.60` while it is off.
+The model can also ask for a compaction itself, with the `compact` tool, and carries on from the summary. It is told not to reach for it unprompted: only you know whether the detail a summary drops still matters, and plank compacts on its own when the window gets tight.
+
+Speculative decoding verifies its drafts by argmax, so it only runs at temperature 0: `/mtp on` pins the temperature there and `/mtp off` gives you back the one you were sampling at. `/mtp on` is refused without loaded draft support — that is chosen at startup (`--mtp`, `--mtp-model`) and cannot be loaded into a running engine. The status bar shows `✨` while speculation is on, with its per-step figures beside it, and `🌡 0.60` while it is off.
 
 `/loopguard off` silences every rung of every guard: the repetition guard and its think budget, the repeated-tool-call guard and its no-progress budget, and the repeat advisory. Unlike other settings commands it takes effect on a turn that is already generating, because the moment you want the guards out of the way is usually while they are firing. `🔁` in the status bar means they are armed; `♻ looping` means one has actually seen a cycle. The switch is session-only and is never written to disk (the underlying setting is `tools.loopGuards`).
 

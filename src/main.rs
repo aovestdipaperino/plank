@@ -155,6 +155,33 @@ fn report_kvcache_migration() {
     }
 }
 
+/// Records the live model family for the session store.
+///
+/// Must run before anything opens the store, which both startup paths do
+/// within a few lines: the family decides the transcript extension, and a
+/// store opened before it would name files for the wrong one.
+fn select_session_family(cfg: &plank::config::AgentConfig) {
+    // Resolved the same way the engine will resolve it, so the tag matches the
+    // model that actually loads. A path that does not exist yet — a first run,
+    // before the download — probes as `Ds4`, which is the right default.
+    let model = cfg
+        .model_path
+        .clone()
+        .unwrap_or_else(plank::download::default_model_path);
+    plank::session::set_family(plank::gguf::family_of(&model));
+}
+
+/// The detached downloader's entry point.
+///
+/// Its model set is the second argument. A helper spawned by a plank that
+/// predates two sets passes none, which reads as `ds4` — the set plank managed
+/// when there was only one.
+fn run_model_downloader(args: &[String]) -> i32 {
+    let set =
+        plank::manifest::ModelSet::from_str_or_default(args.get(1).map_or("", String::as_str));
+    plank::downloader::run_helper(set)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -165,7 +192,7 @@ fn main() -> ExitCode {
     // through `~/.plank/downloads/job.json`, and exits. Handled before every
     // other dispatch so nothing above can print to a stream that is /dev/null.
     if args.first().map(String::as_str) == Some("--model-downloader") {
-        return ExitCode::from(u8::try_from(plank::downloader::run_helper()).unwrap_or(1));
+        return ExitCode::from(u8::try_from(run_model_downloader(&args)).unwrap_or(1));
     }
 
     // `plank serve ...` runs the flavor-(a) host instead of the interactive
@@ -302,6 +329,7 @@ fn main() -> ExitCode {
     // the live alternate screen garbled the warm-progress frame), so the gate
     // is the fix rather than a reorder. Nothing to migrate exists before the
     // directory does, so skipping is exact rather than merely cheap.
+    select_session_family(&cfg);
     report_kvcache_migration();
     // `--worktree` runs before anything reads the working directory, because
     // the whole session — its hooks, agent definitions, and every tool's cwd —
@@ -625,13 +653,13 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         plank::download::ensure_model(&model)?;
         // Vision is always on: the encoder GGUF sits beside the main model and
         // is fetched on demand when missing, the same as the main model.
-        plank::download::ensure_vision_encoder()?;
-        // DSpark is on by default; without `--mtp` it resolves to the default
-        // support model, fetched on demand (`--dspark-off` skips this). Kept
-        // local rather than written back into `cfg`: only the engine open
-        // needs it.
+        // Speculation is on by default; without `--mtp-model` a DeepSeek run
+        // resolves the default support GGUF and fetches it on demand
+        // (`--mtp-off` skips that). Kept local rather than written back into
+        // `cfg`: only the engine open needs it. A Qwen model skips both side
+        // artifacts, since it opens neither.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_dspark_support(&mut tuning)?;
+        plank::download::ensure_side_artifacts(&model, &mut tuning)?;
 
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
@@ -798,6 +826,8 @@ fn run_serve(args: &[String]) -> ExitCode {
     };
     plank::interrupt::install();
 
+    select_session_family(&cfg);
+
     // Shared-engine mode (issue #28): host one model for many concurrent
     // per-session_id clients. Off by default; the local single-tenant path is
     // byte-for-byte unchanged. Not combined with --remote (that is a client).
@@ -875,10 +905,9 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         plank::download::ensure_model(&model_path)?;
         // Vision is always on: the encoder GGUF sits beside the main model and
         // is fetched on demand when missing, the same as the main model.
-        plank::download::ensure_vision_encoder()?;
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_dspark_support(&mut tuning)?;
+        plank::download::ensure_side_artifacts(&model_path, &mut tuning)?;
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,
