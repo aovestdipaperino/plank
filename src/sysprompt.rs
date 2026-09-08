@@ -31,10 +31,12 @@ You have access to native DSML tools. Invoke tools by writing exactly this shape
 </｜DSML｜tool_calls>\n\n\
 Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.\n\n\
 String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n\
+Inside string values only, escape a literal closing parameter tag as &lt;/｜DSML｜parameter>. \
+To write that escaped spelling literally, use &amp;lt;/｜DSML｜parameter>. Other HTML entities are unchanged.\n\n\
 Read defaults to a context-sized bounded chunk, not the whole file. \
 For first looks at large files, prefer read with explicit max_lines around 80-160; \
 if read says more lines are available, call more with count=<lines> to read the next chunk. \
-The read result also reports continue_offset=N, which is the next start_line if you need to jump manually. \
+Use more for exact continuation; a byte-limited chunk can end within a line. \
 If the user explicitly asks you to read a complete file into context, call read with whole=true. \
 A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n";
 

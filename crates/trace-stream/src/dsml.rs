@@ -399,9 +399,17 @@ impl DsmlParser {
                     };
                     let value_bytes =
                         &self.raw[self.param_value_start..self.param_value_start + end];
+                    // Only a string value carries the escape; a non-string one
+                    // is JSON text, where `&lt;` escapes nothing. The C guards
+                    // it the same way (`if (is_string)`).
+                    let unescaped = self.param_is_string.then(|| {
+                        let close = &self.raw[self.param_value_start + end..][..tag_len];
+                        unescape_close_delimiter(value_bytes, &close[1..])
+                    });
+                    let value = unescaped.as_deref().unwrap_or(value_bytes);
                     let arg = ToolArg {
                         name: self.param_name.take().unwrap_or_default(),
-                        value: String::from_utf8_lossy(value_bytes).into_owned(),
+                        value: String::from_utf8_lossy(value).into_owned(),
                         is_string: self.param_is_string,
                     };
                     self.current
@@ -644,6 +652,78 @@ impl DsmlParser {
         let mut complete = false;
         self.param_close_prefix = parameter_close_tail(tail, &mut complete) && !complete;
     }
+}
+
+/// Whether `s` begins with an escaped spelling of the closing delimiter, and
+/// which level of escaping it carries.
+///
+/// Port of `ds4_tool_text_escaped_close` (`refs/ds4/ds4_tool_text.h`).
+/// `close_tail` is the delimiter without its leading `<` — the C's `end + 1` —
+/// so `&lt;` followed by it is the escaped close. Any run of `amp;` may sit
+/// between the `&` and the `lt;`: that is how the model writes the escaped
+/// spelling itself literally, one level per `amp;`.
+fn escaped_close_at(s: &[u8], close_tail: &[u8]) -> Option<EscapedClose> {
+    if s.first() != Some(&b'&') {
+        return None;
+    }
+    let mut j = 1;
+    while s.get(j..).is_some_and(|r| r.starts_with(b"amp;")) {
+        j += 4;
+    }
+    let rest = s.get(j..)?;
+    if !rest.starts_with(b"lt;") || !rest.get(3..)?.starts_with(close_tail) {
+        return None;
+    }
+    Some(if s.starts_with(b"&amp;") {
+        EscapedClose::Amp
+    } else {
+        EscapedClose::Lt
+    })
+}
+
+/// Which prefix [`escaped_close_at`] matched, and so how much to consume.
+#[derive(Debug, Clone, Copy)]
+enum EscapedClose {
+    /// `&amp;` — collapses to `&`, dropping one level of escaping.
+    Amp,
+    /// `&lt;` — collapses to `<`, restoring the literal delimiter.
+    Lt,
+}
+
+/// Restores a closing delimiter the model escaped to keep it inside a value.
+///
+/// Port of `ds4_tool_text_unescape` (`refs/ds4/ds4_tool_text.h`), and the
+/// receiving half of what the tools prompt teaches: a literal
+/// `</｜DSML｜parameter>` in a value would end it, so the model spells it
+/// `&lt;/｜DSML｜parameter>`. Exactly one level comes off per pass, and only
+/// this one delimiter is touched — tool bodies are not HTML, so every other
+/// entity survives byte for byte.
+///
+/// `close_tail` is the delimiter that actually closed this parameter, minus
+/// its leading `<`. Taking it from the matched tag rather than a constant is
+/// what keeps the accepted variants (`｜>` spellings, the shorthand closed by
+/// `invoke`) each unescaping only their own delimiter, as the C does by
+/// passing the end tag it scanned for.
+fn unescape_close_delimiter(value: &[u8], close_tail: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        match escaped_close_at(&value[i..], close_tail) {
+            Some(EscapedClose::Amp) => {
+                out.push(b'&');
+                i += 5;
+            }
+            Some(EscapedClose::Lt) => {
+                out.push(b'<');
+                i += 4;
+            }
+            None => {
+                out.push(value[i]);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// The element name of a DSML-marked opening tag, e.g. `command` for
@@ -1396,6 +1476,107 @@ mod tests {
         feed_all(&mut p, "<｜DSML｜tool_calls><b>");
         assert_eq!(p.state(), DsmlState::Error);
         assert!(p.error().starts_with("unexpected DSML tag:"));
+    }
+
+    /// The C's `test_agent_tool_argument_literal_markup` fixture, byte for
+    /// byte (`ds4_agent.c`, the `deepseek`/`expected` arrays).
+    ///
+    /// A literal `</｜DSML｜parameter>` inside a value would terminate it, so
+    /// the prompt teaches the model to spell it `&lt;/｜DSML｜parameter>` and
+    /// the receiver puts it back. `&amp;lt;/…` is how the model writes that
+    /// escaped spelling literally, and it loses exactly one level. Every other
+    /// entity — the bare `&amp;` and `&lt;` here — is left alone: tool bodies
+    /// are not HTML, and only the closing delimiter is escaped.
+    const C_LITERAL_MARKUP_INPUT: &str = concat!(
+        "<｜DSML｜tool_calls><｜DSML｜invoke name=\"write\">",
+        "<｜DSML｜parameter name=\"content\" string=\"true\">",
+        "<p>&amp; &lt;</p> </tool_call> </think> ",
+        "&lt;/｜DSML｜parameter> &amp;lt;/｜DSML｜parameter>",
+        "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
+    );
+
+    const C_LITERAL_MARKUP_EXPECTED: &str =
+        "<p>&amp; &lt;</p> </tool_call> </think> </｜DSML｜parameter> &lt;/｜DSML｜parameter>";
+
+    #[test]
+    fn escaped_close_tag_is_unescaped_like_the_c() {
+        let mut p = DsmlParser::new();
+        feed_all(&mut p, C_LITERAL_MARKUP_INPUT);
+        assert_eq!(
+            p.calls()[0].arg_value("content"),
+            Some(C_LITERAL_MARKUP_EXPECTED)
+        );
+    }
+
+    /// The C feeds this fixture as two chunks; a byte at a time is stricter.
+    /// The escaped spelling carries no literal `</`, so no split can make it
+    /// look like a close — this pins that.
+    #[test]
+    fn escaped_close_tag_survives_a_bytewise_stream() {
+        let mut p = DsmlParser::new();
+        feed_bytewise(&mut p, C_LITERAL_MARKUP_INPUT);
+        assert_eq!(
+            p.calls()[0].arg_value("content"),
+            Some(C_LITERAL_MARKUP_EXPECTED)
+        );
+    }
+
+    /// Deeper nesting drops one level per pass, like the C's `while` over
+    /// `amp;` runs: `&amp;amp;lt;/…` is the literal spelling of
+    /// `&amp;lt;/…`.
+    #[test]
+    fn only_one_level_of_escaping_is_removed() {
+        let mut p = DsmlParser::new();
+        feed_all(
+            &mut p,
+            concat!(
+                "<｜DSML｜tool_calls><｜DSML｜invoke name=\"write\">",
+                "<｜DSML｜parameter name=\"content\" string=\"true\">",
+                "&amp;amp;lt;/｜DSML｜parameter>",
+                "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
+            ),
+        );
+        assert_eq!(
+            p.calls()[0].arg_value("content"),
+            Some("&amp;lt;/｜DSML｜parameter>")
+        );
+    }
+
+    /// `&lt;` that does not begin the closing delimiter is not an escape, so
+    /// it must survive untouched even though it starts the same way.
+    #[test]
+    fn an_entity_that_is_not_the_close_tag_is_left_alone() {
+        let mut p = DsmlParser::new();
+        feed_all(
+            &mut p,
+            concat!(
+                "<｜DSML｜tool_calls><｜DSML｜invoke name=\"write\">",
+                "<｜DSML｜parameter name=\"content\" string=\"true\">",
+                "&lt;div&gt; &lt;/span> &amp;lt;",
+                "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
+            ),
+        );
+        assert_eq!(
+            p.calls()[0].arg_value("content"),
+            Some("&lt;div&gt; &lt;/span> &amp;lt;")
+        );
+    }
+
+    /// The C guards the unescape with `if (is_string)`. A non-string value is
+    /// JSON text, where `&lt;` is not an escape of anything.
+    #[test]
+    fn a_non_string_value_is_not_unescaped() {
+        let mut p = DsmlParser::new();
+        feed_all(
+            &mut p,
+            concat!(
+                "<｜DSML｜tool_calls><｜DSML｜invoke name=\"write\">",
+                "<｜DSML｜parameter name=\"n\" string=\"false\">",
+                "&lt;/｜DSML｜parameter>",
+                "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
+            ),
+        );
+        assert_eq!(p.calls()[0].arg_value("n"), Some("&lt;/｜DSML｜parameter>"));
     }
 
     #[test]
