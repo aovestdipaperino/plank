@@ -138,9 +138,18 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v5.0.0 is out</strong>, and the beta channel has reopened on
-5.0.1. The patch number is still the channel: <code>.0</code> is stable,
-anything above it is beta.</p>
+<p><strong>v5.0.0 is out</strong>, and the beta channel is on 5.0.2. The
+patch number is still the channel: <code>.0</code> is stable, anything
+above it is beta.</p>
+<p><strong>5.0.2 (beta) gives the write tool a live preview.</strong> A
+<code>Writing &lt;path&gt;</code> header, the first five lines of the
+file, then a <code>… N lines</code> counter that ticks as the file
+streams and settles on a <code>└ N lines</code> summary when the write
+lands. <code>/usage</code> typed during a turn now opens its dismissable
+panel instead of spilling into the scrollback, the rotating tip sits on
+its own line while the agent works, and the AGENTS.md startup offer has
+a "Don't ask for this folder" choice that remembers the answer in
+<code>~/.plank/agentsmd-skip</code>.</p>
 <p><strong>Plank runs two models now.</strong> Qwen3.8-Flash-Next joins
 DeepSeek V4 Flash: <code>--qwen</code> reads
 <code>~/.plank/qwen.gguf</code> and the PLE sidecar it requires from

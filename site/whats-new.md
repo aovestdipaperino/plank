@@ -7,8 +7,16 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.0.0 is out**, and the beta channel has reopened on 5.0.1. The patch number
+**v5.0.0 is out**, and the beta channel is on 5.0.2. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.0.2 (beta) gives the write tool a live preview.** A `Writing <path>`
+header, the first five lines of the file, then a `… N lines` counter that ticks
+as the file streams and settles on a `└ N lines` summary when the write lands.
+`/usage` typed during a turn now opens its dismissable panel instead of
+spilling into the scrollback, the rotating tip sits on its own line while the
+agent works, and the AGENTS.md startup offer has a "Don't ask for this folder"
+choice that remembers the answer in `~/.plank/agentsmd-skip`.
 
 **Plank runs two models now.** Qwen3.8-Flash-Next joins DeepSeek V4 Flash:
 `--qwen` reads `~/.plank/qwen.gguf` and the PLE sidecar it requires from

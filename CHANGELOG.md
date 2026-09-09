@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.0.2] - 2026-09-09
+
+### Added
+
+- **The AGENTS.md startup offer can be silenced per folder.** When neither
+  `AGENTS.md` nor `CLAUDE.md` exists, the offer now has three choices:
+  Generate (the default), Not now, and "Don't ask for this folder", which
+  records the project path in `~/.plank/agentsmd-skip` so that folder is never
+  asked again. The plain-stdin path takes `[Y/n/d]`.
+- **The write preview shows a live line counter.** Past the preview cap (now 5
+  lines, up from 3) the collapsed body shows a `… N lines` line that ticks as
+  the file streams and settles on the permanent `└ N lines` summary. The
+  preview header is `Writing <repo-relative-path>` in a bulleted, indented
+  block.
+
+### Changed
+
+- **`/usage` typed during a turn opens its panel** instead of dumping the
+  report into the scrollback between the model's streaming output. Esc
+  dismisses it, PageUp/PageDown scroll it, and the next submit retires it.
+- **The rotating tip sits on its own line while the agent works**, below the
+  progress row, instead of in the status tail; at rest it stays in the tail.
+
+### Fixed
+
+- **A `/usage` typed mid-write no longer duplicates the line counter.** The
+  echo landed after the live counter and the next tick popped the echo instead,
+  leaving a stale count above a fresh one. Out-of-stream pushes now retire the
+  counter first.
+
 ## [5.0.0] - 2026-09-08
 
 ### Added

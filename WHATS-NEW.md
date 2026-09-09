@@ -10,10 +10,17 @@ it.
 
 ## In the betas
 
-Riding ahead of stable 5.0.0 in the 5.0.1 beta. Install with `brew install
+Riding ahead of stable 5.0.0 in the 5.0.2 beta. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
 
-Nothing new here yet — 5.0.1 opens where 5.0.0 landed.
+### 5.0.2
+
+The write tool got a proper preview: a `Writing <path>` header, five lines of
+the file, then a live `… N lines` counter that ticks as the file streams and
+settles on a `└ N lines` summary. `/usage` typed during a turn opens its panel
+instead of spilling into the scrollback, and the rotating tip moves onto its
+own line while the agent works. If you never want the AGENTS.md offer in a
+folder, "Don't ask for this folder" now records that.
 
 ## Stable releases
 
