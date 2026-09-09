@@ -2419,3 +2419,18 @@ hard-linked files", which plank never checks. Its other claims do hold, so the
 block is adoptable sentence by sentence once those two are settled. The parity
 tests subtract exactly that span, with markers that fail loudly if upstream
 reshapes it.
+
+## A vision encoder is refused unless the checkpoint is Vision-Exp
+
+`ds4_engine_open` does not load the encoder best-effort when the main model
+cannot use it: with a `vision_path` set and a `DeepSeek` GGUF that lacks
+`deepseek4.checkpoint_variant = "vision-exp"`, it prints "--vision requires
+GLM-5.3, Qwen3.8-Flash-Next or the pinned DeepSeek V4 Flash Vision-Exp model"
+and fails the whole open. plank used to pass the encoder for every `DeepSeek`
+run, so a language-only or re-quantized checkpoint (an abliterated Q2, say)
+could not be opened at all, and the only message was the generic "failed to
+open model". `gguf::supports_vision` now reads that key before the open;
+`Ds4Model::open` passes a null `vision_path` and `ensure_side_artifacts` skips
+the encoder download when it is absent, and a note at open time says the run
+is text-only. `view_image` then refuses at call time, the same path a missing
+encoder file already took.
