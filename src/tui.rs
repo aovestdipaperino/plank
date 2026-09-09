@@ -3130,6 +3130,11 @@ pub fn draw_warm(
     let done = done.clamp(0, total);
     let pct = u16::try_from(i64::from(done) * 100 / i64::from(total)).unwrap_or(100);
     let bar = crate::status::progress_bar(done, total, tps, false);
+    // ETA sits after the percentage so the bar+t/s prefix keeps a stable width;
+    // it is absent until the rate is known, rather than showing a bogus `~0s`.
+    let eta = crate::status::prefill_eta(done, total, tps)
+        .map(|eta| format!("  ~{eta} left"))
+        .unwrap_or_default();
     let area = frame.area();
     let rows = Layout::vertical([
         Constraint::Percentage(45),
@@ -3145,7 +3150,7 @@ pub fn draw_warm(
                 .add_modifier(Modifier::BOLD),
         ))
         .centered(),
-        Line::from(format!("{bar}  {pct}%")).centered(),
+        Line::from(format!("{bar}  {pct}%{eta}")).centered(),
     ]);
     frame.render_widget(Paragraph::new(text), rows[1]);
     // Reason for the rebuild (cache missing / prompt changed + diff), below the

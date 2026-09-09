@@ -1670,7 +1670,7 @@ pub fn progress_bar(done: i32, total: i32, tps: f64, color: bool) -> String {
 /// Time left for a prefill pass at the current throughput, as a
 /// [`format_elapsed`] string. `None` while the rate is unknown or nothing is
 /// left, so the readout never shows a bogus `~0s left` or a division by zero.
-fn prefill_eta(done: i32, total: i32, tps: f64) -> Option<String> {
+pub(crate) fn prefill_eta(done: i32, total: i32, tps: f64) -> Option<String> {
     let remaining = total.saturating_sub(done);
     if remaining <= 0 || !tps.is_finite() || tps <= 0.0 {
         return None;
