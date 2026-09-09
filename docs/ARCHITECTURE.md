@@ -101,6 +101,16 @@ sequenceDiagram
 plank supports two model families and tells them apart three times, from three
 different sources, because each answer is needed at a different moment.
 
+The second family, Qwen3.8-Flash-Next, is behind the **`qwen` Cargo feature and
+is off by default** — see the feature's comment in `Cargo.toml`. What the gate
+covers is the *capability*: the `--qwen` flag, the model's tools prompt and
+`<tool_call>` parser (`trace_stream::qwen`, swapped for a no-op stub so
+`viz.rs` needs no `#[cfg]` on its dialect dispatch), and the PLE wiring. What
+it deliberately does **not** cover is detection or anything on disk:
+`gguf::family_of` still recognises a Qwen GGUF so `ds4engine::supported_family`
+can refuse it by name instead of misparsing it as DeepSeek, and `.qwn.kv`
+transcripts written by a Qwen-enabled build still load, sweep and GC normally.
+
 `gguf::family_of` reads a model's own `general.architecture` — matching
 `qwen4exp` exactly as the C's `config_validate_model` does — and is the only
 answer available *before* `ds4_engine_open`. It has to be: the companion GGUF

@@ -11,6 +11,13 @@ keywords = ["llm", "streaming", "markdown", "ansi", "terminal"]
 categories = ["command-line-interface", "text-processing"]
 readme = "README.md"
 
+[features]
+# The Qwen3.8-Flash-Next tool-call dialect (`<tool_call>` / `<function=…>`).
+# Off by default: plank does not build Qwen support by default either, and with
+# it off `qwen_stub.rs` stands in for the parser so `viz.rs` needs no `#[cfg]`
+# on the dialect dispatch it runs for every generation.
+qwen = []
+
 [dependencies]
 
 [lints]

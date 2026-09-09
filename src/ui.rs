@@ -609,9 +609,19 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
                 "Tool error: invalid DSML tool call: {err}\n{}",
                 sysprompt::dsml_syntax_reminder()
             ),
+            #[cfg(feature = "qwen")]
             sysprompt::ToolSyntax::Qwen => format!(
                 "Tool error: invalid tool call: {err}\n{}",
                 sysprompt::qwen_syntax_reminder()
+            ),
+            // Unreachable — a Qwen model cannot be opened by this build — but
+            // the variant still exists, so the match must stay total. Falling
+            // back to the DSML reminder is the honest answer: DSML is the only
+            // dialect this build speaks.
+            #[cfg(not(feature = "qwen"))]
+            sysprompt::ToolSyntax::Qwen => format!(
+                "Tool error: invalid tool call: {err}\n{}",
+                sysprompt::dsml_syntax_reminder()
             ),
         },
     }
@@ -17337,7 +17347,11 @@ mod tests {
             session: Session::new(),
             store: SessionStore::open(dir).unwrap(),
             pending_aside: None,
-            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            // The scratch dir, not the process cwd: a test agent whose tools
+            // write relative paths would otherwise drop them in the repo root
+            // — `a_turn_that_keeps_writing_is_never_stopped_for_lack_of_progress`
+            // left five `out<N>.txt` behind on every `cargo test --lib`.
+            tool_ctx: ToolContext::new(dir.to_path_buf()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),

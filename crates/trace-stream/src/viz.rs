@@ -3593,6 +3593,7 @@ mod qwen_dialect_tests {
     /// dispatch as a call instead of the "invalid DSML tool call" a real
     /// session got four times in a row.
     #[test]
+    #[cfg(feature = "qwen")]
     fn a_qwen_stanza_becomes_a_dispatchable_call() {
         let sr = run(CALL);
         let done = sr.finished();
@@ -3627,12 +3628,14 @@ mod qwen_dialect_tests {
     /// settled again at end of generation. Two calls here would mean every
     /// tool ran twice.
     #[test]
+    #[cfg(feature = "qwen")]
     fn calls_are_not_collected_twice_by_finish() {
         let sr = run(CALL);
         assert_eq!(sr.finished().calls.len(), 1, "settled exactly once");
     }
 
     #[test]
+    #[cfg(feature = "qwen")]
     fn two_stanzas_in_one_generation_both_dispatch() {
         let sr = run(&format!("{CALL}\n{CALL}"));
         assert_eq!(sr.finished().calls.len(), 2);
@@ -3641,6 +3644,7 @@ mod qwen_dialect_tests {
     /// A malformed stanza has to come back as a retryable tool error, not be
     /// silently dropped.
     #[test]
+    #[cfg(feature = "qwen")]
     fn a_malformed_qwen_stanza_reports_an_error() {
         let sr = run("<tool_call>\n<parameter=path>\na\n</parameter>\n</function>\n</tool_call>");
         let done = sr.finished();
@@ -3677,6 +3681,21 @@ mod qwen_dialect_tests {
         let done = sr.finished();
         assert!(done.calls.is_empty());
         assert_eq!(done.error, None);
+    }
+
+    /// Without the `qwen` feature the stanza is prose, not a half-recognised
+    /// call: the stub parser stays in `Search`, so nothing is dispatched and —
+    /// the part that matters — no incomplete-tool-call error is fed back to a
+    /// model that did nothing wrong.
+    #[test]
+    #[cfg(not(feature = "qwen"))]
+    fn without_the_feature_a_qwen_stanza_is_inert() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Qwen);
+        sr.push(CALL);
+        sr.finish();
+        let done = sr.finished();
+        assert!(done.calls.is_empty(), "nothing is dispatched");
+        assert_eq!(done.error, None, "and nothing is reported as malformed");
     }
 
     /// A DSML-configured renderer must not react to Qwen markup, which is

@@ -446,6 +446,23 @@ pub fn parse_backend(name: &str) -> Option<Backend> {
     }
 }
 
+/// The `--qwen` entry, present only in a build that carries the model.
+///
+/// Listing a flag the build refuses would send the reader to a fix that is not
+/// available to them; the flag's own error message names the feature instead.
+#[cfg(feature = "qwen")]
+const QWEN_USAGE: &str = "\
+      --qwen               run Qwen3.8-Flash-Next instead of DeepSeek V4 (off by
+                           default): shorthand for -m ~/.plank/qwen.gguf
+                           --mtp-model ~/.plank/qwen.mtp.gguf, both expected to be
+                           symlinks you point at your own build. An explicit -m or
+                           --mtp-model wins.
+";
+
+/// See the gated [`QWEN_USAGE`].
+#[cfg(not(feature = "qwen"))]
+const QWEN_USAGE: &str = "";
+
 /// Returns the usage help text, close to the C agent's `-h` output.
 #[must_use]
 #[allow(clippy::too_many_lines)] // one long string literal
@@ -459,11 +476,10 @@ Options:
       --debug              look for a running turbo-debug-console and mirror the
                            raw model stream to it while ui.showThinking is off
   -m, --model PATH         load a ds4 GGUF model (real inference)
-      --qwen               run Qwen3.8-Flash-Next instead of DeepSeek V4 (off by
-                           default): shorthand for -m ~/.plank/qwen.gguf
-                           --mtp-model ~/.plank/qwen.mtp.gguf, both expected to be
-                           symlinks you point at your own build. An explicit -m or
-                           --mtp-model wins.
+"
+    .to_owned()
+        + QWEN_USAGE
+        + "\
   -t, --threads N          worker thread count (backend default when unset)
       --backend NAME       select backend by name: metal, cuda, cpu
       --metal              use the Metal backend
@@ -595,7 +611,6 @@ Settings file:
       No secrets: keep the provider API key on --api-key or the environment,
       since ./.plank/settings.json is inside the working tree.
 "
-    .to_owned()
 }
 
 /// Parses a positive `i32`, naming `opt` in the error message.
@@ -1422,7 +1437,19 @@ pub fn parse_options_with(
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
             "--ssd-streaming-cold" => c.engine.ssd_streaming_cold = true,
+            #[cfg(feature = "qwen")]
             "--qwen" => c.qwen = true,
+            // Named rather than reported as unknown: the flag exists, this
+            // build just does not carry the model. Telling the user which
+            // build they have is the difference between a one-line fix and a
+            // hunt through the option list for a typo.
+            #[cfg(not(feature = "qwen"))]
+            "--qwen" => {
+                return Err(
+                    "--qwen: this build has no Qwen support; rebuild with --features qwen"
+                        .to_owned(),
+                );
+            }
             "--mtp" => c.engine.mtp = true,
             "--mtp-off" => c.engine.mtp = false,
             "--mtp-strict" => {
@@ -2201,7 +2228,19 @@ mod tests {
     /// decided at open time from the model's own architecture, not here — this
     /// only pins that the flag carries a path and disturbs nothing else.
     /// `--qwen` fills in both default paths, and nothing else: the flag is a
+    /// Without the feature the flag is refused *by name*, not swallowed as an
+    /// unknown option: the user needs to learn which build they have, not go
+    /// hunting for a typo.
+    #[cfg(not(feature = "qwen"))]
+    #[test]
+    fn the_qwen_flag_is_refused_by_name_without_the_feature() {
+        let err = parse_options(&args(&["--qwen"])).unwrap_err();
+        assert!(err.contains("--qwen"), "names the flag: {err}");
+        assert!(err.contains("--features qwen"), "names the fix: {err}");
+    }
+
     /// shorthand, so it must not touch the knobs around it.
+    #[cfg(feature = "qwen")]
     #[test]
     fn qwen_flag_fills_in_both_default_paths() {
         let c = parse_options(&args(&["--qwen"])).unwrap();
@@ -2224,6 +2263,7 @@ mod tests {
 
     /// An explicit path wins on either side of `--qwen`, which is the whole
     /// reason the flag is applied after parsing rather than at the flag.
+    #[cfg(feature = "qwen")]
     #[test]
     fn an_explicit_model_beats_qwen_in_either_order() {
         for order in [
@@ -2245,6 +2285,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "qwen")]
     #[test]
     fn an_explicit_companion_beats_qwen_in_either_order() {
         for order in [

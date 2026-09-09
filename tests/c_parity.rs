@@ -494,6 +494,7 @@ fn metal_kernels_match_the_c_reference() {
 /// The C sentence that opens `AGENT_TOOL_CONTRACTS`, which plank omits.
 const CONTRACTS_HEAD: &str = "Read output is limited to 128 KiB.";
 /// The sentence that follows that block, marking where plank resumes.
+#[cfg(feature = "qwen")]
 const AFTER_CONTRACTS: &str = "Inside string values only,";
 
 /// plank's Qwen tools prompt against the C's, assembled the same way.
@@ -506,7 +507,9 @@ const AFTER_CONTRACTS: &str = "Inside string values only,";
 /// sentences are false of plank (a 128 KiB read cap it does not have, and
 /// hard-link rejection it never checks). Everything else must match byte for
 /// byte, so upstream wording changes still surface here.
+// The Qwen prompt text only exists in a build that carries the model.
 #[test]
+#[cfg(feature = "qwen")]
 fn qwen_tools_prompt_matches_c_source() {
     let Some(src) = c_source() else {
         eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
@@ -553,7 +556,9 @@ fn qwen_tools_prompt_matches_c_source() {
     );
 }
 
+// The Qwen prompt text only exists in a build that carries the model.
 #[test]
+#[cfg(feature = "qwen")]
 fn qwen_syntax_reminder_matches_c_source() {
     let Some(src) = c_source() else {
         eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");

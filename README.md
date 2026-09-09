@@ -46,6 +46,7 @@ cargo build --release
 
 - **With `refs/ds4` present:** `build.rs` builds `libds4core.a` from the Metal-backend objects and links the required frameworks, enabling the `ds4_engine` cfg.
 - **Missing submodule:** plank still builds, but without the native engine it uses the echo engine only (useful for development/CI).
+- **Qwen3.8-Flash-Next is not built by default.** DeepSeek V4 Flash is the model plank is for; Qwen3.8 was ported for dialect parity with the C reference and its output quality does not justify shipping it to everyone. Build `--features qwen` to get the `--qwen` flag, the model's own tools prompt and `<tool_call>` dialect, and its PLE sidecar wiring. A default build still *recognises* a Qwen GGUF and refuses it by name rather than misparsing it, and still reads and sweeps `.qwn.kv` transcripts a Qwen-enabled build left behind.
 
 You will also need a GGUF model file (e.g. `ds4flash.gguf`) for real inference; see the `download_model.sh` script in `refs/ds4`.
 

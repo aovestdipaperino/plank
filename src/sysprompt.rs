@@ -64,6 +64,7 @@ A whole-file read may fail if the result would not fit the current context; then
 ///   candidate for adoption sentence by sentence once those two are settled.
 /// - The vision schema, because a Qwen run is text-only here (see
 ///   `Ds4Model::open`).
+#[cfg(feature = "qwen")]
 pub const TOOLS_PROMPT_QWEN: &str = r#"You are a coding agent running in a local workspace. Use tools for local file and system work. Avoid printing large file contents or large code blocks as answers; create or edit files with tools, then summarize results briefly.
 
 # Tools
@@ -127,6 +128,7 @@ Tool calls are not allowed inside <think></think>; finish thinking before emitti
 /// The counterpart of [`dsml_syntax_reminder`]: re-shown after a malformed
 /// call so the model has the shape in front of it.
 #[must_use]
+#[cfg(feature = "qwen")]
 pub fn qwen_syntax_reminder() -> &'static str {
     "Tool-call syntax reminder:\n\
 <tool_call>\n<function=$TOOL_NAME>\n<parameter=$PARAMETER_NAME>\n\
@@ -605,8 +607,14 @@ fn build_tools_prompt_parts_with_wasm(
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
-    syntax: ToolSyntax,
+    #[cfg_attr(not(feature = "qwen"), allow(unused_variables))] syntax: ToolSyntax,
 ) -> (String, usize) {
+    // Unreachable without the feature: `Ds4Model::open` refuses a Qwen model
+    // before any prompt is built, so the dialect can never be selected. The
+    // arm is gated rather than left to fall through to DSML so that, if that
+    // refusal is ever bypassed, the build fails to compile instead of quietly
+    // handing a Qwen model the wrong prompt.
+    #[cfg(feature = "qwen")]
     if syntax == ToolSyntax::Qwen {
         return build_qwen_tools_prompt_parts(mcp_servers, wasm_tools);
     }
@@ -639,8 +647,10 @@ fn build_tools_prompt_parts_with_wasm(
 /// DSML, so there is nothing to preserve, and the C agrees — it hands an
 /// XML-dialect tools prompt over as an ordinary system message rather than as
 /// rendered chat (`agent_syntax_is_xml_tool_call`).
+#[cfg(feature = "qwen")]
 const QWEN_SCHEMA_FENCE: &str = "\n</tools>";
 
+#[cfg(feature = "qwen")]
 fn build_qwen_tools_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],

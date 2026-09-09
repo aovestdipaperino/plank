@@ -72,6 +72,18 @@ docparse = ["dep:liteparse", "dep:tokio"]
 # whose no-op implementation is what the rest of plank talks to when the feature
 # is off: the same shape as `Engine`/`EchoEngine`, and for the same reason.
 plugins = ["dep:extism"]
+# Qwen3.8-Flash-Next support: the `--qwen` flag and its default model paths,
+# the model's own tools prompt and `<tool_call>` dialect, the PLE n-gram
+# sidecar wiring, and the downloader's Qwen artifacts.
+#
+# **Off by default.** The DeepSeek V4 Flash path is the product; Qwen3.8 was
+# ported for dialect parity with the C reference and its output quality does
+# not justify offering it to everyone who builds plank. A build without this
+# still *recognises* a Qwen GGUF — `gguf::family_of` is unconditional — and
+# refuses it by name rather than misparsing it as DeepSeek, and it still reads,
+# sweeps and GCs `.qwn.kv` transcripts left by a build that had the feature on.
+# On-disk compatibility is deliberately not part of the gate.
+qwen = ["trace-stream/qwen"]
 
 [dependencies]
 trace-stream = { path = "crates/trace-stream" }

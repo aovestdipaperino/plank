@@ -209,7 +209,7 @@ impl Ds4Model {
             })
             .transpose()
         };
-        let family = crate::gguf::family_of(path);
+        let family = supported_family(crate::gguf::family_of(path), path)?;
         let (mtp_path, ple_path) = companion_slots(family, tuning.mtp_path.as_deref());
         let c_mtp = c_opt_path(mtp_path, "mtp model")?;
         let c_ple = c_opt_path(ple_path, "ple sidecar")?;
@@ -2544,6 +2544,41 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     ("DS4_METAL_QWEN4_VISION_SOURCE", "qwen4_vision.metal"),
 ];
 
+/// Passes `family` through, or rejects one this build cannot serve before the
+/// engine loads it.
+///
+/// Without the `qwen` feature the tools prompt, the `<tool_call>` parser and
+/// the PLE wiring are all absent, so a Qwen model would load, be handed a DSML
+/// prompt it was not trained on, and emit a dialect nothing parses. Family
+/// detection is deliberately *not* gated, so this can be a refusal that names
+/// the model and the fix rather than a silent misparse as `DeepSeek`.
+///
+/// # Errors
+/// Returns [`EngineError`] when this build cannot serve `family`.
+#[cfg_attr(
+    feature = "qwen",
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "the \
+    feature-on build refuses nothing, but the call site is shared"
+    )
+)]
+fn supported_family(
+    family: crate::gguf::ModelFamily,
+    path: &Path,
+) -> Result<crate::gguf::ModelFamily, EngineError> {
+    #[cfg(not(feature = "qwen"))]
+    if family == crate::gguf::ModelFamily::Qwen {
+        return Err(EngineError::new(format!(
+            "{} is a Qwen3.8-Flash-Next model and this build has no Qwen support; rebuild with --features qwen",
+            path.display()
+        )));
+    }
+    #[cfg(feature = "qwen")]
+    let _ = path;
+    Ok(family)
+}
+
 /// Which of the engine's two companion slots `--mtp-model` fills.
 ///
 /// Decided by the family of the *main* model, read from its own GGUF metadata.
@@ -2721,6 +2756,42 @@ fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
 
 #[cfg(test)]
 mod tests {
+    /// A `DeepSeek` model is served by every build. The refusal is the other
+    /// half of the `qwen` feature's contract: detection is ungated so an
+    /// unsupported model is named, not misparsed.
+    #[test]
+    fn a_deepseek_model_is_served_by_every_build() {
+        let path = std::path::Path::new("/models/ds4flash.gguf");
+        assert_eq!(
+            super::supported_family(crate::gguf::ModelFamily::Ds4, path).unwrap(),
+            crate::gguf::ModelFamily::Ds4
+        );
+    }
+
+    /// Without the feature a Qwen model is refused by name, with the fix in the
+    /// message — never loaded to emit a dialect this build cannot parse.
+    #[test]
+    #[cfg(not(feature = "qwen"))]
+    fn a_qwen_model_is_refused_by_name_without_the_feature() {
+        let path = std::path::Path::new("/models/qwen.gguf");
+        let err = super::supported_family(crate::gguf::ModelFamily::Qwen, path)
+            .expect_err("a build without Qwen support must refuse a Qwen model");
+        let msg = err.to_string();
+        assert!(msg.contains("/models/qwen.gguf"), "names the model: {msg}");
+        assert!(msg.contains("--features qwen"), "names the fix: {msg}");
+    }
+
+    /// With the feature it loads like any other family.
+    #[test]
+    #[cfg(feature = "qwen")]
+    fn a_qwen_model_is_served_with_the_feature() {
+        let path = std::path::Path::new("/models/qwen.gguf");
+        assert_eq!(
+            super::supported_family(crate::gguf::ModelFamily::Qwen, path).unwrap(),
+            crate::gguf::ModelFamily::Qwen
+        );
+    }
+
     /// The filter that keeps a position-based callback honest. Both hooks are
     /// installed, so both names must pass; anything else must not be read as a
     /// prompt position.

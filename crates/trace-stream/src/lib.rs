@@ -15,6 +15,13 @@
 //!   and syntax-highlighting renderer (the ds4 C parity path).
 
 pub mod dsml;
+#[cfg(feature = "qwen")]
+pub mod qwen;
+// The no-op stand-in, mounted at the same path so `viz.rs` is identical either
+// way. See `qwen_stub.rs` for why this is a module swap and not a `#[cfg]` on
+// each dispatch arm.
+#[cfg(not(feature = "qwen"))]
+#[path = "qwen_stub.rs"]
 pub mod qwen;
 pub mod render;
 pub mod sink;
