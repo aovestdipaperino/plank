@@ -1,4 +1,5 @@
-//! Just enough GGUF reading to learn which model family a file is.
+//! Just enough GGUF reading to learn which model family a file is, and
+//! whether it is the checkpoint the engine will pair with a vision encoder.
 //!
 //! plank has to know this *before* `ds4_engine_open`, and the engine cannot
 //! tell it: the C detects the family while opening, but the companion-GGUF
@@ -72,6 +73,36 @@ pub fn family_of(path: &Path) -> ModelFamily {
 /// `None` when the file is not GGUF, is truncated, or has no such key.
 #[must_use]
 pub fn architecture(path: &Path) -> Option<String> {
+    string_value(path, "general.architecture")
+}
+
+/// The `deepseek4.checkpoint_variant` value the C requires before it will
+/// bind the `DeepSeek` vision encoder (`g_ds4_flash_vision_exp`).
+const VISION_EXP_VARIANT: &str = "vision-exp";
+
+/// Whether the engine will accept a vision encoder alongside the model at
+/// `path`.
+///
+/// The C refuses `ds4_engine_open` outright — "--vision requires ... the
+/// pinned `DeepSeek` V4 Flash Vision-Exp model" — when a `vision_path` is set
+/// and the main GGUF is not that checkpoint, so plank has to know before the
+/// open whether to pass one at all. Any other `DeepSeek` V4 checkpoint (a
+/// language-only quant, an abliterated re-quant) is text-only; the
+/// `view_image` tool then refuses at call time exactly as it does when the
+/// encoder file is missing. Qwen is answered elsewhere: the C would accept a
+/// Qwen encoder, but plank does not ship one, so this stays a `DeepSeek`
+/// question.
+#[must_use]
+pub fn supports_vision(path: &Path) -> bool {
+    string_value(path, "deepseek4.checkpoint_variant").as_deref() == Some(VISION_EXP_VARIANT)
+}
+
+/// Reads one string-typed metadata value out of a GGUF file.
+///
+/// `None` when the file is not GGUF, is truncated, has no such key, or the
+/// key holds a non-string value.
+#[must_use]
+pub fn string_value(path: &Path, wanted: &str) -> Option<String> {
     let mut r = BufReader::new(File::open(path).ok()?);
     if &read_exact::<4>(&mut r)? != b"GGUF" {
         return None;
@@ -85,7 +116,7 @@ pub fn architecture(path: &Path) -> Option<String> {
     for _ in 0..kv_count {
         let key = read_string(&mut r)?;
         let ty = u32::from_le_bytes(read_exact::<4>(&mut r)?);
-        if key == "general.architecture" {
+        if key == wanted {
             // Type 8 is STRING. A different type here means the file is not
             // shaped the way the engine expects, so say nothing rather than
             // coerce it.
@@ -294,6 +325,35 @@ mod tests {
             assert_eq!(family_of(&p), ModelFamily::Ds4, "{arch}");
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// Only the pinned Vision-Exp checkpoint may be opened with a vision
+    /// encoder; the C refuses the open for any other `DeepSeek` GGUF. A
+    /// language-only or re-quantized checkpoint has no
+    /// `deepseek4.checkpoint_variant` key at all.
+    #[test]
+    fn only_the_vision_exp_checkpoint_supports_vision() {
+        let vision = Gguf::default()
+            .str_val("general.architecture", "deepseek4")
+            .str_val("deepseek4.checkpoint_variant", "vision-exp")
+            .write("vision-exp");
+        assert!(supports_vision(&vision));
+        let _ = std::fs::remove_file(vision);
+
+        let plain = Gguf::default()
+            .str_val("general.architecture", "deepseek4")
+            .u32_val("deepseek4.block_count", 47)
+            .write("plain-ds4");
+        assert!(!supports_vision(&plain));
+        let _ = std::fs::remove_file(plain);
+
+        let other = Gguf::default()
+            .str_val("deepseek4.checkpoint_variant", "something-else")
+            .write("other-variant");
+        assert!(!supports_vision(&other));
+        let _ = std::fs::remove_file(other);
+
+        assert!(!supports_vision(Path::new("/nonexistent/x.gguf")));
     }
 
     /// A probe is run on whatever path the user passed, so it has to survive

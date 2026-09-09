@@ -38,7 +38,8 @@ const REPO: &str = "antirez/deepseek-v4-gguf";
 ///
 /// The 0731 language checkpoint has been superseded by the Vision-Experimental
 /// build, which carries the same routed-expert layout plus native image-token
-/// support. plank assumes vision is always on, so this is the default model.
+/// support, which plank pairs with the vision encoder, so this is the default
+/// model.
 const FILE: &str = "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf";
 
 /// The `DSpark` speculative-decoding support GGUF (~5.6 GB) for the
@@ -53,8 +54,8 @@ const DSPARK_FILE: &str = "DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf";
 /// The vision-encoder GGUF that pairs with the Vision-Experimental checkpoint.
 ///
 /// A standalone encoder (~0.9 GB) loaded alongside the main model so the
-/// `view_image` tool can decode images. plank assumes vision is always on, so
-/// this is fetched at startup when absent, the same as the main model.
+/// `view_image` tool can decode images. It is fetched at startup when absent
+/// for any Vision-Exp run, the same as the main model.
 const VISION_ENCODER_FILE: &str = "DeepSeek-V4-Flash-Vision-Encoder.gguf";
 
 /// Rotating status lines shown while the model downloads.
@@ -315,8 +316,8 @@ pub fn default_qwen_mtp_path() -> PathBuf {
     home.join(".plank").join("qwen.mtp.gguf")
 }
 
-/// Default vision-encoder location. plank assumes vision is always on, so this
-/// is loaded alongside the main model whenever the native engine is used.
+/// Default vision-encoder location. Loaded alongside the main model whenever
+/// the native engine opens the Vision-Exp checkpoint.
 ///
 /// Sits beside the main model: `ds4flash.gguf` and `ds4flash.vision.gguf`.
 #[must_use]
@@ -423,6 +424,12 @@ pub fn ensure_dspark_support(engine: &mut crate::config::EngineTuning) -> Result
 /// embedded in its own main GGUF rather than from a draft checkpoint. Fetching
 /// them would cost ~7 GB for files this run never reads.
 ///
+/// The vision encoder is also skipped for a `DeepSeek` checkpoint that is not
+/// the pinned Vision-Exp model (`gguf::supports_vision`): the engine refuses
+/// to open such a model with an encoder, so plank never passes one and the run
+/// is text-only. Prompting for a ~0.9 GB download it could not use would be
+/// worse than useless.
+///
 /// Speculation is *not* switched off here. Under the unified `--mtp` it stays
 /// meaningful for Qwen — it just runs off the embedded block, which needs no
 /// download and no companion file.
@@ -436,15 +443,17 @@ pub fn ensure_side_artifacts(
     if crate::gguf::family_of(model_path) == crate::gguf::ModelFamily::Qwen {
         return Ok(());
     }
-    ensure_vision_encoder()?;
+    if crate::gguf::supports_vision(model_path) {
+        ensure_vision_encoder()?;
+    }
     ensure_dspark_support(engine)
 }
 
 /// Ensures the vision-encoder GGUF exists at its default path, offering to
 /// download it if missing.
 ///
-/// plank assumes vision is always on, so this runs on every native-engine
-/// startup alongside [`ensure_model`]. A missing encoder is a hard error: the
+/// This runs on every native-engine startup alongside [`ensure_model`] for a
+/// model that can use the encoder. A missing encoder is then a hard error: the
 /// `view_image` tool would refuse at call time, and the model was trained to
 /// expect image tokens.
 ///
@@ -1818,6 +1827,23 @@ mod tests {
         bytes.extend_from_slice(arch.as_bytes());
         std::fs::write(&path, bytes).expect("write stub");
         path
+    }
+
+    /// A `DeepSeek` checkpoint that is not the pinned Vision-Exp model must
+    /// not prompt for the vision encoder: the engine refuses to open it with
+    /// one, so the download would be for a file the run can never pass. No
+    /// encoder is stubbed here on purpose, and `mtp` is off so the `DSpark`
+    /// ensure returns early — if the vision gate regressed, the ensure would
+    /// try to prompt on a non-terminal stdin and fail.
+    #[test]
+    fn a_non_vision_deepseek_model_skips_the_vision_encoder() {
+        let model = stub_model("plain-ds4", "deepseek4");
+        let mut e = crate::config::EngineTuning {
+            mtp: false,
+            ..Default::default()
+        };
+        assert!(ensure_side_artifacts(&model, &mut e).is_ok());
+        let _ = std::fs::remove_file(model);
     }
 
     /// A Qwen model must not reach for either `DeepSeek` side artifact: it

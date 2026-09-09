@@ -534,8 +534,9 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // and idempotent: it does nothing at all when no download is running.
         plank::downloader::spawn_watcher();
         plank::download::ensure_model(&model)?;
-        // Vision is always on: the encoder GGUF sits beside the main model and
-        // is fetched on demand when missing, the same as the main model.
+        // The vision encoder sits beside the main model and is fetched on
+        // demand when the model can use it (the pinned Vision-Exp checkpoint);
+        // any other DeepSeek checkpoint runs text-only.
         // Speculation is on by default; without `--mtp-model` a DeepSeek run
         // resolves the default support GGUF and fetches it on demand
         // (`--mtp-off` skips that). Kept local rather than written back into
@@ -776,8 +777,9 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         // and idempotent: it does nothing at all when no download is running.
         plank::downloader::spawn_watcher();
         plank::download::ensure_model(&model_path)?;
-        // Vision is always on: the encoder GGUF sits beside the main model and
-        // is fetched on demand when missing, the same as the main model.
+        // The vision encoder sits beside the main model and is fetched on
+        // demand when the model can use it (the pinned Vision-Exp checkpoint);
+        // any other DeepSeek checkpoint runs text-only.
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
         plank::download::ensure_side_artifacts(&model_path, &mut tuning)?;

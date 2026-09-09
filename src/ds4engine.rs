@@ -184,6 +184,51 @@ fn steady_rate(mark: Option<(std::time::Instant, i32)>, generated: i32) -> f64 {
 /// reported. A couple of tokens divided by a sliver of a second is noise.
 const STEADY_MIN_TOKENS: i32 = 8;
 
+/// Whether the engine is handed the vision encoder for this model.
+///
+/// The encoder GGUF sits beside the main model at
+/// `~/.plank/ds4flash.vision.gguf` and is downloaded at startup when the model
+/// can use it. It is passed only when the C would accept it: `ds4_engine_open`
+/// fails outright when `vision_path` is set and the main GGUF is not the pinned
+/// Vision-Exp checkpoint ("--vision requires ... the pinned `DeepSeek` V4 Flash
+/// Vision-Exp model"), so a language-only or re-quantized `DeepSeek`
+/// checkpoint must open with a null path and run text-only. Likewise for a
+/// Qwen3.8-Flash-Next model: the DS4 encoder is not a Qwen encoder, and a Qwen
+/// run is text-only until a Qwen encoder is wired up (the C branch ships a
+/// separate `qwen38-vision` target). Either way the `view_image` tool refuses
+/// at call time instead of the open failing.
+fn model_supports_vision(family: crate::gguf::ModelFamily, path: &Path) -> bool {
+    family != crate::gguf::ModelFamily::Qwen && crate::gguf::supports_vision(path)
+}
+
+/// Says at open time why the run is text-only, instead of letting the first
+/// `view_image` call be the only symptom several turns into a session.
+///
+/// The engine loads the vision encoder best-effort: a missing or unreadable
+/// GGUF leaves it text-only without failing the open, so this is the one place
+/// that knows. Each cause gets its own line, because naming the encoder path
+/// for a model plank deliberately never passed it to would report a failure to
+/// read a file that was never opened.
+fn report_text_only(
+    family: crate::gguf::ModelFamily,
+    model_supports_vision: bool,
+    vision_path: &Path,
+) {
+    if family == crate::gguf::ModelFamily::Qwen {
+        eprintln!("note: Qwen3.8 runs text-only in plank; view_image will be refused");
+    } else if !model_supports_vision {
+        eprintln!(
+            "note: this checkpoint is not the DeepSeek V4 Flash Vision-Exp model, \
+             so it runs text-only; view_image will be refused"
+        );
+    } else {
+        eprintln!(
+            "warning: vision encoder not loaded from {}; view_image will be refused",
+            vision_path.display()
+        );
+    }
+}
+
 impl Ds4Model {
     /// Opens a model file with the given backend, context size, and tuning
     /// knobs (`--mtp`, `--ssd-streaming`, steering, ...).
@@ -214,19 +259,12 @@ impl Ds4Model {
         let c_mtp = c_opt_path(mtp_path, "mtp model")?;
         let c_ple = c_opt_path(ple_path, "ple sidecar")?;
         let c_steering = c_opt_path(tuning.dir_steering_file.as_deref(), "dir-steering file")?;
-        // Vision is always on: the encoder GGUF sits beside the main model at
-        // `~/.plank/ds4flash.vision.gguf` and is downloaded at startup when
-        // absent. A null path would keep the engine text-only, but plank never
-        // passes one — the `view_image` tool is served unconditionally.
-        // ...except for a Qwen3.8-Flash-Next model. The DS4 encoder is not a
-        // Qwen encoder, and handing it over fails the load outright, so a Qwen
-        // run is text-only until a Qwen encoder is wired up (the C branch
-        // ships a separate `qwen38-vision` target).
         let vision_path = crate::download::default_vision_path();
-        let c_vision = if family == crate::gguf::ModelFamily::Qwen {
-            None
-        } else {
+        let model_supports_vision = model_supports_vision(family, path);
+        let c_vision = if model_supports_vision {
             c_opt_path(Some(&vision_path), "vision encoder")?
+        } else {
+            None
         };
         let as_ptr = |c: &Option<CString>| c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let opts = ffi::Ds4EngineOptions {
@@ -307,23 +345,9 @@ impl Ds4Model {
             }
             return Err(EngineError::new(msg));
         }
-        // The engine loads the vision encoder best-effort: a missing or
-        // unreadable GGUF leaves it text-only without failing the open. Say so
-        // now, at the one place that knows, instead of letting the first
-        // `view_image` call be the only symptom several turns into a session.
         // SAFETY: `engine` is non-null and valid, checked just above.
-        // A Qwen run is the one case where no encoder was offered at all, so
-        // it gets its own line: naming the DeepSeek path there would report a
-        // failure to read a file plank deliberately never passed.
         if !unsafe { ffi::ds4_engine_has_vision(engine) } {
-            if family == crate::gguf::ModelFamily::Qwen {
-                eprintln!("note: Qwen3.8 runs text-only in plank; view_image will be refused");
-            } else {
-                eprintln!(
-                    "warning: vision encoder not loaded from {}; view_image will be refused",
-                    vision_path.display()
-                );
-            }
+            report_text_only(family, model_supports_vision, &vision_path);
         }
         Ok(Self {
             engine,
