@@ -257,7 +257,7 @@ fn tool_prefix(name: &str) -> Option<&'static str> {
     match name {
         "bash" => Some("$ "),
         "read" => Some("read "),
-        "write" => Some("write "),
+        "write" => Some("Writing "),
         "edit" => Some("edit "),
         "search" => Some("search "),
         "google_search" => Some("google "),
@@ -270,8 +270,7 @@ fn tool_prefix(name: &str) -> Option<&'static str> {
 /// Renders `path` relative to `base` when it sits inside it; otherwise returns
 /// `path` unchanged. Used to shorten the `write` preview header for files in
 /// the working tree while leaving out-of-tree paths absolute.
-#[must_use]
-pub fn repo_relative(path: &str, base: &std::path::Path) -> String {
+fn repo_relative(path: &str, base: &std::path::Path) -> String {
     let p = std::path::Path::new(path);
     match p.strip_prefix(base) {
         Ok(rel) if rel.as_os_str().is_empty() => path.to_string(),
@@ -279,6 +278,7 @@ pub fn repo_relative(path: &str, base: &std::path::Path) -> String {
         Err(_) => path.to_string(),
     }
 }
+
 fn diff_prefix(kind: ParamKind) -> Option<&'static str> {
     match kind {
         ParamKind::DiffOld => Some("- "),
@@ -1485,10 +1485,12 @@ impl<S: RenderSink> StreamRenderer<S> {
                     if self.viz.write_is_create && !self.show_tool_calls {
                         let path = if self.viz.write_path.is_empty() {
                             "<file>".to_string()
+                        } else if let Ok(cwd) = std::env::current_dir() {
+                            repo_relative(&self.viz.write_path, &cwd)
                         } else {
                             self.viz.write_path.clone()
                         };
-                        self.viz_preview_puts(&format!("write {path}\n"));
+                        self.viz_preview_puts(&format!("Writing {path}\n"));
                     }
                 } else {
                     let label = format!("{name}:\n");
@@ -2448,7 +2450,7 @@ mod tests {
         sr.push(stanza);
         sr.finish();
         let think = &sr.sink().think;
-        assert!(think.contains("write src/foo.rs"), "header: {think:?}");
+        assert!(think.contains("Writing src/foo.rs"), "header: {think:?}");
         assert!(think.contains("fn main() {}"), "content preview: {think:?}");
         assert!(
             !sr.sink().visible.contains("fn main()"),
@@ -2456,6 +2458,27 @@ mod tests {
             sr.sink().visible
         );
         assert_eq!(sr.finished().calls.len(), 1, "call still parsed");
+    }
+
+    #[test]
+    fn write_banner_verb_reads_writing_when_banners_on() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"path\">src/foo.rs</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"content\">fn main() {}\n</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let mut sr = StreamRenderer::new(Cap::default());
+        // Banners on (default): the 🛠️ banner names the verb.
+        sr.push(stanza);
+        sr.finish();
+        assert!(
+            sr.sink().visible.contains("Writing "),
+            "banner verb: {:?}",
+            sr.sink().visible
+        );
     }
 
     #[test]
@@ -3443,7 +3466,7 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🛠️ write  path=x.txt"), "{vis:?}");
+            assert!(vis.contains("🛠️ Writing  path=x.txt"), "{vis:?}");
             // The content now previews on the dim (think) channel, not visible.
             assert!(!vis.contains("line one"), "{vis:?}");
             assert!(
