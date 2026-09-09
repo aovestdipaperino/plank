@@ -93,8 +93,9 @@ fn collapse_prompt(prompt: &str) -> Option<String> {
 /// a sparkle, a dizzy star and a glowing star trailing it. Frame `0` is the
 /// bare rocket and doubles as the static form (reduced motion); it is padded
 /// to the width of the two-glyph frames so the rocket does not shift as the
-/// trail appears.
-const ROCKET_GLYPHS: [&str; 4] = ["  🚀", "✨🚀", "💫🚀", "🌟🚀"];
+/// trail appears. The padding is two middle dots, not spaces: terminals trim
+/// leading whitespace from a title, which would undo the alignment.
+const ROCKET_GLYPHS: [&str; 4] = ["··🚀", "✨🚀", "💫🚀", "🌟🚀"];
 
 /// Frames in one cycle of the rocket glyphs.
 const ROCKET_FRAMES: usize = ROCKET_GLYPHS.len();
@@ -289,15 +290,15 @@ mod tests {
     fn busy_prompt_is_collapsed_and_truncated() {
         assert_eq!(
             window_title(State::Busy("fix  the\nbug")),
-            "  🚀 fix the bug"
+            "··🚀 fix the bug"
         );
         let long = "a".repeat(60);
         let t = window_title(State::Busy(&long));
-        assert!(t.starts_with("  🚀 "));
+        assert!(t.starts_with("··🚀 "));
         assert!(t.ends_with('…'));
         assert_eq!(
             t.chars().count(),
-            "  🚀 ".chars().count() + TITLE_PROMPT_MAX + 1
+            "··🚀 ".chars().count() + TITLE_PROMPT_MAX + 1
         );
     }
 
@@ -308,10 +309,11 @@ mod tests {
         let frames: Vec<String> = (0..=ROCKET_FRAMES).map(|f| busy_title("go", f)).collect();
         assert_eq!(
             frames,
-            ["  🚀 go", "✨🚀 go", "💫🚀 go", "🌟🚀 go", "  🚀 go"]
+            ["··🚀 go", "✨🚀 go", "💫🚀 go", "🌟🚀 go", "··🚀 go"]
         );
         let long = "b".repeat(40);
-        assert!(busy_title(&long, 3).ends_with(&busy_title(&long, 0)[6..]));
+        let tail = |f: usize| busy_title(&long, f)[ROCKET_GLYPHS[f].len()..].to_owned();
+        assert_eq!(tail(3), tail(0));
     }
 
     /// `tick` advances only a busy title, is parked by a `Scoped` displacement
@@ -358,7 +360,7 @@ mod tests {
         tick();
         assert_eq!(
             last().as_deref(),
-            Some("  🚀 go"),
+            Some("··🚀 go"),
             "still under reduced motion"
         );
         crate::anim::set_reduced_motion(was_reduced);
