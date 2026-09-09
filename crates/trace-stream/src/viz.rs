@@ -267,6 +267,18 @@ fn tool_prefix(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Renders `path` relative to `base` when it sits inside it; otherwise returns
+/// `path` unchanged. Used to shorten the `write` preview header for files in
+/// the working tree while leaving out-of-tree paths absolute.
+#[must_use]
+pub fn repo_relative(path: &str, base: &std::path::Path) -> String {
+    let p = std::path::Path::new(path);
+    match p.strip_prefix(base) {
+        Ok(rel) if rel.as_os_str().is_empty() => path.to_string(),
+        Ok(rel) => rel.to_string_lossy().into_owned(),
+        Err(_) => path.to_string(),
+    }
+}
 fn diff_prefix(kind: ParamKind) -> Option<&'static str> {
     match kind {
         ParamKind::DiffOld => Some("- "),
@@ -3558,6 +3570,37 @@ mod tests {
             "{:?}",
             in_think.sink().visible
         );
+    }
+
+    #[test]
+    fn repo_relative_strips_base_prefix() {
+        let base = std::path::Path::new("/Users/x/proj");
+        assert_eq!(
+            repo_relative("/Users/x/proj/src/foo.rs", base),
+            "src/foo.rs"
+        );
+    }
+
+    #[test]
+    fn repo_relative_leaves_outside_paths_absolute() {
+        let base = std::path::Path::new("/Users/x/proj");
+        assert_eq!(
+            repo_relative("/tmp/other/main.rs", base),
+            "/tmp/other/main.rs"
+        );
+    }
+
+    #[test]
+    fn repo_relative_passes_through_already_relative() {
+        let base = std::path::Path::new("/Users/x/proj");
+        assert_eq!(repo_relative("src/foo.rs", base), "src/foo.rs");
+    }
+
+    #[test]
+    fn repo_relative_handles_base_itself() {
+        let base = std::path::Path::new("/Users/x/proj");
+        // The base dir with a trailing slash strips to empty -> keep the path.
+        assert_eq!(repo_relative("/Users/x/proj", base), "/Users/x/proj");
     }
 }
 
