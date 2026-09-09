@@ -43,6 +43,11 @@ const THINK_CLOSE: &[u8] = b"</think>";
 /// "sentence" that runs past this is cut at a word boundary with an ellipsis.
 const THINK_STATUS_CAP: usize = 160;
 
+/// How many body lines the banners-off `write` preview shows before it
+/// collapses the rest behind a single `…` line. The `└ N lines` summary still
+/// reports the true total.
+const WRITE_PREVIEW_MAX_LINES: usize = 3;
+
 /// The first sentence of `text`: up to and including the first `.`, `!` or
 /// `?` that is followed by whitespace, or up to the first newline, whichever
 /// comes first. `None` while no such boundary has arrived and `force` is
@@ -581,6 +586,10 @@ struct ToolViz {
     /// True when the create body has emitted bytes on the current line that
     /// are not yet newline-terminated (a trailing partial line to count).
     write_partial_line: bool,
+    /// True once the collapsed preview has emitted its `…` line, so the
+    /// remaining body bytes are suppressed (they are still counted for the
+    /// `└ N lines` summary). Only the banners-off preview collapses.
+    write_truncated: bool,
 }
 
 impl ToolViz {
@@ -1456,7 +1465,16 @@ impl<S: RenderSink> StreamRenderer<S> {
         // dropped here (the post-edit diff card shows it).
         if self.viz_is_write_preview() {
             if self.viz.write_is_create {
-                self.emit_preview_bytes(&[c]);
+                if self.show_tool_calls {
+                    // Banners on: the 🛠️ banner is the header, so stream the
+                    // whole body flush as before.
+                    self.emit_preview_bytes(&[c]);
+                } else {
+                    // Banners off: the `● Writing …` header owns this block, so
+                    // indent the body two columns and collapse it after
+                    // `WRITE_PREVIEW_MAX_LINES` lines behind a single `…`.
+                    self.viz_write_preview_body_byte(c);
+                }
                 if c == b'\n' {
                     self.viz.write_content_newlines += 1;
                     self.viz.write_partial_line = false;
@@ -1470,6 +1488,26 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.viz_code_prefix();
         self.emit_visible_bytes(&[c]);
         self.viz.at_line_start = c == b'\n';
+    }
+
+    /// Emits one body byte of the banners-off `write` preview: the first
+    /// [`WRITE_PREVIEW_MAX_LINES`] lines are shown indented two columns; once
+    /// the body runs past that, a single `…` line stands in for the rest and
+    /// further bytes are dropped (the caller still counts them for the summary).
+    fn viz_write_preview_body_byte(&mut self, c: u8) {
+        if self.viz.write_truncated {
+            return;
+        }
+        if self.viz.write_content_newlines >= WRITE_PREVIEW_MAX_LINES {
+            // We have entered the first line past the cap: collapse the rest.
+            self.viz_preview_puts("  …\n");
+            self.viz.write_truncated = true;
+            return;
+        }
+        if self.viz.at_line_start && c != b'\n' {
+            self.viz_preview_puts("  ");
+        }
+        self.emit_preview_bytes(&[c]);
     }
 
     fn viz_param_begin(&mut self, name: &str) {
@@ -1503,7 +1541,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                         } else {
                             self.viz.write_path.clone()
                         };
-                        self.viz_preview_puts(&format!("Writing {path}\n"));
+                        self.viz_preview_puts(&format!("● Writing {path}\n"));
                     }
                 } else {
                     let label = format!("{name}:\n");
@@ -1537,7 +1575,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             if !self.viz.at_line_start {
                 self.viz_preview_puts("\n");
             }
-            self.viz_preview_puts(&format!("└ {n} {unit}\n"));
+            self.viz_preview_puts(&format!("  └ {n} {unit}\n"));
         }
         self.viz.param_end_tail.clear();
         if self.viz.code_param_active {
@@ -1619,6 +1657,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.viz.read_whole.clear();
         self.viz.write_content_newlines = 0;
         self.viz.write_partial_line = false;
+        self.viz.write_truncated = false;
         self.viz.write_path.clear();
         self.viz.tool_announced = false;
     }
@@ -2540,6 +2579,51 @@ mod tests {
         // Cargo.toml exists relative to the crate dir -> treated as an overwrite.
         let think = write_summary_for("Cargo.toml", "whatever\n");
         assert!(!think.contains("└"), "no summary for overwrite: {think:?}");
+    }
+
+    #[test]
+    fn write_preview_has_bullet_header_and_indented_block() {
+        let think = write_summary_for("src/bullet_new.rs", "one\n");
+        assert!(
+            think.contains("● Writing src/bullet_new.rs"),
+            "bullet header: {think:?}"
+        );
+        assert!(
+            think.contains("  one"),
+            "body indented two columns: {think:?}"
+        );
+        assert!(think.contains("  └ 1 line"), "indented summary: {think:?}");
+    }
+
+    #[test]
+    fn write_preview_collapses_the_body_past_the_cap() {
+        // Five lines, cap is three: the first three show, the rest collapse to
+        // one `…`, and the summary still reports the true total.
+        let think = write_summary_for("src/collapse_new.rs", "l1\nl2\nl3\nl4\nl5\n");
+        assert!(
+            think.contains("  l1") && think.contains("  l2") && think.contains("  l3"),
+            "first three lines shown: {think:?}"
+        );
+        assert!(
+            !think.contains("l4") && !think.contains("l5"),
+            "lines past the cap are collapsed: {think:?}"
+        );
+        assert!(
+            think.contains("  …"),
+            "ellipsis stands in for the rest: {think:?}"
+        );
+        assert!(
+            think.contains("  └ 5 lines"),
+            "summary reports the true total: {think:?}"
+        );
+    }
+
+    #[test]
+    fn write_preview_does_not_collapse_at_the_cap() {
+        // Exactly three lines: all shown, no ellipsis.
+        let think = write_summary_for("src/exact_new.rs", "a\nb\nc\n");
+        assert!(!think.contains('…'), "no ellipsis at the cap: {think:?}");
+        assert!(think.contains("  └ 3 lines"), "summary: {think:?}");
     }
 
     #[test]
