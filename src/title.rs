@@ -5,7 +5,9 @@
 //!
 //! A handful of states, so the window (and tab) names plank's phase at a
 //! glance: `🚀 Plank loading...` before a front end is up, `🪵 Plank - READY.`
-//! while idle at the prompt, `🚀 <prompt>` while a turn runs,
+//! while idle at the prompt, `🚀 <prompt>` while a turn runs (the rocket
+//! flies along a short track of dots, one step per [`tick`], unless reduced
+//! motion is on),
 //! `❓ waiting for you...` while the `ask` tool holds the turn open for an
 //! answer, and
 //! `👀 introspecting...` while `/insights` reads back the user's own history. Set via the OSC 0
@@ -67,21 +69,82 @@ const ASKING: &str = "❓ waiting for you...";
 /// whitespace-only prompt degrades to the plain loading form.
 #[must_use]
 pub fn window_title(state: State<'_>) -> String {
-    let prompt = match state {
-        State::Loading => return LOADING.to_string(),
-        State::Idle => return "🪵 Plank - READY.".to_string(),
-        State::Introspecting => return INTROSPECTING.to_string(),
-        State::Compacting => return COMPACTING.to_string(),
-        State::Asking => return ASKING.to_string(),
-        State::Busy(p) => p.split_whitespace().collect::<Vec<_>>().join(" "),
+    match state {
+        State::Loading => LOADING.to_string(),
+        State::Idle => "🪵 Plank - READY.".to_string(),
+        State::Introspecting => INTROSPECTING.to_string(),
+        State::Compacting => COMPACTING.to_string(),
+        State::Asking => ASKING.to_string(),
+        State::Busy(p) => match collapse_prompt(p) {
+            Some(prompt) => busy_title(&prompt, 0),
+            None => LOADING.to_string(),
+        },
+    }
+}
+
+/// Collapses a busy prompt to one whitespace-normalized line; `None` when
+/// nothing is left, so the caller can fall back to the loading title.
+fn collapse_prompt(prompt: &str) -> Option<String> {
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then_some(collapsed)
+}
+
+/// Length of the dotted track the busy rocket flies along, in cells. One more
+/// than the number of positions the rocket can take, so it always has a dot
+/// ahead or behind it and the title keeps a constant width.
+const ROCKET_TRACK: usize = 4;
+
+/// Frames in one pass of the rocket along its track: every position on the
+/// way out and back, without repeating the two ends.
+const ROCKET_FRAMES: usize = 2 * (ROCKET_TRACK - 1);
+
+/// Formats the [`State::Busy`] title for animation frame `frame`: the rocket
+/// at that step of its out-and-back run along a dotted track, then the
+/// already-collapsed `prompt`, truncated past [`TITLE_PROMPT_MAX`] characters.
+/// Frame `0` is the rocket at the head of the track.
+fn busy_title(prompt: &str, frame: usize) -> String {
+    let step = frame % ROCKET_FRAMES;
+    let pos = if step < ROCKET_TRACK {
+        step
+    } else {
+        ROCKET_FRAMES - step
     };
-    if prompt.is_empty() {
-        return LOADING.to_string();
+    let mut track = String::new();
+    for i in 0..ROCKET_TRACK {
+        track.push_str(if i == pos { "🚀" } else { "·" });
     }
     match prompt.char_indices().nth(TITLE_PROMPT_MAX) {
-        Some((i, _)) => format!("🚀 {}…", prompt[..i].trim_end()),
-        None => format!("🚀 {prompt}"),
+        Some((i, _)) => format!("{track} {}…", prompt[..i].trim_end()),
+        None => format!("{track} {prompt}"),
     }
+}
+
+/// The running busy animation: the collapsed prompt and the frame last shown.
+/// `Some` only while the title is a [`State::Busy`] rocket; any other state
+/// clears it, and [`Scoped`] parks and restores it with the title it displaces.
+static BUSY: std::sync::Mutex<Option<(String, usize)>> = std::sync::Mutex::new(None);
+
+fn busy_lock() -> std::sync::MutexGuard<'static, Option<(String, usize)>> {
+    BUSY.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Advances the busy rocket one frame, if a [`State::Busy`] title is showing.
+/// Called from the TUI's redraw loop; a no-op at any other title, and under
+/// reduced motion (`ui.reducedMotion`), where the rocket stays at frame 0.
+pub fn tick() {
+    if crate::anim::reduced_motion() {
+        return;
+    }
+    let next = {
+        let mut busy = busy_lock();
+        let Some((prompt, frame)) = busy.as_mut() else {
+            return;
+        };
+        *frame = (*frame + 1) % ROCKET_FRAMES;
+        busy_title(prompt, *frame)
+    };
+    set_text(&next);
 }
 
 /// The title last written, so a transient state ([`Scoped`]) can put back what
@@ -91,6 +154,12 @@ static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// Sets the terminal window title to [`window_title`]`(state)`. Best-effort:
 /// errors are ignored, and nothing is written when stderr is not a tty.
 pub fn set(state: State<'_>) {
+    // Record the prompt for `tick` only when the title is actually the busy
+    // rocket — a blank prompt degrades to the loading form and must not animate.
+    *busy_lock() = match state {
+        State::Busy(p) => collapse_prompt(p).map(|prompt| (prompt, 0)),
+        _ => None,
+    };
     set_text(&window_title(state));
 }
 
@@ -119,24 +188,31 @@ fn set_text(title: &str) {
 /// [`State::Idle`]), so the phase itself cannot know what to restore — and
 /// restoring on drop covers the interrupted and failed passes too.
 #[derive(Debug)]
-pub struct Scoped(Option<String>);
+pub struct Scoped {
+    title: Option<String>,
+    /// The busy animation that was running, parked while the guard lives so
+    /// `tick` does not fly the rocket over the displaced title.
+    busy: Option<(String, usize)>,
+}
 
 impl Scoped {
     /// Displaces the current title with `state`'s.
     #[must_use]
     pub fn set(state: State<'_>) -> Self {
-        let previous = LAST
+        let title = LAST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let busy = busy_lock().take();
         crate::title::set(state);
-        Self(previous)
+        Self { title, busy }
     }
 }
 
 impl Drop for Scoped {
     fn drop(&mut self) {
-        if let Some(previous) = self.0.take() {
+        *busy_lock() = self.busy.take();
+        if let Some(previous) = self.title.take() {
             set_text(&previous);
         }
     }
@@ -200,7 +276,7 @@ mod tests {
         set_text("sentinel-title");
         let guard = Scoped::set(State::Compacting);
         assert_eq!(
-            guard.0.as_deref(),
+            guard.title.as_deref(),
             Some("sentinel-title"),
             "the guard must capture the title it displaced"
         );
@@ -220,14 +296,97 @@ mod tests {
 
     #[test]
     fn busy_prompt_is_collapsed_and_truncated() {
-        assert_eq!(window_title(State::Busy("fix  the\nbug")), "🚀 fix the bug");
+        assert_eq!(
+            window_title(State::Busy("fix  the\nbug")),
+            "🚀··· fix the bug"
+        );
         let long = "a".repeat(60);
         let t = window_title(State::Busy(&long));
-        assert!(t.starts_with("🚀 "));
+        assert!(t.starts_with("🚀··· "));
         assert!(t.ends_with('…'));
         assert_eq!(
             t.chars().count(),
-            "🚀 ".chars().count() + TITLE_PROMPT_MAX + 1
+            "🚀··· ".chars().count() + TITLE_PROMPT_MAX + 1
         );
+    }
+
+    /// The rocket flies out along the track and back without pausing at
+    /// either end, and every frame is the same width.
+    #[test]
+    fn rocket_frames_run_out_and_back_at_constant_width() {
+        let frames: Vec<String> = (0..=ROCKET_FRAMES).map(|f| busy_title("go", f)).collect();
+        assert_eq!(
+            frames,
+            [
+                "🚀··· go",
+                "·🚀·· go",
+                "··🚀· go",
+                "···🚀 go",
+                "··🚀· go",
+                "·🚀·· go",
+                "🚀··· go",
+            ]
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.chars().count() == frames[0].chars().count())
+        );
+        // A truncated prompt is cut the same way on every frame.
+        let long = "b".repeat(40);
+        assert_eq!(
+            busy_title(&long, 3).chars().count(),
+            busy_title(&long, 0).chars().count()
+        );
+    }
+
+    /// `tick` advances only a busy title, is parked by a `Scoped` displacement
+    /// and resumes where it left off, and stops once the title leaves Busy.
+    #[test]
+    fn tick_flies_the_rocket_only_while_busy() {
+        let _serial = TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_reduced = crate::anim::reduced_motion();
+        crate::anim::set_reduced_motion(false);
+        let last = || {
+            LAST.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        set(State::Busy("go"));
+        tick();
+        assert_eq!(last().as_deref(), Some("·🚀·· go"));
+        let guard = Scoped::set(State::Compacting);
+        tick();
+        assert_eq!(
+            last().as_deref(),
+            Some(COMPACTING),
+            "parked while displaced"
+        );
+        drop(guard);
+        assert_eq!(
+            last().as_deref(),
+            Some("·🚀·· go"),
+            "displaced frame restored"
+        );
+        tick();
+        assert_eq!(
+            last().as_deref(),
+            Some("··🚀· go"),
+            "resumes from where it was"
+        );
+        set(State::Idle);
+        tick();
+        assert_eq!(last().as_deref(), Some("🪵 Plank - READY."));
+        crate::anim::set_reduced_motion(true);
+        set(State::Busy("go"));
+        tick();
+        assert_eq!(
+            last().as_deref(),
+            Some("🚀··· go"),
+            "still under reduced motion"
+        );
+        crate::anim::set_reduced_motion(was_reduced);
     }
 }

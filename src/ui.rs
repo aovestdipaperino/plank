@@ -14598,6 +14598,11 @@ fn escalation_clock(
     }
 }
 
+/// How often the busy window-title rocket advances a frame. Slow on purpose:
+/// a title change is a whole-window repaint in most terminals, and the tab
+/// strip is read in glances, not watched.
+const TITLE_TICK: Duration = Duration::from_millis(400);
+
 /// UI-thread event loop while a worker job runs: applies streamed render
 /// events to the log, keeps the prompt editable (Enter queues the line for
 /// the worker), scrolls, and maps Esc/Ctrl-C to a worker interrupt.
@@ -14670,6 +14675,7 @@ fn busy_ui_loop(
     // loop: render events arrive irregularly, so the frame delta has to be
     // measured rather than inferred from the poll timeout.
     let mut arcade_last = Instant::now();
+    let mut title_last = Instant::now();
     loop {
         interrupt_at = escalation_clock(
             interrupt_at,
@@ -14680,6 +14686,13 @@ fn busy_ui_loop(
             let dt = arcade_last.elapsed();
             arcade_last = Instant::now();
             arcade.step(u64::try_from(dt.as_millis()).unwrap_or(u64::MAX));
+        }
+        // The window-title rocket flies one step every `TITLE_TICK`, whatever
+        // the poll cadence below is doing (`title::tick` is a no-op unless a
+        // busy title is up).
+        if title_last.elapsed() >= TITLE_TICK {
+            title_last = Instant::now();
+            crate::title::tick();
         }
         // An `ask` question parked by the worker takes over the input region
         // until answered; the worker is blocked meanwhile, so no render events
