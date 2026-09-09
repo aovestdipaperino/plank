@@ -8008,7 +8008,42 @@ the original is frozen and listed in /tree"
                 .display()
                 .to_string()
         };
+        // Asked of the live engine, not of the config: a `/model` swap or a
+        // provider sub-agent means the configured path and the loaded model
+        // are different things, and the loaded one is the one that produced
+        // the transcript.
+        let model_name = self.engine.model_name();
+        let syntax = self.tool_syntax();
+        let family = crate::manifest::ModelSet::for_family(crate::gguf::ModelFamily::from(syntax));
+        let installed = crate::manifest::read_at(&crate::manifest::installed_path(family));
+        let artifact_version = installed.as_ref().map(|m| m.version);
+        // The `main` entry is the weights themselves; its URL carries the
+        // Hugging Face repo the set came from.
+        let main_entry = installed.as_ref().and_then(|m| m.files.get("main"));
+        let weights_file = main_entry.map(|f| f.name.clone()).unwrap_or_default();
+        let hf_url = main_entry
+            .and_then(|f| crate::manifest::hf_repo_url(&f.url))
+            .unwrap_or_default();
+        let companion = self
+            .cfg
+            .engine
+            .mtp_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         let meta = crate::repro::Meta {
+            model: crate::repro::ModelMeta {
+                name: &model_name,
+                family: family.as_str(),
+                syntax: match syntax {
+                    crate::sysprompt::ToolSyntax::Dsml => "dsml",
+                    crate::sysprompt::ToolSyntax::Qwen => "qwen",
+                },
+                artifact_version,
+                companion: &companion,
+                weights_file: &weights_file,
+                hf_url: &hf_url,
+            },
             version: &version,
             date: &date,
             ctx_size: self.engine.ctx_size(),
@@ -17528,6 +17563,49 @@ mod tests {
 
     /// Under `--debug`, quitting leaves the dump on disk without anyone having
     /// to remember `/repro` first; with debug off it writes nothing.
+    /// The call site, not the formatter: `build_report` is unit-tested against
+    /// a hand-built `ModelMeta`, which cannot catch a field wired to the wrong
+    /// source. This drives the real `write_repro_with` and reads the file back.
+    #[test]
+    fn a_written_repro_names_the_model_the_engine_reports() {
+        let dir = scratch_dir("repro-model-meta");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            model: Some("DeepSeek V4 Flash Vision Experimental".to_owned()),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+
+        let (path, _) = agent
+            .write_repro_with("", "repro-modelmeta")
+            .expect("written");
+        let text = std::fs::read_to_string(&path).expect("readable");
+        let section = text
+            .split_once("## Model\n")
+            .expect("a Model section")
+            .1
+            .split_once("## Generation")
+            .expect("followed by Generation")
+            .0;
+        // The engine's own answer, not the configured path — a `/model` swap
+        // makes those two different things.
+        assert!(
+            section.contains("- name: DeepSeek V4 Flash Vision Experimental"),
+            "{section}"
+        );
+        // Dialect follows from the name, and the family follows from the
+        // dialect; a DSML model must never be labelled qwen.
+        assert!(section.contains("- tool dialect: dsml"), "{section}");
+        assert!(section.contains("- family: ds4"), "{section}");
+        // The artifact set line is always present, in one of its two shapes,
+        // because "no manifest installed" is itself the answer.
+        assert!(section.contains("- artifact set: "), "{section}");
+        assert!(!section.contains("/resolve/"), "no download URL: {section}");
+        let _ = std::fs::remove_file(&path);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn quitting_under_debug_writes_a_repro_and_otherwise_writes_nothing() {
         // `set_enabled` is process-wide (it defaults to on under `cfg(test)`),

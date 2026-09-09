@@ -26,10 +26,50 @@ use std::path::{Path, PathBuf};
 
 use crate::config::AgentConfig;
 
+/// Which model produced the transcript, as far as anything can say.
+///
+/// Four different answers, because no one of them identifies a model on its
+/// own. The configured *path* is often a symlink the reporter repointed; the
+/// engine-reported *name* is the shape the C matched and is what selects the
+/// dialect; the *family* decides the companion slot and the transcript
+/// extension; and the artifact set *version* names the weights, which is the
+/// one thing a maintainer cannot recover from the other three. A report that
+/// carried only the path has repeatedly not been enough to tell which build of
+/// which model was actually loaded.
+#[derive(Debug, Default)]
+pub struct ModelMeta<'a> {
+    /// Shape name the engine reports after opening, e.g. `DeepSeek V4 Flash
+    /// Vision Experimental`. Empty when no engine is loaded (the echo stub).
+    pub name: &'a str,
+    /// Family the loaded model belongs to, spelled as the CLI spells it
+    /// (`ds4` / `qwen`).
+    pub family: &'a str,
+    /// Tool-call dialect in force. Derived from `name`, recorded separately
+    /// because a mismatch between the two is itself a bug worth seeing.
+    pub syntax: &'a str,
+    /// `version` of the installed `ds4.manifest`, i.e. which artifact set is
+    /// on disk. `None` when no manifest is installed.
+    pub artifact_version: Option<u32>,
+    /// The companion GGUF in effect: the `DSpark` draft checkpoint for
+    /// `DeepSeek`, the PLE n-gram sidecar for Qwen. Empty when none is configured.
+    pub companion: &'a str,
+    /// File name of the main artifact the installed manifest declares — the
+    /// weights' real name, which a symlinked `path` hides. Empty when no
+    /// manifest is installed.
+    pub weights_file: &'a str,
+    /// Hugging Face *repository* page for the weights (see
+    /// [`crate::manifest::hf_repo_url`]), so a report links somewhere a human
+    /// can read rather than somewhere a click starts an 87 GB download. Empty
+    /// when no manifest is installed or its URL is not a Hugging Face link.
+    pub hf_url: &'a str,
+}
+
 /// Runtime facts worth recording alongside the transcript, gathered from the
 /// live `Agent` by the caller (which owns the engine and config).
 #[derive(Debug)]
 pub struct Meta<'a> {
+    /// Which model produced this transcript. See [`ModelMeta`].
+    pub model: ModelMeta<'a>,
     /// plank version string.
     pub version: &'a str,
     /// Local ISO date/time the repro was taken.
@@ -228,6 +268,51 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     let _ = writeln!(out, "- power: {}%", meta.power_percent);
     let _ = writeln!(out);
 
+    // Its own section rather than more lines on the header list: this is the
+    // block a maintainer reads first, and burying the weights' identity under
+    // sampling knobs is what made "which model was this?" a question worth
+    // asking of a report that already answered it.
+    let m = &meta.model;
+    let _ = writeln!(out, "## Model");
+    let _ = writeln!(out);
+    if m.name.is_empty() {
+        // The echo stub, or a dump taken before the engine opened. Said out
+        // loud, because a blank line reads as "the field was not filled in".
+        let _ = writeln!(out, "- name: (no engine loaded)");
+    } else {
+        let _ = writeln!(out, "- name: {}", m.name);
+    }
+    if !m.family.is_empty() {
+        let _ = writeln!(out, "- family: {}", m.family);
+    }
+    if !m.syntax.is_empty() {
+        let _ = writeln!(out, "- tool dialect: {}", m.syntax);
+    }
+    if let Some(model) = &cfg.model_path {
+        let _ = writeln!(out, "- path: {}", model.display());
+    }
+    if !m.companion.is_empty() {
+        let _ = writeln!(out, "- companion: {}", m.companion);
+    }
+    match m.artifact_version {
+        Some(v) => {
+            let _ = writeln!(out, "- artifact set: version {v}");
+        }
+        None => {
+            let _ = writeln!(out, "- artifact set: (no manifest installed)");
+        }
+    }
+    if !m.weights_file.is_empty() {
+        let _ = writeln!(out, "- weights file: {}", m.weights_file);
+    }
+    if !m.hf_url.is_empty() {
+        let _ = writeln!(out, "- hugging face: {}", m.hf_url);
+    }
+    if let Some(backend) = &cfg.backend {
+        let _ = writeln!(out, "- backend: {backend:?}");
+    }
+    let _ = writeln!(out);
+
     let _ = writeln!(out, "## Generation");
     let _ = writeln!(out);
     let _ = writeln!(out, "- think mode: {}", meta.think.name());
@@ -238,12 +323,7 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     let _ = writeln!(out, "- top_p: {}", g.top_p);
     let _ = writeln!(out, "- min_p: {}", g.min_p);
     let _ = writeln!(out, "- seed: {}", g.seed);
-    if let Some(model) = &cfg.model_path {
-        let _ = writeln!(out, "- model: {}", model.display());
-    }
-    if let Some(backend) = &cfg.backend {
-        let _ = writeln!(out, "- backend: {backend:?}");
-    }
+    // Model path and backend used to be listed here; they moved to `## Model`.
     if cfg.engine != crate::config::EngineTuning::default() {
         let _ = writeln!(out, "- engine tuning: {:?}", cfg.engine);
     }
@@ -398,6 +478,15 @@ mod tests {
 
     fn meta() -> Meta<'static> {
         Meta {
+            model: ModelMeta {
+                name: "DeepSeek V4 Flash Vision Experimental",
+                family: "ds4",
+                syntax: "dsml",
+                artifact_version: Some(7),
+                companion: "/home/u/.plank/ds4flash.dspark.gguf",
+                weights_file: "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS.gguf",
+                hf_url: "https://huggingface.co/antirez/deepseek-v4-gguf",
+            },
             version: "9.9.9",
             date: "2026-07-19T10:00:00",
             ctx_size: 1_000_000,
@@ -439,6 +528,68 @@ mod tests {
     fn a_panic_report_with_no_transcript_says_so() {
         let text = build_panic_report("9.9.9", "d", "boom", None);
         assert!(text.contains("(no transcript was captured before the panic)"));
+    }
+
+    /// The weights' identity is the thing a maintainer cannot reconstruct from
+    /// anything else in the file, so all four answers are pinned: the engine's
+    /// own name, the family, the dialect, and the installed artifact version.
+    #[test]
+    fn the_model_section_records_which_model_produced_the_transcript() {
+        let cfg = AgentConfig::default();
+        let report = build_report(&meta(), &cfg, "[user]\nhi\n");
+        let section = report
+            .split_once("## Model\n")
+            .expect("a Model section")
+            .1
+            .split_once("## Generation")
+            .expect("followed by Generation")
+            .0;
+        assert!(
+            section.contains("- name: DeepSeek V4 Flash Vision Experimental"),
+            "{section}"
+        );
+        assert!(section.contains("- family: ds4"), "{section}");
+        assert!(section.contains("- tool dialect: dsml"), "{section}");
+        assert!(section.contains("- artifact set: version 7"), "{section}");
+        assert!(
+            section.contains("- weights file: DeepSeek-V4-Flash-Vision-Exp-IQ2XXS.gguf"),
+            "{section}"
+        );
+        // The repo page, never the `/resolve/` download URL.
+        assert!(
+            section.contains("- hugging face: https://huggingface.co/antirez/deepseek-v4-gguf"),
+            "{section}"
+        );
+        assert!(!section.contains("/resolve/"), "no download URL: {section}");
+        assert!(
+            section.contains("- companion: /home/u/.plank/ds4flash.dspark.gguf"),
+            "{section}"
+        );
+        // It moved out of `## Generation`, so it must not be in both places.
+        let generation = report.split_once("## Generation").unwrap().1;
+        assert!(
+            !generation.contains("- name:") && !generation.contains("- model:"),
+            "the model is recorded once, in its own section: {generation}"
+        );
+    }
+
+    /// An absent engine and an absent manifest are stated, not left blank: a
+    /// missing line reads as a field nobody filled in, which is a different
+    /// bug report from "there was no engine".
+    #[test]
+    fn an_unknown_model_says_so_rather_than_leaving_the_field_empty() {
+        let cfg = AgentConfig::default();
+        let mut m = meta();
+        m.model = ModelMeta::default();
+        let report = build_report(&m, &cfg, "[user]\nhi\n");
+        assert!(report.contains("- name: (no engine loaded)"), "{report}");
+        assert!(
+            report.contains("- artifact set: (no manifest installed)"),
+            "{report}"
+        );
+        // The optional lines are simply absent rather than printed empty.
+        assert!(!report.contains("- family: \n"), "{report}");
+        assert!(!report.contains("- companion: \n"), "{report}");
     }
 
     #[test]

@@ -451,8 +451,8 @@ pub fn parse_backend(name: &str) -> Option<Backend> {
 /// Listing a flag the build refuses would send the reader to a fix that is not
 /// available to them; the flag's own error message names the feature instead.
 #[cfg(feature = "qwen")]
-const QWEN_USAGE: &str = "\
-      --qwen               run Qwen3.8-Flash-Next instead of DeepSeek V4 (off by
+const QWEN_USAGE: &str =
+    "      --qwen               run Qwen3.8-Flash-Next instead of DeepSeek V4 (off by
                            default): shorthand for -m ~/.plank/qwen.gguf
                            --mtp-model ~/.plank/qwen.mtp.gguf, both expected to be
                            symlinks you point at your own build. An explicit -m or
@@ -479,8 +479,7 @@ Options:
 "
     .to_owned()
         + QWEN_USAGE
-        + "\
-  -t, --threads N          worker thread count (backend default when unset)
+        + "  -t, --threads N          worker thread count (backend default when unset)
       --backend NAME       select backend by name: metal, cuda, cpu
       --metal              use the Metal backend
       --cuda               use the CUDA backend
@@ -2080,6 +2079,42 @@ mod tests {
             assert!(!c.show_help, "{a}");
         }
         assert!(!parse_options(&args(&[])).unwrap().show_version);
+    }
+
+    /// `usage()` is three concatenated literals, and a `\`-continued Rust
+    /// literal strips the *next* line's leading whitespace — so a chunk that
+    /// starts with one silently un-indents its first option and the column
+    /// alignment breaks at exactly the seam. Both seams are pinned here; the
+    /// bug shipped twice before this test existed.
+    #[test]
+    fn every_option_line_keeps_its_indentation_across_the_chunk_seams() {
+        let text = usage();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('-') {
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+            // A wrapped description sits in the text column and can begin with
+            // a flag name of its own; only the flag column is being checked.
+            if indent >= 10 {
+                continue;
+            }
+            assert!(
+                indent == 2 || indent == 6,
+                "option line lost its indent at a literal seam: {line:?}"
+            );
+        }
+        // The seams themselves, named so a failure says which one moved.
+        assert!(
+            text.contains("\n  -t, --threads N"),
+            "the chunk after QWEN_USAGE is un-indented"
+        );
+        #[cfg(feature = "qwen")]
+        assert!(
+            text.contains("\n      --qwen  "),
+            "QWEN_USAGE itself is un-indented"
+        );
     }
 
     #[test]

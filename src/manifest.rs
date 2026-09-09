@@ -115,6 +115,27 @@ pub struct FileEntry {
     pub sha256: String,
 }
 
+/// The Hugging Face *repository page* behind an artifact URL, or `None` when
+/// the URL is not a Hugging Face `resolve` link.
+///
+/// Deliberately not the artifact URL itself. A manifest entry points at
+/// `…/resolve/main/<file>`, which is the download: putting that in a bug
+/// report invites a maintainer to click it and start fetching ~87 GB. The repo
+/// page is the thing a human actually wants to open, and the file name is
+/// recorded separately beside it.
+#[must_use]
+pub fn hf_repo_url(artifact_url: &str) -> Option<String> {
+    let rest = artifact_url.strip_prefix("https://huggingface.co/")?;
+    let (repo, _) = rest.split_once("/resolve/")?;
+    // `<owner>/<name>` exactly — anything else is a shape this does not know.
+    let mut parts = repo.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    (!owner.is_empty() && !name.is_empty())
+        .then(|| format!("https://huggingface.co/{owner}/{name}"))
+}
+
 /// A parsed `ds4.manifest`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -361,6 +382,30 @@ pub fn decide(
 
 #[cfg(test)]
 mod tests {
+
+    /// The repo page, not the artifact URL: a `/resolve/` link in a bug report
+    /// is an invitation to start an 87 GB download by clicking it.
+    #[test]
+    fn an_artifact_url_yields_its_hugging_face_repo_page() {
+        assert_eq!(
+            super::hf_repo_url(
+                "https://huggingface.co/antirez/deepseek-v4-gguf/resolve/main/Model-Q2.gguf"
+            )
+            .as_deref(),
+            Some("https://huggingface.co/antirez/deepseek-v4-gguf")
+        );
+        // Anything that is not a Hugging Face resolve link has no repo page,
+        // and a mirror or a self-hosted manifest is a perfectly ordinary case.
+        for other in [
+            "https://example.com/models/main.gguf",
+            "https://huggingface.co/antirez/deepseek-v4-gguf",
+            "https://huggingface.co/too/many/segments/resolve/main/f.gguf",
+            "https://huggingface.co//resolve/main/f.gguf",
+        ] {
+            assert_eq!(super::hf_repo_url(other), None, "{other}");
+        }
+    }
+
     use super::*;
 
     /// 64 lowercase hex characters, distinguishable by their leading digit so
