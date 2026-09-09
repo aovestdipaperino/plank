@@ -107,7 +107,7 @@ Speculative decoding verifies its drafts by argmax, so it only runs at temperatu
 
 `/repro` is the one to reach for when you want to report a problem: it captures the rendered prompt the engine would see plus the model, backend, context size, sampling settings and think mode, in a single self-contained file. It never touches the live session.
 
-Under `--debug` (or after `/debug on`) plank dumps on its own as well: quitting writes `repro-quit-<timestamp>.md`, and a panic writes `repro-panic-<timestamp>.md` with whatever transcript the session had last rendered. Neither needs you to remember `/repro` before the session ends.
+Under `--debug` (or after `/debug on`) plank dumps on its own as well: quitting writes `repro-debug-<timestamp>.md`, and a panic writes `repro-panic-<timestamp>.md` with whatever transcript the session had last rendered. Neither needs you to remember `/repro` before the session ends.
 
 `/insights` computes **every number in code** and uses the model only for prose it cannot replace — a failed or skipped model call costs the report its narrative, never its statistics.
 

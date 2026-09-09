@@ -7954,7 +7954,7 @@ the original is frozen and listed in /tree"
         )
     }
 
-    /// The dump taken on the way out under `--debug` (`repro-quit-<secs>.md`),
+    /// The dump taken on the way out under `--debug` (`repro-debug-<secs>.md`),
     /// so the session that was being debugged is on disk without anyone having
     /// to remember `/repro` before quitting. Returns the line to print, or
     /// `None` when debug is off — which is every ordinary run.
@@ -7968,10 +7968,10 @@ the original is frozen and listed in /tree"
         Some(
             match self.write_repro_with(
                 "quitting under --debug; repro saved automatically",
-                "repro-quit",
+                "repro-debug",
             ) {
                 Ok((path, sidecars)) => Self::repro_written_line(&path, sidecars),
-                Err(e) => format!("[quit repro not written: {e}]"),
+                Err(e) => format!("[repro-debug not written: {e}]"),
             },
         )
     }
@@ -17516,9 +17516,9 @@ mod tests {
         let written = std::fs::read_dir(test_repro_dir())
             .expect("repro dir")
             .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with("repro-quit-"))
+            .filter(|e| e.file_name().to_string_lossy().starts_with("repro-debug-"))
             .count();
-        assert!(written >= 1, "a repro-quit dump should exist");
+        assert!(written >= 1, "a repro-debug dump should exist");
 
         crate::debugmirror::set_enabled(false);
         assert!(
