@@ -1617,6 +1617,9 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.viz.read_start.clear();
         self.viz.read_max.clear();
         self.viz.read_whole.clear();
+        self.viz.write_content_newlines = 0;
+        self.viz.write_partial_line = false;
+        self.viz.write_path.clear();
         self.viz.tool_announced = false;
     }
 
@@ -2537,6 +2540,41 @@ mod tests {
         // Cargo.toml exists relative to the crate dir -> treated as an overwrite.
         let think = write_summary_for("Cargo.toml", "whatever\n");
         assert!(!think.contains("└"), "no summary for overwrite: {think:?}");
+    }
+
+    #[test]
+    fn write_preview_state_resets_between_invokes_in_one_stanza() {
+        // Two `write` creates in a single stanza: the second invoke's summary
+        // must not be inflated by the first invoke's line count, and its
+        // header must not be a concatenation of both paths.
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"path\">src/multi_a.rs</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"content\">a\nb\n</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"path\">src/multi_b.rs</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"content\">x\n</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_tool_calls(false);
+        sr.push(stanza);
+        sr.finish();
+        let think = &sr.sink().think;
+        assert!(think.contains("└ 2 lines"), "first summary: {think:?}");
+        assert!(think.contains("└ 1 line"), "second summary: {think:?}");
+        assert!(!think.contains("└ 3 lines"), "inflated summary: {think:?}");
+        assert!(
+            think.contains("Writing src/multi_b.rs"),
+            "second header: {think:?}"
+        );
+        assert!(
+            !think.contains("multi_asrc"),
+            "concatenated path leaked: {think:?}"
+        );
     }
 
     #[test]
