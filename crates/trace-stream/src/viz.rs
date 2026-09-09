@@ -1535,6 +1535,11 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// `N` is the number of body lines seen so far. Sinks that cannot rewrite a
     /// line ignore it.
     fn viz_write_preview_tick(&mut self) {
+        // Gated with the rest of the preview: `/init` turns the whole preview
+        // off, and the transient line must go with it.
+        if !self.show_write_preview {
+            return;
+        }
         let n = self.viz.write_content_newlines;
         let unit = if n == 1 { "line" } else { "lines" };
         self.flush_carry();
@@ -1605,9 +1610,13 @@ impl<S: RenderSink> StreamRenderer<S> {
             let unit = if n == 1 { "line" } else { "lines" };
             if self.viz.write_truncated {
                 // The collapsed body had a live `… N lines` line. Drop it and
-                // land the permanent `└ N lines` summary in its place.
-                self.flush_carry();
-                self.sink.preview_status(None);
+                // land the permanent `└ N lines` summary in its place. Gated
+                // with the preview: `/init` shows neither, so there is no
+                // transient line to clear.
+                if self.show_write_preview {
+                    self.flush_carry();
+                    self.sink.preview_status(None);
+                }
             } else if !self.viz.at_line_start {
                 self.viz_preview_puts("\n");
             }
@@ -2763,7 +2772,9 @@ mod tests {
             "<｜DSML｜tool_calls>",
             "<｜DSML｜invoke name=\"write\">",
             "<｜DSML｜parameter name=\"path\">src/foo.rs</｜DSML｜parameter>",
-            "<｜DSML｜parameter name=\"content\">fn main() {}\n</｜DSML｜parameter>",
+            // A long body: past the cap it would tick the live counter unless
+            // that too is gated off with the rest of the preview.
+            "<｜DSML｜parameter name=\"content\">l1\nl2\nl3\nl4\nl5\nl6\nl7\n</｜DSML｜parameter>",
             "</｜DSML｜invoke>",
             "</｜DSML｜tool_calls>",
         );
@@ -2776,9 +2787,14 @@ mod tests {
         sr.finish();
         assert!(sr.sink().think.is_empty(), "think: {:?}", sr.sink().think);
         assert!(
-            !sr.sink().visible.contains("fn main()"),
+            !sr.sink().visible.contains("l1"),
             "visible: {:?}",
             sr.sink().visible
+        );
+        assert!(
+            sr.sink().preview.is_empty(),
+            "no live counter when the preview is off: {:?}",
+            sr.sink().preview
         );
         assert_eq!(sr.finished().calls.len(), 1, "call still parsed");
     }
