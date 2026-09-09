@@ -2276,6 +2276,21 @@ Anything else that addresses rows by position — the cursor, `move_cursor`,
 `current` — is only ever exercised while `selecting` is set, which is exactly
 when every row is shown, so those stay index-for-index with `runs`.
 
+## The live write counter owns the last log line, so every other push must retire it
+
+The collapsed `write` preview's `… N lines` counter is a single `OutputLog`
+line rewritten in place: `preview_open` means "the last committed line is the
+counter, pop it before pushing the next count". That contract breaks the
+moment anything else appends to the log while a write is streaming — a
+`/usage` echo typed mid-turn, a `/context` report, a skill-loaded notice. The
+next tick popped the *pushed* line instead of the counter, so the echo
+vanished and a stale `… 85 lines` sat above a fresh `… 167 lines`. Every
+out-of-stream push (`push_spans`, `push_user_echo`, `push_ansi`,
+`push_markdown`, `push_skill_loaded`) therefore goes through
+`retire_preview` first: drop the transient counter, clear the flag, and let
+the next tick re-push it below whatever landed. The alternative — leaving the
+counter and just clearing the flag — freezes a wrong count in the scrollback.
+
 ## C parity stops at the wire format: tool error text is ours
 
 `view_image`'s refusal used to be the C's string byte-for-byte —

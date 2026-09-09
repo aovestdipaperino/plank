@@ -999,6 +999,7 @@ impl OutputLog {
 
     /// Appends a fully-styled standalone line (e.g. the user echo).
     pub fn push_spans(&mut self, spans: Vec<Span<'static>>) {
+        self.retire_preview();
         self.md_close();
         if !self.current.is_empty() {
             self.newline();
@@ -1013,6 +1014,7 @@ impl OutputLog {
     /// plan under `ExitPlanMode`. It is committed immediately, not left in the
     /// streaming buffer, so a later segment cannot re-render or truncate it.
     pub fn push_markdown(&mut self, src: &str) {
+        self.retire_preview();
         self.md_close();
         self.end_line();
         let start = self.lines.len();
@@ -1023,6 +1025,7 @@ impl OutputLog {
     /// Appends the echo of a submitted prompt, keeping the user's own line
     /// breaks (see [`user_echo_lines`]).
     pub fn push_user_echo(&mut self, text: &str) {
+        self.retire_preview();
         self.md_close();
         if !self.current.is_empty() {
             self.newline();
@@ -1034,6 +1037,7 @@ impl OutputLog {
     /// a green `●` bullet with `Skill(<name>)`, then an indented
     /// `└ Successfully loaded skill` under it.
     pub fn push_skill_loaded(&mut self, name: &str) {
+        self.retire_preview();
         self.md_close();
         self.end_line();
         self.lines.push(Line::from(vec![
@@ -1069,6 +1073,7 @@ impl OutputLog {
 
     /// Appends ANSI-colored text, one log line per input line.
     pub fn push_ansi(&mut self, text: &str) {
+        self.retire_preview();
         self.md_close();
         self.end_line();
         self.lines.extend(ansi_to_lines(text));
@@ -1081,15 +1086,24 @@ impl OutputLog {
         self.lines.pop();
     }
 
+    /// Drops the transient live preview line if one is the last committed line.
+    /// Every out-of-stream push (a user echo, a `/context` report, a skill
+    /// notice) goes through here first: otherwise the next counter tick would
+    /// pop the pushed line instead of the counter, leaving a stale count above
+    /// a fresh one and losing the pushed line.
+    fn retire_preview(&mut self) {
+        if self.preview_open {
+            self.pop_line();
+            self.preview_open = false;
+        }
+    }
+
     /// Sets, updates, or clears the transient live preview line — the collapsed
     /// `write` counter (`… N lines`). `Some(text)` replaces it in place (pops
     /// the old one, pushes the new dim line); `None` removes it, so the caller
     /// can then append the permanent `└ N lines` summary as ordinary text.
     pub fn apply_preview_status(&mut self, text: Option<&str>) {
-        if self.preview_open {
-            self.pop_line();
-            self.preview_open = false;
-        }
+        self.retire_preview();
         if let Some(text) = text {
             self.push_dim(text.to_string());
             self.preview_open = true;
@@ -7286,6 +7300,33 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.contains("└ 7 lines")),
             "permanent summary present: {rows:?}"
+        );
+    }
+
+    /// A line pushed from outside the stream (the echo of a `/usage` typed
+    /// mid-write) retires the transient counter first, so the next tick does not
+    /// pop the echo and leave a stale counter above a fresh one.
+    #[test]
+    fn preview_status_survives_an_interleaved_push() {
+        let mut log = OutputLog::new();
+        log.push_dim("● Writing x.rs");
+        log.apply_preview_status(Some("  … 85 lines"));
+        log.push_user_echo("/usage");
+        log.apply_preview_status(Some("  … 167 lines"));
+        let rows: Vec<String> = log.to_text().lines.iter().map(Line::to_string).collect();
+        assert_eq!(
+            rows.iter().filter(|r| r.contains('…')).count(),
+            1,
+            "only one transient line at a time: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("/usage")),
+            "echo kept: {rows:?}"
+        );
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some("  … 167 lines"),
+            "{rows:?}"
         );
     }
 
