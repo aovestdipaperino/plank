@@ -14550,6 +14550,10 @@ fn busy_ui_loop(
     done: impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut status_line = String::new();
+    // A `/usage` report shown mid-turn goes in this dismissable panel — the
+    // same treatment as at idle — instead of being dumped into the scrollback
+    // where it interleaves with the model's streaming output.
+    let mut report: Option<tui::ReportPanel> = None;
     // Latest task-list snapshot (issue #35), updated on every `UiEvent::Tasks`
     // and passed to `draw` for the status-bar counter and the contextual strip.
     let mut task_view = tui::TaskView::default();
@@ -14819,6 +14823,11 @@ fn busy_ui_loop(
                 if let Some(p) = &input.popup {
                     tui::draw_popup(f, input.buf.text(), p, roster_rows);
                 }
+                // The `/usage` report panel, anchored above the input like the
+                // slash menu; the turn keeps streaming into the log behind it.
+                if let Some(panel) = report.as_mut() {
+                    tui::draw_report(f, Some(input.buf.text()), panel, roster_rows);
+                }
                 // Drawn last, over the live turn. Translucent by default here,
                 // so the model's output keeps streaming legibly underneath.
                 if arcade.is_open() {
@@ -14951,6 +14960,20 @@ fn busy_ui_loop(
                     // Esc leaves the roster before it interrupts the turn: the
                     // roster is what the user is looking at, and an accidental
                     // interrupt here would be expensive.
+                    // A `/usage` report panel is the most modal thing on
+                    // screen, so Esc dismisses it before it can collapse the
+                    // roster or interrupt the turn.
+                    KeyCode::Esc if report.is_some() => report = None,
+                    KeyCode::PageUp if report.is_some() => {
+                        if let Some(panel) = report.as_mut() {
+                            panel.scroll(-5);
+                        }
+                    }
+                    KeyCode::PageDown if report.is_some() => {
+                        if let Some(panel) = report.as_mut() {
+                            panel.scroll(5);
+                        }
+                    }
                     KeyCode::Esc if sub.collapse() => {}
                     KeyCode::Esc => {
                         close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
@@ -15008,6 +15031,8 @@ fn busy_ui_loop(
                         let line = input.buf.text().trim().to_owned();
                         input.buf.clear();
                         input.hist_idx = None;
+                        // Submitting anything retires an open `/usage` report.
+                        report = None;
                         if line.is_empty() {
                         } else if btw_question(&line).is_some() {
                             // A `/btw` gets priority: it preempts the running
@@ -15037,14 +15062,24 @@ fn busy_ui_loop(
                             }
                             view.follow = true;
                             sub.follow_all();
+                        } else if line.split_whitespace().next() == Some("/usage") {
+                            // A report, not conversation: show it in the
+                            // dismissable panel (as at idle) instead of dumping
+                            // it into the scrollback where it would interleave
+                            // with the model's streaming output.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report = Some(tui::ReportPanel::new("usage", &live_cmds.usage));
+                            view.follow = true;
+                            sub.follow_all();
                         } else if let Some(out) = line
                             .starts_with('/')
                             .then(|| line.split_whitespace().next().unwrap_or(&line))
                             .and_then(|cmd| live_cmds.output(cmd))
                         {
-                            // Read-only reports (`/context`, `/usage`, `/mcp`,
-                            // `/help`) run against a turn-start snapshot, so they
-                            // stay available while the model streams.
+                            // The other read-only reports (`/context`, `/mcp`,
+                            // `/help`) run against a turn-start snapshot and
+                            // stream into the log, matching their idle behavior.
                             input.history.add(&line);
                             log.push_user_echo(&line);
                             log.push_ansi(&out);
