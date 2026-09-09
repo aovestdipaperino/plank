@@ -1841,6 +1841,14 @@ fn frame_rows(
     // three rows so it never crowds the scrollback.
     let strip = if has_prompt { tasks.strip_rows() } else { &[] };
     let strip_rows = u16::try_from(strip.len()).unwrap_or(0);
+    // Reserve a third status row for an own-line tip, but only while the agent
+    // works (no resting prompt to shift). `status_bar_lines` renders under the
+    // same predicate, so height and content agree.
+    let status_rows = if tip_on_own_line(!has_prompt, anim_tick_ms()) {
+        STATUS_ROWS + 1
+    } else {
+        STATUS_ROWS
+    };
     let FrameGeom {
         output,
         input,
@@ -1849,7 +1857,14 @@ fn frame_rows(
         rule_bottom,
         strip: strip_area,
         roster: roster_area,
-    } = frame_geom(area, has_prompt, input_rows, strip_rows, roster.height());
+    } = frame_geom(
+        area,
+        has_prompt,
+        input_rows,
+        strip_rows,
+        roster.height(),
+        status_rows,
+    );
     // Draw-site instrumentation for `--ui-remote`. This is the one place both
     // `draw` and `draw_btw_split` funnel through, so the frame is reset and
     // the structural regions published here; `render_input` and `render_popup`
@@ -2095,12 +2110,13 @@ fn frame_geom(
     input_rows: u16,
     strip_rows: u16,
     roster_rows: u16,
+    status_rows: u16,
 ) -> FrameGeom {
     // The roster sits below everything, and it never shrinks the scrollback to
     // nothing: on a short terminal it gives its rows back to the output.
     let roster_rows = roster_rows.min(
         area.height
-            .saturating_sub(STATUS_ROWS.saturating_add(input_rows).saturating_add(3)),
+            .saturating_sub(status_rows.saturating_add(input_rows).saturating_add(3)),
     );
     if has_prompt {
         let r = Layout::vertical([
@@ -2109,7 +2125,7 @@ fn frame_geom(
             Constraint::Length(1),           // top rule
             Constraint::Length(input_rows),  // input
             Constraint::Length(1),           // bottom rule
-            Constraint::Length(STATUS_ROWS), // status (two rows: see status_bar_lines)
+            Constraint::Length(status_rows), // status (2 rows, +1 for an own-line tip: see status_bar_lines)
             Constraint::Length(roster_rows), // sub-agent roster (0 until one runs)
         ])
         .split(area);
@@ -2126,7 +2142,7 @@ fn frame_geom(
         let r = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(STATUS_ROWS),
+            Constraint::Length(status_rows),
             Constraint::Length(roster_rows),
         ])
         .split(area);
@@ -2359,6 +2375,7 @@ pub fn draw_report(
         input_text.map_or(1, |t| input_height(t, tw)),
         0,
         roster_rows,
+        STATUS_ROWS,
     );
     if g.output.height < 3 {
         return;
@@ -2491,6 +2508,7 @@ pub fn draw_popup(
         input_height(input_text, tw),
         0,
         roster_rows,
+        STATUS_ROWS,
     );
     let rows = u16::try_from(popup.rows().len()).unwrap_or(u16::MAX);
     render_popup(frame, popup_rect(g.output, g.input, rows), popup);
@@ -2619,6 +2637,7 @@ pub fn draw_slash_menu(
         input_height(input_text, tw),
         0,
         roster_rows,
+        STATUS_ROWS,
     );
     let rows = u16::try_from(menu.rows().len()).unwrap_or(u16::MAX);
     render_slash_menu(frame, popup_rect(g.output, g.input, rows), menu);
@@ -3992,6 +4011,7 @@ pub fn draw(
             anim_tick_ms(),
             status_style,
             tasks,
+            input.is_none(),
         ))
         .style(status_style),
         status_row,
@@ -4036,6 +4056,7 @@ pub fn draw_ask(
             anim_tick_ms(),
             status_style,
             tasks,
+            false,
         ))
         .style(status_style),
         r[2],
@@ -4225,6 +4246,7 @@ pub fn draw_btw_split(
             anim_tick_ms(),
             status_style,
             tasks,
+            input.is_none(),
         ))
         .style(status_style),
         status_row,
@@ -4527,7 +4549,27 @@ fn compact_slot_spans(frac: f64, tick_ms: u64, base: Style) -> Vec<Span<'static>
 ///
 /// The bar segment lives between `[` and `]`; `▶` cells render in the theme
 /// color (military green) and `·` cells a dim gray.
-fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> Vec<Line<'static>> {
+/// Whether the rotating tip should render on its own indented line below the
+/// status bar rather than in the tail slot. Only while the agent is working
+/// (`input_hidden`), so the extra row never pushes a resting prompt around; and
+/// only when nothing else owns the tail (no running tool, no flash) and a tip
+/// is actually within its visibility window. `frame_rows` and
+/// [`status_bar_lines`] both consult this so the reserved height and the
+/// rendered lines agree.
+fn tip_on_own_line(input_hidden: bool, tick_ms: u64) -> bool {
+    input_hidden
+        && crate::status::tool_activity().is_none()
+        && crate::status::flash_tip().is_none()
+        && !crate::status::rotating_tip(tick_ms).is_empty()
+}
+
+fn status_bar_lines(
+    text: &str,
+    tick_ms: u64,
+    base: Style,
+    tasks: &TaskView,
+    input_hidden: bool,
+) -> Vec<Line<'static>> {
     let theme = base
         .fg(Color::Indexed(crate::status::THEME_COLOR))
         .add_modifier(Modifier::BOLD);
@@ -4665,17 +4707,48 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
             flash,
             base.fg(Color::Green).add_modifier(Modifier::BOLD),
         ));
-    } else {
-        let tip = crate::status::rotating_tip(tick_ms);
-        if !tip.is_empty() {
-            spans.push(Span::styled(" | ".to_string(), base));
-            spans.push(Span::styled(
-                format!("💡 {tip}"),
-                base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
-        }
     }
-    vec![Line::from(first), Line::from(spans)]
+    // The rotating tip: appended to the tail at rest, or returned as its own
+    // indented line while the agent works.
+    let tip_line = place_rotating_tip(&mut spans, base, tick_ms, input_hidden);
+    let mut lines = vec![Line::from(first), Line::from(spans)];
+    if let Some(tip_line) = tip_line {
+        lines.push(tip_line);
+    }
+    lines
+}
+
+/// Places the rotating tip. At rest it is pushed onto `spans` (the status
+/// tail); while the agent works (`input_hidden`) it is returned as its own
+/// indented `└` line below the progress row, matching the `└` continuations
+/// used elsewhere. Yellow-bold either way. Returns `None` when a running tool
+/// or a flash owns the tail, or no tip is within its visibility window.
+fn place_rotating_tip(
+    spans: &mut Vec<Span<'static>>,
+    base: Style,
+    tick_ms: u64,
+    input_hidden: bool,
+) -> Option<Line<'static>> {
+    if crate::status::tool_activity().is_some() || crate::status::flash_tip().is_some() {
+        return None;
+    }
+    let tip = crate::status::rotating_tip(tick_ms);
+    if tip.is_empty() {
+        return None;
+    }
+    let tip_span = Span::styled(
+        format!("💡 {tip}"),
+        base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    );
+    if input_hidden {
+        return Some(Line::from(vec![
+            Span::styled("  └ ".to_string(), base.fg(Color::Indexed(240))),
+            tip_span,
+        ]));
+    }
+    spans.push(Span::styled(" | ".to_string(), base));
+    spans.push(tip_span);
+    None
 }
 
 #[cfg(test)]
@@ -6610,7 +6683,7 @@ mod tests {
     #[test]
     fn frame_geom_survives_oversized_input_rows() {
         let area = Rect::new(0, 0, 80, 24);
-        let geom = frame_geom(area, true, u16::MAX, 0, 3);
+        let geom = frame_geom(area, true, u16::MAX, 0, 3, STATUS_ROWS);
         assert!(geom.output.height <= area.height);
     }
 
@@ -6939,7 +7012,7 @@ mod tests {
     /// Both status rows flattened into one span list, for assertions about
     /// content rather than placement.
     fn status_spans(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> Vec<Span<'static>> {
-        status_bar_lines(text, tick_ms, base, tasks)
+        status_bar_lines(text, tick_ms, base, tasks, false)
             .into_iter()
             .flat_map(|l| l.spans)
             .collect()
@@ -7080,7 +7153,7 @@ mod tests {
         let text = format!("~/x | {} med | ctx 12% | idle", crate::status::THINK_MARK);
         let tip_spans = |rotation: u64| -> Vec<(String, Option<Color>, bool)> {
             let tick = crate::status::TIP_ROTATE_MS * rotation;
-            status_bar_lines(&text, tick, base, &TaskView::default())
+            status_bar_lines(&text, tick, base, &TaskView::default(), false)
                 .into_iter()
                 .flat_map(|l| l.spans)
                 .filter(|s| s.content.contains('💡'))
@@ -7105,6 +7178,53 @@ mod tests {
             "same colour and weight as a real tip"
         );
         assert!(promo[0].0.starts_with("💡 "), "same prefix: {}", promo[0].0);
+    }
+
+    /// While the agent works (input hidden), a visible tip drops onto its own
+    /// indented `└` line below the progress row, keeping its yellow-bold
+    /// styling, and is not also shown in the tail.
+    #[test]
+    fn a_tip_drops_to_its_own_line_while_the_agent_works() {
+        crate::status::clear_flash_tip();
+        let base = Style::default();
+        let text = format!("~/x | {} med | ctx 12% | idle", crate::status::THINK_MARK);
+        // tick 0 sits inside the tip's visibility window.
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), true);
+        assert_eq!(rows.len(), 3, "a busy tip takes a third row: {rows:?}");
+        let tip_row: String = rows[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            tip_row.starts_with("  └ "),
+            "indented connector: {tip_row:?}"
+        );
+        assert!(tip_row.contains("💡 "), "keeps the tip glyph: {tip_row:?}");
+        let tail_row: String = rows[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !tail_row.contains('💡'),
+            "not duplicated in the tail: {tail_row:?}"
+        );
+        let tip_span = rows[2]
+            .spans
+            .iter()
+            .find(|s| s.content.contains('💡'))
+            .expect("tip span");
+        assert_eq!(tip_span.style.fg, Some(Color::Yellow), "coloring preserved");
+        assert!(tip_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// At rest (input shown) the tip stays in the tail slot, so the status bar
+    /// keeps its two rows and no third row shifts the prompt.
+    #[test]
+    fn a_tip_stays_in_the_tail_when_idle() {
+        crate::status::clear_flash_tip();
+        let base = Style::default();
+        let text = format!("~/x | {} med | ctx 12% | idle", crate::status::THINK_MARK);
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
+        assert_eq!(rows.len(), 2, "idle keeps two rows: {rows:?}");
+        let tail_row: String = rows[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            tail_row.contains('💡'),
+            "tip in the tail when idle: {tail_row:?}"
+        );
     }
 
     /// A fenced code block that opens on the line directly after a paragraph —
@@ -7159,7 +7279,7 @@ mod tests {
         let mark = crate::status::THINK_MARK;
         let text = format!("~/x | {mark} med | ctx 12% | generating");
         let rows = || -> Vec<String> {
-            status_bar_lines(&text, 0, base, &TaskView::default())
+            status_bar_lines(&text, 0, base, &TaskView::default(), false)
                 .into_iter()
                 .map(|l| l.spans.iter().map(|sp| sp.content.to_string()).collect())
                 .collect()
@@ -7214,6 +7334,7 @@ mod tests {
                             0,
                             base,
                             &TaskView::default(),
+                            false,
                         )),
                         f.area(),
                     );
@@ -7261,7 +7382,7 @@ mod tests {
         let origin = crate::status::engine_origin_label();
         let text =
             format!("~/Code/plank {glyph} main | {mark} 3 · +12 -4 | {origin} | ctx 12% | idle");
-        let rows = status_bar_lines(&text, 0, base, &TaskView::default());
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
         let row: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(
             row,
@@ -7300,7 +7421,7 @@ mod tests {
         let _guard = crate::status::origin_test_guard();
         let origin = crate::status::engine_origin_label();
         let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
-        let rows = status_bar_lines(&text, 0, base, &TaskView::default());
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
         assert_eq!(rows.len(), 2, "two rows");
 
         let row =
@@ -7377,7 +7498,7 @@ mod tests {
         let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
         let mut term = Terminal::new(TestBackend::new(70, 2)).unwrap();
         term.draw(|f| {
-            let rows = status_bar_lines(&text, 0, Style::default(), &TaskView::default());
+            let rows = status_bar_lines(&text, 0, Style::default(), &TaskView::default(), false);
             f.render_widget(ratatui::widgets::Paragraph::new(rows), f.area());
         })
         .unwrap();
@@ -7408,7 +7529,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         // No strip: the top rule sits directly above the input, the bottom
         // rule directly below it (above the status bar).
-        let g0 = frame_geom(area, true, 1, 0, 0);
+        let g0 = frame_geom(area, true, 1, 0, 0, STATUS_ROWS);
         let (out0, in0, st0, rule0, rule_bot0, strip0) = (
             g0.output,
             g0.input,
@@ -7438,7 +7559,7 @@ mod tests {
         );
         // Three strip rows: reserved between the output and the rule, and the
         // output pane shrinks by exactly three rows.
-        let g3 = frame_geom(area, true, 1, 3, 0);
+        let g3 = frame_geom(area, true, 1, 3, 0, STATUS_ROWS);
         let (out3, rule3, strip3) = (g3.output, g3.rule_top, g3.strip);
         let strip3 = strip3.expect("strip present");
         let rule3 = rule3.expect("rule present");
@@ -7970,7 +8091,14 @@ mod tests {
         // hand-made rects, for a one-row and a tall multi-row input.
         for (input_text, rows) in [("@src", 5u16), ("a\nb\nc\n@src", 15)] {
             let screen = Rect::new(0, 0, 80, 24);
-            let g = frame_geom(screen, true, input_height(input_text, 78), 0, 0);
+            let g = frame_geom(
+                screen,
+                true,
+                input_height(input_text, 78),
+                0,
+                0,
+                STATUS_ROWS,
+            );
             let (output, input, status, rule) = (g.output, g.input, g.status, g.rule_top);
             let rule = rule.expect("prompt showing means a rule row");
             let r = popup_rect(output, input, rows);
