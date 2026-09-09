@@ -574,6 +574,13 @@ struct ToolViz {
     /// only then does the content stream as a dim preview (an overwrite is left
     /// to the post-edit diff card).
     write_is_create: bool,
+    /// Content lines seen so far for the current create preview: full,
+    /// newline-terminated lines. `write_partial_line` covers a final line
+    /// with no trailing newline. Together they form the `└ N lines` summary.
+    write_content_newlines: usize,
+    /// True when the create body has emitted bytes on the current line that
+    /// are not yet newline-terminated (a trailing partial line to count).
+    write_partial_line: bool,
 }
 
 impl ToolViz {
@@ -1450,6 +1457,12 @@ impl<S: RenderSink> StreamRenderer<S> {
         if self.viz_is_write_preview() {
             if self.viz.write_is_create {
                 self.emit_preview_bytes(&[c]);
+                if c == b'\n' {
+                    self.viz.write_content_newlines += 1;
+                    self.viz.write_partial_line = false;
+                } else {
+                    self.viz.write_partial_line = true;
+                }
             }
             self.viz.at_line_start = c == b'\n';
             return;
@@ -1513,6 +1526,19 @@ impl<S: RenderSink> StreamRenderer<S> {
     }
 
     fn viz_param_end(&mut self) {
+        // A create's content just finished: append the line-count summary on
+        // the same dim preview channel, on its own line.
+        if self.viz.tool_name == "write"
+            && self.viz.param_kind == ParamKind::Content
+            && self.viz.write_is_create
+        {
+            let n = self.viz.write_content_newlines + usize::from(self.viz.write_partial_line);
+            let unit = if n == 1 { "line" } else { "lines" };
+            if !self.viz.at_line_start {
+                self.viz_preview_puts("\n");
+            }
+            self.viz_preview_puts(&format!("└ {n} {unit}\n"));
+        }
         self.viz.param_end_tail.clear();
         if self.viz.code_param_active {
             self.viz_code_end();
@@ -2458,6 +2484,59 @@ mod tests {
             sr.sink().visible
         );
         assert_eq!(sr.finished().calls.len(), 1, "call still parsed");
+    }
+
+    fn write_summary_for(path: &str, content: &str) -> String {
+        let stanza = format!(
+            concat!(
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"write\">",
+                "<｜DSML｜parameter name=\"path\">{}</｜DSML｜parameter>",
+                "<｜DSML｜parameter name=\"content\">{}</｜DSML｜parameter>",
+                "</｜DSML｜invoke>",
+                "</｜DSML｜tool_calls>",
+            ),
+            path, content,
+        );
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_tool_calls(false); // banners-off preview path (dim channel)
+        sr.push(&stanza);
+        sr.finish();
+        sr.sink().think.clone()
+    }
+
+    #[test]
+    fn write_summary_counts_multiple_lines() {
+        // Three content lines, each newline-terminated.
+        let think = write_summary_for("src/new_a.rs", "one\ntwo\nthree\n");
+        assert!(think.contains("└ 3 lines"), "summary: {think:?}");
+    }
+
+    #[test]
+    fn write_summary_is_singular_for_one_line() {
+        let think = write_summary_for("src/new_b.rs", "only\n");
+        assert!(think.contains("└ 1 line"), "summary: {think:?}");
+        assert!(!think.contains("└ 1 lines"), "singular grammar: {think:?}");
+    }
+
+    #[test]
+    fn write_summary_counts_trailing_partial_line() {
+        // No trailing newline: the last partial line still counts.
+        let think = write_summary_for("src/new_c.rs", "a\nb");
+        assert!(think.contains("└ 2 lines"), "summary: {think:?}");
+    }
+
+    #[test]
+    fn write_summary_is_zero_for_empty_body() {
+        let think = write_summary_for("src/new_d.rs", "");
+        assert!(think.contains("└ 0 lines"), "summary: {think:?}");
+    }
+
+    #[test]
+    fn write_summary_absent_for_overwrite() {
+        // Cargo.toml exists relative to the crate dir -> treated as an overwrite.
+        let think = write_summary_for("Cargo.toml", "whatever\n");
+        assert!(!think.contains("└"), "no summary for overwrite: {think:?}");
     }
 
     #[test]
