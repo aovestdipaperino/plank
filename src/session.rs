@@ -955,22 +955,27 @@ impl SessionStore {
         freed
     }
 
-    /// The system-prompt text the last Tier 1 checkpoint was built from, or
-    /// `None` when no sidecar has been written yet (first run, or a cleared
-    /// cache). Used only to explain a Tier 1 miss — never to validate a cache.
+    /// The system-prompt text the live family's last Tier 1 checkpoint was
+    /// built from, or `None` when that family has written no sidecar yet
+    /// (first run, a cleared cache, or a family whose note predates the
+    /// per-family split). Used only to explain a Tier 1 miss — never to
+    /// validate a cache.
+    ///
+    /// Reading only the live family's note is the point: see
+    /// [`sysprompt_note_name`].
     #[must_use]
     pub fn system_prompt_note(&self) -> Option<String> {
-        fs::read_to_string(self.dir.join(SYSPROMPT_NOTE_NAME)).ok()
+        fs::read_to_string(self.dir.join(sysprompt_note_name(family()))).ok()
     }
 
-    /// Records `system` as the prompt text behind the current Tier 1
-    /// checkpoint.
+    /// Records `system` as the prompt text behind the live family's current
+    /// Tier 1 checkpoint.
     ///
     /// # Errors
     /// Returns the underlying [`io::Error`] when the write fails. Best-effort:
     /// losing the sidecar costs only the explanation on the next miss.
     pub fn store_system_prompt_note(&self, system: &str) -> io::Result<()> {
-        fs::write(self.dir.join(SYSPROMPT_NOTE_NAME), system)
+        fs::write(self.dir.join(sysprompt_note_name(family())), system)
     }
 
     /// Filesystem location backing a [`KvKey`].
@@ -1100,7 +1105,7 @@ impl SessionStore {
                 if !entry.file_type().is_ok_and(|t| t.is_file()) {
                     continue;
                 }
-                if name == SYSPROMPT_NOTE_NAME {
+                if is_sysprompt_note(name) {
                     // Deleted but deliberately not counted: it's a tiny
                     // diagnostic sidecar, not cache, and the tally means
                     // cache bytes reclaimed.
@@ -1758,12 +1763,41 @@ const SYSPROMPT_STEM: &str = "sysprompt";
 /// `sysprompt-<fp1>.kv_raw`.
 const SYSPROMPT_PREFIX: &str = "sysprompt-";
 
-/// Sidecar holding the system-prompt text that the most recent Tier 1
-/// checkpoint was built from. Deliberately *not* keyed by `fp1` — a changed
-/// prompt yields a different key, so the point of this file is to be findable
-/// after the fingerprint has already moved. Its name ends in `.prompt`, not
-/// `.kv_raw`, so [`SessionStore::sweep`] never sees it as a blob.
-const SYSPROMPT_NOTE_NAME: &str = "sysprompt-last.prompt";
+/// Shared prefix of the sidecars holding the system-prompt text behind the
+/// most recent Tier 1 checkpoint, one per model family.
+///
+/// Deliberately *not* keyed by `fp1` — a changed prompt yields a different
+/// key, so the point of these files is to be findable after the fingerprint
+/// has already moved. The name ends in `.prompt`, not `.kv_raw`, so
+/// [`SessionStore::sweep`] never sees one as a blob.
+const SYSPROMPT_NOTE_PREFIX: &str = "sysprompt-last";
+
+/// Suffix of a system-prompt note, after the family tag.
+const SYSPROMPT_NOTE_SUFFIX: &str = ".prompt";
+
+/// The pre-family note name, written by builds before the note was split per
+/// family. Swept like the tagged ones and never read: it cannot be attributed
+/// to a family, which is the whole reason the split exists.
+const LEGACY_SYSPROMPT_NOTE_NAME: &str = "sysprompt-last.prompt";
+
+/// Whether `name` is a system-prompt note sidecar of any family, including the
+/// untagged legacy one.
+fn is_sysprompt_note(name: &str) -> bool {
+    name == LEGACY_SYSPROMPT_NOTE_NAME
+        || (name.starts_with(SYSPROMPT_NOTE_PREFIX) && name.ends_with(SYSPROMPT_NOTE_SUFFIX))
+}
+
+/// Note filename for one model family: `sysprompt-last.<family>.prompt`.
+///
+/// The families share one cache directory, so an untagged note is whichever
+/// family launched last. Diffing a `DeepSeek` prompt against a note left by a
+/// Qwen run explains a Tier 1 miss with a Qwen-to-DSML diff that has nothing
+/// to do with why the checkpoint missed — a confidently wrong diagnosis
+/// exactly when families are being alternated.
+fn sysprompt_note_name(family: crate::gguf::ModelFamily) -> String {
+    let tag = family_ext(family).trim_end_matches(LEGACY_FILE_EXT);
+    format!("{SYSPROMPT_NOTE_PREFIX}{tag}{SYSPROMPT_NOTE_SUFFIX}")
+}
 
 /// File-stem prefix of the Tier 2 project-stable KV checkpoints (issue #60):
 /// `project-<fp2>.kv_raw`, living under the per-project subdirectory.
@@ -3028,6 +3062,60 @@ mod tests {
             "the rung must be evicted ahead of the older session payload, not after it"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two families share one cache directory, so their notes must not
+    /// share one filename: an untagged note is whichever family launched last,
+    /// and diffing against it explains a DS4-family miss with a Qwen diff.
+    #[test]
+    fn the_system_prompt_note_is_named_per_family() {
+        let ds4 = sysprompt_note_name(crate::gguf::ModelFamily::Ds4);
+        let qwen = sysprompt_note_name(crate::gguf::ModelFamily::Qwen);
+        assert_eq!(ds4, "sysprompt-last.ds4.prompt");
+        assert_eq!(qwen, "sysprompt-last.qwn.prompt");
+        assert_ne!(ds4, qwen, "one family's note must never shadow the other's");
+
+        // Every spelling is swept, so switching families cannot leave the
+        // other's note behind as cache the tally never accounts for — and the
+        // untagged legacy name is swept too, since it can never be attributed.
+        assert!(is_sysprompt_note(&ds4));
+        assert!(is_sysprompt_note(&qwen));
+        assert!(is_sysprompt_note(LEGACY_SYSPROMPT_NOTE_NAME));
+        // A checkpoint blob is not a note: `.kv_raw` must keep reaching the
+        // byte-budget tally rather than being deleted as a diagnostic.
+        assert!(!is_sysprompt_note("sysprompt-a19f.kv_raw"));
+        assert!(!is_sysprompt_note("cheeky-bell.ds4.kv"));
+    }
+
+    /// A note written under one family is invisible to the other, so the miss
+    /// explanation either diffs against that family's own last prompt or says
+    /// nothing at all. Saying nothing beats saying something false.
+    #[test]
+    fn a_note_from_one_family_is_not_read_by_the_other() {
+        let dir = std::env::temp_dir().join(format!("plank-spnote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        std::fs::write(
+            dir.join(sysprompt_note_name(crate::gguf::ModelFamily::Qwen)),
+            "the qwen prompt",
+        )
+        .unwrap();
+        // The live family is DeepSeek by default, so the Qwen note is not it.
+        assert_eq!(family(), crate::gguf::ModelFamily::Ds4);
+        assert_eq!(store.system_prompt_note(), None);
+
+        store.store_system_prompt_note("the ds4 prompt").unwrap();
+        assert_eq!(
+            store.system_prompt_note().as_deref(),
+            Some("the ds4 prompt")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(sysprompt_note_name(crate::gguf::ModelFamily::Qwen)))
+                .unwrap(),
+            "the qwen prompt",
+            "writing one family's note must not clobber the other's"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

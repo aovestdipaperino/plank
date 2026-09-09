@@ -728,7 +728,8 @@ extension checkpoint of the one above it. `kvtier::plan` builds the list;
 
 | Tier | Content | Key | Storage |
 |---|---|---|---|
-| 1 | system prompt, global MCP tool defs, sub-agent roster | `fp1 = sha1(model ‖ think ‖ trusted_len ‖ system)` | `sysprompt-<fp1>.kv_raw`, model-global |
+| 1 | the trusted built-in system prompt | `fp1a = sha1(model ‖ think ‖ trusted_len ‖ trusted span)` | `sysprompt-<fp1a>.kv_raw`, model-global |
+| 1b | the prompt's untrusted tail: global MCP tool defs and instructions, `-sys` text, sub-agent roster | `fp1 = sha1(model ‖ think ‖ trusted_len ‖ system)` | `sysprompt-<fp1>.kv_raw`, model-global |
 | 2 | project-stable context: `AGENTS.md`/`CLAUDE.md`, memory, local MCP tool defs | `fp2 = tier(fp1, stable ‖ local defs)` | `<project-key>/project-<fp2>.kv_raw` |
 | 3 | session-volatile: git status, date, hook output | — | never cached |
 | 4 | conversation turns | `tier(fp2, transcript)` | `<session>.kv_raw` |
@@ -736,6 +737,32 @@ extension checkpoint of the one above it. `kvtier::plan` builds the list;
 Each fingerprint **chains its parent's**, which is what makes the walk sound:
 a deep tier matching proves every ancestor matches, so the walk can restore the
 deepest hit without independently revalidating what sits above it.
+
+#### Why Tier 1 is split at `trusted_len`
+
+The two halves change at completely different rates. The built-in prompt above
+the cut moves only when plank is rebuilt; the tail below it moves whenever a
+tool set does — an MCP server added, a project entered for the first time, a
+`-sys` string edited. Undivided, the cheap change paid for the expensive one:
+the whole ~14.5k-token prompt re-prefilled to absorb a few hundred tokens of
+schema appended at its very end, about a minute of wall clock on a Metal build.
+
+The cut is legal for one specific reason, and only there. "A cache boundary has
+to fall on a message boundary" (Part 2) forbids mid-message splits because BPE
+merges straddle a seam — but `Ds4Model::append_system_text` already sends the
+two halves through **two separate tokenizer calls**: the trusted span through
+`ds4_tokenize_rendered_chat`, so its literal `｜DSML｜` markers become real
+vocabulary tokens, and the remainder through `ds4_chat_append_message` as a
+`system`-role message. No merge can cross that join, so the boundary is already
+a hard token boundary and a checkpoint may sit on it. Do not generalise this to
+any other offset in the prompt.
+
+`fp1` keeps meaning *the whole system prompt*, so Tier 1b lands on the key an
+undivided Tier 1 used and every checkpoint already on disk stays valid; the
+split adds a cheaper rung above rather than renumbering the ladder. The split
+is engine-gated on `Engine::splits_system_tail`, which only the ds4 backend
+answers yes to — a backend whose tokenizer does not already break at
+`trusted_len` gets the single undivided tier and is none the wiser.
 
 #### What is allowed in Tier 1
 

@@ -11381,9 +11381,23 @@ impl Agent<'_> {
         let local_names = crate::tools::mcp::local_server_names(None);
         let local_defs = crate::tools::mcp::local_tool_defs(&self.tool_ctx.mcp, &local_names);
         let local_material = crate::kvtier::tool_defs_material(&local_defs);
+        // Tier 1 is split only when the engine can hold a checkpoint at the
+        // trusted/untrusted boundary; the base is keyed on the trusted span
+        // alone so a changed tool set re-prefills the tail and nothing above it.
+        let base_fp = self.engine.splits_system_tail().then(|| {
+            let trusted =
+                &self.system[..crate::kvtier::trusted_cut(&self.system, self.trusted_system_len)];
+            crate::kvtier::system_fingerprint(model, trusted, self.think, self.trusted_system_len)
+        });
         crate::kvtier::plan(
             &fp1,
             &self.system,
+            base_fp
+                .as_deref()
+                .map(|base_fp| crate::kvtier::SystemSplit {
+                    base_fp,
+                    trusted_len: self.trusted_system_len,
+                }),
             &self.context_content.stable_context(),
             &self.context_content.volatile_context(),
             &local_material,

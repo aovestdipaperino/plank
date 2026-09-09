@@ -1910,6 +1910,27 @@ impl Engine for Ds4Session {
         Ok(())
     }
 
+    // The two halves of the system prompt already reach the tokenizer as
+    // separate calls — `append_system_text` sends the trusted span through
+    // `ds4_tokenize_rendered_chat` and the remainder through
+    // `ds4_chat_append_message` — so the boundary between them is a hard token
+    // boundary no BPE merge can straddle. That is what makes it a legal place
+    // to keep a checkpoint.
+    fn splits_system_tail(&self) -> bool {
+        true
+    }
+
+    fn warm_append_system(&mut self, text: &str) -> Result<(), EngineError> {
+        // `trusted_len` 0 sends the whole text down the plain path, which is
+        // byte-for-byte the branch `append_system_text` would take for this
+        // same remainder. So `warm_reset(trusted)` followed by this call builds
+        // exactly the buffer `build_system_tokens(whole, trusted_len)` builds,
+        // and the split costs no token movement at all.
+        let msg = self.model.system_message_tokens(text, 0);
+        self.warm_tokens.push_all(&msg);
+        Ok(())
+    }
+
     fn warm_sync(&mut self, on_event: &mut dyn FnMut(EngineEvent)) -> Result<bool, EngineError> {
         // An interrupted generation leaves the thread-local cancel flag raised
         // and `cancel_cb` still registered on the session; `generate`/`prefill`

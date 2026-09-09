@@ -949,6 +949,37 @@ pub trait Engine: Debug + Send {
         Ok(())
     }
 
+    /// Whether this engine can hold a checkpoint boundary *inside* the system
+    /// prompt, between its trusted control-text span and the untrusted
+    /// remainder (`sysprompt::SplitSystemPrompt::trusted_len`).
+    ///
+    /// Off by default, and the tier planner emits no system-tail tier unless an
+    /// engine says yes, so every other backend keeps the single undivided
+    /// system tier it has always had.
+    ///
+    /// The boundary is only safe where the two halves already reach the
+    /// tokenizer as separate calls — otherwise it would be a mid-message split
+    /// whose tokenization could shift under BPE merges, which
+    /// [`Engine::warm_append`] forbids for exactly that reason.
+    fn splits_system_tail(&self) -> bool {
+        false
+    }
+
+    /// Appends the system prompt's untrusted remainder to the warm buffer as a
+    /// `system`-role message — the tail half of the split
+    /// [`splits_system_tail`](Engine::splits_system_tail) describes.
+    ///
+    /// The default is the user-role append, which is wrong for a role-aware
+    /// backend and harmless for the rest: no engine reaches it without first
+    /// declaring the split, and the ones that never declare it are handed no
+    /// tail tier to append.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the backend fails to tokenize.
+    fn warm_append_system(&mut self, text: &str) -> Result<(), EngineError> {
+        self.warm_append(Some(text))
+    }
+
     /// Prefills the session up to the cumulative warm buffer's end. Returns
     /// `true` when a prefill actually ran.
     ///
