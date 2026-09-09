@@ -160,7 +160,7 @@ See [Tools](05-tools.md).
 
 ## Notifications and the window title
 
-Long turns end with a native macOS notification: your prompt as the headline, the tail of the answer as the body (`interrupted` for an aborted turn). The terminal title tracks the current task: `🚀··· fix the bug…` while a turn runs, with the rocket flying back and forth along its track until the turn ends (a static rocket under `ui.reducedMotion`), `🪵 Plank - READY.` at the prompt. It names the phase when plank is busy with something that is not your turn: `🗑️ compacting...` while it reclaims context, `👀 introspecting...` during `/insights`. The title it displaced comes back afterwards, so a compaction mid-turn returns the title to your prompt.
+Long turns end with a native macOS notification: your prompt as the headline, the tail of the answer as the body (`interrupted` for an aborted turn). The terminal title tracks the current task: `🚀 fix the bug…` while a turn runs, with the rocket sparkling through a few glyphs until the turn ends (a static rocket under `ui.reducedMotion`), `🪵 Plank - READY.` at the prompt. It names the phase when plank is busy with something that is not your turn: `🗑️ compacting...` while it reclaims context, `👀 introspecting...` during `/insights`. The title it displaced comes back afterwards, so a compaction mid-turn returns the title to your prompt.
 
 - `ui.notifications` — `always`, `unfocused` (only when the terminal is not focused), or `never`.
 - `ui.notifyAfterSecs` — minimum turn length before a completion notification fires (default 10). Awaiting-input notifications ignore it.

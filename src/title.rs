@@ -6,8 +6,8 @@
 //! A handful of states, so the window (and tab) names plank's phase at a
 //! glance: `🚀 Plank loading...` before a front end is up, `🪵 Plank - READY.`
 //! while idle at the prompt, `🚀 <prompt>` while a turn runs (the rocket
-//! flies along a short track of dots, one step per [`tick`], unless reduced
-//! motion is on),
+//! cycles through a few sparkling glyphs, one step per [`tick`], unless
+//! reduced motion is on),
 //! `❓ waiting for you...` while the `ask` tool holds the turn open for an
 //! answer, and
 //! `👀 introspecting...` while `/insights` reads back the user's own history. Set via the OSC 0
@@ -89,33 +89,23 @@ fn collapse_prompt(prompt: &str) -> Option<String> {
     (!collapsed.is_empty()).then_some(collapsed)
 }
 
-/// Length of the dotted track the busy rocket flies along, in cells. One more
-/// than the number of positions the rocket can take, so it always has a dot
-/// ahead or behind it and the title keeps a constant width.
-const ROCKET_TRACK: usize = 4;
+/// The busy rocket's animation frames, cycled in place: the plain rocket, then
+/// a sparkle, a dizzy star and a glowing star trailing it. Frame `0` is the
+/// bare rocket, so the static forms (first frame, reduced motion) are the
+/// unanimated title.
+const ROCKET_GLYPHS: [&str; 4] = ["🚀", "✨🚀", "💫🚀", "🌟🚀"];
 
-/// Frames in one pass of the rocket along its track: every position on the
-/// way out and back, without repeating the two ends.
-const ROCKET_FRAMES: usize = 2 * (ROCKET_TRACK - 1);
+/// Frames in one cycle of the rocket glyphs.
+const ROCKET_FRAMES: usize = ROCKET_GLYPHS.len();
 
-/// Formats the [`State::Busy`] title for animation frame `frame`: the rocket
-/// at that step of its out-and-back run along a dotted track, then the
-/// already-collapsed `prompt`, truncated past [`TITLE_PROMPT_MAX`] characters.
-/// Frame `0` is the rocket at the head of the track.
+/// Formats the [`State::Busy`] title for animation frame `frame`: that frame's
+/// rocket glyph from [`ROCKET_GLYPHS`], then the already-collapsed `prompt`,
+/// truncated past [`TITLE_PROMPT_MAX`] characters.
 fn busy_title(prompt: &str, frame: usize) -> String {
-    let step = frame % ROCKET_FRAMES;
-    let pos = if step < ROCKET_TRACK {
-        step
-    } else {
-        ROCKET_FRAMES - step
-    };
-    let mut track = String::new();
-    for i in 0..ROCKET_TRACK {
-        track.push_str(if i == pos { "🚀" } else { "·" });
-    }
+    let glyph = ROCKET_GLYPHS[frame % ROCKET_FRAMES];
     match prompt.char_indices().nth(TITLE_PROMPT_MAX) {
-        Some((i, _)) => format!("{track} {}…", prompt[..i].trim_end()),
-        None => format!("{track} {prompt}"),
+        Some((i, _)) => format!("{glyph} {}…", prompt[..i].trim_end()),
+        None => format!("{glyph} {prompt}"),
     }
 }
 
@@ -296,48 +286,25 @@ mod tests {
 
     #[test]
     fn busy_prompt_is_collapsed_and_truncated() {
-        assert_eq!(
-            window_title(State::Busy("fix  the\nbug")),
-            "🚀··· fix the bug"
-        );
+        assert_eq!(window_title(State::Busy("fix  the\nbug")), "🚀 fix the bug");
         let long = "a".repeat(60);
         let t = window_title(State::Busy(&long));
-        assert!(t.starts_with("🚀··· "));
+        assert!(t.starts_with("🚀 "));
         assert!(t.ends_with('…'));
         assert_eq!(
             t.chars().count(),
-            "🚀··· ".chars().count() + TITLE_PROMPT_MAX + 1
+            "🚀 ".chars().count() + TITLE_PROMPT_MAX + 1
         );
     }
 
-    /// The rocket flies out along the track and back without pausing at
-    /// either end, and every frame is the same width.
+    /// The glyphs cycle in place and wrap back to the bare rocket; a truncated
+    /// prompt is cut the same way on every frame.
     #[test]
-    fn rocket_frames_run_out_and_back_at_constant_width() {
+    fn rocket_glyphs_cycle_and_wrap() {
         let frames: Vec<String> = (0..=ROCKET_FRAMES).map(|f| busy_title("go", f)).collect();
-        assert_eq!(
-            frames,
-            [
-                "🚀··· go",
-                "·🚀·· go",
-                "··🚀· go",
-                "···🚀 go",
-                "··🚀· go",
-                "·🚀·· go",
-                "🚀··· go",
-            ]
-        );
-        assert!(
-            frames
-                .iter()
-                .all(|f| f.chars().count() == frames[0].chars().count())
-        );
-        // A truncated prompt is cut the same way on every frame.
+        assert_eq!(frames, ["🚀 go", "✨🚀 go", "💫🚀 go", "🌟🚀 go", "🚀 go"]);
         let long = "b".repeat(40);
-        assert_eq!(
-            busy_title(&long, 3).chars().count(),
-            busy_title(&long, 0).chars().count()
-        );
+        assert!(busy_title(&long, 3).ends_with(&busy_title(&long, 0)[4..]));
     }
 
     /// `tick` advances only a busy title, is parked by a `Scoped` displacement
@@ -356,7 +323,7 @@ mod tests {
         };
         set(State::Busy("go"));
         tick();
-        assert_eq!(last().as_deref(), Some("·🚀·· go"));
+        assert_eq!(last().as_deref(), Some("✨🚀 go"));
         let guard = Scoped::set(State::Compacting);
         tick();
         assert_eq!(
@@ -367,13 +334,13 @@ mod tests {
         drop(guard);
         assert_eq!(
             last().as_deref(),
-            Some("·🚀·· go"),
+            Some("✨🚀 go"),
             "displaced frame restored"
         );
         tick();
         assert_eq!(
             last().as_deref(),
-            Some("··🚀· go"),
+            Some("💫🚀 go"),
             "resumes from where it was"
         );
         set(State::Idle);
@@ -384,7 +351,7 @@ mod tests {
         tick();
         assert_eq!(
             last().as_deref(),
-            Some("🚀··· go"),
+            Some("🚀 go"),
             "still under reduced motion"
         );
         crate::anim::set_reduced_motion(was_reduced);
