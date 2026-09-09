@@ -46,7 +46,7 @@ const THINK_STATUS_CAP: usize = 160;
 /// How many body lines the banners-off `write` preview shows before it
 /// collapses the rest behind a single `…` line. The `└ N lines` summary still
 /// reports the true total.
-const WRITE_PREVIEW_MAX_LINES: usize = 3;
+const WRITE_PREVIEW_MAX_LINES: usize = 5;
 
 /// The first sentence of `text`: up to and including the first `.`, `!` or
 /// `?` that is followed by whitespace, or up to the first newline, whichever
@@ -2597,15 +2597,19 @@ mod tests {
 
     #[test]
     fn write_preview_collapses_the_body_past_the_cap() {
-        // Five lines, cap is three: the first three show, the rest collapse to
+        // Seven lines, cap is five: the first five show, the rest collapse to
         // one `…`, and the summary still reports the true total.
-        let think = write_summary_for("src/collapse_new.rs", "l1\nl2\nl3\nl4\nl5\n");
+        let think = write_summary_for("src/collapse_new.rs", "l1\nl2\nl3\nl4\nl5\nl6\nl7\n");
         assert!(
-            think.contains("  l1") && think.contains("  l2") && think.contains("  l3"),
-            "first three lines shown: {think:?}"
+            think.contains("  l1")
+                && think.contains("  l2")
+                && think.contains("  l3")
+                && think.contains("  l4")
+                && think.contains("  l5"),
+            "first five lines shown: {think:?}"
         );
         assert!(
-            !think.contains("l4") && !think.contains("l5"),
+            !think.contains("l6") && !think.contains("l7"),
             "lines past the cap are collapsed: {think:?}"
         );
         assert!(
@@ -2613,7 +2617,7 @@ mod tests {
             "ellipsis stands in for the rest: {think:?}"
         );
         assert!(
-            think.contains("  └ 5 lines"),
+            think.contains("  └ 7 lines"),
             "summary reports the true total: {think:?}"
         );
     }
