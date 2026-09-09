@@ -159,6 +159,15 @@ pub trait RenderSink {
     fn error_text(&mut self, text: &str) {
         self.tool_text(text);
     }
+
+    /// Sets, updates, or clears a transient single-line status that replaces
+    /// itself in place — used for the live `… N lines` counter of a collapsed
+    /// `write` preview. `Some(text)` shows/replaces the line; `None` removes
+    /// it (the caller then emits the permanent summary through the normal text
+    /// channel). Sinks that cannot rewrite a line leave this as the default
+    /// no-op: they simply skip the live tick and still receive the final
+    /// summary as ordinary text.
+    fn preview_status(&mut self, _text: Option<&str>) {}
 }
 
 impl RenderSink for Box<dyn RenderSink> {
@@ -173,6 +182,9 @@ impl RenderSink for Box<dyn RenderSink> {
     }
     fn error_text(&mut self, text: &str) {
         (**self).error_text(text);
+    }
+    fn preview_status(&mut self, text: Option<&str>) {
+        (**self).preview_status(text);
     }
 }
 
@@ -191,6 +203,9 @@ impl RenderSink for Box<dyn RenderSink + Send> {
     }
     fn error_text(&mut self, text: &str) {
         (**self).error_text(text);
+    }
+    fn preview_status(&mut self, text: Option<&str>) {
+        (**self).preview_status(text);
     }
 }
 
@@ -1478,6 +1493,10 @@ impl<S: RenderSink> StreamRenderer<S> {
                 if c == b'\n' {
                     self.viz.write_content_newlines += 1;
                     self.viz.write_partial_line = false;
+                    // Past the cap, tick the live counter after each full line.
+                    if self.viz.write_truncated && !self.show_tool_calls {
+                        self.viz_write_preview_tick();
+                    }
                 } else {
                     self.viz.write_partial_line = true;
                 }
@@ -1492,22 +1511,34 @@ impl<S: RenderSink> StreamRenderer<S> {
 
     /// Emits one body byte of the banners-off `write` preview: the first
     /// [`WRITE_PREVIEW_MAX_LINES`] lines are shown indented two columns; once
-    /// the body runs past that, a single `…` line stands in for the rest and
-    /// further bytes are dropped (the caller still counts them for the summary).
+    /// the body runs past that, a live `… N lines` line stands in for the rest
+    /// and further bytes are dropped (the caller still counts them, both for
+    /// the live tick and the final summary).
     fn viz_write_preview_body_byte(&mut self, c: u8) {
         if self.viz.write_truncated {
             return;
         }
         if self.viz.write_content_newlines >= WRITE_PREVIEW_MAX_LINES {
-            // We have entered the first line past the cap: collapse the rest.
-            self.viz_preview_puts("  …\n");
+            // We have entered the first line past the cap: collapse the rest
+            // behind the live counter, which the caller updates per line.
             self.viz.write_truncated = true;
+            self.viz_write_preview_tick();
             return;
         }
         if self.viz.at_line_start && c != b'\n' {
             self.viz_preview_puts("  ");
         }
         self.emit_preview_bytes(&[c]);
+    }
+
+    /// Updates the collapsed preview's live `… N lines` line in place, where
+    /// `N` is the number of body lines seen so far. Sinks that cannot rewrite a
+    /// line ignore it.
+    fn viz_write_preview_tick(&mut self) {
+        let n = self.viz.write_content_newlines;
+        let unit = if n == 1 { "line" } else { "lines" };
+        self.flush_carry();
+        self.sink.preview_status(Some(&format!("  … {n} {unit}")));
     }
 
     fn viz_param_begin(&mut self, name: &str) {
@@ -1572,7 +1603,12 @@ impl<S: RenderSink> StreamRenderer<S> {
         {
             let n = self.viz.write_content_newlines + usize::from(self.viz.write_partial_line);
             let unit = if n == 1 { "line" } else { "lines" };
-            if !self.viz.at_line_start {
+            if self.viz.write_truncated {
+                // The collapsed body had a live `… N lines` line. Drop it and
+                // land the permanent `└ N lines` summary in its place.
+                self.flush_carry();
+                self.sink.preview_status(None);
+            } else if !self.viz.at_line_start {
                 self.viz_preview_puts("\n");
             }
             self.viz_preview_puts(&format!("  └ {n} {unit}\n"));
@@ -2288,6 +2324,9 @@ mod tests {
         visible: String,
         think: String,
         errors: String,
+        /// Each `preview_status(Some(_))` value, in order; a `None` pushes the
+        /// literal marker `"<cleared>"` so tests can see the finalize.
+        preview: Vec<String>,
     }
 
     impl RenderSink for Cap {
@@ -2300,6 +2339,10 @@ mod tests {
         }
         fn think_text(&mut self, text: &str) {
             self.think.push_str(text);
+        }
+        fn preview_status(&mut self, text: Option<&str>) {
+            self.preview
+                .push(text.map_or_else(|| "<cleared>".to_string(), str::to_string));
         }
     }
 
@@ -2597,9 +2640,22 @@ mod tests {
 
     #[test]
     fn write_preview_collapses_the_body_past_the_cap() {
-        // Seven lines, cap is five: the first five show, the rest collapse to
-        // one `…`, and the summary still reports the true total.
-        let think = write_summary_for("src/collapse_new.rs", "l1\nl2\nl3\nl4\nl5\nl6\nl7\n");
+        // Seven lines, cap is five: the first five show, the rest collapse
+        // behind the live `… N lines` counter, and the final summary lands the
+        // true total. Drive it directly so the preview ticks are observable.
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"path\">src/collapse_new.rs</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"content\">l1\nl2\nl3\nl4\nl5\nl6\nl7\n</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_tool_calls(false);
+        sr.push(stanza);
+        sr.finish();
+        let think = &sr.sink().think;
         assert!(
             think.contains("  l1")
                 && think.contains("  l2")
@@ -2612,13 +2668,28 @@ mod tests {
             !think.contains("l6") && !think.contains("l7"),
             "lines past the cap are collapsed: {think:?}"
         );
+        // The live counter ticked as lines 6 and 7 streamed, then was cleared.
+        let preview = &sr.sink().preview;
         assert!(
-            think.contains("  …"),
-            "ellipsis stands in for the rest: {think:?}"
+            preview.iter().any(|p| p == "  … 5 lines"),
+            "counter starts at the cap: {preview:?}"
+        );
+        assert!(
+            preview.iter().any(|p| p == "  … 7 lines"),
+            "counter ticks to the true total: {preview:?}"
+        );
+        assert_eq!(
+            preview.last().map(String::as_str),
+            Some("<cleared>"),
+            "the live line is cleared at close: {preview:?}"
         );
         assert!(
             think.contains("  └ 7 lines"),
-            "summary reports the true total: {think:?}"
+            "permanent summary reports the true total: {think:?}"
+        );
+        assert!(
+            !think.contains("  …"),
+            "no static ellipsis in the text channel: {think:?}"
         );
     }
 

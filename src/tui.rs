@@ -896,6 +896,10 @@ pub struct OutputLog {
     /// not in the conversation yet, and the status line it sits under is the
     /// boundary that says so.
     pending: std::collections::VecDeque<String>,
+    /// True while a transient live preview line (a collapsed `write`'s
+    /// `… N lines` counter) is the last committed line, so the next update pops
+    /// it before pushing the replacement. See [`apply_preview_status`].
+    preview_open: bool,
 }
 
 /// Cached wrapped-row heights for [`OutputLog::lines`]; see the field.
@@ -1077,6 +1081,21 @@ impl OutputLog {
         self.lines.pop();
     }
 
+    /// Sets, updates, or clears the transient live preview line — the collapsed
+    /// `write` counter (`… N lines`). `Some(text)` replaces it in place (pops
+    /// the old one, pushes the new dim line); `None` removes it, so the caller
+    /// can then append the permanent `└ N lines` summary as ordinary text.
+    pub fn apply_preview_status(&mut self, text: Option<&str>) {
+        if self.preview_open {
+            self.pop_line();
+            self.preview_open = false;
+        }
+        if let Some(text) = text {
+            self.push_dim(text.to_string());
+            self.preview_open = true;
+        }
+    }
+
     /// Ensures the streamed output ends on a fresh line. Flushes any
     /// throttle-deferred markdown render first so the turn's final tokens are
     /// committed (the worker sends `EndLine` at the end of every segment).
@@ -1103,6 +1122,9 @@ impl OutputLog {
         self.invalidate_rows_from(len);
         self.lines.truncate(len);
         self.code_blocks.retain(|r| r.header < len);
+        // A rollback may have discarded the transient preview line; forget it
+        // so a later update does not pop an unrelated line.
+        self.preview_open = false;
     }
 
     /// Drops every line, code block, and in-flight streaming state, returning
@@ -1303,6 +1325,9 @@ impl RenderSink for OutputLog {
     fn error_text(&mut self, text: &str) {
         self.md_close();
         self.append(text, error_style());
+    }
+    fn preview_status(&mut self, text: Option<&str>) {
+        self.apply_preview_status(text);
     }
 }
 
@@ -7224,6 +7249,43 @@ mod tests {
         assert!(
             tail_row.contains('💡'),
             "tip in the tail when idle: {tail_row:?}"
+        );
+    }
+
+    /// The live preview counter rewrites a single line in place, and finalizing
+    /// it drops the transient so the permanent summary lands cleanly.
+    #[test]
+    fn preview_status_rewrites_one_line_in_place() {
+        let mut log = OutputLog::new();
+        log.push_dim("● Writing x.rs");
+        log.apply_preview_status(Some("  … 5 lines"));
+        log.apply_preview_status(Some("  … 6 lines"));
+        log.apply_preview_status(Some("  … 7 lines"));
+        let rows: Vec<String> = log.to_text().lines.iter().map(Line::to_string).collect();
+        assert_eq!(
+            rows.iter().filter(|r| r.contains('…')).count(),
+            1,
+            "only one transient line at a time: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r == "  … 7 lines"),
+            "shows the latest count: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r == "● Writing x.rs"),
+            "header untouched: {rows:?}"
+        );
+        // Finalize: transient dropped, permanent summary appended in its place.
+        log.apply_preview_status(None);
+        log.think_text("  └ 7 lines\n");
+        let rows: Vec<String> = log.to_text().lines.iter().map(Line::to_string).collect();
+        assert!(
+            !rows.iter().any(|r| r.contains('…')),
+            "transient dropped: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("└ 7 lines")),
+            "permanent summary present: {rows:?}"
         );
     }
 

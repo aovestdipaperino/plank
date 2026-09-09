@@ -37,6 +37,11 @@ pub enum UiEvent {
     Error(String),
     /// A dim log line (tool observations, notices, hook warnings).
     Dim(String),
+    /// The transient live `… N lines` line of a collapsed `write` preview.
+    /// `Some` sets/replaces it in place; `None` removes it (the permanent
+    /// summary then arrives as ordinary [`Self::Think`] text). See
+    /// [`crate::viz::RenderSink::preview_status`].
+    PreviewStatus(Option<String>),
     /// An agent system status line (`agent_publish_system_status`): carries the
     /// bare message, styled by the UI with [`crate::status::system_line`].
     SystemStatus(String),
@@ -198,6 +203,9 @@ impl RenderSink for ChannelSink {
     }
     fn error_text(&mut self, text: &str) {
         let _ = self.0.send(UiEvent::Error(text.to_owned()));
+    }
+    fn preview_status(&mut self, text: Option<&str>) {
+        let _ = self.0.send(UiEvent::PreviewStatus(text.map(str::to_owned)));
     }
 }
 
@@ -491,6 +499,7 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         UiEvent::Tool(t) => log.tool_text(&t),
         UiEvent::Error(t) => log.error_text(&t),
         UiEvent::Dim(t) => log.push_dim(t),
+        UiEvent::PreviewStatus(t) => log.apply_preview_status(t.as_deref()),
         UiEvent::SystemStatus(t) => log.push_ansi(&crate::status::system_line(&t, true)),
         UiEvent::EditCard(p) => crate::tui::render_diff_card(log, &p),
         UiEvent::Markdown(t) => log.push_markdown(&t),

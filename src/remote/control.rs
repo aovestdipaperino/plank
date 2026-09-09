@@ -352,6 +352,10 @@ impl ServerMsg {
             | UiEvent::SubTokens { .. }
             | UiEvent::Sub(_)
             | UiEvent::Btw(_)
+            // The live preview counter rewrites a line in place, which the wire
+            // cannot express; remote clients skip the tick and still receive the
+            // permanent `└ N lines` summary as ordinary `Think` text.
+            | UiEvent::PreviewStatus(_)
             | UiEvent::QueuedJoined => {
                 return None;
             }
