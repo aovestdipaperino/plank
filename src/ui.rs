@@ -10203,30 +10203,27 @@ impl Agent<'_> {
         // No AGENTS.md and no CLAUDE.md to link: offer to generate one before
         // anything else runs, through the same panel every other question
         // uses. Declining just starts the session.
-        if offer_init
-            && run_yes_no_panel(
-                terminal,
-                &log,
-                &mut view,
-                "AGENTS.md",
-                crate::agentsmd::OFFER_QUESTION,
-                ("Not now", "start the session without one"),
-                (
-                    "Generate",
-                    "run /init: the model reads the codebase and writes AGENTS.md",
-                ),
-            )
-        {
-            self.tui_run_init(
-                &mut log,
-                terminal,
-                &mut view,
-                &mut input,
-                &mut btw_panel,
-                &mut arcade,
-                &mut sub_pane,
-            );
-            last_activity = Instant::now();
+        if offer_init {
+            match run_agentsmd_offer_panel(terminal, &log, &mut view) {
+                crate::agentsmd::Offer::Generate => {
+                    self.tui_run_init(
+                        &mut log,
+                        terminal,
+                        &mut view,
+                        &mut input,
+                        &mut btw_panel,
+                        &mut arcade,
+                        &mut sub_pane,
+                    );
+                    last_activity = Instant::now();
+                }
+                crate::agentsmd::Offer::DontAskHere => {
+                    if let Some(w) = skip_agentsmd_offer_here() {
+                        log.push_dim(format!("plank: {w}"));
+                    }
+                }
+                crate::agentsmd::Offer::NotNow => {}
+            }
         }
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             log.push_user_echo(initial);
@@ -14039,6 +14036,41 @@ fn ask_yes_no_on_stdin(question: &str, prompt: &str) -> bool {
     matches!(answer.trim(), "y" | "Y" | "yes")
 }
 
+/// The plain-REPL form of the startup `AGENTS.md` offer: `y` (or Enter, the
+/// same default as the TUI panel) generates, `d` stops asking for this folder,
+/// anything else starts the session without one. A piped stdin is somebody
+/// else's protocol stream, so it is never read: the offer is declined.
+fn ask_agentsmd_offer_on_stdin() -> crate::agentsmd::Offer {
+    use crate::agentsmd::{OFFER_OPTIONS, OFFER_QUESTION, Offer};
+    if !std::io::stdin().is_terminal() {
+        println!("{OFFER_QUESTION} — declined (stdin is not a terminal)");
+        return Offer::NotNow;
+    }
+    println!("{OFFER_QUESTION}");
+    for (_, label, description) in &OFFER_OPTIONS {
+        println!("  {label} — {description}");
+    }
+    print!("generate it? [Y/n/d] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return Offer::NotNow;
+    }
+    parse_agentsmd_offer(&answer)
+}
+
+/// Maps a `[Y/n/d]` line to an [`Offer`](crate::agentsmd::Offer): empty
+/// and `y`/`yes` generate, `d`/`don't`/`dont` skip the folder, anything else
+/// is "Not now".
+fn parse_agentsmd_offer(answer: &str) -> crate::agentsmd::Offer {
+    use crate::agentsmd::Offer;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Offer::Generate,
+        "d" | "dont" | "don't" => Offer::DontAskHere,
+        _ => Offer::NotNow,
+    }
+}
+
 /// Asks a yes/no question in the TUI, reusing the `ask` tool's option panel
 /// ([`tui::draw_ask`]) so a slash command's confirmation looks like every other
 /// question plank asks. Blocks the loop until answered; Escape and Ctrl-C both
@@ -14075,32 +14107,69 @@ fn run_yes_no_panel(
     no: (&str, &str),
     yes: (&str, &str),
 ) -> bool {
+    run_pick_panel(terminal, log, view, header, question, &[no, yes]) == Some(1)
+}
+
+/// The startup `AGENTS.md` offer as a three-way panel. Generate is listed
+/// first so Enter alone takes it; Escape and Ctrl-C answer "Not now", the
+/// answer that changes nothing on disk and asks again next time.
+fn run_agentsmd_offer_panel(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+) -> crate::agentsmd::Offer {
+    use crate::agentsmd::{OFFER_OPTIONS, OFFER_QUESTION, Offer};
+    let labels: Vec<(&str, &str)> = OFFER_OPTIONS.iter().map(|(_, l, d)| (*l, *d)).collect();
+    run_pick_panel(terminal, log, view, "AGENTS.md", OFFER_QUESTION, &labels)
+        .and_then(|i| OFFER_OPTIONS.get(i))
+        .map_or(Offer::NotNow, |(o, _, _)| *o)
+}
+
+/// Records "Don't ask for this folder" for the current directory. Returns the
+/// warning to show when the choice could not be saved, so the offer will come
+/// back next time and the user knows why.
+fn skip_agentsmd_offer_here() -> Option<String> {
+    std::env::current_dir()
+        .map_err(|e| e.to_string())
+        .and_then(|cwd| crate::agentsmd::skip(&cwd))
+        .err()
+        .map(|e| format!("could not remember the choice: {e}"))
+}
+
+/// A single-choice panel over `options` (`(label, description)` pairs),
+/// drawn with the `ask` tool's panel so every question plank asks looks the
+/// same. The cursor starts on the first option, so callers list the answer a
+/// stray Enter should pick first. Returns the chosen index, or `None` on
+/// Escape, Ctrl-C, or a terminal that can no longer be drawn.
+fn run_pick_panel(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+    header: &str,
+    question: &str,
+    options: &[(&str, &str)],
+) -> Option<usize> {
     use crate::tools::ask::{AskOption, AskRequest, AskState};
     let req = AskRequest {
         question: question.to_owned(),
         header: header.to_owned(),
-        options: vec![
-            AskOption {
-                label: no.0.to_owned(),
-                description: no.1.to_owned(),
-            },
-            AskOption {
-                label: yes.0.to_owned(),
-                description: yes.1.to_owned(),
-            },
-        ],
+        options: options
+            .iter()
+            .map(|(label, description)| AskOption {
+                label: (*label).to_owned(),
+                description: (*description).to_owned(),
+            })
+            .collect(),
         multi: false,
         allow_chat: false,
     };
-    // Cursor starts on the first option, so the safe answer is the one a stray
-    // Enter picks.
     let mut state = AskState::new(req.options.len(), false);
     loop {
         if terminal
             .draw(|f| tui::draw_ask(f, log, &req, &state, "", view, &tui::TaskView::default()))
             .is_err()
         {
-            return false;
+            return None;
         }
         let Ok(Some(Event::Key(key))) = next_event(None, Duration::from_millis(100)) else {
             continue;
@@ -14111,9 +14180,9 @@ fn run_yes_no_panel(
         match key.code {
             KeyCode::Up => state.move_up(),
             KeyCode::Down => state.move_down(),
-            KeyCode::Enter => return state.cursor == 1,
-            KeyCode::Esc => return false,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Enter => return Some(state.cursor),
+            KeyCode::Esc => return None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return None,
             _ => {}
         }
     }
@@ -15654,7 +15723,7 @@ pub fn run_interactive(
             false
         }
         Ok(crate::agentsmd::Startup::Missing) => true,
-        Ok(crate::agentsmd::Startup::Present) => false,
+        Ok(crate::agentsmd::Startup::Present | crate::agentsmd::Startup::Skipped) => false,
         Err(e) => {
             eprintln!("plank: {e}");
             false
@@ -15756,10 +15825,18 @@ fn run_plain_flow(
     if let Some(history) = agent.resumed_history() {
         print!("{history}");
     }
-    // No AGENTS.md and no CLAUDE.md to link: offer to generate one. Declining
-    // (or a non-terminal stdin) simply starts the session.
-    if offer_init && ask_yes_no_on_stdin(crate::agentsmd::OFFER_QUESTION, "generate it? [y/N] ") {
-        agent.run_init();
+    // No AGENTS.md and no CLAUDE.md to link: offer to generate one, the plain
+    // mirror of the TUI's three-way panel. A non-terminal stdin declines.
+    if offer_init {
+        match ask_agentsmd_offer_on_stdin() {
+            crate::agentsmd::Offer::Generate => agent.run_init(),
+            crate::agentsmd::Offer::DontAskHere => {
+                if let Some(w) = skip_agentsmd_offer_here() {
+                    println!("plank: {w}");
+                }
+            }
+            crate::agentsmd::Offer::NotNow => {}
+        }
     }
     if let Some(initial) = cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
         print!("{}", status::format_user_prompt_echo(initial, agent.color));
@@ -16066,6 +16143,19 @@ fn read_batched_from(fd: std::os::fd::RawFd, eof: &mut bool) -> std::io::Result<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agentsmd_offer_line_parses_like_the_panel_order() {
+        use crate::agentsmd::Offer;
+        assert_eq!(super::parse_agentsmd_offer(""), Offer::Generate);
+        assert_eq!(super::parse_agentsmd_offer("\n"), Offer::Generate);
+        assert_eq!(super::parse_agentsmd_offer("Y"), Offer::Generate);
+        assert_eq!(super::parse_agentsmd_offer("yes"), Offer::Generate);
+        assert_eq!(super::parse_agentsmd_offer("n"), Offer::NotNow);
+        assert_eq!(super::parse_agentsmd_offer("whatever"), Offer::NotNow);
+        assert_eq!(super::parse_agentsmd_offer("d"), Offer::DontAskHere);
+        assert_eq!(super::parse_agentsmd_offer("Don't"), Offer::DontAskHere);
+    }
+
     use super::*;
     use crate::engine::{EngineError, EngineEvent, GenerationStats, ThinkMode};
     use std::cell::RefCell;
