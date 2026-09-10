@@ -144,7 +144,7 @@ pub fn tool_ask(asker: Option<&mut Box<dyn Asker>>, call: &ToolCall) -> String {
             .to_string();
     };
     // The window title says the turn is waiting on the user rather than on the
-    // model, and hands back whatever it displaced (normally the `Busy` rocket)
+    // model, and hands back whatever it displaced (normally the `Busy` title)
     // when the guard drops — so a declined or interrupted question restores it
     // just as an answered one does.
     let outcome = {

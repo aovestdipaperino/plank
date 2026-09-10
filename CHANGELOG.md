@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The expert-routing glyph moved from the status bar to the window title.**
+  The busy title now leads with the two-cell braille routing stand-in
+  (`crate::experts`) instead of the sparkling rocket, seeded off the live
+  decoded token while the local engine works and off the frame counter
+  otherwise. The status bar's think segment holds the static 🧠 again, so the
+  footer no longer animates under the reader; the rocket survives only in the
+  `🚀 Plank loading...` state.
+- **A `/init` you type no longer clears the session.** Only the AGENTS.md
+  offer at startup clears afterwards, because that clear is what rebuilds the
+  session context around the file the turn just wrote. A `/init` run
+  mid-session writes `AGENTS.md` and leaves the conversation intact; the next
+  `/clear` picks the new file up like any other.
+
 ## [5.0.3] - 2026-09-10
 
 ### Added

@@ -4769,32 +4769,13 @@ fn status_bar_lines(
     };
     // The think segment is its own span: plain, like the ctx gauge and power
     // suffix it sits beside, and kept away from `push_accented`'s verb shimmer.
-    //
-    // While the *local* engine is prefilling or generating, the brain gives way
-    // to `crate::experts`' routing glyph: the one on-screen signal that says
-    // which engine is actually working, which is otherwise invisible for a
-    // `provider: local` sidechain under a remote main agent. It replaced a blink
-    // because a two-state pulse says only "something is happening", while the
-    // glyph carries the shape of the work — a few of many experts per token,
-    // changing every token. It is a stand-in, not a readout; `crate::experts`
-    // documents exactly what it does and does not claim.
-    //
-    // Braille rather than a second emoji so the segment can carry the theme
-    // color: `THINK_MARK` is a color emoji, and a terminal paints those from the
-    // glyph's own palette — an earlier version dimmed its foreground, which a
-    // terminal simply does not render. Two cells, matching the brain's two
-    // columns, so the swap never reflows the bar.
-    //
-    // Seeded off the live token (else off the pass's own elapsed time, not
-    // `tick_ms`): the status bar redraws when a prefill/generation event lands —
-    // the same event that moves the `9s` and `t/s` readouts — so the glyph steps
-    // in time with the counters beside it.
+    // The brain is static: the expert-routing glyph that used to replace it
+    // while the local engine worked now leads the window title instead, so the
+    // bar holds still and the animation lives in one place.
     if text.starts_with(think_mark)
         && let Some(i) = text.find(" | ")
     {
         let segment = &text[..i];
-        // Reduced motion holds the static brain, like every other effect.
-        let routing = crate::status::local_pass_active() && !crate::anim::reduced_motion();
         let rest = segment.strip_prefix(think_mark).unwrap_or(segment);
         // The level name is temperature-colored (`crate::status::think_color`).
         // The level is read back out of the rendered footer rather than threaded
@@ -4804,14 +4785,7 @@ fn status_bar_lines(
         let level = crate::engine::ThinkMode::parse(rest).map_or(base, |m| {
             base.fg(Color::Indexed(crate::status::think_color(m)))
         });
-        if routing {
-            spans.push(Span::styled(
-                crate::experts::glyphs(crate::status::routing_seed()),
-                theme,
-            ));
-        } else {
-            spans.push(Span::styled(think_mark.to_string(), base));
-        }
+        spans.push(Span::styled(think_mark.to_string(), base));
         spans.push(Span::styled(rest.to_string(), level));
         spans.push(Span::styled(" | ".to_string(), base));
         text = &text[i + " | ".len()..];
@@ -7550,17 +7524,11 @@ mod tests {
         );
     }
 
-    /// The routing glyph replaces the brain for exactly the span of a local
-    /// pass, in the glyph's own width, so the bar never reflows. This is the
-    /// only signal that says *which* engine is working, so it has to hold still
-    /// (as the brain) when nothing local is running and actually move when
-    /// something is.
-    ///
-    /// The seed comes from the pass's own elapsed time when no token has been
-    /// decoded, so the sweep here moves the pass clock rather than the animation
-    /// clock.
+    /// The think segment holds the static brain, local pass or not: the
+    /// expert-routing animation now leads the window title instead, so the bar
+    /// never swaps the glyph out from under the reader.
     #[test]
-    fn the_routing_glyph_replaces_the_brain_only_while_a_local_pass_runs() {
+    fn the_think_segment_keeps_the_static_brain() {
         let base = Style::default();
         let mark = crate::status::THINK_MARK;
         let text = format!("~/x | {mark} med | ctx 12% | generating");
@@ -7571,84 +7539,23 @@ mod tests {
                 .collect()
         };
         let brain_showing = || rows().iter().any(|r| r.contains(mark));
-        // Every rendering must occupy the same columns, brain or braille.
-        let widths = |r: &[String]| -> Vec<usize> { r.iter().map(|l| l.width()).collect() };
-        let reference = widths(&rows());
 
-        // Idle: the brain, whatever the clock is doing.
         assert!(!crate::status::local_pass_active());
-        assert!(brain_showing(), "no routing when nothing local is running");
+        assert!(brain_showing(), "the brain at idle");
 
         {
             let _guard = crate::status::LocalPass::begin();
             assert!(crate::status::local_pass_active());
-            assert!(!brain_showing(), "a local pass draws the routing instead");
-
-            // Frames actually advance with the pass clock, and every one of them
-            // keeps the bar's columns.
             let frames: std::collections::HashSet<Vec<String>> = (0..8u64)
                 .map(|step| {
                     crate::status::set_local_pass_ms(step * crate::status::EXPERT_FRAME_MS);
-                    let r = rows();
-                    assert_eq!(widths(&r), reference, "the bar holds its columns");
-                    r
+                    rows()
                 })
                 .collect();
-            assert!(frames.len() > 1, "the glyph never moved: {frames:?}");
-
-            // Reduced motion collapses it to the static brain like every other
-            // effect. Asserted here rather than in a test of its own — both the
-            // reduced-motion toggle and the local-pass flag are process-global,
-            // so two tests holding them would race under the default harness.
-            crate::anim::set_reduced_motion(true);
-            let brain_back = brain_showing();
-            crate::anim::set_reduced_motion(false);
-            assert!(brain_back, "reduced motion holds the brain");
-
-            // And end-to-end through a real terminal buffer, which is the only
-            // place the property that matters is visible: the braille lands in
-            // the emoji's cells and everything after it stays exactly where it
-            // was. Folded in here because the local-pass flag is process-global.
-            let rendered = |ms: u64| -> String {
-                crate::status::set_local_pass_ms(ms);
-                let mut term =
-                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 2)).unwrap();
-                term.draw(|f| {
-                    f.render_widget(
-                        ratatui::widgets::Paragraph::new(status_bar_lines(
-                            &text,
-                            0,
-                            base,
-                            &TaskView::default(),
-                            false,
-                        )),
-                        f.area(),
-                    );
-                })
-                .unwrap();
-                let buf = term.backend().buffer().clone();
-                (0..buf.area.height)
-                    .map(|y| {
-                        (0..buf.area.width)
-                            .map(|x| buf[(x, y)].symbol().to_string())
-                            .collect::<String>()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            let screen = rendered(0);
-            assert!(!screen.contains(mark), "the brain is gone: {screen:?}");
-            assert!(
-                screen
-                    .chars()
-                    .any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
-                "braille drawn: {screen:?}"
-            );
-            assert!(screen.contains("med | ctx 12%"), "{screen:?}");
+            assert_eq!(frames.len(), 1, "the segment must not animate: {frames:?}");
+            assert!(brain_showing(), "still the brain during a local pass");
         }
 
-        // And the guard's drop ends it, so a finished pass cannot leave the bar
-        // animating forever.
         assert!(!crate::status::local_pass_active());
         assert!(brain_showing());
     }

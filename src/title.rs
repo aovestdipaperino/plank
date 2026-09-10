@@ -5,9 +5,9 @@
 //!
 //! A handful of states, so the window (and tab) names plank's phase at a
 //! glance: `🚀 Plank loading...` before a front end is up, `🪵 Plank - READY.`
-//! while idle at the prompt, `🚀 <prompt>` while a turn runs (the rocket
-//! cycles through a few sparkling glyphs, one step per [`tick`], unless
-//! reduced motion is on),
+//! while idle at the prompt, `⠿⠇ <prompt>` while a turn runs (the
+//! expert-routing glyph of [`crate::experts`], restepped once per [`tick`],
+//! unless reduced motion is on),
 //! `❓ waiting for you...` while the `ask` tool holds the turn open for an
 //! answer, and
 //! `👀 introspecting...` while `/insights` reads back the user's own history. Set via the OSC 0
@@ -37,7 +37,7 @@ pub enum State<'a> {
     /// reason as [`State::Compacting`]: it interrupts a running turn, and it is
     /// the one phase where a backgrounded window should say the turn is not
     /// stalled but waiting on *you*. Always set through [`Scoped`], so whatever
-    /// the turn was showing — normally the [`State::Busy`] rocket — comes back
+    /// the turn was showing — normally the [`State::Busy`] glyph — comes back
     /// however the question ends, including a declined or interrupted one.
     Asking,
     /// Summarizing the transcript to reclaim context. Like
@@ -89,22 +89,25 @@ fn collapse_prompt(prompt: &str) -> Option<String> {
     (!collapsed.is_empty()).then_some(collapsed)
 }
 
-/// The busy rocket's animation frames, cycled in place: the plain rocket, then
-/// a sparkle, a dizzy star and a glowing star trailing it. Frame `0` is the
-/// bare rocket and doubles as the static form (reduced motion); it is padded
-/// to the width of the two-glyph frames so the rocket does not shift as the
-/// trail appears. The padding is two middle dots, not spaces: terminals trim
-/// leading whitespace from a title, which would undo the alignment.
-const ROCKET_GLYPHS: [&str; 4] = ["··🚀", "✨🚀", "💫🚀", "🌟🚀"];
-
-/// Frames in one cycle of the rocket glyphs.
-const ROCKET_FRAMES: usize = ROCKET_GLYPHS.len();
+/// The glyph leading a [`State::Busy`] title at animation frame `frame`: the
+/// expert-routing braille of [`crate::experts`], which the status bar used to
+/// carry. Two cells wide whatever the routing is, so the prompt beside it never
+/// shifts, and the same seed the bar used: the live token while the local
+/// engine is working, else the frame counter, so a remote turn still animates.
+fn busy_glyph(frame: usize) -> String {
+    let seed = if crate::status::local_pass_active() {
+        crate::status::routing_seed()
+    } else {
+        frame as u64
+    };
+    crate::experts::glyphs(seed)
+}
 
 /// Formats the [`State::Busy`] title for animation frame `frame`: that frame's
-/// rocket glyph from [`ROCKET_GLYPHS`], then the already-collapsed `prompt`,
-/// truncated past [`TITLE_PROMPT_MAX`] characters.
+/// routing glyph, then the already-collapsed `prompt`, truncated past
+/// [`TITLE_PROMPT_MAX`] characters.
 fn busy_title(prompt: &str, frame: usize) -> String {
-    let glyph = ROCKET_GLYPHS[frame % ROCKET_FRAMES];
+    let glyph = busy_glyph(frame);
     match prompt.char_indices().nth(TITLE_PROMPT_MAX) {
         Some((i, _)) => format!("{glyph} {}…", prompt[..i].trim_end()),
         None => format!("{glyph} {prompt}"),
@@ -112,7 +115,7 @@ fn busy_title(prompt: &str, frame: usize) -> String {
 }
 
 /// The running busy animation: the collapsed prompt and the frame last shown.
-/// `Some` only while the title is a [`State::Busy`] rocket; any other state
+/// `Some` only while the title is a [`State::Busy`] one; any other state
 /// clears it, and [`Scoped`] parks and restores it with the title it displaces.
 static BUSY: std::sync::Mutex<Option<(String, usize)>> = std::sync::Mutex::new(None);
 
@@ -121,9 +124,9 @@ fn busy_lock() -> std::sync::MutexGuard<'static, Option<(String, usize)>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Advances the busy rocket one frame, if a [`State::Busy`] title is showing.
-/// Called from the TUI's redraw loop; a no-op at any other title, and under
-/// reduced motion (`ui.reducedMotion`), where the rocket stays at frame 0.
+/// Advances the busy routing glyph one frame, if a [`State::Busy`] title is
+/// showing. Called from the TUI's redraw loop; a no-op at any other title, and
+/// under reduced motion (`ui.reducedMotion`), where the glyph stays at frame 0.
 pub fn tick() {
     if crate::anim::reduced_motion() {
         return;
@@ -133,7 +136,7 @@ pub fn tick() {
         let Some((prompt, frame)) = busy.as_mut() else {
             return;
         };
-        *frame = (*frame + 1) % ROCKET_FRAMES;
+        *frame = frame.wrapping_add(1);
         busy_title(prompt, *frame)
     };
     set_text(&next);
@@ -146,8 +149,8 @@ static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// Sets the terminal window title to [`window_title`]`(state)`. Best-effort:
 /// errors are ignored, and nothing is written when stderr is not a tty.
 pub fn set(state: State<'_>) {
-    // Record the prompt for `tick` only when the title is actually the busy
-    // rocket — a blank prompt degrades to the loading form and must not animate.
+    // Record the prompt for `tick` only when the title is actually a busy one —
+    // a blank prompt degrades to the loading form and must not animate.
     *busy_lock() = match state {
         State::Busy(p) => collapse_prompt(p).map(|prompt| (prompt, 0)),
         _ => None,
@@ -183,7 +186,7 @@ fn set_text(title: &str) {
 pub struct Scoped {
     title: Option<String>,
     /// The busy animation that was running, parked while the guard lives so
-    /// `tick` does not fly the rocket over the displaced title.
+    /// `tick` does not step the glyph over the displaced title.
     busy: Option<(String, usize)>,
 }
 
@@ -233,10 +236,10 @@ mod tests {
     }
 
     /// The `ask` tool's contract with the window title: the question mark is up
-    /// only while the user is being asked, and the rocket the turn was flying
-    /// comes back afterwards — whichever way the question ended.
+    /// only while the user is being asked, and the busy title the turn was
+    /// showing comes back afterwards — whichever way the question ended.
     #[test]
-    fn asking_displaces_the_busy_rocket_and_gives_it_back() {
+    fn asking_displaces_the_busy_title_and_gives_it_back() {
         let _serial = TITLE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -288,38 +291,48 @@ mod tests {
 
     #[test]
     fn busy_prompt_is_collapsed_and_truncated() {
+        let glyph = busy_glyph(0);
         assert_eq!(
             window_title(State::Busy("fix  the\nbug")),
-            "··🚀 fix the bug"
+            format!("{glyph} fix the bug")
         );
         let long = "a".repeat(60);
         let t = window_title(State::Busy(&long));
-        assert!(t.starts_with("··🚀 "));
+        assert!(t.starts_with(&format!("{glyph} ")));
         assert!(t.ends_with('…'));
         assert_eq!(
             t.chars().count(),
-            "··🚀 ".chars().count() + TITLE_PROMPT_MAX + 1
+            glyph.chars().count() + 1 + TITLE_PROMPT_MAX + 1
         );
     }
 
-    /// The glyphs cycle in place and wrap back to the bare rocket; a truncated
-    /// prompt is cut the same way on every frame.
+    /// The glyph moves from frame to frame and always in the same two columns,
+    /// so the prompt beside it never shifts; a truncated prompt is cut the same
+    /// way on every frame.
     #[test]
-    fn rocket_glyphs_cycle_and_wrap() {
-        let frames: Vec<String> = (0..=ROCKET_FRAMES).map(|f| busy_title("go", f)).collect();
-        assert_eq!(
-            frames,
-            ["··🚀 go", "✨🚀 go", "💫🚀 go", "🌟🚀 go", "··🚀 go"]
+    fn routing_glyph_steps_in_place() {
+        use unicode_width::UnicodeWidthStr;
+        let frames: Vec<String> = (0..8).map(|f| busy_title("go", f)).collect();
+        assert!(
+            frames
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1,
+            "the glyph never moved: {frames:?}"
         );
+        for f in 0..8 {
+            assert_eq!(busy_glyph(f).width(), busy_glyph(0).width());
+        }
         let long = "b".repeat(40);
-        let tail = |f: usize| busy_title(&long, f)[ROCKET_GLYPHS[f].len()..].to_owned();
+        let tail = |f: usize| busy_title(&long, f)[busy_glyph(f).len()..].to_owned();
         assert_eq!(tail(3), tail(0));
     }
 
     /// `tick` advances only a busy title, is parked by a `Scoped` displacement
     /// and resumes where it left off, and stops once the title leaves Busy.
     #[test]
-    fn tick_flies_the_rocket_only_while_busy() {
+    fn tick_steps_the_glyph_only_while_busy() {
         let _serial = TITLE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -330,9 +343,10 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
         };
+        let frame = |f: usize| format!("{} go", busy_glyph(f));
         set(State::Busy("go"));
         tick();
-        assert_eq!(last().as_deref(), Some("✨🚀 go"));
+        assert_eq!(last().as_deref(), Some(frame(1).as_str()));
         let guard = Scoped::set(State::Compacting);
         tick();
         assert_eq!(
@@ -343,13 +357,13 @@ mod tests {
         drop(guard);
         assert_eq!(
             last().as_deref(),
-            Some("✨🚀 go"),
+            Some(frame(1).as_str()),
             "displaced frame restored"
         );
         tick();
         assert_eq!(
             last().as_deref(),
-            Some("💫🚀 go"),
+            Some(frame(2).as_str()),
             "resumes from where it was"
         );
         set(State::Idle);
@@ -360,7 +374,7 @@ mod tests {
         tick();
         assert_eq!(
             last().as_deref(),
-            Some("··🚀 go"),
+            Some(frame(0).as_str()),
             "still under reduced motion"
         );
         crate::anim::set_reduced_motion(was_reduced);

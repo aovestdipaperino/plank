@@ -2564,6 +2564,21 @@ const PRE_ROLLBACK_CHECKPOINT: &str = "pre-rollback";
 ///
 /// Held only for the duration of one `agent` call: created before the fork,
 /// unwound after it, never persisted.
+/// Who asked for `/init`, which decides whether the session is cleared after
+/// the file is written.
+///
+/// The launch offer runs before the user has said anything, and the context
+/// pushed at startup was assembled when no `AGENTS.md` existed — so clearing is
+/// what gets the new file in front of the model. A `/init` typed mid-session
+/// has a conversation behind it that clearing would throw away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitSource {
+    /// The `AGENTS.md` offer put to the user at interactive startup.
+    LaunchOffer,
+    /// The user typed `/init`.
+    UserCommand,
+}
+
 struct AgentIsolation {
     /// The live worktree session, for the removal that may follow.
     session: crate::worktree::WorktreeSession,
@@ -5442,10 +5457,10 @@ impl Agent<'_> {
         stream.set_preflight(edit_preflight(&self.tool_ctx));
     }
 
-    /// Runs the /init command: prompts the model to create AGENTS.md, then
-    /// clears the session (the plain REPL never clears the screen) so the init
-    /// exchange does not carry into later turns.
-    fn run_init(&mut self) {
+    /// Runs the /init command: prompts the model to create AGENTS.md, then —
+    /// for the launch offer only — clears the session (the plain REPL never
+    /// clears the screen) so the init exchange does not carry into later turns.
+    fn run_init(&mut self, source: InitSource) {
         println!("Initializing AGENTS.md...");
         println!("The model will now analyze the codebase and generate documentation.\n");
 
@@ -5458,19 +5473,30 @@ impl Agent<'_> {
         }
         // The init prompt and the model's AGENTS.md draft are scaffolding for
         // the file write, not part of the conversation — clear the session so
-        // the next turn starts fresh.
-        self.clear_session_plain();
+        // the next turn starts fresh. The clear also rebuilds the session
+        // context (`ContextContent::new_with_agents` re-reads `AGENTS.md` from
+        // disk), which is how the file just written reaches the model at all:
+        // the context pushed at launch was assembled before it existed.
+        //
+        // A `/init` the user typed leaves the session alone: they asked to
+        // write the file, not to throw away the conversation they were having.
+        // The next `/clear` picks the new `AGENTS.md` up, same as any other.
+        if source == InitSource::LaunchOffer {
+            self.clear_session_plain();
+        }
     }
 
     /// Runs the /init command in TUI mode.
     ///
     /// The init prompt is not echoed and the model's AGENTS.md draft is not
     /// left in the log: the turn's output is truncated back to a checkpoint
-    /// taken before it, then the session is cleared without wiping the screen
-    /// so the exchange does not carry into later turns.
+    /// taken before it, then — for the launch offer only — the session is
+    /// cleared without wiping the screen so the exchange does not carry into
+    /// later turns. See [`Agent::run_init`] for why the source matters.
     #[allow(clippy::too_many_arguments)]
     fn tui_run_init(
         &mut self,
+        source: InitSource,
         log: &mut OutputLog,
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
@@ -5494,8 +5520,12 @@ impl Agent<'_> {
         if let Err(e) = result {
             log.push_plain(format!("/init failed: {e}"));
         }
-        // Clear the session without wiping the screen.
-        self.tui_clear_session(log, terminal, view, sub, false);
+        // Clear the session without wiping the screen, so the fresh context
+        // carries the AGENTS.md the turn just wrote. A user-typed `/init`
+        // keeps the conversation it interrupted.
+        if source == InitSource::LaunchOffer {
+            self.tui_clear_session(log, terminal, view, sub, false);
+        }
     }
 
     /// TUI `/clear` (and `/new`): reset the session, optionally wipe the screen,
@@ -5563,7 +5593,7 @@ impl Agent<'_> {
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
             "/init" => {
-                self.run_init();
+                self.run_init(InitSource::UserCommand);
                 return Ok(true);
             }
             "/quit" | "/exit" => return Ok(false),
@@ -10265,6 +10295,7 @@ impl Agent<'_> {
             match run_agentsmd_offer_panel(terminal, &log, &mut view) {
                 crate::agentsmd::Offer::Generate => {
                     self.tui_run_init(
+                        InitSource::LaunchOffer,
                         &mut log,
                         terminal,
                         &mut view,
@@ -13645,7 +13676,16 @@ impl Agent<'_> {
                     &self.render_usage_report(true),
                 ));
             }
-            "/init" => self.tui_run_init(log, terminal, view, input, btw, arcade, sub),
+            "/init" => self.tui_run_init(
+                InitSource::UserCommand,
+                log,
+                terminal,
+                view,
+                input,
+                btw,
+                arcade,
+                sub,
+            ),
             "/compact" => {
                 let result = {
                     // A slash command runs on the UI thread, so nothing else is
@@ -14874,7 +14914,7 @@ fn escalation_clock(
     }
 }
 
-/// How often the busy window-title rocket advances a frame. Slow on purpose:
+/// How often the busy window-title glyph advances a frame. Slow on purpose:
 /// a title change is a whole-window repaint in most terminals, and the tab
 /// strip is read in glances, not watched.
 const TITLE_TICK: Duration = Duration::from_millis(400);
@@ -14963,7 +15003,7 @@ fn busy_ui_loop(
             arcade_last = Instant::now();
             arcade.step(u64::try_from(dt.as_millis()).unwrap_or(u64::MAX));
         }
-        // The window-title rocket flies one step every `TITLE_TICK`, whatever
+        // The window-title glyph steps once every `TITLE_TICK`, whatever
         // the poll cadence below is doing (`title::tick` is a no-op unless a
         // busy title is up).
         if title_last.elapsed() >= TITLE_TICK {
@@ -16186,7 +16226,7 @@ fn run_plain_flow(
     // mirror of the TUI's three-way panel. A non-terminal stdin declines.
     if offer_init {
         match ask_agentsmd_offer_on_stdin() {
-            crate::agentsmd::Offer::Generate => agent.run_init(),
+            crate::agentsmd::Offer::Generate => agent.run_init(InitSource::LaunchOffer),
             crate::agentsmd::Offer::DontAskHere => {
                 if let Some(w) = skip_agentsmd_offer_here() {
                     println!("plank: {w}");
@@ -18948,6 +18988,56 @@ mod tests {
         );
 
         crate::settings::install_for_test(crate::settings::Settings::default());
+    }
+
+    /// `/init` clears the session only when the launch offer ran it.
+    ///
+    /// The offer fires before the user has said anything, and the context
+    /// pushed at startup predates the file the turn just wrote — so the clear
+    /// is the thing that puts the new `AGENTS.md` in front of the model, which
+    /// is why the fresh transcript is checked for it here. A `/init` the user
+    /// typed has a conversation behind it and must keep it.
+    #[test]
+    fn init_clears_the_session_only_for_the_launch_offer() {
+        let dir = scratch_dir("init-clear-source");
+        let cfg = test_cfg();
+        let earlier = "what does this crate do?";
+
+        let mut typed = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        typed.session.push(Message::user(earlier));
+        typed.run_init(InitSource::UserCommand);
+        let text = |a: &Agent<'_>| -> String {
+            a.session
+                .transcript
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            text(&typed).contains(earlier),
+            "a typed /init must not throw the conversation away"
+        );
+
+        let mut offered = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offered.session.push(Message::user(earlier));
+        offered.run_init(InitSource::LaunchOffer);
+        let fresh = text(&offered);
+        assert!(!fresh.contains(earlier), "the offer path clears: {fresh:?}");
+        assert!(
+            !fresh.contains(Agent::INIT_PROMPT),
+            "the init scaffolding must not survive: {fresh:?}"
+        );
+        // The clear re-reads AGENTS.md from disk, so a file written during the
+        // init turn reaches the model. (The repo this runs in has one; when it
+        // does not, there is nothing to assert.)
+        if let Some(md) = crate::context::ContextContent::new().agents_md_content {
+            let head: String = md.lines().take(4).collect::<Vec<_>>().join("\n");
+            assert!(
+                fresh.contains(&head),
+                "the fresh context must carry AGENTS.md: {fresh:?}"
+            );
+        }
     }
 
     /// Replacing the session must clear the ladder and take its blobs with it.
