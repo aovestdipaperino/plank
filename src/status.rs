@@ -292,7 +292,8 @@ const MTP_MARK: &str = "✨";
 const TEMP_MARK: &str = "🌡";
 
 /// Marks the footer's jobs segment: background bash jobs still running.
-const JOBS_MARK: &str = "⧗";
+/// Public so the TUI can find the segment for mouse hit-testing.
+pub const JOBS_MARK: &str = "⧗";
 
 /// Marks the footer's loop-guard segment: the guards are armed and watching.
 /// Distinct from [`LOOP_MARK`], which says a guard has actually seen a cycle.

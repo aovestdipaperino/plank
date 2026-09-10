@@ -2375,6 +2375,20 @@ impl ReportPanel {
         }
     }
 
+    /// The panel's title, as given to [`ReportPanel::new`].
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Replaces the report text, keeping the scroll position where the new
+    /// text allows. For panels that refresh while open (`/jobs`).
+    pub fn set_text(&mut self, report: &str) {
+        let mut log = OutputLog::new();
+        log.push_ansi(report);
+        self.log = log;
+    }
+
     /// Scrolls the report by `delta` rows (negative scrolls up).
     pub fn scroll(&mut self, delta: isize) {
         self.view.follow = false;
@@ -2864,6 +2878,56 @@ impl<'a> InputState<'a> {
 /// busy with the prompt hidden), which is exactly when a click cannot land in
 /// it anyway.
 static INPUT_TEXT_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// The footer's jobs segment (`⧗ N jobs`) from the last drawn frame, for
+/// mouse hit-testing; `None` when no jobs were running on that frame.
+static JOBS_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// Whether a click at (`column`, `row`) landed on the footer's jobs segment.
+#[must_use]
+pub fn jobs_click(column: u16, row: u16) -> bool {
+    JOBS_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// Finds the jobs segment in the status rows just drawn into `buf` and records
+/// its rect. The segment is the run of cells between the ` | ` separators
+/// around [`crate::status::JOBS_MARK`]; scanning the buffer rather than the
+/// source text means the hit box follows whatever elision and styling the bar
+/// applied. Called after every status render so a frame without the mark
+/// forgets the rect.
+pub fn record_jobs_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    let mut found = None;
+    'rows: for y in area.top()..area.bottom() {
+        let cells: Vec<&str> = (area.left()..area.right())
+            .map(|x| buf.cell((x, y)).map_or("", |c| c.symbol()))
+            .collect();
+        let Some(mark) = cells.iter().position(|c| *c == crate::status::JOBS_MARK) else {
+            continue;
+        };
+        let is_sep = |i: usize| {
+            i + 2 < cells.len() && cells[i] == " " && cells[i + 1] == "|" && cells[i + 2] == " "
+        };
+        let mut start = mark;
+        while start > 0 && !(start >= 3 && is_sep(start - 3)) {
+            start -= 1;
+        }
+        let mut end = mark;
+        while end + 1 < cells.len() && !is_sep(end + 1) {
+            end += 1;
+        }
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break 'rows;
+    }
+    if let Ok(mut g) = JOBS_RECT.lock() {
+        *g = found;
+    }
+}
 
 /// The prompt text rect from the last drawn frame, for mouse hit-testing.
 #[must_use]
@@ -4055,6 +4119,7 @@ pub fn draw(
         .style(status_style),
         status_row,
     );
+    record_jobs_rect(frame.buffer_mut(), status_row);
 }
 
 /// Draws one frame while an `ask` question (issue #34) is up: the output log
@@ -4100,6 +4165,7 @@ pub fn draw_ask(
         .style(status_style),
         r[2],
     );
+    record_jobs_rect(frame.buffer_mut(), r[2]);
 }
 
 /// Renders the question panel: a header chip and question, then the options as a
@@ -4290,6 +4356,7 @@ pub fn draw_btw_split(
         .style(status_style),
         status_row,
     );
+    record_jobs_rect(frame.buffer_mut(), status_row);
 }
 
 /// Overlays the sub-agent pane's identity on the output area's top row: the
@@ -4794,6 +4861,28 @@ fn place_rotating_tip(
 mod tests {
     use super::SubPane;
     use unicode_width::UnicodeWidthStr;
+
+    /// The click box for the footer's jobs segment is the run between the
+    /// ` | ` separators around the mark, and a frame without the mark clears it.
+    #[test]
+    fn jobs_rect_spans_the_segment_between_separators() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 40, 1);
+        let text = "ctx 12% | ⧗ 2 jobs | idle";
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, text, ratatui::style::Style::default());
+        super::record_jobs_rect(&buf, area);
+        // "ctx 12% | " is 10 cells; the segment "⧗ 2 jobs" is 8 cells.
+        assert!(super::jobs_click(10, 0));
+        assert!(super::jobs_click(17, 0));
+        assert!(!super::jobs_click(9, 0), "the separator is not the segment");
+        assert!(!super::jobs_click(18, 0));
+        assert!(!super::jobs_click(12, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_jobs_rect(&quiet, area);
+        assert!(!super::jobs_click(10, 0), "no mark, no hit box");
+    }
 
     #[test]
     fn a_skill_load_shows_a_green_bullet_and_an_indented_status() {

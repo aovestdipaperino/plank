@@ -539,32 +539,32 @@ impl BashJobs {
         self.jobs.iter().filter(|j| j.running).count()
     }
 
+    /// A snapshot of every tracked job, for `/jobs` and the UI thread's
+    /// panel (which cannot reach the table while the worker owns it).
+    #[must_use]
+    pub fn rows(&self) -> Vec<JobRow> {
+        self.jobs
+            .iter()
+            .map(|job| JobRow {
+                id: job.id,
+                pid: job.pid,
+                started: job.start,
+                state: if job.running {
+                    JobState::Running
+                } else if job.timed_out {
+                    JobState::TimedOut(job.exit_status)
+                } else {
+                    JobState::Done(job.exit_status)
+                },
+                path: job.path.clone(),
+            })
+            .collect()
+    }
+
     /// One line per tracked job for `/jobs`; a fixed sentence when empty.
     #[must_use]
     pub fn render_table(&self) -> String {
-        if self.jobs.is_empty() {
-            return "no background jobs".to_string();
-        }
-        let mut out = String::new();
-        for job in &self.jobs {
-            let state = if job.running {
-                "running".to_string()
-            } else if job.timed_out {
-                format!("timed out, exit {}", job.exit_status)
-            } else {
-                format!("done, exit {}", job.exit_status)
-            };
-            let _ = writeln!(
-                out,
-                "job {} pid {} {:>7.1}s {state}  {}",
-                job.id,
-                job.pid,
-                job.start.elapsed().as_secs_f64(),
-                job.path.display()
-            );
-        }
-        out.truncate(out.trim_end().len());
-        out
+        render_rows(&self.rows())
     }
 
     /// Whether any job in the table has finished (after a `sweep`).
@@ -629,6 +629,62 @@ impl BashJobs {
         }
         obs
     }
+}
+
+/// Lifecycle of a tracked job as the `/jobs` panel reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    /// Still running.
+    Running,
+    /// Exited on its own with this status.
+    Done(i64),
+    /// Killed by its own timeout; the status is what the kill produced.
+    TimedOut(i64),
+}
+
+/// One job as the `/jobs` panel sees it: a copy, so the UI thread can render
+/// it while the worker thread owns the live table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRow {
+    /// The `job=` id the model uses.
+    pub id: i64,
+    /// The shell's pid.
+    pub pid: u32,
+    /// When the job started; elapsed time is computed at render time so an
+    /// open panel keeps counting.
+    pub started: Instant,
+    /// Running, done or timed out.
+    pub state: JobState,
+    /// The output file the model was shown as `output_path`.
+    pub path: PathBuf,
+}
+
+/// Renders job rows as the `/jobs` text: one line per job, a fixed sentence
+/// when there are none. Pure, so both the live table and a shared snapshot
+/// render identically.
+#[must_use]
+pub fn render_rows(rows: &[JobRow]) -> String {
+    if rows.is_empty() {
+        return "no background jobs".to_string();
+    }
+    let mut out = String::new();
+    for job in rows {
+        let state = match job.state {
+            JobState::Running => "running".to_string(),
+            JobState::TimedOut(code) => format!("timed out, exit {code}"),
+            JobState::Done(code) => format!("done, exit {code}"),
+        };
+        let _ = writeln!(
+            out,
+            "job {} pid {} {:>7.1}s {state}  {}",
+            job.id,
+            job.pid,
+            job.started.elapsed().as_secs_f64(),
+            job.path.display()
+        );
+    }
+    out.truncate(out.trim_end().len());
+    out
 }
 
 /// First line of a background-job notification; the model learns to
@@ -1078,6 +1134,41 @@ mod tests {
         assert!(got[0].starts_with(&format!("bash job={id} pid=")));
         assert!(got[0].contains("timed_out=1\n"), "got: {}", got[0]);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn render_rows_lists_each_job_state() {
+        assert_eq!(render_rows(&[]), "no background jobs");
+        let now = Instant::now();
+        let rows = vec![
+            JobRow {
+                id: 1,
+                pid: 10,
+                started: now,
+                state: JobState::Running,
+                path: PathBuf::from("/tmp/a"),
+            },
+            JobRow {
+                id: 2,
+                pid: 11,
+                started: now,
+                state: JobState::Done(0),
+                path: PathBuf::from("/tmp/b"),
+            },
+            JobRow {
+                id: 3,
+                pid: 12,
+                started: now,
+                state: JobState::TimedOut(143),
+                path: PathBuf::from("/tmp/c"),
+            },
+        ];
+        let text = render_rows(&rows);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("job 1 pid 10 ") && lines[0].contains("running  /tmp/a"));
+        assert!(lines[1].contains("done, exit 0  /tmp/b"));
+        assert!(lines[2].contains("timed out, exit 143  /tmp/c"));
     }
 
     #[test]

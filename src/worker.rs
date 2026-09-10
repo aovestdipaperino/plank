@@ -410,6 +410,10 @@ pub struct TurnShared {
     /// `/btw` side questions queued while the worker is busy, answered FIFO
     /// at generation boundaries (modeled on `OpenClaw`'s side-question queue).
     pub btw: Mutex<Vec<String>>,
+    /// Snapshot of the background bash job table, refreshed by the worker at
+    /// each pass start and tool boundary, so the UI thread can show `/jobs`
+    /// and the footer's jobs panel while the worker owns the live table.
+    pub jobs: Mutex<Vec<crate::tools::bash::JobRow>>,
 }
 
 /// Cap on queued `/btw` questions; a push beyond it drops the oldest entry
@@ -426,6 +430,21 @@ pub const BTW_SUSPEND_MARKER: &str = "[btw — main task paused]";
 pub const BTW_RESUME_MARKER: &str = "[btw — resuming]";
 
 impl TurnShared {
+    /// Replaces the shared job snapshot.
+    pub fn set_jobs(&self, rows: Vec<crate::tools::bash::JobRow>) {
+        if let Ok(mut g) = self.jobs.lock() {
+            *g = rows;
+        }
+    }
+
+    /// The `/jobs` text for the shared snapshot, elapsed times as of now.
+    #[must_use]
+    pub fn jobs_report(&self) -> String {
+        self.jobs
+            .lock()
+            .map_or_else(|_| String::new(), |g| crate::tools::bash::render_rows(&g))
+    }
+
     /// Takes all queued user lines.
     pub fn take_queued(&self) -> Vec<String> {
         self.queued.lock().map_or_else(

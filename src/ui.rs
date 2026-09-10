@@ -3543,6 +3543,10 @@ struct PassDisplay {
 
 /// The footer plumbing for a quiet pass's live status: the channel and the
 /// figures a [`Status`] carries that the pass cannot read for itself.
+/// Title of the `/jobs` report panel; how the loops recognise it for the
+/// click toggle and the per-tick refresh.
+const JOBS_REPORT_TITLE: &str = "jobs";
+
 struct PassStatusCtx {
     tx: Sender<UiEvent>,
     power_percent: i32,
@@ -10376,6 +10380,7 @@ impl Agent<'_> {
             // Width-aware so a contributed cell cannot push the built-in
             // segments off the line; see `build_status_text_within`.
             let cols = terminal.size().map_or(80, |s| s.width) as usize;
+            self.refresh_jobs_report(&mut report);
             let mut status = self.idle_status_text(cols);
             if clip_has_image {
                 status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
@@ -10698,6 +10703,10 @@ impl Agent<'_> {
                             r.contains(ratatui::layout::Position::new(m.column, m.row))
                         }) {
                             v.follow = true;
+                            selection.cancel();
+                        } else if tui::jobs_click(m.column, m.row) {
+                            // The footer's jobs segment toggles the `/jobs` panel.
+                            self.toggle_jobs_report(&mut report);
                             selection.cancel();
                         } else if let Some(run) = roster_hit {
                             sub_pane.click_run(run);
@@ -12542,6 +12551,7 @@ impl Agent<'_> {
                 if woke > 0 {
                     let _ = tx.send(UiEvent::Dim(Self::job_wake_line(woke)));
                 }
+                shared.set_jobs(self.tool_ctx.bash.rows());
                 continue;
             }
             if !out.calls.is_empty() {
@@ -12606,6 +12616,7 @@ impl Agent<'_> {
                 if woke > 0 {
                     let _ = tx.send(UiEvent::Dim(Self::job_wake_line(woke)));
                 }
+                shared.set_jobs(self.tool_ctx.bash.rows());
                 continue;
             }
             // Stop hooks: exit 2 feeds stderr to the model and the turn
@@ -12901,6 +12912,31 @@ impl Agent<'_> {
         self.tool_ctx.bash.render_table()
     }
 
+    /// Opens the `/jobs` panel, or closes it when it is the one showing:
+    /// the footer's jobs segment toggles it on click.
+    fn toggle_jobs_report(&mut self, report: &mut Option<tui::ReportPanel>) {
+        if report
+            .as_ref()
+            .is_some_and(|r| r.title() == JOBS_REPORT_TITLE)
+        {
+            *report = None;
+        } else {
+            *report = Some(tui::ReportPanel::new(
+                JOBS_REPORT_TITLE,
+                &self.jobs_command(),
+            ));
+        }
+    }
+
+    /// Keeps an open `/jobs` panel current: elapsed times count and finished
+    /// jobs change state without the user reopening it.
+    fn refresh_jobs_report(&mut self, report: &mut Option<tui::ReportPanel>) {
+        if let Some(panel) = report.as_mut().filter(|r| r.title() == JOBS_REPORT_TITLE) {
+            let text = self.jobs_command();
+            panel.set_text(&text);
+        }
+    }
+
     /// Moves user lines queued during the turn into the transcript between
     /// tool rounds, mirroring the C's `queued_user_drain`. Each line is
     /// already on screen in the log's pending region, so the UI is told to
@@ -13003,6 +13039,7 @@ impl Agent<'_> {
             self.engine.model_name(),
             self.tool_ctx.bash.running_count(),
         );
+        shared.set_jobs(self.tool_ctx.bash.rows());
         let mut assistant_text = String::new();
 
         let interrupt = || {
@@ -13656,7 +13693,14 @@ impl Agent<'_> {
             "/mtp" => log.push_plain(self.mtp_command(arg)),
             "/temp" => log.push_plain(self.temp_command(arg)),
             "/loopguard" | "/lg" => log.push_plain(loopguard_command(arg)),
-            "/jobs" => log.push_plain(self.jobs_command()),
+            // A report, not conversation: the same dismissable panel as
+            // `/usage`, refreshed every tick while open (`refresh_jobs_report`).
+            "/jobs" => {
+                *report = Some(tui::ReportPanel::new(
+                    JOBS_REPORT_TITLE,
+                    &self.jobs_command(),
+                ));
+            }
             "/think" => {
                 // Moving to (or off) `max` changes the effort preamble, which
                 // re-warms the KV inline — long enough to notice. Pin a throbber
@@ -15000,6 +15044,11 @@ fn busy_ui_loop(
         // must clear while the turn is still running.
         let now = tui::roster_clock_ms();
         sub.expire_rows(now);
+        // An open `/jobs` panel follows the worker's latest snapshot, with
+        // elapsed times counted at draw time.
+        if let Some(panel) = report.as_mut().filter(|r| r.title() == JOBS_REPORT_TITLE) {
+            panel.set_text(&shared.jobs_report());
+        }
         let sub_active = sub.active;
         // Owned for the same reason: the selected run's view is borrowed mutably
         // below, so nothing else may hold a borrow of the pane across the draw.
@@ -15303,6 +15352,17 @@ fn busy_ui_loop(
                             report = Some(tui::ReportPanel::new("usage", &live_cmds.usage));
                             view.follow = true;
                             sub.follow_all();
+                        } else if line.split_whitespace().next() == Some("/jobs") {
+                            // The worker owns the job table; the UI renders the
+                            // snapshot it publishes at every tool boundary.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report = Some(tui::ReportPanel::new(
+                                JOBS_REPORT_TITLE,
+                                &shared.jobs_report(),
+                            ));
+                            view.follow = true;
+                            sub.follow_all();
                         } else if let Some(out) = line
                             .starts_with('/')
                             .then(|| line.split_whitespace().next().unwrap_or(&line))
@@ -15455,6 +15515,21 @@ fn busy_ui_loop(
                 // click-and-drag has to place and select in it here too.
                 // Every press decides afresh which surface the gesture belongs
                 // to, so a release lost off-window cannot strand the next drag.
+                // The footer's jobs segment toggles the `/jobs` panel, as at idle.
+                MouseEventKind::Down(MouseButton::Left) if tui::jobs_click(m.column, m.row) => {
+                    if report
+                        .as_ref()
+                        .is_some_and(|r| r.title() == JOBS_REPORT_TITLE)
+                    {
+                        report = None;
+                    } else {
+                        report = Some(tui::ReportPanel::new(
+                            JOBS_REPORT_TITLE,
+                            &shared.jobs_report(),
+                        ));
+                    }
+                    selection.cancel();
+                }
                 // A click on a roster row selects it and opens its output.
                 MouseEventKind::Down(MouseButton::Left)
                     if let Some(run) = tui::roster_click(m.column, m.row) =>

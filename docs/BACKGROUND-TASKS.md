@@ -278,6 +278,15 @@ default on:
   pass, and the count is most useful at idle. It is drawn whenever jobs run,
   with or without `tools.bashNotify`. A job started by the current tool round
   appears from the next status snapshot built after dispatch.
+- **`/jobs` is a panel, not log text, in the TUI.** It uses the same
+  dismissable `ReportPanel` as `/usage`, refreshes every tick while open (a
+  running job's elapsed time counts, a finished one changes state), and works
+  while the worker is busy: the worker publishes a `JobRow` snapshot into
+  `TurnShared::jobs` at each pass start and tool boundary, and the UI thread
+  renders that. Clicking the footer's `⧗ N jobs` segment toggles the panel in
+  both loops; `tui::record_jobs_rect` finds the segment in the drawn status
+  rows so the hit box follows whatever elision the bar applied. The plain
+  REPL keeps the static text.
 - **Not shipped:** the `JobFinished` hook event and the per-idle wake budget
   (§3.5). The wake budget was dropped because a
   notification is only ever produced by a job the model itself started; a
