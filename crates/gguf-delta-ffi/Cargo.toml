@@ -1,0 +1,26 @@
+[package]
+name = "gguf-delta-ffi"
+version = "0.1.0"
+description = "C ABI for gguf-delta: open, inspect and materialize .ggd weight deltas from C, Python (ctypes) or anything with a foreign function interface"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["gguf", "llm", "delta", "ffi", "c"]
+categories = ["external-ffi-bindings", "compression"]
+readme = "README.md"
+include = ["src/**", "include/**", "examples/**", "python/**", "README.md"]
+
+[lib]
+name = "gguf_delta"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+gguf-delta = { path = "../gguf-delta", version = "0.1.0" }
+
+[dev-dependencies]
+gguf-delta = { path = "../gguf-delta", version = "0.1.0", features = ["testing"] }
+
+[lints]
+workspace = true

@@ -10,6 +10,7 @@
 //! - [`read_header`] and [`read_chunks`] parse one.
 //! - [`apply`] turns a byte copy of the base into the target, in place.
 //! - [`find_base`] finds the base a delta was cut from, beside the delta.
+//! - [`materialize`] does the whole thing: find the base, clone it, apply.
 //! - The `ggd` binary (`ggd create`, `ggd info`) wraps the above.
 //! - [`gguf::layout`] is the small GGUF header reader everything is built on.
 //!
@@ -661,6 +662,85 @@ pub fn apply(delta: &Path, h: &Header, first: u64, clone: &Path) -> Result<(), E
     Ok(())
 }
 
+/// Turns the delta at `delta` into a complete GGUF at `out`: finds the base
+/// beside the delta (then in `extra`), clones or copies it to `out`, and
+/// applies the chunks. Returns the base that was used.
+///
+/// On macOS the copy is an APFS `clonefile(2)`, which is instant and shares
+/// every untouched block with the base; elsewhere `std::fs::copy` is used,
+/// which reflinks where the filesystem supports it (btrfs, XFS) and copies
+/// otherwise. `out` is written through `<out>.part` and renamed into place;
+/// nothing partial is left on failure. An existing `out` is replaced.
+///
+/// # Errors
+/// A malformed delta, no matching base, or I/O; a wrong base fails at the
+/// first chunk.
+pub fn materialize(delta: &Path, out: &Path, extra: &[PathBuf]) -> Result<PathBuf, Error> {
+    let (h, first) = read_header(delta)?;
+    let base = find_base(&h, delta, extra)?;
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir).map_err(io_ctx("cannot create", dir))?;
+    }
+    let part = {
+        let mut p = out.as_os_str().to_owned();
+        p.push(".part");
+        PathBuf::from(p)
+    };
+    let _ = fs::remove_file(&part);
+    let built = clone_or_copy(&base, &part)
+        .map_err(io_ctx("cannot clone", &base))
+        .and_then(|()| apply(delta, &h, first, &part))
+        .and_then(|()| fs::rename(&part, out).map_err(io_ctx("cannot rename", &part)));
+    if let Err(e) = built {
+        let _ = fs::remove_file(&part);
+        return Err(e);
+    }
+    Ok(base)
+}
+
+/// `clonefile(2)` on macOS, falling back to a plain copy where cloning is
+/// impossible (another volume, a non-APFS filesystem, another OS).
+fn clone_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
+    match clonefile(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if e.kind() == io::ErrorKind::Unsupported
+                || e.raw_os_error().is_some_and(
+                    |c| c == 18 /* EXDEV */ || c == 45 /* ENOTSUP */ || c == 22, /* EINVAL */
+                ) =>
+        {
+            fs::copy(src, dst).map(|_| ())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clonefile(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn clonefile(src: *const std::ffi::c_char, dst: *const std::ffi::c_char, flags: u32)
+        -> i32;
+    }
+    let s =
+        CString::new(src.as_os_str().as_bytes()).map_err(|_| io::Error::other("NUL in path"))?;
+    let d =
+        CString::new(dst.as_os_str().as_bytes()).map_err(|_| io::Error::other("NUL in path"))?;
+    // SAFETY: both pointers are valid NUL-terminated C strings for the call.
+    let rc = unsafe { clonefile(s.as_ptr(), d.as_ptr(), 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clonefile(_src: &Path, _dst: &Path) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 /// Whether the file at `candidate` has the size and header the delta was cut
 /// against. `Err` explains why not, in a few words fit for a list.
 ///
@@ -995,6 +1075,32 @@ mod tests {
         assert!(e.contains("wrong size"), "{e}");
         let _ = fs::remove_dir_all(&d);
         let _ = fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn materialize_produces_the_target_beside_the_delta() {
+        let d = dir("materialize");
+        let base_bytes = base_builder().bytes();
+        let base = write(&d, "tiny.gguf", &base_bytes);
+        let layout = gguf::layout(&base).unwrap();
+        let mut target_bytes = base_bytes.clone();
+        target_bytes[range(&layout.tensors[2])].fill(5);
+        let target = write(&d, "tiny-x.gguf", &target_bytes);
+        let out_ggd = d.join("tiny.ggd");
+        write_delta(&base, &target, &out_ggd, &CreateOptions::default()).unwrap();
+        let out = d.join("built").join("tiny-x.gguf");
+        let used = materialize(&out_ggd, &out, &[]).unwrap();
+        assert_eq!(used, base);
+        assert_eq!(fs::read(&out).unwrap(), target_bytes);
+        assert_eq!(fs::read(&base).unwrap(), base_bytes);
+        assert!(!d.join("built").join("tiny-x.gguf.part").exists());
+        // Replacing an existing output works too.
+        materialize(&out_ggd, &out, &[]).unwrap();
+        // A missing base names the sibling it looked for.
+        fs::remove_file(&base).unwrap();
+        let e = materialize(&out_ggd, &out, &[]).unwrap_err().to_string();
+        assert!(e.contains("tiny.gguf: missing"), "{e}");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

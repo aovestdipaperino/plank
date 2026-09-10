@@ -43,6 +43,13 @@ Neither input is ever opened for writing. Every chunk carries a hash of the
 base bytes it replaces, so applying a delta onto the wrong base fails at the
 first chunk instead of producing a corrupt model.
 
+## Other languages
+
+The sibling crate `gguf-delta-ffi` exposes this API as a C library
+(`include/gguf_delta.h`) and a `ctypes`-based Python package, so a `.ggd` can
+be opened and materialized into a full GGUF from C or Python without a Rust
+toolchain at run time.
+
 ## Command line
 
 ```sh

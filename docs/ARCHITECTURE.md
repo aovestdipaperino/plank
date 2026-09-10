@@ -166,7 +166,9 @@ KV caches are shared between base and derived weights on purpose: the engine
 reports one shape name for both and nothing here changes it, so the sysprompt
 snapshot, checkpoints and rungs are all reused. The only visible trace of the
 delta is the startup line. The crate's `ggd` binary (`ggd create`, `ggd
-info`) creates and inspects deltas; plank itself only loads them.
+info`) creates and inspects deltas; plank itself only loads them. A second
+crate, `gguf-delta-ffi`, wraps the same API as a C library with a header and a
+`ctypes` Python package, so other loaders can materialize a delta into a GGUF.
 
 ### Agent core (`ui.rs`, `worker.rs`)
 Owns the `Agent` struct (engine, session, tools, system prompt, trace) and the
