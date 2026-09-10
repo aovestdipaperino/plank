@@ -193,7 +193,8 @@ survives and a later resume re-prefills it</td>
 </tr>
 <tr>
 <td><code>/quit</code>, <code>/exit</code></td>
-<td>leave (the session is saved)</td>
+<td>leave (the session is saved). Mid-turn it asks <code>[y/N]</code>
+first, then interrupts the turn and leaves once it stops</td>
 </tr>
 </tbody>
 </table>
@@ -242,7 +243,8 @@ argument shows the tree</td>
 <tbody>
 <tr>
 <td><code>/context</code></td>
-<td>report context-window usage by category</td>
+<td>report context-window usage by category (or click the
+<code>ctx N%</code> gauge)</td>
 </tr>
 <tr>
 <td><code>/compact [instructions]</code></td>
@@ -253,6 +255,11 @@ pass; an argument steers what this one summary keeps</td>
 <td><code>/usage</code></td>
 <td>billed token counts for the session (hosted providers, including
 cache hit rate)</td>
+</tr>
+<tr>
+<td><code>/toks</code></td>
+<td>a braille line chart of generation speed, one sample per second of
+decoding. Works mid-turn and redraws as the model types</td>
 </tr>
 <tr>
 <td><code>/jobs</code></td>

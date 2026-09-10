@@ -20,7 +20,7 @@ Every command below works identically in the TUI and the plain REPL.
 | `/rename <name>` | change the name later saves use; what is already on disk keeps its old name |
 | `/strip <id>` | drop a saved session's KV payload to reclaim disk; the transcript survives and a later resume re-prefills it |
 | `/history` | reprint recent turns |
-| `/quit`, `/exit` | leave (the session is saved) |
+| `/quit`, `/exit` | leave (the session is saved). Mid-turn it asks `[y/N]` first, then interrupts the turn and leaves once it stops |
 
 See [Sessions](06-sessions.md).
 
@@ -41,6 +41,7 @@ See [Sessions](06-sessions.md).
 | `/context` | report context-window usage by category (or click the `ctx N%` gauge) |
 | `/compact [instructions]` | compact the conversation now, rather than waiting for the automatic pass; an argument steers what this one summary keeps |
 | `/usage` | billed token counts for the session (hosted providers, including cache hit rate) |
+| `/toks` | a braille line chart of generation speed, one sample per second of decoding. Works mid-turn and redraws as the model types |
 | `/jobs` | the background bash job table: id, pid, elapsed, state and output file. A live panel in the TUI, also mid-turn; clicking `⧗ N jobs` in the status bar toggles it |
 | `/rate [+\|-] [note]` | rate the last turn (thumbs up by default) with an optional note; works in the TUI and the plain REPL alike |
 | `/remember [user] <fact>` | append a dated entry to project memory (or user memory with `user`) |

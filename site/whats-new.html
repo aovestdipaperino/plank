@@ -138,9 +138,22 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v5.0.0 is out</strong>, and the beta channel is on 5.0.3. The
+<p><strong>v5.0.0 is out</strong>, and the beta channel is on 5.0.5. The
 patch number is still the channel: <code>.0</code> is stable, anything
 above it is beta.</p>
+<p><strong>5.0.5 (beta) charts the generation speed.</strong>
+<code>/toks</code> draws tokens per second as a braille line in the
+theme green, one sample per second of decoding, in the same dismissable
+panel as <code>/usage</code>. Type it during a turn and it redraws on
+every status tick, so you can watch the rate move while the model types.
+<code>/exit</code> works mid-turn too now: it asks <code>[y/N]</code>,
+then interrupts the turn and leaves once it stops. The loop guard's
+reasoning budget also scales with the context window instead of stopping
+at a fixed 16 KiB, after it was caught cutting off a long design that
+was not looping.</p>
+<p><strong>5.0.4 (beta) moves the routing glyph into the window
+title</strong>, and a <code>/init</code> you type mid-session keeps the
+conversation; only the startup AGENTS.md offer clears afterwards.</p>
 <p><strong>5.0.3 (beta) lets a shell job wake the model.</strong> Turn
 on <code>tools.bashNotify</code> and a <code>bash</code> job the model
 leaves running no longer has to be polled with <code>bash_status</code>:

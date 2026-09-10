@@ -7,8 +7,21 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.0.0 is out**, and the beta channel is on 5.0.3. The patch number
+**v5.0.0 is out**, and the beta channel is on 5.0.5. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.0.5 (beta) charts the generation speed.** `/toks` draws tokens per second
+as a braille line in the theme green, one sample per second of decoding, in
+the same dismissable panel as `/usage`. Type it during a turn and it redraws on
+every status tick, so you can watch the rate move while the model types.
+`/exit` works mid-turn too now: it asks `[y/N]`, then interrupts the turn and
+leaves once it stops. The loop guard's reasoning budget also scales with the
+context window instead of stopping at a fixed 16 KiB, after it was caught
+cutting off a long design that was not looping.
+
+**5.0.4 (beta) moves the routing glyph into the window title**, and a `/init`
+you type mid-session keeps the conversation; only the startup AGENTS.md offer
+clears afterwards.
 
 **5.0.3 (beta) lets a shell job wake the model.** Turn on `tools.bashNotify`
 and a `bash` job the model leaves running no longer has to be polled with

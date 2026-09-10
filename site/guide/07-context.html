@@ -288,6 +288,16 @@ providers</h2>
 <p>reports billed input and output tokens for the session, including
 Anthropic cache reads, cache writes, and the hit rate. Local engines
 have nothing to bill, so it is a provider-only report.</p>
+<h2 id="generation-speed">Generation speed</h2>
+<pre><code>/toks</code></pre>
+<p>draws the generation speed as a braille line chart in the theme
+green: tokens per second, sampled once a second while the model decodes,
+newest at the right, with the current, average, minimum and maximum
+rates underneath. The x axis is decoding time, so passes, tool rounds
+and turns leave no mark on it. It opens in the same dismissable panel as
+<code>/usage</code>, and typed during a turn it redraws on every status
+tick, so you can watch the rate settle as a long answer streams. On the
+piped REPL it prints as plain text.</p>
 <hr />
 <p>Next: <a href="08-configuration.html">Configuration →</a></p>
 

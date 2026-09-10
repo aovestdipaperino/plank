@@ -117,6 +117,14 @@ The model reasons before it answers. `--think-low` (the default), `--think`, `--
 
 reports billed input and output tokens for the session, including Anthropic cache reads, cache writes, and the hit rate. Local engines have nothing to bill, so it is a provider-only report.
 
+## Generation speed
+
+```
+/toks
+```
+
+draws the generation speed as a braille line chart in the theme green: tokens per second, sampled once a second while the model decodes, newest at the right, with the current, average, minimum and maximum rates underneath. The x axis is decoding time, so passes, tool rounds and turns leave no mark on it. It opens in the same dismissable panel as `/usage`, and typed during a turn it redraws on every status tick, so you can watch the rate settle as a long answer streams. On the piped REPL it prints as plain text.
+
 ---
 
 Next: [Configuration →](08-configuration.md)

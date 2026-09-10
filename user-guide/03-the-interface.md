@@ -79,6 +79,8 @@ With an arcade game open, the first `Ctrl-C` closes the game and a second interr
 
 `Esc` at an idle prompt dismisses a `/btw` panel left open from an earlier turn, which is the only way it closes.
 
+Most slash commands wait for the turn to finish, but the read-only reports do not: `/context`, `/usage`, `/mcp` and `/help` answer from a turn-start snapshot, `/jobs` and `/toks` read live state (the `/toks` chart redraws on every status tick), and `/exit` asks `[y/N]` before interrupting the turn and leaving once it stops.
+
 ### In a question panel
 
 The `ask` tool's panel takes `Up`/`Down` to move, `Space` to toggle an option when the question is multi-select, `Enter` to answer, `Esc` to decline, and `Ctrl-C` to interrupt.
@@ -171,6 +173,7 @@ Long turns end with a native macOS notification: your prompt as the headline, th
 - `ui.reducedMotion` collapses every animation — throbber, shimmer, pulse, flash, stall-fade — to a static fallback.
 - `ui.screensaver` sets how long the TUI must sit idle before a screensaver takes the screen: `1m`, `2m`, `5m`, or `never`. Any key or mouse event dismisses it, and it never appears mid-turn or over a dialog. `ui.screensaverFace` picks which one — see [The arcade](11-arcade.md#the-screensaver).
 - `ui.crtOff` plays a CRT power-off animation of the final frame when you exit cleanly.
+- `/exit` during a turn asks for confirmation, then interrupts the model and leaves as soon as the turn stops; the session is saved as usual.
 
 Leaving prints the session's token totals and, per model, the fastest sustained rates it reached:
 

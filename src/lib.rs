@@ -100,6 +100,7 @@ pub mod sysprompt;
 pub mod tasks;
 pub mod templates;
 pub mod title;
+pub mod toks;
 pub mod tools;
 pub mod trace;
 pub mod tui;

@@ -786,6 +786,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "report token usage and timings for this session",
     },
     SlashCommand {
+        name: "/toks",
+        args: "",
+        desc: "chart the generation speed of every pass this session",
+    },
+    SlashCommand {
         name: "/config",
         args: "[section.key value]",
         desc: "edit settings in a form, or set one inline",
@@ -1090,6 +1095,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/mcp"
             | "/context"
             | "/usage"
+            | "/toks"
             | "/init"
             | "/skills"
             | "/plugins"
@@ -2498,6 +2504,7 @@ mod tests {
             "/mcp",
             "/context",
             "/usage",
+            "/toks",
             "/init",
             "/skills",
             "/templates",

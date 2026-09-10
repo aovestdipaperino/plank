@@ -641,8 +641,9 @@ const LOOP_TRIPPED_NOTICE: &str = "turn stopped: the model re-issued the same re
 
 const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating the same text over and over. Do not resume that reasoning. Decide now and act: emit the tool calls for the change you already planned, or answer the user.";
 
-/// Reasoning bytes one pass may generate before it is stopped whatever its
-/// tail looks like ([`crate::insights::RepeatGuard::with_think_budget`]).
+/// Floor for the per-pass reasoning budget
+/// ([`crate::insights::RepeatGuard::with_think_budget`], see
+/// [`repeat_think_budget`]).
 ///
 /// Sized from the 32 dumps in `~/.plank/repro`: 939 passes, 16 of them
 /// looping. 923 passes are genuinely healthy and exactly one of those exceeds
@@ -657,9 +658,25 @@ const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating
 /// ratio inverts from 5:1 to 1:3.9, and a rung that fires on 3% of good
 /// reasoning is one the user turns off. The loops worth catching are enormous,
 /// so latency is the cheap axis here.
-const REPEAT_THINK_BUDGET: usize = 16384;
+const REPEAT_THINK_BUDGET_FLOOR: usize = 16384;
 
-/// Model-facing text for a [`REPEAT_THINK_BUDGET`] stop. Deliberately not
+/// Share of the context window one pass may spend on reasoning: a tenth.
+const REPEAT_THINK_BUDGET_CTX_SHARE: usize = 10;
+
+/// Reasoning bytes one pass may generate before it is stopped, sized from the
+/// engine's context window: `ctx_size / 10` bytes, never below
+/// [`REPEAT_THINK_BUDGET_FLOOR`] (~102 KB on the 1M-token window). The fixed
+/// 16 KiB was cut from a corpus of loops; the seven `repro-loop-17890*` dumps
+/// of 2026-09-10 then showed it firing on reasoning that was not looping at
+/// all — a multi-file feature drafted as code inside `<think>`, restarted
+/// from zero after every stop, so the task could never finish through
+/// reasoning. The rung is a backstop against drift, not a ration.
+fn repeat_think_budget(ctx_size: i32) -> usize {
+    (usize::try_from(ctx_size).unwrap_or(0) / REPEAT_THINK_BUDGET_CTX_SHARE)
+        .max(REPEAT_THINK_BUDGET_FLOOR)
+}
+
+/// Model-facing text for a [`repeat_think_budget`] stop. Deliberately not
 /// [`REPEAT_LOOP_ERROR`]: the guard has *not* proven a loop, only that the
 /// reasoning outran its budget, and telling a model that was thinking hard
 /// that it was repeating itself is a lie it then has to reconcile.
@@ -671,7 +688,7 @@ const THINK_BUDGET_ERROR: &str = "generation stopped: the reasoning ran past its
 ///
 /// The rung the per-pass budget cannot be: `repro-1788796284`'s main turn ran
 /// four passes of 435, 1690, 2768 and 4328 reasoning bytes, none cyclic and
-/// every one far under [`REPEAT_THINK_BUDGET`], then spent fifty minutes and
+/// every one far under the reasoning budget, then spent fifty minutes and
 /// edited nothing. Every per-pass check passes it. What is wrong with that
 /// turn is only visible at turn scale, and only as an absence.
 ///
@@ -758,7 +775,7 @@ fn repeat_trip_text(over_budget: bool, trips: usize) -> String {
 /// the guard saw the tail cycling, or because a mid-stream preflight failed.
 ///
 /// A tripped guard records [`REPEAT_LOOP_ERROR`] — or [`THINK_BUDGET_ERROR`],
-/// when the pass outran [`REPEAT_THINK_BUDGET`] without a provable cycle — on
+/// when the pass outran [`repeat_think_budget`] without a provable cycle — on
 /// the renderer, so the ordinary preflight-error path feeds it back. Only reasoning
 /// is watched: visible output and tool arguments legitimately repeat — a
 /// `write` of a table with identical rows would trip the guard — and the
@@ -2747,7 +2764,7 @@ impl Agent<'_> {
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
         let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-            .with_think_budget(REPEAT_THINK_BUDGET)
+            .with_think_budget(repeat_think_budget(self.engine.ctx_size()))
             .gated();
         // Provider engines take a structured turn; local engines keep the flat
         // rendered transcript (byte parity, §4.4). `bufs`/`st` outlive the call.
@@ -2772,6 +2789,8 @@ impl Agent<'_> {
         // A prompt that diverges behind the live KV end would rebuild from
         // zero; restore the deepest ladder rung below the divergence first.
         self.rescue_prefix_before_rebuild(prompt_text);
+        // The plain REPL has no `LiveStatus`, so it samples `/toks` itself.
+        let mut toks = crate::toks::Sampler::default();
         let stats = self
             .engine
             .generate(
@@ -2784,6 +2803,7 @@ impl Agent<'_> {
                         // Model output has started: drop the prefill bar so the
                         // text streams cleanly from column zero.
                         bar.clear();
+                        toks.note_token();
                         assistant_text.push_str(&t);
                         stream.push(&t);
                         // Tee the exact bytes the local renderer sees to the
@@ -3570,6 +3590,27 @@ const CONTEXT_REPORT_TITLE: &str = "context";
 /// turn-start snapshot.
 const MCP_REPORT_TITLE: &str = "mcp";
 
+/// Border title of the `/toks` report panel.
+const TOKS_REPORT_TITLE: &str = "toks";
+
+/// Braille cells across the `/toks` chart: two samples per cell, so this shows
+/// the newest 128 seconds of decoding, half the ring.
+const TOKS_CHART_WIDTH: usize = 64;
+
+/// Braille cells down the `/toks` chart: four levels per cell.
+const TOKS_CHART_HEIGHT: usize = 6;
+
+/// The `/toks` report over the process-wide sample ring. Needs no agent, so
+/// the UI thread can redraw it mid-turn while the worker owns `self`.
+fn toks_report(color: bool) -> String {
+    crate::toks::render_report(
+        &crate::toks::snapshot(),
+        TOKS_CHART_WIDTH,
+        TOKS_CHART_HEIGHT,
+        color,
+    )
+}
+
 struct PassStatusCtx {
     tx: Sender<UiEvent>,
     power_percent: i32,
@@ -3591,6 +3632,8 @@ struct LiveStatus {
     /// The first token out and the count then, so the live decode rate is
     /// measured over the decode phase alone (`crate::engine::rate_since`).
     gen_mark: Option<(Instant, i32)>,
+    /// Once-a-second decode rate samples for the `/toks` chart.
+    toks: crate::toks::Sampler,
     /// Carried across events so every snapshot keeps the running figures, not
     /// just the one built by a Spec event.
     spec: crate::engine::SpecStats,
@@ -3621,6 +3664,7 @@ impl LiveStatus {
             prompt_tokens,
             gen_count: 0,
             gen_mark: None,
+            toks: crate::toks::Sampler::default(),
             spec: crate::engine::SpecStats::default(),
             verb: status::random_verb_index(),
             started,
@@ -3649,6 +3693,7 @@ impl LiveStatus {
                 if self.gen_mark.is_none() {
                     self.gen_mark = Some((Instant::now(), self.gen_count));
                 }
+                self.toks.tick(self.gen_count);
                 Some(Status {
                     spec: self.spec,
                     state: WorkerState::Generating,
@@ -3748,7 +3793,7 @@ fn generate_pass(
     let preflight_stop = AtomicBool::new(false);
     let greedy = AtomicBool::new(false);
     let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-        .with_think_budget(REPEAT_THINK_BUDGET)
+        .with_think_budget(repeat_think_budget(engine.ctx_size()))
         .gated();
     // Counting the prompt only when someone is listening: it tokenizes the
     // whole rendered transcript.
@@ -5074,9 +5119,6 @@ impl Agent<'_> {
         }
     }
 
-    /// Renders the `/usage` report: cumulative billed token usage for online
-    /// (provider) models this session. Prints a short note when no provider
-    /// turn has run (local engine, or nothing generated yet).
     /// Gathers the figures behind the local `/usage` report: the session
     /// token tally per engine joined with that engine's speed record, wall
     /// time, context fill, working-tree changes and speculation counters.
@@ -5817,6 +5859,7 @@ impl Agent<'_> {
             "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color)),
             "/context" => print!("{}", self.render_context_report(self.color)),
             "/usage" => print!("{}", self.render_usage_report(self.color)),
+            "/toks" => print!("{}", toks_report(self.color)),
             "/goal" => {
                 let arg = arg.trim();
                 if arg.is_empty() {
@@ -10362,6 +10405,10 @@ impl Agent<'_> {
         let capture_crt = crate::settings::active().ui.crt_off && std::io::stdout().is_terminal();
         let mut crt_frame: Option<image::RgbaImage> = None;
         loop {
+            // A `/exit` confirmed mid-turn: the turn has stopped, leave now.
+            if quit_requested() {
+                break;
+            }
             if IMAGES_ENABLED && clip_checked.elapsed() >= Duration::from_secs(3) {
                 clip_has_image = crate::imagepaste::clipboard_has_image();
                 clip_checked = Instant::now();
@@ -11975,6 +12022,7 @@ impl Agent<'_> {
             for q in carry_btw.drain(..) {
                 let _ = shared.push_btw(q);
             }
+            // So a `/toks` opened during the first pass already has history.
             let bus_ref = bus.as_deref();
             // UI-side handle to the `ask` rendezvous (issue #34), cloned out of
             // the tool context before the closure borrows `self`. Only the main
@@ -12028,6 +12076,13 @@ impl Agent<'_> {
                     // `pending` and `shared.queued` empty together instead of
                     // losing the user's input.
                     return Err(self.reconcile_and_fail(log, shared, e));
+                }
+                // A confirmed mid-turn `/exit`: the interrupt has stopped the
+                // turn, so neither the queued lines nor a live goal may start
+                // another one. `tui_loop` sees the flag and leaves.
+                if quit_requested() {
+                    self.goal = None;
+                    return Ok(());
                 }
             } else {
                 let drain_result = run_worker_ui(
@@ -13102,7 +13157,7 @@ impl Agent<'_> {
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
         let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-            .with_think_budget(REPEAT_THINK_BUDGET)
+            .with_think_budget(repeat_think_budget(self.engine.ctx_size()))
             .gated();
         // Bound before the event closure, which cannot borrow `self` while
         // `self.engine` is generating. The elapsed clock is the turn's, so the
@@ -13675,6 +13730,11 @@ impl Agent<'_> {
                     "usage",
                     &self.render_usage_report(true),
                 ));
+            }
+            // A snapshot like `/usage`: the chart belongs in the dismissable
+            // panel, not in the scrollback between the model's output.
+            "/toks" => {
+                *report = Some(tui::ReportPanel::new(TOKS_REPORT_TITLE, &toks_report(true)));
             }
             "/init" => self.tui_run_init(
                 InitSource::UserCommand,
@@ -14839,6 +14899,27 @@ fn run_worker_ui<T: Send>(
 /// reaching for `kill`.
 const FORCE_QUIT_GRACE: Duration = Duration::from_secs(2);
 
+/// Set when the user confirms a mid-turn `/exit`: the busy loop interrupts the
+/// worker, and once the turn has stopped the TUI leaves instead of running the
+/// queued lines or returning to the prompt. Process-wide because the request
+/// is made on the UI thread inside `busy_ui_loop` and consumed two frames up,
+/// in `tui_turn_inner` and `tui_loop`.
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// True once a mid-turn `/exit` has been confirmed.
+fn quit_requested() -> bool {
+    QUIT_REQUESTED.load(Ordering::Relaxed)
+}
+
+/// Border title of the mid-turn `/exit` confirmation panel; while it is up,
+/// the busy loop's keys answer the question instead of editing the prompt.
+const EXIT_CONFIRM_TITLE: &str = "exit";
+
+/// The mid-turn `/exit` question. No is the default: Enter, Esc and any other
+/// key keep the turn running, only `y` stops it.
+const EXIT_CONFIRM_TEXT: &str =
+    "The model is still working. Interrupt the turn and quit plank? [y/N]";
+
 /// Last resort when the worker will not stop: restore the terminal and leave.
 ///
 /// This exits the *process*, not the turn. The worker runs on a scoped thread
@@ -15061,6 +15142,12 @@ fn busy_ui_loop(
                     // they are reading.
                     if let (true, Some(label)) = (sub.active, sub.label()) {
                         status_line = format!("[sub-agent: {label}] {status_line}");
+                    }
+                    // Every status tick redraws the chart while the panel is
+                    // up, so the newest second lands as soon as it is sampled.
+                    if let Some(panel) = report.as_mut().filter(|r| r.title() == TOKS_REPORT_TITLE)
+                    {
+                        panel.set_text(&toks_report(true));
                     }
                 }
                 UiEvent::Tasks(tv) => task_view = tv,
@@ -15337,6 +15424,37 @@ fn busy_ui_loop(
                 // Alt (Option on macOS) or Ctrl turns arrows and
                 // Backspace/Delete into word-wise operations.
                 let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
+                // The `/exit` confirmation owns the next key: `y` interrupts
+                // the worker and quits once it stops, anything else keeps the
+                // turn running. Ahead of every other binding so the answer
+                // cannot leak into the prompt or interrupt the turn by itself.
+                if report
+                    .as_ref()
+                    .is_some_and(|r| r.title() == EXIT_CONFIRM_TITLE)
+                {
+                    report = None;
+                    if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                        QUIT_REQUESTED.store(true, Ordering::Relaxed);
+                        log.push_dim("[quitting as soon as the turn stops]");
+                        raise_worker_interrupt(shared);
+                        // A worker parked on `ask` never polls the flag.
+                        if let Some(bridge) = ask
+                            && bridge.is_pending()
+                        {
+                            bridge.respond(crate::tools::ask::AskOutcome::Interrupted);
+                        }
+                        // Armed like Esc, so a wedged worker can still be
+                        // escaped with the Ctrl-C escalation.
+                        interrupt_at = escalation_clock(
+                            interrupt_at,
+                            shared.interrupt.load(Ordering::Relaxed),
+                            Instant::now(),
+                        );
+                    } else {
+                        log.push_dim("[still running]");
+                    }
+                    continue;
+                }
                 match key.code {
                     // The roster keys, mirroring the idle loop — mid-turn is
                     // exactly when reaching into a running agent matters.
@@ -15493,6 +15611,28 @@ fn busy_ui_loop(
                             input.history.add(&line);
                             log.push_user_echo(&line);
                             report = Some(tui::ReportPanel::new("usage", &live_cmds.usage));
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if matches!(line.split_whitespace().next(), Some("/exit" | "/quit"))
+                        {
+                            // Quitting mid-turn throws the turn away, so it
+                            // asks first; the next key answers (see the
+                            // `EXIT_CONFIRM_TITLE` check above).
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report =
+                                Some(tui::ReportPanel::new(EXIT_CONFIRM_TITLE, EXIT_CONFIRM_TEXT));
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if line.split_whitespace().next() == Some("/toks") {
+                            // The chart is the one report worth watching
+                            // mid-turn: the sampler feeds the ring from the
+                            // worker's token stream and the panel redraws on
+                            // every status tick.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report =
+                                Some(tui::ReportPanel::new(TOKS_REPORT_TITLE, &toks_report(true)));
                             view.follow = true;
                             sub.follow_all();
                         } else if line.split_whitespace().next() == Some("/jobs") {
@@ -23379,6 +23519,17 @@ mod tests {
     /// worker's `stop_block` at `AGENT_DSML_DONE`. Without it the model keeps
     /// sampling past a call it already finished: pure waste, and in the
     /// recorded sessions it sometimes spent those tokens on a second stanza.
+    /// The per-pass reasoning budget is a tenth of the context window, in
+    /// bytes, and never below the 16 KiB the corpus was cut at.
+    #[test]
+    fn the_think_budget_is_a_tenth_of_the_context() {
+        assert_eq!(repeat_think_budget(1_048_576), 104_857);
+        assert_eq!(repeat_think_budget(262_144), 26_214);
+        assert_eq!(repeat_think_budget(131_072), REPEAT_THINK_BUDGET_FLOOR);
+        assert_eq!(repeat_think_budget(0), REPEAT_THINK_BUDGET_FLOOR);
+        assert_eq!(repeat_think_budget(-1), REPEAT_THINK_BUDGET_FLOOR);
+    }
+
     #[test]
     fn a_completed_stanza_stops_the_pass() {
         const STANZA: &str = concat!(
@@ -23390,7 +23541,7 @@ mod tests {
         );
         let mut stream = StreamRenderer::new(NullSink);
         let mut guard = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-            .with_think_budget(REPEAT_THINK_BUDGET)
+            .with_think_budget(REPEAT_THINK_BUDGET_FLOOR)
             .gated();
         let greedy = AtomicBool::new(false);
         let mut feed = |stream: &mut StreamRenderer<NullSink>, chunk: &str| {
@@ -24228,7 +24379,7 @@ mod tests {
     }
 
     /// Reasoning that never repeats a thing and runs well past
-    /// `REPEAT_THINK_BUDGET`, as `repro-1788796284`'s sub-agent did.
+    /// the reasoning budget, as `repro-1788796284`'s sub-agent did.
     fn unbounded_reasoning() -> String {
         use std::fmt::Write as _;
         (0..600).fold(String::new(), |mut acc, i| {

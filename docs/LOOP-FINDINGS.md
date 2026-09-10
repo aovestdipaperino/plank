@@ -22,8 +22,10 @@ The guards, for orientation:
   call, refusal from the 6th, turn ended after three stanzas in a row refused
   in full (`tripped`). Also detects a repeated *sequence* of calls
   (`repeated_period`).
-- **Think budget** — `REPEAT_THINK_BUDGET` = 16 KiB of reasoning per pass,
-  whatever the tail looks like. Recognises nothing, so unlike the cycle rungs
+- **Think budget** — `repeat_think_budget(ctx_size)`: `ctx_size / 10` bytes,
+  floored at 16 KiB (`REPEAT_THINK_BUDGET_FLOOR`; ~102 KB on the 1M-token
+  window) of reasoning
+  per pass, whatever the tail looks like. Recognises nothing, so unlike the cycle rungs
   it has no `2p` latency floor and no period ceiling, and it is the only rung
   that catches a drifting loop. Stops through the same preflight channel with
   `THINK_BUDGET_ERROR`, and counts towards `MAIN_REPEAT_TRIP_CAP`.
@@ -55,6 +57,7 @@ argument for the design.
 | 2026-09-07 | *(this change)* | `REPEAT_THINK_BUDGET = 16 KiB` per-pass reasoning cap (`RepeatGuard::with_think_budget`, `THINK_BUDGET_ERROR`, counted towards `MAIN_REPEAT_TRIP_CAP`); `NO_PROGRESS_BYTE_BUDGET = 32 KiB` per-turn cap on output with no `PROGRESS_TOOLS` call | `repro-1788796284`: a 9042-byte cycle 20 times over in a sub-agent, longer than the whole window so no rung could see it, and a parent turn that looped no text at all yet edited nothing in fifty minutes |
 | 2026-09-07 | `aaf0f3d` | `MAIN_REPEAT_TRIP_CAP = 2` on both main-turn paths (`MAIN_REPEAT_TRIPS_NOTICE`); `Agent::repro_dir` so test dumps stay out of `~/.plank/repro`; this document | `repro-loop-1788708943`/`-1788709421`: the main turn looped, stopped, looped again, and the user quit |
 | 2026-09-08 | *(this change)* | no-progress budget resets only after a successful direct `write` or `edit`, not an attempted `edit` or arbitrary `bash` call | `repro-loop-1788833715`: 5h7m of failed edits, builds, and repeated reads kept resetting the budget |
+| 2026-09-10 | *(this change)* | think budget sized from the context window: `repeat_think_budget` = `ctx_size / 10` bytes, floored at the old 16 KiB (`REPEAT_THINK_BUDGET_FLOOR`) | `repro-loop-1789051332` … `-1789053127`: seven budget stops in three sessions on one feature request, none a cycle — see "The think budget fired on reasoning that was not looping", below |
 | 2026-09-08 | *(this change)* | `tools.loopGuards` and `/loopguard` (alias `/lg`): one switch over every rung — `LoopGuard::observe`/`tripped`, the gated `RepeatGuard` (cycles and think budget), the no-progress budget. Read through `guard::guards_enabled()` at each check, never captured at turn start, so the switch lands on a generation already streaming; `🔁` in the footer while armed, and the tripped marker moved to `♻ looping` | diagnosing the guards themselves, where every rung fires before the behaviour under study can be observed |
 
 Two patterns run through the table. First, every detector started advisory
@@ -222,7 +225,8 @@ what has the floor. Cycle detection needs two copies before it can name a
 cycle, so its latency floor is `2p` — 18 KB here, and unreachable anyway when
 `2p` exceeds the window. A budget has no floor: it just stops counting.
 
-- **`REPEAT_THINK_BUDGET` = 16 KiB**, a per-pass cap on reasoning bytes
+- **`REPEAT_THINK_BUDGET` = 16 KiB** (since 2026-09-10 `repeat_think_budget`,
+  a tenth of the context window with 16 KiB as the floor), a per-pass cap on reasoning bytes
   (`RepeatGuard::with_think_budget`), fed back as `THINK_BUDGET_ERROR` and
   counted towards `MAIN_REPEAT_TRIP_CAP` alongside a real loop, since both
   leave the prompt materially unchanged at temperature 0.
@@ -547,3 +551,52 @@ Two secondary observations from the same pair:
   at 12:08:55 having read three doc chunks and listed two directories, with no
   edit and no answer. The cap is the floor on the damage, not a fix; the cost
   of a loop is still the whole turn.
+
+## The think budget fired on reasoning that was not looping
+
+`repro-loop-1789051332` through `repro-loop-1789053127` (2026-09-10, sessions
+`dapper-jagger`, `grumpy-churchill` at temperature 0 and `witty-jagger` at
+0.6) are one request — "add the ability to expand a folder to select single
+items with the '+' key" against the tommaso disk sweeper — retried three times
+for about forty minutes, with zero edits. All seven stops are
+`THINK_BUDGET_ERROR`; no dump has a byte cycle.
+
+What filled the 16 KiB, pass by pass:
+
+| dump | fenced code lines | "Actually / Wait / Hmm" | option-weighing lines |
+|---|---|---|---|
+| `1789051332` | 135 | 15 | 3 |
+| `1789051554` (recovery) | 122 | 17 | 0 |
+| `1789051976` | 39 | 0 | 2 |
+| `1789052266` (recovery) | 101 | 0 | 3 |
+| `1789052500` (2nd recovery) | 146 | 0 | 0 |
+| `1789052875` | 53 | 16 | 4 |
+| `1789053127` (recovery) | 82 | 23 | 4 |
+
+Two distinct things happen. The **first** pass of each session stalls on
+genuine design forks — sync or async child measurement, one-level or recursive
+expansion, how parent and child ticks interact on delete — questions the user
+could answer in seconds and which the `ask` tool exists for. Across the 78
+dumps in the repro directory the model has called `ask` in exactly one session
+(`repro-quit-1788876504`), both times about process, never about design.
+
+The **recovery** passes show the larger problem. After the budget error the
+model does decide in one sentence, as the error asks, then drafts the entire
+implementation inside `<think>` as fenced Rust — struct fields, `expand()`,
+`ticked_paths()`, the poll loop — until the budget cuts it again mid-function.
+`stub_last_reasoning` then erases the draft, so the next pass restarts the
+code from zero, and the third trip ends the turn. A 16 KiB budget is smaller
+than a multi-file feature drafted as code, so a task this shape could never
+finish through reasoning.
+
+Fixed 2026-09-10 in the cheap direction first: the budget is now
+`repeat_think_budget(ctx_size)`, `ctx_size / 10` bytes with the old 16 KiB as
+the floor — ~102 KB on the 1M-token window, about six times the reasoning any
+of these passes managed before the stop. The rung goes back to
+being a backstop against drift rather than a ration; the exact-cycle rungs
+and the no-progress budget still stop the shorter loops first. Raising it does
+not teach the model to leave code for the edit tool; that, a prompt rule to
+`ask` on user-visible design forks (reconciled with "Decide, do not
+deliberate": decide on internal choices, ask on user-visible ones), and a
+budget error that demands the first *edit* in the same pass rather than a
+one-sentence decision, are the follow-ups.

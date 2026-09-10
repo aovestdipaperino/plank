@@ -10,8 +10,33 @@ it.
 
 ## In the betas
 
-Riding ahead of stable 5.0.0 in the 5.0.2 beta. Install with `brew install
+Riding ahead of stable 5.0.0 in the 5.0.5 beta. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
+
+### 5.0.5
+
+`/toks` charts the generation speed: a braille line in the theme green, one
+sample per second of decoding, in the same dismissable panel as `/usage`. Type
+it during a turn and it redraws on every status tick, so you can watch the
+rate move while the model types. `/exit` works mid-turn too now: it asks
+`[y/N]`, then interrupts the turn and leaves once it stops. Under the hood the
+loop guard's reasoning budget scales with the context window instead of
+stopping at a fixed 16 KiB, after it was caught cutting off a long design that
+was not looping.
+
+### 5.0.4
+
+The expert-routing glyph moved from the status bar to the window title, and a
+`/init` you type mid-session no longer clears the conversation; only the
+startup AGENTS.md offer does.
+
+### 5.0.3
+
+Turn on `tools.bashNotify` and a `bash` job the model leaves running wakes it
+when the job exits, once per job, never over a line you are still typing.
+`/jobs` and the `⧗ N jobs` footer segment show the live job table, also
+mid-turn. The same release fixed a cache regression where every tool call
+under speculative decoding re-read the whole conversation.
 
 ### 5.0.2
 
