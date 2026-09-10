@@ -468,6 +468,7 @@ fn make_engine(cfg: &AgentConfig, plugins: &plank::plugins::PluginSet) -> Result
         use plank::remote::provider::{ProviderEngine, ProviderKind};
         let kind = match provider {
             ProviderSelector::OpenAi => ProviderKind::OpenAi,
+            ProviderSelector::OpenAiResponses => ProviderKind::OpenAiResponses,
             ProviderSelector::Anthropic => ProviderKind::Anthropic,
         };
         let model = cfg
