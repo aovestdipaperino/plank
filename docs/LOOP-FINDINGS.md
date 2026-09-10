@@ -661,6 +661,22 @@ passes, prior reasoning in context was not used as a draft to finish but as
 evidence to re-derive. Whatever the model is asked after a stop, it starts the
 composition over.
 
+**Second occurrence, same evening.** `repro-loop-1789062437` (session
+`peppery-jenner`, 19:33-19:47, still the v5.0.4 build: the draft rung and the
+prompt rule below were installed at 19:33 but this process predates them) is
+the same `do a code review` on the same repository, replayed. The reading
+rounds went exactly as before. This time the synthesis pass did not wait for
+Esc: it cycled inside `<think>` and the exact-cycle rung stopped it at
+19:45:22. The recovery pass opened with "I have enough to write a code review.
+Let me synthesize findings" — the instruction `REPEAT_LOOP_ERROR` gives — and
+then synthesized inside `<think>` again: four numbered bold findings, 6.7 KB,
+before it fell into a ~600-byte cycle enumerating the app-cache dedup list
+("`Library/Caches/org.swift.swiftpm` excluded. `Library/Caches/Yarn`
+excluded. … missing. Also") ten times over. Second trip, cap reached, turn
+ended at 19:47:17: 13m38s, no output. Two sessions, one task, same failure
+from a different trigger, which is what makes the task a fair test of the two
+changes below: the next run of it on the new build is the measurement.
+
 ### A prompt rule for intermediate findings
 
 The candidate fix is in `WORKING_STYLE` (`src/sysprompt.rs`), plank's own
