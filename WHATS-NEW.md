@@ -18,7 +18,11 @@ aovestdipaperino/tap/plank-agent-beta`.
 `/toks` charts the generation speed: a braille line in the theme green, one
 sample per second of decoding, in the same dismissable panel as `/usage`. Type
 it during a turn and it redraws on every status tick, so you can watch the
-rate move while the model types. `/exit` works mid-turn too now: it asks
+rate move while the model types.
+
+![/toks panel: a green braille line chart of generation speed in tok/s, one sample per second, with now, avg, min and max underneath](assets/toks.png)
+
+`/exit` works mid-turn too now: it asks
 `[y/N]`, then interrupts the turn and leaves once it stops. Under the hood the
 loop guard's reasoning budget scales with the context window instead of
 stopping at a fixed 16 KiB, after it was caught cutting off a long design that

@@ -133,6 +133,12 @@ The `/context` command visualizes context-window usage by category:
   <img src="assets/context-usage.png" alt="/context report showing token usage by category" width="700">
 </p>
 
+`/toks` charts the generation speed as it happens, one sample per second of decoding; typed during a turn, the panel redraws as the model types:
+
+<p align="center">
+  <img src="assets/toks.png" alt="/toks panel: a green braille line chart of generation speed in tok/s, one sample per second, with now, avg, min and max underneath" width="700">
+</p>
+
 `/btw` answers a side question *beside* the running task rather than pausing it. The aside runs on a fork of the session, interleaved with the main generation, so both advance at once — here the model keeps counting on the left while `/btw what is the capital of Italy` is answered on the right, with nothing written to the conversation:
 
 <p align="center">
