@@ -9,6 +9,8 @@
 //! - [`write_delta`] creates a `.ggd` from a base and a target.
 //! - [`read_header`] and [`read_chunks`] parse one.
 //! - [`apply`] turns a byte copy of the base into the target, in place.
+//! - [`find_base`] follows the link a delta carries to its base.
+//! - The `ggd` binary (`ggd create`, `ggd info`) wraps the above.
 //! - [`gguf::layout`] is the small GGUF header reader everything is built on.
 //!
 //! The format is documented in the crate README. Neither input file is ever
@@ -715,6 +717,48 @@ pub fn check_base(h: &Header, candidate: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Finds the base model `h` describes.
+///
+/// Candidates in order: `base_path` as recorded (a relative one against the
+/// delta's directory), a file named `base_name` beside the delta, then each of
+/// `extra`. The first whose size and header hash match (see [`check_base`])
+/// wins.
+///
+/// # Errors
+/// `Mismatch` listing every candidate tried and why it was rejected.
+pub fn find_base(h: &Header, delta: &Path, extra: &[PathBuf]) -> Result<PathBuf, Error> {
+    let dir = delta
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if !h.base_path.as_os_str().is_empty() {
+        if h.base_path.is_absolute() {
+            candidates.push(h.base_path.clone());
+        } else {
+            candidates.push(dir.join(&h.base_path));
+        }
+    }
+    if !h.base_name.is_empty() {
+        candidates.push(dir.join(&h.base_name));
+    }
+    candidates.extend(extra.iter().cloned());
+    candidates.dedup();
+    let mut reasons = Vec::new();
+    for c in &candidates {
+        match check_base(h, c) {
+            Ok(()) => return Ok(c.clone()),
+            Err(why) => reasons.push(format!("  {}: {why}", c.display())),
+        }
+    }
+    Err(Error::Mismatch(format!(
+        "cannot find the base model for {} ({}):\n{}",
+        delta.display(),
+        h.base_name,
+        reasons.join("\n")
+    )))
+}
+
 /// A human summary of a delta: header fields and the chunk list, with tensor
 /// names when the base's `layout` is given.
 #[must_use]
@@ -967,6 +1011,45 @@ mod tests {
         write_delta(&base, &target, &out, &CreateOptions::default()).unwrap();
         let (h, _) = read_header(&out).unwrap();
         assert_eq!(h.base_path, base);
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn find_base_follows_the_link_then_siblings_then_extras() {
+        let d = dir("find");
+        let elsewhere = dir("find-elsewhere");
+        let base_bytes = base_builder().bytes();
+        let base = write(&d, "b.gguf", &base_bytes);
+        let target = write(&d, "t.gguf", &base_bytes);
+        let out = elsewhere.join("d.ggd");
+        write_delta(&base, &target, &out, &CreateOptions::default()).unwrap();
+        let (h, _) = read_header(&out).unwrap();
+        // 1. The recorded link.
+        assert_eq!(find_base(&h, &out, &[]).unwrap(), base);
+        // 2. Link broken, sibling by name.
+        fs::rename(&base, elsewhere.join("b.gguf")).unwrap();
+        assert_eq!(find_base(&h, &out, &[]).unwrap(), elsewhere.join("b.gguf"));
+        // 3. Neither; an extra candidate. A wrong-size sibling is skipped
+        //    with a reason, and the missing link is named too.
+        fs::rename(elsewhere.join("b.gguf"), d.join("moved.gguf")).unwrap();
+        write(&elsewhere, "b.gguf", b"short");
+        let e = find_base(&h, &out, &[]).unwrap_err().to_string();
+        assert!(e.contains("wrong size"), "{e}");
+        assert!(e.contains("missing"), "{e}");
+        assert_eq!(
+            find_base(&h, &out, &[d.join("moved.gguf")]).unwrap(),
+            d.join("moved.gguf")
+        );
+        // A relative link resolves against the delta's directory.
+        let mut rel = h.clone();
+        rel.base_path = Path::new("..")
+            .join(d.file_name().unwrap())
+            .join("moved.gguf");
+        assert_eq!(
+            find_base(&rel, &out, &[]).unwrap(),
+            elsewhere.join(&rel.base_path)
+        );
         let _ = fs::remove_dir_all(&d);
         let _ = fs::remove_dir_all(&elsewhere);
     }

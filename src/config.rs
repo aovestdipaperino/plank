@@ -487,12 +487,8 @@ Options:
                            weight delta loads as the model it derives, by
                            cloning its base into ~/.plank/models/patched/
                            and patching the clone (base and delta untouched)
-      --gguf-delta-create BASE TARGET OUT.ggd [--label NAME] [--hash-base]
-                           write the weight delta from BASE to TARGET (same
-                           layout GGUFs) and exit
-      --gguf-delta-info FILE.ggd
-                           describe a weight delta and whether its base is
-                           reachable, then exit
+                           (create deltas with the ggd tool from the
+                           gguf-delta crate: ggd create BASE TARGET OUT.ggd)
 "
     .to_owned()
         + QWEN_USAGE

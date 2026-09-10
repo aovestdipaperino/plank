@@ -11,6 +11,10 @@ keywords = ["gguf", "llm", "delta", "quantization", "model"]
 categories = ["compression", "parser-implementations"]
 readme = "README.md"
 
+[[bin]]
+name = "ggd"
+path = "src/bin/ggd.rs"
+
 [features]
 # In-memory GGUF builder for tests of code that consumes this crate.
 testing = []

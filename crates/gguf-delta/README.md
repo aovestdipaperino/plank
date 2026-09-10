@@ -43,6 +43,18 @@ Neither input is ever opened for writing. Every chunk carries a hash of the
 base bytes it replaces, so applying a delta onto the wrong base fails at the
 first chunk instead of producing a corrupt model.
 
+## Command line
+
+```sh
+cargo install gguf-delta            # installs `ggd`
+ggd create base.gguf base-abliterated.gguf abliterated.ggd [--label NAME] [--hash-base]
+ggd info abliterated.ggd
+```
+
+`create` streams both files once and prints what changed; `info` prints the
+header, whether the base link resolves (the recorded path, then a same-named
+file beside the delta), and the chunk list with tensor names.
+
 ## Format
 
 Little-endian, streamed: header, then chunks in file order.

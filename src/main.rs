@@ -41,18 +41,6 @@ fn arm_panic_dump() {
     ));
 }
 
-/// `plank --gguf-delta-create` and `--gguf-delta-info` are offline tools for
-/// `.ggd` weight deltas (`src/ggufdelta.rs`): no engine, no settings, no
-/// session. `None` when `args` is not one of them.
-fn run_gguf_delta_tool(args: &[String]) -> Option<ExitCode> {
-    let rc = match args.first().map(String::as_str) {
-        Some("--gguf-delta-create") => plank::ggufdelta::run_create(args),
-        Some("--gguf-delta-info") => plank::ggufdelta::run_info(args),
-        _ => return None,
-    };
-    Some(ExitCode::from(u8::try_from(rc).unwrap_or(1)))
-}
-
 /// The real config parse, with a `.ggd` model swapped for its patched clone.
 /// Errors are already printed under `prog`; the caller just returns the code.
 fn parse_config(
@@ -134,10 +122,6 @@ fn main() -> ExitCode {
     // other dispatch so nothing above can print to a stream that is /dev/null.
     if args.first().map(String::as_str) == Some("--model-downloader") {
         return ExitCode::from(u8::try_from(run_model_downloader(&args)).unwrap_or(1));
-    }
-
-    if let Some(code) = run_gguf_delta_tool(&args) {
-        return code;
     }
 
     // `plank serve ...` runs the flavor-(a) host instead of the interactive
