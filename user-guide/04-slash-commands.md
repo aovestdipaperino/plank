@@ -41,6 +41,7 @@ See [Sessions](06-sessions.md).
 | `/context` | report context-window usage by category |
 | `/compact [instructions]` | compact the conversation now, rather than waiting for the automatic pass; an argument steers what this one summary keeps |
 | `/usage` | billed token counts for the session (hosted providers, including cache hit rate) |
+| `/jobs` | the background bash job table: id, pid, elapsed, state and output file. A live panel in the TUI, also mid-turn; clicking `⧗ N jobs` in the status bar toggles it |
 | `/rate [+\|-] [note]` | rate the last turn (thumbs up by default) with an optional note; works in the TUI and the plain REPL alike |
 | `/remember [user] <fact>` | append a dated entry to project memory (or user memory with `user`) |
 | `/memory` | open user and project memory as one buffer in the built-in editor; edits are split back to the right file on save |

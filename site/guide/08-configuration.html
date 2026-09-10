@@ -327,6 +327,39 @@ see.</p>
 </tr>
 </tbody>
 </table>
+<h3 id="tools"><code>tools</code></h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tools.bashNotify</code></td>
+<td><code>false</code></td>
+<td>wake the model when a bash job it left running finishes, instead of
+having it poll with <code>bash_status</code>. Adds one sentence to the
+system prompt, so it takes effect in a new session. See <a
+href="05-tools.html#background-jobs">Background jobs</a>.</td>
+</tr>
+<tr>
+<td><code>tools.loopGuards</code></td>
+<td><code>true</code></td>
+<td>arm the loop guards (<code>/loopguard</code> flips it for the
+session)</td>
+</tr>
+<tr>
+<td><code>tools.recall</code>, <code>tools.fanout</code>,
+<code>tools.runCode</code></td>
+<td><code>true</code></td>
+<td>offer the <code>recall</code>, <code>fanout</code> and
+<code>run_code</code> tools to the model</td>
+</tr>
+</tbody>
+</table>
 <h3 id="mcp-ask-update-agents"><code>mcp</code>, <code>ask</code>,
 <code>update</code>, <code>agents</code></h3>
 <table>

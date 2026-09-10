@@ -228,6 +228,34 @@ the whole tree, so a <code>sleep 600; echo ok</code> or a
 past its timeout is reaped by whatever tool call comes next, not only
 when the model polls it. Interrupting a running command (Ctrl-C in the
 REPL, Esc in the TUI) kills its group and reports exit status 143.</p>
+<h4 id="background-jobs">Background jobs</h4>
+<p><code>refresh_sec</code> is how long a <code>bash</code> or
+<code>bash_status</code> call waits before it gives up and reports
+<code>status=running</code>. Out of the box the model then has to poll:
+every <code>bash_status</code> is a generation pass that reads "still
+running" and asks again. With <code>tools.bashNotify</code> on, the wait
+moves to plank. The model leaves the job running and ends its turn, you
+get the prompt back, and when the job exits plank appends a
+<code>[BACKGROUND JOB NOTIFICATION]</code> message carrying the same
+observation <code>bash_status</code> would have returned, then starts a
+turn so the model can report. Each job is announced once, and never if
+the model polled it to completion itself. A job that finishes while a
+turn is still running is announced at the next tool boundary
+instead.</p>
+<p>The wake is careful about your prompt: in the TUI it waits while you
+have unsent text in the editor or a pane open, and in the plain REPL it
+prints a blank line before the notice so nothing lands on your
+half-typed line. Headless runs print
+<code>+DWARFSTAR_JOBS_FINISHED &lt;n&gt;</code> on stderr before the
+turn, so a driver can tell an automatic turn from a reply to its own
+prompt.</p>
+<p>While any job runs the status bar shows <code>⧗ N jobs</code>. Click
+it, or type <code>/jobs</code>, for the job table: id, pid, elapsed
+time, state and output file, in a panel that keeps counting while it is
+open and works mid-turn. The setting is off by default because turning
+it on adds one sentence to the system prompt (telling the model it need
+not poll), which starts a fresh prompt cache; enable it in
+<code>settings.json</code> and start a new session.</p>
 <h3 id="documents">Documents</h3>
 <p><code>read</code> on a <code>.pdf</code> transparently converts the
 file to Markdown first, so a PDF is just a readable file:</p>

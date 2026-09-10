@@ -83,6 +83,14 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 | `sandbox` | on (macOS) | default for the bash write sandbox. Same as `--sandbox` / `--no-sandbox`. |
 | `btwSuspend` | `true` | default for `/btw` mid-generation suspend |
 
+### `tools`
+
+| Key | Default | What |
+|---|---|---|
+| `tools.bashNotify` | `false` | wake the model when a bash job it left running finishes, instead of having it poll with `bash_status`. Adds one sentence to the system prompt, so it takes effect in a new session. See [Background jobs](05-tools.md#background-jobs). |
+| `tools.loopGuards` | `true` | arm the loop guards (`/loopguard` flips it for the session) |
+| `tools.recall`, `tools.fanout`, `tools.runCode` | `true` | offer the `recall`, `fanout` and `run_code` tools to the model |
+
 ### `mcp`, `ask`, `update`, `agents`
 
 | Key | Default | What |

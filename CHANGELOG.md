@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.0.3] - 2026-09-10
+
+### Added
+
+- **Background bash jobs wake the model (`tools.bashNotify`, default off).**
+  A job the model leaves running with a short `refresh_sec` no longer has to
+  be polled: when it exits, plank appends a `[BACKGROUND JOB NOTIFICATION]`
+  user message carrying the same observation `bash_status` would return and
+  starts a turn. Each job is announced once, never if the model saw the exit
+  itself, and only at a turn boundary: the next tool round, or the idle loop
+  of each front end (the TUI tick, a stdin thread in the plain REPL, a bounded
+  poll in headless mode that prints `+DWARFSTAR_JOBS_FINISHED <n>` first).
+  The TUI does not wake while you have unsent text or a pane open. Turning
+  the setting on appends one sentence to the shell rules, so it takes effect
+  in a fresh session. Design and verification notes in
+  `docs/BACKGROUND-TASKS.md`.
+- **`/jobs` and a `⧗ N jobs` footer segment.** The job table (id, pid,
+  elapsed, state, output file) opens in the same dismissable panel as
+  `/usage`, refreshes while open, and works mid-turn from a snapshot the
+  worker publishes at every tool boundary. Clicking the footer segment
+  toggles it; the plain REPL prints the table as text.
+
+### Fixed
+
+- **Every tool round under speculative decoding re-prefilled the whole
+  conversation.** When a tool stanza closed inside an accepted MTP block the
+  loop rewound the KV to the kept token, mirroring the C agent; on DeepSeek
+  that rewind cannot roll the compressor frontiers back and marks the
+  checkpoint invalid, so the next pass rebuilt from token zero (an 18k-token
+  session paid it on every `bash` call, `cached=0` in the KV log). The
+  committed tail is now recorded in the assistant span as unrendered shadow
+  tokens, so the token buffer mirrors the live KV and the next prompt extends
+  it. The ladder rescue also logs an invalidated checkpoint instead of
+  returning silently.
+
 ## [5.0.2] - 2026-09-09
 
 ### Added

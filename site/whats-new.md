@@ -7,8 +7,18 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.0.0 is out**, and the beta channel is on 5.0.2. The patch number
+**v5.0.0 is out**, and the beta channel is on 5.0.3. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.0.3 (beta) lets a shell job wake the model.** Turn on `tools.bashNotify`
+and a `bash` job the model leaves running no longer has to be polled with
+`bash_status`: the model ends its turn, you get the prompt back, and when the
+job exits plank appends a notification with the job's final output and starts
+a turn to report it. Once per job, never over a line you are still typing.
+The status bar shows `⧗ N jobs` while anything runs; click it, or type
+`/jobs`, for a live job panel that also works mid-turn. The same release fixes
+a cache regression where every tool call under speculative decoding quietly
+re-read the whole conversation.
 
 **5.0.2 (beta) gives the write tool a live preview.** A `Writing <path>`
 header, the first five lines of the file, then a `… N lines` counter that ticks
