@@ -1,0 +1,23 @@
+[package]
+name = "gguf-delta"
+version = "0.1.0"
+description = "Compact weight deltas between same-layout GGUF model files: create a .ggd from two files, apply it onto a copy of the base"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["gguf", "llm", "delta", "quantization", "model"]
+categories = ["compression", "parser-implementations"]
+readme = "README.md"
+
+[features]
+# In-memory GGUF builder for tests of code that consumes this crate.
+testing = []
+
+[dependencies]
+flate2 = "1"
+sha2 = "0.10"
+
+[lints]
+workspace = true

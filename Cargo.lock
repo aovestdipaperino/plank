@@ -2042,6 +2042,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gguf-delta"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "sha2",
+]
+
+[[package]]
 name = "ghash"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3812,6 +3820,7 @@ dependencies = [
  "crt-off",
  "edit",
  "extism",
+ "gguf-delta",
  "git2",
  "image",
  "libc",
