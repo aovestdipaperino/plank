@@ -1671,6 +1671,112 @@ pub struct RepeatGuard {
     budget: Option<usize>,
     /// Whether this guard answers to `tools.loopGuards`; see [`Self::gated`].
     gated: bool,
+    /// The draft rung's line scanner: the current reasoning line so far,
+    /// whether it is inside a fenced code block, and what it has counted.
+    /// See [`RepeatGuard::drafting`].
+    draft: DraftScan,
+}
+
+/// What the draft rung has seen of the reasoning so far, line by line.
+#[derive(Debug, Default)]
+struct DraftScan {
+    /// Bytes of the current line not yet terminated by a newline.
+    line: String,
+    /// Inside a triple-backtick code fence.
+    in_fence: bool,
+    /// Lines that read as numbered deliverable headings (`**Bug 3:**`,
+    /// `1. **Title**`, `### 4.`).
+    headings: usize,
+    /// Bytes of lines inside fenced code blocks.
+    fenced_bytes: usize,
+}
+
+/// What the reasoning guard saw of one pass, for the `## Passes` table of a
+/// repro dump: the figures a maintainer otherwise has to reconstruct from the
+/// transcript by hand — how much reasoning there was, whether a cycle was
+/// found and how long, and what the draft rung counted.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GuardSnapshot {
+    /// Reasoning bytes fed this pass.
+    pub fed: usize,
+    /// The think budget in effect, if the guard had one.
+    pub budget: Option<usize>,
+    /// A latched cycle: `(period bytes, copies confirmed)`.
+    pub cycle: Option<(usize, usize)>,
+    /// Numbered deliverable headings the draft rung counted.
+    pub headings: usize,
+    /// Bytes inside code fences the draft rung counted.
+    pub fenced_bytes: usize,
+}
+
+/// Reasoning bytes a pass must have produced before the draft rung may fire:
+/// a short think block with a couple of headings is an outline, not a draft.
+pub const DRAFT_MIN_BYTES: usize = 8192;
+
+/// Numbered deliverable headings inside one pass's reasoning past which it is
+/// a list being written out rather than thought about. `repro-loop-1789060243`
+/// had thirty-one `**Bug N:**` entries in 30 KB; an honest plan rarely
+/// numbers more than a handful.
+pub const DRAFT_HEADINGS: usize = 10;
+
+/// Bytes inside fenced code blocks in one pass's reasoning past which the
+/// reasoning is drafting the implementation. The 2026-09-10 recovery passes
+/// carried 100-150 fenced lines each, well over this, before the budget cut
+/// them; a snippet quoted to reason about stays under it.
+pub const DRAFT_FENCED_BYTES: usize = 4096;
+
+impl DraftScan {
+    /// Feeds reasoning text, scanning each completed line.
+    fn feed(&mut self, chunk: &str) {
+        for part in chunk.split_inclusive('\n') {
+            self.line.push_str(part);
+            if self.line.ends_with('\n') {
+                let line = std::mem::take(&mut self.line);
+                self.scan_line(&line);
+            }
+        }
+    }
+
+    fn scan_line(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            self.in_fence = !self.in_fence;
+            return;
+        }
+        if self.in_fence {
+            self.fenced_bytes += line.len();
+        } else if is_deliverable_heading(trimmed) {
+            self.headings += 1;
+        }
+    }
+}
+
+/// Whether a reasoning line reads as the heading of one item in a numbered
+/// deliverable: leading `#`s or `**` optional, then an optional word, a
+/// number, and `.`, `:`, `)` or `**` — `**Bug 22:**`, `1. **Scan worker
+/// panic**`, `### 3.`, `Finding 7:`. Plain numbered thoughts (`1. read the
+/// file`) do not count unless bolded, which is what a written-out list looks
+/// like and a plan does not.
+fn is_deliverable_heading(line: &str) -> bool {
+    let headed = line.starts_with('#');
+    let mut rest = line.trim_start_matches('#').trim_start();
+    let bold = headed || rest.starts_with("**");
+    rest = rest.trim_start_matches('*').trim_start();
+    // Optional label word: `Bug`, `Finding`, `Issue`, `Step`.
+    let after_word = rest
+        .split_once(' ')
+        .filter(|(w, _)| w.chars().all(char::is_alphabetic) && !w.is_empty())
+        .map_or(rest, |(_, r)| r);
+    let digits = after_word.trim_start_matches(|c: char| c.is_ascii_digit());
+    let ndigits = after_word.len() - digits.len();
+    if ndigits == 0 || ndigits > 3 {
+        return false;
+    }
+    let numbered_bold = digits.starts_with(". **") || digits.starts_with(") **");
+    let labelled = after_word.len() > ndigits
+        && (digits.starts_with(':') || digits.starts_with("**") || digits.starts_with(". "))
+        && (bold || after_word.as_ptr() != rest.as_ptr());
+    numbered_bold || labelled
 }
 
 /// A cycle the warn rung has confirmed, followed forward through the stream.
@@ -1705,6 +1811,7 @@ impl Default for RepeatGuard {
             repeating: false,
             budget: None,
             gated: false,
+            draft: DraftScan::default(),
         }
     }
 }
@@ -1790,6 +1897,36 @@ impl RepeatGuard {
         self.live() && self.budget.is_some_and(|b| self.total > b)
     }
 
+    /// Whether this pass's reasoning is a draft of the answer rather than
+    /// deliberation: past [`DRAFT_MIN_BYTES`], either [`DRAFT_HEADINGS`]
+    /// numbered deliverable headings or [`DRAFT_FENCED_BYTES`] of fenced code.
+    /// `repro-loop-1789060243` wrote a thirty-one-item review inside
+    /// `<think>` and never closed it; the 2026-09-10 recovery passes drafted a
+    /// feature as fenced Rust there. Neither cycles, so the exact-cycle rungs
+    /// are blind to them, and the budget only stops them late, by size. Like
+    /// the budget it is a nudge, not a verdict, and only guards with a budget
+    /// (the turn guards) run it. Sticky, since the counts only grow.
+    #[must_use]
+    pub fn drafting(&self) -> bool {
+        self.live()
+            && self.budget.is_some()
+            && self.total >= DRAFT_MIN_BYTES
+            && (self.draft.headings >= DRAFT_HEADINGS
+                || self.draft.fenced_bytes >= DRAFT_FENCED_BYTES)
+    }
+
+    /// The pass's figures for a repro dump; see [`GuardSnapshot`].
+    #[must_use]
+    pub fn snapshot(&self) -> GuardSnapshot {
+        GuardSnapshot {
+            fed: self.total,
+            budget: self.budget,
+            cycle: self.latched.as_ref().map(|l| (l.block.len(), l.cycles)),
+            headings: self.draft.headings,
+            fenced_bytes: self.draft.fenced_bytes,
+        }
+    }
+
     /// Reasoning bytes fed to the guard this pass, for the message a budget
     /// stop shows: a number the reader can compare against the budget beats
     /// "it went on too long".
@@ -1814,6 +1951,9 @@ impl RepeatGuard {
     fn feed_tail(&mut self, chunk: &str) -> bool {
         self.tail.push_str(chunk);
         self.total += chunk.len();
+        if self.budget.is_some() {
+            self.draft.feed(chunk);
+        }
         if self.tail.len() > self.window {
             // Trim from the front to a char boundary: the window is a byte
             // budget, and slicing mid-character would panic.
@@ -3219,6 +3359,107 @@ Tool result 3 (read):\nfine\n</tool_result>",
         }
         assert!(guard.fed() < 4096, "test is only meaningful under budget");
         assert!(!guard.over_budget());
+    }
+
+    #[test]
+    fn a_numbered_list_written_out_in_reasoning_is_a_draft() {
+        // `repro-loop-1789060243`: `**Bug N:**` entries, thirty-one of them,
+        // no byte cycle, 30 KB before the user gave up.
+        let mut guard = RepeatGuard::with_window(8192).with_think_budget(1 << 20);
+        for i in 1..=12 {
+            let _ = guard.feed(&format!("**Bug {i}: something about module {i}**\n"));
+            for j in 0..20 {
+                let _ = guard.feed(&format!(
+                    "sentence {i}-{j} of explanation, distinct by position. "
+                ));
+            }
+            let _ = guard.feed("\n\n");
+        }
+        assert!(guard.fed() >= DRAFT_MIN_BYTES, "fed {} B", guard.fed());
+        assert!(guard.drafting(), "headings {}", guard.draft.headings);
+        assert!(!guard.repeating(), "nothing cycles here");
+    }
+
+    #[test]
+    fn code_drafted_in_reasoning_is_a_draft() {
+        // The 2026-09-10 recovery passes: the implementation as fenced Rust.
+        let mut guard = RepeatGuard::with_window(8192).with_think_budget(1 << 20);
+        let _ = guard.feed(&"Deciding how to structure the expansion. ".repeat(220));
+        let _ = guard.feed("\n```rust\n");
+        for i in 0..120 {
+            let _ = guard.feed(&format!("    let field_{i} = compute_{i}(&state, {i});\n"));
+        }
+        let _ = guard.feed("```\n");
+        assert!(guard.drafting(), "fenced {} B", guard.draft.fenced_bytes);
+    }
+
+    #[test]
+    fn a_short_outline_is_not_a_draft() {
+        // A dozen numbered headings in under the byte floor is a plan.
+        let mut guard = RepeatGuard::with_window(8192).with_think_budget(1 << 20);
+        for i in 1..=12 {
+            let _ = guard.feed(&format!("{i}. **step {i}** do the thing\n"));
+        }
+        assert!(guard.fed() < DRAFT_MIN_BYTES);
+        assert!(!guard.drafting());
+        // Long reasoning with a couple of headings and a quoted snippet is
+        // deliberation, not a draft.
+        let mut guard = RepeatGuard::with_window(8192).with_think_budget(1 << 20);
+        let _ = guard.feed("**Option 1:** keep it sync\n**Option 2:** go async\n");
+        let _ = guard.feed("```rust\nfn poll(&mut self) {}\n```\n");
+        let _ = guard.feed(&"weighing the two designs against each call site. ".repeat(300));
+        assert!(guard.fed() >= DRAFT_MIN_BYTES);
+        assert!(!guard.drafting());
+    }
+
+    #[test]
+    fn deliverable_headings_are_recognised_and_plain_lists_are_not() {
+        for h in [
+            "**Bug 22: `poll_expansion` similar**",
+            "1. **Scan worker panic leaves UI stuck**",
+            "### 3. Ticked snapshots",
+            "**Finding 7:** errors swallowed",
+            "Issue 12: something",
+            "2) **Second**",
+        ] {
+            assert!(is_deliverable_heading(h), "{h:?}");
+        }
+        for h in [
+            "1. read the file",
+            "Let me check 3 things",
+            "**Bold thought without a number**",
+            "The buffer is 4096 bytes",
+            "2026-09-10 is the date",
+            "",
+        ] {
+            assert!(!is_deliverable_heading(h), "{h:?}");
+        }
+    }
+
+    #[test]
+    fn the_insights_guard_has_no_draft_rung() {
+        let mut guard = RepeatGuard::new();
+        for i in 1..=40 {
+            let _ = guard.feed(&format!("**Bug {i}:** {}\n", "x".repeat(400)));
+        }
+        assert!(guard.fed() >= DRAFT_MIN_BYTES);
+        assert!(!guard.drafting());
+    }
+
+    #[test]
+    fn the_switch_silences_the_draft_rung() {
+        let mut guard = RepeatGuard::with_window(8192)
+            .with_think_budget(1 << 20)
+            .gated();
+        for i in 1..=40 {
+            let _ = guard.feed(&format!("**Bug {i}:** {}\n", "x".repeat(400)));
+        }
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = false;
+        crate::settings::install_for_test(settings);
+        assert!(!guard.drafting(), "but the switch is off");
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        assert!(guard.drafting());
     }
 
     #[test]

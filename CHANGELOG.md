@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A draft rung on the reasoning guard.** Past 8 KiB of reasoning, ten
+  numbered deliverable headings (`**Bug 3:**`, `1. **Title**`) or 4 KiB of
+  fenced code inside `<think>` stop the pass with "write this as your answer,
+  not in reasoning": the reasoning was drafting the answer, not deciding what
+  to do. Checked after the cycle rungs and before the think budget, counted
+  towards the same trip cap, silenced by `/loopguard off` like the rest. From
+  `repro-loop-1789060243`, a thirty-one-item code review written inside
+  `<think>` for thirteen minutes and never emitted.
+- **"Write findings as you find them" in the working-style prompt.** When
+  the answer is a list — a review, an audit, a survey of options — the model
+  is told to emit each item after `</think>` as soon as it has it rather than
+  accumulate the list in reasoning. A system-prompt change, so the first
+  launch rebuilds the prompt cache.
+- **Repro dumps carry a `## Passes` table.** One row per generation pass:
+  when it ended and how long after the previous one, which agent ran it,
+  tokens and rate, the reasoning bytes the guard saw, any latched cycle as
+  period × copies, the draft rung's heading and fenced-code counts, and why
+  the pass stopped (`tool calls: N`, `answer`, `interrupted by user`,
+  `guard: cycle|draft|budget`, `tool error`). The `## Generation` section
+  also says whether the loop guards were armed and the think budget in
+  effect. `repro-loop-1789060243` left it ambiguous whether its 30 KB
+  reasoning pass was stopped by the user or a guard; now the dump says.
+
 ## [5.0.5] - 2026-09-10
 
 ### Added

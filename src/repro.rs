@@ -99,7 +99,38 @@ pub struct Meta<'a> {
     pub session_path: &'a str,
     /// Optional user note describing the bug.
     pub note: &'a str,
+    /// Whether `tools.loopGuards` was armed when the dump was taken.
+    pub guards_armed: bool,
+    /// One entry per generation pass this session, oldest first; see
+    /// [`PassNote`]. Empty for dumps taken before any pass ran.
+    pub passes: &'a [PassNote],
 }
+
+/// One generation pass as the agent saw it end, for the `## Passes` table.
+///
+/// The transcript alone cannot answer the questions a loop dump raises —
+/// `repro-loop-1789060243` left it ambiguous whether a 30 KB reasoning pass
+/// with no `</think>` was stopped by the user or a guard, and how much of it
+/// the guard had counted. This records the answer at the moment it is known.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PassNote {
+    /// Wall-clock second the pass ended.
+    pub at: u64,
+    /// Which agent ran it: empty for the main turn, the sub-agent's label
+    /// otherwise.
+    pub label: String,
+    /// Tokens the pass generated, and its rate.
+    pub generated: i32,
+    pub tps: f64,
+    /// What the reasoning guard counted.
+    pub guard: crate::insights::GuardSnapshot,
+    /// Why the pass ended: `tool calls: N`, `answer`, `interrupted by user`,
+    /// `guard: cycle` / `guard: draft` / `guard: budget`, `tool error`.
+    pub stop: String,
+}
+
+/// Passes remembered for the table; older ones fall off the front.
+pub const PASS_NOTES_CAP: usize = 256;
 
 /// How many finished sub-agent sidechains the agent remembers for `/repro`.
 /// Oldest are dropped first; a fan-out of N slots contributes N entries.
@@ -240,6 +271,54 @@ pub fn repro_dir(cwd: &Path) -> PathBuf {
 /// The transcript is emitted between explicit `BEGIN`/`END` fences rather than
 /// a markdown code block, because it can itself contain triple-backtick code
 /// and must survive round-tripping byte-for-byte.
+/// The `## Passes` table: one row per generation pass, oldest first; nothing
+/// when no pass has run.
+fn write_passes(out: &mut String, passes: &[PassNote]) {
+    if !passes.is_empty() {
+        let _ = writeln!(out, "## Passes");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "One row per generation pass, oldest first. `reasoning` is the bytes the guard saw inside `<think>`; `cycle` is a latched period × copies; `headings`/`fenced` are the draft rung's counts."
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "| # | ended | Δ | agent | tokens | tok/s | reasoning | cycle | headings | fenced | stop |"
+        );
+        let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|");
+        let mut prev: Option<u64> = None;
+        for (i, p) in passes.iter().enumerate() {
+            let delta = prev.map_or_else(String::new, |q| {
+                crate::ui::format_elapsed(p.at.saturating_sub(q))
+            });
+            prev = Some(p.at);
+            let cycle = p.guard.cycle.map_or_else(
+                || "-".to_owned(),
+                |(period, copies)| format!("{period} B × {copies}"),
+            );
+            let label = if p.label.is_empty() {
+                "main"
+            } else {
+                p.label.as_str()
+            };
+            let _ = writeln!(
+                out,
+                "| {} | {} | {delta} | {label} | {} | {:.1} | {} | {cycle} | {} | {} | {} |",
+                i + 1,
+                crate::context::format_local_time(p.at),
+                p.generated,
+                p.tps,
+                p.guard.fed,
+                p.guard.headings,
+                p.guard.fenced_bytes,
+                p.stop
+            );
+        }
+        let _ = writeln!(out);
+    }
+}
+
 #[must_use]
 pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -> String {
     let g = &cfg.generation;
@@ -327,7 +406,21 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     if cfg.engine != crate::config::EngineTuning::default() {
         let _ = writeln!(out, "- engine tuning: {:?}", cfg.engine);
     }
+    let _ = writeln!(
+        out,
+        "- loop guards: {}",
+        if meta.guards_armed {
+            "armed"
+        } else {
+            "off (/loopguard off)"
+        }
+    );
+    if let Some(budget) = meta.passes.iter().rev().find_map(|p| p.guard.budget) {
+        let _ = writeln!(out, "- think budget: {budget} bytes of reasoning per pass");
+    }
     let _ = writeln!(out);
+
+    write_passes(&mut out, meta.passes);
 
     let _ = writeln!(out, "## Rendered transcript (exact engine input)");
     let _ = writeln!(out);
@@ -498,6 +591,8 @@ mod tests {
                 show_thinking: true,
                 show_tool_calls: false,
             },
+            guards_armed: true,
+            passes: &[],
             session_id: "abc123",
             session_tag: "",
             session_path: "/home/u/.plank/kvcache/abc123.kv",
@@ -715,5 +810,59 @@ mod tests {
         let c = save_in(&dir, "repro", 1000, "manual").unwrap();
         assert_eq!(c.file_name().unwrap().to_str().unwrap(), "repro-1000.md");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_passes_table_names_each_stop() {
+        let passes = vec![
+            PassNote {
+                at: 1_700_000_000,
+                label: String::new(),
+                generated: 900,
+                tps: 16.7,
+                guard: crate::insights::GuardSnapshot {
+                    fed: 30_467,
+                    budget: Some(104_857),
+                    cycle: None,
+                    headings: 31,
+                    fenced_bytes: 0,
+                },
+                stop: "interrupted by user".to_owned(),
+            },
+            PassNote {
+                at: 1_700_000_311,
+                label: "reviewer".to_owned(),
+                generated: 500,
+                tps: 15.0,
+                guard: crate::insights::GuardSnapshot {
+                    fed: 17_038,
+                    budget: Some(104_857),
+                    cycle: Some((631, 5)),
+                    headings: 6,
+                    fenced_bytes: 0,
+                },
+                stop: "guard: cycle".to_owned(),
+            },
+        ];
+        let mut m = meta();
+        m.passes = &passes;
+        let report = build_report(&m, &AgentConfig::default(), "");
+        assert!(report.contains("## Passes"), "{report}");
+        assert!(
+            report.contains("| main | 900 | 16.7 | 30467 | - | 31 | 0 | interrupted by user |"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "| +5m11s | reviewer | 500 | 15.0 | 17038 | 631 B × 5 | 6 | 0 | guard: cycle |"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("- loop guards: armed"), "{report}");
+        assert!(report.contains("- think budget: 104857 bytes"), "{report}");
+        // No passes: no table, and no budget line to invent one from.
+        let report = build_report(&meta(), &AgentConfig::default(), "");
+        assert!(!report.contains("## Passes"));
+        assert!(!report.contains("think budget"));
     }
 }

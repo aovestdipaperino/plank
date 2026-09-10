@@ -676,6 +676,15 @@ fn repeat_think_budget(ctx_size: i32) -> usize {
         .max(REPEAT_THINK_BUDGET_FLOOR)
 }
 
+/// The reasoning guard every turn pass runs: the cycle rungs over
+/// [`REPEAT_LOOP_WINDOW`], the think budget sized from the context window,
+/// the draft rung that comes with a budget, all under `tools.loopGuards`.
+fn turn_repeat_guard(ctx_size: i32) -> crate::insights::RepeatGuard {
+    crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
+        .with_think_budget(repeat_think_budget(ctx_size))
+        .gated()
+}
+
 /// Model-facing text for a [`repeat_think_budget`] stop. Deliberately not
 /// [`REPEAT_LOOP_ERROR`]: the guard has *not* proven a loop, only that the
 /// reasoning outran its budget, and telling a model that was thinking hard
@@ -712,8 +721,35 @@ const NO_PROGRESS_NOTICE: &str = "turn stopped: the model generated 32KB of outp
 /// towards [`MAIN_REPEAT_TRIP_CAP`]. Both stops leave the prompt materially
 /// unchanged at temperature 0, so both need the cap for the same reason.
 fn is_reasoning_stop(err: Option<&str>) -> bool {
-    matches!(err, Some(REPEAT_LOOP_ERROR | THINK_BUDGET_ERROR))
+    matches!(
+        err,
+        Some(REPEAT_LOOP_ERROR | THINK_BUDGET_ERROR | DRAFT_ERROR)
+    )
 }
+
+/// The `stop` column of a repro dump's `## Passes` table: which rung, if a
+/// rung; otherwise whether the user, a tool error, tool calls or a plain
+/// answer ended the pass.
+fn pass_stop_text(interrupted: bool, error: Option<&str>, calls: usize) -> String {
+    match error {
+        Some(e) if e.contains(REPEAT_LOOP_ERROR) => "guard: cycle".to_owned(),
+        Some(e) if e.contains(DRAFT_ERROR) => "guard: draft".to_owned(),
+        Some(e) if e.contains(THINK_BUDGET_ERROR) => "guard: budget".to_owned(),
+        _ if interrupted => "interrupted by user".to_owned(),
+        Some(_) => "tool error".to_owned(),
+        _ if calls > 0 => format!("tool calls: {calls}"),
+        _ => "answer".to_owned(),
+    }
+}
+
+/// Model-facing text for a [`crate::insights::RepeatGuard::drafting`] stop:
+/// the reasoning was writing the answer — a numbered list of findings, or the
+/// code — rather than deciding what it is. Neither [`REPEAT_LOOP_ERROR`] nor
+/// [`THINK_BUDGET_ERROR`] says what actually went wrong here, and the honest
+/// instruction is the one that fixes it: write this as your answer, not in
+/// reasoning. `repro-loop-1789060243` and the seven 2026-09-10 dumps in
+/// `docs/LOOP-FINDINGS.md`.
+const DRAFT_ERROR: &str = "generation stopped: the reasoning was drafting the answer — numbered findings or code — instead of deciding what to do. Write this as your answer, not in reasoning. Close the thinking now and emit the items you already have to the user one at a time as you go; for code, make the change with the edit or write tool rather than drafting it in thought.";
 
 /// Consecutive repeat-guard stops a sub-agent may take before it is asked for
 /// its report instead of another attempt. At temperature 0 a pass is a pure
@@ -756,11 +792,11 @@ fn guard_notice(what: &str, label: Option<&str>) -> String {
 /// in. A budget stop is named as one, because it is a weaker claim — the
 /// pass was long, not provably circular — and reporting it as a loop would
 /// send whoever reads the dump looking for a cycle that is not there.
-fn repeat_trip_text(over_budget: bool, trips: usize) -> String {
-    let what = if over_budget {
-        "stopped an over-budget pass"
-    } else {
-        "stopped a reasoning loop"
+fn repeat_trip_text(payload: Option<&str>, trips: usize) -> String {
+    let what = match payload {
+        Some(p) if p.contains(THINK_BUDGET_ERROR) => "stopped an over-budget pass",
+        Some(p) if p.contains(DRAFT_ERROR) => "stopped a pass drafting its answer in reasoning",
+        _ => "stopped a reasoning loop",
     };
     if trips > 1 {
         format!("{what} ({trips} in a row)")
@@ -794,6 +830,10 @@ fn stream_chunk_must_stop<S: RenderSink>(
         // the model something the budget's cannot.
         if guard.feed(chunk) {
             stream.fail_preflight(REPEAT_LOOP_ERROR);
+        } else if guard.drafting() {
+            // Ahead of the budget: it names the shape of the reasoning,
+            // which the budget's byte count cannot.
+            stream.fail_preflight(DRAFT_ERROR);
         } else if guard.over_budget() {
             stream.fail_preflight(THINK_BUDGET_ERROR);
         }
@@ -1316,7 +1356,8 @@ pub fn render_messages_for_repro(messages: &[Message], system: Option<&str>) -> 
 }
 
 /// Formats a duration in seconds as `+Xs`, `+XmYs`, or `+XhYm`.
-fn format_elapsed(secs: u64) -> String {
+#[must_use]
+pub fn format_elapsed(secs: u64) -> String {
     if secs < 60 {
         format!("+{secs}s")
     } else if secs < 3600 {
@@ -2074,6 +2115,12 @@ struct Agent<'a> {
     usage: SessionUsage,
     /// Engine-agnostic in/out token tally for the end-of-session stats.
     stats: SessionStats,
+    /// One note per generation pass, for the `## Passes` table of a repro
+    /// dump (`crate::repro::PassNote`); bounded by `PASS_NOTES_CAP`.
+    passes: Vec<crate::repro::PassNote>,
+    /// What the reasoning guard saw of the pass that just ended, left by the
+    /// generate paths for the turn loop that knows how the pass stopped.
+    last_guard: crate::insights::GuardSnapshot,
     /// When the current session began (process start, or the last `/clear`,
     /// `/resume`, or `/switch`), for the end-of-session duration.
     session_start: std::time::Instant,
@@ -2675,6 +2722,32 @@ impl Agent<'_> {
         }
     }
 
+    /// Records how a pass ended for the repro dump's `## Passes` table. `guard`
+    /// is the snapshot the generate path left in `last_guard` (taken here so
+    /// a pass is never noted twice), or the one a quiet pass carried.
+    fn note_pass(
+        &mut self,
+        label: Option<&str>,
+        stats: &crate::engine::GenerationStats,
+        guard: crate::insights::GuardSnapshot,
+        stop: String,
+    ) {
+        if self.passes.len() >= crate::repro::PASS_NOTES_CAP {
+            self.passes.remove(0);
+        }
+        self.passes.push(crate::repro::PassNote {
+            at: now_secs(),
+            label: label
+                .or(self.tool_ctx.subagent_label.as_deref())
+                .unwrap_or_default()
+                .to_owned(),
+            generated: stats.generated,
+            tps: stats.tps,
+            guard,
+            stop,
+        });
+    }
+
     /// Collects image embeddings from the transcript and hands them to the
     /// engine via [`Engine::set_pending_images`], so the engine can append
     /// image tokens alongside the matching section text during `reconcile`.
@@ -2763,9 +2836,7 @@ impl Agent<'_> {
         // Mirrors the C's worker greedy flag: argmax sampling while the
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
-        let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-            .with_think_budget(repeat_think_budget(self.engine.ctx_size()))
-            .gated();
+        let mut repeat = turn_repeat_guard(self.engine.ctx_size());
         // Provider engines take a structured turn; local engines keep the flat
         // rendered transcript (byte parity, §4.4). `bufs`/`st` outlive the call.
         let bufs = self
@@ -2854,6 +2925,7 @@ impl Agent<'_> {
         bar.clear();
         self.record_usage(&stats);
         self.last_ctx_used = stats.ctx_used;
+        self.last_guard = repeat.snapshot();
         Ok((stream, assistant_text, stats))
     }
 
@@ -3343,13 +3415,15 @@ impl Agent<'_> {
                 }
             };
             self.session.push(Message::assistant(pass.assistant_text));
+            self.note_pass(
+                None,
+                &pass.stats,
+                pass.guard.clone(),
+                pass_stop_text(false, pass.tool_error.as_deref(), pass.calls.len()),
+            );
             if pass.looped {
                 trips += 1;
-                let over = pass
-                    .tool_error
-                    .as_deref()
-                    .is_some_and(|e| e.contains(THINK_BUDGET_ERROR));
-                self.report_guard(&repeat_trip_text(over, trips));
+                self.report_guard(&repeat_trip_text(pass.tool_error.as_deref(), trips));
             } else {
                 trips = 0;
             }
@@ -3519,6 +3593,8 @@ struct QuietPass {
     /// Returned rather than recorded, because usage accounting lives on the
     /// `Agent` and a pass may run on a thread that cannot touch it.
     stats: crate::engine::GenerationStats,
+    /// What the reasoning guard saw, for the repro dump's pass note.
+    guard: crate::insights::GuardSnapshot,
 }
 
 /// Why a quiet pass ended with nothing to feed back: the engine failed, or the
@@ -3792,9 +3868,7 @@ fn generate_pass(
     let mut assistant_text = String::new();
     let preflight_stop = AtomicBool::new(false);
     let greedy = AtomicBool::new(false);
-    let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-        .with_think_budget(repeat_think_budget(engine.ctx_size()))
-        .gated();
+    let mut repeat = turn_repeat_guard(engine.ctx_size());
     // Counting the prompt only when someone is listening: it tokenizes the
     // whole rendered transcript.
     let mut live = ctx.status.as_ref().map(|sc| {
@@ -3861,7 +3935,7 @@ fn generate_pass(
     };
     stream.finish();
     crate::debugmirror::flush();
-    finish_quiet_pass(&stream, assistant_text, stats)
+    finish_quiet_pass(&stream, assistant_text, stats, repeat.snapshot())
 }
 
 /// Shapes a finished quiet pass into what the sub-agent loops act on: an
@@ -3870,6 +3944,7 @@ fn finish_quiet_pass<S: RenderSink>(
     stream: &StreamRenderer<S>,
     mut assistant_text: String,
     stats: crate::engine::GenerationStats,
+    guard: crate::insights::GuardSnapshot,
 ) -> Result<QuietPass, QuietAbort> {
     let preflight_error = stream.preflight_error().map(str::to_owned);
     if stopped_by_user(
@@ -3899,6 +3974,7 @@ fn finish_quiet_pass<S: RenderSink>(
             tool_error: Some(payload),
             looped: is_reasoning_stop(preflight_error.as_deref()),
             stats,
+            guard,
         });
     }
     let calls = finished.calls.to_vec();
@@ -3909,6 +3985,7 @@ fn finish_quiet_pass<S: RenderSink>(
         tool_error: None,
         looped: false,
         stats,
+        guard,
     })
 }
 
@@ -4007,6 +4084,13 @@ impl Agent<'_> {
             );
             ungrounded += assistant_text.len();
             self.session.push(Message::assistant(assistant_text));
+            let guard = std::mem::take(&mut self.last_guard);
+            let stop = pass_stop_text(
+                real_interrupt,
+                preflight_error.as_deref().or(finished.error),
+                finished.calls.len(),
+            );
+            self.note_pass(None, &stats, guard, stop);
             // Streamed live to the parent window, so the console has seen it:
             // it must not be replayed to a window that connects later.
             self.note_pass_mirrored();
@@ -4015,8 +4099,7 @@ impl Agent<'_> {
             // error goes back to the model and the turn moves on.
             if is_reasoning_stop(preflight_error.as_deref()) {
                 repeat_trips += 1;
-                let over = preflight_error.as_deref() == Some(THINK_BUDGET_ERROR);
-                self.report_guard(&repeat_trip_text(over, repeat_trips));
+                self.report_guard(&repeat_trip_text(preflight_error.as_deref(), repeat_trips));
                 if let Some(line) = self.loop_repro_line() {
                     println!("{}", self.debug_line(&line));
                 }
@@ -8170,6 +8253,8 @@ the original is frozen and listed in /tree"
             session_tag: &self.session.tag,
             session_path: &session_path,
             note: note.trim(),
+            guards_armed: crate::guard::guards_enabled(),
+            passes: &self.passes,
         };
         // The live options, not the startup ones: `/temp` and `/mtp` change
         // how the very next pass samples, and a dump that reported the
@@ -8909,13 +8994,18 @@ the original is frozen and listed in /tree"
         };
         self.fold_fanout_usage(slot, pass.stats.usage);
         slot.session.push(Message::assistant(pass.assistant_text));
+        self.note_pass(
+            Some(&slot.label),
+            &pass.stats,
+            pass.guard.clone(),
+            pass_stop_text(false, pass.tool_error.as_deref(), pass.calls.len()),
+        );
         if pass.looped {
             slot.trips += 1;
-            let over = pass
-                .tool_error
-                .as_deref()
-                .is_some_and(|e| e.contains(THINK_BUDGET_ERROR));
-            self.report_guard_for(Some(&slot.label), &repeat_trip_text(over, slot.trips));
+            self.report_guard_for(
+                Some(&slot.label),
+                &repeat_trip_text(pass.tool_error.as_deref(), slot.trips),
+            );
         } else {
             slot.trips = 0;
         }
@@ -9602,6 +9692,8 @@ type AltEngine = (EngineKey, Box<dyn Engine>);
 
 /// Result of one TUI generation pass.
 struct TurnOutput {
+    /// The pass's engine figures, for the repro dump's pass note.
+    stats: crate::engine::GenerationStats,
     interrupted: bool,
     /// A priority `/btw` stopped this main pass; the caller discards the
     /// partial output, answers the side question, and re-runs the pass.
@@ -12623,6 +12715,13 @@ impl Agent<'_> {
             close_open_think(&mut assistant_text, out.ended_in_think && turn_continues);
             ungrounded += assistant_text.len();
             self.session.push(Message::assistant(assistant_text));
+            let guard = std::mem::take(&mut self.last_guard);
+            let stop = pass_stop_text(
+                out.interrupted,
+                out.error.as_ref().map(|f| f.payload.as_str()),
+                out.calls.len(),
+            );
+            self.note_pass(None, &out.stats, guard, stop);
             // Streamed live to the parent window, so the console has seen it:
             // it must not be replayed to a window that connects later.
             self.note_pass_mirrored();
@@ -12632,8 +12731,7 @@ impl Agent<'_> {
             // error goes back to the model and the turn moves on.
             if let Some(f) = out.error.as_ref().filter(|e| e.looped) {
                 repeat_trips += 1;
-                let over = f.payload.contains(THINK_BUDGET_ERROR);
-                self.report_guard(&repeat_trip_text(over, repeat_trips));
+                self.report_guard(&repeat_trip_text(Some(&f.payload), repeat_trips));
                 if let Some(line) = self.loop_repro_line() {
                     let _ = tx.send(UiEvent::Dim(line));
                 }
@@ -13156,9 +13254,7 @@ impl Agent<'_> {
         // Mirrors the C's worker greedy flag: argmax sampling while the
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
-        let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-            .with_think_budget(repeat_think_budget(self.engine.ctx_size()))
-            .gated();
+        let mut repeat = turn_repeat_guard(self.engine.ctx_size());
         // Bound before the event closure, which cannot borrow `self` while
         // `self.engine` is generating. The elapsed clock is the turn's, so the
         // footer's seconds accumulate across the generate → tools → generate
@@ -13282,6 +13378,7 @@ impl Agent<'_> {
         let stats = result.map_err(|e| e.to_string())?;
         self.record_usage(&stats);
         self.last_ctx_used = stats.ctx_used;
+        self.last_guard = repeat.snapshot();
         stream.finish();
         crate::debugmirror::flush();
         let finished = stream.finished();
@@ -13320,6 +13417,7 @@ impl Agent<'_> {
         // Consume the interrupt so a queued follow-up turn starts clean.
         shared.interrupt.store(false, Ordering::Relaxed);
         Ok(TurnOutput {
+            stats,
             interrupted,
             preempted,
             assistant_text,
@@ -16217,6 +16315,8 @@ fn new_agent(
         ui_remote: None,
         usage: SessionUsage::default(),
         stats: SessionStats::default(),
+        passes: Vec::new(),
+        last_guard: crate::insights::GuardSnapshot::default(),
         session_start: std::time::Instant::now(),
         sub_sink: SubSinkTarget::default(),
         fork_kv: Vec::new(),
@@ -18175,6 +18275,8 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -22256,6 +22358,8 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -22371,6 +22475,8 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -23489,6 +23595,8 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -23749,6 +23857,8 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -23849,6 +23959,8 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -23936,6 +24048,8 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -24046,6 +24160,8 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -26322,6 +26438,8 @@ or the user's next message aborts before its first token"
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -26451,6 +26569,8 @@ or the user's next message aborts before its first token"
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -26614,6 +26734,8 @@ or the user's next message aborts before its first token"
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),

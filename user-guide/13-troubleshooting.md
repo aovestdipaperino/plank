@@ -182,7 +182,7 @@ Nothing breaks. Malformed JSON, a wrongly-typed value, an unknown key, or an unr
 /repro
 ```
 
-Run it before you change anything. It writes `~/.plank/repro/repro-<timestamp>.md` containing the exact prompt the engine would see plus the model, backend, context size, sampling settings, think mode and engine tuning — self-contained, read-only, and enough for a maintainer to reproduce the state that triggered the problem without your session.
+Run it before you change anything. It writes `~/.plank/repro/repro-<timestamp>.md` containing the exact prompt the engine would see plus the model, backend, context size, sampling settings, think mode and engine tuning, whether the loop guards were armed, and a `## Passes` table with one row per generation pass: when it ended, tokens and rate, the reasoning bytes the guard saw, any cycle it latched, and why the pass stopped (tool calls, answer, your interrupt, or which guard rung) — self-contained, read-only, and enough for a maintainer to reproduce the state that triggered the problem without your session.
 
 Attach that to an issue at [github.com/aovestdipaperino/plank](https://github.com/aovestdipaperino/plank/issues). Strip anything proprietary first — a repro carries your actual prompt and transcript.
 
