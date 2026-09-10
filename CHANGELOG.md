@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.0.5] - 2026-09-10
+
+### Added
+
+- **`/toks`: a live chart of generation speed.** A braille line chart of
+  tokens per second as a time series: while the model decodes, the rate is
+  sampled once a second into a 256-entry process-wide ring, so the x axis is
+  decode time and the chart knows nothing about passes or turns. It opens in
+  the same dismissable panel as `/usage` (plain text on the piped REPL) and
+  also runs mid-turn, redrawing on every status tick so the line grows while
+  the model types. The dots are drawn in the theme green.
+- **`/exit` and `/quit` work mid-turn, behind a confirmation.** Typing either
+  while the model is working opens a `[y/N]` panel; `y` interrupts the turn
+  on both routes a generation polls, unblocks a worker parked on `ask`, and
+  leaves as soon as the turn stops without running the queued lines or a
+  live goal. Any other key keeps the turn running.
+
+### Changed
+
+- **The per-pass reasoning budget scales with the context window.** The loop
+  guard's think budget is now a tenth of the context window in bytes
+  (`repeat_think_budget`), never below the old 16 KiB, so on the 1M-token
+  window it is ~102 KB. Seven dumps from 2026-09-10 showed the fixed budget
+  stopping reasoning that was not looping at all: a multi-file feature drafted
+  as code inside `<think>`, restarted from zero after every stop. Details in
+  `docs/LOOP-FINDINGS.md`.
+
 ## [5.0.4] - 2026-09-10
 
 ### Changed
