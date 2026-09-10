@@ -269,6 +269,9 @@ pub struct Status {
     /// conditional now: with [`mtp`](Self::mtp) on the segment is drawn
     /// whether or not a pass has speculated yet.
     pub spec: crate::engine::SpecStats,
+    /// Background bash jobs still running (`BashJobs::running_count`); the
+    /// jobs segment is drawn only when this is non-zero.
+    pub running_jobs: usize,
 }
 
 /// Marks the speculative-decoding segment, mirroring how `THINK_MARK` labels
@@ -287,6 +290,9 @@ const MTP_MARK: &str = "✨";
 /// the footer is width-sensitive and the emoji-presentation form measures
 /// differently across terminals.
 const TEMP_MARK: &str = "🌡";
+
+/// Marks the footer's jobs segment: background bash jobs still running.
+const JOBS_MARK: &str = "⧗";
 
 /// Marks the footer's loop-guard segment: the guards are armed and watching.
 /// Distinct from [`LOOP_MARK`], which says a guard has actually seen a cycle.
@@ -1810,6 +1816,10 @@ fn build_status_text_with_cells(
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
     };
+    let ctx = match jobs_segment(st) {
+        Some(seg) => format!("{ctx} | {}", theme(&seg)),
+        None => ctx,
+    };
     // The download segment rides with the ctx gauge for the same reason the
     // MTP segment does: it describes the whole session rather than this
     // turn, and keeping it left of the state word keeps the power suffix
@@ -1883,6 +1893,19 @@ pub fn spec_segment(st: &Status) -> Option<String> {
 #[must_use]
 pub fn guard_segment() -> Option<String> {
     crate::guard::guards_enabled().then(|| GUARD_MARK.to_owned())
+}
+
+/// The jobs segment: `⧗ 2 jobs` while background bash jobs are still running
+/// (`docs/BACKGROUND-TASKS.md` §3.7), `None` otherwise so an ordinary footer is
+/// unchanged. Rides with the ctx gauge like the guard segment: a job belongs
+/// to the session, not to the pass, and is most useful to see at idle.
+#[must_use]
+pub fn jobs_segment(st: &Status) -> Option<String> {
+    match st.running_jobs {
+        0 => None,
+        1 => Some(format!("{JOBS_MARK} 1 job")),
+        n => Some(format!("{JOBS_MARK} {n} jobs")),
+    }
 }
 
 /// Appends `seg` (already themed) to `ctx`, or returns `ctx` unchanged.
@@ -2213,6 +2236,20 @@ mod tests {
         assert_eq!(visible_width("\x1b[38;5;120mgreen\x1b[0m!"), 6);
     }
     use super::*;
+
+    #[test]
+    fn jobs_segment_shows_only_while_jobs_run() {
+        let mut st = Status::default();
+        assert_eq!(jobs_segment(&st), None);
+        st.running_jobs = 1;
+        assert_eq!(jobs_segment(&st).as_deref(), Some("⧗ 1 job"));
+        st.running_jobs = 3;
+        assert_eq!(jobs_segment(&st).as_deref(), Some("⧗ 3 jobs"));
+        let text = build_status_text(&st, false, true);
+        assert!(text.contains(" | ⧗ 3 jobs | "), "got: {text}");
+        let quiet = build_status_text(&Status::default(), false, true);
+        assert!(!quiet.contains('⧗'), "got: {quiet}");
+    }
 
     #[test]
     fn system_line_is_theme_green_with_white_urls() {

@@ -3448,6 +3448,7 @@ impl Agent<'_> {
             tx: tx.clone(),
             power_percent: self.power_percent,
             think: self.think,
+            running_jobs: self.tool_ctx.bash.running_count(),
         })
     }
 
@@ -3546,6 +3547,7 @@ struct PassStatusCtx {
     tx: Sender<UiEvent>,
     power_percent: i32,
     think: crate::engine::ThinkMode,
+    running_jobs: usize,
 }
 
 /// Builds the [`Status`] snapshots a generation pass publishes as it runs, from
@@ -3572,6 +3574,10 @@ struct LiveStatus {
     power_percent: i32,
     think: crate::engine::ThinkMode,
     model_name: String,
+    /// Background bash jobs running when the pass began; the footer's jobs
+    /// segment. A job started by this pass's own tool round shows from the
+    /// next snapshot that is built after dispatch.
+    running_jobs: usize,
 }
 
 impl LiveStatus {
@@ -3582,6 +3588,7 @@ impl LiveStatus {
         power_percent: i32,
         think: crate::engine::ThinkMode,
         model_name: String,
+        running_jobs: usize,
     ) -> Self {
         Self {
             prompt_tokens,
@@ -3594,6 +3601,7 @@ impl LiveStatus {
             power_percent,
             think,
             model_name,
+            running_jobs,
         }
     }
 
@@ -3628,6 +3636,7 @@ impl LiveStatus {
                     think: self.think,
                     greedy_sampling: greedy,
                     looping,
+                    running_jobs: self.running_jobs,
                     ..Status::default()
                 })
             }
@@ -3652,6 +3661,7 @@ impl LiveStatus {
                     ctx_size: self.ctx_size,
                     power_percent: self.power_percent,
                     think: self.think,
+                    running_jobs: self.running_jobs,
                     ..Status::default()
                 })
             }
@@ -3723,6 +3733,7 @@ fn generate_pass(
             sc.power_percent,
             sc.think,
             engine.model_name(),
+            sc.running_jobs,
         )
     });
     let st;
@@ -3962,6 +3973,7 @@ impl Agent<'_> {
                 spec: stats.spec,
                 power_percent: self.power_percent,
                 think: self.think,
+                running_jobs: self.tool_ctx.bash.running_count(),
                 ..Status::default()
             };
             if real_interrupt {
@@ -11798,6 +11810,7 @@ impl Agent<'_> {
             power_percent: self.power_percent,
             think: self.think,
             spec: self.last_spec,
+            running_jobs: self.tool_ctx.bash.running_count(),
             ..Status::default()
         }
     }
@@ -12988,6 +13001,7 @@ impl Agent<'_> {
             self.power_percent,
             self.think,
             self.engine.model_name(),
+            self.tool_ctx.bash.running_count(),
         );
         let mut assistant_text = String::new();
 

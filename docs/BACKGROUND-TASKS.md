@@ -272,8 +272,14 @@ default on:
   helper thread and the loop uses `recv_timeout(250 ms)`. EOF and read errors
   travel over the same channel. Ctrl-C behavior is unchanged because the
   interrupt flag was never tied to `read_line`.
-- **Not shipped:** the footer job count (§3.7), the `JobFinished` hook event,
-  and the per-idle wake budget (§3.5). The wake budget was dropped because a
+- **Footer job count** shipped after the first cut as `⧗ N jobs`
+  (`status::jobs_segment`), riding with the ctx gauge rather than the stats
+  segment planned in §3.7, because a job belongs to the session, not to the
+  pass, and the count is most useful at idle. It is drawn whenever jobs run,
+  with or without `tools.bashNotify`. A job started by the current tool round
+  appears from the next status snapshot built after dispatch.
+- **Not shipped:** the `JobFinished` hook event and the per-idle wake budget
+  (§3.5). The wake budget was dropped because a
   notification is only ever produced by a job the model itself started; a
   model that reacts to each wake by starting a new job is still bounded by
   the tool-call loop guards on the turn that starts it. Revisit if a real
