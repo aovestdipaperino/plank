@@ -139,7 +139,8 @@ pub struct AgentConfig {
     /// host's estimated resident KV past the budget, bounding RAM instead of
     /// OOM-ing.
     pub kv_budget_bytes: u64,
-    /// Third-party provider from `--provider openai|anthropic` (flavor b, issue
+    /// Third-party provider from `--provider openai|openai-responses|anthropic`
+    /// (flavor b, issue
     /// #26); selects [`crate::remote::provider::ProviderEngine`]. `None` unless
     /// `--provider` was given.
     pub provider: Option<ProviderSelector>,
@@ -176,16 +177,22 @@ pub struct AgentConfig {
 pub enum ProviderSelector {
     /// OpenAI-compatible chat completions.
     OpenAi,
+    /// `OpenAI` Responses API (`/responses`), which the newest reasoning models
+    /// require for function tools. `openai` switches to this on its own when
+    /// the endpoint says so; naming it up front skips that first failed request.
+    OpenAiResponses,
     /// Anthropic Messages.
     Anthropic,
 }
 
 impl ProviderSelector {
-    /// Short lowercase label (`openai` / `anthropic`) for reports.
+    /// Short lowercase label (`openai` / `openai-responses` / `anthropic`) for
+    /// reports.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::OpenAi => "openai",
+            Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
         }
     }
@@ -544,9 +551,11 @@ Options:
                            reject an attach past B rather than OOM (default 0 = off,
                            count-only admission)
       --provider NAME      drive a third-party LLM API: openai (OpenAI-compatible,
-                           also vLLM/Ollama/OpenRouter) or anthropic. Use with
-                           --model NAME; key from --api-key or $OPENAI_API_KEY /
-                           $ANTHROPIC_API_KEY
+                           also vLLM/Ollama/OpenRouter), openai-responses (the
+                           /responses API, which the newest reasoning models
+                           require for tools; openai switches to it by itself)
+                           or anthropic. Use with --model NAME; key from
+                           --api-key or $OPENAI_API_KEY / $ANTHROPIC_API_KEY
       --base-url URL       base URL for --provider (OpenAI-compatible gateways)
       --api-key KEY        API key for --provider (prefer the env var)
       --provider-cache on|off  Anthropic prompt caching over the stable prefix
@@ -1362,6 +1371,7 @@ pub fn parse_options_with(
             "--provider" => {
                 c.provider = Some(match need_arg(&mut i)? {
                     "openai" => ProviderSelector::OpenAi,
+                    "openai-responses" | "responses" => ProviderSelector::OpenAiResponses,
                     "anthropic" => ProviderSelector::Anthropic,
                     other => return Err(format!("invalid provider: {other}")),
                 });
@@ -1557,7 +1567,7 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
         // given on the command line (§4.7, constraint 6).
         if c.provider_api_key.is_none() {
             let env = match provider {
-                ProviderSelector::OpenAi => "OPENAI_API_KEY",
+                ProviderSelector::OpenAi | ProviderSelector::OpenAiResponses => "OPENAI_API_KEY",
                 ProviderSelector::Anthropic => "ANTHROPIC_API_KEY",
             };
             c.provider_api_key = std::env::var(env).ok().filter(|k| !k.is_empty());

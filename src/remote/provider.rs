@@ -33,6 +33,11 @@ use std::time::{Duration, Instant};
 pub enum ProviderKind {
     /// OpenAI-compatible `/chat/completions` (also `vLLM`, `Ollama`, `OpenRouter`...).
     OpenAi,
+    /// `OpenAI` Responses API (`/responses`). The newest reasoning models
+    /// serve function tools only here; [`Self::OpenAi`] falls back to this
+    /// automatically when the endpoint says so (see
+    /// [`requires_responses_api`]).
+    OpenAiResponses,
     /// Anthropic Messages API (`/v1/messages`).
     Anthropic,
 }
@@ -43,6 +48,7 @@ impl ProviderKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "openai" => Some(Self::OpenAi),
+            "openai-responses" | "responses" => Some(Self::OpenAiResponses),
             "anthropic" => Some(Self::Anthropic),
             _ => None,
         }
@@ -52,7 +58,7 @@ impl ProviderKind {
     #[must_use]
     pub fn api_key_env(self) -> &'static str {
         match self {
-            Self::OpenAi => "OPENAI_API_KEY",
+            Self::OpenAi | Self::OpenAiResponses => "OPENAI_API_KEY",
             Self::Anthropic => "ANTHROPIC_API_KEY",
         }
     }
@@ -61,16 +67,17 @@ impl ProviderKind {
     #[must_use]
     pub fn default_base_url(self) -> &'static str {
         match self {
-            Self::OpenAi => "https://api.openai.com/v1",
+            Self::OpenAi | Self::OpenAiResponses => "https://api.openai.com/v1",
             Self::Anthropic => "https://api.anthropic.com/v1",
         }
     }
 
-    /// Short lowercase label (`openai` / `anthropic`).
+    /// Short lowercase label (`openai` / `openai-responses` / `anthropic`).
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::OpenAi => "openai",
+            Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
         }
     }
@@ -352,6 +359,214 @@ impl SseTranslator for OpenAiTranslator {
     fn usage(&self) -> Option<ProviderUsage> {
         OpenAiTranslator::usage(self)
     }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Responses streaming translation (/responses SSE -> EngineEvent)
+// ---------------------------------------------------------------------------
+
+/// Accumulator that turns an `OpenAI` **Responses** SSE stream into the
+/// [`EngineEvent`] shape the renderer expects, re-emitting native
+/// `function_call` items as the SAME canonical DSML stanza the other two
+/// translators emit, so `viz`/`dsml`/`dispatch` stay backend-agnostic.
+///
+/// Events dispatch on the JSON `type` field (`response.output_text.delta`,
+/// `response.output_item.done`, `response.completed`, …), so the shared
+/// [`read_sse`] reader — which forwards only `data:` payloads — suffices and
+/// `event:` lines are ignored, exactly as on the Anthropic path.
+///
+/// Reasoning arrives as *summary* text (the raw chain is not streamed), and is
+/// wrapped in one synthetic `<think>`…`</think>` so the renderer routes it to
+/// `think_text` rather than the answer.
+#[derive(Debug, Default)]
+pub struct ResponsesTranslator {
+    /// Completed tool calls, in arrival order.
+    tool_calls: Vec<NativeToolCall>,
+    /// True while a `<think>` block is open (reasoning-summary deltas).
+    thinking_open: bool,
+    /// Usage from the terminal `response.completed` event, if any.
+    usage: Option<ProviderUsage>,
+    /// True once a terminal event was seen.
+    done: bool,
+    /// True once the DSML tool stanza has been flushed by `finish`.
+    flushed: bool,
+}
+
+impl ResponsesTranslator {
+    /// Creates an empty translator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Usage reported so far.
+    #[must_use]
+    pub fn usage(&self) -> Option<ProviderUsage> {
+        self.usage
+    }
+
+    /// Feeds one SSE `data:` payload, emitting any resulting events. Returns
+    /// `false` when the stream is complete, so the caller can stop.
+    pub fn feed(&mut self, payload: &str, on_event: &mut dyn FnMut(EngineEvent)) -> bool {
+        let payload = payload.trim();
+        if payload.is_empty() {
+            return true;
+        }
+        if payload == "[DONE]" {
+            self.done = true;
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return true;
+        };
+        let Some(kind) = value.get("type").and_then(|t| t.as_str()) else {
+            return true;
+        };
+        match kind {
+            // Reasoning summary and raw reasoning text both land in <think>.
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(d) = value.get("delta").and_then(|d| d.as_str())
+                    && !d.is_empty()
+                {
+                    self.open_thinking(on_event);
+                    on_event(EngineEvent::Text(d.to_string()));
+                }
+            }
+            "response.output_text.delta" => {
+                if let Some(d) = value.get("delta").and_then(|d| d.as_str())
+                    && !d.is_empty()
+                {
+                    self.close_thinking(on_event);
+                    on_event(EngineEvent::Text(d.to_string()));
+                }
+            }
+            // A finished output item: only `function_call` items matter here —
+            // text arrived as deltas already, and re-reading it would duplicate.
+            "response.output_item.done" => {
+                if let Some(item) = value.get("item")
+                    && item.get("type").and_then(|t| t.as_str()) == Some("function_call")
+                {
+                    let name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !name.is_empty() {
+                        self.tool_calls.push(NativeToolCall {
+                            name,
+                            // `call_id` is the id a `function_call_output` pairs
+                            // on; the item's own `id` is not interchangeable.
+                            id: item
+                                .get("call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            arguments: item
+                                .get("arguments")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                if let Some(usage) = value
+                    .get("response")
+                    .and_then(|r| r.get("usage"))
+                    .and_then(parse_responses_usage)
+                {
+                    self.usage = Some(usage);
+                }
+                self.done = true;
+                return false;
+            }
+            "response.failed" | "error" => {
+                self.done = true;
+                return false;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn open_thinking(&mut self, on_event: &mut dyn FnMut(EngineEvent)) {
+        if !self.thinking_open {
+            on_event(EngineEvent::Text("<think>".to_string()));
+            self.thinking_open = true;
+        }
+    }
+
+    fn close_thinking(&mut self, on_event: &mut dyn FnMut(EngineEvent)) {
+        if self.thinking_open {
+            on_event(EngineEvent::Text("</think>".to_string()));
+            self.thinking_open = false;
+        }
+    }
+
+    /// Flushes an open thinking block and the synthesized DSML tool stanza.
+    /// Idempotent: safe to call once at end of stream.
+    pub fn finish(&mut self, on_event: &mut dyn FnMut(EngineEvent)) {
+        if self.flushed {
+            return;
+        }
+        self.flushed = true;
+        self.close_thinking(on_event);
+        if !self.tool_calls.is_empty() {
+            on_event(EngineEvent::Text(synthesize_dsml(&self.tool_calls)));
+        }
+    }
+
+    /// The finalized native tool calls, for the id side-map.
+    #[must_use]
+    pub fn finalized_calls(&self) -> Vec<NativeToolCall> {
+        self.tool_calls.clone()
+    }
+}
+
+impl SseTranslator for ResponsesTranslator {
+    fn feed(&mut self, payload: &str, on_event: &mut dyn FnMut(EngineEvent)) -> bool {
+        ResponsesTranslator::feed(self, payload, on_event)
+    }
+    fn finish(&mut self, on_event: &mut dyn FnMut(EngineEvent)) {
+        ResponsesTranslator::finish(self, on_event);
+    }
+    fn usage(&self) -> Option<ProviderUsage> {
+        ResponsesTranslator::usage(self)
+    }
+}
+
+/// Reads a Responses-API `usage` object. The field names differ from
+/// chat-completions (`input_tokens`/`output_tokens`, not
+/// `prompt_tokens`/`completion_tokens`), and cached prompt tokens are reported
+/// *inside* `input_tokens` — so they are recorded as cache reads and subtracted
+/// from the uncached remainder, matching what the Anthropic path reports and
+/// keeping `ctx_used` from double-counting them.
+fn parse_responses_usage(value: &serde_json::Value) -> Option<ProviderUsage> {
+    if value.is_null() {
+        return None;
+    }
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    };
+    let input = i32::try_from(field("input_tokens")).unwrap_or(i32::MAX);
+    let output = i32::try_from(field("output_tokens")).unwrap_or(i32::MAX);
+    let cached = value
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+        .unwrap_or(0)
+        .clamp(0, input);
+    Some(ProviderUsage {
+        input_tokens: input - cached,
+        output_tokens: output,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: cached,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -720,7 +935,9 @@ fn ureq_provider_request(
         .header("Content-Type", "application/json")
         .header("Accept-Encoding", "identity");
     match kind {
-        ProviderKind::OpenAi => request.header("Authorization", format!("Bearer {api_key}")),
+        ProviderKind::OpenAi | ProviderKind::OpenAiResponses => {
+            request.header("Authorization", format!("Bearer {api_key}"))
+        }
         ProviderKind::Anthropic => request
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
@@ -804,6 +1021,29 @@ fn open_provider_stream(
         }
     }
     Err(last_err.unwrap_or_else(|| "provider request: connection failed".to_string()))
+}
+
+/// True when a provider error says function tools are unavailable on
+/// `/chat/completions` and the Responses API must be used instead, e.g.
+/// "Function tools with `reasoning_effort` are not supported for `<model>` in
+/// `/v1/chat/completions`. To use function tools, use /v1/responses or set
+/// `reasoning_effort` to 'none'".
+///
+/// Setting `reasoning_effort` to "none" is *not* a usable workaround on those
+/// models: they reject that value in turn ("Supported values are: 'low',
+/// 'medium', 'high', and 'xhigh'"), which is why the only fix is to switch
+/// endpoints. The second message is matched too, so a gateway that reports the
+/// value error first also triggers the switch.
+///
+/// Matched against the whole error string (status prefix included) because that
+/// is what reaches [`ProviderEngine::generate`]; `400` is required so a 5xx
+/// echoing the same prose cannot flip the endpoint.
+fn requires_responses_api(error: &str) -> bool {
+    error.contains("400")
+        && error.contains("reasoning_effort")
+        && (error.contains("/responses")
+            || error.contains("tool")
+            || error.contains("does not support"))
 }
 
 /// The Anthropic beta opt-in required for the 1-hour prompt-cache tier.
@@ -1045,7 +1285,9 @@ pub fn build_openai_request(
         "top_p": round2(opts.top_p),
     });
     if opts.n_predict > 0 {
-        body["max_tokens"] = serde_json::json!(opts.n_predict);
+        // Newer OpenAI models (o-series, GPT-5) reject `max_tokens` outright and
+        // require `max_completion_tokens`; older models accept the latter too.
+        body["max_completion_tokens"] = serde_json::json!(opts.n_predict);
     }
     if !tools.is_empty() {
         let wire_tools: Vec<serde_json::Value> = tools
@@ -1065,6 +1307,118 @@ pub fn build_openai_request(
         body["tool_choice"] = serde_json::json!("auto");
         // plank dispatches serially and re-feeds; parallel batches would
         // complicate the single-transcript reconciliation (§4.3).
+        body["parallel_tool_calls"] = serde_json::json!(false);
+    }
+    body
+}
+
+/// Builds an `OpenAI` **Responses** API (`/responses`) request body.
+///
+/// Why a second `OpenAI` shape exists: the newest reasoning models refuse
+/// function tools on `/chat/completions` at any reasoning effort — they demand
+/// `reasoning_effort: "none"`, which those same models then reject as an
+/// unsupported value (only `low`..`xhigh` exist). `/responses` is the only
+/// endpoint where tools and reasoning coexist for them.
+///
+/// Differences from [`build_openai_request`] that matter:
+/// - the system prompt is `instructions`, not a message;
+/// - tool specs are flat (`{type, name, description, parameters}`), not nested
+///   under `function`;
+/// - a tool call and its result are top-level input items (`function_call` /
+///   `function_call_output`) paired by `call_id`;
+/// - `max_output_tokens` replaces `max_completion_tokens`;
+/// - `temperature`/`top_p` are omitted, as the reasoning models this path
+///   exists for reject them (the same reason the Anthropic path omits them);
+/// - `reasoning.effort` is left to the server default, since the only value
+///   plank could pick would be a guess about a model it does not know.
+#[must_use]
+pub fn build_responses_request(
+    model: &str,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+    opts: &GenerationOptions,
+) -> serde_json::Value {
+    let mut input = Vec::new();
+    for m in messages {
+        match m.role {
+            ChatRole::System => {
+                // Folded into `instructions` by the caller when it is the turn's
+                // system prompt; a mid-transcript system message becomes a
+                // developer item so it keeps its position.
+                input.push(serde_json::json!({
+                    "role": "developer",
+                    "content": [{ "type": "input_text", "text": m.content }],
+                }));
+            }
+            ChatRole::User => input.push(serde_json::json!({
+                "role": "user",
+                "content": [{ "type": "input_text", "text": m.content }],
+            })),
+            ChatRole::Assistant => {
+                if !m.content.is_empty() {
+                    input.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": m.content }],
+                    }));
+                }
+                for tc in &m.tool_calls {
+                    input.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    }));
+                }
+            }
+            ChatRole::Tool => {
+                // Without a retained id there is no `call_id` to pair on, so the
+                // result degrades to a user message — the same fallback the
+                // chat-completions path takes (design §4.4 / constraint 8).
+                if let Some(id) = &m.tool_call_id {
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": id,
+                        "output": m.content,
+                    }));
+                } else {
+                    input.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": format!("Tool result:\n{}", m.content),
+                        }],
+                    }));
+                }
+            }
+        }
+    }
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "input": input,
+        "stream": true,
+    });
+    if !system.is_empty() {
+        body["instructions"] = serde_json::json!(system);
+    }
+    if opts.n_predict > 0 {
+        body["max_output_tokens"] = serde_json::json!(opts.n_predict);
+    }
+    if !tools.is_empty() {
+        let wire_tools: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                })
+            })
+            .collect();
+        body["tools"] = serde_json::json!(wire_tools);
+        body["tool_choice"] = serde_json::json!("auto");
         body["parallel_tool_calls"] = serde_json::json!(false);
     }
     body
@@ -1179,6 +1533,13 @@ impl ProviderEngine {
                 let messages = [ChatMessage::new(ChatRole::User, text)];
                 build_openai_request(&self.model, "", &messages, &[], opts)
             }
+            (ProviderKind::OpenAiResponses, Prompt::Structured(turn)) => {
+                build_responses_request(&self.model, turn.system, turn.messages, turn.tools, opts)
+            }
+            (ProviderKind::OpenAiResponses, Prompt::Flat(text)) => {
+                let messages = [ChatMessage::new(ChatRole::User, text)];
+                build_responses_request(&self.model, "", &messages, &[], opts)
+            }
             (ProviderKind::Anthropic, Prompt::Structured(turn)) => build_anthropic_request(
                 &self.model,
                 turn.system,
@@ -1199,6 +1560,7 @@ impl ProviderEngine {
     fn endpoint(&self) -> &'static str {
         match self.kind {
             ProviderKind::OpenAi => "/chat/completions",
+            ProviderKind::OpenAiResponses => "/responses",
             ProviderKind::Anthropic => "/messages",
         }
     }
@@ -1207,6 +1569,7 @@ impl ProviderEngine {
     fn translator(&self) -> Box<dyn SseTranslator> {
         match self.kind {
             ProviderKind::OpenAi => Box::new(OpenAiTranslator::new()),
+            ProviderKind::OpenAiResponses => Box::new(ResponsesTranslator::new()),
             ProviderKind::Anthropic => Box::new(AnthropicTranslator::new()),
         }
     }
@@ -1257,9 +1620,6 @@ impl Engine for ProviderEngine {
         _greedy: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<GenerationStats, EngineError> {
-        let body = self.request_for(prompt, opts);
-        let payload = serde_json::to_string(&body)
-            .map_err(|e| EngineError::new(format!("serialize provider request: {e}")))?;
         // Clocked from before the request so `tps` is the honest wall-clock rate
         // for the whole pass, retries and all, exactly as the local engines
         // report it.
@@ -1274,7 +1634,6 @@ impl Engine for ProviderEngine {
             tps: 0.0,
         }));
 
-        let mut translator = self.translator();
         // Connect, send, retries and the body read all run on one reader thread,
         // consumed here through a channel, so `interrupt` is polled on a clock
         // rather than per arriving event and the blocking send never sits on the
@@ -1283,30 +1642,57 @@ impl Engine for ProviderEngine {
         // — could never be cancelled) and did the send synchronously here (a
         // black-holed connect froze the turn with nothing for Ctrl-C to reach).
         // Both are now covered by `pump_sse`'s clock below.
-        let url = format!("{}{}", self.base_url, self.endpoint());
-        let kind = self.kind;
-        let api_key = self.api_key.clone();
-        let rx = crate::remote::spawn_sse_stream(move || {
-            open_provider_stream(kind, &url, &api_key, &payload)
-        });
         // When the first text arrives: everything before it is time-to-first-
         // token (connect, queue, server prefill) and none of it is decode.
         let first_text = std::cell::Cell::new(None);
-        let end = {
-            let mut tap = |ev: EngineEvent| {
-                if first_text.get().is_none() && matches!(ev, EngineEvent::Text(_)) {
-                    first_text.set(Some(Instant::now()));
-                }
-                on_event(ev);
+        let mut translator = self.translator();
+        let end = loop {
+            let body = self.request_for(prompt, opts);
+            let payload = serde_json::to_string(&body)
+                .map_err(|e| EngineError::new(format!("serialize provider request: {e}")))?;
+            let url = format!("{}{}", self.base_url, self.endpoint());
+            let kind = self.kind;
+            let api_key = self.api_key.clone();
+            let rx = crate::remote::spawn_sse_stream(move || {
+                open_provider_stream(kind, &url, &api_key, &payload)
+            });
+            let outcome = {
+                let mut tap = |ev: EngineEvent| {
+                    if first_text.get().is_none() && matches!(ev, EngineEvent::Text(_)) {
+                        first_text.set(Some(Instant::now()));
+                    }
+                    on_event(ev);
+                };
+                crate::remote::pump_sse(
+                    &rx,
+                    crate::remote::STREAM_IDLE_TIMEOUT,
+                    crate::remote::STREAM_POLL_INTERVAL,
+                    interrupt,
+                    |data| translator.feed(data, &mut tap),
+                )
             };
-            crate::remote::pump_sse(
-                &rx,
-                crate::remote::STREAM_IDLE_TIMEOUT,
-                crate::remote::STREAM_POLL_INTERVAL,
-                interrupt,
-                |data| translator.feed(data, &mut tap),
-            )
-            .map_err(EngineError::new)?
+            match outcome {
+                Ok(end) => break end,
+                // The newest reasoning models refuse function tools on
+                // `/chat/completions` and name `/responses` as the only place
+                // they work. Switch this engine over and retry once: the
+                // rejection arrives before any byte of output (so nothing is
+                // duplicated), and the switch sticks for the rest of the
+                // session rather than paying a failed request per turn.
+                Err(e)
+                    if self.kind == ProviderKind::OpenAi
+                        && first_text.get().is_none()
+                        && requires_responses_api(&e) =>
+                {
+                    self.kind = ProviderKind::OpenAiResponses;
+                    translator = self.translator();
+                    on_event(EngineEvent::Notice(format!(
+                        "provider: {} needs the Responses API for tools; switching to /responses",
+                        self.model
+                    )));
+                }
+                Err(e) => return Err(EngineError::new(e)),
+            }
         };
         let interrupted = end == crate::remote::SseEnd::Interrupted;
 
@@ -1581,6 +1967,189 @@ mod tests {
         assert_eq!(body["tools"][0]["function"]["name"], "read");
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    /// Newer `OpenAI` models reject `max_tokens` (HTTP 400) and require
+    /// `max_completion_tokens`; the `OpenAI`-compatible path must never send the
+    /// old field name.
+    #[test]
+    fn openai_uses_max_completion_tokens() {
+        let opts = GenerationOptions {
+            n_predict: 64,
+            ..GenerationOptions::default()
+        };
+        let body = build_openai_request("gpt-5", "", &[], &[], &opts);
+        assert_eq!(body["max_completion_tokens"], 64);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+        // The Anthropic path keeps its own `max_tokens` field.
+        let anthropic = build_anthropic_request("claude-opus-5", "", &[], &[], &opts, true);
+        assert_eq!(anthropic["max_tokens"], 64);
+    }
+
+    /// The two 400s a `/chat/completions` request draws from a reasoning model
+    /// that only serves tools on `/responses`. Both must flip the endpoint;
+    /// `reasoning_effort: "none"` is a dead end because the model rejects that
+    /// value in turn.
+    #[test]
+    fn responses_api_requirement_is_recognized() {
+        let refuses_tools = "provider request failed (HTTP 400): Function tools with \
+             reasoning_effort are not supported for gpt-6-astra in /v1/chat/completions. \
+             To use function tools, use /v1/responses or set reasoning_effort to 'none'.";
+        let refuses_none = "provider request failed (HTTP 400): Unsupported value: \
+             'reasoning_effort' does not support 'none' with this model. Supported \
+             values are: 'low', 'medium', 'high', and 'xhigh'.";
+        assert!(requires_responses_api(refuses_tools));
+        assert!(requires_responses_api(refuses_none));
+        // Unrelated failures must never move the endpoint.
+        assert!(!requires_responses_api(
+            "provider request failed (HTTP 400): invalid api key"
+        ));
+        assert!(!requires_responses_api(
+            "provider request failed (HTTP 500): reasoning_effort backend blew up"
+        ));
+    }
+
+    /// The Responses body differs from chat-completions in every field that
+    /// matters: `instructions`, `input` items, flat tool specs,
+    /// `max_output_tokens`, and no sampling parameters.
+    #[test]
+    fn responses_request_shape() {
+        let tools = vec![ToolSpec {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        }];
+        let messages = vec![ChatMessage::new(ChatRole::User, "hello")];
+        let opts = GenerationOptions {
+            n_predict: 128,
+            ..GenerationOptions::default()
+        };
+        let body =
+            build_responses_request("gpt-6-astra", "You are helpful", &messages, &tools, &opts);
+        assert_eq!(body["model"], "gpt-6-astra");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["instructions"], "You are helpful");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+        // Flat tool spec, not nested under `function`.
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert!(body["tools"][0].get("function").is_none(), "{body}");
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["max_output_tokens"], 128);
+        // Fields the reasoning models this path exists for reject.
+        for dead in [
+            "messages",
+            "max_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "top_p",
+        ] {
+            assert!(body.get(dead).is_none(), "{dead} must not be sent: {body}");
+        }
+    }
+
+    /// A tool call and its result pair by `call_id` as top-level input items,
+    /// and an id-less result degrades to a user message rather than being lost.
+    #[test]
+    fn responses_request_threads_tool_calls_and_results() {
+        let messages = vec![
+            ChatMessage::new(ChatRole::User, "read it"),
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "on it".to_string(),
+                tool_calls: vec![crate::engine::ToolCallRef {
+                    name: "read".to_string(),
+                    id: "call_1".to_string(),
+                    arguments: r#"{"path":"a.txt"}"#.to_string(),
+                }],
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: ChatRole::Tool,
+                content: "contents".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_1".to_string()),
+            },
+            ChatMessage {
+                role: ChatRole::Tool,
+                content: "orphan".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+        ];
+        let body = build_responses_request("m", "", &messages, &[], &GenerationOptions::default());
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"][0]["type"], "output_text");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[2]["arguments"], r#"{"path":"a.txt"}"#);
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[3]["output"], "contents");
+        assert_eq!(input[4]["role"], "user");
+        assert!(
+            input[4]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("orphan")
+        );
+        // No system prompt, no `instructions` key.
+        assert!(body.get("instructions").is_none(), "{body}");
+    }
+
+    /// A `/responses` stream becomes the same events as the other providers:
+    /// reasoning wrapped in one `<think>` block, answer text plain, and native
+    /// `function_call` items re-emitted as the canonical DSML stanza.
+    #[test]
+    fn responses_stream_to_events_and_dsml() {
+        let frames = [
+            r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","delta":"weighing"}"#,
+            r#"{"type":"response.output_text.delta","delta":"Reading "}"#,
+            r#"{"type":"response.output_text.delta","delta":"the file."}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","name":"read","call_id":"call_9","arguments":"{\"path\":\"a.txt\"}"}}"#,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":100,"output_tokens":7,"input_tokens_details":{"cached_tokens":40}}}}"#,
+        ];
+        let mut tr = ResponsesTranslator::new();
+        let mut events = Vec::new();
+        for f in frames {
+            let live = tr.feed(f, &mut |e| events.push(e));
+            // Only the terminal event stops the stream.
+            assert_eq!(live, !f.contains("response.completed"), "{f}");
+        }
+        tr.finish(&mut |e| events.push(e));
+
+        let text = collect_text(&events);
+        assert!(
+            text.starts_with("<think>weighing</think>"),
+            "reasoning must be wrapped: {text}"
+        );
+        assert!(text.contains("Reading the file."), "{text}");
+
+        // The stanza the shared dispatcher parses.
+        let mut parser = DsmlParser::new();
+        parser.feed(text.as_bytes());
+        assert_eq!(parser.state(), DsmlState::Done, "raw: {text}");
+        let calls = parser.calls();
+        assert_eq!(calls.len(), 1, "{text}");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arg_value("path"), Some("a.txt"));
+        assert_eq!(
+            tr.finalized_calls()[0].id,
+            "call_9",
+            "call_id is what a function_call_output pairs on"
+        );
+
+        // Cached prompt tokens are reported as reads, not double-counted in
+        // `input_tokens`.
+        let usage = tr.usage().expect("usage");
+        assert_eq!(usage.input_tokens, 60);
+        assert_eq!(usage.cache_read_input_tokens, 40);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
     }
 
     #[test]
