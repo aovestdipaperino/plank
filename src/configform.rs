@@ -56,6 +56,7 @@ pub enum FieldId {
     ToolsRecall,
     ToolsFanout,
     ToolsRunCode,
+    ToolsBashNotify,
     ContextMicrocompact,
 }
 
@@ -344,6 +345,13 @@ pub static FIELDS: &[Field] = &[
         Kind::Bool,
     ),
     f(
+        FieldId::ToolsBashNotify,
+        "tools",
+        "bashNotify",
+        "wake the model when a background bash job finishes",
+        Kind::Bool,
+    ),
+    f(
         FieldId::ContextMicrocompact,
         "context",
         "microcompact",
@@ -427,6 +435,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::ToolsRecall => s.tools.recall.to_string(),
         FieldId::ToolsFanout => s.tools.fanout.to_string(),
         FieldId::ToolsRunCode => s.tools.run_code.to_string(),
+        FieldId::ToolsBashNotify => s.tools.bash_notify.to_string(),
         FieldId::ContextMicrocompact => s.context.microcompact.to_string(),
     }
 }
@@ -590,6 +599,7 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::ToolsRecall
         | FieldId::ToolsFanout
         | FieldId::ToolsRunCode
+        | FieldId::ToolsBashNotify
         | FieldId::ContextMicrocompact => {
             let b = parse_bool(raw)?;
             set_bool(s, id, b);
@@ -626,6 +636,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::ToolsRecall => s.tools.recall = b,
         FieldId::ToolsFanout => s.tools.fanout = b,
         FieldId::ToolsRunCode => s.tools.run_code = b,
+        FieldId::ToolsBashNotify => s.tools.bash_notify = b,
         FieldId::ContextMicrocompact => s.context.microcompact = b,
         _ => {}
     }

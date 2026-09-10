@@ -3,7 +3,9 @@
 Implementation plan for letting a finished bash job wake the model instead of
 making the model poll for it.
 
-Status: **plan, not started.**
+Status: **shipped behind `tools.bashNotify` (default off).** Steps 1 through 7
+and the prompt sentence, setting, `/jobs` command and desktop notice from step
+8 landed together. Deviations from the plan below are recorded in §7.
 
 ## 1. The problem
 
@@ -252,3 +254,31 @@ default on:
   intent.
 - Notifying about MCP tool calls or sub-agents. Sub-agents already return at
   their own boundary; MCP has no long-running call model.
+
+## 7. What shipped, and where it differs from the plan
+
+- **No `announced` flag.** The job table itself is the source of truth:
+  `job_tool_result` already removes a job the moment the model observes it as
+  `status=done`, so any job still in the table and not running finished
+  unseen. `BashJobs::take_finished` polls, removes and returns those. This is
+  simpler than §3.3 and has the same invariant: one notification per job,
+  none if the model saw the exit itself.
+- **Headless protocol.** The event is a stderr marker in the existing
+  `+DWARFSTAR_*` family, `+DWARFSTAR_JOBS_FINISHED <n>`, not a JSON line on
+  stdout, and plank does run the turn itself after appending the
+  notification. The driver still sees the marker before any output from that
+  turn, so it can tell an auto-turn from a reply to its own prompt.
+- **REPL stdin thread.** `run_repl_plain_local` reads stdin on a detached
+  helper thread and the loop uses `recv_timeout(250 ms)`. EOF and read errors
+  travel over the same channel. Ctrl-C behavior is unchanged because the
+  interrupt flag was never tied to `read_line`.
+- **Not shipped:** the footer job count (§3.7), the `JobFinished` hook event,
+  and the per-idle wake budget (§3.5). The wake budget was dropped because a
+  notification is only ever produced by a job the model itself started; a
+  model that reacts to each wake by starting a new job is still bounded by
+  the tool-call loop guards on the turn that starts it. Revisit if a real
+  session shows otherwise.
+- **Setting is off by default.** Turning it on also appends one sentence to
+  the shell rules, so it churns the `fp1` system-prompt fingerprint like
+  `tools.recall` does. The §5 smoke test has not been run against the real
+  engine yet; flip the default only after it passes.

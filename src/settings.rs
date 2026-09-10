@@ -60,7 +60,8 @@
 //!   tearing down and rebuilding the whole inference stack mid-session.
 //! - `safety.sandbox`, `safety.btwSuspend` — copied into `AgentConfig` once at
 //!   startup.
-//! - `tools.recall`, `tools.fanout`, `tools.runCode`, `git.signCommits` — these
+//! - `tools.recall`, `tools.fanout`, `tools.runCode`, `tools.bashNotify`,
+//!   `git.signCommits` — these
 //!   feed the system prompt text, which is built once per session and then
 //!   KV-cached (see `docs/KV-CACHE.md`); applying a change live would silently
 //!   invalidate a cache the model's prefill is relying on to be exactly what it
@@ -357,6 +358,11 @@ pub struct ToolsSettings {
     /// prompt and churns the `fp1` fingerprint — a deliberate, versioned
     /// deviation, documented in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
     pub run_code: bool,
+    /// Whether a bash job that finishes after the model stopped watching it
+    /// wakes the model with a notification (`docs/BACKGROUND-TASKS.md`).
+    /// Default off while the feature is in beta: on, it also appends one
+    /// sentence to the shell rules, which churns the `fp1` fingerprint.
+    pub bash_notify: bool,
 }
 
 impl Default for ToolsSettings {
@@ -370,6 +376,7 @@ impl Default for ToolsSettings {
             recall: true,
             fanout: true,
             run_code: true,
+            bash_notify: false,
         }
     }
 }
@@ -733,6 +740,10 @@ impl Settings {
         if let Some(v) = boolean(tools, "runCode") {
             self.tools.run_code = v;
             self.note("tools.runCode", origin);
+        }
+        if let Some(v) = boolean(tools, "bashNotify") {
+            self.tools.bash_notify = v;
+            self.note("tools.bashNotify", origin);
         }
 
         self.overlay_agents_and_worktree(&root, origin);
@@ -1922,6 +1933,19 @@ mod tests {
         let s = Settings::load_from_paths(&[low], &[high]);
         assert_eq!(s.kvcache.max_bytes, 222);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tools_bash_notify_parses_and_defaults_off() {
+        assert!(!Settings::default().tools.bash_notify);
+        let dir = std::env::temp_dir().join(format!("plank-settings-bn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"tools":{"bashNotify":true}}"#).expect("write");
+        // The user layer: a plugin layer may not set `tools.*` at all.
+        let s = Settings::load_from_paths(&[], std::slice::from_ref(&path));
+        assert!(s.tools.bash_notify);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -247,7 +247,7 @@ module for Y), call the agent tool with a fully specified task and continue from
 for several independent parts use fanout. Your context then holds conclusions, not file dumps.\n",
     );
     out.push_str("\n## Shell\n\n");
-    out.push_str(SHELL_RULES);
+    out.push_str(&shell_rules());
     out.push_str("\n## Git\n\n");
     out.push_str(GIT_RULES);
     if crate::settings::active().git.sign_commits {
@@ -726,6 +726,22 @@ Do not sleep between commands that can run immediately. To wait on a job, poll i
 A refused tool call means the user declined it. Do not re-issue the same call; change approach or ask. Treat hook output as feedback from the user.
 ";
 
+/// Appended to [`SHELL_RULES`] when `tools.bashNotify` is on: the model may
+/// leave a job running and end its turn, because plank wakes it with the
+/// job's final observation (`docs/BACKGROUND-TASKS.md` §3.6). Without this
+/// line the model keeps polling and the feature is invisible. Changes `fp1`.
+pub const BASH_NOTIFY_RULE: &str = "When a bash job is still running you may end your turn: plank notifies you automatically when it finishes, so do not poll or sleep to wait for it.
+";
+
+/// The shell rules plus [`BASH_NOTIFY_RULE`] when the setting is on.
+fn shell_rules() -> String {
+    let mut out = SHELL_RULES.to_string();
+    if crate::settings::active().tools.bash_notify {
+        out.push_str(BASH_NOTIFY_RULE);
+    }
+    out
+}
+
 /// Git conduct the model is not otherwise told. Body only, see
 /// [`SHELL_RULES`] for why. Adapted from the Bash git safety protocol in the
 /// Claude Code system prompts; the model runs git in roughly a tenth of the
@@ -743,7 +759,7 @@ fn append_working_style(out: &mut String) {
     out.push('\n');
     out.push_str(WORKING_STYLE);
     out.push_str("\n# Shell\n\n");
-    out.push_str(SHELL_RULES);
+    out.push_str(&shell_rules());
     out.push_str("\n# Git\n\n");
     out.push_str(GIT_RULES);
 }
@@ -1405,6 +1421,23 @@ mod tests {
             !text.contains("\"recall\""),
             "tools.recall = false removes the schema"
         );
+    }
+
+    #[test]
+    fn bash_notify_rule_rides_on_the_setting() {
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        assert!(!shell_rules().contains(BASH_NOTIFY_RULE), "off by default");
+        assert_eq!(
+            shell_rules(),
+            SHELL_RULES,
+            "off leaves the C-adjacent bytes alone"
+        );
+        let mut s = crate::settings::Settings::default();
+        s.tools.bash_notify = true;
+        crate::settings::install_for_test(s);
+        let rules = shell_rules();
+        assert!(rules.starts_with(SHELL_RULES));
+        assert!(rules.ends_with(BASH_NOTIFY_RULE));
     }
 
     #[test]

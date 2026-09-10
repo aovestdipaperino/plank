@@ -3997,6 +3997,8 @@ impl Agent<'_> {
                     self.report_guard(MAIN_REPEAT_TRIPS_NOTICE);
                     return Ok(());
                 }
+                let woke = self.drain_job_notifications();
+                self.print_job_wake(woke);
                 continue;
             }
             if !finished.calls.is_empty() {
@@ -4061,6 +4063,8 @@ impl Agent<'_> {
                     self.report_guard(NO_PROGRESS_NOTICE);
                     return Ok(());
                 }
+                let woke = self.drain_job_notifications();
+                self.print_job_wake(woke);
                 continue;
             }
             let mut renderer = stream.into_sink().into_renderer();
@@ -5680,6 +5684,7 @@ impl Agent<'_> {
             "/mtp" => println!("{}", self.mtp_command(arg)),
             "/temp" => println!("{}", self.temp_command(arg)),
             "/loopguard" | "/lg" => println!("{}", loopguard_command(arg)),
+            "/jobs" => println!("{}", self.jobs_command()),
             "/think" => {
                 // A level change that moves the effort preamble re-warms the KV
                 // before returning. The plain REPL has no persistent prompt to
@@ -10533,6 +10538,35 @@ impl Agent<'_> {
                         last_activity = Instant::now();
                     }
                 }
+                // A background job finished while the prompt sat idle: wake
+                // the model with its observation (`docs/BACKGROUND-TASKS.md`
+                // §3.4). Never over a draft the user is still typing, and
+                // never under a modal pane, where a turn would fight the
+                // dialog for the screen.
+                if input.buf.text().is_empty()
+                    && config_form.is_none()
+                    && kv_pane.is_none()
+                    && resume_pane.is_none()
+                    && !arcade.is_open()
+                    && wasm_frame.is_none()
+                    && self.has_finished_jobs()
+                {
+                    let n = self.drain_job_notifications();
+                    if n > 0 {
+                        log.push_dim(Self::job_wake_line(n));
+                        Self::notify_jobs_finished(n);
+                        self.tui_turn(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut input,
+                            &mut btw_panel,
+                            &mut arcade,
+                            &mut sub_pane,
+                        )?;
+                        last_activity = Instant::now();
+                    }
+                }
                 continue;
             };
             // What counts as the user being here: keys, mouse, and pastes.
@@ -12479,6 +12513,10 @@ impl Agent<'_> {
                     return Ok(());
                 }
                 self.drain_queued(shared, tx);
+                let woke = self.drain_job_notifications();
+                if woke > 0 {
+                    let _ = tx.send(UiEvent::Dim(Self::job_wake_line(woke)));
+                }
                 continue;
             }
             if !out.calls.is_empty() {
@@ -12539,6 +12577,10 @@ impl Agent<'_> {
                     return Ok(());
                 }
                 self.drain_queued(shared, tx);
+                let woke = self.drain_job_notifications();
+                if woke > 0 {
+                    let _ = tx.send(UiEvent::Dim(Self::job_wake_line(woke)));
+                }
                 continue;
             }
             // Stop hooks: exit 2 feeds stderr to the model and the turn
@@ -12752,6 +12794,86 @@ impl Agent<'_> {
     ) -> String {
         self.absorb_leftover(log, shared.take_queued());
         err
+    }
+
+    /// Appends a notification for background jobs that finished since the
+    /// model last looked, if any, returning the number of jobs announced.
+    ///
+    /// Called at every turn boundary where a user message may legally join
+    /// the transcript (after each tool round, and from `wake_for_jobs` when
+    /// idle). Off unless `tools.bashNotify` is set; sidechains never drain,
+    /// since the jobs belong to the main transcript (`docs/BACKGROUND-TASKS.md`).
+    fn drain_job_notifications(&mut self) -> usize {
+        if !crate::settings::active().tools.bash_notify || self.in_sidechain() {
+            return 0;
+        }
+        let finished = self.tool_ctx.bash.take_finished();
+        let Some(text) = crate::tools::bash::render_notification(&finished) else {
+            return 0;
+        };
+        self.session.push(Message::user(text));
+        finished.len()
+    }
+
+    /// Plain-stdout mirror of the TUI's dim wake line; silent for `0`.
+    fn print_job_wake(&self, n: usize) {
+        if n > 0 {
+            println!("{}", self.debug_line(&Self::job_wake_line(n)));
+        }
+    }
+
+    /// Starts a turn driven by finished background jobs rather than a user
+    /// line (plain REPL and headless). Returns `Ok(false)` without generating
+    /// when nothing has finished (`docs/BACKGROUND-TASKS.md` §3.4).
+    ///
+    /// # Errors
+    /// Propagates the turn's engine error.
+    pub fn wake_for_jobs(&mut self) -> Result<bool, String> {
+        let n = self.drain_job_notifications();
+        if n == 0 {
+            return Ok(false);
+        }
+        self.print_job_wake(n);
+        Self::notify_jobs_finished(n);
+        self.run_turn()?;
+        Ok(true)
+    }
+
+    /// Desktop notice for a job finishing while the user is away from the
+    /// prompt; `notify` itself is a no-op when notifications are off.
+    fn notify_jobs_finished(n: usize) {
+        let body = if n == 1 {
+            "A background job finished; plank is reporting on it.".to_string()
+        } else {
+            format!("{n} background jobs finished; plank is reporting on them.")
+        };
+        crate::notify::notify("plank", &body);
+    }
+
+    /// The dim log line announcing that `n` jobs woke the model.
+    fn job_wake_line(n: usize) -> String {
+        if n == 1 {
+            "background job finished; notifying the model".to_string()
+        } else {
+            format!("{n} background jobs finished; notifying the model")
+        }
+    }
+
+    /// Whether an idle wake is pending: at least one background job has
+    /// finished unseen. Cheap (one `try_wait` per job); safe on any tick.
+    pub fn has_finished_jobs(&mut self) -> bool {
+        if !crate::settings::active().tools.bash_notify {
+            return false;
+        }
+        self.tool_ctx.bash.sweep();
+        self.tool_ctx.bash.has_finished()
+    }
+
+    /// `/jobs`: the background job table as static text, shared by both
+    /// front ends so the plain path needs no pane.
+    fn jobs_command(&mut self) -> String {
+        self.tool_ctx.bash.sweep();
+        self.tool_ctx.bash.render_table()
     }
 
     /// Moves user lines queued during the turn into the transcript between
@@ -13508,6 +13630,7 @@ impl Agent<'_> {
             "/mtp" => log.push_plain(self.mtp_command(arg)),
             "/temp" => log.push_plain(self.temp_command(arg)),
             "/loopguard" | "/lg" => log.push_plain(loopguard_command(arg)),
+            "/jobs" => log.push_plain(self.jobs_command()),
             "/think" => {
                 // Moving to (or off) `max` changes the effort preamble, which
                 // re-warms the KV inline — long enough to notice. Pin a throbber
@@ -16034,18 +16157,50 @@ fn handle_plain_line(agent: &mut Agent<'_>, line: &str) -> Result<bool, String> 
 /// The classic blocking plain REPL (no remote bridge): read a line, handle it,
 /// repeat until EOF.
 fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
-    let stdin = std::io::stdin();
+    // stdin is read on a helper thread so the loop can wake for a finished
+    // background job while nobody is typing (`docs/BACKGROUND-TASKS.md`
+    // §3.4). Lines arrive whole; `Ok(None)` is EOF. The thread is detached:
+    // it dies with the process, and a `read_line` blocked on a TTY cannot be
+    // interrupted from here anyway.
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<Option<String>>>();
+    std::thread::Builder::new()
+        .name("plank-stdin".into())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            loop {
+                let mut line = String::new();
+                let msg = match stdin.lock().read_line(&mut line) {
+                    Ok(0) => Ok(None),
+                    Ok(_) => Ok(Some(line)),
+                    Err(e) => Err(e),
+                };
+                let stop = !matches!(msg, Ok(Some(_)));
+                if tx.send(msg).is_err() || stop {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
     loop {
         print!("{}", status::prompt_text());
         std::io::stdout().flush().map_err(|e| e.to_string())?;
-        let mut line = String::new();
-        let n = stdin
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Ok(()); // EOF
-        }
+        let line = loop {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(Ok(Some(line))) => break line,
+                Ok(Ok(None)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(()); // EOF
+                }
+                Ok(Err(e)) => return Err(e.to_string()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if agent.has_finished_jobs() {
+                        println!();
+                        agent.wake_for_jobs()?;
+                        print!("{}", status::prompt_text());
+                        std::io::stdout().flush().map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        };
         if !handle_plain_line(agent, &line)? {
             return Ok(());
         }
@@ -16079,11 +16234,30 @@ pub fn run_non_interactive(
     // until stdin has been quiet for 200 ms, submit that buffer as one prompt,
     // repeat until EOF. (The C also queues input arriving mid-generation; the
     // synchronous port reads between turns instead.)
+    // With `tools.bashNotify` on, the idle wait ticks every 250 ms so a
+    // finished background job can be announced (`docs/BACKGROUND-TASKS.md`
+    // §3.4). The driver owns the loop: plank appends the notification, marks
+    // it on stderr, and runs the turn, then goes back to waiting.
     let mut eof = false;
     while !eof {
         eprintln!("+DWARFSTAR_WAITING");
-        let Some(prompt) = read_quiet_batched(&mut eof).map_err(|e| e.to_string())? else {
-            break;
+        let idle_ms = if crate::settings::active().tools.bash_notify {
+            250
+        } else {
+            -1
+        };
+        let Some(prompt) = read_quiet_batched(&mut eof, idle_ms).map_err(|e| e.to_string())? else {
+            if eof {
+                break;
+            }
+            if agent.has_finished_jobs() {
+                let n = agent.drain_job_notifications();
+                if n > 0 {
+                    eprintln!("+DWARFSTAR_JOBS_FINISHED {n}");
+                    agent.run_turn()?;
+                }
+            }
+            continue;
         };
         if prompt.trim().is_empty() {
             continue;
@@ -16099,20 +16273,28 @@ pub fn run_non_interactive(
 
 /// Reads one stdin batch: bytes accumulated until a 200 ms quiet window.
 ///
-/// Returns `None` at EOF with nothing buffered; sets `eof` once stdin closes.
-fn read_quiet_batched(eof: &mut bool) -> std::io::Result<Option<String>> {
-    read_batched_from(libc::STDIN_FILENO, eof)
+/// Returns `None` at EOF with nothing buffered, or when `idle_ms` (>= 0)
+/// elapsed with nothing buffered and `eof` still clear; sets `eof` once stdin
+/// closes. `-1` waits for input indefinitely.
+fn read_quiet_batched(eof: &mut bool, idle_ms: i32) -> std::io::Result<Option<String>> {
+    read_batched_from(libc::STDIN_FILENO, eof, idle_ms)
 }
 
 /// Reads one batch from `fd`: bytes accumulated until a 200 ms quiet window.
 ///
 /// Factored from [`read_quiet_batched`] so the pipe-split fix is testable
-/// without spawning a subprocess.
-fn read_batched_from(fd: std::os::fd::RawFd, eof: &mut bool) -> std::io::Result<Option<String>> {
+/// without spawning a subprocess. `idle_ms` bounds the wait for the first
+/// byte (`-1` = forever); a bounded wait that expires returns `Ok(None)`
+/// without setting `eof`.
+fn read_batched_from(
+    fd: std::os::fd::RawFd,
+    eof: &mut bool,
+    idle_ms: i32,
+) -> std::io::Result<Option<String>> {
     const QUIET_MS: i32 = 200;
     let mut buf = Vec::new();
     loop {
-        let timeout = if buf.is_empty() { -1 } else { QUIET_MS };
+        let timeout = if buf.is_empty() { idle_ms } else { QUIET_MS };
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -26027,6 +26209,113 @@ or the user's next message aborts before its first token"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A background job that finished before a tool round is announced to
+    /// the model at that round, once, as a user message after the tool result
+    /// and any queued lines (`docs/BACKGROUND-TASKS.md` §3.4 point 1).
+    #[test]
+    fn worker_turn_announces_finished_background_jobs_between_tool_rounds() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-jobs-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.bash_notify = true;
+        crate::settings::install_for_test(settings);
+        let stanza = concat!(
+            "Checking.\n",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo hi</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let engine = ScriptedEngine {
+            replies: vec![stanza.to_string(), "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("run echo"));
+
+        // A job "left running" by an earlier turn that exits before this one
+        // reaches its first tool boundary.
+        let id = agent
+            .tool_ctx
+            .bash
+            .start(&dir, "echo background-done", 30, None)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+
+        // user, assistant(tool call), user(tool result), user(notification),
+        // assistant(final)
+        let texts: Vec<&str> = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(texts.len(), 5, "got: {texts:#?}");
+        assert!(texts[2].starts_with("<tool_result>"));
+        let note = texts[3];
+        assert!(note.starts_with("<system-reminder>\n"), "got: {note}");
+        assert!(note.contains(crate::tools::bash::NOTIFICATION_HEADER));
+        assert!(note.contains(&format!("bash job={id} pid=")));
+        assert!(note.contains("exit_status=0\n"));
+        assert!(note.contains("background-done\n"));
+        assert!(texts[4].contains("Done."));
+        // Announced once: the table forgot the job.
+        assert!(agent.tool_ctx.bash.take_finished().is_empty());
+
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UiEvent::Dim(t) if t.contains("background job finished"))),
+            "the UI is told why the transcript grew"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With the feature off nothing is announced, even with a finished job
+    /// in the table, so parity sessions never see the new message.
+    #[test]
+    fn worker_turn_leaves_finished_jobs_alone_when_notify_is_off() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-jobs-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo hi</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let engine = ScriptedEngine {
+            replies: vec![stanza.to_string(), "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("run echo"));
+        agent
+            .tool_ctx
+            .bash
+            .start(&dir, "echo background-done", 30, None)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let shared = TurnShared::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        assert_eq!(agent.session.transcript.len(), 4);
+        assert!(!agent.has_finished_jobs(), "off means the tick never wakes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The second join site: lines a tool round never absorbed still have to
     /// leave the log's pending region and land in the transcript. Pins that
     /// `absorb_leftover` does both — the commit count and the pushed
@@ -26416,7 +26705,7 @@ or the user's next message aborts before its first token"
             drop(tx);
         });
         let mut eof = false;
-        let prompt = read_batched_from(rx, &mut eof).expect("read");
+        let prompt = read_batched_from(rx, &mut eof, -1).expect("read");
         writer.join().expect("writer joined");
         // The full prompt was collected — not truncated at 4096.
         assert_eq!(prompt.as_deref(), Some(payload.as_str()));

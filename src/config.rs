@@ -958,6 +958,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "alias for /loopguard",
     },
     SlashCommand {
+        name: "/jobs",
+        args: "",
+        desc: "list running and finished background bash jobs",
+    },
+    SlashCommand {
         name: "/notify",
         args: "[mode]",
         desc: "choose when a finished turn notifies you",
@@ -1079,6 +1084,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/frame"
             | "/templates"
             | "/tasks"
+            | "/jobs"
             | "/memory"
             | "/agent"
             | "/hooks"
@@ -2555,6 +2561,7 @@ mod tests {
         assert!(slash_command_known("/del 1"));
         assert!(slash_command_known("/strip"));
         assert!(slash_command_known("/kvcache"));
+        assert!(slash_command_known("/jobs"));
         assert!(slash_command_known("/kvcache gc"));
         assert!(!slash_command_known("/kvcaches"));
         assert!(slash_command_known("/history 10"));

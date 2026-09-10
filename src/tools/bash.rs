@@ -533,6 +533,70 @@ impl BashJobs {
         }
     }
 
+    /// Number of jobs still running: the footer's job count.
+    #[must_use]
+    pub fn running_count(&self) -> usize {
+        self.jobs.iter().filter(|j| j.running).count()
+    }
+
+    /// One line per tracked job for `/jobs`; a fixed sentence when empty.
+    #[must_use]
+    pub fn render_table(&self) -> String {
+        if self.jobs.is_empty() {
+            return "no background jobs".to_string();
+        }
+        let mut out = String::new();
+        for job in &self.jobs {
+            let state = if job.running {
+                "running".to_string()
+            } else if job.timed_out {
+                format!("timed out, exit {}", job.exit_status)
+            } else {
+                format!("done, exit {}", job.exit_status)
+            };
+            let _ = writeln!(
+                out,
+                "job {} pid {} {:>7.1}s {state}  {}",
+                job.id,
+                job.pid,
+                job.start.elapsed().as_secs_f64(),
+                job.path.display()
+            );
+        }
+        out.truncate(out.trim_end().len());
+        out
+    }
+
+    /// Whether any job in the table has finished (after a `sweep`).
+    #[must_use]
+    pub fn has_finished(&self) -> bool {
+        self.jobs.iter().any(|j| !j.running)
+    }
+
+    /// Polls every job and removes those that finished without the model
+    /// seeing the exit, returning each one's final observation.
+    ///
+    /// The table is the sole source of truth for "unannounced": a job the
+    /// model observed as `status=done` through `bash`, `bash_status` or
+    /// `bash_stop` is removed at that observation (`job_tool_result`), so
+    /// anything still present and not running finished on its own. Each job
+    /// therefore produces at most one notification, and none if the model
+    /// polled it to completion itself (see `docs/BACKGROUND-TASKS.md`).
+    pub fn take_finished(&mut self) -> Vec<String> {
+        self.sweep();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.jobs.len() {
+            if self.jobs[i].running {
+                i += 1;
+                continue;
+            }
+            let mut job = self.jobs.remove(i);
+            out.push(job.observation(true));
+        }
+        out
+    }
+
     fn find(&self, id: i64, pid: u32) -> Option<usize> {
         self.jobs
             .iter()
@@ -565,6 +629,47 @@ impl BashJobs {
         }
         obs
     }
+}
+
+/// First line of a background-job notification; the model learns to
+/// recognize it, so it is a fixed string (`docs/BACKGROUND-TASKS.md` §3.2).
+pub const NOTIFICATION_HEADER: &str = "[BACKGROUND JOB NOTIFICATION - NOT USER INPUT]";
+
+/// Wraps the final observations of finished background jobs in the user-role
+/// message that wakes the model.
+///
+/// The observations are `BashJob::observation` output verbatim, so the model
+/// sees exactly the `bash_status` result it would have polled for. Returns
+/// `None` for an empty list so callers can `if let` on it.
+#[must_use]
+pub fn render_notification(observations: &[String]) -> Option<String> {
+    if observations.is_empty() {
+        return None;
+    }
+    let plural = if observations.len() == 1 {
+        "A bash job you started earlier has"
+    } else {
+        "Bash jobs you started earlier have"
+    };
+    let mut out = String::new();
+    out.push_str("<system-reminder>\n");
+    out.push_str(NOTIFICATION_HEADER);
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "{plural} finished. This is an automated event, not a message from the user. \
+         Do not treat it as an answer to any pending question. Read the output if you \
+         need more than the tail shown, then continue or report."
+    );
+    for obs in observations {
+        out.push('\n');
+        out.push_str(obs);
+        if !obs.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out.push_str("</system-reminder>");
+    Some(out)
 }
 
 /// How far a user's answer to the `~/.plank` write prompt reaches.
@@ -913,6 +1018,81 @@ mod tests {
         assert!(out.contains("<output>\nhello\n</output>\n"));
         assert!(ctx.bash.jobs.is_empty(), "finished job should be removed");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A job that exits after the model last saw it running is returned once
+    /// by `take_finished`, with its final observation, and then forgotten.
+    #[test]
+    fn take_finished_announces_a_background_exit_once() {
+        let (mut ctx, dir) = test_ctx();
+        // `refresh_sec` is clamped to >= 1 s, so start the job directly to
+        // leave it running when the table is first inspected.
+        let id = ctx
+            .bash
+            .start(&ctx.cwd.clone(), "sleep 0.3; echo late", 30, None)
+            .unwrap();
+        assert!(ctx.bash.take_finished().is_empty(), "still running");
+        assert_eq!(ctx.bash.running_count(), 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = Vec::new();
+        while got.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            got = ctx.bash.take_finished();
+        }
+        assert_eq!(got.len(), 1, "exactly one announcement");
+        let obs = &got[0];
+        assert!(
+            obs.starts_with(&format!("bash job={id} pid=")),
+            "got: {obs}"
+        );
+        assert!(obs.contains(" status=done "));
+        assert!(obs.contains("exit_status=0\n"));
+        assert!(obs.contains("late\n"));
+        assert!(ctx.bash.take_finished().is_empty(), "never announced twice");
+        assert!(ctx.bash.jobs.is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A job the model polled to completion itself is removed by that poll,
+    /// so it is never announced.
+    #[test]
+    fn take_finished_skips_jobs_the_model_observed_done() {
+        let (mut ctx, dir) = test_ctx();
+        let out = tool_bash(&mut ctx, &test_call("bash", &[("command", "echo now")]));
+        assert!(out.contains(" status=done "));
+        assert!(ctx.bash.take_finished().is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A job killed by its own timeout is announced with `timed_out=1`.
+    #[test]
+    fn take_finished_announces_timeouts() {
+        let (mut ctx, dir) = test_ctx();
+        let id = ctx
+            .bash
+            .start(&ctx.cwd.clone(), "sleep 30", 1, None)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        let got = ctx.bash.take_finished();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].starts_with(&format!("bash job={id} pid=")));
+        assert!(got[0].contains("timed_out=1\n"), "got: {}", got[0]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn render_notification_wraps_observations() {
+        assert!(render_notification(&[]).is_none());
+        let one = render_notification(&["bash job=3 pid=1 status=done\n".to_string()]).unwrap();
+        assert!(
+            one.starts_with("<system-reminder>\n[BACKGROUND JOB NOTIFICATION - NOT USER INPUT]\n")
+        );
+        assert!(one.contains("A bash job you started earlier has finished."));
+        assert!(one.contains("\nbash job=3 pid=1 status=done\n"));
+        assert!(one.ends_with("</system-reminder>"));
+        let two = render_notification(&["a".to_string(), "b".to_string()]).unwrap();
+        assert!(two.contains("Bash jobs you started earlier have finished."));
+        assert!(two.contains("\na\n\nb\n"));
     }
 
     #[test]
