@@ -15,10 +15,9 @@
 //! untouched block with the base and costs only the diverged blocks on disk.
 //! Neither the base nor the delta is ever opened for writing.
 //!
-//! The base is found with `gguf_delta::find_base`: the link recorded in the
-//! delta (a relative one, the default when the two files were created side
-//! by side, resolves against the `.ggd`'s own directory), then a same-named
-//! file beside the delta, then plank's own places — `~/.plank/models/<name>`
+//! The base is found with `gguf_delta::find_base`: a delta records only its
+//! base's filename and is expected to sit beside it, so the lookup is
+//! `<ggd dir>/<base_name>`, then plank's own places — `~/.plank/models/<name>`
 //! and the default model path. A candidate counts only if its size and header
 //! hash match.
 //!
@@ -353,12 +352,11 @@ mod tests {
     }
 
     #[test]
-    fn a_delta_beside_its_base_records_only_the_filename() {
+    fn a_delta_moves_with_its_base() {
         let d = dir("beside");
         let (base, _target, out) = fixture(&d);
         let (h, _) = read_header(&out).unwrap();
-        assert_eq!(h.base_path, PathBuf::from("tiny.gguf"));
-        // Move the pair together: the link still resolves.
+        assert_eq!(h.base_name, "tiny.gguf");
         let moved = dir("beside-moved");
         fs::rename(&base, moved.join("tiny.gguf")).unwrap();
         fs::rename(&out, moved.join("tiny.ggd")).unwrap();

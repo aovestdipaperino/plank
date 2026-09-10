@@ -9,7 +9,7 @@
 //! - [`write_delta`] creates a `.ggd` from a base and a target.
 //! - [`read_header`] and [`read_chunks`] parse one.
 //! - [`apply`] turns a byte copy of the base into the target, in place.
-//! - [`find_base`] follows the link a delta carries to its base.
+//! - [`find_base`] finds the base a delta was cut from, beside the delta.
 //! - The `ggd` binary (`ggd create`, `ggd info`) wraps the above.
 //! - [`gguf::layout`] is the small GGUF header reader everything is built on.
 //!
@@ -121,9 +121,8 @@ pub struct Header {
     pub target_sha256: [u8; 32],
     /// Short human name of the edit, e.g. `abliterated`.
     pub label: String,
-    /// The base as given at creation: absolute, or relative to the `.ggd`.
-    pub base_path: PathBuf,
-    /// The base's filename, for lookup when the path has moved.
+    /// The base's filename. A delta always sits beside its base: the base is
+    /// looked up as `<delta dir>/<base_name>`, never by an absolute path.
     pub base_name: String,
     /// `general.name` from the base's metadata.
     pub base_general: String,
@@ -293,7 +292,6 @@ fn encode_header(h: &Header) -> (Vec<u8>, usize) {
     out.extend_from_slice(&h.base_sha256);
     out.extend_from_slice(&h.target_sha256);
     put_str(&mut out, &h.label);
-    put_str(&mut out, &h.base_path.to_string_lossy());
     put_str(&mut out, &h.base_name);
     put_str(&mut out, &h.base_general);
     put_str(&mut out, &h.base_source_url);
@@ -367,7 +365,6 @@ fn read_header_from(f: &File) -> Result<(Header, u64), Error> {
         ..Header::default()
     };
     h.label = r.string()?;
-    h.base_path = PathBuf::from(r.string()?);
     h.base_name = r.string()?;
     h.base_general = r.string()?;
     h.base_source_url = r.string()?;
@@ -429,28 +426,6 @@ fn check_of(bytes: &[u8]) -> [u8; 8] {
     d[..8].try_into().expect("8 of 32")
 }
 
-/// The base path to record: just the filename when the base sits in the
-/// same directory as the delta, so the pair can move together; otherwise the
-/// base as given.
-fn recorded_base_path(base: &Path, out: &Path) -> PathBuf {
-    let dir_of = |p: &Path| {
-        let d = p.parent().unwrap_or(Path::new("."));
-        let d = if d.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            d
-        };
-        fs::canonicalize(d).ok()
-    };
-    let same_dir = matches!((dir_of(base), dir_of(out)), (Some(a), Some(b)) if a == b);
-    if same_dir {
-        base.file_name()
-            .map_or_else(|| base.to_path_buf(), PathBuf::from)
-    } else {
-        base.to_path_buf()
-    }
-}
-
 /// Writes the delta from `base` to `target` into `out`.
 ///
 /// Both inputs are opened read-only. `out` is written through `<out>.part`
@@ -495,7 +470,6 @@ pub fn write_delta(
         data_pos: layout.data_pos,
         header_sha256: header_sha,
         label: label.clone(),
-        base_path: recorded_base_path(base, out),
         base_name: name_of(base),
         base_general: gguf::string_value(base, "general.name").unwrap_or_default(),
         base_source_url: gguf::string_value(base, "general.source.url").unwrap_or_default(),
@@ -719,10 +693,9 @@ pub fn check_base(h: &Header, candidate: &Path) -> Result<(), Error> {
 
 /// Finds the base model `h` describes.
 ///
-/// Candidates in order: `base_path` as recorded (a relative one against the
-/// delta's directory), a file named `base_name` beside the delta, then each of
-/// `extra`. The first whose size and header hash match (see [`check_base`])
-/// wins.
+/// A delta lives beside its base, so the first candidate is `base_name` in
+/// the delta's own directory; then each of `extra`, in order. The first whose
+/// size and header hash match (see [`check_base`]) wins.
 ///
 /// # Errors
 /// `Mismatch` listing every candidate tried and why it was rejected.
@@ -732,13 +705,6 @@ pub fn find_base(h: &Header, delta: &Path, extra: &[PathBuf]) -> Result<PathBuf,
         .filter(|d| !d.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if !h.base_path.as_os_str().is_empty() {
-        if h.base_path.is_absolute() {
-            candidates.push(h.base_path.clone());
-        } else {
-            candidates.push(dir.join(&h.base_path));
-        }
-    }
     if !h.base_name.is_empty() {
         candidates.push(dir.join(&h.base_name));
     }
@@ -766,7 +732,6 @@ pub fn describe(h: &Header, chunks: &[ChunkInfo], layout: Option<&Layout>) -> St
     use std::fmt::Write as _;
     let mut s = String::new();
     let _ = writeln!(s, "  label:          {}", h.label);
-    let _ = writeln!(s, "  base path:      {}", h.base_path.display());
     let _ = writeln!(s, "  base name:      {}", h.base_name);
     let _ = writeln!(s, "  base model:     {}", h.base_general);
     if !h.base_source_url.is_empty() {
@@ -859,11 +824,6 @@ mod tests {
 
         let (h, first) = read_header(&out).unwrap();
         assert_eq!(h.base_size, base_bytes.len() as u64);
-        assert_eq!(
-            h.base_path,
-            PathBuf::from("tiny.gguf"),
-            "same dir: bare filename"
-        );
         assert_eq!(h.base_name, "tiny.gguf");
         assert_eq!(h.base_general, "Tiny Test Model");
         assert_eq!(h.base_source_url, "https://example.invalid/tiny");
@@ -1001,22 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn base_path_is_recorded_as_given_when_dirs_differ() {
-        let d = dir("recorded");
-        let elsewhere = dir("recorded-elsewhere");
-        let base_bytes = base_builder().bytes();
-        let base = write(&d, "b.gguf", &base_bytes);
-        let target = write(&d, "t.gguf", &base_bytes);
-        let out = elsewhere.join("d.ggd");
-        write_delta(&base, &target, &out, &CreateOptions::default()).unwrap();
-        let (h, _) = read_header(&out).unwrap();
-        assert_eq!(h.base_path, base);
-        let _ = fs::remove_dir_all(&d);
-        let _ = fs::remove_dir_all(&elsewhere);
-    }
-
-    #[test]
-    fn find_base_follows_the_link_then_siblings_then_extras() {
+    fn find_base_looks_beside_the_delta_then_in_extras() {
         let d = dir("find");
         let elsewhere = dir("find-elsewhere");
         let base_bytes = base_builder().bytes();
@@ -1025,31 +970,29 @@ mod tests {
         let out = elsewhere.join("d.ggd");
         write_delta(&base, &target, &out, &CreateOptions::default()).unwrap();
         let (h, _) = read_header(&out).unwrap();
-        // 1. The recorded link.
-        assert_eq!(find_base(&h, &out, &[]).unwrap(), base);
-        // 2. Link broken, sibling by name.
+        assert_eq!(h.base_name, "b.gguf");
+        // The base is not beside the delta: refused, naming the sibling path.
+        let e = find_base(&h, &out, &[]).unwrap_err().to_string();
+        assert!(e.contains("missing"), "{e}");
+        assert!(
+            e.contains(&elsewhere.join("b.gguf").display().to_string()),
+            "{e}"
+        );
+        // An extra candidate rescues it.
+        assert_eq!(
+            find_base(&h, &out, std::slice::from_ref(&base)).unwrap(),
+            base
+        );
+        // Beside the delta, it is found first, even with extras present.
         fs::rename(&base, elsewhere.join("b.gguf")).unwrap();
-        assert_eq!(find_base(&h, &out, &[]).unwrap(), elsewhere.join("b.gguf"));
-        // 3. Neither; an extra candidate. A wrong-size sibling is skipped
-        //    with a reason, and the missing link is named too.
-        fs::rename(elsewhere.join("b.gguf"), d.join("moved.gguf")).unwrap();
-        write(&elsewhere, "b.gguf", b"short");
+        assert_eq!(
+            find_base(&h, &out, &[d.join("b.gguf")]).unwrap(),
+            elsewhere.join("b.gguf")
+        );
+        // A wrong-size sibling is skipped with a reason.
+        fs::write(elsewhere.join("b.gguf"), b"short").unwrap();
         let e = find_base(&h, &out, &[]).unwrap_err().to_string();
         assert!(e.contains("wrong size"), "{e}");
-        assert!(e.contains("missing"), "{e}");
-        assert_eq!(
-            find_base(&h, &out, &[d.join("moved.gguf")]).unwrap(),
-            d.join("moved.gguf")
-        );
-        // A relative link resolves against the delta's directory.
-        let mut rel = h.clone();
-        rel.base_path = Path::new("..")
-            .join(d.file_name().unwrap())
-            .join("moved.gguf");
-        assert_eq!(
-            find_base(&rel, &out, &[]).unwrap(),
-            elsewhere.join(&rel.base_path)
-        );
         let _ = fs::remove_dir_all(&d);
         let _ = fs::remove_dir_all(&elsewhere);
     }

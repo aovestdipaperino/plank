@@ -14,10 +14,10 @@ target bytes look random. On an 87 GB DeepSeek V4 Flash checkpoint with 33
 edited `Q8_0` tensors, the 1.18 GB of changed spans become a 440 MB delta.
 
 The delta is self-describing. It carries the base's size, a hash of its
-header (metadata and tensor table), the base's path as given at creation, its
-filename and its `general.*` metadata strings, plus the target's whole-file
-hash. A relative base path is meant to resolve against the `.ggd`'s own
-directory, so a delta placed beside its base keeps working when the pair moves.
+header (metadata and tensor table), the base's filename and its `general.*`
+metadata strings, plus the target's whole-file hash. There is no path: a delta
+always sits beside its base and is resolved as `<delta dir>/<base_name>`, so
+the pair keeps working wherever it is moved together.
 
 ```rust
 use gguf_delta::{write_delta, apply, read_header, CreateOptions};
@@ -52,8 +52,8 @@ ggd info abliterated.ggd
 ```
 
 `create` streams both files once and prints what changed; `info` prints the
-header, whether the base link resolves (the recorded path, then a same-named
-file beside the delta), and the chunk list with tensor names.
+header, whether the base is found beside the delta, and the chunk list with
+tensor names.
 
 ## Format
 
@@ -69,7 +69,6 @@ header_sha256    32  sha256(base[0 .. data_pos])
 base_sha256      32  sha256 of the whole base, or zero
 target_sha256    32  sha256 of the whole target
 label            str
-base_path        str
 base_name        str
 base_general     str general.name
 base_source_url  str general.source.url

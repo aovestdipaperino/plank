@@ -155,11 +155,10 @@ sidecar names the same delta hash; a base on another volume falls back to a
 full copy with a warning. Neither the base nor the delta is ever opened for
 writing.
 
-The delta carries its own link to the base: the path as given at creation
-(just the filename when the two were created side by side, so the pair can
-move together), the base's filename, and its `general.*` metadata. Lookup
-tries the link, then a same-named sibling of the `.ggd`, then
-`~/.plank/models/<name>`, then the default model path, accepting only a file
+The delta records its base's filename and `general.*` metadata, never a
+path: a `.ggd` sits beside its base, so the pair moves together. Lookup tries
+`<ggd dir>/<base_name>`, then `~/.plank/models/<name>`, then the default
+model path, accepting only a file
 whose size and header hash match; every chunk additionally checks a hash of
 the base bytes it replaces, so the wrong base fails at the first chunk.
 
