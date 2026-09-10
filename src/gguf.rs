@@ -15,7 +15,7 @@
 //! metadata keys are read, and only up to the key in question.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// The model families plank treats differently.
@@ -127,6 +127,109 @@ pub fn string_value(path: &Path, wanted: &str) -> Option<String> {
     None
 }
 
+/// One tensor's byte span in a GGUF file, in absolute file offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorSpan {
+    /// The tensor's name, e.g. `blk.10.attn_output_b.weight`.
+    pub name: String,
+    /// Absolute offset of the first byte of the tensor's data.
+    pub offset: u64,
+    /// Bytes up to the next tensor's data, or to the end of the file for the
+    /// last one. Derived from the offsets rather than from the quantization
+    /// type, so no type table has to be kept in step with the engine.
+    pub len: u64,
+}
+
+/// Where the tensor data lives in a GGUF file.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Layout {
+    /// First byte of the tensor data region: the header end rounded up to
+    /// `general.alignment` (32 when the key is absent).
+    pub data_pos: u64,
+    /// Every tensor, sorted by offset.
+    pub tensors: Vec<TensorSpan>,
+}
+
+/// GGUF v3's default `general.alignment`.
+const DEFAULT_ALIGNMENT: u64 = 32;
+
+/// Refuses a tensor count beyond this; the largest real model has a few
+/// thousand.
+const MAX_TENSORS: u64 = 1 << 20;
+
+/// Reads the tensor layout of the GGUF file at `path`.
+///
+/// # Errors
+/// Any read failure or malformed header is an `InvalidData` error naming the
+/// stage that failed, so a caller can print it as is.
+pub fn layout(path: &Path) -> io::Result<Layout> {
+    let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_owned());
+    let file_len = std::fs::metadata(path)?.len();
+    let mut r = BufReader::new(File::open(path)?);
+    if &read_exact::<4>(&mut r).ok_or_else(|| bad("not a GGUF file"))? != b"GGUF" {
+        return Err(bad("not a GGUF file"));
+    }
+    let version = u32::from_le_bytes(read_exact::<4>(&mut r).ok_or_else(|| bad("truncated"))?);
+    if version != 3 {
+        return Err(bad("only GGUF v3 is supported"));
+    }
+    let tensor_count = read_u64(&mut r).ok_or_else(|| bad("truncated"))?;
+    let kv_count = read_u64(&mut r).ok_or_else(|| bad("truncated"))?;
+    if kv_count > MAX_KV_PAIRS || tensor_count > MAX_TENSORS {
+        return Err(bad("absurd header counts"));
+    }
+    let mut alignment = DEFAULT_ALIGNMENT;
+    for _ in 0..kv_count {
+        let key = read_string(&mut r).ok_or_else(|| bad("bad metadata key"))?;
+        let ty = u32::from_le_bytes(read_exact::<4>(&mut r).ok_or_else(|| bad("truncated"))?);
+        if key == "general.alignment" && ty == 4 {
+            let v = u32::from_le_bytes(read_exact::<4>(&mut r).ok_or_else(|| bad("truncated"))?);
+            if v == 0 {
+                return Err(bad("general.alignment is zero"));
+            }
+            alignment = u64::from(v);
+            continue;
+        }
+        skip_value(&mut r, ty).ok_or_else(|| bad("bad metadata value"))?;
+    }
+    let mut infos = Vec::with_capacity(usize::try_from(tensor_count).unwrap_or(0));
+    for _ in 0..tensor_count {
+        let name = read_string(&mut r).ok_or_else(|| bad("bad tensor name"))?;
+        let n_dims = u32::from_le_bytes(read_exact::<4>(&mut r).ok_or_else(|| bad("truncated"))?);
+        if n_dims > 8 {
+            return Err(bad("tensor has too many dimensions"));
+        }
+        for _ in 0..n_dims {
+            read_u64(&mut r).ok_or_else(|| bad("truncated"))?;
+        }
+        let _ty = read_exact::<4>(&mut r).ok_or_else(|| bad("truncated"))?;
+        let rel = read_u64(&mut r).ok_or_else(|| bad("truncated"))?;
+        infos.push((name, rel));
+    }
+    let header_end = r.stream_position()?;
+    let data_pos = header_end.div_ceil(alignment) * alignment;
+    infos.sort_by_key(|(_, rel)| *rel);
+    let mut tensors = Vec::with_capacity(infos.len());
+    for (i, (name, rel)) in infos.iter().enumerate() {
+        let offset = data_pos
+            .checked_add(*rel)
+            .ok_or_else(|| bad("tensor offset overflows"))?;
+        let end = match infos.get(i + 1) {
+            Some((_, next)) => data_pos + next,
+            None => file_len,
+        };
+        if end < offset || offset > file_len {
+            return Err(bad("tensor points outside the file"));
+        }
+        tensors.push(TensorSpan {
+            name: name.clone(),
+            offset,
+            len: end - offset,
+        });
+    }
+    Ok(Layout { data_pos, tensors })
+}
+
 fn read_exact<const N: usize>(r: &mut impl Read) -> Option<[u8; N]> {
     let mut buf = [0u8; N];
     r.read_exact(&mut buf).ok()?;
@@ -194,18 +297,22 @@ fn skip_value<R: Read + Seek>(r: &mut BufReader<R>, ty: u32) -> Option<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
 
     /// Builds a GGUF header with the given metadata keys, so the tests do not
     /// depend on an 80 GB file being present.
     #[derive(Default)]
-    struct Gguf {
+    pub(crate) struct Gguf {
         kv: Vec<u8>,
         count: u64,
+        infos: Vec<u8>,
+        n_tensors: u64,
+        data: Vec<u8>,
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     impl Gguf {
         fn str_val(mut self, key: &str, val: &str) -> Self {
             self.push_str(key);
@@ -257,17 +364,89 @@ mod tests {
             self.kv.extend_from_slice(s.as_bytes());
         }
 
+        /// Appends a tensor whose data is `data`, placed right after the
+        /// previous tensor's data (32-byte aligned, as the writers do).
+        pub(crate) fn tensor(mut self, name: &str, dims: &[u64], ty: u32, data: &[u8]) -> Self {
+            let rel = (self.data.len() as u64).div_ceil(32) * 32;
+            self.data.resize(rel as usize, 0);
+            self.data.extend_from_slice(data);
+            self.infos
+                .extend_from_slice(&(name.len() as u64).to_le_bytes());
+            self.infos.extend_from_slice(name.as_bytes());
+            self.infos
+                .extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for d in dims {
+                self.infos.extend_from_slice(&d.to_le_bytes());
+            }
+            self.infos.extend_from_slice(&ty.to_le_bytes());
+            self.infos.extend_from_slice(&rel.to_le_bytes());
+            self.n_tensors += 1;
+            self
+        }
+
+        /// The complete file bytes.
+        pub(crate) fn bytes(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(b"GGUF");
+            out.extend_from_slice(&3u32.to_le_bytes());
+            out.extend_from_slice(&self.n_tensors.to_le_bytes());
+            out.extend_from_slice(&self.count.to_le_bytes());
+            out.extend_from_slice(&self.kv);
+            out.extend_from_slice(&self.infos);
+            let data_pos = (out.len() as u64).div_ceil(32) * 32;
+            out.resize(data_pos as usize, 0);
+            out.extend_from_slice(&self.data);
+            out
+        }
+
         fn write(self, name: &str) -> std::path::PathBuf {
             let path =
                 std::env::temp_dir().join(format!("plank-gguf-{}-{name}", std::process::id()));
             let mut f = File::create(&path).expect("create");
-            f.write_all(b"GGUF").unwrap();
-            f.write_all(&3u32.to_le_bytes()).unwrap();
-            f.write_all(&0u64.to_le_bytes()).unwrap(); // tensor count
-            f.write_all(&self.count.to_le_bytes()).unwrap();
-            f.write_all(&self.kv).unwrap();
+            f.write_all(&self.bytes()).unwrap();
             path
         }
+    }
+
+    #[test]
+    fn layout_reports_absolute_spans_in_offset_order() {
+        let p = Gguf::default()
+            .str_val("general.architecture", "deepseek4")
+            .tensor("b", &[4], 0, &[2u8; 40])
+            .tensor("a", &[8], 0, &[1u8; 8])
+            .write("layout");
+        let l = layout(&p).expect("layout");
+        assert_eq!(l.data_pos % 32, 0);
+        assert_eq!(l.tensors.len(), 2);
+        assert_eq!(l.tensors[0].name, "b");
+        assert_eq!(l.tensors[0].offset, l.data_pos);
+        // 40 bytes of data padded to the next 32-byte boundary.
+        assert_eq!(l.tensors[0].len, 64);
+        assert_eq!(l.tensors[1].name, "a");
+        assert_eq!(l.tensors[1].offset, l.data_pos + 64);
+        assert_eq!(l.tensors[1].len, 8);
+        assert_eq!(
+            l.tensors[1].offset + 8,
+            std::fs::metadata(&p).unwrap().len()
+        );
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn layout_of_a_header_only_file_is_empty() {
+        let p = Gguf::default().str_val("k", "v").write("layout-empty");
+        let l = layout(&p).expect("layout");
+        assert!(l.tensors.is_empty());
+        assert!(l.data_pos >= std::fs::metadata(&p).unwrap().len());
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn layout_refuses_a_non_gguf_file() {
+        let p = std::env::temp_dir().join(format!("plank-gguf-{}-notgguf", std::process::id()));
+        std::fs::write(&p, b"nope").unwrap();
+        assert!(layout(&p).is_err());
+        let _ = std::fs::remove_file(p);
     }
 
     /// The probe and the dialect selector must agree, or the footer would
