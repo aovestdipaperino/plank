@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.0.4] - 2026-09-10
+
 ### Changed
 
 - **The expert-routing glyph moved from the status bar to the window title.**
