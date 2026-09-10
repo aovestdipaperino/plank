@@ -86,7 +86,14 @@ pub struct AgentConfig {
     /// Optional help topic following `-h`/`--help`.
     pub help_topic: Option<String>,
     /// Model file supplied with `-m`/`--model`; enables the real ds4 engine.
+    ///
+    /// A `.ggd` weight delta given here is replaced by the patched clone it
+    /// resolves to before anything reads it (`main::resolve_model_delta`),
+    /// and the delta is remembered in `model_delta`.
     pub model_path: Option<PathBuf>,
+    /// The `.ggd` weight delta `model_path` was resolved from, if any, for
+    /// the startup line.
+    pub model_delta: Option<crate::ggufdelta::Resolved>,
     /// Backend selector from `--metal`/`--cuda`/`--cpu`; `None` = platform default.
     pub backend: Option<Backend>,
     /// Worker thread count from `-t`/`--threads`; 0 = engine default.
@@ -366,6 +373,7 @@ impl Default for AgentConfig {
             help_topic: None,
             qwen: false,
             model_path: None,
+            model_delta: None,
             backend: None,
             n_threads: 0,
             power_percent: 0,
@@ -475,7 +483,16 @@ Options:
   -V, --version            show the version and commit id, then exit
       --debug              look for a running turbo-debug-console and mirror the
                            raw model stream to it while ui.showThinking is off
-  -m, --model PATH         load a ds4 GGUF model (real inference)
+  -m, --model PATH         load a ds4 GGUF model (real inference); a .ggd
+                           weight delta loads as the model it derives, by
+                           cloning its base into ~/.plank/models/patched/
+                           and patching the clone (base and delta untouched)
+      --gguf-delta-create BASE TARGET OUT.ggd [--label NAME] [--hash-base]
+                           write the weight delta from BASE to TARGET (same
+                           layout GGUFs) and exit
+      --gguf-delta-info FILE.ggd
+                           describe a weight delta and whether its base is
+                           reachable, then exit
 "
     .to_owned()
         + QWEN_USAGE

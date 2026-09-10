@@ -133,6 +133,42 @@ because the invariant that makes a swap safe is per-set — the manifest moves
 last, so its presence proves that set landed, and one shared staging area would
 let a half-staged download of one family read as proof about the other.
 
+### Weight deltas (`ggufdelta.rs`, `crates/gguf-delta`)
+A `.ggd` file is the difference between two GGUF files of identical layout —
+same metadata, same tensor table — as the changed byte spans, each stored as a
+deflate-compressed byte-wise `(target - base) mod 256` difference. Quantized
+weights nudged by a small edit (an abliteration touches 33 of 1328 tensors)
+compress far better this way than the raw target bytes do: ~440 MB for a
+1.18 GB span. The format, its reader and writer, and the small GGUF layout
+reader they need live in the `gguf-delta` workspace crate, published on its own;
+`ggufdelta.rs` is plank's side.
+
+`plank -m file.ggd` loads a delta as the model it derives. The engine cannot
+apply it in memory — `model_open` in `refs/ds4/ds4.c` maps the model read-only
+and, on Metal, `MAP_SHARED`, then wraps slices as no-copy `MTLBuffer`s — so
+`ggufdelta::resolve` APFS-clones the base into `~/.plank/models/patched/`
+(`clonefile(2)`, instant, sharing every untouched block), writes the changed
+spans into the clone, and `main::parse_config` swaps the clone's path in for
+the configured model before anything reads a header. Everything downstream
+sees an ordinary GGUF. The clone is reused across launches when its `.json`
+sidecar names the same delta hash; a base on another volume falls back to a
+full copy with a warning. Neither the base nor the delta is ever opened for
+writing.
+
+The delta carries its own link to the base: the path as given at creation
+(just the filename when the two were created side by side, so the pair can
+move together), the base's filename, and its `general.*` metadata. Lookup
+tries the link, then a same-named sibling of the `.ggd`, then
+`~/.plank/models/<name>`, then the default model path, accepting only a file
+whose size and header hash match; every chunk additionally checks a hash of
+the base bytes it replaces, so the wrong base fails at the first chunk.
+
+KV caches are shared between base and derived weights on purpose: the engine
+reports one shape name for both and nothing here changes it, so the sysprompt
+snapshot, checkpoints and rungs are all reused. The only visible trace of the
+delta is the startup line. `plank --gguf-delta-create` and
+`--gguf-delta-info` are the offline tools.
+
 ### Agent core (`ui.rs`, `worker.rs`)
 Owns the `Agent` struct (engine, session, tools, system prompt, trace) and the
 turn loop (`run_turn` / `worker_turn`). Hosts the two interactive front-ends and

@@ -2389,6 +2389,31 @@ disagree again. The old Enter-time echo had the same exposure (it also sat
 inside the rolled-back range), so this is not a regression and rollback
 behaviour is intentionally left alone here.
 
+## Weight deltas cannot be applied in memory, and the engine cannot tell two weight sets apart
+
+Two things shaped `.ggd` weight deltas (`ggufdelta.rs`, `crates/gguf-delta`).
+
+`model_open` in `refs/ds4/ds4.c` maps the model `PROT_READ` and, on Metal,
+`MAP_SHARED`, then wraps slices of that mapping as no-copy `MTLBuffer`s. There
+is no hook to substitute bytes, and the comment above the `mmap` says the
+shared/private choice was made around a Darwin VM bug. So a delta is applied
+to a *file* — an APFS `clonefile(2)` of the base, patched in place — and the
+engine loads that. The clone costs only the diverged blocks; on the abliterated
+Vision-Exp checkpoint that is ~1.2 GB against an 87 GB base.
+
+`ds4_engine_model_name` returns `DS4_MODEL_SHAPE_NAME`, a compile-time shape
+name, so base and derived weights report the *same* model name. plank keys the
+sysprompt KV snapshot as `sha(model ‖ system)` and stamps that name into every
+KV sidecar, so the two weight sets share every KV cache. This is accepted on
+purpose: a rank-1 edit on 33 tensors is within the noise the model already
+tolerates from quantization, and re-prefilling per variant would cost more
+than it buys. Do not "fix" it by suffixing the model name without also
+deciding that the cache split is worth it.
+
+A last measurement worth keeping: raw target bytes of an edited Q8_0 tensor
+deflate to 92%, but the byte-wise `(target - base) mod 256` deflates to 37%,
+because most int8 weights moved by 0 or ±1. Diff, then compress.
+
 ## Qwen3.8-Flash-Next — the traps that cost the most
 
 Every one of these was found by running the model, not by reading the C.

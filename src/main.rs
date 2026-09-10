@@ -41,6 +41,61 @@ fn arm_panic_dump() {
     ));
 }
 
+/// `plank --gguf-delta-create` and `--gguf-delta-info` are offline tools for
+/// `.ggd` weight deltas (`src/ggufdelta.rs`): no engine, no settings, no
+/// session. `None` when `args` is not one of them.
+fn run_gguf_delta_tool(args: &[String]) -> Option<ExitCode> {
+    let rc = match args.first().map(String::as_str) {
+        Some("--gguf-delta-create") => plank::ggufdelta::run_create(args),
+        Some("--gguf-delta-info") => plank::ggufdelta::run_info(args),
+        _ => return None,
+    };
+    Some(ExitCode::from(u8::try_from(rc).unwrap_or(1)))
+}
+
+/// The real config parse, with a `.ggd` model swapped for its patched clone.
+/// Errors are already printed under `prog`; the caller just returns the code.
+fn parse_config(
+    settings: &plank::settings::Settings,
+    args: &[String],
+    prog: &str,
+) -> Result<plank::config::AgentConfig, ExitCode> {
+    plank::config::parse_options_with(settings, args)
+        .and_then(|mut cfg| resolve_model_delta(&mut cfg).map(|()| cfg))
+        .map_err(|msg| {
+            eprintln!("{prog}: {msg}");
+            ExitCode::from(2)
+        })
+}
+
+/// Swaps a `.ggd` weight delta given as the model for the patched clone it
+/// resolves to, so everything downstream — family probe, manifest check,
+/// companion lookup, the engine open — sees an ordinary GGUF.
+///
+/// Runs right after the config is parsed and before anything reads a model
+/// header. The clone is materialized on first use and reused afterwards
+/// (`ggufdelta::resolve`). Prints one line naming the delta and its base.
+fn resolve_model_delta(cfg: &mut plank::config::AgentConfig) -> Result<(), String> {
+    let Some(delta) = cfg
+        .model_path
+        .as_deref()
+        .filter(|p| plank::ggufdelta::is_delta_path(p))
+        .map(std::path::Path::to_path_buf)
+    else {
+        return Ok(());
+    };
+    let resolved = plank::ggufdelta::resolve(&delta)?;
+    eprintln!(
+        "plank: {} ({}): {}",
+        delta.display(),
+        resolved.describe(),
+        resolved.path.display()
+    );
+    cfg.model_path = Some(resolved.path.clone());
+    cfg.model_delta = Some(resolved);
+    Ok(())
+}
+
 /// Records the live model family for the session store.
 ///
 /// Must run before anything opens the store, which both startup paths do
@@ -79,6 +134,10 @@ fn main() -> ExitCode {
     // other dispatch so nothing above can print to a stream that is /dev/null.
     if args.first().map(String::as_str) == Some("--model-downloader") {
         return ExitCode::from(u8::try_from(run_model_downloader(&args)).unwrap_or(1));
+    }
+
+    if let Some(code) = run_gguf_delta_tool(&args) {
+        return code;
     }
 
     // `plank serve ...` runs the flavor-(a) host instead of the interactive
@@ -160,12 +219,9 @@ fn main() -> ExitCode {
     // chance to dial the console.
     plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
-    let cfg = match plank::config::parse_options_with(&settings, &args) {
+    let cfg = match parse_config(&settings, &args, "plank") {
         Ok(cfg) => cfg,
-        Err(msg) => {
-            eprintln!("plank: {msg}");
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
     // Backstop: the provisional parse above answers `--help` in practice, but
     // it falls back to defaults when the argument list does not parse, and the
@@ -564,7 +620,13 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         )
         .map_err(|e| e.to_string())?;
         drop(replacer);
-        eprintln!("plank: model ready: {}", engine.model_name());
+        eprintln!(
+            "plank: model ready: {}{}",
+            engine.model_name(),
+            cfg.model_delta
+                .as_ref()
+                .map_or_else(String::new, |d| format!(" ({})", d.describe()))
+        );
         Ok(Box::new(engine))
     }
     #[cfg(not(ds4_engine))]
@@ -691,12 +753,9 @@ fn run_serve(args: &[String]) -> ExitCode {
     // chance to dial the console.
     plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
-    let cfg = match plank::config::parse_options_with(&settings, &passthrough) {
+    let cfg = match parse_config(&settings, &passthrough, "plank serve") {
         Ok(cfg) => cfg,
-        Err(msg) => {
-            eprintln!("plank serve: {msg}");
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
     plank::interrupt::install();
 
@@ -801,7 +860,13 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         )
         .map_err(|e| e.to_string())?;
         drop(replacer);
-        eprintln!("plank: shared model ready: {}", model.model_name());
+        eprintln!(
+            "plank: shared model ready: {}{}",
+            model.model_name(),
+            cfg.model_delta
+                .as_ref()
+                .map_or_else(String::new, |d| format!(" ({})", d.describe()))
+        );
         Ok(EngineHost::new(model, host_cfg))
     }
     #[cfg(not(ds4_engine))]
