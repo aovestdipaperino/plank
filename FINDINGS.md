@@ -456,13 +456,32 @@ test` and review the diff before committing.
   one discarded for sitting inside `<think>`, which the model still has to
   retry), `stream_chunk_must_stop` turns it into `PassStop::ToolCall`, and
   `Ds4Engine::generate` polls `interrupt()` *per token inside* the accepted
-  speculative run rather than once per block, so the rest of the run is rewound
-  out of the KV instead of generated. The trap: that stop rides the same
+  speculative run rather than once per block, so the rest of the run is never
+  rendered. The trap: that stop rides the same
   `interrupt` closure a preflight failure does — the only stop channel
   `Engine::generate` has — so it comes back as `stats.interrupted`, and every
   site that asks "did the user stop this?" has to go through `stopped_by_user`
   or the turn is abandoned with a parsed, complete tool call that never runs. A
   genuine Ctrl-C still wins there, deliberately.
+
+- **Never `ds4_session_rewind` a DeepSeek session; record the committed tail
+  instead.** The C agent rewinds the accepted speculative run to the token it
+  kept when a stanza closes or EOS lands mid-block, and plank copied that
+  (commit `19b4796`). On DeepSeek the rewind cannot roll the compressor
+  frontiers back, so `ds4.c` marks the checkpoint invalid; the next pass's
+  `ds4_session_common_prefix` then returns 0 and `ds4_session_sync` re-prefills
+  the whole conversation. A `PLANK_KV_DEBUG` log showed it on every tool round
+  of an 18k-token session: `reconcile ... kept 6` followed by `generate:
+  cached=0 prefill=17885 (0.0% reused)`, with no `full rebuild` note because
+  `common` itself was 0. The ladder rescue never fired either:
+  `KvReuse::rebuilds_from_zero` needs `common > 0`, so an invalid checkpoint
+  returned silently (it now logs `ladder fallback: live checkpoint invalid`).
+  The fix keeps the committed-but-unrendered tail as *shadow tokens* in the
+  recorded assistant span (`assistant_span_tokens`): the token buffer mirrors
+  the live KV exactly and the next prompt extends it. The model sees at most
+  one draft block of stray tokens between the stanza close and EOS; with the
+  default one-token draft that is a single token. Without MTP nothing changes,
+  since the serial path never overshoots.
 
 - **Post-update weights also write the parameter name as the element name.**
   `<｜DSML｜command string="true">ls</｜DSML｜invoke>` in place of

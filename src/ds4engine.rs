@@ -36,15 +36,32 @@ use crate::snapshot::{RestoreOnDrop, SessionSnapshot};
 /// is the ceiling the entry point itself is written against.
 const SPEC_ACCEPT_CAP: usize = 17;
 
-/// Where the live KV must be rewound to after a speculative block, or `None`
-/// when the block was consumed whole.
+/// The token span recorded for an assistant reply: the assistant prefix, the
+/// rendered reply, then any `shadow` tokens the engine committed but the pass
+/// never rendered, and finally EOS unless the shadow already ended on one.
 ///
-/// The engine commits all `committed` accepted tokens starting at
-/// `block_start`; the generate loop keeps only the `kept` tokens before a stop
-/// token or the token budget. Any committed token it did not keep is not in the
-/// transcript, so leaving it in the KV makes the next prompt diverge *behind*
-/// the live end and `ds4_session_sync` rebuilds from zero. Mirrors the C agent's
-/// `ds4_session_rewind(w->session, block_start + ti)`.
+/// Shadow tokens exist because a speculative block is committed to the KV
+/// whole while the generate loop may stop part-way through it (a tool stanza
+/// closed, EOS, the token budget, a user interrupt). The C agent rewinds the
+/// KV to the kept token; on `DeepSeek` `ds4_session_rewind` cannot roll the
+/// compressor frontiers back and so marks the checkpoint invalid, which makes
+/// the *next* pass re-prefill the whole conversation (a recorded 18k-token
+/// session paid that on every tool round). Recording the committed tail here
+/// instead keeps the token buffer an exact mirror of the live KV, so the next
+/// prompt extends it and prefills only the new message. The cost is at most a
+/// draft block of unrendered tokens that the model sees between the stanza
+/// close and EOS; with the default one-token draft that is a single token.
+fn assistant_span_tokens(prefix: &[i32], reply: &[i32], shadow: &[i32], eos: i32) -> Vec<i32> {
+    let mut span = Vec::with_capacity(prefix.len() + reply.len() + shadow.len() + 1);
+    span.extend_from_slice(prefix);
+    span.extend_from_slice(reply);
+    span.extend_from_slice(shadow);
+    if span.last() != Some(&eos) {
+        span.push(eos);
+    }
+    span
+}
+
 /// The `</think>` the UI appended to a recorded assistant reply, when
 /// `incoming` is exactly `held` (compared trailing-trimmed, as
 /// [`TokenTranscript::common_prefix`] compares) followed by that close and
@@ -53,13 +70,6 @@ fn think_close_suffix<'a>(held: &str, incoming: &'a str) -> Option<&'a str> {
     const CLOSE: &str = "</think>";
     let rest = incoming.strip_prefix(held.trim_end())?;
     (rest == CLOSE).then_some(rest)
-}
-
-fn spec_block_rewind_target(block_start: i32, committed: i32, kept: i32) -> Option<i32> {
-    if committed <= 0 || kept < 0 || kept >= committed {
-        return None;
-    }
-    Some(block_start.saturating_add(kept))
 }
 
 /// The immutable, shareable half of the ds4 engine: weights, tokenizer, and the
@@ -1298,15 +1308,24 @@ impl Ds4Session {
     /// (sampled but never evaluated) — exactly the token sequence the next
     /// turn's KV common-prefix probe expects. `text` is the trimmed reply text
     /// used as the span's reconciliation key.
-    fn record_reply(&mut self, text: String, reply_tokens: &[i32], think: ThinkMode) {
-        if reply_tokens.is_empty() {
+    fn record_reply(
+        &mut self,
+        text: String,
+        reply_tokens: &[i32],
+        shadow_tokens: &[i32],
+        think: ThinkMode,
+    ) {
+        if reply_tokens.is_empty() && shadow_tokens.is_empty() {
             return;
         }
-        let mut span = self.model.assistant_prefix_tokens(think);
-        span.extend_from_slice(reply_tokens);
         // SAFETY: engine valid.
         let eos = unsafe { ffi::ds4_token_eos(self.model.engine) };
-        span.push(eos);
+        let span = assistant_span_tokens(
+            &self.model.assistant_prefix_tokens(think),
+            reply_tokens,
+            shadow_tokens,
+            eos,
+        );
         // A reply that follows another assistant span *continues* it: the pass
         // was suspended for an in-pass `/btw` and resumed, and the UI splices
         // both halves into one assistant message. Extend rather than append, so
@@ -1474,6 +1493,10 @@ impl Engine for Ds4Session {
         };
         let mut generated = 0;
         let mut reply_tokens: Vec<i32> = Vec::new();
+        // Tokens the engine committed in a speculative block after the point
+        // the walk stopped: in the KV, never rendered. Recorded with the reply
+        // so the token buffer mirrors the live KV (see `assistant_span_tokens`).
+        let mut shadow_tokens: Vec<i32> = Vec::new();
         let mut reply_text = String::new();
         let mut utf8 = crate::engine::Utf8Stream::default();
         // The local chat template opens `<think>` in the prefill prefix unless
@@ -1542,13 +1565,11 @@ impl Engine for Ds4Session {
             if speculative {
                 let mut accepted = [0_i32; SPEC_ACCEPT_CAP];
                 let cap = i32::try_from(accepted.len()).unwrap_or(i32::MAX);
-                // Where this block starts in the live KV. The C commits every
-                // accepted token, EOS included, so whatever the walk below
-                // drops must be rewound, or the KV ends one token past the
-                // transcript and the next turn rebuilds from zero (a recorded
-                // session re-prefilled 117k tokens this way).
-                // SAFETY: session valid.
-                let block_start = unsafe { ffi::ds4_session_pos(session) };
+                // The C commits every accepted token, EOS included; whatever
+                // the walk below drops stays in the KV and is recorded as
+                // shadow tokens, or the KV ends past the transcript and the
+                // next turn rebuilds from zero (a recorded session
+                // re-prefilled 117k tokens this way).
                 // SAFETY: session valid; `accepted` is a valid out-buffer of
                 // `cap` ints; err buffer valid.
                 let n = unsafe {
@@ -1619,11 +1640,14 @@ impl Engine for Ds4Session {
                         break;
                     }
                 }
-                if let Some(pos) = spec_block_rewind_target(block_start, n, kept) {
-                    // SAFETY: session valid; `pos` lies inside the block the
-                    // engine just committed, so the dropped tokens are still
-                    // in the raw window — the same call the C agent makes.
-                    unsafe { ffi::ds4_session_rewind(session, pos) };
+                // The engine committed the whole run; the walk stopped at
+                // `kept`. Not rewound: on DeepSeek a rewind invalidates the
+                // checkpoint and the next pass re-prefills from token zero.
+                // The tail is kept as shadow tokens instead.
+                if let Ok(kept) = usize::try_from(kept)
+                    && kept < run.len()
+                {
+                    shadow_tokens.extend_from_slice(&run[kept..]);
                 }
                 if hit_eos || stopped {
                     break;
@@ -1702,7 +1726,7 @@ impl Engine for Ds4Session {
         // and the two halves have to concatenate into exactly what the UI
         // renders (`docs/DOUBLE-BTW.md` §4.1). `common_prefix` trims when it
         // compares, so a completed reply still matches its rendered section.
-        self.record_reply(reply_text, &reply_tokens, opts.think_mode);
+        self.record_reply(reply_text, &reply_tokens, &shadow_tokens, opts.think_mode);
 
         let interrupted = interrupt() || INTERRUPT.with(|f| f.load(Ordering::SeqCst));
         let secs = start.elapsed().as_secs_f64();
@@ -2330,7 +2354,7 @@ impl Ds4HostSession {
         // mid-stream characters were already reassembled by the carry.
         reply_text.push_str(&st.utf8.flush());
         self.inner
-            .record_reply(reply_text, &st.reply_tokens, st.opts.think_mode);
+            .record_reply(reply_text, &st.reply_tokens, &[], st.opts.think_mode);
         let secs = st.start.elapsed().as_secs_f64();
         // SAFETY: session valid (created during prefill).
         let ctx_used = unsafe { ffi::ds4_session_pos(self.inner.session) };
@@ -2835,8 +2859,7 @@ mod tests {
     }
 
     use super::{
-        is_prefill_event, parse_sections, spec_block_rewind_target, strip_legacy,
-        think_close_suffix,
+        assistant_span_tokens, is_prefill_event, parse_sections, strip_legacy, think_close_suffix,
     };
 
     /// Regression for the 56k-token rebuild in `turbo-vision-debug-2.log`: the
@@ -2860,28 +2883,29 @@ mod tests {
         assert_eq!(think_close_suffix("reply", "reply more</think>"), None);
     }
 
-    /// Regression for the recorded 117k-token rebuild: a speculative block
-    /// whose accepted run ends in EOS leaves the KV one token past the
-    /// transcript unless the loop rewinds to the tokens it actually kept.
+    /// The recorded span mirrors the live KV exactly: prefix, rendered reply,
+    /// the committed-but-unrendered tail of a cut speculative block, then one
+    /// EOS — never two.
     #[test]
-    fn spec_block_rewind_drops_only_the_tokens_the_loop_did_not_keep() {
-        // Block of 4 committed at 117365; EOS was the 4th, so 3 were kept:
-        // the KV must end at 117368, not 117369.
-        assert_eq!(spec_block_rewind_target(117_365, 4, 3), Some(117_368));
-        // EOS as the very first accepted token: rewind to the block start.
-        assert_eq!(spec_block_rewind_target(100, 1, 0), Some(100));
-        // Token budget cut the walk short mid-block: same rule.
-        assert_eq!(spec_block_rewind_target(100, 5, 2), Some(102));
-    }
-
-    #[test]
-    fn spec_block_rewind_is_a_no_op_when_the_whole_block_was_kept() {
-        assert_eq!(spec_block_rewind_target(100, 5, 5), None);
-        assert_eq!(spec_block_rewind_target(100, 1, 1), None);
-        // Nothing committed (the caller breaks before reaching here anyway).
-        assert_eq!(spec_block_rewind_target(100, 0, 0), None);
-        // Defensive: a kept count past the block never rewinds forward.
-        assert_eq!(spec_block_rewind_target(100, 3, 7), None);
+    fn assistant_span_keeps_the_committed_tail_and_ends_on_one_eos() {
+        let eos = 1;
+        // Whole block kept: prefix + reply + EOS, as before.
+        assert_eq!(
+            assistant_span_tokens(&[9], &[5, 6], &[], eos),
+            vec![9, 5, 6, 1]
+        );
+        // A tool stanza closed mid-block: the extra committed token rides along.
+        assert_eq!(
+            assistant_span_tokens(&[9], &[5, 6], &[7], eos),
+            vec![9, 5, 6, 7, 1]
+        );
+        // The engine stopped the block on EOS: it is already the last token.
+        assert_eq!(
+            assistant_span_tokens(&[9], &[5, 6], &[1], eos),
+            vec![9, 5, 6, 1]
+        );
+        // EOS as the very first accepted token of the reply.
+        assert_eq!(assistant_span_tokens(&[9], &[], &[1], eos), vec![9, 1]);
     }
 
     #[test]

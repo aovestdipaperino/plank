@@ -6706,6 +6706,18 @@ the original is frozen and listed in /tree"
             return None;
         }
         let probe = self.engine.kv_reuse_probe(prompt_text, self.think)?;
+        if probe.live > 0 && probe.common == 0 {
+            // Not a divergence but an invalidated checkpoint (the C probe
+            // returns 0 for one): no rung sits below token zero, so nothing
+            // can be rescued — but say so, or the rebuild is silent.
+            crate::engine::kv_debug(|| {
+                format!(
+                    "ladder fallback: live checkpoint invalid (live={}); rebuilding from zero",
+                    probe.live
+                )
+            });
+            return None;
+        }
         if !probe.rebuilds_from_zero() {
             return None;
         }
