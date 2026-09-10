@@ -2883,6 +2883,10 @@ static INPUT_TEXT_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(N
 /// mouse hit-testing; `None` when no jobs were running on that frame.
 static JOBS_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 
+/// The footer's ctx gauge (`ctx N%`) from the last drawn frame, for mouse
+/// hit-testing; `None` when the row it was drawn on held no gauge.
+static CTX_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
 /// Whether a click at (`column`, `row`) landed on the footer's jobs segment.
 #[must_use]
 pub fn jobs_click(column: u16, row: u16) -> bool {
@@ -2893,6 +2897,78 @@ pub fn jobs_click(column: u16, row: u16) -> bool {
         .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
 }
 
+/// Whether a click at (`column`, `row`) landed on the footer's ctx gauge.
+#[must_use]
+pub fn ctx_click(column: u16, row: u16) -> bool {
+    CTX_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// The cells of row `y` of `area`, as the segment scanners read them.
+fn status_row_cells(buf: &ratatui::buffer::Buffer, area: Rect, y: u16) -> Vec<&str> {
+    (area.left()..area.right())
+        .map(|x| buf.cell((x, y)).map_or("", |c| c.symbol()))
+        .collect()
+}
+
+/// Widens `anchor` to the whole ` | `-separated run of cells it sits in,
+/// returning the inclusive `(start, end)` indices. Shared by the jobs and ctx
+/// hit boxes: scanning the drawn buffer rather than the source text means each
+/// box follows whatever elision and styling the bar applied.
+fn segment_bounds(cells: &[&str], anchor: usize) -> (usize, usize) {
+    let is_sep = |i: usize| {
+        i + 2 < cells.len() && cells[i] == " " && cells[i + 1] == "|" && cells[i + 2] == " "
+    };
+    let mut start = anchor;
+    while start > 0 && !(start >= 3 && is_sep(start - 3)) {
+        start -= 1;
+    }
+    let mut end = anchor;
+    while end + 1 < cells.len() && !is_sep(end + 1) {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// Finds the ctx gauge in the status rows just drawn into `buf` and records its
+/// rect. The anchor is the literal `ctx ` followed by digits and `%`, rather
+/// than a bare `ctx`, so a working directory or branch name containing those
+/// three letters cannot claim the hit box. Called after every status render, so
+/// a frame drawn without a gauge forgets the rect.
+pub fn record_ctx_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        // The gauge reads `ctx ` then at least one digit then `%`; scan for the
+        // first index where the whole shape matches.
+        let anchor = (0..cells.len()).find(|&i| {
+            if cells.get(i..i + 4) != Some(&["c", "t", "x", " "][..]) {
+                return false;
+            }
+            let mut j = i + 4;
+            while cells
+                .get(j)
+                .is_some_and(|c| c.chars().all(char::is_numeric) && !c.is_empty())
+            {
+                j += 1;
+            }
+            j > i + 4 && cells.get(j) == Some(&"%")
+        });
+        let Some(anchor) = anchor else { continue };
+        let (start, end) = segment_bounds(&cells, anchor);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = CTX_RECT.lock() {
+        *g = found;
+    }
+}
+
 /// Finds the jobs segment in the status rows just drawn into `buf` and records
 /// its rect. The segment is the run of cells between the ` | ` separators
 /// around [`crate::status::JOBS_MARK`]; scanning the buffer rather than the
@@ -2901,28 +2977,16 @@ pub fn jobs_click(column: u16, row: u16) -> bool {
 /// forgets the rect.
 pub fn record_jobs_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
     let mut found = None;
-    'rows: for y in area.top()..area.bottom() {
-        let cells: Vec<&str> = (area.left()..area.right())
-            .map(|x| buf.cell((x, y)).map_or("", |c| c.symbol()))
-            .collect();
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
         let Some(mark) = cells.iter().position(|c| *c == crate::status::JOBS_MARK) else {
             continue;
         };
-        let is_sep = |i: usize| {
-            i + 2 < cells.len() && cells[i] == " " && cells[i + 1] == "|" && cells[i + 2] == " "
-        };
-        let mut start = mark;
-        while start > 0 && !(start >= 3 && is_sep(start - 3)) {
-            start -= 1;
-        }
-        let mut end = mark;
-        while end + 1 < cells.len() && !is_sep(end + 1) {
-            end += 1;
-        }
+        let (start, end) = segment_bounds(&cells, mark);
         let x = area.left() + u16::try_from(start).unwrap_or(0);
         let w = u16::try_from(end - start + 1).unwrap_or(1);
         found = Some(Rect::new(x, y, w, 1));
-        break 'rows;
+        break;
     }
     if let Ok(mut g) = JOBS_RECT.lock() {
         *g = found;
@@ -4120,6 +4184,7 @@ pub fn draw(
         status_row,
     );
     record_jobs_rect(frame.buffer_mut(), status_row);
+    record_ctx_rect(frame.buffer_mut(), status_row);
 }
 
 /// Draws one frame while an `ask` question (issue #34) is up: the output log
@@ -4166,6 +4231,7 @@ pub fn draw_ask(
         r[2],
     );
     record_jobs_rect(frame.buffer_mut(), r[2]);
+    record_ctx_rect(frame.buffer_mut(), r[2]);
 }
 
 /// Renders the question panel: a header chip and question, then the options as a
@@ -4357,6 +4423,7 @@ pub fn draw_btw_split(
         status_row,
     );
     record_jobs_rect(frame.buffer_mut(), status_row);
+    record_ctx_rect(frame.buffer_mut(), status_row);
 }
 
 /// Overlays the sub-agent pane's identity on the output area's top row: the
@@ -4882,6 +4949,33 @@ mod tests {
         let quiet = Buffer::empty(area);
         super::record_jobs_rect(&quiet, area);
         assert!(!super::jobs_click(10, 0), "no mark, no hit box");
+    }
+
+    /// The ctx gauge gets the same segment-wide click box, and its anchor is
+    /// the whole `ctx <digits>%` shape: a directory or branch name that merely
+    /// contains the three letters must not claim the box.
+    #[test]
+    fn ctx_rect_spans_the_gauge_and_ignores_lookalike_text() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 40, 1);
+        // The leading `ctx ` here is followed by a letter, not a digit.
+        let text = "my ctx dir | ctx 12% | idle";
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, text, ratatui::style::Style::default());
+        super::record_ctx_rect(&buf, area);
+        assert!(super::ctx_click(13, 0), "the gauge itself");
+        assert!(super::ctx_click(19, 0), "through the percent sign");
+        assert!(
+            !super::ctx_click(5, 0),
+            "the lookalike text must not be the hit box"
+        );
+        assert!(!super::ctx_click(12, 0), "the separator is not the segment");
+        assert!(!super::ctx_click(20, 0));
+        assert!(!super::ctx_click(13, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_ctx_rect(&quiet, area);
+        assert!(!super::ctx_click(13, 0), "no gauge, no hit box");
     }
 
     #[test]

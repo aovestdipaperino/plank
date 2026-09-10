@@ -3547,6 +3547,14 @@ struct PassDisplay {
 /// click toggle and the per-tick refresh.
 const JOBS_REPORT_TITLE: &str = "jobs";
 
+/// Title of the `/context` report panel; how the loops recognise it for the
+/// ctx-gauge click toggle.
+const CONTEXT_REPORT_TITLE: &str = "context";
+
+/// Title of the `/mcp` report panel; the mid-turn loop names it to reopen the
+/// turn-start snapshot.
+const MCP_REPORT_TITLE: &str = "mcp";
+
 struct PassStatusCtx {
     tx: Sender<UiEvent>,
     power_percent: i32,
@@ -10708,6 +10716,12 @@ impl Agent<'_> {
                             // The footer's jobs segment toggles the `/jobs` panel.
                             self.toggle_jobs_report(&mut report);
                             selection.cancel();
+                        } else if tui::ctx_click(m.column, m.row) {
+                            // The footer's ctx gauge toggles the `/context`
+                            // panel: the gauge is the one-number summary, the
+                            // panel is the breakdown behind it.
+                            self.toggle_context_report(&mut report);
+                            selection.cancel();
                         } else if let Some(run) = roster_hit {
                             sub_pane.click_run(run);
                             selection.cancel();
@@ -12928,6 +12942,22 @@ impl Agent<'_> {
         }
     }
 
+    /// Opens the `/context` panel, or closes it when it is the one showing:
+    /// the footer's ctx gauge toggles it on click.
+    fn toggle_context_report(&mut self, report: &mut Option<tui::ReportPanel>) {
+        if report
+            .as_ref()
+            .is_some_and(|r| r.title() == CONTEXT_REPORT_TITLE)
+        {
+            *report = None;
+        } else {
+            *report = Some(tui::ReportPanel::new(
+                CONTEXT_REPORT_TITLE,
+                &self.render_context_report(true),
+            ));
+        }
+    }
+
     /// Keeps an open `/jobs` panel current: elapsed times count and finished
     /// jobs change state without the user reopening it.
     fn refresh_jobs_report(&mut self, report: &mut Option<tui::ReportPanel>) {
@@ -13553,7 +13583,9 @@ impl Agent<'_> {
                     }
                 }
             }
-            "/tree" => log.push_ansi(&self.tree_view(true)),
+            "/tree" => {
+                *report = Some(tui::ReportPanel::new("tree", &self.tree_view(true)));
+            }
             "/fork" => match self.fork_branch(arg, true) {
                 Ok(msg) => log.push_ansi(&msg),
                 Err(e) => log.push_plain(e),
@@ -13568,8 +13600,25 @@ impl Agent<'_> {
                 }
             }
             "/version" => log.push_plain(format!("plank {}", crate::logo::version_label())),
-            "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
-            "/context" => log.push_ansi(&self.render_context_report(true)),
+            // The inventory reports below all go to the dismissable panel for
+            // the reason `/usage` does: they are snapshots of state, so in the
+            // scrollback they interleave with the model's output and scroll
+            // away for good.
+            "/mcp" => {
+                *report = Some(tui::ReportPanel::new(
+                    MCP_REPORT_TITLE,
+                    &render_mcp_report(&self.tool_ctx.mcp, true),
+                ));
+            }
+            // A report, not conversation: the same dismissable panel `/usage`
+            // uses, so the breakdown stays in one place instead of scrolling
+            // away inside the model's output.
+            "/context" => {
+                *report = Some(tui::ReportPanel::new(
+                    CONTEXT_REPORT_TITLE,
+                    &self.render_context_report(true),
+                ));
+            }
             // A report, not conversation: it goes in a dismissable panel at
             // the bottom instead of into the scrollback, where it would
             // interleave with the model's output and scroll away for good.
@@ -13627,12 +13676,12 @@ impl Agent<'_> {
             }
             "/list" => match self.store.list() {
                 Ok(entries) => {
-                    for line in
-                        crate::session::render_session_list(&entries, now_secs(), false).lines()
-                    {
-                        log.push_plain(line.to_owned());
-                    }
+                    *report = Some(tui::ReportPanel::new(
+                        "sessions",
+                        &crate::session::render_session_list(&entries, now_secs(), false),
+                    ));
                 }
+                // A failure is a one-line acknowledgement, not a report.
                 Err(e) => log.push_plain(format!("list failed: {e}")),
             },
             "/switch" => match self.store.load(arg) {
@@ -13770,18 +13819,34 @@ impl Agent<'_> {
                 log.push_dim(Self::model_text_command(arg));
             }
             "/skills" => {
-                for line in crate::skills::render_list(&self.skills).lines() {
-                    log.push_plain(line.to_owned());
-                }
+                *report = Some(tui::ReportPanel::new(
+                    "skills",
+                    &crate::skills::render_list(&self.skills),
+                ));
             }
+            // A bare `/frame` lists the openable frames, which is a report; with
+            // an argument it opens one, which is an action and stays a line in
+            // the scrollback.
             "/frame" => {
-                for line in self.frame_command(arg).lines() {
-                    log.push_plain(line.to_owned());
+                let out = self.frame_command(arg);
+                if arg.trim().is_empty() {
+                    *report = Some(tui::ReportPanel::new("frames", &out));
+                } else {
+                    for line in out.lines() {
+                        log.push_plain(line.to_owned());
+                    }
                 }
             }
+            // As with `/frame`: bare is the inventory, an argument installs,
+            // removes or trusts and reports its outcome as a line.
             "/plugins" => {
-                for line in self.plugins_command(arg).lines() {
-                    log.push_plain(line.to_owned());
+                let out = self.plugins_command(arg);
+                if arg.trim().is_empty() {
+                    *report = Some(tui::ReportPanel::new("plugins", &out));
+                } else {
+                    for line in out.lines() {
+                        log.push_plain(line.to_owned());
+                    }
                 }
             }
             "/install-claude-plugin" => {
@@ -13790,29 +13855,28 @@ impl Agent<'_> {
                 }
             }
             "/templates" => {
-                for line in crate::templates::render_list(&self.templates).lines() {
-                    log.push_plain(line.to_owned());
-                }
+                *report = Some(tui::ReportPanel::new(
+                    "templates",
+                    &crate::templates::render_list(&self.templates),
+                ));
             }
             "/tasks" => {
-                for line in self
-                    .session
-                    .tasks
-                    .render_list(self.session.goal.as_ref())
-                    .lines()
-                {
-                    log.push_plain(line.to_owned());
-                }
+                *report = Some(tui::ReportPanel::new(
+                    "tasks",
+                    &self.session.tasks.render_list(self.session.goal.as_ref()),
+                ));
             }
             "/agent" => {
-                for line in crate::agents::render_list(&self.agents).lines() {
-                    log.push_plain(line.to_owned());
-                }
+                *report = Some(tui::ReportPanel::new(
+                    "agents",
+                    &crate::agents::render_list(&self.agents),
+                ));
             }
             "/hooks" => {
-                for line in crate::hooks::render_list(&self.tool_ctx.hooks).lines() {
-                    log.push_plain(line.to_owned());
-                }
+                *report = Some(tui::ReportPanel::new(
+                    "hooks",
+                    &crate::hooks::render_list(&self.tool_ctx.hooks),
+                ));
             }
             "/remote-control" | "/rc" => {
                 for line in self.remote_toggle_lines(cmd, arg) {
@@ -14629,12 +14693,14 @@ impl LiveCommands {
     /// ANSI output for a read-only command runnable mid-turn, or `None` when
     /// the command must wait for the turn to finish. `/help` is static, so it
     /// is rendered on demand rather than snapshotted.
-    fn output(&self, cmd: &str) -> Option<std::borrow::Cow<'_, str>> {
+    ///
+    /// `/context`, `/usage` and `/mcp` are absent on purpose: all three go to
+    /// the report panel rather than the scrollback, so the mid-turn loop reads
+    /// their snapshots (`context`, `usage`, `mcp`) directly instead of
+    /// streaming them.
+    fn output(cmd: &str) -> Option<std::borrow::Cow<'static, str>> {
         use std::borrow::Cow;
         match cmd {
-            "/context" => Some(Cow::Borrowed(self.context.as_str())),
-            "/usage" => Some(Cow::Borrowed(self.usage.as_str())),
-            "/mcp" => Some(Cow::Borrowed(self.mcp.as_str())),
             "/help" => Some(Cow::Owned(crate::config::usage())),
             "/version" => Some(Cow::Owned(format!(
                 "plank {}",
@@ -15342,6 +15408,26 @@ fn busy_ui_loop(
                             }
                             view.follow = true;
                             sub.follow_all();
+                        } else if line.split_whitespace().next() == Some("/mcp") {
+                            // Same panel as at idle, over the turn-start
+                            // snapshot the worker cannot re-render mid-turn.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report = Some(tui::ReportPanel::new(MCP_REPORT_TITLE, &live_cmds.mcp));
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if line.split_whitespace().next() == Some("/context") {
+                            // Same panel as at idle, over the turn-start
+                            // snapshot: the worker owns the engine, so the
+                            // breakdown cannot be re-rendered mid-turn.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report = Some(tui::ReportPanel::new(
+                                CONTEXT_REPORT_TITLE,
+                                &live_cmds.context,
+                            ));
+                            view.follow = true;
+                            sub.follow_all();
                         } else if line.split_whitespace().next() == Some("/usage") {
                             // A report, not conversation: show it in the
                             // dismissable panel (as at idle) instead of dumping
@@ -15366,10 +15452,10 @@ fn busy_ui_loop(
                         } else if let Some(out) = line
                             .starts_with('/')
                             .then(|| line.split_whitespace().next().unwrap_or(&line))
-                            .and_then(|cmd| live_cmds.output(cmd))
+                            .and_then(LiveCommands::output)
                         {
-                            // The other read-only reports (`/context`, `/mcp`,
-                            // `/help`) run against a turn-start snapshot and
+                            // The other read-only reports (`/mcp`, `/help`,
+                            // `/config`) run against a turn-start snapshot and
                             // stream into the log, matching their idle behavior.
                             input.history.add(&line);
                             log.push_user_echo(&line);
@@ -15526,6 +15612,23 @@ fn busy_ui_loop(
                         report = Some(tui::ReportPanel::new(
                             JOBS_REPORT_TITLE,
                             &shared.jobs_report(),
+                        ));
+                    }
+                    selection.cancel();
+                }
+                // The footer's ctx gauge toggles the `/context` panel, as at
+                // idle, over the same turn-start snapshot the typed command
+                // gets.
+                MouseEventKind::Down(MouseButton::Left) if tui::ctx_click(m.column, m.row) => {
+                    if report
+                        .as_ref()
+                        .is_some_and(|r| r.title() == CONTEXT_REPORT_TITLE)
+                    {
+                        report = None;
+                    } else {
+                        report = Some(tui::ReportPanel::new(
+                            CONTEXT_REPORT_TITLE,
+                            &live_cmds.context,
                         ));
                     }
                     selection.cancel();
@@ -20334,16 +20437,22 @@ mod tests {
             usage: "USE".to_owned(),
             mcp: "MCP".to_owned(),
         };
-        assert_eq!(live.output("/context").as_deref(), Some("CTX"));
-        assert_eq!(live.output("/usage").as_deref(), Some("USE"));
-        assert_eq!(live.output("/mcp").as_deref(), Some("MCP"));
+        // `/context`, `/usage` and `/mcp` are snapshotted for the report
+        // panel, which reads the fields directly, so they are deliberately not
+        // streamable.
+        assert_eq!(live.context, "CTX");
+        assert_eq!(live.usage, "USE");
+        assert_eq!(live.mcp, "MCP");
+        assert!(LiveCommands::output("/context").is_none());
+        assert!(LiveCommands::output("/usage").is_none());
+        assert!(LiveCommands::output("/mcp").is_none());
         // /help is static, rendered on demand — just present.
-        assert!(live.output("/help").is_some());
+        assert!(LiveCommands::output("/help").is_some());
         // Mutating / stateful commands must not run mid-turn.
-        assert!(live.output("/compact").is_none());
-        assert!(live.output("/save").is_none());
-        assert!(live.output("/resume").is_none());
-        assert!(live.output("/context-ish").is_none());
+        assert!(LiveCommands::output("/compact").is_none());
+        assert!(LiveCommands::output("/save").is_none());
+        assert!(LiveCommands::output("/resume").is_none());
+        assert!(LiveCommands::output("/context-ish").is_none());
     }
 
     /// A console that connects after two turns receives exactly those two

@@ -38,7 +38,7 @@ See [Sessions](06-sessions.md).
 
 | Command | What it does |
 |---|---|
-| `/context` | report context-window usage by category |
+| `/context` | report context-window usage by category (or click the `ctx N%` gauge) |
 | `/compact [instructions]` | compact the conversation now, rather than waiting for the automatic pass; an argument steers what this one summary keeps |
 | `/usage` | billed token counts for the session (hosted providers, including cache hit rate) |
 | `/jobs` | the background bash job table: id, pid, elapsed, state and output file. A live panel in the TUI, also mid-turn; clicking `⧗ N jobs` in the status bar toggles it |
