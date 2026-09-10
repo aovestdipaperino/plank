@@ -9562,6 +9562,11 @@ struct TuiInput {
     /// True when the current history walk started from a `!` line, fixing it
     /// to bash mode for the rest of the walk.
     hist_bang: bool,
+    /// Set by a history recall and consumed by the [`TuiInput::sync_popup`]
+    /// that follows it in the key loop, which keeps the `/` menu shut over a
+    /// recalled command. Without it the menu opens on the recalled text and
+    /// then swallows the next Up/Down, stranding the walk after one step.
+    hist_recall: bool,
     stash: String,
     /// Open `@` suggestion popup, when one is showing.
     popup: Option<crate::complete::Popup>,
@@ -9591,6 +9596,7 @@ impl TuiInput {
             history: History::live(),
             hist_idx: None,
             hist_bang: false,
+            hist_recall: false,
             stash: String::new(),
             popup: None,
             slash: None,
@@ -9656,6 +9662,14 @@ impl TuiInput {
     /// Called after every key. Starts the index worker lazily on the first `@`
     /// so a session that never completes never shells out to git.
     fn sync_popup(&mut self) {
+        // A recalled line is not something the user is composing, so neither
+        // menu opens over it. The flag is consumed here, so the next real edit
+        // completes as usual.
+        if std::mem::take(&mut self.hist_recall) {
+            self.popup = None;
+            self.slash = None;
+            return;
+        }
         self.sync_slash();
         let token = crate::complete::detect_at_token(self.left_of_cursor())
             .filter(|_| self.cursor_at_token_end());
@@ -9985,6 +9999,9 @@ impl TuiInput {
     }
 
     fn history_move(&mut self, dir: i32) {
+        // Every arm below either replaces the buffer from history or restores
+        // the stash, so the whole call is a recall as far as the menus care.
+        self.hist_recall = true;
         if self.hist_idx.is_none() {
             // Mode is fixed when navigation starts. Re-deriving it per keypress
             // would flip it the moment a non-`!` entry lands in the buffer,
@@ -17662,6 +17679,39 @@ mod tests {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert!(!input.popup_key(enter));
         assert_eq!(input.buf.text(), "@src");
+    }
+
+    /// Walking history onto a slash command must not open the `/` menu: the
+    /// menu takes Up and Down for its own selection, so an opened menu strands
+    /// the walk on that entry.
+    #[test]
+    fn a_recalled_slash_command_does_not_open_the_menu() {
+        let mut input = TuiInput::new();
+        input.history.add("/context");
+        input.history.add("/usage");
+        // The key loop syncs after every key, which is what used to open the
+        // menu over the recalled text.
+        input.history_move(-1);
+        input.sync_popup();
+        assert_eq!(input.buf.text(), "/usage");
+        assert!(
+            input.slash.is_none(),
+            "the menu must stay shut over a recalled command"
+        );
+        // With no menu holding the key, a second Up keeps walking back.
+        assert!(!input.popup_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        input.history_move(-1);
+        input.sync_popup();
+        assert_eq!(input.buf.text(), "/context");
+        assert!(input.slash.is_none());
+        // Typing again is composing, not recalling, so completion resumes.
+        input.buf.set_text("/con");
+        input.buf.move_end();
+        input.sync_popup();
+        assert!(
+            input.slash.is_some(),
+            "an edited line completes as usual again"
+        );
     }
 
     #[test]
