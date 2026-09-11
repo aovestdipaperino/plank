@@ -1689,6 +1689,72 @@ struct DraftScan {
     headings: usize,
     /// Bytes of lines inside fenced code blocks.
     fenced_bytes: usize,
+    /// Exact numbered-line bodies, ignoring only their leading list ordinal.
+    numbered: NumberedCycle,
+}
+
+/// Bounded history independent of the byte-cycle window. A 26-item cycle in
+/// repro-1789068543 is over 7 KiB long and changes its ordinal on every line.
+#[derive(Debug, Default)]
+struct NumberedCycle {
+    bodies: std::collections::VecDeque<([u8; 32], usize)>,
+    /// Normalized period in bytes and number of copies, not raw-byte equality.
+    cycle: Option<(usize, usize)>,
+}
+
+impl NumberedCycle {
+    fn feed_line(&mut self, line: &str) {
+        use sha2::{Digest, Sha256};
+        const MAX_ITEMS: usize = 256;
+        const MIN_BODY_BYTES: usize = 12;
+        const MAX_BODY_BYTES: usize = 16 * 1024;
+        // Blank separators are allowed; other prose breaks the sequence.
+        if line.is_empty() {
+            return;
+        }
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        let body = line.get(digits..).and_then(|tail| {
+            if digits == 0 {
+                return None;
+            }
+            tail.strip_prefix(". ").or_else(|| tail.strip_prefix(") "))
+        });
+        let Some(body) = body.filter(|b| (MIN_BODY_BYTES..=MAX_BODY_BYTES).contains(&b.len()))
+        else {
+            self.bodies.clear();
+            return;
+        };
+        self.bodies
+            .push_back((Sha256::digest(body.as_bytes()).into(), body.len()));
+        if self.bodies.len() > MAX_ITEMS {
+            self.bodies.pop_front();
+        }
+        let entries = self.bodies.make_contiguous();
+        for period in 3..=entries.len() / REPEAT_CYCLES {
+            let repeated = &entries[entries.len() - period * REPEAT_CYCLES..];
+            let block = &repeated[..period];
+            if !repeated.chunks_exact(period).all(|copy| copy == block) {
+                continue;
+            }
+            // A repeated sentence or alternating boilerplate is not enough:
+            // require at least three distinct substantial bodies per cycle.
+            let first = block[0].0;
+            let Some(second) = block.iter().find(|entry| entry.0 != first) else {
+                continue;
+            };
+            if !block
+                .iter()
+                .any(|entry| entry.0 != first && entry.0 != second.0)
+            {
+                continue;
+            }
+            let bytes = block.iter().map(|entry| entry.1).sum::<usize>();
+            if bytes >= 256 {
+                self.cycle = Some((bytes, REPEAT_CYCLES));
+                break;
+            }
+        }
+    }
 }
 
 /// What the reasoning guard saw of one pass, for the `## Passes` table of a
@@ -1741,12 +1807,16 @@ impl DraftScan {
         let trimmed = line.trim();
         if trimmed.starts_with("```") {
             self.in_fence = !self.in_fence;
+            self.numbered.bodies.clear();
             return;
         }
         if self.in_fence {
             self.fenced_bytes += line.len();
-        } else if is_deliverable_heading(trimmed) {
-            self.headings += 1;
+        } else {
+            self.numbered.feed_line(trimmed);
+            if is_deliverable_heading(trimmed) {
+                self.headings += 1;
+            }
         }
     }
 }
@@ -1944,7 +2014,9 @@ impl RepeatGuard {
     /// never answers true.
     pub fn feed(&mut self, chunk: &str) -> bool {
         let cycling = self.feed_tail(chunk);
-        cycling && self.live()
+        let numbered_cycle = self.draft.numbered.cycle.is_some();
+        self.repeating |= numbered_cycle;
+        (cycling || numbered_cycle) && self.live()
     }
 
     /// [`feed`](Self::feed) without the switch: the detection itself.
