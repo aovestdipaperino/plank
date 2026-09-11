@@ -103,7 +103,7 @@ impl Hysteresis {
     pub fn note_external_yield(&mut self, now_secs: u64) {
         self.yielded = true;
         self.shed = true;
-        self.normal_since = Some(now_secs);
+        self.normal_since = None;
         self.critical_since = None;
         self.last_yield = Some(now_secs);
     }
@@ -126,11 +126,11 @@ impl Hysteresis {
             return Decision::Hold;
         }
 
-        // Any non-Normal level interrupts a resume dwell in progress; while
-        // already yielded, a dip back into pressure restarts the dwell clock
-        // rather than clearing it, since the dwell must run from *this*
-        // reading, not from whenever the next Normal happens to be observed.
-        self.normal_since = if self.yielded { Some(now_secs) } else { None };
+        // Any non-Normal level clears a resume dwell in progress. The clock
+        // restarts from the next observed Normal, not from this reading: the
+        // dwell has to be evidence that the machine was quiet, and only an
+        // actual Normal observation is that evidence.
+        self.normal_since = None;
 
         if self.yielded {
             // Already given back everything there is to give.
@@ -162,7 +162,6 @@ impl Hysteresis {
         }
         self.yielded = true;
         self.shed = true;
-        self.normal_since = Some(now_secs);
         self.critical_since = None;
         self.last_yield = Some(now_secs);
         Decision::Yield
@@ -199,14 +198,18 @@ mod tests {
     fn resume_waits_for_the_full_dwell() {
         let mut h = Hysteresis::new();
         h.observe(PressureLevel::Critical, 0);
-        assert_eq!(h.observe(PressureLevel::Normal, 1), Decision::Hold);
         assert_eq!(
-            h.observe(PressureLevel::Normal, RESUME_DWELL_SECS),
+            h.observe(PressureLevel::Normal, 1),
+            Decision::Hold,
+            "the first Normal only starts the clock; it proves nothing yet"
+        );
+        assert_eq!(
+            h.observe(PressureLevel::Normal, 1 + RESUME_DWELL_SECS),
             Decision::Hold,
             "the dwell is measured from the first Normal, and is exclusive"
         );
         assert_eq!(
-            h.observe(PressureLevel::Normal, 1 + RESUME_DWELL_SECS),
+            h.observe(PressureLevel::Normal, 2 + RESUME_DWELL_SECS),
             Decision::Resume
         );
     }
@@ -265,6 +268,11 @@ mod tests {
         );
         assert_eq!(
             h.observe(PressureLevel::Normal, 2 + RESUME_DWELL_SECS),
+            Decision::Hold,
+            "the first Normal after the dip only starts the clock"
+        );
+        assert_eq!(
+            h.observe(PressureLevel::Normal, 3 + 2 * RESUME_DWELL_SECS),
             Decision::Resume,
             "a mid-pass yield must still get its matching resume"
         );
@@ -274,13 +282,18 @@ mod tests {
     fn min_interval_suppresses_a_second_yield() {
         let mut h = Hysteresis::new();
         assert_eq!(h.observe(PressureLevel::Critical, 0), Decision::Yield);
-        // Resume, then go critical again well inside the guard window.
+        // Resume needs two Normals spanning the dwell, then go critical again
+        // well inside the guard window.
         assert_eq!(
             h.observe(PressureLevel::Normal, 1 + RESUME_DWELL_SECS),
+            Decision::Hold
+        );
+        assert_eq!(
+            h.observe(PressureLevel::Normal, 2 + 2 * RESUME_DWELL_SECS),
             Decision::Resume
         );
         assert_eq!(
-            h.observe(PressureLevel::Critical, 2 + RESUME_DWELL_SECS),
+            h.observe(PressureLevel::Critical, 3 + 2 * RESUME_DWELL_SECS),
             Decision::Hold,
             "a re-prefill that re-triggers pressure must not yield again at once"
         );
@@ -288,6 +301,17 @@ mod tests {
             h.observe(PressureLevel::Critical, 1 + MIN_YIELD_INTERVAL_SECS),
             Decision::Yield,
             "past the guard window, pressure is actionable again"
+        );
+    }
+
+    #[test]
+    fn a_single_normal_reading_never_resumes() {
+        let mut h = Hysteresis::new();
+        h.observe(PressureLevel::Critical, 0);
+        assert_eq!(
+            h.observe(PressureLevel::Normal, 10_000),
+            Decision::Hold,
+            "one sample proves time passed, not that the machine was quiet"
         );
     }
 }
