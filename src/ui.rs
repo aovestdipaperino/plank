@@ -7376,6 +7376,19 @@ the original is frozen and listed in /tree"
         self.yield_policy.plan().is_some()
     }
 
+    /// True when the state machine committed a yield that never happened.
+    ///
+    /// `Hysteresis::observe` sets the yielded flag before the caller has tried
+    /// to act on it, so a decision that is suppressed — first turn, sidechain,
+    /// user abort — or that the engine refuses leaves the machine believing it
+    /// freed memory it never freed. It would then hold off every later
+    /// `Critical` until a full resume dwell elapsed, suppressing exactly the
+    /// retries that matter. A live restore plan is the discriminator: that
+    /// means a real yield, which still needs its matching `Resume`.
+    fn yield_is_phantom(&self) -> bool {
+        self.hysteresis.is_yielded() && !self.is_pressure_yielded()
+    }
+
     /// Latches whether the pass that just returned was stopped by memory
     /// pressure.
     ///
@@ -7481,6 +7494,9 @@ the original is frozen and listed in /tree"
         // The user asked to stop between the raise and here: that ends the
         // turn, so leave the session alone and let the abort path run.
         if crate::interrupt::pending() {
+            if self.yield_is_phantom() {
+                self.hysteresis.note_yield_declined();
+            }
             crate::ds4engine::clear_cancel();
             return None;
         }
@@ -7503,7 +7519,7 @@ the original is frozen and listed in /tree"
                 // Critical is actionable.
                 self.hysteresis.note_yield_declined();
             }
-        } else if self.hysteresis.is_yielded() && !self.is_pressure_yielded() {
+        } else if self.yield_is_phantom() {
             // Same invariant as `poll_pressure`: yielded state with nothing
             // freed must be rolled back. This path never commits a yield of its
             // own (the stop came from the cancel hook), but an `observe` earlier
@@ -17789,6 +17805,7 @@ mod tests {
         );
 
         // Suppressed because the agent is inside a sub-agent sidechain.
+        agent.hysteresis = crate::mempressure::Hysteresis::new();
         agent.first_turn_done = true;
         agent.sidechain_depth = 1;
         assert!(agent.poll_pressure().is_none(), "the yield is suppressed");
