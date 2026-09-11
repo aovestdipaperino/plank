@@ -977,6 +977,50 @@ impl Compacted {
 const COMPACT_INTERRUPTED: &str =
     "Compaction interrupted; keeping the previous conversation state.";
 
+/// Footer marker shown while plank has given its KV back to the system.
+// Wired into the turn paths in the next commit; tests exercise it now.
+#[allow(dead_code)]
+const PRESSURE_YIELDED: &str =
+    "paused: system memory pressure \u{2014} KV released, will resume when it clears";
+
+/// System line shown on resume when the rebuild is not free.
+///
+/// The disclosure rule: plank always yields, even when the resume is expensive,
+/// so it has to *say* the cost. A long re-prefill behind a silent stall is
+/// indistinguishable from a hang.
+// Wired into the turn paths in the next commit; tests exercise it now.
+#[allow(dead_code)]
+fn pressure_disclosure(plan: &crate::yieldpolicy::RestorePlan) -> String {
+    if plan.reprefill_tokens <= 0 {
+        return String::new();
+    }
+    format!(
+        "resuming after memory pressure: re-prefilling {} tokens",
+        plan.reprefill_tokens
+    )
+}
+
+/// Whether a pressure decision should be acted on now.
+///
+/// Two suppressions. Before the first turn finishes there is no session worth
+/// saving and yielding would mean never starting. Inside a sub-agent sidechain
+/// there are no rungs (`in_sidechain()` never pushes them), so a yield costs a
+/// full sidechain rebuild \u{2014} and sidechains are short enough to wait out.
+// Wired into the turn paths in the next commit; tests exercise it now.
+#[allow(dead_code)]
+fn should_act(
+    decision: crate::mempressure::Decision,
+    first_turn_done: bool,
+    in_sidechain: bool,
+) -> bool {
+    use crate::mempressure::Decision;
+    match decision {
+        Decision::Hold => false,
+        Decision::Yield => first_turn_done && !in_sidechain,
+        Decision::ShedCache | Decision::Resume => true,
+    }
+}
+
 /// Reported when the summary pass produced nothing usable.
 ///
 /// Rebuilding on an empty summary would destroy the transcript and put an empty
@@ -17150,6 +17194,64 @@ mod tests {
 
     use super::*;
     use crate::engine::{EngineError, EngineEvent, GenerationStats, ThinkMode};
+
+    #[test]
+    fn the_disclosure_names_the_reprefill_cost() {
+        let plan = crate::yieldpolicy::RestorePlan {
+            reprefill_tokens: 11_808,
+            keep: vec!["tier2".to_owned()],
+        };
+        let line = pressure_disclosure(&plan);
+        assert!(
+            line.contains("11808") || line.contains("11,808"),
+            "a silent multi-minute re-prefill reads as a hang: {line}"
+        );
+    }
+
+    #[test]
+    fn the_yield_marker_names_the_cause() {
+        assert!(
+            PRESSURE_YIELDED.contains("memory pressure"),
+            "the footer marker has to say why plank stopped: {PRESSURE_YIELDED}"
+        );
+    }
+
+    #[test]
+    fn a_free_resume_says_nothing() {
+        let plan = crate::yieldpolicy::RestorePlan {
+            reprefill_tokens: 0,
+            keep: vec![],
+        };
+        assert!(
+            pressure_disclosure(&plan).is_empty(),
+            "nothing to disclose when nothing must be rebuilt"
+        );
+    }
+
+    #[test]
+    fn pressure_is_ignored_until_the_first_turn_completes() {
+        use crate::mempressure::{Decision, Hysteresis, PressureLevel};
+        let mut h = Hysteresis::new();
+        let first_turn_done = false;
+        let decision = h.observe(PressureLevel::Critical, 0);
+        assert_eq!(decision, Decision::Yield);
+        assert!(
+            !should_act(decision, first_turn_done, false),
+            "yielding during the initial sysprompt prefill means never starting"
+        );
+    }
+
+    #[test]
+    fn a_sidechain_defers_the_yield() {
+        use crate::mempressure::Decision;
+        assert!(
+            !should_act(Decision::Yield, true, true),
+            "a sidechain has no rungs to fall back to, so waiting out a short \
+             one beats rebuilding it"
+        );
+        assert!(should_act(Decision::Yield, true, false));
+    }
+
     use std::cell::RefCell;
     use std::rc::Rc;
 
