@@ -10975,6 +10975,21 @@ impl Agent<'_> {
                             // glyph is the handle on it.
                             toggle_toks_report(&mut report);
                             selection.cancel();
+                        } else if tui::camera_click(m.column, m.row) {
+                            // The dir prefix's camera takes a `/repro` of the
+                            // session as it stands, and says where it landed —
+                            // the same line, and the same clipboard copy, the
+                            // typed command produces. Idle only: the dump
+                            // renders the transcript, which a running turn is
+                            // still writing.
+                            match self.write_repro("") {
+                                Ok((path, sidecars)) => {
+                                    log.push_dim(Self::repro_copied_line(&path, sidecars));
+                                }
+                                Err(e) => log.push_plain(format!("repro failed: {e}")),
+                            }
+                            view.follow = true;
+                            selection.cancel();
                         } else if tui::ctx_click(m.column, m.row) {
                             // The footer's ctx gauge toggles the `/context`
                             // panel: the gauge is the one-number summary, the

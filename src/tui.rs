@@ -2895,6 +2895,10 @@ static MC_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 /// the chart glyph can be mapped to it.
 static TOKS_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 
+/// Screen rect the footer's repro shutter last occupied, so a click on the
+/// camera can be mapped to it.
+static CAMERA_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
 /// Whether a click at (`column`, `row`) landed on the footer's jobs segment.
 #[must_use]
 pub fn jobs_click(column: u16, row: u16) -> bool {
@@ -2921,6 +2925,17 @@ pub fn mc_click(column: u16, row: u16) -> bool {
 #[must_use]
 pub fn toks_click(column: u16, row: u16) -> bool {
     TOKS_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// Whether a click at (`column`, `row`) landed on the footer's repro shutter
+/// (the camera glyph in the dir prefix).
+#[must_use]
+pub fn camera_click(column: u16, row: u16) -> bool {
+    CAMERA_RECT
         .lock()
         .ok()
         .and_then(|r| *r)
@@ -3070,6 +3085,29 @@ pub fn record_toks_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
         break;
     }
     if let Ok(mut g) = TOKS_RECT.lock() {
+        *g = found;
+    }
+}
+
+/// Finds the repro shutter in the status rows just drawn into `buf` and
+/// records its rect, exactly as [`record_toks_rect`] does for the chart glyph:
+/// the anchor is [`crate::status::CAMERA_MARK`] and the box is the run between
+/// the ` | ` separators around it. Called after every status render so a frame
+/// drawn without the glyph forgets the rect.
+pub fn record_camera_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        let Some(mark) = cells.iter().position(|c| *c == crate::status::CAMERA_MARK) else {
+            continue;
+        };
+        let (start, end) = segment_bounds(&cells, mark);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = CAMERA_RECT.lock() {
         *g = found;
     }
 }
@@ -4268,6 +4306,7 @@ pub fn draw(
     record_ctx_rect(frame.buffer_mut(), status_row);
     record_toks_rect(frame.buffer_mut(), status_row);
     record_mc_rect(frame.buffer_mut(), status_row);
+    record_camera_rect(frame.buffer_mut(), status_row);
 }
 
 /// Draws one frame while an `ask` question (issue #34) is up: the output log
@@ -4317,6 +4356,7 @@ pub fn draw_ask(
     record_ctx_rect(frame.buffer_mut(), r[2]);
     record_toks_rect(frame.buffer_mut(), r[2]);
     record_mc_rect(frame.buffer_mut(), r[2]);
+    record_camera_rect(frame.buffer_mut(), r[2]);
 }
 
 /// Renders the question panel: a header chip and question, then the options as a
@@ -4511,6 +4551,7 @@ pub fn draw_btw_split(
     record_ctx_rect(frame.buffer_mut(), status_row);
     record_toks_rect(frame.buffer_mut(), status_row);
     record_mc_rect(frame.buffer_mut(), status_row);
+    record_camera_rect(frame.buffer_mut(), status_row);
 }
 
 /// Overlays the sub-agent pane's identity on the output area's top row: the
@@ -4652,6 +4693,17 @@ fn push_dir_prefix(
         }
         None => (segment, String::new()),
     };
+    // The shutter is the last segment of row one, between the tree it snapshots
+    // and the origin already peeled above. Peel it so it keeps the bar's own
+    // style instead of being painted as part of the branch or the git stat.
+    let camera = crate::status::CAMERA_MARK;
+    let (segment, shutter) = match segment.trim_end().strip_suffix(camera) {
+        Some(head) => {
+            let head = head.trim_end();
+            (head.strip_suffix('|').map_or(head, str::trim_end), camera)
+        }
+        None => (segment, ""),
+    };
     if let Some(gi) = segment.find(glyph) {
         let path = segment[..gi].trim_end();
         let tail = segment[gi + glyph.len_utf8()..].trim();
@@ -4677,8 +4729,14 @@ fn push_dir_prefix(
             first.push(Span::styled(" | ".to_string(), base));
             push_git_stat(first, stat, base);
         }
-    } else {
+    } else if !segment.trim_end().is_empty() {
         first.push(Span::styled(segment.trim_end().to_string(), theme));
+    }
+    if !shutter.is_empty() {
+        if !first.is_empty() {
+            first.push(Span::styled(" | ".to_string(), base));
+        }
+        first.push(Span::styled(shutter.to_string(), base));
     }
     // The origin heads the *second* row rather than trailing the first: row one
     // answers "which tree am I in", and only that, so it stays readable at a
@@ -5055,6 +5113,30 @@ mod tests {
         let quiet = Buffer::empty(area);
         super::record_toks_rect(&quiet, area);
         assert!(!super::toks_click(10, 0), "no glyph, no hit box");
+    }
+
+    /// The camera gets its own segment-wide click box on the dir-prefix row,
+    /// so a press on the shutter writes a `/repro`.
+    #[test]
+    fn camera_rect_spans_the_shutter_segment() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 40, 1);
+        let text = format!("~/p \u{e0a0} main | {} | ds4", crate::status::CAMERA_MARK);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, &text, ratatui::style::Style::default());
+        super::record_camera_rect(&buf, area);
+        // "~/p \u{e0a0} main | " is 13 cells; the wide glyph spans the next two.
+        assert!(super::camera_click(13, 0), "the glyph itself");
+        assert!(
+            !super::camera_click(12, 0),
+            "the separator is not the segment"
+        );
+        assert!(!super::camera_click(15, 0), "past the segment");
+        assert!(!super::camera_click(13, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_camera_rect(&quiet, area);
+        assert!(!super::camera_click(13, 0), "no glyph, no hit box");
     }
 
     /// The ctx gauge gets the same segment-wide click box, and its anchor is
@@ -7371,6 +7453,32 @@ mod tests {
         let line = status_spans("idle", 0, base, &tv);
         let counter = line.iter().find(|s| s.content.contains("1/1")).unwrap();
         assert_eq!(counter.style.fg, Some(Color::Indexed(240)));
+    }
+
+    /// The shutter is the last segment of row one, and stays plain: peeled off
+    /// like the origin, so neither the branch nor the git stat absorbs it.
+    #[test]
+    fn status_bar_keeps_the_shutter_out_of_the_branch() {
+        let base = Style::default();
+        let theme = Color::Indexed(crate::status::THEME_COLOR);
+        let glyph = crate::status::POWERLINE_BRANCH;
+        let camera = crate::status::CAMERA_MARK;
+        let origin = crate::status::engine_origin_label();
+        let text = format!("~/Code/plank {glyph} main | {camera} | {origin} | ctx 12% | idle");
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
+        let first: Vec<_> = rows[0].spans.iter().collect();
+
+        let branch = first
+            .iter()
+            .find(|s| s.content == "main")
+            .expect("branch span ends at the branch");
+        assert_eq!(branch.style.fg, Some(theme));
+
+        let shutter = first
+            .iter()
+            .find(|s| s.content == camera)
+            .expect("the shutter is its own span on row one");
+        assert_eq!(shutter.style.fg, None, "plain, like the separators");
     }
 
     /// With the think segment present, the branch must still end at the branch:

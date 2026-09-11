@@ -327,6 +327,19 @@ const MICROCOMPACT_OFF: &str = "🔴";
 /// this symbol in the drawn buffer.
 pub const TOKS_MARK: &str = "📈";
 
+/// Marks the footer's repro shutter, which writes a `/repro` dump on click.
+/// Public so the TUI can find the segment for mouse hit-testing, the same
+/// reason [`JOBS_MARK`] is.
+///
+/// It rides in the dir prefix, on the row that answers "which tree am I in",
+/// because a repro is a snapshot of *this* session in *this* tree.
+///
+/// The bare codepoint, without the U+FE0F variation selector, for the reason
+/// [`MICROCOMPACT_MARK`] spells out: here the measurement is also the click
+/// box, since [`crate::tui::record_camera_rect`] locates the segment by
+/// finding this symbol in the drawn buffer.
+pub const CAMERA_MARK: &str = "\u{1f4f7}";
+
 /// Marks the footer's loop segment, shown while the repetition guard sees the
 /// reasoning cycling (`♻ looping`).
 ///
@@ -1834,19 +1847,19 @@ fn build_status_text_with_cells(
     // but as its own bar-separated segment, like the think and ctx segments.
     let origin = format!("{} | ", engine_origin_label());
     let dir = if cwd.is_empty() {
-        origin
+        format!("{CAMERA_MARK} | {origin}")
     } else if let Some(branch) = git_branch_label() {
         // The git stat segment rides with the branch, inside the dir prefix:
         // it answers "what have I changed in this tree", which is the same
         // question the path and branch answer, one level down.
         let stat = git_stat_segment(color).map_or(String::new(), |s| format!(" | {s}"));
         format!(
-            "{} {POWERLINE_BRANCH} {}{stat} | {origin}",
+            "{} {POWERLINE_BRANCH} {}{stat} | {CAMERA_MARK} | {origin}",
             theme(&cwd),
             theme(&branch)
         )
     } else {
-        format!("{} | {origin}", theme(&cwd))
+        format!("{} | {CAMERA_MARK} | {origin}", theme(&cwd))
     };
     let ctx = format!("{think}{ctx}");
     // The MTP segment sits with the ctx gauge rather than in the state word:
