@@ -32,6 +32,20 @@ pub const IN_THINK_PROHIBITION: &str =
 const DSML_START: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
 /// Canonical invoke opener, seeded when the model skips the outer wrapper.
 const CANONICAL_INVOKE: &[u8] = "<｜DSML｜invoke".as_bytes();
+
+/// Tree glyphs for the tool-call banner.
+///
+/// Every parameter branch is `├─`; the last one is never `└─`. Values stream
+/// in byte by byte, and nothing tells this renderer a parameter was the final
+/// one until the invoke's close tag arrives — long after the connector was
+/// painted and flushed. A uniform connector is the only shape that stays
+/// honest without buffering the whole call, which is the one thing a
+/// streaming renderer must not do.
+const TREE_BRANCH: &str = "  ├─ ";
+/// Continuation rail under a branch, for a value spanning several lines.
+/// Same column count as [`TREE_BRANCH`], so the rail sits directly under the
+/// branch glyph it continues.
+const TREE_RAIL: &str = "  │  ";
 /// The Qwen dialect's one and only stanza opener.
 const QWEN_START: &[u8] = b"<tool_call>";
 const DSML_BAR: &[u8] = "｜".as_bytes();
@@ -272,20 +286,6 @@ fn param_kind_for(tool: &str, param: &str) -> ParamKind {
     }
 }
 
-/// Display prefix for known tools; `None` falls back to the tool name.
-fn tool_prefix(name: &str) -> Option<&'static str> {
-    match name {
-        "bash" => Some("$ "),
-        "read" => Some("read "),
-        "write" => Some("Writing "),
-        "edit" => Some("edit "),
-        "search" => Some("search "),
-        "google_search" => Some("google "),
-        "visit_page" => Some("visit "),
-        name if name.starts_with("mcp_") => Some("mcp "),
-        _ => None,
-    }
-}
 
 /// Renders `path` relative to `base` when it sits inside it; otherwise returns
 /// `path` unchanged. Used to shorten the `write` preview header for files in
@@ -535,11 +535,18 @@ impl PseudoToolDetector {
             } else {
                 text == *opener
             }
-        }) || self.tool_names.iter().any(|name| {
-            text.strip_prefix('<')
-                .and_then(|t| t.strip_suffix('>'))
-                .is_some_and(|inner| inner == name)
-        });
+        }) || text
+            .strip_prefix('<')
+            .and_then(|t| t.strip_suffix('>'))
+            .is_some_and(|inner| {
+                // Plus the prefix arm plank's `dispatch` ends with: every
+                // `mcp__server__tool` name routes to the MCP bridge, and those
+                // names are discovered per server at runtime, so no static
+                // table can list them. Without this an invented `<mcp__x__y>`
+                // block was not tool-shaped to the detector and the turn ended
+                // with no call and no error for the model to correct from.
+                inner.starts_with("mcp__") || self.tool_names.iter().any(|n| inner == n)
+            });
         if !matched {
             return None;
         }
@@ -572,6 +579,10 @@ enum DsmlScan {
 #[derive(Debug, Default)]
 struct ToolViz {
     active: bool,
+    /// Whether the `🛠️ tool_calls` root line has been painted. Emitted at the
+    /// first invoke rather than at the stanza opener, so a stanza that turns
+    /// out to be malformed reports its error without a stray header above it.
+    root_emitted: bool,
     tool_announced: bool,
     param_active: bool,
     at_line_start: bool,
@@ -1355,7 +1366,7 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// Starts a tool banner line: "🛠️ ".
     fn viz_line_prefix(&mut self) {
         self.viz_newline_if_open();
-        self.viz_puts("🛠️ ");
+        self.viz_puts("🔧 ");
         self.viz.at_line_start = false;
     }
 
@@ -1369,19 +1380,24 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.viz.tool_name = name.to_string();
         self.viz.tool_announced = true;
         self.viz.read_style = name == "read";
+        if !self.viz.root_emitted {
+            self.viz.root_emitted = true;
+            self.viz_newline_if_open();
+            self.viz_puts("🛠️ tool_calls\n");
+            self.viz.at_line_start = true;
+        }
         self.viz_line_prefix();
         if self.viz.read_style {
+            self.viz_puts("read\n");
+            self.viz_puts(TREE_BRANCH);
             self.viz_puts("Reading ");
             self.viz.read_prefix_rendered = true;
             return;
         }
-        if let Some(prefix) = tool_prefix(name) {
-            self.viz_puts(prefix);
-        } else {
-            let owned = name.to_string();
-            self.viz_puts(&owned);
-            self.viz_puts(" ");
-        }
+        let owned = name.to_string();
+        self.viz_puts(&owned);
+        self.viz_puts("\n");
+        self.viz.at_line_start = true;
     }
 
     fn viz_read_value_byte(&mut self, c: u8) {
@@ -1405,6 +1421,8 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
         if !self.viz.read_prefix_rendered {
             self.viz_line_prefix();
+            self.viz_puts("read\n");
+            self.viz_puts(TREE_BRANCH);
             self.viz_puts("Reading ");
             let path = if self.viz.read_path.is_empty() {
                 "<unknown>".to_string()
@@ -1453,6 +1471,10 @@ impl<S: RenderSink> StreamRenderer<S> {
     fn viz_code_prefix(&mut self) {
         if !self.viz.at_line_start {
             return;
+        }
+        if !self.viz_is_write_preview() {
+            self.viz_puts(TREE_RAIL);
+            self.viz.at_line_start = false;
         }
         if let Some(prefix) = diff_prefix(self.viz.param_kind) {
             self.viz_puts(prefix);
@@ -1558,6 +1580,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         match self.viz.param_kind {
             ParamKind::DiffOld | ParamKind::DiffNew => {
                 self.viz_newline_if_open();
+                self.viz_puts(&format!("{TREE_BRANCH}{name} ─\n"));
                 self.viz.at_line_start = true;
                 self.viz_code_begin();
             }
@@ -1580,21 +1603,17 @@ impl<S: RenderSink> StreamRenderer<S> {
                         self.viz_preview_puts(&format!("● Writing {path}\n"));
                     }
                 } else {
-                    let label = format!("{name}:\n");
-                    self.viz_puts(&label);
+                    self.viz_puts(&format!("{TREE_BRANCH}{name} ─\n"));
                 }
                 self.viz.at_line_start = true;
                 if self.viz_param_is_code_body() {
                     self.viz_code_begin();
                 }
             }
-            ParamKind::BashCommand => {}
-            ParamKind::Normal | ParamKind::Path => {
-                if !self.viz.at_line_start {
-                    self.viz_puts(" ");
-                }
-                let label = format!("{name}=");
-                self.viz_puts(&label);
+            ParamKind::BashCommand | ParamKind::Normal | ParamKind::Path => {
+                self.viz_newline_if_open();
+                self.viz_puts(&format!("{TREE_BRANCH}{name} ─ "));
+                self.viz.at_line_start = false;
             }
         }
     }
@@ -1626,6 +1645,10 @@ impl<S: RenderSink> StreamRenderer<S> {
         if self.viz.code_param_active {
             self.viz_code_end();
         }
+        if !self.viz.read_style {
+            self.viz_newline_if_open();
+            self.viz.at_line_start = true;
+        }
         self.viz.param_active = false;
         self.viz.param_name.clear();
         self.scan = DsmlScan::Between;
@@ -1648,6 +1671,9 @@ impl<S: RenderSink> StreamRenderer<S> {
         // Capture the write destination for the content-preview header.
         if self.viz.tool_name == "write" && self.viz.param_kind == ParamKind::Path {
             self.viz.write_path.push(c as char);
+        }
+        if self.viz.at_line_start && c != b'\n' {
+            self.viz_puts(TREE_RAIL);
         }
         self.emit_visible_bytes(&[c]);
         self.viz.at_line_start = c == b'\n';
@@ -2368,6 +2394,21 @@ mod tests {
         sr
     }
 
+    /// `dispatch` routes any `mcp__server__tool` name to the MCP bridge via a
+    /// prefix arm, so the detector must treat that shape as tool-shaped too —
+    /// the names are discovered per server and no static table can hold them.
+    #[test]
+    fn invented_mcp_block_is_reported() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push("<think>planning</think>");
+        sr.push("<mcp__tokensave__tokensave_search>\nquery: \"Settings\"\n");
+        sr.finish();
+        assert!(
+            sr.finished().error.is_some(),
+            "invented mcp call produced no error for the model to correct from"
+        );
+    }
+
     // Issue #51: the model invents <task> XML for tools it was not trained on.
     // Nothing recognized it, so the turn ended with no tool call and no error and
     // the model retried forever.
@@ -2745,8 +2786,11 @@ mod tests {
         );
     }
 
+    /// With banners on the tree names the tool (`🔧 write`) rather than a
+    /// verb; the `Writing <path>` phrasing survives only in the banners-off
+    /// preview header, which `write_preview_header_*` covers.
     #[test]
-    fn write_banner_verb_reads_writing_when_banners_on() {
+    fn write_banner_names_the_tool_when_banners_on() {
         let stanza = concat!(
             "<｜DSML｜tool_calls>",
             "<｜DSML｜invoke name=\"write\">",
@@ -2756,12 +2800,12 @@ mod tests {
             "</｜DSML｜tool_calls>",
         );
         let mut sr = StreamRenderer::new(Cap::default());
-        // Banners on (default): the 🛠️ banner names the verb.
+        // Banners on (default): the tree node names the tool.
         sr.push(stanza);
         sr.finish();
         assert!(
-            sr.sink().visible.contains("Writing "),
-            "banner verb: {:?}",
+            sr.sink().visible.contains("🔧 write\n  ├─ path ─ src/foo.rs"),
+            "banner node: {:?}",
             sr.sink().visible
         );
     }
@@ -2997,7 +3041,7 @@ mod tests {
         );
         for sr in [run_chunked(text), run_charwise(text)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🛠️ $ cat documents.rs"), "{vis:?}");
+            assert!(vis.contains("🔧 bash\n  ├─ command ─ cat documents.rs"), "{vis:?}");
             assert!(!vis.contains("SSML"), "{vis:?}");
             let fin = sr.finished();
             assert_eq!(fin.calls.len(), 1);
@@ -3054,7 +3098,7 @@ mod tests {
         for sr in [run_chunked(&text), run_charwise(&text)] {
             let vis = &sr.sink().visible;
             assert!(vis.starts_with("Let me look.\n"), "{vis:?}");
-            assert!(vis.contains("🛠️ $ ls -la"), "{vis:?}");
+            assert!(vis.contains("🔧 bash\n  ├─ command ─ ls -la"), "{vis:?}");
             assert!(!vis.contains("DSML"), "{vis:?}");
             let fin = sr.finished();
             assert_eq!(fin.calls.len(), 1);
@@ -3075,7 +3119,7 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🛠️ Reading src/main.rs 1:500...\n"), "{vis:?}");
+            assert!(vis.contains("🔧 read\n  ├─ Reading src/main.rs 1:500...\n"), "{vis:?}");
             assert!(!vis.contains("DSML"), "{vis:?}");
         }
     }
@@ -3094,7 +3138,7 @@ mod tests {
         assert!(
             sr.sink()
                 .visible
-                .contains("🛠️ Reading a.c (whole file)...\n"),
+                .contains("🔧 read\n  ├─ Reading a.c (whole file)...\n"),
             "{:?}",
             sr.sink().visible
         );
@@ -3113,7 +3157,7 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🛠️ edit  path=a.rs"), "{vis:?}");
+            assert!(vis.contains("🔧 edit\n  ├─ path ─ a.rs"), "{vis:?}");
             assert!(vis.contains("- let a = 1;"), "{vis:?}");
             assert!(vis.contains("+ let a = 2;"), "{vis:?}");
             assert!(!vis.contains("DSML"), "{vis:?}");
@@ -3344,7 +3388,7 @@ mod tests {
         assert_eq!(fin.calls.len(), 1, "{:?}", fin.calls);
         assert_eq!(fin.calls[0].name, "bash");
         assert!(
-            sr.sink().visible.contains("🛠️ $ ls -la"),
+            sr.sink().visible.contains("🔧 bash\n  ├─ command ─ ls -la"),
             "{:?}",
             sr.sink().visible
         );
@@ -3368,7 +3412,7 @@ mod tests {
         assert_eq!(fin.calls.len(), 1, "{:?}", fin.calls);
         assert_eq!(fin.calls[0].arg_value("command"), Some("ls -la"));
         assert!(
-            sr.sink().visible.contains("🛠️ $ ls -la"),
+            sr.sink().visible.contains("🔧 bash\n  ├─ command ─ ls -la"),
             "{:?}",
             sr.sink().visible
         );
@@ -3421,7 +3465,7 @@ mod tests {
             // The banner renders like any other tool call, and raw DSML never
             // reaches either sink.
             assert!(
-                sr.sink().visible.contains("🛠️ $ ls -la"),
+                sr.sink().visible.contains("🔧 bash\n  ├─ command ─ ls -la"),
                 "{:?}",
                 sr.sink().visible
             );
@@ -3461,7 +3505,7 @@ mod tests {
         sr.push("<｜DSML｜parameter name=\"command\">sleep 1");
         sr.finish();
         let vis = &sr.sink().visible;
-        assert!(vis.contains("🛠️ $ sleep 1"), "{vis:?}");
+        assert!(vis.contains("🔧 bash\n  ├─ command ─ sleep 1"), "{vis:?}");
         assert!(vis.contains("[tool call interrupted]\n"), "{vis:?}");
         assert!(sr.finished().calls.is_empty());
     }
@@ -3683,6 +3727,40 @@ mod tests {
         assert_eq!(fin.calls.len(), 0, "an in-think stanza is not dispatched");
     }
 
+    /// The banner renders as a tree: a stanza root, one `🔧` node per invoke,
+    /// and a `├─` branch per parameter with long values indented under a rail.
+    #[test]
+    fn tree_banner_shape() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"glob\">",
+            "<｜DSML｜parameter name=\"pattern\">src/settings.rs</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "<｜DSML｜invoke name=\"mcp__tokensave__tokensave_search\">",
+            "<｜DSML｜parameter name=\"query\">Settings</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"limit\">15</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\">cargo test\ncargo build</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let want = concat!(
+            "🛠️ tool_calls\n",
+            "🔧 glob\n",
+            "  ├─ pattern ─ src/settings.rs\n",
+            "🔧 mcp__tokensave__tokensave_search\n",
+            "  ├─ query ─ Settings\n",
+            "  ├─ limit ─ 15\n",
+            "🔧 bash\n",
+            "  ├─ command ─ cargo test\n",
+            "  │  cargo build\n",
+        );
+        for sr in [run_chunked(stanza), run_charwise(stanza)] {
+            assert_eq!(sr.sink().visible, want);
+        }
+    }
+
     #[test]
     fn implicit_invoke_opener_is_accepted() {
         let stanza = concat!(
@@ -3693,7 +3771,7 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             assert!(
-                sr.sink().visible.contains("🛠️ $ pwd"),
+                sr.sink().visible.contains("🔧 bash\n  ├─ command ─ pwd"),
                 "{:?}",
                 sr.sink().visible
             );
@@ -3758,7 +3836,7 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🛠️ Writing  path=x.txt"), "{vis:?}");
+            assert!(vis.contains("🔧 write\n  ├─ path ─ x.txt"), "{vis:?}");
             // The content now previews on the dim (think) channel, not visible.
             assert!(!vis.contains("line one"), "{vis:?}");
             assert!(
@@ -3836,8 +3914,10 @@ mod tests {
         assert_eq!(calls.len(), 2, "both stanzas must dispatch: {calls:?}");
         assert_eq!(calls[0].args[0].value, "A.md");
         assert_eq!(calls[1].args[0].value, "B.md");
-        // And none of the second stanza's markup leaked to the screen.
-        assert!(!vis.contains("tool_calls"), "{vis:?}");
+        // And none of the second stanza's markup leaked to the screen. The
+        // check is against the marker spelling, not the bare word: the tree
+        // banner's own root line reads "🛠️ tool_calls".
+        assert!(!vis.contains("｜tool_calls"), "{vis:?}");
         assert!(!vis.contains("parameter name="), "{vis:?}");
     }
 
