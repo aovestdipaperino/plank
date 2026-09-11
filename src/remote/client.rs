@@ -204,7 +204,8 @@ fn send_frame(
     frame: &ClientFrame,
 ) -> Result<(), String> {
     let json = frame.to_json().map_err(|e| e.to_string())?;
-    ws.send(Message::Text(json)).map_err(|e| e.to_string())?;
+    ws.send(Message::Text(json.into()))
+        .map_err(|e| e.to_string())?;
     ws.flush().map_err(|e| e.to_string())
 }
 

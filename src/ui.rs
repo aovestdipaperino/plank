@@ -20162,7 +20162,7 @@ mod tests {
             ClientMsg::RequestControl,
             ClientMsg::Prompt { text: "hi".into() },
         ] {
-            ws.send(Message::Text(ClientFrame::new(m).to_json().unwrap()))
+            ws.send(Message::Text(ClientFrame::new(m).to_json().unwrap().into()))
                 .unwrap();
         }
 

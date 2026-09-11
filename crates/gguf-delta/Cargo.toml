@@ -21,7 +21,7 @@ testing = []
 
 [dependencies]
 flate2 = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [lints]
 workspace = true
