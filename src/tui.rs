@@ -2891,6 +2891,10 @@ static CTX_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 /// double-click on the wastebasket can be mapped to it.
 static MC_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 
+/// Screen rect the footer's throughput segment last occupied, so a click on
+/// the chart glyph can be mapped to it.
+static TOKS_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
 /// Whether a click at (`column`, `row`) landed on the footer's jobs segment.
 #[must_use]
 pub fn jobs_click(column: u16, row: u16) -> bool {
@@ -2906,6 +2910,17 @@ pub fn jobs_click(column: u16, row: u16) -> bool {
 #[must_use]
 pub fn mc_click(column: u16, row: u16) -> bool {
     MC_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// Whether a click at (`column`, `row`) landed on the footer's chart glyph
+/// (the throughput segment).
+#[must_use]
+pub fn toks_click(column: u16, row: u16) -> bool {
+    TOKS_RECT
         .lock()
         .ok()
         .and_then(|r| *r)
@@ -3032,6 +3047,29 @@ pub fn record_mc_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
         break;
     }
     if let Ok(mut g) = MC_RECT.lock() {
+        *g = found;
+    }
+}
+
+/// Finds the throughput segment in the status rows just drawn into `buf` and
+/// records its rect, exactly as [`record_mc_rect`] does for the wastebasket:
+/// the anchor is [`crate::status::TOKS_MARK`] and the box is the run between
+/// the ` | ` separators around it. Called after every status render so a frame
+/// drawn without the glyph forgets the rect.
+pub fn record_toks_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        let Some(mark) = cells.iter().position(|c| *c == crate::status::TOKS_MARK) else {
+            continue;
+        };
+        let (start, end) = segment_bounds(&cells, mark);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = TOKS_RECT.lock() {
         *g = found;
     }
 }
@@ -4228,6 +4266,7 @@ pub fn draw(
     );
     record_jobs_rect(frame.buffer_mut(), status_row);
     record_ctx_rect(frame.buffer_mut(), status_row);
+    record_toks_rect(frame.buffer_mut(), status_row);
     record_mc_rect(frame.buffer_mut(), status_row);
 }
 
@@ -4276,6 +4315,7 @@ pub fn draw_ask(
     );
     record_jobs_rect(frame.buffer_mut(), r[2]);
     record_ctx_rect(frame.buffer_mut(), r[2]);
+    record_toks_rect(frame.buffer_mut(), r[2]);
     record_mc_rect(frame.buffer_mut(), r[2]);
 }
 
@@ -4469,6 +4509,7 @@ pub fn draw_btw_split(
     );
     record_jobs_rect(frame.buffer_mut(), status_row);
     record_ctx_rect(frame.buffer_mut(), status_row);
+    record_toks_rect(frame.buffer_mut(), status_row);
     record_mc_rect(frame.buffer_mut(), status_row);
 }
 
@@ -4993,6 +5034,27 @@ mod tests {
         let quiet = Buffer::empty(area);
         super::record_mc_rect(&quiet, area);
         assert!(!super::mc_click(10, 0), "no mark, no hit box");
+    }
+
+    /// The chart glyph gets its own segment-wide click box, so a press
+    /// anywhere in the throughput segment opens `/toks`.
+    #[test]
+    fn toks_rect_spans_the_chart_segment() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 40, 1);
+        let text = format!("ctx 12% | {} | idle", crate::status::toks_segment());
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, &text, ratatui::style::Style::default());
+        super::record_toks_rect(&buf, area);
+        // "ctx 12% | " is 10 cells; the wide glyph spans the next two.
+        assert!(super::toks_click(10, 0), "the glyph itself");
+        assert!(!super::toks_click(9, 0), "the separator is not the segment");
+        assert!(!super::toks_click(12, 0), "past the segment");
+        assert!(!super::toks_click(10, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_toks_rect(&quiet, area);
+        assert!(!super::toks_click(10, 0), "no glyph, no hit box");
     }
 
     /// The ctx gauge gets the same segment-wide click box, and its anchor is

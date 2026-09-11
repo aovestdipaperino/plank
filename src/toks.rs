@@ -3,14 +3,19 @@
 
 //! Generation throughput history for `/toks`.
 //!
-//! A time series, not a per-pass tally: while the model is decoding, a
-//! [`Sampler`] measures the instantaneous rate once every
-//! [`Sampler::INTERVAL`] and records it in one process-wide [`TokRing`]
-//! ([`record`]/[`snapshot`]), so the x axis is decode time and the chart knows
-//! nothing about passes, turns or tool rounds. [`render_chart`] draws the ring
-//! as a braille line chart: two samples per column and four levels per row.
-//! Text, not a widget, so the same chart serves the plain REPL and the TUI's
-//! report panel, and the TUI can redraw it on every status tick.
+//! Two series, drawn side by side. Generation is a time series, not a per-pass
+//! tally: while the model is decoding, a [`Sampler`] measures the
+//! instantaneous rate once every [`Sampler::INTERVAL`] and records it in one
+//! process-wide [`TokRing`] ([`record`]/[`snapshot`]), so the x axis is decode
+//! time and the chart knows nothing about passes, turns or tool rounds.
+//! Prefill is sampled per *pass* instead ([`record_prefill`]): a prefill lasts
+//! a second or two, so a once-a-second gate would miss whole passes, and the
+//! rate the engine reports when it finishes is the figure worth keeping.
+//!
+//! [`render_chart`] draws a ring as a braille line chart: two samples per
+//! column and four levels per row. Text, not a widget, so the same charts
+//! serve the plain REPL and the TUI's report panel, and the TUI can redraw
+//! them on every status tick.
 
 use std::fmt::Write as _;
 use std::sync::Mutex;
@@ -18,17 +23,47 @@ use std::time::{Duration, Instant};
 
 static RING: Mutex<TokRing> = Mutex::new(TokRing::new());
 
-/// Records one throughput sample in the process-wide ring.
+static PREFILL_RING: Mutex<TokRing> = Mutex::new(TokRing::new());
+
+/// Records one generation throughput sample in the process-wide ring.
 pub fn record(tps: f64) {
     if let Ok(mut r) = RING.lock() {
         r.push(tps);
     }
 }
 
-/// The recorded samples, oldest first.
+/// Records one prefill throughput sample — the rate a finished prefill
+/// reported — in the process-wide prefill ring.
+pub fn record_prefill(tps: f64) {
+    if let Ok(mut r) = PREFILL_RING.lock() {
+        r.push(tps);
+    }
+}
+
+/// Records a prefill progress event's rate, keeping only the one that closes
+/// the pass.
+///
+/// The `complete` gate lives here rather than at the two call sites so both
+/// front ends sample prefill the same way from one line, and so the rule —
+/// one sample per pass, taken where the rate is final — is stated once.
+pub fn note_prefill_progress(complete: bool, tps: f64) {
+    if complete {
+        record_prefill(tps);
+    }
+}
+
+/// The recorded generation samples, oldest first.
 #[must_use]
 pub fn snapshot() -> Vec<f64> {
     RING.lock().map_or_else(|_| Vec::new(), |r| r.samples())
+}
+
+/// The recorded prefill samples, oldest first.
+#[must_use]
+pub fn prefill_snapshot() -> Vec<f64> {
+    PREFILL_RING
+        .lock()
+        .map_or_else(|_| Vec::new(), |r| r.samples())
 }
 
 /// Measures the decode rate over fixed wall-clock windows from a running
@@ -44,8 +79,8 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    /// Wall-clock width of one sample: a second, so a 64-cell chart shows
-    /// about two minutes of decoding.
+    /// Wall-clock width of one sample: a second, so the chart's
+    /// [`TokRing::SHOWN`] samples span a minute of decoding.
     pub const INTERVAL: Duration = Duration::from_secs(1);
 
     /// Notes that `generated` tokens have been produced so far, at `now`.
@@ -95,9 +130,16 @@ impl Default for TokRing {
 }
 
 impl TokRing {
-    /// Samples kept: with two samples per braille column this fills a
-    /// 128-cell chart, wider than any panel plank draws.
-    pub const CAPACITY: usize = 256;
+    /// Samples kept. A little above [`Self::SHOWN`] so the chart is never
+    /// drawn from a ring that is exactly full: the few extra samples are the
+    /// margin the newest-first window slides over, which keeps the oldest
+    /// column from flickering in and out as each new sample lands.
+    pub const CAPACITY: usize = 64;
+
+    /// Samples the chart draws, whatever the ring holds and however wide the
+    /// panel is: the window is the newest [`Self::SHOWN`], so both charts span
+    /// the same stretch of history no matter which one has been fed more.
+    pub const SHOWN: usize = 60;
 
     /// An empty ring. `const` so it can back a `static`.
     #[must_use]
@@ -152,14 +194,15 @@ const fn dot(x: usize, y: usize) -> u32 {
 
 /// Draws `samples` (oldest first) as a braille line chart `width` cells wide
 /// and `height` cells tall, each line prefixed by a right-aligned axis label
-/// on the top and bottom rows. Only the newest `2 * width` samples fit; older
-/// ones fall off the left. Adjacent samples are joined vertically so a jump
-/// reads as a line rather than two dots.
+/// on the top and bottom rows. Only the newest `2 * width` samples fit, capped
+/// at [`TokRing::SHOWN`] however wide the panel is; older ones fall off the
+/// left. Adjacent samples are joined vertically so a jump reads as a line
+/// rather than two dots.
 #[must_use]
 pub fn render_chart(samples: &[f64], width: usize, height: usize) -> String {
     let width = width.max(1);
     let height = height.max(1);
-    let cols = width * 2;
+    let cols = (width * 2).min(TokRing::SHOWN);
     let rows = height * 4;
     let start = samples.len().saturating_sub(cols);
     let shown = &samples[start..];
@@ -228,35 +271,62 @@ pub fn render_chart(samples: &[f64], width: usize, height: usize) -> String {
     out
 }
 
-/// The full `/toks` report over `samples` (oldest first): the chart plus a
-/// one-line summary. `width` is the chart width in cells.
-#[must_use]
-pub fn render_report(samples: &[f64], width: usize, height: usize, color: bool) -> String {
+/// Visible width of `line`, i.e. its chars with any SGR escape sequences
+/// discounted. Both panels are padded to a common width before they are joined
+/// side by side, and the themed text carries escapes that must not count
+/// toward that padding. Braille cells and the axis tick are single-width, so
+/// counting chars is the right measure for everything that does count.
+fn visible_width(line: &str) -> usize {
+    let mut w = 0;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // `\x1b[ … m`: skip to the terminating letter.
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            w += 1;
+        }
+    }
+    w
+}
+
+/// One chart panel: a title, the braille chart, and the summary line under it.
+/// Returned as lines so [`render_report`] can set two panels side by side.
+///
+/// The title carries no units or sampling note: the figures are tok/s
+/// throughout, and the two panels are side by side precisely so they are read
+/// against each other rather than off an axis legend.
+fn render_panel(
+    title: &str,
+    samples: &[f64],
+    width: usize,
+    height: usize,
+    color: bool,
+) -> Vec<String> {
     let dim = if color { "\x1b[2m" } else { "" };
     let bold = if color { "\x1b[1m" } else { "" };
     let reset = if color { "\x1b[0m" } else { "" };
-    let mut out = format!(
-        "{bold}Generation speed{reset} {dim}(tok/s, one sample per second of decoding){reset}\n"
-    );
-    if samples.is_empty() {
-        let _ = writeln!(out, "{dim}nothing generated yet{reset}");
-        return out;
-    }
-    let chart = render_chart(samples, width, height);
-    if color {
-        // The dots in the theme green, the axis labels left as they are: the
-        // chart line is the accent, the scale is furniture.
-        let green = format!("\x1b[38;5;{}m", crate::status::THEME_COLOR);
-        for line in chart.lines() {
-            match line.split_once('┤') {
-                Some((axis, dots)) => {
-                    let _ = writeln!(out, "{axis}┤{green}{dots}{reset}");
-                }
-                None => out.push_str(line),
-            }
-        }
+    let green = if color {
+        format!("\x1b[38;5;{}m", crate::status::THEME_COLOR)
     } else {
-        out.push_str(&chart);
+        String::new()
+    };
+    let mut lines = vec![format!("{bold}{title}{reset}")];
+    if samples.is_empty() {
+        lines.push(format!("{dim}nothing recorded yet{reset}"));
+        return lines;
+    }
+    // The dots in the theme green, the axis labels left as they are: the
+    // chart line is the accent, the scale is furniture.
+    for line in render_chart(samples, width, height).lines() {
+        match line.split_once('\u{2524}') {
+            Some((axis, dots)) => lines.push(format!("{axis}\u{2524}{green}{dots}{reset}")),
+            None => lines.push(line.to_owned()),
+        }
     }
     let n = samples.len();
     let last = samples[n - 1];
@@ -265,11 +335,47 @@ pub fn render_report(samples: &[f64], width: usize, height: usize, color: bool) 
     let avg = samples.iter().sum::<f64>() / n as f64;
     let min = samples.iter().copied().fold(f64::MAX, f64::min);
     let max = samples.iter().copied().fold(f64::MIN, f64::max);
-    let shown = n.min(width * 2);
-    let _ = writeln!(
-        out,
-        "{dim}now{reset} {bold}{last:.1}{reset} {dim}· avg{reset} {avg:.1} {dim}· min{reset} {min:.1} {dim}· max{reset} {max:.1} {dim}· last {shown} s of {n}{reset}"
-    );
+    // `now` in the theme green, like the chart line: it is the one figure the
+    // chart's right edge is also showing, so the two read as the same news.
+    lines.push(format!(
+        "{dim}now{reset} {green}{bold}{last:.1}{reset} {dim}\u{b7} avg{reset} {avg:.1} {dim}\u{b7} min{reset} {min:.1} {dim}\u{b7} max{reset} {max:.1}"
+    ));
+    lines
+}
+
+/// The full `/toks` report: the generation chart and the prefill chart side by
+/// side, each with its own scale and summary. `width` is one chart's width in
+/// cells, so the report is a little over twice that wide.
+///
+/// Two panels rather than one stacked pair because the question they answer is
+/// comparative — a pass that feels slow is either prefill-bound or
+/// decode-bound — and that reading is only immediate when both lines are on
+/// the same rows.
+#[must_use]
+pub fn render_report(
+    gen_samples: &[f64],
+    prefill_samples: &[f64],
+    width: usize,
+    height: usize,
+    color: bool,
+) -> String {
+    let left = render_panel("Generation speed", gen_samples, width, height, color);
+    let right = render_panel("Prefill speed", prefill_samples, width, height, color);
+    let lhs_w = left.iter().map(|l| visible_width(l)).max().unwrap_or(0);
+    let gutter = "   ";
+    let mut out = String::new();
+    for row in 0..left.len().max(right.len()) {
+        let l = left.get(row).map_or("", String::as_str);
+        let r = right.get(row).map_or("", String::as_str);
+        let pad = lhs_w.saturating_sub(visible_width(l));
+        if r.is_empty() {
+            // No right-hand cell: stop at the left text rather than trailing
+            // the padding and the gutter into the panel's blank space.
+            let _ = writeln!(out, "{l}");
+        } else {
+            let _ = writeln!(out, "{l}{:pad$}{gutter}{r}", "");
+        }
+    }
     out
 }
 
@@ -349,16 +455,48 @@ mod tests {
 
     #[test]
     fn the_report_summarises_and_handles_empty() {
-        assert!(render_report(&[], 20, 4, false).contains("nothing generated yet"));
-        let r = render_report(&[20.0, 30.0], 20, 4, false);
+        // Both panels empty: each says so, and the report is still two panels.
+        let empty = render_report(&[], &[], 20, 4, false);
+        assert_eq!(empty.matches("nothing recorded yet").count(), 2, "{empty}");
+        let r = render_report(&[20.0, 30.0], &[400.0, 600.0], 20, 4, false);
         assert!(r.contains("now 30.0"), "{r}");
         assert!(r.contains("avg 25.0"), "{r}");
-        assert!(r.contains("last 2 s of 2"), "{r}");
+        assert!(r.contains("now 600.0"), "{r}");
+        assert!(r.contains("avg 500.0"), "{r}");
+        // The window count is gone: the chart's own axis says the scale.
+        assert!(!r.contains("last 2 s of 2"), "{r}");
+    }
+
+    /// Both panels sit on the same rows, and the report carries no sampling
+    /// note beside either title.
+    #[test]
+    fn the_report_sets_the_two_charts_side_by_side() {
+        let r = render_report(&[20.0, 30.0], &[400.0, 600.0], 6, 2, false);
+        let head = r.lines().next().unwrap();
+        assert!(head.starts_with("Generation speed"), "{head:?}");
+        assert!(head.contains("Prefill speed"), "{head:?}");
+        assert!(!r.contains("one sample per"), "{r}");
+        // A chart row of each panel: two axis ticks on the same line.
+        let chart_rows = r.lines().filter(|l| l.matches('\u{2524}').count() == 2);
+        assert_eq!(chart_rows.count(), 2, "{r}");
+        // And the summaries likewise share a row.
+        let sums = r.lines().filter(|l| l.matches("now ").count() == 2);
+        assert_eq!(sums.count(), 1, "{r}");
+    }
+
+    /// A panel with no samples is shorter than its neighbour; the taller one
+    /// must still print its remaining rows rather than being truncated.
+    #[test]
+    fn a_lopsided_report_keeps_the_longer_panel_whole() {
+        let r = render_report(&[20.0, 30.0], &[], 6, 2, false);
+        assert!(r.contains("nothing recorded yet"), "{r}");
+        assert!(r.contains("now 30.0"), "{r}");
+        assert_eq!(r.lines().count(), 4, "{r}");
     }
 
     #[test]
     fn the_colored_chart_paints_the_dots_theme_green() {
-        let r = render_report(&[20.0, 30.0], 4, 2, true);
+        let r = render_report(&[20.0, 30.0], &[], 4, 2, true);
         let green = format!("\x1b[38;5;{}m", crate::status::THEME_COLOR);
         // Every chart row: axis tick, then green, then dots, then reset.
         let rows: Vec<&str> = r.lines().filter(|l| l.contains('┤')).collect();
@@ -368,7 +506,9 @@ mod tests {
             assert!(dots.starts_with(&green), "{row:?}");
             assert!(dots.ends_with("\x1b[0m"), "{row:?}");
         }
-        assert!(!render_report(&[20.0], 4, 2, false).contains(&green));
+        assert!(!render_report(&[20.0], &[], 4, 2, false).contains(&green));
+        // The `now` figure wears the same green as the line it is the tip of.
+        assert!(r.contains(&format!("{green}\x1b[1m30.0")), "{r}");
     }
 
     #[test]

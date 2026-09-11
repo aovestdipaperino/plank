@@ -317,6 +317,16 @@ const MICROCOMPACT_ON: &str = "🟢";
 /// the transcript is kept verbatim until a full compaction.
 const MICROCOMPACT_OFF: &str = "🔴";
 
+/// Marks the footer's throughput segment, which toggles the `/toks` panel on
+/// click. Public so the TUI can find the segment for mouse hit-testing, the
+/// same reason [`JOBS_MARK`] is.
+///
+/// The bare codepoint, without the U+FE0F variation selector, for the reason
+/// [`MICROCOMPACT_MARK`] spells out: here the measurement is also the click
+/// box, since [`crate::tui::record_toks_rect`] locates the segment by finding
+/// this symbol in the drawn buffer.
+pub const TOKS_MARK: &str = "📈";
+
 /// Marks the footer's loop segment, shown while the repetition guard sees the
 /// reasoning cycling (`♻ looping`).
 ///
@@ -1845,6 +1855,9 @@ fn build_status_text_with_cells(
             crate::settings::active().context.microcompact
         ))
     );
+    // Beside the wastebasket: both are footer glyphs whose whole purpose is
+    // to be clicked, and neither belongs to the running turn.
+    let ctx = format!("{ctx} | {}", theme(&toks_segment()));
     let ctx = match jobs_segment(st) {
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
@@ -1940,6 +1953,18 @@ pub fn microcompact_segment(on: bool) -> String {
         MICROCOMPACT_OFF
     };
     format!("{MICROCOMPACT_MARK} {light}")
+}
+
+/// The throughput segment: [`TOKS_MARK`] alone, a click target that toggles
+/// the `/toks` panel.
+///
+/// Always drawn, like [`microcompact_segment`] and for the same reason: the
+/// glyph *is* the affordance, so it has to be there to be clicked. It carries
+/// no reading of its own — the chart behind it needs more room than the footer
+/// has, and a bare icon keeps the bar's width unchanged whatever the rate.
+#[must_use]
+pub fn toks_segment() -> String {
+    TOKS_MARK.to_owned()
 }
 
 /// The jobs segment: `⧗ 2 jobs` while background bash jobs are still running
@@ -2359,7 +2384,7 @@ mod tests {
             ..Status::default()
         };
         assert!(
-            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡 0.00 | 🗑 🟢 | idle"),
+            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡 0.00 | 🗑 🟢 | 📈 | idle"),
             "{}",
             build_status_text(&st, false, true)
         );
@@ -2411,7 +2436,7 @@ mod tests {
         let line = build_status_text(&plain, false, true);
         assert!(
             line.ends_with(&format!(
-                "ctx 12% | {MTP_MARK} | {} | idle",
+                "ctx 12% | {MTP_MARK} | {} | {TOKS_MARK} | idle",
                 microcompact_segment(true)
             )),
             "{line}"
@@ -2430,7 +2455,7 @@ mod tests {
         let line = build_status_text(&spark, false, true);
         assert!(
             line.ends_with(&format!(
-                "ctx 12% | {MTP_MARK} 3.0t/step 50% | {} | idle",
+                "ctx 12% | {MTP_MARK} 3.0t/step 50% | {} | {TOKS_MARK} | idle",
                 microcompact_segment(true)
             )),
             "{line}"

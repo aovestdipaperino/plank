@@ -3006,9 +3006,7 @@ impl Agent<'_> {
                         }
                     }
                     EngineEvent::Prefill(p) => {
-                        // Every sample, not just the last: a pass that ends
-                        // without a final event still cost the time it cost.
-                        crate::speeds::note_prefill_progress(&model_name, p.done, p.tps);
+                        note_prefill_event(&model_name, &p);
                         bar.show(&Status {
                             // A finished prefill means the engine is sampling,
                             // not prefilling. Saying "prefilling" through the
@@ -3791,12 +3789,39 @@ const CONTEXT_REPORT_TITLE: &str = "context";
 /// turn-start snapshot.
 const MCP_REPORT_TITLE: &str = "mcp";
 
+/// Opens the `/toks` panel, or closes it when it is the one showing: the
+/// footer's chart glyph toggles it on click. Free-standing like
+/// [`toks_report`], and for the same reason — the samples are process-wide, so
+/// this needs no agent.
+fn toggle_toks_report(report: &mut Option<tui::ReportPanel>) {
+    if report
+        .as_ref()
+        .is_some_and(|r| r.title() == TOKS_REPORT_TITLE)
+    {
+        *report = None;
+    } else {
+        *report = Some(tui::ReportPanel::new(TOKS_REPORT_TITLE, &toks_report(true)));
+    }
+}
+
+/// Feeds one prefill progress event to both of its readers, so the two front
+/// ends cannot drift on which events they count.
+///
+/// The session totals take every sample — a pass that ends without a final
+/// event still cost the time it cost — while `/toks` keeps only the rate the
+/// closing event reports, which is the pass's finished prefill speed.
+fn note_prefill_event(model: &str, p: &crate::engine::PrefillProgress) {
+    crate::speeds::note_prefill_progress(model, p.done, p.tps);
+    crate::toks::note_prefill_progress(p.is_complete(), p.tps);
+}
+
 /// Border title of the `/toks` report panel.
 const TOKS_REPORT_TITLE: &str = "toks";
 
-/// Braille cells across the `/toks` chart: two samples per cell, so this shows
-/// the newest 128 seconds of decoding, half the ring.
-const TOKS_CHART_WIDTH: usize = 64;
+/// Braille cells across *one* of the `/toks` charts: two samples per cell, so
+/// the pair shows [`crate::toks::TokRing::SHOWN`] samples each. The report
+/// sets the two side by side, so it is a little over twice this wide.
+const TOKS_CHART_WIDTH: usize = crate::toks::TokRing::SHOWN / 2;
 
 /// Braille cells down the `/toks` chart: four levels per cell.
 const TOKS_CHART_HEIGHT: usize = 6;
@@ -3816,6 +3841,7 @@ fn live_context_report(shared: &TurnShared, used: i32) -> String {
 fn toks_report(color: bool) -> String {
     crate::toks::render_report(
         &crate::toks::snapshot(),
+        &crate::toks::prefill_snapshot(),
         TOKS_CHART_WIDTH,
         TOKS_CHART_HEIGHT,
         color,
@@ -3925,7 +3951,7 @@ impl LiveStatus {
             }
             EngineEvent::Prefill(p) => {
                 // Every sample feeds the totals; see the plain path.
-                crate::speeds::note_prefill_progress(&self.model_name, p.done, p.tps);
+                note_prefill_event(&self.model_name, p);
                 Some(Status {
                     // A completed prefill is the sampling wait, not prefilling
                     // (#64 follow-up).
@@ -10943,6 +10969,12 @@ impl Agent<'_> {
                             }
                             view.follow = true;
                             selection.cancel();
+                        } else if tui::toks_click(m.column, m.row) {
+                            // The footer's chart glyph toggles the `/toks`
+                            // panel: the bar has no room for the chart, so the
+                            // glyph is the handle on it.
+                            toggle_toks_report(&mut report);
+                            selection.cancel();
                         } else if tui::ctx_click(m.column, m.row) {
                             // The footer's ctx gauge toggles the `/context`
                             // panel: the gauge is the one-number summary, the
@@ -16115,6 +16147,12 @@ fn busy_ui_loop(
                     }
                     view.follow = true;
                     sub.follow_all();
+                    selection.cancel();
+                }
+                // The footer's chart glyph toggles the `/toks` panel, as at
+                // idle. The samples are process-wide, so this needs no agent.
+                MouseEventKind::Down(MouseButton::Left) if tui::toks_click(m.column, m.row) => {
+                    toggle_toks_report(&mut report);
                     selection.cancel();
                 }
                 // The footer's ctx gauge toggles the `/context` panel, as at
