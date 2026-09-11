@@ -4723,7 +4723,7 @@ impl Agent<'_> {
         );
         let out = crate::hooks::run_event_ctx(
             &self.tool_ctx.hooks.session_start,
-            "",
+            source,
             &input,
             &self.tool_ctx.cwd,
         );
@@ -4842,7 +4842,7 @@ impl Agent<'_> {
         );
         let out = crate::hooks::run_event(
             &self.tool_ctx.hooks.session_end,
-            "",
+            reason,
             &input,
             &self.tool_ctx.cwd,
         );
@@ -5130,7 +5130,7 @@ impl Agent<'_> {
         );
         let out = crate::hooks::run_event_ctx(
             &self.tool_ctx.hooks.pre_compact,
-            "",
+            trigger,
             &input,
             &self.tool_ctx.cwd,
         );
@@ -5166,7 +5166,7 @@ impl Agent<'_> {
         );
         let out = crate::hooks::run_event_ctx(
             &self.tool_ctx.hooks.post_compact,
-            "",
+            trigger,
             &input,
             &self.tool_ctx.cwd,
         );

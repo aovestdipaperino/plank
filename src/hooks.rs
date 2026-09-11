@@ -87,8 +87,11 @@ pub struct HookMatcher {
 }
 
 impl HookMatcher {
-    /// True when this group applies to `target` (a tool name; Stop and
-    /// lifecycle hooks use an empty target and match everything).
+    /// True when this group applies to `target` — a tool name for tool events,
+    /// and for lifecycle events the event's own discriminator (`SessionStart`'s
+    /// `source`, `SessionEnd`'s `reason`, compaction's `trigger`), so a matcher
+    /// like `startup|clear|compact` selects among them. An empty matcher always
+    /// matches, which is what `Stop` and the unfiltered lifecycle hooks use.
     ///
     /// Each `|`-separated alternative is either a bare tool name (`bash`) or a
     /// name with an argument glob in parentheses (`bash(git *)`, `write(*.md)`).
@@ -924,6 +927,37 @@ mod tests {
         assert_eq!(out.system_messages, vec!["heads up".to_string()]);
         // Envelope JSON is not re-used as plain context.
         assert!(out.context.is_none());
+    }
+
+    #[test]
+    fn lifecycle_matcher_selects_on_the_event_discriminator() {
+        // The superpowers SessionStart matcher. Firing it with the source as
+        // the target is what makes it select; an empty matcher still matches.
+        let groups = one("echo ctx", "startup|clear|compact");
+        let cwd = std::env::temp_dir();
+        assert_eq!(
+            run_event_ctx(&groups, "startup", "{}", &cwd)
+                .context
+                .as_deref(),
+            Some("ctx")
+        );
+        assert_eq!(
+            run_event_ctx(&groups, "clear", "{}", &cwd)
+                .context
+                .as_deref(),
+            Some("ctx")
+        );
+        assert!(
+            run_event_ctx(&groups, "resume", "{}", &cwd)
+                .context
+                .is_none()
+        );
+        assert_eq!(
+            run_event_ctx(&one("echo ctx", ""), "resume", "{}", &cwd)
+                .context
+                .as_deref(),
+            Some("ctx")
+        );
     }
 
     #[test]
