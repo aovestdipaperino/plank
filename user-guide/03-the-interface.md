@@ -99,6 +99,12 @@ The moment anything is delegated — by you with `/subagent`, or by the model wi
 
 A fan-out gets a row each, with its own output buffer, so concurrent agents never overwrite one another. `←` on an empty prompt steps into the roster, `←`/`→` walk the rows, `Enter` expands the selected agent's output over the transcript with its own scroll position, and `Esc` comes back.
 
+While a sub-agent is working, the progress line under the transcript reads
+`Waiting… (for sub-agent <name> to complete)`. The live counters — the verb, the
+clock, the tokens and the tokens per second — belong to the sub-agent's pass, so
+they are shown in that agent's own view, reached through the roster. The main
+transcript no longer looks like it is the one generating.
+
 It is a live readout: it appears with the first agent and goes away with the last, staying put only while you are reading it, and `←` brings a finished roster back so a report you delegated is still reachable. The last eight runs are kept. The transcript itself gets only a one-line signpost, which is the point of delegating in the first place — see [Extending plank](09-extending.md).
 
 The plain REPL has no roster and prints subagent output inline instead; `--non-interactive` stays silent so its stdout protocol is not corrupted.

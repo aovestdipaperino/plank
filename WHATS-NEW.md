@@ -10,8 +10,17 @@ it.
 
 ## In the betas
 
-Riding ahead of stable 5.0.0 in the 5.0.6 beta. Install with `brew install
+Riding ahead of stable 5.0.0 in the 5.0.7 beta. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
+
+### 5.0.7
+
+A sub-agent's progress belongs to the sub-agent. While one is working, the main
+transcript's progress line now reads `Waiting… (for sub-agent <name> to
+complete)`, and the live verb, clock, token count and tokens per second are
+shown in that agent's own view, reached from the roster with `←` and `Enter`.
+Before, the main transcript carried the sub-agent's counters and looked as
+though it were the one generating.
 
 ### 5.0.6
 

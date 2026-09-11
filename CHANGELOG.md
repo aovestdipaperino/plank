@@ -6,7 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.0.7] - 2026-09-11
+
 ### Changed
+
+- **The parent transcript says it is waiting while a sub-agent works.** The
+  pinned progress line under the main transcript showed the verb, the clock,
+  the tokens and the t/s of whatever pass the engine was running — which,
+  while a sub-agent holds it, is the sub-agent's, not the main agent's. The
+  live readout now goes to the sub-agent's own pane, where the roster can
+  reach it, and the main transcript reads `Waiting… (for sub-agent <name> to
+  complete)`. A finished run's progress line is cleared instead of freezing on
+  its last verb.
 
 - **`/context` is live during a turn, not a turn-start snapshot.** The report
   split into the numbers (which only the agent can count, so the worker

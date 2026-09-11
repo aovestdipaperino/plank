@@ -7,8 +7,15 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.0.0 is out**, and the beta channel is on 5.0.6. The patch number
+**v5.0.0 is out**, and the beta channel is on 5.0.7. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.0.7 (beta) stops the parent from wearing the sub-agent's numbers.** While a
+sub-agent is working, the main transcript's progress line says
+`Waiting… (for sub-agent <name> to complete)`, and the live verb, clock, tokens
+and tokens per second move to that agent's own view — `←` then `Enter` from the
+roster. Until now the main transcript showed whatever pass the engine was
+running, which made the parent look busy generating when it was only waiting.
 
 **5.0.6 (beta) puts micro-compaction on the footer.** A wastebasket with a
 green or red light shows whether it is on, and double-clicking it flips the

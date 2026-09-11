@@ -138,9 +138,17 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v5.0.0 is out</strong>, and the beta channel is on 5.0.6. The
+<p><strong>v5.0.0 is out</strong>, and the beta channel is on 5.0.7. The
 patch number is still the channel: <code>.0</code> is stable, anything
 above it is beta.</p>
+<p><strong>5.0.7 (beta) stops the parent from wearing the sub-agent's
+numbers.</strong> While a sub-agent is working, the main transcript's
+progress line says
+<code>Waiting… (for sub-agent &lt;name&gt; to complete)</code>, and the
+live verb, clock, tokens and tokens per second move to that agent's own
+view — <code>←</code> then <code>Enter</code> from the roster. Until now
+the main transcript showed whatever pass the engine was running, which
+made the parent look busy generating when it was only waiting.</p>
 <p><strong>5.0.6 (beta) puts micro-compaction on the footer.</strong> A
 wastebasket with a green or red light shows whether it is on, and
 double-clicking it flips the setting for the session;

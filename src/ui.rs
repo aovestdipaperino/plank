@@ -15430,9 +15430,23 @@ fn busy_ui_loop(
                     // lives on a line pinned below the output, not in the
                     // footer — independent of showThinking.
                     status_line = status::build_status_text(&st, false, false);
-                    log.set_progress(
-                        status::progress_segment(&st, false).map(|p| tui::progress_line(&p)),
-                    );
+                    let progress = status::progress_segment(&st, false);
+                    // While a sub-agent holds the engine the live readout —
+                    // verb, elapsed, tokens, t/s — is *its* pass, so it belongs
+                    // on its own pane. The main transcript only reports that it
+                    // is waiting, or the parent looks like it is the one
+                    // generating.
+                    let waiting = (sub.running() && progress.is_some())
+                        .then(|| status::subagent_wait_segment(sub.label()));
+                    match waiting {
+                        Some(waiting) => {
+                            if let Some(sub_log) = sub.current_log_mut() {
+                                sub_log.set_progress(progress.as_deref().map(tui::progress_line));
+                            }
+                            log.set_progress(Some(tui::progress_line(&waiting)));
+                        }
+                        None => log.set_progress(progress.as_deref().map(tui::progress_line)),
+                    }
                     // The snapshot describes whichever pass the engine is
                     // running, so while a lone sub-agent holds it, it is that
                     // sub-agent's — and the only live token count its roster row
@@ -15489,7 +15503,14 @@ fn busy_ui_loop(
                 UiEvent::SubStart { label, task } => {
                     sub.on_sub_start(label, &task, tui::roster_clock_ms());
                 }
-                UiEvent::SubEnd => sub.on_sub_end(tui::roster_clock_ms()),
+                UiEvent::SubEnd => {
+                    // The run is finished: its pinned progress would otherwise
+                    // stay frozen on the last verb it was given.
+                    if let Some(sub_log) = sub.current_log_mut() {
+                        sub_log.set_progress(None);
+                    }
+                    sub.on_sub_end(tui::roster_clock_ms());
+                }
                 // Addressed to the current run. Before any run has started there
                 // is no buffer to write to, so it falls back to the transcript
                 // rather than dropping the output on the floor.

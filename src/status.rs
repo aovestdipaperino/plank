@@ -1760,6 +1760,21 @@ pub fn progress_segment(st: &Status, color: bool) -> Option<String> {
     }
 }
 
+/// The progress line the *main* transcript shows while a sub-agent holds the
+/// engine: the turn is not idle, but none of the live counters are the main
+/// agent's, so they stay in the sub-agent's own pane and this says what the
+/// parent is actually doing.
+#[must_use]
+pub fn subagent_wait_segment(label: Option<&str>) -> String {
+    match label {
+        Some(label) => format!(
+            "{} Waiting… (for sub-agent {label} to complete)",
+            throbber()
+        ),
+        None => format!("{} Waiting… (for the sub-agent to complete)", throbber()),
+    }
+}
+
 /// Builds the compact one-line footer shown below the prompt. When
 /// `progress_in_bar` is false the animated [`progress_segment`] is omitted from
 /// prefill/generating footers (the TUI renders it in the output area instead).
@@ -2149,6 +2164,23 @@ mod tests {
     /// builds exact-match text under default (parallel) test threads, and a
     /// global set mid-run would leak into them (this repo's `FINDINGS.md` has
     /// a prior instance of exactly this flake).
+    /// The parent's line while a sub-agent works names the sub-agent and
+    /// carries none of the live counters: those are the sub-agent's pass, and
+    /// showing them on the main transcript is what made the parent look busy.
+    #[test]
+    fn the_waiting_line_names_the_sub_agent_and_counts_nothing() {
+        let line = super::subagent_wait_segment(Some("scout"));
+        assert!(
+            line.contains("Waiting… (for sub-agent scout to complete)"),
+            "{line}"
+        );
+        assert!(!line.contains("t/s"), "{line}");
+        assert!(
+            super::subagent_wait_segment(None).contains("the sub-agent"),
+            "an unlabelled run still reads as a sentence"
+        );
+    }
+
     #[test]
     fn the_download_segment_rides_with_the_ctx_gauge() {
         let ctx = splice_download_segment(
