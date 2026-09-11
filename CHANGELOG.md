@@ -8,6 +8,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/mc [on|off]` and a wastebasket on the footer.** Micro-compaction's live
+  state is now on the status bar as `🗑 🟢` (on) or `🗑 🔴` (off), beside the
+  loop-guard segment, and **double-clicking it** flips the setting for the
+  session. A single click reports the state and names the gesture instead of
+  toggling: micro-compaction rewrites old tool results in place and costs a
+  rung restore when it does, so a stray press in the status bar must not
+  rewrite the transcript. `/mc` is the typed equivalent, and like
+  `/loopguard` both work mid-turn, because every micro-compaction check reads
+  the setting afresh.
+- **The reasoning guard catches numbered-list cycles.** A cycle whose only
+  variation is the list ordinal is not byte-exact, so the existing rungs were
+  blind to it; numbered lines are now hashed with the ordinal stripped and a
+  repeat of at least three distinct items is reported as a cycle. From a
+  26-item, 7 KiB cycle that the byte-window rungs could not see.
+
 - **A draft rung on the reasoning guard.** Past 8 KiB of reasoning, ten
   numbered deliverable headings (`**Bug 3:**`, `1. **Title**`) or 4 KiB of
   fenced code inside `<think>` stop the pass with "write this as your answer,

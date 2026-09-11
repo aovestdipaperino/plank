@@ -299,6 +299,24 @@ pub const JOBS_MARK: &str = "⧗";
 /// Distinct from [`LOOP_MARK`], which says a guard has actually seen a cycle.
 const GUARD_MARK: &str = "🔁";
 
+/// Marks the footer's micro-compaction segment. Public so the TUI can find the
+/// segment for mouse hit-testing, the same reason [`JOBS_MARK`] is.
+///
+/// The bare codepoint, deliberately without the U+FE0F variation selector, for
+/// the same reason as [`TEMP_MARK`]: the footer is width-sensitive and the
+/// emoji-presentation form measures differently across terminals — and here
+/// the measurement is also the click box, since [`crate::tui::record_mc_rect`]
+/// locates the segment by finding this symbol in the drawn buffer.
+pub const MICROCOMPACT_MARK: &str = "🗑";
+
+/// Beside [`MICROCOMPACT_MARK`] when micro-compaction is on: it is rewriting
+/// old tool results in place to reclaim context.
+const MICROCOMPACT_ON: &str = "🟢";
+
+/// Beside [`MICROCOMPACT_MARK`] when micro-compaction is off (`/mc off`), so
+/// the transcript is kept verbatim until a full compaction.
+const MICROCOMPACT_OFF: &str = "🔴";
+
 /// Marks the footer's loop segment, shown while the repetition guard sees the
 /// reasoning cycling (`♻ looping`).
 ///
@@ -1817,6 +1835,16 @@ fn build_status_text_with_cells(
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
     };
+    // Beside the guard segment, and for the same reason: both are session-wide
+    // switches that change how every following turn is built, and both are
+    // thrown from the footer itself — the guard with `/loopguard`, this one
+    // with a double-click on the wastebasket.
+    let ctx = format!(
+        "{ctx} | {}",
+        theme(&microcompact_segment(
+            crate::settings::active().context.microcompact
+        ))
+    );
     let ctx = match jobs_segment(st) {
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
@@ -1894,6 +1922,24 @@ pub fn spec_segment(st: &Status) -> Option<String> {
 #[must_use]
 pub fn guard_segment() -> Option<String> {
     crate::guard::guards_enabled().then(|| GUARD_MARK.to_owned())
+}
+
+/// The micro-compaction segment: `🗑 🟢` when on, `🗑 🔴` when off.
+///
+/// Always drawn, both states, unlike the conditional segments around it: the
+/// footer is where the switch is thrown, so the box has to be there to be
+/// double-clicked even when the answer is "off". Takes the state as a
+/// parameter rather than reading the live settings, for the reason
+/// [`splice_download_segment`] spells out — a test must be able to ask for
+/// both states without writing a process-global under parallel test threads.
+#[must_use]
+pub fn microcompact_segment(on: bool) -> String {
+    let light = if on {
+        MICROCOMPACT_ON
+    } else {
+        MICROCOMPACT_OFF
+    };
+    format!("{MICROCOMPACT_MARK} {light}")
 }
 
 /// The jobs segment: `⧗ 2 jobs` while background bash jobs are still running
@@ -2239,6 +2285,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_microcompact_segment_shows_both_states() {
+        assert_eq!(microcompact_segment(true), "🗑 🟢");
+        assert_eq!(microcompact_segment(false), "🗑 🔴");
+        // Off is a state, not an absence: the box stays on the line so it can
+        // be double-clicked back on.
+        let st = Status::default();
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains(MICROCOMPACT_MARK), "{line}");
+        // No variation selector: the mark the TUI hit-tests against is the one
+        // the footer actually draws.
+        assert!(!line.contains('\u{fe0f}'), "{line:?}");
+    }
+
+    #[test]
     fn jobs_segment_shows_only_while_jobs_run() {
         let mut st = Status::default();
         assert_eq!(jobs_segment(&st), None);
@@ -2299,7 +2359,7 @@ mod tests {
             ..Status::default()
         };
         assert!(
-            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡 0.00 | idle"),
+            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡 0.00 | 🗑 🟢 | idle"),
             "{}",
             build_status_text(&st, false, true)
         );
@@ -2350,7 +2410,10 @@ mod tests {
         // question the slot exists to answer.
         let line = build_status_text(&plain, false, true);
         assert!(
-            line.ends_with(&format!("ctx 12% | {MTP_MARK} | idle")),
+            line.ends_with(&format!(
+                "ctx 12% | {MTP_MARK} | {} | idle",
+                microcompact_segment(true)
+            )),
             "{line}"
         );
         assert!(!line.contains(TEMP_MARK), "{line}");
@@ -2366,7 +2429,10 @@ mod tests {
         };
         let line = build_status_text(&spark, false, true);
         assert!(
-            line.ends_with(&format!("ctx 12% | {MTP_MARK} 3.0t/step 50% | idle")),
+            line.ends_with(&format!(
+                "ctx 12% | {MTP_MARK} 3.0t/step 50% | {} | idle",
+                microcompact_segment(true)
+            )),
             "{line}"
         );
     }

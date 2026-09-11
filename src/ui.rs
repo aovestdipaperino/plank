@@ -689,7 +689,7 @@ fn turn_repeat_guard(ctx_size: i32) -> crate::insights::RepeatGuard {
 /// [`REPEAT_LOOP_ERROR`]: the guard has *not* proven a loop, only that the
 /// reasoning outran its budget, and telling a model that was thinking hard
 /// that it was repeating itself is a lie it then has to reconcile.
-const THINK_BUDGET_ERROR: &str = "generation stopped: the reasoning ran past its budget without reaching a decision. Do not restate the options. Pick the one you were leaning towards, say it in one sentence, and emit the tool calls for it now.";
+const THINK_BUDGET_ERROR: &str = "generation stopped: the reasoning exhausted its budget; this does not establish a loop. The previous analysis is retained as unverified working context. Do not restart it or restate the options. Close the thinking and deliver one small result now: a supported finding for a review, the next edit for an implementation, or a concise blocker or question if you cannot proceed. Do not claim that unexecuted code or unchecked findings are verified.";
 
 /// Bytes a turn may generate without a successful direct file mutation before
 /// it is ended. Bytes rather than tokens because that is the unit the corpus
@@ -749,7 +749,7 @@ fn pass_stop_text(interrupted: bool, error: Option<&str>, calls: usize) -> Strin
 /// instruction is the one that fixes it: write this as your answer, not in
 /// reasoning. `repro-loop-1789060243` and the seven 2026-09-10 dumps in
 /// `docs/LOOP-FINDINGS.md`.
-const DRAFT_ERROR: &str = "generation stopped: the reasoning was drafting the answer — numbered findings or code — instead of deciding what to do. Write this as your answer, not in reasoning. Close the thinking now and emit the items you already have to the user one at a time as you go; for code, make the change with the edit or write tool rather than drafting it in thought.";
+const DRAFT_ERROR: &str = "generation paused: lengthy structured reasoning reached a delivery checkpoint; this does not establish a loop or a finished draft. The analysis is retained as unverified working context. Do not restart the survey or compose it again. Close the thinking and deliver one supported finding now, make the next small code change with edit or write, or state what still needs verification. Do not promote rejected ideas or unexecuted code into results.";
 
 /// Consecutive repeat-guard stops a sub-agent may take before it is asked for
 /// its report instead of another attempt. At temperature 0 a pass is a pure
@@ -771,7 +771,7 @@ const MAIN_REPEAT_TRIP_CAP: usize = 2;
 
 /// Shown when [`MAIN_REPEAT_TRIP_CAP`] ends a turn. The transcript keeps the
 /// guard's tool error as its last message, so the next prompt sees why.
-const MAIN_REPEAT_TRIPS_NOTICE: &str = "turn stopped: the model's reasoning was cut short twice in a row, for looping or for running past its budget. Rephrase the request, narrow it, or give it what it is missing.";
+const MAIN_REPEAT_TRIPS_NOTICE: &str = "turn stopped: reasoning was cut short twice in a row for repetition, excessive drafting, or exhausting its budget. Narrow the request or ask for one concrete result.";
 
 /// Reported to the parent when the forced report pass looped as well.
 const REPEAT_TRIPS_NOTICE: &str =
@@ -795,7 +795,7 @@ fn guard_notice(what: &str, label: Option<&str>) -> String {
 fn repeat_trip_text(payload: Option<&str>, trips: usize) -> String {
     let what = match payload {
         Some(p) if p.contains(THINK_BUDGET_ERROR) => "stopped an over-budget pass",
-        Some(p) if p.contains(DRAFT_ERROR) => "stopped a pass drafting its answer in reasoning",
+        Some(p) if p.contains(DRAFT_ERROR) => "paused lengthy structured reasoning for delivery",
         _ => "stopped a reasoning loop",
     };
     if trips > 1 {
@@ -1070,6 +1070,29 @@ fn stub_stopped_reasoning(text: &mut String) {
         &text[close + CLOSE.len()..]
     );
     *text = rebuilt;
+}
+
+/// Gives generation a cycle-free copy while preserving the original sidechain
+/// for repros. Match the complete harness error, not text quoted by a tool.
+/// Draft and budget stops deliberately retain their unverified working context.
+fn recovery_session(session: &Session) -> std::borrow::Cow<'_, Session> {
+    let cycle_error = format!("<tool_result>Tool error: {REPEAT_LOOP_ERROR}\n</tool_result>");
+    let mut recovery = std::borrow::Cow::Borrowed(session);
+    for i in 1..session.transcript.len() {
+        let previous = &session.transcript[i - 1];
+        let message = &session.transcript[i];
+        if previous.role == crate::session::Role::Assistant
+            && message.role == crate::session::Role::User
+            && message.text == cycle_error
+        {
+            let mut text = previous.text.clone();
+            stub_stopped_reasoning(&mut text);
+            if text != previous.text {
+                recovery.to_mut().transcript[i - 1].text = text;
+            }
+        }
+    }
+    recovery
 }
 
 /// Builds the mid-stream edit preflight hook for a [`StreamRenderer`]: it
@@ -3401,7 +3424,7 @@ impl Agent<'_> {
                 self.session
                     .push(Message::user(crate::agents::final_round_reminder()));
             }
-            let prompt_text = render_transcript(&self.session, &self.system);
+            let prompt_text = render_transcript(&recovery_session(&self.session), &self.system);
             let pass = match self.generate_quiet(&prompt_text, turn_start) {
                 Ok(pass) => pass,
                 Err(abort) => {
@@ -3507,7 +3530,7 @@ impl Agent<'_> {
         let bufs = self
             .engine
             .wants_structured()
-            .then(|| self.build_structured(prompt_text));
+            .then(|| self.build_structured_for(&recovery_session(&self.session), prompt_text));
         // Cloned rather than borrowed: the live options are `self`'s now (they
         // used to hang off the immutably-shared `cfg`), and this function goes
         // on to touch `self` mutably.
@@ -4103,8 +4126,11 @@ impl Agent<'_> {
                 if let Some(line) = self.loop_repro_line() {
                     println!("{}", self.debug_line(&line));
                 }
-                // Dump first, then take the cycle out of the model's copy.
-                self.stub_last_reasoning();
+                // Only proven cycles are discarded; drafts and budget-stopped
+                // analysis remain available for the bounded delivery attempt.
+                if preflight_error.as_deref() == Some(REPEAT_LOOP_ERROR) {
+                    self.stub_last_reasoning();
+                }
             } else {
                 repeat_trips = 0;
             }
@@ -5863,6 +5889,7 @@ impl Agent<'_> {
             "/mtp" => println!("{}", self.mtp_command(arg)),
             "/temp" => println!("{}", self.temp_command(arg)),
             "/loopguard" | "/lg" => println!("{}", loopguard_command(arg)),
+            "/mc" => println!("{}", microcompact_command(arg)),
             "/jobs" => println!("{}", self.jobs_command()),
             "/think" => {
                 // A level change that moves the effort preamble re-warms the KV
@@ -8922,11 +8949,12 @@ the original is frozen and listed in /tree"
                     if slot.done {
                         return None;
                     }
-                    let prompt = render_transcript(&slot.session, &system);
+                    let recovery = recovery_session(&slot.session);
+                    let prompt = render_transcript(&recovery, &system);
                     let bufs = slot
                         .engine
                         .wants_structured()
-                        .then(|| self.build_structured_for(&slot.session, &prompt));
+                        .then(|| self.build_structured_for(&recovery, &prompt));
                     Some((prompt, bufs))
                 })
                 .collect();
@@ -10466,6 +10494,9 @@ impl Agent<'_> {
             last_activity = Instant::now();
         }
 
+        // Presses on the footer's wastebasket, so the second inside the window
+        // toggles micro-compaction. The mid-turn loop keeps its own.
+        let mut mc_clicks = SegmentDoubleClick::default();
         // Endpoints of a mouse drag selection over the output area, in content
         // space: `(column, absolute-wrapped-row)`. Anchoring the row to content
         // (not the screen) lets the selection survive scrolling. Copied to the
@@ -10902,6 +10933,16 @@ impl Agent<'_> {
                         } else if tui::jobs_click(m.column, m.row) {
                             // The footer's jobs segment toggles the `/jobs` panel.
                             self.toggle_jobs_report(&mut report);
+                            selection.cancel();
+                        } else if tui::mc_click(m.column, m.row) {
+                            // The footer's wastebasket: a double-click flips
+                            // micro-compaction, a single press says what it is.
+                            if mc_clicks.press(Instant::now()) {
+                                log.push_plain(microcompact_toggle());
+                            } else {
+                                log.push_dim(microcompact_click_hint());
+                            }
+                            view.follow = true;
                             selection.cancel();
                         } else if tui::ctx_click(m.column, m.row) {
                             // The footer's ctx gauge toggles the `/context`
@@ -12735,8 +12776,10 @@ impl Agent<'_> {
                 if let Some(line) = self.loop_repro_line() {
                     let _ = tx.send(UiEvent::Dim(line));
                 }
-                // Dump first, then take the cycle out of the model's copy.
-                self.stub_last_reasoning();
+                // Match the plain path: keep useful non-cyclic analysis.
+                if f.payload.contains(REPEAT_LOOP_ERROR) {
+                    self.stub_last_reasoning();
+                }
             } else {
                 repeat_trips = 0;
             }
@@ -13957,6 +14000,7 @@ impl Agent<'_> {
             "/mtp" => log.push_plain(self.mtp_command(arg)),
             "/temp" => log.push_plain(self.temp_command(arg)),
             "/loopguard" | "/lg" => log.push_plain(loopguard_command(arg)),
+            "/mc" => log.push_plain(microcompact_command(arg)),
             // A report, not conversation: the same dismissable panel as
             // `/usage`, refreshed every tick while open (`refresh_jobs_report`).
             "/jobs" => {
@@ -14826,6 +14870,41 @@ fn await_yes_default() -> Result<bool, String> {
     }
 }
 
+/// `/mc [on|off]` changes only the live micro-compaction setting, not disk
+/// preferences or full summarization. All micro-compaction gates read it live.
+fn microcompact_command(arg: &str) -> String {
+    let (want, reply) = microcompact_reply(arg, crate::settings::active().context.microcompact);
+    if let Some(want) = want {
+        let mut settings = crate::settings::active().clone();
+        settings.context.microcompact = want;
+        crate::settings::reinstall(settings);
+    }
+    reply
+}
+
+fn microcompact_reply(arg: &str, on: bool) -> (Option<bool>, String) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return (
+            None,
+            format!("micro-compaction: {}", if on { "on" } else { "off" }),
+        );
+    }
+    let want = match arg {
+        "on" => true,
+        "off" => false,
+        _ => return (None, format!("/mc: expected on|off, got `{arg}`")),
+    };
+    if want == on {
+        (None, format!("micro-compaction already {arg}"))
+    } else {
+        (
+            Some(want),
+            format!("micro-compaction: {arg} (this session)"),
+        )
+    }
+}
+
 /// `/loopguard [on|off]` — arm or silence every loop guard, reporting the
 /// state with no argument.
 ///
@@ -14987,6 +15066,69 @@ fn run_worker_ui<T: Send>(
         ui?;
         out
     })
+}
+
+/// Tracks repeated left-presses on one footer segment, so a double-click can
+/// be told from two unrelated clicks.
+///
+/// One instance per clickable target per key loop, rather than a screen-wide
+/// gesture recognizer: crossterm reports presses, not clicks, and the only
+/// thing that needs the distinction is the wastebasket. Position is
+/// deliberately *not* compared — the caller has already established that both
+/// presses landed on the same segment, and the segment is a few columns of
+/// wide glyphs, so a one-cell drift between the two presses of a real
+/// double-click must not disarm it.
+#[derive(Debug, Default)]
+struct SegmentDoubleClick {
+    /// When the unpaired press landed, if one is waiting for its partner.
+    pending: Option<Instant>,
+}
+
+impl SegmentDoubleClick {
+    /// How long the second press has to arrive. The macOS default double-click
+    /// interval is 500 ms; this is a little under it, because the cost of
+    /// missing one is a repeated click and the cost of pairing two deliberate
+    /// separate clicks is a setting flipped by surprise.
+    const WINDOW: Duration = Duration::from_millis(400);
+
+    /// Records a press on the segment and reports whether it completed a
+    /// double-click.
+    fn press(&mut self, now: Instant) -> bool {
+        let paired = self
+            .pending
+            .is_some_and(|at| now.duration_since(at) <= Self::WINDOW);
+        // Consumed on a pair, so a third press opens a fresh one instead of
+        // reporting a second double-click off the same first press.
+        self.pending = if paired { None } else { Some(now) };
+        paired
+    }
+}
+
+/// Flips micro-compaction, for the footer's wastebasket double-click. Goes
+/// through [`microcompact_command`] rather than writing the setting itself, so
+/// the gesture and the typed `/mc on|off` cannot drift.
+fn microcompact_toggle() -> String {
+    let on = crate::settings::active().context.microcompact;
+    microcompact_command(if on { "off" } else { "on" })
+}
+
+/// What a single click on the wastebasket leaves in the log: the state, and the
+/// gesture that changes it.
+///
+/// A single click deliberately does not toggle. Micro-compaction rewrites old
+/// tool results in place and costs a rung restore when it does, so it is not a
+/// thing to flip on a stray press in the status bar — and a footer where one
+/// glyph answers a click by changing the session is a footer nobody clicks
+/// twice.
+fn microcompact_click_hint() -> String {
+    format!(
+        "micro-compaction: {} (double-click to toggle)",
+        if crate::settings::active().context.microcompact {
+            "on"
+        } else {
+            "off"
+        }
+    )
 }
 
 /// How long an unacknowledged interrupt waits before a second Ctrl-C is taken
@@ -15155,6 +15297,8 @@ fn busy_ui_loop(
     // it. Rows are absolute wrapped-row indices, so the selection stays on its
     // text as new output arrives underneath it.
     let mut selection = tui::DragSelect::default();
+    // Presses on the footer's wastebasket; see the idle loop's own tracker.
+    let mut mc_clicks = SegmentDoubleClick::default();
     // True while the progress line is showing the compaction bar, so it is
     // cleared exactly once when the pass ends.
     let mut compacting_line = false;
@@ -15758,6 +15902,15 @@ fn busy_ui_loop(
                             view.follow = true;
                             sub.follow_all();
                         } else if let Some(arg) = line
+                            .strip_prefix("/mc")
+                            .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+                        {
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            log.push_plain(microcompact_command(arg));
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if let Some(arg) = line
                             .strip_prefix("/loopguard")
                             .or_else(|| line.strip_prefix("/lg"))
                             .filter(|rest| rest.is_empty() || rest.starts_with(' '))
@@ -15909,6 +16062,21 @@ fn busy_ui_loop(
                             &shared.jobs_report(),
                         ));
                     }
+                    selection.cancel();
+                }
+                // The footer's wastebasket, as at idle. The one *mutating*
+                // gesture that works mid-turn, for the same reason
+                // `/loopguard` is: every micro-compaction check reads the
+                // setting afresh, so the switch lands on the turn already
+                // running — which is when you want it.
+                MouseEventKind::Down(MouseButton::Left) if tui::mc_click(m.column, m.row) => {
+                    if mc_clicks.press(Instant::now()) {
+                        log.push_plain(microcompact_toggle());
+                    } else {
+                        log.push_dim(microcompact_click_hint());
+                    }
+                    view.follow = true;
+                    sub.follow_all();
                     selection.cancel();
                 }
                 // The footer's ctx gauge toggles the `/context` panel, as at
@@ -18524,6 +18692,27 @@ mod tests {
                 .1
                 .contains("expected on|off")
         );
+    }
+
+    /// The wastebasket's gesture: two presses inside the window are a
+    /// double-click, a slow second press is not, and a pair is consumed so a
+    /// third press cannot ride the first one.
+    #[test]
+    fn a_second_press_inside_the_window_is_a_double_click() {
+        let mut g = SegmentDoubleClick::default();
+        let t0 = Instant::now();
+        assert!(!g.press(t0), "the first press is never a double-click");
+        assert!(g.press(t0 + Duration::from_millis(120)));
+        // Consumed: the next press opens a fresh pair rather than pairing with
+        // the press that already fired.
+        assert!(!g.press(t0 + Duration::from_millis(140)));
+        // Too slow: it becomes the start of the next pair instead.
+        assert!(!g.press(t0 + Duration::from_secs(5)));
+        assert!(g.press(t0 + Duration::from_secs(5) + SegmentDoubleClick::WINDOW));
+        // Exactly at the edge counted above; a hair past it does not.
+        let mut g = SegmentDoubleClick::default();
+        assert!(!g.press(t0));
+        assert!(!g.press(t0 + SegmentDoubleClick::WINDOW + Duration::from_millis(1)));
     }
 
     /// Regression: the screensaver's idle clock must not be reset by focus or

@@ -2887,10 +2887,25 @@ static JOBS_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 /// hit-testing; `None` when the row it was drawn on held no gauge.
 static CTX_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 
+/// Screen rect the footer's micro-compaction segment last occupied, so a
+/// double-click on the wastebasket can be mapped to it.
+static MC_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
 /// Whether a click at (`column`, `row`) landed on the footer's jobs segment.
 #[must_use]
 pub fn jobs_click(column: u16, row: u16) -> bool {
     JOBS_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// Whether a click at (`column`, `row`) landed on the footer's wastebasket
+/// (the micro-compaction segment).
+#[must_use]
+pub fn mc_click(column: u16, row: u16) -> bool {
+    MC_RECT
         .lock()
         .ok()
         .and_then(|r| *r)
@@ -2989,6 +3004,34 @@ pub fn record_jobs_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
         break;
     }
     if let Ok(mut g) = JOBS_RECT.lock() {
+        *g = found;
+    }
+}
+
+/// Finds the micro-compaction segment in the status rows just drawn into `buf`
+/// and records its rect, exactly as [`record_jobs_rect`] does for the jobs
+/// segment: the anchor is [`crate::status::MICROCOMPACT_MARK`] and the box is
+/// the run between the ` | ` separators around it, so the hit box follows
+/// whatever styling and elision the bar applied. The mark is a wide glyph, so
+/// the anchor cell is its first column and the second belongs to the same
+/// segment either way.
+pub fn record_mc_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        let Some(mark) = cells
+            .iter()
+            .position(|c| *c == crate::status::MICROCOMPACT_MARK)
+        else {
+            continue;
+        };
+        let (start, end) = segment_bounds(&cells, mark);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = MC_RECT.lock() {
         *g = found;
     }
 }
@@ -4185,6 +4228,7 @@ pub fn draw(
     );
     record_jobs_rect(frame.buffer_mut(), status_row);
     record_ctx_rect(frame.buffer_mut(), status_row);
+    record_mc_rect(frame.buffer_mut(), status_row);
 }
 
 /// Draws one frame while an `ask` question (issue #34) is up: the output log
@@ -4232,6 +4276,7 @@ pub fn draw_ask(
     );
     record_jobs_rect(frame.buffer_mut(), r[2]);
     record_ctx_rect(frame.buffer_mut(), r[2]);
+    record_mc_rect(frame.buffer_mut(), r[2]);
 }
 
 /// Renders the question panel: a header chip and question, then the options as a
@@ -4424,6 +4469,7 @@ pub fn draw_btw_split(
     );
     record_jobs_rect(frame.buffer_mut(), status_row);
     record_ctx_rect(frame.buffer_mut(), status_row);
+    record_mc_rect(frame.buffer_mut(), status_row);
 }
 
 /// Overlays the sub-agent pane's identity on the output area's top row: the
@@ -4923,6 +4969,30 @@ mod tests {
         let quiet = Buffer::empty(area);
         super::record_jobs_rect(&quiet, area);
         assert!(!super::jobs_click(10, 0), "no mark, no hit box");
+    }
+
+    /// The wastebasket gets the same segment-wide click box as the jobs
+    /// segment, and a frame drawn without it clears the box.
+    #[test]
+    fn mc_rect_spans_the_wastebasket_segment() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 40, 1);
+        let text = format!(
+            "ctx 12% | {} | idle",
+            crate::status::microcompact_segment(true)
+        );
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, &text, ratatui::style::Style::default());
+        super::record_mc_rect(&buf, area);
+        // "ctx 12% | " is 10 cells; the two wide glyphs and their space span 5.
+        assert!(super::mc_click(10, 0), "the mark itself");
+        assert!(super::mc_click(13, 0), "through the indicator light");
+        assert!(!super::mc_click(9, 0), "the separator is not the segment");
+        assert!(!super::mc_click(10, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_mc_rect(&quiet, area);
+        assert!(!super::mc_click(10, 0), "no mark, no hit box");
     }
 
     /// The ctx gauge gets the same segment-wide click box, and its anchor is

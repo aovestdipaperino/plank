@@ -975,6 +975,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "set the sampling temperature (not while mtp is on)",
     },
     SlashCommand {
+        name: "/mc",
+        args: "[on|off]",
+        desc: "toggle micro-compaction for this session, even mid-turn",
+    },
+    SlashCommand {
         name: "/loopguard",
         args: "[on|off]",
         desc: "arm or silence the loop guards, even mid-turn",
@@ -1153,6 +1158,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/debug")
         || slash_command_with_args(cmd, "/mtp")
         || slash_command_with_args(cmd, "/temp")
+        || slash_command_with_args(cmd, "/mc")
         || slash_command_with_args(cmd, "/loopguard")
         || slash_command_with_args(cmd, "/lg")
         || slash_command_with_args(cmd, "/export")
@@ -2598,6 +2604,10 @@ mod tests {
         assert!(slash_command_known("/repro"));
         assert!(slash_command_known("/mtp off"));
         assert!(slash_command_known("/temp 0.6"));
+        assert!(slash_command_known("/mc"));
+        assert!(slash_command_known("/mc on"));
+        assert!(slash_command_known("/mc off"));
+        assert!(!slash_command_known("/mcx"));
         assert!(slash_command_known("/loopguard"));
         assert!(slash_command_known("/lg on"));
         assert!(!slash_command_known("/lgx"));
