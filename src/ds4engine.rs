@@ -239,6 +239,31 @@ fn report_text_only(
     }
 }
 
+/// Whether the Metal kernel sources are absent from where the engine looks.
+///
+/// `set_metal_source_env` points `DS4_METAL_FLASH_ATTN_SOURCE` at them when it
+/// can find them; if the variable is unset or names a path that is gone, the
+/// engine cannot build its kernels and the open fails with nothing on the
+/// file's own account.
+fn metal_kernels_missing() -> bool {
+    std::env::var_os("DS4_METAL_FLASH_ATTN_SOURCE").is_none_or(|p| !Path::new(&p).exists())
+}
+
+/// The companion files an open passed, labelled for a failure message. Each is
+/// `None` when plank deliberately did not pass it, which
+/// [`crate::gguf::file_detail`] reports as nothing rather than as absent.
+fn companion_notes<'a>(
+    mtp: Option<&'a Path>,
+    ple: Option<&'a Path>,
+    vision: Option<&'a Path>,
+) -> [(&'static str, Option<&'a Path>); 3] {
+    [
+        ("mtp draft model", mtp),
+        ("ple sidecar", ple),
+        ("vision encoder", vision),
+    ]
+}
+
 impl Ds4Model {
     /// Opens a model file with the given backend, context size, and tuning
     /// knobs (`--mtp`, `--ssd-streaming`, steering, ...).
@@ -344,16 +369,22 @@ impl Ds4Model {
         // SAFETY: opts and its CStrings outlive the call; engine is a valid out-ptr.
         let rc = unsafe { ffi::ds4_engine_open(&raw mut engine, &raw const opts) };
         if rc != 0 || engine.is_null() {
-            let mut msg = format!("failed to open model {}", path.display());
-            let kernels_missing = std::env::var_os("DS4_METAL_FLASH_ATTN_SOURCE")
-                .is_none_or(|p| !Path::new(&p).exists());
-            if kernels_missing {
-                msg.push_str(
-                    " (Metal kernel sources not found; set DS4_METAL_DIR to a \
-                     directory containing the .metal files)",
-                );
-            }
-            return Err(EngineError::new(msg));
+            // Everything the message can establish without the engine lives in
+            // `gguf`, which is always compiled and so CI-tested; this side
+            // supplies only what is FFI-shaped.
+            let vision = model_supports_vision.then_some(vision_path.as_path());
+            return Err(EngineError::new(crate::gguf::open_failure_detail(
+                &crate::gguf::OpenAttempt {
+                    path,
+                    rc,
+                    engine_null: engine.is_null(),
+                    family,
+                    backend: &format!("{backend:?}"),
+                    ctx_size,
+                    companions: &companion_notes(mtp_path, ple_path, vision),
+                    metal_kernels_missing: metal_kernels_missing(),
+                },
+            )));
         }
         // SAFETY: `engine` is non-null and valid, checked just above.
         if !unsafe { ffi::ds4_engine_has_vision(engine) } {

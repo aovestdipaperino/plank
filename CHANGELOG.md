@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **"failed to open model" now says why.** The message carried the path and,
+  on macOS, a Metal-kernels hint; it now adds what `ds4_engine_open` returned
+  (or that it returned success with no engine), the family, backend and
+  context size plank asked for, the model file's own state — a dangling
+  symlink names its target, a directory, an unreadable file, otherwise the
+  size — a size mismatch against the installed manifest, which is what a
+  truncated or interrupted install looks like, and the same state for each
+  companion actually passed, so a Qwen run missing its PLE sidecar says so.
+  Companions plank never passed stay unmentioned rather than being reported
+  as missing. The assembly is FFI-free and lives in `gguf`, so it is tested
+  without the engine submodule.
+
 ### Fixed
 
 - **The no-progress notice claimed running a command would have satisfied

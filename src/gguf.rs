@@ -193,6 +193,212 @@ fn skip_value<R: Read + Seek>(r: &mut BufReader<R>, ty: u32) -> Option<()> {
     }
 }
 
+/// One detail line about a file the engine open depended on: whether it is
+/// there, what a symlink points at, how big it is, and whether this process
+/// can actually read it.
+///
+/// `None` when `path` is `None`, so a companion plank deliberately never
+/// passed is not reported as a file that is missing — the same distinction
+/// `report_text_only` makes for the vision encoder.
+#[must_use]
+pub fn file_detail(label: &str, path: Option<&Path>) -> Option<String> {
+    use std::fmt::Write as _;
+    let path = path?;
+    let mut line = format!("- {label}: {}", path.display());
+    // `symlink_metadata` first: plank's own default model paths are symlinks
+    // by convention (`~/.plank/qwen.gguf` and its sidecar are expected to
+    // point at whichever build you keep), so a dangling one is the single most
+    // likely cause of an open that fails with the path looking perfectly fine.
+    match std::fs::symlink_metadata(path) {
+        Err(e) => {
+            let _ = write!(line, " — not found ({e})");
+            return Some(line);
+        }
+        Ok(md) if md.file_type().is_symlink() => {
+            match std::fs::read_link(path) {
+                Ok(target) => {
+                    let _ = write!(line, " → {}", target.display());
+                }
+                Err(e) => {
+                    let _ = write!(line, " — symlink unreadable ({e})");
+                    return Some(line);
+                }
+            }
+            if !path.exists() {
+                line.push_str(" — DANGLING: the symlink target does not exist");
+                return Some(line);
+            }
+        }
+        Ok(_) => {}
+    }
+    match std::fs::metadata(path) {
+        Ok(md) if md.is_dir() => line.push_str(" — is a directory, not a file"),
+        Ok(md) => {
+            let _ = write!(line, ", {}", crate::kvpane::human_bytes(md.len()));
+            // Size says nothing about permissions, and an artifact copied in
+            // as root is a real way to get here.
+            if let Err(e) = File::open(path) {
+                let _ = write!(line, " — cannot read it ({e})");
+            }
+        }
+        Err(e) => {
+            let _ = write!(line, " — cannot stat ({e})");
+        }
+    }
+    Some(line)
+}
+
+/// The line comparing an artifact against the length the installed manifest
+/// records for it, when `path` is one of the managed artifacts and the two
+/// disagree.
+///
+/// The decisive check for the failure mode a plain "failed to open" hides
+/// worst: a truncated weights file. An interrupted install, a full disk, or a
+/// half-copied file opens as a perfectly ordinary path of the right name, and
+/// the engine's own complaint about it is a parse error deep in a tensor
+/// table. plank already knows the expected byte count, so it can say so.
+#[must_use]
+pub fn artifact_size_mismatch(path: &Path, family: ModelFamily) -> Option<String> {
+    let on_disk = std::fs::metadata(path).ok()?.len();
+    let set = crate::manifest::ModelSet::for_family(family);
+    let manifest = crate::manifest::read_at(&crate::manifest::installed_path(set))?;
+    let same = |a: &Path, b: &Path| {
+        a == b
+            || match (a.canonicalize(), b.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+    };
+    let (_, entry) = manifest.files.iter().find(|(kind, _)| {
+        crate::manifest::local_path_for(set, kind).is_some_and(|p| same(&p, path))
+    })?;
+    (entry.bytes != on_disk).then(|| {
+        format!(
+            "- SIZE MISMATCH: the installed {} manifest records {} for this artifact, but the file is {} — an interrupted or truncated install",
+            set.as_str(),
+            crate::kvpane::human_bytes(entry.bytes),
+            crate::kvpane::human_bytes(on_disk)
+        )
+    })
+}
+
+/// What plank knew when it asked the engine to open a model, for
+/// [`open_failure_detail`]. A struct because the answer draws on eight
+/// unrelated facts and a positional call of that width is a bug waiting for a
+/// refactor to swap two of them.
+#[derive(Debug)]
+pub struct OpenAttempt<'a> {
+    /// The model file handed to the engine.
+    pub path: &'a Path,
+    /// What `ds4_engine_open` returned.
+    pub rc: i32,
+    /// Whether it left the out-pointer null.
+    pub engine_null: bool,
+    /// Family plank detected from the file's own metadata before opening.
+    pub family: ModelFamily,
+    /// Backend label, already formatted by the caller so this module needs no
+    /// FFI type.
+    pub backend: &'a str,
+    /// Context window requested, in tokens.
+    pub ctx_size: i32,
+    /// Companion files actually passed, label first. `None` for one plank
+    /// deliberately did not pass.
+    pub companions: &'a [(&'a str, Option<&'a Path>)],
+    /// Whether the Metal kernel sources were absent where the engine looks.
+    pub metal_kernels_missing: bool,
+}
+
+/// The multi-line body of a "failed to open model" error: every fact plank can
+/// establish about why, on its own, without the engine.
+///
+/// A bare "failed to open model &lt;path&gt;" is the least useful form of a
+/// failure that has a handful of cheap and decisive causes: a dangling symlink,
+/// a truncated artifact from an interrupted install, a companion sidecar that
+/// is absent (a Qwen run cannot open without its PLE file, and `--mtp` on a
+/// `DeepSeek` run cannot without the draft checkpoint), a context size the
+/// machine cannot hold, or the Metal kernel sources not being where the engine
+/// looks. Each gets its own line, and only when it is true, so the message
+/// never pads itself out with reassurance that everything is fine.
+///
+/// Lives here rather than beside the open it describes because everything in
+/// it is FFI-free and so stays CI-tested, the same split `ds4tokens` makes:
+/// the gated engine wrapper passes its backend as a label and its return code
+/// as a number.
+#[must_use]
+pub fn open_failure_detail(attempt: &OpenAttempt) -> String {
+    use std::fmt::Write as _;
+    let OpenAttempt {
+        path,
+        rc,
+        engine_null,
+        family,
+        backend,
+        ctx_size,
+        companions,
+        metal_kernels_missing,
+    } = *attempt;
+    let mut msg = format!("failed to open model {}", path.display());
+    // The two ways the C reports a refusal are worth telling apart: a code is
+    // something it decided, a null engine with a zero code is a bug in the
+    // glue or an allocation that failed without saying so.
+    if rc != 0 {
+        let _ = write!(
+            msg,
+            "
+- ds4_engine_open returned {rc}"
+        );
+    } else if engine_null {
+        msg.push_str(
+            "
+- ds4_engine_open reported success but returned no engine",
+        );
+    }
+    let _ = write!(
+        msg,
+        "
+- opened as: {} family, {backend} backend, context {ctx_size} tokens",
+        crate::manifest::ModelSet::for_family(family).as_str()
+    );
+    if let Some(line) = file_detail("model file", Some(path)) {
+        let _ = write!(
+            msg,
+            "
+{line}"
+        );
+    }
+    if let Some(line) = artifact_size_mismatch(path, family) {
+        let _ = write!(
+            msg,
+            "
+{line}"
+        );
+    }
+    for (label, companion) in companions {
+        if let Some(line) = file_detail(label, *companion) {
+            let _ = write!(
+                msg,
+                "
+{line}"
+            );
+        }
+    }
+    if metal_kernels_missing {
+        msg.push_str(
+            "
+- Metal kernel sources not found; set DS4_METAL_DIR to a directory \
+             containing the .metal files",
+        );
+    }
+    // The C logs its own diagnosis on the way out, and plank renders that log
+    // in place on a single row, so the line that actually names the cause is
+    // usually the last thing above this message — and easy to read past.
+    msg.push_str(
+        "
+- the engine's own log is on the lines above this one",
+    );
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +598,111 @@ mod tests {
         std::fs::write(&p, &bytes).unwrap();
         assert_eq!(architecture(&p), None);
         let _ = std::fs::remove_file(p);
+    }
+
+    /// A path for one test's fixtures, in the shape the tests above already
+    /// use: process-scoped so parallel runs cannot collide.
+    fn detail_tmp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("plank-detail-{}-{name}", std::process::id()))
+    }
+
+    /// The file line reports what is wrong: absent, a dangling symlink, a
+    /// directory, or present with its size.
+    #[test]
+    fn the_file_detail_line_names_what_is_wrong() {
+        // Never passed is not the same as missing, and says nothing.
+        assert_eq!(file_detail("vision encoder", None), None);
+
+        let missing = detail_tmp("missing.gguf");
+        let _ = std::fs::remove_file(&missing);
+        let line = file_detail("model file", Some(&missing)).expect("a path was given");
+        assert!(line.starts_with("- model file: "), "{line}");
+        assert!(line.contains("not found"), "{line}");
+
+        // A real file reports its size.
+        let real = detail_tmp("real.gguf");
+        std::fs::write(&real, vec![7u8; 2048]).expect("write");
+        let line = file_detail("model file", Some(&real)).expect("a path was given");
+        assert!(line.contains("2.0 KB"), "{line}");
+        assert!(!line.contains("not found"), "{line}");
+
+        // The case plank's own symlinked default paths make likely.
+        let dangling = detail_tmp("dangling.gguf");
+        let _ = std::fs::remove_file(&dangling);
+        std::os::unix::fs::symlink(detail_tmp("nowhere.gguf"), &dangling).expect("symlink");
+        let line = file_detail("model file", Some(&dangling)).expect("a path was given");
+        assert!(line.contains("DANGLING"), "{line}");
+        assert!(line.contains("nowhere.gguf"), "the target is named: {line}");
+
+        // A symlink that resolves names its target and still sizes it.
+        let good_link = detail_tmp("good.gguf");
+        let _ = std::fs::remove_file(&good_link);
+        std::os::unix::fs::symlink(&real, &good_link).expect("symlink");
+        let line = file_detail("model file", Some(&good_link)).expect("a path was given");
+        assert!(line.contains("real.gguf"), "{line}");
+        assert!(line.contains("2.0 KB"), "{line}");
+        assert!(!line.contains("DANGLING"), "{line}");
+
+        let dir = detail_tmp("dir.gguf");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let line = file_detail("model file", Some(&dir)).expect("a path was given");
+        assert!(line.contains("is a directory"), "{line}");
+
+        let _ = std::fs::remove_file(&real);
+        let _ = std::fs::remove_file(&dangling);
+        let _ = std::fs::remove_file(&good_link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The assembled message: the return code, what was opened, the file
+    /// itself, only the companions that were passed, and the hints — and no
+    /// line for anything that is fine.
+    #[test]
+    fn the_open_failure_message_names_every_fact_it_has() {
+        let model = detail_tmp("attempt.gguf");
+        std::fs::write(&model, vec![0u8; 4096]).expect("write");
+        let ple = detail_tmp("attempt.ple.gguf");
+        let _ = std::fs::remove_file(&ple);
+        let msg = open_failure_detail(&OpenAttempt {
+            path: &model,
+            rc: -3,
+            engine_null: true,
+            family: ModelFamily::Qwen,
+            backend: "Metal",
+            ctx_size: 1_048_576,
+            companions: &[("ple sidecar", Some(&ple)), ("vision encoder", None)],
+            metal_kernels_missing: true,
+        });
+        assert!(msg.starts_with("failed to open model "), "{msg}");
+        assert!(msg.contains("returned -3"), "{msg}");
+        assert!(
+            msg.contains("qwen family, Metal backend, context 1048576 tokens"),
+            "{msg}"
+        );
+        assert!(msg.contains("- model file: "), "{msg}");
+        assert!(msg.contains("4.0 KB"), "{msg}");
+        // The companion that was passed and is absent gets a line; the one
+        // plank never passed gets none.
+        assert!(msg.contains("- ple sidecar: "), "{msg}");
+        assert!(!msg.contains("vision encoder"), "{msg}");
+        assert!(msg.contains("DS4_METAL_DIR"), "{msg}");
+        assert!(msg.contains("engine's own log"), "{msg}");
+
+        // A non-zero code and a null engine are different news, and only one
+        // of them is reported per failure.
+        let msg = open_failure_detail(&OpenAttempt {
+            path: &model,
+            rc: 0,
+            engine_null: true,
+            family: ModelFamily::Ds4,
+            backend: "Cpu",
+            ctx_size: 8192,
+            companions: &[],
+            metal_kernels_missing: false,
+        });
+        assert!(msg.contains("success but returned no engine"), "{msg}");
+        assert!(!msg.contains("returned 0"), "{msg}");
+        assert!(!msg.contains("DS4_METAL_DIR"), "{msg}");
+        let _ = std::fs::remove_file(&model);
     }
 }
