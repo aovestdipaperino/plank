@@ -2518,3 +2518,38 @@ open model". `gguf::supports_vision` now reads that key before the open;
 the encoder download when it is absent, and a note at open time says the run
 is text-only. `view_image` then refuses at call time, the same path a missing
 encoder file already took.
+
+## Cancel is polled during prefill, and chunked prefill keeps its partial checkpoint
+
+`ds4_session_set_cancel`'s callback is polled per token during prefill, not
+only during generation (`refs/ds4/ds4.c:33264`, `33289`, `37888`, `37933`).
+More usefully, `ds4_session_note_prefill_progress` (`70570`) rewrites the live
+checkpoint on every `prefill_chunk` event, and on cancel `ds4_session_sync`
+sets `checkpoint_valid = s->checkpoint.len > 0` (`71795`) — so an interrupted
+chunked prefill leaves a valid *shorter* KV prefix rather than nothing.
+
+Not every path chunks: decode-style streaming prefill reports "one cacheable
+chunk at the end" (`33256`), and `metal_graph_prefill_raw_swa` returns
+INTERRUPTED without advancing the checkpoint. Yield depth is therefore
+path-dependent, and anything reporting a re-prefill cost must read the
+checkpoint that actually survived rather than assume one.
+
+## A decided yield that does not free has to be rolled back by hand
+
+`Hysteresis::observe` commits the yielded flag *before* the caller acts on its
+verdict, so the state machine already believes a yield happened by the time the
+caller discovers it cannot free — a session holding vision state, a turn that
+is not in a yieldable phase, an engine that declines. Every such path must call
+`note_yield_declined()`. Miss one and the machine stays latched in "yielded"
+with nothing freed: later pressure is swallowed as already-handled for a full
+resume dwell, which reads as plank ignoring memory pressure entirely and shows
+up nowhere in a test that only drives the happy path.
+
+## Micro-compaction must not run while yielded
+
+`restore_rung_below` → `set_kv` → `ensure_session` lazily *re-acquires* the very
+session the yield just freed, which is a multi-gigabyte allocation made at the
+one moment the machine has no memory to spare — the opposite of what the yield
+was for. Micro-compaction is therefore suppressed for the duration of a yield
+rather than allowed to race the resume; the rewrite it wanted to do is still
+waiting when the session comes back.

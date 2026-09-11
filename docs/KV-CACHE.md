@@ -1200,6 +1200,62 @@ missing blob, or no rung shallow enough) the code path is identical to having
 no ladder at all — the transcript rewrite proceeds and the next turn simply
 re-prefills, exactly as it always did.
 
+### Layer 8: the memory-pressure yield
+
+Every other layer in this document exists to *keep* KV around. This one throws
+it away on purpose.
+
+When macOS reports memory pressure caused by other applications, plank's live
+session is the largest thing it holds that the kernel cannot reclaim by itself:
+the KV is wired, so the system will page everything else out and still be under
+pressure. plank therefore stops at a token boundary, frees the session outright,
+and comes back once the pressure clears.
+
+The deliberate omission is the snapshot. Nothing on the yield path calls
+`get_kv`. Capturing the session would serialise gigabytes — allocating a second
+copy of the very thing that is too large — at exactly the moment memory is
+scarce, which is the failure the yield exists to avoid. The yield frees; it does
+not save.
+
+What makes that affordable is that the resume has a floor already on disk. It is
+never a rebuild from token zero:
+
+- if a ladder rung (Layer 7) survives at a depth at or below the current
+  transcript, the deepest such rung is the restore point;
+- otherwise the tier blobs (Layer 2, walked by Layer 3) are, and the system
+  prompt's tier-1 checkpoint alone spares the largest single span.
+
+So the cost of a yield is bounded by the distance from the deepest surviving
+blob to the live cursor, not by the length of the conversation. The resume is a
+`kvtier::warm` walk like any cold start, and takes the same path — which is why
+it needs no new trust machinery: the signature checks of Part 2 already decide
+what may be restored.
+
+Three things about the ordering are load-bearing.
+
+**The restore plan is pinned at yield time, not at resume time.** Deciding which
+blob the resume will use *after* the pressure clears leaves a window in which the
+retention sweep (below) can delete it — it is, by every measure the sweep uses,
+a cold file nobody is holding open. Resolving the plan when the session is freed
+and pinning it into the GC keep set closes that window, at the cost of one blob's
+worth of disk held through the yield.
+
+**The session is freed before the cancel reason is cleared.** Reversed, a turn
+racing the resume can enter `generate` — which clears the flag on entry — and
+start a pass against a session that is about to disappear underneath it.
+
+**A session holding vision state is never yielded.** `release_session` mirrors
+`get_kv`'s two vision gates exactly and returns `false` for either, because a
+rebuild goes through `warm_sync`'s plain `ds4_session_sync`: it would re-prefill
+the image token positions with no embeddings behind them, leaving a session that
+looks whole and is silently ungrounded. Refusing the yield and staying large is
+the correct trade. A caller whose yield is declined this way must roll back the
+hysteresis state it already committed (see `FINDINGS.md`).
+
+Micro-compaction is suppressed while yielded for the same reason the yield skips
+`get_kv`: `restore_rung_below` → `set_kv` → `ensure_session` would re-acquire the
+session the yield just freed.
+
 ### Garbage collection
 
 Checkpoints run to hundreds of megabytes, and a plank upgrade, an MCP server
@@ -1483,6 +1539,16 @@ never hits.
 justifies it.** A `set_kv` restore is only valid to perform once the caller
 already knows it will use the result; performing it speculatively and then
 declining leaves the engine worse off than doing nothing.
+
+**The memory-pressure yield never calls `get_kv`.** Snapshotting to save a
+session being freed for memory pressure allocates gigabytes at the one moment
+there are none. The resume rebuilds from the blobs already on disk.
+
+**The session is freed before the cancel reason is cleared**, never after.
+
+**A yield's restore plan is pinned into the GC keep set when the session is
+freed**, not looked up when the resume runs, so the sweep cannot delete the blob
+the resume depends on.
 
 **A sidechain never writes the live session's cache.** A payload or rung
 captured over messages that are about to be truncated back out describes a

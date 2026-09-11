@@ -3875,6 +3875,98 @@ mod tests {
         );
     }
 
+    // The one behaviour no spy engine can prove: a generation interrupted by a
+    // memory-pressure yield and resumed produces the *same* continuation as an
+    // uninterrupted one. The yield deliberately captures no KV payload — it
+    // frees the live session outright — so the resumed turn rebuilds its prefix
+    // from the transcript alone. If that rebuild ever serves a wrong prefix
+    // (an off-by-one retokenization, a stale `warm_tokens`, a checkpoint kept
+    // past the free), the continuation diverges and this test catches it; a
+    // reuse-count assertion would not, because a wrong prefix can still be
+    // "reused" cheaply.
+    //
+    // Harness copied from `switch_payload_resume_suffix_only`: same
+    // `Ds4Session::open` construction, the same seeded `GenerationOptions`,
+    // the same scoped one-live-engine-per-process discipline, and
+    // `gen_capture_reply` to drive a generation and collect its text.
+    //
+    // Requires a loaded model; skips unless PLANK_TEST_MODEL points at a GGUF.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn a_pressure_yield_resumes_to_the_same_continuation() {
+        use crate::engine::{Engine, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let opts = GenerationOptions {
+            seed: 42,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+        let transcript = "[user]\nName a fruit.\n";
+
+        // Only ONE live engine per process: each engine lives in its own scope
+        // so its Metal model is fully dropped before the next one opens.
+
+        // Baseline: two turns, uninterrupted.
+        let (baseline, resumed_transcript) = {
+            let mut a =
+                super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            let (_, reply1) = gen_capture_reply(&mut a, transcript, &opts);
+            let second = format!(
+                "{transcript}[assistant]\n{}\n[user]\nName a planet.\n",
+                reply1.trim()
+            );
+            let (_, reply2) = gen_capture_reply(&mut a, &second, &opts);
+            (reply2, second)
+        };
+
+        // Same two turns, but the session is freed between them exactly as the
+        // pressure path frees it: raise the reason, free, *then* clear. The
+        // order matters — `clear_cancel` before the free lets a racing turn
+        // start against a session about to vanish — and `generate` clears the
+        // flag on entry anyway, so a reason raised between passes would be
+        // dropped if the free did not already consume it.
+        let resumed = {
+            let mut b =
+                super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            let (_, reply1) = gen_capture_reply(&mut b, transcript, &opts);
+            assert_eq!(
+                resumed_transcript,
+                format!(
+                    "{transcript}[assistant]\n{}\n[user]\nName a planet.\n",
+                    reply1.trim()
+                ),
+                "the two runs must reach the same second-turn prompt, or the \
+                 continuation comparison below proves nothing"
+            );
+
+            request_pressure_cancel();
+            assert!(cancelled_by_pressure());
+            assert!(
+                b.release_session(),
+                "a text-only session must actually be freed by the yield; a \
+                 declined release means there is no yield to resume from"
+            );
+            super::clear_cancel();
+            assert!(!cancelled_by_pressure());
+
+            // No `set_kv` here on purpose: the resume rebuilds from the
+            // transcript, which is the whole point of not snapshotting.
+            gen_capture_reply(&mut b, &resumed_transcript, &opts).1
+        };
+
+        assert_eq!(
+            baseline, resumed,
+            "a yield must be invisible in the output; a differing continuation \
+             means the restore served a wrong prefix"
+        );
+    }
+
     // Session cloning on real Metal (docs/SESSION-CLONE-DESIGN.md §5.2). These
     // are the tests that actually decide whether cloning is sound: everything
     // below `EngineHost::attach_clone` is a no-op on `EchoEngine`, so the
