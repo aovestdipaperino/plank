@@ -3482,7 +3482,8 @@ dependencies = [
 [[package]]
 name = "nano-cursor"
 version = "0.2.0"
-source = "git+https://github.com/aovestdipaperino/nano-cursor?rev=ba9f8d7235708bead9846efc6145c1115ef9c6b8#ba9f8d7235708bead9846efc6145c1115ef9c6b8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e9e9cbf5228f5675ccb1966b70149a3a004c91459b98b6502a95d73ebe728f0"
 dependencies = [
  "ratatui",
  "unicode-width",

@@ -98,10 +98,9 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 # it. OSC 12 is a request, and Warp renders its cursor as a widget in its own
 # UI where no escape can reach it — the indicator has to be drawn to be
 # reliable. Pulls ratatui's `underline-color` feature (additive, and unused
-# here: plank draws a block). Taken by rev rather than from crates.io until
-# 0.2.0 — the ratatui 0.30 move — is published; 0.1.0 is the last release and
-# it cannot share a frame with a 0.30 buffer.
-nano-cursor = { git = "https://github.com/aovestdipaperino/nano-cursor", rev = "ba9f8d7235708bead9846efc6145c1115ef9c6b8" }
+# here: plank draws a block). 0.2 is the ratatui 0.30 line; 0.1 draws into a
+# 0.29 buffer and cannot share a frame with this one.
+nano-cursor = "0.2"
 unicode-width = "0.2"
 ureq = "3"
 # Plugin signature verification (minisign, docs/WASM-PLUGINS.md). `ring` is
