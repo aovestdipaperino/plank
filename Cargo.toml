@@ -128,7 +128,52 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # The fork also carries the move to ratatui 0.30, which v0.3.6 predates.
 # Pinned by rev so builds are reproducible; retire the fork if the fix is ever
 # released under the original licence. See that repo's FORK.md.
-ratatui-markdown = { git = "https://github.com/aovestdipaperino/ratatui-markdown", rev = "c66b7176b7617e03550c9262542789be02a488f9", features = ["highlight-lang-all"] }
+#
+# The grammar list is `highlight-lang-all` spelled out, minus
+# `highlight-lang-sql`. That one pulls `tree-sitter-sequel`, which has
+# required `cc = "~1.2.1"` since its 0.3.7 and so holds the *whole* build
+# — every build script in the tree — to cc 1.2.x. SQL fences render
+# unhighlighted; nothing else changes. Restore the feature (or go back to
+# `highlight-lang-all`) if that pin is ever relaxed upstream.
+ratatui-markdown = { git = "https://github.com/aovestdipaperino/ratatui-markdown", rev = "c66b7176b7617e03550c9262542789be02a488f9", features = [
+    "highlight-pest",
+    "highlight-lang-bash",
+    "highlight-lang-c",
+    "highlight-lang-cpp",
+    "highlight-lang-c-sharp",
+    "highlight-lang-css",
+    "highlight-lang-dart",
+    "highlight-lang-diff",
+    "highlight-lang-elixir",
+    "highlight-lang-go",
+    "highlight-lang-haskell",
+    "highlight-lang-html",
+    "highlight-lang-java",
+    "highlight-lang-javascript",
+    "highlight-lang-json",
+    "highlight-lang-cmake",
+    "highlight-lang-kotlin",
+    "highlight-lang-lua",
+    "highlight-lang-nix",
+    "highlight-lang-objc",
+    "highlight-lang-ocaml",
+    "highlight-lang-php",
+    "highlight-lang-powershell",
+    "highlight-lang-proto",
+    "highlight-lang-python",
+    "highlight-lang-r",
+    "highlight-lang-regex",
+    "highlight-lang-ruby",
+    "highlight-lang-rust",
+    "highlight-lang-scala",
+    "highlight-lang-solidity",
+    "highlight-lang-swift",
+    "highlight-lang-toml",
+    "highlight-lang-typescript",
+    "highlight-lang-xml",
+    "highlight-lang-yaml",
+    "highlight-lang-zig",
+] }
 # serde JSON is shared by the remote-control protocol (#25) and the
 # remote-engine wire types (#26). The remote-control server uses tungstenite;
 # the sync remote-engine client (flavor a) reuses the ureq client above.
@@ -149,7 +194,9 @@ tokio = { version = "1", features = ["rt"], optional = true }
 # Document → Markdown conversion for the `read` tool (feature `docparse`).
 # Pinned exactly: the crate shipped 27 releases in three months and the
 # fixture assertions in `src/doc/mod.rs` are coupled to its markdown emitter.
-liteparse = { version = "=2.10", optional = true }
+# 2.10 → 2.14 needed no fixture change; re-run `doc::tests` before moving it
+# again, and keep the pin exact.
+liteparse = { version = "=2.14", optional = true }
 # Text buffer, immediate-mode TUI framework, and VT input parser behind the
 # built-in Ctrl-G editor (feature `builtin_editor`); the paths point into the
 # refs/edit git submodule. MIT (c) Microsoft Corporation. `stdext` carries the
