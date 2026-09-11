@@ -825,6 +825,13 @@ fn guard_notice(what: &str, label: Option<&str>) -> String {
     }
 }
 
+/// The draft rung's wording. It is the one guard stop that is not news to
+/// the user — the pass is resumed, nothing is lost, and a red line about the
+/// model's reasoning shape only reads as an error. So [`report_guard_for`]
+/// keeps it off every front end and mirrors it to the debug console instead,
+/// where someone watching the raw stream does want to see it.
+const DRAFT_PAUSE_TEXT: &str = "paused lengthy structured reasoning for delivery";
+
 /// What the reasoning guard did, worded for [`guard_notice`]: the count
 /// matters once it is more than one, because that is when the cap is closing
 /// in. A budget stop is named as one, because it is a weaker claim — the
@@ -833,7 +840,7 @@ fn guard_notice(what: &str, label: Option<&str>) -> String {
 fn repeat_trip_text(payload: Option<&str>, trips: usize) -> String {
     let what = match payload {
         Some(p) if p.contains(THINK_BUDGET_ERROR) => "stopped an over-budget pass",
-        Some(p) if p.contains(DRAFT_ERROR) => "paused lengthy structured reasoning for delivery",
+        Some(p) if p.contains(DRAFT_ERROR) => DRAFT_PAUSE_TEXT,
         _ => "stopped a reasoning loop",
     };
     if trips > 1 {
@@ -2789,6 +2796,14 @@ impl Agent<'_> {
     /// a fan-out slot, which is not the innermost serial sub-agent.
     fn report_guard_for(&self, label: Option<&str>, what: &str) {
         let line = guard_notice(what, label);
+        // The draft pause is debug-console-only: see [`DRAFT_PAUSE_TEXT`].
+        if what.starts_with(DRAFT_PAUSE_TEXT) {
+            if crate::debugmirror::enabled() {
+                crate::debugmirror::push(&format!("\n{line}\n"));
+                crate::debugmirror::flush();
+            }
+            return;
+        }
         match &self.sub_sink {
             SubSinkTarget::Events(tx) => {
                 let _ = tx.send(UiEvent::Error(line));

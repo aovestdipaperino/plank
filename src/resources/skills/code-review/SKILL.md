@@ -9,6 +9,10 @@ argument-hint: [diff | branch | file | PR number]
 Review the work described by `$ARGUMENTS`. If that is empty, review the
 uncommitted diff plus anything on this branch that is not on `main`.
 
+**Review mode:** If the user says "as-is" or "current state", review the
+snapshot as-is without comparing to a previous commit/branch. Read the
+current files directly instead of using `git diff`.
+
 **Core principle:** every finding names a file:line, says what breaks, and
 says why it matters. A review with no file:line references is not a review.
 
@@ -23,6 +27,13 @@ to you, which is the point - you stay the coordinator.
 Hand it precisely crafted context, never this session's history: what was
 built, the base and head SHAs, and the invariant list below. Its final report
 is what you get, so ask for the output format explicitly.
+
+**Sub-agent constraints:**
+
+- **Stop early with findings, not a full review:** A sub-agent should report as soon as it has a handful of real findings (3-5). Don't wait to read every file or write a complete synthesis.
+- **Emit items immediately:** Each finding goes to the user after `</think>`, one at a time. No accumulating items in reasoning.
+- **No drafting in reasoning:** If reasoning contains numbered deliverables or fenced code, stop and emit what you have.
+- **Use fanout for large diffs:** For diffs >300 lines, split by directory and use multiple sub-agents instead of one exhaustive reviewer.
 
 For a diff too large for one brief, split it by area and issue several `agent`
 calls. `fanout` takes the same subtasks as one JSON array, but it runs them
@@ -44,7 +55,13 @@ wrong - a reviewer that misread the code is not an instruction.
     git diff main...HEAD          # the branch's own work
     git diff --stat main...HEAD   # size first, so you know how many passes
 
-For a PR number use `gh pr diff <n>`. Read the *files* a hunk sits in, not
+For a PR number use `gh pr diff <n>`.
+
+**As-is review:** If the user wants to assess the current state without
+comparison, skip `git diff` and read the current files directly. Focus on
+code quality, style, and correctness rather than change impact.
+
+Read the *files* a hunk sits in, not
 only the hunk: what usually goes wrong here is an invariant the change stepped
 on somewhere off-screen, rather than anything visibly wrong in the added lines.
 Say so in the brief, or the reviewer will read the diff and miss precisely
@@ -174,11 +191,22 @@ The commands run and their real output.
 ### Assessment
 **Ready to merge?** Yes | No | With fixes, plus one or two sentences.
 
+## Loop Prevention for Large Tasks
+
+When the review task is large or open-ended, use these patterns to avoid loops:
+
+- **Emit deliverables immediately:** For list-shaped answers (reviews, audits, surveys), emit each item after `</think>` as soon as it's decided. Don't accumulate items in reasoning and write them at the end.
+- **Draft in code, not reasoning:** Use the `edit` tool for concrete code. If reasoning contains numbered deliverables or fenced code blocks, stop and emit what you have—never continue drafting inside `<think>`.
+- **Break large tasks:** For large diffs (>300 lines), split the review by directory or module and use `fanout` with multiple reviewer sub-agents.
+- **Watch for intent loops:** If the reasoning repeatedly states "Let me check X" or "I will verify Y" without actually calling the tool, the model is stuck deliberating. Force a decision with `ask` on user-visible choices.
+
 ## Red Flags
 
 | Thought | Reality |
 |---------|---------|
-| "I'll just read the diff inline" | That burns the context you need to keep driving the work. Dispatch a reviewer; keep the findings, not the diff. |
+| "I'll write the whole review in reasoning first" | A 30 KB review drafted in `<think>` and never emitted loses all work on interrupt. Emit items one at a time. |
+| "I'll just read the diff inline" | That burns the context you need to keep driving the work. Dispatch a reviewer sub-agent; keep the findings, not the diff. |
+| "I'll check the docs / build / tests to be thorough" | Without explicit tool calls, deliberation loops produce no edits. `ask` on user-visible design choices, not internal ones. |
 | "It's a small diff, it's fine" | Small diffs break invariants too. Check the list. |
 | "Tests probably pass" | Run them. Evidence before assertions, always. |
 | "Improve error handling" | Vague. Name the file, the line, and the failure. |
