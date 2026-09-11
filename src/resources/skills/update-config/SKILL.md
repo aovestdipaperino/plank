@@ -18,13 +18,15 @@ The user wants to change plank's configuration: $ARGUMENTS
 | `~/.plank/.mcp.json`, `./.mcp.json` | user, project | same | MCP servers |
 | a plugin's `settings.json` | plugin | in the plugin | below the user file, always |
 
-Precedence: built-in defaults < `~/.plank/settings.json` < `./.plank/settings.json`
-< env < CLI flags. A missing, unreadable or malformed file falls back to
-defaults per key - a broken settings file degrades preferences, never startup.
+Later wins: built-in defaults, then `~/.plank/settings.json`, then
+`./.plank/settings.json`, then the environment, then CLI flags. Absent,
+unreadable and malformed files are all handled the same way, key by key,
+against the defaults - so the worst a mangled settings file can do is cost you
+your preferences, not the launch.
 
-**Secrets never go here.** `./.plank/settings.json` sits inside the worktree
-and is easy to commit by accident; the provider API key stays on the
-environment or the command line.
+**Keep secrets out.** Anything under `./.plank/` is a `git add` away from
+being published; provider API keys belong in the environment or on the command
+line and nowhere near these files.
 
 ## Settings Sections
 
@@ -43,26 +45,28 @@ environment or the command line.
                    "spillPreviewBytes", "recall", "fanout", "runCode", "bashNotify" }
     }
 
-Read `settings.rs` for the authoritative list and each default - do not quote
-a default from memory, and be aware that a doc comment there can lag the
-actual `Default` impl.
+`settings.rs` is where the real list and the real defaults are. Never recite a
+default from memory, and when you do read it, believe the `Default` impl over
+a doc comment that may have been left behind.
 
 Two things to check before promising an effect:
 
 1. **Live vs restart-bound.** Most keys are read fresh at the point of use, so
    a `/config` save takes effect on the next read. A value captured once at
    startup (engine sizing, for instance) needs a restart. Say which applies.
-2. **What a plugin may not set.** `engine.*`, `worktree.*`, `tools.*` and
-   `pluginConfig` are dropped from a plugin's `settings.json` with a warning
-   surfaced through `settings_audit_warnings` (`PLUGIN_REFUSED_SECTIONS`).
+2. **Plugins are not allowed everywhere.** Four sections - `engine.*`,
+   `worktree.*`, `tools.*`, `pluginConfig` - are stripped out of a plugin's
+   `settings.json` (`PLUGIN_REFUSED_SECTIONS`), and the user hears about it
+   through `settings_audit_warnings`.
 
 For simple toggles, point the user at the `/config` form
 (`/config <section>.<key> <value>`) rather than hand-editing JSON.
 
 ## Hooks: the Only Way to Automate a Behavior
 
-"From now on, whenever X, do Y" cannot be satisfied by memory or by a
-preference: plank runs hooks, the model does not. Write a hook.
+No amount of remembering delivers "from now on, whenever X, do Y" - the model
+is not what runs between turns, plank is, and what plank runs is hooks. So
+write one.
 
 Events: `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`,
 `UserPromptSubmit`, `SessionStart`, `SessionEnd`, `PreCompact`, `PostCompact`,
@@ -76,8 +80,9 @@ tool name (`bash`) or a name with an argument glob (`bash(git *)`,
 the event's own discriminator: `SessionStart`'s source (`startup`, `clear`,
 `compact`, `resume`), `SessionEnd`'s reason, compaction's trigger.
 
-Exit codes: 0 succeeds (on a context-capable event its stdout is injected as
-turn context), 2 blocks and feeds stderr back, anything else warns the user.
+What the exit code buys you: 0 is success, and where the event can carry
+context, stdout becomes that context; 2 blocks the action and returns stderr
+to the model; every other code is reported to the user as a warning.
 A command hook may also print a JSON envelope on stdout:
 `{"continue": false, "stopReason": "..."}` halts the turn, `systemMessage`
 warns the user, `suppressOutput` keeps stdout out of the transcript, and
@@ -87,11 +92,10 @@ warns the user, `suppressOutput` keeps stdout out of the transcript, and
 
 ## Workflow
 
-1. Clarify what the user actually wants, and decide which file it belongs in -
-   personal preference goes user-scope, anything the project needs goes
-   project-scope.
-2. Read the existing file before writing. Never clobber keys you did not come
-   for.
+1. Pin down the actual request, then pick the file by who it serves: a taste
+   of the user's is user-scope, a requirement of the repo's is project-scope.
+2. Open the file before you write it, and leave every key you did not come for
+   exactly as it was.
 3. Merge, write, and show the diff of what changed.
 4. State plainly whether it is live now or needs a restart, and how to undo it.
 5. Verify: `/config` for a settings key, `/hooks` for the hook listing.

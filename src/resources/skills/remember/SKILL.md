@@ -12,9 +12,9 @@ by action. Do NOT apply anything - present proposals for approval.
 
 - `~/.plank/MEMORY.md` - user scope, follows the user across projects.
 - `./.plank/MEMORY.md` - project scope, tied to this checkout.
-- `AGENTS.md` - the committed layer every contributor and every agent reads.
-  `agentsmd.rs` links it to a lone `CLAUDE.md` in the project root when one
-  exists, so treat them as one layer, not two.
+- `AGENTS.md` - checked in, and read by every contributor and every agent
+  alike. Where the project root holds a single `CLAUDE.md`, `agentsmd.rs` ties
+  the two together, so count them as one layer rather than two.
 
 Both MEMORY.md files are already in the session context. Read AGENTS.md.
 
@@ -28,13 +28,15 @@ Both MEMORY.md files are already in the session context. Read AGENTS.md.
 | stays put | Session-specific observations, uncertain patterns |
 
 Distinctions that matter:
-- AGENTS.md is instructions for whoever works here; MEMORY.md is what *this*
-  user is doing. A fact the next contributor needs belongs in AGENTS.md.
-- Anything derivable from the code, the tests or git history belongs in none
-  of them. If the user asks to remember something like that, ask what was
-  non-obvious about it and record that instead.
-- Workflow practice (branch naming, release steps) is ambiguous - ask whether
-  it is personal or project-wide rather than guessing.
+- Ask who the sentence is addressed to. AGENTS.md talks to anyone who works
+  in this repo; MEMORY.md tracks what this particular user is up to. If the
+  next contributor would be worse off not knowing it, it is AGENTS.md.
+- If the code, the tests or `git log` already answer it, no layer should. When
+  a request like that comes up, find out which part of it was not obvious and
+  keep that part.
+- Habits around workflow - how branches get named, how a release is cut - sit
+  on the fence. Ask whether it is theirs or the project's instead of picking
+  for them.
 
 ## 3. Find Cleanup
 

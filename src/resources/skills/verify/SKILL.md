@@ -10,19 +10,20 @@ Verify: $ARGUMENTS (if empty, verify the change just made.)
 
 ## Before You Run Anything
 
-**The model lock is single-instance.** The ds4 engine maps tens of GiB and
-refuses a second process. If the user has a plank session open, you cannot
-start another one with the real engine - and the EchoEngine is no substitute
-when what you are verifying is turn timing, streaming or anything
-model-driven. Check first, and if a session is live, say so and ask rather
-than starting a run that will fail or, worse, disturb theirs.
+**Only one plank can hold the model.** Tens of GiB get mapped, and the ds4
+engine turns away whoever asks second. So a session the user already has open
+rules out starting your own against the real engine, and swapping in the
+EchoEngine does not rescue a check about streaming, turn timing or anything
+else the model drives. Look before you launch: if something is live, say so
+and ask, instead of firing off a run that either fails or walks over theirs.
 
 ## Pick the Front End the Change Touches
 
-`main.rs` selects: a TTY on both ends gives the Ratatui TUI, piped input gives
-the plain line REPL, `--non-interactive` gives the headless stdin protocol.
-Verify in the one your change affects - and remember a slash command usually
-has two implementations, so a TUI-only check proves half the work.
+`main.rs` decides which one you get: TTYs on both ends bring up the Ratatui
+TUI, a pipe drops to the plain line REPL, `--non-interactive` runs the
+headless stdin protocol. Exercise whichever one your change lands in, keeping
+in mind that a slash command is normally written twice - checking it in the
+TUI leaves the other half unproven.
 
 **Headless** (the default choice - scriptable, no terminal to drive):
 
@@ -34,20 +35,21 @@ want the run saved.
 
 **Plain REPL:** pipe the input.
 
-**TUI:** needs a real terminal. Drive it through the terminal MCP tools and
-screenshot, and quit cleanly with Ctrl+D before closing the terminal - a
-killed terminal leaves the session and the model lock behind.
+**TUI:** there has to be a real terminal. Drive one with the terminal MCP
+tools and take screenshots, then leave with Ctrl+D before the terminal itself
+goes away - killing the window strands the session and keeps the model lock
+held.
 
-**No model available:** `cargo build` without `refs/ds4` still gives a
-runnable plank on the EchoEngine. Enough for command wiring, rendering and
-tool dispatch; not enough for anything about generation.
+**No model available:** a `cargo build` with `refs/ds4` absent still produces
+a plank you can run, backed by the EchoEngine. Command wiring, rendering and
+tool dispatch are all testable that way; nothing about generation is.
 
 ## Report
 
-State the command you ran, quote the output that shows the behavior, and say
-plainly whether it worked. If you verified on the EchoEngine or in only one
-front end, say which - a partial verification reported as complete is worse
-than no verification.
+Give the command, quote the lines of output that actually demonstrate the
+behavior, and answer the question of whether it worked. Name the limits too -
+the EchoEngine, or a single front end - because a half-check described as a
+full one misleads in a way that no check at all does not.
 
 Clean up what you created: remove a scratch session you saved, and leave the
 tree as you found it.

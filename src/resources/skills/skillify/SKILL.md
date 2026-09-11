@@ -10,17 +10,19 @@ Capture: $ARGUMENTS
 
 ## 1. Analyze First
 
-Before asking anything, work out from the session: what repeatable process
-happened, what its inputs were, the distinct steps in order, what proves each
-step done, where the user corrected or steered you, and which tools it needed.
-The corrections matter most - they are the difference between the process the
-user wanted and the one you would have run.
+Reconstruct it from the session before you ask a single question: which
+repeatable process actually ran, what it started from, the steps in the order
+they happened, the evidence that closed each one, the tools involved, and
+every point where the user redirected you. Pay most attention to those
+redirections - they mark where your default and the process the user wanted
+came apart.
 
 ## 2. Interview
 
-Use the `ask` tool for every question; never ask in plain prose. The user
-always gets a free-form option, so do not invent an "I'll provide edits"
-choice - offer the substantive ones. `ask.maxOptions` bounds how many.
+Questions go through the `ask` tool, not through prose. A free-form answer is
+always available to the user, which makes an "I'll provide edits" option pure
+padding - spend the slots on real alternatives. How many slots you get is
+`ask.maxOptions`.
 
 - **Round 1:** propose a name and a description; confirm the goal and what
   success looks like.
@@ -53,17 +55,18 @@ Stop once you have enough. Do not over-ask a three-step process.
 
 Rules that come from how `skills.rs` actually loads a skill:
 
-- The directory holds `SKILL.md`; the file name is fixed.
-- A skill with an empty body is skipped entirely. A missing `name` falls back
-  to the directory name.
-- `$ARGUMENTS` is substituted wherever it appears. With no placeholder and
-  non-empty arguments, they are appended as a trailing paragraph, so they are
-  never silently dropped - but a skill that uses its arguments should say
-  where.
-- Project skills override user skills of the same name; plugin skills are
-  namespaced (`/plugin:name`) and never claim the bare name.
-- Write for the model that will read it mid-turn: state the constraint, then
-  the reason. A rule with no reason gets rationalized away.
+- One file per directory, and its name is not negotiable: `SKILL.md`.
+- An empty body means the skill is dropped on load. Leave `name` out and the
+  directory name stands in for it.
+- Every `$ARGUMENTS` in the text is filled in. Arguments given to a skill with
+  no placeholder anywhere are tacked on as a final paragraph rather than
+  discarded - still, if a skill expects arguments it should mark where they
+  go.
+- A project skill shadows a user skill sharing its name. Plugin skills only
+  ever answer to `/plugin:name`, never to the bare one.
+- Your reader is a model halfway through a turn. Put the constraint first and
+  follow it with why it holds; an unexplained rule is one the reader talks
+  itself out of.
 
 ## 4. Confirm and Save
 

@@ -44,55 +44,61 @@ wrong - a reviewer that misread the code is not an instruction.
     git diff main...HEAD          # the branch's own work
     git diff --stat main...HEAD   # size first, so you know how many passes
 
-For a PR number use `gh pr diff <n>`. Read the *files* around a hunk, not just
-the hunk: plank's bugs usually live in the invariant a hunk quietly broke, not
-in the lines it added. Put that instruction in the brief - a reviewer that
-reads only the diff misses exactly these.
+For a PR number use `gh pr diff <n>`. Read the *files* a hunk sits in, not
+only the hunk: what usually goes wrong here is an invariant the change stepped
+on somewhere off-screen, rather than anything visibly wrong in the added lines.
+Say so in the brief, or the reviewer will read the diff and miss precisely
+those.
 
 ## plank's Invariants
 
 These are the mistakes this codebase actually makes. Check every one the diff
 touches, and say explicitly which ones you checked.
 
-**C parity.** `refs/ds4` is the source of truth for wire formats and prompt
-text: tool-output framing, DSML tool-call syntax and the system prompt must
-stay byte-for-byte identical, because that is what the model was trained on.
-`tests/c_parity.rs` must still pass. Flag any `\`-continued Rust string
-literal in model-facing text: the continuation strips the next line's leading
-whitespace and silently alters the bytes.
+**C parity.** Wire formats and prompt text answer to `refs/ds4`, not to what
+reads better: the framing around tool output, the DSML call syntax and the
+system prompt have to come out as the exact bytes the model was trained on, so
+`tests/c_parity.rs` still has to be green. Watch for `\`-continued Rust string
+literals anywhere the model will read the result - the continuation eats the
+next line's indentation, so the bytes change without the diff looking like it
+changed them.
 
-**Write containment.** Any tool that writes a path must resolve it through
-`ToolContext::resolve_for_write`. That is the single choke point the Seatbelt
-profile shares via `Sandbox::write_roots`; a tool that builds its own path
-bypasses both. Reads are deliberately uncontained - not a finding.
+**Write containment.** Every write path goes through
+`ToolContext::resolve_for_write`. It is one function on purpose: the Seatbelt
+profile is generated from the same `Sandbox::write_roots`, so a tool that
+assembles its own destination escapes the runtime check and the sandbox in one
+move. Reading is a different matter and is left open by design, so an
+uncontained read is not a finding.
 
-**KV ladder.** A rung is looked up under the fingerprint of the transcript
-*truncated to the rung's own recorded depth*, never the full current
-transcript. Rollback must `discard_ladder`; fork and `end_subagent_fork` must
-`KvLadder::truncate_to`; sidechains (`in_sidechain()`) must neither store the
-payload nor push rungs; the GC keep set must include live rungs.
+**KV ladder.** Look a rung up under the fingerprint of the transcript cut back
+to the depth that rung recorded - never the fingerprint of the transcript as it
+stands now. Beyond that: `discard_ladder` on rollback, `KvLadder::truncate_to`
+on fork and `end_subagent_fork`, no stored payload and no new rungs while
+`in_sidechain()`, and live rungs held by the GC keep set.
 
-**Staged artifact swap.** In `downloader::swap_staged` the staged
-`ds4.manifest` moves last - its presence is the proof the whole set landed.
+**Staged artifact swap.** `downloader::swap_staged` has to move the staged
+`ds4.manifest` after everything else, because a landed manifest is what tells
+the next launch the rest of the set landed too.
 
-**Two front ends.** `ui.rs` handles slash commands on two parallel paths, the
-plain stdout REPL and the Ratatui TUI. A one-sided change is Important; a
-pane-based command also needs a static text equivalent on the plain path.
+**Two front ends.** Slash commands are implemented twice in `ui.rs`, once for
+the plain stdout REPL and once for the Ratatui TUI. Touching only one of them
+is Important; if the command opens a pane, the plain path needs a text-only
+equivalent as well.
 
-**Background jobs.** The `BashJobs` table is the sole source of truth: a job
-the model observed done is removed at that observation, so `take_finished`
-announces each job at most once. Notifications join the transcript only at a
-turn boundary.
+**Background jobs.** Nothing but the `BashJobs` table decides what has been
+reported: observing a job as done drops it from the table, which is exactly
+why `take_finished` can never announce the same job twice. A notification
+enters the transcript at a turn boundary and nowhere else.
 
-**Fingerprint churn.** A change to model-facing tool descriptions or shell
-rules churns `fp1` and invalidates the system-prompt KV snapshot. That is
-allowed but must be deliberate and documented in
+**Fingerprint churn.** Editing model-facing tool descriptions or shell rules
+moves `fp1`, which throws away the system-prompt KV snapshot. That is a fine
+thing to do on purpose, and a surprising thing to do by accident - record it in
 `docs/SYSTEM-PROMPT-OVERRIDES.md`.
 
-**Sessions and settings.** Transcript ids are the filename stem; `validate_name`
-accepts only ASCII alphanumerics and `-`. A plugin `settings.json` can never
-set `engine.*`, `worktree.*`, `tools.*` or `pluginConfig`
-(`PLUGIN_REFUSED_SECTIONS`).
+**Sessions and settings.** A transcript's identity is its filename stem, and
+`validate_name` will take nothing but ASCII alphanumerics and `-`. Four
+sections are off-limits to a plugin's `settings.json` - `engine.*`,
+`worktree.*`, `tools.*` and `pluginConfig` (`PLUGIN_REFUSED_SECTIONS`).
 
 ## Reuse (simplify pass 1)
 
@@ -149,8 +155,8 @@ what they actually printed:
     cargo test --lib
     cargo clippy --workspace --all-targets -- -D warnings
 
-Clippy only re-lints crates it recompiles, so a cached clean run can miss
-warnings in untouched files. A report that says "tests pass" without quoting
+A clean local run proves less than it looks: clippy lints only what it
+recompiled, so warnings in files the build skipped stay hidden. A report that says "tests pass" without quoting
 output has not verified anything - run them yourself before acting on it.
 
 ## Output Format
