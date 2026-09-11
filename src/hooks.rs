@@ -24,7 +24,9 @@
 //! A hook is a `command` (shell) or a `prompt` (static text injected to the
 //! model). Beyond exit codes, a command hook may print a JSON response envelope
 //! on stdout — `continue:false`+`stopReason` (halt the turn), `systemMessage`
-//! (warn the user), `suppressOutput`, `async:true`+`asyncTimeout` — additive
+//! (warn the user), `suppressOutput`, `additionalContext` (inject context on a
+//! context-capable event; also read from `hookSpecificOutput.additionalContext`
+//! and `additional_context`), `async:true`+`asyncTimeout` — additive
 //! over the exit-code protocol. Matchers alternate on tool name and may match
 //! arguments, e.g. `bash(git *)` or `write(*.md)`. Unknown event names load
 //! with a warning rather than failing.
@@ -653,16 +655,21 @@ fn run_event_inner(
             }
             match code {
                 0 => {
-                    // Plain (non-envelope) stdout of a context event is injected
-                    // unless the hook asked to suppress its output.
-                    if capture_context && envelope.is_none() && !outcome.suppress_output {
-                        let stdout = stdout.trim();
-                        if !stdout.is_empty() {
-                            if !context.is_empty() {
-                                context.push('\n');
-                            }
-                            context.push_str(stdout);
+                    // A context event injects either the envelope's
+                    // `additionalContext` or, when stdout is not an envelope,
+                    // the plain stdout — unless the hook suppressed its output.
+                    let injected = match &envelope {
+                        Some(env) => env.additional_context.clone(),
+                        None => Some(stdout.trim().to_string()),
+                    };
+                    if capture_context
+                        && !outcome.suppress_output
+                        && let Some(text) = injected.filter(|t| !t.is_empty())
+                    {
+                        if !context.is_empty() {
+                            context.push('\n');
                         }
+                        context.push_str(&text);
                     }
                 }
                 2 => {
@@ -698,6 +705,9 @@ struct Envelope {
     system_message: Option<String>,
     /// `suppressOutput` flag.
     suppress_output: bool,
+    /// Context the hook asked to inject: top-level `additionalContext` /
+    /// `additional_context`, or `hookSpecificOutput.additionalContext`.
+    additional_context: Option<String>,
 }
 
 /// Parses a hook's stdout as a response envelope. Returns `None` unless the
@@ -723,10 +733,28 @@ fn parse_envelope(stdout: &str) -> Option<Envelope> {
         _ => None,
     };
     let suppress_output = matches!(root.get("suppressOutput"), Some(Json::Bool(true)));
+    // Claude Code spells it `hookSpecificOutput.additionalContext`; other hosts
+    // (and older superpowers builds) put it at the top level under either
+    // spelling. Accept all three, preferring the nested canonical one.
+    let nested = root
+        .get("hookSpecificOutput")
+        .and_then(|o| o.get("additionalContext"));
+    let additional_context = [
+        nested,
+        root.get("additionalContext"),
+        root.get("additional_context"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|v| match v {
+        Json::Str(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => None,
+    });
     Some(Envelope {
         stop_reason,
         system_message,
         suppress_output,
+        additional_context,
     })
 }
 
@@ -895,6 +923,69 @@ mod tests {
         assert_eq!(out.stop_reason.as_deref(), Some("stop now"));
         assert_eq!(out.system_messages, vec!["heads up".to_string()]);
         // Envelope JSON is not re-used as plain context.
+        assert!(out.context.is_none());
+    }
+
+    #[test]
+    fn envelope_additional_context_is_injected() {
+        let cwd = std::env::temp_dir();
+        // The superpowers SessionStart hook's shape: a JSON envelope whose only
+        // payload is the context to inject.
+        let out = run_event_ctx(
+            &one(
+                r#"echo '{"additionalContext": "you have superpowers"}'"#,
+                "",
+            ),
+            "",
+            "{}",
+            &cwd,
+        );
+        assert_eq!(out.context.as_deref(), Some("you have superpowers"));
+        // Claude Code's canonical nested spelling.
+        let nested = run_event_ctx(
+            &one(
+                r#"echo '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "nested ctx"}}'"#,
+                "",
+            ),
+            "",
+            "{}",
+            &cwd,
+        );
+        assert_eq!(nested.context.as_deref(), Some("nested ctx"));
+        // Cursor's snake_case spelling.
+        let snake = run_event_ctx(
+            &one(r#"echo '{"additional_context": "snake ctx"}'"#, ""),
+            "",
+            "{}",
+            &cwd,
+        );
+        assert_eq!(snake.context.as_deref(), Some("snake ctx"));
+        // Tool events never inject, envelope or not.
+        let plain = run_event(
+            &one(
+                r#"echo '{"additionalContext": "you have superpowers"}'"#,
+                "",
+            ),
+            "bash",
+            "{}",
+            &cwd,
+        );
+        assert!(plain.context.is_none());
+    }
+
+    #[test]
+    fn envelope_additional_context_honors_suppress_output() {
+        let cwd = std::env::temp_dir();
+        let out = run_event_ctx(
+            &one(
+                r#"echo '{"suppressOutput": true, "additionalContext": "hidden"}'"#,
+                "",
+            ),
+            "",
+            "{}",
+            &cwd,
+        );
+        assert!(out.suppress_output);
         assert!(out.context.is_none());
     }
 
