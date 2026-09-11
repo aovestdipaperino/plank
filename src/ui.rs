@@ -18907,6 +18907,13 @@ mod tests {
     }
 
     impl Engine for ScriptedEngine {
+        /// Reports a real release, so a test can tell a *suppressed* yield
+        /// apart from a *declined* one. With the trait default (`false`) every
+        /// yield reads as declined and rolls the hysteresis back on its own,
+        /// which would make any suppression assertion pass vacuously.
+        fn release_session(&mut self) -> bool {
+            true
+        }
         fn is_local(&self) -> bool {
             self.local
         }
