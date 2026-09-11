@@ -20,7 +20,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
 use crate::ds4tokens::{self, SectionKey, SpanRole, TokenTranscript};
 use crate::engine::{
@@ -87,12 +87,89 @@ pub struct Ds4Model {
 unsafe impl Send for Ds4Model {}
 unsafe impl Sync for Ds4Model {}
 
+/// Why the engine was asked to stop.
+///
+/// One flag could say *that* somebody wants the pass to stop, but not *who* —
+/// and the consequences differ completely. A user's Esc ends the turn; a
+/// memory-pressure yield frees the session and comes back. Ordered by
+/// precedence: a raise never lowers the reason, so an Esc during a yield wins
+/// and the resume is abandoned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelReason {
+    None,
+    Pressure,
+    User,
+}
+
+impl CancelReason {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Pressure => 1,
+            Self::User => 2,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Pressure,
+            2 => Self::User,
+            _ => Self::None,
+        }
+    }
+}
+
 thread_local! {
-    static INTERRUPT: AtomicBool = const { AtomicBool::new(false) };
+    static CANCEL: AtomicU8 = const { AtomicU8::new(0) };
+}
+
+/// Raises the cancel flag, keeping whichever reason outranks the other.
+fn cancel_request(reason: CancelReason) {
+    CANCEL.with(|f| {
+        let _ = f.fetch_max(reason.as_u8(), Ordering::SeqCst);
+    });
+}
+
+/// The current reason, or [`CancelReason::None`].
+fn cancel_reason() -> CancelReason {
+    CancelReason::from_u8(CANCEL.with(|f| f.load(Ordering::SeqCst)))
+}
+
+/// Clears the flag. Every path that reads the reason clears it on entry — the
+/// stale-flag bug this fixes is documented at `warm_sync` below.
+fn cancel_clear() {
+    CANCEL.with(|f| f.store(0, Ordering::SeqCst));
+}
+
+/// Raises a memory-pressure cancel on the calling thread.
+///
+/// The mid-pass yield path. It must be called from the thread running
+/// `generate`, because the flag `cancel_cb` reads is thread-local — the sensor
+/// thread cannot raise it directly, which is why the front end polls the
+/// sensor from inside the interrupt closure instead.
+pub fn request_pressure_cancel() {
+    cancel_request(CancelReason::Pressure);
+}
+
+/// True when the last stop was a memory-pressure yield rather than a user
+/// interrupt. The caller uses it to decide whether to end the turn or to free
+/// the session and come back.
+#[must_use]
+pub fn cancelled_by_pressure() -> bool {
+    cancel_reason() == CancelReason::Pressure
+}
+
+/// Clears the cancel flag from outside the module.
+///
+/// **Ordering:** callers must free the session *before* calling this.
+/// Reversed, a racing turn can start a generation against a session that is
+/// about to be freed underneath it.
+pub fn clear_cancel() {
+    cancel_clear();
 }
 
 unsafe extern "C" fn cancel_cb(_ud: *mut std::os::raw::c_void) -> bool {
-    INTERRUPT.with(|f| f.load(Ordering::SeqCst))
+    cancel_reason() != CancelReason::None
 }
 
 /// `DS4_SESSION_SYNC_INTERRUPTED` (ds4.h): `ds4_session_sync` stopped because
@@ -159,7 +236,7 @@ unsafe extern "C" fn progress_cb(
     // callback's flag; relay the caller's interrupt here so Esc/Ctrl-C can
     // abort prefill, not just token generation.
     if (ctx.interrupt)() {
-        INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
+        cancel_request(CancelReason::User);
     }
     let secs = ctx.start.elapsed().as_secs_f64();
     let progress = PrefillProgress::from_absolute(ctx.base, cur, &mut ctx.total, secs);
@@ -1411,7 +1488,7 @@ impl Engine for Ds4Session {
         // recomputed. Create it lazily on the first turn.
         let session = self.ensure_session()?;
 
-        INTERRUPT.with(|f| f.store(false, Ordering::SeqCst));
+        cancel_clear();
         // SAFETY: session valid; cancel_cb reads a thread-local flag.
         unsafe { ffi::ds4_session_set_cancel(session, Some(cancel_cb), std::ptr::null_mut()) };
 
@@ -1485,7 +1562,7 @@ impl Engine for Ds4Session {
         unsafe { ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut()) };
         let on_event = progress.on_event;
         if sync_rc != 0 {
-            if interrupt() || INTERRUPT.with(|f| f.load(Ordering::SeqCst)) {
+            if interrupt() || cancel_reason() != CancelReason::None {
                 return Ok(GenerationStats {
                     interrupted: true,
                     ctx_used: prompt_len,
@@ -1559,7 +1636,7 @@ impl Engine for Ds4Session {
                 steady_mark = Some((std::time::Instant::now(), generated));
             }
             if interrupt() {
-                INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
+                cancel_request(CancelReason::User);
                 break;
             }
             // A burst covers the whole remaining budget: the callback stops it
@@ -1750,7 +1827,7 @@ impl Engine for Ds4Session {
         // compares, so a completed reply still matches its rendered section.
         self.record_reply(reply_text, &reply_tokens, &shadow_tokens, opts.think_mode);
 
-        let interrupted = interrupt() || INTERRUPT.with(|f| f.load(Ordering::SeqCst));
+        let interrupted = interrupt() || cancel_reason() != CancelReason::None;
         let secs = start.elapsed().as_secs_f64();
         // SAFETY: session valid.
         let ctx_used = unsafe { ffi::ds4_session_pos(session) };
@@ -2006,7 +2083,7 @@ impl Engine for Ds4Session {
         // and `cancel_cb` still registered on the session; `generate`/`prefill`
         // reset it on entry but this path never did, so the sync below would
         // stop at once with `SYNC_INTERRUPTED` and report a failed prefill.
-        INTERRUPT.with(|f| f.store(false, Ordering::SeqCst));
+        cancel_clear();
         let total = self.warm_tokens.len();
         let session = self.ensure_session()?;
         // SAFETY: session and tokens are valid.
@@ -2292,7 +2369,7 @@ impl Ds4HostSession {
         let prompt_len = tokens.len();
         let session = self.inner.ensure_session()?;
 
-        INTERRUPT.with(|f| f.store(false, Ordering::SeqCst));
+        cancel_clear();
         // SAFETY: session valid; cancel_cb reads a thread-local flag.
         unsafe { ffi::ds4_session_set_cancel(session, Some(cancel_cb), std::ptr::null_mut()) };
 
@@ -2324,7 +2401,7 @@ impl Ds4HostSession {
         // SAFETY: session valid; clearing before ProgressCtx drops.
         unsafe { ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut()) };
         if sync_rc != 0 {
-            if interrupt.load(Ordering::SeqCst) || INTERRUPT.with(|f| f.load(Ordering::SeqCst)) {
+            if interrupt.load(Ordering::SeqCst) || cancel_reason() != CancelReason::None {
                 return Ok(Err(GenerationStats {
                     interrupted: true,
                     ctx_used: prompt_len,
@@ -2427,7 +2504,7 @@ impl HostSession for Ds4HostSession {
         loop {
             let st = self.active.as_mut().expect("gen present after prefill");
             if interrupt.load(Ordering::SeqCst) {
-                INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
+                cancel_request(CancelReason::User);
                 return Ok(Some(self.finalize(true)));
             }
             if st.generated >= st.max_tokens {
@@ -2826,6 +2903,72 @@ fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        CancelReason, cancel_cb, cancel_clear, cancel_reason, cancel_request,
+        cancelled_by_pressure, request_pressure_cancel,
+    };
+
+    #[test]
+    fn a_user_interrupt_outranks_a_pressure_yield() {
+        cancel_clear();
+        cancel_request(CancelReason::Pressure);
+        assert_eq!(cancel_reason(), CancelReason::Pressure);
+        cancel_request(CancelReason::User);
+        assert_eq!(
+            cancel_reason(),
+            CancelReason::User,
+            "Esc during a yield must end the turn, not resume it"
+        );
+    }
+
+    #[test]
+    fn a_pressure_yield_never_downgrades_a_user_interrupt() {
+        cancel_clear();
+        cancel_request(CancelReason::User);
+        cancel_request(CancelReason::Pressure);
+        assert_eq!(
+            cancel_reason(),
+            CancelReason::User,
+            "pressure must not turn a killed generation into a resumable one"
+        );
+    }
+
+    #[test]
+    fn clear_resets_to_none() {
+        cancel_clear();
+        cancel_request(CancelReason::Pressure);
+        cancel_clear();
+        assert_eq!(cancel_reason(), CancelReason::None);
+    }
+
+    #[test]
+    fn the_cancel_callback_fires_for_either_reason() {
+        for reason in [CancelReason::User, CancelReason::Pressure] {
+            cancel_clear();
+            cancel_request(reason);
+            // SAFETY: cancel_cb only reads a thread-local; the pointer is unused.
+            assert!(
+                unsafe { cancel_cb(std::ptr::null_mut()) },
+                "{reason:?} must stop the engine"
+            );
+        }
+        cancel_clear();
+        // SAFETY: as above.
+        assert!(!unsafe { cancel_cb(std::ptr::null_mut()) });
+    }
+
+    #[test]
+    fn pressure_is_reported_only_for_a_pressure_stop() {
+        cancel_clear();
+        assert!(!cancelled_by_pressure());
+        request_pressure_cancel();
+        assert!(cancelled_by_pressure());
+        cancel_request(CancelReason::User);
+        assert!(
+            !cancelled_by_pressure(),
+            "an Esc during a yield ends the turn; it must not look resumable"
+        );
+    }
     /// A `DeepSeek` model is served by every build. The refusal is the other
     /// half of the `qwen` feature's contract: detection is ungated so an
     /// unsupported model is named, not misparsed.
