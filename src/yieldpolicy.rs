@@ -18,18 +18,19 @@ use crate::kvladder::KvLadder;
 
 /// What a resume will cost, computed at yield time.
 ///
-/// Computed *before* the session is freed, because afterwards the information
-/// is gone: the surviving restore point and the keep set both depend on state
-/// the free destroys.
+/// The plan pins the deepest *surviving* ladder rung, when one exists, as the
+/// restore point: a yield leaves the rungs alone (shedding them is the separate
+/// `shed` path), so the resume can come back through that rung's blob and
+/// re-prefill only the suffix above it. That is why the rung's blob has to
+/// appear in `keep` and survive the GC sweep. If no rung survives, the floor is
+/// a tier blob and the whole live prefix is re-prefilled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestorePlan {
-    /// Rungs discarded getting here, for the disclosure line.
-    pub rungs_dropped: usize,
     /// Tokens the resume must re-prefill.
     pub reprefill_tokens: i32,
-    /// Blob stems the GC must not sweep while plank is yielded. A yielded
-    /// session has no live rungs, so without this the sweep is free to delete
-    /// the very blob the resume needs.
+    /// Blob stems the GC must not sweep while plank is yielded — the restore
+    /// point among them. Without this the sweep is free to delete the very blob
+    /// the resume needs.
     pub keep: Vec<String>,
 }
 
@@ -45,7 +46,8 @@ impl YieldPolicy {
         Self::default()
     }
 
-    /// Drops every ladder rung, returning how many went.
+    /// Drops the ladder rungs recorded above span zero, returning how many
+    /// went — in practice every rung, since nothing pushes one at span zero.
     ///
     /// The `Warn` response: rungs are pure cache, already on disk, and losing
     /// them costs only a deeper re-prefill later that may never be needed. No
@@ -57,26 +59,30 @@ impl YieldPolicy {
     /// Frees the live session and records what the resume will cost.
     ///
     /// `live_tokens` is the engine's current KV depth; `keep` is the set of
-    /// blob stems the resume will restore through.
+    /// blob stems the resume will restore through. Returns `None` when the
+    /// engine declined to release: nothing was freed, so there is nothing to
+    /// resume from and no plan to pin.
     pub fn yield_now(
         &mut self,
         engine: &mut dyn Engine,
         ladder: &KvLadder,
         live_tokens: i32,
         keep: Vec<String>,
-    ) -> RestorePlan {
+    ) -> Option<RestorePlan> {
         // Deepest surviving rung, if any, is the restore point; otherwise the
         // floor is a tier blob and the whole live prefix is rebuilt.
         let floor = ladder.rungs().last().map_or(0, |r| r.tokens);
         let plan = RestorePlan {
-            rungs_dropped: ladder.rungs().len(),
             reprefill_tokens: (live_tokens - floor).max(0),
             keep,
         };
-        // Order matters: the plan is computed from state the free destroys.
-        engine.release_session();
+        // The plan is derived from the ladder and the engine's depth; freeing
+        // the session is the last step.
+        if !engine.release_session() {
+            return None;
+        }
         self.plan = Some(plan.clone());
-        plan
+        Some(plan)
     }
 
     /// The pinned plan, while yielded.
@@ -136,8 +142,9 @@ mod tests {
             self.restored += 1;
             Ok(())
         }
-        fn release_session(&mut self) {
+        fn release_session(&mut self) -> bool {
             self.released += 1;
+            true
         }
     }
 
@@ -154,7 +161,8 @@ mod tests {
         let mut spy = YieldSpy::default();
         let mut p = YieldPolicy::new();
         let ladder = ladder_with(&[(2, 8192)]);
-        p.yield_now(&mut spy, &ladder, 20_000, vec!["tier2".to_owned()]);
+        p.yield_now(&mut spy, &ladder, 20_000, vec!["tier2".to_owned()])
+            .expect("the spy releases, so a plan is pinned");
         assert_eq!(
             spy.captured, 0,
             "get_kv allocates twice the session size; calling it here is the \
@@ -182,7 +190,9 @@ mod tests {
         // No rungs: the restore floor is a tier blob, so the whole live
         // transcript must be re-prefilled.
         let ladder = KvLadder::new();
-        let plan = p.yield_now(&mut spy, &ladder, 20_000, vec!["tier2".to_owned()]);
+        let plan = p
+            .yield_now(&mut spy, &ladder, 20_000, vec!["tier2".to_owned()])
+            .expect("the spy releases, so a plan is pinned");
         assert_eq!(
             plan.reprefill_tokens, 20_000,
             "with no rung the entire live prefix is rebuilt"
@@ -194,7 +204,9 @@ mod tests {
         let mut spy = YieldSpy::default();
         let mut p = YieldPolicy::new();
         let ladder = ladder_with(&[(2, 8192)]);
-        let plan = p.yield_now(&mut spy, &ladder, 20_000, vec!["tier2".to_owned()]);
+        let plan = p
+            .yield_now(&mut spy, &ladder, 20_000, vec!["tier2".to_owned()])
+            .expect("the spy releases, so a plan is pinned");
         assert_eq!(
             plan.reprefill_tokens,
             20_000 - 8192,
@@ -207,7 +219,8 @@ mod tests {
         let mut spy = YieldSpy::default();
         let mut p = YieldPolicy::new();
         assert!(p.plan().is_none());
-        p.yield_now(&mut spy, &KvLadder::new(), 100, vec!["tier2".to_owned()]);
+        p.yield_now(&mut spy, &KvLadder::new(), 100, vec!["tier2".to_owned()])
+            .expect("the spy releases, so a plan is pinned");
         assert_eq!(
             p.plan().map(|pl| pl.keep.as_slice()),
             Some(["tier2".to_owned()].as_slice()),
@@ -216,5 +229,49 @@ mod tests {
         );
         assert!(p.clear_plan().is_some());
         assert!(p.plan().is_none(), "resuming retires the plan");
+    }
+
+    #[test]
+    fn an_engine_that_declines_leaves_no_plan() {
+        /// Stands in for a session holding vision state, which cannot be
+        /// rebuilt from text alone.
+        #[derive(Default)]
+        struct Declines;
+        impl std::fmt::Debug for Declines {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Declines")
+            }
+        }
+        impl Engine for Declines {
+            fn generate(
+                &mut self,
+                _p: crate::engine::Prompt<'_>,
+                _o: &crate::engine::GenerationOptions,
+                _i: &dyn Fn() -> bool,
+                _g: &dyn Fn() -> bool,
+                _e: &mut dyn FnMut(crate::engine::EngineEvent),
+            ) -> Result<crate::engine::GenerationStats, crate::engine::EngineError> {
+                unreachable!("the yield path never generates")
+            }
+            fn ctx_size(&self) -> i32 {
+                4096
+            }
+            fn release_session(&mut self) -> bool {
+                false
+            }
+        }
+
+        let mut p = YieldPolicy::new();
+        assert!(
+            p.yield_now(
+                &mut Declines,
+                &KvLadder::new(),
+                100,
+                vec!["tier2".to_owned()]
+            )
+            .is_none(),
+            "declining to free means there is nothing to resume from"
+        );
+        assert!(p.plan().is_none(), "a refused yield must not pin a plan");
     }
 }

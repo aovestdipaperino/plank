@@ -2200,9 +2200,19 @@ impl Engine for Ds4Session {
         Ok(())
     }
 
-    fn release_session(&mut self) {
+    fn release_session(&mut self) -> bool {
         if self.session.is_null() {
-            return;
+            return false;
+        }
+        if !self.vision_spans.is_empty() {
+            // An image-conditioned session cannot be rebuilt from the
+            // transcript: `warm_sync` re-prefills through plain
+            // `ds4_session_sync`, so the image token positions would come back
+            // with no embeddings behind them and the prefix would be silently
+            // ungrounded. Refuse the yield, the same way `get_kv` refuses to
+            // capture such a session.
+            kv_debug(|| "release_session: declined, session holds vision state".to_owned());
+            return false;
         }
         // SAFETY: session is non-null and owned by this engine; ds4_session_free
         // is the matching destructor for ds4_session_new.
@@ -2215,6 +2225,7 @@ impl Engine for Ds4Session {
         // rebuild from, and would leave `warm_sync`'s common-prefix probe
         // comparing against nothing. Only the session handle is destroyed.
         kv_debug(|| "release_session: live KV freed for memory pressure".to_owned());
+        true
     }
 
     // ── Vision ───────────────────────────────────────────────────────────

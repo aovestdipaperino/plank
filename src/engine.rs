@@ -926,8 +926,15 @@ pub trait Engine: Debug + Send {
     /// memory — and must leave the engine usable: the next `warm_sync` or
     /// `generate` recreates the session lazily.
     ///
-    /// Engines holding no local KV do nothing.
-    fn release_session(&mut self) {}
+    /// An engine may decline: it returns `true` only when the session was
+    /// actually released, and `false` when it refused (for instance because
+    /// the session holds state that cannot be rebuilt from text alone). A
+    /// caller must not assume memory was returned.
+    ///
+    /// Engines holding no local KV do nothing and release nothing.
+    fn release_session(&mut self) -> bool {
+        false
+    }
 
     /// Begins a warm walk: resets the cumulative warm token buffer to the
     /// system prompt's tokens. No prefill happens yet.
