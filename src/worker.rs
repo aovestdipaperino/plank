@@ -414,6 +414,10 @@ pub struct TurnShared {
     /// each pass start and tool boundary, so the UI thread can show `/jobs`
     /// and the footer's jobs panel while the worker owns the live table.
     pub jobs: Mutex<Vec<crate::tools::bash::JobRow>>,
+    /// Token counts behind the `/context` report, refreshed by the worker
+    /// wherever the transcript changes, so the UI thread can draw the panel
+    /// mid-turn against the live fill while the worker owns the agent.
+    pub context: Mutex<crate::ctxreport::Breakdown>,
 }
 
 /// Cap on queued `/btw` questions; a push beyond it drops the oldest entry
@@ -435,6 +439,21 @@ impl TurnShared {
         if let Ok(mut g) = self.jobs.lock() {
             *g = rows;
         }
+    }
+
+    /// Replaces the shared `/context` breakdown.
+    pub fn set_context(&self, breakdown: crate::ctxreport::Breakdown) {
+        if let Ok(mut g) = self.context.lock() {
+            *g = breakdown;
+        }
+    }
+
+    /// The `/context` breakdown the worker last published.
+    #[must_use]
+    pub fn context(&self) -> crate::ctxreport::Breakdown {
+        self.context
+            .lock()
+            .map_or_else(|_| crate::ctxreport::Breakdown::default(), |g| g.clone())
     }
 
     /// The `/jobs` text for the shared snapshot, elapsed times as of now.

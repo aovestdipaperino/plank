@@ -21,6 +21,7 @@ pub mod config;
 pub mod configform;
 pub mod consent;
 pub mod context;
+pub mod ctxreport;
 pub mod cursor;
 pub mod debugmirror;
 /// Document ingestion for the `read` tool (PDF → Markdown). Always compiled so

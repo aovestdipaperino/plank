@@ -3801,6 +3801,16 @@ const TOKS_CHART_WIDTH: usize = 64;
 /// Braille cells down the `/toks` chart: four levels per cell.
 const TOKS_CHART_HEIGHT: usize = 6;
 
+/// The mid-turn `/context` report: the breakdown the worker last published,
+/// drawn against the live resident count from the latest status snapshot.
+///
+/// The breakdown refines at each tool boundary, which is where context grows
+/// in bulk; `used` moves with every generated token, so the grid and the
+/// percentage fill while the model types.
+fn live_context_report(shared: &TurnShared, used: i32) -> String {
+    crate::ctxreport::render(&shared.context(), used, true)
+}
+
 /// The `/toks` report over the process-wide sample ring. Needs no agent, so
 /// the UI thread can redraw it mid-turn while the worker owns `self`.
 fn toks_report(color: bool) -> String {
@@ -5439,192 +5449,56 @@ impl Agent<'_> {
         out
     }
 
-    /// Renders the `/context` usage breakdown with Claude Code's layout: a
-    /// 20-column cell grid (1k tokens per cell, coarser for large contexts
-    /// so the grid stays within half a typical screen) beside the model and
-    /// totals, then the estimated usage per category.
-    #[allow(clippy::too_many_lines)]
-    fn render_context_report(&self, color: bool) -> String {
-        use std::fmt::Write as _;
-        /// Glyph for an unused context cell in the grid.
-        const FREE_CELL: char = '⛶';
-        /// Grid width in cells.
-        const GRID_COLS: usize = 20;
-        /// Maximum grid height in rows.
-        const MAX_GRID_ROWS: usize = 16;
-        /// Category colors matching Claude Code: violet, cyan, purple, gray.
-        const COL_SYSTEM: &str = "\x1b[38;5;105m";
-        const COL_MCP: &str = "\x1b[38;5;44m";
-        const COL_MSG: &str = "\x1b[38;5;134m";
-        const COL_CONTEXT: &str = "\x1b[38;5;208m";
-        const COL_MEMORY: &str = "\x1b[38;5;114m";
-        const COL_FREE: &str = "\x1b[38;5;240m";
-        let paint = |col: &'static str| if color { col } else { "" };
-        let reset = if color { ANSI_RESET } else { "" };
-        let ctx_size = self.engine.ctx_size().max(1);
+    /// Gathers the token counts behind the `/context` report.
+    ///
+    /// Only the agent can do this — it needs the engine's tokenizer and the
+    /// live transcript — so the worker gathers it at every point the
+    /// transcript changes and publishes it for the UI thread, which renders it
+    /// with the live fill. See [`crate::ctxreport`].
+    fn context_breakdown(&self) -> crate::ctxreport::Breakdown {
         let mut schemas = String::new();
         crate::tools::mcp::append_tool_schemas(&mut schemas, &self.tool_ctx.mcp);
-        let mcp_tokens = if schemas.is_empty() {
+        let mcp = if schemas.is_empty() {
             0
         } else {
             self.engine.count_tokens(&schemas)
         };
         // MCP tool schemas are embedded in the composed system prompt; split
         // them out so the two categories don't double-count.
-        // The system prompt includes: tools prompt + user system text
-        let mut system_tokens = (self.engine.count_tokens(&self.system) - mcp_tokens).max(0);
-        let mut mcp_tokens = mcp_tokens;
-        // AGENTS.md tokens from the context collected at session start.
+        let system = (self.engine.count_tokens(&self.system) - mcp).max(0);
+        // AGENTS.md and memory tokens from the context collected at session
+        // start. Both are subsets of the first user message, so they come out
+        // of the message total rather than adding to it.
         let context_tokens =
             ContextTokens::count(&self.context_content, |s| self.engine.count_tokens(s));
-        // Message tokens: all transcript messages (user and assistant)
-        let raw_message_tokens: i32 = self
+        let raw_messages: i32 = self
             .session
             .transcript
             .iter()
             .map(|m| self.engine.count_tokens(&m.text))
             .sum();
-        // AGENTS.md gets its own category; git and date context stay grouped
-        // under Messages (they are part of the injected first user message).
-        let agents_md_tokens = context_tokens.agents_md;
-        let memory_tokens = context_tokens.memory;
-        let mut message_tokens = raw_message_tokens - agents_md_tokens - memory_tokens;
-
-        let estimated =
-            system_tokens + mcp_tokens + message_tokens + agents_md_tokens + memory_tokens;
-        if self.last_ctx_used > estimated && estimated > 0 {
-            let scale = |t: i32| {
-                i32::try_from(i64::from(t) * i64::from(self.last_ctx_used) / i64::from(estimated))
-                    .unwrap_or(t)
-            };
-            system_tokens = scale(system_tokens);
-            mcp_tokens = scale(mcp_tokens);
-            message_tokens = scale(message_tokens);
+        crate::ctxreport::Breakdown {
+            ctx_size: self.engine.ctx_size(),
+            model: self.engine.model_name(),
+            system,
+            mcp,
+            // Clamped: `AGENTS.md` and memory are counted from the context
+            // collected at session start, which is only *usually* still in
+            // the transcript. A `/clear` drops the message carrying them
+            // while `context_content` keeps them, and the subtraction then
+            // goes negative — a category with fewer than no tokens in it,
+            // which the scaling and the grid both then read as real.
+            messages: (raw_messages - context_tokens.agents_md - context_tokens.memory).max(0),
+            agents_md: context_tokens.agents_md,
+            memory: context_tokens.memory,
         }
+    }
 
-        let used = (system_tokens + mcp_tokens + message_tokens + agents_md_tokens + memory_tokens)
-            .min(ctx_size);
-        let free = ctx_size - used;
-        let pct = |n: i32| f64::from(n) * 100.0 / f64::from(ctx_size);
-
-        // Categories are told apart by color; the glyph of each cell shows
-        // how full that cell is (see `fill_glyph`).
-        let mut categories = vec![
-            ("System prompt", system_tokens, COL_SYSTEM),
-            ("MCP tools", mcp_tokens, COL_MCP),
-        ];
-
-        if agents_md_tokens > 0 {
-            categories.push(("AGENTS.md", agents_md_tokens, COL_CONTEXT));
-        }
-
-        if memory_tokens > 0 {
-            categories.push(("Memory", memory_tokens, COL_MEMORY));
-        }
-
-        categories.push(("Messages", message_tokens, COL_MSG));
-
-        // Glyph for a cell by its fill fraction: <25%, <50%, <75%, full.
-        let fill_glyph = |frac: f64| -> char {
-            if frac < 0.25 {
-                '⛀'
-            } else if frac < 0.5 {
-                '⛂'
-            } else if frac < 0.75 {
-                '⛁'
-            } else {
-                '⛃'
-            }
-        };
-
-        // Adaptive density: 1k tokens per cell, coarsened (in 1k steps) so the
-        // grid never exceeds half a typical 24-row screen. Every non-empty
-        // category shows at least one cell; free space takes what remains.
-        #[allow(clippy::cast_sign_loss)]
-        let ctx = ctx_size as usize;
-        let tokens_per_cell = ctx
-            .div_ceil(GRID_COLS * MAX_GRID_ROWS)
-            .div_ceil(1000)
-            .max(1)
-            * 1000;
-        let total_cells = ctx.div_ceil(tokens_per_cell);
-        let mut cells: Vec<(char, &'static str)> = Vec::with_capacity(total_cells);
-        for &(_, tokens, col) in &categories {
-            if tokens <= 0 || cells.len() == total_cells {
-                continue;
-            }
-            // Whole cells render full; the trailing remainder renders with a
-            // glyph matching its fill fraction.
-            #[allow(clippy::cast_sign_loss)]
-            let tokens = tokens as usize;
-            let full = (tokens / tokens_per_cell).min(total_cells - cells.len());
-            cells.extend(std::iter::repeat_n(('⛃', col), full));
-            let rem = tokens % tokens_per_cell;
-            if rem > 0 && cells.len() < total_cells {
-                #[allow(clippy::cast_precision_loss)]
-                cells.push((fill_glyph(rem as f64 / tokens_per_cell as f64), col));
-            }
-        }
-        cells.truncate(total_cells);
-        cells.resize(total_cells, (FREE_CELL, COL_FREE));
-        let grid_rows = total_cells.div_ceil(GRID_COLS);
-
-        // Right-hand column: model line, totals, then the category legend.
-        let model = self.engine.model_name();
-        let mut right: Vec<String> = Vec::new();
-        if !model.is_empty() {
-            right.push(model);
-        }
-        right.push(format!(
-            "{}/{} tokens ({:.0}%)",
-            status::format_ctx_size(used),
-            status::format_ctx_size(ctx_size),
-            pct(used)
-        ));
-        right.push(String::new());
-        right.push("Estimated usage by category".to_owned());
-        for &(label, tokens, col) in &categories {
-            right.push(format!(
-                "{}⛃{reset} {label}: {} tokens ({:.1}%)",
-                paint(col),
-                status::format_ctx_size(tokens),
-                pct(tokens)
-            ));
-        }
-        right.push(format!(
-            "{}{FREE_CELL}{reset} Free space: {} ({:.1}%)",
-            paint(COL_FREE),
-            status::format_ctx_size(free),
-            pct(free)
-        ));
-        right.push(format!(
-            "1 cell = {} tokens",
-            status::format_ctx_size(i32::try_from(tokens_per_cell).unwrap_or(i32::MAX))
-        ));
-
-        let mut out = String::from("Context Usage\n");
-        let rows = right.len().max(grid_rows);
-        for row in 0..rows {
-            out.push_str("  ");
-            if row < grid_rows {
-                let start = row * GRID_COLS;
-                let end = (start + GRID_COLS).min(total_cells);
-                for &(glyph, col) in &cells[start..end] {
-                    out.push_str(paint(col));
-                    out.push(glyph);
-                    out.push_str(reset);
-                    out.push(' ');
-                }
-                out.push_str(&" ".repeat(2 * (start + GRID_COLS - end)));
-            } else {
-                out.push_str(&" ".repeat(2 * GRID_COLS));
-            }
-            if let Some(text) = right.get(row) {
-                let _ = write!(out, "   {text}");
-            }
-            out.push('\n');
-        }
-        out
+    /// The `/context` report as of now, against the last resident count the
+    /// engine reported. The mid-turn panel renders the same breakdown against
+    /// the live figure instead (`crate::ctxreport::render`).
+    fn render_context_report(&self, color: bool) -> String {
+        crate::ctxreport::render(&self.context_breakdown(), self.last_ctx_used, color)
     }
 
     /// The `/init` prompt: asks the model to analyze the codebase and write an
@@ -12280,7 +12154,9 @@ impl Agent<'_> {
             for q in carry_btw.drain(..) {
                 let _ = shared.push_btw(q);
             }
-            // So a `/toks` opened during the first pass already has history.
+            // So a `/context` opened during the first pass has real numbers
+            // rather than an empty breakdown.
+            shared.set_context(self.context_breakdown());
             let bus_ref = bus.as_deref();
             // UI-side handle to the `ask` rendezvous (issue #34), cloned out of
             // the tool context before the closure borrows `self`. Only the main
@@ -12950,6 +12826,10 @@ impl Agent<'_> {
                     let _ = tx.send(UiEvent::Dim(Self::job_wake_line(woke)));
                 }
                 shared.set_jobs(self.tool_ctx.bash.rows());
+                // The transcript just grew by this round's results, which is
+                // where context fills in bulk; re-count so the panel's
+                // breakdown is current, not turn-start.
+                shared.set_context(self.context_breakdown());
                 continue;
             }
             if !out.calls.is_empty() {
@@ -13015,6 +12895,10 @@ impl Agent<'_> {
                     let _ = tx.send(UiEvent::Dim(Self::job_wake_line(woke)));
                 }
                 shared.set_jobs(self.tool_ctx.bash.rows());
+                // The transcript just grew by this round's results, which is
+                // where context fills in bulk; re-count so the panel's
+                // breakdown is current, not turn-start.
+                shared.set_context(self.context_breakdown());
                 continue;
             }
             // Stop hooks: exit 2 feeds stderr to the model and the turn
@@ -13454,6 +13338,7 @@ impl Agent<'_> {
             self.tool_ctx.bash.running_count(),
         );
         shared.set_jobs(self.tool_ctx.bash.rows());
+        shared.set_context(self.context_breakdown());
         let mut assistant_text = String::new();
 
         let interrupt = || {
@@ -15111,7 +14996,6 @@ fn loopguard_reply(arg: &str, on: bool) -> (Option<bool>, String) {
 /// cheap next to the prefill/decoding the turn is about to do. Commands not
 /// listed here still tell the user to wait for the turn to finish.
 struct LiveCommands {
-    context: String,
     usage: String,
     mcp: String,
 }
@@ -15120,7 +15004,6 @@ impl LiveCommands {
     /// Captures the read-only reports before the worker takes the engine.
     fn capture(agent: &Agent<'_>) -> Self {
         Self {
-            context: agent.render_context_report(true),
             usage: agent.render_usage_report(true),
             mcp: render_mcp_report(&agent.tool_ctx.mcp, true),
         }
@@ -15441,6 +15324,10 @@ fn busy_ui_loop(
     let mut selection = tui::DragSelect::default();
     // Presses on the footer's wastebasket; see the idle loop's own tracker.
     let mut mc_clicks = SegmentDoubleClick::default();
+    // Context tokens resident as of the last status snapshot, which counts up
+    // with every generated token. What makes an open `/context` panel fill
+    // live rather than sitting on the last boundary's figure.
+    let mut live_ctx_used = 0i32;
     // True while the progress line is showing the compaction bar, so it is
     // cleared exactly once when the pass ends.
     let mut compacting_line = false;
@@ -15527,11 +15414,20 @@ fn busy_ui_loop(
                     if let (true, Some(label)) = (sub.active, sub.label()) {
                         status_line = format!("[sub-agent: {label}] {status_line}");
                     }
+                    live_ctx_used = st.ctx_used;
                     // Every status tick redraws the chart while the panel is
                     // up, so the newest second lands as soon as it is sampled.
                     if let Some(panel) = report.as_mut().filter(|r| r.title() == TOKS_REPORT_TITLE)
                     {
                         panel.set_text(&toks_report(true));
+                    }
+                    // Same for the context panel: the breakdown is whatever the
+                    // worker last published, the fill is this snapshot's.
+                    if let Some(panel) = report
+                        .as_mut()
+                        .filter(|r| r.title() == CONTEXT_REPORT_TITLE)
+                    {
+                        panel.set_text(&live_context_report(shared, live_ctx_used));
                     }
                 }
                 UiEvent::Tasks(tv) => task_view = tv,
@@ -15976,14 +15872,14 @@ fn busy_ui_loop(
                             view.follow = true;
                             sub.follow_all();
                         } else if line.split_whitespace().next() == Some("/context") {
-                            // Same panel as at idle, over the turn-start
-                            // snapshot: the worker owns the engine, so the
-                            // breakdown cannot be re-rendered mid-turn.
+                            // The same panel as at idle, and live: the worker
+                            // publishes the breakdown at every boundary and the
+                            // status ticks supply the fill.
                             input.history.add(&line);
                             log.push_user_echo(&line);
                             report = Some(tui::ReportPanel::new(
                                 CONTEXT_REPORT_TITLE,
-                                &live_cmds.context,
+                                &live_context_report(shared, live_ctx_used),
                             ));
                             view.follow = true;
                             sub.follow_all();
@@ -16233,7 +16129,7 @@ fn busy_ui_loop(
                     } else {
                         report = Some(tui::ReportPanel::new(
                             CONTEXT_REPORT_TITLE,
-                            &live_cmds.context,
+                            &live_context_report(shared, live_ctx_used),
                         ));
                     }
                     selection.cancel();
@@ -21156,14 +21052,12 @@ mod tests {
     #[test]
     fn live_commands_allow_read_only_reports_and_reject_the_rest() {
         let live = LiveCommands {
-            context: "CTX".to_owned(),
             usage: "USE".to_owned(),
             mcp: "MCP".to_owned(),
         };
         // `/context`, `/usage` and `/mcp` are snapshotted for the report
         // panel, which reads the fields directly, so they are deliberately not
         // streamable.
-        assert_eq!(live.context, "CTX");
         assert_eq!(live.usage, "USE");
         assert_eq!(live.mcp, "MCP");
         assert!(LiveCommands::output("/context").is_none());
@@ -25181,6 +25075,58 @@ mod tests {
         assert!(is_draft_stop(&framed));
         // The draft rung gets the looser cap.
         assert_eq!((MAIN_REPEAT_TRIP_CAP, MAIN_DRAFT_TRIP_CAP), (2, 3));
+    }
+
+    /// The `/context` panel stays current during a turn: the worker publishes
+    /// the breakdown into the shared turn state wherever the transcript grows,
+    /// and the UI thread draws it against the live resident count without ever
+    /// touching the agent.
+    #[test]
+    fn the_context_breakdown_is_published_as_the_turn_runs() {
+        let dir = scratch_dir("live-context");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["All done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let shared = TurnShared::default();
+        // Nothing published yet: an empty breakdown renders rather than
+        // dividing by a zero window.
+        assert_eq!(shared.context(), crate::ctxreport::Breakdown::default());
+        assert!(live_context_report(&shared, 0).starts_with("Context Usage"));
+
+        agent.session.push(Message::user("count the context"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+
+        let published = shared.context();
+        assert_eq!(published.ctx_size, agent.engine.ctx_size());
+        assert!(published.system > 0, "{published:?}");
+        assert!(published.estimated() > 0, "{published:?}");
+        // No category is ever negative, whatever the session-start context
+        // and the transcript disagree about.
+        assert!(published.messages >= 0, "{published:?}");
+        // The same numbers the agent would report at idle.
+        assert_eq!(published, agent.context_breakdown());
+
+        // The fill is the UI thread's, not the breakdown's: the same published
+        // numbers drawn against a larger live count report a fuller window.
+        let idle = live_context_report(&shared, 0);
+        let mid_pass = live_context_report(&shared, published.ctx_size / 2);
+        assert_ne!(idle, mid_pass);
+        // The reported total is the sum of the categories, not the live figure
+        // itself — the legend has to agree with the grid drawn from those same
+        // numbers — so what a bigger live count buys is a fuller report, which
+        // is the thing the panel is watched for.
+        let free_cells = |r: &str| r.matches('⛶').count();
+        assert!(
+            free_cells(&mid_pass) < free_cells(&idle),
+            "idle {} vs mid-pass {}",
+            free_cells(&idle),
+            free_cells(&mid_pass)
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

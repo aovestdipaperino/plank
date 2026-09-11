@@ -79,7 +79,7 @@ With an arcade game open, the first `Ctrl-C` closes the game and a second interr
 
 `Esc` at an idle prompt dismisses a `/btw` panel left open from an earlier turn, which is the only way it closes.
 
-Most slash commands wait for the turn to finish, but the read-only reports do not: `/context`, `/usage`, `/mcp` and `/help` answer from a turn-start snapshot, `/jobs` and `/toks` read live state (the `/toks` chart redraws on every status tick), and `/exit` asks `[y/N]` before interrupting the turn and leaving once it stops.
+Most slash commands wait for the turn to finish, but the read-only reports do not: `/usage`, `/mcp` and `/help` answer from a turn-start snapshot, while `/context`, `/jobs` and `/toks` read live state and redraw as the turn runs — open `/context` mid-turn and you can watch the window fill, category breakdown refreshed at each tool boundary and the total on every status tick. `/exit` asks `[y/N]` before interrupting the turn and leaving once it stops.
 
 ### In a question panel
 

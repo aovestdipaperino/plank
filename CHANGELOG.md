@@ -6,7 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`/context` is live during a turn, not a turn-start snapshot.** The report
+  split into the numbers (which only the agent can count, so the worker
+  gathers them wherever the transcript grows — at turn start and every tool
+  boundary) and the drawing (which needs no agent, so the UI thread redraws on
+  every status tick against the tokens resident right then). Open the panel
+  mid-turn, or click the `ctx` gauge, and the grid fills as the model
+  generates. The rendering moved to its own module and is tested without an
+  engine.
+
 ### Fixed
+
+- **The `/context` report could show a negative Messages category.**
+  `AGENTS.md` and memory tokens are counted from the context collected at
+  session start and subtracted from the transcript total, but a `/clear` drops
+  the message carrying them while that count stays — and the scaling and the
+  grid both then read the negative as real. Clamped at zero.
 
 - **A guard stop no longer leaves the model drafting in the same place.** The
   pass after any reasoning-rung stop is generated with reasoning closed, so
