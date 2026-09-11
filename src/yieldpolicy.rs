@@ -79,6 +79,9 @@ impl YieldPolicy {
         // The plan is derived from the ladder and the engine's depth; freeing
         // the session is the last step.
         if !engine.release_session() {
+            // A refusal means nothing was yielded right now, so no plan may
+            // stand — clear any plan a prior successful yield left pinned.
+            self.plan = None;
             return None;
         }
         self.plan = Some(plan.clone());
@@ -231,36 +234,36 @@ mod tests {
         assert!(p.plan().is_none(), "resuming retires the plan");
     }
 
+    /// Stands in for a session holding vision state, which cannot be rebuilt
+    /// from text alone: `release_session` always declines.
+    #[derive(Default)]
+    struct Declines;
+    impl std::fmt::Debug for Declines {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Declines")
+        }
+    }
+    impl Engine for Declines {
+        fn generate(
+            &mut self,
+            _p: crate::engine::Prompt<'_>,
+            _o: &crate::engine::GenerationOptions,
+            _i: &dyn Fn() -> bool,
+            _g: &dyn Fn() -> bool,
+            _e: &mut dyn FnMut(crate::engine::EngineEvent),
+        ) -> Result<crate::engine::GenerationStats, crate::engine::EngineError> {
+            unreachable!("the yield path never generates")
+        }
+        fn ctx_size(&self) -> i32 {
+            4096
+        }
+        fn release_session(&mut self) -> bool {
+            false
+        }
+    }
+
     #[test]
     fn an_engine_that_declines_leaves_no_plan() {
-        /// Stands in for a session holding vision state, which cannot be
-        /// rebuilt from text alone.
-        #[derive(Default)]
-        struct Declines;
-        impl std::fmt::Debug for Declines {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("Declines")
-            }
-        }
-        impl Engine for Declines {
-            fn generate(
-                &mut self,
-                _p: crate::engine::Prompt<'_>,
-                _o: &crate::engine::GenerationOptions,
-                _i: &dyn Fn() -> bool,
-                _g: &dyn Fn() -> bool,
-                _e: &mut dyn FnMut(crate::engine::EngineEvent),
-            ) -> Result<crate::engine::GenerationStats, crate::engine::EngineError> {
-                unreachable!("the yield path never generates")
-            }
-            fn ctx_size(&self) -> i32 {
-                4096
-            }
-            fn release_session(&mut self) -> bool {
-                false
-            }
-        }
-
         let mut p = YieldPolicy::new();
         assert!(
             p.yield_now(
@@ -273,5 +276,24 @@ mod tests {
             "declining to free means there is nothing to resume from"
         );
         assert!(p.plan().is_none(), "a refused yield must not pin a plan");
+    }
+
+    #[test]
+    fn a_refusal_clears_a_plan_left_by_an_earlier_yield() {
+        let mut spy = YieldSpy::default();
+        let mut p = YieldPolicy::new();
+        p.yield_now(&mut spy, &KvLadder::new(), 100, vec!["tier2".to_owned()])
+            .expect("the spy releases, so this yield succeeds");
+        assert!(p.plan().is_some(), "precondition: a plan is pinned");
+
+        // The same policy later meets an engine that will not release.
+        assert!(
+            p.yield_now(&mut Declines, &KvLadder::new(), 100, vec![])
+                .is_none()
+        );
+        assert!(
+            p.plan().is_none(),
+            "a refusal means nothing is yielded now, so no plan may stand"
+        );
     }
 }

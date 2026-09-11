@@ -2204,14 +2204,19 @@ impl Engine for Ds4Session {
         if self.session.is_null() {
             return false;
         }
+        // Mirror get_kv's two vision gates exactly: `vision_spans` is plank's
+        // own record, the FFI check is the engine's internal one, and either
+        // being non-empty means a rebuilt session would re-prefill image
+        // token positions with no embeddings behind them — silently
+        // ungrounded. Refuse the yield the same way `get_kv` refuses to
+        // capture such a session.
         if !self.vision_spans.is_empty() {
-            // An image-conditioned session cannot be rebuilt from the
-            // transcript: `warm_sync` re-prefills through plain
-            // `ds4_session_sync`, so the image token positions would come back
-            // with no embeddings behind them and the prefix would be silently
-            // ungrounded. Refuse the yield, the same way `get_kv` refuses to
-            // capture such a session.
             kv_debug(|| "release_session: declined, session holds vision state".to_owned());
+            return false;
+        }
+        // SAFETY: session is non-null (checked above).
+        if unsafe { ffi::ds4_session_has_vision_state(self.session) } {
+            kv_debug(|| "release_session: declined, engine holds vision state".to_owned());
             return false;
         }
         // SAFETY: session is non-null and owned by this engine; ds4_session_free
