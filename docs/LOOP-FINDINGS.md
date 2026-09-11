@@ -29,7 +29,9 @@ The guards, for orientation:
   it has no `2p` latency floor and no period ceiling, and it is the only rung
   that catches a drifting loop. Stops through the same preflight channel with
   `THINK_BUDGET_ERROR`, and counts towards `MAIN_REPEAT_TRIP_CAP`.
-- **Draft rung** — `RepeatGuard::drafting`: past `DRAFT_MIN_BYTES` (8 KiB) of
+- **Draft rung** — `RepeatGuard::drafting`: past `draft_min_bytes` (an eighth
+  of the pass's think budget, so ~12.8 KiB on the 1M-token window, never below
+  the 8 KiB `DRAFT_MIN_BYTES_FLOOR`) of
   reasoning, `DRAFT_HEADINGS` (10) numbered deliverable headings
   (`**Bug 3:**`, `1. **Title**`, `### 4.`) or `DRAFT_FENCED_BYTES` (4 KiB)
   inside code fences means the reasoning is writing the answer, not deciding
@@ -67,6 +69,7 @@ argument for the design.
 | 2026-09-07 | `aaf0f3d` | `MAIN_REPEAT_TRIP_CAP = 2` on both main-turn paths (`MAIN_REPEAT_TRIPS_NOTICE`); `Agent::repro_dir` so test dumps stay out of `~/.plank/repro`; this document | `repro-loop-1788708943`/`-1788709421`: the main turn looped, stopped, looped again, and the user quit |
 | 2026-09-08 | *(this change)* | no-progress budget resets only after a successful direct `write` or `edit`, not an attempted `edit` or arbitrary `bash` call | `repro-loop-1788833715`: 5h7m of failed edits, builds, and repeated reads kept resetting the budget |
 | 2026-09-10 | *(this change)* | think budget sized from the context window: `repeat_think_budget` = `ctx_size / 10` bytes, floored at the old 16 KiB (`REPEAT_THINK_BUDGET_FLOOR`) | `repro-loop-1789051332` … `-1789053127`: seven budget stops in three sessions on one feature request, none a cycle — see "The think budget fired on reasoning that was not looping", below |
+| 2026-09-11 | *(this change)* | `NO_PROGRESS_NOTICE` reworded: it no longer claims a shell command would have reset the budget, and it names what does | `repro-1789107544`: the tripping pass had just run `cargo test` and `cargo clippy` successfully — see "The no-progress notice named the wrong evidence", below |
 | 2026-09-10 | *(this change)* | draft rung (`RepeatGuard::drafting`, `DRAFT_ERROR`): numbered deliverable headings or fenced code accumulating inside `<think>` past 8 KiB stop the pass with "write this as your answer, not in reasoning"; and a `WORKING_STYLE` rule, "Write findings as you find them", so list-shaped answers are emitted item by item after `</think>` | `repro-loop-1789060243` and the seven 2026-09-10 dumps: deliverables drafted in reasoning, never emitted |
 | 2026-09-10 | *(no code change)* | counter-case to the raised budget recorded: a 30 KB review drafted inside `<think>` under the ~102 KB budget, interrupted by the user at 12m42s; the `resume` pass redrafted and fell into a 5-line cycle the exact-cycle rung caught | `repro-loop-1789060243`: `do a code review`, 18 minutes, no visible output — see "The review that was written in the wrong place", below |
 | 2026-09-08 | *(this change)* | `tools.loopGuards` and `/loopguard` (alias `/lg`): one switch over every rung — `LoopGuard::observe`/`tripped`, the gated `RepeatGuard` (cycles and think budget), the no-progress budget. Read through `guard::guards_enabled()` at each check, never captured at turn start, so the switch lands on a generation already streaming; `🔁` in the footer while armed, and the tripped marker moved to `♻ looping` | diagnosing the guards themselves, where every rung fires before the behaviour under study can be observed |
@@ -716,8 +719,22 @@ worker panic**`, `### 3.`, `Finding 7:` — counts once, and every byte of a
 line inside a ``` fence counts towards a second tally. Plain numbered
 thoughts (`1. read the file`) do not count: a plan numbers its steps too, and
 the difference between a plan and a written-out list is the bold title on
-each item. Past `DRAFT_MIN_BYTES` = 8 KiB of reasoning, `DRAFT_HEADINGS` = 10
+each item. Past `draft_min_bytes` of reasoning, `DRAFT_HEADINGS` = 10
 headings or `DRAFT_FENCED_BYTES` = 4 KiB of fenced code trips it.
+
+The byte gate is a share of the pass's think budget — a
+`DRAFT_MIN_BUDGET_SHARE` of it, an eighth, never below the 8 KiB
+`DRAFT_MIN_BYTES_FLOOR` — rather than an absolute, because "long enough to be
+a draft rather than an outline" is relative to how much room the pass has:
+8 KiB is nothing on the 1M-token window and a large fraction of everything a
+small one can hold. Since the budget is already `ctx_size / 10`, measuring
+against it scales the rung with the window without plumbing the window into
+the guard, and it fixes the relationship that matters — the draft rung starts
+looking at an eighth of where the budget would stop the pass anyway, which is
+what makes it the early rung. Every window at or under 640k tokens sits on the
+floor and behaves exactly as the fixed 8 KiB did. The heading count and the
+fence threshold stay absolute: those are evidence about the *shape* of the
+reasoning, and neither claim gets truer because the window is bigger.
 
 The thresholds against the corpus: the review pass had thirty-one headings in
 30 KB, so it would have stopped around the tenth, at roughly 9-10 KB and three
@@ -757,3 +774,36 @@ think budget in effect. The pass notes live on the agent
 pass's message is pushed: the plain and TUI turn loops, the serial
 sub-agent loop and the fan-out fold. Future entries in this file should quote
 the table rather than re-derive it.
+
+## The no-progress notice named the wrong evidence
+
+`repro-1789107544` (plucky-goodall, 2026-09-11, a `do a code review` on
+tommaso) ended with the no-progress budget, and the notice said the turn had
+generated 32 KB "without writing a file, editing one, or running a command".
+The pass that tripped it had just run `cargo test` and `cargo clippy`, both
+successfully.
+
+The stop was correct. Across the whole session the model called `read` eleven
+times, `bash` five and `more` twice, and never wrote or edited anything, so
+`last_written` was never set and the budget correctly ran to its cap. The
+third clause of the notice was simply false: a shell command has not reset
+this budget since 2026-09-08, for the reason the section above gives, and the
+comment on `NO_PROGRESS_BYTE_BUDGET` says as much three lines from the string
+that contradicted it. Reworded to name what actually counts, since the stop
+almost always lands right after a tool round and a notice that miscounts the
+evidence reads as a malfunction.
+
+Two things in the same dump are worth keeping, both from the `## Passes`
+table this file asked for:
+
+- **The draft rung's first live catch.** Pass 11 stopped at 27,542 bytes of
+  reasoning with 10 numbered headings and no cycle — the shape the rung was
+  cut for, and invisible to every other rung. Pass 14 then answered with 15
+  headings in 6,717 bytes, under the byte gate, which is the rung correctly
+  staying quiet on an outline.
+- **The alternation, demonstrated.** Pass 11's stop was the first consecutive
+  reasoning stop; pass 12 was a real tool round, which reset that counter to
+  zero. Had those two `cargo` commands also reset the no-progress budget, as
+  they would have before 2026-09-08, nothing would have been left bounding the
+  turn and it would have continued exactly as `repro-loop-1788833715` did.
+  This budget is the only rung that was still holding.

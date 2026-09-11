@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The no-progress notice claimed running a command would have satisfied
+  it.** Only a successful `write` or `edit` resets that budget — reads and
+  shell commands deliberately do not, since a turn of failed edits and builds
+  is what the rule was written for — so the old wording contradicted both the
+  code and the comment above the constant, and the stop read as a malfunction
+  because it usually lands right after a tool round. It now says what counts.
+
 ### Added
 
 - **`/mc [on|off]` and a wastebasket on the footer.** Micro-compaction's live
@@ -23,7 +32,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   repeat of at least three distinct items is reported as a cycle. From a
   26-item, 7 KiB cycle that the byte-window rungs could not see.
 
-- **A draft rung on the reasoning guard.** Past 8 KiB of reasoning, ten
+- **A draft rung on the reasoning guard.** Past an eighth of the pass's think
+  budget in reasoning (~12.8 KiB on the 1M-token window, never below 8 KiB), ten
   numbered deliverable headings (`**Bug 3:**`, `1. **Title**`) or 4 KiB of
   fenced code inside `<think>` stop the pass with "write this as your answer,
   not in reasoning": the reasoning was drafting the answer, not deciding what

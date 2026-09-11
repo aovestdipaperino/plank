@@ -1775,9 +1775,39 @@ pub struct GuardSnapshot {
     pub fenced_bytes: usize,
 }
 
+/// Floor for the draft rung's byte gate; see [`draft_min_bytes`]. Below this
+/// a think block is an outline whatever the window size, and the 2026-09-10
+/// dumps were read against this number.
+pub const DRAFT_MIN_BYTES_FLOOR: usize = 8192;
+
+/// Share of the pass's think budget at which the draft rung starts looking:
+/// an eighth.
+///
+/// Expressed against the budget rather than as an absolute, because "long
+/// enough to be a draft rather than an outline" is relative to how much room
+/// the pass has: 8 KiB is nothing on the 1M-token window and a large fraction
+/// of everything a small one can hold. The budget is already `ctx_size / 10`
+/// bytes (`crate::ui::repeat_think_budget`), so measuring against it scales
+/// the rung with the context window without plumbing the window into the
+/// guard — and it states the relationship that actually matters: the draft
+/// rung starts looking at an eighth of where the budget would stop the pass
+/// anyway, which is what makes it the early rung.
+pub const DRAFT_MIN_BUDGET_SHARE: usize = 8;
+
 /// Reasoning bytes a pass must have produced before the draft rung may fire:
-/// a short think block with a couple of headings is an outline, not a draft.
-pub const DRAFT_MIN_BYTES: usize = 8192;
+/// a [`DRAFT_MIN_BUDGET_SHARE`] of its think `budget`, never below
+/// [`DRAFT_MIN_BYTES_FLOOR`].
+///
+/// On the 1M-token window (budget ~102 KB) that is ~12.8 KiB; every window at
+/// or under 640k tokens sits on the floor and behaves exactly as the fixed
+/// 8 KiB did. The corpus judgments are unchanged either way:
+/// `repro-loop-1789060243` reached its tenth `**Bug N:**` heading at ~9.7 KB
+/// and its thirteenth at ~13 KB, so the rung still stops it inside four
+/// minutes rather than at the thirty-KB mark where the user gave up.
+#[must_use]
+pub fn draft_min_bytes(budget: usize) -> usize {
+    (budget / DRAFT_MIN_BUDGET_SHARE).max(DRAFT_MIN_BYTES_FLOOR)
+}
 
 /// Numbered deliverable headings inside one pass's reasoning past which it is
 /// a list being written out rather than thought about. `repro-loop-1789060243`
@@ -1786,7 +1816,14 @@ pub const DRAFT_MIN_BYTES: usize = 8192;
 pub const DRAFT_HEADINGS: usize = 10;
 
 /// Bytes inside fenced code blocks in one pass's reasoning past which the
-/// reasoning is drafting the implementation. The 2026-09-10 recovery passes
+/// reasoning is drafting the implementation.
+///
+/// Absolute, unlike [`draft_min_bytes`], and so is [`DRAFT_HEADINGS`]: those
+/// two are evidence about the *shape* of the reasoning — this much fenced code
+/// is a draft, and ten numbered titles are a list being written out — and
+/// neither claim gets truer or falser because the window is bigger. Only the
+/// "has this gone on long enough to look at" gate is relative.
+/// The 2026-09-10 recovery passes
 /// carried 100-150 fenced lines each, well over this, before the budget cut
 /// them; a snippet quoted to reason about stays under it.
 pub const DRAFT_FENCED_BYTES: usize = 4096;
@@ -1968,7 +2005,7 @@ impl RepeatGuard {
     }
 
     /// Whether this pass's reasoning is a draft of the answer rather than
-    /// deliberation: past [`DRAFT_MIN_BYTES`], either [`DRAFT_HEADINGS`]
+    /// deliberation: past [`draft_min_bytes`], either [`DRAFT_HEADINGS`]
     /// numbered deliverable headings or [`DRAFT_FENCED_BYTES`] of fenced code.
     /// `repro-loop-1789060243` wrote a thirty-one-item review inside
     /// `<think>` and never closed it; the 2026-09-10 recovery passes drafted a
@@ -1978,9 +2015,13 @@ impl RepeatGuard {
     /// (the turn guards) run it. Sticky, since the counts only grow.
     #[must_use]
     pub fn drafting(&self) -> bool {
+        // Only guards with a budget run this rung, and the budget is also
+        // what sizes its byte gate.
+        let Some(budget) = self.budget else {
+            return false;
+        };
         self.live()
-            && self.budget.is_some()
-            && self.total >= DRAFT_MIN_BYTES
+            && self.total >= draft_min_bytes(budget)
             && (self.draft.headings >= DRAFT_HEADINGS
                 || self.draft.fenced_bytes >= DRAFT_FENCED_BYTES)
     }
@@ -3437,7 +3478,7 @@ Tool result 3 (read):\nfine\n</tool_result>",
     fn a_numbered_list_written_out_in_reasoning_is_a_draft() {
         // `repro-loop-1789060243`: `**Bug N:**` entries, thirty-one of them,
         // no byte cycle, 30 KB before the user gave up.
-        let mut guard = RepeatGuard::with_window(8192).with_think_budget(1 << 20);
+        let mut guard = RepeatGuard::with_window(8192).with_think_budget(16_384);
         for i in 1..=12 {
             let _ = guard.feed(&format!("**Bug {i}: something about module {i}**\n"));
             for j in 0..20 {
@@ -3447,7 +3488,11 @@ Tool result 3 (read):\nfine\n</tool_result>",
             }
             let _ = guard.feed("\n\n");
         }
-        assert!(guard.fed() >= DRAFT_MIN_BYTES, "fed {} B", guard.fed());
+        assert!(
+            guard.fed() >= DRAFT_MIN_BYTES_FLOOR,
+            "fed {} B",
+            guard.fed()
+        );
         assert!(guard.drafting(), "headings {}", guard.draft.headings);
         assert!(!guard.repeating(), "nothing cycles here");
     }
@@ -3455,7 +3500,7 @@ Tool result 3 (read):\nfine\n</tool_result>",
     #[test]
     fn code_drafted_in_reasoning_is_a_draft() {
         // The 2026-09-10 recovery passes: the implementation as fenced Rust.
-        let mut guard = RepeatGuard::with_window(8192).with_think_budget(1 << 20);
+        let mut guard = RepeatGuard::with_window(8192).with_think_budget(16_384);
         let _ = guard.feed(&"Deciding how to structure the expansion. ".repeat(220));
         let _ = guard.feed("\n```rust\n");
         for i in 0..120 {
@@ -3465,22 +3510,58 @@ Tool result 3 (read):\nfine\n</tool_result>",
         assert!(guard.drafting(), "fenced {} B", guard.draft.fenced_bytes);
     }
 
+    /// The byte gate scales with the context window, through the think budget
+    /// that window already sizes: an eighth of it, never under the floor the
+    /// 2026-09-10 dumps were read against.
+    #[test]
+    fn the_draft_byte_gate_follows_the_context_window() {
+        // The 1M-token window: budget ~102 KB, so the rung starts looking at
+        // ~12.8 KiB rather than at the fixed 8 KiB.
+        assert_eq!(draft_min_bytes(104_857), 13_107);
+        // Smaller windows sit on the floor and behave as before — including
+        // the budget's own floor, which is where a 128k window lands.
+        assert_eq!(draft_min_bytes(26_214), DRAFT_MIN_BYTES_FLOOR);
+        assert_eq!(draft_min_bytes(16_384), DRAFT_MIN_BYTES_FLOOR);
+        assert_eq!(draft_min_bytes(0), DRAFT_MIN_BYTES_FLOOR);
+        // And the gate is live: reasoning that is a draft under a small window
+        // is still only an outline under a large one.
+        let mut small = RepeatGuard::with_window(8192).with_think_budget(16_384);
+        let mut large = RepeatGuard::with_window(8192).with_think_budget(104_857);
+        for i in 1..=12 {
+            for g in [&mut small, &mut large] {
+                let _ = g.feed(&format!("**Bug {i}: about module {i}**\n"));
+                for j in 0..16 {
+                    let _ = g.feed(&format!("sentence {i}-{j}, distinct by position, here. "));
+                }
+                let _ = g.feed("\n\n");
+            }
+        }
+        assert!(
+            small.fed() >= DRAFT_MIN_BYTES_FLOOR,
+            "fed {} B",
+            small.fed()
+        );
+        assert!(small.fed() < 13_107, "fed {} B", small.fed());
+        assert!(small.drafting(), "fed {} B", small.fed());
+        assert!(!large.drafting(), "fed {} B, gate 13107", large.fed());
+    }
+
     #[test]
     fn a_short_outline_is_not_a_draft() {
         // A dozen numbered headings in under the byte floor is a plan.
-        let mut guard = RepeatGuard::with_window(8192).with_think_budget(1 << 20);
+        let mut guard = RepeatGuard::with_window(8192).with_think_budget(16_384);
         for i in 1..=12 {
             let _ = guard.feed(&format!("{i}. **step {i}** do the thing\n"));
         }
-        assert!(guard.fed() < DRAFT_MIN_BYTES);
+        assert!(guard.fed() < DRAFT_MIN_BYTES_FLOOR);
         assert!(!guard.drafting());
         // Long reasoning with a couple of headings and a quoted snippet is
         // deliberation, not a draft.
-        let mut guard = RepeatGuard::with_window(8192).with_think_budget(1 << 20);
+        let mut guard = RepeatGuard::with_window(8192).with_think_budget(16_384);
         let _ = guard.feed("**Option 1:** keep it sync\n**Option 2:** go async\n");
         let _ = guard.feed("```rust\nfn poll(&mut self) {}\n```\n");
         let _ = guard.feed(&"weighing the two designs against each call site. ".repeat(300));
-        assert!(guard.fed() >= DRAFT_MIN_BYTES);
+        assert!(guard.fed() >= DRAFT_MIN_BYTES_FLOOR);
         assert!(!guard.drafting());
     }
 
@@ -3514,14 +3595,14 @@ Tool result 3 (read):\nfine\n</tool_result>",
         for i in 1..=40 {
             let _ = guard.feed(&format!("**Bug {i}:** {}\n", "x".repeat(400)));
         }
-        assert!(guard.fed() >= DRAFT_MIN_BYTES);
+        assert!(guard.fed() >= DRAFT_MIN_BYTES_FLOOR);
         assert!(!guard.drafting());
     }
 
     #[test]
     fn the_switch_silences_the_draft_rung() {
         let mut guard = RepeatGuard::with_window(8192)
-            .with_think_budget(1 << 20)
+            .with_think_budget(16_384)
             .gated();
         for i in 1..=40 {
             let _ = guard.feed(&format!("**Bug {i}:** {}\n", "x".repeat(400)));

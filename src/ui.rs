@@ -715,7 +715,16 @@ const NO_PROGRESS_BYTE_BUDGET: usize = 32768;
 /// Shown when [`NO_PROGRESS_BYTE_BUDGET`] ends a turn. Names the absence,
 /// because "stopped" without "and nothing was written" sends the reader
 /// looking for a crash.
-const NO_PROGRESS_NOTICE: &str = "turn stopped: the model generated 32KB of output without writing a file, editing one, or running a command. Nothing was changed. Narrow the request, or tell it which file to start with.";
+///
+/// It also has to name what does *not* count, because the stop most often
+/// lands right after a tool round and reads as a malfunction otherwise. In
+/// `repro-1789107544` the tripping pass had just run `cargo test` and
+/// `cargo clippy`, both successfully, and the notice as first written claimed
+/// the turn had gone 32 KB "without ... running a command" — contradicting
+/// both the code and the comment on the constant three lines above it. Only
+/// `last_written` resets this budget; reads and shell commands never have
+/// (see `docs/LOOP-FINDINGS.md`, "An attempted mutation is not progress").
+const NO_PROGRESS_NOTICE: &str = "turn stopped: the model generated 32KB of output and changed no file. Only a successful write or edit counts here — reads and shell commands, however many, do not. Narrow the request, or tell it which file to start with.";
 
 /// Whether a preflight error is one of the reasoning rungs, and so counts
 /// towards [`MAIN_REPEAT_TRIP_CAP`]. Both stops leave the prompt materially
