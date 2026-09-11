@@ -350,6 +350,30 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   the engine extends forward from the rung instead of rebuilding. See
   `docs/KV-CACHE.md` for the rationale and the full mechanics.
 
+### Skills (`skills.rs`)
+- A skill is a directory holding a `SKILL.md`: optional frontmatter (`name`,
+  `description`, `argument-hint`) over a markdown body that becomes a user-turn
+  preamble, with `$ARGUMENTS` substituted (or the arguments appended as a
+  trailing paragraph when the body has no placeholder, so they are never
+  silently dropped). The name becomes a slash command, so it must be routable:
+  no whitespace, no `/`, and no `:` — the colon belongs to `<plugin>:<name>`.
+- Six skills ship compiled into the binary from `src/resources/skills/`
+  (`code-review`, `debug`, `remember`, `skillify`, `update-config`, `verify`),
+  declared in the `BUILTIN` table and parsed by the *same* loader as a user's,
+  so a built-in cannot rely on anything a user's skill could not use. They have
+  no source directory, which is what `Skill::is_builtin` keys on and what
+  `/skills` marks `[built-in]`.
+- Layering is `load_layered`: built-ins first, then `~/.plank/skills`, then
+  `./.plank/skills`, each layer replacing the last by name. A project
+  `code-review/` therefore *replaces* the built-in rather than colliding with
+  it — the built-ins are defaults, not reserved words.
+- `load_from` is deliberately disk-only. `plugins::gather` loads each plugin's
+  `skills/` directory through it, and seeding built-ins there would re-attribute
+  plank's own skills to every plugin as `<plugin>:code-review`.
+- The model reaches skills through the `skill` tool (enumerate with no name,
+  expand by name), bounded per turn by `SKILL_DEPTH_CAP` so a skill whose text
+  invokes another cannot loop.
+
 ### Plugins (`plugins.rs`, `claudeplugin.rs`)
 - `plugins.rs` — what a plugin *is* once it is on disk: a directory bundling
   skills, agents, templates, hooks, an `.mcp.json` and a `settings.json`,

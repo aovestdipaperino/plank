@@ -1095,7 +1095,10 @@ pub fn skills_in(
         roots.push(home.join(".plank").join("skills"));
     }
     roots.push(cwd.join(".plank").join("skills"));
-    let local = crate::skills::load_from(&roots);
+    // The built-ins sit under the user and project directories (`load_layered`),
+    // never under a plugin's: `gather` loads each plugin root through the plain
+    // disk loader so plank's own skills are not re-attributed to a plugin.
+    let local = crate::skills::load_layered(&roots);
     let plugin = gather(set, "skills", "skills", crate::skills::load_from);
     reconcile("skills", local, plugin, false)
 }
@@ -2224,8 +2227,11 @@ mod tests {
         );
         let set = load_in(Some(&home), &cwd, &[plugin]);
         let (skills, _, _) = skills_in(Some(&home), &cwd, &set);
-        // Plugin skills are namespaced only: one entry, the alias.
-        assert_eq!(skills.len(), 1, "only the alias: {skills:?}");
+        // Plugin skills are namespaced only: one non-built-in entry, the alias.
+        let contributed: Vec<&crate::skills::Skill> =
+            skills.iter().filter(|s| !s.is_builtin()).collect();
+        assert_eq!(contributed.len(), 1, "only the alias: {contributed:?}");
+        assert_eq!(contributed[0].name, "demo:greet");
         for out in [
             crate::skills::render_list(&skills),
             crate::skills::render_names(&skills),
