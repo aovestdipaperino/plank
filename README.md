@@ -442,6 +442,43 @@ Each module in `src/` maps to one functional section of the original `ds4_agent.
 - `arcade.rs`, `arcade/` — the easter-egg games, the matrix rain, the starfield and the minions (see above)
 - `config.rs`, `settings.rs`, `trace.rs`, `interrupt.rs`, `status.rs` — configuration, persistent settings, tracing, signal handling
 
+## Known warnings
+
+`cargo update` reports one dependency as behind the latest release, and it
+stays that way on purpose:
+
+```
+generic-array v0.14.7 (available: v0.14.9)
+```
+
+It is not ours to move. `crypto-common 0.1` requires `generic-array` at
+exactly `=0.14.7`, and that pin is deliberate: `generic-array` types appear
+in `crypto-common`'s public API, so the exact version is part of the contract
+between every crate compiled against it. In this tree that means `digest`,
+`cipher`, `aead` and `universal-hash`, and under those `aes`, `aes-gcm`,
+`cbc`, `ctr`, `ecb`, `hmac`, `sha1`, `md-5`, `pbkdf2` and `polyval` — the
+whole RustCrypto 0.10-era stack.
+
+So there is no local fix worth having. Patching it would mean forking the
+trait crate that all of those compile against and carrying that fork
+indefinitely, to gain a patch release. What actually resolves it is those
+crates reaching `digest 0.11`, which drops the 0.10 stack out of the graph;
+plank's own `sha2` and `blake2` are already on `0.11`.
+
+Two neighbouring pins are worth knowing about for the same reason, though
+neither produces a warning any more:
+
+- **`liteparse` is held at `=2.14`** rather than tracking its latest. The
+  crate shipped 27 releases in three months, and the fixtures in
+  `src/doc/mod.rs` are coupled to its markdown emitter. Bump it deliberately
+  and re-run `cargo test --lib doc::` before trusting the result.
+- **SQL code fences are not syntax-highlighted.** The grammar for them,
+  `tree-sitter-sequel`, requires `cc = "~1.2.1"`, and because cargo unifies
+  `cc` across the whole graph that one optional grammar held every build
+  script in the tree to `cc` 1.2.x. Plank lists ratatui-markdown's grammar
+  features explicitly, minus `highlight-lang-sql`, so the crate leaves the
+  graph entirely. Restore the feature if that pin is ever relaxed upstream.
+
 ## Star History
 
 <!-- Chart is rendered in CI by .github/workflows/star-history.yml (the hosted
