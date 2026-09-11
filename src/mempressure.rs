@@ -168,6 +168,148 @@ impl Hysteresis {
     }
 }
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+impl PressureLevel {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::Warn => 1,
+            Self::Critical => 2,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Warn,
+            2 => Self::Critical,
+            _ => Self::Normal,
+        }
+    }
+}
+
+/// Publishes the kernel's current memory-pressure level.
+///
+/// On macOS a `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` source writes the atomic
+/// from its own queue; everywhere else the atomic simply stays at `Normal`, so
+/// every consumer compiles and behaves as though the machine were never under
+/// pressure.
+#[derive(Debug, Clone)]
+pub struct PressureSensor {
+    level: Arc<AtomicU8>,
+}
+
+impl PressureSensor {
+    /// Starts the sensor. Safe to call more than once; each call installs its
+    /// own source, and plank installs exactly one at startup.
+    #[must_use]
+    pub fn start() -> Self {
+        let level = Arc::new(AtomicU8::new(PressureLevel::Normal.as_u8()));
+        #[cfg(target_os = "macos")]
+        macos::install(&level);
+        Self { level }
+    }
+
+    /// The most recent level the kernel reported.
+    #[must_use]
+    pub fn level(&self) -> PressureLevel {
+        PressureLevel::from_u8(self.level.load(Ordering::SeqCst))
+    }
+
+    /// Drives the level directly, for tests and for `--force-pressure`-style
+    /// manual exercise. Never called by the dispatch source.
+    pub fn set_for_test(&self, level: PressureLevel) {
+        self.level.store(level.as_u8(), Ordering::SeqCst);
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::{Arc, AtomicU8, Ordering, PressureLevel};
+    use std::ffi::c_void;
+
+    // libdispatch is part of libSystem, which every Rust binary already links
+    // on macOS, so these need no build.rs change.
+    const DISPATCH_MEMORYPRESSURE_NORMAL: usize = 0x01;
+    const DISPATCH_MEMORYPRESSURE_WARN: usize = 0x02;
+    const DISPATCH_MEMORYPRESSURE_CRITICAL: usize = 0x04;
+
+    unsafe extern "C" {
+        #[link_name = "_dispatch_source_type_memorypressure"]
+        static SOURCE_TYPE_MEMORYPRESSURE: c_void;
+
+        fn dispatch_source_create(
+            ty: *const c_void,
+            handle: usize,
+            mask: usize,
+            queue: *mut c_void,
+        ) -> *mut c_void;
+        fn dispatch_source_set_event_handler_f(
+            source: *mut c_void,
+            handler: Option<unsafe extern "C" fn(*mut c_void)>,
+        );
+        fn dispatch_set_context(object: *mut c_void, context: *mut c_void);
+        fn dispatch_source_get_data(source: *mut c_void) -> usize;
+        fn dispatch_resume(object: *mut c_void);
+        fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut c_void;
+    }
+
+    /// Leaked on purpose: the source lives for the process, and the handler
+    /// dereferences this pointer from libdispatch's queue at arbitrary times.
+    /// A drop would be a use-after-free with no upside — plank has exactly one
+    /// sensor and it is meant to outlive every turn.
+    struct Ctx {
+        level: Arc<AtomicU8>,
+        source: *mut c_void,
+    }
+
+    unsafe extern "C" fn on_event(ud: *mut c_void) {
+        // SAFETY: ud is the leaked Ctx we installed with dispatch_set_context.
+        let ctx = unsafe { &*ud.cast::<Ctx>() };
+        // SAFETY: source is the live dispatch source that invoked us.
+        let data = unsafe { dispatch_source_get_data(ctx.source) };
+        let level = if data & DISPATCH_MEMORYPRESSURE_CRITICAL != 0 {
+            PressureLevel::Critical
+        } else if data & DISPATCH_MEMORYPRESSURE_WARN != 0 {
+            PressureLevel::Warn
+        } else {
+            PressureLevel::Normal
+        };
+        ctx.level.store(level.as_u8(), Ordering::SeqCst);
+    }
+
+    pub(super) fn install(level: &Arc<AtomicU8>) {
+        let mask = DISPATCH_MEMORYPRESSURE_NORMAL
+            | DISPATCH_MEMORYPRESSURE_WARN
+            | DISPATCH_MEMORYPRESSURE_CRITICAL;
+        // SAFETY: all four calls are the documented libdispatch construction
+        // sequence; the queue is a global queue that always exists, and the
+        // context outlives the source because it is leaked.
+        unsafe {
+            let queue = dispatch_get_global_queue(0, 0);
+            let source = dispatch_source_create(
+                std::ptr::addr_of!(SOURCE_TYPE_MEMORYPRESSURE),
+                0,
+                mask,
+                queue,
+            );
+            if source.is_null() {
+                // No sensor means plank never yields, which is the old
+                // behaviour. Not worth failing startup over.
+                return;
+            }
+            let ctx = Box::into_raw(Box::new(Ctx {
+                level: Arc::clone(level),
+                source,
+            }));
+            dispatch_set_context(source, ctx.cast::<c_void>());
+            dispatch_source_set_event_handler_f(source, Some(on_event));
+            dispatch_resume(source);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +455,28 @@ mod tests {
             Decision::Hold,
             "one sample proves time passed, not that the machine was quiet"
         );
+    }
+
+    #[test]
+    fn a_fresh_sensor_reports_normal() {
+        let s = PressureSensor::start();
+        assert_eq!(
+            s.level(),
+            PressureLevel::Normal,
+            "no reading yet must never look like pressure"
+        );
+    }
+
+    #[test]
+    fn the_sensor_round_trips_every_level() {
+        let s = PressureSensor::start();
+        for level in [
+            PressureLevel::Warn,
+            PressureLevel::Critical,
+            PressureLevel::Normal,
+        ] {
+            s.set_for_test(level);
+            assert_eq!(s.level(), level);
+        }
     }
 }
