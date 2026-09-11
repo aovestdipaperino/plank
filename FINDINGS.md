@@ -2553,3 +2553,28 @@ one moment the machine has no memory to spare — the opposite of what the yield
 was for. Micro-compaction is therefore suppressed for the duration of a yield
 rather than allowed to race the resume; the rewrite it wanted to do is still
 waiting when the session comes back.
+
+## A livelock guard inside the state machine does not protect the path that bypasses it
+
+`MIN_YIELD_INTERVAL_SECS` was enforced in exactly one place: `Hysteresis::observe`.
+But the mid-pass yield never calls `observe` — it goes `pressure_tick` (inside the
+generation's interrupt hook) → `finish_pressure_stop` → `do_pressure_yield` →
+`note_external_yield`, which *sets* `last_yield` and never *reads* it. The guard
+looked fully wired up while covering only the turn-boundary half of the paths
+that can yield.
+
+What made the gap expensive rather than merely untidy is that `warm_sync` is
+uncancellable by pressure: it passes `interrupt: &|| false` and calls
+`cancel_clear()` on entry, so the whole multi-gigabyte re-prefill is paid, the
+memory is re-wired, and only then can the first sampled token see the cancel.
+Under sustained `Critical` that is one full rebuild-and-free per turn, forever —
+precisely the loop the constant exists to forbid.
+
+The fix is a query on the state machine (`Hysteresis::yield_allowed_at`) that both
+paths consult, with the arithmetic staying in `mempressure.rs`; the mid-pass path
+samples it *before* the pass, so a suppressed yield costs no truncated generation.
+The general lesson: a guard that lives inside a state machine protects only the
+callers that go through it. Any out-of-band path that reports its outcome back to
+the machine (`note_external_yield`, and the `note_yield_declined` rollback above)
+has to ask the machine for permission on the way in, not just tell it on the way
+out.

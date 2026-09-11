@@ -94,6 +94,34 @@ impl Hysteresis {
         self.yielded
     }
 
+    /// Whether [`MIN_YIELD_INTERVAL_SECS`] has elapsed since the last yield.
+    ///
+    /// The livelock guard has exactly one home, and this is it. [`Self::observe`]
+    /// applies it to a turn-boundary yield; the mid-pass yield path never
+    /// reaches `observe`, so it asks here instead. Without that the guard
+    /// protects only half the paths that can yield, and sustained `Critical`
+    /// makes every turn pay a full re-prefill that is cancelled at its first
+    /// token — `warm_sync` is uncancellable by pressure, so the whole rebuild
+    /// is paid before the cancel can be seen.
+    #[must_use]
+    pub fn yield_allowed_at(&self, now_secs: u64) -> bool {
+        self.last_yield
+            .is_none_or(|last| now_secs.saturating_sub(last) >= MIN_YIELD_INTERVAL_SECS)
+    }
+
+    /// Records that the session has been rebuilt, ending the yielded state.
+    ///
+    /// The yielded state ends when the KV is live again, not when `Normal` has
+    /// dwelled: the first `generate` after a yield re-acquires the session, so
+    /// anything still claiming "yielded" past that point is lying to the footer
+    /// and suppressing the next episode's yield. `last_yield` is deliberately
+    /// kept — the guard window measures yields, not resumes.
+    pub fn note_resumed(&mut self) {
+        self.yielded = false;
+        self.normal_since = None;
+        self.critical_since = None;
+    }
+
     /// Records a yield that happened outside [`Self::observe`].
     ///
     /// A mid-generation yield is raised by the cancel callback during the
@@ -179,9 +207,7 @@ impl Hysteresis {
         if now_secs.saturating_sub(since) < YIELD_DWELL_SECS {
             return Decision::Hold;
         }
-        if let Some(last) = self.last_yield
-            && now_secs.saturating_sub(last) < MIN_YIELD_INTERVAL_SECS
-        {
+        if !self.yield_allowed_at(now_secs) {
             return Decision::Hold;
         }
         self.yielded = true;
@@ -204,11 +230,17 @@ impl PressureLevel {
         }
     }
 
+    /// Inverse of [`Self::as_u8`], which is the only thing that ever writes the
+    /// atomic. The catch-all is `unreachable!` rather than a default so that a
+    /// fourth variant is caught loudly here instead of degrading silently into
+    /// "no pressure" — the one direction of this mapping that is unsafe to get
+    /// wrong.
     fn from_u8(v: u8) -> Self {
         match v {
+            0 => Self::Normal,
             1 => Self::Warn,
             2 => Self::Critical,
-            _ => Self::Normal,
+            other => unreachable!("PressureLevel::from_u8 fed a byte no as_u8 emits: {other}"),
         }
     }
 }
@@ -243,6 +275,7 @@ impl PressureSensor {
 
     /// Drives the level directly, for tests and for `--force-pressure`-style
     /// manual exercise. Never called by the dispatch source.
+    #[doc(hidden)]
     pub fn set_for_test(&self, level: PressureLevel) {
         self.level.store(level.as_u8(), Ordering::SeqCst);
     }
@@ -283,6 +316,25 @@ mod macos {
     /// dereferences this pointer from libdispatch's queue at arbitrary times.
     /// A drop would be a use-after-free with no upside — plank has exactly one
     /// sensor and it is meant to outlive every turn.
+    ///
+    /// SAFETY: `Ctx` holds a raw `*mut c_void` and is handed to libdispatch,
+    /// which dereferences it from its own queue — a cross-thread transfer of a
+    /// raw pointer, and the one unsound-if-wrong thing in this module. It is
+    /// sound because of the construction order in [`install`], which is the
+    /// order libdispatch documents:
+    ///   1. `dispatch_source_create` returns the source *suspended*: no handler
+    ///      can run yet, so nothing can observe a half-built `Ctx`.
+    ///   2. The `Ctx` is fully initialised (both fields, including the source
+    ///      pointer it will later read) *before* `dispatch_set_context`, so the
+    ///      store that publishes it happens-after the initialisation.
+    ///   3. The handler is installed only after the context, so the first call
+    ///      that can possibly read `ctx` already sees the published pointer.
+    ///   4. `dispatch_resume` is last: the source only starts firing once all of
+    ///      the above is in place.
+    ///   5. The `Ctx` is leaked and never mutated afterwards — the only interior
+    ///      state is the `AtomicU8` behind the `Arc` — so the handler can hold a
+    ///      shared reference from any thread for the life of the process with no
+    ///      aliasing, no drop, and no data race.
     struct Ctx {
         level: Arc<AtomicU8>,
         source: *mut c_void,
@@ -320,7 +372,12 @@ mod macos {
             );
             if source.is_null() {
                 // No sensor means plank never yields, which is the old
-                // behaviour. Not worth failing startup over.
+                // behaviour. Not worth failing startup over — but say so, or an
+                // absent sensor is indistinguishable from a permanently quiet
+                // machine for the rest of the run.
+                crate::engine::kv_debug(|| {
+                    "mempressure: dispatch_source_create returned null; memory-pressure yielding is disabled for this run".to_owned()
+                });
                 return;
             }
             let ctx = Box::into_raw(Box::new(Ctx {

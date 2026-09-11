@@ -1256,6 +1256,24 @@ Micro-compaction is suppressed while yielded for the same reason the yield skips
 `get_kv`: `restore_rung_below` → `set_kv` → `ensure_session` would re-acquire the
 session the yield just freed.
 
+**The yielded state ends when the session is rebuilt, not when the pressure
+clears.** The restore plan is retired — and its disclosure printed — at the turn
+boundary that is about to re-enter the engine, so the "re-prefilling N tokens"
+line precedes the wait it describes instead of arriving thirty seconds of quiet
+later, when nothing is pending. Everything that keys off "yielded" (the footer
+marker, the micro-compaction and end-of-turn-flush suppressions, and the
+hysteresis' "already yielded, nothing left to free") therefore stops the moment
+the KV is live again. What prevents that from becoming a yield-per-turn loop is
+the minimum-interval guard, which `Hysteresis` now answers for *both* the
+turn-boundary and the mid-pass paths.
+
+**Exiting while yielded loses the GC keep protection until the next launch.**
+The plan's `keep` set lives in memory, so a plank that exits mid-yield leaves
+the blobs it named unpinned: a sweep at the next launch judges them on age and
+budget like any other cold file, and one may be gone before the session is
+reloaded. Benign — the blobs are on disk and a missing one only deepens the
+re-prefill — but it means a yield is not a durable reservation.
+
 ### Garbage collection
 
 Checkpoints run to hundreds of megabytes, and a plank upgrade, an MCP server

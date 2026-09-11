@@ -110,11 +110,16 @@ impl CancelReason {
         }
     }
 
+    /// Inverse of [`Self::as_u8`], the only thing that ever writes the flag.
+    /// Explicitly exhaustive with a loud catch-all: a fourth variant that
+    /// forgot this arm must be an obvious panic, never a silent "nobody asked
+    /// to stop" that turns a cancel into a truncated answer.
     fn from_u8(v: u8) -> Self {
         match v {
+            0 => Self::None,
             1 => Self::Pressure,
             2 => Self::User,
-            _ => Self::None,
+            other => unreachable!("CancelReason::from_u8 fed a byte no as_u8 emits: {other}"),
         }
     }
 }

@@ -1005,15 +1005,56 @@ fn pressure_disclosure(plan: &crate::yieldpolicy::RestorePlan) -> String {
 fn should_raise_pressure_cancel(
     level: crate::mempressure::PressureLevel,
     user_stopped: bool,
+    gate: PressureGate,
 ) -> bool {
-    level == crate::mempressure::PressureLevel::Critical && !user_stopped
+    level == crate::mempressure::PressureLevel::Critical && !user_stopped && gate.armed()
+}
+
+/// Everything that decides whether a mid-pass yield could actually happen,
+/// sampled once before the pass rather than per token.
+///
+/// The cancel must never be raised where the yield would then be suppressed: a
+/// raise truncates the generation at a token boundary, and if the yield is then
+/// refused nothing is freed and nothing is disclosed — a sidechain would hand a
+/// silently truncated answer back to its parent. The livelock guard belongs
+/// here for the same reason: `Hysteresis::observe` enforces it for a
+/// turn-boundary yield, but the mid-pass path never reaches `observe`, and
+/// under sustained `Critical` an unguarded raise makes every turn pay a full
+/// re-prefill (uncancellable — `warm_sync` clears the flag on entry) only to
+/// throw it away at the first token.
+///
+/// Sampling once is sound: none of the three can change during a single pass.
+#[derive(Debug, Clone, Copy)]
+struct PressureGate {
+    /// [`crate::mempressure::MIN_YIELD_INTERVAL_SECS`] has elapsed since the
+    /// last yield.
+    yield_allowed: bool,
+    first_turn_done: bool,
+    in_sidechain: bool,
+}
+
+impl PressureGate {
+    /// True when a yield raised now could actually be carried out.
+    fn armed(self) -> bool {
+        self.yield_allowed
+            && should_act(
+                crate::mempressure::Decision::Yield,
+                self.first_turn_done,
+                self.in_sidechain,
+            )
+    }
 }
 
 /// Polled from a generation's interrupt hook: raises a pressure cancel when the
-/// system is critical and the user has not already asked to stop, then passes
-/// `stopping` through so a front end's own stop conditions stay one expression.
-fn pressure_tick(sensor: &crate::mempressure::PressureSensor, stopping: bool) -> bool {
-    if should_raise_pressure_cancel(sensor.level(), crate::interrupt::pending()) {
+/// system is critical, the user has not already asked to stop, and the gate says
+/// the resulting yield would actually happen; then passes `stopping` through so
+/// a front end's own stop conditions stay one expression.
+fn pressure_tick(
+    sensor: &crate::mempressure::PressureSensor,
+    gate: PressureGate,
+    stopping: bool,
+) -> bool {
+    if should_raise_pressure_cancel(sensor.level(), crate::interrupt::pending(), gate) {
         crate::ds4engine::request_pressure_cancel();
     }
     stopping
@@ -3080,12 +3121,14 @@ impl Agent<'_> {
         // The plain REPL has no `LiveStatus`, so it samples `/toks` itself.
         let mut toks = crate::toks::Sampler::default();
         let pressure = self.sensor.clone();
+        let gate = self.pressure_gate();
         let result = self.engine.generate(
             prompt,
             &pass_opts,
             &|| {
                 pressure_tick(
                     &pressure,
+                    gate,
                     preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
                 )
             },
@@ -4277,9 +4320,13 @@ impl Agent<'_> {
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
         // Turn boundary: the same place background job notifications join the
-        // transcript. A yield here frees the KV before the turn re-enters the
-        // engine; a resume only retires the pinned plan and says what the
-        // rebuild will cost.
+        // transcript. The resume disclosure comes first — this turn is about to
+        // re-enter the engine, so the re-prefill it names is the one the user is
+        // about to wait through. Only then is fresh pressure observed, which may
+        // free the KV again before the turn starts.
+        if let Some(line) = self.announce_pressure_resume() {
+            println!("{}", status::system_line(&line, self.color));
+        }
         if let Some(line) = self.poll_pressure() {
             println!("{}", status::system_line(&line, self.color));
         }
@@ -5355,6 +5402,7 @@ impl Agent<'_> {
         let progress = status::CompactProgress::begin();
         let mut summary = String::new();
         let pressure = self.sensor.clone();
+        let gate = self.pressure_gate();
         let stats = self
             .engine
             .generate(
@@ -5363,7 +5411,7 @@ impl Agent<'_> {
                 // A pressure stop during compaction abandons the pass down the
                 // existing interrupted path: a half-written summary is worse
                 // than none, and the yield is taken at the next turn boundary.
-                &|| pressure_tick(&pressure, crate::interrupt::pending()),
+                &|| pressure_tick(&pressure, gate, crate::interrupt::pending()),
                 &|| false,
                 &mut |ev| match ev {
                     EngineEvent::Text(t) => {
@@ -6882,6 +6930,21 @@ the original is frozen and listed in /tree"
             let _ = self.store.remove_rungs(&self.session.id);
         }
         self.ladder = crate::kvladder::KvLadder::new();
+        // A pinned restore plan describes *this* chain: its `keep` stems and
+        // its re-prefill depth. Every transcript identity change — `/new`,
+        // `/clear`, `/switch`, `/resume`, rollback, fork, a full compaction —
+        // comes through here, and carrying the plan across one would disclose a
+        // wrong number and keep the footer and the micro-compaction suppression
+        // pinned to an unrelated session.
+        self.clear_pressure_plan();
+    }
+
+    /// Retires a pinned restore plan without disclosing anything, because the
+    /// transcript it described is gone.
+    fn clear_pressure_plan(&mut self) {
+        if self.yield_policy.clear_plan().is_some() {
+            self.hysteresis.note_resumed();
+        }
     }
 
     /// Forgets every rung deeper than `spans` and deletes its blobs, after the
@@ -7399,6 +7462,36 @@ the original is frozen and listed in /tree"
         self.pressure_stop = crate::ds4engine::cancelled_by_pressure();
     }
 
+    /// Samples the mid-pass yield gate for the pass about to run.
+    ///
+    /// See [`PressureGate`]: the cancel must not be raised where the yield
+    /// would be suppressed or refused by the livelock guard.
+    fn pressure_gate(&self) -> PressureGate {
+        PressureGate {
+            yield_allowed: self.hysteresis.yield_allowed_at(Self::pressure_now()),
+            first_turn_done: self.first_turn_done,
+            in_sidechain: self.in_sidechain(),
+        }
+    }
+
+    /// Ends the yielded state because this turn is about to re-enter the engine.
+    ///
+    /// The yielded state ends when the session is *rebuilt*, not when `Normal`
+    /// has dwelled for thirty seconds. Called at the turn boundary, before any
+    /// generate (compaction included) can start a re-prefill, so the disclosure
+    /// reaches the user *before* the wait it describes rather than after it —
+    /// and so nothing keeps claiming "yielded" while plank is generating: the
+    /// footer marker, the micro-compaction and end-of-turn-flush suppressions,
+    /// and `observe`'s "already yielded, nothing left to free" all key off state
+    /// this retires. The livelock guard is what stops the next `Critical`
+    /// yielding again immediately; `note_resumed` leaves it untouched.
+    fn announce_pressure_resume(&mut self) -> Option<String> {
+        let plan = self.yield_policy.clear_plan()?;
+        self.hysteresis.note_resumed();
+        let line = pressure_disclosure(&plan);
+        (!line.is_empty()).then_some(line)
+    }
+
     /// Seconds since the epoch, for the hysteresis clock.
     fn pressure_now() -> u64 {
         std::time::SystemTime::now()
@@ -7470,14 +7563,17 @@ the original is frozen and listed in /tree"
                     None
                 }
             }
-            // There is no explicit resume: retiring the plan is the whole
-            // action. The next `generate` finds a null session and rebuilds
-            // through `kvtier::warm` exactly as on a cold start.
-            Decision::Resume => self
-                .yield_policy
-                .clear_plan()
-                .map(|plan| pressure_disclosure(&plan))
-                .filter(|line| !line.is_empty()),
+            // Almost a no-op. The disclosure and the retirement belong to
+            // `announce_pressure_resume`, at the moment the session is actually
+            // rebuilt; a plan still pinned here means no generate has happened
+            // since the yield, so it is retired quietly. Saying "re-prefilling
+            // N tokens" here would announce a cost nobody is about to pay, and
+            // leave the real one — on whichever turn the user submits next —
+            // silent.
+            Decision::Resume => {
+                let _ = self.yield_policy.clear_plan();
+                None
+            }
             Decision::Hold => None,
         }
     }
@@ -7501,11 +7597,11 @@ the original is frozen and listed in /tree"
             return None;
         }
         let mut line = None;
-        if should_act(
-            crate::mempressure::Decision::Yield,
-            self.first_turn_done,
-            self.in_sidechain(),
-        ) {
+        // The same gate the cancel was raised behind, re-checked here because
+        // the raise was decided before the pass and the guard window may have
+        // opened or closed since. The arithmetic lives in `Hysteresis`, never
+        // here.
+        if self.pressure_gate().armed() {
             if self.do_pressure_yield() {
                 line = Some(PRESSURE_YIELDED.to_owned());
                 // The state machine did not make this decision, so tell it — or
@@ -13030,7 +13126,11 @@ impl Agent<'_> {
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
         self.tool_ctx.tasks.clone_from(&self.session.tasks);
-        // Mirror of the plain path's turn-boundary poll (`run_turn`).
+        // Mirror of the plain path's turn-boundary poll (`run_turn`), including
+        // the resume disclosure that must precede the re-prefill it describes.
+        if let Some(line) = self.announce_pressure_resume() {
+            let _ = tx.send(UiEvent::Dim(line));
+        }
         if let Some(line) = self.poll_pressure() {
             let _ = tx.send(UiEvent::Dim(line));
         }
@@ -13768,9 +13868,11 @@ impl Agent<'_> {
         // guards that matter (first turn, sidechain) are checked once after the
         // pass rather than per token.
         let pressure = self.sensor.clone();
+        let gate = self.pressure_gate();
         let interrupt = || {
             pressure_tick(
                 &pressure,
+                gate,
                 shared.interrupt.load(Ordering::Relaxed)
                     || (is_main && shared.preempt.load(Ordering::Relaxed))
                     || preflight_stop.load(Ordering::Relaxed)
@@ -14034,7 +14136,8 @@ impl Agent<'_> {
         let mut summary = String::new();
         // Mirror of the plain path's compaction guard (`compact`).
         let pressure = self.sensor.clone();
-        let interrupt = &|| pressure_tick(&pressure, interrupt());
+        let gate = self.pressure_gate();
+        let interrupt = &|| pressure_tick(&pressure, gate, interrupt());
         let stats = self
             .engine
             .generate(
@@ -17569,13 +17672,21 @@ mod tests {
     #[test]
     fn a_pressure_stop_is_not_a_user_abort() {
         use crate::mempressure::PressureLevel;
-        assert!(should_raise_pressure_cancel(PressureLevel::Critical, false));
+        assert!(should_raise_pressure_cancel(
+            PressureLevel::Critical,
+            false,
+            open_gate()
+        ));
         assert!(
-            !should_raise_pressure_cancel(PressureLevel::Critical, true),
+            !should_raise_pressure_cancel(PressureLevel::Critical, true, open_gate()),
             "once the user has asked to stop, pressure must not make the turn \
              resumable again"
         );
-        assert!(!should_raise_pressure_cancel(PressureLevel::Warn, false));
+        assert!(!should_raise_pressure_cancel(
+            PressureLevel::Warn,
+            false,
+            open_gate()
+        ));
         // And the engine agrees at its own level: the reason a pressure stop
         // records is not the reason a user stop records.
         crate::ds4engine::clear_cancel();
@@ -17583,6 +17694,76 @@ mod tests {
         assert!(crate::ds4engine::cancelled_by_pressure());
         crate::ds4engine::clear_cancel();
         assert!(!crate::ds4engine::cancelled_by_pressure());
+    }
+
+    /// A gate with nothing suppressing the yield: past the guard window, past
+    /// the first turn, not in a sidechain.
+    fn open_gate() -> PressureGate {
+        PressureGate {
+            yield_allowed: true,
+            first_turn_done: true,
+            in_sidechain: false,
+        }
+    }
+
+    #[test]
+    fn the_livelock_guard_covers_the_mid_pass_path() {
+        use crate::mempressure::PressureLevel;
+        // F1: `MIN_YIELD_INTERVAL_SECS` used to be enforced only inside
+        // `Hysteresis::observe`, which the mid-pass path never calls. A second
+        // yield inside the guard window must be refused *before* the cancel is
+        // raised — a raise there truncates a generation and buys a re-prefill
+        // that `warm_sync` will not even let pressure cancel.
+        let mut h = crate::mempressure::Hysteresis::new();
+        assert_eq!(
+            h.observe(PressureLevel::Critical, 0),
+            crate::mempressure::Decision::Yield
+        );
+        // The session is rebuilt at the next generate, so the machine is no
+        // longer yielded — exactly the F3/F4 state where only the guard stands
+        // between plank and a yield-per-turn loop.
+        h.note_resumed();
+        let inside = PressureGate {
+            yield_allowed: h.yield_allowed_at(1),
+            ..open_gate()
+        };
+        assert!(
+            !should_raise_pressure_cancel(PressureLevel::Critical, false, inside),
+            "a second mid-pass yield inside the guard window would re-prefill \
+             gigabytes once per turn, forever"
+        );
+        let outside = PressureGate {
+            yield_allowed: h.yield_allowed_at(1 + crate::mempressure::MIN_YIELD_INTERVAL_SECS),
+            ..open_gate()
+        };
+        assert!(
+            should_raise_pressure_cancel(PressureLevel::Critical, false, outside),
+            "past the window, sustained pressure is actionable again"
+        );
+    }
+
+    #[test]
+    fn a_sidechain_under_critical_is_not_cancelled() {
+        use crate::mempressure::PressureLevel;
+        // F2: `should_act` suppresses a sidechain's yield, so raising the
+        // cancel there truncates the sub-agent's answer, frees nothing and
+        // discloses nothing — the parent gets a silently short answer.
+        let sidechain = PressureGate {
+            in_sidechain: true,
+            ..open_gate()
+        };
+        assert!(
+            !should_raise_pressure_cancel(PressureLevel::Critical, false, sidechain),
+            "a sidechain's yield is suppressed, so its cancel must never be raised"
+        );
+        let first_turn = PressureGate {
+            first_turn_done: false,
+            ..open_gate()
+        };
+        assert!(
+            !should_raise_pressure_cancel(PressureLevel::Critical, false, first_turn),
+            "the first turn's yield is suppressed for the same reason"
+        );
     }
 
     #[test]
@@ -19663,6 +19844,76 @@ mod tests {
     /// synthetic context pressure is high. The measured trade (~1.2 bytes per
     /// token) is below the strict floor, so before the pressure term this pass
     /// was refused at every pressure and the restore never ran.
+    #[test]
+    fn the_plan_does_not_survive_the_session_being_rebuilt() {
+        // F3/F4: the yielded state used to end at `Decision::Resume`, thirty
+        // seconds into a sustained Normal — long after the first post-yield
+        // generate had already re-acquired the session, and possibly long
+        // before it, so the user paid a silent multi-gigabyte re-prefill and
+        // read about it later.
+        let dir = scratch_dir("pressure-rebuild-retires-plan");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.first_turn_done = true;
+        agent.session.push(Message::user("do a thing"));
+
+        assert!(agent.do_pressure_yield(), "the scripted engine releases");
+        agent.hysteresis.note_external_yield(Agent::pressure_now());
+        assert!(
+            agent.is_pressure_yielded(),
+            "precondition: a plan is pinned"
+        );
+
+        // The turn boundary: this is where the session is about to be rebuilt.
+        let line = agent.announce_pressure_resume();
+        assert!(
+            line.is_some_and(|l| l.contains("re-prefilling")),
+            "the disclosure must reach the user before the wait it describes"
+        );
+        assert!(
+            !agent.is_pressure_yielded(),
+            "no state may claim 'yielded' once the session is live again"
+        );
+        assert!(
+            !agent.hysteresis.is_yielded(),
+            "the hysteresis must be able to act on the next episode"
+        );
+        assert!(
+            agent.announce_pressure_resume().is_none(),
+            "the plan is retired exactly once"
+        );
+
+        // ...and F1 is what stops the next Critical yielding straight back:
+        // un-yielding at the rebuild is only safe behind the guard window.
+        assert!(
+            !agent.pressure_gate().armed(),
+            "a fresh yield inside the guard window would be the livelock"
+        );
+    }
+
+    #[test]
+    fn a_new_session_does_not_inherit_a_restore_plan() {
+        // F5: `plan.keep` names the old chain's tier stems and
+        // `reprefill_tokens` the old depth; carried across a `/new` or a
+        // `/switch` it would disclose a wrong number and keep micro-compaction
+        // and the footer marker suppressed on an unrelated session.
+        let dir = scratch_dir("pressure-plan-not-inherited");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.first_turn_done = true;
+        agent.session.push(Message::user("do a thing"));
+        assert!(agent.do_pressure_yield());
+        agent.hysteresis.note_external_yield(Agent::pressure_now());
+
+        // Every transcript-identity change funnels through here.
+        agent.discard_ladder();
+        assert!(
+            !agent.is_pressure_yielded(),
+            "a plan from a transcript that no longer exists must not stand"
+        );
+        assert!(!agent.hysteresis.is_yielded());
+    }
+
     #[test]
     fn under_pressure_the_opportunistic_pass_fires_and_restores_a_rung() {
         let dir = scratch_dir("ladder-pressure-e2e");
