@@ -744,9 +744,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.67"
+version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17dd265a7d0f31ef544e1b20e03add05d3b45b491b633b10d67145d2acc1a38"
+checksum = "005ec2760ca554fae18df7a11195552ec576cd665632a881bc011d5bb2fd4d80"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1917,9 +1917,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.9"
+version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "finl_unicode"
@@ -3098,9 +3098,9 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "liteparse"
-version = "2.10.0"
+version = "2.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "addb72ac8ba8cdd51523221c1b535134d360a3875f20264ff18d3dfed529f8f9"
+checksum = "a22077c07e0e879f34da79b132b6eada4722bd8e6c3ab6d6ddf5a628399d5641"
 dependencies = [
  "blake3",
  "clap",
@@ -3110,6 +3110,7 @@ dependencies = [
  "liteparse-pdfium",
  "liteparse-pdfium-sys",
  "lopdf",
+ "memchr",
  "ordered-float 5.3.0",
  "reqwest 0.13.4",
  "resvg",
@@ -3127,18 +3128,18 @@ dependencies = [
 
 [[package]]
 name = "liteparse-pdfium"
-version = "1.4.0"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f5c690b3b2af849ef52df096470be8b590887a0438429ca429ff3aab4e4283"
+checksum = "ad60e933a6b3d6877132686731f600d6dc3b0e0f02d9d5e70d7a96b7e8f5bcd0"
 dependencies = [
  "liteparse-pdfium-sys",
 ]
 
 [[package]]
 name = "liteparse-pdfium-sys"
-version = "1.4.0"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79fbf6e983483b9bf66055b0b6c61604c62366ffb1ce850abfad63e7a746644a"
+checksum = "4f32076a5a00c5cfa6923e9597f74f54f3eba41ecec062eb2d0bb62ee578ab75"
 dependencies = [
  "flate2",
  "libloading",
@@ -4713,7 +4714,6 @@ dependencies = [
  "tree-sitter-ruby",
  "tree-sitter-rust",
  "tree-sitter-scala",
- "tree-sitter-sequel",
  "tree-sitter-solidity",
  "tree-sitter-swift",
  "tree-sitter-toml-ng",
@@ -6774,16 +6774,6 @@ name = "tree-sitter-scala"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de5a4a7ff23a55474ce6a741d52aaeca7a82fe9421bb982b86e98c6ac8629397"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-sequel"
-version = "0.3.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d198ad3c319c02e43c21efa1ec796b837afcb96ffaef1a40c1978fbdcec7d17"
 dependencies = [
  "cc",
  "tree-sitter-language",
