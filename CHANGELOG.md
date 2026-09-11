@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A guard-stopped pass no longer re-prefills its whole prefix to append
+  `</think>`.** When the UI closes a `<think>` the model left open before a
+  tool continuation, the recorded ids are meant to be kept and the close
+  spliced in ahead of the EOS. The code that recognized that shape read the
+  span the truncation had already dropped, so it never matched and the
+  reconcile fell back to re-tokenizing from text — rebuilding the KV from that
+  span on (a recorded session lost a 56k-token prefix to exactly this). The
+  decision now runs before the truncate, and the held span is kept. The logic
+  moved to `TokenTranscript::think_close`, which is FFI-free and so covered by
+  CI rather than only by an engine build.
+
 ## [5.0.7] - 2026-09-11
 
 ### Changed

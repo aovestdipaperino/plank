@@ -2081,6 +2081,31 @@ Related: `sha2` is a direct dependency solely because artifacts are verified
 time. A resumed `.part` re-reads itself from disk to rebuild the hasher, since
 `sha2` exposes no serializable state — do not add a hasher-state sidecar.
 
+## A `</think>` splice has to be decided before the truncate, or the branch is dead
+
+`Ds4Session`'s prompt reconciliation truncates the token buffer to the common
+prefix and re-tokenizes the rest. One divergence is deliberately not a rewrite:
+the UI closes a `<think>` the model left open before a tool continuation
+(`close_open_think`), so the incoming assistant text is the recorded reply plus
+exactly `</think>`. Re-tokenizing that from text yields ids unrelated to the
+sampled ones and rebuilds the KV from that span on — a recorded session lost a
+56k-token prefix to it (`turbo-vision-debug-2.log`, 18008 bytes against 18000).
+The splice path exists to keep the sampled ids and insert the close ahead of the
+recorded EOS instead.
+
+It was also unreachable. `truncate_spans(keep)` leaves exactly `keep` spans, and
+the span the splice recognizes is `spans()[keep]` — the *first one dropped*. With
+the truncate running first the lookup found nothing, every time, for every input:
+no error, no log line, just every guard-stopped pass paying a full re-prefill to
+append eight bytes. The decision now happens before the truncate, and the hold is
+widened by one span when there is a close, so the span survives to be spliced.
+
+The lesson generalizes past this call site: a lookup positioned *at* a truncation
+boundary is silently dead on the wrong side of it. The decision is FFI-free, so it
+moved to `TokenTranscript::think_close` in `ds4tokens.rs` where CI compiles and
+tests it (`the_think_close_must_be_read_before_the_truncate_not_after` asserts
+both orders — the wrong one answers `None`, the right one splices).
+
 ## Hand-rolled test tempdirs need an atomic counter, not just pid + nanos
 
 Model-manifest tests that build their own scratch directory (rather than using

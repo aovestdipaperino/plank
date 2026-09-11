@@ -62,16 +62,6 @@ fn assistant_span_tokens(prefix: &[i32], reply: &[i32], shadow: &[i32], eos: i32
     span
 }
 
-/// The `</think>` the UI appended to a recorded assistant reply, when
-/// `incoming` is exactly `held` (compared trailing-trimmed, as
-/// [`TokenTranscript::common_prefix`] compares) followed by that close and
-/// nothing else. Any other difference is a genuine rewrite and returns `None`.
-fn think_close_suffix<'a>(held: &str, incoming: &'a str) -> Option<&'a str> {
-    const CLOSE: &str = "</think>";
-    let rest = incoming.strip_prefix(held.trim_end())?;
-    (rest == CLOSE).then_some(rest)
-}
-
 /// The immutable, shareable half of the ds4 engine: weights, tokenizer, and the
 /// Metal command queue. Cheap to share read-only, expensive to build, so it
 /// lives behind an `Arc` (design §3, §4). Frees the engine on drop; the last
@@ -1133,15 +1123,7 @@ impl Ds4Session {
         // real buffer is the span itself. A kept span's tokens are reused
         // verbatim and do not move, so its offsets stay valid; everything from
         // the divergence on is retokenized and its spans are freed.
-        let kept_tokens = self
-            .transcript
-            .spans()
-            .iter()
-            .take(keep)
-            .map(|s| s.ntokens)
-            .sum::<usize>();
-        self.free_vision_spans_from(u32::try_from(kept_tokens).unwrap_or(0));
-        self.transcript.truncate_spans(keep);
+        //
         // The one divergence that is not a rewrite: the UI closed a `<think>`
         // the model left open before a tool continuation (`close_open_think`),
         // so the incoming assistant text is the recorded reply plus `</think>`.
@@ -1150,17 +1132,26 @@ impl Ds4Session {
         // lost a 56k-token prefix to exactly this). Keep the sampled ids and
         // splice the close in ahead of the recorded EOS instead; the buffer
         // stays a strict extension of the live KV.
+        //
+        // Decided here, *before* the truncate: `truncate_spans(keep)` leaves
+        // exactly `keep` spans, so the held span at index `keep` is gone by the
+        // time the splice would look for it — which is how this whole branch
+        // once became unreachable, and every guard-stopped pass paid a full
+        // re-prefill for one appended `</think>`.
+        let close: Option<String> = self.transcript.think_close(&keys, keep).map(str::to_owned);
+        // The spliced span is kept, so its tokens (and any vision spans behind
+        // them) stay: they do not move and their offsets stay valid.
+        let hold = keep + usize::from(close.is_some());
+        let kept_tokens = self.transcript.tokens_upto_span(hold);
+        self.free_vision_spans_from(u32::try_from(kept_tokens).unwrap_or(0));
+        self.transcript.truncate_spans(hold);
         let mut keep = keep;
-        if let (Some(held), Some(sec)) = (self.transcript.spans().get(keep), keys.get(keep))
-            && held.role == SpanRole::Assistant
-            && let Some(close) = think_close_suffix(&held.text, &sec.text)
-        {
-            self.transcript.truncate_spans(keep + 1);
-            let tokens = self.model.tokenize_rendered(close);
+        if let Some(close) = close {
+            let tokens = self.model.tokenize_rendered(&close);
             // SAFETY: engine valid.
             let eos = unsafe { ffi::ds4_token_eos(self.model.engine) };
             let tail = usize::from(self.transcript.tokens().last() == Some(&eos));
-            self.transcript.splice_last_span(close, &tokens, tail);
+            self.transcript.splice_last_span(&close, &tokens, tail);
             kv_debug(|| {
                 format!("reconcile: spliced {close:?} into the held assistant span {keep}")
             });
@@ -2889,30 +2880,7 @@ mod tests {
         }
     }
 
-    use super::{
-        assistant_span_tokens, is_prefill_event, parse_sections, strip_legacy, think_close_suffix,
-    };
-
-    /// Regression for the 56k-token rebuild in `turbo-vision-debug-2.log`: the
-    /// incoming assistant section was the held reply plus exactly `</think>`
-    /// (18008 vs 18000 bytes). Only that shape is a splice; anything else is a
-    /// rewrite.
-    #[test]
-    fn only_an_appended_think_close_counts_as_a_splice() {
-        assert_eq!(
-            think_close_suffix("We have enough.", "We have enough.</think>"),
-            Some("</think>")
-        );
-        // The held text is stored raw and compared trimmed, like common_prefix.
-        assert_eq!(
-            think_close_suffix("reply\n\n", "reply</think>"),
-            Some("</think>")
-        );
-        assert_eq!(think_close_suffix("reply", "reply"), None);
-        assert_eq!(think_close_suffix("reply", "reply</think>\n\n"), None);
-        assert_eq!(think_close_suffix("reply", "other</think>"), None);
-        assert_eq!(think_close_suffix("reply", "reply more</think>"), None);
-    }
+    use super::{assistant_span_tokens, is_prefill_event, parse_sections, strip_legacy};
 
     /// The recorded span mirrors the live KV exactly: prefix, rendered reply,
     /// the committed-but-unrendered tail of a cut speculative block, then one
