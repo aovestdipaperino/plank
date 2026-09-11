@@ -67,6 +67,7 @@ pub mod kvtree;
 pub mod logo;
 pub mod manifest;
 pub mod memory;
+pub mod mempressure;
 #[cfg(feature = "builtin_editor")]
 pub mod miniedit;
 pub mod names;
