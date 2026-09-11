@@ -639,7 +639,7 @@ const REPEAT_LOOP_WINDOW: usize = 8192;
 /// re-emitted the same refused tool calls three passes running.
 const LOOP_TRIPPED_NOTICE: &str = "turn stopped: the model re-issued the same refused tool calls three times in a row. Rephrase the request or give it what it is missing.";
 
-const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating the same text over and over. Do not resume that reasoning. Decide now and act: emit the tool calls for the change you already planned, or answer the user.";
+const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating the same text over and over. Do not resume that reasoning. Decide now and act: emit the tool calls for the change you already planned, or answer the user. Your next reply has no reasoning step: write the answer, or the tool calls, directly.";
 
 /// Floor for the per-pass reasoning budget
 /// ([`crate::insights::RepeatGuard::with_think_budget`], see
@@ -689,7 +689,7 @@ fn turn_repeat_guard(ctx_size: i32) -> crate::insights::RepeatGuard {
 /// [`REPEAT_LOOP_ERROR`]: the guard has *not* proven a loop, only that the
 /// reasoning outran its budget, and telling a model that was thinking hard
 /// that it was repeating itself is a lie it then has to reconcile.
-const THINK_BUDGET_ERROR: &str = "generation stopped: the reasoning exhausted its budget; this does not establish a loop. The previous analysis is retained as unverified working context. Do not restart it or restate the options. Close the thinking and deliver one small result now: a supported finding for a review, the next edit for an implementation, or a concise blocker or question if you cannot proceed. Do not claim that unexecuted code or unchecked findings are verified.";
+const THINK_BUDGET_ERROR: &str = "generation stopped: the reasoning exhausted its budget; this does not establish a loop. The previous analysis is retained as unverified working context. Do not restart it or restate the options. Close the thinking and deliver one small result now: a supported finding for a review, the next edit for an implementation, or a concise blocker or question if you cannot proceed. Do not claim that unexecuted code or unchecked findings are verified. Your next reply has no reasoning step: write the answer, or the tool calls, directly.";
 
 /// Bytes a turn may generate without a successful direct file mutation before
 /// it is ended. Bytes rather than tokens because that is the unit the corpus
@@ -758,7 +758,7 @@ fn pass_stop_text(interrupted: bool, error: Option<&str>, calls: usize) -> Strin
 /// instruction is the one that fixes it: write this as your answer, not in
 /// reasoning. `repro-loop-1789060243` and the seven 2026-09-10 dumps in
 /// `docs/LOOP-FINDINGS.md`.
-const DRAFT_ERROR: &str = "generation paused: lengthy structured reasoning reached a delivery checkpoint; this does not establish a loop or a finished draft. The analysis is retained as unverified working context. Do not restart the survey or compose it again. Close the thinking and deliver one supported finding now, make the next small code change with edit or write, or state what still needs verification. Do not promote rejected ideas or unexecuted code into results.";
+const DRAFT_ERROR: &str = "generation paused: lengthy structured reasoning reached a delivery checkpoint; this does not establish a loop or a finished draft. The analysis is retained as unverified working context. Do not restart the survey or compose it again. Close the thinking and deliver one supported finding now, make the next small code change with edit or write, or state what still needs verification. Do not promote rejected ideas or unexecuted code into results. Your next reply has no reasoning step: write the answer, or the tool calls, directly.";
 
 /// Consecutive repeat-guard stops a sub-agent may take before it is asked for
 /// its report instead of another attempt. At temperature 0 a pass is a pure
@@ -777,6 +777,35 @@ const SUBAGENT_REPEAT_TRIP_CAP: usize = 2;
 /// same way, until the user quit on the third pass. Ending the turn hands the
 /// prompt back to the one party who can change it materially.
 const MAIN_REPEAT_TRIP_CAP: usize = 2;
+
+/// Consecutive *draft-rung* stops a main turn may take before it is ended.
+///
+/// Its own counter, well above [`MAIN_REPEAT_TRIP_CAP`], because a draft stop
+/// is not evidence that the pass was wasted: it says "write this out", and
+/// `repro-loop-1789108509` / `-1789108726` are a turn ended for obeying it
+/// twice. The model announced "let me stop the exhaustive analysis and deliver
+/// findings", listed fourteen of them, and was cut at the byte gate again —
+/// because the only place it had to write them was the think block it was
+/// already inside. Killing that turn at the second nudge contradicts the
+/// nudge.
+///
+/// With [`Agent::pass_opts`]'s closed-think recovery a second draft stop
+/// cannot happen at all on a local engine, since the pass after a stop has no
+/// think block to draft in. This cap is the backstop for an engine that
+/// ignores the override (every provider, for now) and for a shape nobody has
+/// seen yet.
+const MAIN_DRAFT_TRIP_CAP: usize = 3;
+
+/// Shown when [`MAIN_DRAFT_TRIP_CAP`] ends a turn. Unlike
+/// [`MAIN_REPEAT_TRIPS_NOTICE`] it points at the analysis, because there is
+/// some: a draft stop never erases what the pass reasoned.
+const MAIN_DRAFT_TRIPS_NOTICE: &str = "turn stopped: the model kept composing its answer inside its reasoning instead of writing it out. The analysis is still in the transcript — ask for the findings it already has.";
+
+/// Whether a reasoning stop is the draft rung's, which gets
+/// [`MAIN_DRAFT_TRIP_CAP`] rather than [`MAIN_REPEAT_TRIP_CAP`].
+fn is_draft_stop(payload: &str) -> bool {
+    payload.contains(DRAFT_ERROR)
+}
 
 /// Shown when [`MAIN_REPEAT_TRIP_CAP`] ends a turn. The transcript keeps the
 /// guard's tool error as its last message, so the next prompt sees why.
@@ -853,6 +882,18 @@ fn stream_chunk_must_stop<S: RenderSink>(
     // Ordered second so a preflight failure in the same chunk still wins: it
     // has an error to feed back, and this does not.
     stream.tool_stanza_complete().then_some(PassStop::ToolCall)
+}
+
+/// Whether a pass generated under `opts` starts *inside* a `<think>` block,
+/// so the renderer — and the debug console, which only ever sees bytes — has
+/// to be told it is already there.
+///
+/// Reads the mode of the pass about to run, not the session's: a closed-think
+/// recovery pass ([`Agent::pass_opts`]) would otherwise have its answer
+/// rendered as hidden reasoning, which is the same bug in a new costume, the
+/// model delivering and the user still seeing nothing.
+fn pass_opens_in_think(opts: &crate::engine::GenerationOptions, engine: &dyn Engine) -> bool {
+    !matches!(opts.think_mode, crate::engine::ThinkMode::Off) && !engine.wants_structured()
 }
 
 /// Why a pass stopped itself before the engine ran out of tokens.
@@ -2153,6 +2194,9 @@ struct Agent<'a> {
     /// What the reasoning guard saw of the pass that just ended, left by the
     /// generate paths for the turn loop that knows how the pass stopped.
     last_guard: crate::insights::GuardSnapshot,
+    /// Set when a reasoning rung stopped the previous pass: the *next* pass
+    /// runs with reasoning closed. See [`Agent::pass_opts`].
+    reply_only_next: bool,
     /// When the current session began (process start, or the last `/clear`,
     /// `/resume`, or `/switch`), for the end-of-session duration.
     session_start: std::time::Instant,
@@ -2754,6 +2798,47 @@ impl Agent<'_> {
         }
     }
 
+    /// The generation options for the next pass, with the one-pass
+    /// closed-think override applied and consumed.
+    ///
+    /// Two things ride on the `think_mode` this returns. The engine builds the
+    /// assistant prefix from it — open `<think>` for a thinking level, the
+    /// same prefix already closed for `Off` — and records the reply span under
+    /// it, so it decides whether the pass *can* reason at all. That prefix is
+    /// the last few tokens of the prompt and is re-prefilled every pass, while
+    /// the effort preamble that keys the KV prefix comes from the engine's own
+    /// level, which this never touches. So a pass can be made reply-only for
+    /// free, with the whole cached prefix intact.
+    ///
+    /// After a reasoning-rung stop, that is exactly what happens
+    /// (`reply_only_next`, `docs/disable-thinking-guard.md`). The model does
+    /// obey the stop — `repro-loop-1789108726`'s recovery pass opens "let me
+    /// stop the exhaustive analysis and deliver findings" and lists fourteen —
+    /// but every pass begins inside a think block the chat template opened, so
+    /// "deliver now" was obeyed *there* and cut at the same byte gate again.
+    /// Taking the block away leaves the answer and the tool calls as the only
+    /// things the pass can write.
+    ///
+    /// Also the one place the live level reaches the engine's prefix:
+    /// `gen_opts.think_mode` is the startup value and `/think` only ever
+    /// updated `self.think`, so before this a mid-session `/think off` left
+    /// the assistant prefix opening `<think>` regardless.
+    fn pass_opts(&mut self) -> crate::engine::GenerationOptions {
+        let mut opts = self.gen_opts.clone();
+        opts.think_mode = if std::mem::take(&mut self.reply_only_next) {
+            crate::engine::ThinkMode::Off
+        } else {
+            self.think
+        };
+        opts
+    }
+
+    /// Arms the closed-think recovery for the next pass, which every
+    /// reasoning-rung stop does.
+    fn arm_reply_only(&mut self) {
+        self.reply_only_next = true;
+    }
+
     /// Records how a pass ended for the repro dump's `## Passes` table. `guard`
     /// is the snapshot the generate path left in `last_guard` (taken here so
     /// a pass is never noted twice), or the one a quiet pass carried.
@@ -2832,6 +2917,9 @@ impl Agent<'_> {
         let mut stream = StreamRenderer::with_syntax(sink, self.tool_syntax());
         stream.set_freeze_on_error(true);
         self.configure_stream(&mut stream);
+        // Bound before the closures borrow `self`: this both applies the
+        // one-pass closed-think override and consumes it.
+        let pass_opts = self.pass_opts();
         // Defensive retry point: picks up a console that started after plank
         // did, or a setting change that raced this turn's start. A settings
         // change itself already reconciles immediately (`settings::reinstall`),
@@ -2845,7 +2933,7 @@ impl Agent<'_> {
         // renders gray until `</think>`. Provider engines are excluded: their
         // translator emits explicit `<think>`/`</think>` tags, so pre-opening
         // here would mis-color any output not preceded by a reasoning delta.
-        if !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured() {
+        if pass_opens_in_think(&pass_opts, self.engine.as_ref()) {
             stream.begin_in_think();
             // The mirror gets no direct call into its own renderer, only raw
             // bytes — so under the same guard, tell it the same thing we just
@@ -2898,7 +2986,7 @@ impl Agent<'_> {
             .engine
             .generate(
                 prompt,
-                &self.gen_opts,
+                &pass_opts,
                 &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
                 &|| greedy.load(Ordering::Relaxed),
                 &mut |ev| match ev {
@@ -3456,6 +3544,11 @@ impl Agent<'_> {
             if pass.looped {
                 trips += 1;
                 self.report_guard(&repeat_trip_text(pass.tool_error.as_deref(), trips));
+                // The sidechain's next quiet pass gets the same closed-think
+                // recovery the main turn does; its cap is left alone, since
+                // `SUBAGENT_REPEAT_TRIP_CAP` already asks for the report
+                // rather than ending the work.
+                self.arm_reply_only();
             } else {
                 trips = 0;
             }
@@ -3543,10 +3636,10 @@ impl Agent<'_> {
         // Cloned rather than borrowed: the live options are `self`'s now (they
         // used to hang off the immutably-shared `cfg`), and this function goes
         // on to touch `self` mutably.
-        let live_opts = self.gen_opts.clone();
+        let live_opts = self.pass_opts();
         let ctx = PassCtx {
             opts: &live_opts,
-            think_off: matches!(self.think, crate::engine::ThinkMode::Off),
+            think_off: matches!(live_opts.think_mode, crate::engine::ThinkMode::Off),
             // Read here, not inside the pass: `settings::install_for_test` is
             // thread-local, so a spawned pass would silently see defaults.
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
@@ -4065,6 +4158,8 @@ impl Agent<'_> {
         let mut stop_hook_ran = false;
         // Passes in a row the repeat guard stopped; see `MAIN_REPEAT_TRIP_CAP`.
         let mut repeat_trips = 0usize;
+        // The draft rung's own tally; see `MAIN_DRAFT_TRIP_CAP`.
+        let mut draft_trips = 0usize;
         // Bytes generated since the last tool call with an effect; see
         // `NO_PROGRESS_BYTE_BUDGET`.
         let mut ungrounded = 0usize;
@@ -4130,8 +4225,17 @@ impl Agent<'_> {
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
             if is_reasoning_stop(preflight_error.as_deref()) {
-                repeat_trips += 1;
-                self.report_guard(&repeat_trip_text(preflight_error.as_deref(), repeat_trips));
+                // A draft stop counts on its own tally: it is a nudge to
+                // deliver, not evidence the pass was wasted, and a cycle
+                // either side of one is still two cycles.
+                let draft = preflight_error.as_deref().is_some_and(is_draft_stop);
+                if draft {
+                    draft_trips += 1;
+                } else {
+                    repeat_trips += 1;
+                }
+                let trips = if draft { draft_trips } else { repeat_trips };
+                self.report_guard(&repeat_trip_text(preflight_error.as_deref(), trips));
                 if let Some(line) = self.loop_repro_line() {
                     println!("{}", self.debug_line(&line));
                 }
@@ -4140,8 +4244,12 @@ impl Agent<'_> {
                 if preflight_error.as_deref() == Some(REPEAT_LOOP_ERROR) {
                     self.stub_last_reasoning();
                 }
+                // Whatever the rung, the next pass has no think block to
+                // reason — or draft — in.
+                self.arm_reply_only();
             } else {
                 repeat_trips = 0;
+                draft_trips = 0;
             }
             let st = Status {
                 // `real_interrupt`, not `stats.interrupted`: a pass that
@@ -4197,6 +4305,10 @@ impl Agent<'_> {
                 )));
                 if repeat_trips >= MAIN_REPEAT_TRIP_CAP {
                     self.report_guard(MAIN_REPEAT_TRIPS_NOTICE);
+                    return Ok(());
+                }
+                if draft_trips >= MAIN_DRAFT_TRIP_CAP {
+                    self.report_guard(MAIN_DRAFT_TRIPS_NOTICE);
                     return Ok(());
                 }
                 let woke = self.drain_job_notifications();
@@ -8921,10 +9033,14 @@ the original is frozen and listed in /tree"
     fn run_fanout_rounds(&mut self, slots: &mut [FanoutSlot], width: usize) {
         const MAX_ROUNDS: usize = 40;
         let system = self.system.clone();
-        let opts = self.gen_opts.clone();
+        // No closed-think recovery here: one `PassCtx` is shared by every
+        // slot and every round, so a per-slot override has nowhere to live.
+        // `MAIN_DRAFT_TRIP_CAP`'s sibling still bounds a drafting slot.
+        let mut opts = self.gen_opts.clone();
+        opts.think_mode = self.think;
         let ctx = PassCtx {
             opts: &opts,
-            think_off: matches!(self.think, crate::engine::ThinkMode::Off),
+            think_off: matches!(opts.think_mode, crate::engine::ThinkMode::Off),
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
             display: PassDisplay {
                 show_thinking: crate::settings::active().ui.show_thinking,
@@ -12680,6 +12796,8 @@ impl Agent<'_> {
         let mut stop_hook_ran = false;
         // Passes in a row the repeat guard stopped; see `MAIN_REPEAT_TRIP_CAP`.
         let mut repeat_trips = 0usize;
+        // The draft rung's own tally; see `MAIN_DRAFT_TRIP_CAP`.
+        let mut draft_trips = 0usize;
         // Bytes generated since the last tool call with an effect; see
         // `NO_PROGRESS_BYTE_BUDGET`.
         let mut ungrounded = 0usize;
@@ -12780,8 +12898,15 @@ impl Agent<'_> {
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
             if let Some(f) = out.error.as_ref().filter(|e| e.looped) {
-                repeat_trips += 1;
-                self.report_guard(&repeat_trip_text(Some(&f.payload), repeat_trips));
+                // Same split as the plain path, for the same reason.
+                let draft = is_draft_stop(&f.payload);
+                if draft {
+                    draft_trips += 1;
+                } else {
+                    repeat_trips += 1;
+                }
+                let trips = if draft { draft_trips } else { repeat_trips };
+                self.report_guard(&repeat_trip_text(Some(&f.payload), trips));
                 if let Some(line) = self.loop_repro_line() {
                     let _ = tx.send(UiEvent::Dim(line));
                 }
@@ -12789,8 +12914,10 @@ impl Agent<'_> {
                 if f.payload.contains(REPEAT_LOOP_ERROR) {
                     self.stub_last_reasoning();
                 }
+                self.arm_reply_only();
             } else {
                 repeat_trips = 0;
+                draft_trips = 0;
             }
             if out.interrupted {
                 crate::interrupt::clear();
@@ -12811,6 +12938,10 @@ impl Agent<'_> {
                 )));
                 if repeat_trips >= MAIN_REPEAT_TRIP_CAP {
                     self.report_guard(MAIN_REPEAT_TRIPS_NOTICE);
+                    return Ok(());
+                }
+                if draft_trips >= MAIN_DRAFT_TRIP_CAP {
+                    self.report_guard(MAIN_DRAFT_TRIPS_NOTICE);
                     return Ok(());
                 }
                 self.drain_queued(shared, tx);
@@ -13289,12 +13420,14 @@ impl Agent<'_> {
         // See the matching comment in `stream_generation`: a defensive retry
         // point, cheap when already reconciled, and the backfill for whatever
         // it newly dialed.
+        // Same as the plain path: applied and consumed before the borrows.
+        let pass_opts = self.pass_opts();
         let reconciled = crate::debugmirror::reconcile();
         self.backfill_console(&reconciled);
         // Local engines open `<think>` implicitly in the prefill; provider
         // engines emit explicit tags, so only pre-open for local ones (see the
         // matching note in the plain-REPL path).
-        if !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured() {
+        if pass_opens_in_think(&pass_opts, self.engine.as_ref()) {
             stream.begin_in_think();
             // See the matching comment in `stream_generation`: the mirror
             // needs the same synthetic tag, under the same guard.
@@ -13395,7 +13528,7 @@ impl Agent<'_> {
                 .generate_multiplexed(
                     prompt,
                     &aside_prompt,
-                    &self.gen_opts,
+                    &pass_opts,
                     &interrupt,
                     &mut |which, ev| match which {
                         crate::engine::AsideStream::Main => on_event(ev),
@@ -13420,7 +13553,7 @@ impl Agent<'_> {
         } else {
             self.engine.generate(
                 engine_prompt,
-                &self.gen_opts,
+                &pass_opts,
                 &interrupt,
                 &greedy_fn,
                 &mut on_event,
@@ -16494,6 +16627,7 @@ fn new_agent(
         stats: SessionStats::default(),
         passes: Vec::new(),
         last_guard: crate::insights::GuardSnapshot::default(),
+        reply_only_next: false,
         session_start: std::time::Instant::now(),
         sub_sink: SubSinkTarget::default(),
         fork_kv: Vec::new(),
@@ -18234,6 +18368,11 @@ mod tests {
         /// Records every `set_think_mode` call, so a test can assert the level
         /// change reached the engine (where it drops cached tokens and KV).
         think_modes: Option<std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>>>,
+        /// Records the `think_mode` on each `generate`'s options — the mode
+        /// that decides whether the pass opens inside `<think>` at all, and so
+        /// the one the closed-think recovery works through
+        /// (`Agent::pass_opts`).
+        pass_modes: Option<std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>>>,
         /// Records every `set_trusted_system_prefix` call, the other half of
         /// the configuration an engine needs before it tokenizes anything.
         trusted_lens: Option<std::sync::Arc<std::sync::Mutex<Vec<usize>>>>,
@@ -18297,11 +18436,14 @@ mod tests {
         fn generate(
             &mut self,
             prompt: crate::engine::Prompt<'_>,
-            _opts: &crate::engine::GenerationOptions,
+            opts: &crate::engine::GenerationOptions,
             _interrupt: &dyn Fn() -> bool,
             _greedy: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> Result<GenerationStats, EngineError> {
+            if let Some(seen) = &self.pass_modes {
+                seen.lock().unwrap().push(opts.think_mode);
+            }
             if let Some(seen) = &self.saw_local_pass {
                 seen.store(crate::status::local_pass_active(), Ordering::Relaxed);
             }
@@ -18454,6 +18596,7 @@ mod tests {
             stats: SessionStats::default(),
             passes: Vec::new(),
             last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -22558,6 +22701,7 @@ mod tests {
             stats: SessionStats::default(),
             passes: Vec::new(),
             last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -22675,6 +22819,7 @@ mod tests {
             stats: SessionStats::default(),
             passes: Vec::new(),
             last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -23795,6 +23940,7 @@ mod tests {
             stats: SessionStats::default(),
             passes: Vec::new(),
             last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -24057,6 +24203,7 @@ mod tests {
             stats: SessionStats::default(),
             passes: Vec::new(),
             last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -24159,6 +24306,7 @@ mod tests {
             stats: SessionStats::default(),
             passes: Vec::new(),
             last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -24248,6 +24396,7 @@ mod tests {
             stats: SessionStats::default(),
             passes: Vec::new(),
             last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -24360,6 +24509,7 @@ mod tests {
             stats: SessionStats::default(),
             passes: Vec::new(),
             last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -24431,6 +24581,18 @@ mod tests {
     /// repeat guard's four cycles, never closing its `<think>`.
     fn looping_reasoning() -> String {
         "Now, `WindowLike::window(self).frame`? Yes.\n\n".repeat(400)
+    }
+
+    /// [`looping_reasoning`] that opens its own `<think>`.
+    ///
+    /// A pass generated after a reasoning stop runs under the closed-think
+    /// recovery (`Agent::pass_opts`), so the chat template's implicit open is
+    /// gone and only an explicit tag puts the model back inside a reasoning
+    /// block. That is the case the trip caps still have to bound: a model that
+    /// reopens thinking anyway, which is the only way a *second* consecutive
+    /// reasoning stop can still happen.
+    fn reopened_looping_reasoning() -> String {
+        format!("<think>{}", looping_reasoning())
     }
 
     /// Runs `agent_call(task, None)` with the given sub-agent replies on a TUI
@@ -24569,7 +24731,7 @@ mod tests {
         let engine = ScriptedEngine {
             replies: vec![
                 looping_reasoning(),
-                looping_reasoning(),
+                reopened_looping_reasoning(),
                 "</think>What I found before looping.\n".to_string(),
             ],
             prompts: prompts.clone(),
@@ -24621,8 +24783,8 @@ mod tests {
         let engine = ScriptedEngine {
             replies: vec![
                 looping_reasoning(),
-                looping_reasoning(),
-                looping_reasoning(),
+                reopened_looping_reasoning(),
+                reopened_looping_reasoning(),
             ],
             prompts: prompts.clone(),
             ..ScriptedEngine::default()
@@ -24958,6 +25120,69 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `repro-loop-1789108509` / `-1789108726`: the draft rung stopped the
+    /// synthesis pass, the model announced "let me stop the exhaustive
+    /// analysis and deliver findings", listed fourteen of them — inside the
+    /// think block it was still in — and was cut at the same byte gate. The
+    /// recovery takes the block away: the pass after any reasoning stop is
+    /// generated with `ThinkMode::Off`, so the answer is the only thing it can
+    /// write, and the pass after that is back to the session's level.
+    #[test]
+    fn the_pass_after_a_reasoning_stop_has_no_reasoning() {
+        let dir = scratch_dir("reply-only-recovery");
+        let mut cfg = test_cfg();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Low;
+        let modes: std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec![
+                looping_reasoning(),
+                // Delivered, not drafted: no think block to draft in.
+                "Here is the finding I had.\n".to_string(),
+            ],
+            pass_modes: Some(std::sync::Arc::clone(&modes)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a code review"));
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert_eq!(
+            *modes.lock().unwrap(),
+            vec![ThinkMode::Low, ThinkMode::Off],
+            "the stopped pass thinks, the one after it does not: {events:?}"
+        );
+        // One stop, and then an answer: the turn is not ended by the cap.
+        assert_eq!(
+            error_lines(&events),
+            vec!["guard: stopped a reasoning loop".to_string()],
+            "{events:?}"
+        );
+        // The override is one pass. A third pass would think again.
+        assert!(!agent.reply_only_next, "the override was consumed");
+        assert_eq!(agent.pass_opts().think_mode, ThinkMode::Low);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A draft stop is a nudge to deliver, not evidence the pass was wasted,
+    /// so it counts on its own tally: two of them no longer end the turn the
+    /// way two cycles do (`MAIN_DRAFT_TRIP_CAP`), and a cycle either side of
+    /// one is still two cycles.
+    #[test]
+    fn draft_stops_and_cycles_count_separately() {
+        assert!(is_draft_stop(DRAFT_ERROR));
+        assert!(!is_draft_stop(REPEAT_LOOP_ERROR));
+        assert!(!is_draft_stop(THINK_BUDGET_ERROR));
+        // The framed payload the turn loop actually inspects, not the bare
+        // string: `tool_error_payload` wraps it.
+        let framed = format!("<tool_result>Tool error: {DRAFT_ERROR}</tool_result>");
+        assert!(is_draft_stop(&framed));
+        // The draft rung gets the looser cap.
+        assert_eq!((MAIN_REPEAT_TRIP_CAP, MAIN_DRAFT_TRIP_CAP), (2, 3));
+    }
+
     #[test]
     fn a_main_turn_that_loops_twice_in_a_row_is_stopped() {
         // `repro-loop-1788708943` / `-1788709421`: one session, the guard
@@ -24970,7 +25195,7 @@ mod tests {
         let engine = ScriptedEngine {
             replies: vec![
                 looping_reasoning(),
-                looping_reasoning(),
+                reopened_looping_reasoning(),
                 "</think>Done.\n".to_string(),
             ],
             prompts: prompts.clone(),
@@ -26638,6 +26863,7 @@ or the user's next message aborts before its first token"
             stats: SessionStats::default(),
             passes: Vec::new(),
             last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -26769,6 +26995,7 @@ or the user's next message aborts before its first token"
             stats: SessionStats::default(),
             passes: Vec::new(),
             last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
@@ -26934,6 +27161,7 @@ or the user's next message aborts before its first token"
             stats: SessionStats::default(),
             passes: Vec::new(),
             last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),

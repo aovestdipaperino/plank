@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A guard stop no longer leaves the model drafting in the same place.** The
+  pass after any reasoning-rung stop is generated with reasoning closed, so
+  the answer and the tool calls are the only things it can write. From
+  `repro-loop-1789108509` / `-1789108726`: the draft rung stopped a code
+  review's synthesis pass, the model said "let me stop the exhaustive analysis
+  and deliver findings", listed fourteen of them inside the think block it was
+  still in, and was cut at the same byte gate again — two stops, and the turn
+  ended with nothing delivered. The three stop messages now also say the next
+  reply has no reasoning step. As a side effect a mid-session `/think off`
+  reaches the engine's prompt prefix, which it never did before.
+- **A draft stop no longer counts against the loop cap.** It gets its own,
+  looser tally: a draft stop is an instruction to deliver, not evidence the
+  pass was wasted, and ending a turn because the model obeyed it twice is the
+  opposite of what it asks. A cycle either side of a draft stop is still two
+  cycles.
+
 ## [5.0.6] - 2026-09-11
 
 ### Changed

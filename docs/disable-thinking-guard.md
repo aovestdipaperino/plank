@@ -1,6 +1,8 @@
 # Closed-think recovery after a reasoning-guard stop
 
-Status: proposed, 2026-09-10. Not implemented.
+Status: **implemented 2026-09-11** (`Agent::pass_opts`,
+`pass_opens_in_think`, `MAIN_DRAFT_TRIP_CAP`). Kept as the rationale; what
+shipped differs from the plan below in three places, noted at the end.
 
 ## The problem this fixes
 
@@ -182,3 +184,52 @@ Half a day. One field on `Agent` and one on `FanoutSlot`, four set sites, three
 consume sites, one renderer helper replacing four inline tests, one sentence
 appended to three error strings, and the tests above. No C-parity impact, no
 settings, no new documentation beyond `LOOP-FINDINGS.md` and a CHANGELOG line.
+
+## What shipped, and where it differs from the plan above
+
+Implemented 2026-09-11 after `repro-loop-1789108509` / `-1789108726` made the
+case unarguable: the draft rung stopped the synthesis pass, the model announced
+"let me stop the exhaustive analysis and deliver findings", listed fourteen of
+them *inside the think block it was still in*, and was cut at the same byte
+gate 13,113 bytes in. Two stops, cap reached, turn over, nothing delivered.
+
+Three differences from the plan:
+
+1. **One method, not a flag plus four consume sites.** `Agent::pass_opts`
+   returns the options for the next pass, applying and consuming
+   `reply_only_next` in one place, and the three live paths (plain, TUI,
+   serial sub-agent) call it instead of borrowing `self.gen_opts`. The
+   renderer decision moved into the free `pass_opens_in_think(opts, engine)`,
+   which both live paths and `generate_pass`'s `PassCtx` read, so the mode the
+   renderer assumes and the mode the engine was given cannot drift.
+2. **The fan-out is not covered.** One `PassCtx` is shared by every slot and
+   every round, so a per-slot override has nowhere to live. Its pass options
+   now at least carry the *live* level. A drafting slot is still bounded by
+   the sub-agent trip cap.
+3. **A latent bug fixed on the way.** `gen_opts.think_mode` was the startup
+   value and `/think` only ever updated `self.think` and the engine's own
+   level. The engine builds its assistant prefix from `opts.think_mode`, so
+   before this a mid-session `/think off` left the prefix opening `<think>`
+   anyway. `pass_opts` is now the single place the live level reaches it.
+
+Alongside it, and for the same dumps: a draft stop counts on its own tally
+(`MAIN_DRAFT_TRIP_CAP` = 3, `MAIN_DRAFT_TRIPS_NOTICE`) rather than against
+`MAIN_REPEAT_TRIP_CAP` = 2. A draft stop is a nudge to deliver, not evidence
+the pass was wasted, and ending a turn because the model obeyed it twice is the
+opposite of what the nudge asks for. A cycle either side of a draft stop is
+still two cycles: neither counter resets the other.
+
+The three stop errors each gained one sentence — "Your next reply has no
+reasoning step: write the answer, or the tool calls, directly." — so the model
+is not left wondering where its think block went.
+
+One consequence worth stating plainly: on a local engine a *second*
+consecutive reasoning stop is now nearly unreachable, because the pass after
+the first has no reasoning to stop. Three tests that relied on it had to script
+an explicit `<think>` in the recovery reply (`reopened_looping_reasoning`),
+which is the only way a model can get back inside a block the prefix closed —
+and exactly the case the caps still bound. The corollary is that a model which
+loops in *visible* output after a stop is watched by nothing, since the cycle
+rungs deliberately ignore visible text. If the dumps show that, it is a new
+rung, not a reason to reopen `<think>`.
+

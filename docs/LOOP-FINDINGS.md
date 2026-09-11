@@ -69,6 +69,7 @@ argument for the design.
 | 2026-09-07 | `aaf0f3d` | `MAIN_REPEAT_TRIP_CAP = 2` on both main-turn paths (`MAIN_REPEAT_TRIPS_NOTICE`); `Agent::repro_dir` so test dumps stay out of `~/.plank/repro`; this document | `repro-loop-1788708943`/`-1788709421`: the main turn looped, stopped, looped again, and the user quit |
 | 2026-09-08 | *(this change)* | no-progress budget resets only after a successful direct `write` or `edit`, not an attempted `edit` or arbitrary `bash` call | `repro-loop-1788833715`: 5h7m of failed edits, builds, and repeated reads kept resetting the budget |
 | 2026-09-10 | *(this change)* | think budget sized from the context window: `repeat_think_budget` = `ctx_size / 10` bytes, floored at the old 16 KiB (`REPEAT_THINK_BUDGET_FLOOR`) | `repro-loop-1789051332` … `-1789053127`: seven budget stops in three sessions on one feature request, none a cycle — see "The think budget fired on reasoning that was not looping", below |
+| 2026-09-11 | *(this change)* | closed-think recovery (`Agent::pass_opts`): the pass after any reasoning stop is generated with `ThinkMode::Off`, so it can only deliver; and a draft stop counts on its own tally (`MAIN_DRAFT_TRIP_CAP` = 3) instead of against `MAIN_REPEAT_TRIP_CAP` | `repro-loop-1789108509` / `-1789108726`: a turn ended for obeying the draft rung twice — see "The recovery had nowhere to write", below |
 | 2026-09-11 | *(this change)* | `NO_PROGRESS_NOTICE` reworded: it no longer claims a shell command would have reset the budget, and it names what does | `repro-1789107544`: the tripping pass had just run `cargo test` and `cargo clippy` successfully — see "The no-progress notice named the wrong evidence", below |
 | 2026-09-10 | *(this change)* | draft rung (`RepeatGuard::drafting`, `DRAFT_ERROR`): numbered deliverable headings or fenced code accumulating inside `<think>` past 8 KiB stop the pass with "write this as your answer, not in reasoning"; and a `WORKING_STYLE` rule, "Write findings as you find them", so list-shaped answers are emitted item by item after `</think>` | `repro-loop-1789060243` and the seven 2026-09-10 dumps: deliverables drafted in reasoning, never emitted |
 | 2026-09-10 | *(no code change)* | counter-case to the raised budget recorded: a 30 KB review drafted inside `<think>` under the ~102 KB budget, interrupted by the user at 12m42s; the `resume` pass redrafted and fell into a 5-line cycle the exact-cycle rung caught | `repro-loop-1789060243`: `do a code review`, 18 minutes, no visible output — see "The review that was written in the wrong place", below |
@@ -807,3 +808,58 @@ table this file asked for:
   they would have before 2026-09-08, nothing would have been left bounding the
   turn and it would have continued exactly as `repro-loop-1788833715` did.
   This budget is the only rung that was still holding.
+
+## The recovery had nowhere to write
+
+`repro-loop-1789108509` and `-1789108726` are one session (`sparkly-boltzmann`,
+2026-09-11, `do a code review`, 217 seconds apart) and the first evidence that
+the draft rung made a turn *worse*. From the pass table:
+
+| # | reasoning | headings | stop |
+|---|---|---|---|
+| 1-7 | ≤380 B | 0 | tool calls |
+| 8 | 13,109 | 12 | guard: draft |
+| 9 | 13,113 | 14 | guard: draft |
+
+Two consecutive draft stops, cap reached, turn over, nothing delivered. The
+day before, the same request on the same repository reached an answer on its
+fourteenth pass; the only structural difference is that a tool round happened
+to land between its two stops and reset the counter.
+
+Three things are visible here and only here.
+
+**The byte gate is the binding condition, not the shape.** Both stops landed
+two and six bytes past the 13,107 gate. In a numbered review the tenth heading
+arrives long before 13 KB, so the heading condition is satisfied early and the
+rung fires the instant the byte floor is crossed. For this shape of task the
+rung is a reasoning cap, not a shape detector. (Scaling the gate with the
+window softened this — at the old fixed 8 KiB it would have fired sooner — but
+did not change its character.)
+
+**The model obeyed and still lost.** Pass 9 opens "Let me stop the exhaustive
+analysis and deliver findings. I have enough to write a review." and then lists
+fourteen findings. That is precisely what `DRAFT_ERROR` asks for. It had
+nowhere to write them but the think block it was already inside, because every
+pass begins inside one the chat template opened, so it was cut at the same byte
+count and the second stop ended the turn. The reasoning was *not* stubbed — a
+draft stop keeps it, as the error promises — so the analysis was in the
+transcript the whole time. It simply never reached the user.
+
+**Counting a draft stop as a loop was the design error.** `is_reasoning_stop`
+lumped `DRAFT_ERROR` with the cycle and budget errors, so a draft stop
+consumed one of `MAIN_REPEAT_TRIP_CAP`'s two lives. A draft stop carries no
+evidence of a loop; it is an instruction to deliver. Ending the turn because
+the model followed it twice is the opposite of what it asks.
+
+Fixed the same day, in both directions at once:
+
+- the pass after *any* reasoning stop is generated with `ThinkMode::Off`
+  (`Agent::pass_opts`), so it physically cannot draft — the answer and the tool
+  calls are the only things it can write. Full rationale and the three
+  deviations from the original plan in `disable-thinking-guard.md`;
+- a draft stop counts on its own tally, `MAIN_DRAFT_TRIP_CAP` = 3, which with
+  the recovery in place is unreachable on a local engine and exists for the
+  provider paths that ignore the override.
+
+Had both been in place, pass 9's fourteen findings would have been the answer.
+
