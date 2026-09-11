@@ -915,6 +915,20 @@ pub trait Engine: Debug + Send {
         Err(EngineError::new("engine does not support KV snapshots"))
     }
 
+    /// Frees the live KV session, keeping the model open.
+    ///
+    /// The yield path for memory pressure: the session is anonymous and partly
+    /// wired, so the kernel cannot reclaim it, while the GGUF weights are
+    /// file-backed and reclaimed for free. Closing the engine would therefore
+    /// trade a large certain cost for almost no gain.
+    ///
+    /// Must not allocate — it is called precisely when the system has no
+    /// memory — and must leave the engine usable: the next `warm_sync` or
+    /// `generate` recreates the session lazily.
+    ///
+    /// Engines holding no local KV do nothing.
+    fn release_session(&mut self) {}
+
     /// Begins a warm walk: resets the cumulative warm token buffer to the
     /// system prompt's tokens. No prefill happens yet.
     ///

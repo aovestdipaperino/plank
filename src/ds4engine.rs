@@ -2200,6 +2200,23 @@ impl Engine for Ds4Session {
         Ok(())
     }
 
+    fn release_session(&mut self) {
+        if self.session.is_null() {
+            return;
+        }
+        // SAFETY: session is non-null and owned by this engine; ds4_session_free
+        // is the matching destructor for ds4_session_new.
+        unsafe { ffi::ds4_session_free(self.session) };
+        self.session = std::ptr::null_mut();
+        // `warm_tokens` and `vision_spans` describe the live prompt, not the
+        // freed native session: they are what the next `warm_sync` resends into
+        // whatever session `ensure_session` recreates lazily. Clearing them
+        // here would throw away the very transcript this design means to
+        // rebuild from, and would leave `warm_sync`'s common-prefix probe
+        // comparing against nothing. Only the session handle is destroyed.
+        kv_debug(|| "release_session: live KV freed for memory pressure".to_owned());
+    }
+
     // ── Vision ───────────────────────────────────────────────────────────
 
     fn has_vision(&self) -> bool {

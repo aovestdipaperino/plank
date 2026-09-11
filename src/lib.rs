@@ -119,3 +119,4 @@ pub mod wasmreg;
 pub mod wasmsig;
 pub mod worker;
 pub mod worktree;
+pub mod yieldpolicy;
