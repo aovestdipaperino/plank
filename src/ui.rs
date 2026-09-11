@@ -978,8 +978,6 @@ const COMPACT_INTERRUPTED: &str =
     "Compaction interrupted; keeping the previous conversation state.";
 
 /// Footer marker shown while plank has given its KV back to the system.
-// Wired into the turn paths in the next commit; tests exercise it now.
-#[allow(dead_code)]
 const PRESSURE_YIELDED: &str =
     "paused: system memory pressure \u{2014} KV released, will resume when it clears";
 
@@ -988,8 +986,6 @@ const PRESSURE_YIELDED: &str =
 /// The disclosure rule: plank always yields, even when the resume is expensive,
 /// so it has to *say* the cost. A long re-prefill behind a silent stall is
 /// indistinguishable from a hang.
-// Wired into the turn paths in the next commit; tests exercise it now.
-#[allow(dead_code)]
 fn pressure_disclosure(plan: &crate::yieldpolicy::RestorePlan) -> String {
     if plan.reprefill_tokens <= 0 {
         return String::new();
@@ -1000,14 +996,35 @@ fn pressure_disclosure(plan: &crate::yieldpolicy::RestorePlan) -> String {
     )
 }
 
+/// Whether a generation's interrupt hook should raise a pressure cancel.
+///
+/// A user interrupt outranks a pressure yield: once someone has asked the turn
+/// to stop, it must end, not pause and resume. The engine's cancel reason
+/// already gives the user priority, but raising at all once the user has asked
+/// would make the stop look resumable to whichever check runs first.
+fn should_raise_pressure_cancel(
+    level: crate::mempressure::PressureLevel,
+    user_stopped: bool,
+) -> bool {
+    level == crate::mempressure::PressureLevel::Critical && !user_stopped
+}
+
+/// Polled from a generation's interrupt hook: raises a pressure cancel when the
+/// system is critical and the user has not already asked to stop, then passes
+/// `stopping` through so a front end's own stop conditions stay one expression.
+fn pressure_tick(sensor: &crate::mempressure::PressureSensor, stopping: bool) -> bool {
+    if should_raise_pressure_cancel(sensor.level(), crate::interrupt::pending()) {
+        crate::ds4engine::request_pressure_cancel();
+    }
+    stopping
+}
+
 /// Whether a pressure decision should be acted on now.
 ///
 /// Two suppressions. Before the first turn finishes there is no session worth
 /// saving and yielding would mean never starting. Inside a sub-agent sidechain
 /// there are no rungs (`in_sidechain()` never pushes them), so a yield costs a
 /// full sidechain rebuild \u{2014} and sidechains are short enough to wait out.
-// Wired into the turn paths in the next commit; tests exercise it now.
-#[allow(dead_code)]
 fn should_act(
     decision: crate::mempressure::Decision,
     first_turn_done: bool,
@@ -2119,6 +2136,20 @@ struct Agent<'a> {
     payload_dirty: bool,
     /// Depth-indexed KV snapshots for this session, newest turn last.
     ladder: crate::kvladder::KvLadder,
+    /// Reads the OS memory-pressure level; cheap to clone into a generation's
+    /// interrupt closure.
+    sensor: crate::mempressure::PressureSensor,
+    /// Debounces the raw level into yield/resume decisions.
+    hysteresis: crate::mempressure::Hysteresis,
+    /// Applies those decisions to the engine and pins the restore plan.
+    yield_policy: crate::yieldpolicy::YieldPolicy,
+    /// False until the first turn completes; see [`should_act`].
+    first_turn_done: bool,
+    /// Set by a generation pass that the pressure hook cancelled, read by the
+    /// turn loop immediately afterwards. A field rather than a return value
+    /// because the flag it mirrors is thread-local and cleared by the next
+    /// engine entry, so it has to be captured the instant `generate` returns.
+    pressure_stop: bool,
     /// How many sub-agent forks are open on the live transcript (see
     /// [`Agent::begin_subagent_fork`]). While it is non-zero the transcript
     /// carries a sidechain that `end_subagent_fork` will truncate back out,
@@ -2949,6 +2980,23 @@ impl Agent<'_> {
     /// Streams one generation pass: paints the live status bar for prefill and
     /// generation, and routes model text through the viz + markdown pipeline.
     #[allow(clippy::type_complexity)]
+    /// The plain REPL's stream renderer: a colorized stdout sink, configured
+    /// exactly as every other pass on this path configures it.
+    fn plain_stream(&mut self) -> StreamRenderer<TerminalSink<FlushingStdout>> {
+        let sink = TerminalSink::new(TokenRenderer::new(
+            FlushingStdout,
+            RenderOptions {
+                use_color: self.color,
+                format_thinking: true,
+                format_markdown: true,
+            },
+        ));
+        let mut stream = StreamRenderer::with_syntax(sink, self.tool_syntax());
+        stream.set_freeze_on_error(true);
+        self.configure_stream(&mut stream);
+        stream
+    }
+
     fn stream_generation(
         &mut self,
         prompt_text: &str,
@@ -2961,21 +3009,11 @@ impl Agent<'_> {
         ),
         String,
     > {
-        let sink = TerminalSink::new(TokenRenderer::new(
-            FlushingStdout,
-            RenderOptions {
-                use_color: self.color,
-                format_thinking: true,
-                format_markdown: true,
-            },
-        ));
         // See the matching guard in `worker_generate_kind`: the plain REPL has
         // no blinking brain to drive, but the flag is process-global and a
         // remote client attached to this session renders off it.
         let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
-        let mut stream = StreamRenderer::with_syntax(sink, self.tool_syntax());
-        stream.set_freeze_on_error(true);
-        self.configure_stream(&mut stream);
+        let mut stream = self.plain_stream();
         // Bound before the closures borrow `self`: this both applies the
         // one-pass closed-think override and consumes it.
         let pass_opts = self.pass_opts();
@@ -3041,62 +3079,67 @@ impl Agent<'_> {
         self.rescue_prefix_before_rebuild(prompt_text);
         // The plain REPL has no `LiveStatus`, so it samples `/toks` itself.
         let mut toks = crate::toks::Sampler::default();
-        let stats = self
-            .engine
-            .generate(
-                prompt,
-                &pass_opts,
-                &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
-                &|| greedy.load(Ordering::Relaxed),
-                &mut |ev| match ev {
-                    EngineEvent::Text(t) => {
-                        // Model output has started: drop the prefill bar so the
-                        // text streams cleanly from column zero.
-                        bar.clear();
-                        toks.note_token();
-                        assistant_text.push_str(&t);
-                        stream.push(&t);
-                        // Tee the exact bytes the local renderer sees to the
-                        // debug console; a no-op unless showThinking is off
-                        // and a console is connected.
-                        crate::debugmirror::push(&t);
-                        if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy).is_some() {
-                            preflight_stop.store(true, Ordering::Relaxed);
-                        }
+        let pressure = self.sensor.clone();
+        let result = self.engine.generate(
+            prompt,
+            &pass_opts,
+            &|| {
+                pressure_tick(
+                    &pressure,
+                    preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
+                )
+            },
+            &|| greedy.load(Ordering::Relaxed),
+            &mut |ev| match ev {
+                EngineEvent::Text(t) => {
+                    // Model output has started: drop the prefill bar so the
+                    // text streams cleanly from column zero.
+                    bar.clear();
+                    toks.note_token();
+                    assistant_text.push_str(&t);
+                    stream.push(&t);
+                    // Tee the exact bytes the local renderer sees to the
+                    // debug console; a no-op unless showThinking is off
+                    // and a console is connected.
+                    crate::debugmirror::push(&t);
+                    if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy).is_some() {
+                        preflight_stop.store(true, Ordering::Relaxed);
                     }
-                    EngineEvent::Prefill(p) => {
-                        note_prefill_event(&model_name, &p);
-                        bar.show(&Status {
-                            // A finished prefill means the engine is sampling,
-                            // not prefilling. Saying "prefilling" through the
-                            // whole time-to-first-token reads as a hang, and a
-                            // fully cached turn has no further event coming to
-                            // correct it (#64 follow-up).
-                            state: if p.is_complete() {
-                                WorkerState::Generating
-                            } else {
-                                WorkerState::Prefill
-                            },
-                            prefill_done: p.done,
-                            prefill_total: p.total,
-                            prefill_label: verb,
-                            thinking: stream.in_think(),
-                            prefill_tps: p.tps,
-                            elapsed_secs: turn_start.elapsed().as_secs_f64(),
-                            ctx_used: prompt_tokens,
-                            ctx_size,
-                            power_percent: power,
-                            think,
-                            ..Status::default()
-                        });
-                    }
-                    // Notices are a warm-up-only signal, never emitted mid-turn;
-                    // Spec counters reach this front-end's status line through
-                    // `stats` below, since the plain REPL has no live footer.
-                    EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
-                },
-            )
-            .map_err(|e| e.to_string())?;
+                }
+                EngineEvent::Prefill(p) => {
+                    note_prefill_event(&model_name, &p);
+                    bar.show(&Status {
+                        // A finished prefill means the engine is sampling,
+                        // not prefilling. Saying "prefilling" through the
+                        // whole time-to-first-token reads as a hang, and a
+                        // fully cached turn has no further event coming to
+                        // correct it (#64 follow-up).
+                        state: if p.is_complete() {
+                            WorkerState::Generating
+                        } else {
+                            WorkerState::Prefill
+                        },
+                        prefill_done: p.done,
+                        prefill_total: p.total,
+                        prefill_label: verb,
+                        thinking: stream.in_think(),
+                        prefill_tps: p.tps,
+                        elapsed_secs: turn_start.elapsed().as_secs_f64(),
+                        ctx_used: prompt_tokens,
+                        ctx_size,
+                        power_percent: power,
+                        think,
+                        ..Status::default()
+                    });
+                }
+                // Notices are a warm-up-only signal, never emitted mid-turn;
+                // Spec counters reach this front-end's status line through
+                // `stats` below, since the plain REPL has no live footer.
+                EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
+            },
+        );
+        self.note_pressure_stop();
+        let stats = result.map_err(|e| e.to_string())?;
         stream.finish();
         crate::debugmirror::flush();
         bar.clear();
@@ -4227,6 +4270,13 @@ impl Agent<'_> {
         crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
+        // Turn boundary: the same place background job notifications join the
+        // transcript. A yield here frees the KV before the turn re-enters the
+        // engine; a resume only retires the pinned plan and says what the
+        // rebuild will cost.
+        if let Some(line) = self.poll_pressure() {
+            println!("{}", status::system_line(&line, self.color));
+        }
         // The session owns the persisted task list; load it into the live tool
         // context so the `task` tool mutates the copy that renders and saves.
         self.tool_ctx.tasks.clone_from(&self.session.tasks);
@@ -4317,6 +4367,19 @@ impl Agent<'_> {
             // it must not be replayed to a window that connects later.
             self.note_pass_mirrored();
             self.payload_dirty = true;
+            // The partial output is in the transcript above, so a resume
+            // continues rather than repeats. Checked before `first_turn_done`
+            // is set, so a yield during the very first pass stays suppressed.
+            if let Some(line) = self.finish_pressure_stop() {
+                println!("{}", status::system_line(&line, self.color));
+            }
+            self.first_turn_done = true;
+            if self.is_pressure_yielded() {
+                // Not a completed answer and not a user abort: the next turn's
+                // `generate` rebuilds through `kvtier::warm` on its own.
+                self.save_payload_if_dirty();
+                return Ok(());
+            }
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
             if is_reasoning_stop(preflight_error.as_deref()) {
@@ -5267,12 +5330,16 @@ impl Agent<'_> {
         // but the state is then correct for whoever reads it.
         let progress = status::CompactProgress::begin();
         let mut summary = String::new();
+        let pressure = self.sensor.clone();
         let stats = self
             .engine
             .generate(
                 crate::engine::Prompt::Flat(&prompt_text),
                 &self.gen_opts,
-                &|| crate::interrupt::pending(),
+                // A pressure stop during compaction abandons the pass down the
+                // existing interrupted path: a half-written summary is worse
+                // than none, and the yield is taken at the next turn boundary.
+                &|| pressure_tick(&pressure, crate::interrupt::pending()),
                 &|| false,
                 &mut |ev| match ev {
                     EngineEvent::Text(t) => {
@@ -5291,6 +5358,7 @@ impl Agent<'_> {
         if stats.interrupted {
             println!("{}", status::system_line(COMPACT_INTERRUPTED, self.color));
             crate::interrupt::clear();
+            crate::ds4engine::clear_cancel();
             return Ok(Compacted::Interrupted);
         }
         let extracted = compact::extract_summary(&summary);
@@ -7243,6 +7311,138 @@ the original is frozen and listed in /tree"
         note
     }
 
+    /// Blob stems a resume would restore through: every cacheable tier of this
+    /// launch's chain, in `kvtier::warm`'s own order.
+    ///
+    /// These are what the GC must not sweep while plank is yielded — the KV is
+    /// deliberately not snapshotted, so these blobs are the whole restore path.
+    fn tier_keep_stems(&self) -> Vec<String> {
+        self.kv_tiers()
+            .into_iter()
+            .filter(crate::kvtier::TierSpec::cacheable)
+            .map(|t| t.fingerprint)
+            .collect()
+    }
+
+    /// True while plank has given its KV back to the system.
+    ///
+    /// The pinned restore plan *is* the yielded state: it exists from the
+    /// moment the session is released until `Decision::Resume` retires it. A
+    /// yield is therefore distinguishable from a completed turn (no plan) and
+    /// from a user abort ([`Self::last_turn_interrupted`]) without either front
+    /// end needing a third turn outcome.
+    fn is_pressure_yielded(&self) -> bool {
+        self.yield_policy.plan().is_some()
+    }
+
+    /// Latches whether the pass that just returned was stopped by memory
+    /// pressure.
+    ///
+    /// Must be called the instant `generate` returns and before anything
+    /// re-enters the engine: `clear_cancel` runs on entry to every generate and
+    /// warm pass, so the reason is gone the moment the next one starts.
+    fn note_pressure_stop(&mut self) {
+        self.pressure_stop = crate::ds4engine::cancelled_by_pressure();
+    }
+
+    /// Seconds since the epoch, for the hysteresis clock.
+    fn pressure_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    /// Releases the live session and pins the restore plan.
+    ///
+    /// Returns false when the engine declined — today, a session holding vision
+    /// state, which cannot be rebuilt from text alone. A decline is a normal
+    /// outcome: nothing was freed, so nothing is disclosed.
+    fn do_pressure_yield(&mut self) -> bool {
+        let live = self
+            .engine
+            .count_tokens(&render_transcript(&self.session, &self.system));
+        let keep = self.tier_keep_stems();
+        // `self.ladder` and `self.engine` are disjoint fields, but the borrow
+        // checker cannot see through `self`, so the ladder is lent separately.
+        let ladder = std::mem::take(&mut self.ladder);
+        let plan = self
+            .yield_policy
+            .yield_now(self.engine.as_mut(), &ladder, live, keep);
+        self.ladder = ladder;
+        plan.is_some()
+    }
+
+    /// Observes memory pressure and applies the resulting decision.
+    ///
+    /// Called at turn boundaries only — the same place background job
+    /// notifications join the transcript, never mid-pass. Mid-pass yielding
+    /// happens through the cancel callback instead, which stops at a token
+    /// boundary.
+    ///
+    /// Returns the system line the caller should surface, if any: the two front
+    /// ends print a system line by different means, so the decision is made
+    /// here and the printing is left to each path.
+    fn poll_pressure(&mut self) -> Option<String> {
+        use crate::mempressure::Decision;
+        let decision = self
+            .hysteresis
+            .observe(self.sensor.level(), Self::pressure_now());
+        if !should_act(decision, self.first_turn_done, self.in_sidechain()) {
+            return None;
+        }
+        match decision {
+            Decision::ShedCache => {
+                self.yield_policy.shed(&mut self.ladder);
+                None
+            }
+            Decision::Yield => self
+                .do_pressure_yield()
+                .then(|| PRESSURE_YIELDED.to_owned()),
+            // There is no explicit resume: retiring the plan is the whole
+            // action. The next `generate` finds a null session and rebuilds
+            // through `kvtier::warm` exactly as on a cold start.
+            Decision::Resume => self
+                .yield_policy
+                .clear_plan()
+                .map(|plan| pressure_disclosure(&plan))
+                .filter(|line| !line.is_empty()),
+            Decision::Hold => None,
+        }
+    }
+
+    /// Handles a generation the pressure hook cancelled mid-pass.
+    ///
+    /// Returns the system line to surface, if any. The partial output the model
+    /// produced before the stop is already in the transcript by the time this
+    /// runs, so the resume continues rather than repeats.
+    fn finish_pressure_stop(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.pressure_stop) {
+            return None;
+        }
+        // The user asked to stop between the raise and here: that ends the
+        // turn, so leave the session alone and let the abort path run.
+        if crate::interrupt::pending() {
+            crate::ds4engine::clear_cancel();
+            return None;
+        }
+        let mut line = None;
+        if should_act(
+            crate::mempressure::Decision::Yield,
+            self.first_turn_done,
+            self.in_sidechain(),
+        ) && self.do_pressure_yield()
+        {
+            line = Some(PRESSURE_YIELDED.to_owned());
+            // The state machine did not make this decision, so tell it — or it
+            // will never emit the matching Resume.
+            self.hysteresis.note_external_yield(Self::pressure_now());
+        }
+        // Free first, clear second. Reversed, a racing turn can start a
+        // generation against a session about to be freed underneath it.
+        crate::ds4engine::clear_cancel();
+        line
+    }
+
     /// Every fingerprint this launch is using, across every engine it holds and
     /// including the live session's payload.
     ///
@@ -7272,6 +7472,12 @@ the original is frozen and listed in /tree"
             let mut prefix = self.session.clone();
             prefix.transcript.truncate(rung.spans);
             keep.push(self.payload_fingerprint_for(&prefix));
+        }
+        // A yielded session presents no live rungs, so without this the sweep
+        // is free to delete the very blob the resume needs. The pinned plan is
+        // the only record of it while plank holds no KV at all.
+        if let Some(plan) = self.yield_policy.plan() {
+            keep.extend(plan.keep.iter().cloned());
         }
         keep
     }
@@ -12730,6 +12936,10 @@ impl Agent<'_> {
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
         self.tool_ctx.tasks.clone_from(&self.session.tasks);
+        // Mirror of the plain path's turn-boundary poll (`run_turn`).
+        if let Some(line) = self.poll_pressure() {
+            let _ = tx.send(UiEvent::Dim(line));
+        }
         let mut note = |s: String| {
             let _ = tx.send(UiEvent::Dim(s));
         };
@@ -12877,6 +13087,16 @@ impl Agent<'_> {
             self.note_pass_mirrored();
             self.payload_dirty = true;
             let _ = tx.send(UiEvent::EndLine);
+            // Mirror of the plain path: see `run_turn`.
+            if let Some(line) = self.finish_pressure_stop() {
+                let _ = tx.send(UiEvent::Dim(line));
+            }
+            self.first_turn_done = true;
+            if self.is_pressure_yielded() {
+                self.save_payload_if_dirty();
+                self.drain_btw(tx, shared);
+                return Ok(());
+            }
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
             if let Some(f) = out.error.as_ref().filter(|e| e.looped) {
@@ -13447,11 +13667,21 @@ impl Agent<'_> {
         shared.set_context(self.context_breakdown());
         let mut assistant_text = String::new();
 
+        // Polled between tokens, and relayed into prefill by the progress
+        // callback. The raise has to happen on this thread: the cancel flag is
+        // thread-local, so the sensor thread cannot set it. It deliberately
+        // does not consult `Hysteresis` — the yield dwell is zero, and the
+        // guards that matter (first turn, sidechain) are checked once after the
+        // pass rather than per token.
+        let pressure = self.sensor.clone();
         let interrupt = || {
-            shared.interrupt.load(Ordering::Relaxed)
-                || (is_main && shared.preempt.load(Ordering::Relaxed))
-                || preflight_stop.load(Ordering::Relaxed)
-                || crate::interrupt::pending()
+            pressure_tick(
+                &pressure,
+                shared.interrupt.load(Ordering::Relaxed)
+                    || (is_main && shared.preempt.load(Ordering::Relaxed))
+                    || preflight_stop.load(Ordering::Relaxed)
+                    || crate::interrupt::pending(),
+            )
         };
         let greedy_fn = || greedy.load(Ordering::Relaxed);
         let mut on_event = |ev: EngineEvent| {
@@ -13551,6 +13781,7 @@ impl Agent<'_> {
             )
         };
 
+        self.note_pressure_stop();
         let stats = result.map_err(|e| e.to_string())?;
         self.record_usage(&stats);
         self.last_ctx_used = stats.ctx_used;
@@ -13702,6 +13933,9 @@ impl Agent<'_> {
         // the interrupt and engine-error paths below.
         let progress = status::CompactProgress::begin();
         let mut summary = String::new();
+        // Mirror of the plain path's compaction guard (`compact`).
+        let pressure = self.sensor.clone();
+        let interrupt = &|| pressure_tick(&pressure, interrupt());
         let stats = self
             .engine
             .generate(
@@ -13726,6 +13960,7 @@ impl Agent<'_> {
         if stats.interrupted {
             sink.note(COMPACT_INTERRUPTED.to_owned());
             crate::interrupt::clear();
+            crate::ds4engine::clear_cancel();
             return Ok(Compacted::Interrupted);
         }
         let extracted = compact::extract_summary(&summary);
@@ -16626,6 +16861,11 @@ fn new_agent(
         payload_restored: false,
         payload_dirty: false,
         ladder: crate::kvladder::KvLadder::new(),
+        sensor: crate::mempressure::PressureSensor::start(),
+        hysteresis: crate::mempressure::Hysteresis::new(),
+        yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+        first_turn_done: false,
+        pressure_stop: false,
         sidechain_depth: 0,
         repro_dir,
         quiet_tools: false,
@@ -17214,6 +17454,25 @@ mod tests {
             PRESSURE_YIELDED.contains("memory pressure"),
             "the footer marker has to say why plank stopped: {PRESSURE_YIELDED}"
         );
+    }
+
+    #[test]
+    fn a_pressure_stop_is_not_a_user_abort() {
+        use crate::mempressure::PressureLevel;
+        assert!(should_raise_pressure_cancel(PressureLevel::Critical, false));
+        assert!(
+            !should_raise_pressure_cancel(PressureLevel::Critical, true),
+            "once the user has asked to stop, pressure must not make the turn \
+             resumable again"
+        );
+        assert!(!should_raise_pressure_cancel(PressureLevel::Warn, false));
+        // And the engine agrees at its own level: the reason a pressure stop
+        // records is not the reason a user stop records.
+        crate::ds4engine::clear_cancel();
+        crate::ds4engine::request_pressure_cancel();
+        assert!(crate::ds4engine::cancelled_by_pressure());
+        crate::ds4engine::clear_cancel();
+        assert!(!crate::ds4engine::cancelled_by_pressure());
     }
 
     #[test]
@@ -18654,6 +18913,11 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -22757,6 +23021,11 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -22875,6 +23144,11 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -23996,6 +24270,11 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -24259,6 +24538,11 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -24362,6 +24646,11 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -24452,6 +24741,11 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -24565,6 +24859,11 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -26971,6 +27270,11 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -27103,6 +27407,11 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -27269,6 +27578,11 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
