@@ -229,6 +229,11 @@ pub enum WorkerState {
 }
 
 /// Snapshot of worker progress shown in the footer, mirroring `agent_status`.
+///
+/// The bools are independent readings the footer draws side by side, not a
+/// state that should have been an enum — each names its own segment, and any
+/// combination of them is a real footer.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct Status {
     /// Current worker state.
@@ -272,6 +277,10 @@ pub struct Status {
     /// Background bash jobs still running (`BashJobs::running_count`); the
     /// jobs segment is drawn only when this is non-zero.
     pub running_jobs: usize,
+    /// True while plank has handed its KV session back to the system under
+    /// memory pressure. Drives [`pressure_segment`], the one marker that says
+    /// a wait of up to `RESUME_DWELL_SECS` is a pause and not a hang.
+    pub pressure_yielded: bool,
 }
 
 /// Marks the speculative-decoding segment, mirroring how `THINK_MARK` labels
@@ -294,6 +303,13 @@ const TEMP_MARK: &str = "🌡";
 /// Marks the footer's jobs segment: background bash jobs still running.
 /// Public so the TUI can find the segment for mouse hit-testing.
 pub const JOBS_MARK: &str = "⧗";
+
+/// Marks the footer's memory-pressure segment: plank is paused with its KV
+/// released, waiting for the system to calm down.
+///
+/// The bare codepoint, without the U+FE0F variation selector, for the reason
+/// [`TEMP_MARK`] spells out: the footer is width-sensitive.
+const PRESSURE_MARK: &str = "⏸";
 
 /// Marks the footer's loop-guard segment: the guards are armed and watching.
 /// Distinct from [`LOOP_MARK`], which says a guard has actually seen a cycle.
@@ -1890,6 +1906,13 @@ fn build_status_text_with_cells(
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
     };
+    // Beside the jobs segment: both are session-scoped states that outlive the
+    // pass, and both matter most at idle — which is exactly where a yielded
+    // plank sits.
+    let ctx = match pressure_segment(st) {
+        Some(seg) => format!("{ctx} | {}", theme(&seg)),
+        None => ctx,
+    };
     // The download segment rides with the ctx gauge for the same reason the
     // MTP segment does: it describes the whole session rather than this
     // turn, and keeping it left of the state word keeps the power suffix
@@ -2006,6 +2029,23 @@ pub fn jobs_segment(st: &Status) -> Option<String> {
         1 => Some(format!("{JOBS_MARK} 1 job")),
         n => Some(format!("{JOBS_MARK} {n} jobs")),
     }
+}
+
+/// The memory-pressure segment: `⏸ paused: memory` while plank has given its
+/// KV session back to the system, `None` otherwise so an ordinary footer is
+/// unchanged.
+///
+/// Rides with the ctx gauge beside the jobs segment, and for the same reason:
+/// it is a property of the session rather than of a running pass, and the
+/// whole point is that it is readable at idle — the yielded window can last
+/// `RESUME_DWELL_SECS`, which without a persistent marker reads as a hang.
+/// The wording is deliberately terser than the one-shot system line: that line
+/// marks the transition and can afford a sentence, this marks the state and
+/// has to fit beside everything else.
+#[must_use]
+pub fn pressure_segment(st: &Status) -> Option<String> {
+    st.pressure_yielded
+        .then(|| format!("{PRESSURE_MARK} paused: memory"))
 }
 
 /// Appends `seg` (already themed) to `ctx`, or returns `ctx` unchanged.
@@ -2366,6 +2406,23 @@ mod tests {
         // No variation selector: the mark the TUI hit-tests against is the one
         // the footer actually draws.
         assert!(!line.contains('\u{fe0f}'), "{line:?}");
+    }
+
+    #[test]
+    fn the_pressure_segment_marks_the_yielded_state_persistently() {
+        let mut st = Status::default();
+        assert_eq!(
+            pressure_segment(&st),
+            None,
+            "an ordinary footer must be unchanged"
+        );
+        st.pressure_yielded = true;
+        assert_eq!(pressure_segment(&st).as_deref(), Some("⏸ paused: memory"));
+        // Idle is the state the marker exists for: the yielded window is a
+        // wait, and without this it reads as a hang.
+        st.state = WorkerState::Idle;
+        let text = build_status_text(&st, false, true);
+        assert!(text.contains(" | ⏸ paused: memory | "), "got: {text}");
     }
 
     #[test]

@@ -108,6 +108,30 @@ impl Hysteresis {
         self.last_yield = Some(now_secs);
     }
 
+    /// Rolls back a [`Decision::Yield`] the caller could not carry out.
+    ///
+    /// `observe` commits the yield before the caller has tried it, but the
+    /// engine may refuse — a session holding vision state cannot be rebuilt
+    /// from text alone. Without this the machine would sit in the yielded
+    /// state having freed nothing, holding off every later `Critical` until a
+    /// full resume dwell elapsed: a refusal would suppress exactly the retries
+    /// that matter while memory is scarce.
+    ///
+    /// The `last_yield` stamp is deliberately NOT rolled back: a refusal still
+    /// cost a stop, and the minimum-interval guard exists to stop plank
+    /// thrashing on that cost.
+    ///
+    /// `shed` and `critical_since` are left exactly as `observe` set them.
+    /// `shed` stays true because the yield decision subsumed the cheaper shed
+    /// for this episode, and `critical_since` stays `None` so a later
+    /// `Critical` starts its own dwell — immaterial while
+    /// [`YIELD_DWELL_SECS`] is zero, and the conservative reading if it ever
+    /// is not.
+    pub fn note_yield_declined(&mut self) {
+        self.yielded = false;
+        self.normal_since = None;
+    }
+
     /// Observes one level reading and returns the action it implies.
     pub fn observe(&mut self, level: PressureLevel, now_secs: u64) -> Decision {
         if level == PressureLevel::Normal {
@@ -443,6 +467,31 @@ mod tests {
             h.observe(PressureLevel::Critical, 1 + MIN_YIELD_INTERVAL_SECS),
             Decision::Yield,
             "past the guard window, pressure is actionable again"
+        );
+    }
+
+    #[test]
+    fn a_declined_yield_can_be_retried() {
+        let mut h = Hysteresis::new();
+        assert_eq!(h.observe(PressureLevel::Critical, 0), Decision::Yield);
+        h.note_yield_declined();
+        assert!(!h.is_yielded(), "nothing was freed, so nothing is yielded");
+        assert_eq!(
+            h.observe(PressureLevel::Critical, 1 + MIN_YIELD_INTERVAL_SECS),
+            Decision::Yield,
+            "a refusal must not wedge the machine against later pressure"
+        );
+    }
+
+    #[test]
+    fn a_declined_yield_still_respects_the_min_interval() {
+        let mut h = Hysteresis::new();
+        assert_eq!(h.observe(PressureLevel::Critical, 0), Decision::Yield);
+        h.note_yield_declined();
+        assert_eq!(
+            h.observe(PressureLevel::Critical, 1),
+            Decision::Hold,
+            "a refusal still cost a stop; the guard window still applies"
         );
     }
 

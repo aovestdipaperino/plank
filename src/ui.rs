@@ -2977,9 +2977,6 @@ impl Agent<'_> {
         self.engine.set_pending_images(images);
     }
 
-    /// Streams one generation pass: paints the live status bar for prefill and
-    /// generation, and routes model text through the viz + markdown pipeline.
-    #[allow(clippy::type_complexity)]
     /// The plain REPL's stream renderer: a colorized stdout sink, configured
     /// exactly as every other pass on this path configures it.
     fn plain_stream(&mut self) -> StreamRenderer<TerminalSink<FlushingStdout>> {
@@ -2997,6 +2994,9 @@ impl Agent<'_> {
         stream
     }
 
+    /// Streams one generation pass: paints the live status bar for prefill and
+    /// generation, and routes model text through the viz + markdown pipeline.
+    #[allow(clippy::type_complexity)]
     fn stream_generation(
         &mut self,
         prompt_text: &str,
@@ -3139,7 +3139,13 @@ impl Agent<'_> {
             },
         );
         self.note_pressure_stop();
-        let stats = result.map_err(|e| e.to_string())?;
+        // The latch is consumed by `finish_pressure_stop` on the success path
+        // only; an engine error ends the turn here, so clearing it is what
+        // stops the *next* pass acting on a stale reading.
+        let stats = result.map_err(|e| {
+            self.pressure_stop = false;
+            e.to_string()
+        })?;
         stream.finish();
         crate::debugmirror::flush();
         bar.clear();
@@ -4378,6 +4384,16 @@ impl Agent<'_> {
                 // Not a completed answer and not a user abort: the next turn's
                 // `generate` rebuilds through `kvtier::warm` on its own.
                 self.save_payload_if_dirty();
+                // A yielded turn is still a turn that ended, and the window
+                // title is the one cue the user gets: leaving it on `Busy` for
+                // the whole yielded window says the opposite of what happened.
+                // Everything the ordinary close-out does runs here *except*
+                // the opportunistic microcompact and the end-of-turn KV flush,
+                // which would re-enter the engine and rebuild the very session
+                // the yield just freed.
+                crate::title::set(crate::title::State::Idle);
+                crate::warp::emit("stop", &self.session.id);
+                self.fire_turn_end(stats.generated, turn_start.elapsed());
                 return Ok(());
             }
             // The looping text is in the transcript now: dump it before the
@@ -4430,6 +4446,7 @@ impl Agent<'_> {
                 power_percent: self.power_percent,
                 think: self.think,
                 running_jobs: self.tool_ctx.bash.running_count(),
+                pressure_yielded: self.yield_policy.plan().is_some(),
                 ..Status::default()
             };
             if real_interrupt {
@@ -5350,17 +5367,34 @@ impl Agent<'_> {
                     EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
                 },
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string());
+        // Latched the instant `generate` returns, before anything can re-enter
+        // the engine and clear the reason (`note_pressure_stop`).
+        self.note_pressure_stop();
+        let stats = stats.inspect_err(|_| {
+            self.pressure_stop = false;
+        })?;
         drop(progress);
         if self.color {
             print!("\x1b[0m");
         }
         if stats.interrupted {
             println!("{}", status::system_line(COMPACT_INTERRUPTED, self.color));
+            // A pressure stop during compaction ends the turn here. Without
+            // this the yield would wait for the next `run_turn`'s
+            // `poll_pressure`, which on an interactive path means waiting for
+            // the user to type — the memory would stay wired exactly as long
+            // as nobody was there, which is the opposite of the point.
+            // Before `clear_cancel` (C4): free the session first, so a racing
+            // turn cannot start a generation against a session about to go.
+            if let Some(line) = self.finish_pressure_stop() {
+                println!("{}", status::system_line(&line, self.color));
+            }
             crate::interrupt::clear();
             crate::ds4engine::clear_cancel();
             return Ok(Compacted::Interrupted);
         }
+        self.pressure_stop = false;
         let extracted = compact::extract_summary(&summary);
         if extracted.trim().is_empty() {
             println!("{}", status::system_line(COMPACT_NO_SUMMARY, self.color));
@@ -7395,9 +7429,17 @@ the original is frozen and listed in /tree"
                 self.yield_policy.shed(&mut self.ladder);
                 None
             }
-            Decision::Yield => self
-                .do_pressure_yield()
-                .then(|| PRESSURE_YIELDED.to_owned()),
+            Decision::Yield => {
+                if self.do_pressure_yield() {
+                    Some(PRESSURE_YIELDED.to_owned())
+                } else {
+                    // Nothing was freed, so the machine must not believe it is
+                    // yielded: it would hold off every later Critical until a
+                    // full resume dwell had passed.
+                    self.hysteresis.note_yield_declined();
+                    None
+                }
+            }
             // There is no explicit resume: retiring the plan is the whole
             // action. The next `generate` finds a null session and rebuilds
             // through `kvtier::warm` exactly as on a cold start.
@@ -7430,12 +7472,20 @@ the original is frozen and listed in /tree"
             crate::mempressure::Decision::Yield,
             self.first_turn_done,
             self.in_sidechain(),
-        ) && self.do_pressure_yield()
-        {
-            line = Some(PRESSURE_YIELDED.to_owned());
-            // The state machine did not make this decision, so tell it — or it
-            // will never emit the matching Resume.
-            self.hysteresis.note_external_yield(Self::pressure_now());
+        ) {
+            if self.do_pressure_yield() {
+                line = Some(PRESSURE_YIELDED.to_owned());
+                // The state machine did not make this decision, so tell it — or
+                // it will never emit the matching Resume.
+                self.hysteresis.note_external_yield(Self::pressure_now());
+            } else {
+                // The engine declined. The machine never committed this yield
+                // (it came from the cancel hook, not from `observe`), but a
+                // `Yield` it *did* decide earlier in this same turn boundary
+                // may have left it committed; roll that back so the next
+                // Critical is actionable.
+                self.hysteresis.note_yield_declined();
+            }
         }
         // Free first, clear second. Reversed, a racing turn can start a
         // generation against a session about to be freed underneath it.
@@ -12373,6 +12423,7 @@ impl Agent<'_> {
             think: self.think,
             spec: self.last_spec,
             running_jobs: self.tool_ctx.bash.running_count(),
+            pressure_yielded: self.yield_policy.plan().is_some(),
             ..Status::default()
         }
     }
@@ -13782,7 +13833,12 @@ impl Agent<'_> {
         };
 
         self.note_pressure_stop();
-        let stats = result.map_err(|e| e.to_string())?;
+        // Mirror of the plain path: an engine error ends the turn without a
+        // `finish_pressure_stop`, so the latch has to be cleared here.
+        let stats = result.map_err(|e| {
+            self.pressure_stop = false;
+            e.to_string()
+        })?;
         self.record_usage(&stats);
         self.last_ctx_used = stats.ctx_used;
         self.last_guard = repeat.snapshot();
@@ -13955,14 +14011,25 @@ impl Agent<'_> {
                     sink.redraw();
                 },
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string());
+        // Mirror of the plain path (`compact`).
+        self.note_pressure_stop();
+        let stats = stats.inspect_err(|_| {
+            self.pressure_stop = false;
+        })?;
         drop(progress);
         if stats.interrupted {
             sink.note(COMPACT_INTERRUPTED.to_owned());
+            // Mirror of the plain path: free now rather than at the next
+            // prompt, and free before the cancel reason is cleared (C4).
+            if let Some(line) = self.finish_pressure_stop() {
+                sink.note(line);
+            }
             crate::interrupt::clear();
             crate::ds4engine::clear_cancel();
             return Ok(Compacted::Interrupted);
         }
+        self.pressure_stop = false;
         let extracted = compact::extract_summary(&summary);
         if extracted.trim().is_empty() {
             sink.note(COMPACT_NO_SUMMARY.to_owned());
