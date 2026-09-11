@@ -286,7 +286,6 @@ fn param_kind_for(tool: &str, param: &str) -> ParamKind {
     }
 }
 
-
 /// Renders `path` relative to `base` when it sits inside it; otherwise returns
 /// `path` unchanged. Used to shorten the `write` preview header for files in
 /// the working tree while leaving out-of-tree paths absolute.
@@ -2804,7 +2803,9 @@ mod tests {
         sr.push(stanza);
         sr.finish();
         assert!(
-            sr.sink().visible.contains("🔧 write\n  ├─ path ─ src/foo.rs"),
+            sr.sink()
+                .visible
+                .contains("🔧 write\n  ├─ path ─ src/foo.rs"),
             "banner node: {:?}",
             sr.sink().visible
         );
@@ -3041,7 +3042,10 @@ mod tests {
         );
         for sr in [run_chunked(text), run_charwise(text)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🔧 bash\n  ├─ command ─ cat documents.rs"), "{vis:?}");
+            assert!(
+                vis.contains("🔧 bash\n  ├─ command ─ cat documents.rs"),
+                "{vis:?}"
+            );
             assert!(!vis.contains("SSML"), "{vis:?}");
             let fin = sr.finished();
             assert_eq!(fin.calls.len(), 1);
@@ -3119,7 +3123,10 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🔧 read\n  ├─ Reading src/main.rs 1:500...\n"), "{vis:?}");
+            assert!(
+                vis.contains("🔧 read\n  ├─ Reading src/main.rs 1:500...\n"),
+                "{vis:?}"
+            );
             assert!(!vis.contains("DSML"), "{vis:?}");
         }
     }
