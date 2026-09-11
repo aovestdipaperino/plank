@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.0.6] - 2026-09-11
+
 ### Changed
 
 - **"failed to open model" now says why.** The message carried the path and,

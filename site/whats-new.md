@@ -7,8 +7,20 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.0.0 is out**, and the beta channel is on 5.0.5. The patch number
+**v5.0.0 is out**, and the beta channel is on 5.0.6. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.0.6 (beta) puts micro-compaction on the footer.** A wastebasket with a
+green or red light shows whether it is on, and double-clicking it flips the
+setting for the session; `/mc [on|off]` does the same by typing, and both work
+mid-turn. The loop guards learned two new shapes: reasoning that is drafting
+the answer rather than deciding what to do — a numbered list of findings, or
+the implementation as fenced code — is stopped and told to write it as the
+answer, and a cycle whose only variation is the list number is caught even
+though it is not byte-exact. A model that fails to open now says why, naming a
+dangling symlink's missing target, a truncated install caught against the
+manifest, or an absent companion sidecar. And every repro dump carries a table
+of its generation passes, which is how both guard changes were found.
 
 **5.0.5 (beta) charts the generation speed.** `/toks` draws tokens per second
 as a braille line in the theme green, one sample per second of decoding, in

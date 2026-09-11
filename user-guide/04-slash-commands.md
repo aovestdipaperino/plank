@@ -84,7 +84,8 @@ See [Extending plank](09-extending.md).
 | `/power <1..100>` | cap GPU power draw for this run; shown as `(local ⚡60%)` in the status bar |
 | `/mtp [on\|off]` | turn speculative decoding (multi-token prediction) on or off for this session; bare `/mtp` reports the state |
 | `/temp [0..100]` | set the sampling temperature; refused while `/mtp` is on, which pins it at 0 |
-| `/loopguard [on\|off]`, `/lg` | arm or silence the loop guards. The one mutating command that also works mid-turn |
+| `/loopguard [on\|off]`, `/lg` | arm or silence the loop guards. Works mid-turn |
+| `/mc [on\|off]` | turn micro-compaction on or off for this session; bare `/mc` reports the state. Works mid-turn, and double-clicking the footer's wastebasket does the same |
 | `/notify <mode>` | change notification mode for this session |
 | `/version` | the running version |
 | `/help` | full command and flag reference |

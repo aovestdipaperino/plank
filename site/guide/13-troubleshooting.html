@@ -299,6 +299,29 @@ bytes.</p>
 text-only — there is no vision model wired in yet — so a screenshot
 reaches the model as a filename. Transcribe the part that matters into
 your prompt.</p>
+<h2 id="failed-to-open-model">"failed to open model"</h2>
+<p>The message lists what plank could establish on its own, and usually
+one of those lines is the answer:</p>
+<ul>
+<li><strong>the return code</strong>, or that the engine reported
+success and handed back nothing;</li>
+<li><strong>what was asked for</strong> — the family read from the
+file's own metadata, the backend, and the context size;</li>
+<li><strong>the model file itself</strong>: a dangling symlink names the
+target that is gone, which is the common one because the default model
+paths are symlinks by convention, and otherwise you get a directory, an
+unreadable file, or the size;</li>
+<li><strong>a size mismatch</strong> against the installed manifest,
+which is what a truncated or interrupted install looks like;</li>
+<li><strong>each companion that was passed</strong>, so a Qwen run whose
+PLE sidecar is missing says so. A companion plank never passed is not
+listed, rather than listed as absent;</li>
+<li><strong>the Metal kernel sources</strong>, when they are not where
+the engine looks.</li>
+</ul>
+<p>The engine writes its own diagnosis just above that message, on the
+line plank has been updating in place while loading, so it is easy to
+read past.</p>
 <h2 id="the-model-downloads-stopped-or-wont-start">The model downloads
 stopped, or won't start</h2>
 <p>The model download streams to a <code>.part</code> file next to the
@@ -403,7 +426,11 @@ The same bad name passed to <code>--backend</code> <em>is</em> an error
 <p>Run it before you change anything. It writes
 <code>~/.plank/repro/repro-&lt;timestamp&gt;.md</code> containing the
 exact prompt the engine would see plus the model, backend, context size,
-sampling settings, think mode and engine tuning — self-contained,
+sampling settings, think mode and engine tuning, whether the loop guards
+were armed, and a <code>## Passes</code> table with one row per
+generation pass: when it ended, tokens and rate, the reasoning bytes the
+guard saw, any cycle it latched, and why the pass stopped (tool calls,
+answer, your interrupt, or which guard rung) — self-contained,
 read-only, and enough for a maintainer to reproduce the state that
 triggered the problem without your session.</p>
 <p>Attach that to an issue at <a

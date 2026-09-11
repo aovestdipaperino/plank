@@ -404,8 +404,13 @@ which pins it at 0</td>
 </tr>
 <tr>
 <td><code>/loopguard [on|off]</code>, <code>/lg</code></td>
-<td>arm or silence the loop guards. The one mutating command that also
-works mid-turn</td>
+<td>arm or silence the loop guards. Works mid-turn</td>
+</tr>
+<tr>
+<td><code>/mc [on|off]</code></td>
+<td>turn micro-compaction on or off for this session; bare
+<code>/mc</code> reports the state. Works mid-turn, and double-clicking
+the footer's wastebasket does the same</td>
 </tr>
 <tr>
 <td><code>/notify &lt;mode&gt;</code></td>
@@ -435,14 +440,14 @@ cannot be loaded into a running engine. The status bar shows
 <code>✨</code> while speculation is on, with its per-step figures
 beside it, and <code>🌡 0.60</code> while it is off.</p>
 <p><code>/loopguard off</code> silences every rung of every guard: the
-repetition guard and its think budget, the repeated-tool-call guard and
-its no-progress budget, and the repeat advisory. Unlike other settings
-commands it takes effect on a turn that is already generating, because
-the moment you want the guards out of the way is usually while they are
-firing. <code>🔁</code> in the status bar means they are armed;
-<code>♻ looping</code> means one has actually seen a cycle. The switch
-is session-only and is never written to disk (the underlying setting is
-<code>tools.loopGuards</code>).</p>
+repetition guard with its draft rung and think budget, the
+repeated-tool-call guard and its no-progress budget, and the repeat
+advisory. Unlike other settings commands it takes effect on a turn that
+is already generating, because the moment you want the guards out of the
+way is usually while they are firing. <code>🔁</code> in the status bar
+means they are armed; <code>♻ looping</code> means one has actually seen
+a cycle. The switch is session-only and is never written to disk (the
+underlying setting is <code>tools.loopGuards</code>).</p>
 <p><code>/config</code> changes write to
 <code>./.plank/settings.json</code> and apply immediately. In the TUI, a
 bare <code>/config</code> opens the form and

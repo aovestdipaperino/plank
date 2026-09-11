@@ -10,8 +10,22 @@ it.
 
 ## In the betas
 
-Riding ahead of stable 5.0.0 in the 5.0.5 beta. Install with `brew install
+Riding ahead of stable 5.0.0 in the 5.0.6 beta. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
+
+### 5.0.6
+
+Micro-compaction is on the footer now, as a wastebasket with a green or red
+light, and double-clicking it turns the feature on or off for the session.
+`/mc` does the same by typing, and both work mid-turn. The loop guards learned
+two new shapes: reasoning that is drafting the answer — a numbered list of
+findings, or the code — is stopped and told to write it as the answer instead,
+and a cycle whose only variation is the list number is no longer invisible just
+because it is not byte-exact. When a model fails to open, the error now says
+why: a dangling symlink names the target that is gone, a truncated install is
+caught by comparing against the manifest, and a missing companion sidecar is
+named. Repro dumps gained a table of every generation pass, which is how the
+two guard changes above were found.
 
 ### 5.0.5
 
