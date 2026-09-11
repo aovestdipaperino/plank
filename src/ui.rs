@@ -5142,6 +5142,13 @@ impl Agent<'_> {
         if !crate::settings::active().context.microcompact || self.in_sidechain() {
             return None;
         }
+        // Never while yielded to memory pressure: a microcompact restores a
+        // ladder rung, and `restore_rung_below` -> `set_kv` -> `ensure_session`
+        // re-acquires the very session the yield just released. Guarding here
+        // rather than at each call site closes it for both front ends at once.
+        if self.is_pressure_yielded() {
+            return None;
+        }
         let reclaimable = compact::microcompact_reclaimable(&self.session.transcript);
         if reclaimable < compact::MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES {
             return None;
@@ -7422,6 +7429,16 @@ the original is frozen and listed in /tree"
             .hysteresis
             .observe(self.sensor.level(), Self::pressure_now());
         if !should_act(decision, self.first_turn_done, self.in_sidechain()) {
+            // Invariant: if the machine is in the yielded state and nothing was
+            // actually freed, roll it back. `observe` commits `yielded` before
+            // returning `Yield`, so a suppressed yield — the first turn, or a
+            // sub-agent sidechain — would otherwise leave the machine believing
+            // it holds no session, holding off every later Critical until a full
+            // resume dwell elapsed. Only `Yield` commits the flag; a suppressed
+            // `ShedCache` or `Resume` has nothing to roll back.
+            if decision == Decision::Yield {
+                self.hysteresis.note_yield_declined();
+            }
             return None;
         }
         match decision {
@@ -7486,6 +7503,16 @@ the original is frozen and listed in /tree"
                 // Critical is actionable.
                 self.hysteresis.note_yield_declined();
             }
+        } else if self.hysteresis.is_yielded() && !self.is_pressure_yielded() {
+            // Same invariant as `poll_pressure`: yielded state with nothing
+            // freed must be rolled back. This path never commits a yield of its
+            // own (the stop came from the cancel hook), but an `observe` earlier
+            // in this turn boundary may have committed one that was then
+            // suppressed here, and no session was released either way. A live
+            // restore plan means a yield really did happen, and rolling that
+            // back would cost the machine its matching Resume — so it is left
+            // alone.
+            self.hysteresis.note_yield_declined();
         }
         // Free first, clear second. Reversed, a racing turn can start a
         // generation against a session about to be freed underneath it.
@@ -17743,6 +17770,29 @@ mod tests {
                 .any(|n| matches!(n, crate::guard::Nudge::Block(_))),
             "6th identical call should be blocked"
         );
+    }
+
+    #[test]
+    fn a_suppressed_yield_does_not_wedge_the_hysteresis() {
+        use crate::mempressure::PressureLevel;
+        let dir = scratch_dir("pressure-suppressed");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.sensor.set_for_test(PressureLevel::Critical);
+
+        // Suppressed because the first turn has not completed.
+        agent.first_turn_done = false;
+        assert!(agent.poll_pressure().is_none(), "the yield is suppressed");
+        assert!(
+            !agent.hysteresis.is_yielded(),
+            "nothing was freed, so the machine must not believe it yielded"
+        );
+
+        // Suppressed because the agent is inside a sub-agent sidechain.
+        agent.first_turn_done = true;
+        agent.sidechain_depth = 1;
+        assert!(agent.poll_pressure().is_none(), "the yield is suppressed");
+        assert!(!agent.hysteresis.is_yielded());
     }
 
     #[test]

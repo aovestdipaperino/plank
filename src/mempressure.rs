@@ -496,6 +496,28 @@ mod tests {
     }
 
     #[test]
+    fn a_suppressed_yield_rolls_back_without_losing_the_guard() {
+        // The caller suppressed the yield (first turn, or a sidechain) rather
+        // than refusing it, so nothing was freed and the machine must not sit
+        // in the yielded state — but the guard window still applies, exactly as
+        // for an engine refusal.
+        let mut h = Hysteresis::new();
+        assert_eq!(h.observe(PressureLevel::Critical, 0), Decision::Yield);
+        h.note_yield_declined();
+        assert!(!h.is_yielded(), "a suppressed yield freed nothing");
+        assert_eq!(
+            h.observe(PressureLevel::Critical, 1),
+            Decision::Hold,
+            "the min-interval guard survives a suppression rollback"
+        );
+        assert_eq!(
+            h.observe(PressureLevel::Critical, 1 + MIN_YIELD_INTERVAL_SECS),
+            Decision::Yield,
+            "and past the window the episode is actionable again"
+        );
+    }
+
+    #[test]
     fn a_single_normal_reading_never_resumes() {
         let mut h = Hysteresis::new();
         h.observe(PressureLevel::Critical, 0);
