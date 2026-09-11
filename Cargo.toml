@@ -93,13 +93,15 @@ libc = "0.2"
 # unstable-rendered-line-info exposes Paragraph::line_count for exact
 # wrapped-line counts, so scrollback can clamp to the true bottom (word-wrap
 # produces more rows than a char-packing estimate).
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 # Paints the cursor into the frame instead of asking the terminal to recolour
 # it. OSC 12 is a request, and Warp renders its cursor as a widget in its own
 # UI where no escape can reach it — the indicator has to be drawn to be
 # reliable. Pulls ratatui's `underline-color` feature (additive, and unused
-# here: plank draws a block).
-nano-cursor = "0.1"
+# here: plank draws a block). Taken by rev rather than from crates.io until
+# 0.2.0 — the ratatui 0.30 move — is published; 0.1.0 is the last release and
+# it cannot share a frame with a 0.30 buffer.
+nano-cursor = { git = "https://github.com/aovestdipaperino/nano-cursor", rev = "ba9f8d7235708bead9846efc6145c1115ef9c6b8" }
 unicode-width = "0.2"
 ureq = "3"
 # Plugin signature verification (minisign, docs/WASM-PLUGINS.md). `ring` is
@@ -124,9 +126,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # the project relicensed to SySL-1.0) carrying one parser fix: a fenced code
 # block opening directly after a paragraph parsed *ahead* of that paragraph, so
 # an assistant message rendered its code sample above the line introducing it.
+# The fork also carries the move to ratatui 0.30, which v0.3.6 predates.
 # Pinned by rev so builds are reproducible; retire the fork if the fix is ever
 # released under the original licence. See that repo's FORK.md.
-ratatui-markdown = { git = "https://github.com/aovestdipaperino/ratatui-markdown", rev = "a819ef8dc4f902c5812e8291f403f7802254a9fd", features = ["highlight-lang-all"] }
+ratatui-markdown = { git = "https://github.com/aovestdipaperino/ratatui-markdown", rev = "c66b7176b7617e03550c9262542789be02a488f9", features = ["highlight-lang-all"] }
 # serde JSON is shared by the remote-control protocol (#25) and the
 # remote-engine wire types (#26). The remote-control server uses tungstenite;
 # the sync remote-engine client (flavor a) reuses the ureq client above.
