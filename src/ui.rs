@@ -16987,8 +16987,9 @@ fn new_agent(
     }
     let wasm_tools = tool_ctx.wasm.registry.tools();
     // The dialect the loaded model speaks decides which parser reads its
-    // output back (every dialect takes the same tools prompt). Taken from the
-    // name the engine reports after detecting the file, not from the path.
+    // output back (every dialect takes the same tools prompt, with V4.1
+    // respelling three tag names). Taken from the name the engine reports
+    // after detecting the file, not from the path.
     let syntax = sysprompt::ToolSyntax::for_model_name(&engine.model_name());
     let system = sysprompt::build_system_prompt_parts_with_wasm(
         &cfg.system,

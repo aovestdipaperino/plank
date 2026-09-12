@@ -313,6 +313,17 @@ fn companion_notes<'a>(
     ]
 }
 
+/// Decides whether V4.1 expects an empty `system` message ahead of the tools
+/// prompt, exactly as `agent_append_system_prompt` pushes one before the
+/// rendered-chat tokenization. Gated on a non-empty `trusted` span so the
+/// split path (`warm_append_system`, which passes `trusted_len` 0 for the
+/// untrusted remainder) cannot emit a second one.
+fn wants_empty_system(model_name: &str, trusted: &str) -> bool {
+    !trusted.is_empty()
+        && crate::sysprompt::ToolSyntax::for_model_name(model_name)
+            == crate::sysprompt::ToolSyntax::Dsml41
+}
+
 impl Ds4Model {
     /// Opens a model file with the given backend, context size, and tuning
     /// knobs (`--mtp`, `--ssd-streaming`, steering, ...).
@@ -577,14 +588,7 @@ impl Ds4Model {
             .find(|&i| system.is_char_boundary(i))
             .unwrap_or(0);
         let (trusted, plain) = system.split_at(split);
-        // V4.1 expects an empty `system` message ahead of the tools prompt,
-        // exactly as `agent_append_system_prompt` pushes one before the
-        // rendered-chat tokenization. Gated on a non-empty trusted span so the
-        // split path (`warm_append_system`, which passes `trusted_len` 0 for
-        // the untrusted remainder) cannot emit a second one.
-        if !trusted.is_empty()
-            && crate::sysprompt::ToolSyntax::for_model_name(&self.model_name())
-                == crate::sysprompt::ToolSyntax::Dsml41
+        if wants_empty_system(&self.model_name(), trusted)
             && let (Ok(role), Ok(empty)) = (CString::new("system"), CString::new(""))
         {
             // SAFETY: engine and tokens valid; strings outlive the call.
@@ -2922,8 +2926,28 @@ fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
 mod tests {
     use super::{
         CancelReason, cancel_cb, cancel_clear, cancel_reason, cancel_request,
-        cancelled_by_pressure, request_pressure_cancel,
+        cancelled_by_pressure, request_pressure_cancel, wants_empty_system,
     };
+
+    #[test]
+    fn wants_empty_system_for_v41_with_trusted_text() {
+        assert!(wants_empty_system("DeepSeek V4.1 Flash", "system text"));
+    }
+
+    #[test]
+    fn wants_empty_system_false_for_v4() {
+        assert!(!wants_empty_system("DeepSeek V4 Flash", "system text"));
+    }
+
+    #[test]
+    fn wants_empty_system_false_when_trusted_is_empty() {
+        assert!(!wants_empty_system("DeepSeek V4.1 Flash", ""));
+    }
+
+    #[test]
+    fn wants_empty_system_false_for_empty_model_name() {
+        assert!(!wants_empty_system("", "system text"));
+    }
 
     #[test]
     fn a_user_interrupt_outranks_a_pressure_yield() {
