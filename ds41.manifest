@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "released": "2026-09-12",
+  "notes": "DeepSeek V4.1 Flash Q2, initial manifest",
+  "files": {
+    "main": {
+      "name": "DeepSeek-V4.1-Flash-Q2.gguf",
+      "url": "https://huggingface.co/antirez/deepseek-v4.1-flash-gguf/resolve/main/DeepSeek-V4.1-Flash-Q2.gguf",
+      "bytes": 365713686528,
+      "sha256": "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"
+    },
+    "vision": {
+      "name": "DeepSeek-V4.1-Flash-Vision.gguf",
+      "url": "https://huggingface.co/antirez/deepseek-v4.1-flash-gguf/resolve/main/DeepSeek-V4.1-Flash-Vision.gguf",
+      "bytes": 970555552,
+      "sha256": "cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15"
+    }
+  }
+}

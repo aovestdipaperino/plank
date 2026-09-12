@@ -823,6 +823,7 @@ pub fn lock_path() -> PathBuf {
 pub fn job_path_in(root: &Path, set: crate::manifest::ModelSet) -> PathBuf {
     let name = match set {
         crate::manifest::ModelSet::Ds4 => "job.json",
+        crate::manifest::ModelSet::Ds41 => "job-ds41.json",
     };
     crate::manifest::downloads_dir_in(root).join(name)
 }

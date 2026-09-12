@@ -295,6 +295,23 @@ pub fn default_vision_path() -> PathBuf {
     home.join(".plank").join("ds4flash.vision.gguf")
 }
 
+/// Default `DeepSeek` V4.1 Flash model location.
+///
+/// A separate name from [`default_model_path`] on purpose: the two sets are
+/// wholly disjoint on disk, so a V4.1 install can never overwrite a V4 one.
+#[must_use]
+pub fn default_ds41_model_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("ds41flash.gguf")
+}
+
+/// Default V4.1 vision-encoder location, beside its main model.
+#[must_use]
+pub fn default_ds41_vision_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("ds41flash.vision.gguf")
+}
+
 /// Hugging Face download URL for the default Flash GGUF.
 #[must_use]
 pub fn model_url() -> String {
@@ -1408,6 +1425,7 @@ pub fn manifest_set_for_model(model_path: Option<&Path>) -> Option<crate::manife
     match model_path {
         None => Some(crate::manifest::ModelSet::Ds4),
         Some(p) if p == default_model_path() => Some(crate::manifest::ModelSet::Ds4),
+        Some(p) if p == default_ds41_model_path() => Some(crate::manifest::ModelSet::Ds41),
         Some(_) => None,
     }
 }

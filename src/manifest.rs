@@ -22,6 +22,12 @@ use std::path::{Path, PathBuf};
 /// every client that predates it.
 pub const KINDS: [&str; 3] = ["main", "vision", "dspark"];
 
+/// The artifact kinds plank knows how to install for `DeepSeek` V4.1.
+///
+/// No `dspark`: upstream's `refs/ds4/docs/MODELS.md` states the `DSpark`
+/// drafter is not implemented for V4.1, so there is no such artifact to fetch.
+pub const DS41_KINDS: [&str; 2] = ["main", "vision"];
+
 /// Which model set a manifest, staging area, and install location belong to.
 ///
 /// Every artifact path in this module is scoped by one of these. Sets are kept
@@ -35,17 +41,25 @@ pub enum ModelSet {
     /// `DeepSeek` V4 Flash: main model, vision encoder, `DSpark` drafter.
     #[default]
     Ds4,
+    /// `DeepSeek` V4.1 Flash: main model and vision encoder only.
+    Ds41,
 }
+
+/// Every variant of [`ModelSet`], so the path-disjointness invariant can be
+/// asserted across the whole set rather than a hardcoded pair.
+///
+/// Adding a variant without adding it here would silently narrow that test,
+/// which is why `every_set_variant_is_listed` exhaustively matches on a
+/// variant to force this list to be revisited.
+pub const ALL_SETS: [ModelSet; 2] = [ModelSet::Ds4, ModelSet::Ds41];
 
 impl ModelSet {
     /// The set a model of this family belongs to.
     #[must_use]
     pub fn for_family(family: crate::gguf::ModelFamily) -> Self {
         match family {
-            // V4.1 has no artifact set of its own yet: its weights are still
-            // installed and named as the `DeepSeek` set, so pointing it at a
-            // set that does not exist would break every manifest lookup.
-            crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41 => Self::Ds4,
+            crate::gguf::ModelFamily::Ds4 => Self::Ds4,
+            crate::gguf::ModelFamily::Ds41 => Self::Ds41,
         }
     }
 
@@ -54,6 +68,7 @@ impl ModelSet {
     pub fn kinds(self) -> &'static [&'static str] {
         match self {
             Self::Ds4 => &KINDS,
+            Self::Ds41 => &DS41_KINDS,
         }
     }
 
@@ -62,6 +77,7 @@ impl ModelSet {
     pub fn manifest_name(self) -> &'static str {
         match self {
             Self::Ds4 => "ds4.manifest",
+            Self::Ds41 => "ds41.manifest",
         }
     }
 
@@ -70,6 +86,7 @@ impl ModelSet {
     pub fn staging_leaf(self) -> &'static str {
         match self {
             Self::Ds4 => "staging",
+            Self::Ds41 => "staging-ds41",
         }
     }
 
@@ -78,14 +95,18 @@ impl ModelSet {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ds4 => "ds4",
+            Self::Ds41 => "ds41",
         }
     }
 
     /// Parses [`Self::as_str`]. Anything unrecognized reads as `Ds4`, which is
     /// what a helper spawned by an older plank passes: nothing.
     #[must_use]
-    pub fn from_str_or_default(_s: &str) -> Self {
-        Self::Ds4
+    pub fn from_str_or_default(s: &str) -> Self {
+        match s {
+            "ds41" => Self::Ds41,
+            _ => Self::Ds4,
+        }
     }
 }
 
@@ -264,6 +285,8 @@ pub fn local_path_for_in(root: &Path, set: ModelSet, kind: &str) -> Option<PathB
         (ModelSet::Ds4, "main") => Some(root.join("ds4flash.gguf")),
         (ModelSet::Ds4, "vision") => Some(root.join("ds4flash.vision.gguf")),
         (ModelSet::Ds4, "dspark") => Some(root.join("ds4flash.dspark.gguf")),
+        (ModelSet::Ds41, "main") => Some(root.join("ds41flash.gguf")),
+        (ModelSet::Ds41, "vision") => Some(root.join("ds41flash.vision.gguf")),
         _ => None,
     }
 }
@@ -279,8 +302,27 @@ pub fn local_path_for(set: ModelSet, kind: &str) -> Option<PathBuf> {
         (ModelSet::Ds4, "main") => Some(crate::download::default_model_path()),
         (ModelSet::Ds4, "vision") => Some(crate::download::default_vision_path()),
         (ModelSet::Ds4, "dspark") => Some(crate::download::default_dspark_path()),
+        (ModelSet::Ds41, "main") => Some(crate::download::default_ds41_model_path()),
+        (ModelSet::Ds41, "vision") => Some(crate::download::default_ds41_vision_path()),
         _ => None,
     }
+}
+
+/// Which set a plank rooted at `root` manages by default.
+///
+/// A fresh install — nothing recorded for any set — takes the newest set,
+/// `Ds41`. An install that already records `ds4.manifest` stays on `Ds4` and is
+/// never migrated: promoting it would offer an existing user a 341 GiB download
+/// they never asked for.
+#[must_use]
+pub fn default_set_for_root(root: &Path) -> ModelSet {
+    if installed_path_in(root, ModelSet::Ds41).exists() {
+        return ModelSet::Ds41;
+    }
+    if installed_path_in(root, ModelSet::Ds4).exists() {
+        return ModelSet::Ds4;
+    }
+    ModelSet::Ds41
 }
 
 /// Reads and parses the manifest at `path`, if it is there and valid.
@@ -581,14 +623,162 @@ mod tests {
         let root = Path::new("/tmp/plank-set-test");
         assert_eq!(ModelSet::Ds4.kinds(), &["main", "vision", "dspark"]);
         assert!(local_path_for_in(root, ModelSet::Ds4, "mtp").is_none());
+        assert_eq!(ModelSet::Ds41.kinds(), &["main", "vision"]);
+        // V4.1 has no `DSpark` drafter upstream, so it must not resolve one.
+        assert!(local_path_for_in(root, ModelSet::Ds41, "dspark").is_none());
+    }
+
+    /// The V4.1 set, end to end: family mapping, kinds, manifest name, staging
+    /// leaf, CLI name and install paths.
+    #[test]
+    fn ds41_set_is_wired_end_to_end() {
+        let s = ModelSet::for_family(crate::gguf::ModelFamily::Ds41);
+        assert_eq!(s, ModelSet::Ds41);
+        assert_eq!(s.kinds(), &["main", "vision"]);
+        assert_eq!(s.manifest_name(), "ds41.manifest");
+        assert_eq!(s.staging_leaf(), "staging-ds41");
+        assert_eq!(s.as_str(), "ds41");
+        assert_eq!(ModelSet::from_str_or_default("ds41"), ModelSet::Ds41);
+        assert!(!s.kinds().contains(&"dspark"));
+        // The V4 family must not have been dragged along with it.
+        assert_eq!(
+            ModelSet::for_family(crate::gguf::ModelFamily::Ds4),
+            ModelSet::Ds4
+        );
+        let root = Path::new("/tmp/plank-set-test");
+        assert_eq!(
+            local_path_for_in(root, ModelSet::Ds41, "main"),
+            Some(root.join("ds41flash.gguf"))
+        );
+        assert_eq!(
+            local_path_for_in(root, ModelSet::Ds41, "vision"),
+            Some(root.join("ds41flash.vision.gguf"))
+        );
+    }
+
+    /// The manifest that actually ships. The byte counts and digests here were
+    /// checked against the published artifacts: a typo would only be found
+    /// after a 341 GiB download failed its final verification.
+    #[test]
+    fn the_shipped_ds41_manifest_parses() {
+        let m = parse(include_str!("../ds41.manifest")).expect("ds41.manifest parses");
+        let main = m.files.get("main").expect("main entry");
+        assert_eq!(main.bytes, 365_713_686_528);
+        assert_eq!(
+            main.sha256,
+            "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"
+        );
+        let vision = m.files.get("vision").expect("vision entry");
+        assert_eq!(vision.bytes, 970_555_552);
+        assert_eq!(
+            vision.sha256,
+            "cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15"
+        );
+        assert!(!m.files.contains_key("dspark"));
+    }
+
+    /// The shipped V4 manifest must keep parsing too: both files are compiled
+    /// in, and a malformed one is only noticed here.
+    #[test]
+    fn the_shipped_ds4_manifest_parses() {
+        let m = parse(include_str!("../ds4.manifest")).expect("ds4.manifest parses");
+        assert!(m.files.contains_key("dspark"));
+    }
+
+    /// A fresh install takes the newest set; an install that already records
+    /// the V4 manifest is never migrated, because migrating it would offer a
+    /// 341 GiB download nobody asked for.
+    #[test]
+    fn a_fresh_install_defaults_to_ds41_but_an_existing_v4_install_does_not_migrate() {
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        assert_eq!(default_set_for_root(&root), ModelSet::Ds41);
+        std::fs::write(root.join("ds4.manifest"), "{}").expect("write");
+        assert_eq!(default_set_for_root(&root), ModelSet::Ds4);
+        // A root recording both stays on the newest.
+        std::fs::write(root.join("ds41.manifest"), "{}").expect("write");
+        assert_eq!(default_set_for_root(&root), ModelSet::Ds41);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `ALL_SETS` must list every variant. The exhaustive match makes adding a
+    /// variant a compile error here rather than a silently narrowed invariant
+    /// below.
+    #[test]
+    fn every_set_variant_is_listed() {
+        for set in ALL_SETS {
+            match set {
+                ModelSet::Ds4 | ModelSet::Ds41 => {}
+            }
+        }
+        assert_eq!(ALL_SETS.len(), 2);
+        // No duplicates, or the disjointness test would compare a set to
+        // itself and pass vacuously.
+        for (i, a) in ALL_SETS.iter().enumerate() {
+            for b in &ALL_SETS[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    /// Two sets must never collide on any path they write.
+    ///
+    /// Load-bearing, not cosmetic: the swap's guarantee is that the manifest
+    /// file moves *last*, so its presence proves that set landed whole. Share
+    /// a staging directory between two sets and a half-staged download of one
+    /// could be read as proof about the other. Iterates every variant rather
+    /// than a hardcoded pair so it keeps holding for the next family.
+    #[test]
+    fn the_sets_never_share_a_path() {
+        let root = Path::new("/tmp/plank-set-disjoint");
+        for (i, a) in ALL_SETS.iter().enumerate() {
+            for b in &ALL_SETS[i + 1..] {
+                let (a, b) = (*a, *b);
+                assert_ne!(a.staging_leaf(), b.staging_leaf(), "{a:?} vs {b:?}");
+                assert_ne!(a.manifest_name(), b.manifest_name(), "{a:?} vs {b:?}");
+                assert_ne!(a.as_str(), b.as_str(), "{a:?} vs {b:?}");
+                assert_ne!(
+                    staging_dir_in(root, a),
+                    staging_dir_in(root, b),
+                    "{a:?} vs {b:?}"
+                );
+                assert_ne!(
+                    installed_path_in(root, a),
+                    installed_path_in(root, b),
+                    "{a:?} vs {b:?}"
+                );
+                // Every install path of one set, against every install path of
+                // the other: two sets sharing a kind name must still land on
+                // different files.
+                for ka in a.kinds() {
+                    for kb in b.kinds() {
+                        let (pa, pb) = (
+                            local_path_for_in(root, a, ka),
+                            local_path_for_in(root, b, kb),
+                        );
+                        assert!(pa.is_some() && pb.is_some(), "{a:?}/{ka} {b:?}/{kb}");
+                        assert_ne!(pa, pb, "{a:?}/{ka} collides with {b:?}/{kb}");
+                        assert_ne!(
+                            local_path_for(a, ka),
+                            local_path_for(b, kb),
+                            "{a:?}/{ka} collides with {b:?}/{kb}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The helper is handed its set in argv, and one spawned by a plank that
     /// predates two sets passes nothing.
     #[test]
     fn the_set_round_trips_through_argv() {
-        let set = ModelSet::Ds4;
-        assert_eq!(ModelSet::from_str_or_default(set.as_str()), set);
+        for set in ALL_SETS {
+            assert_eq!(ModelSet::from_str_or_default(set.as_str()), set, "{set:?}");
+        }
+        assert_eq!(ModelSet::from_str_or_default("ds41"), ModelSet::Ds41);
+        assert_eq!(ModelSet::from_str_or_default("ds4"), ModelSet::Ds4);
+        // An older helper passes nothing at all; that path must keep working.
         assert_eq!(ModelSet::from_str_or_default(""), ModelSet::Ds4);
         assert_eq!(ModelSet::from_str_or_default("glm"), ModelSet::Ds4);
     }
