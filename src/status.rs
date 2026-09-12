@@ -2223,7 +2223,9 @@ pub fn build_status_text_within(
 /// Visible width, ignoring ANSI escapes so a coloured line is not judged by
 /// the length of its escape sequences.
 fn visible_width(text: &str) -> usize {
-    let mut width = 0;
+    use unicode_width::UnicodeWidthStr;
+
+    let mut stripped = String::with_capacity(text.len());
     let mut in_escape = false;
     for c in text.chars() {
         if in_escape {
@@ -2234,10 +2236,19 @@ fn visible_width(text: &str) -> usize {
         } else if c == '\u{1b}' {
             in_escape = true;
         } else {
-            width += 1;
+            stripped.push(c);
         }
     }
-    width
+    // Measured once over the whole stripped string (not per-char) so a
+    // multi-codepoint grapheme is judged by `unicode_width`'s own notion of
+    // combined width rather than summed as independent characters. This is
+    // still not grapheme-cluster aware: a ZWJ sequence (e.g. a family emoji
+    // built from several emoji joined by U+200D) is measured as the sum of
+    // its constituent codepoints' widths, which overcounts relative to how
+    // most terminals render the joined cluster in a single cell. Plain
+    // emoji, flags (regional indicator pairs) and emoji+variation-selector
+    // pairs are measured correctly; true ZWJ sequences are the known gap.
+    stripped.width()
 }
 
 /// Formats the echoed user prompt line (`* <text>` with bold styling on TTYs).
@@ -2510,6 +2521,60 @@ mod tests {
         assert_eq!(visible_width("\x1b[1;31mred\x1b[0m"), 3);
         assert_eq!(visible_width("\x1b[38;5;120mgreen\x1b[0m!"), 6);
     }
+
+    /// Emoji occupy (at least) two terminal columns each in real terminals,
+    /// but `unicode_width` measures per the Unicode East Asian Width tables:
+    /// most of the footer's marks are "Wide" (2 columns), while `🌡`
+    /// (U+1F321) and `🗑` (U+1F5D1) are categorized "Ambiguous"/narrow at
+    /// this Unicode version and measure 1. Either way this is a strict
+    /// improvement over `chars()` (which gave 1 for all six), and it is the
+    /// same measurement `src/experts.rs` already relies on for the brain
+    /// glyph, so the two stay consistent.
+    #[test]
+    fn visible_width_counts_wide_emoji_as_two_columns() {
+        assert_eq!(visible_width("🌡"), 1);
+        assert_eq!(visible_width("🗑"), 1);
+        assert_eq!(visible_width("🟢"), 2);
+        assert_eq!(visible_width("📈"), 2);
+        assert_eq!(visible_width("🧠"), 2);
+        assert_eq!(visible_width("💾"), 2);
+        assert_eq!(visible_width("🗑 🟢"), 4); // 1 + space + 2
+    }
+
+    #[test]
+    fn visible_width_emoji_mixed_with_ansi() {
+        assert_eq!(visible_width("\x1b[1;31m🧠\x1b[0m"), 2);
+        assert_eq!(visible_width("\x1b[38;5;120m🧠 💾\x1b[0m!"), 6); // 2+1+2+1
+    }
+
+    #[test]
+    fn visible_width_realistic_footer_with_several_emoji() {
+        // A representative footer fragment: thermometer, brain, chart, disk,
+        // wastebasket+dot.
+        let footer = "🌡 72% 🧠 4.2k 📈 1.1x 💾 🗑 🟢";
+        let ascii_len = footer.chars().filter(char::is_ascii).count();
+        // 🌡 and 🗑 measure 1 column each under unicode_width; 🧠, 📈, 💾, 🟢
+        // measure 2 each.
+        assert_eq!(visible_width(footer), ascii_len + 2 + 4 * 2);
+    }
+
+    /// Pins the real bug: a footer whose emoji make it wider than `cols`
+    /// must be treated as not fitting, so the elider picks a shorter
+    /// candidate instead of overflowing/wrapping the line.
+    #[test]
+    fn visible_width_boundary_emoji_footer_does_not_falsely_fit() {
+        // 40 ASCII chars + one emoji (2 cols) = 42 true columns, but the old
+        // chars()-based counter would have reported 41 and wrongly believed
+        // it fit in a 41-column terminal.
+        let ascii_prefix = "x".repeat(40);
+        let footer = format!("{ascii_prefix}💾");
+        assert_eq!(footer.chars().count(), 41);
+        assert_eq!(visible_width(&footer), 42);
+        assert!(
+            visible_width(&footer) > 41,
+            "must not appear to fit in 41 cols"
+        );
+    }
     use super::*;
 
     #[test]
@@ -2607,6 +2672,65 @@ mod tests {
             build_status_text(&st, false, true).ends_with("ctx 12% | 🌡 0.00 | 🗑 🟢 | 📈 | idle"),
             "{}",
             build_status_text(&st, false, true)
+        );
+    }
+
+    /// The actual user-visible bug: with `chars().count()` measuring width,
+    /// a footer whose true column width exceeds `cols` (because of its
+    /// emoji) was judged to fit, so `build_status_text_within` returned the
+    /// full, overflowing line instead of eliding down to a shorter one.
+    ///
+    /// Built-in segments are never elided (only contributed plugin cells
+    /// are), so this needs at least one plugin cell to give the elider
+    /// something to drop; it is restored to empty before the guard is
+    /// released.
+    #[test]
+    fn build_status_text_within_elides_when_emoji_push_past_cols() {
+        // Resets the process-global wasm-segments slot on scope exit, panic
+        // or not, so a failing assertion here can never leak a segment into
+        // an unrelated test running under the same `quiet_footer` lock.
+        struct ResetWasmSegments;
+        impl Drop for ResetWasmSegments {
+            fn drop(&mut self) {
+                set_wasm_segments(Vec::new());
+            }
+        }
+
+        let _lock = quiet_footer();
+        let _reset = ResetWasmSegments;
+        set_wasm_segments(vec![Cell {
+            text: "💾 spill".to_string(),
+            priority: 1,
+            fg: None,
+            bg: None,
+        }]);
+        let st = Status {
+            ctx_used: 1000,
+            ctx_size: 8000,
+            ..Status::default()
+        };
+        let full = build_status_text(&st, false, true);
+        let true_width = visible_width(&full);
+        let naive_width = full.chars().count();
+        // The footer's 💾 plugin cell measures 2 columns under
+        // unicode_width, but only 1 char, so the naive count undercounts
+        // relative to the true column width.
+        assert!(naive_width < true_width, "{full}");
+
+        // Pick cols right at the boundary: the full line fits under the
+        // old, wrong measurement but must NOT fit under the true one, so it
+        // must be elided down (dropping the plugin cell) to something that
+        // actually fits.
+        let cols = naive_width;
+        let candidate = build_status_text_within(&st, false, true, cols);
+        assert!(
+            visible_width(&candidate) <= cols,
+            "candidate must actually fit: {candidate:?} (width {}, cols {cols})",
+            visible_width(&candidate)
+        );
+        assert_ne!(
+            candidate, full,
+            "the full line does not truly fit and must have been elided"
         );
     }
 
