@@ -604,20 +604,11 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
         // its "DSML" was invalid, and handing it DSML to copy when it speaks
         // something else, is how a recorded session ended with the model
         // insisting the harness was broken rather than fixing its markup.
+        // V4.1 speaks its own DSML dialect; until its reminder text is pinned
+        // against the C, the V4 reminder is the closest true thing to hand it
+        // — both are DSML, only the tag table differs, so the two share one
+        // arm, which is now every dialect there is.
         PassError::Dsml => match syntax {
-            // Unreachable — plank no longer serves a Qwen model — but the
-            // variant still exists until the dialect layer is removed, so the
-            // match must stay total. Falling back to the DSML reminder is the
-            // honest answer: DSML is the only dialect this build speaks; the
-            // arm goes away with the dialect.
-            sysprompt::ToolSyntax::Qwen => format!(
-                "Tool error: invalid tool call: {err}\n{}",
-                sysprompt::dsml_syntax_reminder()
-            ),
-            // V4.1 speaks its own DSML dialect; until its reminder text is
-            // pinned against the C, the V4 reminder is the closest true thing
-            // to hand it — both are DSML, only the tag table differs, so the
-            // two share one arm.
             sysprompt::ToolSyntax::Dsml | sysprompt::ToolSyntax::Dsml41 => format!(
                 "Tool error: invalid DSML tool call: {err}\n{}",
                 sysprompt::dsml_syntax_reminder()
@@ -8712,11 +8703,8 @@ the original is frozen and listed in /tree"
         // the transcript.
         let model_name = self.engine.model_name();
         let syntax = self.tool_syntax();
-        // `Qwen` has no family any more, and no engine this build opens can
-        // report it; the `DeepSeek` default is the only artifact set there is.
-        let family = crate::manifest::ModelSet::for_family(
-            crate::gguf::ModelFamily::from_syntax(syntax).unwrap_or_default(),
-        );
+        let family =
+            crate::manifest::ModelSet::for_family(crate::gguf::ModelFamily::from_syntax(syntax));
         let installed = crate::manifest::read_at(&crate::manifest::installed_path(family));
         let artifact_version = installed.as_ref().map(|m| m.version);
         // The `main` entry is the weights themselves; its URL carries the
@@ -8739,7 +8727,6 @@ the original is frozen and listed in /tree"
                 family: family.as_str(),
                 syntax: match syntax {
                     crate::sysprompt::ToolSyntax::Dsml => "dsml",
-                    crate::sysprompt::ToolSyntax::Qwen => "qwen",
                     crate::sysprompt::ToolSyntax::Dsml41 => "dsml41",
                 },
                 artifact_version,
@@ -16997,16 +16984,15 @@ fn new_agent(
         contribution_warnings.extend(warnings);
     }
     let wasm_tools = tool_ctx.wasm.registry.tools();
-    // The dialect the loaded model speaks decides which tools prompt it gets,
-    // and later which parser reads its output back. Taken from the name the
-    // engine reports after detecting the file, not from the path.
+    // The dialect the loaded model speaks decides which parser reads its
+    // output back (every dialect takes the same tools prompt). Taken from the
+    // name the engine reports after detecting the file, not from the path.
     let syntax = sysprompt::ToolSyntax::for_model_name(&engine.model_name());
     let system = sysprompt::build_system_prompt_parts_with_wasm(
         &cfg.system,
         &tool_ctx.mcp,
         &wasm_tools,
         !crate::settings::active().engine.thinking_tool_calls,
-        syntax,
     );
     drop(wasm_tools);
     // Tell the engine where the trusted control text ends before it tokenizes
@@ -17023,9 +17009,7 @@ fn new_agent(
     // Which model this local engine is, for the footer's origin label. Taken
     // from the dialect already resolved above, so the tag can never disagree
     // with the syntax the parser is using.
-    crate::status::set_local_family(
-        crate::gguf::ModelFamily::from_syntax(syntax).unwrap_or_default(),
-    );
+    crate::status::set_local_family(crate::gguf::ModelFamily::from_syntax(syntax));
     // The footer's mtp/temperature slot, seeded the same way: `/mtp` and
     // `/temp` publish to it later, but the first frame is drawn before either
     // can be typed. An engine with no support model reads as off however the

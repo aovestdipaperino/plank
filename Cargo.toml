@@ -13,11 +13,6 @@ repository = "https://github.com/aovestdipaperino/plank"
 missing_debug_implementations = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unused_lifetimes = "warn"
-# The `qwen` cargo feature is gone, but `#[cfg(feature = "qwen")]` arms still
-# stand in `ds4engine.rs`, `sysprompt.rs` and `ui.rs` until the remaining
-# staged Qwen removals land (they are always-false there now, which is the
-# intended behaviour in the meantime). Drop this line with the last of them.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("qwen"))'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -227,9 +227,7 @@ pub struct DsmlParser {
     /// True just after an opener that ended at its `｜`, so a `>` arriving
     /// next belongs to that opener and is not structural content.
     swallow_gt: bool,
-    /// The dialect this parser accepts. `Qwen` never reaches here — the
-    /// caller picks a different parser for it — so [`Self::tags`] falls back
-    /// to `Dsml` if it ever does.
+    /// The dialect this parser accepts.
     syntax: crate::syntax::ToolSyntax,
 }
 
@@ -256,9 +254,6 @@ impl DsmlParser {
     }
 
     /// Creates a parser in the `Search` state for `syntax`.
-    ///
-    /// `Qwen` is not a DSML dialect and is rejected by the caller before
-    /// reaching here; it falls back to `Dsml`.
     #[must_use]
     pub fn with_syntax(syntax: crate::syntax::ToolSyntax) -> Self {
         Self {
@@ -269,11 +264,7 @@ impl DsmlParser {
 
     /// This parser's tag spellings.
     fn tags(&self) -> crate::syntax::DsmlTags {
-        self.syntax.dsml_tags().unwrap_or_else(|| {
-            crate::syntax::ToolSyntax::Dsml
-                .dsml_tags()
-                .expect("dsml has tags")
-        })
+        self.syntax.dsml_tags()
     }
 
     /// Current parser state.

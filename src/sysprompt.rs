@@ -1107,7 +1107,7 @@ pub fn build_system_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> SplitSystemPrompt {
-    build_system_prompt_parts_with_wasm(user_system, mcp_servers, &[], parity, ToolSyntax::Dsml)
+    build_system_prompt_parts_with_wasm(user_system, mcp_servers, &[], parity)
 }
 
 /// [`build_system_prompt_parts`] with WASM component tools folded in.
@@ -1122,13 +1122,9 @@ pub fn build_system_prompt_parts_with_wasm(
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
-    syntax: ToolSyntax,
 ) -> SplitSystemPrompt {
-    // Every dialect plank still serves is DSML-shaped and takes the same tools
-    // prompt, so the dialect no longer selects one. The parameter stays on this
-    // public signature until `ToolSyntax` itself goes away with the dialect
-    // layer.
-    let _ = syntax;
+    // Every dialect plank serves is DSML-shaped and takes the same tools
+    // prompt, so the dialect does not select one and is not a parameter here.
     let (mut text, trusted_len) =
         build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity);
     if crate::settings::active().git.sign_commits {
