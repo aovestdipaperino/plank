@@ -333,6 +333,26 @@ fn parse_usage(value: &serde_json::Value) -> Option<ProviderUsage> {
     })
 }
 
+/// The human-readable message out of a Responses `response.failed`/`error`
+/// frame, which spells it three ways: `response.error.message`, a top-level
+/// `error.message`, or a bare top-level `message`.
+fn responses_error_message(value: &serde_json::Value) -> String {
+    let msg = value
+        .get("response")
+        .and_then(|r| r.get("error"))
+        .or_else(|| value.get("error"))
+        .and_then(|e| e.get("message"))
+        .or_else(|| value.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .trim();
+    if msg.is_empty() {
+        "provider stream failed without a message".to_string()
+    } else {
+        format!("provider stream failed: {msg}")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared streaming-translator surface
 // ---------------------------------------------------------------------------
@@ -347,6 +367,12 @@ pub trait SseTranslator {
     fn finish(&mut self, on_event: &mut dyn FnMut(EngineEvent));
     /// Usage reported so far, if any.
     fn usage(&self) -> Option<ProviderUsage>;
+    /// The provider's own message for a failure the *stream* reported, if one
+    /// ended it. A stream can fail after a 200 and the body's terminal frame is
+    /// then the only place that says so, which no HTTP-level check can see.
+    fn stream_error(&self) -> Option<String> {
+        None
+    }
 }
 
 impl SseTranslator for OpenAiTranslator {
@@ -390,6 +416,9 @@ pub struct ResponsesTranslator {
     done: bool,
     /// True once the DSML tool stanza has been flushed by `finish`.
     flushed: bool,
+    /// Set when the stream ended on `response.failed`/`error`, so the pass
+    /// fails with the provider's message instead of passing for an answer.
+    stream_error: Option<String>,
 }
 
 impl ResponsesTranslator {
@@ -403,6 +432,12 @@ impl ResponsesTranslator {
     #[must_use]
     pub fn usage(&self) -> Option<ProviderUsage> {
         self.usage
+    }
+
+    /// The failure that ended the stream, if one did.
+    #[must_use]
+    pub fn stream_error(&self) -> Option<String> {
+        self.stream_error.clone()
     }
 
     /// Feeds one SSE `data:` payload, emitting any resulting events. Returns
@@ -478,10 +513,30 @@ impl ResponsesTranslator {
                 {
                     self.usage = Some(usage);
                 }
+                // A truncated response is a real answer, so it keeps its usage
+                // and its text — but silently, it is indistinguishable from a
+                // finished one, and the user is owed the difference.
+                if kind == "response.incomplete" {
+                    let reason = value
+                        .get("response")
+                        .and_then(|r| r.get("incomplete_details"))
+                        .and_then(|d| d.get("reason"))
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("unspecified");
+                    self.close_thinking(on_event);
+                    on_event(EngineEvent::Notice(format!(
+                        "provider: response truncated ({reason}); the answer is incomplete"
+                    )));
+                }
                 self.done = true;
                 return false;
             }
             "response.failed" | "error" => {
+                // The body's terminal frame is the only place a post-200
+                // failure says so: swallowing it turns a failed request into an
+                // empty answer the turn loop accepts, which is what
+                // `repro-1789068998` recorded four times with nothing logged.
+                self.stream_error = Some(responses_error_message(&value));
                 self.done = true;
                 return false;
             }
@@ -527,6 +582,9 @@ impl ResponsesTranslator {
 impl SseTranslator for ResponsesTranslator {
     fn feed(&mut self, payload: &str, on_event: &mut dyn FnMut(EngineEvent)) -> bool {
         ResponsesTranslator::feed(self, payload, on_event)
+    }
+    fn stream_error(&self) -> Option<String> {
+        ResponsesTranslator::stream_error(self)
     }
     fn finish(&mut self, on_event: &mut dyn FnMut(EngineEvent)) {
         ResponsesTranslator::finish(self, on_event);
@@ -1703,6 +1761,14 @@ impl Engine for ProviderEngine {
             });
         }
 
+        // A stream that failed after its 200 reports it in the body, not in the
+        // status: without this the pass returns zero tokens and the turn loop
+        // reads the silence as the model's answer.
+        if let Some(err) = translator.stream_error() {
+            crate::errlog::log_error("provider", &err);
+            return Err(EngineError::new(err));
+        }
+
         translator.finish(on_event);
         let usage = translator.usage().unwrap_or(ProviderUsage {
             input_tokens: total,
@@ -2150,6 +2216,58 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 40);
         assert_eq!(usage.output_tokens, 7);
         assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    /// A provider-side stream failure must not read as an empty answer: the
+    /// translator keeps the server's own message so `generate` can fail the
+    /// pass with a diagnosis (`repro-1789068998`: four 0-token "answer" passes
+    /// that left no trace in the log).
+    #[test]
+    fn responses_stream_error_is_surfaced() {
+        for frame in [
+            r#"{"type":"response.failed","response":{"error":{"message":"the model is overloaded"}}}"#,
+            r#"{"type":"error","message":"the model is overloaded"}"#,
+            r#"{"type":"error","error":{"message":"the model is overloaded"}}"#,
+        ] {
+            let mut tr = ResponsesTranslator::new();
+            let live = tr.feed(frame, &mut |_| {});
+            assert!(!live, "a failure is terminal: {frame}");
+            let err = tr.stream_error().expect(frame);
+            assert!(err.contains("the model is overloaded"), "{err}");
+        }
+    }
+
+    /// A failure with no message still fails the pass, since the alternative is
+    /// the silent empty answer this exists to prevent.
+    #[test]
+    fn responses_stream_error_without_message_still_fails() {
+        let mut tr = ResponsesTranslator::new();
+        assert!(!tr.feed(r#"{"type":"response.failed"}"#, &mut |_| {}));
+        assert!(tr.stream_error().is_some());
+    }
+
+    /// A truncated response is not a finished one: usage is still taken, but
+    /// the reason is announced instead of passing for a complete answer.
+    #[test]
+    fn responses_incomplete_notices_the_reason() {
+        let mut tr = ResponsesTranslator::new();
+        let mut events = Vec::new();
+        let live = tr.feed(
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":4}}}"#,
+            &mut |e| events.push(e),
+        );
+        assert!(!live, "still terminal");
+        assert!(tr.stream_error().is_none(), "truncation is not a failure");
+        assert_eq!(tr.usage().expect("usage").output_tokens, 4);
+        let notices: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Notice(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "{events:?}");
+        assert!(notices[0].contains("max_output_tokens"), "{}", notices[0]);
     }
 
     #[test]

@@ -18,6 +18,10 @@ The guards, for orientation:
   *latched* at the warn rung and then tracked forward copy by copy
   (`RepeatGuard::extend_latched`), so the period a stop can see is not capped
   by the window — see "The stop rung saw a quarter of the window", below.
+  A second, byte-independent cycle rung rides on the draft scanner
+  (`NumberedCycle`): numbered lines are hashed with their leading ordinal
+  stripped, so a cycle whose only variation is its list number is still a
+  cycle — see "A cycle that renumbers itself is not byte-exact", below.
 - **Tool-call loop guard** — `guard::LoopGuard`: advisory on the 3rd identical
   call, refusal from the 6th, turn ended after three stanzas in a row refused
   in full (`tripped`). Also detects a repeated *sequence* of calls
@@ -73,6 +77,9 @@ argument for the design.
 | 2026-09-11 | *(this change)* | `NO_PROGRESS_NOTICE` reworded: it no longer claims a shell command would have reset the budget, and it names what does | `repro-1789107544`: the tripping pass had just run `cargo test` and `cargo clippy` successfully — see "The no-progress notice named the wrong evidence", below |
 | 2026-09-10 | *(this change)* | draft rung (`RepeatGuard::drafting`, `DRAFT_ERROR`): numbered deliverable headings or fenced code accumulating inside `<think>` past 8 KiB stop the pass with "write this as your answer, not in reasoning"; and a `WORKING_STYLE` rule, "Write findings as you find them", so list-shaped answers are emitted item by item after `</think>` | `repro-loop-1789060243` and the seven 2026-09-10 dumps: deliverables drafted in reasoning, never emitted |
 | 2026-09-10 | *(no code change)* | counter-case to the raised budget recorded: a 30 KB review drafted inside `<think>` under the ~102 KB budget, interrupted by the user at 12m42s; the `resume` pass redrafted and fell into a 5-line cycle the exact-cycle rung caught | `repro-loop-1789060243`: `do a code review`, 18 minutes, no visible output — see "The review that was written in the wrong place", below |
+| 2026-09-10 | `1a09915` | `NumberedCycle` inside `DraftScan`: numbered reasoning lines hashed with the leading ordinal stripped, a bounded 256-item history independent of the byte window, reported as a cycle through `RepeatGuard::feed` at `REPEAT_CYCLES` copies; a cycle must carry three distinct substantial bodies and 256 bytes | `repro-1789068543`: a 26-item cycle, over 7 KiB per copy, that no byte rung could match — see "A cycle that renumbers itself is not byte-exact", below |
+| 2026-09-11 | `4dde15d` | a repro shutter (camera glyph) at the end of the footer's dir prefix, writing the same `/repro` dump and clipboard copy the typed command produces | hand-saved dumps were the only record of a loop no rung fired on, and typing `/repro` mid-stall is the thing a user does last |
+| 2026-09-11 | `13b75cc` | `DRAFT_PAUSE_TEXT`: a draft stop is worded as a pause and mirrored to the debug console instead of printed as a red `guard:` line on the front ends; `DRAFT_ERROR` reworded around delivery rather than accusation | the draft rung is the one stop that loses nothing — see "A draft stop is a pause, not news", below |
 | 2026-09-08 | *(this change)* | `tools.loopGuards` and `/loopguard` (alias `/lg`): one switch over every rung — `LoopGuard::observe`/`tripped`, the gated `RepeatGuard` (cycles and think budget), the no-progress budget. Read through `guard::guards_enabled()` at each check, never captured at turn start, so the switch lands on a generation already streaming; `🔁` in the footer while armed, and the tripped marker moved to `♻ looping` | diagnosing the guards themselves, where every rung fires before the behaviour under study can be observed |
 
 Two patterns run through the table. First, every detector started advisory
@@ -863,3 +870,82 @@ Fixed the same day, in both directions at once:
 
 Had both been in place, pass 9's fourteen findings would have been the answer.
 
+## A cycle that renumbers itself is not byte-exact
+
+`repro-1789068543` (sneezy-hahn, 2026-09-10, saved by hand — the `repro-`
+rather than `repro-loop-` prefix is again the tell that no rung ended it). The
+pass table is the whole diagnosis:
+
+| # | reasoning | cycle | headings | stop |
+|---|---|---|---|---|
+| 1-3 | ≤380 B | - | 0 | tool calls |
+| 4 | 18 228 | - | 10 | guard: draft |
+| 5 | **58 317** | **-** | 0 | interrupted by user |
+
+Pass 5 ran 16m9s and cycled a numbered list of 26 items, over 7 KiB per copy,
+and every rung read `-`. Two independent reasons, and closing either alone
+would not have been enough: the copies are not byte-equal, because each line
+carries its own ordinal and the ordinals keep climbing, so `cycle_period` and
+`extend_latched` have nothing to match; and at 7 KiB a copy the period is
+larger than the 8 KiB byte window anyway, which is the `p > window/2` gap from
+"A cycle can be longer than the whole window" all over again. The draft rung
+did not cover it either — pass 5 registered zero headings, because these are
+plain numbered items, exactly the shape the heading test deliberately excludes
+so that a numbered *plan* does not trip it.
+
+Fixed 2026-09-10 by hashing, not by widening. `NumberedCycle` keeps one SHA-256
+per numbered line with the leading `N. ` or `N) ` stripped, in a 256-entry
+deque that is bounded by *items* rather than bytes, so the detectable period no
+longer has anything to do with the byte window. A repeat of `REPEAT_CYCLES`
+copies is reported to `RepeatGuard::feed` as a cycle, with the normalized bytes
+as the period, so it reaches the same stop, the same footer marker and the same
+`cycle` column as a byte-exact loop.
+
+What keeps it from firing on honest enumeration is the shape requirement, and
+it is the part to preserve if this rung is ever touched: a repeated block must
+contain at least three *distinct* substantial bodies and total 256 bytes, so a
+sentence repeated verbatim, or two lines alternating, is not a cycle; bodies
+under 12 bytes or over 16 KiB are ignored; and any non-list prose or a code
+fence clears the history, so a list that is genuinely being written once, with
+commentary between the items, never accumulates a period. Blank lines are the
+single allowed separator.
+
+The generalization is the same one the 9 KB sub-agent cycle taught, one level
+up: a loop repeats *structure*, and byte equality is only the cheapest proxy
+for it. Every time the model found a new way to vary the surface — an ordinal
+here, drifting wording in the stutter section — the byte rungs went quiet while
+the behaviour was unchanged. A rung that normalizes the varying part and keeps
+its own bounded history costs nothing against the window and is the shape the
+next such finding will want too.
+
+## A draft stop is a pause, not news
+
+The draft rung differs from every other rung in what it costs. A cycle stop, a
+budget stop and a no-progress stop all end something: the reasoning is stubbed,
+or the turn is over. A draft stop keeps the reasoning, counts on its own tally
+(`MAIN_DRAFT_TRIP_CAP`), and since the closed-think recovery the following pass
+simply delivers. Nothing is lost, and the turn continues.
+
+It was nonetheless reported the way the others are — a red `guard:` line on the
+main window — which reads as an error about the model's reasoning *shape*, for
+an event the user has no action to take on and which is followed immediately by
+the answer. Fixed 2026-09-11: `report_guard_for` recognises `DRAFT_PAUSE_TEXT`
+and mirrors it to the debug console rather than printing it, where someone
+watching the raw stream still sees it; the other guard stops are unchanged.
+
+`DRAFT_ERROR` itself was reworded in the same direction: it opens "generation
+paused", says outright that this establishes neither a loop nor a finished
+draft, states that the analysis is retained as unverified working context, and
+asks for one supported finding or the next small edit — plus a warning not to
+promote rejected ideas or unexecuted code into results, and notice that the next
+reply has no reasoning step. The old text ("generation stopped: the reasoning
+was drafting the answer") made a claim the dumps had already shown to be wrong
+half the time: the pass that trips this rung is frequently doing real analysis
+that merely reached the byte gate, as "The recovery had nowhere to write"
+records. `repeat_trip_text` follows the same wording, so the pass table and the
+dump call it a pause too.
+
+The rule this keeps arriving at: a guard's message and its presentation are
+part of its design, not decoration. A stop that removes work should be loud and
+should say what it removed; a stop that only redirects where the next bytes go
+should be quiet and should not accuse.

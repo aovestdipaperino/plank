@@ -2578,3 +2578,38 @@ callers that go through it. Any out-of-band path that reports its outcome back t
 the machine (`note_external_yield`, and the `note_yield_declined` rollback above)
 has to ask the machine for permission on the way in, not just tell it on the way
 out.
+
+## A stream that fails after its 200 says so in the body, and swallowing it looks like an answer
+
+`repro-1789068998` (session `zesty-chaplin`, `openai-responses:gpt-6-astra`) has
+four passes — 59, 72, 79 and 81 — that ran 1 to 13 seconds, generated **0 tokens
+at 0.0 tok/s**, and ended with the stop reason `answer`. Pass 81 is the last one
+in the session: the user typed `finish`, the assistant block came back empty, and
+the turn ended. No loop guard tripped, and `~/.plank/errors.log` has nothing at
+all between 20:01 and 21:52, so the whole episode left no trace anywhere.
+
+The cause was three lines in the Responses translator: `"response.failed" |
+"error"` set `done` and returned `false`, with no notice, no log line and no
+error. `ProviderEngine::generate` then took its ordinary success path —
+`translator.usage()` is `None` for a stream that never reached
+`response.completed`, so the `unwrap_or` fallback reports `output_tokens: 0` —
+and returned `Ok(GenerationStats)`. The turn loop sees an answer with no tool
+calls and ends the turn. A failed request and a model that chose to say nothing
+are, from the user's seat, the same event.
+
+The tell that the pass really got no terminal frame is in the dump's header:
+`last ctx used: 160942` against `transcript tokens: 160945`. Both are plank's own
+count. A server-reported `input_tokens` would not track the local tokenizer that
+closely; the fallback does, because it *is* the local count.
+
+Two rules come out of it. An HTTP status cannot diagnose a streamed provider:
+the 200 is committed before the model runs, so the body's terminal frame is the
+only place a mid-generation failure is reported, and a translator that drops it
+is the last place it could have been caught. And a terminal frame that is not a
+success must not share an arm with one that is: `response.incomplete` was handled
+identically to `response.completed`, which presented a truncation (an exhausted
+`max_output_tokens` — plank sends `n_predict`, 50 000 there — or a content
+filter) as a finished answer. Failures now carry the provider's message out
+through `SseTranslator::stream_error` into an `EngineError` and the error log,
+and a truncation keeps its usage and its text but announces the reason as a
+`Notice`. Neither event had a test before; both do now.
