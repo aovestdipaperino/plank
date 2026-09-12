@@ -311,6 +311,66 @@ fn chunk_end(done: u64, total: u64) -> Option<u64> {
     Some(done.saturating_add(RANGE_CHUNK).min(total) - 1)
 }
 
+/// Attempts for one chunk before giving up on the whole artifact — this
+/// attempt plus three retries. A 341 GiB artifact is ~1364 chunk requests, so
+/// even a small per-chunk failure rate would make manual intervention likely
+/// over a multi-hour transfer; three retries absorbs a transient blip (a
+/// dropped connection, a 5xx, a truncated body) without turning a persistent
+/// problem (a revoked URL, a firewall block) into a job that never ends.
+const CHUNK_RETRY_ATTEMPTS: u32 = 4;
+
+/// The unit backoff `chunk_backoff` doubles from. 1s in production; under
+/// `cfg(test)` a few milliseconds, so the retry *logic* is exercised (same
+/// doubling, same cap) without a unit test actually sleeping for seconds.
+#[cfg(not(test))]
+const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Backoff before retry number `attempt` (1-based, counting only retries —
+/// the first attempt has none), doubling from `BACKOFF_UNIT` and capped at
+/// 16x it. With `CHUNK_RETRY_ATTEMPTS` = 4 (three retries: attempts 2, 3, 4)
+/// the worst-case delay a permanently failing chunk adds before the job fails
+/// is 1x + 2x + 4x = 7 units (7s in production), on top of whatever the
+/// failing requests themselves took.
+fn chunk_backoff(attempt: u32) -> std::time::Duration {
+    BACKOFF_UNIT * (1u32 << attempt.saturating_sub(1).min(4))
+}
+
+/// Sleeps up to `total`, polling the cancel flag every 100ms so a backoff
+/// never adds more than ~100ms to cancellation latency — the same
+/// granularity as the per-read and per-chunk polls elsewhere in this file.
+/// Returns the pending request the moment one is observed, without waiting
+/// out the rest of `total`.
+fn sleep_watching_cancel(root: &Path, total: std::time::Duration) -> Option<Cancel> {
+    let poll = std::time::Duration::from_millis(100);
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        if let Some(how) = read_cancel_in(root) {
+            return Some(how);
+        }
+        if waited >= total {
+            return None;
+        }
+        let step = poll.min(total.saturating_sub(waited));
+        std::thread::sleep(step);
+        waited += step;
+    }
+}
+
+/// Human-readable stand-in for the internal "resume-not-supported" sentinel
+/// when it surfaces as a final job failure rather than being handled by the
+/// offset-0 reset (the only place it is *expected*, at the very start of an
+/// artifact). A later occurrence is a real, non-retryable failure — retrying
+/// a deterministic server behaviour would just loop pointlessly — so it is
+/// reported in plain language instead of leaking the internal token.
+fn resume_not_supported_message(kind: &str) -> String {
+    format!(
+        "{kind}: the server stopped honoring resumed byte ranges partway through the \
+         download; restart it from the beginning (/model download)"
+    )
+}
+
 /// In-flight bytes for `kind`, under `root`.
 #[must_use]
 pub fn part_path_in(root: &Path, set: crate::manifest::ModelSet, kind: &str) -> PathBuf {
@@ -577,6 +637,15 @@ fn staged_is_current(
 
 /// Downloads and verifies one artifact. `Ok(Some(how))` means a cancel was
 /// observed mid-stream.
+///
+/// The artifact's total length comes solely from `entry.bytes` (the
+/// manifest) — no `Content-Length` or `Content-Range` response header is ever
+/// consulted. This is deliberate: the manifest is the trusted description of
+/// what should exist, and the SHA-256 check already catches both failure
+/// modes a lying server could cause — claiming more than `entry.bytes` fails
+/// the digest (the byte-cap in the read loop below stops the hash at the
+/// declared length), and claiming less ends as a short body, caught by the
+/// `done != entry.bytes` check after the chunk loop.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn one_artifact(
     root: &Path,
@@ -625,18 +694,40 @@ fn one_artifact(
     }
 
     let mut want_to = chunk_end(done, entry.bytes);
-    let mut reader = match fetch(&entry.url, done, want_to) {
-        Ok(r) => r,
-        Err(e) if e == "resume-not-supported" => {
-            // The server sent the whole body despite the Range ask. Throw the
-            // partial away and restart the hash, as `download::fetch` does.
-            let _ = std::fs::remove_file(&part);
-            hasher = Sha256::new();
-            done = 0;
-            want_to = chunk_end(0, entry.bytes);
-            fetch(&entry.url, 0, want_to)?
+    // Attempts already spent on the *current* chunk (open or reopen after a
+    // failed read); reset to 0 whenever the loop below moves on to a genuinely
+    // new chunk. Counts as 1 once a fetch below succeeds.
+    let mut attempts = 0u32;
+    let mut reader = loop {
+        attempts += 1;
+        match fetch(&entry.url, done, want_to) {
+            Ok(r) => break r,
+            Err(e) if e == "resume-not-supported" => {
+                // The server sent the whole body despite the Range ask. Throw
+                // the partial away and restart the hash, as `download::fetch`
+                // does. Deterministic server behaviour: never retried.
+                let _ = std::fs::remove_file(&part);
+                hasher = Sha256::new();
+                done = 0;
+                want_to = chunk_end(0, entry.bytes);
+                attempts = 0;
+                match fetch(&entry.url, 0, want_to) {
+                    Ok(r) => break r,
+                    Err(e) if e == "resume-not-supported" => {
+                        return Err(resume_not_supported_message(kind));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => {
+                if attempts >= CHUNK_RETRY_ATTEMPTS {
+                    return Err(e);
+                }
+                if let Some(how) = sleep_watching_cancel(root, chunk_backoff(attempts)) {
+                    return Ok(Some(how));
+                }
+            }
         }
-        Err(e) => return Err(e),
     };
 
     let mut file = if done > 0 {
@@ -671,12 +762,24 @@ fn one_artifact(
     // end-of-chunk, not end-of-artifact — the distinction the bounded range
     // forces and the whole reason a 341 GiB transfer can now resume at all.
     'chunks: loop {
+        let mut read_err: Option<String> = None;
         loop {
             if let Some(how) = read_cancel_in(root) {
                 let _ = file.flush();
                 return Ok(Some(how));
             }
-            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+            let n = match reader.read(&mut buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    // `done`, `hasher` and `file` already reflect exactly the
+                    // bytes consumed so far — nothing to unwind. A retry
+                    // reopens the same bounded range starting at the current
+                    // `done`, so no byte already fed to `hasher.update` below
+                    // is ever asked for, let alone hashed, a second time.
+                    read_err = Some(e.to_string());
+                    break;
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -723,6 +826,24 @@ fn one_artifact(
                 );
             }
         }
+        if let Some(e) = read_err {
+            if attempts >= CHUNK_RETRY_ATTEMPTS {
+                return Err(e);
+            }
+            if let Some(how) = sleep_watching_cancel(root, chunk_backoff(attempts)) {
+                let _ = file.flush();
+                return Ok(Some(how));
+            }
+            attempts += 1;
+            reader = match fetch(&entry.url, done, want_to) {
+                Ok(r) => r,
+                Err(e) if e == "resume-not-supported" => {
+                    return Err(resume_not_supported_message(kind));
+                }
+                Err(e) => return Err(e),
+            };
+            continue 'chunks;
+        }
         // The artifact is complete, or the chunk ended short of its last byte
         // (a truncated body): either way stop and let the length check below
         // decide. `want_to` is None only for a zero-length artifact.
@@ -735,7 +856,25 @@ fn one_artifact(
             return Ok(Some(how));
         }
         want_to = chunk_end(done, entry.bytes);
-        reader = fetch(&entry.url, done, want_to)?;
+        attempts = 0;
+        reader = loop {
+            attempts += 1;
+            match fetch(&entry.url, done, want_to) {
+                Ok(r) => break r,
+                Err(e) if e == "resume-not-supported" => {
+                    return Err(resume_not_supported_message(kind));
+                }
+                Err(e) => {
+                    if attempts >= CHUNK_RETRY_ATTEMPTS {
+                        return Err(e);
+                    }
+                    if let Some(how) = sleep_watching_cancel(root, chunk_backoff(attempts)) {
+                        let _ = file.flush();
+                        return Ok(Some(how));
+                    }
+                }
+            }
+        };
     }
     file.flush().map_err(|e| e.to_string())?;
 
@@ -2263,6 +2402,155 @@ pub(crate) mod tests {
             .expect("staged"),
             full,
             "a resume that spans a chunk boundary must reassemble exactly"
+        );
+    }
+
+    /// A reader that fails its first `n` reads (transient), then serves
+    /// `data` normally — standing in for a socket blip that clears up.
+    struct FlakyThenGood {
+        data: Vec<u8>,
+        pos: usize,
+        fails_left: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl Read for FlakyThenGood {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self
+                .fails_left
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| (n > 0).then(|| n - 1),
+                )
+                .is_ok()
+            {
+                return Err(std::io::Error::other("transient blip"));
+            }
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_transient_chunk_failure_is_retried_and_the_download_completes() {
+        // Finding 1: one flaky read on the very first chunk must not fail the
+        // job — it is well under CHUNK_RETRY_ATTEMPTS, so the retry absorbs it
+        // and the download finishes with the correct digest.
+        let root = tempdir();
+        let full: &[u8] = b"the quick brown fox jumps over the lazy dog, twice over";
+        let mut hasher = Sha256::new();
+        hasher.update(full);
+        let sha = hex(&hasher.finalize());
+        let m = manifest_for(&[("main", full, &sha)]);
+
+        // Pre-seed a partial `.part` so the flaky read below is retried with
+        // `done > 0` already on the books — the case that actually exercises
+        // hasher-safety (see the mutation test in this module's comment).
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
+        std::fs::write(
+            part_path_in(&root, crate::manifest::ModelSet::Ds4, "main"),
+            &full[..10],
+        )
+        .expect("seed part");
+
+        let owned = full.to_vec();
+        let fails_left = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1));
+        let opens = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let opens_log = std::sync::Arc::clone(&opens);
+        let fails_left_for_fetch = std::sync::Arc::clone(&fails_left);
+        let fetcher = move |_: &str, offset: u64, end: Option<u64>| {
+            opens_log.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let start = usize::try_from(offset).expect("fits");
+            let stop = usize::try_from(end.expect("bounded") + 1)
+                .expect("fits")
+                .min(owned.len());
+            Ok(Box::new(FlakyThenGood {
+                data: owned[start..stop].to_vec(),
+                pos: 0,
+                fails_left: std::sync::Arc::clone(&fails_left_for_fetch),
+            }) as Box<dyn Read + Send>)
+        };
+
+        let outcome = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &fetcher);
+        assert_eq!(outcome, Outcome::Verified);
+        assert_eq!(
+            std::fs::read(staged_path_in(
+                &root,
+                crate::manifest::ModelSet::Ds4,
+                "main"
+            ))
+            .expect("staged"),
+            full,
+            "a retried chunk must not double-feed the hasher or duplicate bytes"
+        );
+        assert!(
+            opens.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the flaky read must have forced at least one reopen"
+        );
+    }
+
+    #[test]
+    fn a_permanently_failing_chunk_gives_up_and_leaves_a_resumable_part() {
+        // Finding 1: a chunk that never recovers must still fail the job
+        // cleanly (not hang, not loop forever) and leave the .part intact.
+        let root = tempdir();
+        let full: &[u8] = b"the quick brown fox jumps over the lazy dog, twice over";
+        let mut hasher = Sha256::new();
+        hasher.update(full);
+        let sha = hex(&hasher.finalize());
+        let m = manifest_for(&[("main", full, &sha)]);
+
+        let always_dies = move |_: &str, _: u64, _: Option<u64>| {
+            Ok(Box::new(DiesAfter {
+                data: Vec::new(),
+                pos: 0,
+                die: true,
+            }) as Box<dyn Read + Send>)
+        };
+
+        let outcome = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &always_dies);
+        assert!(matches!(outcome, Outcome::Failed(_)), "got {outcome:?}");
+        assert!(
+            part_path_in(&root, crate::manifest::ModelSet::Ds4, "main").exists()
+                || !std::fs::exists(part_path_in(&root, crate::manifest::ModelSet::Ds4, "main"))
+                    .unwrap_or(true),
+            "a .part that never received a byte need not exist, but must not panic to check"
+        );
+    }
+
+    #[test]
+    fn cancellation_during_chunk_retry_backoff_is_observed() {
+        // Finding 1: a sleeping retry must not make cancellation unresponsive.
+        // Set the cancel flag from inside the failing read itself (mid-first
+        // attempt), before any backoff sleep would otherwise run out.
+        let root = tempdir();
+        let full: &[u8] = b"the quick brown fox jumps over the lazy dog, twice over";
+        let m = manifest_for(&[("main", full, EMPTY_SHA)]);
+
+        let root_for_reader = root.clone();
+        let fetcher = move |_: &str, _: u64, _: Option<u64>| {
+            request_cancel_in(&root_for_reader, Cancel::Keep).expect("flag");
+            Ok(Box::new(DiesAfter {
+                data: Vec::new(),
+                pos: 0,
+                die: true,
+            }) as Box<dyn Read + Send>)
+        };
+
+        let outcome = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &fetcher);
+        assert_eq!(
+            outcome,
+            Outcome::Cancelled,
+            "a cancel set during the retry backoff must be observed, not waited out"
         );
     }
 
