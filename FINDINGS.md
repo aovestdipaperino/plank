@@ -2082,11 +2082,19 @@ time. A resumed `.part` re-reads itself from disk to rebuild the hasher, since
 `sha2` exposes no serializable state — do not add a hasher-state sidecar.
 
 Related: the artifacts must be fetched in **bounded** ranges. Hugging Face's
-xet CDN answers `Range: bytes={offset}-` with `400 Bad Request` for these
+xet CDN answers `Range: bytes={offset}-` with `400 Bad Request` for the **V4.1**
 objects while answering `Range: bytes={offset}-{end}` with `206`, verified live
 against the 341 GiB V4.1 main artifact (`bytes=100-199` → 206,
 `bytes=100-` → 400, `bytes=1000000000-1268435455` → 206 with
-`Content-Length: 268435456`). So `downloader::http_fetch` always names an end
+`Content-Length: 268435456`), and reproduced independently.
+
+The scoping matters: the **V4** artifacts are served by a backend that still
+*accepts* `bytes={offset}-`, so this is not a property of Hugging Face in
+general, nor something to infer from a V4 probe. Two reviews initially
+contradicted each other for exactly that reason — one had probed the V4 object
+from `ds4.manifest` and concluded open-ended ranges were fine. Always probe the
+artifact you actually ship. Naming an end offset is correct against both
+backends, so `http_fetch` does it unconditionally rather than per-set. So `downloader::http_fetch` always names an end
 offset and `one_artifact` loops over 256 MiB chunks: end-of-stream means
 end-of-*chunk*, not end-of-file. Before this, any interruption of a multi-hour
 download restarted from zero and the whole `.part` rehash machinery was dead
