@@ -12,20 +12,6 @@
 //!
 //! Port of the `agent_dsml_*` family from `ds4_agent.c`.
 
-const DSML_START: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
-const SSML_START: &[u8] = "<｜SSML｜tool_calls>".as_bytes();
-/// The same openers ending in a trailing `｜`, with the `>` optional.
-///
-/// Closing tags have always tolerated that bar; post-update weights emit it
-/// on the opener too, and newer ones drop the `>` after it altogether —
-/// `<｜DSML｜tool_calls｜` followed by a newline is what a local ds4 build
-/// writes. Both are accepted here: the opener is taken at the bar, and a `>`
-/// that does follow is swallowed rather than left to the structural parser,
-/// which would read it as a malformed tag. Without this the stanza never
-/// opens, the markup reaches the screen as if it were prose, and the tool
-/// never runs.
-const DSML_START_BAR: &[u8] = "<｜DSML｜tool_calls｜".as_bytes();
-const SSML_START_BAR: &[u8] = "<｜SSML｜tool_calls｜".as_bytes();
 /// Cheap scan filter used to locate candidate closing tags: any `</` byte
 /// pair, not just a validated close marker. Real validation happens in
 /// [`close_tag_at`], which requires a full [`tag_prefix_len`] match against
@@ -241,6 +227,10 @@ pub struct DsmlParser {
     /// True just after an opener that ended at its `｜`, so a `>` arriving
     /// next belongs to that opener and is not structural content.
     swallow_gt: bool,
+    /// The dialect this parser accepts. `Qwen` never reaches here — the
+    /// caller picks a different parser for it — so [`Self::tags`] falls back
+    /// to `Dsml` if it ever does.
+    syntax: crate::syntax::ToolSyntax,
 }
 
 #[derive(Debug, Default)]
@@ -259,10 +249,31 @@ fn is_prompt_placeholder(name: &str) -> bool {
 }
 
 impl DsmlParser {
-    /// Creates a parser in the `Search` state.
+    /// Creates a parser in the `Search` state, for the `Dsml` (V4) dialect.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a parser in the `Search` state for `syntax`.
+    ///
+    /// `Qwen` is not a DSML dialect and is rejected by the caller before
+    /// reaching here; it falls back to `Dsml`.
+    #[must_use]
+    pub fn with_syntax(syntax: crate::syntax::ToolSyntax) -> Self {
+        Self {
+            syntax,
+            ..Self::new()
+        }
+    }
+
+    /// This parser's tag spellings.
+    fn tags(&self) -> crate::syntax::DsmlTags {
+        self.syntax.dsml_tags().unwrap_or_else(|| {
+            crate::syntax::ToolSyntax::Dsml
+                .dsml_tags()
+                .expect("dsml has tags")
+        })
     }
 
     /// Current parser state.
@@ -322,14 +333,16 @@ impl DsmlParser {
                     self.search_tail.remove(0);
                 }
                 self.search_tail.push(c);
-                if [DSML_START, SSML_START]
+                if self
+                    .start_markers(false)
                     .iter()
-                    .any(|f| self.search_tail.ends_with(f))
+                    .any(|f| self.search_tail.ends_with(f.as_bytes()))
                 {
                     self.start();
-                } else if [DSML_START_BAR, SSML_START_BAR]
+                } else if self
+                    .start_markers(true)
                     .iter()
-                    .any(|f| self.search_tail.ends_with(f))
+                    .any(|f| self.search_tail.ends_with(f.as_bytes()))
                 {
                     // Opened at the bar; a `>` may still follow.
                     self.start();
@@ -356,11 +369,35 @@ impl DsmlParser {
         }
     }
 
+    /// The dialect's opener under every accepted marker name (`DSML`, `SSML`),
+    /// each in both the canonical and dropped-leading-bar spelling — the same
+    /// tolerance inner tags get from [`tag_prefix_len`], applied here to the
+    /// stanza opener itself.
+    ///
+    /// Substituting into the tag table rather than a hand-typed constant is
+    /// what keeps this correct for V4.1's leading-space spelling: `base` is
+    /// `"<｜DSML｜ calls>"`, and only the marker word `DSML` is replaced, never
+    /// the space that follows the second bar.
+    fn start_markers(&self, bar: bool) -> Vec<String> {
+        let tags = self.tags();
+        let base = if bar { tags.start_bar } else { tags.start };
+        MARKER_NAMES
+            .iter()
+            .flat_map(|m| {
+                let canonical = base.replace("DSML", m);
+                // Drop only the leading `｜`, right after the `<`.
+                let dropped = canonical.replacen(std::str::from_utf8(DSML_BAR).unwrap(), "", 1);
+                [canonical, dropped]
+            })
+            .collect()
+    }
+
     fn start(&mut self) {
         self.state = DsmlState::Structural;
         self.search_tail.clear();
-        self.raw.extend_from_slice(DSML_START);
-        self.parse_pos = DSML_START.len();
+        let start = self.tags().start;
+        self.raw.extend_from_slice(start.as_bytes());
+        self.parse_pos = start.len();
     }
 
     fn set_error(&mut self, msg: impl Into<String>) {
@@ -379,6 +416,7 @@ impl DsmlParser {
 
     /// Parses as much of the accumulated buffer as possible.
     fn parse(&mut self) {
+        let tags = self.tags();
         loop {
             match self.state {
                 DsmlState::ParamValue => {
@@ -387,10 +425,10 @@ impl DsmlParser {
                     // `</｜DSML｜invoke>`, not `</｜DSML｜command>`. Accept either,
                     // plus `parameter`, and take whichever lands first.
                     let elem = self.param_elem.take();
-                    let mut names: Vec<&str> = vec!["parameter"];
+                    let mut names: Vec<&str> = vec![tags.param_name];
                     if let Some(elem) = elem.as_deref() {
                         names.push(elem);
-                        names.push("invoke");
+                        names.push(tags.invoke_name);
                     }
                     let found = self.find_param_close(&names);
                     self.param_elem = elem;
@@ -432,13 +470,13 @@ impl DsmlParser {
                     }
 
                     let rest = &self.raw[self.parse_pos..];
-                    if let Some(close_len) = close_tag_at(rest, "tool_calls") {
+                    if let Some(close_len) = close_tag_at(rest, tags.calls_name) {
                         self.push_current();
                         self.parse_pos += close_len;
                         self.state = DsmlState::Done;
                         return;
                     }
-                    if let Some(close_len) = close_tag_at(rest, "invoke") {
+                    if let Some(close_len) = close_tag_at(rest, tags.invoke_name) {
                         self.push_current();
                         self.parse_pos += close_len;
                         continue;
@@ -468,16 +506,17 @@ impl DsmlParser {
     /// [`Self::shorthand_invoke_name`] for why the open invoke is the whole
     /// distinction).
     fn open_tag(&mut self, tag: &str, tag_len: usize) -> bool {
+        let tags = self.tags();
         // A repeated wrapper opener is the model restating itself, not a second
         // stanza — `repro-1785770781.md` does it 37 times. The stanza is already
         // open, so consuming the tag and moving on is idempotent, and strictly
         // better than the alternatives: erroring costs the turn, and treating it
         // as a name invents a `tool_calls` call that swallows the parameters.
-        if open_tag_is(tag, "tool_calls") {
+        if open_tag_is(tag, tags.calls_name) {
             self.parse_pos += tag_len;
             return true;
         }
-        if open_tag_is(tag, "invoke") {
+        if open_tag_is(tag, tags.invoke_name) {
             let Some(name) = parse_attr(tag, "name") else {
                 self.set_error("tool invoke without name");
                 return false;
@@ -489,7 +528,7 @@ impl DsmlParser {
                 return false;
             }
             self.open_invoke(name, tag_len);
-        } else if open_tag_is(tag, "parameter") {
+        } else if open_tag_is(tag, tags.param_name) {
             let Some(name) = parse_attr(tag, "name") else {
                 self.set_error("tool parameter without name");
                 return false;
@@ -553,7 +592,7 @@ impl DsmlParser {
             return None;
         }
         let elem = element_name(tag)?;
-        (!is_prompt_placeholder(&elem) && !Self::STRUCTURAL_ELEMS.contains(&elem.as_str()))
+        (!is_prompt_placeholder(&elem) && !self.structural_elems().contains(&elem.as_str()))
             .then_some(elem)
     }
 
@@ -564,7 +603,10 @@ impl DsmlParser {
     /// twice in a row, and the second one parsed as a *successful* call named
     /// `tool_calls` that swallowed the real parameters. Erroring would be better
     /// than that; skipping it, as [`Self::open_tag`] now does, is better still.
-    const STRUCTURAL_ELEMS: [&'static str; 3] = ["tool_calls", "invoke", "parameter"];
+    fn structural_elems(&self) -> [&'static str; 3] {
+        let tags = self.tags();
+        [tags.calls_name, tags.invoke_name, tags.param_name]
+    }
 
     /// The same shorthand one level up: the *tool* name written as the element
     /// name, `<｜DSML｜edit>…</｜DSML｜invoke>` in place of
@@ -591,7 +633,7 @@ impl DsmlParser {
             return None;
         }
         let elem = element_name(tag)?;
-        (!is_prompt_placeholder(&elem) && !Self::STRUCTURAL_ELEMS.contains(&elem.as_str()))
+        (!is_prompt_placeholder(&elem) && !self.structural_elems().contains(&elem.as_str()))
             .then_some(elem)
     }
 
@@ -876,6 +918,60 @@ fn parse_attr(tag: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syntax::ToolSyntax;
+
+    #[test]
+    fn v41_stanza_parses_like_its_v4_twin() {
+        let v4 = concat!(
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name=\"read\">\n",
+            "<｜DSML｜parameter name=\"path\" string=\"true\">src/a.rs</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>"
+        );
+        let v41 = concat!(
+            "<｜DSML｜ calls>\n",
+            "<｜DSML｜ invoke name=\"read\">\n",
+            "<｜DSML｜ parameter name=\"path\" string=\"true\">src/a.rs</｜DSML｜ parameter>\n",
+            "</｜DSML｜ invoke>\n",
+            "</｜DSML｜ calls>"
+        );
+
+        let mut a = DsmlParser::with_syntax(ToolSyntax::Dsml);
+        a.feed(v4);
+        let mut b = DsmlParser::with_syntax(ToolSyntax::Dsml41);
+        b.feed(v41);
+
+        assert_eq!(a.state(), DsmlState::Done, "v4: {}", a.error());
+        assert_eq!(b.state(), DsmlState::Done, "v41: {}", b.error());
+        assert_eq!(a.calls().len(), 1);
+        assert_eq!(b.calls().len(), 1);
+        assert_eq!(a.calls()[0].name, b.calls()[0].name);
+        assert_eq!(a.calls()[0].arg_value("path"), Some("src/a.rs"));
+        assert_eq!(b.calls()[0].arg_value("path"), Some("src/a.rs"));
+    }
+
+    #[test]
+    fn v41_parser_rejects_the_v4_spelling() {
+        let mut p = DsmlParser::with_syntax(ToolSyntax::Dsml41);
+        p.feed("<｜DSML｜tool_calls>\n");
+        assert_ne!(p.state(), DsmlState::Done);
+        assert!(p.calls().is_empty());
+    }
+
+    #[test]
+    fn v41_tolerates_the_dropped_leading_bar() {
+        let mut p = DsmlParser::with_syntax(ToolSyntax::Dsml41);
+        p.feed(concat!(
+            "<DSML｜ calls>\n",
+            "<｜DSML｜ invoke name=\"read\">\n",
+            "<｜DSML｜ parameter name=\"path\" string=\"true\">x</｜DSML｜ parameter>\n",
+            "</｜DSML｜ invoke>\n",
+            "</｜DSML｜ calls>"
+        ));
+        assert_eq!(p.state(), DsmlState::Done, "{}", p.error());
+        assert_eq!(p.calls()[0].arg_value("path"), Some("x"));
+    }
 
     const STANZA: &str = concat!(
         "<｜DSML｜tool_calls>",
