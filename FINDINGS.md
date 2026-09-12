@@ -2081,6 +2081,17 @@ Related: `sha2` is a direct dependency solely because artifacts are verified
 time. A resumed `.part` re-reads itself from disk to rebuild the hasher, since
 `sha2` exposes no serializable state — do not add a hasher-state sidecar.
 
+Related: the artifacts must be fetched in **bounded** ranges. Hugging Face's
+xet CDN answers `Range: bytes={offset}-` with `400 Bad Request` for these
+objects while answering `Range: bytes={offset}-{end}` with `206`, verified live
+against the 341 GiB V4.1 main artifact (`bytes=100-199` → 206,
+`bytes=100-` → 400, `bytes=1000000000-1268435455` → 206 with
+`Content-Length: 268435456`). So `downloader::http_fetch` always names an end
+offset and `one_artifact` loops over 256 MiB chunks: end-of-stream means
+end-of-*chunk*, not end-of-file. Before this, any interruption of a multi-hour
+download restarted from zero and the whole `.part` rehash machinery was dead
+weight — one real interruption cost 88 GiB.
+
 ## A `</think>` splice has to be decided before the truncate, or the branch is dead
 
 `Ds4Session`'s prompt reconciliation truncates the token buffer to the common

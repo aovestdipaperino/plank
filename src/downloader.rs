@@ -282,6 +282,35 @@ const CHUNK: usize = 1 << 20;
 /// for a status bar and slow enough that the rename costs nothing.
 const PUBLISH_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How many bytes one ranged request asks for.
+///
+/// Hugging Face's xet CDN answers `Range: bytes=<n>-` (open-ended) with
+/// `400 Bad Request` for these artifacts while answering a *bounded* range
+/// with `206 Partial Content`, so every resume must name an end offset. 256
+/// MiB is the compromise: the 341 GiB V4.1 main artifact becomes ~1364
+/// requests, whose redirect round-trips cost seconds against a multi-hour
+/// transfer, and a 256 MiB bounded range was verified live against the real
+/// object at a deep offset (`bytes=1000000000-1268435455` →
+/// `206`, `Content-Length: 268435456`). The ~1 GiB vision encoder is four
+/// chunks, so the same scheme covers both ends of the set.
+#[cfg(not(test))]
+const RANGE_CHUNK: u64 = 256 << 20;
+/// Under `cfg(test)` the chunk is eight bytes, so the multi-chunk loop — the
+/// part of this that a 341 GiB artifact exercises 1364 times and a unit test
+/// would otherwise never reach at all — is driven by fixtures a few dozen
+/// bytes long. Only the size differs; every line of the loop is the same.
+#[cfg(test)]
+const RANGE_CHUNK: u64 = 8;
+
+/// The inclusive last byte of the chunk that starts at `done`, or `None` when
+/// there is nothing bounded to ask for (a zero-length artifact).
+fn chunk_end(done: u64, total: u64) -> Option<u64> {
+    if total == 0 || done >= total {
+        return None;
+    }
+    Some(done.saturating_add(RANGE_CHUNK).min(total) - 1)
+}
+
 /// In-flight bytes for `kind`, under `root`.
 #[must_use]
 pub fn part_path_in(root: &Path, set: crate::manifest::ModelSet, kind: &str) -> PathBuf {
@@ -384,21 +413,33 @@ pub enum Outcome {
     Failed(String),
 }
 
-/// A fetcher: given a URL and a resume offset, returns an owned byte stream or
-/// a failure message. Injected so tests drive [`run_job`] without a socket.
-type Fetcher = dyn Fn(&str, u64) -> Result<Box<dyn Read + Send>, String>;
+/// A fetcher: given a URL, a resume offset and the inclusive last byte wanted
+/// (`None` for "to the end"), returns an owned byte stream or a failure
+/// message. Injected so tests drive [`run_job`] without a socket.
+type Fetcher = dyn Fn(&str, u64, Option<u64>) -> Result<Box<dyn Read + Send>, String>;
 
-/// Opens `url` at byte `offset`, resuming where the server allows it.
+/// Opens `url` at byte `offset`, up to and including `end` when one is given.
+///
+/// A bounded range is not a nicety: Hugging Face's xet CDN rejects
+/// `bytes={offset}-` with `400 Bad Request` for these artifacts while serving
+/// `bytes={offset}-{end}` as `206`. `end` is `None` only for a caller that
+/// genuinely wants the whole tail.
 ///
 /// Injected into [`run_job`] so tests drive the whole loop without a socket,
 /// mirroring `download::fetch_tree`'s `#[cfg(test)]` stub.
 ///
 /// # Errors
 /// Returns a message on any transport or status failure.
-pub fn http_fetch(url: &str, offset: u64) -> Result<Box<dyn Read + Send>, String> {
+pub fn http_fetch(
+    url: &str,
+    offset: u64,
+    end: Option<u64>,
+) -> Result<Box<dyn Read + Send>, String> {
     let mut request = ureq::get(url);
-    if offset > 0 {
-        request = request.header("Range", format!("bytes={offset}-"));
+    match end {
+        Some(end) => request = request.header("Range", format!("bytes={offset}-{end}")),
+        None if offset > 0 => request = request.header("Range", format!("bytes={offset}-")),
+        None => {}
     }
     let response = request
         .call()
@@ -583,7 +624,8 @@ fn one_artifact(
         done = 0;
     }
 
-    let mut reader = match fetch(&entry.url, done) {
+    let mut want_to = chunk_end(done, entry.bytes);
+    let mut reader = match fetch(&entry.url, done, want_to) {
         Ok(r) => r,
         Err(e) if e == "resume-not-supported" => {
             // The server sent the whole body despite the Range ask. Throw the
@@ -591,7 +633,8 @@ fn one_artifact(
             let _ = std::fs::remove_file(&part);
             hasher = Sha256::new();
             done = 0;
-            fetch(&entry.url, 0)?
+            want_to = chunk_end(0, entry.bytes);
+            fetch(&entry.url, 0, want_to)?
         }
         Err(e) => return Err(e),
     };
@@ -623,48 +666,76 @@ fn one_artifact(
     let mut window_start = Instant::now();
     let mut window_bytes = 0u64;
     let mut rate = 0u64;
-    loop {
+    // Two loops: the inner one drains the current *chunk*, the outer one opens
+    // the next chunk where the last ended. End-of-stream therefore means
+    // end-of-chunk, not end-of-artifact — the distinction the bounded range
+    // forces and the whole reason a 341 GiB transfer can now resume at all.
+    'chunks: loop {
+        loop {
+            if let Some(how) = read_cancel_in(root) {
+                let _ = file.flush();
+                return Ok(Some(how));
+            }
+            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            // A server that ignored the bounded range hands back everything
+            // from `offset` on. Those bytes are still the right bytes, so they
+            // are kept — but never more than the artifact is declared to be,
+            // or the digest would be taken over a longer stream than the
+            // manifest describes.
+            let n = usize::try_from(entry.bytes - done).unwrap_or(n).min(n);
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+            hasher.update(&buf[..n]);
+            done += n as u64;
+            window_bytes += n as u64;
+            if last_publish.elapsed() >= PUBLISH_EVERY {
+                let secs = window_start.elapsed().as_secs_f64();
+                if secs > 0.0 {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        clippy::cast_precision_loss
+                    )]
+                    {
+                        rate = (window_bytes as f64 / secs) as u64;
+                    }
+                }
+                window_start = Instant::now();
+                window_bytes = 0;
+                last_publish = Instant::now();
+                publish(
+                    root,
+                    set,
+                    manifest,
+                    kind,
+                    index,
+                    of,
+                    done,
+                    entry.bytes,
+                    rate,
+                    Phase::Downloading,
+                    None,
+                );
+            }
+        }
+        // The artifact is complete, or the chunk ended short of its last byte
+        // (a truncated body): either way stop and let the length check below
+        // decide. `want_to` is None only for a zero-length artifact.
+        match want_to {
+            Some(end) if done == end + 1 && done < entry.bytes => {}
+            _ => break 'chunks,
+        }
         if let Some(how) = read_cancel_in(root) {
             let _ = file.flush();
             return Ok(Some(how));
         }
-        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        hasher.update(&buf[..n]);
-        done += n as u64;
-        window_bytes += n as u64;
-        if last_publish.elapsed() >= PUBLISH_EVERY {
-            let secs = window_start.elapsed().as_secs_f64();
-            if secs > 0.0 {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    clippy::cast_precision_loss
-                )]
-                {
-                    rate = (window_bytes as f64 / secs) as u64;
-                }
-            }
-            window_start = Instant::now();
-            window_bytes = 0;
-            last_publish = Instant::now();
-            publish(
-                root,
-                set,
-                manifest,
-                kind,
-                index,
-                of,
-                done,
-                entry.bytes,
-                rate,
-                Phase::Downloading,
-                None,
-            );
-        }
+        want_to = chunk_end(done, entry.bytes);
+        reader = fetch(&entry.url, done, want_to)?;
     }
     file.flush().map_err(|e| e.to_string())?;
 
@@ -1791,7 +1862,7 @@ pub(crate) mod tests {
         .expect("sidecar");
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
         // A fetcher that would panic if called proves nothing was refetched.
-        let never = |_: &str, _: u64| -> Result<Box<dyn Read + Send>, String> {
+        let never = |_: &str, _: u64, _: Option<u64>| -> Result<Box<dyn Read + Send>, String> {
             panic!("must not refetch a staged artifact")
         };
         assert_eq!(
@@ -1930,16 +2001,33 @@ pub(crate) mod tests {
         // slice (any other wrong offset), and the final digest check would
         // catch it either way.
         let full_owned = full.to_vec();
-        let resume_only = move |url: &str, offset: u64| -> Result<Box<dyn Read + Send>, String> {
+        let full_len = full.len() as u64;
+        let first_call = std::sync::atomic::AtomicBool::new(true);
+        let resume_only = move |url: &str,
+                                offset: u64,
+                                end: Option<u64>|
+              -> Result<Box<dyn Read + Send>, String> {
             let kind = url.rsplit('/').next().unwrap_or_default();
             assert_eq!(kind, "main");
-            let offset = usize::try_from(offset).expect("offset fits in usize in this test");
             assert_eq!(
-                offset, half,
-                "run_job must resume from exactly the bytes already on disk"
+                end,
+                chunk_end(offset, full_len),
+                "every resume request must be a bounded range, never open-ended"
             );
+            let offset = usize::try_from(offset).expect("offset fits in usize in this test");
+            assert!(
+                offset >= half,
+                "run_job must resume at or past the bytes already on disk, got {offset}"
+            );
+            if first_call.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                assert_eq!(
+                    offset, half,
+                    "run_job must resume from exactly the bytes already on disk"
+                );
+            }
+            let stop = usize::try_from(end.expect("bounded") + 1).expect("fits");
             Ok(Box::new(std::io::Cursor::new(
-                full_owned[offset..].to_vec(),
+                full_owned[offset..stop].to_vec(),
             )))
         };
         let outcome2 = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &resume_only);
@@ -2003,15 +2091,16 @@ pub(crate) mod tests {
         let m = manifest_for(&[("main", b"abcdefghij".as_slice(), EMPTY_SHA)]);
 
         let root_for_reader = root.clone();
-        let fetcher = move |_: &str, offset: u64| -> Result<Box<dyn Read + Send>, String> {
-            assert_eq!(offset, 0);
-            Ok(Box::new(CancelAfterFirstChunk {
-                root: root_for_reader.clone(),
-                data: b"abcdefghij".to_vec(),
-                pos: 0,
-                fired: false,
-            }) as Box<dyn Read + Send>)
-        };
+        let fetcher =
+            move |_: &str, offset: u64, _: Option<u64>| -> Result<Box<dyn Read + Send>, String> {
+                assert_eq!(offset, 0);
+                Ok(Box::new(CancelAfterFirstChunk {
+                    root: root_for_reader.clone(),
+                    data: b"abcdefghij".to_vec(),
+                    pos: 0,
+                    fired: false,
+                }) as Box<dyn Read + Send>)
+            };
 
         let outcome = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &fetcher);
         assert_eq!(outcome, Outcome::Cancelled);
@@ -2024,6 +2113,214 @@ pub(crate) mod tests {
                 .expect("partial bytes"),
             b"abc",
             "only the bytes received before the cancel was observed are kept"
+        );
+    }
+
+    #[test]
+    fn a_chunk_end_is_bounded_and_never_runs_past_the_artifact() {
+        // The open-ended `bytes=N-` this replaces is what the xet CDN answers
+        // with 400, so "there is always an end offset" is the whole fix.
+        assert_eq!(chunk_end(0, 100), Some(RANGE_CHUNK - 1));
+        assert_eq!(chunk_end(RANGE_CHUNK, 100), Some(2 * RANGE_CHUNK - 1));
+        // The last chunk stops at the final byte, never past it.
+        assert_eq!(chunk_end(96, 100), Some(99));
+        assert_eq!(chunk_end(0, 3), Some(2));
+        // Nothing left to ask for.
+        assert_eq!(chunk_end(100, 100), None);
+        assert_eq!(chunk_end(0, 0), None);
+    }
+
+    #[test]
+    fn every_range_request_is_bounded_and_the_chunks_reassemble_exactly() {
+        // The core of the fix: a body longer than one chunk must be fetched as
+        // a sequence of *bounded*, contiguous ranges, and the bytes that land
+        // on disk must equal the source exactly — no gap, no overlap, no
+        // duplicated head.
+        let root = tempdir();
+        let full: &[u8] = b"the quick brown fox jumps over the lazy dog, twice over";
+        let mut hasher = Sha256::new();
+        hasher.update(full);
+        let sha = hex(&hasher.finalize());
+        let m = manifest_for(&[("main", full, &sha)]);
+
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, Option<u64>)>::new()));
+        let log = std::sync::Arc::clone(&asked);
+        let inner = serving(&[("main", full.to_vec())]);
+        let fetcher = move |url: &str, offset: u64, end: Option<u64>| {
+            log.lock().expect("lock").push((offset, end));
+            inner(url, offset, end)
+        };
+
+        let outcome = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &fetcher);
+        assert_eq!(outcome, Outcome::Verified);
+        assert_eq!(
+            std::fs::read(staged_path_in(
+                &root,
+                crate::manifest::ModelSet::Ds4,
+                "main"
+            ))
+            .expect("staged"),
+            full,
+            "the reassembled chunks must equal the source byte for byte"
+        );
+
+        let asked = asked.lock().expect("lock").clone();
+        let total = full.len() as u64;
+        assert!(
+            asked.len() > 1,
+            "this fixture must span several chunks, got {asked:?}"
+        );
+        let mut want = 0u64;
+        for (offset, end) in &asked {
+            assert_eq!(*offset, want, "chunks must be contiguous: {asked:?}");
+            assert_eq!(
+                *end,
+                chunk_end(*offset, total),
+                "every request must name an end offset"
+            );
+            want = end.expect("bounded") + 1;
+        }
+        assert_eq!(want, total, "the chunks must cover the whole artifact");
+    }
+
+    /// A reader that serves `data` and then fails, standing in for a socket
+    /// that dies partway through a chunk.
+    struct DiesAfter {
+        data: Vec<u8>,
+        pos: usize,
+        /// Whether running out of `data` is a reset rather than a clean end of
+        /// chunk. Only the chunk that was cut short dies.
+        die: bool,
+    }
+
+    impl Read for DiesAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                if self.die {
+                    return Err(std::io::Error::other("connection reset"));
+                }
+                return Ok(0);
+            }
+            let n = buf.len().min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_failure_mid_chunk_resumes_across_the_boundary_with_the_right_digest() {
+        // A transport failure partway through chunk N must leave the bytes of
+        // chunks 0..N plus the partial chunk on disk, and the next run must
+        // resume from exactly that offset — an offset that is deliberately NOT
+        // a chunk multiple, so a resume that rounded to a boundary would
+        // corrupt the stream and the SHA-256 check would catch it.
+        let root = tempdir();
+        let full: &[u8] = b"the quick brown fox jumps over the lazy dog, twice over";
+        let mut hasher = Sha256::new();
+        hasher.update(full);
+        let sha = hex(&hasher.finalize());
+        let m = manifest_for(&[("main", full, &sha)]);
+
+        // Deliver two whole chunks, then five bytes of the third and a reset.
+        let cut = usize::try_from(RANGE_CHUNK).expect("small in tests") * 2 + 5;
+        let owned = full.to_vec();
+        let dying = move |_: &str, offset: u64, end: Option<u64>| {
+            let start = usize::try_from(offset).expect("fits");
+            let stop = usize::try_from(end.expect("bounded") + 1).expect("fits");
+            let cut_here = stop.min(cut);
+            Ok(Box::new(DiesAfter {
+                data: owned[start..cut_here.max(start)].to_vec(),
+                pos: 0,
+                die: cut_here < stop,
+            }) as Box<dyn Read + Send>)
+        };
+        let outcome = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &dying);
+        assert!(matches!(outcome, Outcome::Failed(_)), "got {outcome:?}");
+        let part = std::fs::read(part_path_in(&root, crate::manifest::ModelSet::Ds4, "main"))
+            .expect("the partial survives a mid-chunk failure");
+        assert_eq!(part, &full[..cut], "only good bytes are kept");
+        assert!(
+            !(part.len() as u64).is_multiple_of(RANGE_CHUNK),
+            "the resume point must fall mid-chunk for this test to mean anything"
+        );
+
+        // Second run: the .part is rehashed from disk and the remainder
+        // streamed. Verification is the digest equality assertion.
+        let outcome = run_job(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+            &m,
+            &serving(&[("main", full.to_vec())]),
+        );
+        assert_eq!(outcome, Outcome::Verified);
+        assert_eq!(
+            std::fs::read(staged_path_in(
+                &root,
+                crate::manifest::ModelSet::Ds4,
+                "main"
+            ))
+            .expect("staged"),
+            full,
+            "a resume that spans a chunk boundary must reassemble exactly"
+        );
+    }
+
+    /// Wraps a body and arms the cancel flag at end-of-chunk, so the poll
+    /// `run_job` makes *between* chunks is the one that sees it.
+    struct CancelAtChunkEnd {
+        root: std::path::PathBuf,
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for CancelAtChunkEnd {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                request_cancel_in(&self.root, Cancel::Keep).expect("flag");
+                return Ok(0);
+            }
+            let n = buf.len().min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_cancel_arriving_between_chunks_is_observed_before_the_next_request() {
+        // Cancellation is a flag file, polled before every read and again
+        // before each new chunk is opened, so the worst case is one
+        // outstanding read plus at most one connect — never a whole chunk.
+        let root = tempdir();
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(
+            &root,
+            crate::manifest::ModelSet::Ds4,
+        ))
+        .expect("staging");
+        let full: &[u8] = b"the quick brown fox jumps over the lazy dog, twice over";
+        let m = manifest_for(&[("main", full, EMPTY_SHA)]);
+
+        let chunk = usize::try_from(RANGE_CHUNK).expect("small in tests");
+        let root_for_fetch = root.clone();
+        let owned = full.to_vec();
+        let fetcher = move |_: &str, offset: u64, end: Option<u64>| {
+            assert_eq!(offset, 0, "the cancel must land before the second chunk");
+            let stop = usize::try_from(end.expect("bounded") + 1).expect("fits");
+            Ok(Box::new(CancelAtChunkEnd {
+                root: root_for_fetch.clone(),
+                data: owned[..stop].to_vec(),
+                pos: 0,
+            }) as Box<dyn Read + Send>)
+        };
+        let outcome = run_job(&root, crate::manifest::ModelSet::Ds4, &m, &fetcher);
+        assert_eq!(outcome, Outcome::Cancelled);
+        let part = std::fs::read(part_path_in(&root, crate::manifest::ModelSet::Ds4, "main"))
+            .expect("Keep leaves the partial");
+        assert_eq!(
+            part,
+            &full[..chunk],
+            "exactly the first chunk is kept, and those bytes are good"
         );
     }
 
@@ -2120,12 +2417,12 @@ pub(crate) mod tests {
     /// Range-capable server would.
     fn serving(
         bodies: &[(&str, Vec<u8>)],
-    ) -> impl Fn(&str, u64) -> Result<Box<dyn Read + Send>, String> + 'static {
+    ) -> impl Fn(&str, u64, Option<u64>) -> Result<Box<dyn Read + Send>, String> + 'static {
         let bodies: Vec<(String, Vec<u8>)> = bodies
             .iter()
             .map(|(k, v)| ((*k).to_string(), v.clone()))
             .collect();
-        move |url: &str, offset: u64| {
+        move |url: &str, offset: u64, end: Option<u64>| {
             let kind = url.rsplit('/').next().unwrap_or_default();
             let body = bodies
                 .iter()
@@ -2135,7 +2432,15 @@ pub(crate) mod tests {
             let start = usize::try_from(offset)
                 .unwrap_or(usize::MAX)
                 .min(body.len());
-            Ok(Box::new(std::io::Cursor::new(body[start..].to_vec())))
+            // Serve exactly the bounded range asked for, the way a
+            // Range-capable server does; an open-ended ask gets the whole tail.
+            let stop = end.map_or(body.len(), |e| {
+                usize::try_from(e.saturating_add(1))
+                    .unwrap_or(usize::MAX)
+                    .min(body.len())
+                    .max(start)
+            });
+            Ok(Box::new(std::io::Cursor::new(body[start..stop].to_vec())))
         }
     }
 

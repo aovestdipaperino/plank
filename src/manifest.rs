@@ -747,6 +747,14 @@ mod tests {
                     installed_path_in(root, b),
                     "{a:?} vs {b:?}"
                 );
+                // The job file too: one set's pending job must never be read
+                // as the other's, or a helper would download one set against
+                // the other's manifest.
+                assert_ne!(
+                    crate::downloader::job_path_in(root, a),
+                    crate::downloader::job_path_in(root, b),
+                    "{a:?} vs {b:?}"
+                );
                 // Every install path of one set, against every install path of
                 // the other: two sets sharing a kind name must still land on
                 // different files.
