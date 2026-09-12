@@ -152,6 +152,16 @@ pub struct AgentConfig {
     /// it may be replaced by the provider's reported window; an explicit value
     /// is the user's decision and is never overridden.
     pub ctx_size_explicit: bool,
+    /// Whether the sampling temperature came from the user (`--temp`) rather
+    /// than from a default — plank's own 0.6, or the 0.0 [`finalize`] imposes
+    /// when speculative decoding is requested.
+    ///
+    /// Consulted when speculation turns out not to run after all (an
+    /// unsupported family, a refused `DSpark` companion): the imposed 0.0 only
+    /// existed to let the draft gate open, so with nothing to gate it is
+    /// dropped for the 0.6 default. A temperature the user typed is never
+    /// touched — see [`temperature_without_speculation`].
+    pub temp_explicit: bool,
     /// Settings keys (`section.key`) a CLI flag overrode, for `/config
     /// --resolved`. Populated by [`parse_options_with`]; empty when no flag
     /// shadowed a settings key.
@@ -424,6 +434,7 @@ impl Default for AgentConfig {
             provider_api_key: None,
             provider_cache: true,
             ctx_size_explicit: false,
+            temp_explicit: false,
             cli_provenance: std::collections::BTreeMap::new(),
             dump_config: false,
         }
@@ -1527,6 +1538,34 @@ pub fn parse_options_with(
     Ok(c)
 }
 
+/// The temperature a session should really sample at, once it is known
+/// whether speculative decoding can run.
+///
+/// [`finalize`] pins the temperature to 0 whenever `--mtp` is on, because the
+/// engine's draft gate only opens at 0 — but it runs during argument parsing,
+/// before the model family is known, and speculation can still fall away at
+/// model-open time: `DSpark` is implemented for `DeepSeek` V4 alone, and an
+/// auto-paired companion a checkpoint refuses is dropped on the retry. Left
+/// alone, such a run samples greedily as a side effect of a feature that is
+/// not running.
+///
+/// So with no speculation in force the imposed 0 is dropped for the
+/// [`GenerationOptions`] default. `temp_explicit` — a temperature the user
+/// typed — always wins, including an explicit `--temp 0`, and so does a run
+/// that never asked for speculation (`--mtp-off`), whose temperature was never
+/// imposed in the first place.
+#[must_use]
+pub fn temperature_without_speculation(
+    opts: &GenerationOptions,
+    temp_explicit: bool,
+    spec_capable: bool,
+) -> f32 {
+    if spec_capable || temp_explicit || !opts.mtp {
+        return opts.temperature;
+    }
+    GenerationOptions::default().temperature
+}
+
 /// Post-parse fixups: the steering-scale default, the `--mtp` temperature
 /// default, and `--remote` validation.
 fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Result<(), String> {
@@ -1537,6 +1576,7 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
     // draft gate), so DSpark defaults the temperature to 0. Done here rather
     // than at the flag because `--temp` may follow it; an explicit `--temp` in
     // either order still wins. `--mtp-off` leaves the 0.6 default in force.
+    c.temp_explicit = temp_set;
     if c.engine.mtp && !temp_set {
         c.generation.temperature = 0.0;
     }
@@ -2289,6 +2329,42 @@ mod tests {
         assert!((c.generation.temperature - 0.0).abs() < 1e-6);
         let c = parse_options(&args(&["--mtp-confidence", "0.3"])).unwrap();
         assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_temperature_falls_back_when_speculation_cannot_run() {
+        // `--mtp` (the default) pinned 0 during parsing; the model then turns
+        // out to have no DSpark drafter, so the pin has nothing left to serve.
+        let c = parse_options(&[]).unwrap();
+        assert!(c.engine.mtp && !c.temp_explicit);
+        assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+        let restored = temperature_without_speculation(&c.generation, c.temp_explicit, false);
+        let default = GenerationOptions::default().temperature;
+        assert!((restored - default).abs() < 1e-6, "{restored}");
+        // A speculating run keeps its 0.
+        let kept = temperature_without_speculation(&c.generation, c.temp_explicit, true);
+        assert!(kept.abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_explicit_temperature_survives_the_fallback() {
+        for arg in ["0", "0.9"] {
+            let c = parse_options(&["--temp".into(), arg.into()]).unwrap();
+            assert!(
+                c.temp_explicit,
+                "--temp {arg} must record the user's choice"
+            );
+            let settled = temperature_without_speculation(&c.generation, c.temp_explicit, false);
+            assert!(
+                (settled - c.generation.temperature).abs() < 1e-6,
+                "--temp {arg} was overridden: {settled}"
+            );
+        }
+        // And `--mtp-off` never had a temperature imposed, so there is nothing
+        // to restore: the 0.6 default stands either way.
+        let c = parse_options(&["--mtp-off".into()]).unwrap();
+        let settled = temperature_without_speculation(&c.generation, c.temp_explicit, false);
+        assert!((settled - 0.6).abs() < 1e-6);
     }
 
     #[test]

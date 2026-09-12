@@ -7868,6 +7868,29 @@ the original is frozen and listed in /tree"
     /// `EchoEngine`, a provider engine, `--mtp` with a missing file) is off
     /// however the flag reads, and every message and marker follows this
     /// answer rather than the flag alone.
+    /// Drops the temperature `config::finalize` pinned to 0 for speculative
+    /// decoding when this session's engine turns out not to be able to
+    /// speculate at all (`DSpark` is `DeepSeek` V4 only, and an auto-paired
+    /// companion a checkpoint refuses is dropped on the open retry). The pin
+    /// exists solely to let the draft gate open; with no gate it would leave
+    /// the session sampling greedily for no reason.
+    ///
+    /// The single choke point for that decision — the constructor calls it
+    /// once, before the first frame is drawn. A temperature the user typed is
+    /// never touched (`temp_explicit`), and `resume_temp` follows, so a later
+    /// `/mtp off` returns to the same number.
+    fn settle_speculation_temperature(&mut self, temp_explicit: bool) {
+        let settled = crate::config::temperature_without_speculation(
+            &self.gen_opts,
+            temp_explicit,
+            self.engine.spec_capable(),
+        );
+        self.gen_opts.temperature = settled;
+        if settled > 0.0 {
+            self.resume_temp = settled;
+        }
+    }
+
     fn mtp_on(&self) -> bool {
         self.gen_opts.mtp && self.engine.spec_capable()
     }
@@ -17109,8 +17132,18 @@ fn new_agent(
     // can be typed. An engine with no support model reads as off however the
     // flags were set — the footer must not promise speculation the engine
     // cannot do.
+    // Speculation may have fallen away since the flags were parsed (an
+    // unsupported family, a companion the checkpoint refused), and the 0
+    // `finalize` pinned for it has no reason to stand once it cannot run.
+    // Settled here, so the very first frame shows the temperature the session
+    // will actually sample at.
+    let settled_temperature = crate::config::temperature_without_speculation(
+        &cfg.generation,
+        cfg.temp_explicit,
+        engine.spec_capable(),
+    );
     crate::status::set_mtp(cfg.generation.mtp && engine.spec_capable());
-    crate::status::set_temperature(cfg.generation.temperature);
+    crate::status::set_temperature(settled_temperature);
     // The alt local engine needs both for the same reasons, and it cannot be
     // skipped as an optimization: `warm_reset` builds its system tokens from
     // these two fields, so an unconfigured engine tokenizes the *same* system
@@ -17139,7 +17172,7 @@ fn new_agent(
     // uses; hand the dispatch context its own copy.
     tool_ctx.skills.clone_from(&skills);
     let repro_dir = crate::repro::repro_dir(&tool_ctx.cwd);
-    Ok(Agent {
+    let mut agent = Agent {
         gen_opts: cfg.generation.clone(),
         resume_temp: if cfg.generation.temperature > 0.0 {
             cfg.generation.temperature
@@ -17211,7 +17244,11 @@ fn new_agent(
             .collect(),
         local_alt_warmed: false,
         warm_note: None,
-    })
+    };
+    // Speculation may have fallen away since the flags were parsed, and the 0
+    // `config::finalize` pinned for it then has nothing left to serve.
+    agent.settle_speculation_temperature(cfg.temp_explicit);
+    Ok(agent)
 }
 
 /// Runs the interactive REPL until the user exits.
@@ -19299,7 +19336,7 @@ mod tests {
         engine: ScriptedEngine,
         cfg: &'a crate::config::AgentConfig,
     ) -> Agent<'a> {
-        Agent {
+        let mut agent = Agent {
             engine: Box::new(engine),
             cfg,
             gen_opts: cfg.generation.clone(),
@@ -19363,7 +19400,12 @@ mod tests {
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
-        }
+        };
+        // The same settling the real constructor does, so a test agent over an
+        // engine that cannot speculate has the temperature production would
+        // give it.
+        agent.settle_speculation_temperature(cfg.temp_explicit);
+        agent
     }
 
     impl Agent<'_> {
@@ -19477,6 +19519,63 @@ mod tests {
         assert!(!agent.mtp_on());
         // And with no support model the temperature is the user's again.
         assert_eq!(agent.temp_command("0.5"), "temperature 0.50");
+    }
+
+    /// A run started under the default `--mtp` had its temperature pinned to
+    /// 0 during argument parsing, before the family was known. When the engine
+    /// turns out to have no drafter (`DSpark` is V4-only, or the companion was
+    /// refused), the pin is serving nothing and the session would sample
+    /// greedily for no reason: the 0.6 default comes back.
+    #[test]
+    fn a_run_that_cannot_speculate_gets_its_default_temperature_back() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("mtp-unsupported-temp");
+        let mut cfg = test_cfg();
+        cfg.generation.mtp = true;
+        cfg.generation.temperature = 0.0;
+        cfg.temp_explicit = false;
+        // `ScriptedEngine::default()` has no support model (`spec: false`).
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let default = crate::engine::GenerationOptions::default().temperature;
+        assert!(!agent.engine.spec_capable());
+        assert!(
+            (agent.gen_opts.temperature - default).abs() < 1e-6,
+            "{}",
+            agent.gen_opts.temperature
+        );
+        // The footer and `/mtp` already read off `spec_capable`, so they stay
+        // truthful through the fallback.
+        assert!(!agent.mtp_on());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same run, with the user having typed `--temp 0`: their choice is
+    /// never second-guessed, speculating or not.
+    #[test]
+    fn an_explicit_zero_temperature_survives_a_run_that_cannot_speculate() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("mtp-unsupported-temp-explicit");
+        let mut cfg = test_cfg();
+        cfg.generation.mtp = true;
+        cfg.generation.temperature = 0.0;
+        cfg.temp_explicit = true;
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert!(agent.gen_opts.temperature.abs() < 1e-6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// And a session that really can speculate keeps its pinned 0.
+    #[test]
+    fn a_speculating_run_keeps_the_pinned_zero_temperature() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("mtp-supported-temp");
+        let mut cfg = test_cfg();
+        cfg.generation.mtp = true;
+        cfg.generation.temperature = 0.0;
+        let agent = spark_agent(&dir, &cfg);
+        assert!(agent.mtp_on());
+        assert!(agent.gen_opts.temperature.abs() < 1e-6);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
