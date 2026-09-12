@@ -44,12 +44,8 @@ impl ModelSet {
         match family {
             // V4.1 has no artifact set of its own yet: its weights are still
             // installed and named as the `DeepSeek` set, so pointing it at a
-            // set that does not exist would break every manifest lookup. Qwen
-            // has no set of its own any more; it is named here only because
-            // the family still exists, and drops out of this arm with it.
-            crate::gguf::ModelFamily::Ds4
-            | crate::gguf::ModelFamily::Ds41
-            | crate::gguf::ModelFamily::Qwen => Self::Ds4,
+            // set that does not exist would break every manifest lookup.
+            crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41 => Self::Ds4,
         }
     }
 

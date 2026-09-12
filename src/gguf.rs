@@ -4,9 +4,8 @@
 //! plank has to know this *before* `ds4_engine_open`, and the engine cannot
 //! tell it: the C detects the family while opening, but the companion-GGUF
 //! path has to be in the options struct by then, and it goes in a different
-//! field per family (`mtp_path` for a `DeepSeek` draft model, `ple_path` for a
-//! Qwen sidecar). Putting it in the wrong one is a hard error — the C refuses
-//! a `ple_path` for a non-Qwen model — so guessing is not an option and
+//! field per family (`mtp_path` for a `DeepSeek` draft model). Putting it in
+//! the wrong one is a hard error, so guessing is not an option and
 //! opening twice is not either, since the first open pays the whole residency
 //! cost.
 //!
@@ -24,8 +23,6 @@ pub enum ModelFamily {
     /// `DeepSeek` V4 and anything else the C falls through to.
     #[default]
     Ds4,
-    /// Qwen3.8-Flash-Next (`qwen4exp`).
-    Qwen,
     /// `DeepSeek` V4.1 Flash (`deepseek41`). A distinct family, not a revision
     /// of V4: its weights, vision encoder and tokenizer are not interchangeable,
     /// and it speaks its own DSML dialect, so nothing captured under one family
@@ -33,23 +30,33 @@ pub enum ModelFamily {
     Ds41,
 }
 
-impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
+impl ModelFamily {
+    /// The family behind a tool dialect, or `None` for a dialect that is not
+    /// one of plank's families.
+    ///
     /// The two enums answer the same question from different sides — the
     /// dialect is read from the engine's reported shape name after opening,
     /// the family from the file's metadata before it — and they live in
     /// different crates, so they cannot be one type. This is the single place
     /// they are reconciled, rather than a second string matcher.
-    fn from(syntax: trace_stream::syntax::ToolSyntax) -> Self {
+    ///
+    /// It returns an `Option` rather than folding the unknown case into
+    /// [`ModelFamily::Ds4`] on purpose. `ToolSyntax::Qwen` still exists in
+    /// `trace-stream` (it goes away with the dialect in the next task), and
+    /// mapping it to `Ds4` would *misattribute* a Qwen KV blob left on disk to
+    /// the `DeepSeek` family — which would both list it in `/kvcache` and put
+    /// it under the live family's GC. `None` means "not a family this build
+    /// serves": inert, never swept, never fed to another model.
+    #[must_use]
+    pub fn from_syntax(syntax: trace_stream::syntax::ToolSyntax) -> Option<Self> {
         match syntax {
-            trace_stream::syntax::ToolSyntax::Qwen => Self::Qwen,
-            trace_stream::syntax::ToolSyntax::Dsml41 => Self::Ds41,
-            trace_stream::syntax::ToolSyntax::Dsml => Self::Ds4,
+            trace_stream::syntax::ToolSyntax::Dsml41 => Some(Self::Ds41),
+            trace_stream::syntax::ToolSyntax::Dsml => Some(Self::Ds4),
+            // Unreachable-but-required until the dialect itself is removed.
+            trace_stream::syntax::ToolSyntax::Qwen => None,
         }
     }
 }
-
-/// The `general.architecture` value the C matches for Qwen3.8-Flash-Next.
-const QWEN_ARCH: &str = "qwen4exp";
 
 /// The `general.architecture` value the C matches for `DeepSeek` V4.1 Flash.
 ///
@@ -75,7 +82,6 @@ const MAX_KV_PAIRS: u64 = 1 << 20;
 #[must_use]
 pub fn family_of(path: &Path) -> ModelFamily {
     match architecture(path).as_deref() {
-        Some(QWEN_ARCH) => ModelFamily::Qwen,
         Some(DS41_ARCH) => ModelFamily::Ds41,
         _ => ModelFamily::Ds4,
     }
@@ -102,9 +108,7 @@ const VISION_EXP_VARIANT: &str = "vision-exp";
 /// open whether to pass one at all. Any other `DeepSeek` V4 checkpoint (a
 /// language-only quant, an abliterated re-quant) is text-only; the
 /// `view_image` tool then refuses at call time exactly as it does when the
-/// encoder file is missing. Qwen is answered elsewhere: the C would accept a
-/// Qwen encoder, but plank does not ship one, so this stays a `DeepSeek`
-/// question.
+/// encoder file is missing.
 #[must_use]
 pub fn supports_vision(path: &Path) -> bool {
     string_value(path, "deepseek4.checkpoint_variant").as_deref() == Some(VISION_EXP_VARIANT)
@@ -219,7 +223,7 @@ pub fn file_detail(label: &str, path: Option<&Path>) -> Option<String> {
     let path = path?;
     let mut line = format!("- {label}: {}", path.display());
     // `symlink_metadata` first: plank's own default model paths are symlinks
-    // by convention (`~/.plank/qwen.gguf` and its sidecar are expected to
+    // by convention (`~/.plank/ds4.gguf` and its sidecar are expected to
     // point at whichever build you keep), so a dangling one is the single most
     // likely cause of an open that fails with the path looking perfectly fine.
     match std::fs::symlink_metadata(path) {
@@ -327,8 +331,8 @@ pub struct OpenAttempt<'a> {
 /// A bare "failed to open model &lt;path&gt;" is the least useful form of a
 /// failure that has a handful of cheap and decisive causes: a dangling symlink,
 /// a truncated artifact from an interrupted install, a companion sidecar that
-/// is absent (a Qwen run cannot open without its PLE file, and `--mtp` on a
-/// `DeepSeek` run cannot without the draft checkpoint), a context size the
+/// is absent (`--mtp` on a `DeepSeek` run cannot open without the draft
+/// checkpoint), a context size the
 /// machine cannot hold, or the Metal kernel sources not being where the engine
 /// looks. Each gets its own line, and only when it is true, so the message
 /// never pads itself out with reassurance that everything is fine.
@@ -494,25 +498,36 @@ mod tests {
     #[test]
     fn the_dialect_and_the_family_agree() {
         use trace_stream::syntax::ToolSyntax;
-        assert_eq!(ModelFamily::from(ToolSyntax::Qwen), ModelFamily::Qwen);
-        assert_eq!(ModelFamily::from(ToolSyntax::Dsml), ModelFamily::Ds4);
         assert_eq!(
-            ModelFamily::from(ToolSyntax::for_model_name("Qwen3.8 Flash Next")),
-            ModelFamily::Qwen
+            ModelFamily::from_syntax(ToolSyntax::Dsml),
+            Some(ModelFamily::Ds4)
         );
         assert_eq!(
-            ModelFamily::from(ToolSyntax::for_model_name("DeepSeek V4 Flash")),
-            ModelFamily::Ds4
+            ModelFamily::from_syntax(ToolSyntax::for_model_name("DeepSeek V4 Flash")),
+            Some(ModelFamily::Ds4)
+        );
+    }
+
+    /// The Qwen dialect outlives the Qwen family by one task. It must map to
+    /// *no* family rather than fold into `Ds4`: a leftover `.qwn.kv` blob
+    /// attributed to `Ds4` would be listed, and swept, as a `DeepSeek` one.
+    #[test]
+    fn the_qwen_dialect_maps_to_no_family() {
+        use trace_stream::syntax::ToolSyntax;
+        assert_eq!(ModelFamily::from_syntax(ToolSyntax::Qwen), None);
+        assert_eq!(
+            ModelFamily::from_syntax(ToolSyntax::for_model_name("Qwen3.8 Flash Next")),
+            None
         );
     }
 
     #[test]
     fn reads_the_architecture_string() {
         let p = Gguf::default()
-            .str_val("general.architecture", "qwen4exp")
+            .str_val("general.architecture", "deepseek41")
             .write("arch");
-        assert_eq!(architecture(&p).as_deref(), Some("qwen4exp"));
-        assert_eq!(family_of(&p), ModelFamily::Qwen);
+        assert_eq!(architecture(&p).as_deref(), Some("deepseek41"));
+        assert_eq!(family_of(&p), ModelFamily::Ds41);
         let _ = std::fs::remove_file(p);
     }
 
@@ -533,11 +548,11 @@ mod tests {
         let _ = std::fs::remove_file(p);
     }
 
-    /// Anything the C would not recognize as Qwen must read as the `DeepSeek`
+    /// Anything the C does not recognize must read as the `DeepSeek`
     /// fallthrough, which is the same thing `config_validate_model` does.
     #[test]
     fn unknown_architectures_fall_through_to_ds4() {
-        for arch in ["deepseek4", "glm-dsa", "glm5-next", "llama", ""] {
+        for arch in ["deepseek4", "qwen4exp", "glm-dsa", "glm5-next", "llama", ""] {
             let p = Gguf::default()
                 .str_val("general.architecture", arch)
                 .write("other");
@@ -559,14 +574,17 @@ mod tests {
     }
 
     /// The probe and the dialect selector must agree for V4.1 too, the same
-    /// way `the_dialect_and_the_family_agree` checks it for V4 and Qwen.
+    /// way `the_dialect_and_the_family_agree` checks it for V4.
     #[test]
     fn v41_dialect_maps_to_the_v41_family() {
         use trace_stream::syntax::ToolSyntax;
-        assert_eq!(ModelFamily::from(ToolSyntax::Dsml41), ModelFamily::Ds41);
         assert_eq!(
-            ModelFamily::from(ToolSyntax::for_model_name("DeepSeek V4.1 Flash")),
-            ModelFamily::Ds41
+            ModelFamily::from_syntax(ToolSyntax::Dsml41),
+            Some(ModelFamily::Ds41)
+        );
+        assert_eq!(
+            ModelFamily::from_syntax(ToolSyntax::for_model_name("DeepSeek V4.1 Flash")),
+            Some(ModelFamily::Ds41)
         );
     }
 
@@ -602,7 +620,7 @@ mod tests {
     /// A probe is run on whatever path the user passed, so it has to survive
     /// files that are not models at all rather than panic or hang.
     #[test]
-    fn junk_and_missing_files_are_not_qwen() {
+    fn junk_and_missing_files_read_as_the_fallthrough_family() {
         assert_eq!(architecture(Path::new("/nonexistent/x.gguf")), None);
         assert_eq!(
             family_of(Path::new("/nonexistent/x.gguf")),

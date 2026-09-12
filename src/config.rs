@@ -234,12 +234,10 @@ pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 pub struct EngineTuning {
     /// The model's companion GGUF, from `--mtp PATH`.
     ///
-    /// One flag, two destinations, chosen by the family of the *main* model:
-    /// a `DeepSeek` run passes it as the engine's `mtp_path` (its `DSpark`
-    /// draft checkpoint), a Qwen run as `ple_path` (its required n-gram
-    /// sidecar). `Ds4Model::open` does the routing, because the engine cannot:
-    /// it detects the family while opening, and the path has to be in the
-    /// options struct before that.
+    /// Passed as the engine's `mtp_path`: the `DSpark` draft checkpoint every
+    /// family plank serves speculates from. `Ds4Model::open` routes it, because
+    /// the engine cannot: it detects the family while opening, and the path has
+    /// to be in the options struct before that.
     pub mtp_path: Option<PathBuf>,
     /// Draft tokens per MTP step from `--mtp-draft` (C default: 1).
     pub mtp_draft_tokens: i32,
@@ -247,17 +245,13 @@ pub struct EngineTuning {
     pub mtp_margin: f32,
     /// Speculative decoding. On by default; `--mtp-off` turns it off.
     ///
-    /// One name, one meaning — "predict more than one token per step" — and a
-    /// different mechanism per family. A `DeepSeek` run speculates with its
-    /// `DSpark` draft checkpoint, taken from `--mtp` when given and otherwise
-    /// resolved to `~/.plank/ds4flash.dspark.gguf` and downloaded if absent. A
-    /// Qwen run speculates with the MTP block embedded in its own main GGUF,
-    /// so it needs no companion for this at all — its `--mtp` path is the PLE
-    /// sidecar, which is required whether speculation is on or off.
+    /// One name, one meaning — "predict more than one token per step". A run
+    /// speculates with its `DSpark` draft checkpoint, taken from `--mtp` when
+    /// given and otherwise resolved to `~/.plank/ds4flash.dspark.gguf` and
+    /// downloaded if absent.
     ///
-    /// That asymmetry is why the flag governs speculation rather than the
-    /// companion file: `--mtp-off` has to stay harmless, and for Qwen
-    /// "no sidecar" means the model cannot load.
+    /// The flag governs speculation rather than the companion file, so
+    /// `--mtp-off` stays harmless however the paths were set.
     ///
     /// `--mtp-confidence` and `--mtp-strict` also imply it, mirroring the C.
     pub mtp: bool,
@@ -480,13 +474,10 @@ Options:
                            (on by default; defaults --temp to 0 unless --temp
                            is given). DeepSeek speculates with its DSpark draft
                            model, downloaded to ~/.plank/ds4flash.dspark.gguf
-                           unless --mtp-model names one; Qwen3.8 speculates with
-                           the MTP block inside its own main GGUF
+                           unless --mtp-model names one
       --mtp-off            disable speculative decoding (target-only decode)
       --mtp-model PATH     this model's companion GGUF: the DSpark draft model
-                           for DeepSeek, the required PLE n-gram sidecar for
-                           Qwen3.8 (a Qwen run is text-only, so the DS4 vision
-                           encoder is not loaded)
+                           for DeepSeek
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
       --mtp-confidence F   confidence pruning threshold 0..1

@@ -42,7 +42,7 @@ pub struct ModelMeta<'a> {
     /// Vision Experimental`. Empty when no engine is loaded (the echo stub).
     pub name: &'a str,
     /// Family the loaded model belongs to, spelled as the CLI spells it
-    /// (`ds4` / `qwen`).
+    /// (`ds4`).
     pub family: &'a str,
     /// Tool-call dialect in force. Derived from `name`, recorded separately
     /// because a mismatch between the two is itself a bug worth seeing.
@@ -50,8 +50,8 @@ pub struct ModelMeta<'a> {
     /// `version` of the installed `ds4.manifest`, i.e. which artifact set is
     /// on disk. `None` when no manifest is installed.
     pub artifact_version: Option<u32>,
-    /// The companion GGUF in effect: the `DSpark` draft checkpoint for
-    /// `DeepSeek`, the PLE n-gram sidecar for Qwen. Empty when none is configured.
+    /// The companion GGUF in effect: the `DSpark` draft checkpoint. Empty when
+    /// none is configured.
     pub companion: &'a str,
     /// File name of the main artifact the installed manifest declares — the
     /// weights' real name, which a symlinked `path` hides. Empty when no

@@ -385,33 +385,20 @@ pub fn ensure_dspark_support(engine: &mut crate::config::EngineTuning) -> Result
     Ok(())
 }
 
-/// Fetches the DS4 side artifacts (vision encoder, `DSpark` support) unless the
-/// model is a Qwen3.8-Flash-Next one.
+/// Fetches the DS4 side artifacts (vision encoder, `DSpark` support).
 ///
-/// Both are `DeepSeek` V4 files, and a Qwen run opens neither: the engine is
-/// not handed the vision encoder, and Qwen speculates from the MTP block
-/// embedded in its own main GGUF rather than from a draft checkpoint. Fetching
-/// them would cost ~7 GB for files this run never reads.
-///
-/// The vision encoder is also skipped for a `DeepSeek` checkpoint that is not
+/// The vision encoder is skipped for a `DeepSeek` checkpoint that is not
 /// the pinned Vision-Exp model (`gguf::supports_vision`): the engine refuses
 /// to open such a model with an encoder, so plank never passes one and the run
 /// is text-only. Prompting for a ~0.9 GB download it could not use would be
 /// worse than useless.
 ///
-/// Speculation is *not* switched off here. Under the unified `--mtp` it stays
-/// meaningful for Qwen — it just runs off the embedded block, which needs no
-/// download and no companion file.
-///
 /// # Errors
-/// Propagates the underlying ensure failures for non-Qwen runs.
+/// Propagates the underlying ensure failures.
 pub fn ensure_side_artifacts(
     model_path: &Path,
     engine: &mut crate::config::EngineTuning,
 ) -> Result<(), String> {
-    if crate::gguf::family_of(model_path) == crate::gguf::ModelFamily::Qwen {
-        return Ok(());
-    }
     if crate::gguf::supports_vision(model_path) {
         ensure_vision_encoder()?;
     }
@@ -1809,30 +1796,6 @@ mod tests {
             ..Default::default()
         };
         assert!(ensure_side_artifacts(&model, &mut e).is_ok());
-        let _ = std::fs::remove_file(model);
-    }
-
-    /// A non-`DeepSeek` model must not reach for either side artifact: it
-    /// opens neither the DS4 vision encoder nor a DS4 draft checkpoint. No
-    /// download is stubbed here on purpose — if the gate regressed, the ensure
-    /// calls would try to prompt or fetch and fail.
-    #[test]
-    fn a_non_ds4_model_skips_the_ds4_side_artifacts() {
-        let model = stub_model("qwen", "qwen4exp");
-        let mut e = crate::config::EngineTuning {
-            mtp: true,
-            mtp_strict: true,
-            ..Default::default()
-        };
-        assert!(ensure_side_artifacts(&model, &mut e).is_ok());
-        // Speculation stays on: under the unified `--mtp` such a run
-        // speculates from the block embedded in its own main GGUF, which needs
-        // neither a download nor a companion file.
-        assert!(e.mtp, "speculation is still meaningful here");
-        assert!(
-            e.mtp_path.is_none(),
-            "no DeepSeek support model resolved for a non-DS4 run"
-        );
         let _ = std::fs::remove_file(model);
     }
 

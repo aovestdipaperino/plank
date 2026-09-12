@@ -629,31 +629,39 @@ pub fn set_local_power(percent: i32) {
 /// Process-global like the power share, and for the same reason: the footer is
 /// drawn from places that hold no engine handle, including a remote client
 /// rendering this session's bar.
-static LOCAL_FAMILY_IS_QWEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// A tag rather than a flag: this was a `LOCAL_FAMILY_IS_QWEN` bool, which is
+/// why V4.1 used to render as `local:ds`. `0` is the unset value an untouched
+/// static holds, so it has to stay the `DeepSeek` V4 tag — the footer may be
+/// drawn before any model is open.
+static LOCAL_FAMILY: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(LOCAL_FAMILY_DS4);
+
+const LOCAL_FAMILY_DS4: u8 = 0;
+const LOCAL_FAMILY_DS41: u8 = 1;
 
 /// Records the local engine's model family, once the model is open.
 pub fn set_local_family(family: crate::gguf::ModelFamily) {
-    LOCAL_FAMILY_IS_QWEN.store(
-        family == crate::gguf::ModelFamily::Qwen,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let tag = match family {
+        crate::gguf::ModelFamily::Ds4 => LOCAL_FAMILY_DS4,
+        crate::gguf::ModelFamily::Ds41 => LOCAL_FAMILY_DS41,
+    };
+    LOCAL_FAMILY.store(tag, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The family tag the origin label carries: `ds` or `qwen`.
+/// The family tag the origin label carries: `ds` or `ds41`.
 ///
 /// Short on purpose. It sits in the footer's tightest segment, and the point
 /// is to answer "which model is this" at a glance, not to name the release.
 fn local_family_tag() -> &'static str {
-    if LOCAL_FAMILY_IS_QWEN.load(std::sync::atomic::Ordering::Relaxed) {
-        "qwen"
+    if LOCAL_FAMILY.load(std::sync::atomic::Ordering::Relaxed) == LOCAL_FAMILY_DS41 {
+        "ds41"
     } else {
         "ds"
     }
 }
 
 /// The local engine's origin label, naming the model family and carrying the
-/// power share: `(local:ds ⚡100%)`, or `(local:qwen ⚡60%)` under a cap.
+/// power share: `(local:ds ⚡100%)`, or `(local:ds41 ⚡60%)` under a cap.
 ///
 /// The family tag is what tells two local runs apart at a glance — the same
 /// footer, the same directory, a different model.
@@ -3274,15 +3282,14 @@ mod tests {
             ..Status::default()
         };
 
-        set_local_family(crate::gguf::ModelFamily::Qwen);
+        set_local_family(crate::gguf::ModelFamily::Ds41);
         let line = build_status_text(&st, false, true);
-        assert!(line.contains("(local:qwen"), "{line}");
-        assert!(!line.contains("(local:ds"), "one tag only: {line}");
+        assert!(line.contains("(local:ds41"), "{line}");
 
         set_local_family(crate::gguf::ModelFamily::Ds4);
         let line = build_status_text(&st, false, true);
-        assert!(line.contains("(local:ds"), "{line}");
-        assert!(!line.contains("(local:qwen"), "one tag only: {line}");
+        assert!(line.contains("(local:ds "), "{line}");
+        assert!(!line.contains("(local:ds41"), "one tag only: {line}");
 
         // The bare form is the registration key, not a rendering: it must
         // never reach the bar, or the tag would be silently missing.

@@ -600,33 +600,25 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
             ),
             sysprompt::IN_THINK_PROHIBITION
         ),
-        // Named for the dialect the model actually speaks. Telling a Qwen
-        // model its "DSML" was invalid, and handing it DSML to copy, is how a
-        // recorded session ended with the model insisting the harness was
-        // broken rather than fixing its markup.
+        // Named for the dialect the model actually speaks. Telling a model
+        // its "DSML" was invalid, and handing it DSML to copy when it speaks
+        // something else, is how a recorded session ended with the model
+        // insisting the harness was broken rather than fixing its markup.
         PassError::Dsml => match syntax {
-            sysprompt::ToolSyntax::Dsml => format!(
-                "Tool error: invalid DSML tool call: {err}\n{}",
-                sysprompt::dsml_syntax_reminder()
-            ),
-            #[cfg(feature = "qwen")]
-            sysprompt::ToolSyntax::Qwen => format!(
-                "Tool error: invalid tool call: {err}\n{}",
-                sysprompt::qwen_syntax_reminder()
-            ),
-            // Unreachable — a Qwen model cannot be opened by this build — but
-            // the variant still exists, so the match must stay total. Falling
-            // back to the DSML reminder is the honest answer: DSML is the only
-            // dialect this build speaks.
-            #[cfg(not(feature = "qwen"))]
+            // Unreachable — plank no longer serves a Qwen model — but the
+            // variant still exists until the dialect layer is removed, so the
+            // match must stay total. Falling back to the DSML reminder is the
+            // honest answer: DSML is the only dialect this build speaks; the
+            // arm goes away with the dialect.
             sysprompt::ToolSyntax::Qwen => format!(
                 "Tool error: invalid tool call: {err}\n{}",
                 sysprompt::dsml_syntax_reminder()
             ),
             // V4.1 speaks its own DSML dialect; until its reminder text is
             // pinned against the C, the V4 reminder is the closest true thing
-            // to hand it — both are DSML, only the tag table differs.
-            sysprompt::ToolSyntax::Dsml41 => format!(
+            // to hand it — both are DSML, only the tag table differs, so the
+            // two share one arm.
+            sysprompt::ToolSyntax::Dsml | sysprompt::ToolSyntax::Dsml41 => format!(
                 "Tool error: invalid DSML tool call: {err}\n{}",
                 sysprompt::dsml_syntax_reminder()
             ),
@@ -8720,7 +8712,11 @@ the original is frozen and listed in /tree"
         // the transcript.
         let model_name = self.engine.model_name();
         let syntax = self.tool_syntax();
-        let family = crate::manifest::ModelSet::for_family(crate::gguf::ModelFamily::from(syntax));
+        // `Qwen` has no family any more, and no engine this build opens can
+        // report it; the `DeepSeek` default is the only artifact set there is.
+        let family = crate::manifest::ModelSet::for_family(
+            crate::gguf::ModelFamily::from_syntax(syntax).unwrap_or_default(),
+        );
         let installed = crate::manifest::read_at(&crate::manifest::installed_path(family));
         let artifact_version = installed.as_ref().map(|m| m.version);
         // The `main` entry is the weights themselves; its URL carries the
@@ -17027,7 +17023,9 @@ fn new_agent(
     // Which model this local engine is, for the footer's origin label. Taken
     // from the dialect already resolved above, so the tag can never disagree
     // with the syntax the parser is using.
-    crate::status::set_local_family(syntax.into());
+    crate::status::set_local_family(
+        crate::gguf::ModelFamily::from_syntax(syntax).unwrap_or_default(),
+    );
     // The footer's mtp/temperature slot, seeded the same way: `/mtp` and
     // `/temp` publish to it later, but the first frame is drawn before either
     // can be typed. An engine with no support model reads as off however the
@@ -19452,7 +19450,7 @@ mod tests {
             "{section}"
         );
         // Dialect follows from the name, and the family follows from the
-        // dialect; a DSML model must never be labelled qwen.
+        // dialect; the two must never disagree.
         assert!(section.contains("- tool dialect: dsml"), "{section}");
         assert!(section.contains("- family: ds4"), "{section}");
         // The artifact set line is always present, in one of its two shapes,

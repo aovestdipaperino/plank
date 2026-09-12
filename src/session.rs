@@ -86,8 +86,6 @@ const HISTORY_TOOL_MAX_BYTES: usize = 3000;
 const MAGIC: &str = "plank-session 1";
 /// Transcript extension for a `DeepSeek` session.
 const DS4_FILE_EXT: &str = ".ds4.kv";
-/// Transcript extension for a Qwen session.
-const QWEN_FILE_EXT: &str = ".qwn.kv";
 /// Transcript extension for a `DeepSeek` V4.1 session.
 ///
 /// Note it is not a suffix of, nor suffixed by, [`DS4_FILE_EXT`]: `.ds4.kv`
@@ -106,13 +104,15 @@ const LEGACY_FILE_EXT: &str = ".kv";
 /// (the `/kvcache` browser, the insights reader), and threading a family
 /// through every one of them to name a file extension is not worth it.
 /// A tag rather than a flag: this was a `FAMILY_IS_QWEN` bool until V4.1
-/// arrived, and a third family no longer fits in a yes/no. `0` is the unset
-/// value an untouched static holds, so it has to stay `Ds4` — every transcript
-/// written before the families split was a `DeepSeek` one.
+/// arrived, and more than two families no longer fit in a yes/no. `0` is the
+/// unset value an untouched static holds, so it has to stay `Ds4` — every
+/// transcript written before the families split was a `DeepSeek` one. The tag
+/// numbering is frozen: `1` was Qwen's and is deliberately left unused rather
+/// than reassigned, so no persisted or defaulted value can shift family.
 static FAMILY_TAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(FAMILY_TAG_DS4);
 
 const FAMILY_TAG_DS4: u8 = 0;
-const FAMILY_TAG_QWEN: u8 = 1;
+// `1` was `FAMILY_TAG_QWEN`. Retired, never reused.
 const FAMILY_TAG_DS41: u8 = 2;
 
 /// Records the live model family. Called once at startup, before any store is
@@ -121,7 +121,6 @@ const FAMILY_TAG_DS41: u8 = 2;
 pub fn set_family(family: crate::gguf::ModelFamily) {
     let tag = match family {
         crate::gguf::ModelFamily::Ds4 => FAMILY_TAG_DS4,
-        crate::gguf::ModelFamily::Qwen => FAMILY_TAG_QWEN,
         crate::gguf::ModelFamily::Ds41 => FAMILY_TAG_DS41,
     };
     FAMILY_TAG.store(tag, std::sync::atomic::Ordering::Relaxed);
@@ -131,7 +130,6 @@ pub fn set_family(family: crate::gguf::ModelFamily) {
 #[must_use]
 pub fn family() -> crate::gguf::ModelFamily {
     match FAMILY_TAG.load(std::sync::atomic::Ordering::Relaxed) {
-        FAMILY_TAG_QWEN => crate::gguf::ModelFamily::Qwen,
         FAMILY_TAG_DS41 => crate::gguf::ModelFamily::Ds41,
         // Including any value never stored: unset and unknown both read as the
         // pre-split family, never as a wrong one.
@@ -155,7 +153,6 @@ fn current_ext() -> &'static str {
 pub fn family_ext(family: crate::gguf::ModelFamily) -> &'static str {
     match family {
         crate::gguf::ModelFamily::Ds4 => DS4_FILE_EXT,
-        crate::gguf::ModelFamily::Qwen => QWEN_FILE_EXT,
         crate::gguf::ModelFamily::Ds41 => DS41_FILE_EXT,
     }
 }
@@ -748,7 +745,7 @@ impl SessionStore {
                 let meta = Self::kv_node_at(&path, &fp);
                 (path, meta)
             })
-            .filter(|(_, meta)| blob_family(meta) == family())
+            .filter(|(_, meta)| blob_family(meta) == Some(family()))
             .collect()
     }
 
@@ -1185,9 +1182,10 @@ impl SessionStore {
             let Some(stem) = name.strip_suffix(LEGACY_FILE_EXT) else {
                 continue;
             };
-            // `.ds4.kv`, `.qwn.kv` and `.ds41.kv` all end in `.kv`, so the tagged files
-            // reach here too; their "stem" still carries the tag, and a stem
-            // containing a dot is never a valid id.
+            // `.ds4.kv` and `.ds41.kv` — and the retired `.qwn.kv` a user may
+            // still hold — all end in `.kv`, so the tagged files reach here
+            // too; their "stem" still carries the tag, and a stem containing a
+            // dot is never a valid id, so none of them is ever renamed.
             if !is_valid_id_prefix(stem) {
                 continue;
             }
@@ -1750,19 +1748,24 @@ impl SessionStore {
     }
 }
 
-/// The family a blob was captured under.
+/// The family a blob was captured under, or `None` for one belonging to no
+/// family this build serves.
 ///
-/// The two families share one cache directory, so the sweep would otherwise
-/// see the other family's blobs as inactive — none of their fingerprints are
-/// in this launch's `active` set — and evict them under the shared byte
-/// budget. Every model's checkpoints would then be destroyed by the next
-/// launch of the other, which is the whole cost the tag exists to avoid.
+/// The families share one cache directory, so the sweep would otherwise see
+/// the other families' blobs as inactive — none of their fingerprints are in
+/// this launch's `active` set — and evict them under the shared byte budget.
+/// Every model's checkpoints would then be destroyed by the next launch of
+/// another, which is the whole cost the tag exists to avoid.
 ///
 /// Judged from the model name the sidecar recorded at capture time. An empty
 /// or unreadable model reads as `Ds4`, matching the `.kv` to `.ds4.kv`
 /// migration: anything written before the split was a `DeepSeek` blob.
-fn blob_family(meta: &crate::kvmeta::KvMeta) -> crate::gguf::ModelFamily {
-    crate::gguf::ModelFamily::from(trace_stream::syntax::ToolSyntax::for_model_name(
+///
+/// A blob captured under the retired Qwen model reads as `None` and so matches
+/// no live family: it is never listed and never swept. Folding it into `Ds4`
+/// instead would hand one model's KV cache to another.
+fn blob_family(meta: &crate::kvmeta::KvMeta) -> Option<crate::gguf::ModelFamily> {
+    crate::gguf::ModelFamily::from_syntax(trace_stream::syntax::ToolSyntax::for_model_name(
         &meta.model,
     ))
 }
@@ -1810,7 +1813,7 @@ fn is_sysprompt_note(name: &str) -> bool {
 ///
 /// The families share one cache directory, so an untagged note is whichever
 /// family launched last. Diffing a `DeepSeek` prompt against a note left by a
-/// Qwen run explains a Tier 1 miss with a Qwen-to-DSML diff that has nothing
+/// V4.1 run explains a Tier 1 miss with a cross-dialect diff that has nothing
 /// to do with why the checkpoint missed — a confidently wrong diagnosis
 /// exactly when families are being alternated.
 fn sysprompt_note_name(family: crate::gguf::ModelFamily) -> String {
@@ -3084,22 +3087,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The two families share one cache directory, so their notes must not
-    /// share one filename: an untagged note is whichever family launched last,
-    /// and diffing against it explains a DS4-family miss with a Qwen diff.
+    /// The families share one cache directory, so their notes must not share
+    /// one filename: an untagged note is whichever family launched last, and
+    /// diffing against it explains a V4 miss with a V4.1 diff.
     #[test]
     fn the_system_prompt_note_is_named_per_family() {
         let ds4 = sysprompt_note_name(crate::gguf::ModelFamily::Ds4);
-        let qwen = sysprompt_note_name(crate::gguf::ModelFamily::Qwen);
+        let ds41 = sysprompt_note_name(crate::gguf::ModelFamily::Ds41);
         assert_eq!(ds4, "sysprompt-last.ds4.prompt");
-        assert_eq!(qwen, "sysprompt-last.qwn.prompt");
-        assert_ne!(ds4, qwen, "one family's note must never shadow the other's");
+        assert_eq!(ds41, "sysprompt-last.ds41.prompt");
+        assert_ne!(ds4, ds41, "one family's note must never shadow the other's");
 
         // Every spelling is swept, so switching families cannot leave the
         // other's note behind as cache the tally never accounts for — and the
         // untagged legacy name is swept too, since it can never be attributed.
         assert!(is_sysprompt_note(&ds4));
-        assert!(is_sysprompt_note(&qwen));
+        assert!(is_sysprompt_note(&ds41));
+        // Including a note left by the retired Qwen family: it can never be
+        // read again, so it must at least be swept rather than linger as cache
+        // the tally never accounts for.
+        assert!(is_sysprompt_note("sysprompt-last.qwn.prompt"));
         assert!(is_sysprompt_note(LEGACY_SYSPROMPT_NOTE_NAME));
         // A checkpoint blob is not a note: `.kv_raw` must keep reaching the
         // byte-budget tally rather than being deleted as a diagnostic.
@@ -3116,11 +3123,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = SessionStore::open(&dir).unwrap();
         std::fs::write(
-            dir.join(sysprompt_note_name(crate::gguf::ModelFamily::Qwen)),
-            "the qwen prompt",
+            dir.join(sysprompt_note_name(crate::gguf::ModelFamily::Ds41)),
+            "the ds41 prompt",
         )
         .unwrap();
-        // The live family is DeepSeek by default, so the Qwen note is not it.
+        // The live family is V4 by default, so the V4.1 note is not it.
         assert_eq!(family(), crate::gguf::ModelFamily::Ds4);
         assert_eq!(store.system_prompt_note(), None);
 
@@ -3130,9 +3137,9 @@ mod tests {
             Some("the ds4 prompt")
         );
         assert_eq!(
-            std::fs::read_to_string(dir.join(sysprompt_note_name(crate::gguf::ModelFamily::Qwen)))
+            std::fs::read_to_string(dir.join(sysprompt_note_name(crate::gguf::ModelFamily::Ds41)))
                 .unwrap(),
-            "the qwen prompt",
+            "the ds41 prompt",
             "writing one family's note must not clobber the other's"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3670,10 +3677,10 @@ hello\n";
     fn the_families_tag_their_transcripts_differently() {
         use crate::gguf::ModelFamily;
         assert_eq!(family_ext(ModelFamily::Ds4), ".ds4.kv");
-        assert_eq!(family_ext(ModelFamily::Qwen), ".qwn.kv");
-        assert_ne!(family_ext(ModelFamily::Ds4), family_ext(ModelFamily::Qwen));
+        assert_eq!(family_ext(ModelFamily::Ds41), ".ds41.kv");
+        assert_ne!(family_ext(ModelFamily::Ds4), family_ext(ModelFamily::Ds41));
         // Both still end in `.kv`, so anything matching on that keeps working.
-        for f in [ModelFamily::Ds4, ModelFamily::Qwen, ModelFamily::Ds41] {
+        for f in [ModelFamily::Ds4, ModelFamily::Ds41] {
             assert!(family_ext(f).ends_with(LEGACY_FILE_EXT));
         }
     }
@@ -3768,16 +3775,68 @@ hello\n";
             ..KvMeta::synthesized(KvRole::Session, "fp", 1, 0)
         };
         assert_eq!(
-            blob_family(&with_model("Qwen3.8 Flash Next")),
-            ModelFamily::Qwen
+            blob_family(&with_model("DeepSeek V4.1 Flash")),
+            Some(ModelFamily::Ds41)
         );
         assert_eq!(
             blob_family(&with_model("DeepSeek V4 Flash")),
-            ModelFamily::Ds4
+            Some(ModelFamily::Ds4)
         );
         // Unknown or absent reads as ds4, matching the `.kv` -> `.ds4.kv`
         // migration: anything written before the split was DeepSeek.
-        assert_eq!(blob_family(&with_model("")), ModelFamily::Ds4);
+        assert_eq!(blob_family(&with_model("")), Some(ModelFamily::Ds4));
+    }
+
+    /// A KV blob captured under the retired Qwen model must belong to *no*
+    /// family, so it matches no live family and is therefore never listed and
+    /// never swept. Folding it into `Ds4` would be worse than deleting it: a
+    /// `DeepSeek` engine would be handed another model's KV cache, which is
+    /// silent corruption rather than a visible error.
+    #[test]
+    fn a_retired_qwen_blob_belongs_to_no_live_family() {
+        use crate::gguf::ModelFamily;
+        use crate::kvmeta::{KvMeta, KvRole};
+        let qwen = KvMeta {
+            model: "Qwen3.8 Flash Next".into(),
+            ..KvMeta::synthesized(KvRole::Session, "fp", 1, 0)
+        };
+        assert_eq!(blob_family(&qwen), None);
+        for live in [ModelFamily::Ds4, ModelFamily::Ds41] {
+            assert_ne!(
+                blob_family(&qwen),
+                Some(live),
+                "a Qwen blob must never be attributed to {live:?}"
+            );
+        }
+    }
+
+    /// The whole disposition of a leftover `.qwn.kv` transcript, in one place:
+    /// it is not renamed by the untagged sweep (its stem carries a dot, which
+    /// `is_valid_id_prefix` rejects), no live family can name it, and it is
+    /// still on disk afterwards. Inert and ignored, not destroyed.
+    #[test]
+    fn a_retired_qwen_transcript_is_left_inert() {
+        use crate::gguf::ModelFamily;
+        let dir = temp_dir("qwn-inert");
+        let store = SessionStore::open(&dir).unwrap();
+        let qwn = dir.join("wily-curie.qwn.kv");
+        fs::write(&qwn, b"plank-session 1\n").unwrap();
+
+        // The legacy sweep strips `.kv` and gets `wily-curie.qwn`, which is
+        // not a valid id, so the rename never fires.
+        assert!(!is_valid_id_prefix("wily-curie.qwn"));
+        assert_eq!(store.migrate_untagged_transcripts(), 0);
+        assert!(qwn.exists(), "not renamed and not deleted");
+        assert!(
+            !dir.join("wily-curie.qwn.ds4.kv").exists(),
+            "never re-tagged as a DeepSeek transcript"
+        );
+
+        // And no family this build serves produces that name for that id.
+        for f in [ModelFamily::Ds4, ModelFamily::Ds41] {
+            assert_ne!(family_ext(f), ".qwn.kv");
+        }
+        assert!(!store.list().unwrap().iter().any(|s| s.id == "wily-curie"));
     }
 
     #[test]

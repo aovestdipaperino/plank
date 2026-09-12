@@ -159,8 +159,10 @@ pub struct Ds4EngineOptions {
     pub mtp_path: *const c_char,
     /// Vision-encoder GGUF path; `NULL` keeps the engine text-only.
     pub vision_path: *const c_char,
-    /// Qwen3.8-Flash-Next external PLE n-gram sidecar GGUF; `NULL` for every
-    /// other model. The C engine rejects it unless the main model is Qwen3.8.
+    /// External PLE n-gram sidecar GGUF. plank always passes `NULL`: the only
+    /// model the C accepts one for is Qwen3.8-Flash-Next, which plank no longer
+    /// serves. The field stays because this struct is the C's, matched
+    /// field-for-field by offset.
     pub ple_path: *const c_char,
     pub backend: Ds4Backend,
     pub n_threads: c_int,
@@ -324,8 +326,8 @@ unsafe extern "C" {
     /// The chunk-level prefill hook, distinct from `set_display_progress`.
     ///
     /// Both report an absolute prompt position. The `DeepSeek` graph paths emit
-    /// the finer `prefill_display` events; the Qwen3.8 path emits only
-    /// `prefill_chunk` on this one, so a Qwen run shows no prefill rate at all
+    /// the finer `prefill_display` events; other paths emit only
+    /// `prefill_chunk` on this one, so such a run shows no prefill rate at all
     /// unless plank listens here too.
     pub fn ds4_session_set_progress(
         s: *mut Ds4Session,
