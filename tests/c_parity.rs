@@ -485,6 +485,88 @@ fn think_max_min_context_matches_c_source() {
     );
 }
 
+/// `chat_push_think_prefix`'s fall-through arm (non-GLM, non-DeepSeek41 model
+/// families — this covers V4) only appends `DS4_REASONING_EFFORT_MAX_PREFIX`
+/// when the mode is exactly `DS4_THINK_MAX`. plank relies on that: it always
+/// passes a numeric effort level (e.g. `Level(25)` for `/think low`) down to
+/// this same C function on every family, and it is a documented byte-for-byte
+/// no-op on V4 *only* because this arm ignores everything but `DS4_THINK_MAX`.
+/// If a submodule bump changed this arm to react to numeric levels — or to
+/// any non-MAX mode — V4 users at `low` would silently start getting a
+/// different system prompt, and nothing else would catch it (a full
+/// end-to-end check needs an 81 GB engine open).
+#[test]
+fn think_prefix_fallthrough_arm_matches_c_source() {
+    let Some(src) = c_core_source() else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+
+    let fn_start = src
+        .find("static void chat_push_think_prefix(")
+        .expect("chat_push_think_prefix not found in ds4.c");
+    let brace_start = src[fn_start..]
+        .find('{')
+        .map(|i| fn_start + i)
+        .expect("chat_push_think_prefix has no body");
+    // Balance braces to find the function's closing brace.
+    let bytes = src.as_bytes();
+    let mut depth = 0i32;
+    let mut i = brace_start;
+    let body_end = loop {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    };
+    let body = &src[brace_start..body_end];
+
+    assert!(
+        body.contains("DS4_MODEL_FAMILY_GLM_DSA") && body.contains("DS4_MODEL_FAMILY_DEEPSEEK41"),
+        "chat_push_think_prefix no longer branches on GLM_DSA/DeepSeek41 \
+         first; the fall-through arm this test pins may no longer be the \
+         non-GLM, non-DeepSeek41 branch — re-derive the test against the new \
+         shape"
+    );
+
+    // The final `else if` in the chain (with no preceding family check) is
+    // the fall-through arm for every other family, V4 included. Take the
+    // text after the LAST "else if" so branch reordering upstream of it
+    // (e.g. swapping the GLM_DSA and DeepSeek41 blocks) cannot affect which
+    // clause this test reads.
+    let last_else_if = body
+        .rsplit("else if")
+        .next()
+        .expect("chat_push_think_prefix has no else-if fall-through arm");
+    let cond_end = last_else_if
+        .find('{')
+        .expect("fall-through arm's condition has no body");
+    // Collapse whitespace so reformatting (line breaks, extra spaces) can't
+    // trip the check.
+    let condition: String = last_else_if[..cond_end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        condition, "(think_mode == DS4_THINK_MAX)",
+        "chat_push_think_prefix's fall-through arm no longer guards on \
+         `think_mode == DS4_THINK_MAX` alone (now: {condition:?}). On V4 and \
+         any other non-GLM, non-DeepSeek41 family, plank passes a numeric \
+         effort level to this function on every ThinkMode, trusting this arm \
+         to ignore it outside DS4_THINK_MAX; if upstream widened this \
+         condition, V4 users at low/medium would silently start getting a \
+         different system prompt than before, with no test catching it \
+         short of opening the 81 GB engine."
+    );
+}
+
 /// plank's Metal kernel table must list exactly what the C engine requires.
 ///
 /// `ds4_gpu_full_source` treats every entry in its `required_sources` array as
