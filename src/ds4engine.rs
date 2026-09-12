@@ -2695,6 +2695,10 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     // kernels landed in the antirez/main sync and must be pointed at
     // explicitly, since the C engine's fallback search paths (relative
     // `metal/...` and `./metal/...`) only work from the submodule root.
+    // `DS4_METAL_DSV41_SOURCE` (`dsv41.metal`) arrived with the V4.1 bump
+    // for the same reason: the combined Metal source is compiled once for
+    // every model, so a missing V4.1 kernel would abort startup even for a
+    // plain V4 run.
     ("DS4_METAL_FLASH_ATTN_SOURCE", "flash_attn.metal"),
     ("DS4_METAL_DENSE_SOURCE", "dense.metal"),
     ("DS4_METAL_GLM53_BF16_SOURCE", "glm53_bf16.metal"),
@@ -2708,6 +2712,7 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     ("DS4_METAL_DSV4_HC_SOURCE", "dsv4_hc.metal"),
     ("DS4_METAL_UNARY_SOURCE", "unary.metal"),
     ("DS4_METAL_DSV4_KV_SOURCE", "dsv4_kv.metal"),
+    ("DS4_METAL_DSV41_SOURCE", "dsv41.metal"),
     ("DS4_METAL_DSV4_ROPE_SOURCE", "dsv4_rope.metal"),
     ("DS4_METAL_DSV4_MISC_SOURCE", "dsv4_misc.metal"),
     ("DS4_METAL_ARGSORT_SOURCE", "argsort.metal"),
