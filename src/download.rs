@@ -1420,14 +1420,31 @@ fn check_manifest_at_startup_in(
 /// it, which is why the check used to skip whenever `-m` was given at all.
 /// That skip is by *path* rather than by presence, so a flag that resolves to
 /// a managed default path is still upgraded.
+///
+/// Two different questions meet here. With `Some(path)` it is "which set does
+/// *this* model belong to", answered by the path alone: a V4.1 GGUF means the
+/// V4.1 set even on a machine that has only ever managed V4. With `None` it is
+/// "which set should this machine manage", answered by what `root` already
+/// records — [`crate::manifest::default_set_for_root`] — so a fresh install
+/// takes V4.1 while an install already recording `ds4.manifest` stays on V4
+/// and is never migrated.
 #[must_use]
-pub fn manifest_set_for_model(model_path: Option<&Path>) -> Option<crate::manifest::ModelSet> {
+pub fn manifest_set_for_model_in(
+    root: &Path,
+    model_path: Option<&Path>,
+) -> Option<crate::manifest::ModelSet> {
     match model_path {
-        None => Some(crate::manifest::ModelSet::Ds4),
+        None => Some(crate::manifest::default_set_for_root(root)),
         Some(p) if p == default_model_path() => Some(crate::manifest::ModelSet::Ds4),
         Some(p) if p == default_ds41_model_path() => Some(crate::manifest::ModelSet::Ds41),
         Some(_) => None,
     }
+}
+
+/// [`manifest_set_for_model_in`] rooted at `~/.plank`.
+#[must_use]
+pub fn manifest_set_for_model(model_path: Option<&Path>) -> Option<crate::manifest::ModelSet> {
+    manifest_set_for_model_in(&crate::manifest::plank_dir(), model_path)
 }
 
 pub fn check_manifest_at_startup(model_path: Option<&Path>) {
@@ -1450,7 +1467,7 @@ fn check_manifest_at_startup_with(
     spawn: &dyn Fn(crate::manifest::ModelSet, &crate::manifest::Manifest) -> Result<(), String>,
     confirm: &dyn Fn(&crate::manifest::Manifest, u32) -> Option<bool>,
 ) {
-    let Some(set) = manifest_set_for_model(model_path) else {
+    let Some(set) = manifest_set_for_model_in(root, model_path) else {
         return;
     };
     check_manifest_at_startup_in(root, set, fetch, spawn, confirm);
@@ -1823,17 +1840,132 @@ mod tests {
     #[test]
     fn the_managed_paths_map_to_their_set() {
         use crate::manifest::ModelSet;
-        assert_eq!(manifest_set_for_model(None), Some(ModelSet::Ds4));
+        let root = crate::downloader::tests::tempdir();
         assert_eq!(
-            manifest_set_for_model(Some(&default_model_path())),
+            manifest_set_for_model_in(&root, Some(&default_model_path())),
             Some(ModelSet::Ds4)
+        );
+        assert_eq!(
+            manifest_set_for_model_in(&root, Some(&default_ds41_model_path())),
+            Some(ModelSet::Ds41)
         );
         // A path plank does not manage gets no manifest check at all: it is
         // the user's file, and plank must never propose replacing it.
         assert_eq!(
-            manifest_set_for_model(Some(Path::new("/models/mine.gguf"))),
+            manifest_set_for_model_in(&root, Some(Path::new("/models/mine.gguf"))),
             None
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With no `-m`, the set is the machine's default: V4.1 on a fresh root,
+    /// and an unchanged V4 on a root that already records `ds4.manifest`. The
+    /// second half is the no-migration guarantee.
+    #[test]
+    fn no_model_flag_takes_the_roots_default_set_and_never_migrates_v4() {
+        use crate::manifest::ModelSet;
+        let root = crate::downloader::tests::tempdir();
+        // Fresh: nothing recorded at all.
+        assert_eq!(
+            manifest_set_for_model_in(&root, None),
+            Some(ModelSet::Ds41),
+            "a fresh install manages the newest set"
+        );
+        // An existing V4 install stays on V4.
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, ModelSet::Ds4),
+            "{}",
+        )
+        .expect("write");
+        assert_eq!(
+            manifest_set_for_model_in(&root, None),
+            Some(ModelSet::Ds4),
+            "an existing V4 install is never migrated to the V4.1 set"
+        );
+        // An explicit `-m` at the V4 default path still resolves to V4 even on
+        // an otherwise-fresh machine: that is the path question, not the
+        // machine-default question.
+        let fresh = crate::downloader::tests::tempdir();
+        assert_eq!(
+            manifest_set_for_model_in(&fresh, Some(&default_model_path())),
+            Some(ModelSet::Ds4)
+        );
+        // A root recording the V4.1 manifest stays on V4.1.
+        std::fs::write(
+            crate::manifest::installed_path_in(&fresh, ModelSet::Ds41),
+            "{}",
+        )
+        .expect("write");
+        assert_eq!(
+            manifest_set_for_model_in(&fresh, None),
+            Some(ModelSet::Ds41)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    /// An existing V4 install sees no change at all from the fresh-install
+    /// default: startup still fetches and decides against the V4 set, and the
+    /// V4.1 set is never consulted.
+    #[test]
+    fn an_existing_v4_install_still_runs_the_v4_manifest_flow() {
+        use std::cell::Cell;
+        let root = crate::downloader::tests::tempdir();
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            manifest_text(4, 100),
+        )
+        .expect("write");
+        let seen: Cell<Option<crate::manifest::ModelSet>> = Cell::new(None);
+        let text = manifest_text(4, 100);
+        check_manifest_at_startup_with(
+            None,
+            &root,
+            &|set| {
+                seen.set(Some(set));
+                Some(text.clone())
+            },
+            &|_, _| panic!("an up-to-date V4 install downloads nothing"),
+            &|_, _| panic!("and is never asked anything"),
+        );
+        assert_eq!(
+            seen.get(),
+            Some(crate::manifest::ModelSet::Ds4),
+            "an existing V4 install keeps managing the V4 set"
+        );
+        assert!(
+            !crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds41).exists(),
+            "nothing is recorded for the V4.1 set"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fresh install must not be *offered* the V4.1 set's 341 GiB download
+    /// at launch: with no installed manifest and no model on disk, the
+    /// first-run gate returns before any confirmation, leaving acquisition to
+    /// `ensure_model`.
+    #[test]
+    fn a_fresh_install_is_not_offered_the_ds41_download_at_launch() {
+        use std::cell::Cell;
+        let root = crate::downloader::tests::tempdir();
+        let seen: Cell<Option<crate::manifest::ModelSet>> = Cell::new(None);
+        let text = manifest_text(7, 100);
+        check_manifest_at_startup_with(
+            None,
+            &root,
+            &|set| {
+                seen.set(Some(set));
+                Some(text.clone())
+            },
+            &|_, _| panic!("a fresh install starts no background download"),
+            &|_, _| panic!("and is never offered one"),
+        );
+        assert_eq!(
+            seen.get(),
+            Some(crate::manifest::ModelSet::Ds41),
+            "a fresh root manages the V4.1 set"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

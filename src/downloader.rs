@@ -1105,7 +1105,7 @@ pub fn read_job_in(
 pub fn pending_job_in(
     root: &Path,
 ) -> Option<(crate::manifest::ModelSet, crate::manifest::Manifest)> {
-    [crate::manifest::ModelSet::Ds4]
+    crate::manifest::ALL_SETS
         .into_iter()
         .find_map(|set| read_job_in(root, set).map(|m| (set, m)))
 }
