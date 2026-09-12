@@ -128,6 +128,22 @@ fn dsml_syntax_reminder_matches_fixture() {
 }
 
 #[test]
+fn dsml41_tools_prompt_matches_fixture() {
+    assert_fixture_eq(
+        "tools_prompt_dsml41.txt",
+        &plank::sysprompt::dsml41_tools_prompt(&plank::sysprompt::build_tools_prompt(&[], true)),
+    );
+}
+
+#[test]
+fn dsml41_syntax_reminder_matches_fixture() {
+    assert_fixture_eq(
+        "dsml41_reminder.txt",
+        plank::sysprompt::dsml41_syntax_reminder(),
+    );
+}
+
+#[test]
 fn system_prompt_reminder_matches_fixture() {
     assert_fixture_eq(
         "system_prompt_reminder.txt",
@@ -365,6 +381,47 @@ fn dsml_reminder_matches_c_source() {
         &expected,
         plank::sysprompt::dsml_syntax_reminder(),
         "DSML reminder vs C",
+    );
+}
+
+/// The V4.1 reminder is its own C constant (`agent_dsml41_syntax_reminder`),
+/// not a derivation, so it is pinned straight against the C source.
+#[test]
+fn dsml41_reminder_matches_c_source() {
+    let Some(src) = c_source() else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    let expected = extract_c_string_constant(&src, "agent_dsml41_syntax_reminder");
+    assert_identical(
+        &expected,
+        plank::sysprompt::dsml41_syntax_reminder(),
+        "DSML 4.1 reminder vs C",
+    );
+}
+
+/// `agent_dsml41_tools_prompt` is a rewrite rather than a constant, so parity
+/// is checked on its output: the C's own reminder constant is the shortest
+/// text carrying all three tags, and running plank's port over the V4 constant
+/// must produce the C's V4.1 constant byte-for-byte.
+#[test]
+fn dsml41_rewrite_matches_c_source() {
+    let Some(src) = c_source() else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    let v4 = extract_c_string_constant(&src, "agent_dsml_syntax_reminder");
+    let v41 = extract_c_string_constant(&src, "agent_dsml41_syntax_reminder");
+    assert_identical(
+        &v41,
+        &plank::sysprompt::dsml41_tools_prompt(&v4),
+        "DSML 4.1 rewrite vs C",
+    );
+    // And the predicate the C applies: the name must be followed by `>` or a
+    // space, so `p[n] == '>' || p[n] == ' '` is still what the C tests.
+    assert!(
+        src.contains("p[n] == '>' || p[n] == ' '"),
+        "C DSML 4.1 rewrite predicate changed"
     );
 }
 

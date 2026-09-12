@@ -502,7 +502,7 @@ fn build_tools_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> (String, usize) {
-    build_tools_prompt_parts_with_wasm(mcp_servers, &[], parity)
+    build_tools_prompt_parts_with_wasm(mcp_servers, &[], parity, ToolSyntax::Dsml)
 }
 
 /// [`build_tools_prompt_parts`] with WASM component tools folded in.
@@ -514,12 +514,20 @@ fn build_tools_prompt_parts_with_wasm(
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
+    syntax: ToolSyntax,
 ) -> (String, usize) {
     let mut out = build_tools_prompt_base(parity);
     insert_marker_spelling_note(&mut out);
     insert_document_read_note(&mut out);
     append_native_extra_schemas(&mut out);
     append_working_style(&mut out);
+    // The V4.1 tag respelling happens here and nowhere else: at this point
+    // `out` is entirely plank's own trusted prompt text, and not one byte of
+    // MCP, WASM or `-sys` text has been appended yet. See
+    // [`dsml41_tools_prompt`] for why that ordering is load-bearing.
+    if syntax == ToolSyntax::Dsml41 {
+        out = dsml41_tools_prompt(&out);
+    }
     let trusted_len = out.len();
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
@@ -1011,6 +1019,74 @@ pub fn dsml_syntax_reminder() -> &'static str {
 </｜DSML｜tool_calls>\n"
 }
 
+/// Returns the short DSML syntax reminder in the V4.1 dialect (verbatim from
+/// the C's `agent_dsml41_syntax_reminder`).
+///
+/// Written as plain lines rather than a `\`-continued literal, so no leading
+/// whitespace can be stripped: the V4.1 tag names *begin* with a space.
+#[must_use]
+pub fn dsml41_syntax_reminder() -> &'static str {
+    concat!(
+        "DSML syntax reminder:\n",
+        "<｜DSML｜ calls>\n",
+        "<｜DSML｜ invoke name=\"$TOOL_NAME\">\n",
+        "<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n",
+        "</｜DSML｜ calls>\n",
+    )
+}
+
+/// Rewrites the three DSML tag names in **plank's own tools prompt** to their
+/// V4.1 spellings.
+///
+/// Ports `agent_dsml41_tools_prompt` from `refs/ds4/ds4_agent.c`, whose comment
+/// states the rule this function inherits:
+///
+/// > Adapt only our trusted examples, including their escaped closing tags.
+/// > Never translate sampled text or user/tool payloads between model formats.
+///
+/// So this must only ever be called on text plank authored. It is not a
+/// general DSML translator: applying it to model output, user input, MCP
+/// schemas or tool results would let untrusted bytes be reshaped into control
+/// text of a dialect the parser then honours. Its one call site is inside
+/// [`build_tools_prompt_parts_with_wasm`], before any third-party text has
+/// been appended to the buffer.
+///
+/// The rewrite walks for the `｜DSML｜` marker and, immediately after each
+/// occurrence, replaces `tool_calls`, `invoke` or `parameter` with the V4.1
+/// name — but only when the word is followed by `>` or a space, so it is
+/// really a tag and not prose. A bare "parameter" in a sentence is untouched.
+#[must_use]
+pub fn dsml41_tools_prompt(source: &str) -> String {
+    const MARKER: &str = "｜DSML｜";
+    let tags = ToolSyntax::Dsml41.dsml_tags();
+    let v4 = ToolSyntax::Dsml.dsml_tags();
+    let names = [
+        (v4.calls_name, tags.calls_name),
+        (v4.invoke_name, tags.invoke_name),
+        (v4.param_name, tags.param_name),
+    ];
+
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(at) = rest.find(MARKER) {
+        let after = at + MARKER.len();
+        out.push_str(&rest[..after]);
+        rest = &rest[after..];
+        for (from, to) in names {
+            if let Some(tail) = rest.strip_prefix(from)
+                && (tail.starts_with('>') || tail.starts_with(' '))
+            {
+                out.push_str(to);
+                rest = tail;
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Builds the full system prompt reminder block, framed like the C version.
 ///
 /// Mirrors `agent_build_system_prompt_reminder`: the tools prompt wrapped in
@@ -1107,7 +1183,7 @@ pub fn build_system_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> SplitSystemPrompt {
-    build_system_prompt_parts_with_wasm(user_system, mcp_servers, &[], parity)
+    build_system_prompt_parts_with_wasm(user_system, mcp_servers, &[], parity, ToolSyntax::Dsml)
 }
 
 /// [`build_system_prompt_parts`] with WASM component tools folded in.
@@ -1122,11 +1198,12 @@ pub fn build_system_prompt_parts_with_wasm(
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
+    syntax: ToolSyntax,
 ) -> SplitSystemPrompt {
-    // Every dialect plank serves is DSML-shaped and takes the same tools
-    // prompt, so the dialect does not select one and is not a parameter here.
+    // Both dialects share one tools prompt; V4.1 differs only by the three tag
+    // names the builder respells inside the trusted span.
     let (mut text, trusted_len) =
-        build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity);
+        build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity, syntax);
     if crate::settings::active().git.sign_commits {
         text.push_str("\n\n");
         text.push_str(COMMIT_SIGNATURE_INSTRUCTION);
@@ -1700,6 +1777,106 @@ mod tests {
         assert_eq!(read.parameters["type"], "object");
         assert!(read.parameters["properties"].get("path").is_some());
         assert!(!read.description.is_empty());
+    }
+
+    #[test]
+    fn dsml41_reminder_shape() {
+        let r = dsml41_syntax_reminder();
+        assert!(r.starts_with("DSML syntax reminder:\n"));
+        assert!(r.contains("<｜DSML｜ invoke name=\"$TOOL_NAME\">"));
+        assert!(r.contains("</｜DSML｜ parameter>"));
+        assert!(r.ends_with("</｜DSML｜ calls>\n"));
+        assert!(!r.contains("tool_calls"));
+    }
+
+    /// The V4 reminder rewritten by [`dsml41_tools_prompt`] is exactly the
+    /// V4.1 reminder — the two constants cannot drift apart silently.
+    #[test]
+    fn dsml41_reminder_is_the_v4_reminder_rewritten() {
+        assert_eq!(
+            dsml41_tools_prompt(dsml_syntax_reminder()),
+            dsml41_syntax_reminder()
+        );
+    }
+
+    #[test]
+    fn dsml41_rewrite_touches_only_the_three_tag_names() {
+        let src = concat!(
+            "call it with <｜DSML｜tool_calls> then <｜DSML｜invoke name=\"read\"> and ",
+            "<｜DSML｜parameter name=\"path\">v</｜DSML｜parameter></｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>. The word parameter alone is untouched."
+        );
+        let out = dsml41_tools_prompt(src);
+        assert!(out.contains("<｜DSML｜ calls>"));
+        assert!(out.contains("<｜DSML｜ invoke name=\"read\">"));
+        assert!(out.contains("</｜DSML｜ parameter>"));
+        assert!(!out.contains("tool_calls"));
+        assert!(out.ends_with("The word parameter alone is untouched."));
+    }
+
+    /// A tag name that is not followed by `>` or a space is prose, not a tag:
+    /// the C's predicate leaves it alone, and so must this port. A marker at
+    /// the very end of the input must not index past the string either.
+    #[test]
+    fn dsml41_rewrite_leaves_non_tag_text_alone() {
+        assert_eq!(
+            dsml41_tools_prompt("<｜DSML｜parameters> and ｜DSML｜invoked"),
+            "<｜DSML｜parameters> and ｜DSML｜invoked"
+        );
+        assert_eq!(
+            dsml41_tools_prompt("trailing ｜DSML｜"),
+            "trailing ｜DSML｜"
+        );
+        assert_eq!(dsml41_tools_prompt(""), "");
+    }
+
+    /// The V4.1 prompt is the V4 prompt with exactly those three tag names
+    /// rewritten, and nothing else: every byte of difference is accounted for
+    /// by `tool_calls` (10 bytes) becoming ` calls` (6, so -4 each) and
+    /// `invoke`/`parameter` each gaining one leading space (+1 each).
+    #[test]
+    fn dsml41_prompt_is_the_v4_prompt_with_tags_rewritten() {
+        let v4 = build_tools_prompt(&[], true);
+        let v41 = dsml41_tools_prompt(&v4);
+
+        // Count only real tags: the marker, the name, then `>` or a space.
+        let tags = |name: &str| -> usize {
+            let needle = format!("｜DSML｜{name}");
+            v4.match_indices(&needle)
+                .filter(|(at, _)| {
+                    let tail = &v4[at + needle.len()..];
+                    tail.starts_with('>') || tail.starts_with(' ')
+                })
+                .count()
+        };
+        let (calls, invokes, params) = (tags("tool_calls"), tags("invoke"), tags("parameter"));
+        assert!(calls > 0 && invokes > 0 && params > 0);
+
+        // Stated as an addition so no subtraction can underflow: the V4 bytes
+        // plus the spaces V4.1 gains equal the V4.1 bytes plus the 4 bytes
+        // each `tool_calls` loses.
+        assert_eq!(v4.len() + invokes + params, v41.len() + calls * 4);
+        assert!(!v41.contains("tool_calls"));
+        assert!(!v41.contains("｜DSML｜invoke"));
+        assert!(!v41.contains("｜DSML｜parameter"));
+        // Rewriting back must reproduce the V4 prompt exactly.
+        assert_eq!(
+            v41.replace("｜DSML｜ calls", "｜DSML｜tool_calls")
+                .replace("｜DSML｜ invoke", "｜DSML｜invoke")
+                .replace("｜DSML｜ parameter", "｜DSML｜parameter"),
+            v4
+        );
+    }
+
+    /// The dialect reaches the built prompt through the public entry point,
+    /// and MCP text appended after the trusted span is never rewritten.
+    #[test]
+    fn dsml41_syntax_selects_the_rewritten_tools_prompt() {
+        let v4 = build_system_prompt_parts_with_wasm("", &[], &[], true, ToolSyntax::Dsml);
+        let v41 = build_system_prompt_parts_with_wasm("", &[], &[], true, ToolSyntax::Dsml41);
+        assert_eq!(dsml41_tools_prompt(&v4.text), v41.text);
+        assert!(v41.text.contains("<｜DSML｜ calls>"));
+        assert!(!v41.text.contains("tool_calls"));
     }
 
     #[test]

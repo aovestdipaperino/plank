@@ -604,16 +604,18 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
         // its "DSML" was invalid, and handing it DSML to copy when it speaks
         // something else, is how a recorded session ended with the model
         // insisting the harness was broken rather than fixing its markup.
-        // V4.1 speaks its own DSML dialect; until its reminder text is pinned
-        // against the C, the V4 reminder is the closest true thing to hand it
-        // — both are DSML, only the tag table differs, so the two share one
-        // arm, which is now every dialect there is.
-        PassError::Dsml => match syntax {
-            sysprompt::ToolSyntax::Dsml | sysprompt::ToolSyntax::Dsml41 => format!(
-                "Tool error: invalid DSML tool call: {err}\n{}",
-                sysprompt::dsml_syntax_reminder()
-            ),
-        },
+        // Each dialect gets its own reminder text, both pinned against the C
+        // (`agent_dsml_syntax_reminder` / `agent_dsml41_syntax_reminder`):
+        // handing a model DSML to copy in a tag spelling it does not speak is
+        // how a recorded session ended with the model insisting the harness
+        // was broken rather than fixing its markup.
+        PassError::Dsml => format!(
+            "Tool error: invalid DSML tool call: {err}\n{}",
+            match syntax {
+                sysprompt::ToolSyntax::Dsml => sysprompt::dsml_syntax_reminder(),
+                sysprompt::ToolSyntax::Dsml41 => sysprompt::dsml41_syntax_reminder(),
+            }
+        ),
     }
 }
 
@@ -16993,6 +16995,7 @@ fn new_agent(
         &tool_ctx.mcp,
         &wasm_tools,
         !crate::settings::active().engine.thinking_tool_calls,
+        syntax,
     );
     drop(wasm_tools);
     // Tell the engine where the trusted control text ends before it tokenizes

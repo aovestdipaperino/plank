@@ -577,6 +577,26 @@ impl Ds4Model {
             .find(|&i| system.is_char_boundary(i))
             .unwrap_or(0);
         let (trusted, plain) = system.split_at(split);
+        // V4.1 expects an empty `system` message ahead of the tools prompt,
+        // exactly as `agent_append_system_prompt` pushes one before the
+        // rendered-chat tokenization. Gated on a non-empty trusted span so the
+        // split path (`warm_append_system`, which passes `trusted_len` 0 for
+        // the untrusted remainder) cannot emit a second one.
+        if !trusted.is_empty()
+            && crate::sysprompt::ToolSyntax::for_model_name(&self.model_name())
+                == crate::sysprompt::ToolSyntax::Dsml41
+            && let (Ok(role), Ok(empty)) = (CString::new("system"), CString::new(""))
+        {
+            // SAFETY: engine and tokens valid; strings outlive the call.
+            unsafe {
+                ffi::ds4_chat_append_message(
+                    self.engine,
+                    tokens.as_mut_ptr(),
+                    role.as_ptr(),
+                    empty.as_ptr(),
+                );
+            }
+        }
         if !trusted.is_empty()
             && let Ok(text) = CString::new(trusted)
         {
