@@ -500,6 +500,11 @@ pub fn ensure_side_artifacts(
     // family and does not depend on the companion resolution below. It needs
     // the context size, which is why this function takes one.
     auto_enable_ssd_streaming(model_path, ctx, engine);
+    // The streaming decision is final here — nothing below touches it — so
+    // this is where the footer's `HD` marker learns about it. Published rather
+    // than read off `cfg` by the bar, because the auto-enable lands on the
+    // caller's local `EngineTuning` copy and never goes back into `cfg`.
+    crate::status::set_ssd_streaming(engine.ssd_streaming);
     if crate::gguf::supports_vision(model_path) {
         ensure_vision_encoder()?;
     }

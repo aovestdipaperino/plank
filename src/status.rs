@@ -308,6 +308,11 @@ const TEMP_MARK: &str = "🌡";
 /// Public so the TUI can find the segment for mouse hit-testing.
 pub const JOBS_MARK: &str = "⧗";
 
+/// The SSD-streaming marker. Plain letters rather than a glyph: it has to hold
+/// a fixed two columns in both blink phases, and an emoji's width is the one
+/// thing a terminal is least likely to agree with us about.
+const HD_MARK: &str = "HD";
+
 /// Marks the footer's memory-pressure segment: plank is paused with its KV
 /// released, waiting for the system to calm down.
 ///
@@ -611,6 +616,24 @@ pub fn set_mtp(on: bool) {
 #[must_use]
 pub fn mtp() -> bool {
     DSPARK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the loaded model streams its experts from SSD rather than holding
+/// them resident. Process-global beside the speculation marker and for the same
+/// reason: [`build_status_text`] is a pure function called from a dozen
+/// snapshot sites, and a field would have to be copied forward by every one.
+/// Startup publishes here once the streaming decision is final; the bar reads.
+static SSD_STREAMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether the local engine streams experts from SSD.
+pub fn set_ssd_streaming(on: bool) {
+    SSD_STREAMING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the footer should show the `HD` marker.
+#[must_use]
+pub fn ssd_streaming() -> bool {
+    SSD_STREAMING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Records the sampling temperature, from startup config or `/temp`.
@@ -1897,6 +1920,12 @@ fn build_status_text_with_cells(
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
     };
+    // Beside the speculation segment: both are facts about the loaded engine
+    // that hold for every turn, not readings from this one.
+    let ctx = match hd_segment(st, color) {
+        Some(seg) => format!("{ctx} | {seg}"),
+        None => ctx,
+    };
     let ctx = match guard_segment() {
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
@@ -2041,6 +2070,65 @@ pub fn jobs_segment(st: &Status) -> Option<String> {
         1 => Some(format!("{JOBS_MARK} 1 job")),
         n => Some(format!("{JOBS_MARK} {n} jobs")),
     }
+}
+
+/// The SSD-streaming segment: `HD`, shown whenever the loaded model streams its
+/// experts from disk instead of holding them resident, and blinking while the
+/// engine is prefilling or decoding.
+///
+/// **The blink is a proxy for streaming activity, not a measurement of disk
+/// I/O.** The engine reports no such thing: its only progress event is
+/// `prefill_chunk` (`ds4_session_progress_fn`), and there is no expert-cache
+/// hit/miss counter and no SSD-read callback to hang a real reading on. So the
+/// marker blinks on the one fact plank does know — that a pass is in flight —
+/// which is when a streaming model must be reading experts, without claiming to
+/// count the reads. Steady `HD` therefore means "this model streams", not "the
+/// disk is idle".
+///
+/// Rides with the ctx gauge next to the speculation segment: both describe how
+/// the engine executes every turn rather than anything about this one, and both
+/// have to stay left of the power suffix, which is the line's right anchor.
+///
+/// Both phases are exactly two columns of `HD` — the blink is a style change
+/// (bright/dim), never a substitution or a removal, so nothing to its right
+/// shifts. Under reduced motion the shared clock goes dark and the marker is
+/// steady, like the throbber.
+#[must_use]
+pub fn hd_segment(st: &Status, color: bool) -> Option<String> {
+    let active = matches!(st.state, WorkerState::Prefill | WorkerState::Generating);
+    hd_segment_at(ssd_streaming(), active, color, crate::anim::clock_ms())
+}
+
+/// [`hd_segment`] with every input injected, so both phases are testable at a
+/// chosen timestamp without a running clock or a process-global write.
+///
+/// `tick_ms` is [`crate::anim::clock_ms`]: `None` is reduced motion, and the
+/// marker then renders lit whatever the engine is doing.
+#[must_use]
+pub fn hd_segment_at(
+    streaming: bool,
+    active: bool,
+    color: bool,
+    tick_ms: Option<u64>,
+) -> Option<String> {
+    if !streaming {
+        return None;
+    }
+    let lit = match tick_ms {
+        // Reduced motion: no blink, and the marker stays in its lit form.
+        None => true,
+        Some(ms) => !active || tool_blink_on(ms),
+    };
+    if !color {
+        // A monochrome footer has no second appearance to blink into, and
+        // blanking the slot would shift the segments to its right. One form.
+        return Some(HD_MARK.to_owned());
+    }
+    // `;1m` bold vs `;2m` faint: same glyphs, same width, different weight.
+    let weight = if lit { 1 } else { 2 };
+    Some(format!(
+        "\x1b[38;5;{THEME_COLOR};{weight}m{HD_MARK}{STATUS_STYLE_START}"
+    ))
 }
 
 /// The memory-pressure segment: `⏸ paused: memory` while plank has given its
@@ -3299,6 +3387,97 @@ mod tests {
         // never reach the bar, or the tag would be silently missing.
         assert!(!line.contains("(local )"), "{line}");
         assert!(!line.contains("(local ⚡"), "{line}");
+    }
+
+    // `HD` appears only for a streaming model, and its two blink phases are
+    // the same two columns, so nothing to its right moves.
+    #[test]
+    fn hd_segment_is_absent_off_and_width_stable_on() {
+        // Visible columns, with the SGR escapes taken back out.
+        fn plain(s: &str) -> String {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '\u{1b}' {
+                    for e in chars.by_ref() {
+                        if e == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        assert_eq!(hd_segment_at(false, false, true, Some(0)), None);
+        assert_eq!(hd_segment_at(false, true, true, Some(0)), None);
+
+        // Idle streaming model: steady, never blinking.
+        let idle = hd_segment_at(true, false, true, Some(0)).unwrap();
+        let idle_late = hd_segment_at(true, false, true, Some(TOOL_BLINK_MS / 2)).unwrap();
+        assert_eq!(
+            idle, idle_late,
+            "a steady marker does not depend on the tick"
+        );
+
+        // Working: the two phases differ in style only.
+        let lit = hd_segment_at(true, true, true, Some(0)).unwrap();
+        let dim = hd_segment_at(true, true, true, Some(TOOL_BLINK_MS / 2)).unwrap();
+        assert_ne!(lit, dim, "the marker has to actually blink");
+        assert_eq!(lit, idle, "the lit phase is the steady form");
+        let visible = |s: &str| plain(s).chars().count();
+        assert_eq!(visible(&lit), 2);
+        assert_eq!(visible(&dim), 2, "the blink must not change the width");
+        assert!(plain(&dim).contains("HD"));
+        // Both phases hand the footer's own style back, so the bar background
+        // survives past the segment.
+        assert!(lit.ends_with(STATUS_STYLE_START));
+        assert!(dim.ends_with(STATUS_STYLE_START));
+    }
+
+    // Reduced motion freezes the marker the way it freezes the throbber: the
+    // shared clock returns `None` and the lit form is what is drawn.
+    #[test]
+    fn hd_segment_is_steady_under_reduced_motion() {
+        let lit = hd_segment_at(true, true, true, Some(0)).unwrap();
+        assert_eq!(
+            hd_segment_at(true, true, true, None).as_deref(),
+            Some(&*lit)
+        );
+        assert_eq!(
+            hd_segment_at(true, false, true, None).as_deref(),
+            Some(&*lit)
+        );
+        // A monochrome footer has no second appearance to blink into.
+        assert_eq!(
+            hd_segment_at(true, true, false, Some(0)).as_deref(),
+            Some("HD")
+        );
+        assert_eq!(
+            hd_segment_at(true, true, false, Some(TOOL_BLINK_MS / 2)).as_deref(),
+            Some("HD")
+        );
+    }
+
+    // The whole footer, not just the segment: `HD` shows up beside the ctx
+    // gauge for a streaming model and is nowhere to be seen otherwise.
+    #[test]
+    fn hd_rides_in_the_footer_beside_the_ctx_gauge() {
+        let _lock = quiet_footer();
+        let st = Status {
+            ctx_size: 1000,
+            ctx_used: 100,
+            ..Status::default()
+        };
+        set_ssd_streaming(false);
+        let off = build_status_text(&st, false, true);
+        assert!(!off.contains("HD"), "{off}");
+        set_ssd_streaming(true);
+        let on = build_status_text(&st, false, true);
+        assert!(on.contains("| HD |"), "{on}");
+        set_ssd_streaming(false);
     }
 
     /// The power cap rides with the local origin, not the bar's tail: it caps
