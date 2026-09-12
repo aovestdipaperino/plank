@@ -18,7 +18,7 @@ use crate::dsml::{
     DsmlParser, DsmlState, MARKER_NAMES, ToolCall, tag_prefix_len, tag_prefix_partial,
 };
 use crate::qwen::QwenParser;
-use crate::syntax::ToolSyntax;
+use crate::syntax::{DsmlTags, ToolSyntax};
 
 /// Told to the model when it emitted a tool call inside `<think>`.
 ///
@@ -27,11 +27,6 @@ use crate::syntax::ToolSyntax;
 /// and `tests/c_parity.rs` locks its text against `refs/ds4`.
 pub const IN_THINK_PROHIBITION: &str =
     "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.";
-
-/// The canonical DSML tool-call opening marker.
-const DSML_START: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
-/// Canonical invoke opener, seeded when the model skips the outer wrapper.
-const CANONICAL_INVOKE: &[u8] = "<｜DSML｜invoke".as_bytes();
 
 /// Tree glyphs for the tool-call banner.
 ///
@@ -331,13 +326,15 @@ fn parse_attr(tag: &str, name: &str) -> Option<String> {
 ///
 /// Returns true while `tail` could still become (or already is) a full
 /// `</｜DSML｜parameter...>` close tag; sets `complete` when the tail is a
-/// full close tag ending exactly at the last byte.
-fn parameter_close_tail(tail: &[u8], complete: &mut bool) -> bool {
+/// full close tag ending exactly at the last byte. `name` is the dialect's
+/// parameter tag name (V4.1 spells it with a leading space), so no spelling is
+/// fixed here.
+fn parameter_close_tail(tail: &[u8], name: &str, complete: &mut bool) -> bool {
     *complete = false;
-    if tag_prefix_partial(tail, true, "parameter") {
+    if tag_prefix_partial(tail, true, name) {
         return true;
     }
-    let Some(mut i) = tag_prefix_len(tail, true, "parameter") else {
+    let Some(mut i) = tag_prefix_len(tail, true, name) else {
         return false;
     };
     while i < tail.len() && tail[i].is_ascii_whitespace() {
@@ -364,24 +361,35 @@ fn parameter_close_tail(tail: &[u8], complete: &mut bool) -> bool {
 
 /// Matches a growing tail against the accepted DSML start forms.
 ///
+/// Port of `agent_stream_dsml_start_match` (`refs/ds4/ds4_agent.c`), which
+/// builds its `canonical` / `missing_bar` / `invoke` / `invoke_missing_bar`
+/// candidates from the dialect's spellings. `tags` supplies those spellings so
+/// V4 and V4.1 share one detector and neither can grow a hand-typed literal.
+///
 /// Returns true while `tail` is a prefix of any accepted opening form; sets
 /// `complete` when a form matched fully and `implicit_invoke` when the form
-/// was a direct invoke opener without the outer `tool_calls` wrapper.
-fn dsml_start_match(tail: &[u8], complete: &mut bool, implicit_invoke: &mut bool) -> bool {
+/// was a direct invoke opener without the outer wrapper.
+fn dsml_start_match(
+    tail: &[u8],
+    tags: DsmlTags,
+    complete: &mut bool,
+    implicit_invoke: &mut bool,
+) -> bool {
     *complete = false;
     *implicit_invoke = false;
     // Each marker contributes the canonical form and the dropped-leading-bar
     // typo, for both the wrapper and the bare invoke opener. The wrapper also
     // accepts a trailing `｜` before `>` — the closing tags always tolerated it,
     // and post-update weights emit it on the opener too.
+    let (calls, invoke) = (tags.calls_name, tags.invoke_name);
     let forms = MARKER_NAMES.iter().flat_map(|m| {
         [
-            (format!("<｜{m}｜tool_calls>"), false),
-            (format!("<｜{m}｜tool_calls｜>"), false),
-            (format!("<{m}｜tool_calls>"), false),
-            (format!("<{m}｜tool_calls｜>"), false),
-            (format!("<｜{m}｜invoke"), true),
-            (format!("<{m}｜invoke"), true),
+            (format!("<｜{m}｜{calls}>"), false),
+            (format!("<｜{m}｜{calls}｜>"), false),
+            (format!("<{m}｜{calls}>"), false),
+            (format!("<{m}｜{calls}｜>"), false),
+            (format!("<｜{m}｜{invoke}"), true),
+            (format!("<{m}｜{invoke}"), true),
         ]
     });
     for (form, implicit) in forms {
@@ -682,7 +690,11 @@ enum Parser {
 impl Parser {
     fn new(syntax: ToolSyntax) -> Self {
         match syntax {
-            ToolSyntax::Dsml | ToolSyntax::Dsml41 => Self::Dsml(DsmlParser::new()),
+            // One parser type, two tag tables: the dialect must be handed
+            // through, or a V4.1 stanza reaches a parser scanning for V4 tags
+            // and every call is silently dropped.
+            ToolSyntax::Dsml => Self::Dsml(DsmlParser::with_syntax(ToolSyntax::Dsml)),
+            ToolSyntax::Dsml41 => Self::Dsml(DsmlParser::with_syntax(ToolSyntax::Dsml41)),
             ToolSyntax::Qwen => Self::Qwen(QwenParser::new()),
         }
     }
@@ -1696,7 +1708,8 @@ impl<S: RenderSink> StreamRenderer<S> {
             }
             self.viz.param_end_tail.push(c);
             let mut complete = false;
-            if parameter_close_tail(&self.viz.param_end_tail, &mut complete) {
+            let (_, param_name) = self.dsml_tag_names();
+            if parameter_close_tail(&self.viz.param_end_tail, param_name, &mut complete) {
                 if complete {
                     self.viz_param_end();
                 }
@@ -1789,15 +1802,30 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
     }
 
+    /// The dialect's inner tag names for the display scan.
+    ///
+    /// V4 and V4.1 spell `invoke` and `parameter` differently (V4.1 carries a
+    /// leading space), and the banner scan matches them by name. Qwen never
+    /// reaches these paths; it keeps the V4 names so its behaviour is
+    /// unchanged.
+    fn dsml_tag_names(&self) -> (&'static str, &'static str) {
+        self.syntax
+            .dsml_tags()
+            .map_or(("invoke", "parameter"), |tags| {
+                (tags.invoke_name, tags.param_name)
+            })
+    }
+
     fn scan_dsml_tag(&mut self, tag: &[u8]) {
         let tag = String::from_utf8_lossy(tag).into_owned();
         let b = tag.as_bytes();
-        if tag_prefix_len(b, true, "invoke").is_some() {
+        let (invoke_name, param_name) = self.dsml_tag_names();
+        if tag_prefix_len(b, true, invoke_name).is_some() {
             self.viz_invoke_end();
-        } else if tag_prefix_len(b, false, "invoke").is_some() {
+        } else if tag_prefix_len(b, false, invoke_name).is_some() {
             let name = parse_attr(&tag, "name").unwrap_or_else(|| "tool".to_string());
             self.viz_tool(&name);
-        } else if tag_prefix_len(b, false, "parameter").is_some()
+        } else if tag_prefix_len(b, false, param_name).is_some()
             && let Some(name) = parse_attr(&tag, "name")
         {
             self.viz_param_begin(&name);
@@ -1942,16 +1970,16 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// bare invoke standing in for the wrapper); Qwen has exactly one opener,
     /// and no implicit-invoke form to stand in for it.
     fn start_match(&self, complete: &mut bool, implicit_invoke: &mut bool) -> bool {
-        match self.syntax {
-            ToolSyntax::Dsml | ToolSyntax::Dsml41 => {
-                dsml_start_match(&self.dsml_start_tail, complete, implicit_invoke)
-            }
-            ToolSyntax::Qwen => {
-                *implicit_invoke = false;
-                let tail = &self.dsml_start_tail[..];
-                *complete = tail == QWEN_START;
-                tail.len() <= QWEN_START.len() && QWEN_START[..tail.len()] == *tail
-            }
+        // Every DSML dialect answers `dsml_tags`, and the candidate openers are
+        // built from that table — no spelling is named here, so a new dialect
+        // cannot silently miss this site. Qwen has no table, and one opener.
+        if let Some(tags) = self.syntax.dsml_tags() {
+            dsml_start_match(&self.dsml_start_tail, tags, complete, implicit_invoke)
+        } else {
+            *implicit_invoke = false;
+            let tail = &self.dsml_start_tail[..];
+            *complete = tail == QWEN_START;
+            tail.len() <= QWEN_START.len() && QWEN_START[..tail.len()] == *tail
         }
     }
 
@@ -1981,9 +2009,9 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.post_think_gap = false;
         // The parser has its own opener scan, and it is fed the *canonical*
         // spelling rather than whichever accepted variant the model wrote.
-        self.parser.feed(match self.syntax {
-            ToolSyntax::Dsml | ToolSyntax::Dsml41 => DSML_START,
-            ToolSyntax::Qwen => QWEN_START,
+        self.parser.feed(match self.syntax.dsml_tags() {
+            Some(tags) => tags.start.as_bytes(),
+            None => QWEN_START,
         });
         self.scan = DsmlScan::Between;
         if !self.dsml_ignored {
@@ -2189,7 +2217,14 @@ impl<S: RenderSink> StreamRenderer<S> {
 
         // Swallow the visual whitespace gap the model emits right after
         // `</think>`; normal rendering resumes at the first non-space byte.
-        if self.post_think_gap && matches!(c, b' ' | b'\t' | b'\r' | b'\n') {
+        // Upstream `bd66c40` added `!sr->dsml_start_len` here: whitespace is
+        // only a visual gap while no opener is half-matched. Without it a
+        // space arriving mid-opener was eaten, and the partial match then
+        // leaked as raw markup.
+        if self.post_think_gap
+            && self.dsml_start_tail.is_empty()
+            && matches!(c, b' ' | b'\t' | b'\r' | b'\n')
+        {
             return;
         }
 
@@ -2204,7 +2239,10 @@ impl<S: RenderSink> StreamRenderer<S> {
                     // an ordinary tool call that happens to sit inside a thought.
                     self.start_dsml();
                     if implicit_invoke {
-                        for &b in CANONICAL_INVOKE {
+                        // Same rule as the opener: replay the dialect's own
+                        // canonical invoke, not the bytes the model wrote.
+                        let invoke = self.syntax.dsml_tags().map_or("", |tags| tags.invoke);
+                        for &b in invoke.as_bytes() {
                             self.feed_dsml_byte(b);
                         }
                     }
@@ -4009,7 +4047,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod qwen_dialect_tests {
+mod dialect_tests {
     use super::*;
     use crate::syntax::ToolSyntax;
 
@@ -4153,5 +4191,92 @@ mod qwen_dialect_tests {
         sr.push(CALL);
         sr.finish();
         assert!(sr.finished().calls.is_empty(), "not a DSML call");
+    }
+
+    /// V4.1 speaks the same DSML shape with a leading space and a shorter
+    /// outer tag name. Fed one byte at a time, the detector must still find
+    /// the opener and hide every scrap of markup from the sink.
+    #[test]
+    fn v41_stream_detects_a_stanza_and_hides_its_markup() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Dsml41);
+        let text = concat!(
+            "before\n",
+            "<\u{ff5c}DSML\u{ff5c} calls>\n",
+            "<\u{ff5c}DSML\u{ff5c} invoke name=\"read\">\n",
+            "<\u{ff5c}DSML\u{ff5c} parameter name=\"path\" string=\"true\">src/a.rs",
+            "</\u{ff5c}DSML\u{ff5c} parameter>\n",
+            "</\u{ff5c}DSML\u{ff5c} invoke>\n",
+            "</\u{ff5c}DSML\u{ff5c} calls>"
+        );
+        let mut buf = [0u8; 4];
+        for ch in text.chars() {
+            sr.push(&*ch.encode_utf8(&mut buf));
+        }
+        sr.finish();
+        let calls = sr.finished().calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert!(
+            !sr.sink().visible.contains("DSML"),
+            "markup leaked to the sink: {:?}",
+            sr.sink().visible
+        );
+        // The banner is painted by the display scan, which matches the inner
+        // tags by name; with V4 names it silently paints nothing at all.
+        let visible = &sr.sink().visible;
+        assert!(visible.contains("read"), "no tool banner: {visible:?}");
+        assert!(
+            visible.contains("src/a.rs"),
+            "no parameter value: {visible:?}"
+        );
+    }
+
+    /// The C accepts a bare invoke opener as an implicit `calls` wrapper
+    /// (`agent_stream_normal_byte`); the replayed canonical invoke must be the
+    /// dialect's, not V4's.
+    #[test]
+    fn v41_implicit_invoke_without_the_outer_wrapper_still_calls() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Dsml41);
+        sr.push(concat!(
+            "<\u{ff5c}DSML\u{ff5c} invoke name=\"read\">\n",
+            "<\u{ff5c}DSML\u{ff5c} parameter name=\"path\" string=\"true\">x",
+            "</\u{ff5c}DSML\u{ff5c} parameter>\n",
+            "</\u{ff5c}DSML\u{ff5c} invoke>\n",
+            "</\u{ff5c}DSML\u{ff5c} calls>"
+        ));
+        sr.finish();
+        assert_eq!(sr.finished().calls.len(), 1);
+    }
+
+    /// Upstream `bd66c40` added `&& !sr->dsml_start_len` to the post-thinking
+    /// whitespace suppressor, so a partially matched opener is no longer eaten.
+    /// It is a real fix and applies to the V4 path too.
+    ///
+    /// The gap suppressor exists to hide the blank lines `DeepSeek` emits after
+    /// `</think>`. While an opener is half-matched those bytes are not a gap:
+    /// swallowing one silently spliced two non-adjacent runs into a "complete"
+    /// opener, fabricating a stanza the model never wrote. With the guard the
+    /// whitespace survives, the bogus opener is abandoned, and the held bytes
+    /// are flushed verbatim instead of vanishing.
+    #[test]
+    fn post_think_gap_does_not_swallow_a_started_opener() {
+        for syntax in [ToolSyntax::Dsml, ToolSyntax::Dsml41] {
+            let tags = syntax.dsml_tags().expect("dsml dialect");
+            let mut sr = StreamRenderer::with_syntax(Cap::default(), syntax);
+            sr.push("<think>reasoning</think>");
+            sr.push(&tags.start[..tags.start.len() - 1]);
+            sr.push(" ");
+            sr.push(&tags.start[tags.start.len() - 1..]);
+            sr.finish();
+            assert!(
+                sr.sink().visible.contains(&format!("{} ", tags.calls_name)),
+                "{syntax:?}: the gap ate a byte of a half-matched opener: {:?}",
+                sr.sink().visible
+            );
+            assert!(
+                sr.finished().calls.is_empty(),
+                "{syntax:?}: fabricated a stanza across the gap"
+            );
+        }
     }
 }
