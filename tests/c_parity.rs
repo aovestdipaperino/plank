@@ -663,3 +663,91 @@ fn the_committed_manifests_parse_and_name_installable_kinds() {
         }
     }
 }
+
+/// The field list of `ds4_engine_options`, read out of the C header itself.
+///
+/// `Ds4EngineOptions` is `#[repr(C)]` and positional: a field added to,
+/// removed from, or reordered in the C shifts every field after it, and
+/// *nothing about that fails to compile*. The engine simply reads its
+/// configuration from the wrong bytes — which is how `refs/ds4` bd66c40
+/// deleting `ple_path` left `--ssd-streaming` silently unread, one slot short,
+/// and the V4.1 model unloadable.
+///
+/// The `offset_of!` assertions in `src/ffi.rs` cannot catch that: they compare
+/// plank to hardcoded constants, so they stay green while being wrong. This
+/// one compares plank to the C, and it is the guard that matters on a bump.
+///
+/// What it catches: a field added, removed, renamed, or reordered in
+/// `ds4_engine_options`. What it does *not*: a field whose **type** changed
+/// with its name kept (`uint32_t` → `uint64_t`), a change inside a nested
+/// struct (`ds4_distributed_options`, `ds4_tp_options`), or anything about the
+/// `extern` function signatures. The `src/ffi.rs` offset table covers the
+/// widths of the fields it lists; the nested structs and the `extern` block are
+/// still reviewed by hand on a submodule bump.
+#[test]
+fn engine_options_fields_match_the_c_header() {
+    let Some(src) = c_file("ds4.h") else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    let from_c = c_struct_field_names(&src, "ds4_engine_options");
+    assert!(
+        from_c.len() > 30,
+        "parsed only {} fields out of ds4_engine_options; the parser drifted \
+         from the header layout rather than the struct shrinking: {from_c:?}",
+        from_c.len()
+    );
+    let ours: Vec<String> = plank::ffi::DS4_ENGINE_OPTIONS_FIELDS
+        .iter()
+        .map(|&f| f.to_owned())
+        .collect();
+    assert_eq!(
+        ours, from_c,
+        "plank's Ds4EngineOptions no longer mirrors ds4_engine_options in \
+         refs/ds4/ds4.h. Every field after the first difference is read by the \
+         engine from the wrong offset, silently. Fix src/ffi.rs (and the \
+         offset table in its tests) to match the C, in this order."
+    );
+}
+
+/// Field names, in declaration order, of the `typedef struct { … } name;` that
+/// declares `name` in a C header.
+///
+/// Deliberately simple: it understands one-line `type name;` declarations with
+/// `/* … */` comments, which is all `ds4.h` uses. A nested struct definition or
+/// a function-pointer field would confuse it — hence the "parsed enough fields"
+/// sanity check at the call site, so the parser drifting out of date fails
+/// loudly instead of asserting against an empty list.
+fn c_struct_field_names(src: &str, name: &str) -> Vec<String> {
+    let body = src
+        .split_once(&format!("}} {name};"))
+        .unwrap_or_else(|| panic!("no `}} {name};` in the header"))
+        .0
+        .rsplit_once("typedef struct {")
+        .unwrap_or_else(|| panic!("no `typedef struct {{` opening {name}"))
+        .1;
+    // Strip block comments, which may sit on their own line or trail a field.
+    let mut stripped = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some((before, after)) = rest.split_once("/*") {
+        stripped.push_str(before);
+        stripped.push(' ');
+        rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+    }
+    stripped.push_str(rest);
+
+    stripped
+        .split(';')
+        .filter_map(|decl| {
+            let ident = decl.split_whitespace().last()?;
+            // `*ptr` and `arr[32]` both reduce to the bare identifier.
+            let ident = ident.trim_start_matches('*');
+            let ident = ident.split('[').next()?;
+            ident
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                .then(|| ident.to_owned())
+                .filter(|i| !i.is_empty())
+        })
+        .collect()
+}

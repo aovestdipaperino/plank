@@ -754,8 +754,8 @@ mod tests {
     fn the_open_failure_message_names_every_fact_it_has() {
         let model = detail_tmp("attempt.gguf");
         std::fs::write(&model, vec![0u8; 4096]).expect("write");
-        let ple = detail_tmp("attempt.ple.gguf");
-        let _ = std::fs::remove_file(&ple);
+        let drafter = detail_tmp("attempt.dspark.gguf");
+        let _ = std::fs::remove_file(&drafter);
         let msg = open_failure_detail(&OpenAttempt {
             path: &model,
             rc: -3,
@@ -763,7 +763,10 @@ mod tests {
             family: ModelFamily::Ds4,
             backend: "Metal",
             ctx_size: 1_048_576,
-            companions: &[("ple sidecar", Some(&ple)), ("vision encoder", None)],
+            companions: &[
+                ("mtp draft model", Some(&drafter)),
+                ("vision encoder", None),
+            ],
             metal_kernels_missing: true,
         });
         assert!(msg.starts_with("failed to open model "), "{msg}");
@@ -776,7 +779,7 @@ mod tests {
         assert!(msg.contains("4.0 KB"), "{msg}");
         // The companion that was passed and is absent gets a line; the one
         // plank never passed gets none.
-        assert!(msg.contains("- ple sidecar: "), "{msg}");
+        assert!(msg.contains("- mtp draft model: "), "{msg}");
         assert!(!msg.contains("vision encoder"), "{msg}");
         assert!(msg.contains("DS4_METAL_DIR"), "{msg}");
         assert!(msg.contains("engine's own log"), "{msg}");

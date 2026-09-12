@@ -303,14 +303,9 @@ fn metal_kernels_missing() -> bool {
 /// [`crate::gguf::file_detail`] reports as nothing rather than as absent.
 fn companion_notes<'a>(
     mtp: Option<&'a Path>,
-    ple: Option<&'a Path>,
     vision: Option<&'a Path>,
-) -> [(&'static str, Option<&'a Path>); 3] {
-    [
-        ("mtp draft model", mtp),
-        ("ple sidecar", ple),
-        ("vision encoder", vision),
-    ]
+) -> [(&'static str, Option<&'a Path>); 2] {
+    [("mtp draft model", mtp), ("vision encoder", vision)]
 }
 
 /// Decides whether V4.1 expects an empty `system` message ahead of the tools
@@ -352,9 +347,8 @@ impl Ds4Model {
         // Every family the probe can now report is one this build serves; the
         // refusal that used to sit here existed only for Qwen.
         let family = crate::gguf::family_of(path);
-        let (mtp_path, ple_path) = companion_slots(family, tuning.mtp_path.as_deref());
+        let mtp_path = mtp_companion(family, tuning.mtp_path.as_deref());
         let c_mtp = c_opt_path(mtp_path, "mtp model")?;
-        let c_ple = c_opt_path(ple_path, "ple sidecar")?;
         let c_steering = c_opt_path(tuning.dir_steering_file.as_deref(), "dir-steering file")?;
         let vision_path = crate::download::default_vision_path();
         // Vision is passed only when the C would accept it: `ds4_engine_open`
@@ -373,7 +367,6 @@ impl Ds4Model {
             model_path: c_path.as_ptr(),
             mtp_path: as_ptr(&c_mtp),
             vision_path: as_ptr(&c_vision),
-            ple_path: as_ptr(&c_ple),
             backend,
             n_threads,
             context_size: ctx_size,
@@ -445,7 +438,7 @@ impl Ds4Model {
                     family,
                     backend: &format!("{backend:?}"),
                     ctx_size,
-                    companions: &companion_notes(mtp_path, ple_path, vision),
+                    companions: &companion_notes(mtp_path, vision),
                     metal_kernels_missing: metal_kernels_missing(),
                 },
             )));
@@ -2759,25 +2752,22 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     ("DS4_METAL_SET_ROWS_SOURCE", "set_rows.metal"),
 ];
 
-/// Which of the engine's two companion slots `--mtp-model` fills.
+/// The `--mtp-model` companion, checked against the family of the *main* model.
 ///
-/// Decided by the family of the *main* model, read from its own GGUF metadata.
-/// The engine cannot be asked: it detects the family while opening, and both
-/// paths have to be in the options struct before that call — and a `ple_path`
-/// handed to a model that wants none is a hard error there, not a warning.
+/// The engine cannot be asked which companion it wants: it detects the family
+/// while opening, and the path has to be in the options struct before that
+/// call. So the family is read from the main model's own GGUF metadata and the
+/// companion is warned about here, ahead of `ds4_engine_open`.
 ///
-/// Every family plank now serves takes a `DSpark`-shaped drafter in `mtp_path`,
-/// so the second slot is never filled: `ple_path` was the Qwen n-gram
-/// sidecar's alone. It stays in the FFI options struct because that struct is
-/// the C's, matched field-for-field by offset.
-fn companion_slots(
-    family: crate::gguf::ModelFamily,
-    companion: Option<&Path>,
-) -> (Option<&Path>, Option<&Path>) {
+/// There used to be a second slot, `ple_path`, for the Qwen3.8 n-gram sidecar.
+/// `refs/ds4` bd66c40 deleted the field from `ds4_engine_options`, and plank
+/// had already stopped serving the only family that took one, so the pair
+/// collapsed to the drafter alone.
+fn mtp_companion(family: crate::gguf::ModelFamily, companion: Option<&Path>) -> Option<&Path> {
     if let Some(c) = companion {
         warn_on_companion_mismatch(family, c);
     }
-    (companion, None)
+    companion
 }
 
 /// Warns when the `--mtp-model` companion is not the kind this family wants.
@@ -3042,9 +3032,9 @@ mod tests {
             "an Esc during a yield ends the turn; it must not look resumable"
         );
     }
-    /// The `--mtp` companion fills the drafter slot for every family plank
-    /// serves; the engine's second slot was the Qwen n-gram sidecar's and must
-    /// now stay empty, or the C would reject the open outright.
+    /// The `--mtp` companion reaches the drafter slot unchanged for every
+    /// family plank serves: the warning is advisory, never a filter, so a
+    /// companion the heuristic dislikes must still be handed to the engine.
     #[test]
     fn the_companion_always_fills_the_drafter_slot() {
         let c = std::path::Path::new("/models/dspark.gguf");
@@ -3052,10 +3042,8 @@ mod tests {
             crate::gguf::ModelFamily::Ds4,
             crate::gguf::ModelFamily::Ds41,
         ] {
-            assert_eq!(super::companion_slots(family, None), (None, None));
-            let (mtp, ple) = super::companion_slots(family, Some(c));
-            assert_eq!(mtp, Some(c));
-            assert_eq!(ple, None, "the ple slot is never filled");
+            assert_eq!(super::mtp_companion(family, None), None);
+            assert_eq!(super::mtp_companion(family, Some(c)), Some(c));
         }
     }
 
