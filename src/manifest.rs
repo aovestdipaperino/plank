@@ -310,19 +310,39 @@ pub fn local_path_for(set: ModelSet, kind: &str) -> Option<PathBuf> {
 
 /// Which set a plank rooted at `root` manages by default.
 ///
-/// A fresh install — nothing recorded for any set — takes the newest set,
-/// `Ds41`. An install that already records `ds4.manifest` stays on `Ds4` and is
-/// never migrated: promoting it would offer an existing user a 341 GiB download
-/// they never asked for.
+/// A fresh install — nothing recorded and nothing on disk — takes the newest
+/// set, `Ds41`. An install that already records `ds4.manifest` stays on `Ds4`
+/// and is never migrated: promoting it would offer an existing user a 341 GiB
+/// download they never asked for.
+///
+/// The recorded manifest is not the only evidence of a V4 install. The entire
+/// installed base predates manifests: those machines have the V4 weights on
+/// disk and *no* `ds4.manifest`, and are exactly who adopt-on-first-sight
+/// exists for. Reading them as fresh would point them at the V4.1 set, whose
+/// artifacts are absent, so `decide` would answer `Offer { from: 0 }`, the
+/// first-run gate would swallow it, and `ds4.manifest` would never be adopted
+/// — the machine would silently stop receiving V4 upgrades forever while still
+/// loading the V4 model. So a V4 `main` artifact present on disk counts as a
+/// V4 install too.
 #[must_use]
 pub fn default_set_for_root(root: &Path) -> ModelSet {
     if installed_path_in(root, ModelSet::Ds41).exists() {
         return ModelSet::Ds41;
     }
-    if installed_path_in(root, ModelSet::Ds4).exists() {
+    if installed_path_in(root, ModelSet::Ds4).exists() || artifact_installed_in(root, ModelSet::Ds4)
+    {
         return ModelSet::Ds4;
     }
     ModelSet::Ds41
+}
+
+/// Whether `set`'s `main` artifact is present under `root`.
+///
+/// Only `main` is consulted: the vision and dspark artifacts are optional
+/// side-fetches, so their absence says nothing about which set is installed.
+#[must_use]
+pub fn artifact_installed_in(root: &Path, set: ModelSet) -> bool {
+    local_path_for_in(root, set, "main").is_some_and(|p| p.exists())
 }
 
 /// Reads and parses the manifest at `path`, if it is there and valid.
@@ -698,6 +718,27 @@ mod tests {
         // A root recording both stays on the newest.
         std::fs::write(root.join("ds41.manifest"), "{}").expect("write");
         assert_eq!(default_set_for_root(&root), ModelSet::Ds41);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The regression this guards: every machine in the existing installed
+    /// base has the V4 weights on disk and no recorded manifest, because it
+    /// predates manifests. Read as fresh it would be pointed at the V4.1 set,
+    /// whose artifacts are absent, and `ds4.manifest` would never be adopted —
+    /// so V4 upgrade offers would stop forever.
+    #[test]
+    fn v4_weights_on_disk_with_no_recorded_manifest_still_default_to_ds4() {
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        // Nothing at all: genuinely fresh.
+        assert_eq!(default_set_for_root(&root), ModelSet::Ds41);
+        let main = local_path_for_in(&root, ModelSet::Ds4, "main").expect("v4 main path");
+        std::fs::write(&main, b"gguf").expect("write");
+        assert_eq!(
+            default_set_for_root(&root),
+            ModelSet::Ds4,
+            "a pre-manifest V4 install must not be read as a fresh machine"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

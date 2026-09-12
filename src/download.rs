@@ -312,6 +312,26 @@ pub fn default_ds41_vision_path() -> PathBuf {
     home.join(".plank").join("ds41flash.vision.gguf")
 }
 
+/// The `main` model path of the set this machine manages by default, under
+/// `root`.
+///
+/// What `-m` falls back to. It follows [`crate::manifest::default_set_for_root`]
+/// so the model that loads belongs to the set whose manifest plank tracks: a
+/// fresh install takes V4.1, and an install with V4 already recorded or on
+/// disk stays on V4. Falls back to [`default_model_path`] only if a set ever
+/// stops declaring a `main` artifact, which no set does.
+#[must_use]
+pub fn default_managed_model_path_in(root: &Path) -> PathBuf {
+    crate::manifest::local_path_for_in(root, crate::manifest::default_set_for_root(root), "main")
+        .unwrap_or_else(default_model_path)
+}
+
+/// [`default_managed_model_path_in`] rooted at `~/.plank`.
+#[must_use]
+pub fn default_managed_model_path() -> PathBuf {
+    default_managed_model_path_in(&crate::manifest::plank_dir())
+}
+
 /// Hugging Face download URL for the default Flash GGUF.
 #[must_use]
 pub fn model_url() -> String {
@@ -1403,16 +1423,6 @@ fn check_manifest_at_startup_in(
     }
 }
 
-/// The whole startup manifest flow: install anything staged, then decide
-/// whether to start a background download.
-///
-/// Skips entirely when `model_path` is `Some`: a `-m <path>` user's model
-/// never lives at the manifest's hardcoded `~/.plank` locations, so the size
-/// check would always read "nothing installed" and both the swap and the
-/// download decision would operate on a file the engine never loads from.
-///
-/// Never fatal, and never blocking except on the interactive download prompt
-/// (itself gated on a real terminal).
 /// The manifest set plank manages for this model path, or `None` for a path it
 /// does not manage.
 ///
@@ -1832,6 +1842,50 @@ mod tests {
         };
         assert!(ensure_side_artifacts(&model, &mut e).is_ok());
         let _ = std::fs::remove_file(model);
+    }
+
+    /// The fallback for a missing `-m` follows the machine's default set, so
+    /// the model that loads belongs to the set whose manifest plank tracks. A
+    /// fresh install would otherwise track `ds41.manifest` while loading a V4
+    /// GGUF.
+    #[test]
+    fn the_default_model_path_follows_the_roots_default_set() {
+        use crate::manifest::ModelSet;
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let v4 = crate::manifest::local_path_for_in(&root, ModelSet::Ds4, "main").expect("v4");
+        let v41 = crate::manifest::local_path_for_in(&root, ModelSet::Ds41, "main").expect("v41");
+        // Fresh: the newest set's model.
+        assert_eq!(default_managed_model_path_in(&root), v41);
+        // V4 weights on disk, nothing recorded — the existing installed base.
+        std::fs::write(&v4, b"gguf").expect("write");
+        assert_eq!(default_managed_model_path_in(&root), v4);
+        // And with the V4 manifest recorded.
+        std::fs::remove_file(&v4).expect("rm");
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, ModelSet::Ds4),
+            "{}",
+        )
+        .expect("write");
+        assert_eq!(default_managed_model_path_in(&root), v4);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fresh install now points at a V4.1 GGUF that is not on disk yet. That
+    /// must reach `ensure_model`'s graceful "no model at <path>" error — never
+    /// a panic, and never a prompt to fetch V4 into the V4.1 slot.
+    #[test]
+    fn an_absent_v41_model_errors_gracefully_rather_than_panicking() {
+        // The branch taken is "not the V4 default path", which is exactly what
+        // the V4.1 default is.
+        assert_ne!(default_ds41_model_path(), default_model_path());
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let missing = root.join("ds41flash.gguf");
+        assert!(!missing.exists());
+        let err = ensure_model(&missing).expect_err("an absent model must be an error");
+        assert!(err.starts_with("no model at "), "unexpected message: {err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Which set a model path belongs to. The skip used to be "any `-m` at

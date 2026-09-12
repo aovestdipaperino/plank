@@ -91,12 +91,14 @@ fn resolve_model_delta(cfg: &mut plank::config::AgentConfig) -> Result<(), Strin
 /// store opened before it would name files for the wrong one.
 fn select_session_family(cfg: &plank::config::AgentConfig) {
     // Resolved the same way the engine will resolve it, so the tag matches the
-    // model that actually loads. A path that does not exist yet — a first run,
-    // before the download — probes as `Ds4`, which is the right default.
+    // model that actually loads — including the fallback, which follows the
+    // set this machine manages rather than always naming the V4 path. A path
+    // that does not exist yet — a first run, before the download — is probed by
+    // name, so it still tags the family of the model that is about to land.
     let model = cfg
         .model_path
         .clone()
-        .unwrap_or_else(plank::download::default_model_path);
+        .unwrap_or_else(plank::download::default_managed_model_path);
     plank::session::set_family(plank::gguf::family_of(&model));
 }
 
@@ -565,7 +567,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         let model = cfg
             .model_path
             .clone()
-            .unwrap_or_else(plank::download::default_model_path);
+            .unwrap_or_else(plank::download::default_managed_model_path);
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
@@ -810,7 +812,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         let model_path = cfg
             .model_path
             .clone()
-            .unwrap_or_else(plank::download::default_model_path);
+            .unwrap_or_else(plank::download::default_managed_model_path);
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
