@@ -1417,7 +1417,9 @@ pub fn parse_options_with(
                 let v = need_arg(&mut i)?;
                 c.generation.think_mode = ThinkMode::parse(v)
                     .filter(|m| matches!(m, ThinkMode::Off | ThinkMode::Level(_)))
-                    .ok_or_else(|| format!("{arg} must be a number 0..100 (got `{v}`)"))?;
+                    .ok_or_else(|| {
+                        format!("{arg} requires an integer from 0 to 100 (got `{v}`)")
+                    })?;
             }
             "--chdir" => c.chdir_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--worktree" => c.worktree = Some(need_arg(&mut i)?.to_string()),

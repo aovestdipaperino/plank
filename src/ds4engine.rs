@@ -658,6 +658,24 @@ impl Ds4Model {
     fn append_effort_prefix(&self, tokens: &mut Ds4TokensGuard, think: ThinkMode) {
         if think == ThinkMode::Low {
             tokens.push_all(&self.tokenize_rendered(crate::engine::THINK_LOW_PREFIX));
+            // `Low` has no dedicated C think mode, so it is `HIGH` at the FFI
+            // boundary (`ds4_think`) — and the C's own DeepSeek V4.1 effort
+            // text defaults `HIGH` to 75, indistinguishable from `Medium`. Ask
+            // for the explicit low effort level instead: on V4.1 this appends
+            // `Reasoning Effort: 25 ...` right after plank's own preamble
+            // above, restoring `low < medium < max`; on every other family
+            // `chat_push_think_prefix`'s family switch has no branch for a
+            // plain numeric level (the GLM/DeepSeek41 arms return NULL for it,
+            // and the non-effort-text `else` arm only fires for `MAX`), so the
+            // call is a byte-for-byte no-op there.
+            // SAFETY: engine and tokens are valid for the call.
+            unsafe {
+                ffi::ds4_chat_append_think_prefix(
+                    self.engine,
+                    tokens.as_mut_ptr(),
+                    ds4_think(ThinkMode::Level(crate::engine::THINK_LOW_EFFORT_LEVEL)),
+                );
+            }
             return;
         }
         // SAFETY: engine and tokens are valid for the call.

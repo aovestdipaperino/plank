@@ -31,7 +31,11 @@ pub enum ThinkMode {
     /// Suppress thinking: the assistant prefix opens with `</think>`.
     Off,
     /// Ordinary thinking plus the brief-reasoning preamble in
-    /// [`THINK_LOW_PREFIX`]. A plank extension, not a C level.
+    /// [`THINK_LOW_PREFIX`]. A plank extension, not a C level. On `DeepSeek`
+    /// V4.1 this is followed by a `Reasoning Effort: 25` system line
+    /// ([`THINK_LOW_EFFORT_LEVEL`]), so `low` stays strictly below `medium`'s
+    /// (V4.1-only, implicit) effort of 75 instead of leaving the model's
+    /// numeric effort unspecified; every other family sees only the preamble.
     Low,
     /// Ordinary thinking (the C's `DS4_THINK_HIGH`). The default.
     #[default]
@@ -67,12 +71,16 @@ impl ThinkMode {
             // Owned, and distinct per level: this is KV-fingerprint key
             // material, so two efforts that named themselves alike would share
             // a cache built at the other's prompt.
-            Self::Level(n) => Cow::Owned(n.to_string()),
+            Self::Level(n) => {
+                debug_assert!(n > 0, "Level(0) is incoherent — it means Off, not a level");
+                Cow::Owned(n.to_string())
+            }
         }
     }
 
     /// The level's name abbreviated to a fixed three columns: `off`, `low`,
-    /// `med`, `max`.
+    /// `med`, `max`, or a right-aligned number (`  7`, ` 25`, `100`) for an
+    /// explicit numeric level.
     ///
     /// For the status footer, where every level must occupy the same width — a
     /// segment that grows and shrinks as the level changes shifts everything to
@@ -90,7 +98,10 @@ impl ThinkMode {
             // Right-aligned so the segment stays exactly three columns wide at
             // every level (`  7`, ` 25`, `100`); `parse` trims, so what the
             // footer shows still parses back.
-            Self::Level(n) => Cow::Owned(format!("{n:>3}")),
+            Self::Level(n) => {
+                debug_assert!(n > 0, "Level(0) is incoherent — it means Off, not a level");
+                Cow::Owned(format!("{n:>3}"))
+            }
         }
     }
 
@@ -146,7 +157,13 @@ impl ThinkMode {
             // prompt prefix exactly as moving between two named levels does.
             // The tokens themselves come from the C on a V4.1 engine; this is
             // the change-detection key.
-            Self::Level(n) => Some(Cow::Owned(deepseek41_effort_text(n))),
+            Self::Level(n) => {
+                debug_assert!(
+                    n > 0,
+                    "Level(0) is incoherent — the C returns NULL (no prefix) for it, not a level"
+                );
+                Some(Cow::Owned(deepseek41_effort_text(n)))
+            }
         }
     }
 }
@@ -158,6 +175,16 @@ impl ThinkMode {
 /// On a real V4.1 engine the tokens come from the C itself
 /// (`ds4_chat_append_think_prefix`); this copy exists so a level has a prefix
 /// to compare and a text to show without a model loaded.
+/// The numeric reasoning effort `ThinkMode::Low` asks for on `DeepSeek` V4.1,
+/// via the same `Reasoning Effort: N` system line a `/think 25` session would
+/// get. Upstream's own example of an explicit low setting
+/// (`--think-level 25`, `refs/ds4/docs/MODELS.md`), used here so `low` sits
+/// strictly below `medium`'s 75 instead of being unspecified (V4.1 defaults
+/// its `HIGH` mode, which `Low` maps to at the FFI boundary, to the same 75 as
+/// `Medium`). On every other model family this number is inert: those
+/// families' `chat_push_think_prefix` branches ignore a plain numeric level.
+pub const THINK_LOW_EFFORT_LEVEL: u8 = 25;
+
 #[must_use]
 pub fn deepseek41_effort_text(level: u8) -> String {
     format!(
@@ -1506,8 +1533,8 @@ mod spec_stats_tests {
 mod tests {
     use super::{
         EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, PrefillProgress,
-        THINK_LOW_PREFIX, THINK_MAX_PREFIX, ThinkMode, ThinkToolRecovery, Utf8Stream,
-        deepseek41_effort_text, reusable_prefix, think_level_unsupported,
+        THINK_LOW_EFFORT_LEVEL, THINK_LOW_PREFIX, THINK_MAX_PREFIX, ThinkMode, ThinkToolRecovery,
+        Utf8Stream, deepseek41_effort_text, reusable_prefix, think_level_unsupported,
     };
 
     // A KV-backed engine holds one live session, so concurrent sidechains on it
@@ -1641,6 +1668,30 @@ mod tests {
         assert_eq!(crate::ffi::Ds4ThinkMode::NONE.0, 0);
         assert_eq!(crate::ffi::Ds4ThinkMode::HIGH.0, 1);
         assert_eq!(crate::ffi::Ds4ThinkMode::MAX.0, 2);
+    }
+
+    // On DeepSeek V4.1 the C maps `Medium` (its `HIGH`) to 75 and `Max` to 100
+    // (`ds4_deepseek41_reasoning_effort_text`, `refs/ds4/ds4.c:41934-41935`);
+    // `append_effort_prefix` (`src/ds4engine.rs`) asks for
+    // `THINK_LOW_EFFORT_LEVEL` on `Low` for the same reason. Effort must
+    // strictly increase off < low < medium < max, never leaving `low`
+    // unspecified (which would make it indistinguishable from — or worse,
+    // higher than — `medium`).
+    #[test]
+    fn v41_effort_ordering_is_strictly_increasing() {
+        const V41_MEDIUM_EFFORT: u8 = 75;
+        const V41_MAX_EFFORT: u8 = 100;
+        const {
+            assert!(THINK_LOW_EFFORT_LEVEL > 0, "0 means Off, not a low effort");
+            assert!(
+                THINK_LOW_EFFORT_LEVEL < V41_MEDIUM_EFFORT,
+                "low must sit below medium"
+            );
+            assert!(
+                V41_MEDIUM_EFFORT < V41_MAX_EFFORT,
+                "medium must sit below max"
+            );
+        }
     }
 
     // The effort line mirrors `ds4_deepseek41_reasoning_effort_text`.
