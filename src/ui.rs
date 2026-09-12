@@ -6246,7 +6246,7 @@ impl Agent<'_> {
                 // pass. The interrupted case already printed its own notice.
                 self.compact("user request", arg)?;
             }
-            "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
+            "/skills" => print!("{}", self.skills_command(arg)),
             "/frame" => println!(
                 "/frame needs the full-screen TUI — a piped session has no screen to give a \
                  component\n{}",
@@ -7986,6 +7986,39 @@ the original is frozen and listed in /tree"
         };
         crate::status::set_temperature(temp);
         format!("temperature {temp:.2}")
+    }
+
+    /// `/skills [on|off]`: the shared body for both front ends.
+    ///
+    /// One implementation rather than two, exactly as [`Self::hooks_command`]
+    /// is: the plain-stdout REPL prints it and the TUI puts it in a pane, and
+    /// neither can drift on what the command accepts. Bare `/skills` lists the
+    /// loaded skills *and* says whether they are currently enabled, so the
+    /// listing never implies a skill that would refuse to run. Returns the text
+    /// to print/pane, always newline-terminated.
+    fn skills_command(&self, arg: &str) -> String {
+        match arg.trim() {
+            "" => {
+                let state = if crate::skills::enabled() {
+                    "skills are enabled"
+                } else {
+                    crate::skills::DISABLED_NOTICE
+                };
+                format!("{}{state}\n", crate::skills::render_list(&self.skills))
+            }
+            "on" => {
+                crate::skills::set_enabled(true);
+                "skills enabled: /name and the skill tool expand again\n".to_string()
+            }
+            "off" => {
+                crate::skills::set_enabled(false);
+                // Runtime only: nothing is written to any SKILL.md or settings
+                // file, so the next launch is back to the configured behaviour.
+                "skills disabled for the rest of this session (nothing was written to disk)\n"
+                    .to_string()
+            }
+            other => format!("usage: /skills [on|off] (got {other:?})\n"),
+        }
     }
 
     /// `/hooks [on|off]`: the shared body for both front ends.
@@ -10277,6 +10310,17 @@ the original is frozen and listed in /tree"
     /// match — the caller reports an unknown command; `Some(Err)` is a
     /// matched template whose variables could not be bound.
     fn slash_message(&self, cmd: &str, arg: &str) -> Option<Result<String, String>> {
+        // The first of the two invocation routes. Reported as an error rather
+        // than passed over, so `/plan` with skills off says why instead of
+        // falling through to "unknown command" — or, worse, reaching the model
+        // as a bare prompt.
+        if !crate::skills::enabled()
+            && self
+                .skill_name(cmd)
+                .is_some_and(|name| self.skills.iter().any(|s| s.name == name))
+        {
+            return Some(Err(crate::skills::DISABLED_NOTICE.to_owned()));
+        }
         if let Some(message) = self.skill_message(cmd, arg) {
             return Some(Ok(message));
         }
@@ -14768,10 +14812,7 @@ impl Agent<'_> {
                 log.push_dim(Self::model_text_command(arg));
             }
             "/skills" => {
-                *report = Some(tui::ReportPanel::new(
-                    "skills",
-                    &crate::skills::render_list(&self.skills),
-                ));
+                *report = Some(tui::ReportPanel::new("skills", &self.skills_command(arg)));
             }
             // A bare `/frame` lists the openable frames, which is a report; with
             // an argument it opens one, which is an action and stays a line in
@@ -19576,6 +19617,72 @@ mod tests {
         assert!(agent.mtp_on());
         assert!(agent.gen_opts.temperature.abs() < 1e-6);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/skills` lists and reports state; `on`/`off` flip the session switch
+    /// and anything else is a usage line. One body serves both front ends.
+    #[test]
+    fn skills_command_lists_toggles_and_rejects_junk() {
+        let _lock = crate::skills::TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch_dir("skills-toggle");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.skills.push(crate::skills::Skill {
+            name: "plan".into(),
+            description: "plans".into(),
+            argument_hint: String::new(),
+            body: "plan body $ARGUMENTS".into(),
+            dir: std::path::PathBuf::new(),
+        });
+        crate::skills::set_enabled(true);
+
+        // Bare: the listing AND the state.
+        let out = agent.skills_command("");
+        assert!(out.contains("/plan"), "{out}");
+        assert!(out.contains("skills are enabled"), "{out}");
+
+        let out = agent.skills_command("off");
+        assert!(out.contains("disabled"), "{out}");
+        assert!(!crate::skills::enabled());
+        assert!(
+            agent
+                .skills_command("")
+                .contains(crate::skills::DISABLED_NOTICE),
+            "the listing must report the switch"
+        );
+        // The slash route is gated too: `/plan` says why instead of expanding,
+        // and never reaches the model as a bare prompt.
+        let refused = agent.slash_message("/plan", "x");
+        assert_eq!(
+            refused,
+            Some(Err(crate::skills::DISABLED_NOTICE.to_owned()))
+        );
+
+        let out = agent.skills_command("on");
+        assert!(out.contains("enabled"), "{out}");
+        assert_eq!(
+            agent.slash_message("/plan", "x").unwrap().unwrap(),
+            "plan body x"
+        );
+
+        let out = agent.skills_command("sideways");
+        assert!(out.contains("usage: /skills [on|off]"), "{out}");
+        crate::skills::set_enabled(true);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The trap the `/hooks` work hit: without the with-args recognizer,
+    /// `/skills off` is not a known command and the line goes to the model.
+    #[test]
+    fn skills_with_an_argument_is_a_known_command() {
+        for line in ["/skills", "/skills on", "/skills off", "/skills sideways"] {
+            assert!(
+                crate::config::slash_command_known(line),
+                "{line} would be forwarded to the model"
+            );
+        }
     }
 
     #[test]

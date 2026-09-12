@@ -921,8 +921,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/skills",
-        args: "",
-        desc: "list the skills loaded from SKILL.md files",
+        args: "[on|off]",
+        desc: "list the loaded skills, or turn skill expansion on/off for this session",
     },
     SlashCommand {
         name: "/plugins",
@@ -1126,7 +1126,6 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/usage"
             | "/toks"
             | "/init"
-            | "/skills"
             | "/plugins"
             | "/install-claude-plugin"
             | "/frame"
@@ -1186,6 +1185,9 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/think")
         // `/hooks` takes an optional `on`/`off` runtime toggle.
         || slash_command_with_args(cmd, "/hooks")
+        // And `/skills`, the same way: without this, `/skills off` is not a
+        // known command and the whole line is forwarded to the model.
+        || slash_command_with_args(cmd, "/skills")
         || slash_command_with_args(cmd, "/switch")
         || slash_command_with_args(cmd, "/del")
         || slash_command_with_args(cmd, "/strip")

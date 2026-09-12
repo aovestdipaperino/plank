@@ -297,6 +297,35 @@ pub fn render_names(skills: &[Skill]) -> String {
     out
 }
 
+/// Whether skills may be expanded this session — the master switch `/skills
+/// on|off` flips.
+///
+/// Session-scoped on purpose: nothing is written to disk, so a restart returns
+/// to the configured behaviour. Process-global for the same reason
+/// [`crate::hooks::enabled`] is: a skill can be expanded from the slash path or
+/// from the `skill` tool, each holding its own borrow of the loaded set, and a
+/// flag threaded through both would be one missed route away from a skill that
+/// still runs while the UI says skills are off.
+static SKILLS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Serializes the tests that write the process-global skills master switch.
+#[cfg(test)]
+pub(crate) static TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Enables or disables skill expansion for the rest of the session.
+pub fn set_enabled(on: bool) {
+    SKILLS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether skills currently expand.
+#[must_use]
+pub fn enabled() -> bool {
+    SKILLS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What every route says when a skill is asked for while the switch is off.
+pub const DISABLED_NOTICE: &str = "skills are disabled for this session (/skills on to re-enable)";
+
 /// `skill` tool: lets the model invoke a skill by name, mirroring what the
 /// user's `/name args` slash command produces (issue #36).
 ///
@@ -310,6 +339,12 @@ pub fn tool_skill(
     cap: usize,
     call: &crate::dsml::ToolCall,
 ) -> String {
+    // The second of the two invocation routes, gated on the same switch as the
+    // slash path: gating only the slash command would leave skills running as
+    // a tool while the UI reports them off.
+    if !enabled() {
+        return format!("Tool error: {DISABLED_NOTICE}\n");
+    }
     let name = call.arg_value("name").unwrap_or("").trim();
     if name.is_empty() {
         return render_names(skills);
@@ -495,6 +530,31 @@ mod tests {
         assert!(list.contains("/review <path> — Review code"), "{list}");
         assert!(render_list(&[]).contains("no skills found"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The tool route obeys the `/skills off` master switch — otherwise a
+    /// session that reports skills as off would still expand them whenever the
+    /// model reached for the `skill` tool.
+    #[test]
+    fn the_skill_tool_refuses_while_skills_are_disabled() {
+        let _lock = TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let skills = vec![skill("plan", "plan body")];
+        let mut n = 0;
+        set_enabled(false);
+        let out = tool_skill(&skills, &mut n, 8, &skill_call(&[("name", "plan")]));
+        assert!(out.contains(DISABLED_NOTICE), "{out}");
+        assert!(!out.contains("plan body"), "{out}");
+        // Not even the bare listing, which would otherwise advertise skills the
+        // model cannot run.
+        let listing = tool_skill(&skills, &mut n, 8, &skill_call(&[]));
+        assert!(listing.contains(DISABLED_NOTICE), "{listing}");
+        assert_eq!(n, 0, "a refused invocation must not spend the round budget");
+
+        set_enabled(true);
+        let out = tool_skill(&skills, &mut n, 8, &skill_call(&[("name", "plan")]));
+        assert!(out.contains("plan body"), "{out}");
     }
 
     #[test]
