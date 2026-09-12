@@ -492,8 +492,14 @@ pub fn ensure_dspark_support(engine: &mut crate::config::EngineTuning) -> Result
 /// Propagates the underlying ensure failures.
 pub fn ensure_side_artifacts(
     model_path: &Path,
+    ctx: i32,
     engine: &mut crate::config::EngineTuning,
 ) -> Result<(), String> {
+    // A checkpoint too large to hold resident is streamed from SSD rather than
+    // failing to open; decided before anything else, since it applies to every
+    // family and does not depend on the companion resolution below. It needs
+    // the context size, which is why this function takes one.
+    auto_enable_ssd_streaming(model_path, ctx, engine);
     if crate::gguf::supports_vision(model_path) {
         ensure_vision_encoder()?;
     }
@@ -505,6 +511,171 @@ pub fn ensure_side_artifacts(
         return Ok(());
     }
     ensure_dspark_support(engine)
+}
+
+/// Fraction of installed RAM, as a percentage, that plank treats as available
+/// for a resident model.
+///
+/// Calibrated against the engine's own arithmetic: `ds41_memory_admit_for_host`
+/// (`refs/ds4/ds4.c` at bd66c40) takes `host / 8 * 7` (87.5%) capped by Metal's
+/// recommended working-set size, and on this 128 GiB machine reported a safe
+/// budget of 107.52 GiB — 84% of RAM. 80% sits just under that, deliberately.
+///
+/// Erring low is the safe direction: a model that could have been resident
+/// merely streams, which is slower but works, while erring high means a model
+/// that cannot fit fails to open at all — the failure this rule exists to
+/// prevent.
+pub const SSD_STREAMING_RAM_PERCENT: u64 = 80;
+
+/// Context-independent part of the engine's static context buffers, in bytes.
+///
+/// See [`context_reserve_bytes`] for the derivation.
+const CONTEXT_FIXED_BYTES: u64 = 7722 * 1024 * 1024;
+
+/// Context-dependent part of the engine's static context buffers, in bytes per
+/// context token.
+///
+/// See [`context_reserve_bytes`] for the derivation.
+const CONTEXT_BYTES_PER_TOKEN: u64 = 11_264;
+
+/// Bytes the engine will reserve for static context buffers at `ctx` tokens,
+/// which must come out of the resident budget before the weights do.
+///
+/// There is **no pre-open source of truth** for this: the C computes it in
+/// `ds41_graph_bytes` (`refs/ds4/ds4.c` at bd66c40), which is `static` and
+/// reachable only from inside a model open — by which point the admission check
+/// that refuses the model has already run. So this is an estimate, derived from
+/// that function rather than guessed:
+///
+/// * The terms that scale with `ctx` are the compressed/index caches
+///   (`2.5 * ctx * 640` floats = 6400 B/token), the prefill `block_mask`
+///   (`ctx/8 * prefill_cap` floats = 4096 B/token at the 8192 prefill cap), the
+///   carry `block_mask` (`ctx/256` words times a 32768 carry cap = 512 B/token)
+///   and the index sorter's merge buffers
+///   (`DS41_INDEX_BATCH * ctx * 2 * 4` = 256 B/token). That is 11 KiB/token,
+///   which is [`CONTEXT_BYTES_PER_TOKEN`].
+/// * Everything else is sized by `prefill_cap` and fixed buffers.
+///   [`CONTEXT_FIXED_BYTES`] is the remainder at the one point the engine
+///   printed: "V4.1 static context buffers 8073.52 MiB (ctx=32768)", i.e.
+///   8073.52 MiB - 32768 * 11 KiB = 7721.5 MiB, rounded up to 7722 MiB.
+///
+/// Accuracy: exact to under 1 MiB at ctx=32768, and linear above it, where
+/// `prefill_cap` and the carry cap are both pinned at their maxima and the
+/// formula really is affine. Below ctx=16384 the engine uses a smaller
+/// `prefill_cap` (4096, and 2048 below 8192), so the real figure is *smaller*
+/// than this estimate by up to ~2 GiB — an overestimate, which shrinks the
+/// budget and is the conservative direction. The V4 family allocates its
+/// context differently, but it is much the smaller allocator, so the V4.1
+/// figures are used for every family.
+fn context_reserve_bytes(ctx: u32) -> u64 {
+    CONTEXT_FIXED_BYTES.saturating_add(CONTEXT_BYTES_PER_TOKEN.saturating_mul(u64::from(ctx)))
+}
+
+/// Bytes of model weights the machine can hold resident at `ctx` tokens:
+/// [`SSD_STREAMING_RAM_PERCENT`] of `ram_bytes`, less the static context
+/// buffers.
+///
+/// Saturates at zero rather than wrapping on a machine too small to hold the
+/// context alone.
+fn resident_budget_bytes(ram_bytes: u64, ctx: u32) -> u64 {
+    (ram_bytes / 100)
+        .saturating_mul(SSD_STREAMING_RAM_PERCENT)
+        .saturating_sub(context_reserve_bytes(ctx))
+}
+
+/// Whether SSD expert streaming should be turned on by itself, and the resident
+/// budget that says so.
+///
+/// `already_on` is the whole of "an explicit user choice wins": `--ssd-streaming`
+/// is the only switch there is and it has no negative form — there is no way to
+/// demand a resident load — so auto-enable can never override an opt-out. The
+/// tuning flags (`--ssd-streaming-cold`, `--ssd-streaming-cache-experts`,
+/// `--ssd-streaming-preload-experts`) are never touched, so a user who set them
+/// keeps exactly what they asked for.
+///
+/// `None` — no auto-enable — whenever the model file or the installed RAM is
+/// unknown: neither is ours to diagnose, and guessing in the dark could push a
+/// model that fits perfectly well onto the SSD.
+fn decide_ssd_streaming(
+    model_bytes: Option<u64>,
+    ram_bytes: Option<u64>,
+    ctx: u32,
+    already_on: bool,
+) -> Option<u64> {
+    if already_on {
+        return None;
+    }
+    let budget = resident_budget_bytes(ram_bytes?, ctx);
+    (model_bytes? > budget).then_some(budget)
+}
+
+/// Turns SSD expert streaming on when the model file will not fit in the
+/// machine's resident budget, so a user with a 341 GiB checkpoint does not have
+/// to discover `--ssd-streaming` from the engine's refusal to open it.
+///
+/// A missing or unreadable file is not our error to report: `ensure_model` has
+/// already run, and the open that follows produces plank's own "no model at"
+/// message. We simply decline to guess.
+fn auto_enable_ssd_streaming(
+    model_path: &Path,
+    ctx: i32,
+    engine: &mut crate::config::EngineTuning,
+) {
+    // The config carries the context size signed; a non-positive one is not a
+    // real configuration, and reserving nothing for it is the right answer.
+    let ctx = u32::try_from(ctx).unwrap_or(0);
+    let model_bytes = std::fs::metadata(model_path).ok().map(|m| m.len());
+    let ram_bytes = total_ram_bytes();
+    let Some(budget) = decide_ssd_streaming(model_bytes, ram_bytes, ctx, engine.ssd_streaming)
+    else {
+        return;
+    };
+    engine.ssd_streaming = true;
+    eprintln!(
+        "note: SSD streaming enabled automatically (model {} exceeds the {} resident budget: {}% \
+         of {} RAM minus {} for ctx={ctx})",
+        gib(model_bytes.unwrap_or(0)),
+        gib(budget),
+        SSD_STREAMING_RAM_PERCENT,
+        gib(ram_bytes.unwrap_or(0)),
+        gib(context_reserve_bytes(ctx)),
+    );
+}
+
+/// Total physical RAM in bytes, via `sysctl hw.memsize`.
+///
+/// `None` when it cannot be determined, and on every platform that is not
+/// macOS — the only one the ds4 engine builds on.
+#[must_use]
+pub fn total_ram_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut mem: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: hw.memsize returns a u64; `mem`/`len` are valid out-params
+        // and the name is a NUL-terminated C string.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&raw mut mem).cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(mem)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Renders a byte count the way the engine prints sizes: binary GiB, 2 decimals.
+fn gib(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let g = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    format!("{g:.2} GiB")
 }
 
 /// Turns speculative decoding off for a family that has no `DSpark` drafter,
@@ -1888,6 +2059,119 @@ mod tests {
         );
     }
 
+    /// Measured file sizes of the checkpoints this rule has to separate.
+    const V4_BYTES: u64 = 86_720_111_776;
+    const V41_BYTES: u64 = 365_713_686_528;
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The three machines the rule is specified against, with RAM injected so
+    /// none of them needs the hardware.
+    #[test]
+    fn the_resident_budget_tracks_installed_ram() {
+        let ctx = 32768;
+        // 128 GiB: V4 stays resident, V4.1 streams.
+        let ram = Some(128 * GIB);
+        assert!(decide_ssd_streaming(Some(V4_BYTES), ram, ctx, false).is_none());
+        assert!(decide_ssd_streaming(Some(V41_BYTES), ram, ctx, false).is_some());
+        // 64 GiB: neither fits.
+        let ram = Some(64 * GIB);
+        assert!(decide_ssd_streaming(Some(V4_BYTES), ram, ctx, false).is_some());
+        assert!(decide_ssd_streaming(Some(V41_BYTES), ram, ctx, false).is_some());
+        // 512 GiB: both fit, including V4.1 — upstream documents a 512 GB Mac
+        // holding it resident, which a fixed byte threshold would get wrong.
+        let ram = Some(512 * GIB);
+        assert!(decide_ssd_streaming(Some(V4_BYTES), ram, ctx, false).is_none());
+        assert!(decide_ssd_streaming(Some(V41_BYTES), ram, ctx, false).is_none());
+    }
+
+    /// The budget is 80% of RAM less the context reserve, and the reported
+    /// number is the one the note prints.
+    #[test]
+    fn the_budget_is_ram_percent_minus_the_context_reserve() {
+        let ctx = 32768;
+        let ram = 128 * GIB;
+        let expected = (ram / 100) * 80 - context_reserve_bytes(ctx);
+        assert_eq!(resident_budget_bytes(ram, ctx), expected);
+        assert_eq!(
+            decide_ssd_streaming(Some(V41_BYTES), Some(ram), ctx, false),
+            Some(expected)
+        );
+        // ~94.5 GiB on this machine: above V4, far below V4.1.
+        assert!(expected > V4_BYTES && expected < V41_BYTES);
+        assert_eq!(SSD_STREAMING_RAM_PERCENT, 80);
+    }
+
+    /// A bigger context leaves less room for weights, so the same model can
+    /// cross from resident to streaming on context alone.
+    #[test]
+    fn a_larger_context_shrinks_the_resident_budget() {
+        let ram = 128 * GIB;
+        assert!(resident_budget_bytes(ram, 262_144) < resident_budget_bytes(ram, 4096));
+        // The engine printed "static context buffers 8073.52 MiB (ctx=32768)";
+        // the estimate must land within a MiB of it.
+        // 8073.52 MiB, in bytes, without a float cast.
+        let measured = 8073 * 1_048_576 + 52 * 1_048_576 / 100;
+        let estimate = context_reserve_bytes(32768);
+        assert!(
+            estimate >= measured && estimate - measured < 1024 * 1024,
+            "estimate {estimate} vs measured {measured}"
+        );
+        // A machine that cannot even hold the context saturates at zero rather
+        // than wrapping.
+        assert_eq!(resident_budget_bytes(4 * GIB, 262_144), 0);
+    }
+
+    /// `--ssd-streaming` already covers the case, so auto-enable stays out of
+    /// the way; there is no flag that turns streaming off, so nothing to
+    /// override.
+    #[test]
+    fn an_explicit_streaming_flag_is_left_alone() {
+        assert!(decide_ssd_streaming(Some(V41_BYTES), Some(128 * GIB), 32768, true).is_none());
+        assert!(decide_ssd_streaming(Some(1), Some(128 * GIB), 32768, true).is_none());
+    }
+
+    /// An unreadable model file, or RAM we cannot read, is not ours to
+    /// diagnose: no panic, and no guess.
+    #[test]
+    fn an_unknown_size_or_ram_neither_panics_nor_auto_enables() {
+        assert!(decide_ssd_streaming(None, Some(128 * GIB), 32768, false).is_none());
+        assert!(decide_ssd_streaming(Some(V41_BYTES), None, 32768, false).is_none());
+        let mut e = crate::config::EngineTuning::default();
+        assert!(!e.ssd_streaming);
+        auto_enable_ssd_streaming(Path::new("/nonexistent/no-such-model.gguf"), 32768, &mut e);
+        assert!(!e.ssd_streaming, "a missing file never enables streaming");
+    }
+
+    /// The tuning knobs a user set are carried through untouched when
+    /// auto-enable fires.
+    #[test]
+    fn auto_enable_preserves_streaming_tuning() {
+        let mut e = crate::config::EngineTuning {
+            ssd_streaming_cold: true,
+            ssd_streaming_cache_experts: 12,
+            ssd_streaming_preload_experts: 4,
+            ..crate::config::EngineTuning::default()
+        };
+        // Drive the pure decision, then the mutation it gates, without needing
+        // a 341 GiB file on disk.
+        assert!(
+            decide_ssd_streaming(Some(V41_BYTES), Some(128 * GIB), 32768, e.ssd_streaming)
+                .is_some()
+        );
+        e.ssd_streaming = true;
+        assert!(e.ssd_streaming_cold);
+        assert_eq!(e.ssd_streaming_cache_experts, 12);
+        assert_eq!(e.ssd_streaming_preload_experts, 4);
+    }
+
+    /// The machine plank is running on reports a plausible RAM figure.
+    #[test]
+    fn installed_ram_is_readable_on_this_platform() {
+        if let Some(ram) = total_ram_bytes() {
+            assert!(ram >= GIB, "implausible RAM reading: {ram}");
+        }
+    }
+
     /// V4.1 has no `DSpark` drafter and the engine refuses to open the model at
     /// all when one is attached, so plank must never auto-pair there.
     #[test]
@@ -2002,7 +2286,7 @@ mod tests {
             mtp: false,
             ..Default::default()
         };
-        assert!(ensure_side_artifacts(&model, &mut e).is_ok());
+        assert!(ensure_side_artifacts(&model, 32768, &mut e).is_ok());
         let _ = std::fs::remove_file(model);
     }
 

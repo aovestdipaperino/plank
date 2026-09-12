@@ -526,6 +526,7 @@ Options:
       --quality            enable quality mode
       --warm-weights       touch all weights at load
       --ssd-streaming      stream experts from SSD instead of loading resident
+                           (automatic when the model cannot fit in RAM)
       --ssd-streaming-cold          assume a cold SSD cache
       --ssd-streaming-cache-experts N|<N>GB   bound the expert cache
       --ssd-streaming-preload-experts N       preload N experts at startup

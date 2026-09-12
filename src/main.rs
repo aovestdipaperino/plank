@@ -351,25 +351,6 @@ fn enter_startup_worktree(
 #[cfg(ds4_engine)]
 const MIN_RAM_BYTES: u64 = 96 * 1024 * 1024 * 1024;
 
-/// Total physical RAM in bytes, via `sysctl hw.memsize`.
-#[cfg(ds4_engine)]
-fn total_ram_bytes() -> Option<u64> {
-    let mut mem: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    // SAFETY: hw.memsize returns a u64; `mem`/`len` are valid out-params and
-    // the name is a NUL-terminated C string.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&raw mut mem).cast(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (rc == 0).then_some(mem)
-}
-
 /// Fails fast when another plank/ds4 instance is already running, with a clear
 /// message — instead of the engine's own guard, which calls `exit(2)` deep in
 /// `ds4_engine_open` (`ds4_acquire_instance_lock` in `ds4.c`) and kills the
@@ -409,7 +390,7 @@ fn acquire_model_lock() -> Result<(), String> {
 /// Returns an explanatory message when physical RAM is below the minimum.
 #[cfg(ds4_engine)]
 fn require_min_ram() -> Result<(), String> {
-    if let Some(bytes) = total_ram_bytes()
+    if let Some(bytes) = plank::download::total_ram_bytes()
         && bytes < MIN_RAM_BYTES
     {
         #[allow(clippy::cast_precision_loss)]
@@ -585,7 +566,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // (`--mtp-off` skips that). Kept local rather than written back into
         // `cfg`: only the engine open needs it.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&model, &mut tuning)?;
+        plank::download::ensure_side_artifacts(&model, cfg.generation.ctx_size, &mut tuning)?;
 
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
@@ -859,7 +840,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         // any other DeepSeek checkpoint runs text-only.
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&model_path, &mut tuning)?;
+        plank::download::ensure_side_artifacts(&model_path, cfg.generation.ctx_size, &mut tuning)?;
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,
