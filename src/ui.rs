@@ -623,6 +623,13 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
                 "Tool error: invalid tool call: {err}\n{}",
                 sysprompt::dsml_syntax_reminder()
             ),
+            // V4.1 speaks its own DSML dialect; until its reminder text is
+            // pinned against the C, the V4 reminder is the closest true thing
+            // to hand it — both are DSML, only the tag table differs.
+            sysprompt::ToolSyntax::Dsml41 => format!(
+                "Tool error: invalid DSML tool call: {err}\n{}",
+                sysprompt::dsml_syntax_reminder()
+            ),
         },
     }
 }
@@ -8737,6 +8744,7 @@ the original is frozen and listed in /tree"
                 syntax: match syntax {
                     crate::sysprompt::ToolSyntax::Dsml => "dsml",
                     crate::sysprompt::ToolSyntax::Qwen => "qwen",
+                    crate::sysprompt::ToolSyntax::Dsml41 => "dsml41",
                 },
                 artifact_version,
                 companion: &companion,

@@ -88,6 +88,12 @@ const MAGIC: &str = "plank-session 1";
 const DS4_FILE_EXT: &str = ".ds4.kv";
 /// Transcript extension for a Qwen session.
 const QWEN_FILE_EXT: &str = ".qwn.kv";
+/// Transcript extension for a `DeepSeek` V4.1 session.
+///
+/// Note it is not a suffix of, nor suffixed by, [`DS4_FILE_EXT`]: `.ds4.kv`
+/// and `.ds41.kv` differ before the final `.kv`, so the plain `ends_with`
+/// matching everything here does keeps the two families apart.
+const DS41_FILE_EXT: &str = ".ds41.kv";
 /// The untagged extension every transcript used before the families split.
 ///
 /// Migrated to [`DS4_FILE_EXT`] on first launch; nothing writes it any more.
@@ -99,25 +105,37 @@ const LEGACY_FILE_EXT: &str = ".kv";
 /// reason: a `SessionStore` is opened from places that hold no engine handle
 /// (the `/kvcache` browser, the insights reader), and threading a family
 /// through every one of them to name a file extension is not worth it.
-static FAMILY_IS_QWEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A tag rather than a flag: this was a `FAMILY_IS_QWEN` bool until V4.1
+/// arrived, and a third family no longer fits in a yes/no. `0` is the unset
+/// value an untouched static holds, so it has to stay `Ds4` — every transcript
+/// written before the families split was a `DeepSeek` one.
+static FAMILY_TAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(FAMILY_TAG_DS4);
+
+const FAMILY_TAG_DS4: u8 = 0;
+const FAMILY_TAG_QWEN: u8 = 1;
+const FAMILY_TAG_DS41: u8 = 2;
 
 /// Records the live model family. Called once at startup, before any store is
 /// opened; unset means `Ds4`, which is what every transcript written before
 /// the families split was.
 pub fn set_family(family: crate::gguf::ModelFamily) {
-    FAMILY_IS_QWEN.store(
-        family == crate::gguf::ModelFamily::Qwen,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let tag = match family {
+        crate::gguf::ModelFamily::Ds4 => FAMILY_TAG_DS4,
+        crate::gguf::ModelFamily::Qwen => FAMILY_TAG_QWEN,
+        crate::gguf::ModelFamily::Ds41 => FAMILY_TAG_DS41,
+    };
+    FAMILY_TAG.store(tag, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The live model family.
 #[must_use]
 pub fn family() -> crate::gguf::ModelFamily {
-    if FAMILY_IS_QWEN.load(std::sync::atomic::Ordering::Relaxed) {
-        crate::gguf::ModelFamily::Qwen
-    } else {
-        crate::gguf::ModelFamily::Ds4
+    match FAMILY_TAG.load(std::sync::atomic::Ordering::Relaxed) {
+        FAMILY_TAG_QWEN => crate::gguf::ModelFamily::Qwen,
+        FAMILY_TAG_DS41 => crate::gguf::ModelFamily::Ds41,
+        // Including any value never stored: unset and unknown both read as the
+        // pre-split family, never as a wrong one.
+        _ => crate::gguf::ModelFamily::Ds4,
     }
 }
 
@@ -138,6 +156,7 @@ pub fn family_ext(family: crate::gguf::ModelFamily) -> &'static str {
     match family {
         crate::gguf::ModelFamily::Ds4 => DS4_FILE_EXT,
         crate::gguf::ModelFamily::Qwen => QWEN_FILE_EXT,
+        crate::gguf::ModelFamily::Ds41 => DS41_FILE_EXT,
     }
 }
 /// Extension of the engine KV payload written beside a transcript.
@@ -1166,7 +1185,7 @@ impl SessionStore {
             let Some(stem) = name.strip_suffix(LEGACY_FILE_EXT) else {
                 continue;
             };
-            // `.ds4.kv` and `.qwn.kv` both end in `.kv`, so the tagged files
+            // `.ds4.kv`, `.qwn.kv` and `.ds41.kv` all end in `.kv`, so the tagged files
             // reach here too; their "stem" still carries the tag, and a stem
             // containing a dot is never a valid id.
             if !is_valid_id_prefix(stem) {
@@ -3654,9 +3673,25 @@ hello\n";
         assert_eq!(family_ext(ModelFamily::Qwen), ".qwn.kv");
         assert_ne!(family_ext(ModelFamily::Ds4), family_ext(ModelFamily::Qwen));
         // Both still end in `.kv`, so anything matching on that keeps working.
-        for f in [ModelFamily::Ds4, ModelFamily::Qwen] {
+        for f in [ModelFamily::Ds4, ModelFamily::Qwen, ModelFamily::Ds41] {
             assert!(family_ext(f).ends_with(LEGACY_FILE_EXT));
         }
+    }
+
+    /// V4.1 shares the cache directory with V4, and `.ds41.kv` also ends in
+    /// `.kv` — the one arrangement where a sloppy suffix match would let one
+    /// family read the other's transcripts.
+    #[test]
+    fn ds41_has_its_own_transcript_extension() {
+        use crate::gguf::ModelFamily;
+        assert_eq!(family_ext(ModelFamily::Ds41), ".ds41.kv");
+        // `.ds4.kv` must not match a `.ds41.kv` name by suffix.
+        assert!(!"wily-curie.ds41.kv".ends_with(family_ext(ModelFamily::Ds4)));
+        assert!(!"wily-curie.ds4.kv".ends_with(family_ext(ModelFamily::Ds41)));
+        assert_eq!(
+            sysprompt_note_name(ModelFamily::Ds41),
+            "sysprompt-last.ds41.prompt"
+        );
     }
 
     /// Untagged transcripts are renamed once, at the top level only.

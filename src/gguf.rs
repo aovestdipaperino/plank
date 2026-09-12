@@ -26,6 +26,11 @@ pub enum ModelFamily {
     Ds4,
     /// Qwen3.8-Flash-Next (`qwen4exp`).
     Qwen,
+    /// `DeepSeek` V4.1 Flash (`deepseek41`). A distinct family, not a revision
+    /// of V4: its weights, vision encoder and tokenizer are not interchangeable,
+    /// and it speaks its own DSML dialect, so nothing captured under one family
+    /// may be replayed under the other.
+    Ds41,
 }
 
 impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
@@ -37,6 +42,7 @@ impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
     fn from(syntax: trace_stream::syntax::ToolSyntax) -> Self {
         match syntax {
             trace_stream::syntax::ToolSyntax::Qwen => Self::Qwen,
+            trace_stream::syntax::ToolSyntax::Dsml41 => Self::Ds41,
             trace_stream::syntax::ToolSyntax::Dsml => Self::Ds4,
         }
     }
@@ -44,6 +50,12 @@ impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
 
 /// The `general.architecture` value the C matches for Qwen3.8-Flash-Next.
 const QWEN_ARCH: &str = "qwen4exp";
+
+/// The `general.architecture` value the C matches for `DeepSeek` V4.1 Flash.
+///
+/// V4's is `deepseek4`, which is *not* a prefix match away: the C compares the
+/// whole string, so `deepseek41` must be listed on its own.
+const DS41_ARCH: &str = "deepseek41";
 
 /// Refuses to allocate for a declared length beyond this. The file may be
 /// truncated or not a GGUF at all, and a bogus 64-bit length would otherwise
@@ -64,6 +76,7 @@ const MAX_KV_PAIRS: u64 = 1 << 20;
 pub fn family_of(path: &Path) -> ModelFamily {
     match architecture(path).as_deref() {
         Some(QWEN_ARCH) => ModelFamily::Qwen,
+        Some(DS41_ARCH) => ModelFamily::Ds41,
         _ => ModelFamily::Ds4,
     }
 }

@@ -51,7 +51,10 @@ impl ModelSet {
     pub fn for_family(family: crate::gguf::ModelFamily) -> Self {
         match family {
             crate::gguf::ModelFamily::Qwen => Self::Qwen,
-            crate::gguf::ModelFamily::Ds4 => Self::Ds4,
+            // V4.1 has no artifact set of its own yet: its weights are still
+            // installed and named as the `DeepSeek` set, so pointing it at a
+            // set that does not exist would break every manifest lookup.
+            crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41 => Self::Ds4,
         }
     }
 

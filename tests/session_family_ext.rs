@@ -31,5 +31,17 @@ fn setting_the_family_changes_the_transcript_extension() {
     assert_ne!(before, after);
     assert_eq!(family_ext(ModelFamily::Qwen), ".qwn.kv");
 
+    // V4.1 is a third family, so the tag can no longer be a Qwen yes/no: every
+    // family must round-trip through the global, not just the two extremes.
+    set_family(ModelFamily::Ds41);
+    assert_eq!(family(), ModelFamily::Ds41);
+    let v41 = store.path_for_id("cheeky-bell");
+    assert!(v41.to_string_lossy().ends_with(".ds41.kv"), "{v41:?}");
+    assert_ne!(v41, before);
+    assert_ne!(v41, after);
+
+    set_family(ModelFamily::Ds4);
+    assert_eq!(family(), ModelFamily::Ds4);
+
     let _ = std::fs::remove_dir_all(&dir);
 }

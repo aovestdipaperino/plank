@@ -2779,7 +2779,9 @@ fn companion_slots(
     }
     match family {
         crate::gguf::ModelFamily::Qwen => (None, companion),
-        crate::gguf::ModelFamily::Ds4 => (companion, None),
+        // V4.1 takes a `DSpark`-shaped drafter in the same slot V4 does; the
+        // `ple_path` slot is Qwen's alone.
+        crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41 => (companion, None),
     }
 }
 
@@ -2800,6 +2802,9 @@ fn warn_on_companion_mismatch(family: crate::gguf::ModelFamily, companion: &Path
     let expected = match family {
         crate::gguf::ModelFamily::Qwen => "qwen4-exp-ple",
         crate::gguf::ModelFamily::Ds4 => "deepseek4-dspark",
+        // V4.1's own drafter names itself after its architecture, the way
+        // V4's does.
+        crate::gguf::ModelFamily::Ds41 => "deepseek41-dspark",
     };
     if arch != expected {
         eprintln!(
