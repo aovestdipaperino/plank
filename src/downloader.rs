@@ -823,7 +823,6 @@ pub fn lock_path() -> PathBuf {
 pub fn job_path_in(root: &Path, set: crate::manifest::ModelSet) -> PathBuf {
     let name = match set {
         crate::manifest::ModelSet::Ds4 => "job.json",
-        crate::manifest::ModelSet::Qwen => "job-qwen.json",
     };
     crate::manifest::downloads_dir_in(root).join(name)
 }
@@ -889,18 +888,15 @@ pub fn read_job_in(
 /// The one pending job under `root`, and which set it belongs to.
 ///
 /// At most one download runs at a time, so at most one job file normally
-/// exists. Qwen is checked first only to make the scan deterministic; if both
-/// somehow exist, the helper each was written for still reads its own.
+/// exists. The scan is ordered so it stays deterministic if more than one set
+/// ever has a job file; the helper each was written for still reads its own.
 #[must_use]
 pub fn pending_job_in(
     root: &Path,
 ) -> Option<(crate::manifest::ModelSet, crate::manifest::Manifest)> {
-    [
-        crate::manifest::ModelSet::Qwen,
-        crate::manifest::ModelSet::Ds4,
-    ]
-    .into_iter()
-    .find_map(|set| read_job_in(root, set).map(|m| (set, m)))
+    [crate::manifest::ModelSet::Ds4]
+        .into_iter()
+        .find_map(|set| read_job_in(root, set).map(|m| (set, m)))
 }
 
 /// The pending job under `~/.plank`, if one is recorded and still parses.
