@@ -596,16 +596,48 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         eprintln!("plank: loading model {}...", model.display());
         // Render the C engine's noisy startup log in place on one row.
         let replacer = plank::stderrline::StderrLineReplacer::start();
-        let engine = Ds4Engine::open(
-            &model,
-            backend,
-            cfg.generation.ctx_size,
-            cfg.n_threads,
-            cfg.power_percent,
-            &tuning,
-        )
-        .map_err(|e| e.to_string())?;
+        let opened = (|| {
+            let first = match Ds4Engine::open(
+                &model,
+                backend,
+                cfg.generation.ctx_size,
+                cfg.n_threads,
+                cfg.power_percent,
+                &tuning,
+            ) {
+                Ok(engine) => return Ok(engine),
+                Err(e) => e.to_string(),
+            };
+            // The C refuses to open a checkpoint at all when the DSpark draft
+            // model does not match it. When plank picked that companion itself,
+            // retry once (never in a loop) rather than making the user discover
+            // `--mtp-off`; a companion the user named is never dropped (see
+            // `EngineTuning::without_auto_companion`).
+            let Some(solo) = tuning.without_auto_companion() else {
+                return Err(first);
+            };
+            eprintln!(
+                "note: speculative decoding disabled (the DSpark draft model is not compatible with this checkpoint)"
+            );
+            Ds4Engine::open(
+                &model,
+                backend,
+                cfg.generation.ctx_size,
+                cfg.n_threads,
+                cfg.power_percent,
+                &solo,
+            )
+            // Report the original failure, with the retry's as context: the
+            // retry only rules the companion out, it does not diagnose a
+            // corrupt model.
+            .map_err(|second| {
+                format!(
+                    "{first}\n(retried without the DSpark draft model, which also failed: {second})"
+                )
+            })
+        })();
         drop(replacer);
+        let engine = opened?;
         eprintln!(
             "plank: model ready: {}{}",
             engine.model_name(),

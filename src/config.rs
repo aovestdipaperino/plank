@@ -239,6 +239,15 @@ pub struct EngineTuning {
     /// the engine cannot: it detects the family while opening, and the path has
     /// to be in the options struct before that.
     pub mtp_path: Option<PathBuf>,
+    /// Whether [`EngineTuning::mtp_path`] came from the user naming it
+    /// (`--mtp-model PATH`) rather than from plank resolving the default
+    /// `DSpark` file on disk ([`crate::download::ensure_dspark_support`]).
+    ///
+    /// The distinction is what lets a failed open retry without the companion:
+    /// a file plank chose itself may be dropped when the checkpoint refuses it,
+    /// while one the user named must fail loudly instead of being silently
+    /// ignored.
+    pub mtp_path_explicit: bool,
     /// Draft tokens per MTP step from `--mtp-draft` (C default: 1).
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
@@ -295,10 +304,41 @@ pub struct EngineTuning {
     pub dir_steering_ffn: f32,
 }
 
+impl EngineTuning {
+    /// The same tuning with a plank-chosen `DSpark` companion removed, when
+    /// there is one to remove.
+    ///
+    /// Used for the single retry after a model open that failed with a
+    /// companion attached: the C refuses to open a checkpoint at all when the
+    /// draft model does not match it (V4.1, and the Vision-Exp drafter against
+    /// the `0731` language checkpoint), so a run plank auto-paired must be able
+    /// to fall back to target-only decode instead of refusing to start.
+    ///
+    /// `None` when there is nothing to drop, and — deliberately — when the user
+    /// named the companion themselves: dropping that silently would hide a
+    /// mistyped `--mtp-model` behind a slower run.
+    #[must_use]
+    pub fn without_auto_companion(&self) -> Option<Self> {
+        if self.mtp_path.is_none() || self.mtp_path_explicit {
+            return None;
+        }
+        Some(Self {
+            mtp_path: None,
+            // Speculation needs the drafter; without it the DSpark runtime
+            // would be selected with no support model, which the C rejects
+            // outright ("--dspark requires --mtp-model FILE").
+            mtp: false,
+            mtp_strict: false,
+            ..self.clone()
+        })
+    }
+}
+
 impl Default for EngineTuning {
     fn default() -> Self {
         Self {
             mtp_path: None,
+            mtp_path_explicit: false,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
             mtp: true,
@@ -1192,7 +1232,10 @@ fn parse_engine_option(
     steering_scale_set: &mut bool,
 ) -> Result<(), String> {
     match arg {
-        "--mtp-model" => e.mtp_path = Some(PathBuf::from(v)),
+        "--mtp-model" => {
+            e.mtp_path = Some(PathBuf::from(v));
+            e.mtp_path_explicit = true;
+        }
         "--mtp-draft" => e.mtp_draft_tokens = parse_int(v, arg)?,
         "--mtp-margin" => e.mtp_margin = parse_float_range(v, arg, 0.0, 1000.0)?,
         // The C turns DSpark on for any of its three flags, so the threshold
@@ -2159,6 +2202,46 @@ mod tests {
         assert!(err.contains("invalid value for --seed"));
         let err = parse_options(&args(&["--temp", "nan"])).unwrap_err();
         assert!(err.contains("invalid value for --temp"));
+    }
+
+    /// `--mtp-model` marks the companion as the user's own choice, which is
+    /// what stops a failed open from silently dropping it.
+    #[test]
+    fn an_explicit_mtp_model_is_marked_as_the_users_choice() {
+        let c = parse_options(&args(&["--mtp-model", "/d.gguf"])).unwrap();
+        assert_eq!(c.engine.mtp_path, Some(PathBuf::from("/d.gguf")));
+        assert!(c.engine.mtp_path_explicit);
+        assert!(
+            c.engine.without_auto_companion().is_none(),
+            "a user-named companion must never be dropped"
+        );
+        // Nothing else sets the flag.
+        let c = parse_options(&args(&["--mtp"])).unwrap();
+        assert!(!c.engine.mtp_path_explicit);
+    }
+
+    /// The retry's decision: drop a plank-chosen companion (and with it the
+    /// `DSpark` runtime, which the C rejects with no support model), keep every
+    /// other knob, and report nothing to drop when there is no companion.
+    #[test]
+    fn the_companion_fallback_drops_only_a_plank_chosen_drafter() {
+        let auto = EngineTuning {
+            mtp: true,
+            mtp_strict: true,
+            mtp_path: Some(PathBuf::from("/auto/dspark.gguf")),
+            mtp_path_explicit: false,
+            ssd_streaming: true,
+            ..EngineTuning::default()
+        };
+        let solo = auto.without_auto_companion().expect("auto is droppable");
+        assert_eq!(solo.mtp_path, None);
+        assert!(!solo.mtp);
+        assert!(!solo.mtp_strict);
+        assert!(solo.ssd_streaming, "unrelated tuning is preserved");
+        // Nothing to drop: no companion at all.
+        assert!(EngineTuning::default().without_auto_companion().is_none());
+        // And the retry is not offered twice: the fallback has no companion.
+        assert!(solo.without_auto_companion().is_none());
     }
 
     #[test]

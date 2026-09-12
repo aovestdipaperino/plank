@@ -497,7 +497,38 @@ pub fn ensure_side_artifacts(
     if crate::gguf::supports_vision(model_path) {
         ensure_vision_encoder()?;
     }
+    // DSpark is implemented for V4 only (`refs/ds4/docs/MODELS.md` at bd66c40):
+    // the engine refuses to open a V4.1 checkpoint at all when a draft model is
+    // attached, so plank must not auto-pair one. A companion the user named
+    // themselves still goes through, and still fails loudly there.
+    if drop_dspark_for_family(crate::gguf::family_of(model_path), engine) {
+        return Ok(());
+    }
     ensure_dspark_support(engine)
+}
+
+/// Turns speculative decoding off for a family that has no `DSpark` drafter,
+/// returning whether the caller should skip companion resolution entirely.
+///
+/// V4 is the only family the engine implements `DSpark` for (`refs/ds4/docs/MODELS.md`
+/// at bd66c40); it refuses to open a V4.1 checkpoint at all when a draft model
+/// is attached. A companion the *user* named is left alone: they asked for it,
+/// so the engine's own refusal is the right answer, not a silent downgrade.
+fn drop_dspark_for_family(
+    family: crate::gguf::ModelFamily,
+    engine: &mut crate::config::EngineTuning,
+) -> bool {
+    if family == crate::gguf::ModelFamily::Ds4 {
+        return false;
+    }
+    if engine.mtp && engine.mtp_path.is_none() {
+        engine.mtp = false;
+        engine.mtp_strict = false;
+        eprintln!(
+            "note: speculative decoding disabled (DSpark is not implemented for DeepSeek V4.1 Flash)"
+        );
+    }
+    true
 }
 
 /// Ensures the vision-encoder GGUF exists at its default path, offering to
@@ -1855,6 +1886,60 @@ mod tests {
             url.contains("Vision-Exp"),
             "must be the vision-experimental support: {url}"
         );
+    }
+
+    /// V4.1 has no `DSpark` drafter and the engine refuses to open the model at
+    /// all when one is attached, so plank must never auto-pair there.
+    #[test]
+    fn a_family_without_a_drafter_never_auto_pairs_one() {
+        use crate::gguf::ModelFamily;
+        let mut e = crate::config::EngineTuning::default();
+        assert!(e.mtp, "speculation is on by default");
+        assert!(drop_dspark_for_family(ModelFamily::Ds41, &mut e));
+        assert!(!e.mtp);
+        assert!(!e.mtp_strict);
+        assert_eq!(e.mtp_path, None);
+        // V4 is the family that takes one, so resolution proceeds there.
+        let mut v4 = crate::config::EngineTuning::default();
+        assert!(!drop_dspark_for_family(ModelFamily::Ds4, &mut v4));
+        assert!(v4.mtp);
+    }
+
+    /// A companion the user named survives the family gate: the engine's own
+    /// refusal is the answer they asked for.
+    #[test]
+    fn an_explicit_companion_is_not_dropped_by_the_family_gate() {
+        let mut e = crate::config::EngineTuning {
+            mtp: true,
+            mtp_path: Some(PathBuf::from("/somewhere/custom-drafter.gguf")),
+            mtp_path_explicit: true,
+            ..crate::config::EngineTuning::default()
+        };
+        assert!(drop_dspark_for_family(
+            crate::gguf::ModelFamily::Ds41,
+            &mut e
+        ));
+        assert!(e.mtp);
+        assert_eq!(
+            e.mtp_path,
+            Some(PathBuf::from("/somewhere/custom-drafter.gguf"))
+        );
+    }
+
+    /// The auto-resolved path is marked as plank's own choice, so a failed open
+    /// may retry without it.
+    #[test]
+    fn an_auto_resolved_companion_is_not_marked_explicit() {
+        let mut e = crate::config::EngineTuning::default();
+        // Only reached when the file already exists; skip when it does not, so
+        // the test never prompts or downloads.
+        if !default_dspark_path().exists() {
+            return;
+        }
+        assert!(ensure_dspark_support(&mut e).is_ok());
+        assert_eq!(e.mtp_path, Some(default_dspark_path()));
+        assert!(!e.mtp_path_explicit);
+        assert!(e.without_auto_companion().is_some());
     }
 
     #[test]
