@@ -243,10 +243,10 @@ pub const THINK_LEVEL_REQUIRES_V41: &str = "--think-level requires a DeepSeek V4
 ///
 /// Every decision that turns on the numeric-effort family goes through here,
 /// rather than each site re-deriving it from [`crate::sysprompt::ToolSyntax`]:
-/// refusing `/think <n>` elsewhere ([`think_level_unsupported`]) and showing
-/// the effort number in the footer ([`ThinkMode::for_display`]). One
-/// predicate, so a future family that gains the knob is added in exactly one
-/// place.
+/// refusing `/think <n>` elsewhere ([`think_level_unsupported`]), showing the
+/// effort number in the footer ([`ThinkMode::for_display`]), and suppressing
+/// plank's own reasoning prose ([`injects_low_preamble`]). One predicate, so a
+/// future family that gains the knob is added in exactly one place.
 #[must_use]
 pub fn numeric_thinking_model(model_name: &str) -> bool {
     crate::sysprompt::ToolSyntax::for_model_name(model_name) == crate::sysprompt::ToolSyntax::Dsml41
@@ -257,6 +257,19 @@ pub fn numeric_thinking_model(model_name: &str) -> bool {
 #[must_use]
 pub fn think_level_unsupported(mode: ThinkMode, model_name: &str) -> bool {
     matches!(mode, ThinkMode::Level(_)) && !numeric_thinking_model(model_name)
+}
+
+/// Whether plank's own [`THINK_LOW_PREFIX`] prose should be injected ahead of
+/// the system prompt for `mode` on the named model.
+///
+/// On a numeric-thinking family the model has a real effort dial, and the C
+/// already emits `Reasoning Effort: 25` for `Low` ([`THINK_LOW_EFFORT_LEVEL`])
+/// — so plank injecting *additional* invented prose on top would mangle a
+/// prompt the model was trained on to say something it already says better.
+/// Only families with no such dial get the preamble.
+#[must_use]
+pub fn injects_low_preamble(mode: ThinkMode, model_name: &str) -> bool {
+    mode == ThinkMode::Low && !numeric_thinking_model(model_name)
 }
 
 /// The numeric effort `DeepSeek` V4.1 applies for the C's `HIGH` mode, which
@@ -1597,7 +1610,7 @@ mod tests {
         EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, PrefillProgress,
         THINK_LOW_EFFORT_LEVEL, THINK_LOW_PREFIX, THINK_MAX_PREFIX, ThinkMode, ThinkToolRecovery,
         Utf8Stream, V41_MAX_EFFORT, V41_MEDIUM_EFFORT, deepseek41_effort_text,
-        numeric_thinking_model, reusable_prefix, think_level_unsupported,
+        injects_low_preamble, numeric_thinking_model, reusable_prefix, think_level_unsupported,
     };
 
     /// A model name the family resolver reads as `DeepSeek` V4.1 — the one
@@ -1867,6 +1880,24 @@ mod tests {
         assert_eq!(ThinkMode::Medium.effort_level(), Some(V41_MEDIUM_EFFORT));
         assert_eq!(ThinkMode::Max.effort_level(), Some(V41_MAX_EFFORT));
         assert_eq!(ThinkMode::Level(42).effort_level(), Some(42));
+    }
+
+    // CHANGE 2: plank's invented brief-reasoning prose is injected only where
+    // the model has no effort dial of its own. On V4.1 the C's
+    // `Reasoning Effort: 25` line is the whole of what `low` emits.
+    #[test]
+    fn the_low_preamble_is_suppressed_on_a_numeric_family() {
+        assert!(!injects_low_preamble(ThinkMode::Low, V41));
+        assert!(injects_low_preamble(ThinkMode::Low, V4));
+        assert!(injects_low_preamble(ThinkMode::Low, "Qwen3 Coder"));
+        // No other level ever carried it, on any family.
+        for m in [ThinkMode::Off, ThinkMode::Medium, ThinkMode::Max] {
+            assert!(!injects_low_preamble(m, V4), "{m:?}");
+            assert!(!injects_low_preamble(m, V41), "{m:?}");
+        }
+        for n in [1u8, 25, 100] {
+            assert!(!injects_low_preamble(ThinkMode::Level(n), V41));
+        }
     }
 
     // The C's own names for the two levels it shares with us, plus the casing

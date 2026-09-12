@@ -647,10 +647,21 @@ impl Ds4Model {
     /// appends nothing for the modes that carry no preamble, which is why it is
     /// safe to call unconditionally. `Low`, which the C does not have, is
     /// tokenized here from [`crate::engine::THINK_LOW_PREFIX`] through the same
-    /// rendered-chat tokenizer the C symbol uses internally.
+    /// rendered-chat tokenizer the C symbol uses internally — but only on a
+    /// family without a native effort knob
+    /// ([`crate::engine::injects_low_preamble`]); on one with a knob the C's
+    /// own `Reasoning Effort: 25` line is the whole of what `Low` emits.
     fn append_effort_prefix(&self, tokens: &mut Ds4TokensGuard, think: ThinkMode) {
         if think == ThinkMode::Low {
-            tokens.push_all(&self.tokenize_rendered(crate::engine::THINK_LOW_PREFIX));
+            // Plank's invented brief-reasoning prose, but only on a family with
+            // no effort dial of its own: where the model has one, the
+            // `Reasoning Effort: 25` line below says the same thing in the
+            // model's own trained vocabulary, and stacking plank prose on top
+            // of it is exactly the prompt-mangling this avoids
+            // (`engine::injects_low_preamble`).
+            if crate::engine::injects_low_preamble(think, &self.model_name()) {
+                tokens.push_all(&self.tokenize_rendered(crate::engine::THINK_LOW_PREFIX));
+            }
             // `Low` has no dedicated C think mode, so it is `HIGH` at the FFI
             // boundary (`ds4_think`) — and the C's own DeepSeek V4.1 effort
             // text defaults `HIGH` to 75, indistinguishable from `Medium`. Ask
