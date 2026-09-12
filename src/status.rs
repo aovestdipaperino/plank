@@ -3343,6 +3343,56 @@ mod tests {
         assert!(seg.ends_with(STATUS_STYLE_START), "{seg}");
     }
 
+    /// On a model with a native numeric effort knob the think segment shows
+    /// the effort number in force instead of plank's name for the level — and
+    /// must still hold exactly the same width, so nothing to its right shifts
+    /// when the level changes.
+    #[test]
+    fn the_think_segment_keeps_its_width_with_a_numeric_effort() {
+        use crate::engine::ThinkMode;
+
+        let seg_and_rest = |think: ThinkMode| {
+            let st = Status {
+                think,
+                ctx_size: 1000,
+                ctx_used: 30,
+                ..Status::default()
+            };
+            let line = build_status_text(&st, false, true);
+            let at = line.find(THINK_MARK).expect("think segment present");
+            // The segment alone, mark to bar: measuring the whole tail would
+            // also pick up neighbours that carry process-global state.
+            let rest = &line[at..];
+            let end = rest.find('|').expect("think segment ends at a bar");
+            rest[..=end].chars().count()
+        };
+        // Every level the footer can be in on a numeric family, as the UI
+        // layer maps it for display (`ThinkMode::for_display`).
+        let mut widths = std::collections::HashSet::new();
+        for m in ThinkMode::ALL {
+            widths.insert(seg_and_rest(m.for_display(true)));
+            widths.insert(seg_and_rest(m.for_display(false)));
+        }
+        for n in 1..=100u8 {
+            widths.insert(seg_and_rest(ThinkMode::Level(n)));
+        }
+        assert_eq!(
+            widths.len(),
+            1,
+            "the think segment changed width: {widths:?}"
+        );
+        // And the number is what is shown: `low` reads as 25 on V4.1.
+        let st = Status {
+            think: ThinkMode::Low.for_display(true),
+            ctx_size: 1000,
+            ctx_used: 30,
+            ..Status::default()
+        };
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("25"), "{line}");
+        assert!(!line.contains("low"), "{line}");
+    }
+
     /// A clean tree says nothing: the segment exists to report change, and a
     /// permanent `0 · +0 -0` would be three columns of noise.
     #[test]

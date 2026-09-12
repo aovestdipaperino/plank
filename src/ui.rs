@@ -3027,6 +3027,16 @@ impl Agent<'_> {
         stream
     }
 
+    /// The reasoning level as the *footer* should show it: on a model with a
+    /// native numeric effort knob the segment carries the effort number in
+    /// force rather than plank's name for the level
+    /// ([`crate::engine::ThinkMode::for_display`]). Display only — `self.think`
+    /// stays the real state, which is what keys the KV fingerprint.
+    fn footer_think(&self, model_name: &str) -> crate::engine::ThinkMode {
+        self.think
+            .for_display(crate::engine::numeric_thinking_model(model_name))
+    }
+
     /// Streams one generation pass: paints the live status bar for prefill and
     /// generation, and routes model text through the viz + markdown pipeline.
     #[allow(clippy::type_complexity)]
@@ -3073,10 +3083,10 @@ impl Agent<'_> {
         let mut assistant_text = String::new();
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
-        let think = self.think;
         // Bound here rather than inside the event closure, which cannot borrow
         // `self` while `self.engine` is generating.
         let model_name = self.engine.model_name();
+        let think = self.footer_think(&model_name);
         let prompt_tokens = self.engine.count_tokens(prompt_text);
         let mut bar = crate::statusbar::StatusBar::new(self.show_footer && self.color, self.color);
         let verb = status::random_verb_index();
@@ -4050,7 +4060,10 @@ impl LiveStatus {
             started,
             ctx_size,
             power_percent,
-            think,
+            // Footer-facing only: a numeric-thinking family shows the effort
+            // number in force instead of plank's name for it. Mapped once,
+            // here, so every snapshot this builder emits agrees.
+            think: think.for_display(crate::engine::numeric_thinking_model(&model_name)),
             model_name,
             running_jobs,
         }
@@ -4483,7 +4496,7 @@ impl Agent<'_> {
                 // be useful, which is when people actually want them.
                 spec: stats.spec,
                 power_percent: self.power_percent,
-                think: self.think,
+                think: self.footer_think(&self.engine.model_name()),
                 running_jobs: self.tool_ctx.bash.running_count(),
                 pressure_yielded: self.yield_policy.plan().is_some(),
                 ..Status::default()
@@ -12631,7 +12644,7 @@ impl Agent<'_> {
             ctx_used: self.engine.count_tokens(&rendered),
             ctx_size: self.engine.ctx_size(),
             power_percent: self.power_percent,
-            think: self.think,
+            think: self.footer_think(&self.engine.model_name()),
             spec: self.last_spec,
             running_jobs: self.tool_ctx.bash.running_count(),
             pressure_yielded: self.yield_policy.plan().is_some(),
