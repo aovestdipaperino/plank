@@ -935,8 +935,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/hooks",
-        args: "",
-        desc: "list the configured hooks and what triggers them",
+        args: "[on|off]",
+        desc: "list the configured hooks, or turn hook execution on/off for this session",
     },
     SlashCommand {
         name: "/mcp",
@@ -1124,7 +1124,6 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/jobs"
             | "/memory"
             | "/agent"
-            | "/hooks"
             | "/remote-control"
             | "/rc"
             | "/remote"
@@ -1174,6 +1173,8 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/rate")
         || slash_command_with_args(cmd, "/power")
         || slash_command_with_args(cmd, "/think")
+        // `/hooks` takes an optional `on`/`off` runtime toggle.
+        || slash_command_with_args(cmd, "/hooks")
         || slash_command_with_args(cmd, "/switch")
         || slash_command_with_args(cmd, "/del")
         || slash_command_with_args(cmd, "/strip")

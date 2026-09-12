@@ -6247,7 +6247,7 @@ impl Agent<'_> {
                 self.session.tasks.render_list(self.session.goal.as_ref())
             ),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
-            "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
+            "/hooks" => print!("{}", self.hooks_command(arg)),
             "/remote-control" | "/rc" => {
                 println!(
                     "{cmd} needs the full-screen TUI — a piped session can't mirror output or run remote prompts"
@@ -7950,6 +7950,39 @@ the original is frozen and listed in /tree"
         };
         crate::status::set_temperature(temp);
         format!("temperature {temp:.2}")
+    }
+
+    /// `/hooks [on|off]`: the shared body for both front ends.
+    ///
+    /// One implementation rather than two, so the plain-stdout REPL and the
+    /// TUI pane can never drift apart on what the command accepts. Returns the
+    /// text to print/pane, always newline-terminated.
+    fn hooks_command(&self, arg: &str) -> String {
+        match arg.trim() {
+            "" => {
+                let state = if crate::hooks::enabled() {
+                    "hooks are enabled"
+                } else {
+                    "hooks are disabled for this session (/hooks on to re-enable)"
+                };
+                format!(
+                    "{}{state}\n",
+                    crate::hooks::render_list(&self.tool_ctx.hooks)
+                )
+            }
+            "on" => {
+                crate::hooks::set_enabled(true);
+                "hooks enabled: hooks will run again from the next event\n".to_string()
+            }
+            "off" => {
+                crate::hooks::set_enabled(false);
+                // Runtime only: nothing is written to hooks.json or settings,
+                // so the next launch is back to the configured behaviour.
+                "hooks disabled for the rest of this session (nothing was written to disk)\n"
+                    .to_string()
+            }
+            other => format!("usage: /hooks [on|off] (got {other:?})\n"),
+        }
     }
 
     fn think_command(&mut self, arg: &str, on_progress: &mut dyn FnMut()) -> String {
@@ -14752,10 +14785,7 @@ impl Agent<'_> {
                 ));
             }
             "/hooks" => {
-                *report = Some(tui::ReportPanel::new(
-                    "hooks",
-                    &crate::hooks::render_list(&self.tool_ctx.hooks),
-                ));
+                *report = Some(tui::ReportPanel::new("hooks", &self.hooks_command(arg)));
             }
             "/remote-control" | "/rc" => {
                 for line in self.remote_toggle_lines(cmd, arg) {
@@ -21630,6 +21660,38 @@ mod tests {
         // An unknown prefix is a clean error, not a panic.
         let mut d = test_agent(&dir, ScriptedEngine::default(), &cfg);
         assert!(d.resume_from_cli("nonexistent0").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // `/hooks` shares one body between the plain REPL and the TUI pane, so this
+    // covers both call sites. The toggle is runtime-only: nothing is written.
+    #[test]
+    fn hooks_command_lists_toggles_and_rejects_junk() {
+        let _lock = crate::hooks::TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch_dir("hooks-cmd");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        // Bare form still lists, and now says which way the switch is thrown.
+        let out = agent.hooks_command("");
+        assert!(out.contains("hooks are enabled"), "got: {out}");
+
+        let out = agent.hooks_command("off");
+        assert!(out.contains("disabled"), "got: {out}");
+        assert!(!crate::hooks::enabled());
+        let listed = agent.hooks_command("");
+        assert!(listed.contains("hooks are disabled"), "got: {listed}");
+
+        let out = agent.hooks_command("on");
+        assert!(out.contains("enabled"), "got: {out}");
+        assert!(crate::hooks::enabled());
+
+        let out = agent.hooks_command("sideways");
+        assert!(out.contains("usage: /hooks [on|off]"), "got: {out}");
+        // A bad argument changes nothing.
+        assert!(crate::hooks::enabled());
         std::fs::remove_dir_all(&dir).ok();
     }
 
