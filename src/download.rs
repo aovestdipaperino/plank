@@ -33,6 +33,15 @@ use crate::arcade::breakout::Breakout;
 
 /// Hugging Face repository hosting the GGUF files.
 const REPO: &str = "antirez/deepseek-v4-gguf";
+
+/// Hugging Face repository for `DeepSeek` V4.1 Flash artifacts. Separate from
+/// [`REPO`] because V4 and V4.1 are published as distinct repositories
+/// upstream (`refs/ds4/download_model.sh`).
+const DS41_REPO: &str = "antirez/deepseek-v4.1-flash-gguf";
+
+/// V4.1 main model filename, mirroring `refs/ds4/download_model.sh`'s
+/// `DS41_Q2_FILE`.
+const DS41_FILE: &str = "DeepSeek-V4.1-Flash-Q2.gguf";
 /// The recommended Vision-Experimental Flash quant (~81 GB) for 96–128 GB
 /// machines.
 ///
@@ -271,7 +280,12 @@ pub fn default_model_path() -> PathBuf {
 
 /// Hugging Face download URL for `file` in [`REPO`].
 fn file_url(file: &str) -> String {
-    format!("https://huggingface.co/{REPO}/resolve/main/{file}")
+    repo_file_url(REPO, file)
+}
+
+/// Hugging Face download URL for `file` in `repo`.
+fn repo_file_url(repo: &str, file: &str) -> String {
+    format!("https://huggingface.co/{repo}/resolve/main/{file}")
 }
 
 /// Default `DSpark` support-model location, used when `--dspark` is given
@@ -336,6 +350,50 @@ pub fn default_managed_model_path() -> PathBuf {
 #[must_use]
 pub fn model_url() -> String {
     file_url(FILE)
+}
+
+/// Hugging Face download URL for the V4.1 Flash main GGUF.
+#[must_use]
+pub fn ds41_model_url() -> String {
+    repo_file_url(DS41_REPO, DS41_FILE)
+}
+
+/// Uncompiled-in size estimate for a set's `main` artifact, in GB, used only
+/// when no manifest is on hand to give an exact figure. From
+/// `refs/ds4/docs/MODELS.md`.
+fn fallback_main_gb(set: crate::manifest::ModelSet) -> f64 {
+    match set {
+        crate::manifest::ModelSet::Ds4 => 87.0,
+        crate::manifest::ModelSet::Ds41 => 341.0,
+    }
+}
+
+/// Human-facing size of `set`'s `main` artifact under `root`, in GB.
+///
+/// Prefers a manifest already on hand — an in-flight/declined download job,
+/// or a previously installed manifest — over the hardcoded estimate, so a
+/// figure the manifest has already revised is reported rather than a stale
+/// compiled-in guess.
+fn main_artifact_gb(root: &Path, set: crate::manifest::ModelSet) -> f64 {
+    let from_manifest = |m: crate::manifest::Manifest| m.files.get("main").map(|e| e.bytes);
+    crate::downloader::read_job_in(root, set)
+        .and_then(from_manifest)
+        .or_else(|| {
+            crate::manifest::read_at(&crate::manifest::installed_path_in(root, set))
+                .and_then(from_manifest)
+        })
+        .map_or_else(|| fallback_main_gb(set), gb)
+}
+
+/// Whether a missing `path` under `root` is exactly the resolved set's own
+/// managed `main` path, i.e. whether it should be offered for acquisition
+/// rather than met with a plain error. `None` for any other path, including a
+/// managed path for a set other than the root's current default — an
+/// explicit `-m` that does not exist is the user's own file, and offering a
+/// download for it risked fetching hundreds of GB into the wrong slot.
+fn offer_target_in(root: &Path, path: &Path) -> Option<crate::manifest::ModelSet> {
+    let set = crate::manifest::default_set_for_root(root);
+    (path == default_managed_model_path_in(root)).then_some(set)
 }
 
 /// Hugging Face download URL for the `DSpark` support GGUF.
@@ -498,22 +556,38 @@ pub fn ensure_vision_encoder() -> Result<(), String> {
 /// Returns an error string when the user declines, when stdin is not a
 /// terminal (so no prompt is possible), or when the download fails.
 pub fn ensure_model(path: &Path) -> Result<(), String> {
+    ensure_model_in(&crate::manifest::plank_dir(), path)
+}
+
+/// [`ensure_model`] with the managed root injected, so a test can point it at
+/// a scratch directory instead of the real `~/.plank`.
+fn ensure_model_in(root: &Path, path: &Path) -> Result<(), String> {
     if path.exists() {
         // Upgrades are the manifest's business now (`check_manifest_at_startup`),
         // and they happen in the background rather than as a blocking prompt
         // before the engine loads.
         return Ok(());
     }
-    if !std::io::stdin().is_terminal() || path != default_model_path() {
-        // Only the DeepSeek default is offered for download, because that is
-        // the only model `ds4.manifest` describes. Offering it for any missing
-        // path meant a mistyped `-m` proposed fetching 87 GB of DeepSeek into
-        // the wrong slot.
+    // Only the resolved set's own managed default path is offered for
+    // download: an explicit `-m` that does not exist is the user's own file,
+    // and offering a download for any missing path meant a mistyped `-m`
+    // proposed fetching hundreds of GB into the wrong slot.
+    let Some(set) = offer_target_in(root, path) else {
+        return Err(format!(
+            "no model at {}; pass -m <path> or download it first",
+            path.display()
+        ));
+    };
+    if !std::io::stdin().is_terminal() {
         return Err(format!(
             "no model at {}; pass -m <path> or download it first",
             path.display()
         ));
     }
+    let (label, url) = match set {
+        crate::manifest::ModelSet::Ds4 => ("DeepSeek V4 Flash", model_url()),
+        crate::manifest::ModelSet::Ds41 => ("DeepSeek V4.1 Flash", ds41_model_url()),
+    };
     // A leftover .part file means a previous download can be resumed.
     let resuming = partial_bytes(path) > 0;
     eprintln!("No model found at {}.", path.display());
@@ -523,9 +597,12 @@ pub fn ensure_model(path: &Path) -> Result<(), String> {
             gb(partial_bytes(path))
         );
     } else {
-        eprintln!("plank can download DeepSeek V4 Flash (~87 GB) from Hugging Face:");
+        eprintln!(
+            "plank can download {label} (~{:.0} GB) from Hugging Face:",
+            main_artifact_gb(root, set)
+        );
     }
-    eprintln!("  {}", model_url());
+    eprintln!("  {url}");
     eprint!(
         "{} it now? [Y/n] ",
         if resuming { "Resume" } else { "Download" }
@@ -539,7 +616,7 @@ pub fn ensure_model(path: &Path) -> Result<(), String> {
     if matches!(answer.trim(), "n" | "N" | "no") {
         return Err("no model available; re-run with -m <path> or download it".to_string());
     }
-    download(&model_url(), path)
+    download(&url, path)
 }
 
 /// Size of the partial download alongside `dest`, or 0 if none.
@@ -2033,6 +2110,79 @@ mod tests {
             !err.contains("DeepSeek"),
             "must not offer the DeepSeek download for a non-default path: {err}"
         );
+    }
+
+    /// A fresh install's missing model is exactly its resolved set's managed
+    /// `main` path, so it must be offered acquisition for the V4.1 set — the
+    /// regression this module exists to fix — with the V4.1 (341 GB), not
+    /// V4 (87 GB), size reported.
+    #[test]
+    fn fresh_install_offers_the_v41_acquisition_with_the_v41_size() {
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let path = default_managed_model_path_in(&root);
+        assert_eq!(
+            path,
+            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds41, "main")
+                .expect("v41 main path"),
+            "a fresh root's default path is the V4.1 managed main path"
+        );
+        assert_eq!(
+            offer_target_in(&root, &path),
+            Some(crate::manifest::ModelSet::Ds41),
+            "a fresh root's own default path must be offered, not errored"
+        );
+        assert!(
+            (main_artifact_gb(&root, crate::manifest::ModelSet::Ds41) - 341.0).abs() < 0.01,
+            "no manifest on hand yet: falls back to the V4.1 341 GB estimate"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An existing V4 install with no model at its (V4) managed path still
+    /// gets exactly the V4 offer it always did — never migrated to V4.1, and
+    /// reporting the V4 87 GB size, not the V4.1 one.
+    #[test]
+    fn existing_v4_install_still_offers_the_v4_acquisition_with_the_v4_size() {
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            "{}",
+        )
+        .expect("write");
+        let path = default_managed_model_path_in(&root);
+        assert_eq!(
+            path,
+            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds4, "main")
+                .expect("v4 main path"),
+            "an existing V4 install stays on the V4 managed path"
+        );
+        assert_eq!(
+            offer_target_in(&root, &path),
+            Some(crate::manifest::ModelSet::Ds4)
+        );
+        assert!(
+            (main_artifact_gb(&root, crate::manifest::ModelSet::Ds4) - 87.0).abs() < 0.01,
+            "no manifest bytes on hand: falls back to the V4 87 GB estimate"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An explicit `-m /some/path` that does not exist must never trigger a
+    /// download offer, even though it happens to be the only missing model on
+    /// this (fresh) root: it is the user's own file, not the managed default.
+    #[test]
+    fn an_explicit_nonexistent_path_is_never_offered_acquisition() {
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let explicit = root.join("some/other/path.gguf");
+        assert_eq!(
+            offer_target_in(&root, &explicit),
+            None,
+            "an arbitrary explicit path is never the offer target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
