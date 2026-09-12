@@ -2698,7 +2698,12 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     // `DS4_METAL_DSV41_SOURCE` (`dsv41.metal`) arrived with the V4.1 bump
     // for the same reason: the combined Metal source is compiled once for
     // every model, so a missing V4.1 kernel would abort startup even for a
-    // plain V4 run.
+    // plain V4 run. The table can also drift the other way: upstream
+    // removed Qwen Metal support entirely at `bd66c40` (`qwen4.metal` and
+    // `qwen4_vision.metal` deleted, every reference in `ds4_metal.m` gone
+    // with them), so entries here that the C no longer requires are just
+    // as much a lockstep failure as a missing one — `c_parity` checks
+    // both directions.
     ("DS4_METAL_FLASH_ATTN_SOURCE", "flash_attn.metal"),
     ("DS4_METAL_DENSE_SOURCE", "dense.metal"),
     ("DS4_METAL_GLM53_BF16_SOURCE", "glm53_bf16.metal"),
@@ -2726,12 +2731,6 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     ("DS4_METAL_NORM_SOURCE", "norm.metal"),
     ("DS4_METAL_BIN_SOURCE", "bin.metal"),
     ("DS4_METAL_SET_ROWS_SOURCE", "set_rows.metal"),
-    // Added by the Qwen3.8-Flash-Next bump. Required unconditionally,
-    // not only for a Qwen run: the C compiles one combined Metal source
-    // for every model, so a missing Qwen kernel aborts a DeepSeek
-    // startup too.
-    ("DS4_METAL_QWEN4_SOURCE", "qwen4.metal"),
-    ("DS4_METAL_QWEN4_VISION_SOURCE", "qwen4_vision.metal"),
 ];
 
 /// Passes `family` through, or rejects one this build cannot serve before the
