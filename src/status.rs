@@ -308,10 +308,18 @@ const TEMP_MARK: &str = "🌡";
 /// Public so the TUI can find the segment for mouse hit-testing.
 pub const JOBS_MARK: &str = "⧗";
 
-/// The SSD-streaming marker. Plain letters rather than a glyph: it has to hold
-/// a fixed two columns in both blink phases, and an emoji's width is the one
-/// thing a terminal is least likely to agree with us about.
-const HD_MARK: &str = "HD";
+/// The SSD-streaming marker. `unicode_width::UnicodeWidthStr::width` (the
+/// same measure [`crate::experts`] uses to pin the brain emoji's width) puts
+/// this at exactly two columns, matching [`HD_MARK_OFF`] below — see
+/// `hd_segment_at` for why the blink alternates the glyph rather than its
+/// style.
+const HD_MARK: &str = "💾";
+
+/// The off phase of the SSD-streaming blink: two spaces, chosen because they
+/// measure the same two columns as [`HD_MARK`] (again by
+/// `unicode_width::UnicodeWidthStr::width`), so swapping between the two never
+/// shifts anything to the segment's right.
+const HD_MARK_OFF: &str = "  ";
 
 /// Marks the footer's memory-pressure segment: plank is paused with its KV
 /// released, waiting for the system to calm down.
@@ -630,7 +638,7 @@ pub fn set_ssd_streaming(on: bool) {
     SSD_STREAMING.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether the footer should show the `HD` marker.
+/// Whether the footer should show the `💾` marker.
 #[must_use]
 pub fn ssd_streaming() -> bool {
     SSD_STREAMING.load(std::sync::atomic::Ordering::Relaxed)
@@ -2072,7 +2080,7 @@ pub fn jobs_segment(st: &Status) -> Option<String> {
     }
 }
 
-/// The SSD-streaming segment: `HD`, shown whenever the loaded model streams its
+/// The SSD-streaming segment: `💾`, shown whenever the loaded model streams its
 /// experts from disk instead of holding them resident, and blinking while the
 /// engine is prefilling or decoding.
 ///
@@ -2082,17 +2090,22 @@ pub fn jobs_segment(st: &Status) -> Option<String> {
 /// hit/miss counter and no SSD-read callback to hang a real reading on. So the
 /// marker blinks on the one fact plank does know — that a pass is in flight —
 /// which is when a streaming model must be reading experts, without claiming to
-/// count the reads. Steady `HD` therefore means "this model streams", not "the
+/// count the reads. Steady `💾` therefore means "this model streams", not "the
 /// disk is idle".
 ///
 /// Rides with the ctx gauge next to the speculation segment: both describe how
 /// the engine executes every turn rather than anything about this one, and both
 /// have to stay left of the power suffix, which is the line's right anchor.
 ///
-/// Both phases are exactly two columns of `HD` — the blink is a style change
-/// (bright/dim), never a substitution or a removal, so nothing to its right
-/// shifts. Under reduced motion the shared clock goes dark and the marker is
-/// steady, like the throbber.
+/// Most terminals render an emoji glyph with its own colour and ignore SGR
+/// foreground/weight changes, so a style-only blink (as this used to be, back
+/// when the marker was the plain letters `HD`) would be invisible on an emoji.
+/// The blink is therefore a *substitution*: [`HD_MARK`] alternates with
+/// [`HD_MARK_OFF`], two spaces that measure the same two columns (by
+/// `unicode_width::UnicodeWidthStr::width`, the same measure
+/// [`crate::experts`] uses for the brain emoji), so nothing to its right
+/// shifts even though the glyph itself changes. Under reduced motion the
+/// shared clock goes dark and the marker is steady, like the throbber.
 #[must_use]
 pub fn hd_segment(st: &Status, color: bool) -> Option<String> {
     let active = matches!(st.state, WorkerState::Prefill | WorkerState::Generating);
@@ -2124,10 +2137,15 @@ pub fn hd_segment_at(
         // blanking the slot would shift the segments to its right. One form.
         return Some(HD_MARK.to_owned());
     }
-    // `;1m` bold vs `;2m` faint: same glyphs, same width, different weight.
-    let weight = if lit { 1 } else { 2 };
+    // A style-only blink (bold vs faint) is invisible on an emoji glyph in
+    // most terminals, which render emoji in their own colour and ignore SGR
+    // foreground/weight. So the blink swaps the glyph itself instead:
+    // `HD_MARK` for lit, `HD_MARK_OFF` (two spaces) for the off phase — both
+    // measure the same two columns, so the swap never shifts anything to the
+    // segment's right.
+    let mark = if lit { HD_MARK } else { HD_MARK_OFF };
     Some(format!(
-        "\x1b[38;5;{THEME_COLOR};{weight}m{HD_MARK}{STATUS_STYLE_START}"
+        "\x1b[38;5;{THEME_COLOR}m{mark}{STATUS_STYLE_START}"
     ))
 }
 
@@ -3439,7 +3457,19 @@ mod tests {
         assert!(!line.contains("(local ⚡"), "{line}");
     }
 
-    // `HD` appears only for a streaming model, and its two blink phases are
+    // The two blink glyphs themselves, independent of any segment plumbing:
+    // this is the exact method src/experts.rs uses to pin the brain emoji's
+    // width, applied to the SSD-streaming marker's two phases.
+    #[test]
+    fn hd_mark_and_off_form_are_the_same_display_width() {
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(HD_MARK),
+            unicode_width::UnicodeWidthStr::width(HD_MARK_OFF),
+        );
+        assert_eq!(unicode_width::UnicodeWidthStr::width(HD_MARK), 2);
+    }
+
+    // `💾` appears only for a streaming model, and its two blink phases are
     // the same two columns, so nothing to its right moves.
     #[test]
     fn hd_segment_is_absent_off_and_width_stable_on() {
@@ -3472,15 +3502,17 @@ mod tests {
             "a steady marker does not depend on the tick"
         );
 
-        // Working: the two phases differ in style only.
+        // Working: the two phases differ in glyph, not style.
         let lit = hd_segment_at(true, true, true, Some(0)).unwrap();
         let dim = hd_segment_at(true, true, true, Some(TOOL_BLINK_MS / 2)).unwrap();
         assert_ne!(lit, dim, "the marker has to actually blink");
         assert_eq!(lit, idle, "the lit phase is the steady form");
-        let visible = |s: &str| plain(s).chars().count();
+        // Same measure src/experts.rs uses to pin the brain emoji's width.
+        let visible = |s: &str| unicode_width::UnicodeWidthStr::width(plain(s).as_str());
         assert_eq!(visible(&lit), 2);
         assert_eq!(visible(&dim), 2, "the blink must not change the width");
-        assert!(plain(&dim).contains("HD"));
+        assert!(plain(&lit).contains(HD_MARK));
+        assert!(plain(&dim).contains(HD_MARK_OFF));
         // Both phases hand the footer's own style back, so the bar background
         // survives past the segment.
         assert!(lit.ends_with(STATUS_STYLE_START));
@@ -3503,15 +3535,15 @@ mod tests {
         // A monochrome footer has no second appearance to blink into.
         assert_eq!(
             hd_segment_at(true, true, false, Some(0)).as_deref(),
-            Some("HD")
+            Some(HD_MARK)
         );
         assert_eq!(
             hd_segment_at(true, true, false, Some(TOOL_BLINK_MS / 2)).as_deref(),
-            Some("HD")
+            Some(HD_MARK)
         );
     }
 
-    // The whole footer, not just the segment: `HD` shows up beside the ctx
+    // The whole footer, not just the segment: `💾` shows up beside the ctx
     // gauge for a streaming model and is nowhere to be seen otherwise.
     #[test]
     fn hd_rides_in_the_footer_beside_the_ctx_gauge() {
@@ -3523,10 +3555,10 @@ mod tests {
         };
         set_ssd_streaming(false);
         let off = build_status_text(&st, false, true);
-        assert!(!off.contains("HD"), "{off}");
+        assert!(!off.contains(HD_MARK), "{off}");
         set_ssd_streaming(true);
         let on = build_status_text(&st, false, true);
-        assert!(on.contains("| HD |"), "{on}");
+        assert!(on.contains(&format!("| {HD_MARK} |")), "{on}");
         set_ssd_streaming(false);
     }
 
