@@ -8038,8 +8038,9 @@ the original is frozen and listed in /tree"
         // ("incompatible session or no context room"); plank splits them, since
         // the incompatible-session half is already covered by the V4.1 and
         // `max` refusals above and the user can act on a number.
+        let numeric = crate::engine::numeric_thinking_model(&self.engine.model_name());
         let preamble_tokens = |mode: ThinkMode, engine: &dyn crate::engine::Engine| {
-            mode.effort_prefix()
+            mode.effort_prefix(numeric)
                 .map_or(0, |text| engine.count_tokens(&text))
         };
         let delta = preamble_tokens(level, self.engine.as_ref())
@@ -8072,7 +8073,7 @@ the original is frozen and listed in /tree"
         // drops its cached tokens and KV here. Re-warm from the tier
         // checkpoints under the new fingerprint rather than making the next
         // turn re-prefill the system prompt inline.
-        let prefix_changed = current.effort_prefix() != level.effort_prefix();
+        let prefix_changed = current.effort_prefix(numeric) != level.effort_prefix(numeric);
         self.engine.set_think_mode(level);
         // Cached alt engines too: `self.think` keys their Tier 1 checkpoint and
         // frames their sidechains, so an engine left at the old level would
@@ -21811,8 +21812,8 @@ mod tests {
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         assert_eq!(agent.think, ThinkMode::Off);
         assert_eq!(
-            ThinkMode::Off.effort_prefix(),
-            ThinkMode::Medium.effort_prefix(),
+            ThinkMode::Off.effort_prefix(false),
+            ThinkMode::Medium.effort_prefix(false),
             "this test is about the pair that shares a preamble",
         );
         seed_ladder(&mut agent, 2);

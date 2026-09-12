@@ -147,8 +147,28 @@ impl ThinkMode {
     /// token transcript and KV. `Off` and `Medium` differ only in the per-turn
     /// assistant prefix, which is re-derived every turn and never cached, so
     /// both return `None` and moving between them is free.
+    ///
+    /// Family-aware, exactly as [`for_display`] is, because what is emitted
+    /// depends on the family: on a numeric-thinking model the *only* thing any
+    /// level puts ahead of the system prompt is the C's `Reasoning Effort: N`
+    /// line ([`effort_level`]), so plank's own `low` prose and the V4 `max`
+    /// text are never emitted there ([`injects_low_preamble`]). Reporting them
+    /// anyway would claim a prefix change between `low` and `/think 25` (which
+    /// emit identical bytes) and make the `/think` context-room guard charge
+    /// for prose it will not send. `numeric_family` is
+    /// [`numeric_thinking_model`] of the live model name.
+    ///
+    /// [`for_display`]: ThinkMode::for_display
+    /// [`effort_level`]: ThinkMode::effort_level
     #[must_use]
-    pub fn effort_prefix(self) -> Option<Cow<'static, str>> {
+    pub fn effort_prefix(self, numeric_family: bool) -> Option<Cow<'static, str>> {
+        if numeric_family {
+            // The whole preamble on this family is the numeric line, for every
+            // level; `Off` is thinking-disabled and carries none.
+            return self
+                .effort_level()
+                .map(|n| Cow::Owned(deepseek41_effort_text(n)));
+        }
         match self {
             Self::Off | Self::Medium => None,
             Self::Low => Some(Cow::Borrowed(THINK_LOW_PREFIX)),
@@ -1714,7 +1734,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for n in 1..=100u8 {
             let prefix = ThinkMode::Level(n)
-                .effort_prefix()
+                .effort_prefix(false)
                 .expect("a numeric level always carries one");
             assert!(seen.insert(prefix.into_owned()), "{n}");
         }
@@ -1781,6 +1801,48 @@ mod tests {
             deepseek41_effort_text(25),
             "Reasoning Effort: 25 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
         );
+    }
+
+    // On a numeric-thinking family `low` IS `/think 25`: plank injects no prose
+    // of its own there, so the two emit the same bytes and moving between them
+    // must not be reported as a prefix change (which would cost a re-prefill).
+    #[test]
+    fn low_and_level_25_share_a_prefix_on_a_numeric_family() {
+        let numeric = numeric_thinking_model(V41);
+        assert!(numeric);
+        assert_eq!(
+            ThinkMode::Low.effort_prefix(numeric),
+            ThinkMode::Level(THINK_LOW_EFFORT_LEVEL).effort_prefix(numeric),
+        );
+        // And on a family without the knob they genuinely differ: there `low`
+        // really does emit plank's prose.
+        assert_ne!(
+            ThinkMode::Low.effort_prefix(false),
+            ThinkMode::Level(THINK_LOW_EFFORT_LEVEL).effort_prefix(false),
+        );
+    }
+
+    // The `/think` context-room guard sizes the preamble it is about to emit.
+    // On a numeric family that is the one `Reasoning Effort:` line, not plank's
+    // ~97-token prose — charging for the prose can wrongly refuse a level
+    // change that would have fit.
+    #[test]
+    fn a_numeric_family_reports_no_phantom_prose_tokens() {
+        let reported = ThinkMode::Low
+            .effort_prefix(true)
+            .expect("low carries the numeric line");
+        assert_eq!(reported, deepseek41_effort_text(THINK_LOW_EFFORT_LEVEL));
+        assert!(
+            !reported.contains(THINK_LOW_PREFIX),
+            "plank's prose must not be counted on a numeric family"
+        );
+        // Same for `max`, whose V4 prose is likewise never emitted there.
+        assert_eq!(
+            ThinkMode::Max.effort_prefix(true).as_deref(),
+            Some(deepseek41_effort_text(V41_MAX_EFFORT).as_str())
+        );
+        // `Off` disables thinking outright, so it carries no line at all.
+        assert_eq!(ThinkMode::Off.effort_prefix(true), None);
     }
 
     // A numeric effort is a V4.1 knob; the named levels are everyone's.
@@ -1936,14 +1998,14 @@ mod tests {
     // levels must report one, and the two preambles must differ.
     #[test]
     fn only_low_and_max_carry_an_effort_prefix() {
-        assert_eq!(ThinkMode::Off.effort_prefix(), None);
-        assert_eq!(ThinkMode::Medium.effort_prefix(), None);
+        assert_eq!(ThinkMode::Off.effort_prefix(false), None);
+        assert_eq!(ThinkMode::Medium.effort_prefix(false), None);
         assert_eq!(
-            ThinkMode::Low.effort_prefix().as_deref(),
+            ThinkMode::Low.effort_prefix(false).as_deref(),
             Some(THINK_LOW_PREFIX)
         );
         assert_eq!(
-            ThinkMode::Max.effort_prefix().as_deref(),
+            ThinkMode::Max.effort_prefix(false).as_deref(),
             Some(THINK_MAX_PREFIX)
         );
         assert_ne!(THINK_LOW_PREFIX, THINK_MAX_PREFIX);
@@ -1953,7 +2015,7 @@ mod tests {
     // This is the property `set_think_mode` and `/think` both key on.
     #[test]
     fn effort_prefix_identifies_the_free_level_changes() {
-        let changed = |a: ThinkMode, b: ThinkMode| a.effort_prefix() != b.effort_prefix();
+        let changed = |a: ThinkMode, b: ThinkMode| a.effort_prefix(false) != b.effort_prefix(false);
         assert!(!changed(ThinkMode::Off, ThinkMode::Medium));
         assert!(changed(ThinkMode::Medium, ThinkMode::Low));
         assert!(changed(ThinkMode::Low, ThinkMode::Max));

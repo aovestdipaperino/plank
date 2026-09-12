@@ -2069,7 +2069,8 @@ impl Engine for Ds4Session {
         // `Medium` lives entirely in the per-turn assistant prefix, which is
         // re-derived every turn and never cached. So a level change that keeps
         // the preamble where it is costs nothing.
-        let prefix_changed = self.think.effort_prefix() != mode.effort_prefix();
+        let numeric = crate::engine::numeric_thinking_model(&self.model_name());
+        let prefix_changed = self.think.effort_prefix(numeric) != mode.effort_prefix(numeric);
         self.think = mode;
         if prefix_changed {
             // The whole token buffer now starts with the wrong prefix. Drop it
