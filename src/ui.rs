@@ -7983,7 +7983,45 @@ the original is frozen and listed in /tree"
         if level == current {
             return format!("thinking already {}", level.name());
         }
+        // The C's context-room guard, from `worker_apply_requested_think`:
+        // `transcript.len + delta >= ctx_size` is refused outright, because the
+        // longer effort preamble would push the session past its own ceiling.
+        // plank measures the same delta in tokens between the two preambles;
+        // only a *growing* preamble can run out of room, so a shrink is always
+        // allowed. The C's message names one condition for two causes
+        // ("incompatible session or no context room"); plank splits them, since
+        // the incompatible-session half is already covered by the V4.1 and
+        // `max` refusals above and the user can act on a number.
+        let preamble_tokens = |mode: ThinkMode, engine: &dyn crate::engine::Engine| {
+            mode.effort_prefix()
+                .map_or(0, |text| engine.count_tokens(&text))
+        };
+        let delta = preamble_tokens(level, self.engine.as_ref())
+            - preamble_tokens(current, self.engine.as_ref());
+        if delta > 0 && self.last_ctx_used.saturating_add(delta) >= ctx {
+            return format!(
+                "/think {arg}: no context room for the longer reasoning preamble \
+                 ({} of {ctx} tokens in use, {delta} more needed); still {}",
+                self.last_ctx_used,
+                current.name()
+            );
+        }
         self.think = level;
+        // Every KV ladder rung was captured under the *old* level, and
+        // `session::payload_fingerprint` hashes `think.name()` — so from this
+        // line on no rung can be found again, at ANY level change, whether or
+        // not it moves the preamble (`off` -> `medium` share the empty preamble
+        // and still change the key). Leaving them is strictly worse than having
+        // none: `KvLadder::wants_anchor` keeps comparing against a rung that can
+        // no longer be loaded, so a fresh transcript reads as already covered
+        // and no anchor is ever captured again, while the blobs leak on disk.
+        // This is plank's half of the C's `ds4_session_invalidate`: the C
+        // invalidates the engine session (plank's `Engine::set_think_mode`
+        // does that, below), and plank must additionally drop the cache layer
+        // the C does not have. Unconditional on purpose — gating it on
+        // `prefix_changed` would leave exactly the `off`/`medium` pair silently
+        // broken, with the feature still looking fully wired up.
+        self.discard_ladder();
         // A change of effort preamble changes the prompt prefix, so the engine
         // drops its cached tokens and KV here. Re-warm from the tier
         // checkpoints under the new fingerprint rather than making the next
@@ -21631,6 +21669,185 @@ mod tests {
         let out = agent.think_command("medium", &mut || {});
         assert!(out.contains("already"), "got: {out}");
         assert_eq!(seen.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scripted engine the numeric `/think` levels are accepted on.
+    fn v41_engine() -> ScriptedEngine {
+        ScriptedEngine {
+            model: Some("DeepSeek V4.1 Flash".to_owned()),
+            ..ScriptedEngine::default()
+        }
+    }
+
+    /// Seeds `agent` with a named session, a short transcript and `rungs` KV
+    /// ladder rungs, so a test can watch what a `/think` does to them. The rung
+    /// depths and token counts only have to be increasing — nothing here reads
+    /// a blob, and `discard_ladder`'s deletes are best-effort over a scratch
+    /// dir that has none.
+    fn seed_ladder(agent: &mut Agent<'_>, rungs: usize) {
+        agent.session.id = "brave-curie".to_owned();
+        for i in 0..4u32 {
+            agent
+                .session
+                .transcript
+                .push(Message::user(format!("m{i}")));
+        }
+        for i in 0..rungs {
+            agent
+                .ladder
+                .push(i + 1, i32::try_from(i + 1).unwrap() * 100);
+        }
+        assert_eq!(agent.ladder.rungs().len(), rungs, "seeding failed");
+    }
+
+    /// The silent one. Every rung was captured under the old reasoning level,
+    /// and `session::payload_fingerprint` hashes `think.name()`, so after a
+    /// `/think` no rung can ever be loaded again. A surviving rung is not a
+    /// wrong-KV hazard here — `restore_rung` only hands the engine a blob it
+    /// actually loaded — but it is a permanently dead ladder: `wants_anchor`
+    /// measures against a rung that can no longer be found, so the ladder reads
+    /// as covered and never captures again, with nothing in the logs to say so.
+    #[test]
+    fn changing_effort_discards_every_kv_rung() {
+        let dir = scratch_dir("think-ladder-discard");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, v41_engine(), &cfg);
+        seed_ladder(&mut agent, 3);
+
+        let out = agent.think_command("25", &mut || {});
+        assert!(out.contains("25"), "got: {out}");
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "a rung survived a reasoning-level change: {:?}",
+            agent.ladder.rungs()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `off` and `medium` share the empty effort preamble, so nothing about the
+    /// *prompt* moves — but `payload_fingerprint` keys on the level's name, not
+    /// on its preamble, so the rungs die just the same. This is the pair a
+    /// `prefix_changed` gate would silently leave broken.
+    #[test]
+    fn a_level_change_that_keeps_the_preamble_still_discards_the_ladder() {
+        let dir = scratch_dir("think-ladder-free-pair");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert_eq!(agent.think, ThinkMode::Off);
+        assert_eq!(
+            ThinkMode::Off.effort_prefix(),
+            ThinkMode::Medium.effort_prefix(),
+            "this test is about the pair that shares a preamble",
+        );
+        seed_ladder(&mut agent, 2);
+
+        agent.think_command("medium", &mut || {});
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "the ladder outlived a level change that kept the preamble",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The C splices the new prefix in front of the transcript tail and leaves
+    /// every token behind it untouched. plank never materializes that prefix
+    /// into the transcript at all — it is re-rendered from `self.think` on each
+    /// prompt build — so the tail must come through a `/think` byte-identical,
+    /// and a `/think` that rewrote conversation content would be a bug the C
+    /// does not have either.
+    #[test]
+    fn changing_effort_preserves_the_transcript_tail() {
+        let dir = scratch_dir("think-ladder-tail");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, v41_engine(), &cfg);
+        seed_ladder(&mut agent, 1);
+        let before = render_transcript(&agent.session, &agent.system);
+
+        agent.think_command("25", &mut || {});
+        assert_eq!(
+            render_transcript(&agent.session, &agent.system),
+            before,
+            "the transcript tail must survive a think-prefix change verbatim",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The C scans levels 0..100 to find the prefix a *restored* session really
+    /// carries, because its transcript holds spliced tokens that may predate the
+    /// current CLI setting. plank has no such disagreement to resolve — the
+    /// prefix is rebuilt from `self.think` every time — but the hazard the scan
+    /// guards against is real here in the cache layer: a session restored with
+    /// rungs signed at some other level must still lose them, whatever level the
+    /// session is currently sitting at, and whether the change moves the
+    /// preamble or not.
+    #[test]
+    fn a_restored_session_at_another_effort_still_loses_its_rungs() {
+        let dir = scratch_dir("think-ladder-restored");
+        let mut cfg = crate::config::AgentConfig::default();
+        // The session came back at `max`; the rungs on disk were signed by
+        // whatever level wrote them.
+        cfg.generation.think_mode = ThinkMode::Max;
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                ctx_override: Some(crate::engine::THINK_MAX_MIN_CONTEXT),
+                ..v41_engine()
+            },
+            &cfg,
+        );
+        assert_eq!(agent.think, ThinkMode::Max);
+        seed_ladder(&mut agent, 3);
+
+        let out = agent.think_command("7", &mut || {});
+        assert!(out.contains('7'), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Level(7));
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "a restored session kept rungs signed at a different effort",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The C refuses when `transcript.len + delta >= ctx_size`: a longer effort
+    /// preamble that does not fit is not worth a session that no longer fits its
+    /// own context. Only a growth can run out of room, so the shrink back is
+    /// always allowed — and a refusal changes nothing, not the level, not the
+    /// engine, not the ladder.
+    #[test]
+    fn think_refuses_a_longer_preamble_with_no_context_room() {
+        let dir = scratch_dir("think-no-room");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cfg = test_cfg();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                ctx_override: Some(512),
+                think_modes: Some(std::sync::Arc::clone(&seen)),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        seed_ladder(&mut agent, 2);
+        // Full to the brim: any preamble growth at all overruns.
+        agent.last_ctx_used = 512;
+
+        let out = agent.think_command("low", &mut || {});
+        assert!(out.contains("no context room"), "got: {out}");
+        assert_eq!(
+            agent.think,
+            ThinkMode::Off,
+            "a refusal must not take effect"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the engine must not be told"
+        );
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            2,
+            "a refused change must leave the ladder alone",
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
