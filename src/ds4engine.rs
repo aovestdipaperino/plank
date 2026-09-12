@@ -646,20 +646,23 @@ impl Ds4Model {
     /// past the BOS). Folding it into the system *string* instead would place
     /// it after the system role marker and diverge.
     ///
-    /// `Max` goes through the C's own `ds4_chat_append_max_effort_prefix` so its
-    /// tokens stay byte-identical to the reference; `Low`, which the C does not
-    /// have, is tokenized here from [`crate::engine::THINK_LOW_PREFIX`] through
-    /// the same rendered-chat tokenizer the C symbol uses internally.
+    /// Every level but `Low` goes through the C's own
+    /// `ds4_chat_append_think_prefix` — the same call
+    /// `agent_worker_build_system_tokens` makes — so the tokens stay
+    /// byte-identical to the reference and the family decides the spelling: the
+    /// V4 max-effort text, or V4.1's `Reasoning Effort: N` system line. It
+    /// appends nothing for the modes that carry no preamble, which is why it is
+    /// safe to call unconditionally. `Low`, which the C does not have, is
+    /// tokenized here from [`crate::engine::THINK_LOW_PREFIX`] through the same
+    /// rendered-chat tokenizer the C symbol uses internally.
     fn append_effort_prefix(&self, tokens: &mut Ds4TokensGuard, think: ThinkMode) {
-        match think {
-            ThinkMode::Max => {
-                // SAFETY: engine and tokens are valid for the call.
-                unsafe { ffi::ds4_chat_append_max_effort_prefix(self.engine, tokens.as_mut_ptr()) };
-            }
-            ThinkMode::Low => {
-                tokens.push_all(&self.tokenize_rendered(crate::engine::THINK_LOW_PREFIX));
-            }
-            ThinkMode::Off | ThinkMode::Medium => {}
+        if think == ThinkMode::Low {
+            tokens.push_all(&self.tokenize_rendered(crate::engine::THINK_LOW_PREFIX));
+            return;
+        }
+        // SAFETY: engine and tokens are valid for the call.
+        unsafe {
+            ffi::ds4_chat_append_think_prefix(self.engine, tokens.as_mut_ptr(), ds4_think(think));
         }
     }
 
@@ -1446,7 +1449,7 @@ impl Ds4Session {
             self.transcript.extend_last_span(&text, &span);
         } else {
             self.transcript
-                .push_span(SpanRole::Assistant, ds4_think(think) as u8, text, &span);
+                .push_span(SpanRole::Assistant, think_span_tag(think), text, &span);
         }
     }
 }
@@ -2837,14 +2840,25 @@ fn cstr_message(buf: &[i8], fallback: &str) -> String {
     s.to_string_lossy().into_owned()
 }
 
+/// The reasoning discriminant recorded on an assistant span.
+///
+/// Saturating, because the span field is one byte while a V4.1 effort rides at
+/// `1000 + n`: every explicit effort therefore tags as 255, distinct from the
+/// three named modes, which keep the C's 0/1/2 as they always had.
+fn think_span_tag(think: ThinkMode) -> u8 {
+    u8::try_from(ds4_think(think).0).unwrap_or(u8::MAX)
+}
+
 /// Maps the engine-agnostic think mode to ds4's.
 fn ds4_think(think: ThinkMode) -> ffi::Ds4ThinkMode {
     match think {
-        ThinkMode::Off => ffi::Ds4ThinkMode::None,
+        ThinkMode::Off => ffi::Ds4ThinkMode::NONE,
         // `Low` is `HIGH` to the engine — the brevity request lives entirely in
         // the prompt preamble, since the engine has no level below `HIGH`.
-        ThinkMode::Low | ThinkMode::Medium => ffi::Ds4ThinkMode::High,
-        ThinkMode::Max => ffi::Ds4ThinkMode::Max,
+        ThinkMode::Low | ThinkMode::Medium => ffi::Ds4ThinkMode::HIGH,
+        ThinkMode::Max => ffi::Ds4ThinkMode::MAX,
+        // The explicit V4.1 effort, `DS4_THINK_LEVEL_BASE + n`.
+        ThinkMode::Level(n) => ffi::Ds4ThinkMode::level(n),
     }
 }
 

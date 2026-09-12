@@ -7,6 +7,7 @@
 //! behind a narrow trait so the UX layer works against any backend; a stub
 //! echo engine makes the agent runnable end-to-end without a model.
 
+use std::borrow::Cow;
 use std::fmt::Debug;
 
 /// Reasoning level requested for a generation, mirroring `ds4_think_mode`.
@@ -38,6 +39,12 @@ pub enum ThinkMode {
     /// Ordinary thinking plus the reasoning-effort preamble, prepended ahead of
     /// the system prompt. Needs a context of at least [`THINK_MAX_MIN_CONTEXT`].
     Max,
+    /// An explicit numeric reasoning effort, `1..=100`, which only `DeepSeek`
+    /// V4.1 understands (the C's `DS4_THINK_LEVEL_BASE + level`). The engine
+    /// turns it into the `Reasoning Effort: N` system line
+    /// [`deepseek41_effort_text`] mirrors; on any other model family a level is
+    /// rejected rather than silently ignored.
+    Level(u8),
 }
 
 impl ThinkMode {
@@ -51,12 +58,16 @@ impl ThinkMode {
     ///
     /// [`parse`]: ThinkMode::parse
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub fn name(self) -> Cow<'static, str> {
         match self {
-            Self::Off => "off",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::Max => "max",
+            Self::Off => Cow::Borrowed("off"),
+            Self::Low => Cow::Borrowed("low"),
+            Self::Medium => Cow::Borrowed("medium"),
+            Self::Max => Cow::Borrowed("max"),
+            // Owned, and distinct per level: this is KV-fingerprint key
+            // material, so two efforts that named themselves alike would share
+            // a cache built at the other's prompt.
+            Self::Level(n) => Cow::Owned(n.to_string()),
         }
     }
 
@@ -70,12 +81,16 @@ impl ThinkMode {
     ///
     /// [`name`]: ThinkMode::name
     #[must_use]
-    pub fn short_name(self) -> &'static str {
+    pub fn short_name(self) -> Cow<'static, str> {
         match self {
-            Self::Off => "off",
-            Self::Low => "low",
-            Self::Medium => "med",
-            Self::Max => "max",
+            Self::Off => Cow::Borrowed("off"),
+            Self::Low => Cow::Borrowed("low"),
+            Self::Medium => Cow::Borrowed("med"),
+            Self::Max => Cow::Borrowed("max"),
+            // Right-aligned so the segment stays exactly three columns wide at
+            // every level (`  7`, ` 25`, `100`); `parse` trims, so what the
+            // footer shows still parses back.
+            Self::Level(n) => Cow::Owned(format!("{n:>3}")),
         }
     }
 
@@ -89,6 +104,19 @@ impl ThinkMode {
             "low" | "brief" => Some(Self::Low),
             "medium" | "med" | "high" | "on" => Some(Self::Medium),
             "max" | "maximum" => Some(Self::Max),
+            // A numeric effort, mirroring the C's `ds4_think_mode_parse_level`:
+            // digits only, `0..=100`. Zero is not a level — the C's effort text
+            // is empty there — so it means `Off`, and a sign or any other
+            // character is not a number at all.
+            s if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => match s.parse::<u16>() {
+                Ok(0) => Some(Self::Off),
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "guarded to 1..=100 by the arm"
+                )]
+                Ok(n) if n <= 100 => Some(Self::Level(n as u8)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -109,13 +137,46 @@ impl ThinkMode {
     /// assistant prefix, which is re-derived every turn and never cached, so
     /// both return `None` and moving between them is free.
     #[must_use]
-    pub fn effort_prefix(self) -> Option<&'static str> {
+    pub fn effort_prefix(self) -> Option<Cow<'static, str>> {
         match self {
             Self::Off | Self::Medium => None,
-            Self::Low => Some(THINK_LOW_PREFIX),
-            Self::Max => Some(THINK_MAX_PREFIX),
+            Self::Low => Some(Cow::Borrowed(THINK_LOW_PREFIX)),
+            Self::Max => Some(Cow::Borrowed(THINK_MAX_PREFIX)),
+            // Distinct per level, because moving between two efforts moves the
+            // prompt prefix exactly as moving between two named levels does.
+            // The tokens themselves come from the C on a V4.1 engine; this is
+            // the change-detection key.
+            Self::Level(n) => Some(Cow::Owned(deepseek41_effort_text(n))),
         }
     }
+}
+
+/// The `Reasoning Effort: N` system line a numeric level carries on `DeepSeek`
+/// V4.1, byte-for-byte the C's `ds4_deepseek41_reasoning_effort_text`
+/// (`refs/ds4/ds4.c`).
+///
+/// On a real V4.1 engine the tokens come from the C itself
+/// (`ds4_chat_append_think_prefix`); this copy exists so a level has a prefix
+/// to compare and a text to show without a model loaded.
+#[must_use]
+pub fn deepseek41_effort_text(level: u8) -> String {
+    format!(
+        "Reasoning Effort: {level} (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+    )
+}
+
+/// The C's rejection of a numeric reasoning effort on a model that has no such
+/// knob: `ds4_agent.c`'s message word for word, minus its `ds4-agent: ` prefix,
+/// because plank's error path prefixes `plank: ` itself.
+pub const THINK_LEVEL_REQUIRES_V41: &str = "--think-level requires a DeepSeek V4.1 model";
+
+/// Whether `mode` is a numeric level the named model cannot honour, in which
+/// case the caller must refuse rather than silently fall back to `HIGH`.
+#[must_use]
+pub fn think_level_unsupported(mode: ThinkMode, model_name: &str) -> bool {
+    matches!(mode, ThinkMode::Level(_))
+        && crate::sysprompt::ToolSyntax::for_model_name(model_name)
+            != crate::sysprompt::ToolSyntax::Dsml41
 }
 
 /// The reasoning-effort preamble `Max` prepends ahead of the system prompt,
@@ -1446,7 +1507,7 @@ mod tests {
     use super::{
         EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, PrefillProgress,
         THINK_LOW_PREFIX, THINK_MAX_PREFIX, ThinkMode, ThinkToolRecovery, Utf8Stream,
-        reusable_prefix,
+        deepseek41_effort_text, reusable_prefix, think_level_unsupported,
     };
 
     // A KV-backed engine holds one live session, so concurrent sidechains on it
@@ -1483,21 +1544,127 @@ mod tests {
     // The footer's segment must not change width with the level.
     #[test]
     fn think_mode_short_names_are_a_fixed_width() {
-        let names: Vec<&str> = ThinkMode::ALL.iter().map(|l| l.short_name()).collect();
+        let names: Vec<String> = ThinkMode::ALL
+            .iter()
+            .map(|l| l.short_name().into_owned())
+            .collect();
         assert!(
             names.iter().all(|n| n.chars().count() == 3),
             "{names:?} must all be three columns wide"
         );
         // And each still parses back, since it is what the user sees and copies.
         for level in ThinkMode::ALL {
-            assert_eq!(ThinkMode::parse(level.short_name()), Some(level));
+            assert_eq!(ThinkMode::parse(&level.short_name()), Some(level));
         }
     }
 
     #[test]
     fn think_mode_round_trips_through_its_name() {
         for level in ThinkMode::ALL {
-            assert_eq!(ThinkMode::parse(level.name()), Some(level), "{level:?}");
+            assert_eq!(ThinkMode::parse(&level.name()), Some(level), "{level:?}");
+        }
+    }
+
+    // The numeric effort V4.1 adds, with the C's own bounds: digits only,
+    // `0..=100`, and zero is `off` rather than a level (the C's effort text is
+    // empty at zero).
+    #[test]
+    fn numeric_levels_parse_and_bound() {
+        assert_eq!(ThinkMode::parse("25"), Some(ThinkMode::Level(25)));
+        assert_eq!(ThinkMode::parse("0"), Some(ThinkMode::Off));
+        assert_eq!(ThinkMode::parse("1"), Some(ThinkMode::Level(1)));
+        assert_eq!(ThinkMode::parse("100"), Some(ThinkMode::Level(100)));
+        assert_eq!(ThinkMode::parse(" 42 "), Some(ThinkMode::Level(42)));
+        assert_eq!(ThinkMode::parse("101"), None);
+        assert_eq!(ThinkMode::parse("-1"), None);
+        assert_eq!(ThinkMode::parse("+5"), None);
+        assert_eq!(ThinkMode::parse("1e2"), None);
+        assert_eq!(ThinkMode::parse("99999999999999999999"), None);
+        // The named levels keep working.
+        assert_eq!(ThinkMode::parse("max"), Some(ThinkMode::Max));
+    }
+
+    // `name` is KV-fingerprint key material (`kvtier::system_fingerprint`,
+    // `session`), so two efforts that named themselves alike would let a cache
+    // built at one be reused at the other: the wrong prompt, silently.
+    #[test]
+    fn each_level_names_itself_distinctly_for_the_fingerprint() {
+        let mut seen = std::collections::HashSet::new();
+        for n in 1..=100u8 {
+            assert!(seen.insert(ThinkMode::Level(n).name().to_string()), "{n}");
+        }
+        for m in ThinkMode::ALL {
+            assert!(seen.insert(m.name().to_string()), "{m:?} collides");
+        }
+    }
+
+    // And the same for the prefix, which is what decides whether a level change
+    // costs a re-prefill.
+    #[test]
+    fn each_level_carries_a_distinct_effort_prefix() {
+        let mut seen = std::collections::HashSet::new();
+        for n in 1..=100u8 {
+            let prefix = ThinkMode::Level(n)
+                .effort_prefix()
+                .expect("a numeric level always carries one");
+            assert!(seen.insert(prefix.into_owned()), "{n}");
+        }
+        assert!(seen.insert(THINK_LOW_PREFIX.to_owned()));
+        assert!(seen.insert(THINK_MAX_PREFIX.to_owned()));
+    }
+
+    // Right-aligned, so the footer's segment is three columns at every effort,
+    // and still parses back because `parse` trims.
+    #[test]
+    fn numeric_short_names_stay_three_columns() {
+        for n in 1..=100u8 {
+            let short = ThinkMode::Level(n).short_name();
+            assert_eq!(short.chars().count(), 3, "{n}: {short:?}");
+            assert_eq!(ThinkMode::parse(&short), Some(ThinkMode::Level(n)));
+        }
+    }
+
+    // A level thinks, like every mode but `off`.
+    #[test]
+    fn numeric_levels_think() {
+        assert!(ThinkMode::Level(1).thinks());
+        assert!(ThinkMode::Level(100).thinks());
+    }
+
+    // The C's `DS4_THINK_LEVEL_BASE` is 1000, and the named modes keep the
+    // exact discriminants the FFI boundary has always carried.
+    #[test]
+    fn ffi_level_repr_matches_the_c_base() {
+        assert_eq!(crate::ffi::Ds4ThinkMode::level(25).0, 1025);
+        assert_eq!(crate::ffi::Ds4ThinkMode::level(0).0, 1000);
+        assert_eq!(crate::ffi::Ds4ThinkMode::level(100).0, 1100);
+        assert_eq!(crate::ffi::Ds4ThinkMode::NONE.0, 0);
+        assert_eq!(crate::ffi::Ds4ThinkMode::HIGH.0, 1);
+        assert_eq!(crate::ffi::Ds4ThinkMode::MAX.0, 2);
+    }
+
+    // The effort line mirrors `ds4_deepseek41_reasoning_effort_text`.
+    #[test]
+    fn the_effort_text_matches_the_c_format() {
+        assert_eq!(
+            deepseek41_effort_text(25),
+            "Reasoning Effort: 25 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+        );
+    }
+
+    // A numeric effort is a V4.1 knob; the named levels are everyone's.
+    #[test]
+    fn only_a_numeric_level_is_refused_off_v41() {
+        assert!(think_level_unsupported(
+            ThinkMode::Level(50),
+            "DeepSeek V4 Flash"
+        ));
+        assert!(!think_level_unsupported(
+            ThinkMode::Level(50),
+            "DeepSeek V4.1 Flash"
+        ));
+        for m in ThinkMode::ALL {
+            assert!(!think_level_unsupported(m, "DeepSeek V4 Flash"), "{m:?}");
         }
     }
 
@@ -1539,8 +1706,14 @@ mod tests {
     fn only_low_and_max_carry_an_effort_prefix() {
         assert_eq!(ThinkMode::Off.effort_prefix(), None);
         assert_eq!(ThinkMode::Medium.effort_prefix(), None);
-        assert_eq!(ThinkMode::Low.effort_prefix(), Some(THINK_LOW_PREFIX));
-        assert_eq!(ThinkMode::Max.effort_prefix(), Some(THINK_MAX_PREFIX));
+        assert_eq!(
+            ThinkMode::Low.effort_prefix().as_deref(),
+            Some(THINK_LOW_PREFIX)
+        );
+        assert_eq!(
+            ThinkMode::Max.effort_prefix().as_deref(),
+            Some(THINK_MAX_PREFIX)
+        );
         assert_ne!(THINK_LOW_PREFIX, THINK_MAX_PREFIX);
     }
 

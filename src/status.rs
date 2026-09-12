@@ -201,8 +201,12 @@ pub fn think_color(mode: crate::engine::ThinkMode) -> u8 {
     match mode {
         ThinkMode::Max => 196,
         ThinkMode::Medium => 231,
-        ThinkMode::Low => 39,
         ThinkMode::Off => 245,
+        // A numeric effort borrows the color of the named level it sits
+        // nearest, so the footer reads at a glance at any effort.
+        ThinkMode::Level(n) if n >= 90 => 196,
+        ThinkMode::Level(n) if n >= 34 => 231,
+        ThinkMode::Low | ThinkMode::Level(_) => 39,
     }
 }
 
@@ -1853,7 +1857,7 @@ fn build_status_text_with_cells(
             st.think.short_name()
         )
     } else {
-        st.think.short_name().to_owned()
+        st.think.short_name().into_owned()
     };
     let think = format!("{THINK_MARK} {level} | ");
     let power = power_suffix(st);
@@ -3153,7 +3157,7 @@ mod tests {
             assert!(colored.contains(&want), "{level:?}: {colored:?}");
             let plain = build_status_text(&st, false, true);
             assert!(!plain.contains("\x1b["), "{level:?}: {plain:?}");
-            assert!(plain.contains(level.short_name()), "{level:?}: {plain:?}");
+            assert!(plain.contains(&*level.short_name()), "{level:?}: {plain:?}");
         }
     }
 

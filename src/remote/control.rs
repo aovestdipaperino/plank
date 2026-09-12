@@ -168,7 +168,7 @@ impl From<&Status> for StatusWire {
             cwd: crate::status::cwd_label(),
             branch: crate::status::git_branch_label().unwrap_or_default(),
             origin: crate::status::engine_origin_label(),
-            think: s.think.short_name().to_owned(),
+            think: s.think.short_name().into_owned(),
         }
     }
 }

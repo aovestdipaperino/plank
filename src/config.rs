@@ -558,6 +558,7 @@ Options:
       --think              ordinary thinking (default); same as /think medium
       --think-low          ask for brief reasoning (experimental; prompt-only)
       --think-max          maximum reasoning effort; needs --ctx 393216 or more
+      --think-level N      explicit reasoning effort 0..100 (DeepSeek V4.1 only)
       --nothink            disable thinking
       --chdir PATH         change working directory before starting
       --worktree NAME      start inside an isolated git worktree of this repo
@@ -1409,6 +1410,15 @@ pub fn parse_options_with(
             "--think-low" => c.generation.think_mode = ThinkMode::Low,
             "--think-max" => c.generation.think_mode = ThinkMode::Max,
             "--nothink" => c.generation.think_mode = ThinkMode::Off,
+            // The C's `--think-level`: an explicit effort only V4.1 has. The
+            // model is not loaded yet, so the family check happens once the
+            // engine is open (`engine::think_level_unsupported`).
+            "--think-level" => {
+                let v = need_arg(&mut i)?;
+                c.generation.think_mode = ThinkMode::parse(v)
+                    .filter(|m| matches!(m, ThinkMode::Off | ThinkMode::Level(_)))
+                    .ok_or_else(|| format!("{arg} must be a number 0..100 (got `{v}`)"))?;
+            }
             "--chdir" => c.chdir_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--worktree" => c.worktree = Some(need_arg(&mut i)?.to_string()),
             "--worktree-pr" => {
@@ -1966,6 +1976,31 @@ mod tests {
                 .btw
                 .suspend
         );
+    }
+
+    // `--think-level` mirrors the C's flag: a plain `0..100`, with zero
+    // meaning off. The V4.1-only check needs the model, so it happens once the
+    // engine is open, not here.
+    #[test]
+    fn think_level_flag_takes_a_number() {
+        assert_eq!(
+            parse_options(&args(&["--think-level", "25"]))
+                .unwrap()
+                .generation
+                .think_mode,
+            ThinkMode::Level(25)
+        );
+        assert_eq!(
+            parse_options(&args(&["--think-level", "0"]))
+                .unwrap()
+                .generation
+                .think_mode,
+            ThinkMode::Off
+        );
+        for bad in ["101", "max", "-1", ""] {
+            let err = parse_options(&args(&["--think-level", bad])).unwrap_err();
+            assert!(err.contains("--think-level"), "{bad}: {err}");
+        }
     }
 
     #[test]

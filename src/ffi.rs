@@ -20,12 +20,31 @@ pub enum Ds4Backend {
 }
 
 /// Reasoning mode, mirroring `ds4_think_mode`.
-#[repr(C)]
+///
+/// A newtype rather than an enum: `DeepSeek` V4.1 carries an explicit numeric
+/// effort as `DS4_THINK_LEVEL_BASE + level` (`refs/ds4/ds4.h`), which is not
+/// one of the named discriminants — building that value in a three-variant
+/// `#[repr(C)]` enum would be undefined behaviour. The named values keep their
+/// exact C identity, 0/1/2.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ds4ThinkMode {
-    None = 0,
-    High = 1,
-    Max = 2,
+pub struct Ds4ThinkMode(pub c_int);
+
+impl Ds4ThinkMode {
+    /// `DS4_THINK_NONE`.
+    pub const NONE: Self = Self(0);
+    /// `DS4_THINK_HIGH`.
+    pub const HIGH: Self = Self(1);
+    /// `DS4_THINK_MAX`.
+    pub const MAX: Self = Self(2);
+    /// `DS4_THINK_LEVEL_BASE`.
+    const LEVEL_BASE: c_int = 1000;
+
+    /// The mode carrying an explicit reasoning effort of `n` (`0..=100`).
+    #[must_use]
+    pub fn level(n: u8) -> Self {
+        Self(Self::LEVEL_BASE + c_int::from(n))
+    }
 }
 
 /// Growable token vector, mirroring `ds4_tokens`.
@@ -305,6 +324,34 @@ unsafe extern "C" {
     /// than calling them, so both are available without a model loaded.
     /// `tests/c_parity.rs` holds the Rust copies equal to the C source.
     pub fn ds4_chat_append_max_effort_prefix(e: *mut Ds4Engine, tokens: *mut Ds4Tokens);
+
+    /// Appends the reasoning-effort preamble for *any* mode, in the position
+    /// and the spelling the loaded model family wants: the V4 max-effort text,
+    /// or V4.1's `Reasoning Effort: N` system line. Subsumes
+    /// `ds4_chat_append_max_effort_prefix`, which is the `DS4_THINK_MAX` case
+    /// of it, and appends nothing when the mode carries no preamble.
+    pub fn ds4_chat_append_think_prefix(
+        e: *mut Ds4Engine,
+        tokens: *mut Ds4Tokens,
+        mode: Ds4ThinkMode,
+    );
+
+    /// Whether the loaded weights are `DeepSeek` V4.1, the one family that
+    /// understands a numeric reasoning effort.
+    pub fn ds4_engine_is_deepseek41(e: *mut Ds4Engine) -> bool;
+
+    /// The V4.1 `Reasoning Effort: N` line for a mode, or NULL when the mode
+    /// carries none. Mirrored in Rust as `engine::deepseek41_effort_text` so it
+    /// is available without a model loaded.
+    pub fn ds4_deepseek41_reasoning_effort_text(mode: Ds4ThinkMode) -> *const c_char;
+
+    /// The explicit effort a mode carries (`0..=100`), or `-1` when it is one
+    /// of the named modes.
+    pub fn ds4_think_mode_level(mode: Ds4ThinkMode) -> c_int;
+
+    /// Parses a decimal `0..=100` into a mode carrying that effort. Mirrored in
+    /// Rust by `ThinkMode::parse`.
+    pub fn ds4_think_mode_parse_level(text: *const c_char, out: *mut Ds4ThinkMode) -> bool;
 
     /// Tokenizes already-rendered chat text, so control strings like
     /// `</think>` map to their special tokens rather than to literal pieces.

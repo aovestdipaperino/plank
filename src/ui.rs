@@ -7831,7 +7831,7 @@ the original is frozen and listed in /tree"
         format!("notifications {}", if new_state { "on" } else { "off" })
     }
 
-    /// Parses a `/think [off|low|medium|max]` argument and applies it; returns the
+    /// Parses a `/think [off|low|medium|max|0..100]` argument and applies it; returns the
     /// status line to report to the user. Shared by both front-ends so the two
     /// dispatchers cannot drift.
     ///
@@ -7958,11 +7958,19 @@ the original is frozen and listed in /tree"
         let current = self.think;
         let arg = arg.trim();
         if arg.is_empty() {
-            return format!("thinking: {} (off|low|medium|max)", current.name());
+            return format!("thinking: {} (off|low|medium|max|0..100)", current.name());
         }
         let Some(level) = ThinkMode::parse(arg) else {
-            return format!("/think: expected off|low|medium|max, got `{arg}`");
+            return format!("/think: expected off|low|medium|max|0..100, got `{arg}`");
         };
+        // A numeric effort is a V4.1 knob; on any other family the C refuses it
+        // rather than rounding it to `high`.
+        if crate::engine::think_level_unsupported(level, &self.engine.model_name()) {
+            return format!(
+                "/think {arg} requires a DeepSeek V4.1 model; still {}",
+                current.name()
+            );
+        }
         let ctx = self.engine.ctx_size();
         if level == ThinkMode::Max && ctx < THINK_MAX_MIN_CONTEXT {
             return format!(
@@ -12271,7 +12279,7 @@ impl Agent<'_> {
             })
             .unwrap_or_default();
         crate::kvtier::TierLabels {
-            think_mode: self.think.name().to_owned(),
+            think_mode: self.think.name().into_owned(),
             trusted_len: self.trusted_system_len,
             global_mcp: crate::tools::mcp::global_eligible_names(None),
             project_path: self.tool_ctx.cwd.display().to_string(),
@@ -21812,6 +21820,68 @@ mod tests {
         assert!(out.contains("max"), "got: {out}");
         assert_eq!(agent.think, ThinkMode::Max);
         assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Max]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // `/think N` on V4.1: the level is set, reported, and pushed to the engine,
+    // which is where it becomes `DS4_THINK_LEVEL_BASE + N`.
+    #[test]
+    fn think_command_accepts_a_numeric_level_on_v41() {
+        let dir = scratch_dir("think-level-v41");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            model: Some("DeepSeek V4.1 Flash".to_owned()),
+            think_modes: Some(std::sync::Arc::clone(&seen)),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        let out = agent.think_command("25", &mut || {});
+        assert!(out.contains("25"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Level(25));
+        assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Level(25)]);
+
+        // Zero is `off`, not a level, exactly as the C parses it.
+        let out = agent.think_command("0", &mut || {});
+        assert!(out.contains("off"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Off);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // On anything but V4.1 a numeric effort is refused rather than rounded to
+    // ordinary thinking, and the level is left alone.
+    #[test]
+    fn think_command_rejects_a_numeric_level_off_v41() {
+        let dir = scratch_dir("think-level-v4");
+        let engine = ScriptedEngine {
+            model: Some("DeepSeek V4 Flash".to_owned()),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let out = agent.think_command("25", &mut || {});
+        assert!(out.contains("V4.1"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Off, "level unchanged");
+        // The named levels are unaffected.
+        let out = agent.think_command("max", &mut || {});
+        assert!(!out.contains("V4.1"), "got: {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Out of range is not a level at all, on any model.
+    #[test]
+    fn think_command_rejects_an_out_of_range_level() {
+        let dir = scratch_dir("think-level-range");
+        let engine = ScriptedEngine {
+            model: Some("DeepSeek V4.1 Flash".to_owned()),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let out = agent.think_command("101", &mut || {});
+        assert!(out.contains("expected"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Off, "level unchanged");
         std::fs::remove_dir_all(&dir).ok();
     }
 

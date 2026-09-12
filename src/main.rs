@@ -873,6 +873,12 @@ fn run(
     cfg: &AgentConfig,
     plugins: plank::plugins::PluginSet,
 ) -> Result<(), String> {
+    // The family check the C makes right after opening the engine: a numeric
+    // effort is meaningless to anything but V4.1, and falling back to `high`
+    // silently would be worse than refusing.
+    if plank::engine::think_level_unsupported(cfg.generation.think_mode, &engine.model_name()) {
+        return Err(plank::engine::THINK_LEVEL_REQUIRES_V41.to_string());
+    }
     let color = std::io::stdout().is_terminal();
     if cfg.non_interactive {
         return plank::ui::run_non_interactive(engine, cfg, local_engine, plugins);
