@@ -682,7 +682,7 @@ enum Parser {
 impl Parser {
     fn new(syntax: ToolSyntax) -> Self {
         match syntax {
-            ToolSyntax::Dsml => Self::Dsml(DsmlParser::new()),
+            ToolSyntax::Dsml | ToolSyntax::Dsml41 => Self::Dsml(DsmlParser::new()),
             ToolSyntax::Qwen => Self::Qwen(QwenParser::new()),
         }
     }
@@ -1126,7 +1126,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                     DsmlState::Structural | DsmlState::ParamValue
                 )
                 .then_some(match self.syntax {
-                    ToolSyntax::Dsml => "incomplete DSML tool call",
+                    ToolSyntax::Dsml | ToolSyntax::Dsml41 => "incomplete DSML tool call",
                     ToolSyntax::Qwen => "incomplete tool call",
                 })
             });
@@ -1943,7 +1943,9 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// and no implicit-invoke form to stand in for it.
     fn start_match(&self, complete: &mut bool, implicit_invoke: &mut bool) -> bool {
         match self.syntax {
-            ToolSyntax::Dsml => dsml_start_match(&self.dsml_start_tail, complete, implicit_invoke),
+            ToolSyntax::Dsml | ToolSyntax::Dsml41 => {
+                dsml_start_match(&self.dsml_start_tail, complete, implicit_invoke)
+            }
             ToolSyntax::Qwen => {
                 *implicit_invoke = false;
                 let tail = &self.dsml_start_tail[..];
@@ -1980,7 +1982,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         // The parser has its own opener scan, and it is fed the *canonical*
         // spelling rather than whichever accepted variant the model wrote.
         self.parser.feed(match self.syntax {
-            ToolSyntax::Dsml => DSML_START,
+            ToolSyntax::Dsml | ToolSyntax::Dsml41 => DSML_START,
             ToolSyntax::Qwen => QWEN_START,
         });
         self.scan = DsmlScan::Between;
