@@ -3703,6 +3703,10 @@ hello\n";
         fs::write(dir.join("zippy-kennedy.kv"), b"plank-session 1\n").unwrap();
         // Already tagged: must be left exactly as it is.
         fs::write(dir.join("wily-curie.qwn.kv"), b"plank-session 1\n").unwrap();
+        // Also already tagged, and the family whose transcripts the
+        // untagged-rename path must never mistake for the legacy `.kv`
+        // extension it targets.
+        fs::write(dir.join("plucky-turing.ds41.kv"), b"plank-session 1\n").unwrap();
         // A per-project checkpoint tree. Transcripts never live here, and
         // walking it at every launch would be scanning for nothing.
         let proj = dir.join("abcdef123456");
@@ -3719,6 +3723,10 @@ hello\n";
         assert!(
             dir.join("wily-curie.qwn.kv").exists(),
             "tagged file untouched"
+        );
+        assert!(
+            dir.join("plucky-turing.ds41.kv").exists(),
+            "ds41-tagged file untouched"
         );
         assert!(
             proj.join("project-7c02.kv").exists(),

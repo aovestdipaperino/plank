@@ -2799,12 +2799,19 @@ fn warn_on_companion_mismatch(family: crate::gguf::ModelFamily, companion: &Path
     let Some(arch) = crate::gguf::architecture(companion) else {
         return;
     };
+    // DSpark, pipeline execution and non-Metal backends are not implemented
+    // for V4.1 (`refs/ds4/docs/MODELS.md`, as of commit bd66c40) — there is no
+    // V4.1 drafter architecture to name, real or invented.
+    if family == crate::gguf::ModelFamily::Ds41 {
+        eprintln!(
+            "warning: --mtp {} was given, but DSpark speculative decoding is not implemented for DeepSeek V4.1 Flash",
+            companion.display()
+        );
+        return;
+    }
     let expected = match family {
         crate::gguf::ModelFamily::Qwen => "qwen4-exp-ple",
-        crate::gguf::ModelFamily::Ds4 => "deepseek4-dspark",
-        // V4.1's own drafter names itself after its architecture, the way
-        // V4's does.
-        crate::gguf::ModelFamily::Ds41 => "deepseek41-dspark",
+        crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41 => "deepseek4-dspark",
     };
     if arch != expected {
         eprintln!(

@@ -546,6 +546,30 @@ mod tests {
         }
     }
 
+    /// `deepseek41` is not a prefix match away from `deepseek4` and must not
+    /// fall through to it: it is its own family, with its own weights,
+    /// vision encoder, tokenizer and DSML dialect.
+    #[test]
+    fn deepseek41_arch_is_its_own_family() {
+        let p = Gguf::default()
+            .str_val("general.architecture", "deepseek41")
+            .write("ds41");
+        assert_eq!(family_of(&p), ModelFamily::Ds41);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// The probe and the dialect selector must agree for V4.1 too, the same
+    /// way `the_dialect_and_the_family_agree` checks it for V4 and Qwen.
+    #[test]
+    fn v41_dialect_maps_to_the_v41_family() {
+        use trace_stream::syntax::ToolSyntax;
+        assert_eq!(ModelFamily::from(ToolSyntax::Dsml41), ModelFamily::Ds41);
+        assert_eq!(
+            ModelFamily::from(ToolSyntax::for_model_name("DeepSeek V4.1 Flash")),
+            ModelFamily::Ds41
+        );
+    }
+
     /// Only the pinned Vision-Exp checkpoint may be opened with a vision
     /// encoder; the C refuses the open for any other `DeepSeek` GGUF. A
     /// language-only or re-quantized checkpoint has no
