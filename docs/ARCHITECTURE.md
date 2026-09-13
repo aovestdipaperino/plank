@@ -148,6 +148,14 @@ because the invariant that makes a swap safe is per-set — the manifest moves
 last, so its presence proves that set landed, and one shared staging area would
 let a half-staged download of one family read as proof about the other.
 
+Only the V4 set is actually *managed*: `ds4.manifest` is the one manifest in
+the repo, and `default_set_for_root` answers `Ds4` for a fresh install. V4.1 is
+reached by pointing `-m` at a V4.1 GGUF — the family, dialect, transcript
+extension and install paths all follow from the file — and its manifest fetch
+simply 404s, which the startup flow already treats like being offline: nothing
+printed, nothing offered, and the 24-hour check file stamped before the fetch
+so it is not retried until tomorrow.
+
 ### Weight deltas (`ggufdelta.rs`, `crates/gguf-delta`)
 A `.ggd` file is the difference between two GGUF files of identical layout —
 same metadata, same tensor table — as the changed byte spans, each stored as a

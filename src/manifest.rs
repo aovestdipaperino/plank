@@ -73,6 +73,14 @@ impl ModelSet {
     }
 
     /// Filename of the set's manifest, both remote and installed.
+    ///
+    /// Only `ds4.manifest` is actually published: the V4.1 set is reached by
+    /// an explicit `-m` and is not managed, so its name resolves to a file
+    /// that exists nowhere. That is deliberate and already handled — the
+    /// startup fetch answers `None` on a 404 exactly as it does when offline,
+    /// and `check_manifest_at_startup_in` returns silently, having already
+    /// stamped the 24-hour check file, so nothing is printed and nothing is
+    /// re-fetched until tomorrow.
     #[must_use]
     pub fn manifest_name(self) -> &'static str {
         match self {
@@ -676,29 +684,9 @@ mod tests {
         );
     }
 
-    /// The manifest that actually ships. The byte counts and digests here were
-    /// checked against the published artifacts: a typo would only be found
-    /// after a 341 GiB download failed its final verification.
-    #[test]
-    fn the_shipped_ds41_manifest_parses() {
-        let m = parse(include_str!("../ds41.manifest")).expect("ds41.manifest parses");
-        let main = m.files.get("main").expect("main entry");
-        assert_eq!(main.bytes, 365_713_686_528);
-        assert_eq!(
-            main.sha256,
-            "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"
-        );
-        let vision = m.files.get("vision").expect("vision entry");
-        assert_eq!(vision.bytes, 970_555_552);
-        assert_eq!(
-            vision.sha256,
-            "cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15"
-        );
-        assert!(!m.files.contains_key("dspark"));
-    }
-
-    /// The shipped V4 manifest must keep parsing too: both files are compiled
-    /// in, and a malformed one is only noticed here.
+    /// The one manifest that ships must keep parsing: it is compiled in, and a
+    /// malformed one is only noticed here. There is deliberately no V4.1
+    /// manifest — V4.1 is reached by an explicit `-m`, never managed.
     #[test]
     fn the_shipped_ds4_manifest_parses() {
         let m = parse(include_str!("../ds4.manifest")).expect("ds4.manifest parses");

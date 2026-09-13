@@ -332,8 +332,9 @@ pub fn default_ds41_vision_path() -> PathBuf {
 /// What `-m` falls back to. It follows [`crate::manifest::default_set_for_root`]
 /// so the model that loads belongs to the set whose manifest plank tracks: a
 /// fresh install takes V4, as does an install with V4 already recorded or on
-/// disk; only a root recording `ds41.manifest` manages V4.1. Falls back to [`default_model_path`] only if a set ever
-/// stops declaring a `main` artifact, which no set does.
+/// disk; only a root recording `ds41.manifest` manages V4.1. Falls back to
+/// [`default_model_path`] only if a set ever stops declaring a `main`
+/// artifact, which no set does.
 #[must_use]
 pub fn default_managed_model_path_in(root: &Path) -> PathBuf {
     crate::manifest::local_path_for_in(root, crate::manifest::default_set_for_root(root), "main")
