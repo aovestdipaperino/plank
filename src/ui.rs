@@ -2146,6 +2146,29 @@ pub(crate) fn render_mcp_report(servers: &[crate::tools::mcp::McpServer], color:
     out
 }
 
+/// The NATO phonetic alphabet, lowercase, in the conventional spellings
+/// (`juliett` with two t's, `x-ray` hyphenated). Source of truth for the
+/// default sub-agent names; see `nato_label`.
+const NATO_ALPHABET: [&str; 26] = [
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett",
+    "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
+    "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu",
+];
+
+/// The label for the `n`-th unnamed sub-agent of a session, counting from zero:
+/// `alpha`, `bravo`, ... `zulu`, then `alpha-2` ... `zulu-2`, `alpha-3`, and so
+/// on. It never runs out and never repeats, so a log can always tell two
+/// unnamed sub-agents apart.
+fn nato_label(n: usize) -> String {
+    let word = NATO_ALPHABET[n % NATO_ALPHABET.len()];
+    let lap = n / NATO_ALPHABET.len();
+    if lap == 0 {
+        word.to_string()
+    } else {
+        format!("{word}-{}", lap + 1)
+    }
+}
+
 /// Shared turn state for the interactive and headless front-ends.
 // The bools are independent UI/turn latches, not a disguised state machine.
 #[allow(clippy::struct_excessive_bools)]
@@ -2337,6 +2360,13 @@ struct Agent<'a> {
     /// `showThinking` flip or a console restart never repeats what the console
     /// already showed. Reset with the session; clamped by rollback.
     console_seen: usize,
+    /// How many *unnamed* sub-agents this session has already labelled. Every
+    /// one of them used to be called `sub-agent`, which made a log holding
+    /// several of them unreadable; instead each draws the next NATO phonetic
+    /// word from `nato_label`. One counter per session covers both entry points
+    /// (the `agent` tool and `/subagent`) and any nesting, so no two unnamed
+    /// sub-agents in a session ever share a name. Reset with the session.
+    unnamed_subagents: usize,
     /// The last few finished sub-agent sidechains, newest last, for the
     /// `/repro` sidecars: a sidechain is truncated out of the transcript the
     /// moment it ends, so without this the main dump could never show what a
@@ -3459,7 +3489,7 @@ impl Agent<'_> {
         }
         let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
         let label = if name.is_empty() {
-            "sub-agent".to_string()
+            self.next_unnamed_subagent_label()
         } else {
             name.to_string()
         };
@@ -5772,6 +5802,15 @@ impl Agent<'_> {
         "Write the AGENTS.md file to the current directory."
     );
 
+    /// Draw the next label for an unnamed sub-agent, advancing the session's
+    /// counter. A *named* sub-agent never calls this, so naming one in the
+    /// middle of a run does not skip a word.
+    fn next_unnamed_subagent_label(&mut self) -> String {
+        let label = nato_label(self.unnamed_subagents);
+        self.unnamed_subagents += 1;
+        label
+    }
+
     /// The session-state half of `/clear` (and `/new`): drops the ladder, mints
     /// a fresh session, and re-scaffolds session-start context — everything
     /// except the front-end-specific screen wipe and rewarm. Shared by the
@@ -5786,6 +5825,9 @@ impl Agent<'_> {
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
+        // ... and a new log deserves a fresh alphabet: the next unnamed
+        // sub-agent is `alpha` again.
+        self.unnamed_subagents = 0;
         self.broadcast_session_reset(None);
         self.reminder = SystemPromptReminder::new();
         // Same merged roster the launch path advertises, so /clear
@@ -6544,6 +6586,9 @@ impl Agent<'_> {
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
+        // ... and a new log deserves a fresh alphabet: the next unnamed
+        // sub-agent is `alpha` again.
+        self.unnamed_subagents = 0;
         self.last_ctx_used = 0;
         if let Some(note) = note {
             println!("{note}");
@@ -7403,6 +7448,9 @@ the original is frozen and listed in /tree"
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
+        // ... and a new log deserves a fresh alphabet: the next unnamed
+        // sub-agent is `alpha` again.
+        self.unnamed_subagents = 0;
         self.broadcast_session_reset(Some(
             "[session replaced — its history is on the local screen only]",
         ));
@@ -15016,7 +15064,7 @@ impl Agent<'_> {
                     None => (
                         None,
                         None,
-                        "sub-agent".to_string(),
+                        self.next_unnamed_subagent_label(),
                         arg.to_string(),
                         "[subagent started]".to_string(),
                     ),
@@ -17273,6 +17321,7 @@ fn new_agent(
         fork_kv: Vec::new(),
         fork_points: Vec::new(),
         console_seen: 0,
+        unnamed_subagents: 0,
         sidechain_dumps: std::collections::VecDeque::new(),
         // A local engine handed in alongside a provider main agent lives in the
         // same cache as any other alternate: `provider: local` definitions take
@@ -19437,6 +19486,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -24019,6 +24069,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -24142,6 +24193,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25268,6 +25320,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25454,6 +25507,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn tool_call_inside_think_is_dispatched_and_the_block_is_closed() {
         // Opt this thread into in-think dispatch; the shipped default is off.
         let mut settings = crate::settings::Settings::default();
@@ -25536,6 +25590,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25644,6 +25699,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25739,6 +25795,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25857,6 +25914,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -26107,9 +26165,9 @@ mod tests {
         assert_eq!(
             errors,
             vec![
-                "guard: stopped a reasoning loop in sub-agent 'sub-agent'",
-                "guard: stopped a reasoning loop (2 in a row) in sub-agent 'sub-agent'",
-                "guard: asked for the report after 2 loops in a row in sub-agent 'sub-agent'",
+                "guard: stopped a reasoning loop in sub-agent 'alpha'",
+                "guard: stopped a reasoning loop (2 in a row) in sub-agent 'alpha'",
+                "guard: asked for the report after 2 loops in a row in sub-agent 'alpha'",
             ],
             "{events:?}"
         );
@@ -28157,7 +28215,7 @@ or the user's next message aborts before its first token"
             matches!(
                 got.first(),
                 Some(crate::worker::UiEvent::Dim(d))
-                    if d == &crate::tui::subagent_signpost("sub-agent")
+                    if d == &crate::tui::subagent_signpost("alpha")
             ),
             "first event should be the Dim signpost: {got:?}"
         );
@@ -28175,6 +28233,108 @@ or the user's next message aborts before its first token"
             "no sub-agent render output was forwarded: {got:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The generated names are the NATO alphabet, lowercase, and they wrap with
+    /// a lap suffix rather than running out or repeating.
+    #[test]
+    fn nato_labels_run_alpha_bravo_charlie_and_wrap_past_zulu() {
+        assert_eq!(nato_label(0), "alpha");
+        assert_eq!(nato_label(1), "bravo");
+        assert_eq!(nato_label(2), "charlie");
+        assert_eq!(nato_label(3), "delta");
+        // The conventional spellings, not the naive ones.
+        assert_eq!(nato_label(9), "juliett");
+        assert_eq!(nato_label(23), "x-ray");
+        assert_eq!(nato_label(25), "zulu");
+        // Past zulu the alphabet starts again with a lap suffix.
+        assert_eq!(nato_label(26), "alpha-2");
+        assert_eq!(nato_label(27), "bravo-2");
+        assert_eq!(nato_label(51), "zulu-2");
+        assert_eq!(nato_label(52), "alpha-3");
+        // ... and never repeats: 1000 draws, 1000 distinct labels.
+        let all: std::collections::HashSet<String> = (0..1000).map(nato_label).collect();
+        assert_eq!(all.len(), 1000);
+    }
+
+    /// One counter per session, shared by every unnamed sub-agent, and a `/new`
+    /// or `/clear` puts it back to `alpha` so a post-reset log reads the same.
+    #[test]
+    fn the_unnamed_sub_agent_counter_is_per_session_and_resets_with_it() {
+        let dir = scratch_dir("nato-counter");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert_eq!(agent.next_unnamed_subagent_label(), "alpha");
+        assert_eq!(agent.next_unnamed_subagent_label(), "bravo");
+        assert_eq!(agent.next_unnamed_subagent_label(), "charlie");
+        agent.reset_session_state();
+        assert_eq!(
+            agent.next_unnamed_subagent_label(),
+            "alpha",
+            "a session reset restarts the alphabet"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `agent` tool's unnamed sub-agents draw successive NATO names, and a
+    /// *named* one keeps its name without consuming a slot — so naming one in
+    /// the middle does not skip a word.
+    #[test]
+    fn unnamed_agent_tool_calls_are_labelled_alpha_then_bravo() {
+        let dir = scratch_dir("nato-agent-tool");
+        let engine = ScriptedEngine {
+            replies: vec![
+                "one\n".to_string(),
+                "two\n".to_string(),
+                "three\n".to_string(),
+            ],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.agents = vec![named_def("reviewer", true)];
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        for c in [
+            agent_call("say hi", None),
+            agent_call("review it", Some("reviewer")),
+            agent_call("say hi again", None),
+        ] {
+            let out = agent.run_agent_tool(&c);
+            assert!(!out.starts_with("Tool error"), "{out}");
+        }
+        let labels: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                crate::worker::UiEvent::SubStart { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "alpha".to_string(),
+                "reviewer".to_string(),
+                "bravo".to_string()
+            ],
+            "the named run keeps its name and consumes no NATO slot"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other entry point — `/subagent` with no `:<name>` — draws from the
+    /// same per-session sequence, so the two never collide in one log.
+    #[test]
+    fn the_subagent_command_shares_the_nato_sequence() {
+        let dir = scratch_dir("nato-slash");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        // Both sites call the same draw, so the sequence is shared: standing in
+        // for one of them here still proves the other cannot repeat it.
+        assert_eq!(agent.next_unnamed_subagent_label(), "alpha");
+        assert_eq!(agent.next_unnamed_subagent_label(), "bravo");
+        assert_eq!(agent.unnamed_subagents, 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -28268,6 +28428,7 @@ or the user's next message aborts before its first token"
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -28307,7 +28468,7 @@ or the user's next message aborts before its first token"
             "one finished sidechain kept"
         );
         let dump = agent.sidechain_dumps.back().unwrap();
-        assert_eq!(dump.label, "sub-agent");
+        assert_eq!(dump.label, "alpha");
         assert_eq!(dump.outcome, "report");
         assert!(
             dump.messages.iter().any(|m| m.text.contains("echo 42")),
@@ -28405,6 +28566,7 @@ or the user's next message aborts before its first token"
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -28576,6 +28738,7 @@ or the user's next message aborts before its first token"
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
