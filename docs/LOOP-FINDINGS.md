@@ -45,7 +45,9 @@ The guards, for orientation:
   guards that have a budget, i.e. the turn guards — see "The review that was
   written in the wrong place", below.
 - **No-progress budget** — `NO_PROGRESS_BYTE_BUDGET` = 32 KiB generated in one
-  turn with no `PROGRESS_TOOLS` call (`write`, `edit`, `bash`, `bash_stop`).
+  turn with no observed file change: neither a successful `write`/`edit`
+  (`ToolContext::last_written`) nor a working-tree difference across an opaque
+  tool such as `bash` (`ToolContext::touched_tree`, from `treedigest`).
   Turn-scale, so it is the only rung that sees a turn whose every pass is
   individually reasonable and which still changes nothing.
 - **Sub-agent trip cap** — `SUBAGENT_REPEAT_TRIP_CAP = 2`: a sidechain stopped
@@ -75,6 +77,7 @@ argument for the design.
 | 2026-09-10 | *(this change)* | think budget sized from the context window: `repeat_think_budget` = `ctx_size / 10` bytes, floored at the old 16 KiB (`REPEAT_THINK_BUDGET_FLOOR`) | `repro-loop-1789051332` … `-1789053127`: seven budget stops in three sessions on one feature request, none a cycle — see "The think budget fired on reasoning that was not looping", below |
 | 2026-09-11 | *(this change)* | closed-think recovery (`Agent::pass_opts`): the pass after any reasoning stop is generated with `ThinkMode::Off`, so it can only deliver; and a draft stop counts on its own tally (`MAIN_DRAFT_TRIP_CAP` = 3) instead of against `MAIN_REPEAT_TRIP_CAP` | `repro-loop-1789108509` / `-1789108726`: a turn ended for obeying the draft rung twice — see "The recovery had nowhere to write", below |
 | 2026-09-11 | *(this change)* | `NO_PROGRESS_NOTICE` reworded: it no longer claims a shell command would have reset the budget, and it names what does | `repro-1789107544`: the tripping pass had just run `cargo test` and `cargo clippy` successfully — see "The no-progress notice named the wrong evidence", below |
+| 2026-09-13 | *(this change)* | `treedigest`: a git working-tree fingerprint taken before and after every opaque tool (`bash` family, `run_code`, MCP, WASM), whose difference sets `ToolContext::touched_tree` and resets the no-progress budget; `NO_PROGRESS_NOTICE` reworded again to name it | shell-driven work (`sed -i`, `cargo fmt`, codegen, `git apply`) scored zero progress and could trip the budget for doing the job — see "An attempted mutation is not progress", below |
 | 2026-09-10 | *(this change)* | draft rung (`RepeatGuard::drafting`, `DRAFT_ERROR`): numbered deliverable headings or fenced code accumulating inside `<think>` past 8 KiB stop the pass with "write this as your answer, not in reasoning"; and a `WORKING_STYLE` rule, "Write findings as you find them", so list-shaped answers are emitted item by item after `</think>` | `repro-loop-1789060243` and the seven 2026-09-10 dumps: deliverables drafted in reasoning, never emitted |
 | 2026-09-10 | *(no code change)* | counter-case to the raised budget recorded: a 30 KB review drafted inside `<think>` under the ~102 KB budget, interrupted by the user at 12m42s; the `resume` pass redrafted and fell into a 5-line cycle the exact-cycle rung caught | `repro-loop-1789060243`: `do a code review`, 18 minutes, no visible output — see "The review that was written in the wrong place", below |
 | 2026-09-10 | `1a09915` | `NumberedCycle` inside `DraftScan`: numbered reasoning lines hashed with the leading ordinal stripped, a bounded 256-item history independent of the byte window, reported as a cycle through `RepeatGuard::feed` at `REPEAT_CYCLES` copies; a cycle must carry three distinct substantial bodies and 256 bytes | `repro-1789068543`: a 26-item cycle, over 7 KiB per copy, that no byte rung could match — see "A cycle that renumbers itself is not byte-exact", below |
@@ -253,8 +256,10 @@ cycle, so its latency floor is `2p` — 18 KB here, and unreachable anyway when
   counted towards `MAIN_REPEAT_TRIP_CAP` alongside a real loop, since both
   leave the prompt materially unchanged at temperature 0.
 - **`NO_PROGRESS_BYTE_BUDGET` = 32 KiB**, a per-*turn* cap on output generated
-  without a `PROGRESS_TOOLS` call (`write`, `edit`, `bash`, `bash_stop` — the
-  same set plan mode blocks). This is the rung the per-pass budget cannot be:
+  without an observed file change. (As first written this counted a
+  `PROGRESS_TOOLS` *call* — `write`, `edit`, `bash`, `bash_stop`, the same set
+  plan mode blocks — which is the mistake "An attempted mutation is not
+  progress" below is about.) This is the rung the per-pass budget cannot be:
   the parent turn above passes every per-pass check ever written.
 
 Both were sized against the 32 dumps in `~/.plank/repro`, 939 passes, and the
@@ -311,6 +316,22 @@ not assumed to have made progress: detecting arbitrary shell mutations
 reliably would require a separate workspace-mutation witness, rather than an
 exit-status heuristic. Regression tests cover a failed `edit`, a successful
 read-only `bash`, and repeated successful writes.
+
+**2026-09-13: the witness now exists.** Leaving shell calls out was right
+about the evidence and wrong about the cost. A turn doing real work through
+`sed -i`, `cargo fmt`, a codegen script or `git apply` scored zero progress
+and could trip the budget for doing exactly what it was asked. `treedigest`
+supplies the missing witness without reintroducing the exit-status heuristic:
+`dispatch` fingerprints the git working tree before and after every *opaque*
+tool (the `bash` family, `run_code`, MCP and WASM tools — never `write` or
+`edit`, which report themselves precisely), and a **difference** sets
+`ToolContext::touched_tree`. A command that runs successfully and changes
+nothing still resets nothing, which is the property the original finding was
+protecting. Outside a git repository the digest is `None` on both sides and
+the guard falls back to `last_written` alone, exactly as before. See
+`docs/FILE-SYSTEM-HOOK.md` for why this is observation rather than a real
+write hook, and for the FSEvents design that would widen it to ignored and
+non-repo paths.
 
 ## A stopped pass is regenerated verbatim: the main turn has no trip cap
 

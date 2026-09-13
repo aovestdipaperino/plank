@@ -168,6 +168,14 @@ pub struct ToolContext {
     /// creating a new file deliberately produces no diff card (the streaming
     /// preview already showed it) but is still the file the user wants to open.
     pub last_written: Option<PathBuf>,
+    /// Set when an *opaque* tool call — one that can write without saying so,
+    /// such as `bash` or an MCP server's own write tool — left the git working
+    /// tree measurably different than it found it
+    /// ([`crate::treedigest`]). Drained by the UI alongside
+    /// [`last_written`](Self::last_written), and read only by the no-progress
+    /// guard: it is a witness that *something* changed, not a path, so it
+    /// cannot aim `/open` or produce a diff card.
+    pub touched_tree: bool,
     /// Front end that presents `ask` questions (issue #34); `None` in
     /// non-interactive mode, where `ask` fast-fails instead of blocking.
     pub asker: Option<Box<dyn ask::Asker>>,
@@ -201,6 +209,33 @@ const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &["write", "edit", "bash", "EnterWorktr
 #[must_use]
 fn is_plan_mode_blocked(name: &str) -> bool {
     PLAN_MODE_BLOCKED_TOOLS.contains(&name)
+}
+
+/// Tools that can write a file without setting
+/// [`ToolContext::last_written`], and so need the working-tree digest to
+/// speak for them.
+///
+/// `write` and `edit` are deliberately absent: they report their own writes
+/// precisely, and a digest would only be a slower second opinion. The `bash`
+/// family is here for `sed -i`, `cargo fmt`, and every script; `run_code` for
+/// the same reason. MCP and WASM tools are matched dynamically below, since
+/// their names come from the server.
+const OPAQUE_MUTATOR_TOOLS: &[&str] = &[
+    "bash",
+    "bash_status",
+    "bash_stop",
+    "run_code",
+    "mcp_call",
+    "mcp_read_resource",
+];
+
+/// True when `name` names a tool whose writes are invisible to the agent, so
+/// a [`crate::treedigest`] comparison should bracket its dispatch.
+#[must_use]
+fn is_opaque_mutator(name: &str, ctx: &ToolContext) -> bool {
+    OPAQUE_MUTATOR_TOOLS.contains(&name)
+        || name.starts_with("mcp__")
+        || ctx.wasm.registry.tools().iter().any(|t| t.exposed == name)
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -253,6 +288,7 @@ impl ToolContext {
             task_completions: Vec::new(),
             edit_previews: Vec::new(),
             last_written: None,
+            touched_tree: false,
             asker: None,
             ask_bridge: None,
             #[cfg(ds4_engine)]
@@ -406,6 +442,14 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     // around the tool body only, so hooks still see the full output.
     let deadline = crate::settings::active().tools.call_timeout_sec;
     let start = std::time::Instant::now();
+    // Workspace-mutation witness for the tools that cannot report their own
+    // writes (see [`is_opaque_mutator`]). Captured only for those, so a `read`
+    // never pays for a `git status` walk.
+    let tree_before = if is_opaque_mutator(&call.name, ctx) {
+        crate::treedigest::capture(&ctx.cwd)
+    } else {
+        None
+    };
     let output = match call.name.as_str() {
         "EnterWorktree" => worktree::tool_enter_worktree(ctx, call),
         "ExitWorktree" => worktree::tool_exit_worktree(ctx, call),
@@ -453,6 +497,13 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         }
         other => format!("Tool error: unknown tool: {other}\n"),
     };
+    // Compared before the hooks run: a PostToolUse hook may well write a file
+    // of its own, and the hook's work is not the model's progress.
+    if tree_before.is_some()
+        && crate::treedigest::changed(tree_before, crate::treedigest::capture(&ctx.cwd))
+    {
+        ctx.touched_tree = true;
+    }
     // PostToolUse hooks: exit 2 appends stderr to the model's observation.
     let mut output = output;
     if !ctx.hooks.post_tool_use.is_empty() {

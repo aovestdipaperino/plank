@@ -713,10 +713,15 @@ const NO_PROGRESS_BYTE_BUDGET: usize = 32768;
 /// `repro-1789107544` the tripping pass had just run `cargo test` and
 /// `cargo clippy`, both successfully, and the notice as first written claimed
 /// the turn had gone 32 KB "without ... running a command" — contradicting
-/// both the code and the comment on the constant three lines above it. Only
-/// `last_written` resets this budget; reads and shell commands never have
-/// (see `docs/LOOP-FINDINGS.md`, "An attempted mutation is not progress").
-const NO_PROGRESS_NOTICE: &str = "turn stopped: the model generated 32KB of output and changed no file. Only a successful write or edit counts here — reads and shell commands, however many, do not. Narrow the request, or tell it which file to start with.";
+/// both the code and the comment on the constant three lines above it.
+///
+/// Two things reset this budget, and both are observed changes rather than
+/// calls: `last_written`, which `write` and `edit` set on success, and
+/// `touched_tree`, which [`crate::treedigest`] sets when an opaque tool such
+/// as `bash` left the git working tree different than it found it. A read, a
+/// search, or a build that changes nothing still resets nothing (see
+/// `docs/LOOP-FINDINGS.md`, "An attempted mutation is not progress").
+const NO_PROGRESS_NOTICE: &str = "turn stopped: the model generated 32KB of output and changed no file. Only a file that actually changed counts here — a successful write or edit, or a shell command that left the working tree different. Reads, searches and builds, however many, do not. Narrow the request, or tell it which file to start with.";
 
 /// Whether a preflight error is one of the reasoning rungs, and so counts
 /// towards [`MAIN_REPEAT_TRIP_CAP`]. Both stops leave the prompt materially
@@ -4582,10 +4587,15 @@ impl Agent<'_> {
                     println!("{}", self.debug_line(&line));
                 }
                 // `last_written` is set by `write` and `edit` only after the
-                // file operation succeeds. A call-shaped check would let a
-                // failed edit, or a read-only `bash`, reset the no-progress
-                // budget forever (repro-loop-1788833715).
-                let made_progress = self.tool_ctx.last_written.is_some();
+                // file operation succeeds, and `touched_tree` only when an
+                // opaque tool (`bash`, an MCP write) left the git working tree
+                // measurably different. A call-shaped check would let a failed
+                // edit, or a read-only `bash`, reset the no-progress budget
+                // forever (repro-loop-1788833715); both of these are evidence
+                // of an actual change, not of a call having been made.
+                let made_progress =
+                    self.tool_ctx.last_written.is_some() || self.tool_ctx.touched_tree;
+                self.tool_ctx.touched_tree = false;
                 let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
                 crate::openfile::note_written(
                     &mut self.last_edited,
@@ -13592,8 +13602,10 @@ impl Agent<'_> {
                     let _ = tx.send(UiEvent::Dim(line));
                 }
                 // Keep this exactly in step with the plain-stdout path: only
-                // a successful direct file mutation resets the budget.
-                let made_progress = self.tool_ctx.last_written.is_some();
+                // an observed file mutation resets the budget.
+                let made_progress =
+                    self.tool_ctx.last_written.is_some() || self.tool_ctx.touched_tree;
+                self.tool_ctx.touched_tree = false;
                 let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
                 crate::openfile::note_written(
                     &mut self.last_edited,
@@ -26887,8 +26899,14 @@ mod tests {
     fn read_only_bash_does_not_reset_the_no_progress_budget() {
         // Exit status says only that a command ran. It does not establish that
         // the task advanced; in particular it must not excuse repeated builds
-        // and searches such as repro-loop-1788833715.
+        // and searches such as repro-loop-1788833715. The directory is a
+        // repository so the `treedigest` witness is genuinely captured and
+        // genuinely unmoved, rather than absent.
         let dir = scratch_dir("no-progress-bash");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        git2::Repository::init(&dir).unwrap();
         let cfg = test_cfg();
         let bash_call = concat!(
             "<｜DSML｜tool_calls>",
@@ -26914,6 +26932,48 @@ mod tests {
             vec![format!("guard: {NO_PROGRESS_NOTICE}")],
             "{events:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_bash_command_that_writes_resets_the_no_progress_budget() {
+        // The other half of `read_only_bash_does_not_reset_the_no_progress_budget`:
+        // a shell command whose exit status proves nothing, but whose effect on
+        // the working tree does. `sed -i`, `cargo fmt` and codegen scripts all
+        // land here, and before the `treedigest` witness every one of them
+        // counted as zero progress.
+        let dir = scratch_dir("no-progress-bash-writes");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        git2::Repository::init(&dir).unwrap();
+        let cfg = test_cfg();
+        // Appends, so each round grows the file: the digest moves on every
+        // pass without depending on filesystem timestamp resolution.
+        let bash_call = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">printf x >> grew.txt</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let pass = format!("{}{bash_call}", "x".repeat(12 * 1024));
+        let engine = ScriptedEngine {
+            replies: vec![pass.clone(), pass.clone(), pass, "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            error_lines(&events).is_empty(),
+            "36 KB of output, but every round changed the tree: {events:?}"
+        );
+        assert!(dir.join("grew.txt").exists(), "the command never ran");
         std::fs::remove_dir_all(&dir).ok();
     }
 

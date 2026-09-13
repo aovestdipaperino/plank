@@ -105,6 +105,7 @@ pub mod title;
 pub mod toks;
 pub mod tools;
 pub mod trace;
+pub mod treedigest;
 pub mod tui;
 pub mod ui;
 pub mod uiremote;
