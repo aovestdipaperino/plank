@@ -12199,6 +12199,7 @@ impl Agent<'_> {
                             &mut log,
                             terminal,
                             &mut view,
+                            !feedback,
                         );
                         if feedback {
                             self.session
@@ -12206,6 +12207,18 @@ impl Agent<'_> {
                             log.push_dim(
                                 "[recorded for the model — ask about it in your next message]",
                             );
+                        } else if let Some(text) = bang_panel_report(&cmd, &result) {
+                            // `!!` output is the operator's alone, so it goes
+                            // into the same dismissable panel `/context` and
+                            // `/usage` use instead of scrolling away inside the
+                            // conversation. Nothing about it reaches the
+                            // session — that is the whole point of `!!`.
+                            report = Some(tui::ReportPanel::new(bang_panel_title(&cmd), &text));
+                            view.follow = true;
+                        } else {
+                            // Nothing to show: an empty panel would say less
+                            // than the outcome line.
+                            bang_log_outcome(&cmd, &result, &mut log);
                         }
                     } else if line.starts_with('/') {
                         if !self.tui_slash(
@@ -12296,12 +12309,19 @@ impl Agent<'_> {
     /// its output as one user message (see [`bang_transcript_entry`]) so the
     /// model has it as history on the next real prompt. For output the model
     /// should act on *now*, use a regular turn and let it call the `bash` tool.
+    ///
+    /// `quiet` is the `!!` shape: nothing is written to the scrollback — not
+    /// the streamed lines, not the closing outcome — because the caller shows
+    /// the whole thing in a [`tui::ReportPanel`] instead. The command still
+    /// runs through the same sink, so the status line keeps counting seconds
+    /// and Esc still interrupts: a slow `!!` never looks frozen.
     fn tui_bang(
         cwd: &std::path::Path,
         cmd: &str,
         log: &mut OutputLog,
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
+        quiet: bool,
     ) -> Result<crate::tools::bash::ImmediateOutput, String> {
         // Output streams into the log as it arrives (issue #22): the sink's
         // `line` appends and `tick` redraws, so a long-running command shows
@@ -12314,15 +12334,20 @@ impl Agent<'_> {
             cmd: &'b str,
             start: Instant,
             dirty: bool,
+            quiet: bool,
         }
         impl crate::tools::bash::ImmediateSink for Sink<'_, '_> {
             fn line(&mut self, _stream: crate::tools::bash::Stream, text: &str) {
+                if self.quiet {
+                    return;
+                }
                 self.log.push_dim(text.to_owned());
                 self.dirty = true;
             }
             fn tick(&mut self) -> bool {
                 let status = format!(
-                    "! {} ({}s, Esc to stop)",
+                    "{} {} ({}s, Esc to stop)",
+                    if self.quiet { "!!" } else { "!" },
                     self.cmd,
                     self.start.elapsed().as_secs()
                 );
@@ -12363,31 +12388,11 @@ impl Agent<'_> {
             cmd,
             start,
             dirty: false,
+            quiet,
         };
         let result = crate::tools::bash::run_immediate(cwd, cmd, &mut sink);
-        match &result {
-            Ok(out) => {
-                if out.interrupted {
-                    log.push_dim("[interrupted]");
-                } else if out.exit_code == 0 {
-                    // A command that prints nothing is otherwise indis-
-                    // tinguishable from one still running, so say it finished.
-                    // Only when it did: an interrupted command did not.
-                    log.push_spans(vec![ratatui::text::Span::styled(
-                        "done.",
-                        crate::tui::done_style(),
-                    )]);
-                } else {
-                    // A failing command finished too, but saying "done." in
-                    // green next to a non-zero exit reads as success. One red
-                    // line carrying the code is the whole outcome.
-                    log.push_spans(vec![ratatui::text::Span::styled(
-                        format!("failed (exit code {}).", out.exit_code),
-                        crate::tui::failed_style(),
-                    )]);
-                }
-            }
-            Err(e) => log.push_dim(format!("!{cmd}: {e}")),
+        if !quiet {
+            bang_log_outcome(cmd, &result, log);
         }
         result
     }
@@ -17569,6 +17574,97 @@ fn bang_head(text: &str) -> String {
         out.push_str("[output truncated]\n");
     }
     out
+}
+
+/// Writes a finished `!` command's outcome into the TUI scrollback: the
+/// interruption, or the exit status. Shared by the streaming `!` path and by
+/// the `!!` path when the command produced no output at all and so gets no
+/// panel — in both cases this line is the only proof the command finished.
+fn bang_log_outcome(
+    cmd: &str,
+    result: &Result<crate::tools::bash::ImmediateOutput, String>,
+    log: &mut OutputLog,
+) {
+    match result {
+        Ok(out) => {
+            if out.interrupted {
+                log.push_dim("[interrupted]");
+            } else if out.exit_code == 0 {
+                // A command that prints nothing is otherwise indis-
+                // tinguishable from one still running, so say it finished.
+                // Only when it did: an interrupted command did not.
+                log.push_spans(vec![ratatui::text::Span::styled(
+                    "done.",
+                    crate::tui::done_style(),
+                )]);
+            } else {
+                // A failing command finished too, but saying "done." in
+                // green next to a non-zero exit reads as success. One red
+                // line carrying the code is the whole outcome.
+                log.push_spans(vec![ratatui::text::Span::styled(
+                    format!("failed (exit code {}).", out.exit_code),
+                    crate::tui::failed_style(),
+                )]);
+            }
+        }
+        Err(e) => log.push_dim(format!("!{cmd}: {e}")),
+    }
+}
+
+/// The `!!` panel's title. The command is part of it because, unlike `/context`
+/// or `/usage`, the panel shows the output of *one specific command* and the
+/// scrollback above it may have scrolled away. Long commands are clipped so the
+/// title still fits a panel border.
+fn bang_panel_title(cmd: &str) -> String {
+    const MAX: usize = 60;
+    let one_line = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= MAX {
+        format!("!! {one_line}")
+    } else {
+        let head: String = one_line.chars().take(MAX - 1).collect();
+        format!("!! {head}…")
+    }
+}
+
+/// Renders a finished `!!` command as the body of a [`tui::ReportPanel`], or
+/// `None` when the command produced nothing to show — an empty pane explains
+/// less than the one-line outcome the caller logs instead.
+///
+/// stderr is kept, labelled and red rather than interleaved with stdout, and a
+/// non-zero exit or an interruption is stated on its own closing line: a
+/// failure must never reach the panel as silence.
+fn bang_panel_report(
+    cmd: &str,
+    result: &Result<crate::tools::bash::ImmediateOutput, String>,
+) -> Option<String> {
+    use std::fmt::Write as _;
+    let out = result.as_ref().ok()?;
+    let (stdout, stderr) = (out.stdout.trim_end(), out.stderr.trim_end());
+    if stdout.is_empty() && stderr.is_empty() {
+        return None;
+    }
+    let mut s = String::new();
+    let _ = writeln!(s, "\x1b[1m$ {cmd}{ANSI_RESET}\n");
+    if !stdout.is_empty() {
+        let _ = writeln!(s, "{stdout}");
+    }
+    if !stderr.is_empty() {
+        if !stdout.is_empty() {
+            s.push('\n');
+        }
+        let _ = writeln!(s, "\x1b[38;5;238mstderr{ANSI_RESET}");
+        let _ = writeln!(s, "\x1b[31m{stderr}{ANSI_RESET}");
+    }
+    if out.interrupted {
+        let _ = write!(s, "\n\x1b[38;5;238m[interrupted]{ANSI_RESET}");
+    } else if out.exit_code != 0 {
+        let _ = write!(
+            s,
+            "\n\x1b[31mfailed (exit code {}).{ANSI_RESET}",
+            out.exit_code
+        );
+    }
+    Some(s)
 }
 
 /// Builds the single user message a `!` command appends to the transcript:
@@ -23527,6 +23623,67 @@ mod tests {
         assert!(head.ends_with("[output truncated]\n"));
         // Short output passes through untouched apart from escaping.
         assert_eq!(bang_head("ok\n"), "ok\n");
+    }
+
+    /// A `!!` command's output becomes the body of the scrollable panel, with
+    /// the command itself as a header, and the panel title names the command
+    /// so it is identifiable once the echo has scrolled away.
+    #[test]
+    fn bang_panel_shows_the_command_and_its_output() {
+        let out = crate::tools::bash::ImmediateOutput {
+            stdout: "hello\nworld\n".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            interrupted: false,
+        };
+        let text = bang_panel_report("echo hello", &Ok(out)).expect("panel for non-empty output");
+        assert!(text.contains("$ echo hello"), "{text}");
+        assert!(text.contains("hello\nworld"), "{text}");
+        assert_eq!(bang_panel_title("echo hello"), "!! echo hello");
+        // A long command is clipped, not wrapped, so the border still fits.
+        let long = bang_panel_title(&"x".repeat(200));
+        assert!(long.chars().count() <= 63, "{long}");
+        assert!(long.ends_with('…'), "{long}");
+    }
+
+    /// A failing command's exit status and its stderr both reach the panel:
+    /// neither may be dropped just because the output moved out of the log.
+    #[test]
+    fn bang_panel_keeps_stderr_and_the_exit_status() {
+        let out = crate::tools::bash::ImmediateOutput {
+            stdout: String::new(),
+            stderr: "boom: not found\n".to_string(),
+            exit_code: 127,
+            interrupted: false,
+        };
+        let text = bang_panel_report("nope", &Ok(out)).expect("stderr alone still opens a panel");
+        assert!(text.contains("stderr"), "{text}");
+        assert!(text.contains("boom: not found"), "{text}");
+        assert!(text.contains("failed (exit code 127)."), "{text}");
+
+        let stopped = crate::tools::bash::ImmediateOutput {
+            stdout: "partial\n".to_string(),
+            stderr: String::new(),
+            exit_code: 130,
+            interrupted: true,
+        };
+        let text = bang_panel_report("sleep 99", &Ok(stopped)).expect("partial output");
+        assert!(text.contains("[interrupted]"), "{text}");
+    }
+
+    /// Nothing to show means no panel at all — the caller logs the one-line
+    /// outcome instead of opening an empty pane. A spawn failure is the same:
+    /// there is no output, and the error belongs on the `!<cmd>: …` log line.
+    #[test]
+    fn bang_panel_is_skipped_when_there_is_no_output() {
+        let quiet = crate::tools::bash::ImmediateOutput {
+            stdout: "\n".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            interrupted: false,
+        };
+        assert!(bang_panel_report("true", &Ok(quiet)).is_none());
+        assert!(bang_panel_report("nope", &Err("no such binary".into())).is_none());
     }
 
     #[test]
