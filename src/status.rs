@@ -299,10 +299,12 @@ const MTP_MARK: &str = "✨";
 /// while `/mtp` is off — the two are mutually exclusive by construction,
 /// since speculation only runs at temperature 0.
 ///
-/// The bare codepoint, deliberately without the U+FE0F variation selector:
-/// the footer is width-sensitive and the emoji-presentation form measures
-/// differently across terminals.
-const TEMP_MARK: &str = "🌡";
+/// U+1F321 followed by U+FE0F (VS16): the bare codepoint is a *text-default*
+/// emoji, so `unicode_width` reports 1 column for it unless the emoji
+/// presentation is requested explicitly — but terminals render it in colour
+/// at 2 columns regardless. VS16 makes the requested presentation match what
+/// actually gets drawn, so the width measurement agrees with the terminal.
+const TEMP_MARK: &str = "🌡\u{fe0f}";
 
 /// Marks the footer's jobs segment: background bash jobs still running.
 /// Public so the TUI can find the segment for mouse hit-testing.
@@ -324,8 +326,9 @@ const HD_MARK_OFF: &str = "  ";
 /// Marks the footer's memory-pressure segment: plank is paused with its KV
 /// released, waiting for the system to calm down.
 ///
-/// The bare codepoint, without the U+FE0F variation selector, for the reason
-/// [`TEMP_MARK`] spells out: the footer is width-sensitive.
+/// The bare codepoint, without a variation selector: unlike [`TEMP_MARK`] and
+/// [`MICROCOMPACT_MARK`], this glyph has not been verified to need one, so it
+/// is left as-is pending the same check.
 const PRESSURE_MARK: &str = "⏸";
 
 /// Marks the footer's loop-guard segment: the guards are armed and watching.
@@ -335,12 +338,14 @@ const GUARD_MARK: &str = "🔁";
 /// Marks the footer's micro-compaction segment. Public so the TUI can find the
 /// segment for mouse hit-testing, the same reason [`JOBS_MARK`] is.
 ///
-/// The bare codepoint, deliberately without the U+FE0F variation selector, for
-/// the same reason as [`TEMP_MARK`]: the footer is width-sensitive and the
-/// emoji-presentation form measures differently across terminals — and here
-/// the measurement is also the click box, since [`crate::tui::record_mc_rect`]
-/// locates the segment by finding this symbol in the drawn buffer.
-pub const MICROCOMPACT_MARK: &str = "🗑";
+/// U+1F5D1 followed by U+FE0F (VS16), for the same reason as [`TEMP_MARK`]:
+/// the bare codepoint is text-default and `unicode_width` reports 1 column
+/// for it, but terminals draw it in colour at 2 columns regardless, so VS16
+/// makes the two agree. This is also the click box, since
+/// [`crate::tui::record_mc_rect`] locates the segment by finding this exact
+/// symbol (VS16 included) in the drawn buffer — ratatui keeps the whole
+/// grapheme cluster in one cell, so the lookup still matches.
+pub const MICROCOMPACT_MARK: &str = "🗑\u{fe0f}";
 
 /// Beside [`MICROCOMPACT_MARK`] when micro-compaction is on: it is rewriting
 /// old tool results in place to reclaim context.
@@ -2524,21 +2529,39 @@ mod tests {
 
     /// Emoji occupy (at least) two terminal columns each in real terminals,
     /// but `unicode_width` measures per the Unicode East Asian Width tables:
-    /// most of the footer's marks are "Wide" (2 columns), while `🌡`
-    /// (U+1F321) and `🗑` (U+1F5D1) are categorized "Ambiguous"/narrow at
-    /// this Unicode version and measure 1. Either way this is a strict
-    /// improvement over `chars()` (which gave 1 for all six), and it is the
-    /// same measurement `src/experts.rs` already relies on for the brain
-    /// glyph, so the two stay consistent.
+    /// `🌡` (U+1F321) and `🗑` (U+1F5D1) are text-default emoji, so the bare
+    /// codepoint is categorized "Ambiguous"/narrow at this Unicode version
+    /// and measures 1 — not 2, as terminals actually draw it. Appending
+    /// U+FE0F (VS16) requests the emoji presentation explicitly, which
+    /// brings `unicode_width` to 2, matching every other mark. Either way
+    /// this is a strict improvement over `chars()` (which gave 1 for all
+    /// six), and it is the same measurement `src/experts.rs` already relies
+    /// on for the brain glyph, so the two stay consistent.
     #[test]
     fn visible_width_counts_wide_emoji_as_two_columns() {
-        assert_eq!(visible_width("🌡"), 1);
-        assert_eq!(visible_width("🗑"), 1);
+        assert_eq!(visible_width("🌡\u{fe0f}"), 2);
+        assert_eq!(visible_width("🗑\u{fe0f}"), 2);
         assert_eq!(visible_width("🟢"), 2);
         assert_eq!(visible_width("📈"), 2);
         assert_eq!(visible_width("🧠"), 2);
         assert_eq!(visible_width("💾"), 2);
-        assert_eq!(visible_width("🗑 🟢"), 4); // 1 + space + 2
+        assert_eq!(visible_width("🗑\u{fe0f} 🟢"), 5); // 2 + space + 2
+    }
+
+    /// Pins the display width of every footer mark by name, so a future
+    /// change to any of these constants (adding/dropping VS16, swapping the
+    /// glyph) cannot silently reintroduce an undercount. See
+    /// `visible_width_counts_wide_emoji_as_two_columns` for why `TEMP_MARK`
+    /// and `MICROCOMPACT_MARK` carry an explicit VS16 while the others don't
+    /// need one.
+    #[test]
+    fn footer_marks_all_measure_two_columns() {
+        assert_eq!(visible_width(TEMP_MARK), 2, "{TEMP_MARK:?}");
+        assert_eq!(visible_width(MICROCOMPACT_MARK), 2, "{MICROCOMPACT_MARK:?}");
+        assert_eq!(visible_width(MICROCOMPACT_ON), 2, "{MICROCOMPACT_ON:?}");
+        assert_eq!(visible_width(TOKS_MARK), 2, "{TOKS_MARK:?}");
+        assert_eq!(visible_width(HD_MARK), 2, "{HD_MARK:?}");
+        assert_eq!(visible_width(THINK_MARK), 2, "{THINK_MARK:?}");
     }
 
     #[test]
@@ -2550,12 +2573,13 @@ mod tests {
     #[test]
     fn visible_width_realistic_footer_with_several_emoji() {
         // A representative footer fragment: thermometer, brain, chart, disk,
-        // wastebasket+dot.
-        let footer = "🌡 72% 🧠 4.2k 📈 1.1x 💾 🗑 🟢";
+        // wastebasket+dot. Thermometer and wastebasket carry VS16, as the
+        // real constants do, so all six marks measure 2 columns each.
+        let footer = "🌡\u{fe0f} 72% 🧠 4.2k 📈 1.1x 💾 🗑\u{fe0f} 🟢";
         let ascii_len = footer.chars().filter(char::is_ascii).count();
-        // 🌡 and 🗑 measure 1 column each under unicode_width; 🧠, 📈, 💾, 🟢
-        // measure 2 each.
-        assert_eq!(visible_width(footer), ascii_len + 2 + 4 * 2);
+        // Six marks (thermometer, brain, chart, disk, wastebasket, dot), each
+        // measuring 2 columns.
+        assert_eq!(visible_width(footer), ascii_len + 6 * 2);
     }
 
     /// Pins the real bug: a footer whose emoji make it wider than `cols`
@@ -2579,16 +2603,17 @@ mod tests {
 
     #[test]
     fn the_microcompact_segment_shows_both_states() {
-        assert_eq!(microcompact_segment(true), "🗑 🟢");
-        assert_eq!(microcompact_segment(false), "🗑 🔴");
+        assert_eq!(microcompact_segment(true), "🗑\u{fe0f} 🟢");
+        assert_eq!(microcompact_segment(false), "🗑\u{fe0f} 🔴");
         // Off is a state, not an absence: the box stays on the line so it can
         // be double-clicked back on.
         let st = Status::default();
         let line = build_status_text(&st, false, true);
         assert!(line.contains(MICROCOMPACT_MARK), "{line}");
-        // No variation selector: the mark the TUI hit-tests against is the one
-        // the footer actually draws.
-        assert!(!line.contains('\u{fe0f}'), "{line:?}");
+        // The VS16 is deliberate now: it is part of MICROCOMPACT_MARK itself,
+        // so the mark the TUI hit-tests against is exactly the one the footer
+        // draws, VS16 included (see MICROCOMPACT_MARK's doc comment).
+        assert!(line.contains('\u{fe0f}'), "{line:?}");
     }
 
     #[test]
@@ -2669,7 +2694,8 @@ mod tests {
             ..Status::default()
         };
         assert!(
-            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡 0.00 | 🗑 🟢 | 📈 | idle"),
+            build_status_text(&st, false, true)
+                .ends_with("ctx 12% | 🌡\u{fe0f} 0.00 | 🗑\u{fe0f} 🟢 | 📈 | idle"),
             "{}",
             build_status_text(&st, false, true)
         );
