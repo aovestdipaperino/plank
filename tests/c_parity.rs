@@ -751,3 +751,341 @@ fn c_struct_field_names(src: &str, name: &str) -> Vec<String> {
         })
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// FFI shape layer: plank's `extern "C"` declarations vs. the C headers.
+// ---------------------------------------------------------------------------
+
+/// Holds every function plank declares in `src/ffi.rs` equal — in arity and in
+/// coarse parameter *shape* — to its prototype in the C headers.
+///
+/// This is the sibling of [`engine_options_fields_match_the_c_header`], one
+/// layer over: a struct field that moves is silent corruption, and so is a
+/// bound function that gains or loses a parameter. Both went unnoticed once
+/// (`ple_path`), because nothing compared plank to the C at all.
+///
+/// **What it catches**: a bound function whose C prototype changed arity; a
+/// parameter that turned from a pointer into a scalar or vice versa; a scalar
+/// whose C spelling changed to a differently-mapped one (`int` → `size_t`);
+/// a return that changed shape; and a function plank declares that no longer
+/// exists in the headers at all.
+///
+/// **What it does NOT catch**:
+/// - a type change invisible to the shape mapping: any pointer for any other
+///   pointer (`ds4_engine *` → `ds4_session *`, `const char *` → `char *`),
+///   since pointee types are deliberately not compared;
+/// - a scalar swap between C spellings that map to the same Rust type;
+/// - struct *contents* behind a pointer parameter (that is what the
+///   `ds4_engine_options` field test covers, and only for that one struct);
+/// - anything about `src/mempressure.rs`, whose `extern` block binds macOS
+///   system libraries rather than the ds4 C;
+/// - a C function plank does not bind (deliberately out of scope).
+///
+/// Skips when the `refs/ds4` submodule is absent, like every other
+/// source-layer check here.
+#[test]
+fn ffi_declarations_match_the_c_headers() {
+    const HEADERS: &[&str] = &["ds4.h", "ds4_web.h", "ds4_ssd.h"];
+    let mut headers = String::new();
+    let mut found_any = false;
+    for name in HEADERS {
+        if let Some(src) = c_file(name) {
+            found_any = true;
+            headers.push_str(&strip_c_comments(&src));
+            headers.push('\n');
+        }
+    }
+    if !found_any {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    }
+
+    let rust = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("ffi.rs"),
+    )
+    .expect("src/ffi.rs");
+    let ours = rust_extern_fns(&rust);
+    assert!(
+        ours.len() > 30,
+        "parsed only {} extern fns out of src/ffi.rs; the parser drifted rather \
+         than the binding shrinking: {:?}",
+        ours.len(),
+        ours.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+
+    let mut problems: Vec<String> = Vec::new();
+    for ours in &ours {
+        let Some(theirs) = c_prototype(&headers, &ours.name) else {
+            problems.push(format!(
+                "{}: plank declares it, but no prototype exists in {HEADERS:?}. \
+                 Either it was removed from the C (drop the binding) or it moved \
+                 to a header this test does not read (add it to HEADERS).",
+                ours.name
+            ));
+            continue;
+        };
+        assert_eq!(ours.name, theirs.name);
+        if ours.params != theirs.params {
+            problems.push(format!(
+                "{}: parameters differ.\n     plank: {:?}\n     C    : {:?}\n     \
+                 (shapes, not spellings: `ptr` is any pointer or callback)",
+                ours.name, ours.params, theirs.params
+            ));
+        }
+        if ours.ret != theirs.ret {
+            problems.push(format!(
+                "{}: return differs — plank {:?}, C {:?}",
+                ours.name, ours.ret, theirs.ret
+            ));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "plank's `extern \"C\"` declarations in src/ffi.rs no longer match the \
+         refs/ds4 headers. Every call through a mismatched declaration is \
+         undefined behaviour — arguments land in the wrong registers and no \
+         other test can see it. Fix src/ffi.rs to match the C:\n  - {}",
+        problems.join("\n  - ")
+    );
+}
+
+/// A function signature reduced to comparable shapes.
+#[derive(Debug)]
+struct FnShape {
+    name: String,
+    params: Vec<String>,
+    ret: String,
+}
+
+/// Removes `/* … */` and `// …` comments, so a prototype-looking mention
+/// inside prose is never mistaken for a declaration.
+fn strip_c_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let block = rest.find("/*");
+        let line = rest.find("//");
+        let line_first = match (block, line) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(b), Some(l)) => l < b,
+        };
+        if line_first {
+            let l = line.unwrap();
+            out.push_str(&rest[..l]);
+            rest = rest[l..].split_once('\n').map_or("", |(_, t)| t);
+            out.push('\n');
+        } else if let Some(b) = block {
+            out.push_str(&rest[..b]);
+            out.push(' ');
+            rest = rest[b + 2..].split_once("*/").map_or("", |(_, t)| t);
+        } else {
+            out.push_str(rest);
+            return out;
+        }
+    }
+}
+
+/// Every `pub fn …;` inside the `unsafe extern "C" { … }` blocks of `src`.
+fn rust_extern_fns(src: &str) -> Vec<FnShape> {
+    let mut out = Vec::new();
+    let mut rest = src;
+    while let Some((_, after)) = rest.split_once("unsafe extern \"C\" {\n") {
+        // The block ends at the first line-start `}`.
+        let (body, tail) = after.split_once("\n}\n").unwrap_or((after, ""));
+        rest = tail;
+        // Drop doc comments and attributes; keep declaration lines.
+        let body: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut scan = body.as_str();
+        while let Some(at) = scan.find("pub fn ") {
+            let decl = &scan[at + "pub fn ".len()..];
+            let (name, after_name) = decl.split_once('(').expect("extern fn without `(`");
+            let (params, after_params) = split_balanced(after_name, '(', ')');
+            let return_ty = after_params
+                .split_once(';')
+                .map_or("", |(r, _)| r)
+                .trim()
+                .trim_start_matches("->")
+                .trim()
+                .to_string();
+            out.push(FnShape {
+                name: name.trim().to_string(),
+                params: split_top_level(&params)
+                    .iter()
+                    .map(|p| rust_shape(rust_param_type(p)))
+                    .collect(),
+                ret: if return_ty.is_empty() {
+                    "void".to_string()
+                } else {
+                    rust_shape(&return_ty)
+                },
+            });
+            scan = after_params;
+        }
+    }
+    out
+}
+
+/// The prototype of `name` in the (comment-stripped) header text, if one is
+/// declared there.
+fn c_prototype(headers: &str, name: &str) -> Option<FnShape> {
+    let mut from = 0usize;
+    while let Some(rel) = headers[from..].find(name) {
+        let at = from + rel;
+        from = at + name.len();
+        let before_ok = headers[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+        let after = headers[at + name.len()..].trim_start();
+        if !before_ok || !after.starts_with('(') {
+            continue;
+        }
+        let (params, tail) = split_balanced(&after[1..], '(', ')');
+        // A declaration, not a call inside a body we happened to read.
+        if !tail.trim_start().starts_with(';') {
+            continue;
+        }
+        // The return type is whatever precedes the name on its own line.
+        let line_start = headers[..at].rfind('\n').map_or(0, |i| i + 1);
+        let ret = headers[line_start..at].trim();
+        return Some(FnShape {
+            name: name.to_string(),
+            params: c_params(&params),
+            ret: c_shape(ret),
+        });
+    }
+    None
+}
+
+/// Splits `params` into per-parameter shapes; `(void)` means none.
+fn c_params(params: &str) -> Vec<String> {
+    if params.trim() == "void" || params.trim().is_empty() {
+        return Vec::new();
+    }
+    split_top_level(params)
+        .iter()
+        .map(|p| {
+            // Drop the parameter name: the last identifier, when the
+            // declaration has one to spare.
+            let p = p.trim();
+            let shape = c_shape(p);
+            if shape == "ptr" {
+                return shape;
+            }
+            let words: Vec<&str> = p.split_whitespace().collect();
+            let ty = if words.len() > 1 {
+                words[..words.len() - 1].join(" ")
+            } else {
+                words.join(" ")
+            };
+            c_shape(&ty)
+        })
+        .collect()
+}
+
+/// Reduces a C type to `ptr`, `void`, or a normalized scalar spelling.
+fn c_shape(ty: &str) -> String {
+    let ty = ty.replace("const", " ").replace("struct", " ");
+    let ty = ty.trim();
+    if ty.contains('*') || ty.contains('[') || ty.ends_with("_fn") {
+        return "ptr".to_string();
+    }
+    let words: Vec<&str> = ty.split_whitespace().collect();
+    match words.as_slice() {
+        [] | ["void"] => "void".to_string(),
+        _ => words.join(" "),
+    }
+}
+
+/// Reduces a Rust FFI type to the same vocabulary [`c_shape`] produces.
+fn rust_shape(ty: &str) -> String {
+    let ty = ty.trim();
+    if ty.starts_with('*') || ty.starts_with("Option<") || ty.contains("extern \"C\" fn") {
+        return "ptr".to_string();
+    }
+    match ty {
+        "c_int" => "int",
+        "c_uint" => "unsigned int",
+        "c_char" => "char",
+        "c_void" | "()" => "void",
+        "usize" => "size_t",
+        "f32" => "float",
+        "f64" => "double",
+        "u8" => "uint8_t",
+        "u32" => "uint32_t",
+        "u64" => "uint64_t",
+        "i32" => "int32_t",
+        "bool" => "bool",
+        "Ds4ThinkMode" => "ds4_think_mode",
+        "Ds4Backend" => "ds4_backend",
+        other => other,
+    }
+    .to_string()
+}
+
+/// The type half of a Rust `name: Type` parameter (`:` at nesting depth 0).
+fn rust_param_type(param: &str) -> &str {
+    let mut depth = 0i32;
+    let mut prev = ' ';
+    for (i, c) in param.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            // `->` inside a callback type is not a closing angle bracket.
+            '>' if prev == '-' => {}
+            '>' | ')' | ']' => depth -= 1,
+            ':' if depth == 0 => return param[i + 1..].trim(),
+            _ => {}
+        }
+        prev = c;
+    }
+    param.trim()
+}
+
+/// Splits on commas that sit at nesting depth 0, dropping empty trailers.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut prev = ' ';
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            // `->` inside a callback type is not a closing angle bracket.
+            '>' if prev == '-' => {}
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+        prev = c;
+    }
+    out.push(s[start..].trim().to_string());
+    out.retain(|p| !p.is_empty());
+    out
+}
+
+/// Consumes `s` up to the `close` that balances an already-opened `open`,
+/// returning (inside, rest-after-close).
+fn split_balanced(s: &str, open: char, close: char) -> (String, &str) {
+    let mut depth = 1i32;
+    for (i, c) in s.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return (s[..i].to_string(), &s[i + c.len_utf8()..]);
+            }
+        }
+    }
+    (s.to_string(), "")
+}
