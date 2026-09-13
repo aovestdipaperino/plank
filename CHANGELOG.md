@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.1.2] - 2026-09-13
+
+### Fixed
+
+- **The tail of a streaming sentence no longer waits for the tool to finish.**
+  `OutputLog` re-renders a live markdown segment at most once per 100 ms
+  (`MD_RENDER_MIN_GAP`), because highlighting a code block recompiles a
+  tree-sitter query and rendering per token is quadratic in the block's length.
+  Tokens arriving inside that gap were deferred behind `md_dirty` and committed
+  only by the *next* `visible_text` call or by the segment closing — and a
+  generation that stops emitting visible text to open a DSML tool stanza does
+  neither, so the last tokens before the stanza stayed off screen for the whole
+  duration of the tool and the sentence appeared to complete itself when the
+  result landed. `OutputLog::md_tick` now commits a due deferred render on the
+  draw clock, called once per frame by `busy_ui_loop` for the main log, the
+  `/btw` panel and each sub-agent run. The throttle still bounds highlighting
+  cost: a frame re-renders only once the gap has elapsed.
+
 ## [5.1.0] - 2026-09-13
 
 ### Added

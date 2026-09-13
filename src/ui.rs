@@ -16418,6 +16418,19 @@ fn busy_ui_loop(
         if let Some(panel) = report.as_mut().filter(|r| r.title() == JOBS_REPORT_TITLE) {
             panel.set_text(&shared.jobs_report());
         }
+        // Commit any markdown tail the render throttle deferred, on the draw
+        // clock. A generation that stops emitting visible text to open a tool
+        // stanza never calls back into `visible_text`, so without this the last
+        // tokens of the sentence stay off screen until the tool result closes
+        // the segment (the sentence appearing to complete itself when the tool
+        // returns).
+        log.md_tick();
+        if let Some((btw_log, _)) = btw.as_mut() {
+            btw_log.md_tick();
+        }
+        for run in &mut sub.runs {
+            run.log.md_tick();
+        }
         let sub_active = sub.active;
         // Owned for the same reason: the selected run's view is borrowed mutably
         // below, so nothing else may hold a borrow of the pane across the draw.

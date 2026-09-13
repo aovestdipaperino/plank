@@ -979,6 +979,22 @@ impl OutputLog {
         }
     }
 
+    /// Re-renders a throttle-deferred segment once the gap has elapsed, on the
+    /// draw clock rather than on the arrival of the next token.
+    ///
+    /// Without this the tail of a segment is only committed when more visible
+    /// text arrives or the segment closes. A generation that stops emitting
+    /// visible text to open a tool stanza does neither: the last tokens before
+    /// the stanza stay off screen for as long as the tool runs, and the
+    /// sentence completes itself only once the tool result closes the segment.
+    /// Called once per frame by the busy UI loop, so the throttle still bounds
+    /// highlighting cost.
+    pub(crate) fn md_tick(&mut self) {
+        if self.md_dirty && self.md_start.is_some() {
+            self.md_render_throttled();
+        }
+    }
+
     /// Forces a render when the throttle has deferred appended tokens, so a
     /// segment boundary (tool/think text, end of turn, checkpoint) always
     /// commits the full buffer. No-op when nothing is pending.
@@ -7808,6 +7824,37 @@ mod tests {
         assert!(
             view.jump_hint_rect.is_none(),
             "hint hidden while following the newest output"
+        );
+    }
+
+    #[test]
+    fn md_tick_commits_a_deferred_tail_while_the_stream_is_quiet() {
+        let mut log = OutputLog::new();
+        // A burst faster than the throttle: the tail defers.
+        for t in ["document ", "the ", "`force` ", "parameter."] {
+            log.visible_text(t);
+        }
+        let joined = |log: &OutputLog| -> String {
+            log.lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert!(log.md_dirty, "the burst must leave a deferred tail");
+        assert!(
+            !joined(&log).contains("parameter."),
+            "precondition: the tail is not committed yet"
+        );
+        // The stream goes quiet (the model opened a tool stanza) and the gap
+        // elapses. The draw clock, not the next token, must commit the tail.
+        log.last_md_render = Instant::now().checked_sub(MD_RENDER_MIN_GAP * 2);
+        log.md_tick();
+        assert!(!log.md_dirty, "md_tick clears the dirty flag when due");
+        assert!(
+            joined(&log).contains("parameter."),
+            "md_tick must commit the deferred tail: {:?}",
+            joined(&log)
         );
     }
 
