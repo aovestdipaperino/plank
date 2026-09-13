@@ -46,6 +46,11 @@ pub const POWERLINE_BRANCH: char = '\u{e0a0}';
 /// Also the anchor the TUI splits the footer on: it sits between the dir prefix
 /// and the body, so [`crate::tui`] peels it as its own span rather than letting
 /// `push_dir_prefix` mistake it for part of the branch name.
+///
+/// The bare codepoint, without the U+FE0F variation selector, for the reason
+/// [`MICROCOMPACT_MARK`] spells out: here the measurement is also the click
+/// box, since [`crate::tui::record_think_rect`] locates the segment by finding
+/// this symbol in the drawn buffer.
 pub const THINK_MARK: &str = "🧠";
 
 /// Leading glyph of the **git stat segment** (`📄 3 · +12 -4`), shown just

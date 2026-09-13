@@ -2910,6 +2910,10 @@ static TOKS_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 /// camera can be mapped to it.
 static CAMERA_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 
+/// Screen rect the footer's think segment last occupied, so a click on the
+/// brain can be mapped to it.
+static THINK_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
 /// Whether a click at (`column`, `row`) landed on the footer's jobs segment.
 #[must_use]
 pub fn jobs_click(column: u16, row: u16) -> bool {
@@ -2947,6 +2951,17 @@ pub fn toks_click(column: u16, row: u16) -> bool {
 #[must_use]
 pub fn camera_click(column: u16, row: u16) -> bool {
     CAMERA_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// Whether a click at (`column`, `row`) landed on the footer's brain (the
+/// think segment).
+#[must_use]
+pub fn think_click(column: u16, row: u16) -> bool {
+    THINK_RECT
         .lock()
         .ok()
         .and_then(|r| *r)
@@ -3119,6 +3134,37 @@ pub fn record_camera_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
         break;
     }
     if let Ok(mut g) = CAMERA_RECT.lock() {
+        *g = found;
+    }
+}
+
+/// Finds the think segment in the status rows just drawn into `buf` and
+/// records its rect, exactly as [`record_camera_rect`] does for the shutter:
+/// the anchor is [`crate::status::THINK_MARK`] and the box is the run between
+/// the ` | ` separators around it, so the hit box follows whatever elision and
+/// styling the bar applied — which is the point, since the segments left of the
+/// brain (the path, the branch, the git stat) change width from frame to frame
+/// and a column computed from the source text would drift. Called after every
+/// status render so a frame drawn without the brain forgets the rect.
+///
+/// The box is the whole `🧠 med` segment, not the two columns of the glyph, for
+/// the reason every other footer control is segment-wide: the level beside the
+/// brain is the same control's label, and a two-column target in a status bar
+/// is a target users miss.
+pub fn record_think_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        let Some(mark) = cells.iter().position(|c| *c == crate::status::THINK_MARK) else {
+            continue;
+        };
+        let (start, end) = segment_bounds(&cells, mark);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = THINK_RECT.lock() {
         *g = found;
     }
 }
@@ -4756,6 +4802,7 @@ pub fn draw(
     record_toks_rect(frame.buffer_mut(), status_row);
     record_mc_rect(frame.buffer_mut(), status_row);
     record_camera_rect(frame.buffer_mut(), status_row);
+    record_think_rect(frame.buffer_mut(), status_row);
 }
 
 /// Draws one frame while an `ask` question (issue #34) is up: the output log
@@ -4806,6 +4853,7 @@ pub fn draw_ask(
     record_toks_rect(frame.buffer_mut(), r[2]);
     record_mc_rect(frame.buffer_mut(), r[2]);
     record_camera_rect(frame.buffer_mut(), r[2]);
+    record_think_rect(frame.buffer_mut(), r[2]);
 }
 
 /// Renders the question panel: a header chip and question, then the options as a
@@ -5001,6 +5049,7 @@ pub fn draw_btw_split(
     record_toks_rect(frame.buffer_mut(), status_row);
     record_mc_rect(frame.buffer_mut(), status_row);
     record_camera_rect(frame.buffer_mut(), status_row);
+    record_think_rect(frame.buffer_mut(), status_row);
 }
 
 /// Overlays the sub-agent pane's identity on the output area's top row: the
@@ -5586,6 +5635,85 @@ mod tests {
         let quiet = Buffer::empty(area);
         super::record_camera_rect(&quiet, area);
         assert!(!super::camera_click(13, 0), "no glyph, no hit box");
+    }
+
+    /// `THINK_RECT` is one process-wide slot, so the two tests that record
+    /// into it must not overlap.
+    static THINK_RECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The brain gets its own segment-wide click box, so a press anywhere in
+    /// the think segment flips `showThinking`.
+    #[test]
+    fn think_rect_spans_the_brain_segment() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let _g = THINK_RECT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let area = Rect::new(0, 0, 40, 1);
+        let text = format!("~/p | {} med | ctx 12%", crate::status::THINK_MARK);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, &text, ratatui::style::Style::default());
+        super::record_think_rect(&buf, area);
+        // "~/p | " is 6 cells; the wide glyph spans the next two, then " med".
+        assert!(super::think_click(6, 0), "the glyph itself");
+        assert!(super::think_click(10, 0), "through the level label");
+        assert!(
+            !super::think_click(5, 0),
+            "the separator is not the segment"
+        );
+        assert!(!super::think_click(12, 0), "past the segment");
+        assert!(!super::think_click(6, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_think_rect(&quiet, area);
+        assert!(!super::think_click(6, 0), "no glyph, no hit box");
+    }
+
+    /// The case a column computed from the source text gets wrong: everything
+    /// left of the brain changes width (a longer path, a git stat segment, a
+    /// different think level), and the hit box still lands on the brain
+    /// because it is read back out of the drawn buffer.
+    #[test]
+    fn think_rect_follows_the_segments_left_of_it() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let _g = THINK_RECT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let area = Rect::new(0, 0, 60, 1);
+        for (prefix, level) in [
+            ("~/p | ", "med"),
+            ("~/plank \u{e0a0} main | ", "hi"),
+            (
+                &format!(
+                    "~/plank \u{e0a0} main | {} 3 | ",
+                    crate::status::GIT_STAT_MARK
+                ),
+                "off",
+            ),
+        ] {
+            let mut buf = Buffer::empty(area);
+            let text = format!("{prefix}{} {level} | ctx 12%", crate::status::THINK_MARK);
+            buf.set_string(0, 0, &text, ratatui::style::Style::default());
+            super::record_think_rect(&buf, area);
+            // Where the brain actually landed, measured the way the bar
+            // measures: display columns, so the wide glyphs in the prefix
+            // count for two.
+            let at = u16::try_from(crate::status::visible_width(prefix)).unwrap();
+            assert!(super::think_click(at, 0), "brain at {at} for {text:?}");
+            assert!(
+                super::think_click(at + u16::try_from(level.len()).unwrap() + 2, 0),
+                "level end for {text:?}"
+            );
+            assert!(
+                !super::think_click(at.saturating_sub(1), 0),
+                "the separator before the brain for {text:?}"
+            );
+            assert!(
+                !super::think_click(at + u16::try_from(level.len()).unwrap() + 3, 0),
+                "the separator after the level for {text:?}"
+            );
+        }
     }
 
     /// The ctx gauge gets the same segment-wide click box, and its anchor is

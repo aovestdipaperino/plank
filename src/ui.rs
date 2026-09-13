@@ -11645,6 +11645,13 @@ impl Agent<'_> {
                             }
                             view.follow = true;
                             selection.cancel();
+                        } else if tui::think_click(m.column, m.row) {
+                            // The footer's brain flips thinking visibility for
+                            // this session. A single click, unlike the
+                            // wastebasket's double: this changes only what the
+                            // next pass prints, and clicking again undoes it.
+                            think_show_click();
+                            selection.cancel();
                         } else if tui::ctx_click(m.column, m.row) {
                             // The footer's ctx gauge toggles the `/context`
                             // panel: the gauge is the one-number summary, the
@@ -15891,6 +15898,48 @@ fn microcompact_toggle() -> String {
     microcompact_command(if on { "off" } else { "on" })
 }
 
+/// The settings a click on the footer's brain installs, and the flash tip it
+/// leaves behind.
+///
+/// Pure, and taking the current settings rather than reading them, so the whole
+/// of what the gesture changes is testable: the returned `Settings` differs
+/// from `cur` in `ui.show_thinking` and nowhere else, and applying it twice
+/// returns the original.
+fn think_show_toggled(cur: &crate::settings::Settings) -> (crate::settings::Settings, String) {
+    let mut next = cur.clone();
+    next.ui.show_thinking = !cur.ui.show_thinking;
+    let tip = format!(
+        "{} thinking {} (this session)",
+        crate::status::THINK_MARK,
+        if next.ui.show_thinking {
+            "shown"
+        } else {
+            "hidden"
+        }
+    );
+    (next, tip)
+}
+
+/// A click on the footer's brain flips `ui.showThinking` for this session only.
+///
+/// Live settings, never disk: exactly the bargain `/mc` and `/loopguard` make.
+/// A glyph you can hit by accident must not rewrite `settings.json`, and
+/// showing thinking is a "what do I want to watch right now" decision, not a
+/// preference. `/config ui.showThinking` is still the way to make it stick, and
+/// still persists; it overwrites whatever a click left live, because it goes
+/// through the same [`crate::settings::reinstall`] afterwards.
+///
+/// Nothing caches the value: `configure_stream` and `PassCtx` both read
+/// `active()` when a pass starts, so the next generation observes the flip.
+/// Feedback is a flash tip rather than a log line — the answer belongs next to
+/// the glyph that was clicked, and it must not push the output pane around
+/// mid-turn.
+fn think_show_click() {
+    let (next, tip) = think_show_toggled(crate::settings::active());
+    crate::settings::reinstall(next);
+    crate::status::set_flash_tip(tip);
+}
+
 /// What a single click on the wastebasket leaves in the log: the state, and the
 /// gesture that changes it.
 ///
@@ -16896,6 +16945,14 @@ fn busy_ui_loop(
                 // idle. The samples are process-wide, so this needs no agent.
                 MouseEventKind::Down(MouseButton::Left) if tui::toks_click(m.column, m.row) => {
                     toggle_toks_report(&mut report);
+                    selection.cancel();
+                }
+                // The footer's brain, as at idle. Safe mid-turn for the reason
+                // the wastebasket is: each pass re-reads the setting when it
+                // configures its renderer, so the flip lands on the next pass
+                // of the turn already running rather than being lost.
+                MouseEventKind::Down(MouseButton::Left) if tui::think_click(m.column, m.row) => {
+                    think_show_click();
                     selection.cancel();
                 }
                 // The footer's ctx gauge toggles the `/context` panel, as at
@@ -22629,6 +22686,67 @@ mod tests {
         assert!(LiveCommands::output("/save").is_none());
         assert!(LiveCommands::output("/resume").is_none());
         assert!(LiveCommands::output("/context-ish").is_none());
+    }
+
+    /// A brain click flips thinking visibility and changes nothing else.
+    #[test]
+    fn a_brain_click_flips_only_show_thinking() {
+        let mut cur = crate::settings::Settings::default();
+        cur.ui.show_thinking = false;
+        // Some unrelated state, to catch a toggle that rebuilds rather than
+        // clones the settings.
+        cur.context.microcompact = false;
+        let (next, tip) = super::think_show_toggled(&cur);
+        assert!(next.ui.show_thinking, "the click turns thinking on");
+        assert!(tip.contains("shown"), "{tip:?}");
+        assert!(tip.contains("this session"), "{tip:?}");
+        let mut same = next.clone();
+        same.ui.show_thinking = cur.ui.show_thinking;
+        assert_eq!(same, cur, "nothing but showThinking moved");
+    }
+
+    /// Clicking twice puts it back exactly as it was, from either start.
+    #[test]
+    fn two_brain_clicks_round_trip() {
+        for start in [true, false] {
+            let mut cur = crate::settings::Settings::default();
+            cur.ui.show_thinking = start;
+            let (once, _) = super::think_show_toggled(&cur);
+            assert_ne!(once.ui.show_thinking, start);
+            let (twice, tip) = super::think_show_toggled(&once);
+            assert_eq!(twice, cur, "back to the original settings");
+            assert!(
+                tip.contains(if start { "shown" } else { "hidden" }),
+                "{tip:?}"
+            );
+        }
+    }
+
+    /// The click is live-only: it goes through `reinstall`, never `save_to`,
+    /// so the settings file on disk is byte-for-byte what it was.
+    #[test]
+    fn a_brain_click_does_not_touch_the_settings_file() {
+        // `reinstall` reconciles the debug-console mirror off `showThinking`,
+        // and this is the one test here that installs process-wide settings
+        // rather than the thread-local test override: take the same lock the
+        // mirror's own tests take so the two cannot interleave.
+        let _g = crate::debugmirror::test_support::lock();
+        let before = crate::settings::project_path().map(|p| std::fs::read(&p).ok());
+        let live = crate::settings::active().ui.show_thinking;
+        super::think_show_click();
+        assert_ne!(
+            crate::settings::active().ui.show_thinking,
+            live,
+            "the live value flipped"
+        );
+        super::think_show_click();
+        assert_eq!(
+            crate::settings::active().ui.show_thinking,
+            live,
+            "and flipped back"
+        );
+        let after = crate::settings::project_path().map(|p| std::fs::read(&p).ok());
+        assert_eq!(before, after, "settings.json must be untouched");
     }
 
     /// A console that connects after two turns receives exactly those two
