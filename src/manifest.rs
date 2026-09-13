@@ -310,20 +310,20 @@ pub fn local_path_for(set: ModelSet, kind: &str) -> Option<PathBuf> {
 
 /// Which set a plank rooted at `root` manages by default.
 ///
-/// A fresh install — nothing recorded and nothing on disk — takes the newest
-/// set, `Ds41`. An install that already records `ds4.manifest` stays on `Ds4`
-/// and is never migrated: promoting it would offer an existing user a 341 GiB
-/// download they never asked for.
+/// A fresh install — nothing recorded and nothing on disk — takes `Ds4`: V4 is
+/// the default set plank manages and ships a manifest for, and V4.1 is reached
+/// only by pointing `-m` at a V4.1 GGUF. An install that already records
+/// `ds4.manifest` stays on `Ds4` too, and one that somehow records
+/// `ds41.manifest` keeps managing the V4.1 set.
 ///
 /// The recorded manifest is not the only evidence of a V4 install. The entire
 /// installed base predates manifests: those machines have the V4 weights on
 /// disk and *no* `ds4.manifest`, and are exactly who adopt-on-first-sight
-/// exists for. Reading them as fresh would point them at the V4.1 set, whose
-/// artifacts are absent, so `decide` would answer `Offer { from: 0 }`, the
-/// first-run gate would swallow it, and `ds4.manifest` would never be adopted
-/// — the machine would silently stop receiving V4 upgrades forever while still
-/// loading the V4 model. So a V4 `main` artifact present on disk counts as a
-/// V4 install too.
+/// exists for. The check is kept even though a fresh root now resolves `Ds4`
+/// anyway: it is the evidence that makes the classification true rather than
+/// coincidental, and it keeps the guarantee if the fresh-install default ever
+/// moves again. So a V4 `main` artifact present on disk counts as a V4 install
+/// too.
 #[must_use]
 pub fn default_set_for_root(root: &Path) -> ModelSet {
     if installed_path_in(root, ModelSet::Ds41).exists() {
@@ -333,7 +333,7 @@ pub fn default_set_for_root(root: &Path) -> ModelSet {
     {
         return ModelSet::Ds4;
     }
-    ModelSet::Ds41
+    ModelSet::Ds4
 }
 
 /// Whether `set`'s `main` artifact is present under `root`.
@@ -705,17 +705,18 @@ mod tests {
         assert!(m.files.contains_key("dspark"));
     }
 
-    /// A fresh install takes the newest set; an install that already records
-    /// the V4 manifest is never migrated, because migrating it would offer a
-    /// 341 GiB download nobody asked for.
+    /// A fresh install manages the V4 set — plank ships no V4.1 manifest, and
+    /// V4.1 is reached only through an explicit `-m`. An install that already
+    /// records the V4 manifest is likewise never migrated, and a root that
+    /// somehow records `ds41.manifest` keeps managing V4.1.
     #[test]
-    fn a_fresh_install_defaults_to_ds41_but_an_existing_v4_install_does_not_migrate() {
+    fn a_fresh_install_defaults_to_ds4_and_a_recorded_set_is_never_migrated() {
         let root = crate::downloader::tests::tempdir();
         std::fs::create_dir_all(&root).expect("mkdir");
-        assert_eq!(default_set_for_root(&root), ModelSet::Ds41);
+        assert_eq!(default_set_for_root(&root), ModelSet::Ds4);
         std::fs::write(root.join("ds4.manifest"), "{}").expect("write");
         assert_eq!(default_set_for_root(&root), ModelSet::Ds4);
-        // A root recording both stays on the newest.
+        // A root recording the V4.1 manifest stays on V4.1.
         std::fs::write(root.join("ds41.manifest"), "{}").expect("write");
         assert_eq!(default_set_for_root(&root), ModelSet::Ds41);
         let _ = std::fs::remove_dir_all(&root);
@@ -725,13 +726,14 @@ mod tests {
     /// base has the V4 weights on disk and no recorded manifest, because it
     /// predates manifests. Read as fresh it would be pointed at the V4.1 set,
     /// whose artifacts are absent, and `ds4.manifest` would never be adopted —
-    /// so V4 upgrade offers would stop forever.
+    /// so V4 upgrade offers would stop forever. The on-disk check keeps that
+    /// classification true on its own evidence, not on the fresh default.
     #[test]
     fn v4_weights_on_disk_with_no_recorded_manifest_still_default_to_ds4() {
         let root = crate::downloader::tests::tempdir();
         std::fs::create_dir_all(&root).expect("mkdir");
         // Nothing at all: genuinely fresh.
-        assert_eq!(default_set_for_root(&root), ModelSet::Ds41);
+        assert_eq!(default_set_for_root(&root), ModelSet::Ds4);
         let main = local_path_for_in(&root, ModelSet::Ds4, "main").expect("v4 main path");
         std::fs::write(&main, b"gguf").expect("write");
         assert_eq!(

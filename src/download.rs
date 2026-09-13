@@ -331,8 +331,8 @@ pub fn default_ds41_vision_path() -> PathBuf {
 ///
 /// What `-m` falls back to. It follows [`crate::manifest::default_set_for_root`]
 /// so the model that loads belongs to the set whose manifest plank tracks: a
-/// fresh install takes V4.1, and an install with V4 already recorded or on
-/// disk stays on V4. Falls back to [`default_model_path`] only if a set ever
+/// fresh install takes V4, as does an install with V4 already recorded or on
+/// disk; only a root recording `ds41.manifest` manages V4.1. Falls back to [`default_model_path`] only if a set ever
 /// stops declaring a `main` artifact, which no set does.
 #[must_use]
 pub fn default_managed_model_path_in(root: &Path) -> PathBuf {
@@ -1720,8 +1720,8 @@ fn check_manifest_at_startup_in(
 /// V4.1 set even on a machine that has only ever managed V4. With `None` it is
 /// "which set should this machine manage", answered by what `root` already
 /// records — [`crate::manifest::default_set_for_root`] — so a fresh install
-/// takes V4.1 while an install already recording `ds4.manifest` stays on V4
-/// and is never migrated.
+/// manages the V4 set, exactly as an install already recording
+/// `ds4.manifest` does.
 #[must_use]
 pub fn manifest_set_for_model_in(
     root: &Path,
@@ -2297,8 +2297,8 @@ mod tests {
 
     /// The fallback for a missing `-m` follows the machine's default set, so
     /// the model that loads belongs to the set whose manifest plank tracks. A
-    /// fresh install would otherwise track `ds41.manifest` while loading a V4
-    /// GGUF.
+    /// fresh install would otherwise track a manifest for a set other than the
+    /// GGUF it loads.
     #[test]
     fn the_default_model_path_follows_the_roots_default_set() {
         use crate::manifest::ModelSet;
@@ -2306,8 +2306,8 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir");
         let v4 = crate::manifest::local_path_for_in(&root, ModelSet::Ds4, "main").expect("v4");
         let v41 = crate::manifest::local_path_for_in(&root, ModelSet::Ds41, "main").expect("v41");
-        // Fresh: the newest set's model.
-        assert_eq!(default_managed_model_path_in(&root), v41);
+        // Fresh: the V4 model, the default set.
+        assert_eq!(default_managed_model_path_in(&root), v4);
         // V4 weights on disk, nothing recorded — the existing installed base.
         std::fs::write(&v4, b"gguf").expect("write");
         assert_eq!(default_managed_model_path_in(&root), v4);
@@ -2319,10 +2319,17 @@ mod tests {
         )
         .expect("write");
         assert_eq!(default_managed_model_path_in(&root), v4);
+        // Only a root recording the V4.1 manifest resolves the V4.1 model.
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, ModelSet::Ds41),
+            "{}",
+        )
+        .expect("write");
+        assert_eq!(default_managed_model_path_in(&root), v41);
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A fresh install now points at a V4.1 GGUF that is not on disk yet. That
+    /// A V4.1 GGUF that is not on disk yet. That
     /// must reach `ensure_model`'s graceful "no model at <path>" error — never
     /// a panic, and never a prompt to fetch V4 into the V4.1 slot.
     #[test]
@@ -2363,9 +2370,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// With no `-m`, the set is the machine's default: V4.1 on a fresh root,
-    /// and an unchanged V4 on a root that already records `ds4.manifest`. The
-    /// second half is the no-migration guarantee.
+    /// With no `-m`, the set is the machine's default: V4 on a fresh root and
+    /// on a root that already records `ds4.manifest`, V4.1 only where
+    /// `ds41.manifest` is recorded. The middle case is the no-migration
+    /// guarantee.
     #[test]
     fn no_model_flag_takes_the_roots_default_set_and_never_migrates_v4() {
         use crate::manifest::ModelSet;
@@ -2373,8 +2381,8 @@ mod tests {
         // Fresh: nothing recorded at all.
         assert_eq!(
             manifest_set_for_model_in(&root, None),
-            Some(ModelSet::Ds41),
-            "a fresh install manages the newest set"
+            Some(ModelSet::Ds4),
+            "a fresh install manages the V4 set"
         );
         // An existing V4 install stays on V4.
         std::fs::write(
@@ -2445,12 +2453,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A fresh install must not be *offered* the V4.1 set's 341 GiB download
-    /// at launch: with no installed manifest and no model on disk, the
-    /// first-run gate returns before any confirmation, leaving acquisition to
+    /// A fresh install must not be *offered* the managed set's download at
+    /// launch: with no installed manifest and no model on disk, the first-run
+    /// gate returns before any confirmation, leaving acquisition to
     /// `ensure_model`.
     #[test]
-    fn a_fresh_install_is_not_offered_the_ds41_download_at_launch() {
+    fn a_fresh_install_is_not_offered_the_download_at_launch() {
         use std::cell::Cell;
         let root = crate::downloader::tests::tempdir();
         let seen: Cell<Option<crate::manifest::ModelSet>> = Cell::new(None);
@@ -2467,8 +2475,8 @@ mod tests {
         );
         assert_eq!(
             seen.get(),
-            Some(crate::manifest::ModelSet::Ds41),
-            "a fresh root manages the V4.1 set"
+            Some(crate::manifest::ModelSet::Ds4),
+            "a fresh root manages the V4 set"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2487,29 +2495,34 @@ mod tests {
     }
 
     /// A fresh install's missing model is exactly its resolved set's managed
-    /// `main` path, so it must be offered acquisition for the V4.1 set — the
-    /// regression this module exists to fix — with the V4.1 (341 GB), not
-    /// V4 (87 GB), size reported.
+    /// `main` path, so it must be offered acquisition — for the V4 set, with
+    /// the V4 (87 GB) size reported.
     #[test]
-    fn fresh_install_offers_the_v41_acquisition_with_the_v41_size() {
+    fn fresh_install_offers_the_v4_acquisition_with_the_v4_size() {
         let root = crate::downloader::tests::tempdir();
         std::fs::create_dir_all(&root).expect("mkdir");
         let path = default_managed_model_path_in(&root);
         assert_eq!(
             path,
-            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds41, "main")
-                .expect("v41 main path"),
-            "a fresh root's default path is the V4.1 managed main path"
+            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds4, "main")
+                .expect("v4 main path"),
+            "a fresh root's default path is the V4 managed main path"
         );
         assert_eq!(
             offer_target_in(&root, &path),
-            Some(crate::manifest::ModelSet::Ds41),
+            Some(crate::manifest::ModelSet::Ds4),
             "a fresh root's own default path must be offered, not errored"
         );
         assert!(
-            (main_artifact_gb(&root, crate::manifest::ModelSet::Ds41) - 341.0).abs() < 0.01,
-            "no manifest on hand yet: falls back to the V4.1 341 GB estimate"
+            (main_artifact_gb(&root, crate::manifest::ModelSet::Ds4) - 87.0).abs() < 0.01,
+            "no manifest on hand yet: falls back to the V4 87 GB estimate"
         );
+        // The V4.1 managed path is not this root's default, so it is never
+        // offered: a V4.1 GGUF is reached by an explicit `-m`.
+        let v41 =
+            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds41, "main")
+                .expect("v41 main path");
+        assert_eq!(offer_target_in(&root, &v41), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
