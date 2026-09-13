@@ -1146,6 +1146,7 @@ impl Settings {
     ///
     /// # Errors
     /// Returns `Err` if the parent directory cannot be created or the write fails.
+    #[allow(clippy::too_many_lines)]
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
         let mut root: Vec<(String, Json)> = match std::fs::read_to_string(path) {
             Ok(t) => match json_parse(&t) {
@@ -1239,6 +1240,14 @@ impl Settings {
             "microcompact",
             Json::Bool(self.context.microcompact),
         );
+        // Only `loopGuards` is written here — the rest of `ToolsSettings` was
+        // never persisted by `save_to` before this change, and adding that is
+        // out of scope for the loop-guard override work this line supports.
+        upsert(
+            section(&mut root, "tools"),
+            "loopGuards",
+            Json::Bool(self.tools.loop_guards),
+        );
 
         let mut out = String::new();
         write_pretty(&mut out, &Json::Obj(root), 0);
@@ -1331,6 +1340,72 @@ pub fn show_thinking_override() -> Option<bool> {
     #[cfg(not(test))]
     let raw = SHOW_THINKING_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     (raw != SHOW_THINKING_NONE).then_some(raw != 0)
+}
+
+/// Session-only override of `tools.loopGuards`, set by `/loopguard`
+/// (`/lg`). `None` means "no override": the persisted `tools.loop_guards`
+/// stands.
+///
+/// Deliberately *not* a field on [`Settings`], for the same reason as
+/// [`SHOW_THINKING_OVERRIDE`]: a value living there would be written out by
+/// [`Settings::save_to`] the next time anything saved the settings (a later
+/// `/config <any key>`), which is exactly the accidental persistence this
+/// layer exists to prevent. Never serialised, never reaches disk, and — per
+/// the loop guard's own doc comment — outlives `/clear`/`/new`, since it is
+/// process state rather than session state: it defaults on as a protection,
+/// and turning it off is a diagnostic act whose whole point is to survive the
+/// investigation that prompted it.
+#[cfg(not(test))]
+static LOOP_GUARDS_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(LOOP_GUARDS_NONE);
+
+// Scoped to the calling thread in tests for the same reason as
+// `SHOW_THINKING_OVERRIDE` above: libtest runs tests concurrently in one
+// process, and a process-wide override would leak between them.
+#[cfg(test)]
+thread_local! {
+    static LOOP_GUARDS_OVERRIDE: std::cell::Cell<i8> =
+        const { std::cell::Cell::new(LOOP_GUARDS_NONE) };
+}
+
+/// The `LOOP_GUARDS_OVERRIDE` encoding of `None`; `0`/`1` are `false`/`true`.
+const LOOP_GUARDS_NONE: i8 = -1;
+
+/// The live session override of `tools.loopGuards`, or `None` when none is
+/// set.
+#[must_use]
+pub fn loop_guards_override() -> Option<bool> {
+    #[cfg(test)]
+    let raw = LOOP_GUARDS_OVERRIDE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let raw = LOOP_GUARDS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    (raw != LOOP_GUARDS_NONE).then_some(raw != 0)
+}
+
+/// Sets (or with `None` clears) the session override.
+///
+/// Unlike `set_show_thinking_override`, there is no side effect to replicate
+/// here: [`reinstall`]'s four effects (`anim::set_reduced_motion`,
+/// `notify::set_mode`, swapping the `ACTIVE` slot, `debugmirror::reconcile`)
+/// each depend on a field other than `tools.loop_guards`, and the guards
+/// themselves are read fresh from [`crate::guard::guards_enabled`] at every
+/// check rather than cached anywhere that would need reconciling.
+pub fn set_loop_guards_override(value: Option<bool>) {
+    let raw = value.map_or(LOOP_GUARDS_NONE, i8::from);
+    #[cfg(test)]
+    LOOP_GUARDS_OVERRIDE.with(|c| c.set(raw));
+    #[cfg(not(test))]
+    LOOP_GUARDS_OVERRIDE.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the loop guards are armed *right now*: the session override if
+/// one is set, else the persisted `tools.loopGuards`.
+///
+/// [`crate::guard::guards_enabled`] is the sole reader of this; every guard
+/// check goes through it rather than reading `tools.loop_guards` directly.
+#[must_use]
+pub fn loop_guards_effective() -> bool {
+    loop_guards_override().unwrap_or_else(|| active().tools.loop_guards)
 }
 
 /// Sets (or with `None` clears) the session override, then reconciles the

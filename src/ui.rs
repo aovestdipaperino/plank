@@ -9163,6 +9163,13 @@ the original is frozen and listed in /tree"
                             if field.id == crate::configform::FieldId::UiShowThinking {
                                 crate::settings::set_show_thinking_override(None);
                             }
+                            // Same reasoning: an explicit `/config
+                            // tools.loopGuards` is the user stating the
+                            // value, so any `/loopguard` override steps
+                            // aside.
+                            if field.id == crate::configform::FieldId::ToolsLoopGuards {
+                                crate::settings::set_loop_guards_override(None);
+                            }
                             crate::settings::reinstall(working);
                             format!(
                                 "set {section}.{fkey} = {shown} (saved to {})",
@@ -11825,6 +11832,7 @@ impl Agent<'_> {
                                     // form is the user stating the value, so
                                     // any brain-click override steps aside.
                                     crate::settings::set_show_thinking_override(None);
+                                    crate::settings::set_loop_guards_override(None);
                                     crate::settings::reinstall(*settings);
                                     log.push_plain(format!("config saved to {}", path.display()));
                                 }
@@ -15705,39 +15713,61 @@ fn microcompact_reply(arg: &str, on: bool) -> (Option<bool>, String) {
     }
 }
 
-/// `/loopguard [on|off]` — arm or silence every loop guard, reporting the
-/// state with no argument.
+/// `/loopguard [on|off]` — arm or silence every loop guard for this session,
+/// reporting the effective state with no argument.
 ///
-/// Written to the live settings rather than to a field on `self`, and not
-/// saved to disk: the guards are checked from several threads and from
-/// code that has no agent to ask ([`crate::guard::guards_enabled`]), and a
-/// switch thrown to watch one runaway turn is not a preference. Because
-/// every rung re-reads the setting at each check, this also takes effect
-/// on a turn that is already generating — which is the point: the moment
-/// you want the guards out of the way is while they are firing.
+/// A session *override* layer ([`crate::settings::set_loop_guards_override`]),
+/// never the persisted `tools.loopGuards` and never disk — the same shape as
+/// the footer brain's `show_thinking` override (`think_show_click`). The
+/// guard defaults on as a *protection*; turning it off is a diagnostic act,
+/// not a preference, and a protection left silently disabled across future
+/// sessions gives no signal until a runaway generation burns tokens with
+/// nothing pointing at the cause. An earlier implementation cloned the live
+/// settings, flipped `tools.loop_guards` and reinstalled them: it did not
+/// save either, but it left the flipped value inside the live `Settings`, so
+/// the next `/config <any key>` — which clones `active()` and writes the
+/// *whole* object — silently baked it into `settings.json`. Holding the
+/// value outside `Settings` is what closes that hole.
+///
+/// `/config tools.loopGuards` is still the way to make it stick permanently,
+/// and clears the override so the value just typed is plainly the one in
+/// force. The override survives `/clear` and `/new` — it is process state,
+/// not session state, because the investigation it supports outlives a
+/// context reset.
+///
+/// Because [`crate::guard::guards_enabled`] re-reads the effective value at
+/// every check, this also takes effect on a turn that is already
+/// generating — the point is to get the guards out of the way while they
+/// are firing.
 #[must_use]
 pub fn loopguard_command(arg: &str) -> String {
-    let (want, reply) = loopguard_reply(arg, crate::guard::guards_enabled());
+    let (want, reply) = loopguard_reply(arg, crate::settings::loop_guards_effective());
     if let Some(want) = want {
-        let mut settings = crate::settings::active().clone();
-        settings.tools.loop_guards = want;
-        crate::settings::reinstall(settings);
+        crate::settings::set_loop_guards_override(Some(want));
     }
     reply
 }
 
-/// [`loopguard_command`]'s decision: the new setting to install (`None` to
-/// leave it alone) and the line to show, given the current state.
+/// [`loopguard_command`]'s decision: the new override to install (`None` to
+/// leave it alone) and the line to show, given the current effective state.
 ///
 /// Split out so the wording and the state machine are testable without
-/// reinstalling the process-wide settings — a global set mid-run leaks into
+/// touching the process-wide override — a global set mid-run leaks into
 /// every test running in parallel, exactly as `FINDINGS.md` warns.
 fn loopguard_reply(arg: &str, on: bool) -> (Option<bool>, String) {
     let arg = arg.trim();
     if arg.is_empty() {
         return (
             None,
-            format!("loop guards: {}", if on { "on" } else { "off" }),
+            format!(
+                "loop guards: {}{}",
+                if on { "on" } else { "off" },
+                if crate::settings::loop_guards_override().is_some() {
+                    " (session override; /config tools.loopGuards to persist)"
+                } else {
+                    ""
+                }
+            ),
         );
     }
     let want = match arg {
@@ -15753,9 +15783,9 @@ fn loopguard_reply(arg: &str, on: bool) -> (Option<bool>, String) {
     (
         Some(want),
         if want {
-            "loop guards on".to_owned()
+            "loop guards on (this session)".to_owned()
         } else {
-            "loop guards off — nothing will stop a repeating turn but you".to_owned()
+            "loop guards off (this session) — nothing will stop a repeating turn but you".to_owned()
         },
     )
 }
@@ -20023,6 +20053,115 @@ mod tests {
                 .1
                 .contains("expected on|off")
         );
+    }
+
+    /// `/loopguard off` silences the guards for this session without
+    /// touching the persisted `tools.loopGuards`.
+    #[test]
+    fn loopguard_off_disables_for_session_without_persisting() {
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = true;
+        crate::settings::install_for_test(settings);
+        crate::settings::set_loop_guards_override(None);
+
+        assert!(crate::guard::guards_enabled());
+        let out = super::loopguard_command("off");
+        assert!(out.contains("off"), "{out:?}");
+        assert!(!crate::guard::guards_enabled(), "override took effect");
+        assert!(
+            crate::settings::active().tools.loop_guards,
+            "persisted value must be untouched"
+        );
+        crate::settings::set_loop_guards_override(None);
+    }
+
+    /// The bug this layer exists to close: `/loopguard off` followed by a
+    /// `/config` of some *unrelated* key must not smuggle the toggled value
+    /// into the file that `/config` writes in full.
+    #[test]
+    fn loopguard_off_then_config_of_another_key_does_not_persist_it() {
+        let _g = crate::debugmirror::test_support::lock();
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = true;
+        crate::settings::install_for_test(settings);
+        crate::settings::set_loop_guards_override(None);
+
+        let dir = scratch_dir("loopguard-then-config");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let dest = dir.join("settings.json");
+
+        let out = super::loopguard_command("off");
+        assert!(out.contains("off"), "{out:?}");
+        assert!(!crate::guard::guards_enabled());
+
+        // An unrelated key, and deliberately a non-guard, non-display one.
+        let out = agent.config_set_command_at("engine.threads 7", Some(dest.clone()));
+        assert!(out.contains("threads"), "{out:?}");
+        let written = std::fs::read_to_string(&dest).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            json["tools"]["loopGuards"],
+            serde_json::Value::Bool(true),
+            "the toggled value must not reach disk: {written}"
+        );
+        // And the toggle still stands for enforcement: an unrelated
+        // `/config` does not silently cancel it.
+        assert!(!crate::guard::guards_enabled());
+        crate::settings::set_loop_guards_override(None);
+    }
+
+    /// An explicit `/config tools.loopGuards` wins: it persists the value
+    /// and clears `/loopguard`'s override, so what the user typed is what's
+    /// in force.
+    #[test]
+    fn config_loop_guards_persists_and_clears_the_override() {
+        let _g = crate::debugmirror::test_support::lock();
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = true;
+        crate::settings::install_for_test(settings);
+        crate::settings::set_loop_guards_override(None);
+
+        let dir = scratch_dir("config-loop-guards");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let dest = dir.join("settings.json");
+
+        let out = super::loopguard_command("off");
+        assert!(out.contains("off"), "{out:?}");
+        assert!(!crate::guard::guards_enabled());
+
+        let out = agent.config_set_command_at("tools.loopGuards true", Some(dest.clone()));
+        assert!(out.contains("loopGuards"), "{out:?}");
+        assert_eq!(
+            crate::settings::loop_guards_override(),
+            None,
+            "an explicit /config clears the /loopguard toggle"
+        );
+        assert!(crate::guard::guards_enabled());
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(json["tools"]["loopGuards"], serde_json::Value::Bool(true));
+    }
+
+    /// The override is process state, not conversation state: `/clear`/`/new`
+    /// leave it alone, because the investigation it supports outlives a
+    /// context reset.
+    #[test]
+    fn the_loop_guards_override_survives_a_session_clear() {
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = true;
+        crate::settings::install_for_test(settings);
+        crate::settings::set_loop_guards_override(None);
+
+        let dir = scratch_dir("loopguard-survives-clear");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let _ = super::loopguard_command("off");
+        agent.reset_session_state();
+        assert_eq!(crate::settings::loop_guards_override(), Some(false));
+        assert!(!crate::guard::guards_enabled());
+        crate::settings::set_loop_guards_override(None);
     }
 
     /// The wastebasket's gesture: two presses inside the window are a
