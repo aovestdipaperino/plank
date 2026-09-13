@@ -693,8 +693,8 @@ suspending</td>
 </tr>
 <tr>
 <td><code>--mtp-model PATH</code></td>
-<td>the loaded model's companion GGUF: the DSpark drafter for DeepSeek,
-the required PLE sidecar for Qwen3.8</td>
+<td>the loaded model's companion GGUF: the DSpark drafter for DeepSeek
+V4</td>
 </tr>
 <tr>
 <td><code>--mtp-confidence F</code></td>
@@ -705,28 +705,29 @@ five-token blocks)</td>
 <td><code>--mtp-strict</code></td>
 <td>load the drafter but keep target-only decode, for comparisons</td>
 </tr>
-<tr>
-<td><code>--qwen</code></td>
-<td>run Qwen3.8-Flash-Next: shorthand for
-<code>-m ~/.plank/qwen.gguf --mtp-model ~/.plank/qwen.mtp.gguf</code></td>
-</tr>
 </tbody>
 </table>
 <p>Speculative decoding is <strong>on by default</strong> under one
-name, <code>--mtp</code>, with a different mechanism per model family.
-DeepSeek uses its auxiliary DSpark draft checkpoint for V4 Flash: it
-proposes up to five tokens ahead and the main model verifies them,
-committing only the prefix it agrees with, so one verification pass can
-advance the stream by several tokens. Qwen3.8-Flash-Next speculates from
-the MTP block inside its own main GGUF and needs no drafter.
-<code>--mtp-off</code> turns it off for target-only decode.</p>
-<p>On DeepSeek the support model (~5.6 GB) needs no flag of its own — it
+name, <code>--mtp</code>. DeepSeek V4 Flash uses its auxiliary DSpark
+draft checkpoint: it proposes up to five tokens ahead and the main model
+verifies them, committing only the prefix it agrees with, so one
+verification pass can advance the stream by several tokens. DeepSeek
+V4.1 Flash has no drafter upstream, so plank never pairs one with it and
+decodes target-only there. <code>--mtp-off</code> turns speculation off
+explicitly.</p>
+<p>On V4 the support model (~5.6 GB) needs no flag of its own: it
 resolves to <code>~/.plank/ds4flash.dspark.gguf</code> and is offered
 for download through the same resumable path as the main model, unless
-<code>--mtp-model</code> names one. On Qwen the same
-<code>--mtp-model</code> flag carries the PLE sidecar, which is required
-rather than optional; <code>--qwen</code> fills in both default paths
-for you.</p>
+<code>--mtp-model</code> names one.</p>
+<p>A drafter plank paired for you is no longer able to stop a model from
+loading. The engine refuses to open a model at all when the draft
+checkpoint does not match it, so a checkpoint the default drafter does
+not fit used to fail until you found <code>--mtp-off</code>; plank now
+retries the open once without the companion it chose and reports the
+original error only if that fails too. A companion you named with
+<code>--mtp-model</code> is never dropped. When speculation turns out
+not to run, the temperature you would have been sampling at is restored
+rather than left pinned at 0.</p>
 <p>Verification is argmax, so proposals are only used at
 <code>--temp 0</code>; sampled decoding ignores them. Whether it pays
 depends on the engine build, the quant and the machine: on an M5 Max it
@@ -741,10 +742,15 @@ draft model. <code>--ssd-streaming</code> and its companions
 <code>--ssd-streaming-cache-experts</code>,
 <code>--ssd-streaming-preload-experts</code>) stream experts from SSD
 instead of loading them resident, which is how you run a model that does
-not fit. <code>--simulate-used-memory &lt;N&gt;GB</code> pretends memory
-is already used, for testing those paths.
-<code>--dir-steering-file</code>, <code>--dir-steering-ffn</code>,
-<code>--dir-steering-attn</code> apply directional steering vectors.</p>
+not fit. You rarely need to reach for <code>--ssd-streaming</code>
+yourself any more: plank measures the model file at startup and turns
+streaming on when it exceeds 80% of installed RAM less the engine's
+context buffers, printing the calculation it used. Passing the flag
+yourself skips that decision.
+<code>--simulate-used-memory &lt;N&gt;GB</code> pretends memory is
+already used, for testing those paths. <code>--dir-steering-file</code>,
+<code>--dir-steering-ffn</code>, <code>--dir-steering-attn</code> apply
+directional steering vectors.</p>
 <p>Remote, shared-engine, control, and provider flags are covered in <a
 href="10-remote-and-providers.html">Remote and hosted engines</a>.</p>
 <h2 id="environment-variables">Environment variables</h2>

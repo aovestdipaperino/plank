@@ -195,20 +195,21 @@ One limitation: settings come from the directory plank launches in, so project s
 |---|---|
 | `--mtp` | speculative decoding (multi-token prediction), on by default |
 | `--mtp-off` | disable speculative decoding (target-only decode) |
-| `--mtp-model PATH` | the loaded model's companion GGUF: the DSpark drafter for DeepSeek, the required PLE sidecar for Qwen3.8 |
+| `--mtp-model PATH` | the loaded model's companion GGUF: the DSpark drafter for DeepSeek V4 |
 | `--mtp-confidence F` | pruning threshold, `0..1` (`0` forces fixed five-token blocks) |
 | `--mtp-strict` | load the drafter but keep target-only decode, for comparisons |
-| `--qwen` | run Qwen3.8-Flash-Next: shorthand for `-m ~/.plank/qwen.gguf --mtp-model ~/.plank/qwen.mtp.gguf` |
 
-Speculative decoding is **on by default** under one name, `--mtp`, with a different mechanism per model family. DeepSeek uses its auxiliary DSpark draft checkpoint for V4 Flash: it proposes up to five tokens ahead and the main model verifies them, committing only the prefix it agrees with, so one verification pass can advance the stream by several tokens. Qwen3.8-Flash-Next speculates from the MTP block inside its own main GGUF and needs no drafter. `--mtp-off` turns it off for target-only decode.
+Speculative decoding is **on by default** under one name, `--mtp`. DeepSeek V4 Flash uses its auxiliary DSpark draft checkpoint: it proposes up to five tokens ahead and the main model verifies them, committing only the prefix it agrees with, so one verification pass can advance the stream by several tokens. DeepSeek V4.1 Flash has no drafter upstream, so plank never pairs one with it and decodes target-only there. `--mtp-off` turns speculation off explicitly.
 
-On DeepSeek the support model (~5.6 GB) needs no flag of its own — it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download through the same resumable path as the main model, unless `--mtp-model` names one. On Qwen the same `--mtp-model` flag carries the PLE sidecar, which is required rather than optional; `--qwen` fills in both default paths for you.
+On V4 the support model (~5.6 GB) needs no flag of its own: it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download through the same resumable path as the main model, unless `--mtp-model` names one.
+
+A drafter plank paired for you is no longer able to stop a model from loading. The engine refuses to open a model at all when the draft checkpoint does not match it, so a checkpoint the default drafter does not fit used to fail until you found `--mtp-off`; plank now retries the open once without the companion it chose and reports the original error only if that fails too. A companion you named with `--mtp-model` is never dropped. When speculation turns out not to run, the temperature you would have been sampling at is restored rather than left pinned at 0.
 
 Verification is argmax, so proposals are only used at `--temp 0`; sampled decoding ignores them. Whether it pays depends on the engine build, the quant and the machine: on an M5 Max it was a 0.71× *slowdown* until the Metal verifier was pipelined upstream, after which the same measurement read 1.19×. The peak rates in the exit message are the way to check on your own hardware.
 
 ### Advanced engine tuning
 
-`--mtp PATH`, `--mtp-draft N`, `--mtp-margin F` configure multi-token prediction with a draft model. `--ssd-streaming` and its companions (`--ssd-streaming-cold`, `--ssd-streaming-cache-experts`, `--ssd-streaming-preload-experts`) stream experts from SSD instead of loading them resident, which is how you run a model that does not fit. `--simulate-used-memory <N>GB` pretends memory is already used, for testing those paths. `--dir-steering-file`, `--dir-steering-ffn`, `--dir-steering-attn` apply directional steering vectors.
+`--mtp PATH`, `--mtp-draft N`, `--mtp-margin F` configure multi-token prediction with a draft model. `--ssd-streaming` and its companions (`--ssd-streaming-cold`, `--ssd-streaming-cache-experts`, `--ssd-streaming-preload-experts`) stream experts from SSD instead of loading them resident, which is how you run a model that does not fit. You rarely need to reach for `--ssd-streaming` yourself any more: plank measures the model file at startup and turns streaming on when it exceeds 80% of installed RAM less the engine's context buffers, printing the calculation it used. Passing the flag yourself skips that decision. `--simulate-used-memory <N>GB` pretends memory is already used, for testing those paths. `--dir-steering-file`, `--dir-steering-ffn`, `--dir-steering-attn` apply directional steering vectors.
 
 Remote, shared-engine, control, and provider flags are covered in [Remote and hosted engines](10-remote-and-providers.md).
 

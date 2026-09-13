@@ -185,7 +185,14 @@ actual generation.</li>
 no <code>-m</code> flag and nothing at the default path
 (<code>~/.plank/ds4flash.gguf</code>), plank offers to fetch the
 quantized model (~87 GB) from Hugging Face. One keypress and it
-downloads in place with live progress.</p>
+downloads in place with live progress, and an interruption resumes where
+it stopped rather than starting over.</p>
+<p>DeepSeek V4.1 Flash is supported too, as a family of its own with its
+own tool-call dialect and its own <code>.ds41.kv</code> transcripts.
+plank ships no manifest for it, so it is not offered for download: point
+<code>-m</code> at a V4.1 GGUF and the family, the dialect and the
+companion paths all follow from the file's own architecture field. It is
+large enough that plank will usually turn on SSD streaming for you.</p>
 <p>Things worth knowing before you start an 87 GB transfer:</p>
 <ul>
 <li><strong>It resumes.</strong> The download streams to a
@@ -209,18 +216,17 @@ it). See <a
 href="08-configuration.html#speculative-decoding">Configuration</a>.</p>
 <h2 id="staying-on-the-current-model">Staying on the current model</h2>
 <p>Once a model is installed, plank checks for a newer one at most once
-a day by fetching a manifest — <code>ds4.manifest</code> for DeepSeek,
-<code>qwen.manifest</code> for Qwen — a small file naming that set's
-artifacts and a version number. When a newer version appears, plank asks
-first: <code>Download it in the background? [y/N]</code>, defaulting to
-no. Say yes and it starts in a detached background process rather than
-blocking the session: it keeps running even if you quit plank or close
-the terminal, so closing the laptop lid mid-transfer costs nothing but
-time. Say no (or just press Enter) and nothing downloads yet; run
-<code>/model download</code> whenever you are ready to start it. A
-dropped connection or a stopped helper leaves verified artifacts and
-partial files in <code>~/.plank/staging/</code>; nothing resumes it
-automatically, but accepting the next daily offer or running
+a day by fetching <code>ds4.manifest</code>, a small file naming the
+artifact set and a version number. When a newer version appears, plank
+asks first: <code>Download it in the background? [y/N]</code>,
+defaulting to no. Say yes and it starts in a detached background process
+rather than blocking the session: it keeps running even if you quit
+plank or close the terminal, so closing the laptop lid mid-transfer
+costs nothing but time. Say no (or just press Enter) and nothing
+downloads yet; run <code>/model download</code> whenever you are ready
+to start it. A dropped connection or a stopped helper leaves verified
+artifacts and partial files in <code>~/.plank/staging/</code>; nothing
+resumes it automatically, but accepting the next daily offer or running
 <code>/model download</code> picks up right where it left off,
 re-downloading only what wasn't finished. Only one such download runs
 per machine, whichever plank noticed the update first.</p>
@@ -264,15 +270,6 @@ it is what you will see if you launch on an unsupported platform.</p>
 <td><code>~/.plank/ds4flash.dspark.gguf</code></td>
 <td>DSpark draft model, for DeepSeek speculation
 (<code>--mtp</code>)</td>
-</tr>
-<tr>
-<td><code>~/.plank/qwen.gguf</code></td>
-<td>Qwen3.8-Flash-Next main model, when <code>--qwen</code> is used
-(expected to be a symlink)</td>
-</tr>
-<tr>
-<td><code>~/.plank/qwen.mtp.gguf</code></td>
-<td>Qwen3.8-Flash-Next PLE sidecar, required by that model</td>
 </tr>
 <tr>
 <td><code>~/.plank/kvcache/</code></td>

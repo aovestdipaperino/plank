@@ -221,7 +221,7 @@ Anything that must happen *every* time belongs in a hook, not in your memory of 
 ## Getting more out of the hardware
 
 - **`/power <1..100>`** caps GPU draw mid-session, for when you want the laptop to stay cool or quiet.
-- **`--ssd-streaming`** streams experts from SSD rather than loading them resident, which is how you run a model that does not fit in RAM. `--ssd-streaming-cache-experts` and `--ssd-streaming-preload-experts` trade memory for latency.
+- **`--ssd-streaming`** streams experts from SSD rather than loading them resident, which is how you run a model that does not fit in RAM. plank turns it on by itself when the model file exceeds 80% of installed RAM less the engine's context buffers, so the flag is mostly for forcing the decision; `--ssd-streaming-cache-experts` and `--ssd-streaming-preload-experts` trade memory for latency.
 - **`--mtp PATH`** adds a multi-token-prediction draft model, with `--mtp-draft` and `--mtp-margin` tuning how aggressively drafts are accepted.
 - **`plank serve` + `--remote`** puts the work on the machine with the GPU and the typing on the machine you are sitting at. See [Remote and hosted engines](10-remote-and-providers.md).
 

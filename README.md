@@ -101,7 +101,7 @@ plank tracks `ds4_agent` for the core agent loop but moves faster on the user-fa
 
 - **Full-screen Ratatui TUI** — markdown rendering with syntax-highlighted code, mouse-wheel scrollback, and a two-row animated status bar: the working directory, git branch and a working-tree change counter (`📄 3 · +128 -41` — files touched, then lines added in green and deleted in red) on the first row, so the location holds still, and everything volatile on the second — engine origin, reasoning level (colored by how hard the model is thinking, with a braille stand-in for the expert routing that re-rolls every token), context gauge, and the name of the tool currently running. The C reference is a plain line REPL. Resumed sessions replay through the same renderer, so history comes back as markdown with thinking dimmed, not flat text.
 - **Type while it thinks** — each turn runs on a worker thread, so the prompt stays live during generation and you can queue the next message.
-- **`/toks` live speed chart** — a braille line chart of generation speed as a time series, one sample per second of decoding, drawn in the theme green. Open it mid-turn and it redraws on every status tick, so the line grows while the model types. `/exit` also works mid-turn now: it asks `[y/N]` first, then interrupts the turn and leaves once it stops.
+- **`/toks` live speed chart** — two braille line charts side by side, generation speed and prefill speed, each a time series sampled once a second, drawn in the theme green. Open it mid-turn and it redraws on every status tick, so the line grows while the model types. `/exit` also works mid-turn now: it asks `[y/N]` first, then interrupts the turn and leaves once it stops.
 - **A footer you can click** — the ctx gauge opens the `/context` breakdown, `⧗ N jobs` opens the live job table, and a wastebasket shows whether micro-compaction is on (`🗑 🟢`) or off (`🗑 🔴`) — double-click it to flip, mid-turn included. All of them work while the model is generating.
 - **`/btw` side questions** — ask something mid-task; the answer runs on a fork of the session, interleaved with the main generation, so it streams into a split panel while the main task keeps going. Nothing is written to the conversation, and neither side re-prefills.
 - **Checkpoints, resume, and instant KV restore** — `/checkpoint`/`/rollback` and `/resume` snapshot the live engine KV alongside the transcript, so returning to a conversation skips re-prefilling it.
@@ -134,10 +134,10 @@ The `/context` command visualizes context-window usage by category:
   <img src="assets/context-usage.png" alt="/context report showing token usage by category" width="700">
 </p>
 
-`/toks` charts the generation speed as it happens, one sample per second of decoding; typed during a turn, the panel redraws as the model types:
+`/toks` charts the generation speed and the prefill speed side by side as they happen, one sample per second of decoding; typed during a turn, the panel redraws as the model types:
 
 <p align="center">
-  <img src="assets/toks.png" alt="/toks panel: a green braille line chart of generation speed in tok/s, one sample per second, with now, avg, min and max underneath" width="700">
+  <img src="assets/toks.png" alt="/toks panel: two side-by-side braille line charts in the theme green. Generation speed on the left reads now 29.5, avg 32.9, min 26.9, max 45.9 tok/s; prefill speed on the right reads now 232.9, avg 440.0, min 42.8, max 2112.0 tok/s" width="700">
 </p>
 
 `/btw` answers a side question *beside* the running task rather than pausing it. The aside runs on a fork of the session, interleaved with the main generation, so both advance at once — here the model keeps counting on the left while `/btw what is the capital of Italy` is answered on the right, with nothing written to the conversation:

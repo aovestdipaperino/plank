@@ -155,15 +155,19 @@ what you have changed in that tree (<code>📄 3 · +128 -41</code> — files
 touched, then lines added in green and lines deleted in red, staged and
 unstaged together, untracked files included; a clean tree shows
 nothing). The bottom one carries everything that churns — where
-inference is running, the reasoning level, a context-usage gauge, a
-wastebasket with an indicator light for micro-compaction
-(<code>🗑 🟢</code> on, <code>🗑 🔴</code> off — double-click it to flip,
-a single click reports the state), <code>⧗ N jobs</code> while
-background shell jobs are running (click it for the <code>/jobs</code>
-panel), an activity throbber, what the model is doing, generation stats,
-the task counter, and the remote marker. When a tool is running its name
-sits in the notification slot and blinks; otherwise a rotating tip
-appears there.</p>
+inference is running, a brain with the reasoning level beside it (click
+it to hide or show thinking for the session, without writing the
+setting), a context-usage gauge, a wastebasket with an indicator light
+for micro-compaction (<code>🗑 🟢</code> on, <code>🗑 🔴</code> off —
+double-click it to flip, a single click reports the state),
+<code>⧗ N jobs</code> while background shell jobs are running (click it
+for the <code>/jobs</code> panel), a 💾 while the loaded model is
+streaming its experts from SSD (blinking while a pass is in flight),
+<code>⏸ paused: memory</code> while plank has released the engine under
+memory pressure and is waiting to take it back, an activity throbber,
+what the model is doing, generation stats, the task counter, and the
+remote marker. When a tool is running its name sits in the notification
+slot and blinks; otherwise a rotating tip appears there.</p>
 <p><strong>Where inference runs</strong> is named on the second row, and
 there can be more than one answer:</p>
 <pre><code>api.regolo.ai, (local ⚡100%)</code></pre>

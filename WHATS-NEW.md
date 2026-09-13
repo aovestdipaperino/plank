@@ -10,8 +10,62 @@ it.
 
 ## In the betas
 
-Riding ahead of stable 5.0.0 in the 5.0.7 beta. Install with `brew install
+Riding ahead of stable 5.1.0 in the 5.1.1 beta. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
+
+### 5.1.0
+
+**plank runs DeepSeek V4.1 Flash.** It is a model family of its own rather than
+a V4 revision: its own weights and tokenizer, its own tool-call spelling, and
+its own `.ds41.kv` transcripts, which never mix with V4's. You reach it by
+pointing `-m` at a V4.1 GGUF; the family, the dialect and the paths all come out
+of the GGUF's own architecture field, so there is nothing to declare. V4 stays
+the model plank ships and offers to download. V4.1 also has a real reasoning
+dial, 0 to 100, so on that family `low`, `medium` and `max` are just names for
+the 25, 75 and 100 the model is told, `/think 40` works, and the footer shows
+the number instead of the label.
+
+**Two models that needed a flag now just work.** A model too big to sit in RAM
+turns on SSD streaming by itself, printing the arithmetic it used, instead of
+failing to open and telling you to go find `--ssd-streaming`. And a draft
+checkpoint that does not match the model you loaded no longer stops the open:
+plank retries without the drafter it chose for you and decodes target-only. A
+companion you named with `--mtp-model` is still never dropped. While a
+streaming model is loaded the footer carries a 💾, blinking while a pass runs.
+
+**Qwen3.8-Flash-Next is retired.** Upstream deleted its Metal kernels, so the
+family, the `--qwen` flag, its artifact set and its dialect are all gone. Your
+old `.qwn.kv` files are untouched and will stay that way: a retired model name
+matches no live family, so nothing lists them, sweeps them or hands them to a
+DeepSeek engine. They are also no longer loadable.
+
+**plank gets out of the way when the Mac runs out of memory.** Under memory
+pressure it releases the KV cache and the engine session at a turn boundary,
+says so, and comes back to the same continuation when pressure clears, instead
+of thrashing or being killed. The footer shows `⏸ paused: memory` while it
+waits, so the pause does not read as a hang.
+
+**`/toks` now charts prefill speed too**, beside generation speed on the same
+rows, because the question a slow pass raises is whether it is prefill-bound or
+decode-bound.
+
+![/toks panel: two side-by-side braille line charts in the theme green. Generation speed on the left reads now 29.5, avg 32.9, min 26.9, max 45.9 tok/s; prefill speed on the right reads now 232.9, avg 440.0, min 42.8, max 2112.0 tok/s](assets/toks.png)
+
+**Smaller things.** Diff cards are syntax-highlighted now rather than flat red
+and green. `!!` output opens in its own scrollable panel instead of scrolling
+away inside the model's. Sub-agents you did not name are called alpha, bravo,
+charlie instead of four identical `sub-agent` labels. Clicking the footer's
+brain hides or shows thinking for the session without writing a setting.
+`/hooks off` and `/skills off` are session master switches for hooks and
+skills. And an interrupted model download resumes where it stopped rather than
+starting over, which used to cost 88 GiB.
+
+**One settings bug worth naming.** `/config tools.<key>` reported "saved" and
+wrote nothing: the whole `tools` section was missing from the save path, so
+nine settings including `bashNotify` quietly reset at every launch. All nine
+persist now. The toggles that are deliberately session-only, the footer brain
+and `/loopguard`, still cannot reach `settings.json`; `/mc` still can, because
+that one is a real preference.
 
 ### 5.0.7
 
@@ -42,8 +96,6 @@ two guard changes above were found.
 sample per second of decoding, in the same dismissable panel as `/usage`. Type
 it during a turn and it redraws on every status tick, so you can watch the
 rate move while the model types.
-
-![/toks panel: a green braille line chart of generation speed in tok/s, one sample per second, with now, avg, min and max underneath](assets/toks.png)
 
 `/exit` works mid-turn too now: it asks
 `[y/N]`, then interrupts the turn and leaves once it stops. Under the hood the

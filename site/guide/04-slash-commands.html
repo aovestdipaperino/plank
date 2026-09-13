@@ -258,8 +258,9 @@ cache hit rate)</td>
 </tr>
 <tr>
 <td><code>/toks</code></td>
-<td>a braille line chart of generation speed, one sample per second of
-decoding. Works mid-turn and redraws as the model types</td>
+<td>two braille line charts side by side, generation speed and prefill
+speed, one sample per second of decoding. Works mid-turn and redraws as
+the model types</td>
 </tr>
 <tr>
 <td><code>/jobs</code></td>
@@ -304,8 +305,10 @@ edits are split back to the right file on save</td>
 <td>connected MCP servers and the tools they expose</td>
 </tr>
 <tr>
-<td><code>/skills</code></td>
-<td>skills available to the model</td>
+<td><code>/skills [on|off]</code></td>
+<td>skills available to the model; <code>on</code>/<code>off</code>
+enable or disable skill expansion for this session, on both the slash
+route and the <code>skill</code> tool</td>
 </tr>
 <tr>
 <td><code>/templates</code></td>
@@ -317,8 +320,10 @@ edits are split back to the right file on save</td>
 on</td>
 </tr>
 <tr>
-<td><code>/hooks</code></td>
-<td>which hooks are configured and on what events</td>
+<td><code>/hooks [on|off]</code></td>
+<td>which hooks are configured and on what events;
+<code>on</code>/<code>off</code> enable or disable hook execution for
+this session</td>
 </tr>
 <tr>
 <td><code>/plugins</code></td>

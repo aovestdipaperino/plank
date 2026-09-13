@@ -124,7 +124,7 @@ The message lists what plank could establish on its own, and usually one of thos
 - **what was asked for** — the family read from the file's own metadata, the backend, and the context size;
 - **the model file itself**: a dangling symlink names the target that is gone, which is the common one because the default model paths are symlinks by convention, and otherwise you get a directory, an unreadable file, or the size;
 - **a size mismatch** against the installed manifest, which is what a truncated or interrupted install looks like;
-- **each companion that was passed**, so a Qwen run whose PLE sidecar is missing says so. A companion plank never passed is not listed, rather than listed as absent;
+- **each companion that was passed**, so a run whose drafter is missing says so. A companion plank never passed is not listed, rather than listed as absent;
 - **the Metal kernel sources**, when they are not where the engine looks.
 
 The engine writes its own diagnosis just above that message, on the line plank has been updating in place while loading, so it is easy to read past.

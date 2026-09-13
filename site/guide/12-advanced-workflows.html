@@ -389,7 +389,10 @@ hardware</h2>
 mid-session, for when you want the laptop to stay cool or quiet.</li>
 <li><strong><code>--ssd-streaming</code></strong> streams experts from
 SSD rather than loading them resident, which is how you run a model that
-does not fit in RAM. <code>--ssd-streaming-cache-experts</code> and
+does not fit in RAM. plank turns it on by itself when the model file
+exceeds 80% of installed RAM less the engine's context buffers, so the
+flag is mostly for forcing the decision;
+<code>--ssd-streaming-cache-experts</code> and
 <code>--ssd-streaming-preload-experts</code> trade memory for
 latency.</li>
 <li><strong><code>--mtp PATH</code></strong> adds a

@@ -107,7 +107,7 @@ plank: settings in effect (/path/to/.plank/settings.json): threads=3, backend=cp
 
 ## Thinking
 
-The model reasons before it answers. `--think-low` (the default), `--think`, `--think-max`, and `--nothink` set the effort; `ui.showThinking` controls whether you see it. Low is the default because on the same coding task it finished a third faster than medium with the same result, and its reasoning reads as a plan rather than a list of second thoughts. Hiding thinking does not stop it — the model still produces it, and it still occupies context.
+The model reasons before it answers. `--think-low` (the default), `--think`, `--think-max`, and `--nothink` set the effort; `ui.showThinking` controls whether you see it, and clicking the footer's brain toggles that for the session without writing the setting. On DeepSeek V4.1 Flash, which has a native reasoning-effort dial of 0 to 100, those names are labels for the numbers the model is actually told (low is 25, medium is 75, max is 100), `/think <n>` sets a number directly, and the footer shows the number in force. `off` stays `off`, because thinking-disabled is a distinct state rather than effort zero. Low is the default because on the same coding task it finished a third faster than medium with the same result, and its reasoning reads as a plan rather than a list of second thoughts. Hiding thinking does not stop it — the model still produces it, and it still occupies context.
 
 ## Token usage on hosted providers
 
@@ -117,13 +117,13 @@ The model reasons before it answers. `--think-low` (the default), `--think`, `--
 
 reports billed input and output tokens for the session, including Anthropic cache reads, cache writes, and the hit rate. Local engines have nothing to bill, so it is a provider-only report.
 
-## Generation speed
+## Generation and prefill speed
 
 ```
 /toks
 ```
 
-draws the generation speed as a braille line chart in the theme green: tokens per second, sampled once a second while the model decodes, newest at the right, with the current, average, minimum and maximum rates underneath. The x axis is decoding time, so passes, tool rounds and turns leave no mark on it. It opens in the same dismissable panel as `/usage`, and typed during a turn it redraws on every status tick, so you can watch the rate settle as a long answer streams. On the piped REPL it prints as plain text.
+draws two braille line charts side by side in the theme green, generation speed on the left and prefill speed on the right: tokens per second, sampled once a second while the model works, newest at the right, each with its own current, average, minimum and maximum rates underneath. Two panels rather than one because the question a slow pass raises is comparative, whether it is prefill-bound or decode-bound, and that reading is only immediate when both lines sit on the same rows. The x axis is time spent in the engine, so tool rounds and turns leave no mark on it. It opens in the same dismissable panel as `/usage`, and typed during a turn it redraws on every status tick, so you can watch the rate settle as a long answer streams. On the piped REPL it prints as plain text.
 
 ---
 

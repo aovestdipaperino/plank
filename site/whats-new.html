@@ -141,6 +141,59 @@ actually notice.</p>
 <p><strong>v5.0.0 is out</strong>, and the beta channel is on 5.0.7. The
 patch number is still the channel: <code>.0</code> is stable, anything
 above it is beta.</p>
+<p><strong>5.1.0: plank runs DeepSeek V4.1 Flash.</strong> It is a
+family of its own rather than a V4 revision, with its own weights,
+tokenizer, tool-call spelling and <code>.ds41.kv</code> transcripts that
+never mix with V4's. Point <code>-m</code> at a V4.1 GGUF and the
+family, the dialect and the paths all follow from the GGUF's own
+architecture field; V4 stays the model plank ships and offers to
+download. V4.1 also has a real reasoning dial, 0 to 100, so there
+<code>low</code>, <code>medium</code> and <code>max</code> are names for
+the 25, 75 and 100 the model is actually told, <code>/think 40</code>
+works, and the footer shows the number rather than the label.</p>
+<p><strong>Two models that needed a flag now just work.</strong> A model
+too large to sit in RAM turns on SSD streaming by itself, printing the
+arithmetic it used, instead of refusing to open and telling you to go
+find <code>--ssd-streaming</code>. A draft checkpoint that does not
+match the model you loaded no longer stops the open either: plank
+retries without the drafter it chose for you and decodes target-only,
+and a companion you named with <code>--mtp-model</code> is still never
+dropped. While a streaming model is loaded the footer carries a 💾,
+blinking while a pass runs.</p>
+<p><strong>Qwen3.8-Flash-Next is retired.</strong> Upstream deleted its
+Metal kernels, so the family, the <code>--qwen</code> flag, its artifact
+set and its dialect are gone. Existing <code>.qwn.kv</code> files are
+left strictly alone: a retired model name matches no live family, so
+nothing lists them, sweeps them or hands them to a DeepSeek engine. They
+are still on disk, and no longer loadable.</p>
+<p><strong>plank gets out of the way when the Mac runs out of
+memory.</strong> Under memory pressure it releases the KV cache and the
+engine session at a turn boundary, says so, and returns to the same
+continuation once pressure clears, rather than thrashing or being
+killed. <code>⏸ paused: memory</code> on the footer marks the wait so it
+does not read as a hang.</p>
+<p><strong><code>/toks</code> charts prefill speed as well</strong>,
+beside generation speed on the same rows, because the question a slow
+pass raises is whether it is prefill-bound or decode-bound.</p>
+<p><img src="/assets/toks.png"
+alt="/toks panel: two side-by-side braille line charts in the theme green. Generation speed on the left reads now 29.5, avg 32.9, min 26.9, max 45.9 tok/s; prefill speed on the right reads now 232.9, avg 440.0, min 42.8, max 2112.0 tok/s" /></p>
+<p><strong>Smaller things.</strong> Diff cards are syntax-highlighted
+rather than flat red and green. <code>!!</code> output opens in its own
+scrollable panel instead of scrolling away inside the model's.
+Sub-agents you did not name are alpha, bravo and charlie instead of four
+identical <code>sub-agent</code> labels. Clicking the footer's brain
+hides or shows thinking for the session without writing a setting.
+<code>/hooks off</code> and <code>/skills off</code> are session master
+switches. And an interrupted model download resumes where it stopped
+instead of starting over, which used to cost 88 GiB.</p>
+<p><strong>One settings bug worth naming.</strong>
+<code>/config tools.&lt;key&gt;</code> reported "saved" and wrote
+nothing: the whole <code>tools</code> section was missing from the save
+path, so nine settings including <code>bashNotify</code> quietly reset
+at every launch. All nine persist now. The toggles that are deliberately
+session-only, the footer brain and <code>/loopguard</code>, still cannot
+reach <code>settings.json</code>; <code>/mc</code> still can, because
+that one is a real preference.</p>
 <p><strong>5.0.7 (beta) stops the parent from wearing the sub-agent's
 numbers.</strong> While a sub-agent is working, the main transcript's
 progress line says
@@ -168,8 +221,6 @@ theme green, one sample per second of decoding, in the same dismissable
 panel as <code>/usage</code>. Type it during a turn and it redraws on
 every status tick, so you can watch the rate move while the model
 types.</p>
-<p><img src="/assets/toks.png"
-alt="/toks panel: a green braille line chart of generation speed in tok/s, one sample per second, with now, avg, min and max underneath" /></p>
 <p><code>/exit</code> works mid-turn too now: it asks
 <code>[y/N]</code>, then interrupts the turn and leaves once it stops.
 The loop guard's reasoning budget also scales with the context window
@@ -225,15 +276,14 @@ switch now. <strong>This is a breaking change</strong>:
 spellings are gone rather than deprecated, so a stale
 <code>--mtp x.gguf</code> fails loudly instead of quietly misreading the
 path.</p>
-<p><strong>The footer says which model you are talking to</strong>,
-<code>(local:ds ⚡100%)</code> or <code>(local:qwen ⚡100%)</code>. Two
-local runs in the same directory used to look identical in the one place
-that answers that question.</p>
-<p><strong>Qwen upgrades on its own manifest.</strong>
-<code>qwen.manifest</code> sits beside <code>ds4.manifest</code> with
-its own staging area, and an install already on disk at the manifest's
-sizes is adopted rather than re-downloaded — nobody re-fetches 107 GB
-they already have.</p>
+<p><strong>The footer says which model you are talking to</strong>, for
+example <code>(local:ds ⚡100%)</code>. Two local runs in the same
+directory used to look identical in the one place that answers that
+question.</p>
+<p><strong>Artifacts upgrade on a manifest.</strong>
+<code>ds4.manifest</code> names the artifact set and a version, and an
+install already on disk at the manifest's sizes is adopted rather than
+re-downloaded — nobody re-fetches 107 GB they already have.</p>
 <p><strong>The model can ask to compact.</strong> A <code>compact</code>
 tool lets it summarize the conversation and carry on from the summary.
 It is told not to reach for it unprompted: only you know whether the

@@ -41,7 +41,7 @@ See [Sessions](06-sessions.md).
 | `/context` | report context-window usage by category (or click the `ctx N%` gauge) |
 | `/compact [instructions]` | compact the conversation now, rather than waiting for the automatic pass; an argument steers what this one summary keeps |
 | `/usage` | billed token counts for the session (hosted providers, including cache hit rate) |
-| `/toks` | a braille line chart of generation speed, one sample per second of decoding. Works mid-turn and redraws as the model types |
+| `/toks` | two braille line charts side by side, generation speed and prefill speed, one sample per second of decoding. Works mid-turn and redraws as the model types |
 | `/jobs` | the background bash job table: id, pid, elapsed, state and output file. A live panel in the TUI, also mid-turn; clicking `⧗ N jobs` in the status bar toggles it |
 | `/rate [+\|-] [note]` | rate the last turn (thumbs up by default) with an optional note; works in the TUI and the plain REPL alike |
 | `/remember [user] <fact>` | append a dated entry to project memory (or user memory with `user`) |
@@ -55,10 +55,10 @@ See [Context](07-context.md).
 | Command | What it does |
 |---|---|
 | `/mcp` | connected MCP servers and the tools they expose |
-| `/skills` | skills available to the model |
+| `/skills [on\|off]` | skills available to the model; `on`/`off` enable or disable skill expansion for this session, on both the slash route and the `skill` tool |
 | `/templates` | your `{{var}}` prompt templates |
 | `/agent` | named subagents you can delegate to, and which engine each runs on |
-| `/hooks` | which hooks are configured and on what events |
+| `/hooks [on\|off]` | which hooks are configured and on what events; `on`/`off` enable or disable hook execution for this session |
 | `/plugins` | loaded plugins, where each came from, what it contributes, and any warnings |
 | `/tasks` | the model's task list |
 
