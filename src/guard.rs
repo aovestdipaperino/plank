@@ -55,7 +55,7 @@ const MIN_PERIOD: usize = 2;
 /// ([`crate::insights::RepeatGuard::gated`]) go quiet too.
 #[must_use]
 pub fn guards_enabled() -> bool {
-    crate::settings::active().tools.loop_guards
+    crate::settings::loop_guards_effective()
 }
 
 /// A tool call signature: the tool name plus a digest of its normalised args.

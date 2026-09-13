@@ -1146,6 +1146,7 @@ impl Settings {
     ///
     /// # Errors
     /// Returns `Err` if the parent directory cannot be created or the write fails.
+    #[allow(clippy::too_many_lines)]
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
         let mut root: Vec<(String, Json)> = match std::fs::read_to_string(path) {
             Ok(t) => match json_parse(&t) {
@@ -1239,6 +1240,22 @@ impl Settings {
             "microcompact",
             Json::Bool(self.context.microcompact),
         );
+        {
+            let t = section(&mut root, "tools");
+            upsert(t, "repeatAdvisory", Json::Bool(self.tools.repeat_advisory));
+            upsert(t, "loopGuards", Json::Bool(self.tools.loop_guards));
+            upsert(t, "callTimeoutSec", unum(self.tools.call_timeout_sec));
+            upsert(t, "spillMaxBytes", unum(self.tools.spill_max_bytes as u64));
+            upsert(
+                t,
+                "spillPreviewBytes",
+                unum(self.tools.spill_preview_bytes as u64),
+            );
+            upsert(t, "recall", Json::Bool(self.tools.recall));
+            upsert(t, "fanout", Json::Bool(self.tools.fanout));
+            upsert(t, "runCode", Json::Bool(self.tools.run_code));
+            upsert(t, "bashNotify", Json::Bool(self.tools.bash_notify));
+        }
 
         let mut out = String::new();
         write_pretty(&mut out, &Json::Obj(root), 0);
@@ -1297,6 +1314,136 @@ pub fn reinstall(settings: Settings) {
     // call site, is what makes the toggle take effect immediately instead of
     // waiting for the next turn to notice.
     crate::debugmirror::reconcile();
+}
+
+/// Session-only override of `ui.showThinking`, set by the footer's brain
+/// click. `None` means "no override": the persisted `ui.show_thinking` stands.
+///
+/// Deliberately *not* a field on [`Settings`]: a value living there would be
+/// written out by [`Settings::save_to`] the next time anything saved the
+/// settings (a later `/config <any key>`, or a config-form save), which is
+/// exactly the accidental persistence the override exists to prevent. This
+/// layer is never serialised and never reaches disk.
+#[cfg(not(test))]
+static SHOW_THINKING_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(SHOW_THINKING_NONE);
+
+// Scoped to the calling thread in tests for the same reason as
+// `TEST_OVERRIDE` below: libtest runs tests concurrently in one process, and a
+// process-wide override would leak between them.
+#[cfg(test)]
+thread_local! {
+    static SHOW_THINKING_OVERRIDE: std::cell::Cell<i8> =
+        const { std::cell::Cell::new(SHOW_THINKING_NONE) };
+}
+
+/// The `SHOW_THINKING_OVERRIDE` encoding of `None`; `0`/`1` are `false`/`true`.
+const SHOW_THINKING_NONE: i8 = -1;
+
+/// The live session override of `ui.showThinking`, or `None` when none is set.
+#[must_use]
+pub fn show_thinking_override() -> Option<bool> {
+    #[cfg(test)]
+    let raw = SHOW_THINKING_OVERRIDE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let raw = SHOW_THINKING_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    (raw != SHOW_THINKING_NONE).then_some(raw != 0)
+}
+
+/// Session-only override of `tools.loopGuards`, set by `/loopguard`
+/// (`/lg`). `None` means "no override": the persisted `tools.loop_guards`
+/// stands.
+///
+/// Deliberately *not* a field on [`Settings`], for the same reason as
+/// [`SHOW_THINKING_OVERRIDE`]: a value living there would be written out by
+/// [`Settings::save_to`] the next time anything saved the settings (a later
+/// `/config <any key>`), which is exactly the accidental persistence this
+/// layer exists to prevent. Never serialised, never reaches disk, and — per
+/// the loop guard's own doc comment — outlives `/clear`/`/new`, since it is
+/// process state rather than session state: it defaults on as a protection,
+/// and turning it off is a diagnostic act whose whole point is to survive the
+/// investigation that prompted it.
+#[cfg(not(test))]
+static LOOP_GUARDS_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(LOOP_GUARDS_NONE);
+
+// Scoped to the calling thread in tests for the same reason as
+// `SHOW_THINKING_OVERRIDE` above: libtest runs tests concurrently in one
+// process, and a process-wide override would leak between them.
+#[cfg(test)]
+thread_local! {
+    static LOOP_GUARDS_OVERRIDE: std::cell::Cell<i8> =
+        const { std::cell::Cell::new(LOOP_GUARDS_NONE) };
+}
+
+/// The `LOOP_GUARDS_OVERRIDE` encoding of `None`; `0`/`1` are `false`/`true`.
+const LOOP_GUARDS_NONE: i8 = -1;
+
+/// The live session override of `tools.loopGuards`, or `None` when none is
+/// set.
+#[must_use]
+pub fn loop_guards_override() -> Option<bool> {
+    #[cfg(test)]
+    let raw = LOOP_GUARDS_OVERRIDE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let raw = LOOP_GUARDS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    (raw != LOOP_GUARDS_NONE).then_some(raw != 0)
+}
+
+/// Sets (or with `None` clears) the session override.
+///
+/// Unlike `set_show_thinking_override`, there is no side effect to replicate
+/// here: [`reinstall`]'s four effects (`anim::set_reduced_motion`,
+/// `notify::set_mode`, swapping the `ACTIVE` slot, `debugmirror::reconcile`)
+/// each depend on a field other than `tools.loop_guards`, and the guards
+/// themselves are read fresh from [`crate::guard::guards_enabled`] at every
+/// check rather than cached anywhere that would need reconciling.
+pub fn set_loop_guards_override(value: Option<bool>) {
+    let raw = value.map_or(LOOP_GUARDS_NONE, i8::from);
+    #[cfg(test)]
+    LOOP_GUARDS_OVERRIDE.with(|c| c.set(raw));
+    #[cfg(not(test))]
+    LOOP_GUARDS_OVERRIDE.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the loop guards are armed *right now*: the session override if
+/// one is set, else the persisted `tools.loopGuards`.
+///
+/// [`crate::guard::guards_enabled`] is the sole reader of this; every guard
+/// check goes through it rather than reading `tools.loop_guards` directly.
+#[must_use]
+pub fn loop_guards_effective() -> bool {
+    loop_guards_override().unwrap_or_else(|| active().tools.loop_guards)
+}
+
+/// Sets (or with `None` clears) the session override, then reconciles the
+/// debug-console mirror.
+///
+/// The reconcile is the one side effect of [`reinstall`] that depends on
+/// `showThinking`: the mirror is connected only while thinking is *hidden*, so
+/// an override that changed the effective value without reconciling would
+/// leave a console attached (or detached) against what the user just asked
+/// for. `reinstall`'s other effects — `anim::set_reduced_motion`,
+/// `notify::set_mode`, and swapping the `ACTIVE` slot — read fields this layer
+/// cannot touch, so they are deliberately not replicated.
+pub fn set_show_thinking_override(value: Option<bool>) {
+    let raw = value.map_or(SHOW_THINKING_NONE, i8::from);
+    #[cfg(test)]
+    SHOW_THINKING_OVERRIDE.with(|c| c.set(raw));
+    #[cfg(not(test))]
+    SHOW_THINKING_OVERRIDE.store(raw, std::sync::atomic::Ordering::Relaxed);
+    crate::debugmirror::reconcile();
+}
+
+/// Whether thinking is displayed *right now*: the session override if one is
+/// set, else the persisted `ui.showThinking`.
+///
+/// Every display decision reads this. The persisted field is read directly
+/// only where the *configured* value is the subject: saving settings,
+/// rendering the config form, and the session file's render record.
+#[must_use]
+pub fn show_thinking_effective() -> bool {
+    show_thinking_override().unwrap_or_else(|| active().ui.show_thinking)
 }
 
 // Test-only settings override, scoped to the calling thread. The libtest
@@ -1667,6 +1814,84 @@ mod tests {
         assert_eq!(reloaded.mcp.timeout_secs, 45);
         assert_eq!(reloaded.engine.ctx, Some(8192));
         assert_eq!(reloaded.engine.backend, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_to_persists_every_tools_field() {
+        // Regression test for the bug where `save_to` wrote only
+        // `tools.loopGuards` (and, before that commit, nothing at all under
+        // `tools`) while `/config tools.<key> ...` claimed success. Every
+        // field of `ToolsSettings` must round-trip through disk.
+        let dir = std::env::temp_dir().join(format!("plank-cfg-tools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        // Flip every field away from its default.
+        s.tools.repeat_advisory = !s.tools.repeat_advisory;
+        s.tools.loop_guards = !s.tools.loop_guards;
+        s.tools.call_timeout_sec = 42;
+        s.tools.spill_max_bytes = 777;
+        s.tools.spill_preview_bytes = 123;
+        s.tools.recall = !s.tools.recall;
+        s.tools.fanout = !s.tools.fanout;
+        s.tools.run_code = !s.tools.run_code;
+        s.tools.bash_notify = !s.tools.bash_notify;
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+
+        assert_eq!(reloaded.tools.repeat_advisory, s.tools.repeat_advisory);
+        assert_eq!(reloaded.tools.loop_guards, s.tools.loop_guards);
+        assert_eq!(reloaded.tools.call_timeout_sec, s.tools.call_timeout_sec);
+        assert_eq!(reloaded.tools.spill_max_bytes, s.tools.spill_max_bytes);
+        assert_eq!(
+            reloaded.tools.spill_preview_bytes,
+            s.tools.spill_preview_bytes
+        );
+        assert_eq!(reloaded.tools.recall, s.tools.recall);
+        assert_eq!(reloaded.tools.fanout, s.tools.fanout);
+        assert_eq!(reloaded.tools.run_code, s.tools.run_code);
+        assert_eq!(reloaded.tools.bash_notify, s.tools.bash_notify);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_command_persists_tools_fields_to_disk() {
+        // Drives the same path `/config tools.<key> <value>` uses
+        // (`configform::set_from_path`) rather than calling `save_to`
+        // directly, so a regression in the command's own persistence step
+        // (not just in `save_to`) is caught too.
+        use crate::configform::set_from_path;
+
+        let dir = std::env::temp_dir().join(format!("plank-cfg-cmd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        set_from_path(&mut s, "tools.fanout", "false").unwrap();
+        set_from_path(&mut s, "tools.recall", "false").unwrap();
+        set_from_path(&mut s, "tools.repeatAdvisory", "false").unwrap();
+        set_from_path(&mut s, "tools.callTimeoutSec", "30").unwrap();
+        set_from_path(&mut s, "tools.spillMaxBytes", "2048").unwrap();
+        set_from_path(&mut s, "tools.spillPreviewBytes", "256").unwrap();
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+
+        assert!(!reloaded.tools.fanout);
+        assert!(!reloaded.tools.recall);
+        assert!(!reloaded.tools.repeat_advisory);
+        assert_eq!(reloaded.tools.call_timeout_sec, 30);
+        assert_eq!(reloaded.tools.spill_max_bytes, 2048);
+        assert_eq!(reloaded.tools.spill_preview_bytes, 256);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

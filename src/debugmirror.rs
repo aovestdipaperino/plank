@@ -318,7 +318,7 @@ fn raw_session_name() -> String {
 /// `<think>` block across two display modes.
 /// Returns what it newly connected so the caller can backfill those windows.
 pub fn reconcile() -> Reconciled {
-    let want_mirror = enabled() && !crate::settings::active().ui.show_thinking;
+    let want_mirror = enabled() && !crate::settings::show_thinking_effective();
     let mut reg = MIRRORS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -648,7 +648,7 @@ pub fn open_subagent() -> SubagentMirror {
     LIVE.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(id, name.clone());
-    if crate::settings::active().ui.show_thinking {
+    if crate::settings::show_thinking_effective() {
         return SubagentMirror { id };
     }
     let Some(port) = console_port() else {
@@ -668,7 +668,7 @@ pub fn open_subagent() -> SubagentMirror {
 /// everything else here; the sub-agent is gone, so there is nothing to keep
 /// the connection for.
 pub fn replay_finished_subagent(ordinal: usize, payload: &str) {
-    if crate::settings::active().ui.show_thinking {
+    if crate::settings::show_thinking_effective() {
         return;
     }
     let Some(port) = console_port() else {
@@ -1205,6 +1205,62 @@ mod tests {
             MIRRORS.lock().unwrap().is_empty(),
             "showThinking on: no connection should be attempted"
         );
+    }
+
+    /// The session override (the footer's brain click) reconciles the mirror
+    /// exactly as a settings change does: the connection follows the
+    /// *effective* value, not the persisted one.
+    #[test]
+    fn the_show_thinking_override_reconciles_the_mirror() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+
+        let control = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let control_port = control.local_addr().unwrap().port();
+        let data = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let data_port = data.local_addr().unwrap().port();
+        let accepted = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let (mut sock, _) = control.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(sock.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            writeln!(sock, "PORT {data_port}").unwrap();
+            data.accept().unwrap().0
+        });
+        CONTROL_PORT.store(control_port, Ordering::Relaxed);
+
+        // Persisted: thinking shown, so no mirror is wanted.
+        let mut s = crate::settings::Settings::default();
+        s.ui.show_thinking = true;
+        crate::settings::install_for_test(s);
+        crate::settings::set_show_thinking_override(None);
+        assert!(MIRRORS.lock().unwrap().is_empty());
+
+        // A click hides thinking: setting the override alone must connect,
+        // with no `reinstall` anywhere in sight.
+        crate::settings::set_show_thinking_override(Some(false));
+        assert!(
+            MIRRORS.lock().unwrap().contains_key(&MirrorId::PARENT),
+            "the override must connect the mirror"
+        );
+        assert!(
+            crate::settings::active().ui.show_thinking,
+            "and the persisted value is untouched"
+        );
+        let _ = accepted.join();
+
+        // And clicking back drops it again.
+        crate::settings::set_show_thinking_override(Some(true));
+        assert!(
+            MIRRORS.lock().unwrap().is_empty(),
+            "the override must disconnect the mirror"
+        );
+        crate::settings::set_show_thinking_override(None);
+        reset();
     }
 
     #[test]
