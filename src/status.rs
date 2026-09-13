@@ -326,10 +326,10 @@ const HD_MARK_OFF: &str = "  ";
 /// Marks the footer's memory-pressure segment: plank is paused with its KV
 /// released, waiting for the system to calm down.
 ///
-/// The bare codepoint, without a variation selector: unlike [`TEMP_MARK`] and
-/// [`MICROCOMPACT_MARK`], this glyph has not been verified to need one, so it
-/// is left as-is pending the same check.
-const PRESSURE_MARK: &str = "⏸";
+/// U+23F8 followed by U+FE0F (VS16), for the same reason as [`TEMP_MARK`]:
+/// text-default emoji need the selector to measure the two columns
+/// terminals actually render them in.
+const PRESSURE_MARK: &str = "⏸\u{fe0f}";
 
 /// Marks the footer's loop-guard segment: the guards are armed and watching.
 /// Distinct from [`LOOP_MARK`], which says a guard has actually seen a cycle.
@@ -384,7 +384,7 @@ pub const CAMERA_MARK: &str = "\u{1f4f7}";
 /// Deliberately not [`GUARD_MARK`]: that one means the guards are armed, which
 /// is the resting state of every session, and one glyph for "watching" and
 /// "caught something" would be read as the same news twice.
-const LOOP_MARK: &str = "♻";
+const LOOP_MARK: &str = "♻\u{fe0f}";
 
 /// The loop segment: ` | 🔁 looping` while `st.looping`, empty otherwise. Rides
 /// after the ctx gauge in the generating footer, whether or not the progress
@@ -2591,17 +2591,38 @@ mod tests {
     /// Pins the display width of every footer mark by name, so a future
     /// change to any of these constants (adding/dropping VS16, swapping the
     /// glyph) cannot silently reintroduce an undercount. See
-    /// `visible_width_counts_wide_emoji_as_two_columns` for why `TEMP_MARK`
-    /// and `MICROCOMPACT_MARK` carry an explicit VS16 while the others don't
-    /// need one.
+    /// `visible_width_counts_wide_emoji_as_two_columns` for why `TEMP_MARK`,
+    /// `MICROCOMPACT_MARK`, `PRESSURE_MARK` and `LOOP_MARK` carry an explicit
+    /// VS16 while the others don't need one.
+    ///
+    /// Exhaustive over every footer mark constant: each is listed once, with
+    /// its expected column count, so a newly added mark that is never added
+    /// to this list is a compile-clean gap rather than a silent one — the
+    /// list below is the enumeration to extend. `JOBS_MARK` is the one
+    /// legitimate 1-column entry (a mathematical symbol, not an emoji; VS16
+    /// would be meaningless), so it is listed deliberately with its own
+    /// value instead of being covered by the "everything is 2" assumption.
     #[test]
     fn footer_marks_all_measure_two_columns() {
-        assert_eq!(visible_width(TEMP_MARK), 2, "{TEMP_MARK:?}");
-        assert_eq!(visible_width(MICROCOMPACT_MARK), 2, "{MICROCOMPACT_MARK:?}");
-        assert_eq!(visible_width(MICROCOMPACT_ON), 2, "{MICROCOMPACT_ON:?}");
-        assert_eq!(visible_width(TOKS_MARK), 2, "{TOKS_MARK:?}");
-        assert_eq!(visible_width(HD_MARK), 2, "{HD_MARK:?}");
-        assert_eq!(visible_width(THINK_MARK), 2, "{THINK_MARK:?}");
+        let marks: &[(&str, &str, usize)] = &[
+            ("THINK_MARK", THINK_MARK, 2),
+            ("GIT_STAT_MARK", GIT_STAT_MARK, 2),
+            ("MTP_MARK", MTP_MARK, 2),
+            ("TEMP_MARK", TEMP_MARK, 2),
+            ("JOBS_MARK", JOBS_MARK, 1), // deliberate exception: math symbol, not emoji
+            ("HD_MARK", HD_MARK, 2),
+            ("PRESSURE_MARK", PRESSURE_MARK, 2),
+            ("GUARD_MARK", GUARD_MARK, 2),
+            ("MICROCOMPACT_MARK", MICROCOMPACT_MARK, 2),
+            ("MICROCOMPACT_ON", MICROCOMPACT_ON, 2),
+            ("TOKS_MARK", TOKS_MARK, 2),
+            ("CAMERA_MARK", CAMERA_MARK, 2),
+            ("LOOP_MARK", LOOP_MARK, 2),
+            ("SPILL_MARK", SPILL_MARK, 2),
+        ];
+        for (name, mark, expected) in marks {
+            assert_eq!(visible_width(mark), *expected, "{name} = {mark:?}");
+        }
     }
 
     #[test]
@@ -2665,12 +2686,18 @@ mod tests {
             "an ordinary footer must be unchanged"
         );
         st.pressure_yielded = true;
-        assert_eq!(pressure_segment(&st).as_deref(), Some("⏸ paused: memory"));
+        assert_eq!(
+            pressure_segment(&st).as_deref(),
+            Some("⏸\u{fe0f} paused: memory")
+        );
         // Idle is the state the marker exists for: the yielded window is a
         // wait, and without this it reads as a hang.
         st.state = WorkerState::Idle;
         let text = build_status_text(&st, false, true);
-        assert!(text.contains(" | ⏸ paused: memory | "), "got: {text}");
+        assert!(
+            text.contains(" | ⏸\u{fe0f} paused: memory | "),
+            "got: {text}"
+        );
     }
 
     #[test]
