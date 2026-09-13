@@ -1299,6 +1299,70 @@ pub fn reinstall(settings: Settings) {
     crate::debugmirror::reconcile();
 }
 
+/// Session-only override of `ui.showThinking`, set by the footer's brain
+/// click. `None` means "no override": the persisted `ui.show_thinking` stands.
+///
+/// Deliberately *not* a field on [`Settings`]: a value living there would be
+/// written out by [`Settings::save_to`] the next time anything saved the
+/// settings (a later `/config <any key>`, or a config-form save), which is
+/// exactly the accidental persistence the override exists to prevent. This
+/// layer is never serialised and never reaches disk.
+#[cfg(not(test))]
+static SHOW_THINKING_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(SHOW_THINKING_NONE);
+
+// Scoped to the calling thread in tests for the same reason as
+// `TEST_OVERRIDE` below: libtest runs tests concurrently in one process, and a
+// process-wide override would leak between them.
+#[cfg(test)]
+thread_local! {
+    static SHOW_THINKING_OVERRIDE: std::cell::Cell<i8> =
+        const { std::cell::Cell::new(SHOW_THINKING_NONE) };
+}
+
+/// The `SHOW_THINKING_OVERRIDE` encoding of `None`; `0`/`1` are `false`/`true`.
+const SHOW_THINKING_NONE: i8 = -1;
+
+/// The live session override of `ui.showThinking`, or `None` when none is set.
+#[must_use]
+pub fn show_thinking_override() -> Option<bool> {
+    #[cfg(test)]
+    let raw = SHOW_THINKING_OVERRIDE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let raw = SHOW_THINKING_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    (raw != SHOW_THINKING_NONE).then_some(raw != 0)
+}
+
+/// Sets (or with `None` clears) the session override, then reconciles the
+/// debug-console mirror.
+///
+/// The reconcile is the one side effect of [`reinstall`] that depends on
+/// `showThinking`: the mirror is connected only while thinking is *hidden*, so
+/// an override that changed the effective value without reconciling would
+/// leave a console attached (or detached) against what the user just asked
+/// for. `reinstall`'s other effects — `anim::set_reduced_motion`,
+/// `notify::set_mode`, and swapping the `ACTIVE` slot — read fields this layer
+/// cannot touch, so they are deliberately not replicated.
+pub fn set_show_thinking_override(value: Option<bool>) {
+    let raw = value.map_or(SHOW_THINKING_NONE, i8::from);
+    #[cfg(test)]
+    SHOW_THINKING_OVERRIDE.with(|c| c.set(raw));
+    #[cfg(not(test))]
+    SHOW_THINKING_OVERRIDE.store(raw, std::sync::atomic::Ordering::Relaxed);
+    crate::debugmirror::reconcile();
+}
+
+/// Whether thinking is displayed *right now*: the session override if one is
+/// set, else the persisted `ui.showThinking`.
+///
+/// Every display decision reads this. The persisted field is read directly
+/// only where the *configured* value is the subject: saving settings,
+/// rendering the config form, and the session file's render record.
+#[must_use]
+pub fn show_thinking_effective() -> bool {
+    show_thinking_override().unwrap_or_else(|| active().ui.show_thinking)
+}
+
 // Test-only settings override, scoped to the calling thread. The libtest
 // harness runs each test on its own thread, so this lets one test exercise a
 // non-default setting without disturbing the process-wide slot that tests

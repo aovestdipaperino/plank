@@ -3238,7 +3238,7 @@ impl Agent<'_> {
     /// evidence that work happened. Thinking on already shows the calls in
     /// context, and `/init` asks for silence outright.
     fn tool_activity_line(&self, calls: &[ToolCall]) -> Option<String> {
-        if crate::settings::active().ui.show_thinking || self.quiet_tools {
+        if crate::settings::show_thinking_effective() || self.quiet_tools {
             return None;
         }
         // Indented two columns so the line sits under the bulleted output
@@ -3825,9 +3825,9 @@ impl Agent<'_> {
             // thread-local, so a spawned pass would silently see defaults.
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
             display: PassDisplay {
-                show_thinking: crate::settings::active().ui.show_thinking,
+                show_thinking: crate::settings::show_thinking_effective(),
                 show_tool_calls: crate::settings::active().ui.show_tool_calls,
-                think_status: !crate::settings::active().ui.show_thinking
+                think_status: !crate::settings::show_thinking_effective()
                     && self.session.transcript.last().is_some_and(|m| {
                         m.role == crate::session::Role::User && m.text.starts_with("<tool_result>")
                     }),
@@ -5879,14 +5879,14 @@ impl Agent<'_> {
         let settings = crate::settings::active();
         stream.set_show_tool_calls(settings.ui.show_tool_calls && !self.quiet_tools);
         stream.set_show_write_preview(!self.quiet_tools);
-        stream.set_show_thinking(settings.ui.show_thinking);
+        stream.set_show_thinking(crate::settings::show_thinking_effective());
         // With thinking hidden, a pass that follows a tool result shows the
         // first sentence of its thinking as a dim status line, so a long
         // tool-calling turn reads as progress instead of a column of counts.
         let after_tool_result = self.session.transcript.last().is_some_and(|m| {
             m.role == crate::session::Role::User && m.text.starts_with("<tool_result>")
         });
-        stream.set_think_status(!settings.ui.show_thinking && after_tool_result);
+        stream.set_think_status(!crate::settings::show_thinking_effective() && after_tool_result);
         stream.set_thinking_tool_calls(settings.engine.thinking_tool_calls);
         stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
         stream.set_preflight(edit_preflight(&self.tool_ctx));
@@ -9156,6 +9156,13 @@ the original is frozen and listed in /tree"
                             // Rendered from the settings just written, which
                             // is what `reinstall` installs next.
                             let shown = crate::configform::display(&working, field.id);
+                            // An explicit `/config ui.showThinking` wins over
+                            // a brain click: without this the user would set
+                            // the value, be told it was saved, and see nothing
+                            // change because the override still masked it.
+                            if field.id == crate::configform::FieldId::UiShowThinking {
+                                crate::settings::set_show_thinking_override(None);
+                            }
                             crate::settings::reinstall(working);
                             format!(
                                 "set {section}.{fkey} = {shown} (saved to {})",
@@ -9350,7 +9357,7 @@ the original is frozen and listed in /tree"
         if !on {
             return "debug console mirror off".to_owned();
         }
-        if crate::settings::active().ui.show_thinking {
+        if crate::settings::show_thinking_effective() {
             return "debug console mirror on (idle: ui.showThinking is on, nothing is mirrored)"
                 .to_owned();
         }
@@ -9587,7 +9594,7 @@ the original is frozen and listed in /tree"
             think_off: matches!(opts.think_mode, crate::engine::ThinkMode::Off),
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
             display: PassDisplay {
-                show_thinking: crate::settings::active().ui.show_thinking,
+                show_thinking: crate::settings::show_thinking_effective(),
                 show_tool_calls: crate::settings::active().ui.show_tool_calls,
                 think_status: false,
             },
@@ -11813,6 +11820,11 @@ impl Agent<'_> {
                         match crate::settings::project_path() {
                             Some(path) => match settings.save_to(&path) {
                                 Ok(()) => {
+                                    // Same reasoning as `/config
+                                    // ui.showThinking`: an explicit save of the
+                                    // form is the user stating the value, so
+                                    // any brain-click override steps aside.
+                                    crate::settings::set_show_thinking_override(None);
                                     crate::settings::reinstall(*settings);
                                     log.push_plain(format!("config saved to {}", path.display()));
                                 }
@@ -14147,7 +14159,7 @@ impl Agent<'_> {
             // denied for an aside, so it needs none of the dispatch machinery.
             let mut aside_renderer = StreamRenderer::new(crate::worker::BtwSink(tx.clone()));
             aside_renderer.set_freeze_on_error(true);
-            aside_renderer.set_show_thinking(crate::settings::active().ui.show_thinking);
+            aside_renderer.set_show_thinking(crate::settings::show_thinking_effective());
             if !matches!(self.think, crate::engine::ThinkMode::Off) {
                 aside_renderer.begin_in_think();
             }
@@ -15898,45 +15910,46 @@ fn microcompact_toggle() -> String {
     microcompact_command(if on { "off" } else { "on" })
 }
 
-/// The settings a click on the footer's brain installs, and the flash tip it
+/// The override a click on the footer's brain installs, and the flash tip it
 /// leaves behind.
 ///
-/// Pure, and taking the current settings rather than reading them, so the whole
-/// of what the gesture changes is testable: the returned `Settings` differs
-/// from `cur` in `ui.show_thinking` and nowhere else, and applying it twice
-/// returns the original.
-fn think_show_toggled(cur: &crate::settings::Settings) -> (crate::settings::Settings, String) {
-    let mut next = cur.clone();
-    next.ui.show_thinking = !cur.ui.show_thinking;
+/// Pure, and taking the currently effective value rather than reading it, so
+/// the whole of what the gesture decides is testable: the click always sets an
+/// explicit override (never `None`), and applying it twice returns the original
+/// value.
+fn think_show_toggled(effective: bool) -> (bool, String) {
+    let next = !effective;
     let tip = format!(
         "{} thinking {} (this session)",
         crate::status::THINK_MARK,
-        if next.ui.show_thinking {
-            "shown"
-        } else {
-            "hidden"
-        }
+        if next { "shown" } else { "hidden" }
     );
     (next, tip)
 }
 
-/// A click on the footer's brain flips `ui.showThinking` for this session only.
+/// A click on the footer's brain flips thinking display for this session only.
 ///
-/// Live settings, never disk: exactly the bargain `/mc` and `/loopguard` make.
-/// A glyph you can hit by accident must not rewrite `settings.json`, and
-/// showing thinking is a "what do I want to watch right now" decision, not a
-/// preference. `/config ui.showThinking` is still the way to make it stick, and
-/// still persists; it overwrites whatever a click left live, because it goes
-/// through the same [`crate::settings::reinstall`] afterwards.
+/// A session *override* layer, never the persisted setting and never disk. A
+/// glyph you can hit by accident must not rewrite `settings.json`, and showing
+/// thinking is a "what do I want to watch right now" decision, not a
+/// preference. The earlier implementation cloned the settings, flipped
+/// `ui.show_thinking` and reinstalled them: it did not save, but it left the
+/// clicked value inside the live `Settings`, so the next `/config <any key>` —
+/// which clones `active()` and writes the *whole* object — silently baked it
+/// into `settings.json`. Holding the value outside `Settings` is what closes
+/// that hole.
+///
+/// `/config ui.showThinking` is still the way to make it stick, and clears the
+/// override so the value the user just typed is plainly the one in force.
 ///
 /// Nothing caches the value: `configure_stream` and `PassCtx` both read
-/// `active()` when a pass starts, so the next generation observes the flip.
-/// Feedback is a flash tip rather than a log line — the answer belongs next to
-/// the glyph that was clicked, and it must not push the output pane around
-/// mid-turn.
+/// [`crate::settings::show_thinking_effective`] when a pass starts, so the next
+/// generation observes the flip. Feedback is a flash tip rather than a log
+/// line — the answer belongs next to the glyph that was clicked, and it must
+/// not push the output pane around mid-turn.
 fn think_show_click() {
-    let (next, tip) = think_show_toggled(crate::settings::active());
-    crate::settings::reinstall(next);
+    let (next, tip) = think_show_toggled(crate::settings::show_thinking_effective());
+    crate::settings::set_show_thinking_override(Some(next));
     crate::status::set_flash_tip(tip);
 }
 
@@ -22688,33 +22701,23 @@ mod tests {
         assert!(LiveCommands::output("/context-ish").is_none());
     }
 
-    /// A brain click flips thinking visibility and changes nothing else.
+    /// A brain click flips the effective value and names it in the tip.
     #[test]
     fn a_brain_click_flips_only_show_thinking() {
-        let mut cur = crate::settings::Settings::default();
-        cur.ui.show_thinking = false;
-        // Some unrelated state, to catch a toggle that rebuilds rather than
-        // clones the settings.
-        cur.context.microcompact = false;
-        let (next, tip) = super::think_show_toggled(&cur);
-        assert!(next.ui.show_thinking, "the click turns thinking on");
+        let (next, tip) = super::think_show_toggled(false);
+        assert!(next, "the click turns thinking on");
         assert!(tip.contains("shown"), "{tip:?}");
         assert!(tip.contains("this session"), "{tip:?}");
-        let mut same = next.clone();
-        same.ui.show_thinking = cur.ui.show_thinking;
-        assert_eq!(same, cur, "nothing but showThinking moved");
     }
 
     /// Clicking twice puts it back exactly as it was, from either start.
     #[test]
     fn two_brain_clicks_round_trip() {
         for start in [true, false] {
-            let mut cur = crate::settings::Settings::default();
-            cur.ui.show_thinking = start;
-            let (once, _) = super::think_show_toggled(&cur);
-            assert_ne!(once.ui.show_thinking, start);
-            let (twice, tip) = super::think_show_toggled(&once);
-            assert_eq!(twice, cur, "back to the original settings");
+            let (once, _) = super::think_show_toggled(start);
+            assert_ne!(once, start);
+            let (twice, tip) = super::think_show_toggled(once);
+            assert_eq!(twice, start, "back to the original value");
             assert!(
                 tip.contains(if start { "shown" } else { "hidden" }),
                 "{tip:?}"
@@ -22722,31 +22725,126 @@ mod tests {
         }
     }
 
-    /// The click is live-only: it goes through `reinstall`, never `save_to`,
-    /// so the settings file on disk is byte-for-byte what it was.
+    /// The click sets the session override and leaves the *persisted* setting
+    /// — and therefore the settings file — exactly as it was.
     #[test]
     fn a_brain_click_does_not_touch_the_settings_file() {
-        // `reinstall` reconciles the debug-console mirror off `showThinking`,
-        // and this is the one test here that installs process-wide settings
-        // rather than the thread-local test override: take the same lock the
-        // mirror's own tests take so the two cannot interleave.
+        // Setting the override reconciles the debug-console mirror off
+        // `showThinking`: take the same lock the mirror's own tests take so
+        // the two cannot interleave.
         let _g = crate::debugmirror::test_support::lock();
         let before = crate::settings::project_path().map(|p| std::fs::read(&p).ok());
-        let live = crate::settings::active().ui.show_thinking;
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::install_for_test(settings);
+        crate::settings::set_show_thinking_override(None);
+
         super::think_show_click();
-        assert_ne!(
-            crate::settings::active().ui.show_thinking,
-            live,
-            "the live value flipped"
+        assert!(
+            crate::settings::show_thinking_effective(),
+            "the effective value flipped"
+        );
+        assert!(
+            !crate::settings::active().ui.show_thinking,
+            "the persisted value did not move"
         );
         super::think_show_click();
-        assert_eq!(
-            crate::settings::active().ui.show_thinking,
-            live,
+        assert!(
+            !crate::settings::show_thinking_effective(),
             "and flipped back"
         );
+        assert!(!crate::settings::active().ui.show_thinking);
+        crate::settings::set_show_thinking_override(None);
         let after = crate::settings::project_path().map(|p| std::fs::read(&p).ok());
         assert_eq!(before, after, "settings.json must be untouched");
+    }
+
+    /// The bug this layer exists to close: a click followed by a `/config` of
+    /// some *unrelated* key must not smuggle the clicked value into the file
+    /// that `/config` writes in full.
+    #[test]
+    fn a_click_then_config_of_another_key_does_not_persist_the_click() {
+        let _g = crate::debugmirror::test_support::lock();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::install_for_test(settings);
+        crate::settings::set_show_thinking_override(None);
+
+        let dir = scratch_dir("click-then-config");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let dest = dir.join("settings.json");
+
+        super::think_show_click();
+        assert!(crate::settings::show_thinking_effective(), "click took");
+
+        // An unrelated key, and deliberately a non-display one: this test
+        // reinstalls settings process-wide, and a display key would reach
+        // tests running concurrently.
+        let out = agent.config_set_command_at("engine.threads 7", Some(dest.clone()));
+        assert!(out.contains("threads"), "{out:?}");
+        let written = std::fs::read_to_string(&dest).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            json["ui"]["showThinking"],
+            serde_json::Value::Bool(false),
+            "the clicked value must not reach disk: {written}"
+        );
+        // And the click still stands for display: an unrelated `/config` does
+        // not silently cancel it either.
+        assert!(crate::settings::show_thinking_effective());
+        crate::settings::set_show_thinking_override(None);
+    }
+
+    /// An explicit `/config ui.showThinking` wins: it persists the value and
+    /// clears the click's override, so what the user typed is what shows.
+    #[test]
+    fn config_show_thinking_persists_and_clears_the_override() {
+        let _g = crate::debugmirror::test_support::lock();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::install_for_test(settings);
+        crate::settings::set_show_thinking_override(None);
+
+        let dir = scratch_dir("config-show-thinking");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let dest = dir.join("settings.json");
+
+        super::think_show_click();
+        assert!(crate::settings::show_thinking_effective(), "click took");
+
+        let out = agent.config_set_command_at("ui.showThinking false", Some(dest.clone()));
+        assert!(out.contains("showThinking"), "{out:?}");
+        assert_eq!(
+            crate::settings::show_thinking_override(),
+            None,
+            "an explicit /config clears the click"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(json["ui"]["showThinking"], serde_json::Value::Bool(false));
+    }
+
+    /// The override is a property of the terminal session, not of the
+    /// conversation: clearing the conversation leaves it alone, so the footer
+    /// glyph and the display stay in step across `/new`.
+    #[test]
+    fn the_override_survives_a_session_clear() {
+        let _g = crate::debugmirror::test_support::lock();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::install_for_test(settings);
+        crate::settings::set_show_thinking_override(None);
+
+        let dir = scratch_dir("override-survives-clear");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        super::think_show_click();
+        agent.reset_session_state();
+        assert_eq!(crate::settings::show_thinking_override(), Some(true));
+        assert!(crate::settings::show_thinking_effective());
+        crate::settings::set_show_thinking_override(None);
     }
 
     /// A console that connects after two turns receives exactly those two
