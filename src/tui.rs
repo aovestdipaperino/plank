@@ -142,20 +142,31 @@ fn line_text(line: &Line<'_>) -> String {
 /// re-render ([`OutputLog::md_render`]) and the one-shot
 /// [`OutputLog::push_markdown`], so a document pushed whole is styled exactly
 /// like one that arrived a token at a time.
+/// The one process-wide tree-sitter highlighter.
+///
+/// Building a `TreeSitterHighlighter` compiles nothing by itself, but every
+/// grammar it goes on to configure is cached inside it, so the markdown code
+/// fences ([`render_markdown_at`]) and the diff cards
+/// ([`highlight_diff_rows`]) deliberately share one instance rather than each
+/// constructing their own.
+fn highlighter() -> Arc<TreeSitterHighlighter> {
+    static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
+    HIGHLIGHTER
+        .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
+        .clone()
+}
+
 fn render_markdown_at(
     lines: &mut Vec<Line<'static>>,
     start: usize,
     src: &str,
 ) -> Vec<CodeBlockRegion> {
-    static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
     // Two columns are reserved for the output gutter added below.
     let width = ratatui::crossterm::terminal::size()
         .map_or(80, |(w, _)| w as usize)
         .saturating_sub(usize::from(OUTPUT_GUTTER_WIDTH))
         .max(20);
-    let hl = HIGHLIGHTER
-        .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
-        .clone();
+    let hl = highlighter();
     let md =
         MarkdownRenderer::new(width).with_render_hooks(Box::new(HighlightHooks::new(hl, width)));
     let blocks = md.parse(src);
@@ -3351,7 +3362,12 @@ pub fn render_diff_card(log: &mut OutputLog, p: &crate::tools::diff::EditPreview
         .bg(Color::Indexed(28))
         .fg(Color::Indexed(231))
         .add_modifier(Modifier::BOLD);
-    for row in &p.rows {
+    // Syntax colours for the code text of every row, computed once for the
+    // whole card (see `highlight_diff_rows`); empty when the file's extension
+    // names no grammar we have, which leaves the flat rendering below intact.
+    let syntax = highlight_diff_rows(p).unwrap_or_default();
+    let syntax_for = |i: usize| syntax.get(i).map_or(&[][..], Vec::as_slice);
+    for (i, row) in p.rows.iter().enumerate() {
         match row {
             DiffRow::Hunk {
                 old_start,
@@ -3362,23 +3378,41 @@ pub fn render_diff_card(log: &mut OutputLog, p: &crate::tools::diff::EditPreview
                 format!("  @@ -{old_start},{old_len} +{new_start},{new_len} @@"),
                 Style::default().fg(Color::Indexed(44)),
             )]),
-            DiffRow::Context { text, .. } => log.push_spans(vec![
-                Span::styled(format!("{}   ", gutter(row.gutter())), dim),
-                Span::raw(text.clone()),
-            ]),
+            DiffRow::Context { text, .. } => log.push_spans(diff_line_spans(
+                &format!("{}   ", gutter(row.gutter())),
+                text,
+                None,
+                syntax_for(i),
+                RowStyles {
+                    prefix: dim,
+                    base: Style::default(),
+                    emph: Style::default(),
+                    tone: Tone::Context,
+                },
+            )),
             DiffRow::Del { text, segments, .. } => log.push_spans(diff_line_spans(
                 &format!("{} - ", gutter(row.gutter())),
                 text,
                 segments.as_deref(),
-                del,
-                del_emph,
+                syntax_for(i),
+                RowStyles {
+                    prefix: del,
+                    base: del,
+                    emph: del_emph,
+                    tone: Tone::Del,
+                },
             )),
             DiffRow::Add { text, segments, .. } => log.push_spans(diff_line_spans(
                 &format!("{} + ", gutter(row.gutter())),
                 text,
                 segments.as_deref(),
-                add,
-                add_emph,
+                syntax_for(i),
+                RowStyles {
+                    prefix: add,
+                    base: add,
+                    emph: add_emph,
+                    tone: Tone::Add,
+                },
             )),
             DiffRow::Elision(n) => {
                 log.push_spans(vec![Span::styled(format!("      ⋯ {n} more lines ⋯"), dim)]);
@@ -3388,32 +3422,447 @@ pub fn render_diff_card(log: &mut OutputLog, p: &crate::tools::diff::EditPreview
     log.push_spans(vec![]);
 }
 
-/// Builds the styled spans for one Del/Add diff row. With word-level `segments`,
-/// the `prefix` (gutter + sigil) and common runs take `base` while changed runs
-/// take `emph`; without segments the whole line is one `base` span, matching the
-/// prior line-level rendering.
+/// Which side of the diff a run of code sits on, and so which background its
+/// syntax colour has to survive. See [`tone_fg`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tone {
+    /// Over the added background (green, index 22/28): lifted.
+    Add,
+    /// Over the removed background (red, index 52/88): muted.
+    Del,
+    /// No diff background at all: the colour is used as the highlighter gave it.
+    Context,
+}
+
+/// The three style layers one diff row is painted with, plus which diff
+/// background its syntax colours must survive.
+#[derive(Clone, Copy)]
+struct RowStyles {
+    /// Style for the gutter + sigil, which is never syntax-coloured.
+    prefix: Style,
+    /// The row's diff background and default foreground.
+    base: Style,
+    /// Background/modifier for a word-diff changed run.
+    emph: Style,
+    tone: Tone,
+}
+
+/// One syntax-coloured run of a row: a byte range into that row's `text` and
+/// the style the highlighter gave it.
+type SyntaxRun = (usize, usize, Style);
+
+/// The grammar name for a path, or `None` when we would be guessing.
+///
+/// Keyed off the extension only, and mapped to the names
+/// `ratatui_markdown`'s matcher accepts. An extension that is not listed
+/// returns `None` and the card renders exactly as it did before syntax
+/// highlighting existed: a wrong grammar looks worse than no grammar.
+fn diff_lang(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    let lang = match ext.as_str() {
+        "rs" => "rust",
+        "py" | "pyi" => "python",
+        "go" => "go",
+        "java" => "java",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "tsx",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "cs" => "csharp",
+        "sh" | "bash" | "zsh" => "bash",
+        "rb" => "ruby",
+        "swift" => "swift",
+        "php" => "php",
+        "scala" | "sc" => "scala",
+        "kt" | "kts" => "kotlin",
+        "lua" => "lua",
+        "hs" => "haskell",
+        "ex" | "exs" => "elixir",
+        "yaml" | "yml" => "yaml",
+        "dart" => "dart",
+        "zig" => "zig",
+        "ml" | "mli" => "ocaml",
+        "nix" => "nix",
+        "html" | "htm" => "html",
+        "css" | "scss" | "less" => "css",
+        "xml" | "svg" | "xsd" => "xml",
+        "json" => "json",
+        "toml" => "toml",
+        "sol" => "solidity",
+        "patch" | "diff" => "diff",
+        "ps1" | "psm1" => "powershell",
+        "m" | "mm" => "objc",
+        "cmake" => "cmake",
+        "proto" => "proto",
+        "r" => "r",
+        _ => return None,
+    };
+    Some(lang)
+}
+
+/// Syntax runs for every row of a diff card, indexed by row.
+///
+/// Highlighting each line on its own mis-colours anything that spans lines — a
+/// block comment, a multi-line string, a nested brace — so each *side* of each
+/// hunk is reassembled into one buffer and highlighted whole:
+///
+/// * the old-side buffer is that hunk's context + removed lines, in order;
+/// * the new-side buffer is that hunk's context + added lines, in order.
+///
+/// Each buffer is therefore a verbatim slice of one real version of the file,
+/// which is what makes multi-line constructs come out right. The byte ranges
+/// the highlighter returns are mapped back by remembering where each row
+/// started in its buffer and clipping the runs to that window.
+///
+/// Buffers are cut at every `@@` header and every elision marker, because
+/// across those the text is *not* contiguous and splicing it would invent
+/// syntax that is not in the file. Within such a buffer the leading context is
+/// still genuinely missing (a hunk can begin inside a function body, or inside
+/// a block comment); tree-sitter error-recovers, so the damage is bounded to
+/// that hunk and usually invisible — an unterminated construct at a hunk's top
+/// edge is the one case that can still colour oddly, and it cannot be fixed
+/// without reading the whole file, which the card does not have.
+///
+/// Returns `None` when the path names no grammar, so the caller keeps the
+/// previous flat rendering.
+fn highlight_diff_rows(p: &crate::tools::diff::EditPreview) -> Option<Vec<Vec<SyntaxRun>>> {
+    use crate::tools::diff::DiffRow;
+    use ratatui_markdown::highlight::CodeHighlighter;
+
+    let lang = diff_lang(&p.path)?;
+    let hl = highlighter();
+    let mut out: Vec<Vec<SyntaxRun>> = vec![Vec::new(); p.rows.len()];
+
+    // One contiguous run of code rows; flushed at each structural row.
+    let mut old_side: Vec<(usize, &str)> = Vec::new();
+    let mut new_side: Vec<(usize, &str)> = Vec::new();
+    let flush = |old: &mut Vec<(usize, &str)>,
+                 new: &mut Vec<(usize, &str)>,
+                 out: &mut Vec<Vec<SyntaxRun>>| {
+        for side in [&*old, &*new] {
+            if side.is_empty() {
+                continue;
+            }
+            let mut buf = String::new();
+            // (row index, byte offset of the row's text in `buf`).
+            let mut spots: Vec<(usize, usize)> = Vec::with_capacity(side.len());
+            for (idx, text) in side {
+                spots.push((*idx, buf.len()));
+                buf.push_str(text);
+                buf.push('\n');
+            }
+            let segs = hl.highlight(lang, &buf);
+            if segs.is_empty() {
+                continue;
+            }
+            // Both lists are sorted by start offset, so one pass over the
+            // segments per row suffices; `cursor` never walks backwards.
+            let mut cursor = 0usize;
+            for (i, (idx, off)) in spots.iter().enumerate() {
+                let len = side[i].1.len();
+                let end = off + len;
+                while cursor < segs.len() && segs[cursor].end <= *off {
+                    cursor += 1;
+                }
+                let mut runs = Vec::new();
+                let mut scan = cursor;
+                while scan < segs.len() && segs[scan].start < end {
+                    let s = segs[scan].start.max(*off) - off;
+                    let e = segs[scan].end.min(end) - off;
+                    if s < e {
+                        runs.push((s, e, segs[scan].style));
+                    }
+                    scan += 1;
+                }
+                out[*idx] = runs;
+            }
+        }
+        old.clear();
+        new.clear();
+    };
+
+    for (i, row) in p.rows.iter().enumerate() {
+        match row {
+            DiffRow::Context { text, .. } => {
+                old_side.push((i, text));
+                new_side.push((i, text));
+            }
+            DiffRow::Del { text, .. } => old_side.push((i, text)),
+            DiffRow::Add { text, .. } => new_side.push((i, text)),
+            DiffRow::Hunk { .. } | DiffRow::Elision(_) => {
+                flush(&mut old_side, &mut new_side, &mut out);
+            }
+        }
+    }
+    flush(&mut old_side, &mut new_side, &mut out);
+    Some(out)
+}
+
+/// Adapts one syntax colour to the diff background it will be painted on.
+///
+/// The fork's code palette was picked for a plain terminal background, where a
+/// dark comment grey or a green string reads fine; over the card's saturated
+/// red (index 52/88) and green (22/28) several of those colours either vanish
+/// or fight the background. Each colour is resolved to RGB and then:
+///
+/// * **Add** — blended 22% toward white and floored at 0.55 relative
+///   luminance, so every token clears the green ground;
+/// * **Del** — blended 30% toward the removal red and clamped into
+///   0.34…0.72 luminance, which keeps the tokens distinguishable but visibly
+///   *muted* next to the added side, as the reference screenshots show;
+/// * **Context** — left exactly as the highlighter gave it, since no diff
+///   background is painted there.
+///
+/// The result is quantised back to the xterm 6×6×6 cube so the card stays in
+/// the same indexed palette as its backgrounds and the gutter.
+fn tone_fg(c: Color, tone: Tone) -> Color {
+    if tone == Tone::Context {
+        return c;
+    }
+    let Some([r, g, b]) = color_rgb(c) else {
+        return c;
+    };
+    let (mut r, mut g, mut b) = (f32::from(r), f32::from(g), f32::from(b));
+    let mix = |v: &mut f32, target: f32, t: f32| *v += (target - *v) * t;
+    match tone {
+        Tone::Add => {
+            for v in [&mut r, &mut g, &mut b] {
+                mix(v, 255.0, 0.22);
+            }
+            lift(&mut r, &mut g, &mut b, 0.55);
+        }
+        Tone::Del => {
+            // 0x5f0000 is xterm index 52, the removal background.
+            mix(&mut r, 95.0, 0.30);
+            mix(&mut g, 0.0, 0.30);
+            mix(&mut b, 0.0, 0.30);
+            lift(&mut r, &mut g, &mut b, 0.34);
+            damp(&mut r, &mut g, &mut b, 0.72);
+        }
+        Tone::Context => unreachable!(),
+    }
+    Color::Indexed(cube_index(r, g, b))
+}
+
+/// Relative luminance of a 0…255 RGB triple, normalised to 0…1.
+fn luminance(r: f32, g: f32, b: f32) -> f32 {
+    (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+}
+
+/// Blends toward white until the triple reaches `min` luminance.
+fn lift(r: &mut f32, g: &mut f32, b: &mut f32, min: f32) {
+    let lum = luminance(*r, *g, *b);
+    if lum >= min || lum >= 1.0 {
+        return;
+    }
+    let t = (min - lum) / (1.0 - lum);
+    for v in [r, g, b] {
+        *v += (255.0 - *v) * t;
+    }
+}
+
+/// Scales the triple down until it is no brighter than `max` luminance.
+fn damp(r: &mut f32, g: &mut f32, b: &mut f32, max: f32) {
+    let lum = luminance(*r, *g, *b);
+    if lum <= max || lum <= 0.0 {
+        return;
+    }
+    let t = max / lum;
+    for v in [r, g, b] {
+        *v *= t;
+    }
+}
+
+/// Nearest xterm 6×6×6 colour-cube index for a 0…255 RGB triple.
+fn cube_index(red: f32, green: f32, blue: f32) -> u8 {
+    const LEVELS: [f32; 6] = [0.0, 95.0, 135.0, 175.0, 215.0, 255.0];
+    let quantise = |value: f32| -> u8 {
+        let value = value.clamp(0.0, 255.0);
+        let mut best = 0u8;
+        let mut best_dist = f32::MAX;
+        for (slot, level) in LEVELS.iter().enumerate() {
+            let dist = (value - level).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = u8::try_from(slot).unwrap_or(0);
+            }
+        }
+        best
+    };
+    16 + 36 * quantise(red) + 6 * quantise(green) + quantise(blue)
+}
+
+/// RGB for the colours the highlighter can hand back: the 16 ANSI names, the
+/// 256-colour palette, and literal RGB. `None` for `Reset`, which has no fixed
+/// value and is passed through untouched.
+fn color_rgb(c: Color) -> Option<[u8; 3]> {
+    let named = |i: u8| -> [u8; 3] {
+        // The xterm defaults for indices 0..16.
+        const ANSI: [[u8; 3]; 16] = [
+            [0, 0, 0],
+            [205, 0, 0],
+            [0, 205, 0],
+            [205, 205, 0],
+            [0, 0, 238],
+            [205, 0, 205],
+            [0, 205, 205],
+            [229, 229, 229],
+            [127, 127, 127],
+            [255, 0, 0],
+            [0, 255, 0],
+            [255, 255, 0],
+            [92, 92, 255],
+            [255, 0, 255],
+            [0, 255, 255],
+            [255, 255, 255],
+        ];
+        ANSI[i as usize & 15]
+    };
+    let idx = match c {
+        Color::Reset => return None,
+        Color::Rgb(r, g, b) => return Some([r, g, b]),
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+        Color::Indexed(i) => i,
+    };
+    if idx < 16 {
+        return Some(named(idx));
+    }
+    if idx < 232 {
+        const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        let i = idx - 16;
+        return Some([
+            LEVELS[(i / 36) as usize],
+            LEVELS[((i / 6) % 6) as usize],
+            LEVELS[(i % 6) as usize],
+        ]);
+    }
+    let v = 8 + (idx - 232) * 10;
+    Some([v, v, v])
+}
+
+/// Builds the styled spans for one diff row, composing three layers.
+///
+/// * **Background** comes from the diff: `base` (red for a removal, green for
+///   an addition, nothing for context) on every cell of the row, so the row
+///   still reads as one continuous stripe.
+/// * **Foreground** comes from `syntax` — byte ranges into `text`, toned for
+///   this row's [`Tone`] — wherever the highlighter had an opinion; elsewhere
+///   the layer's own foreground stands.
+/// * **Word-diff emphasis** *modulates* rather than overwrites: a changed run
+///   keeps its syntax colour and takes `emph`'s brighter background and bold,
+///   so all three layers are legible at once. Letting `emph` repaint the
+///   foreground white, as it used to, would erase the syntax colour exactly on
+///   the bytes the reader most wants to see.
+///
+/// The `prefix` (gutter and `+`/`-` sigil) is never syntax-coloured: it is not
+/// code, and colouring it would make the sigil column jitter between rows.
+/// Only the `syntax` argument is new; with an empty `syntax` this produces
+/// byte-for-byte the spans it produced before highlighting existed.
 fn diff_line_spans(
     prefix: &str,
     text: &str,
     segments: Option<&[crate::tools::diff::Segment]>,
-    base: Style,
-    emph: Style,
+    syntax: &[SyntaxRun],
+    st: RowStyles,
 ) -> Vec<Span<'static>> {
     use crate::tools::diff::SegKind;
-    match segments {
-        Some(segs) => {
-            let mut spans = vec![Span::styled(prefix.to_string(), base)];
-            for seg in segs {
-                let style = match seg.kind {
+    let RowStyles {
+        prefix: prefix_style,
+        base,
+        emph,
+        tone,
+    } = st;
+    if syntax.is_empty() {
+        // Unchanged flat rendering.
+        return match segments {
+            Some(segs) => {
+                let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
+                for seg in segs {
+                    let style = match seg.kind {
+                        SegKind::Removed | SegKind::Added => emph,
+                        SegKind::Common => base,
+                    };
+                    spans.push(Span::styled(seg.text.clone(), style));
+                }
+                spans
+            }
+            None => vec![
+                Span::styled(prefix.to_string(), prefix_style),
+                Span::styled(text.to_string(), base),
+            ],
+        };
+    }
+
+    // Every boundary either layer introduces, so each emitted span is covered
+    // by exactly one word-diff segment and at most one syntax run.
+    let mut cuts: Vec<usize> = vec![0, text.len()];
+    if let Some(segs) = segments {
+        let mut at = 0usize;
+        for seg in segs {
+            at += seg.text.len();
+            cuts.push(at.min(text.len()));
+        }
+    }
+    for (s, e, _) in syntax {
+        cuts.push((*s).min(text.len()));
+        cuts.push((*e).min(text.len()));
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let word_style = |at: usize| -> Style {
+        let Some(segs) = segments else { return base };
+        let mut start = 0usize;
+        for seg in segs {
+            let end = start + seg.text.len();
+            if at < end {
+                return match seg.kind {
                     SegKind::Removed | SegKind::Added => emph,
                     SegKind::Common => base,
                 };
-                spans.push(Span::styled(seg.text.clone(), style));
             }
-            spans
+            start = end;
         }
-        None => vec![Span::styled(format!("{prefix}{text}"), base)],
+        base
+    };
+
+    let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
+    for w in cuts.windows(2) {
+        let (s, e) = (w[0], w[1]);
+        if s >= e {
+            continue;
+        }
+        let mut style = word_style(s);
+        if let Some((_, _, syn)) = syntax.iter().find(|(rs, re, _)| *rs <= s && s < *re) {
+            if let Some(fg) = syn.fg {
+                style = style.fg(tone_fg(fg, tone));
+            }
+            // Only italics carry over: bold is the word-diff emphasis signal
+            // here, and letting a keyword claim it would blur the two.
+            style = style.add_modifier(syn.add_modifier & Modifier::ITALIC);
+        }
+        spans.push(Span::styled(text[s..e].to_string(), style));
     }
+    spans
 }
 
 /// Minimal pre-UI screen shown while the KV cache is (re)built at launch: a
@@ -9223,5 +9672,239 @@ mod tests {
         assert!(text.contains("rename"), "{text}");
         assert!(text.contains("session-0"), "prefilled with the id: {text}");
         assert!(text.contains("Enter to rename"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod diff_highlight_tests {
+    use super::{OutputLog, Tone, diff_lang, render_diff_card, tone_fg};
+    use crate::tools::diff::edit_preview;
+    use ratatui::style::{Color, Modifier};
+    use ratatui::text::Line;
+
+    /// Every span of every row of the card, as (text, style).
+    fn card(path: &str, old: &str, new: &str) -> Vec<Line<'static>> {
+        let mut log = OutputLog::new();
+        render_diff_card(&mut log, &edit_preview(path, old, new, false));
+        log.lines.clone()
+    }
+
+    /// The row whose joined text contains `needle`.
+    fn row<'a>(lines: &'a [Line<'static>], needle: &str) -> &'a Line<'static> {
+        lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}"))
+    }
+
+    fn fg_of(line: &Line<'static>, token: &str) -> Option<Color> {
+        line.spans
+            .iter()
+            .find(|s| s.content.as_ref() == token)
+            .unwrap_or_else(|| panic!("no span exactly {token:?}"))
+            .style
+            .fg
+    }
+
+    /// A Rust diff colours keywords, strings and comments differently, and
+    /// every cell of a changed row still carries the diff background.
+    #[test]
+    fn rust_rows_are_highlighted_over_the_diff_background() {
+        let old = "fn main() {\n    let x = 1;\n}\n";
+        let new = "fn main() {\n    // note\n    let x = \"hi\";\n}\n";
+        let lines = card("src/lib.rs", old, new);
+
+        let string_row = row(&lines, "\"hi\"");
+        let comment_row = row(&lines, "// note");
+        let kw = fg_of(string_row, "let").expect("keyword coloured");
+        let st = fg_of(string_row, "\"hi\"").expect("string coloured");
+        let cm = fg_of(comment_row, "// note").expect("comment coloured");
+        assert_ne!(kw, st, "keyword and string must differ");
+        assert_ne!(kw, cm, "keyword and comment must differ");
+        assert_ne!(st, cm, "string and comment must differ");
+        // The comment keeps its italic, and the addition background survives
+        // under every span of the row including the gutter.
+        assert!(
+            comment_row
+                .spans
+                .iter()
+                .find(|s| s.content.as_ref() == "// note")
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        for span in &comment_row.spans {
+            assert_eq!(
+                span.style.bg,
+                Some(Color::Indexed(22)),
+                "added background lost under {:?}",
+                span.content
+            );
+        }
+    }
+
+    /// An extension that names no grammar falls back to the flat rendering:
+    /// one uniform foreground over the diff background, no syntax at all.
+    #[test]
+    fn unknown_extension_falls_back_to_flat_rendering() {
+        assert_eq!(diff_lang("notes.wobble"), None);
+        assert_eq!(diff_lang("Makefile"), None);
+        let lines = card("notes.wobble", "fn main() {}\n", "fn other() {}\n");
+        let added = row(&lines, "fn other");
+        for span in &added.spans {
+            assert_eq!(span.style.bg, Some(Color::Indexed(22)));
+            assert_eq!(
+                span.style.fg,
+                Some(Color::Indexed(194)),
+                "flat rows keep the single card foreground"
+            );
+        }
+    }
+
+    /// The gutter, the `+`/`-` sigils and the `@@` headers are never
+    /// syntax-coloured.
+    #[test]
+    fn gutter_and_hunk_headers_are_never_syntax_coloured() {
+        let lines = card("src/lib.rs", "fn main() {}\n", "fn other() {}\n");
+        let hunk = row(&lines, "@@");
+        assert_eq!(hunk.spans.len(), 1);
+        assert_eq!(hunk.spans[0].style.fg, Some(Color::Indexed(44)));
+        let added = row(&lines, "fn other");
+        let first = &added.spans[0];
+        assert!(
+            first.content.contains('+'),
+            "first span is the gutter + sigil, got {:?}",
+            first.content
+        );
+        assert_eq!(
+            first.style.fg,
+            Some(Color::Indexed(194)),
+            "the gutter keeps the card foreground"
+        );
+    }
+
+    /// A block comment spanning several added lines is coloured consistently
+    /// on every one of them — the case line-by-line highlighting gets wrong.
+    #[test]
+    fn multi_line_comment_is_coloured_on_every_row() {
+        let old = "fn main() {}\n";
+        let new = "/* one\n   two\n   three */\nfn main() {}\n";
+        let lines = card("src/lib.rs", old, new);
+        // The comment is one tree-sitter node, so it arrives as a single run
+        // split across rows; each row's slice must carry the same colour.
+        let a = row(&lines, "/* one");
+        let b = row(&lines, "   two");
+        let c = row(&lines, "three */");
+        let grab = |l: &Line<'static>| l.spans.last().unwrap().style.fg;
+        assert_eq!(grab(a), grab(b), "rows 1 and 2 of the comment differ");
+        assert_eq!(grab(b), grab(c), "rows 2 and 3 of the comment differ");
+        assert!(grab(a).is_some(), "the comment is coloured at all");
+        // …and it is not the row's plain foreground.
+        assert_ne!(grab(a), Some(Color::Indexed(194)));
+    }
+
+    /// Word-diff emphasis survives on a row that is also syntax-highlighted:
+    /// the changed run keeps the syntax foreground but takes the brighter
+    /// background and bold.
+    #[test]
+    fn word_diff_emphasis_survives_highlighting() {
+        let old = "let alpha = 1;\n";
+        let new = "let bravo = 1;\n";
+        let lines = card("src/lib.rs", old, new);
+        let added = row(&lines, "bravo");
+        let emph: Vec<_> = added
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Indexed(28)))
+            .collect();
+        assert!(!emph.is_empty(), "no emphasised run on the added row");
+        assert!(
+            emph.iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "emphasis lost its bold"
+        );
+        let removed = row(&lines, "alpha");
+        assert!(
+            removed
+                .spans
+                .iter()
+                .any(|s| s.style.bg == Some(Color::Indexed(88))),
+            "no emphasised run on the removed row"
+        );
+    }
+
+    /// Toning lifts colours over the added background and mutes them over the
+    /// removed one, so the two sides read differently — and context rows are
+    /// left exactly as the highlighter gave them.
+    #[test]
+    fn toning_lifts_additions_and_mutes_removals() {
+        let lum = |c: Color| {
+            let [r, g, b] = super::color_rgb(c).expect("resolvable");
+            super::luminance(f32::from(r), f32::from(g), f32::from(b))
+        };
+        for c in [Color::Magenta, Color::Cyan, Color::DarkGray, Color::Green] {
+            let a = tone_fg(c, Tone::Add);
+            let d = tone_fg(c, Tone::Del);
+            assert_ne!(a, d, "{c:?} must differ between the two sides");
+            assert!(lum(a) >= 0.5, "{c:?} too dark for the green background");
+            assert!(lum(d) <= 0.75, "{c:?} too hot for the red background");
+            assert!(lum(a) > lum(d), "{c:?}: additions must read brighter");
+            assert_eq!(tone_fg(c, Tone::Context), c, "context is untouched");
+        }
+        assert_eq!(
+            tone_fg(Color::Reset, Tone::Add),
+            Color::Reset,
+            "Reset has no fixed value to tone"
+        );
+    }
+
+    /// Extension mapping covers the common languages and never guesses.
+    #[test]
+    fn language_detection_maps_known_extensions() {
+        for (path, lang) in [
+            ("src/tui.rs", "rust"),
+            ("a/b/main.PY", "python"),
+            ("x.tsx", "tsx"),
+            ("x.hpp", "cpp"),
+            ("deploy.sh", "bash"),
+            ("Cargo.toml", "toml"),
+        ] {
+            assert_eq!(diff_lang(path), Some(lang), "{path}");
+        }
+        for path in ["README", "data.bin", "x.unknownext", ""] {
+            assert_eq!(diff_lang(path), None, "{path}");
+        }
+    }
+
+    /// Ignoring styles, a highlighted card shows exactly the same characters
+    /// as a flat one: highlighting splits spans, it never edits text.
+    #[test]
+    fn highlighting_changes_no_text() {
+        let old = "fn main() {\n    let x = 1;\n}\n";
+        let new = "fn main() {\n    let x = 2;\n}\n";
+        let flat = card("notes.wobble", old, new);
+        let lit = card("src/lib.rs", old, new);
+        let flatten = |ls: &[Line<'static>]| {
+            ls.iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let (mut a, mut b) = (flatten(&flat), flatten(&lit));
+        // Only the header names the path, which differs by construction.
+        a.remove(0);
+        b.remove(0);
+        assert_eq!(a, b);
     }
 }
