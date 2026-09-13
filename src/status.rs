@@ -2227,7 +2227,12 @@ pub fn build_status_text_within(
 
 /// Visible width, ignoring ANSI escapes so a coloured line is not judged by
 /// the length of its escape sequences.
-fn visible_width(text: &str) -> usize {
+///
+/// `pub(crate)` so [`crate::statusbar`] can share this exact measure for its
+/// own safety-net truncation rather than duplicating (an earlier, buggy copy
+/// used `chars().count()`, which both undercounts wide emoji and overcounts
+/// coloured text by counting escape bytes as visible columns).
+pub(crate) fn visible_width(text: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
 
     let mut stripped = String::with_capacity(text.len());
@@ -2254,6 +2259,41 @@ fn visible_width(text: &str) -> usize {
     // emoji, flags (regional indicator pairs) and emoji+variation-selector
     // pairs are measured correctly; true ZWJ sequences are the known gap.
     stripped.width()
+}
+
+/// Truncates `text` to at most `cols` visible columns, the same measure
+/// [`visible_width`] uses: ANSI escape sequences are zero-width and are
+/// always copied through whole (never sliced mid-sequence, which would leave
+/// a dangling escape that corrupts the terminal's state), and each remaining
+/// character counts by `unicode_width`'s display width rather than by 1.
+///
+/// `pub(crate)` for the same reason as [`visible_width`]: shared with
+/// [`crate::statusbar`]'s safety-net truncation.
+pub(crate) fn truncate_visible(text: &str, cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut out = String::with_capacity(text.len());
+    let mut width = 0usize;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            out.push(c);
+            for c2 in chars.by_ref() {
+                out.push(c2);
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let w = c.width().unwrap_or(0);
+        if width + w > cols {
+            break;
+        }
+        width += w;
+        out.push(c);
+    }
+    out
 }
 
 /// Formats the echoed user prompt line (`* <text>` with bold styling on TTYs).
