@@ -2081,6 +2081,25 @@ Related: `sha2` is a direct dependency solely because artifacts are verified
 time. A resumed `.part` re-reads itself from disk to rebuild the hasher, since
 `sha2` exposes no serializable state — do not add a hasher-state sidecar.
 
+Related: the artifacts must be fetched in **bounded** ranges. Hugging Face's
+xet CDN answers `Range: bytes={offset}-` with `400 Bad Request` for the **V4.1**
+objects while answering `Range: bytes={offset}-{end}` with `206`, verified live
+against the 341 GiB V4.1 main artifact (`bytes=100-199` → 206,
+`bytes=100-` → 400, `bytes=1000000000-1268435455` → 206 with
+`Content-Length: 268435456`), and reproduced independently.
+
+The scoping matters: the **V4** artifacts are served by a backend that still
+*accepts* `bytes={offset}-`, so this is not a property of Hugging Face in
+general, nor something to infer from a V4 probe. Two reviews initially
+contradicted each other for exactly that reason — one had probed the V4 object
+from `ds4.manifest` and concluded open-ended ranges were fine. Always probe the
+artifact you actually ship. Naming an end offset is correct against both
+backends, so `downloader::http_fetch` does it unconditionally rather than
+per-set, and `one_artifact` loops over 256 MiB chunks: end-of-stream means
+end-of-*chunk*, not end-of-file. Before this, any interruption of a multi-hour
+download restarted from zero and the whole `.part` rehash machinery was dead
+weight — one real interruption cost 88 GiB.
+
 ## A `</think>` splice has to be decided before the truncate, or the branch is dead
 
 `Ds4Session`'s prompt reconciliation truncates the token buffer to the common
@@ -2441,6 +2460,13 @@ because most int8 weights moved by 0 or ±1. Diff, then compress.
 
 ## Qwen3.8-Flash-Next — the traps that cost the most
 
+**Qwen is gone.** Upstream `bd66c40` (the V4.1 bump) deleted the Qwen Metal
+support outright, so plank removed the family, its CLI flag, its tool dialect
+and its `.qwn.kv` namespace with it. This section is kept because most of what
+it cost is not Qwen-specific — in particular the Metal-kernel trap immediately
+below is family-independent and still live, and the prefill-hook and dialect
+notes are the template for the next family plank adds.
+
 Every one of these was found by running the model, not by reading the C.
 
 **The engine compiles one combined Metal source for every model.**
@@ -2613,3 +2639,62 @@ filter) as a finished answer. Failures now carry the provider's message out
 through `SseTranslator::stream_error` into an `EngineError` and the error log,
 and a truncation keeps its usage and its text but announces the reason as a
 `Notice`. Neither event had a test before; both do now.
+
+## The V4.1 DSML dialect is a respelling, so every tag must come from one table
+
+V4.1 does not invent a tool syntax; it respells the existing one. Where V4 writes
+`<｜DSML｜tool_calls>`, `<｜DSML｜invoke` and `</｜DSML｜parameter>`, V4.1 writes
+`<｜DSML｜ calls>`, `<｜DSML｜ invoke` and `</｜DSML｜ parameter>` — the word
+`tool_calls` becomes ` calls`, and the leading **space** after the second bar is
+part of the tag, not formatting. It survives no trimming and no normalization.
+
+The trap is that the difference is small enough to invite hand-typed constants at
+each of the half-dozen sites that name a tag. They must all come from
+`ToolSyntax::dsml_tags` (`crates/trace-stream/src/syntax.rs`) instead, because the
+tolerance plank already grants the V4 spelling has to compose with the respelling:
+`start_markers` accepts every marker name (`DSML`, `SSML`) in both the canonical
+and dropped-leading-bar forms, and it builds them by substituting the marker word
+into the table's `start`, replacing only `DSML` and never the space that follows.
+Hand-type `"<｜DSML｜ calls>"` at one site and the SSML or dropped-bar variant of it
+silently stops being recognized on V4.1 only — which surfaces as the generic
+"DSML markup outside a valid tool_calls block" on every turn.
+
+`ToolSyntax::for_model_name` keys on the C's shape name (`DS4_MODEL_SHAPE_NAME`),
+not the GGUF path, so a renamed or relocated checkpoint still resolves; anything
+not starting with `DeepSeek V4.1` falls through to the V4 dialect.
+
+## The V4 think prefix is unchanged by the V4.1 effort plumbing — dumped, not argued
+
+Adding V4.1's numeric reasoning effort replaced plank's direct
+`ds4_chat_append_max_effort_prefix` call with `ds4_chat_append_think_prefix(mode)`
+for *every* mode. That is only safe if the new call is a no-op on V4 wherever the
+old one did nothing, and the argument for it was pure source-reading for a while.
+
+It holds, and the C makes it nearly trivial: both public symbols are one-line
+wrappers around the same static `chat_push_think_prefix(&e->vocab, mode, tokens)`
+(`refs/ds4/ds4.c:42097`), whose family switch tests `DS4_MODEL_FAMILY` — a
+**runtime** global (`g_ds4_shape.family`), not a compile-time constant. On
+anything that is neither GLM nor DeepSeek41 the only arm that appends is
+`think_mode == DS4_THINK_MAX`, so `NONE`, `HIGH` and any numeric level append
+nothing at all.
+
+The useful part is how to *test* that without the 87 GB of weights:
+`ds4_dump_chat_tokenization` (exposed as `ds4 --dump-tokens`) does
+`model_open` + `vocab_load` + `encode_chat_prompt` and no weight load, so a full
+token dump against a real V4 checkpoint returns in about 0.4 s. Reach for it
+whenever a claim is about prompt bytes; there is no reason to load a model.
+
+Two traps when doing so:
+
+- **`--think-max` silently downgrades to `HIGH` below a 393216-token context**
+  (`ds4_think_mode_for_context`, V4 only). At the default context the MAX prefix
+  simply does not appear, which reads exactly like "the prefix was dropped". Pass
+  `--ctx 524288` or the test proves nothing.
+- **The dump path refuses a numeric level on non-V4.1** before it encodes
+  anything, so `--think-level N` cannot be observed on V4 as shipped. That guard
+  lives in `ds4_dump_chat_tokenization`, *not* in `chat_push_think_prefix` — it
+  therefore does not protect plank, which calls the wrapper directly. This matters
+  because plank's own `Low` passes `Level(25)` on **every** family, V4 included.
+  Temporarily stubbing that one guard and re-dumping confirms the real behaviour:
+  on V4, levels 25/50/100 are byte-identical to plain `--think` and level 0 to
+  `--nothink`. No effort prefix on any of them.

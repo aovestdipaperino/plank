@@ -91,12 +91,14 @@ fn resolve_model_delta(cfg: &mut plank::config::AgentConfig) -> Result<(), Strin
 /// store opened before it would name files for the wrong one.
 fn select_session_family(cfg: &plank::config::AgentConfig) {
     // Resolved the same way the engine will resolve it, so the tag matches the
-    // model that actually loads. A path that does not exist yet — a first run,
-    // before the download — probes as `Ds4`, which is the right default.
+    // model that actually loads — including the fallback, which follows the
+    // set this machine manages rather than always naming the V4 path. A path
+    // that does not exist yet — a first run, before the download — is probed by
+    // name, so it still tags the family of the model that is about to land.
     let model = cfg
         .model_path
         .clone()
-        .unwrap_or_else(plank::download::default_model_path);
+        .unwrap_or_else(plank::download::default_managed_model_path);
     plank::session::set_family(plank::gguf::family_of(&model));
 }
 
@@ -349,25 +351,6 @@ fn enter_startup_worktree(
 #[cfg(ds4_engine)]
 const MIN_RAM_BYTES: u64 = 96 * 1024 * 1024 * 1024;
 
-/// Total physical RAM in bytes, via `sysctl hw.memsize`.
-#[cfg(ds4_engine)]
-fn total_ram_bytes() -> Option<u64> {
-    let mut mem: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    // SAFETY: hw.memsize returns a u64; `mem`/`len` are valid out-params and
-    // the name is a NUL-terminated C string.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&raw mut mem).cast(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (rc == 0).then_some(mem)
-}
-
 /// Fails fast when another plank/ds4 instance is already running, with a clear
 /// message — instead of the engine's own guard, which calls `exit(2)` deep in
 /// `ds4_engine_open` (`ds4_acquire_instance_lock` in `ds4.c`) and kills the
@@ -407,7 +390,7 @@ fn acquire_model_lock() -> Result<(), String> {
 /// Returns an explanatory message when physical RAM is below the minimum.
 #[cfg(ds4_engine)]
 fn require_min_ram() -> Result<(), String> {
-    if let Some(bytes) = total_ram_bytes()
+    if let Some(bytes) = plank::download::total_ram_bytes()
         && bytes < MIN_RAM_BYTES
     {
         #[allow(clippy::cast_precision_loss)]
@@ -565,7 +548,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         let model = cfg
             .model_path
             .clone()
-            .unwrap_or_else(plank::download::default_model_path);
+            .unwrap_or_else(plank::download::default_managed_model_path);
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
@@ -581,10 +564,9 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // Speculation is on by default; without `--mtp-model` a DeepSeek run
         // resolves the default support GGUF and fetches it on demand
         // (`--mtp-off` skips that). Kept local rather than written back into
-        // `cfg`: only the engine open needs it. A Qwen model skips both side
-        // artifacts, since it opens neither.
+        // `cfg`: only the engine open needs it.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&model, &mut tuning)?;
+        plank::download::ensure_side_artifacts(&model, cfg.generation.ctx_size, &mut tuning)?;
 
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
@@ -595,16 +577,48 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         eprintln!("plank: loading model {}...", model.display());
         // Render the C engine's noisy startup log in place on one row.
         let replacer = plank::stderrline::StderrLineReplacer::start();
-        let engine = Ds4Engine::open(
-            &model,
-            backend,
-            cfg.generation.ctx_size,
-            cfg.n_threads,
-            cfg.power_percent,
-            &tuning,
-        )
-        .map_err(|e| e.to_string())?;
+        let opened = (|| {
+            let first = match Ds4Engine::open(
+                &model,
+                backend,
+                cfg.generation.ctx_size,
+                cfg.n_threads,
+                cfg.power_percent,
+                &tuning,
+            ) {
+                Ok(engine) => return Ok(engine),
+                Err(e) => e.to_string(),
+            };
+            // The C refuses to open a checkpoint at all when the DSpark draft
+            // model does not match it. When plank picked that companion itself,
+            // retry once (never in a loop) rather than making the user discover
+            // `--mtp-off`; a companion the user named is never dropped (see
+            // `EngineTuning::without_auto_companion`).
+            let Some(solo) = tuning.without_auto_companion() else {
+                return Err(first);
+            };
+            eprintln!(
+                "note: speculative decoding disabled (the DSpark draft model is not compatible with this checkpoint)"
+            );
+            Ds4Engine::open(
+                &model,
+                backend,
+                cfg.generation.ctx_size,
+                cfg.n_threads,
+                cfg.power_percent,
+                &solo,
+            )
+            // Report the original failure, with the retry's as context: the
+            // retry only rules the companion out, it does not diagnose a
+            // corrupt model.
+            .map_err(|second| {
+                format!(
+                    "{first}\n(retried without the DSpark draft model, which also failed: {second})"
+                )
+            })
+        })();
         drop(replacer);
+        let engine = opened?;
         eprintln!(
             "plank: model ready: {}{}",
             engine.model_name(),
@@ -811,7 +825,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         let model_path = cfg
             .model_path
             .clone()
-            .unwrap_or_else(plank::download::default_model_path);
+            .unwrap_or_else(plank::download::default_managed_model_path);
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
@@ -826,7 +840,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         // any other DeepSeek checkpoint runs text-only.
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&model_path, &mut tuning)?;
+        plank::download::ensure_side_artifacts(&model_path, cfg.generation.ctx_size, &mut tuning)?;
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,
@@ -874,6 +888,12 @@ fn run(
     cfg: &AgentConfig,
     plugins: plank::plugins::PluginSet,
 ) -> Result<(), String> {
+    // The family check the C makes right after opening the engine: a numeric
+    // effort is meaningless to anything but V4.1, and falling back to `high`
+    // silently would be worse than refusing.
+    if plank::engine::think_level_unsupported(cfg.generation.think_mode, &engine.model_name()) {
+        return Err(plank::engine::THINK_LEVEL_REQUIRES_V41.to_string());
+    }
     let color = std::io::stdout().is_terminal();
     if cfg.non_interactive {
         return plank::ui::run_non_interactive(engine, cfg, local_engine, plugins);

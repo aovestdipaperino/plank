@@ -600,30 +600,22 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
             ),
             sysprompt::IN_THINK_PROHIBITION
         ),
-        // Named for the dialect the model actually speaks. Telling a Qwen
-        // model its "DSML" was invalid, and handing it DSML to copy, is how a
-        // recorded session ended with the model insisting the harness was
-        // broken rather than fixing its markup.
-        PassError::Dsml => match syntax {
-            sysprompt::ToolSyntax::Dsml => format!(
-                "Tool error: invalid DSML tool call: {err}\n{}",
-                sysprompt::dsml_syntax_reminder()
-            ),
-            #[cfg(feature = "qwen")]
-            sysprompt::ToolSyntax::Qwen => format!(
-                "Tool error: invalid tool call: {err}\n{}",
-                sysprompt::qwen_syntax_reminder()
-            ),
-            // Unreachable — a Qwen model cannot be opened by this build — but
-            // the variant still exists, so the match must stay total. Falling
-            // back to the DSML reminder is the honest answer: DSML is the only
-            // dialect this build speaks.
-            #[cfg(not(feature = "qwen"))]
-            sysprompt::ToolSyntax::Qwen => format!(
-                "Tool error: invalid tool call: {err}\n{}",
-                sysprompt::dsml_syntax_reminder()
-            ),
-        },
+        // Named for the dialect the model actually speaks. Telling a model
+        // its "DSML" was invalid, and handing it DSML to copy when it speaks
+        // something else, is how a recorded session ended with the model
+        // insisting the harness was broken rather than fixing its markup.
+        // Each dialect gets its own reminder text, both pinned against the C
+        // (`agent_dsml_syntax_reminder` / `agent_dsml41_syntax_reminder`):
+        // handing a model DSML to copy in a tag spelling it does not speak is
+        // how a recorded session ended with the model insisting the harness
+        // was broken rather than fixing its markup.
+        PassError::Dsml => format!(
+            "Tool error: invalid DSML tool call: {err}\n{}",
+            match syntax {
+                sysprompt::ToolSyntax::Dsml => sysprompt::dsml_syntax_reminder(),
+                sysprompt::ToolSyntax::Dsml41 => sysprompt::dsml41_syntax_reminder(),
+            }
+        ),
     }
 }
 
@@ -3035,6 +3027,16 @@ impl Agent<'_> {
         stream
     }
 
+    /// The reasoning level as the *footer* should show it: on a model with a
+    /// native numeric effort knob the segment carries the effort number in
+    /// force rather than plank's name for the level
+    /// ([`crate::engine::ThinkMode::for_display`]). Display only — `self.think`
+    /// stays the real state, which is what keys the KV fingerprint.
+    fn footer_think(&self, model_name: &str) -> crate::engine::ThinkMode {
+        self.think
+            .for_display(crate::engine::numeric_thinking_model(model_name))
+    }
+
     /// Streams one generation pass: paints the live status bar for prefill and
     /// generation, and routes model text through the viz + markdown pipeline.
     #[allow(clippy::type_complexity)]
@@ -3081,10 +3083,10 @@ impl Agent<'_> {
         let mut assistant_text = String::new();
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
-        let think = self.think;
         // Bound here rather than inside the event closure, which cannot borrow
         // `self` while `self.engine` is generating.
         let model_name = self.engine.model_name();
+        let think = self.footer_think(&model_name);
         let prompt_tokens = self.engine.count_tokens(prompt_text);
         let mut bar = crate::statusbar::StatusBar::new(self.show_footer && self.color, self.color);
         let verb = status::random_verb_index();
@@ -4058,7 +4060,10 @@ impl LiveStatus {
             started,
             ctx_size,
             power_percent,
-            think,
+            // Footer-facing only: a numeric-thinking family shows the effort
+            // number in force instead of plank's name for it. Mapped once,
+            // here, so every snapshot this builder emits agrees.
+            think: think.for_display(crate::engine::numeric_thinking_model(&model_name)),
             model_name,
             running_jobs,
         }
@@ -4491,7 +4496,7 @@ impl Agent<'_> {
                 // be useful, which is when people actually want them.
                 spec: stats.spec,
                 power_percent: self.power_percent,
-                think: self.think,
+                think: self.footer_think(&self.engine.model_name()),
                 running_jobs: self.tool_ctx.bash.running_count(),
                 pressure_yielded: self.yield_policy.plan().is_some(),
                 ..Status::default()
@@ -6241,7 +6246,7 @@ impl Agent<'_> {
                 // pass. The interrupted case already printed its own notice.
                 self.compact("user request", arg)?;
             }
-            "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
+            "/skills" => print!("{}", self.skills_command(arg)),
             "/frame" => println!(
                 "/frame needs the full-screen TUI — a piped session has no screen to give a \
                  component\n{}",
@@ -6255,7 +6260,7 @@ impl Agent<'_> {
                 self.session.tasks.render_list(self.session.goal.as_ref())
             ),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
-            "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
+            "/hooks" => print!("{}", self.hooks_command(arg)),
             "/remote-control" | "/rc" => {
                 println!(
                     "{cmd} needs the full-screen TUI — a piped session can't mirror output or run remote prompts"
@@ -7839,7 +7844,7 @@ the original is frozen and listed in /tree"
         format!("notifications {}", if new_state { "on" } else { "off" })
     }
 
-    /// Parses a `/think [off|low|medium|max]` argument and applies it; returns the
+    /// Parses a `/think [off|low|medium|max|0..100]` argument and applies it; returns the
     /// status line to report to the user. Shared by both front-ends so the two
     /// dispatchers cannot drift.
     ///
@@ -7863,6 +7868,29 @@ the original is frozen and listed in /tree"
     /// `EchoEngine`, a provider engine, `--mtp` with a missing file) is off
     /// however the flag reads, and every message and marker follows this
     /// answer rather than the flag alone.
+    /// Drops the temperature `config::finalize` pinned to 0 for speculative
+    /// decoding when this session's engine turns out not to be able to
+    /// speculate at all (`DSpark` is `DeepSeek` V4 only, and an auto-paired
+    /// companion a checkpoint refuses is dropped on the open retry). The pin
+    /// exists solely to let the draft gate open; with no gate it would leave
+    /// the session sampling greedily for no reason.
+    ///
+    /// The single choke point for that decision — the constructor calls it
+    /// once, before the first frame is drawn. A temperature the user typed is
+    /// never touched (`temp_explicit`), and `resume_temp` follows, so a later
+    /// `/mtp off` returns to the same number.
+    fn settle_speculation_temperature(&mut self, temp_explicit: bool) {
+        let settled = crate::config::temperature_without_speculation(
+            &self.gen_opts,
+            temp_explicit,
+            self.engine.spec_capable(),
+        );
+        self.gen_opts.temperature = settled;
+        if settled > 0.0 {
+            self.resume_temp = settled;
+        }
+    }
+
     fn mtp_on(&self) -> bool {
         self.gen_opts.mtp && self.engine.spec_capable()
     }
@@ -7960,17 +7988,91 @@ the original is frozen and listed in /tree"
         format!("temperature {temp:.2}")
     }
 
+    /// `/skills [on|off]`: the shared body for both front ends.
+    ///
+    /// One implementation rather than two, exactly as [`Self::hooks_command`]
+    /// is: the plain-stdout REPL prints it and the TUI puts it in a pane, and
+    /// neither can drift on what the command accepts. Bare `/skills` lists the
+    /// loaded skills *and* says whether they are currently enabled, so the
+    /// listing never implies a skill that would refuse to run. Returns the text
+    /// to print/pane, always newline-terminated.
+    fn skills_command(&self, arg: &str) -> String {
+        match arg.trim() {
+            "" => {
+                let state = if crate::skills::enabled() {
+                    "skills are enabled"
+                } else {
+                    crate::skills::DISABLED_NOTICE
+                };
+                format!("{}{state}\n", crate::skills::render_list(&self.skills))
+            }
+            "on" => {
+                crate::skills::set_enabled(true);
+                "skills enabled: /name and the skill tool expand again\n".to_string()
+            }
+            "off" => {
+                crate::skills::set_enabled(false);
+                // Runtime only: nothing is written to any SKILL.md or settings
+                // file, so the next launch is back to the configured behaviour.
+                "skills disabled for the rest of this session (nothing was written to disk)\n"
+                    .to_string()
+            }
+            other => format!("usage: /skills [on|off] (got {other:?})\n"),
+        }
+    }
+
+    /// `/hooks [on|off]`: the shared body for both front ends.
+    ///
+    /// One implementation rather than two, so the plain-stdout REPL and the
+    /// TUI pane can never drift apart on what the command accepts. Returns the
+    /// text to print/pane, always newline-terminated.
+    fn hooks_command(&self, arg: &str) -> String {
+        match arg.trim() {
+            "" => {
+                let state = if crate::hooks::enabled() {
+                    "hooks are enabled"
+                } else {
+                    "hooks are disabled for this session (/hooks on to re-enable)"
+                };
+                format!(
+                    "{}{state}\n",
+                    crate::hooks::render_list(&self.tool_ctx.hooks)
+                )
+            }
+            "on" => {
+                crate::hooks::set_enabled(true);
+                "hooks enabled: hooks will run again from the next event\n".to_string()
+            }
+            "off" => {
+                crate::hooks::set_enabled(false);
+                // Runtime only: nothing is written to hooks.json or settings,
+                // so the next launch is back to the configured behaviour.
+                "hooks disabled for the rest of this session (nothing was written to disk)\n"
+                    .to_string()
+            }
+            other => format!("usage: /hooks [on|off] (got {other:?})\n"),
+        }
+    }
+
     fn think_command(&mut self, arg: &str, on_progress: &mut dyn FnMut()) -> String {
         use crate::engine::{THINK_MAX_MIN_CONTEXT, ThinkMode};
 
         let current = self.think;
         let arg = arg.trim();
         if arg.is_empty() {
-            return format!("thinking: {} (off|low|medium|max)", current.name());
+            return format!("thinking: {} (off|low|medium|max|0..100)", current.name());
         }
         let Some(level) = ThinkMode::parse(arg) else {
-            return format!("/think: expected off|low|medium|max, got `{arg}`");
+            return format!("/think: expected off|low|medium|max|0..100, got `{arg}`");
         };
+        // A numeric effort is a V4.1 knob; on any other family the C refuses it
+        // rather than rounding it to `high`.
+        if crate::engine::think_level_unsupported(level, &self.engine.model_name()) {
+            return format!(
+                "/think {arg} requires a DeepSeek V4.1 model; still {}",
+                current.name()
+            );
+        }
         let ctx = self.engine.ctx_size();
         if level == ThinkMode::Max && ctx < THINK_MAX_MIN_CONTEXT {
             return format!(
@@ -7983,12 +8085,51 @@ the original is frozen and listed in /tree"
         if level == current {
             return format!("thinking already {}", level.name());
         }
+        // The C's context-room guard, from `worker_apply_requested_think`:
+        // `transcript.len + delta >= ctx_size` is refused outright, because the
+        // longer effort preamble would push the session past its own ceiling.
+        // plank measures the same delta in tokens between the two preambles;
+        // only a *growing* preamble can run out of room, so a shrink is always
+        // allowed. The C's message names one condition for two causes
+        // ("incompatible session or no context room"); plank splits them, since
+        // the incompatible-session half is already covered by the V4.1 and
+        // `max` refusals above and the user can act on a number.
+        let numeric = crate::engine::numeric_thinking_model(&self.engine.model_name());
+        let preamble_tokens = |mode: ThinkMode, engine: &dyn crate::engine::Engine| {
+            mode.effort_prefix(numeric)
+                .map_or(0, |text| engine.count_tokens(&text))
+        };
+        let delta = preamble_tokens(level, self.engine.as_ref())
+            - preamble_tokens(current, self.engine.as_ref());
+        if delta > 0 && self.last_ctx_used.saturating_add(delta) >= ctx {
+            return format!(
+                "/think {arg}: no context room for the longer reasoning preamble \
+                 ({} of {ctx} tokens in use, {delta} more needed); still {}",
+                self.last_ctx_used,
+                current.name()
+            );
+        }
         self.think = level;
+        // Every KV ladder rung was captured under the *old* level, and
+        // `session::payload_fingerprint` hashes `think.name()` — so from this
+        // line on no rung can be found again, at ANY level change, whether or
+        // not it moves the preamble (`off` -> `medium` share the empty preamble
+        // and still change the key). Leaving them is strictly worse than having
+        // none: `KvLadder::wants_anchor` keeps comparing against a rung that can
+        // no longer be loaded, so a fresh transcript reads as already covered
+        // and no anchor is ever captured again, while the blobs leak on disk.
+        // This is plank's half of the C's `ds4_session_invalidate`: the C
+        // invalidates the engine session (plank's `Engine::set_think_mode`
+        // does that, below), and plank must additionally drop the cache layer
+        // the C does not have. Unconditional on purpose — gating it on
+        // `prefix_changed` would leave exactly the `off`/`medium` pair silently
+        // broken, with the feature still looking fully wired up.
+        self.discard_ladder();
         // A change of effort preamble changes the prompt prefix, so the engine
         // drops its cached tokens and KV here. Re-warm from the tier
         // checkpoints under the new fingerprint rather than making the next
         // turn re-prefill the system prompt inline.
-        let prefix_changed = current.effort_prefix() != level.effort_prefix();
+        let prefix_changed = current.effort_prefix(numeric) != level.effort_prefix(numeric);
         self.engine.set_think_mode(level);
         // Cached alt engines too: `self.think` keys their Tier 1 checkpoint and
         // frames their sidechains, so an engine left at the old level would
@@ -8713,7 +8854,8 @@ the original is frozen and listed in /tree"
         // the transcript.
         let model_name = self.engine.model_name();
         let syntax = self.tool_syntax();
-        let family = crate::manifest::ModelSet::for_family(crate::gguf::ModelFamily::from(syntax));
+        let family =
+            crate::manifest::ModelSet::for_family(crate::gguf::ModelFamily::from_syntax(syntax));
         let installed = crate::manifest::read_at(&crate::manifest::installed_path(family));
         let artifact_version = installed.as_ref().map(|m| m.version);
         // The `main` entry is the weights themselves; its URL carries the
@@ -8736,7 +8878,7 @@ the original is frozen and listed in /tree"
                 family: family.as_str(),
                 syntax: match syntax {
                     crate::sysprompt::ToolSyntax::Dsml => "dsml",
-                    crate::sysprompt::ToolSyntax::Qwen => "qwen",
+                    crate::sysprompt::ToolSyntax::Dsml41 => "dsml41",
                 },
                 artifact_version,
                 companion: &companion,
@@ -10168,6 +10310,17 @@ the original is frozen and listed in /tree"
     /// match — the caller reports an unknown command; `Some(Err)` is a
     /// matched template whose variables could not be bound.
     fn slash_message(&self, cmd: &str, arg: &str) -> Option<Result<String, String>> {
+        // The first of the two invocation routes. Reported as an error rather
+        // than passed over, so `/plan` with skills off says why instead of
+        // falling through to "unknown command" — or, worse, reaching the model
+        // as a bare prompt.
+        if !crate::skills::enabled()
+            && self
+                .skill_name(cmd)
+                .is_some_and(|name| self.skills.iter().any(|s| s.name == name))
+        {
+            return Some(Err(crate::skills::DISABLED_NOTICE.to_owned()));
+        }
         if let Some(message) = self.skill_message(cmd, arg) {
             return Some(Ok(message));
         }
@@ -12278,7 +12431,7 @@ impl Agent<'_> {
             })
             .unwrap_or_default();
         crate::kvtier::TierLabels {
-            think_mode: self.think.name().to_owned(),
+            think_mode: self.think.name().into_owned(),
             trusted_len: self.trusted_system_len,
             global_mcp: crate::tools::mcp::global_eligible_names(None),
             project_path: self.tool_ctx.cwd.display().to_string(),
@@ -12559,7 +12712,7 @@ impl Agent<'_> {
             ctx_used: self.engine.count_tokens(&rendered),
             ctx_size: self.engine.ctx_size(),
             power_percent: self.power_percent,
-            think: self.think,
+            think: self.footer_think(&self.engine.model_name()),
             spec: self.last_spec,
             running_jobs: self.tool_ctx.bash.running_count(),
             pressure_yielded: self.yield_policy.plan().is_some(),
@@ -14659,10 +14812,7 @@ impl Agent<'_> {
                 log.push_dim(Self::model_text_command(arg));
             }
             "/skills" => {
-                *report = Some(tui::ReportPanel::new(
-                    "skills",
-                    &crate::skills::render_list(&self.skills),
-                ));
+                *report = Some(tui::ReportPanel::new("skills", &self.skills_command(arg)));
             }
             // A bare `/frame` lists the openable frames, which is a report; with
             // an argument it opens one, which is an action and stays a line in
@@ -14713,10 +14863,7 @@ impl Agent<'_> {
                 ));
             }
             "/hooks" => {
-                *report = Some(tui::ReportPanel::new(
-                    "hooks",
-                    &crate::hooks::render_list(&self.tool_ctx.hooks),
-                ));
+                *report = Some(tui::ReportPanel::new("hooks", &self.hooks_command(arg)));
             }
             "/remote-control" | "/rc" => {
                 for line in self.remote_toggle_lines(cmd, arg) {
@@ -16993,9 +17140,10 @@ fn new_agent(
         contribution_warnings.extend(warnings);
     }
     let wasm_tools = tool_ctx.wasm.registry.tools();
-    // The dialect the loaded model speaks decides which tools prompt it gets,
-    // and later which parser reads its output back. Taken from the name the
-    // engine reports after detecting the file, not from the path.
+    // The dialect the loaded model speaks decides which parser reads its
+    // output back (every dialect takes the same tools prompt, with V4.1
+    // respelling three tag names). Taken from the name the engine reports
+    // after detecting the file, not from the path.
     let syntax = sysprompt::ToolSyntax::for_model_name(&engine.model_name());
     let system = sysprompt::build_system_prompt_parts_with_wasm(
         &cfg.system,
@@ -17019,14 +17167,24 @@ fn new_agent(
     // Which model this local engine is, for the footer's origin label. Taken
     // from the dialect already resolved above, so the tag can never disagree
     // with the syntax the parser is using.
-    crate::status::set_local_family(syntax.into());
+    crate::status::set_local_family(crate::gguf::ModelFamily::from_syntax(syntax));
     // The footer's mtp/temperature slot, seeded the same way: `/mtp` and
     // `/temp` publish to it later, but the first frame is drawn before either
     // can be typed. An engine with no support model reads as off however the
     // flags were set — the footer must not promise speculation the engine
     // cannot do.
+    // Speculation may have fallen away since the flags were parsed (an
+    // unsupported family, a companion the checkpoint refused), and the 0
+    // `finalize` pinned for it has no reason to stand once it cannot run.
+    // Settled here, so the very first frame shows the temperature the session
+    // will actually sample at.
+    let settled_temperature = crate::config::temperature_without_speculation(
+        &cfg.generation,
+        cfg.temp_explicit,
+        engine.spec_capable(),
+    );
     crate::status::set_mtp(cfg.generation.mtp && engine.spec_capable());
-    crate::status::set_temperature(cfg.generation.temperature);
+    crate::status::set_temperature(settled_temperature);
     // The alt local engine needs both for the same reasons, and it cannot be
     // skipped as an optimization: `warm_reset` builds its system tokens from
     // these two fields, so an unconfigured engine tokenizes the *same* system
@@ -17055,7 +17213,7 @@ fn new_agent(
     // uses; hand the dispatch context its own copy.
     tool_ctx.skills.clone_from(&skills);
     let repro_dir = crate::repro::repro_dir(&tool_ctx.cwd);
-    Ok(Agent {
+    let mut agent = Agent {
         gen_opts: cfg.generation.clone(),
         resume_temp: if cfg.generation.temperature > 0.0 {
             cfg.generation.temperature
@@ -17127,7 +17285,11 @@ fn new_agent(
             .collect(),
         local_alt_warmed: false,
         warm_note: None,
-    })
+    };
+    // Speculation may have fallen away since the flags were parsed, and the 0
+    // `config::finalize` pinned for it then has nothing left to serve.
+    agent.settle_speculation_temperature(cfg.temp_explicit);
+    Ok(agent)
 }
 
 /// Runs the interactive REPL until the user exits.
@@ -19215,7 +19377,7 @@ mod tests {
         engine: ScriptedEngine,
         cfg: &'a crate::config::AgentConfig,
     ) -> Agent<'a> {
-        Agent {
+        let mut agent = Agent {
             engine: Box::new(engine),
             cfg,
             gen_opts: cfg.generation.clone(),
@@ -19279,7 +19441,12 @@ mod tests {
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
-        }
+        };
+        // The same settling the real constructor does, so a test agent over an
+        // engine that cannot speculate has the temperature production would
+        // give it.
+        agent.settle_speculation_temperature(cfg.temp_explicit);
+        agent
     }
 
     impl Agent<'_> {
@@ -19395,6 +19562,129 @@ mod tests {
         assert_eq!(agent.temp_command("0.5"), "temperature 0.50");
     }
 
+    /// A run started under the default `--mtp` had its temperature pinned to
+    /// 0 during argument parsing, before the family was known. When the engine
+    /// turns out to have no drafter (`DSpark` is V4-only, or the companion was
+    /// refused), the pin is serving nothing and the session would sample
+    /// greedily for no reason: the 0.6 default comes back.
+    #[test]
+    fn a_run_that_cannot_speculate_gets_its_default_temperature_back() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("mtp-unsupported-temp");
+        let mut cfg = test_cfg();
+        cfg.generation.mtp = true;
+        cfg.generation.temperature = 0.0;
+        cfg.temp_explicit = false;
+        // `ScriptedEngine::default()` has no support model (`spec: false`).
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let default = crate::engine::GenerationOptions::default().temperature;
+        assert!(!agent.engine.spec_capable());
+        assert!(
+            (agent.gen_opts.temperature - default).abs() < 1e-6,
+            "{}",
+            agent.gen_opts.temperature
+        );
+        // The footer and `/mtp` already read off `spec_capable`, so they stay
+        // truthful through the fallback.
+        assert!(!agent.mtp_on());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same run, with the user having typed `--temp 0`: their choice is
+    /// never second-guessed, speculating or not.
+    #[test]
+    fn an_explicit_zero_temperature_survives_a_run_that_cannot_speculate() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("mtp-unsupported-temp-explicit");
+        let mut cfg = test_cfg();
+        cfg.generation.mtp = true;
+        cfg.generation.temperature = 0.0;
+        cfg.temp_explicit = true;
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert!(agent.gen_opts.temperature.abs() < 1e-6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// And a session that really can speculate keeps its pinned 0.
+    #[test]
+    fn a_speculating_run_keeps_the_pinned_zero_temperature() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("mtp-supported-temp");
+        let mut cfg = test_cfg();
+        cfg.generation.mtp = true;
+        cfg.generation.temperature = 0.0;
+        let agent = spark_agent(&dir, &cfg);
+        assert!(agent.mtp_on());
+        assert!(agent.gen_opts.temperature.abs() < 1e-6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/skills` lists and reports state; `on`/`off` flip the session switch
+    /// and anything else is a usage line. One body serves both front ends.
+    #[test]
+    fn skills_command_lists_toggles_and_rejects_junk() {
+        let _lock = crate::skills::TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch_dir("skills-toggle");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.skills.push(crate::skills::Skill {
+            name: "plan".into(),
+            description: "plans".into(),
+            argument_hint: String::new(),
+            body: "plan body $ARGUMENTS".into(),
+            dir: std::path::PathBuf::new(),
+        });
+        crate::skills::set_enabled(true);
+
+        // Bare: the listing AND the state.
+        let out = agent.skills_command("");
+        assert!(out.contains("/plan"), "{out}");
+        assert!(out.contains("skills are enabled"), "{out}");
+
+        let out = agent.skills_command("off");
+        assert!(out.contains("disabled"), "{out}");
+        assert!(!crate::skills::enabled());
+        assert!(
+            agent
+                .skills_command("")
+                .contains(crate::skills::DISABLED_NOTICE),
+            "the listing must report the switch"
+        );
+        // The slash route is gated too: `/plan` says why instead of expanding,
+        // and never reaches the model as a bare prompt.
+        let refused = agent.slash_message("/plan", "x");
+        assert_eq!(
+            refused,
+            Some(Err(crate::skills::DISABLED_NOTICE.to_owned()))
+        );
+
+        let out = agent.skills_command("on");
+        assert!(out.contains("enabled"), "{out}");
+        assert_eq!(
+            agent.slash_message("/plan", "x").unwrap().unwrap(),
+            "plan body x"
+        );
+
+        let out = agent.skills_command("sideways");
+        assert!(out.contains("usage: /skills [on|off]"), "{out}");
+        crate::skills::set_enabled(true);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The trap the `/hooks` work hit: without the with-args recognizer,
+    /// `/skills off` is not a known command and the line goes to the model.
+    #[test]
+    fn skills_with_an_argument_is_a_known_command() {
+        for line in ["/skills", "/skills on", "/skills off", "/skills sideways"] {
+            assert!(
+                crate::config::slash_command_known(line),
+                "{line} would be forwarded to the model"
+            );
+        }
+    }
+
     #[test]
     fn mtp_rejects_anything_but_on_and_off() {
         // `/mtp` and `/temp` publish to the footer's process-global slots,
@@ -19444,7 +19734,7 @@ mod tests {
             "{section}"
         );
         // Dialect follows from the name, and the family follows from the
-        // dialect; a DSML model must never be labelled qwen.
+        // dialect; the two must never disagree.
         assert!(section.contains("- tool dialect: dsml"), "{section}");
         assert!(section.contains("- family: ds4"), "{section}");
         // The artifact set line is always present, in one of its two shapes,
@@ -21593,6 +21883,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // `/hooks` shares one body between the plain REPL and the TUI pane, so this
+    // covers both call sites. The toggle is runtime-only: nothing is written.
+    #[test]
+    fn hooks_command_lists_toggles_and_rejects_junk() {
+        let _lock = crate::hooks::TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch_dir("hooks-cmd");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        // Bare form still lists, and now says which way the switch is thrown.
+        let out = agent.hooks_command("");
+        assert!(out.contains("hooks are enabled"), "got: {out}");
+
+        let out = agent.hooks_command("off");
+        assert!(out.contains("disabled"), "got: {out}");
+        assert!(!crate::hooks::enabled());
+        let listed = agent.hooks_command("");
+        assert!(listed.contains("hooks are disabled"), "got: {listed}");
+
+        let out = agent.hooks_command("on");
+        assert!(out.contains("enabled"), "got: {out}");
+        assert!(crate::hooks::enabled());
+
+        let out = agent.hooks_command("sideways");
+        assert!(out.contains("usage: /hooks [on|off]"), "got: {out}");
+        // A bad argument changes nothing.
+        assert!(crate::hooks::enabled());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // `/think` with no argument reports rather than changes, and names the
     // levels so the user learns the vocabulary from the answer.
     #[test]
@@ -21629,6 +21951,188 @@ mod tests {
         let out = agent.think_command("medium", &mut || {});
         assert!(out.contains("already"), "got: {out}");
         assert_eq!(seen.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scripted engine the numeric `/think` levels are accepted on.
+    fn v41_engine() -> ScriptedEngine {
+        ScriptedEngine {
+            model: Some("DeepSeek V4.1 Flash".to_owned()),
+            ..ScriptedEngine::default()
+        }
+    }
+
+    /// Seeds `agent` with a named session, a short transcript and `rungs` KV
+    /// ladder rungs, so a test can watch what a `/think` does to them. The rung
+    /// depths and token counts only have to be increasing — nothing here reads
+    /// a blob, and `discard_ladder`'s deletes are best-effort over a scratch
+    /// dir that has none.
+    fn seed_ladder(agent: &mut Agent<'_>, rungs: usize) {
+        agent.session.id = "brave-curie".to_owned();
+        for i in 0..4u32 {
+            agent
+                .session
+                .transcript
+                .push(Message::user(format!("m{i}")));
+        }
+        for i in 0..rungs {
+            agent
+                .ladder
+                .push(i + 1, i32::try_from(i + 1).unwrap() * 100);
+        }
+        assert_eq!(agent.ladder.rungs().len(), rungs, "seeding failed");
+    }
+
+    /// The silent one. Every rung was captured under the old reasoning level,
+    /// and `session::payload_fingerprint` hashes `think.name()`, so after a
+    /// `/think` no rung can ever be loaded again. A surviving rung is not a
+    /// wrong-KV hazard here — `restore_rung` only hands the engine a blob it
+    /// actually loaded — but it is a permanently dead ladder: `wants_anchor`
+    /// measures against a rung that can no longer be found, so the ladder reads
+    /// as covered and never captures again, with nothing in the logs to say so.
+    #[test]
+    fn changing_effort_discards_every_kv_rung() {
+        let dir = scratch_dir("think-ladder-discard");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, v41_engine(), &cfg);
+        seed_ladder(&mut agent, 3);
+
+        let out = agent.think_command("25", &mut || {});
+        assert!(out.contains("25"), "got: {out}");
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "a rung survived a reasoning-level change: {:?}",
+            agent.ladder.rungs()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `off` and `medium` share the empty effort preamble, so nothing about the
+    /// *prompt* moves — but `payload_fingerprint` keys on the level's name, not
+    /// on its preamble, so the rungs die just the same. This is the pair a
+    /// `prefix_changed` gate would silently leave broken.
+    #[test]
+    fn a_level_change_that_keeps_the_preamble_still_discards_the_ladder() {
+        let dir = scratch_dir("think-ladder-free-pair");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert_eq!(agent.think, ThinkMode::Off);
+        assert_eq!(
+            ThinkMode::Off.effort_prefix(false),
+            ThinkMode::Medium.effort_prefix(false),
+            "this test is about the pair that shares a preamble",
+        );
+        seed_ladder(&mut agent, 2);
+
+        agent.think_command("medium", &mut || {});
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "the ladder outlived a level change that kept the preamble",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The C splices the new prefix in front of the transcript tail and leaves
+    /// every token behind it untouched. plank never materializes that prefix
+    /// into the transcript at all — it is re-rendered from `self.think` on each
+    /// prompt build — so the tail must come through a `/think` byte-identical,
+    /// and a `/think` that rewrote conversation content would be a bug the C
+    /// does not have either.
+    #[test]
+    fn changing_effort_preserves_the_transcript_tail() {
+        let dir = scratch_dir("think-ladder-tail");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, v41_engine(), &cfg);
+        seed_ladder(&mut agent, 1);
+        let before = render_transcript(&agent.session, &agent.system);
+
+        agent.think_command("25", &mut || {});
+        assert_eq!(
+            render_transcript(&agent.session, &agent.system),
+            before,
+            "the transcript tail must survive a think-prefix change verbatim",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The C scans levels 0..100 to find the prefix a *restored* session really
+    /// carries, because its transcript holds spliced tokens that may predate the
+    /// current CLI setting. plank has no such disagreement to resolve — the
+    /// prefix is rebuilt from `self.think` every time — but the hazard the scan
+    /// guards against is real here in the cache layer: rungs signed at one
+    /// effort must be dropped when the effort changes, whatever level the
+    /// session is sitting at and whether the change moves the preamble or not.
+    ///
+    /// This covers only the in-memory ladder: it seeds rungs with the agent at
+    /// `Max` and switches to a numeric level. Nothing is written to or read
+    /// back from disk, so it proves the drop-on-change rule, not restoration.
+    #[test]
+    fn switching_effort_drops_rungs_seeded_at_the_previous_level() {
+        let dir = scratch_dir("think-ladder-restored");
+        let mut cfg = crate::config::AgentConfig::default();
+        // The session came back at `max`; the rungs on disk were signed by
+        // whatever level wrote them.
+        cfg.generation.think_mode = ThinkMode::Max;
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                ctx_override: Some(crate::engine::THINK_MAX_MIN_CONTEXT),
+                ..v41_engine()
+            },
+            &cfg,
+        );
+        assert_eq!(agent.think, ThinkMode::Max);
+        seed_ladder(&mut agent, 3);
+
+        let out = agent.think_command("7", &mut || {});
+        assert!(out.contains('7'), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Level(7));
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "rungs seeded at a different effort survived the switch",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The C refuses when `transcript.len + delta >= ctx_size`: a longer effort
+    /// preamble that does not fit is not worth a session that no longer fits its
+    /// own context. Only a growth can run out of room, so the shrink back is
+    /// always allowed — and a refusal changes nothing, not the level, not the
+    /// engine, not the ladder.
+    #[test]
+    fn think_refuses_a_longer_preamble_with_no_context_room() {
+        let dir = scratch_dir("think-no-room");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cfg = test_cfg();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                ctx_override: Some(512),
+                think_modes: Some(std::sync::Arc::clone(&seen)),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        seed_ladder(&mut agent, 2);
+        // Full to the brim: any preamble growth at all overruns.
+        agent.last_ctx_used = 512;
+
+        let out = agent.think_command("low", &mut || {});
+        assert!(out.contains("no context room"), "got: {out}");
+        assert_eq!(
+            agent.think,
+            ThinkMode::Off,
+            "a refusal must not take effect"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the engine must not be told"
+        );
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            2,
+            "a refused change must leave the ladder alone",
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -21818,6 +22322,68 @@ mod tests {
         assert!(out.contains("max"), "got: {out}");
         assert_eq!(agent.think, ThinkMode::Max);
         assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Max]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // `/think N` on V4.1: the level is set, reported, and pushed to the engine,
+    // which is where it becomes `DS4_THINK_LEVEL_BASE + N`.
+    #[test]
+    fn think_command_accepts_a_numeric_level_on_v41() {
+        let dir = scratch_dir("think-level-v41");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            model: Some("DeepSeek V4.1 Flash".to_owned()),
+            think_modes: Some(std::sync::Arc::clone(&seen)),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        let out = agent.think_command("25", &mut || {});
+        assert!(out.contains("25"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Level(25));
+        assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Level(25)]);
+
+        // Zero is `off`, not a level, exactly as the C parses it.
+        let out = agent.think_command("0", &mut || {});
+        assert!(out.contains("off"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Off);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // On anything but V4.1 a numeric effort is refused rather than rounded to
+    // ordinary thinking, and the level is left alone.
+    #[test]
+    fn think_command_rejects_a_numeric_level_off_v41() {
+        let dir = scratch_dir("think-level-v4");
+        let engine = ScriptedEngine {
+            model: Some("DeepSeek V4 Flash".to_owned()),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let out = agent.think_command("25", &mut || {});
+        assert!(out.contains("V4.1"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Off, "level unchanged");
+        // The named levels are unaffected.
+        let out = agent.think_command("max", &mut || {});
+        assert!(!out.contains("V4.1"), "got: {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Out of range is not a level at all, on any model.
+    #[test]
+    fn think_command_rejects_an_out_of_range_level() {
+        let dir = scratch_dir("think-level-range");
+        let engine = ScriptedEngine {
+            model: Some("DeepSeek V4.1 Flash".to_owned()),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let out = agent.think_command("101", &mut || {});
+        assert!(out.contains("expected"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Off, "level unchanged");
         std::fs::remove_dir_all(&dir).ok();
     }
 

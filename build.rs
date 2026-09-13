@@ -46,6 +46,7 @@ fn main() {
         "ds4_ssd.o",
         "ds4_metal.o",
         "ds4_layer_pack.o",
+        "ds4_engram.o",
         "ds4_web.o",
     ];
     let status = Command::new("make")
@@ -85,6 +86,8 @@ fn main() {
         "ds4_distributed.c",
         "ds4_tp.c",
         "ds4_layer_pack.c",
+        "ds4_engram.c",
+        "ds4_engram.h",
         "ds4_web.c",
         "ds4_web.h",
     ] {

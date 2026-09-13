@@ -27,16 +27,6 @@ pub const DEFAULT_CTX_SIZE: i32 = 1_048_576;
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // flat CLI flags, not a state machine
 pub struct AgentConfig {
-    /// Run the Qwen3.8-Flash-Next model instead of `DeepSeek` V4, from
-    /// `--qwen`. Off by default.
-    ///
-    /// A shorthand, not a mode: it only fills in the two default paths
-    /// (`~/.plank/qwen.gguf` and its `qwen.mtp.gguf` companion), and an
-    /// explicit `-m` or `--mtp-model` still wins. Everything that actually
-    /// behaves differently for Qwen — the tools prompt, the tool-call parser,
-    /// the companion slot, the cache leaf — is decided from the loaded model's
-    /// own architecture, never from this flag.
-    pub qwen: bool,
     /// Sampling and length options for generation.
     pub generation: GenerationOptions,
     /// One-shot prompt supplied with `-p`/`--prompt`.
@@ -162,6 +152,16 @@ pub struct AgentConfig {
     /// it may be replaced by the provider's reported window; an explicit value
     /// is the user's decision and is never overridden.
     pub ctx_size_explicit: bool,
+    /// Whether the sampling temperature came from the user (`--temp`) rather
+    /// than from a default — plank's own 0.6, or the 0.0 [`finalize`] imposes
+    /// when speculative decoding is requested.
+    ///
+    /// Consulted when speculation turns out not to run after all (an
+    /// unsupported family, a refused `DSpark` companion): the imposed 0.0 only
+    /// existed to let the draft gate open, so with nothing to gate it is
+    /// dropped for the 0.6 default. A temperature the user typed is never
+    /// touched — see [`temperature_without_speculation`].
+    pub temp_explicit: bool,
     /// Settings keys (`section.key`) a CLI flag overrode, for `/config
     /// --resolved`. Populated by [`parse_options_with`]; empty when no flag
     /// shadowed a settings key.
@@ -244,30 +244,33 @@ pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 pub struct EngineTuning {
     /// The model's companion GGUF, from `--mtp PATH`.
     ///
-    /// One flag, two destinations, chosen by the family of the *main* model:
-    /// a `DeepSeek` run passes it as the engine's `mtp_path` (its `DSpark`
-    /// draft checkpoint), a Qwen run as `ple_path` (its required n-gram
-    /// sidecar). `Ds4Model::open` does the routing, because the engine cannot:
-    /// it detects the family while opening, and the path has to be in the
-    /// options struct before that.
+    /// Passed as the engine's `mtp_path`: the `DSpark` draft checkpoint every
+    /// family plank serves speculates from. `Ds4Model::open` routes it, because
+    /// the engine cannot: it detects the family while opening, and the path has
+    /// to be in the options struct before that.
     pub mtp_path: Option<PathBuf>,
+    /// Whether [`EngineTuning::mtp_path`] came from the user naming it
+    /// (`--mtp-model PATH`) rather than from plank resolving the default
+    /// `DSpark` file on disk ([`crate::download::ensure_dspark_support`]).
+    ///
+    /// The distinction is what lets a failed open retry without the companion:
+    /// a file plank chose itself may be dropped when the checkpoint refuses it,
+    /// while one the user named must fail loudly instead of being silently
+    /// ignored.
+    pub mtp_path_explicit: bool,
     /// Draft tokens per MTP step from `--mtp-draft` (C default: 1).
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
     pub mtp_margin: f32,
     /// Speculative decoding. On by default; `--mtp-off` turns it off.
     ///
-    /// One name, one meaning — "predict more than one token per step" — and a
-    /// different mechanism per family. A `DeepSeek` run speculates with its
-    /// `DSpark` draft checkpoint, taken from `--mtp` when given and otherwise
-    /// resolved to `~/.plank/ds4flash.dspark.gguf` and downloaded if absent. A
-    /// Qwen run speculates with the MTP block embedded in its own main GGUF,
-    /// so it needs no companion for this at all — its `--mtp` path is the PLE
-    /// sidecar, which is required whether speculation is on or off.
+    /// One name, one meaning — "predict more than one token per step". A run
+    /// speculates with its `DSpark` draft checkpoint, taken from `--mtp` when
+    /// given and otherwise resolved to `~/.plank/ds4flash.dspark.gguf` and
+    /// downloaded if absent.
     ///
-    /// That asymmetry is why the flag governs speculation rather than the
-    /// companion file: `--mtp-off` has to stay harmless, and for Qwen
-    /// "no sidecar" means the model cannot load.
+    /// The flag governs speculation rather than the companion file, so
+    /// `--mtp-off` stays harmless however the paths were set.
     ///
     /// `--mtp-confidence` and `--mtp-strict` also imply it, mirroring the C.
     pub mtp: bool,
@@ -311,10 +314,41 @@ pub struct EngineTuning {
     pub dir_steering_ffn: f32,
 }
 
+impl EngineTuning {
+    /// The same tuning with a plank-chosen `DSpark` companion removed, when
+    /// there is one to remove.
+    ///
+    /// Used for the single retry after a model open that failed with a
+    /// companion attached: the C refuses to open a checkpoint at all when the
+    /// draft model does not match it (V4.1, and the Vision-Exp drafter against
+    /// the `0731` language checkpoint), so a run plank auto-paired must be able
+    /// to fall back to target-only decode instead of refusing to start.
+    ///
+    /// `None` when there is nothing to drop, and — deliberately — when the user
+    /// named the companion themselves: dropping that silently would hide a
+    /// mistyped `--mtp-model` behind a slower run.
+    #[must_use]
+    pub fn without_auto_companion(&self) -> Option<Self> {
+        if self.mtp_path.is_none() || self.mtp_path_explicit {
+            return None;
+        }
+        Some(Self {
+            mtp_path: None,
+            // Speculation needs the drafter; without it the DSpark runtime
+            // would be selected with no support model, which the C rejects
+            // outright ("--dspark requires --mtp-model FILE").
+            mtp: false,
+            mtp_strict: false,
+            ..self.clone()
+        })
+    }
+}
+
 impl Default for EngineTuning {
     fn default() -> Self {
         Self {
             mtp_path: None,
+            mtp_path_explicit: false,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
             mtp: true,
@@ -378,7 +412,6 @@ impl Default for AgentConfig {
             show_help: false,
             show_version: false,
             help_topic: None,
-            qwen: false,
             model_path: None,
             model_delta: None,
             backend: None,
@@ -401,6 +434,7 @@ impl Default for AgentConfig {
             provider_api_key: None,
             provider_cache: true,
             ctx_size_explicit: false,
+            temp_explicit: false,
             cli_provenance: std::collections::BTreeMap::new(),
             dump_config: false,
         }
@@ -461,23 +495,6 @@ pub fn parse_backend(name: &str) -> Option<Backend> {
     }
 }
 
-/// The `--qwen` entry, present only in a build that carries the model.
-///
-/// Listing a flag the build refuses would send the reader to a fix that is not
-/// available to them; the flag's own error message names the feature instead.
-#[cfg(feature = "qwen")]
-const QWEN_USAGE: &str =
-    "      --qwen               run Qwen3.8-Flash-Next instead of DeepSeek V4 (off by
-                           default): shorthand for -m ~/.plank/qwen.gguf
-                           --mtp-model ~/.plank/qwen.mtp.gguf, both expected to be
-                           symlinks you point at your own build. An explicit -m or
-                           --mtp-model wins.
-";
-
-/// See the gated [`QWEN_USAGE`].
-#[cfg(not(feature = "qwen"))]
-const QWEN_USAGE: &str = "";
-
 /// Returns the usage help text, close to the C agent's `-h` output.
 #[must_use]
 #[allow(clippy::too_many_lines)] // one long string literal
@@ -498,7 +515,6 @@ Options:
                            gguf-delta crate: ggd create BASE TARGET OUT.ggd)
 "
     .to_owned()
-        + QWEN_USAGE
         + "  -t, --threads N          worker thread count (backend default when unset)
       --backend NAME       select backend by name: metal, cuda, cpu
       --metal              use the Metal backend
@@ -509,13 +525,10 @@ Options:
                            (on by default; defaults --temp to 0 unless --temp
                            is given). DeepSeek speculates with its DSpark draft
                            model, downloaded to ~/.plank/ds4flash.dspark.gguf
-                           unless --mtp-model names one; Qwen3.8 speculates with
-                           the MTP block inside its own main GGUF
+                           unless --mtp-model names one
       --mtp-off            disable speculative decoding (target-only decode)
       --mtp-model PATH     this model's companion GGUF: the DSpark draft model
-                           for DeepSeek, the required PLE n-gram sidecar for
-                           Qwen3.8 (a Qwen run is text-only, so the DS4 vision
-                           encoder is not loaded)
+                           for DeepSeek
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
       --mtp-confidence F   confidence pruning threshold 0..1
@@ -524,6 +537,7 @@ Options:
       --quality            enable quality mode
       --warm-weights       touch all weights at load
       --ssd-streaming      stream experts from SSD instead of loading resident
+                           (automatic when the model cannot fit in RAM)
       --ssd-streaming-cold          assume a cold SSD cache
       --ssd-streaming-cache-experts N|<N>GB   bound the expert cache
       --ssd-streaming-preload-experts N       preload N experts at startup
@@ -596,6 +610,7 @@ Options:
       --think              ordinary thinking (default); same as /think medium
       --think-low          ask for brief reasoning (experimental; prompt-only)
       --think-max          maximum reasoning effort; needs --ctx 393216 or more
+      --think-level N      explicit reasoning effort 0..100 (DeepSeek V4.1 only)
       --nothink            disable thinking
       --chdir PATH         change working directory before starting
       --worktree NAME      start inside an isolated git worktree of this repo
@@ -906,8 +921,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/skills",
-        args: "",
-        desc: "list the skills loaded from SKILL.md files",
+        args: "[on|off]",
+        desc: "list the loaded skills, or turn skill expansion on/off for this session",
     },
     SlashCommand {
         name: "/plugins",
@@ -931,8 +946,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/hooks",
-        args: "",
-        desc: "list the configured hooks and what triggers them",
+        args: "[on|off]",
+        desc: "list the configured hooks, or turn hook execution on/off for this session",
     },
     SlashCommand {
         name: "/mcp",
@@ -1111,7 +1126,6 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/usage"
             | "/toks"
             | "/init"
-            | "/skills"
             | "/plugins"
             | "/install-claude-plugin"
             | "/frame"
@@ -1120,7 +1134,6 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/jobs"
             | "/memory"
             | "/agent"
-            | "/hooks"
             | "/remote-control"
             | "/rc"
             | "/remote"
@@ -1170,6 +1183,11 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/rate")
         || slash_command_with_args(cmd, "/power")
         || slash_command_with_args(cmd, "/think")
+        // `/hooks` takes an optional `on`/`off` runtime toggle.
+        || slash_command_with_args(cmd, "/hooks")
+        // And `/skills`, the same way: without this, `/skills off` is not a
+        // known command and the whole line is forwarded to the model.
+        || slash_command_with_args(cmd, "/skills")
         || slash_command_with_args(cmd, "/switch")
         || slash_command_with_args(cmd, "/del")
         || slash_command_with_args(cmd, "/strip")
@@ -1229,7 +1247,10 @@ fn parse_engine_option(
     steering_scale_set: &mut bool,
 ) -> Result<(), String> {
     match arg {
-        "--mtp-model" => e.mtp_path = Some(PathBuf::from(v)),
+        "--mtp-model" => {
+            e.mtp_path = Some(PathBuf::from(v));
+            e.mtp_path_explicit = true;
+        }
         "--mtp-draft" => e.mtp_draft_tokens = parse_int(v, arg)?,
         "--mtp-margin" => e.mtp_margin = parse_float_range(v, arg, 0.0, 1000.0)?,
         // The C turns DSpark on for any of its three flags, so the threshold
@@ -1447,6 +1468,17 @@ pub fn parse_options_with(
             "--think-low" => c.generation.think_mode = ThinkMode::Low,
             "--think-max" => c.generation.think_mode = ThinkMode::Max,
             "--nothink" => c.generation.think_mode = ThinkMode::Off,
+            // The C's `--think-level`: an explicit effort only V4.1 has. The
+            // model is not loaded yet, so the family check happens once the
+            // engine is open (`engine::think_level_unsupported`).
+            "--think-level" => {
+                let v = need_arg(&mut i)?;
+                c.generation.think_mode = ThinkMode::parse(v)
+                    .filter(|m| matches!(m, ThinkMode::Off | ThinkMode::Level(_)))
+                    .ok_or_else(|| {
+                        format!("{arg} requires an integer from 0 to 100 (got `{v}`)")
+                    })?;
+            }
             "--chdir" => c.chdir_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--worktree" => c.worktree = Some(need_arg(&mut i)?.to_string()),
             "--worktree-pr" => {
@@ -1477,19 +1509,6 @@ pub fn parse_options_with(
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
             "--ssd-streaming-cold" => c.engine.ssd_streaming_cold = true,
-            #[cfg(feature = "qwen")]
-            "--qwen" => c.qwen = true,
-            // Named rather than reported as unknown: the flag exists, this
-            // build just does not carry the model. Telling the user which
-            // build they have is the difference between a one-line fix and a
-            // hunt through the option list for a typo.
-            #[cfg(not(feature = "qwen"))]
-            "--qwen" => {
-                return Err(
-                    "--qwen: this build has no Qwen support; rebuild with --features qwen"
-                        .to_owned(),
-                );
-            }
             "--mtp" => c.engine.mtp = true,
             "--mtp-off" => c.engine.mtp = false,
             "--mtp-strict" => {
@@ -1521,26 +1540,45 @@ pub fn parse_options_with(
     Ok(c)
 }
 
+/// The temperature a session should really sample at, once it is known
+/// whether speculative decoding can run.
+///
+/// [`finalize`] pins the temperature to 0 whenever `--mtp` is on, because the
+/// engine's draft gate only opens at 0 — but it runs during argument parsing,
+/// before the model family is known, and speculation can still fall away at
+/// model-open time: `DSpark` is implemented for `DeepSeek` V4 alone, and an
+/// auto-paired companion a checkpoint refuses is dropped on the retry. Left
+/// alone, such a run samples greedily as a side effect of a feature that is
+/// not running.
+///
+/// So with no speculation in force the imposed 0 is dropped for the
+/// [`GenerationOptions`] default. `temp_explicit` — a temperature the user
+/// typed — always wins, including an explicit `--temp 0`, and so does a run
+/// that never asked for speculation (`--mtp-off`), whose temperature was never
+/// imposed in the first place.
+#[must_use]
+pub fn temperature_without_speculation(
+    opts: &GenerationOptions,
+    temp_explicit: bool,
+    spec_capable: bool,
+) -> f32 {
+    if spec_capable || temp_explicit || !opts.mtp {
+        return opts.temperature;
+    }
+    GenerationOptions::default().temperature
+}
+
 /// Post-parse fixups: the steering-scale default, the `--mtp` temperature
 /// default, and `--remote` validation.
 fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Result<(), String> {
     if c.engine.dir_steering_file.is_some() && !steering_scale_set {
         c.engine.dir_steering_ffn = 1.0;
     }
-    // `--qwen` is applied here, not at the flag, so it cannot depend on
-    // argument order: an explicit `-m` or `--mtp-model` wins whichever side of
-    // `--qwen` it appears on.
-    if c.qwen {
-        c.model_path
-            .get_or_insert_with(crate::download::default_qwen_path);
-        c.engine
-            .mtp_path
-            .get_or_insert_with(crate::download::default_qwen_mtp_path);
-    }
     // Speculative decoding only engages at temperature 0 (see `ds4engine`'s
     // draft gate), so DSpark defaults the temperature to 0. Done here rather
     // than at the flag because `--temp` may follow it; an explicit `--temp` in
     // either order still wins. `--mtp-off` leaves the 0.6 default in force.
+    c.temp_explicit = temp_set;
     if c.engine.mtp && !temp_set {
         c.generation.temperature = 0.0;
     }
@@ -2029,6 +2067,31 @@ mod tests {
         );
     }
 
+    // `--think-level` mirrors the C's flag: a plain `0..100`, with zero
+    // meaning off. The V4.1-only check needs the model, so it happens once the
+    // engine is open, not here.
+    #[test]
+    fn think_level_flag_takes_a_number() {
+        assert_eq!(
+            parse_options(&args(&["--think-level", "25"]))
+                .unwrap()
+                .generation
+                .think_mode,
+            ThinkMode::Level(25)
+        );
+        assert_eq!(
+            parse_options(&args(&["--think-level", "0"]))
+                .unwrap()
+                .generation
+                .think_mode,
+            ThinkMode::Off
+        );
+        for bad in ["101", "max", "-1", ""] {
+            let err = parse_options(&args(&["--think-level", bad])).unwrap_err();
+            assert!(err.contains("--think-level"), "{bad}: {err}");
+        }
+    }
+
     #[test]
     fn think_flags() {
         assert_eq!(
@@ -2149,12 +2212,7 @@ mod tests {
         // The seams themselves, named so a failure says which one moved.
         assert!(
             text.contains("\n  -t, --threads N"),
-            "the chunk after QWEN_USAGE is un-indented"
-        );
-        #[cfg(feature = "qwen")]
-        assert!(
-            text.contains("\n      --qwen  "),
-            "QWEN_USAGE itself is un-indented"
+            "the chunk after the -m entry is un-indented"
         );
     }
 
@@ -2188,6 +2246,46 @@ mod tests {
         assert!(err.contains("invalid value for --seed"));
         let err = parse_options(&args(&["--temp", "nan"])).unwrap_err();
         assert!(err.contains("invalid value for --temp"));
+    }
+
+    /// `--mtp-model` marks the companion as the user's own choice, which is
+    /// what stops a failed open from silently dropping it.
+    #[test]
+    fn an_explicit_mtp_model_is_marked_as_the_users_choice() {
+        let c = parse_options(&args(&["--mtp-model", "/d.gguf"])).unwrap();
+        assert_eq!(c.engine.mtp_path, Some(PathBuf::from("/d.gguf")));
+        assert!(c.engine.mtp_path_explicit);
+        assert!(
+            c.engine.without_auto_companion().is_none(),
+            "a user-named companion must never be dropped"
+        );
+        // Nothing else sets the flag.
+        let c = parse_options(&args(&["--mtp"])).unwrap();
+        assert!(!c.engine.mtp_path_explicit);
+    }
+
+    /// The retry's decision: drop a plank-chosen companion (and with it the
+    /// `DSpark` runtime, which the C rejects with no support model), keep every
+    /// other knob, and report nothing to drop when there is no companion.
+    #[test]
+    fn the_companion_fallback_drops_only_a_plank_chosen_drafter() {
+        let auto = EngineTuning {
+            mtp: true,
+            mtp_strict: true,
+            mtp_path: Some(PathBuf::from("/auto/dspark.gguf")),
+            mtp_path_explicit: false,
+            ssd_streaming: true,
+            ..EngineTuning::default()
+        };
+        let solo = auto.without_auto_companion().expect("auto is droppable");
+        assert_eq!(solo.mtp_path, None);
+        assert!(!solo.mtp);
+        assert!(!solo.mtp_strict);
+        assert!(solo.ssd_streaming, "unrelated tuning is preserved");
+        // Nothing to drop: no companion at all.
+        assert!(EngineTuning::default().without_auto_companion().is_none());
+        // And the retry is not offered twice: the fallback has no companion.
+        assert!(solo.without_auto_companion().is_none());
     }
 
     #[test]
@@ -2233,6 +2331,42 @@ mod tests {
         assert!((c.generation.temperature - 0.0).abs() < 1e-6);
         let c = parse_options(&args(&["--mtp-confidence", "0.3"])).unwrap();
         assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_temperature_falls_back_when_speculation_cannot_run() {
+        // `--mtp` (the default) pinned 0 during parsing; the model then turns
+        // out to have no DSpark drafter, so the pin has nothing left to serve.
+        let c = parse_options(&[]).unwrap();
+        assert!(c.engine.mtp && !c.temp_explicit);
+        assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+        let restored = temperature_without_speculation(&c.generation, c.temp_explicit, false);
+        let default = GenerationOptions::default().temperature;
+        assert!((restored - default).abs() < 1e-6, "{restored}");
+        // A speculating run keeps its 0.
+        let kept = temperature_without_speculation(&c.generation, c.temp_explicit, true);
+        assert!(kept.abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_explicit_temperature_survives_the_fallback() {
+        for arg in ["0", "0.9"] {
+            let c = parse_options(&["--temp".into(), arg.into()]).unwrap();
+            assert!(
+                c.temp_explicit,
+                "--temp {arg} must record the user's choice"
+            );
+            let settled = temperature_without_speculation(&c.generation, c.temp_explicit, false);
+            assert!(
+                (settled - c.generation.temperature).abs() < 1e-6,
+                "--temp {arg} was overridden: {settled}"
+            );
+        }
+        // And `--mtp-off` never had a temperature imposed, so there is nothing
+        // to restore: the 0.6 default stands either way.
+        let c = parse_options(&["--mtp-off".into()]).unwrap();
+        let settled = temperature_without_speculation(&c.generation, c.temp_explicit, false);
+        assert!((settled - 0.6).abs() < 1e-6);
     }
 
     #[test]
@@ -2300,88 +2434,17 @@ mod tests {
         assert_eq!(c.engine.simulate_used_memory_bytes, 64 << 30);
     }
 
-    /// One companion flag for both families. Which engine slot it lands in is
-    /// decided at open time from the model's own architecture, not here — this
-    /// only pins that the flag carries a path and disturbs nothing else.
-    /// `--qwen` fills in both default paths, and nothing else: the flag is a
-    /// Without the feature the flag is refused *by name*, not swallowed as an
-    /// unknown option: the user needs to learn which build they have, not go
-    /// hunting for a typo.
-    #[cfg(not(feature = "qwen"))]
+    /// No model paths are filled in unless a flag names one.
     #[test]
-    fn the_qwen_flag_is_refused_by_name_without_the_feature() {
-        let err = parse_options(&args(&["--qwen"])).unwrap_err();
-        assert!(err.contains("--qwen"), "names the flag: {err}");
-        assert!(err.contains("--features qwen"), "names the fix: {err}");
-    }
-
-    /// shorthand, so it must not touch the knobs around it.
-    #[cfg(feature = "qwen")]
-    #[test]
-    fn qwen_flag_fills_in_both_default_paths() {
-        let c = parse_options(&args(&["--qwen"])).unwrap();
-        assert!(c.qwen);
-        assert_eq!(c.model_path, Some(crate::download::default_qwen_path()));
-        assert_eq!(
-            c.engine.mtp_path,
-            Some(crate::download::default_qwen_mtp_path())
-        );
-        assert!(c.engine.mtp, "speculation still defaults on");
-    }
-
-    #[test]
-    fn qwen_is_off_by_default() {
+    fn no_model_paths_by_default() {
         let c = parse_options(&[]).unwrap();
-        assert!(!c.qwen);
         assert!(c.model_path.is_none());
         assert!(c.engine.mtp_path.is_none());
     }
 
-    /// An explicit path wins on either side of `--qwen`, which is the whole
-    /// reason the flag is applied after parsing rather than at the flag.
-    #[cfg(feature = "qwen")]
-    #[test]
-    fn an_explicit_model_beats_qwen_in_either_order() {
-        for order in [
-            vec!["--qwen", "-m", "/custom.gguf"],
-            vec!["-m", "/custom.gguf", "--qwen"],
-        ] {
-            let c = parse_options(&args(&order)).unwrap();
-            assert_eq!(
-                c.model_path,
-                Some(PathBuf::from("/custom.gguf")),
-                "{order:?}"
-            );
-            // The companion still defaults, since only `-m` was overridden.
-            assert_eq!(
-                c.engine.mtp_path,
-                Some(crate::download::default_qwen_mtp_path()),
-                "{order:?}"
-            );
-        }
-    }
-
-    #[cfg(feature = "qwen")]
-    #[test]
-    fn an_explicit_companion_beats_qwen_in_either_order() {
-        for order in [
-            vec!["--qwen", "--mtp-model", "/c.gguf"],
-            vec!["--mtp-model", "/c.gguf", "--qwen"],
-        ] {
-            let c = parse_options(&args(&order)).unwrap();
-            assert_eq!(
-                c.engine.mtp_path,
-                Some(PathBuf::from("/c.gguf")),
-                "{order:?}"
-            );
-            assert_eq!(
-                c.model_path,
-                Some(crate::download::default_qwen_path()),
-                "{order:?}"
-            );
-        }
-    }
-
+    /// One companion flag for every family. Which engine slot it lands in is
+    /// decided at open time from the model's own architecture, not here — this
+    /// only pins that the flag carries a path and disturbs nothing else.
     #[test]
     fn mtp_model_flag_sets_the_companion_path() {
         let c = parse_options(&args(&["--mtp-model", "ple.gguf"])).unwrap();

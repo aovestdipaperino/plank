@@ -101,25 +101,40 @@ sequenceDiagram
 plank supports two model families and tells them apart three times, from three
 different sources, because each answer is needed at a different moment.
 
-The second family, Qwen3.8-Flash-Next, is behind the **`qwen` Cargo feature and
-is off by default** — see the feature's comment in `Cargo.toml`. What the gate
-covers is the *capability*: the `--qwen` flag, the model's tools prompt and
-`<tool_call>` parser (`trace_stream::qwen`, swapped for a no-op stub so
-`viz.rs` needs no `#[cfg]` on its dialect dispatch), and the PLE wiring. What
-it deliberately does **not** cover is detection or anything on disk:
-`gguf::family_of` still recognises a Qwen GGUF so `ds4engine::supported_family`
-can refuse it by name instead of misparsing it as DeepSeek, and `.qwn.kv`
-transcripts written by a Qwen-enabled build still load, sweep and GC normally.
+The second family is DeepSeek V4.1 Flash. It is not a revision of V4 but a
+separate model: different weights, tokenizer and vision encoder, and its own
+DSML dialect (the same markers respelled with a leading space). Nothing
+captured under one family may be replayed under the other, so the split runs
+all the way down — `ModelFamily::Ds4`/`Ds41`, `ToolSyntax::Dsml`/`Dsml41`,
+`ModelSet::Ds4`/`Ds41`, and `.ds4.kv`/`.ds41.kv` transcripts.
+
+Retiring a family is a third thing, neither supporting it nor deleting it.
+plank once served Qwen3.8-Flash-Next; upstream removed its Metal kernels, so
+the support is gone — no Cargo feature, no flag, no dialect, no manifest. What
+remains is `gguf::RETIRED_MODEL_PREFIXES`: `ModelFamily::for_model_name`
+answers `None` for a retired shape name, and because `session::blob_family`
+routes through it, `blob_family(meta) == Some(family())` can never hold for a
+blob captured under one. `.qwn.kv` transcripts and their bodies are therefore
+**inert** — never listed, never swept, never restored. That `None` is the
+data-safety guarantee, not an oversight: folding a retired name into `Ds4`
+would hand one model's KV cache to another. It is meant to stay unmatchable.
 
 `gguf::family_of` reads a model's own `general.architecture` — matching
-`qwen4exp` exactly as the C's `config_validate_model` does — and is the only
-answer available *before* `ds4_engine_open`. It has to be: the companion GGUF
-goes in a different options field per family (`mtp_path` for a DeepSeek draft
-checkpoint, `ple_path` for a Qwen sidecar), both fields must be populated
-before that call, and a `ple_path` handed to a non-Qwen model is a hard error
-in the C. Opening twice to ask the engine is not an option — the first open
-pays the whole residency cost. It also decides the vision skip, the side-artifact
-downloads, and the transcript extension.
+`deepseek41` whole, exactly as the C's `config_validate_model` does, since V4's
+`deepseek4` is not a prefix match away — and is the only answer available
+*before* `ds4_engine_open`. It has to be: the companion GGUF goes in `mtp_path`
+and must be populated before that call, while only the V4 set ships a drafter
+to put there at all. Opening twice to ask the engine is not an option — the
+first open pays the whole residency cost. It also decides the vision skip, the
+side-artifact downloads, and the transcript extension.
+
+`Ds4EngineOptions` (`ffi.rs`) mirrors the C `ds4_engine_options`
+field-for-field, and is declared through a macro that also emits the field-name
+list `tests/c_parity.rs` checks against `refs/ds4/ds4.h`. The guard is there
+because the failure it catches is silent: when a field was dropped from the
+middle of the C struct and plank's mirror kept it, every later field shifted
+eight bytes and `--ssd-streaming` stopped reaching the engine with no error
+anywhere. A field added, removed or reordered in the C now fails the build.
 
 `ToolSyntax::for_model_name` reads the shape name the engine reports *after*
 opening, and selects the tool-call dialect: the tools prompt, the parser, the
@@ -132,6 +147,14 @@ directory, install slots, artifact kinds, remote URL. The sets share nothing,
 because the invariant that makes a swap safe is per-set — the manifest moves
 last, so its presence proves that set landed, and one shared staging area would
 let a half-staged download of one family read as proof about the other.
+
+Only the V4 set is actually *managed*: `ds4.manifest` is the one manifest in
+the repo, and `default_set_for_root` answers `Ds4` for a fresh install. V4.1 is
+reached by pointing `-m` at a V4.1 GGUF — the family, dialect, transcript
+extension and install paths all follow from the file — and its manifest fetch
+simply 404s, which the startup flow already treats like being offline: nothing
+printed, nothing offered, and the 24-hour check file stamped before the fetch
+so it is not retried until tomorrow.
 
 ### Weight deltas (`ggufdelta.rs`, `crates/gguf-delta`)
 A `.ggd` file is the difference between two GGUF files of identical layout —

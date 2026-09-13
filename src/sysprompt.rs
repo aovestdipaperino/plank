@@ -42,99 +42,6 @@ Use more for exact continuation; a byte-limited chunk can end within a line. \
 If the user explicitly asks you to read a complete file into context, call read with whole=true. \
 A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n";
 
-/// Tools prompt for the Qwen3.8-Flash-Next dialect (`ds4_agent.c`,
-/// `agent_build_qwen_tools_prompt` with `edit_upto`).
-///
-/// Qwen3.8 does not speak DSML. It is taught its own `<tool_call>` syntax and
-/// is handed JSON function schemas inside `<tools>`, which is why this is a
-/// separate prompt rather than a variation on [`TOOLS_PROMPT`]. Assembled from
-/// the C by decoding its string literals rather than retyping them, since
-/// every byte here is model-facing.
-///
-/// Two deliberate omissions from the C, both because the text would be false
-/// of plank rather than merely different:
-///
-/// - `AGENT_TOOL_CONTRACTS` is left out whole, exactly as the DSML prompt
-///   leaves it out. It asserts "Read output is limited to 128 KiB", which is
-///   the C's `AGENT_TOOL_MAX_BYTES` buffer limit and not plank's behaviour —
-///   plank bounds a read by context, as the rules below still say — and that
-///   write and edit "reject hard-linked files", which plank never checks.
-///   Its other claims do hold (bash `timeout_sec` 3600, `refresh_sec` 60,
-///   search `max_results` 50 in 1-500, `context` 0 in 0-5), so the block is a
-///   candidate for adoption sentence by sentence once those two are settled.
-/// - The vision schema, because a Qwen run is text-only here (see
-///   `Ds4Model::open`).
-#[cfg(feature = "qwen")]
-pub const TOOLS_PROMPT_QWEN: &str = r#"You are a coding agent running in a local workspace. Use tools for local file and system work. Avoid printing large file contents or large code blocks as answers; create or edit files with tools, then summarize results briefly.
-
-# Tools
-
-You have access to the following functions:
-
-<tools>
-{"type": "function", "function": {"name":"google_search","description":"Search web pages.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}
-{"type": "function", "function": {"name":"visit_page","description":"Read a URL in browser.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}
-{"type": "function", "function": {"name":"bash","description":"Run a shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_sec":{"type":"integer"},"refresh_sec":{"type":"integer"}},"required":["command"]}}}
-{"type": "function", "function": {"name":"bash_status","description":"Check a bash job.","parameters":{"type":"object","properties":{"job":{"type":"integer"},"pid":{"type":"integer"},"refresh_sec":{"type":"integer"}},"required":["job"]}}}
-{"type": "function", "function": {"name":"bash_stop","description":"Stop a bash job.","parameters":{"type":"object","properties":{"job":{"type":"integer"},"pid":{"type":"integer"},"refresh_sec":{"type":"integer"}},"required":["job"]}}}
-{"type": "function", "function": {"name":"read","description":"Read a text file/range.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"max_lines":{"type":"integer"},"whole":{"type":"boolean"},"raw":{"type":"boolean"}},"required":["path"]}}}
-{"type": "function", "function": {"name":"more","description":"Continue previous read-like output.","parameters":{"type":"object","properties":{"count":{"type":"integer"}}}}}
-{"type": "function", "function": {"name":"write","description":"Create or overwrite a file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}
-{"type": "function", "function": {"name":"edit","description":"Replace one exact old text match.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}}}
-{"type": "function", "function": {"name":"search","description":"Search files.","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"mode":{"type":"string","enum":["literal","regex"]},"glob":{"type":"string"},"context":{"type":"integer"},"max_results":{"type":"integer"},"case_sensitive":{"type":"boolean"}},"required":["query"]}}}
-{"type": "function", "function": {"name":"list","description":"List one directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}
-</tools>
-
-Inside string values only, escape a literal </parameter> as &lt;/parameter>. To write that escaped spelling literally, use &amp;lt;/parameter>. Other HTML entities are unchanged.
-
-If you choose to call a function ONLY reply in the following format with NO suffix:
-
-<tool_call>
-<function=example_function_name>
-<parameter=example_parameter_1>
-value_1
-</parameter>
-<parameter=example_parameter_2>
-This is the value for the second parameter
-that can span
-multiple lines
-</parameter>
-</function>
-</tool_call>
-
-<IMPORTANT>
-Reminder:
-- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
-- Required parameters MUST be specified
-- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
-- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
-</IMPORTANT>
-
-Tool calls are not allowed inside <think></think>; finish thinking before emitting <tool_call>.
-
-# Rules
-
-- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.
-- If read says more lines are available, call more with count=<lines> to read the next chunk.
-- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient for the task; add raw=true only when line numbers would corrupt the payload.
-- When editing files, state the target filename before the edit; for the edit tool, put path first.
-- Use edit with exact old text and replacement new text; old may contain one [upto] marker between unique anchors.
-- For long bash jobs, pass refresh_sec and then poll with bash_status or stop with bash_stop.
-- Preserve the current system configuration unless the user explicitly asks otherwise.
-"#;
-
-/// Returns the short Qwen tool-call syntax reminder (verbatim from C).
-///
-/// The counterpart of [`dsml_syntax_reminder`]: re-shown after a malformed
-/// call so the model has the shape in front of it.
-#[must_use]
-#[cfg(feature = "qwen")]
-pub fn qwen_syntax_reminder() -> &'static str {
-    "Tool-call syntax reminder:\n\
-<tool_call>\n<function=$TOOL_NAME>\n<parameter=$PARAMETER_NAME>\n\
-$PARAMETER_VALUE\n</parameter>\n</function>\n</tool_call>\n"
-}
-
 /// Editing-instructions section of the tools prompt (verbatim from C).
 ///
 /// This is the C's `agent_tools_prompt_edit_upto` variant: plank's edit tool
@@ -607,72 +514,26 @@ fn build_tools_prompt_parts_with_wasm(
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
-    #[cfg_attr(not(feature = "qwen"), allow(unused_variables))] syntax: ToolSyntax,
+    syntax: ToolSyntax,
 ) -> (String, usize) {
-    // Unreachable without the feature: `Ds4Model::open` refuses a Qwen model
-    // before any prompt is built, so the dialect can never be selected. The
-    // arm is gated rather than left to fall through to DSML so that, if that
-    // refusal is ever bypassed, the build fails to compile instead of quietly
-    // handing a Qwen model the wrong prompt.
-    #[cfg(feature = "qwen")]
-    if syntax == ToolSyntax::Qwen {
-        return build_qwen_tools_prompt_parts(mcp_servers, wasm_tools);
-    }
     let mut out = build_tools_prompt_base(parity);
     insert_marker_spelling_note(&mut out);
     insert_document_read_note(&mut out);
     append_native_extra_schemas(&mut out);
     append_working_style(&mut out);
+    // The V4.1 tag respelling happens here and nowhere else: at this point
+    // `out` is entirely plank's own trusted prompt text, and not one byte of
+    // MCP, WASM or `-sys` text has been appended yet. See
+    // [`dsml41_tools_prompt`] for why that ordering is load-bearing.
+    if syntax == ToolSyntax::Dsml41 {
+        out = dsml41_tools_prompt(&out);
+    }
     let trusted_len = out.len();
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     append_wasm_tool_schemas(&mut out, wasm_tools);
     (out, trusted_len)
-}
-
-/// [`TOOLS_PROMPT_QWEN`] with plank's own tools spliced into its schema list.
-///
-/// The dialects differ in shape here, not just in wording. The DSML prompt is
-/// a run of schemas that plank can append to, so its extras go on the end; the
-/// Qwen prompt fences its schemas inside `<tools>` … `</tools>` and puts the
-/// call-format instructions and rules *after* that, so appending would advertise
-/// tools below the rules that describe how to call them. They are inserted
-/// instead. The schema shape is the same `{"type": "function", …}` object in
-/// both, which is what makes the splice possible at all.
-///
-/// The trusted span is empty, unlike the DSML path. That span exists so the
-/// literal `｜DSML｜` in the prompt's examples tokenizes as the model's own
-/// marker token rather than as spelled-out BPE pieces; this prompt contains no
-/// DSML, so there is nothing to preserve, and the C agrees — it hands an
-/// XML-dialect tools prompt over as an ordinary system message rather than as
-/// rendered chat (`agent_syntax_is_xml_tool_call`).
-#[cfg(feature = "qwen")]
-const QWEN_SCHEMA_FENCE: &str = "\n</tools>";
-
-#[cfg(feature = "qwen")]
-fn build_qwen_tools_prompt_parts(
-    mcp_servers: &[crate::tools::mcp::McpServer],
-    wasm_tools: &[&crate::wasmreg::WasmTool],
-) -> (String, usize) {
-    // Schemas belong inside the fence; server *instructions* are prose and
-    // belong after it, with the rest of the guidance.
-    let mut schemas = String::new();
-    append_native_extra_schemas(&mut schemas);
-    crate::tools::mcp::append_tool_schemas(&mut schemas, mcp_servers);
-    crate::tools::mcp::append_resource_tool_schemas(&mut schemas, mcp_servers);
-    append_wasm_tool_schemas(&mut schemas, wasm_tools);
-
-    let at = TOOLS_PROMPT_QWEN
-        .find(QWEN_SCHEMA_FENCE)
-        .expect("the Qwen tools prompt fences its schemas with </tools>");
-    let mut out = String::with_capacity(TOOLS_PROMPT_QWEN.len() + schemas.len());
-    out.push_str(&TOOLS_PROMPT_QWEN[..at]);
-    out.push_str(&schemas);
-    out.push_str(&TOOLS_PROMPT_QWEN[at..]);
-    crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
-    append_working_style(&mut out);
-    (out, 0)
 }
 
 /// Plank-owned guidance on how to spend turns, appended after the native tool
@@ -1158,6 +1019,74 @@ pub fn dsml_syntax_reminder() -> &'static str {
 </｜DSML｜tool_calls>\n"
 }
 
+/// Returns the short DSML syntax reminder in the V4.1 dialect (verbatim from
+/// the C's `agent_dsml41_syntax_reminder`).
+///
+/// Written as plain lines rather than a `\`-continued literal, so no leading
+/// whitespace can be stripped: the V4.1 tag names *begin* with a space.
+#[must_use]
+pub fn dsml41_syntax_reminder() -> &'static str {
+    concat!(
+        "DSML syntax reminder:\n",
+        "<｜DSML｜ calls>\n",
+        "<｜DSML｜ invoke name=\"$TOOL_NAME\">\n",
+        "<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n",
+        "</｜DSML｜ calls>\n",
+    )
+}
+
+/// Rewrites the three DSML tag names in **plank's own tools prompt** to their
+/// V4.1 spellings.
+///
+/// Ports `agent_dsml41_tools_prompt` from `refs/ds4/ds4_agent.c`, whose comment
+/// states the rule this function inherits:
+///
+/// > Adapt only our trusted examples, including their escaped closing tags.
+/// > Never translate sampled text or user/tool payloads between model formats.
+///
+/// So this must only ever be called on text plank authored. It is not a
+/// general DSML translator: applying it to model output, user input, MCP
+/// schemas or tool results would let untrusted bytes be reshaped into control
+/// text of a dialect the parser then honours. Its one call site is inside
+/// [`build_tools_prompt_parts_with_wasm`], before any third-party text has
+/// been appended to the buffer.
+///
+/// The rewrite walks for the `｜DSML｜` marker and, immediately after each
+/// occurrence, replaces `tool_calls`, `invoke` or `parameter` with the V4.1
+/// name — but only when the word is followed by `>` or a space, so it is
+/// really a tag and not prose. A bare "parameter" in a sentence is untouched.
+#[must_use]
+pub fn dsml41_tools_prompt(source: &str) -> String {
+    const MARKER: &str = "｜DSML｜";
+    let tags = ToolSyntax::Dsml41.dsml_tags();
+    let v4 = ToolSyntax::Dsml.dsml_tags();
+    let names = [
+        (v4.calls_name, tags.calls_name),
+        (v4.invoke_name, tags.invoke_name),
+        (v4.param_name, tags.param_name),
+    ];
+
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(at) = rest.find(MARKER) {
+        let after = at + MARKER.len();
+        out.push_str(&rest[..after]);
+        rest = &rest[after..];
+        for (from, to) in names {
+            if let Some(tail) = rest.strip_prefix(from)
+                && (tail.starts_with('>') || tail.starts_with(' '))
+            {
+                out.push_str(to);
+                rest = tail;
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Builds the full system prompt reminder block, framed like the C version.
 ///
 /// Mirrors `agent_build_system_prompt_reminder`: the tools prompt wrapped in
@@ -1271,6 +1200,8 @@ pub fn build_system_prompt_parts_with_wasm(
     parity: bool,
     syntax: ToolSyntax,
 ) -> SplitSystemPrompt {
+    // Both dialects share one tools prompt; V4.1 differs only by the three tag
+    // names the builder respells inside the trusted span.
     let (mut text, trusted_len) =
         build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity, syntax);
     if crate::settings::active().git.sign_commits {
@@ -1846,6 +1777,106 @@ mod tests {
         assert_eq!(read.parameters["type"], "object");
         assert!(read.parameters["properties"].get("path").is_some());
         assert!(!read.description.is_empty());
+    }
+
+    #[test]
+    fn dsml41_reminder_shape() {
+        let r = dsml41_syntax_reminder();
+        assert!(r.starts_with("DSML syntax reminder:\n"));
+        assert!(r.contains("<｜DSML｜ invoke name=\"$TOOL_NAME\">"));
+        assert!(r.contains("</｜DSML｜ parameter>"));
+        assert!(r.ends_with("</｜DSML｜ calls>\n"));
+        assert!(!r.contains("tool_calls"));
+    }
+
+    /// The V4 reminder rewritten by [`dsml41_tools_prompt`] is exactly the
+    /// V4.1 reminder — the two constants cannot drift apart silently.
+    #[test]
+    fn dsml41_reminder_is_the_v4_reminder_rewritten() {
+        assert_eq!(
+            dsml41_tools_prompt(dsml_syntax_reminder()),
+            dsml41_syntax_reminder()
+        );
+    }
+
+    #[test]
+    fn dsml41_rewrite_touches_only_the_three_tag_names() {
+        let src = concat!(
+            "call it with <｜DSML｜tool_calls> then <｜DSML｜invoke name=\"read\"> and ",
+            "<｜DSML｜parameter name=\"path\">v</｜DSML｜parameter></｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>. The word parameter alone is untouched."
+        );
+        let out = dsml41_tools_prompt(src);
+        assert!(out.contains("<｜DSML｜ calls>"));
+        assert!(out.contains("<｜DSML｜ invoke name=\"read\">"));
+        assert!(out.contains("</｜DSML｜ parameter>"));
+        assert!(!out.contains("tool_calls"));
+        assert!(out.ends_with("The word parameter alone is untouched."));
+    }
+
+    /// A tag name that is not followed by `>` or a space is prose, not a tag:
+    /// the C's predicate leaves it alone, and so must this port. A marker at
+    /// the very end of the input must not index past the string either.
+    #[test]
+    fn dsml41_rewrite_leaves_non_tag_text_alone() {
+        assert_eq!(
+            dsml41_tools_prompt("<｜DSML｜parameters> and ｜DSML｜invoked"),
+            "<｜DSML｜parameters> and ｜DSML｜invoked"
+        );
+        assert_eq!(
+            dsml41_tools_prompt("trailing ｜DSML｜"),
+            "trailing ｜DSML｜"
+        );
+        assert_eq!(dsml41_tools_prompt(""), "");
+    }
+
+    /// The V4.1 prompt is the V4 prompt with exactly those three tag names
+    /// rewritten, and nothing else: every byte of difference is accounted for
+    /// by `tool_calls` (10 bytes) becoming ` calls` (6, so -4 each) and
+    /// `invoke`/`parameter` each gaining one leading space (+1 each).
+    #[test]
+    fn dsml41_prompt_is_the_v4_prompt_with_tags_rewritten() {
+        let v4 = build_tools_prompt(&[], true);
+        let v41 = dsml41_tools_prompt(&v4);
+
+        // Count only real tags: the marker, the name, then `>` or a space.
+        let tags = |name: &str| -> usize {
+            let needle = format!("｜DSML｜{name}");
+            v4.match_indices(&needle)
+                .filter(|(at, _)| {
+                    let tail = &v4[at + needle.len()..];
+                    tail.starts_with('>') || tail.starts_with(' ')
+                })
+                .count()
+        };
+        let (calls, invokes, params) = (tags("tool_calls"), tags("invoke"), tags("parameter"));
+        assert!(calls > 0 && invokes > 0 && params > 0);
+
+        // Stated as an addition so no subtraction can underflow: the V4 bytes
+        // plus the spaces V4.1 gains equal the V4.1 bytes plus the 4 bytes
+        // each `tool_calls` loses.
+        assert_eq!(v4.len() + invokes + params, v41.len() + calls * 4);
+        assert!(!v41.contains("tool_calls"));
+        assert!(!v41.contains("｜DSML｜invoke"));
+        assert!(!v41.contains("｜DSML｜parameter"));
+        // Rewriting back must reproduce the V4 prompt exactly.
+        assert_eq!(
+            v41.replace("｜DSML｜ calls", "｜DSML｜tool_calls")
+                .replace("｜DSML｜ invoke", "｜DSML｜invoke")
+                .replace("｜DSML｜ parameter", "｜DSML｜parameter"),
+            v4
+        );
+    }
+
+    /// The dialect reaches the built prompt through the public entry point,
+    /// and MCP text appended after the trusted span is never rewritten.
+    #[test]
+    fn dsml41_syntax_selects_the_rewritten_tools_prompt() {
+        let v4 = build_system_prompt_parts_with_wasm("", &[], &[], true, ToolSyntax::Dsml);
+        let v41 = build_system_prompt_parts_with_wasm("", &[], &[], true, ToolSyntax::Dsml41);
+        assert_eq!(dsml41_tools_prompt(&v4.text), v41.text);
+        assert!(v41.text.contains("<｜DSML｜ calls>"));
+        assert!(!v41.text.contains("tool_calls"));
     }
 
     #[test]

@@ -201,8 +201,12 @@ pub fn think_color(mode: crate::engine::ThinkMode) -> u8 {
     match mode {
         ThinkMode::Max => 196,
         ThinkMode::Medium => 231,
-        ThinkMode::Low => 39,
         ThinkMode::Off => 245,
+        // A numeric effort borrows the color of the named level it sits
+        // nearest, so the footer reads at a glance at any effort.
+        ThinkMode::Level(n) if n >= 90 => 196,
+        ThinkMode::Level(n) if n >= 34 => 231,
+        ThinkMode::Low | ThinkMode::Level(_) => 39,
     }
 }
 
@@ -295,21 +299,37 @@ const MTP_MARK: &str = "✨";
 /// while `/mtp` is off — the two are mutually exclusive by construction,
 /// since speculation only runs at temperature 0.
 ///
-/// The bare codepoint, deliberately without the U+FE0F variation selector:
-/// the footer is width-sensitive and the emoji-presentation form measures
-/// differently across terminals.
-const TEMP_MARK: &str = "🌡";
+/// U+1F321 followed by U+FE0F (VS16): the bare codepoint is a *text-default*
+/// emoji, so `unicode_width` reports 1 column for it unless the emoji
+/// presentation is requested explicitly — but terminals render it in colour
+/// at 2 columns regardless. VS16 makes the requested presentation match what
+/// actually gets drawn, so the width measurement agrees with the terminal.
+const TEMP_MARK: &str = "🌡\u{fe0f}";
 
 /// Marks the footer's jobs segment: background bash jobs still running.
 /// Public so the TUI can find the segment for mouse hit-testing.
 pub const JOBS_MARK: &str = "⧗";
 
+/// The SSD-streaming marker. `unicode_width::UnicodeWidthStr::width` (the
+/// same measure [`crate::experts`] uses to pin the brain emoji's width) puts
+/// this at exactly two columns, matching [`HD_MARK_OFF`] below — see
+/// `hd_segment_at` for why the blink alternates the glyph rather than its
+/// style.
+const HD_MARK: &str = "💾";
+
+/// The off phase of the SSD-streaming blink: two spaces, chosen because they
+/// measure the same two columns as [`HD_MARK`] (again by
+/// `unicode_width::UnicodeWidthStr::width`), so swapping between the two never
+/// shifts anything to the segment's right.
+const HD_MARK_OFF: &str = "  ";
+
 /// Marks the footer's memory-pressure segment: plank is paused with its KV
 /// released, waiting for the system to calm down.
 ///
-/// The bare codepoint, without the U+FE0F variation selector, for the reason
-/// [`TEMP_MARK`] spells out: the footer is width-sensitive.
-const PRESSURE_MARK: &str = "⏸";
+/// U+23F8 followed by U+FE0F (VS16), for the same reason as [`TEMP_MARK`]:
+/// text-default emoji need the selector to measure the two columns
+/// terminals actually render them in.
+const PRESSURE_MARK: &str = "⏸\u{fe0f}";
 
 /// Marks the footer's loop-guard segment: the guards are armed and watching.
 /// Distinct from [`LOOP_MARK`], which says a guard has actually seen a cycle.
@@ -318,12 +338,14 @@ const GUARD_MARK: &str = "🔁";
 /// Marks the footer's micro-compaction segment. Public so the TUI can find the
 /// segment for mouse hit-testing, the same reason [`JOBS_MARK`] is.
 ///
-/// The bare codepoint, deliberately without the U+FE0F variation selector, for
-/// the same reason as [`TEMP_MARK`]: the footer is width-sensitive and the
-/// emoji-presentation form measures differently across terminals — and here
-/// the measurement is also the click box, since [`crate::tui::record_mc_rect`]
-/// locates the segment by finding this symbol in the drawn buffer.
-pub const MICROCOMPACT_MARK: &str = "🗑";
+/// U+1F5D1 followed by U+FE0F (VS16), for the same reason as [`TEMP_MARK`]:
+/// the bare codepoint is text-default and `unicode_width` reports 1 column
+/// for it, but terminals draw it in colour at 2 columns regardless, so VS16
+/// makes the two agree. This is also the click box, since
+/// [`crate::tui::record_mc_rect`] locates the segment by finding this exact
+/// symbol (VS16 included) in the drawn buffer — ratatui keeps the whole
+/// grapheme cluster in one cell, so the lookup still matches.
+pub const MICROCOMPACT_MARK: &str = "🗑\u{fe0f}";
 
 /// Beside [`MICROCOMPACT_MARK`] when micro-compaction is on: it is rewriting
 /// old tool results in place to reclaim context.
@@ -362,7 +384,7 @@ pub const CAMERA_MARK: &str = "\u{1f4f7}";
 /// Deliberately not [`GUARD_MARK`]: that one means the guards are armed, which
 /// is the resting state of every session, and one glyph for "watching" and
 /// "caught something" would be read as the same news twice.
-const LOOP_MARK: &str = "♻";
+const LOOP_MARK: &str = "♻\u{fe0f}";
 
 /// The loop segment: ` | 🔁 looping` while `st.looping`, empty otherwise. Rides
 /// after the ctx gauge in the generating footer, whether or not the progress
@@ -609,6 +631,24 @@ pub fn mtp() -> bool {
     DSPARK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the loaded model streams its experts from SSD rather than holding
+/// them resident. Process-global beside the speculation marker and for the same
+/// reason: [`build_status_text`] is a pure function called from a dozen
+/// snapshot sites, and a field would have to be copied forward by every one.
+/// Startup publishes here once the streaming decision is final; the bar reads.
+static SSD_STREAMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether the local engine streams experts from SSD.
+pub fn set_ssd_streaming(on: bool) {
+    SSD_STREAMING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the footer should show the `💾` marker.
+#[must_use]
+pub fn ssd_streaming() -> bool {
+    SSD_STREAMING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Records the sampling temperature, from startup config or `/temp`.
 pub fn set_temperature(temp: f32) {
     TEMPERATURE.store(temp.to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -629,31 +669,39 @@ pub fn set_local_power(percent: i32) {
 /// Process-global like the power share, and for the same reason: the footer is
 /// drawn from places that hold no engine handle, including a remote client
 /// rendering this session's bar.
-static LOCAL_FAMILY_IS_QWEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// A tag rather than a flag: this was a `LOCAL_FAMILY_IS_QWEN` bool, which is
+/// why V4.1 used to render as `local:ds`. `0` is the unset value an untouched
+/// static holds, so it has to stay the `DeepSeek` V4 tag — the footer may be
+/// drawn before any model is open.
+static LOCAL_FAMILY: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(LOCAL_FAMILY_DS4);
+
+const LOCAL_FAMILY_DS4: u8 = 0;
+const LOCAL_FAMILY_DS41: u8 = 1;
 
 /// Records the local engine's model family, once the model is open.
 pub fn set_local_family(family: crate::gguf::ModelFamily) {
-    LOCAL_FAMILY_IS_QWEN.store(
-        family == crate::gguf::ModelFamily::Qwen,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let tag = match family {
+        crate::gguf::ModelFamily::Ds4 => LOCAL_FAMILY_DS4,
+        crate::gguf::ModelFamily::Ds41 => LOCAL_FAMILY_DS41,
+    };
+    LOCAL_FAMILY.store(tag, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The family tag the origin label carries: `ds` or `qwen`.
+/// The family tag the origin label carries: `ds` or `ds41`.
 ///
 /// Short on purpose. It sits in the footer's tightest segment, and the point
 /// is to answer "which model is this" at a glance, not to name the release.
 fn local_family_tag() -> &'static str {
-    if LOCAL_FAMILY_IS_QWEN.load(std::sync::atomic::Ordering::Relaxed) {
-        "qwen"
+    if LOCAL_FAMILY.load(std::sync::atomic::Ordering::Relaxed) == LOCAL_FAMILY_DS41 {
+        "ds41"
     } else {
         "ds"
     }
 }
 
 /// The local engine's origin label, naming the model family and carrying the
-/// power share: `(local:ds ⚡100%)`, or `(local:qwen ⚡60%)` under a cap.
+/// power share: `(local:ds ⚡100%)`, or `(local:ds41 ⚡60%)` under a cap.
 ///
 /// The family tag is what tells two local runs apart at a glance — the same
 /// footer, the same directory, a different model.
@@ -1845,7 +1893,7 @@ fn build_status_text_with_cells(
             st.think.short_name()
         )
     } else {
-        st.think.short_name().to_owned()
+        st.think.short_name().into_owned()
     };
     let think = format!("{THINK_MARK} {level} | ");
     let power = power_suffix(st);
@@ -1883,6 +1931,12 @@ fn build_status_text_with_cells(
     // power suffix anchored on the right.
     let ctx = match spec_segment(st) {
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
+        None => ctx,
+    };
+    // Beside the speculation segment: both are facts about the loaded engine
+    // that hold for every turn, not readings from this one.
+    let ctx = match hd_segment(st, color) {
+        Some(seg) => format!("{ctx} | {seg}"),
         None => ctx,
     };
     let ctx = match guard_segment() {
@@ -2031,6 +2085,75 @@ pub fn jobs_segment(st: &Status) -> Option<String> {
     }
 }
 
+/// The SSD-streaming segment: `💾`, shown whenever the loaded model streams its
+/// experts from disk instead of holding them resident, and blinking while the
+/// engine is prefilling or decoding.
+///
+/// **The blink is a proxy for streaming activity, not a measurement of disk
+/// I/O.** The engine reports no such thing: its only progress event is
+/// `prefill_chunk` (`ds4_session_progress_fn`), and there is no expert-cache
+/// hit/miss counter and no SSD-read callback to hang a real reading on. So the
+/// marker blinks on the one fact plank does know — that a pass is in flight —
+/// which is when a streaming model must be reading experts, without claiming to
+/// count the reads. Steady `💾` therefore means "this model streams", not "the
+/// disk is idle".
+///
+/// Rides with the ctx gauge next to the speculation segment: both describe how
+/// the engine executes every turn rather than anything about this one, and both
+/// have to stay left of the power suffix, which is the line's right anchor.
+///
+/// Most terminals render an emoji glyph with its own colour and ignore SGR
+/// foreground/weight changes, so a style-only blink (as this used to be, back
+/// when the marker was the plain letters `HD`) would be invisible on an emoji.
+/// The blink is therefore a *substitution*: [`HD_MARK`] alternates with
+/// [`HD_MARK_OFF`], two spaces that measure the same two columns (by
+/// `unicode_width::UnicodeWidthStr::width`, the same measure
+/// [`crate::experts`] uses for the brain emoji), so nothing to its right
+/// shifts even though the glyph itself changes. Under reduced motion the
+/// shared clock goes dark and the marker is steady, like the throbber.
+#[must_use]
+pub fn hd_segment(st: &Status, color: bool) -> Option<String> {
+    let active = matches!(st.state, WorkerState::Prefill | WorkerState::Generating);
+    hd_segment_at(ssd_streaming(), active, color, crate::anim::clock_ms())
+}
+
+/// [`hd_segment`] with every input injected, so both phases are testable at a
+/// chosen timestamp without a running clock or a process-global write.
+///
+/// `tick_ms` is [`crate::anim::clock_ms`]: `None` is reduced motion, and the
+/// marker then renders lit whatever the engine is doing.
+#[must_use]
+pub fn hd_segment_at(
+    streaming: bool,
+    active: bool,
+    color: bool,
+    tick_ms: Option<u64>,
+) -> Option<String> {
+    if !streaming {
+        return None;
+    }
+    let lit = match tick_ms {
+        // Reduced motion: no blink, and the marker stays in its lit form.
+        None => true,
+        Some(ms) => !active || tool_blink_on(ms),
+    };
+    if !color {
+        // A monochrome footer has no second appearance to blink into, and
+        // blanking the slot would shift the segments to its right. One form.
+        return Some(HD_MARK.to_owned());
+    }
+    // A style-only blink (bold vs faint) is invisible on an emoji glyph in
+    // most terminals, which render emoji in their own colour and ignore SGR
+    // foreground/weight. So the blink swaps the glyph itself instead:
+    // `HD_MARK` for lit, `HD_MARK_OFF` (two spaces) for the off phase — both
+    // measure the same two columns, so the swap never shifts anything to the
+    // segment's right.
+    let mark = if lit { HD_MARK } else { HD_MARK_OFF };
+    Some(format!(
+        "\x1b[38;5;{THEME_COLOR}m{mark}{STATUS_STYLE_START}"
+    ))
+}
+
 /// The memory-pressure segment: `⏸ paused: memory` while plank has given its
 /// KV session back to the system, `None` otherwise so an ordinary footer is
 /// unchanged.
@@ -2104,8 +2227,15 @@ pub fn build_status_text_within(
 
 /// Visible width, ignoring ANSI escapes so a coloured line is not judged by
 /// the length of its escape sequences.
-fn visible_width(text: &str) -> usize {
-    let mut width = 0;
+///
+/// `pub(crate)` so [`crate::statusbar`] can share this exact measure for its
+/// own safety-net truncation rather than duplicating (an earlier, buggy copy
+/// used `chars().count()`, which both undercounts wide emoji and overcounts
+/// coloured text by counting escape bytes as visible columns).
+pub(crate) fn visible_width(text: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+
+    let mut stripped = String::with_capacity(text.len());
     let mut in_escape = false;
     for c in text.chars() {
         if in_escape {
@@ -2116,10 +2246,54 @@ fn visible_width(text: &str) -> usize {
         } else if c == '\u{1b}' {
             in_escape = true;
         } else {
-            width += 1;
+            stripped.push(c);
         }
     }
-    width
+    // Measured once over the whole stripped string (not per-char) so a
+    // multi-codepoint grapheme is judged by `unicode_width`'s own notion of
+    // combined width rather than summed as independent characters. This is
+    // still not grapheme-cluster aware: a ZWJ sequence (e.g. a family emoji
+    // built from several emoji joined by U+200D) is measured as the sum of
+    // its constituent codepoints' widths, which overcounts relative to how
+    // most terminals render the joined cluster in a single cell. Plain
+    // emoji, flags (regional indicator pairs) and emoji+variation-selector
+    // pairs are measured correctly; true ZWJ sequences are the known gap.
+    stripped.width()
+}
+
+/// Truncates `text` to at most `cols` visible columns, the same measure
+/// [`visible_width`] uses: ANSI escape sequences are zero-width and are
+/// always copied through whole (never sliced mid-sequence, which would leave
+/// a dangling escape that corrupts the terminal's state), and each remaining
+/// character counts by `unicode_width`'s display width rather than by 1.
+///
+/// `pub(crate)` for the same reason as [`visible_width`]: shared with
+/// [`crate::statusbar`]'s safety-net truncation.
+pub(crate) fn truncate_visible(text: &str, cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut out = String::with_capacity(text.len());
+    let mut width = 0usize;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            out.push(c);
+            for c2 in chars.by_ref() {
+                out.push(c2);
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let w = c.width().unwrap_or(0);
+        if width + w > cols {
+            break;
+        }
+        width += w;
+        out.push(c);
+    }
+    out
 }
 
 /// Formats the echoed user prompt line (`* <text>` with bold styling on TTYs).
@@ -2392,20 +2566,115 @@ mod tests {
         assert_eq!(visible_width("\x1b[1;31mred\x1b[0m"), 3);
         assert_eq!(visible_width("\x1b[38;5;120mgreen\x1b[0m!"), 6);
     }
+
+    /// Emoji occupy (at least) two terminal columns each in real terminals,
+    /// but `unicode_width` measures per the Unicode East Asian Width tables:
+    /// `🌡` (U+1F321) and `🗑` (U+1F5D1) are text-default emoji, so the bare
+    /// codepoint is categorized "Ambiguous"/narrow at this Unicode version
+    /// and measures 1 — not 2, as terminals actually draw it. Appending
+    /// U+FE0F (VS16) requests the emoji presentation explicitly, which
+    /// brings `unicode_width` to 2, matching every other mark. Either way
+    /// this is a strict improvement over `chars()` (which gave 1 for all
+    /// six), and it is the same measurement `src/experts.rs` already relies
+    /// on for the brain glyph, so the two stay consistent.
+    #[test]
+    fn visible_width_counts_wide_emoji_as_two_columns() {
+        assert_eq!(visible_width("🌡\u{fe0f}"), 2);
+        assert_eq!(visible_width("🗑\u{fe0f}"), 2);
+        assert_eq!(visible_width("🟢"), 2);
+        assert_eq!(visible_width("📈"), 2);
+        assert_eq!(visible_width("🧠"), 2);
+        assert_eq!(visible_width("💾"), 2);
+        assert_eq!(visible_width("🗑\u{fe0f} 🟢"), 5); // 2 + space + 2
+    }
+
+    /// Pins the display width of every footer mark by name, so a future
+    /// change to any of these constants (adding/dropping VS16, swapping the
+    /// glyph) cannot silently reintroduce an undercount. See
+    /// `visible_width_counts_wide_emoji_as_two_columns` for why `TEMP_MARK`,
+    /// `MICROCOMPACT_MARK`, `PRESSURE_MARK` and `LOOP_MARK` carry an explicit
+    /// VS16 while the others don't need one.
+    ///
+    /// Exhaustive over every footer mark constant: each is listed once, with
+    /// its expected column count, so a newly added mark that is never added
+    /// to this list is a compile-clean gap rather than a silent one — the
+    /// list below is the enumeration to extend. `JOBS_MARK` is the one
+    /// legitimate 1-column entry (a mathematical symbol, not an emoji; VS16
+    /// would be meaningless), so it is listed deliberately with its own
+    /// value instead of being covered by the "everything is 2" assumption.
+    #[test]
+    fn footer_marks_all_measure_two_columns() {
+        let marks: &[(&str, &str, usize)] = &[
+            ("THINK_MARK", THINK_MARK, 2),
+            ("GIT_STAT_MARK", GIT_STAT_MARK, 2),
+            ("MTP_MARK", MTP_MARK, 2),
+            ("TEMP_MARK", TEMP_MARK, 2),
+            ("JOBS_MARK", JOBS_MARK, 1), // deliberate exception: math symbol, not emoji
+            ("HD_MARK", HD_MARK, 2),
+            ("PRESSURE_MARK", PRESSURE_MARK, 2),
+            ("GUARD_MARK", GUARD_MARK, 2),
+            ("MICROCOMPACT_MARK", MICROCOMPACT_MARK, 2),
+            ("MICROCOMPACT_ON", MICROCOMPACT_ON, 2),
+            ("TOKS_MARK", TOKS_MARK, 2),
+            ("CAMERA_MARK", CAMERA_MARK, 2),
+            ("LOOP_MARK", LOOP_MARK, 2),
+            ("SPILL_MARK", SPILL_MARK, 2),
+        ];
+        for (name, mark, expected) in marks {
+            assert_eq!(visible_width(mark), *expected, "{name} = {mark:?}");
+        }
+    }
+
+    #[test]
+    fn visible_width_emoji_mixed_with_ansi() {
+        assert_eq!(visible_width("\x1b[1;31m🧠\x1b[0m"), 2);
+        assert_eq!(visible_width("\x1b[38;5;120m🧠 💾\x1b[0m!"), 6); // 2+1+2+1
+    }
+
+    #[test]
+    fn visible_width_realistic_footer_with_several_emoji() {
+        // A representative footer fragment: thermometer, brain, chart, disk,
+        // wastebasket+dot. Thermometer and wastebasket carry VS16, as the
+        // real constants do, so all six marks measure 2 columns each.
+        let footer = "🌡\u{fe0f} 72% 🧠 4.2k 📈 1.1x 💾 🗑\u{fe0f} 🟢";
+        let ascii_len = footer.chars().filter(char::is_ascii).count();
+        // Six marks (thermometer, brain, chart, disk, wastebasket, dot), each
+        // measuring 2 columns.
+        assert_eq!(visible_width(footer), ascii_len + 6 * 2);
+    }
+
+    /// Pins the real bug: a footer whose emoji make it wider than `cols`
+    /// must be treated as not fitting, so the elider picks a shorter
+    /// candidate instead of overflowing/wrapping the line.
+    #[test]
+    fn visible_width_boundary_emoji_footer_does_not_falsely_fit() {
+        // 40 ASCII chars + one emoji (2 cols) = 42 true columns, but the old
+        // chars()-based counter would have reported 41 and wrongly believed
+        // it fit in a 41-column terminal.
+        let ascii_prefix = "x".repeat(40);
+        let footer = format!("{ascii_prefix}💾");
+        assert_eq!(footer.chars().count(), 41);
+        assert_eq!(visible_width(&footer), 42);
+        assert!(
+            visible_width(&footer) > 41,
+            "must not appear to fit in 41 cols"
+        );
+    }
     use super::*;
 
     #[test]
     fn the_microcompact_segment_shows_both_states() {
-        assert_eq!(microcompact_segment(true), "🗑 🟢");
-        assert_eq!(microcompact_segment(false), "🗑 🔴");
+        assert_eq!(microcompact_segment(true), "🗑\u{fe0f} 🟢");
+        assert_eq!(microcompact_segment(false), "🗑\u{fe0f} 🔴");
         // Off is a state, not an absence: the box stays on the line so it can
         // be double-clicked back on.
         let st = Status::default();
         let line = build_status_text(&st, false, true);
         assert!(line.contains(MICROCOMPACT_MARK), "{line}");
-        // No variation selector: the mark the TUI hit-tests against is the one
-        // the footer actually draws.
-        assert!(!line.contains('\u{fe0f}'), "{line:?}");
+        // The VS16 is deliberate now: it is part of MICROCOMPACT_MARK itself,
+        // so the mark the TUI hit-tests against is exactly the one the footer
+        // draws, VS16 included (see MICROCOMPACT_MARK's doc comment).
+        assert!(line.contains('\u{fe0f}'), "{line:?}");
     }
 
     #[test]
@@ -2417,12 +2686,18 @@ mod tests {
             "an ordinary footer must be unchanged"
         );
         st.pressure_yielded = true;
-        assert_eq!(pressure_segment(&st).as_deref(), Some("⏸ paused: memory"));
+        assert_eq!(
+            pressure_segment(&st).as_deref(),
+            Some("⏸\u{fe0f} paused: memory")
+        );
         // Idle is the state the marker exists for: the yielded window is a
         // wait, and without this it reads as a hang.
         st.state = WorkerState::Idle;
         let text = build_status_text(&st, false, true);
-        assert!(text.contains(" | ⏸ paused: memory | "), "got: {text}");
+        assert!(
+            text.contains(" | ⏸\u{fe0f} paused: memory | "),
+            "got: {text}"
+        );
     }
 
     #[test]
@@ -2486,9 +2761,69 @@ mod tests {
             ..Status::default()
         };
         assert!(
-            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡 0.00 | 🗑 🟢 | 📈 | idle"),
+            build_status_text(&st, false, true)
+                .ends_with("ctx 12% | 🌡\u{fe0f} 0.00 | 🗑\u{fe0f} 🟢 | 📈 | idle"),
             "{}",
             build_status_text(&st, false, true)
+        );
+    }
+
+    /// The actual user-visible bug: with `chars().count()` measuring width,
+    /// a footer whose true column width exceeds `cols` (because of its
+    /// emoji) was judged to fit, so `build_status_text_within` returned the
+    /// full, overflowing line instead of eliding down to a shorter one.
+    ///
+    /// Built-in segments are never elided (only contributed plugin cells
+    /// are), so this needs at least one plugin cell to give the elider
+    /// something to drop; it is restored to empty before the guard is
+    /// released.
+    #[test]
+    fn build_status_text_within_elides_when_emoji_push_past_cols() {
+        // Resets the process-global wasm-segments slot on scope exit, panic
+        // or not, so a failing assertion here can never leak a segment into
+        // an unrelated test running under the same `quiet_footer` lock.
+        struct ResetWasmSegments;
+        impl Drop for ResetWasmSegments {
+            fn drop(&mut self) {
+                set_wasm_segments(Vec::new());
+            }
+        }
+
+        let _lock = quiet_footer();
+        let _reset = ResetWasmSegments;
+        set_wasm_segments(vec![Cell {
+            text: "💾 spill".to_string(),
+            priority: 1,
+            fg: None,
+            bg: None,
+        }]);
+        let st = Status {
+            ctx_used: 1000,
+            ctx_size: 8000,
+            ..Status::default()
+        };
+        let full = build_status_text(&st, false, true);
+        let true_width = visible_width(&full);
+        let naive_width = full.chars().count();
+        // The footer's 💾 plugin cell measures 2 columns under
+        // unicode_width, but only 1 char, so the naive count undercounts
+        // relative to the true column width.
+        assert!(naive_width < true_width, "{full}");
+
+        // Pick cols right at the boundary: the full line fits under the
+        // old, wrong measurement but must NOT fit under the true one, so it
+        // must be elided down (dropping the plugin cell) to something that
+        // actually fits.
+        let cols = naive_width;
+        let candidate = build_status_text_within(&st, false, true, cols);
+        assert!(
+            visible_width(&candidate) <= cols,
+            "candidate must actually fit: {candidate:?} (width {}, cols {cols})",
+            visible_width(&candidate)
+        );
+        assert_ne!(
+            candidate, full,
+            "the full line does not truly fit and must have been elided"
         );
     }
 
@@ -3145,7 +3480,7 @@ mod tests {
             assert!(colored.contains(&want), "{level:?}: {colored:?}");
             let plain = build_status_text(&st, false, true);
             assert!(!plain.contains("\x1b["), "{level:?}: {plain:?}");
-            assert!(plain.contains(level.short_name()), "{level:?}: {plain:?}");
+            assert!(plain.contains(&*level.short_name()), "{level:?}: {plain:?}");
         }
     }
 
@@ -3243,6 +3578,56 @@ mod tests {
         assert!(seg.ends_with(STATUS_STYLE_START), "{seg}");
     }
 
+    /// On a model with a native numeric effort knob the think segment shows
+    /// the effort number in force instead of plank's name for the level — and
+    /// must still hold exactly the same width, so nothing to its right shifts
+    /// when the level changes.
+    #[test]
+    fn the_think_segment_keeps_its_width_with_a_numeric_effort() {
+        use crate::engine::ThinkMode;
+
+        let seg_and_rest = |think: ThinkMode| {
+            let st = Status {
+                think,
+                ctx_size: 1000,
+                ctx_used: 30,
+                ..Status::default()
+            };
+            let line = build_status_text(&st, false, true);
+            let at = line.find(THINK_MARK).expect("think segment present");
+            // The segment alone, mark to bar: measuring the whole tail would
+            // also pick up neighbours that carry process-global state.
+            let rest = &line[at..];
+            let end = rest.find('|').expect("think segment ends at a bar");
+            rest[..=end].chars().count()
+        };
+        // Every level the footer can be in on a numeric family, as the UI
+        // layer maps it for display (`ThinkMode::for_display`).
+        let mut widths = std::collections::HashSet::new();
+        for m in ThinkMode::ALL {
+            widths.insert(seg_and_rest(m.for_display(true)));
+            widths.insert(seg_and_rest(m.for_display(false)));
+        }
+        for n in 1..=100u8 {
+            widths.insert(seg_and_rest(ThinkMode::Level(n)));
+        }
+        assert_eq!(
+            widths.len(),
+            1,
+            "the think segment changed width: {widths:?}"
+        );
+        // And the number is what is shown: `low` reads as 25 on V4.1.
+        let st = Status {
+            think: ThinkMode::Low.for_display(true),
+            ctx_size: 1000,
+            ctx_used: 30,
+            ..Status::default()
+        };
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("25"), "{line}");
+        assert!(!line.contains("low"), "{line}");
+    }
+
     /// A clean tree says nothing: the segment exists to report change, and a
     /// permanent `0 · +0 -0` would be three columns of noise.
     #[test]
@@ -3274,20 +3659,124 @@ mod tests {
             ..Status::default()
         };
 
-        set_local_family(crate::gguf::ModelFamily::Qwen);
+        set_local_family(crate::gguf::ModelFamily::Ds41);
         let line = build_status_text(&st, false, true);
-        assert!(line.contains("(local:qwen"), "{line}");
-        assert!(!line.contains("(local:ds"), "one tag only: {line}");
+        assert!(line.contains("(local:ds41"), "{line}");
 
         set_local_family(crate::gguf::ModelFamily::Ds4);
         let line = build_status_text(&st, false, true);
-        assert!(line.contains("(local:ds"), "{line}");
-        assert!(!line.contains("(local:qwen"), "one tag only: {line}");
+        assert!(line.contains("(local:ds "), "{line}");
+        assert!(!line.contains("(local:ds41"), "one tag only: {line}");
 
         // The bare form is the registration key, not a rendering: it must
         // never reach the bar, or the tag would be silently missing.
         assert!(!line.contains("(local )"), "{line}");
         assert!(!line.contains("(local ⚡"), "{line}");
+    }
+
+    // The two blink glyphs themselves, independent of any segment plumbing:
+    // this is the exact method src/experts.rs uses to pin the brain emoji's
+    // width, applied to the SSD-streaming marker's two phases.
+    #[test]
+    fn hd_mark_and_off_form_are_the_same_display_width() {
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(HD_MARK),
+            unicode_width::UnicodeWidthStr::width(HD_MARK_OFF),
+        );
+        assert_eq!(unicode_width::UnicodeWidthStr::width(HD_MARK), 2);
+    }
+
+    // `💾` appears only for a streaming model, and its two blink phases are
+    // the same two columns, so nothing to its right moves.
+    #[test]
+    fn hd_segment_is_absent_off_and_width_stable_on() {
+        // Visible columns, with the SGR escapes taken back out.
+        fn plain(s: &str) -> String {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '\u{1b}' {
+                    for e in chars.by_ref() {
+                        if e == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        assert_eq!(hd_segment_at(false, false, true, Some(0)), None);
+        assert_eq!(hd_segment_at(false, true, true, Some(0)), None);
+
+        // Idle streaming model: steady, never blinking.
+        let idle = hd_segment_at(true, false, true, Some(0)).unwrap();
+        let idle_late = hd_segment_at(true, false, true, Some(TOOL_BLINK_MS / 2)).unwrap();
+        assert_eq!(
+            idle, idle_late,
+            "a steady marker does not depend on the tick"
+        );
+
+        // Working: the two phases differ in glyph, not style.
+        let lit = hd_segment_at(true, true, true, Some(0)).unwrap();
+        let dim = hd_segment_at(true, true, true, Some(TOOL_BLINK_MS / 2)).unwrap();
+        assert_ne!(lit, dim, "the marker has to actually blink");
+        assert_eq!(lit, idle, "the lit phase is the steady form");
+        // Same measure src/experts.rs uses to pin the brain emoji's width.
+        let visible = |s: &str| unicode_width::UnicodeWidthStr::width(plain(s).as_str());
+        assert_eq!(visible(&lit), 2);
+        assert_eq!(visible(&dim), 2, "the blink must not change the width");
+        assert!(plain(&lit).contains(HD_MARK));
+        assert!(plain(&dim).contains(HD_MARK_OFF));
+        // Both phases hand the footer's own style back, so the bar background
+        // survives past the segment.
+        assert!(lit.ends_with(STATUS_STYLE_START));
+        assert!(dim.ends_with(STATUS_STYLE_START));
+    }
+
+    // Reduced motion freezes the marker the way it freezes the throbber: the
+    // shared clock returns `None` and the lit form is what is drawn.
+    #[test]
+    fn hd_segment_is_steady_under_reduced_motion() {
+        let lit = hd_segment_at(true, true, true, Some(0)).unwrap();
+        assert_eq!(
+            hd_segment_at(true, true, true, None).as_deref(),
+            Some(&*lit)
+        );
+        assert_eq!(
+            hd_segment_at(true, false, true, None).as_deref(),
+            Some(&*lit)
+        );
+        // A monochrome footer has no second appearance to blink into.
+        assert_eq!(
+            hd_segment_at(true, true, false, Some(0)).as_deref(),
+            Some(HD_MARK)
+        );
+        assert_eq!(
+            hd_segment_at(true, true, false, Some(TOOL_BLINK_MS / 2)).as_deref(),
+            Some(HD_MARK)
+        );
+    }
+
+    // The whole footer, not just the segment: `💾` shows up beside the ctx
+    // gauge for a streaming model and is nowhere to be seen otherwise.
+    #[test]
+    fn hd_rides_in_the_footer_beside_the_ctx_gauge() {
+        let _lock = quiet_footer();
+        let st = Status {
+            ctx_size: 1000,
+            ctx_used: 100,
+            ..Status::default()
+        };
+        set_ssd_streaming(false);
+        let off = build_status_text(&st, false, true);
+        assert!(!off.contains(HD_MARK), "{off}");
+        set_ssd_streaming(true);
+        let on = build_status_text(&st, false, true);
+        assert!(on.contains(&format!("| {HD_MARK} |")), "{on}");
+        set_ssd_streaming(false);
     }
 
     /// The power cap rides with the local origin, not the bar's tail: it caps

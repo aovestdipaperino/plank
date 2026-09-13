@@ -266,23 +266,6 @@ fn steady_rate(mark: Option<(std::time::Instant, i32)>, generated: i32) -> f64 {
 /// reported. A couple of tokens divided by a sliver of a second is noise.
 const STEADY_MIN_TOKENS: i32 = 8;
 
-/// Whether the engine is handed the vision encoder for this model.
-///
-/// The encoder GGUF sits beside the main model at
-/// `~/.plank/ds4flash.vision.gguf` and is downloaded at startup when the model
-/// can use it. It is passed only when the C would accept it: `ds4_engine_open`
-/// fails outright when `vision_path` is set and the main GGUF is not the pinned
-/// Vision-Exp checkpoint ("--vision requires ... the pinned `DeepSeek` V4 Flash
-/// Vision-Exp model"), so a language-only or re-quantized `DeepSeek`
-/// checkpoint must open with a null path and run text-only. Likewise for a
-/// Qwen3.8-Flash-Next model: the DS4 encoder is not a Qwen encoder, and a Qwen
-/// run is text-only until a Qwen encoder is wired up (the C branch ships a
-/// separate `qwen38-vision` target). Either way the `view_image` tool refuses
-/// at call time instead of the open failing.
-fn model_supports_vision(family: crate::gguf::ModelFamily, path: &Path) -> bool {
-    family != crate::gguf::ModelFamily::Qwen && crate::gguf::supports_vision(path)
-}
-
 /// Says at open time why the run is text-only, instead of letting the first
 /// `view_image` call be the only symptom several turns into a session.
 ///
@@ -291,22 +274,16 @@ fn model_supports_vision(family: crate::gguf::ModelFamily, path: &Path) -> bool 
 /// that knows. Each cause gets its own line, because naming the encoder path
 /// for a model plank deliberately never passed it to would report a failure to
 /// read a file that was never opened.
-fn report_text_only(
-    family: crate::gguf::ModelFamily,
-    model_supports_vision: bool,
-    vision_path: &Path,
-) {
-    if family == crate::gguf::ModelFamily::Qwen {
-        eprintln!("note: Qwen3.8 runs text-only in plank; view_image will be refused");
-    } else if !model_supports_vision {
-        eprintln!(
-            "note: this checkpoint is not the DeepSeek V4 Flash Vision-Exp model, \
-             so it runs text-only; view_image will be refused"
-        );
-    } else {
+fn report_text_only(model_supports_vision: bool, vision_path: &Path) {
+    if model_supports_vision {
         eprintln!(
             "warning: vision encoder not loaded from {}; view_image will be refused",
             vision_path.display()
+        );
+    } else {
+        eprintln!(
+            "note: this checkpoint is not the DeepSeek V4 Flash Vision-Exp model, \
+             so it runs text-only; view_image will be refused"
         );
     }
 }
@@ -326,14 +303,20 @@ fn metal_kernels_missing() -> bool {
 /// [`crate::gguf::file_detail`] reports as nothing rather than as absent.
 fn companion_notes<'a>(
     mtp: Option<&'a Path>,
-    ple: Option<&'a Path>,
     vision: Option<&'a Path>,
-) -> [(&'static str, Option<&'a Path>); 3] {
-    [
-        ("mtp draft model", mtp),
-        ("ple sidecar", ple),
-        ("vision encoder", vision),
-    ]
+) -> [(&'static str, Option<&'a Path>); 2] {
+    [("mtp draft model", mtp), ("vision encoder", vision)]
+}
+
+/// Decides whether V4.1 expects an empty `system` message ahead of the tools
+/// prompt, exactly as `agent_append_system_prompt` pushes one before the
+/// rendered-chat tokenization. Gated on a non-empty `trusted` span so the
+/// split path (`warm_append_system`, which passes `trusted_len` 0 for the
+/// untrusted remainder) cannot emit a second one.
+fn wants_empty_system(model_name: &str, trusted: &str) -> bool {
+    !trusted.is_empty()
+        && crate::sysprompt::ToolSyntax::for_model_name(model_name)
+            == crate::sysprompt::ToolSyntax::Dsml41
 }
 
 impl Ds4Model {
@@ -361,13 +344,19 @@ impl Ds4Model {
             })
             .transpose()
         };
-        let family = supported_family(crate::gguf::family_of(path), path)?;
-        let (mtp_path, ple_path) = companion_slots(family, tuning.mtp_path.as_deref());
+        // Every family the probe can now report is one this build serves; the
+        // refusal that used to sit here existed only for Qwen.
+        let family = crate::gguf::family_of(path);
+        let mtp_path = mtp_companion(family, tuning.mtp_path.as_deref());
         let c_mtp = c_opt_path(mtp_path, "mtp model")?;
-        let c_ple = c_opt_path(ple_path, "ple sidecar")?;
         let c_steering = c_opt_path(tuning.dir_steering_file.as_deref(), "dir-steering file")?;
         let vision_path = crate::download::default_vision_path();
-        let model_supports_vision = model_supports_vision(family, path);
+        // Vision is passed only when the C would accept it: `ds4_engine_open`
+        // fails outright when `vision_path` is set and the main GGUF is not the
+        // pinned Vision-Exp checkpoint, so a language-only or re-quantized
+        // checkpoint must open with a null path and run text-only, with
+        // `view_image` refusing at call time instead of the open failing.
+        let model_supports_vision = crate::gguf::supports_vision(path);
         let c_vision = if model_supports_vision {
             c_opt_path(Some(&vision_path), "vision encoder")?
         } else {
@@ -378,7 +367,6 @@ impl Ds4Model {
             model_path: c_path.as_ptr(),
             mtp_path: as_ptr(&c_mtp),
             vision_path: as_ptr(&c_vision),
-            ple_path: as_ptr(&c_ple),
             backend,
             n_threads,
             context_size: ctx_size,
@@ -401,18 +389,15 @@ impl Ds4Model {
             simulate_used_memory_bytes: tuning.simulate_used_memory_bytes,
             warm_weights: tuning.warm_weights,
             quality: tuning.quality,
-            // One switch, two mechanisms. `--mtp` means "predict more than
-            // one token per step", and the engine option that does it differs
-            // by family: DeepSeek speculates from a separate DSpark draft
-            // checkpoint (`dspark`), Qwen3.8 from the MTP block inside its own
-            // main GGUF (`glm_mtp`, which `qwen4_graph_alloc` reads at open).
+            // `--mtp` means "predict more than one token per step". The only
+            // mechanism plank still serves is a separate DSpark draft
+            // checkpoint (`dspark`); the engine's other one (`glm_mtp`, an MTP
+            // block inside the main GGUF) belonged to Qwen3.8 and is now never
+            // asked for.
             //
             // Gating matters, it is not tidiness: `dspark` with no `mtp_path`
-            // is a hard error in the C ("--dspark requires --mtp-model FILE"),
-            // and a Qwen run has no `mtp_path` by construction — its companion
-            // went to `ple_path`. Leaving both ungated meant Qwen could not
-            // load at all with speculation at its default-on.
-            glm_mtp: tuning.mtp && family == crate::gguf::ModelFamily::Qwen,
+            // is a hard error in the C ("--dspark requires --mtp-model FILE").
+            glm_mtp: false,
             glm_mtp_timing: false,
             dspark: tuning.mtp && family == crate::gguf::ModelFamily::Ds4,
             dspark_strict: tuning.mtp_strict && family == crate::gguf::ModelFamily::Ds4,
@@ -453,14 +438,14 @@ impl Ds4Model {
                     family,
                     backend: &format!("{backend:?}"),
                     ctx_size,
-                    companions: &companion_notes(mtp_path, ple_path, vision),
+                    companions: &companion_notes(mtp_path, vision),
                     metal_kernels_missing: metal_kernels_missing(),
                 },
             )));
         }
         // SAFETY: `engine` is non-null and valid, checked just above.
         if !unsafe { ffi::ds4_engine_has_vision(engine) } {
-            report_text_only(family, model_supports_vision, &vision_path);
+            report_text_only(model_supports_vision, &vision_path);
         }
         Ok(Self {
             engine,
@@ -596,6 +581,19 @@ impl Ds4Model {
             .find(|&i| system.is_char_boundary(i))
             .unwrap_or(0);
         let (trusted, plain) = system.split_at(split);
+        if wants_empty_system(&self.model_name(), trusted)
+            && let (Ok(role), Ok(empty)) = (CString::new("system"), CString::new(""))
+        {
+            // SAFETY: engine and tokens valid; strings outlive the call.
+            unsafe {
+                ffi::ds4_chat_append_message(
+                    self.engine,
+                    tokens.as_mut_ptr(),
+                    role.as_ptr(),
+                    empty.as_ptr(),
+                );
+            }
+        }
         if !trusted.is_empty()
             && let Ok(text) = CString::new(trusted)
         {
@@ -641,20 +639,52 @@ impl Ds4Model {
     /// past the BOS). Folding it into the system *string* instead would place
     /// it after the system role marker and diverge.
     ///
-    /// `Max` goes through the C's own `ds4_chat_append_max_effort_prefix` so its
-    /// tokens stay byte-identical to the reference; `Low`, which the C does not
-    /// have, is tokenized here from [`crate::engine::THINK_LOW_PREFIX`] through
-    /// the same rendered-chat tokenizer the C symbol uses internally.
+    /// Every level but `Low` goes through the C's own
+    /// `ds4_chat_append_think_prefix` — the same call
+    /// `agent_worker_build_system_tokens` makes — so the tokens stay
+    /// byte-identical to the reference and the family decides the spelling: the
+    /// V4 max-effort text, or V4.1's `Reasoning Effort: N` system line. It
+    /// appends nothing for the modes that carry no preamble, which is why it is
+    /// safe to call unconditionally. `Low`, which the C does not have, is
+    /// tokenized here from [`crate::engine::THINK_LOW_PREFIX`] through the same
+    /// rendered-chat tokenizer the C symbol uses internally — but only on a
+    /// family without a native effort knob
+    /// ([`crate::engine::injects_low_preamble`]); on one with a knob the C's
+    /// own `Reasoning Effort: 25` line is the whole of what `Low` emits.
     fn append_effort_prefix(&self, tokens: &mut Ds4TokensGuard, think: ThinkMode) {
-        match think {
-            ThinkMode::Max => {
-                // SAFETY: engine and tokens are valid for the call.
-                unsafe { ffi::ds4_chat_append_max_effort_prefix(self.engine, tokens.as_mut_ptr()) };
-            }
-            ThinkMode::Low => {
+        if think == ThinkMode::Low {
+            // Plank's invented brief-reasoning prose, but only on a family with
+            // no effort dial of its own: where the model has one, the
+            // `Reasoning Effort: 25` line below says the same thing in the
+            // model's own trained vocabulary, and stacking plank prose on top
+            // of it is exactly the prompt-mangling this avoids
+            // (`engine::injects_low_preamble`).
+            if crate::engine::injects_low_preamble(think, &self.model_name()) {
                 tokens.push_all(&self.tokenize_rendered(crate::engine::THINK_LOW_PREFIX));
             }
-            ThinkMode::Off | ThinkMode::Medium => {}
+            // `Low` has no dedicated C think mode, so it is `HIGH` at the FFI
+            // boundary (`ds4_think`) — and the C's own DeepSeek V4.1 effort
+            // text defaults `HIGH` to 75, indistinguishable from `Medium`. Ask
+            // for the explicit low effort level instead: on V4.1 this appends
+            // `Reasoning Effort: 25 ...` right after plank's own preamble
+            // above, restoring `low < medium < max`; on every other family
+            // `chat_push_think_prefix`'s family switch has no branch for a
+            // plain numeric level (the GLM/DeepSeek41 arms return NULL for it,
+            // and the non-effort-text `else` arm only fires for `MAX`), so the
+            // call is a byte-for-byte no-op there.
+            // SAFETY: engine and tokens are valid for the call.
+            unsafe {
+                ffi::ds4_chat_append_think_prefix(
+                    self.engine,
+                    tokens.as_mut_ptr(),
+                    ds4_think(ThinkMode::Level(crate::engine::THINK_LOW_EFFORT_LEVEL)),
+                );
+            }
+            return;
+        }
+        // SAFETY: engine and tokens are valid for the call.
+        unsafe {
+            ffi::ds4_chat_append_think_prefix(self.engine, tokens.as_mut_ptr(), ds4_think(think));
         }
     }
 
@@ -1441,7 +1471,7 @@ impl Ds4Session {
             self.transcript.extend_last_span(&text, &span);
         } else {
             self.transcript
-                .push_span(SpanRole::Assistant, ds4_think(think) as u8, text, &span);
+                .push_span(SpanRole::Assistant, think_span_tag(think), text, &span);
         }
     }
 }
@@ -1543,7 +1573,7 @@ impl Engine for Ds4Session {
         // which outlives the sync call, and the callback is cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
-            // Qwen3.8 prefill reports only on the chunk hook.
+            // Some engines report prefill only on the chunk hook.
             ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         // SAFETY: session, tokens, and err buffer are valid for the call.
@@ -2039,7 +2069,8 @@ impl Engine for Ds4Session {
         // `Medium` lives entirely in the per-turn assistant prefix, which is
         // re-derived every turn and never cached. So a level change that keeps
         // the preamble where it is costs nothing.
-        let prefix_changed = self.think.effort_prefix() != mode.effort_prefix();
+        let numeric = crate::engine::numeric_thinking_model(&self.model_name());
+        let prefix_changed = self.think.effort_prefix(numeric) != mode.effort_prefix(numeric);
         self.think = mode;
         if prefix_changed {
             // The whole token buffer now starts with the wrong prefix. Drop it
@@ -2109,7 +2140,7 @@ impl Engine for Ds4Session {
         // cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
-            // Qwen3.8 prefill reports only on the chunk hook.
+            // Some engines report prefill only on the chunk hook.
             ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         let mut err = [0_i8; 512];
@@ -2430,7 +2461,7 @@ impl Ds4HostSession {
         // SAFETY: session valid; progress outlives the sync; cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
-            // Qwen3.8 prefill reports only on the chunk hook.
+            // Some engines report prefill only on the chunk hook.
             ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         // SAFETY: session, tokens, and err buffer valid.
@@ -2685,7 +2716,7 @@ impl Drop for Ds4TokensGuard {
 ///
 /// `metal_kernels_match_the_c_reference` in `tests/c_parity.rs` parses that
 /// table out of the C and fails on any drift — the comment alone was not
-/// enough, and a submodule bump that added two Qwen kernels shipped a build
+/// enough, and a submodule bump that added two extra kernels shipped a build
 /// that could not open a model at all.
 pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     // Keep this in lockstep with the C `required_sources` table in
@@ -2695,6 +2726,15 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     // kernels landed in the antirez/main sync and must be pointed at
     // explicitly, since the C engine's fallback search paths (relative
     // `metal/...` and `./metal/...`) only work from the submodule root.
+    // `DS4_METAL_DSV41_SOURCE` (`dsv41.metal`) arrived with the V4.1 bump
+    // for the same reason: the combined Metal source is compiled once for
+    // every model, so a missing V4.1 kernel would abort startup even for a
+    // plain V4 run. The table can also drift the other way: upstream
+    // removed Qwen Metal support entirely at `bd66c40` (`qwen4.metal` and
+    // `qwen4_vision.metal` deleted, every reference in `ds4_metal.m` gone
+    // with them), so entries here that the C no longer requires are just
+    // as much a lockstep failure as a missing one — `c_parity` checks
+    // both directions.
     ("DS4_METAL_FLASH_ATTN_SOURCE", "flash_attn.metal"),
     ("DS4_METAL_DENSE_SOURCE", "dense.metal"),
     ("DS4_METAL_GLM53_BF16_SOURCE", "glm53_bf16.metal"),
@@ -2708,6 +2748,7 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     ("DS4_METAL_DSV4_HC_SOURCE", "dsv4_hc.metal"),
     ("DS4_METAL_UNARY_SOURCE", "unary.metal"),
     ("DS4_METAL_DSV4_KV_SOURCE", "dsv4_kv.metal"),
+    ("DS4_METAL_DSV41_SOURCE", "dsv41.metal"),
     ("DS4_METAL_DSV4_ROPE_SOURCE", "dsv4_rope.metal"),
     ("DS4_METAL_DSV4_MISC_SOURCE", "dsv4_misc.metal"),
     ("DS4_METAL_ARGSORT_SOURCE", "argsort.metal"),
@@ -2721,72 +2762,30 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     ("DS4_METAL_NORM_SOURCE", "norm.metal"),
     ("DS4_METAL_BIN_SOURCE", "bin.metal"),
     ("DS4_METAL_SET_ROWS_SOURCE", "set_rows.metal"),
-    // Added by the Qwen3.8-Flash-Next bump. Required unconditionally,
-    // not only for a Qwen run: the C compiles one combined Metal source
-    // for every model, so a missing Qwen kernel aborts a DeepSeek
-    // startup too.
-    ("DS4_METAL_QWEN4_SOURCE", "qwen4.metal"),
-    ("DS4_METAL_QWEN4_VISION_SOURCE", "qwen4_vision.metal"),
 ];
 
-/// Passes `family` through, or rejects one this build cannot serve before the
-/// engine loads it.
+/// The `--mtp-model` companion, checked against the family of the *main* model.
 ///
-/// Without the `qwen` feature the tools prompt, the `<tool_call>` parser and
-/// the PLE wiring are all absent, so a Qwen model would load, be handed a DSML
-/// prompt it was not trained on, and emit a dialect nothing parses. Family
-/// detection is deliberately *not* gated, so this can be a refusal that names
-/// the model and the fix rather than a silent misparse as `DeepSeek`.
+/// The engine cannot be asked which companion it wants: it detects the family
+/// while opening, and the path has to be in the options struct before that
+/// call. So the family is read from the main model's own GGUF metadata and the
+/// companion is warned about here, ahead of `ds4_engine_open`.
 ///
-/// # Errors
-/// Returns [`EngineError`] when this build cannot serve `family`.
-#[cfg_attr(
-    feature = "qwen",
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "the \
-    feature-on build refuses nothing, but the call site is shared"
-    )
-)]
-fn supported_family(
-    family: crate::gguf::ModelFamily,
-    path: &Path,
-) -> Result<crate::gguf::ModelFamily, EngineError> {
-    #[cfg(not(feature = "qwen"))]
-    if family == crate::gguf::ModelFamily::Qwen {
-        return Err(EngineError::new(format!(
-            "{} is a Qwen3.8-Flash-Next model and this build has no Qwen support; rebuild with --features qwen",
-            path.display()
-        )));
-    }
-    #[cfg(feature = "qwen")]
-    let _ = path;
-    Ok(family)
-}
-
-/// Which of the engine's two companion slots `--mtp-model` fills.
-///
-/// Decided by the family of the *main* model, read from its own GGUF metadata.
-/// The engine cannot be asked: it detects the family while opening, and both
-/// paths have to be in the options struct before that call — and a `ple_path`
-/// handed to a non-Qwen model is a hard error there, not a warning.
-fn companion_slots(
-    family: crate::gguf::ModelFamily,
-    companion: Option<&Path>,
-) -> (Option<&Path>, Option<&Path>) {
+/// There used to be a second slot, `ple_path`, for the Qwen3.8 n-gram sidecar.
+/// `refs/ds4` bd66c40 deleted the field from `ds4_engine_options`, and plank
+/// had already stopped serving the only family that took one, so the pair
+/// collapsed to the drafter alone.
+fn mtp_companion(family: crate::gguf::ModelFamily, companion: Option<&Path>) -> Option<&Path> {
     if let Some(c) = companion {
         warn_on_companion_mismatch(family, c);
     }
-    match family {
-        crate::gguf::ModelFamily::Qwen => (None, companion),
-        crate::gguf::ModelFamily::Ds4 => (companion, None),
-    }
+    companion
 }
 
 /// Warns when the `--mtp-model` companion is not the kind this family wants.
 ///
 /// The companion GGUFs name themselves: `deepseek4-dspark` for a `DSpark`
-/// draft checkpoint, `qwen4-exp-ple` for a Qwen n-gram sidecar. Passing the
+/// draft checkpoint. Passing the
 /// wrong one otherwise surfaces as the engine refusing a tensor it cannot
 /// find, several hundred lines from the flag that caused it.
 ///
@@ -2797,10 +2796,17 @@ fn warn_on_companion_mismatch(family: crate::gguf::ModelFamily, companion: &Path
     let Some(arch) = crate::gguf::architecture(companion) else {
         return;
     };
-    let expected = match family {
-        crate::gguf::ModelFamily::Qwen => "qwen4-exp-ple",
-        crate::gguf::ModelFamily::Ds4 => "deepseek4-dspark",
-    };
+    // DSpark, pipeline execution and non-Metal backends are not implemented
+    // for V4.1 (`refs/ds4/docs/MODELS.md`, as of commit bd66c40) — there is no
+    // V4.1 drafter architecture to name, real or invented.
+    if family == crate::gguf::ModelFamily::Ds41 {
+        eprintln!(
+            "warning: --mtp {} was given, but DSpark speculative decoding is not implemented for DeepSeek V4.1 Flash",
+            companion.display()
+        );
+        return;
+    }
+    let expected = "deepseek4-dspark";
     if arch != expected {
         eprintln!(
             "warning: --mtp {} reports architecture {arch:?}, but this model wants {expected:?}",
@@ -2854,14 +2860,25 @@ fn cstr_message(buf: &[i8], fallback: &str) -> String {
     s.to_string_lossy().into_owned()
 }
 
+/// The reasoning discriminant recorded on an assistant span.
+///
+/// Saturating, because the span field is one byte while a V4.1 effort rides at
+/// `1000 + n`: every explicit effort therefore tags as 255, distinct from the
+/// three named modes, which keep the C's 0/1/2 as they always had.
+fn think_span_tag(think: ThinkMode) -> u8 {
+    u8::try_from(ds4_think(think).0).unwrap_or(u8::MAX)
+}
+
 /// Maps the engine-agnostic think mode to ds4's.
 fn ds4_think(think: ThinkMode) -> ffi::Ds4ThinkMode {
     match think {
-        ThinkMode::Off => ffi::Ds4ThinkMode::None,
+        ThinkMode::Off => ffi::Ds4ThinkMode::NONE,
         // `Low` is `HIGH` to the engine — the brevity request lives entirely in
         // the prompt preamble, since the engine has no level below `HIGH`.
-        ThinkMode::Low | ThinkMode::Medium => ffi::Ds4ThinkMode::High,
-        ThinkMode::Max => ffi::Ds4ThinkMode::Max,
+        ThinkMode::Low | ThinkMode::Medium => ffi::Ds4ThinkMode::HIGH,
+        ThinkMode::Max => ffi::Ds4ThinkMode::MAX,
+        // The explicit V4.1 effort, `DS4_THINK_LEVEL_BASE + n`.
+        ThinkMode::Level(n) => ffi::Ds4ThinkMode::level(n),
     }
 }
 
@@ -2943,8 +2960,28 @@ fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
 mod tests {
     use super::{
         CancelReason, cancel_cb, cancel_clear, cancel_reason, cancel_request,
-        cancelled_by_pressure, request_pressure_cancel,
+        cancelled_by_pressure, request_pressure_cancel, wants_empty_system,
     };
+
+    #[test]
+    fn wants_empty_system_for_v41_with_trusted_text() {
+        assert!(wants_empty_system("DeepSeek V4.1 Flash", "system text"));
+    }
+
+    #[test]
+    fn wants_empty_system_false_for_v4() {
+        assert!(!wants_empty_system("DeepSeek V4 Flash", "system text"));
+    }
+
+    #[test]
+    fn wants_empty_system_false_when_trusted_is_empty() {
+        assert!(!wants_empty_system("DeepSeek V4.1 Flash", ""));
+    }
+
+    #[test]
+    fn wants_empty_system_false_for_empty_model_name() {
+        assert!(!wants_empty_system("", "system text"));
+    }
 
     #[test]
     fn a_user_interrupt_outranks_a_pressure_yield() {
@@ -3007,40 +3044,19 @@ mod tests {
             "an Esc during a yield ends the turn; it must not look resumable"
         );
     }
-    /// A `DeepSeek` model is served by every build. The refusal is the other
-    /// half of the `qwen` feature's contract: detection is ungated so an
-    /// unsupported model is named, not misparsed.
+    /// The `--mtp` companion reaches the drafter slot unchanged for every
+    /// family plank serves: the warning is advisory, never a filter, so a
+    /// companion the heuristic dislikes must still be handed to the engine.
     #[test]
-    fn a_deepseek_model_is_served_by_every_build() {
-        let path = std::path::Path::new("/models/ds4flash.gguf");
-        assert_eq!(
-            super::supported_family(crate::gguf::ModelFamily::Ds4, path).unwrap(),
-            crate::gguf::ModelFamily::Ds4
-        );
-    }
-
-    /// Without the feature a Qwen model is refused by name, with the fix in the
-    /// message — never loaded to emit a dialect this build cannot parse.
-    #[test]
-    #[cfg(not(feature = "qwen"))]
-    fn a_qwen_model_is_refused_by_name_without_the_feature() {
-        let path = std::path::Path::new("/models/qwen.gguf");
-        let err = super::supported_family(crate::gguf::ModelFamily::Qwen, path)
-            .expect_err("a build without Qwen support must refuse a Qwen model");
-        let msg = err.to_string();
-        assert!(msg.contains("/models/qwen.gguf"), "names the model: {msg}");
-        assert!(msg.contains("--features qwen"), "names the fix: {msg}");
-    }
-
-    /// With the feature it loads like any other family.
-    #[test]
-    #[cfg(feature = "qwen")]
-    fn a_qwen_model_is_served_with_the_feature() {
-        let path = std::path::Path::new("/models/qwen.gguf");
-        assert_eq!(
-            super::supported_family(crate::gguf::ModelFamily::Qwen, path).unwrap(),
-            crate::gguf::ModelFamily::Qwen
-        );
+    fn the_companion_always_fills_the_drafter_slot() {
+        let c = std::path::Path::new("/models/dspark.gguf");
+        for family in [
+            crate::gguf::ModelFamily::Ds4,
+            crate::gguf::ModelFamily::Ds41,
+        ] {
+            assert_eq!(super::mtp_companion(family, None), None);
+            assert_eq!(super::mtp_companion(family, Some(c)), Some(c));
+        }
     }
 
     /// The filter that keeps a position-based callback honest. Both hooks are
@@ -3048,7 +3064,7 @@ mod tests {
     /// prompt position.
     #[test]
     fn only_prefill_events_drive_the_prefill_bar() {
-        assert!(is_prefill_event("prefill_chunk"), "the Qwen3.8 hook");
+        assert!(is_prefill_event("prefill_chunk"), "the chunk hook");
         assert!(
             is_prefill_event("prefill_display"),
             "the DeepSeek graph hook"

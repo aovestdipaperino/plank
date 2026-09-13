@@ -850,7 +850,7 @@ extension means **session transcript** and nothing else:
   <project-key>/
     project-<fp2>.kv_raw     tier 2 for one project
     project-<fp2>.json
-  cheeky-bell.kv             a session TRANSCRIPT (user data)
+  cheeky-bell.ds4.kv         a session TRANSCRIPT (user data)
   cheeky-bell.kv_raw         that session's KV payload
   cheeky-bell.json           its metadata
   cheeky-bell.rung-0.kv_raw  a ladder rung (Layer 7)
@@ -877,6 +877,37 @@ migration that introduced this layout (see Garbage collection below) deleted
 every old-format body and did not touch a single transcript, and every scan that
 feeds the sweep filters on `.kv_raw` precisely so that a transcript is not merely
 unlikely to be deleted but unreachable by the code that deletes things.
+
+#### Two families in one directory
+
+Both model families share `~/.plank/kvcache/`, and are told apart by a tag in
+the transcript name: `<id>.ds4.kv` for DeepSeek V4, `<id>.ds41.kv` for V4.1
+(`session::family_ext`). The tag sits *before* the `.kv` so a transcript still
+ends in `.kv` and the id is still everything before the first dot. Untagged
+`.kv` files predate the split and are renamed to `.ds4.kv` once at first
+launch, top level only — everything written before the split was a V4 blob.
+
+The families never see each other's bodies. Every blob carries the model it was
+captured under in its sidecar, and `session::blob_family` resolves that name
+through `gguf::ModelFamily::for_model_name`; the listing and the GC keep only
+blobs whose family equals the live one. So launching V4.1 cannot evict V4's
+checkpoints, and neither can restore the other's KV — which would be silent
+corruption rather than a miss, since the two tokenize differently.
+
+That same routing is how a *retired* model's blobs are made unreachable:
+`for_model_name` answers `None` for a name in `gguf::RETIRED_MODEL_PREFIXES`
+(today, Qwen3.8), and `None` equals no live family, so the `.qwn.kv` era is
+never listed, never swept and never restored. The `None` is deliberate; folding
+a retired name into `Ds4` would hand one model's cache to another.
+
+**Known hazard, pre-existing and unfixed here.** `SessionStore::kv_node_at`
+(`session.rs:753`) synthesises a `KvMeta` from the file name, size and mtime
+when the sidecar is missing or unreadable, and that synthetic metadata has an
+empty `model`. `for_model_name("")` matches no retired prefix and so resolves
+to a live family — meaning a retired-family body whose sidecar was lost *is*
+sweepable, the one path around the guarantee above. It predates the family
+split and nothing in the V4.1 work changed it; it is recorded here so the next
+person to touch either side knows the two interact.
 
 #### The body
 

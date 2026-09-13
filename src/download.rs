@@ -33,6 +33,15 @@ use crate::arcade::breakout::Breakout;
 
 /// Hugging Face repository hosting the GGUF files.
 const REPO: &str = "antirez/deepseek-v4-gguf";
+
+/// Hugging Face repository for `DeepSeek` V4.1 Flash artifacts. Separate from
+/// [`REPO`] because V4 and V4.1 are published as distinct repositories
+/// upstream (`refs/ds4/download_model.sh`).
+const DS41_REPO: &str = "antirez/deepseek-v4.1-flash-gguf";
+
+/// V4.1 main model filename, mirroring `refs/ds4/download_model.sh`'s
+/// `DS41_Q2_FILE`.
+const DS41_FILE: &str = "DeepSeek-V4.1-Flash-Q2.gguf";
 /// The recommended Vision-Experimental Flash quant (~81 GB) for 96–128 GB
 /// machines.
 ///
@@ -271,7 +280,12 @@ pub fn default_model_path() -> PathBuf {
 
 /// Hugging Face download URL for `file` in [`REPO`].
 fn file_url(file: &str) -> String {
-    format!("https://huggingface.co/{REPO}/resolve/main/{file}")
+    repo_file_url(REPO, file)
+}
+
+/// Hugging Face download URL for `file` in `repo`.
+fn repo_file_url(repo: &str, file: &str) -> String {
+    format!("https://huggingface.co/{repo}/resolve/main/{file}")
 }
 
 /// Default `DSpark` support-model location, used when `--dspark` is given
@@ -285,37 +299,6 @@ pub fn default_dspark_path() -> PathBuf {
     home.join(".plank").join("ds4flash.dspark.gguf")
 }
 
-/// Default Qwen3.8-Flash-Next model location, selected by `--qwen`.
-///
-/// plank never downloads this one — the Qwen release is not in `ds4.manifest`
-/// — so it is expected to be a symlink the user points at whichever build they
-/// want:
-///
-/// ```text
-/// ln -sfn ~/models/qwen38-ds4-q4/Qwen3.8-...-MTP.gguf  ~/.plank/qwen.gguf
-/// ln -sfn ~/models/qwen38-ds4-q4/Qwen3.8-...-PLE-Q4_1.gguf ~/.plank/qwen.mtp.gguf
-/// ```
-///
-/// Deliberately outside the `ds4flash.*` family, which the manifest owns: a
-/// staged upgrade moves those three names into place, and a name it recognized
-/// would be replaced under the user's feet.
-#[must_use]
-pub fn default_qwen_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank").join("qwen.gguf")
-}
-
-/// Default companion for [`default_qwen_path`] — the required PLE sidecar.
-///
-/// Named for the flag that carries it (`--mtp-model`) rather than for the
-/// tensor inside it, so the pairing reads the same way `ds4flash.dspark.gguf`
-/// pairs with `ds4flash.gguf`.
-#[must_use]
-pub fn default_qwen_mtp_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank").join("qwen.mtp.gguf")
-}
-
 /// Default vision-encoder location. Loaded alongside the main model whenever
 /// the native engine opens the Vision-Exp checkpoint.
 ///
@@ -326,10 +309,92 @@ pub fn default_vision_path() -> PathBuf {
     home.join(".plank").join("ds4flash.vision.gguf")
 }
 
+/// Default `DeepSeek` V4.1 Flash model location.
+///
+/// A separate name from [`default_model_path`] on purpose: the two sets are
+/// wholly disjoint on disk, so a V4.1 install can never overwrite a V4 one.
+#[must_use]
+pub fn default_ds41_model_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("ds41flash.gguf")
+}
+
+/// Default V4.1 vision-encoder location, beside its main model.
+#[must_use]
+pub fn default_ds41_vision_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("ds41flash.vision.gguf")
+}
+
+/// The `main` model path of the set this machine manages by default, under
+/// `root`.
+///
+/// What `-m` falls back to. It follows [`crate::manifest::default_set_for_root`]
+/// so the model that loads belongs to the set whose manifest plank tracks: a
+/// fresh install takes V4, as does an install with V4 already recorded or on
+/// disk; only a root recording `ds41.manifest` manages V4.1. Falls back to
+/// [`default_model_path`] only if a set ever stops declaring a `main`
+/// artifact, which no set does.
+#[must_use]
+pub fn default_managed_model_path_in(root: &Path) -> PathBuf {
+    crate::manifest::local_path_for_in(root, crate::manifest::default_set_for_root(root), "main")
+        .unwrap_or_else(default_model_path)
+}
+
+/// [`default_managed_model_path_in`] rooted at `~/.plank`.
+#[must_use]
+pub fn default_managed_model_path() -> PathBuf {
+    default_managed_model_path_in(&crate::manifest::plank_dir())
+}
+
 /// Hugging Face download URL for the default Flash GGUF.
 #[must_use]
 pub fn model_url() -> String {
     file_url(FILE)
+}
+
+/// Hugging Face download URL for the V4.1 Flash main GGUF.
+#[must_use]
+pub fn ds41_model_url() -> String {
+    repo_file_url(DS41_REPO, DS41_FILE)
+}
+
+/// Uncompiled-in size estimate for a set's `main` artifact, in GB, used only
+/// when no manifest is on hand to give an exact figure. From
+/// `refs/ds4/docs/MODELS.md`.
+fn fallback_main_gb(set: crate::manifest::ModelSet) -> f64 {
+    match set {
+        crate::manifest::ModelSet::Ds4 => 87.0,
+        crate::manifest::ModelSet::Ds41 => 341.0,
+    }
+}
+
+/// Human-facing size of `set`'s `main` artifact under `root`, in GB.
+///
+/// Prefers a manifest already on hand — an in-flight/declined download job,
+/// or a previously installed manifest — over the hardcoded estimate, so a
+/// figure the manifest has already revised is reported rather than a stale
+/// compiled-in guess.
+fn main_artifact_gb(root: &Path, set: crate::manifest::ModelSet) -> f64 {
+    let from_manifest = |m: crate::manifest::Manifest| m.files.get("main").map(|e| e.bytes);
+    crate::downloader::read_job_in(root, set)
+        .and_then(from_manifest)
+        .or_else(|| {
+            crate::manifest::read_at(&crate::manifest::installed_path_in(root, set))
+                .and_then(from_manifest)
+        })
+        .map_or_else(|| fallback_main_gb(set), gb)
+}
+
+/// Whether a missing `path` under `root` is exactly the resolved set's own
+/// managed `main` path, i.e. whether it should be offered for acquisition
+/// rather than met with a plain error. `None` for any other path, including a
+/// managed path for a set other than the root's current default — an
+/// explicit `-m` that does not exist is the user's own file, and offering a
+/// download for it risked fetching hundreds of GB into the wrong slot.
+fn offer_target_in(root: &Path, path: &Path) -> Option<crate::manifest::ModelSet> {
+    let set = crate::manifest::default_set_for_root(root);
+    (path == default_managed_model_path_in(root)).then_some(set)
 }
 
 /// Hugging Face download URL for the `DSpark` support GGUF.
@@ -416,37 +481,231 @@ pub fn ensure_dspark_support(engine: &mut crate::config::EngineTuning) -> Result
     Ok(())
 }
 
-/// Fetches the DS4 side artifacts (vision encoder, `DSpark` support) unless the
-/// model is a Qwen3.8-Flash-Next one.
+/// Fetches the DS4 side artifacts (vision encoder, `DSpark` support).
 ///
-/// Both are `DeepSeek` V4 files, and a Qwen run opens neither: the engine is
-/// not handed the vision encoder, and Qwen speculates from the MTP block
-/// embedded in its own main GGUF rather than from a draft checkpoint. Fetching
-/// them would cost ~7 GB for files this run never reads.
-///
-/// The vision encoder is also skipped for a `DeepSeek` checkpoint that is not
+/// The vision encoder is skipped for a `DeepSeek` checkpoint that is not
 /// the pinned Vision-Exp model (`gguf::supports_vision`): the engine refuses
 /// to open such a model with an encoder, so plank never passes one and the run
 /// is text-only. Prompting for a ~0.9 GB download it could not use would be
 /// worse than useless.
 ///
-/// Speculation is *not* switched off here. Under the unified `--mtp` it stays
-/// meaningful for Qwen — it just runs off the embedded block, which needs no
-/// download and no companion file.
-///
 /// # Errors
-/// Propagates the underlying ensure failures for non-Qwen runs.
+/// Propagates the underlying ensure failures.
 pub fn ensure_side_artifacts(
     model_path: &Path,
+    ctx: i32,
     engine: &mut crate::config::EngineTuning,
 ) -> Result<(), String> {
-    if crate::gguf::family_of(model_path) == crate::gguf::ModelFamily::Qwen {
-        return Ok(());
-    }
+    // A checkpoint too large to hold resident is streamed from SSD rather than
+    // failing to open; decided before anything else, since it applies to every
+    // family and does not depend on the companion resolution below. It needs
+    // the context size, which is why this function takes one.
+    auto_enable_ssd_streaming(model_path, ctx, engine);
+    // The streaming decision is final here — nothing below touches it — so
+    // this is where the footer's `HD` marker learns about it. Published rather
+    // than read off `cfg` by the bar, because the auto-enable lands on the
+    // caller's local `EngineTuning` copy and never goes back into `cfg`.
+    crate::status::set_ssd_streaming(engine.ssd_streaming);
     if crate::gguf::supports_vision(model_path) {
         ensure_vision_encoder()?;
     }
+    // DSpark is implemented for V4 only (`refs/ds4/docs/MODELS.md` at bd66c40):
+    // the engine refuses to open a V4.1 checkpoint at all when a draft model is
+    // attached, so plank must not auto-pair one. A companion the user named
+    // themselves still goes through, and still fails loudly there.
+    if drop_dspark_for_family(crate::gguf::family_of(model_path), engine) {
+        return Ok(());
+    }
     ensure_dspark_support(engine)
+}
+
+/// Fraction of installed RAM, as a percentage, that plank treats as available
+/// for a resident model.
+///
+/// Calibrated against the engine's own arithmetic: `ds41_memory_admit_for_host`
+/// (`refs/ds4/ds4.c` at bd66c40) takes `host / 8 * 7` (87.5%) capped by Metal's
+/// recommended working-set size, and on this 128 GiB machine reported a safe
+/// budget of 107.52 GiB — 84% of RAM. 80% sits just under that, deliberately.
+///
+/// Erring low is the safe direction: a model that could have been resident
+/// merely streams, which is slower but works, while erring high means a model
+/// that cannot fit fails to open at all — the failure this rule exists to
+/// prevent.
+pub const SSD_STREAMING_RAM_PERCENT: u64 = 80;
+
+/// Context-independent part of the engine's static context buffers, in bytes.
+///
+/// See [`context_reserve_bytes`] for the derivation.
+const CONTEXT_FIXED_BYTES: u64 = 7722 * 1024 * 1024;
+
+/// Context-dependent part of the engine's static context buffers, in bytes per
+/// context token.
+///
+/// See [`context_reserve_bytes`] for the derivation.
+const CONTEXT_BYTES_PER_TOKEN: u64 = 11_264;
+
+/// Bytes the engine will reserve for static context buffers at `ctx` tokens,
+/// which must come out of the resident budget before the weights do.
+///
+/// There is **no pre-open source of truth** for this: the C computes it in
+/// `ds41_graph_bytes` (`refs/ds4/ds4.c` at bd66c40), which is `static` and
+/// reachable only from inside a model open — by which point the admission check
+/// that refuses the model has already run. So this is an estimate, derived from
+/// that function rather than guessed:
+///
+/// * The terms that scale with `ctx` are the compressed/index caches
+///   (`2.5 * ctx * 640` floats = 6400 B/token), the prefill `block_mask`
+///   (`ctx/8 * prefill_cap` floats = 4096 B/token at the 8192 prefill cap), the
+///   carry `block_mask` (`ctx/256` words times a 32768 carry cap = 512 B/token)
+///   and the index sorter's merge buffers
+///   (`DS41_INDEX_BATCH * ctx * 2 * 4` = 256 B/token). That is 11 KiB/token,
+///   which is [`CONTEXT_BYTES_PER_TOKEN`].
+/// * Everything else is sized by `prefill_cap` and fixed buffers.
+///   [`CONTEXT_FIXED_BYTES`] is the remainder at the one point the engine
+///   printed: "V4.1 static context buffers 8073.52 MiB (ctx=32768)", i.e.
+///   8073.52 MiB - 32768 * 11 KiB = 7721.5 MiB, rounded up to 7722 MiB.
+///
+/// Accuracy: exact to under 1 MiB at ctx=32768, and linear above it, where
+/// `prefill_cap` and the carry cap are both pinned at their maxima and the
+/// formula really is affine. Below ctx=16384 the engine uses a smaller
+/// `prefill_cap` (4096, and 2048 below 8192), so the real figure is *smaller*
+/// than this estimate by up to ~2 GiB — an overestimate, which shrinks the
+/// budget and is the conservative direction. The V4 family allocates its
+/// context differently, but it is much the smaller allocator, so the V4.1
+/// figures are used for every family.
+fn context_reserve_bytes(ctx: u32) -> u64 {
+    CONTEXT_FIXED_BYTES.saturating_add(CONTEXT_BYTES_PER_TOKEN.saturating_mul(u64::from(ctx)))
+}
+
+/// Bytes of model weights the machine can hold resident at `ctx` tokens:
+/// [`SSD_STREAMING_RAM_PERCENT`] of `ram_bytes`, less the static context
+/// buffers.
+///
+/// Saturates at zero rather than wrapping on a machine too small to hold the
+/// context alone.
+fn resident_budget_bytes(ram_bytes: u64, ctx: u32) -> u64 {
+    (ram_bytes / 100)
+        .saturating_mul(SSD_STREAMING_RAM_PERCENT)
+        .saturating_sub(context_reserve_bytes(ctx))
+}
+
+/// Whether SSD expert streaming should be turned on by itself, and the resident
+/// budget that says so.
+///
+/// `already_on` is the whole of "an explicit user choice wins": `--ssd-streaming`
+/// is the only switch there is and it has no negative form — there is no way to
+/// demand a resident load — so auto-enable can never override an opt-out. The
+/// tuning flags (`--ssd-streaming-cold`, `--ssd-streaming-cache-experts`,
+/// `--ssd-streaming-preload-experts`) are never touched, so a user who set them
+/// keeps exactly what they asked for.
+///
+/// `None` — no auto-enable — whenever the model file or the installed RAM is
+/// unknown: neither is ours to diagnose, and guessing in the dark could push a
+/// model that fits perfectly well onto the SSD.
+fn decide_ssd_streaming(
+    model_bytes: Option<u64>,
+    ram_bytes: Option<u64>,
+    ctx: u32,
+    already_on: bool,
+) -> Option<u64> {
+    if already_on {
+        return None;
+    }
+    let budget = resident_budget_bytes(ram_bytes?, ctx);
+    (model_bytes? > budget).then_some(budget)
+}
+
+/// Turns SSD expert streaming on when the model file will not fit in the
+/// machine's resident budget, so a user with a 341 GiB checkpoint does not have
+/// to discover `--ssd-streaming` from the engine's refusal to open it.
+///
+/// A missing or unreadable file is not our error to report: `ensure_model` has
+/// already run, and the open that follows produces plank's own "no model at"
+/// message. We simply decline to guess.
+fn auto_enable_ssd_streaming(
+    model_path: &Path,
+    ctx: i32,
+    engine: &mut crate::config::EngineTuning,
+) {
+    // The config carries the context size signed; a non-positive one is not a
+    // real configuration, and reserving nothing for it is the right answer.
+    let ctx = u32::try_from(ctx).unwrap_or(0);
+    let model_bytes = std::fs::metadata(model_path).ok().map(|m| m.len());
+    let ram_bytes = total_ram_bytes();
+    let Some(budget) = decide_ssd_streaming(model_bytes, ram_bytes, ctx, engine.ssd_streaming)
+    else {
+        return;
+    };
+    engine.ssd_streaming = true;
+    eprintln!(
+        "note: SSD streaming enabled automatically (model {} exceeds the {} resident budget: {}% \
+         of {} RAM minus {} for ctx={ctx})",
+        gib(model_bytes.unwrap_or(0)),
+        gib(budget),
+        SSD_STREAMING_RAM_PERCENT,
+        gib(ram_bytes.unwrap_or(0)),
+        gib(context_reserve_bytes(ctx)),
+    );
+}
+
+/// Total physical RAM in bytes, via `sysctl hw.memsize`.
+///
+/// `None` when it cannot be determined, and on every platform that is not
+/// macOS — the only one the ds4 engine builds on.
+#[must_use]
+pub fn total_ram_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut mem: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: hw.memsize returns a u64; `mem`/`len` are valid out-params
+        // and the name is a NUL-terminated C string.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&raw mut mem).cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(mem)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Renders a byte count the way the engine prints sizes: binary GiB, 2 decimals.
+fn gib(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let g = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    format!("{g:.2} GiB")
+}
+
+/// Turns speculative decoding off for a family that has no `DSpark` drafter,
+/// returning whether the caller should skip companion resolution entirely.
+///
+/// V4 is the only family the engine implements `DSpark` for (`refs/ds4/docs/MODELS.md`
+/// at bd66c40); it refuses to open a V4.1 checkpoint at all when a draft model
+/// is attached. A companion the *user* named is left alone: they asked for it,
+/// so the engine's own refusal is the right answer, not a silent downgrade.
+fn drop_dspark_for_family(
+    family: crate::gguf::ModelFamily,
+    engine: &mut crate::config::EngineTuning,
+) -> bool {
+    if family == crate::gguf::ModelFamily::Ds4 {
+        return false;
+    }
+    if engine.mtp && engine.mtp_path.is_none() {
+        engine.mtp = false;
+        engine.mtp_strict = false;
+        eprintln!(
+            "note: speculative decoding disabled (DSpark is not implemented for DeepSeek V4.1 Flash)"
+        );
+    }
+    true
 }
 
 /// Ensures the vision-encoder GGUF exists at its default path, offering to
@@ -505,23 +764,38 @@ pub fn ensure_vision_encoder() -> Result<(), String> {
 /// Returns an error string when the user declines, when stdin is not a
 /// terminal (so no prompt is possible), or when the download fails.
 pub fn ensure_model(path: &Path) -> Result<(), String> {
+    ensure_model_in(&crate::manifest::plank_dir(), path)
+}
+
+/// [`ensure_model`] with the managed root injected, so a test can point it at
+/// a scratch directory instead of the real `~/.plank`.
+fn ensure_model_in(root: &Path, path: &Path) -> Result<(), String> {
     if path.exists() {
         // Upgrades are the manifest's business now (`check_manifest_at_startup`),
         // and they happen in the background rather than as a blocking prompt
         // before the engine loads.
         return Ok(());
     }
-    if !std::io::stdin().is_terminal() || path != default_model_path() {
-        // Only the DeepSeek default is offered for download, because that is
-        // the only model `ds4.manifest` describes. Offering it for any missing
-        // path meant `--qwen` with an unlinked `~/.plank/qwen.gguf` proposed
-        // fetching 87 GB of DeepSeek *into the Qwen slot* — and so did a
-        // mistyped `-m`.
+    // Only the resolved set's own managed default path is offered for
+    // download: an explicit `-m` that does not exist is the user's own file,
+    // and offering a download for any missing path meant a mistyped `-m`
+    // proposed fetching hundreds of GB into the wrong slot.
+    let Some(set) = offer_target_in(root, path) else {
+        return Err(format!(
+            "no model at {}; pass -m <path> or download it first",
+            path.display()
+        ));
+    };
+    if !std::io::stdin().is_terminal() {
         return Err(format!(
             "no model at {}; pass -m <path> or download it first",
             path.display()
         ));
     }
+    let (label, url) = match set {
+        crate::manifest::ModelSet::Ds4 => ("DeepSeek V4 Flash", model_url()),
+        crate::manifest::ModelSet::Ds41 => ("DeepSeek V4.1 Flash", ds41_model_url()),
+    };
     // A leftover .part file means a previous download can be resumed.
     let resuming = partial_bytes(path) > 0;
     eprintln!("No model found at {}.", path.display());
@@ -531,9 +805,12 @@ pub fn ensure_model(path: &Path) -> Result<(), String> {
             gb(partial_bytes(path))
         );
     } else {
-        eprintln!("plank can download DeepSeek V4 Flash (~87 GB) from Hugging Face:");
+        eprintln!(
+            "plank can download {label} (~{:.0} GB) from Hugging Face:",
+            main_artifact_gb(root, set)
+        );
     }
-    eprintln!("  {}", model_url());
+    eprintln!("  {url}");
     eprint!(
         "{} it now? [Y/n] ",
         if resuming { "Resume" } else { "Download" }
@@ -547,7 +824,7 @@ pub fn ensure_model(path: &Path) -> Result<(), String> {
     if matches!(answer.trim(), "n" | "N" | "no") {
         return Err("no model available; re-run with -m <path> or download it".to_string());
     }
-    download(&model_url(), path)
+    download(&url, path)
 }
 
 /// Size of the partial download alongside `dest`, or 0 if none.
@@ -1431,32 +1708,38 @@ fn check_manifest_at_startup_in(
     }
 }
 
-/// The whole startup manifest flow: install anything staged, then decide
-/// whether to start a background download.
-///
-/// Skips entirely when `model_path` is `Some`: a `-m <path>` user's model
-/// never lives at the manifest's hardcoded `~/.plank` locations, so the size
-/// check would always read "nothing installed" and both the swap and the
-/// download decision would operate on a file the engine never loads from.
-///
-/// Never fatal, and never blocking except on the interactive download prompt
-/// (itself gated on a real terminal).
 /// The manifest set plank manages for this model path, or `None` for a path it
 /// does not manage.
 ///
 /// A custom `-m` is the user's own file: plank neither upgrades nor replaces
 /// it, which is why the check used to skip whenever `-m` was given at all.
-/// That skip is now by *path* rather than by presence, because `--qwen`
-/// resolves to a default path — without this, selecting Qwen would silently
-/// opt out of Qwen upgrades.
+/// That skip is by *path* rather than by presence, so a flag that resolves to
+/// a managed default path is still upgraded.
+///
+/// Two different questions meet here. With `Some(path)` it is "which set does
+/// *this* model belong to", answered by the path alone: a V4.1 GGUF means the
+/// V4.1 set even on a machine that has only ever managed V4. With `None` it is
+/// "which set should this machine manage", answered by what `root` already
+/// records — [`crate::manifest::default_set_for_root`] — so a fresh install
+/// manages the V4 set, exactly as an install already recording
+/// `ds4.manifest` does.
 #[must_use]
-pub fn manifest_set_for_model(model_path: Option<&Path>) -> Option<crate::manifest::ModelSet> {
+pub fn manifest_set_for_model_in(
+    root: &Path,
+    model_path: Option<&Path>,
+) -> Option<crate::manifest::ModelSet> {
     match model_path {
-        None => Some(crate::manifest::ModelSet::Ds4),
+        None => Some(crate::manifest::default_set_for_root(root)),
         Some(p) if p == default_model_path() => Some(crate::manifest::ModelSet::Ds4),
-        Some(p) if p == default_qwen_path() => Some(crate::manifest::ModelSet::Qwen),
+        Some(p) if p == default_ds41_model_path() => Some(crate::manifest::ModelSet::Ds41),
         Some(_) => None,
     }
+}
+
+/// [`manifest_set_for_model_in`] rooted at `~/.plank`.
+#[must_use]
+pub fn manifest_set_for_model(model_path: Option<&Path>) -> Option<crate::manifest::ModelSet> {
+    manifest_set_for_model_in(&crate::manifest::plank_dir(), model_path)
 }
 
 pub fn check_manifest_at_startup(model_path: Option<&Path>) {
@@ -1479,7 +1762,7 @@ fn check_manifest_at_startup_with(
     spawn: &dyn Fn(crate::manifest::ModelSet, &crate::manifest::Manifest) -> Result<(), String>,
     confirm: &dyn Fn(&crate::manifest::Manifest, u32) -> Option<bool>,
 ) {
-    let Some(set) = manifest_set_for_model(model_path) else {
+    let Some(set) = manifest_set_for_model_in(root, model_path) else {
         return;
     };
     check_manifest_at_startup_in(root, set, fetch, spawn, confirm);
@@ -1782,6 +2065,173 @@ mod tests {
         );
     }
 
+    /// Measured file sizes of the checkpoints this rule has to separate.
+    const V4_BYTES: u64 = 86_720_111_776;
+    const V41_BYTES: u64 = 365_713_686_528;
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The three machines the rule is specified against, with RAM injected so
+    /// none of them needs the hardware.
+    #[test]
+    fn the_resident_budget_tracks_installed_ram() {
+        let ctx = 32768;
+        // 128 GiB: V4 stays resident, V4.1 streams.
+        let ram = Some(128 * GIB);
+        assert!(decide_ssd_streaming(Some(V4_BYTES), ram, ctx, false).is_none());
+        assert!(decide_ssd_streaming(Some(V41_BYTES), ram, ctx, false).is_some());
+        // 64 GiB: neither fits.
+        let ram = Some(64 * GIB);
+        assert!(decide_ssd_streaming(Some(V4_BYTES), ram, ctx, false).is_some());
+        assert!(decide_ssd_streaming(Some(V41_BYTES), ram, ctx, false).is_some());
+        // 512 GiB: both fit, including V4.1 — upstream documents a 512 GB Mac
+        // holding it resident, which a fixed byte threshold would get wrong.
+        let ram = Some(512 * GIB);
+        assert!(decide_ssd_streaming(Some(V4_BYTES), ram, ctx, false).is_none());
+        assert!(decide_ssd_streaming(Some(V41_BYTES), ram, ctx, false).is_none());
+    }
+
+    /// The budget is 80% of RAM less the context reserve, and the reported
+    /// number is the one the note prints.
+    #[test]
+    fn the_budget_is_ram_percent_minus_the_context_reserve() {
+        let ctx = 32768;
+        let ram = 128 * GIB;
+        let expected = (ram / 100) * 80 - context_reserve_bytes(ctx);
+        assert_eq!(resident_budget_bytes(ram, ctx), expected);
+        assert_eq!(
+            decide_ssd_streaming(Some(V41_BYTES), Some(ram), ctx, false),
+            Some(expected)
+        );
+        // ~94.5 GiB on this machine: above V4, far below V4.1.
+        assert!(expected > V4_BYTES && expected < V41_BYTES);
+        assert_eq!(SSD_STREAMING_RAM_PERCENT, 80);
+    }
+
+    /// A bigger context leaves less room for weights, so the same model can
+    /// cross from resident to streaming on context alone.
+    #[test]
+    fn a_larger_context_shrinks_the_resident_budget() {
+        let ram = 128 * GIB;
+        assert!(resident_budget_bytes(ram, 262_144) < resident_budget_bytes(ram, 4096));
+        // The engine printed "static context buffers 8073.52 MiB (ctx=32768)";
+        // the estimate must land within a MiB of it.
+        // 8073.52 MiB, in bytes, without a float cast.
+        let measured = 8073 * 1_048_576 + 52 * 1_048_576 / 100;
+        let estimate = context_reserve_bytes(32768);
+        assert!(
+            estimate >= measured && estimate - measured < 1024 * 1024,
+            "estimate {estimate} vs measured {measured}"
+        );
+        // A machine that cannot even hold the context saturates at zero rather
+        // than wrapping.
+        assert_eq!(resident_budget_bytes(4 * GIB, 262_144), 0);
+    }
+
+    /// `--ssd-streaming` already covers the case, so auto-enable stays out of
+    /// the way; there is no flag that turns streaming off, so nothing to
+    /// override.
+    #[test]
+    fn an_explicit_streaming_flag_is_left_alone() {
+        assert!(decide_ssd_streaming(Some(V41_BYTES), Some(128 * GIB), 32768, true).is_none());
+        assert!(decide_ssd_streaming(Some(1), Some(128 * GIB), 32768, true).is_none());
+    }
+
+    /// An unreadable model file, or RAM we cannot read, is not ours to
+    /// diagnose: no panic, and no guess.
+    #[test]
+    fn an_unknown_size_or_ram_neither_panics_nor_auto_enables() {
+        assert!(decide_ssd_streaming(None, Some(128 * GIB), 32768, false).is_none());
+        assert!(decide_ssd_streaming(Some(V41_BYTES), None, 32768, false).is_none());
+        let mut e = crate::config::EngineTuning::default();
+        assert!(!e.ssd_streaming);
+        auto_enable_ssd_streaming(Path::new("/nonexistent/no-such-model.gguf"), 32768, &mut e);
+        assert!(!e.ssd_streaming, "a missing file never enables streaming");
+    }
+
+    /// The tuning knobs a user set are carried through untouched when
+    /// auto-enable fires.
+    #[test]
+    fn auto_enable_preserves_streaming_tuning() {
+        let mut e = crate::config::EngineTuning {
+            ssd_streaming_cold: true,
+            ssd_streaming_cache_experts: 12,
+            ssd_streaming_preload_experts: 4,
+            ..crate::config::EngineTuning::default()
+        };
+        // Drive the pure decision, then the mutation it gates, without needing
+        // a 341 GiB file on disk.
+        assert!(
+            decide_ssd_streaming(Some(V41_BYTES), Some(128 * GIB), 32768, e.ssd_streaming)
+                .is_some()
+        );
+        e.ssd_streaming = true;
+        assert!(e.ssd_streaming_cold);
+        assert_eq!(e.ssd_streaming_cache_experts, 12);
+        assert_eq!(e.ssd_streaming_preload_experts, 4);
+    }
+
+    /// The machine plank is running on reports a plausible RAM figure.
+    #[test]
+    fn installed_ram_is_readable_on_this_platform() {
+        if let Some(ram) = total_ram_bytes() {
+            assert!(ram >= GIB, "implausible RAM reading: {ram}");
+        }
+    }
+
+    /// V4.1 has no `DSpark` drafter and the engine refuses to open the model at
+    /// all when one is attached, so plank must never auto-pair there.
+    #[test]
+    fn a_family_without_a_drafter_never_auto_pairs_one() {
+        use crate::gguf::ModelFamily;
+        let mut e = crate::config::EngineTuning::default();
+        assert!(e.mtp, "speculation is on by default");
+        assert!(drop_dspark_for_family(ModelFamily::Ds41, &mut e));
+        assert!(!e.mtp);
+        assert!(!e.mtp_strict);
+        assert_eq!(e.mtp_path, None);
+        // V4 is the family that takes one, so resolution proceeds there.
+        let mut v4 = crate::config::EngineTuning::default();
+        assert!(!drop_dspark_for_family(ModelFamily::Ds4, &mut v4));
+        assert!(v4.mtp);
+    }
+
+    /// A companion the user named survives the family gate: the engine's own
+    /// refusal is the answer they asked for.
+    #[test]
+    fn an_explicit_companion_is_not_dropped_by_the_family_gate() {
+        let mut e = crate::config::EngineTuning {
+            mtp: true,
+            mtp_path: Some(PathBuf::from("/somewhere/custom-drafter.gguf")),
+            mtp_path_explicit: true,
+            ..crate::config::EngineTuning::default()
+        };
+        assert!(drop_dspark_for_family(
+            crate::gguf::ModelFamily::Ds41,
+            &mut e
+        ));
+        assert!(e.mtp);
+        assert_eq!(
+            e.mtp_path,
+            Some(PathBuf::from("/somewhere/custom-drafter.gguf"))
+        );
+    }
+
+    /// The auto-resolved path is marked as plank's own choice, so a failed open
+    /// may retry without it.
+    #[test]
+    fn an_auto_resolved_companion_is_not_marked_explicit() {
+        let mut e = crate::config::EngineTuning::default();
+        // Only reached when the file already exists; skip when it does not, so
+        // the test never prompts or downloads.
+        if !default_dspark_path().exists() {
+            return;
+        }
+        assert!(ensure_dspark_support(&mut e).is_ok());
+        assert_eq!(e.mtp_path, Some(default_dspark_path()));
+        assert!(!e.mtp_path_explicit);
+        assert!(e.without_auto_companion().is_some());
+    }
+
     #[test]
     fn support_resolution_is_skipped_unless_mtp_was_asked_for() {
         // --dspark-off: the resolver must not touch mtp_path, and so must never
@@ -1842,65 +2292,200 @@ mod tests {
             mtp: false,
             ..Default::default()
         };
-        assert!(ensure_side_artifacts(&model, &mut e).is_ok());
+        assert!(ensure_side_artifacts(&model, 32768, &mut e).is_ok());
         let _ = std::fs::remove_file(model);
     }
 
-    /// A Qwen model must not reach for either `DeepSeek` side artifact: it
-    /// opens neither the DS4 vision encoder nor a DS4 draft checkpoint. No
-    /// download is stubbed here on purpose — if the gate regressed, the ensure
-    /// calls would try to prompt or fetch and fail.
+    /// The fallback for a missing `-m` follows the machine's default set, so
+    /// the model that loads belongs to the set whose manifest plank tracks. A
+    /// fresh install would otherwise track a manifest for a set other than the
+    /// GGUF it loads.
     #[test]
-    fn a_qwen_model_skips_the_ds4_side_artifacts() {
-        let model = stub_model("qwen", "qwen4exp");
-        let mut e = crate::config::EngineTuning {
-            mtp: true,
-            mtp_strict: true,
-            ..Default::default()
-        };
-        assert!(ensure_side_artifacts(&model, &mut e).is_ok());
-        // Speculation stays on: under the unified `--mtp` a Qwen run
-        // speculates from the block embedded in its own main GGUF, which needs
-        // neither a download nor a companion file.
-        assert!(e.mtp, "speculation is still meaningful for Qwen");
-        assert!(
-            e.mtp_path.is_none(),
-            "no DeepSeek support model resolved for a Qwen run"
-        );
-        let _ = std::fs::remove_file(model);
+    fn the_default_model_path_follows_the_roots_default_set() {
+        use crate::manifest::ModelSet;
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let v4 = crate::manifest::local_path_for_in(&root, ModelSet::Ds4, "main").expect("v4");
+        let v41 = crate::manifest::local_path_for_in(&root, ModelSet::Ds41, "main").expect("v41");
+        // Fresh: the V4 model, the default set.
+        assert_eq!(default_managed_model_path_in(&root), v4);
+        // V4 weights on disk, nothing recorded — the existing installed base.
+        std::fs::write(&v4, b"gguf").expect("write");
+        assert_eq!(default_managed_model_path_in(&root), v4);
+        // And with the V4 manifest recorded.
+        std::fs::remove_file(&v4).expect("rm");
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, ModelSet::Ds4),
+            "{}",
+        )
+        .expect("write");
+        assert_eq!(default_managed_model_path_in(&root), v4);
+        // Only a root recording the V4.1 manifest resolves the V4.1 model.
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, ModelSet::Ds41),
+            "{}",
+        )
+        .expect("write");
+        assert_eq!(default_managed_model_path_in(&root), v41);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A missing model that is *not* the `DeepSeek` default must never trigger
-    /// the `DeepSeek` download offer. `--qwen` with an unlinked
-    /// `~/.plank/qwen.gguf` used to propose fetching 87 GB of `DeepSeek` into
-    /// the Qwen slot, and so did a mistyped `-m`.
+    /// A V4.1 GGUF that is not on disk yet. That
+    /// must reach `ensure_model`'s graceful "no model at <path>" error — never
+    /// a panic, and never a prompt to fetch V4 into the V4.1 slot.
+    #[test]
+    fn an_absent_v41_model_errors_gracefully_rather_than_panicking() {
+        // The branch taken is "not the V4 default path", which is exactly what
+        // the V4.1 default is.
+        assert_ne!(default_ds41_model_path(), default_model_path());
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let missing = root.join("ds41flash.gguf");
+        assert!(!missing.exists());
+        let err = ensure_model(&missing).expect_err("an absent model must be an error");
+        assert!(err.starts_with("no model at "), "unexpected message: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Which set a model path belongs to. The skip used to be "any `-m` at
-    /// all", which would have opted `--qwen` out of Qwen upgrades entirely,
-    /// since the flag resolves to a default path.
+    /// all", which would have opted a flag resolving to a managed default path
+    /// out of upgrades entirely.
     #[test]
     fn the_managed_paths_map_to_their_set() {
         use crate::manifest::ModelSet;
-        assert_eq!(manifest_set_for_model(None), Some(ModelSet::Ds4));
+        let root = crate::downloader::tests::tempdir();
         assert_eq!(
-            manifest_set_for_model(Some(&default_model_path())),
+            manifest_set_for_model_in(&root, Some(&default_model_path())),
             Some(ModelSet::Ds4)
         );
         assert_eq!(
-            manifest_set_for_model(Some(&default_qwen_path())),
-            Some(ModelSet::Qwen)
+            manifest_set_for_model_in(&root, Some(&default_ds41_model_path())),
+            Some(ModelSet::Ds41)
         );
         // A path plank does not manage gets no manifest check at all: it is
         // the user's file, and plank must never propose replacing it.
         assert_eq!(
-            manifest_set_for_model(Some(Path::new("/models/mine.gguf"))),
+            manifest_set_for_model_in(&root, Some(Path::new("/models/mine.gguf"))),
             None
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With no `-m`, the set is the machine's default: V4 on a fresh root and
+    /// on a root that already records `ds4.manifest`, V4.1 only where
+    /// `ds41.manifest` is recorded. The middle case is the no-migration
+    /// guarantee.
+    #[test]
+    fn no_model_flag_takes_the_roots_default_set_and_never_migrates_v4() {
+        use crate::manifest::ModelSet;
+        let root = crate::downloader::tests::tempdir();
+        // Fresh: nothing recorded at all.
+        assert_eq!(
+            manifest_set_for_model_in(&root, None),
+            Some(ModelSet::Ds4),
+            "a fresh install manages the V4 set"
+        );
+        // An existing V4 install stays on V4.
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, ModelSet::Ds4),
+            "{}",
+        )
+        .expect("write");
+        assert_eq!(
+            manifest_set_for_model_in(&root, None),
+            Some(ModelSet::Ds4),
+            "an existing V4 install is never migrated to the V4.1 set"
+        );
+        // An explicit `-m` at the V4 default path still resolves to V4 even on
+        // an otherwise-fresh machine: that is the path question, not the
+        // machine-default question.
+        let fresh = crate::downloader::tests::tempdir();
+        assert_eq!(
+            manifest_set_for_model_in(&fresh, Some(&default_model_path())),
+            Some(ModelSet::Ds4)
+        );
+        // A root recording the V4.1 manifest stays on V4.1.
+        std::fs::write(
+            crate::manifest::installed_path_in(&fresh, ModelSet::Ds41),
+            "{}",
+        )
+        .expect("write");
+        assert_eq!(
+            manifest_set_for_model_in(&fresh, None),
+            Some(ModelSet::Ds41)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    /// An existing V4 install sees no change at all from the fresh-install
+    /// default: startup still fetches and decides against the V4 set, and the
+    /// V4.1 set is never consulted.
+    #[test]
+    fn an_existing_v4_install_still_runs_the_v4_manifest_flow() {
+        use std::cell::Cell;
+        let root = crate::downloader::tests::tempdir();
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            manifest_text(4, 100),
+        )
+        .expect("write");
+        let seen: Cell<Option<crate::manifest::ModelSet>> = Cell::new(None);
+        let text = manifest_text(4, 100);
+        check_manifest_at_startup_with(
+            None,
+            &root,
+            &|set| {
+                seen.set(Some(set));
+                Some(text.clone())
+            },
+            &|_, _| panic!("an up-to-date V4 install downloads nothing"),
+            &|_, _| panic!("and is never asked anything"),
+        );
+        assert_eq!(
+            seen.get(),
+            Some(crate::manifest::ModelSet::Ds4),
+            "an existing V4 install keeps managing the V4 set"
+        );
+        assert!(
+            !crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds41).exists(),
+            "nothing is recorded for the V4.1 set"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fresh install must not be *offered* the managed set's download at
+    /// launch: with no installed manifest and no model on disk, the first-run
+    /// gate returns before any confirmation, leaving acquisition to
+    /// `ensure_model`.
+    #[test]
+    fn a_fresh_install_is_not_offered_the_download_at_launch() {
+        use std::cell::Cell;
+        let root = crate::downloader::tests::tempdir();
+        let seen: Cell<Option<crate::manifest::ModelSet>> = Cell::new(None);
+        let text = manifest_text(7, 100);
+        check_manifest_at_startup_with(
+            None,
+            &root,
+            &|set| {
+                seen.set(Some(set));
+                Some(text.clone())
+            },
+            &|_, _| panic!("a fresh install starts no background download"),
+            &|_, _| panic!("and is never offered one"),
+        );
+        assert_eq!(
+            seen.get(),
+            Some(crate::manifest::ModelSet::Ds4),
+            "a fresh root manages the V4 set"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_missing_non_default_model_is_an_error_not_a_download_offer() {
         let missing =
-            std::env::temp_dir().join(format!("plank-absent-{}-qwen.gguf", std::process::id()));
+            std::env::temp_dir().join(format!("plank-absent-{}.gguf", std::process::id()));
         assert!(!missing.exists());
         let err = ensure_model(&missing).expect_err("a missing model is an error");
         assert!(err.contains("no model at"), "{err}");
@@ -1908,6 +2493,84 @@ mod tests {
             !err.contains("DeepSeek"),
             "must not offer the DeepSeek download for a non-default path: {err}"
         );
+    }
+
+    /// A fresh install's missing model is exactly its resolved set's managed
+    /// `main` path, so it must be offered acquisition — for the V4 set, with
+    /// the V4 (87 GB) size reported.
+    #[test]
+    fn fresh_install_offers_the_v4_acquisition_with_the_v4_size() {
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let path = default_managed_model_path_in(&root);
+        assert_eq!(
+            path,
+            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds4, "main")
+                .expect("v4 main path"),
+            "a fresh root's default path is the V4 managed main path"
+        );
+        assert_eq!(
+            offer_target_in(&root, &path),
+            Some(crate::manifest::ModelSet::Ds4),
+            "a fresh root's own default path must be offered, not errored"
+        );
+        assert!(
+            (main_artifact_gb(&root, crate::manifest::ModelSet::Ds4) - 87.0).abs() < 0.01,
+            "no manifest on hand yet: falls back to the V4 87 GB estimate"
+        );
+        // The V4.1 managed path is not this root's default, so it is never
+        // offered: a V4.1 GGUF is reached by an explicit `-m`.
+        let v41 =
+            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds41, "main")
+                .expect("v41 main path");
+        assert_eq!(offer_target_in(&root, &v41), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An existing V4 install with no model at its (V4) managed path still
+    /// gets exactly the V4 offer it always did — never migrated to V4.1, and
+    /// reporting the V4 87 GB size, not the V4.1 one.
+    #[test]
+    fn existing_v4_install_still_offers_the_v4_acquisition_with_the_v4_size() {
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(
+            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            "{}",
+        )
+        .expect("write");
+        let path = default_managed_model_path_in(&root);
+        assert_eq!(
+            path,
+            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds4, "main")
+                .expect("v4 main path"),
+            "an existing V4 install stays on the V4 managed path"
+        );
+        assert_eq!(
+            offer_target_in(&root, &path),
+            Some(crate::manifest::ModelSet::Ds4)
+        );
+        assert!(
+            (main_artifact_gb(&root, crate::manifest::ModelSet::Ds4) - 87.0).abs() < 0.01,
+            "no manifest bytes on hand: falls back to the V4 87 GB estimate"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An explicit `-m /some/path` that does not exist must never trigger a
+    /// download offer, even though it happens to be the only missing model on
+    /// this (fresh) root: it is the user's own file, not the managed default.
+    #[test]
+    fn an_explicit_nonexistent_path_is_never_offered_acquisition() {
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let explicit = root.join("some/other/path.gguf");
+        assert_eq!(
+            offer_target_in(&root, &explicit),
+            None,
+            "an arbitrary explicit path is never the offer target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
