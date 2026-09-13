@@ -7,8 +7,18 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.0.0 is out**, and the beta channel is on 5.0.7. The patch number
+**v5.1.0 is out**, and the beta channel is on 5.1.2. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.1.2: sentences no longer finish themselves when a tool returns.** The TUI
+renders streaming markdown on a bounded cadence, so highlighting a long code
+block does not cost a re-render per token. The tail that cadence deferred was
+only committed when the next token arrived — and a model that stops writing to
+open a tool call sends no next token. So the last few words of a sentence sat
+off screen for as long as the tool ran, and the sentence appeared to complete
+itself once the result came back. The deferred tail now goes out on the draw
+clock instead, in the main transcript, the `/btw` panel and every sub-agent
+view.
 
 **5.1.0: plank runs DeepSeek V4.1 Flash.** It is a family of its own rather
 than a V4 revision, with its own weights, tokenizer, tool-call spelling and
@@ -47,7 +57,10 @@ decode-bound.
 ![/toks panel: two side-by-side braille line charts in the theme green. Generation speed on the left reads now 29.5, avg 32.9, min 26.9, max 45.9 tok/s; prefill speed on the right reads now 232.9, avg 440.0, min 42.8, max 2112.0 tok/s](/assets/toks.png)
 
 **Smaller things.** Diff cards are syntax-highlighted rather than flat red and
-green. `!!` output opens in its own scrollable panel instead of scrolling away
+green:
+
+![An edit's diff card: added lines on green and the removed line on red, with Rust keywords, strings and function names highlighted inside both, line numbers down the left and a changed-word highlight on `&& !force`](/assets/diff-highlighting.png)
+ `!!` output opens in its own scrollable panel instead of scrolling away
 inside the model's. Sub-agents you did not name are alpha, bravo and charlie
 instead of four identical `sub-agent` labels. Clicking the footer's brain hides
 or shows thinking for the session without writing a setting. `/hooks off` and

@@ -138,9 +138,19 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v5.0.0 is out</strong>, and the beta channel is on 5.0.7. The
+<p><strong>v5.1.0 is out</strong>, and the beta channel is on 5.1.2. The
 patch number is still the channel: <code>.0</code> is stable, anything
 above it is beta.</p>
+<p><strong>5.1.2: sentences no longer finish themselves when a tool
+returns.</strong> The TUI renders streaming markdown on a bounded
+cadence, so highlighting a long code block does not cost a re-render per
+token. The tail that cadence deferred was only committed when the next
+token arrived — and a model that stops writing to open a tool call sends
+no next token. So the last few words of a sentence sat off screen for as
+long as the tool ran, and the sentence appeared to complete itself once
+the result came back. The deferred tail now goes out on the draw clock
+instead, in the main transcript, the <code>/btw</code> panel and every
+sub-agent view.</p>
 <p><strong>5.1.0: plank runs DeepSeek V4.1 Flash.</strong> It is a
 family of its own rather than a V4 revision, with its own weights,
 tokenizer, tool-call spelling and <code>.ds41.kv</code> transcripts that
@@ -178,11 +188,14 @@ pass raises is whether it is prefill-bound or decode-bound.</p>
 <p><img src="/assets/toks.png"
 alt="/toks panel: two side-by-side braille line charts in the theme green. Generation speed on the left reads now 29.5, avg 32.9, min 26.9, max 45.9 tok/s; prefill speed on the right reads now 232.9, avg 440.0, min 42.8, max 2112.0 tok/s" /></p>
 <p><strong>Smaller things.</strong> Diff cards are syntax-highlighted
-rather than flat red and green. <code>!!</code> output opens in its own
-scrollable panel instead of scrolling away inside the model's.
-Sub-agents you did not name are alpha, bravo and charlie instead of four
-identical <code>sub-agent</code> labels. Clicking the footer's brain
-hides or shows thinking for the session without writing a setting.
+rather than flat red and green:</p>
+<p><img src="/assets/diff-highlighting.png"
+alt="An edit&#39;s diff card: added lines on green and the removed line on red, with Rust keywords, strings and function names highlighted inside both, line numbers down the left and a changed-word highlight on &amp;&amp; !force" />
+<code>!!</code> output opens in its own scrollable panel instead of
+scrolling away inside the model's. Sub-agents you did not name are
+alpha, bravo and charlie instead of four identical
+<code>sub-agent</code> labels. Clicking the footer's brain hides or
+shows thinking for the session without writing a setting.
 <code>/hooks off</code> and <code>/skills off</code> are session master
 switches. And an interrupted model download resumes where it stopped
 instead of starting over, which used to cost 88 GiB.</p>
