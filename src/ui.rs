@@ -2146,6 +2146,29 @@ pub(crate) fn render_mcp_report(servers: &[crate::tools::mcp::McpServer], color:
     out
 }
 
+/// The NATO phonetic alphabet, lowercase, in the conventional spellings
+/// (`juliett` with two t's, `x-ray` hyphenated). Source of truth for the
+/// default sub-agent names; see `nato_label`.
+const NATO_ALPHABET: [&str; 26] = [
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett",
+    "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
+    "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu",
+];
+
+/// The label for the `n`-th unnamed sub-agent of a session, counting from zero:
+/// `alpha`, `bravo`, ... `zulu`, then `alpha-2` ... `zulu-2`, `alpha-3`, and so
+/// on. It never runs out and never repeats, so a log can always tell two
+/// unnamed sub-agents apart.
+fn nato_label(n: usize) -> String {
+    let word = NATO_ALPHABET[n % NATO_ALPHABET.len()];
+    let lap = n / NATO_ALPHABET.len();
+    if lap == 0 {
+        word.to_string()
+    } else {
+        format!("{word}-{}", lap + 1)
+    }
+}
+
 /// Shared turn state for the interactive and headless front-ends.
 // The bools are independent UI/turn latches, not a disguised state machine.
 #[allow(clippy::struct_excessive_bools)]
@@ -2337,6 +2360,13 @@ struct Agent<'a> {
     /// `showThinking` flip or a console restart never repeats what the console
     /// already showed. Reset with the session; clamped by rollback.
     console_seen: usize,
+    /// How many *unnamed* sub-agents this session has already labelled. Every
+    /// one of them used to be called `sub-agent`, which made a log holding
+    /// several of them unreadable; instead each draws the next NATO phonetic
+    /// word from `nato_label`. One counter per session covers both entry points
+    /// (the `agent` tool and `/subagent`) and any nesting, so no two unnamed
+    /// sub-agents in a session ever share a name. Reset with the session.
+    unnamed_subagents: usize,
     /// The last few finished sub-agent sidechains, newest last, for the
     /// `/repro` sidecars: a sidechain is truncated out of the transcript the
     /// moment it ends, so without this the main dump could never show what a
@@ -3459,7 +3489,7 @@ impl Agent<'_> {
         }
         let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
         let label = if name.is_empty() {
-            "sub-agent".to_string()
+            self.next_unnamed_subagent_label()
         } else {
             name.to_string()
         };
@@ -5772,6 +5802,15 @@ impl Agent<'_> {
         "Write the AGENTS.md file to the current directory."
     );
 
+    /// Draw the next label for an unnamed sub-agent, advancing the session's
+    /// counter. A *named* sub-agent never calls this, so naming one in the
+    /// middle of a run does not skip a word.
+    fn next_unnamed_subagent_label(&mut self) -> String {
+        let label = nato_label(self.unnamed_subagents);
+        self.unnamed_subagents += 1;
+        label
+    }
+
     /// The session-state half of `/clear` (and `/new`): drops the ladder, mints
     /// a fresh session, and re-scaffolds session-start context — everything
     /// except the front-end-specific screen wipe and rewarm. Shared by the
@@ -5786,6 +5825,9 @@ impl Agent<'_> {
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
+        // ... and a new log deserves a fresh alphabet: the next unnamed
+        // sub-agent is `alpha` again.
+        self.unnamed_subagents = 0;
         self.broadcast_session_reset(None);
         self.reminder = SystemPromptReminder::new();
         // Same merged roster the launch path advertises, so /clear
@@ -6544,6 +6586,9 @@ impl Agent<'_> {
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
+        // ... and a new log deserves a fresh alphabet: the next unnamed
+        // sub-agent is `alpha` again.
+        self.unnamed_subagents = 0;
         self.last_ctx_used = 0;
         if let Some(note) = note {
             println!("{note}");
@@ -7403,6 +7448,9 @@ the original is frozen and listed in /tree"
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
+        // ... and a new log deserves a fresh alphabet: the next unnamed
+        // sub-agent is `alpha` again.
+        self.unnamed_subagents = 0;
         self.broadcast_session_reset(Some(
             "[session replaced — its history is on the local screen only]",
         ));
@@ -11597,6 +11645,13 @@ impl Agent<'_> {
                             }
                             view.follow = true;
                             selection.cancel();
+                        } else if tui::think_click(m.column, m.row) {
+                            // The footer's brain flips thinking visibility for
+                            // this session. A single click, unlike the
+                            // wastebasket's double: this changes only what the
+                            // next pass prints, and clicking again undoes it.
+                            think_show_click();
+                            selection.cancel();
                         } else if tui::ctx_click(m.column, m.row) {
                             // The footer's ctx gauge toggles the `/context`
                             // panel: the gauge is the one-number summary, the
@@ -12151,6 +12206,7 @@ impl Agent<'_> {
                             &mut log,
                             terminal,
                             &mut view,
+                            !feedback,
                         );
                         if feedback {
                             self.session
@@ -12158,6 +12214,18 @@ impl Agent<'_> {
                             log.push_dim(
                                 "[recorded for the model — ask about it in your next message]",
                             );
+                        } else if let Some(text) = bang_panel_report(&cmd, &result) {
+                            // `!!` output is the operator's alone, so it goes
+                            // into the same dismissable panel `/context` and
+                            // `/usage` use instead of scrolling away inside the
+                            // conversation. Nothing about it reaches the
+                            // session — that is the whole point of `!!`.
+                            report = Some(tui::ReportPanel::new(bang_panel_title(&cmd), &text));
+                            view.follow = true;
+                        } else {
+                            // Nothing to show: an empty panel would say less
+                            // than the outcome line.
+                            bang_log_outcome(&cmd, &result, &mut log);
                         }
                     } else if line.starts_with('/') {
                         if !self.tui_slash(
@@ -12248,12 +12316,19 @@ impl Agent<'_> {
     /// its output as one user message (see [`bang_transcript_entry`]) so the
     /// model has it as history on the next real prompt. For output the model
     /// should act on *now*, use a regular turn and let it call the `bash` tool.
+    ///
+    /// `quiet` is the `!!` shape: nothing is written to the scrollback — not
+    /// the streamed lines, not the closing outcome — because the caller shows
+    /// the whole thing in a [`tui::ReportPanel`] instead. The command still
+    /// runs through the same sink, so the status line keeps counting seconds
+    /// and Esc still interrupts: a slow `!!` never looks frozen.
     fn tui_bang(
         cwd: &std::path::Path,
         cmd: &str,
         log: &mut OutputLog,
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
+        quiet: bool,
     ) -> Result<crate::tools::bash::ImmediateOutput, String> {
         // Output streams into the log as it arrives (issue #22): the sink's
         // `line` appends and `tick` redraws, so a long-running command shows
@@ -12266,15 +12341,20 @@ impl Agent<'_> {
             cmd: &'b str,
             start: Instant,
             dirty: bool,
+            quiet: bool,
         }
         impl crate::tools::bash::ImmediateSink for Sink<'_, '_> {
             fn line(&mut self, _stream: crate::tools::bash::Stream, text: &str) {
+                if self.quiet {
+                    return;
+                }
                 self.log.push_dim(text.to_owned());
                 self.dirty = true;
             }
             fn tick(&mut self) -> bool {
                 let status = format!(
-                    "! {} ({}s, Esc to stop)",
+                    "{} {} ({}s, Esc to stop)",
+                    if self.quiet { "!!" } else { "!" },
                     self.cmd,
                     self.start.elapsed().as_secs()
                 );
@@ -12315,31 +12395,11 @@ impl Agent<'_> {
             cmd,
             start,
             dirty: false,
+            quiet,
         };
         let result = crate::tools::bash::run_immediate(cwd, cmd, &mut sink);
-        match &result {
-            Ok(out) => {
-                if out.interrupted {
-                    log.push_dim("[interrupted]");
-                } else if out.exit_code == 0 {
-                    // A command that prints nothing is otherwise indis-
-                    // tinguishable from one still running, so say it finished.
-                    // Only when it did: an interrupted command did not.
-                    log.push_spans(vec![ratatui::text::Span::styled(
-                        "done.",
-                        crate::tui::done_style(),
-                    )]);
-                } else {
-                    // A failing command finished too, but saying "done." in
-                    // green next to a non-zero exit reads as success. One red
-                    // line carrying the code is the whole outcome.
-                    log.push_spans(vec![ratatui::text::Span::styled(
-                        format!("failed (exit code {}).", out.exit_code),
-                        crate::tui::failed_style(),
-                    )]);
-                }
-            }
-            Err(e) => log.push_dim(format!("!{cmd}: {e}")),
+        if !quiet {
+            bang_log_outcome(cmd, &result, log);
         }
         result
     }
@@ -15016,7 +15076,7 @@ impl Agent<'_> {
                     None => (
                         None,
                         None,
-                        "sub-agent".to_string(),
+                        self.next_unnamed_subagent_label(),
                         arg.to_string(),
                         "[subagent started]".to_string(),
                     ),
@@ -15836,6 +15896,48 @@ impl SegmentDoubleClick {
 fn microcompact_toggle() -> String {
     let on = crate::settings::active().context.microcompact;
     microcompact_command(if on { "off" } else { "on" })
+}
+
+/// The settings a click on the footer's brain installs, and the flash tip it
+/// leaves behind.
+///
+/// Pure, and taking the current settings rather than reading them, so the whole
+/// of what the gesture changes is testable: the returned `Settings` differs
+/// from `cur` in `ui.show_thinking` and nowhere else, and applying it twice
+/// returns the original.
+fn think_show_toggled(cur: &crate::settings::Settings) -> (crate::settings::Settings, String) {
+    let mut next = cur.clone();
+    next.ui.show_thinking = !cur.ui.show_thinking;
+    let tip = format!(
+        "{} thinking {} (this session)",
+        crate::status::THINK_MARK,
+        if next.ui.show_thinking {
+            "shown"
+        } else {
+            "hidden"
+        }
+    );
+    (next, tip)
+}
+
+/// A click on the footer's brain flips `ui.showThinking` for this session only.
+///
+/// Live settings, never disk: exactly the bargain `/mc` and `/loopguard` make.
+/// A glyph you can hit by accident must not rewrite `settings.json`, and
+/// showing thinking is a "what do I want to watch right now" decision, not a
+/// preference. `/config ui.showThinking` is still the way to make it stick, and
+/// still persists; it overwrites whatever a click left live, because it goes
+/// through the same [`crate::settings::reinstall`] afterwards.
+///
+/// Nothing caches the value: `configure_stream` and `PassCtx` both read
+/// `active()` when a pass starts, so the next generation observes the flip.
+/// Feedback is a flash tip rather than a log line — the answer belongs next to
+/// the glyph that was clicked, and it must not push the output pane around
+/// mid-turn.
+fn think_show_click() {
+    let (next, tip) = think_show_toggled(crate::settings::active());
+    crate::settings::reinstall(next);
+    crate::status::set_flash_tip(tip);
 }
 
 /// What a single click on the wastebasket leaves in the log: the state, and the
@@ -16845,6 +16947,14 @@ fn busy_ui_loop(
                     toggle_toks_report(&mut report);
                     selection.cancel();
                 }
+                // The footer's brain, as at idle. Safe mid-turn for the reason
+                // the wastebasket is: each pass re-reads the setting when it
+                // configures its renderer, so the flip lands on the next pass
+                // of the turn already running rather than being lost.
+                MouseEventKind::Down(MouseButton::Left) if tui::think_click(m.column, m.row) => {
+                    think_show_click();
+                    selection.cancel();
+                }
                 // The footer's ctx gauge toggles the `/context` panel, as at
                 // idle, over the same turn-start snapshot the typed command
                 // gets.
@@ -17273,6 +17383,7 @@ fn new_agent(
         fork_kv: Vec::new(),
         fork_points: Vec::new(),
         console_seen: 0,
+        unnamed_subagents: 0,
         sidechain_dumps: std::collections::VecDeque::new(),
         // A local engine handed in alongside a provider main agent lives in the
         // same cache as any other alternate: `provider: local` definitions take
@@ -17520,6 +17631,97 @@ fn bang_head(text: &str) -> String {
         out.push_str("[output truncated]\n");
     }
     out
+}
+
+/// Writes a finished `!` command's outcome into the TUI scrollback: the
+/// interruption, or the exit status. Shared by the streaming `!` path and by
+/// the `!!` path when the command produced no output at all and so gets no
+/// panel — in both cases this line is the only proof the command finished.
+fn bang_log_outcome(
+    cmd: &str,
+    result: &Result<crate::tools::bash::ImmediateOutput, String>,
+    log: &mut OutputLog,
+) {
+    match result {
+        Ok(out) => {
+            if out.interrupted {
+                log.push_dim("[interrupted]");
+            } else if out.exit_code == 0 {
+                // A command that prints nothing is otherwise indis-
+                // tinguishable from one still running, so say it finished.
+                // Only when it did: an interrupted command did not.
+                log.push_spans(vec![ratatui::text::Span::styled(
+                    "done.",
+                    crate::tui::done_style(),
+                )]);
+            } else {
+                // A failing command finished too, but saying "done." in
+                // green next to a non-zero exit reads as success. One red
+                // line carrying the code is the whole outcome.
+                log.push_spans(vec![ratatui::text::Span::styled(
+                    format!("failed (exit code {}).", out.exit_code),
+                    crate::tui::failed_style(),
+                )]);
+            }
+        }
+        Err(e) => log.push_dim(format!("!{cmd}: {e}")),
+    }
+}
+
+/// The `!!` panel's title. The command is part of it because, unlike `/context`
+/// or `/usage`, the panel shows the output of *one specific command* and the
+/// scrollback above it may have scrolled away. Long commands are clipped so the
+/// title still fits a panel border.
+fn bang_panel_title(cmd: &str) -> String {
+    const MAX: usize = 60;
+    let one_line = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= MAX {
+        format!("!! {one_line}")
+    } else {
+        let head: String = one_line.chars().take(MAX - 1).collect();
+        format!("!! {head}…")
+    }
+}
+
+/// Renders a finished `!!` command as the body of a [`tui::ReportPanel`], or
+/// `None` when the command produced nothing to show — an empty pane explains
+/// less than the one-line outcome the caller logs instead.
+///
+/// stderr is kept, labelled and red rather than interleaved with stdout, and a
+/// non-zero exit or an interruption is stated on its own closing line: a
+/// failure must never reach the panel as silence.
+fn bang_panel_report(
+    cmd: &str,
+    result: &Result<crate::tools::bash::ImmediateOutput, String>,
+) -> Option<String> {
+    use std::fmt::Write as _;
+    let out = result.as_ref().ok()?;
+    let (stdout, stderr) = (out.stdout.trim_end(), out.stderr.trim_end());
+    if stdout.is_empty() && stderr.is_empty() {
+        return None;
+    }
+    let mut s = String::new();
+    let _ = writeln!(s, "\x1b[1m$ {cmd}{ANSI_RESET}\n");
+    if !stdout.is_empty() {
+        let _ = writeln!(s, "{stdout}");
+    }
+    if !stderr.is_empty() {
+        if !stdout.is_empty() {
+            s.push('\n');
+        }
+        let _ = writeln!(s, "\x1b[38;5;238mstderr{ANSI_RESET}");
+        let _ = writeln!(s, "\x1b[31m{stderr}{ANSI_RESET}");
+    }
+    if out.interrupted {
+        let _ = write!(s, "\n\x1b[38;5;238m[interrupted]{ANSI_RESET}");
+    } else if out.exit_code != 0 {
+        let _ = write!(
+            s,
+            "\n\x1b[31mfailed (exit code {}).{ANSI_RESET}",
+            out.exit_code
+        );
+    }
+    Some(s)
 }
 
 /// Builds the single user message a `!` command appends to the transcript:
@@ -19437,6 +19639,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -22485,6 +22688,67 @@ mod tests {
         assert!(LiveCommands::output("/context-ish").is_none());
     }
 
+    /// A brain click flips thinking visibility and changes nothing else.
+    #[test]
+    fn a_brain_click_flips_only_show_thinking() {
+        let mut cur = crate::settings::Settings::default();
+        cur.ui.show_thinking = false;
+        // Some unrelated state, to catch a toggle that rebuilds rather than
+        // clones the settings.
+        cur.context.microcompact = false;
+        let (next, tip) = super::think_show_toggled(&cur);
+        assert!(next.ui.show_thinking, "the click turns thinking on");
+        assert!(tip.contains("shown"), "{tip:?}");
+        assert!(tip.contains("this session"), "{tip:?}");
+        let mut same = next.clone();
+        same.ui.show_thinking = cur.ui.show_thinking;
+        assert_eq!(same, cur, "nothing but showThinking moved");
+    }
+
+    /// Clicking twice puts it back exactly as it was, from either start.
+    #[test]
+    fn two_brain_clicks_round_trip() {
+        for start in [true, false] {
+            let mut cur = crate::settings::Settings::default();
+            cur.ui.show_thinking = start;
+            let (once, _) = super::think_show_toggled(&cur);
+            assert_ne!(once.ui.show_thinking, start);
+            let (twice, tip) = super::think_show_toggled(&once);
+            assert_eq!(twice, cur, "back to the original settings");
+            assert!(
+                tip.contains(if start { "shown" } else { "hidden" }),
+                "{tip:?}"
+            );
+        }
+    }
+
+    /// The click is live-only: it goes through `reinstall`, never `save_to`,
+    /// so the settings file on disk is byte-for-byte what it was.
+    #[test]
+    fn a_brain_click_does_not_touch_the_settings_file() {
+        // `reinstall` reconciles the debug-console mirror off `showThinking`,
+        // and this is the one test here that installs process-wide settings
+        // rather than the thread-local test override: take the same lock the
+        // mirror's own tests take so the two cannot interleave.
+        let _g = crate::debugmirror::test_support::lock();
+        let before = crate::settings::project_path().map(|p| std::fs::read(&p).ok());
+        let live = crate::settings::active().ui.show_thinking;
+        super::think_show_click();
+        assert_ne!(
+            crate::settings::active().ui.show_thinking,
+            live,
+            "the live value flipped"
+        );
+        super::think_show_click();
+        assert_eq!(
+            crate::settings::active().ui.show_thinking,
+            live,
+            "and flipped back"
+        );
+        let after = crate::settings::project_path().map(|p| std::fs::read(&p).ok());
+        assert_eq!(before, after, "settings.json must be untouched");
+    }
+
     /// A console that connects after two turns receives exactly those two
     /// passes, framed, before the third turn's live bytes.
     #[test]
@@ -23479,6 +23743,67 @@ mod tests {
         assert_eq!(bang_head("ok\n"), "ok\n");
     }
 
+    /// A `!!` command's output becomes the body of the scrollable panel, with
+    /// the command itself as a header, and the panel title names the command
+    /// so it is identifiable once the echo has scrolled away.
+    #[test]
+    fn bang_panel_shows_the_command_and_its_output() {
+        let out = crate::tools::bash::ImmediateOutput {
+            stdout: "hello\nworld\n".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            interrupted: false,
+        };
+        let text = bang_panel_report("echo hello", &Ok(out)).expect("panel for non-empty output");
+        assert!(text.contains("$ echo hello"), "{text}");
+        assert!(text.contains("hello\nworld"), "{text}");
+        assert_eq!(bang_panel_title("echo hello"), "!! echo hello");
+        // A long command is clipped, not wrapped, so the border still fits.
+        let long = bang_panel_title(&"x".repeat(200));
+        assert!(long.chars().count() <= 63, "{long}");
+        assert!(long.ends_with('…'), "{long}");
+    }
+
+    /// A failing command's exit status and its stderr both reach the panel:
+    /// neither may be dropped just because the output moved out of the log.
+    #[test]
+    fn bang_panel_keeps_stderr_and_the_exit_status() {
+        let out = crate::tools::bash::ImmediateOutput {
+            stdout: String::new(),
+            stderr: "boom: not found\n".to_string(),
+            exit_code: 127,
+            interrupted: false,
+        };
+        let text = bang_panel_report("nope", &Ok(out)).expect("stderr alone still opens a panel");
+        assert!(text.contains("stderr"), "{text}");
+        assert!(text.contains("boom: not found"), "{text}");
+        assert!(text.contains("failed (exit code 127)."), "{text}");
+
+        let stopped = crate::tools::bash::ImmediateOutput {
+            stdout: "partial\n".to_string(),
+            stderr: String::new(),
+            exit_code: 130,
+            interrupted: true,
+        };
+        let text = bang_panel_report("sleep 99", &Ok(stopped)).expect("partial output");
+        assert!(text.contains("[interrupted]"), "{text}");
+    }
+
+    /// Nothing to show means no panel at all — the caller logs the one-line
+    /// outcome instead of opening an empty pane. A spawn failure is the same:
+    /// there is no output, and the error belongs on the `!<cmd>: …` log line.
+    #[test]
+    fn bang_panel_is_skipped_when_there_is_no_output() {
+        let quiet = crate::tools::bash::ImmediateOutput {
+            stdout: "\n".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            interrupted: false,
+        };
+        assert!(bang_panel_report("true", &Ok(quiet)).is_none());
+        assert!(bang_panel_report("nope", &Err("no such binary".into())).is_none());
+    }
+
     #[test]
     fn esc_cancels_a_streaming_answer_and_defers_the_panel_close() {
         let shared = TurnShared::default();
@@ -24019,6 +24344,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -24142,6 +24468,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25268,6 +25595,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25454,6 +25782,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn tool_call_inside_think_is_dispatched_and_the_block_is_closed() {
         // Opt this thread into in-think dispatch; the shipped default is off.
         let mut settings = crate::settings::Settings::default();
@@ -25536,6 +25865,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25644,6 +25974,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25739,6 +26070,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25857,6 +26189,7 @@ mod tests {
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -26107,9 +26440,9 @@ mod tests {
         assert_eq!(
             errors,
             vec![
-                "guard: stopped a reasoning loop in sub-agent 'sub-agent'",
-                "guard: stopped a reasoning loop (2 in a row) in sub-agent 'sub-agent'",
-                "guard: asked for the report after 2 loops in a row in sub-agent 'sub-agent'",
+                "guard: stopped a reasoning loop in sub-agent 'alpha'",
+                "guard: stopped a reasoning loop (2 in a row) in sub-agent 'alpha'",
+                "guard: asked for the report after 2 loops in a row in sub-agent 'alpha'",
             ],
             "{events:?}"
         );
@@ -28157,7 +28490,7 @@ or the user's next message aborts before its first token"
             matches!(
                 got.first(),
                 Some(crate::worker::UiEvent::Dim(d))
-                    if d == &crate::tui::subagent_signpost("sub-agent")
+                    if d == &crate::tui::subagent_signpost("alpha")
             ),
             "first event should be the Dim signpost: {got:?}"
         );
@@ -28175,6 +28508,108 @@ or the user's next message aborts before its first token"
             "no sub-agent render output was forwarded: {got:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The generated names are the NATO alphabet, lowercase, and they wrap with
+    /// a lap suffix rather than running out or repeating.
+    #[test]
+    fn nato_labels_run_alpha_bravo_charlie_and_wrap_past_zulu() {
+        assert_eq!(nato_label(0), "alpha");
+        assert_eq!(nato_label(1), "bravo");
+        assert_eq!(nato_label(2), "charlie");
+        assert_eq!(nato_label(3), "delta");
+        // The conventional spellings, not the naive ones.
+        assert_eq!(nato_label(9), "juliett");
+        assert_eq!(nato_label(23), "x-ray");
+        assert_eq!(nato_label(25), "zulu");
+        // Past zulu the alphabet starts again with a lap suffix.
+        assert_eq!(nato_label(26), "alpha-2");
+        assert_eq!(nato_label(27), "bravo-2");
+        assert_eq!(nato_label(51), "zulu-2");
+        assert_eq!(nato_label(52), "alpha-3");
+        // ... and never repeats: 1000 draws, 1000 distinct labels.
+        let all: std::collections::HashSet<String> = (0..1000).map(nato_label).collect();
+        assert_eq!(all.len(), 1000);
+    }
+
+    /// One counter per session, shared by every unnamed sub-agent, and a `/new`
+    /// or `/clear` puts it back to `alpha` so a post-reset log reads the same.
+    #[test]
+    fn the_unnamed_sub_agent_counter_is_per_session_and_resets_with_it() {
+        let dir = scratch_dir("nato-counter");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert_eq!(agent.next_unnamed_subagent_label(), "alpha");
+        assert_eq!(agent.next_unnamed_subagent_label(), "bravo");
+        assert_eq!(agent.next_unnamed_subagent_label(), "charlie");
+        agent.reset_session_state();
+        assert_eq!(
+            agent.next_unnamed_subagent_label(),
+            "alpha",
+            "a session reset restarts the alphabet"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `agent` tool's unnamed sub-agents draw successive NATO names, and a
+    /// *named* one keeps its name without consuming a slot — so naming one in
+    /// the middle does not skip a word.
+    #[test]
+    fn unnamed_agent_tool_calls_are_labelled_alpha_then_bravo() {
+        let dir = scratch_dir("nato-agent-tool");
+        let engine = ScriptedEngine {
+            replies: vec![
+                "one\n".to_string(),
+                "two\n".to_string(),
+                "three\n".to_string(),
+            ],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.agents = vec![named_def("reviewer", true)];
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        for c in [
+            agent_call("say hi", None),
+            agent_call("review it", Some("reviewer")),
+            agent_call("say hi again", None),
+        ] {
+            let out = agent.run_agent_tool(&c);
+            assert!(!out.starts_with("Tool error"), "{out}");
+        }
+        let labels: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                crate::worker::UiEvent::SubStart { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "alpha".to_string(),
+                "reviewer".to_string(),
+                "bravo".to_string()
+            ],
+            "the named run keeps its name and consumes no NATO slot"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other entry point — `/subagent` with no `:<name>` — draws from the
+    /// same per-session sequence, so the two never collide in one log.
+    #[test]
+    fn the_subagent_command_shares_the_nato_sequence() {
+        let dir = scratch_dir("nato-slash");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        // Both sites call the same draw, so the sequence is shared: standing in
+        // for one of them here still proves the other cannot repeat it.
+        assert_eq!(agent.next_unnamed_subagent_label(), "alpha");
+        assert_eq!(agent.next_unnamed_subagent_label(), "bravo");
+        assert_eq!(agent.unnamed_subagents, 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -28268,6 +28703,7 @@ or the user's next message aborts before its first token"
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -28307,7 +28743,7 @@ or the user's next message aborts before its first token"
             "one finished sidechain kept"
         );
         let dump = agent.sidechain_dumps.back().unwrap();
-        assert_eq!(dump.label, "sub-agent");
+        assert_eq!(dump.label, "alpha");
         assert_eq!(dump.outcome, "report");
         assert!(
             dump.messages.iter().any(|m| m.text.contains("echo 42")),
@@ -28405,6 +28841,7 @@ or the user's next message aborts before its first token"
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -28576,6 +29013,7 @@ or the user's next message aborts before its first token"
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
