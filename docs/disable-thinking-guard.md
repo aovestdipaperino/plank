@@ -116,10 +116,12 @@ looping and has been removed. Do not reconstruct it.") stays as it is.
 
 ### 4. Other engines
 
-- **Qwen** (`ToolSyntax::Qwen`, same `Ds4Engine`): the template's no-think
-  form is `<think></think>`, produced by the same `Ds4ThinkMode::None` mapping
-  in `ds4_think`, so it is covered by the DS4 change. Verify with the Qwen
-  fixture in `ds4engine` tests rather than assume.
+- **DeepSeek V4.1** (`ToolSyntax::Dsml41`, same `Ds4Engine`): the only other
+  dialect plank speaks — `ToolSyntax` is exactly `{ Dsml, Dsml41 }` — and it
+  runs through the same `Ds4ThinkMode::None` mapping in `ds4_think`, so it is
+  covered by the DS4 change. Its reasoning effort is numeric rather than prose,
+  which changes what a *level* emits, not what *off* emits. Verify with the
+  V4.1 fixture in `ds4engine` tests rather than assume.
 - **Provider engines** (`remote/provider.rs`): Anthropic and OpenAI already
   omit sampling parameters and let the server decide reasoning; the Responses
   path leaves `reasoning.effort` to the default. Ignore the flag there in the

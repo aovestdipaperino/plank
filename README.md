@@ -46,7 +46,7 @@ cargo build --release
 
 - **With `refs/ds4` present:** `build.rs` builds `libds4core.a` from the Metal-backend objects and links the required frameworks, enabling the `ds4_engine` cfg.
 - **Missing submodule:** plank still builds, but without the native engine it uses the echo engine only (useful for development/CI).
-- **Qwen3.8-Flash-Next is not built by default.** DeepSeek V4 Flash is the model plank is for; Qwen3.8 was ported for dialect parity with the C reference and its output quality does not justify shipping it to everyone. Build `--features qwen` to get the `--qwen` flag, the model's own tools prompt and `<tool_call>` dialect, and its PLE sidecar wiring. A default build still *recognises* a Qwen GGUF and refuses it by name rather than misparsing it, and still reads and sweeps `.qwn.kv` transcripts a Qwen-enabled build left behind.
+- **Two model families, one build.** DeepSeek V4 Flash and V4.1 Flash are both compiled in and told apart from the GGUF's own `general.architecture`; each has its own tool-call dialect, artifact set and transcript extension (`.ds4.kv` / `.ds41.kv`). Qwen3.8-Flash-Next was served once and is retired — upstream deleted its Metal kernels — so there is no `qwen` feature and no `--qwen` flag. Transcripts a Qwen build left behind are left strictly alone: a retired model name matches no live family, so those files are never listed, swept or restored.
 
 You will also need a GGUF model file (e.g. `ds4flash.gguf`) for real inference; see the `download_model.sh` script in `refs/ds4`.
 
@@ -80,9 +80,9 @@ Without a model (or on non-macOS platforms) plank still runs against a built-in 
 
 ### Speculative decoding (MTP)
 
-Speculative decoding — multi-token prediction, `--mtp` — is **on by default**, with a different mechanism per model family. DeepSeek uses its auxiliary DSpark draft checkpoint for V4 Flash: it reads hidden states from the main model, proposes up to five tokens ahead, and the main model verifies them and commits only the prefix it agrees with, so one verification pass can advance the stream by several tokens. Qwen3.8-Flash-Next instead speculates from the MTP block inside its own main GGUF, so it needs no draft checkpoint at all. `--mtp-off` turns it off for target-only decode.
+Speculative decoding — multi-token prediction, `--mtp` — is **on by default**, with a different mechanism per model family. DeepSeek uses its auxiliary DSpark draft checkpoint for V4 Flash: it reads hidden states from the main model, proposes up to five tokens ahead, and the main model verifies them and commits only the prefix it agrees with, so one verification pass can advance the stream by several tokens. V4.1 Flash ships no drafter, so it decodes target-only. `--mtp-off` turns it off for target-only decode.
 
-On DeepSeek the support model (~5.6 GB) does not need a flag of its own. It resolves to `~/.plank/ds4flash.dspark.gguf` and, when missing, is offered for download through the same resumable, playable path as the main model. `--mtp-model <path>` overrides it, and is the same flag that carries Qwen's required PLE sidecar — one companion flag, routed to whichever slot the loaded model's family wants.
+On DeepSeek the support model (~5.6 GB) does not need a flag of its own. It resolves to `~/.plank/ds4flash.dspark.gguf` and, when missing, is offered for download through the same resumable, playable path as the main model. `--mtp-model <path>` overrides it.
 
 ```sh
 plank --temp 0

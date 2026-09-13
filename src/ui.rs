@@ -22059,12 +22059,15 @@ mod tests {
     /// carries, because its transcript holds spliced tokens that may predate the
     /// current CLI setting. plank has no such disagreement to resolve — the
     /// prefix is rebuilt from `self.think` every time — but the hazard the scan
-    /// guards against is real here in the cache layer: a session restored with
-    /// rungs signed at some other level must still lose them, whatever level the
-    /// session is currently sitting at, and whether the change moves the
-    /// preamble or not.
+    /// guards against is real here in the cache layer: rungs signed at one
+    /// effort must be dropped when the effort changes, whatever level the
+    /// session is sitting at and whether the change moves the preamble or not.
+    ///
+    /// This covers only the in-memory ladder: it seeds rungs with the agent at
+    /// `Max` and switches to a numeric level. Nothing is written to or read
+    /// back from disk, so it proves the drop-on-change rule, not restoration.
     #[test]
-    fn a_restored_session_at_another_effort_still_loses_its_rungs() {
+    fn switching_effort_drops_rungs_seeded_at_the_previous_level() {
         let dir = scratch_dir("think-ladder-restored");
         let mut cfg = crate::config::AgentConfig::default();
         // The session came back at `max`; the rungs on disk were signed by
@@ -22086,7 +22089,7 @@ mod tests {
         assert_eq!(agent.think, ThinkMode::Level(7));
         assert!(
             agent.ladder.rungs().is_empty(),
-            "a restored session kept rungs signed at a different effort",
+            "rungs seeded at a different effort survived the switch",
         );
         std::fs::remove_dir_all(&dir).ok();
     }

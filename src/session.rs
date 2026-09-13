@@ -2145,8 +2145,13 @@ pub fn session_identity_sha(title: &str, created_at: u64) -> String {
 ///
 /// `think` and `trusted_len` are here for the reason the text fields cannot
 /// cover: both change the *tokens* the prompt prefills to while leaving every
-/// byte of `system` and `transcript_render` identical. `ThinkMode::Max`
-/// prepends the reasoning-effort preamble, and `trusted_len` decides how much
+/// byte of `system` and `transcript_render` identical. Every non-default
+/// `think` puts something ahead of the system prompt, and *what* it puts there
+/// depends on the model family as well as the mode: on `DeepSeek` V4 both
+/// `Max` and `Low` prepend a prose reasoning-effort preamble, while on V4.1 the
+/// preamble is suppressed in favour of the C's numeric `Reasoning Effort: N`
+/// line, which every level including `Low` and `Max` maps onto. `trusted_len`
+/// decides how much
 /// of the prompt is tokenized as rendered chat (native `｜DSML｜` versus
 /// spelled-out BPE pieces). Without them a payload written before either
 /// changed — including one written by a build with a different tokenization
