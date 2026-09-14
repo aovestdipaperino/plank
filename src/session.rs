@@ -1763,11 +1763,11 @@ impl SessionStore {
 ///
 /// A blob captured under the retired Qwen model reads as `None` and so matches
 /// no live family: it is never listed and never swept. Folding it into `Ds4`
-/// instead would hand one model's KV cache to another — which is why this goes
-/// through [`crate::gguf::ModelFamily::for_model_name`], the one entry point
-/// that still excludes retired model names, and not through the dialect.
+/// instead would hand one model's KV cache to another.
 fn blob_family(meta: &crate::kvmeta::KvMeta) -> Option<crate::gguf::ModelFamily> {
-    crate::gguf::ModelFamily::for_model_name(&meta.model)
+    crate::gguf::ModelFamily::from_syntax(trace_stream::syntax::ToolSyntax::for_model_name(
+        &meta.model,
+    ))
 }
 
 /// How long a `*.tmp.<pid>` staging file must sit untouched before

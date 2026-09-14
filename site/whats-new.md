@@ -159,13 +159,14 @@ flag and one switch now. **This is a breaking change**: `/dspark` is `/mtp`,
 `--mtp-model PATH`. The old spellings are gone rather than deprecated, so a
 stale `--mtp x.gguf` fails loudly instead of quietly misreading the path.
 
-**The footer says which model you are talking to**, for example
-`(local:ds ⚡100%)`. Two local runs in the same directory used to look
+**The footer says which model you are talking to**, `(local:ds ⚡100%)` or
+`(local:qwen ⚡100%)`. Two local runs in the same directory used to look
 identical in the one place that answers that question.
 
-**Artifacts upgrade on a manifest.** `ds4.manifest` names the artifact set and
-a version, and an install already on disk at the manifest's sizes is adopted
-rather than re-downloaded — nobody re-fetches 107 GB they already have.
+**Qwen upgrades on its own manifest.** `qwen.manifest` sits beside
+`ds4.manifest` with its own staging area, and an install already on disk at the
+manifest's sizes is adopted rather than re-downloaded — nobody re-fetches
+107 GB they already have.
 
 **The model can ask to compact.** A `compact` tool lets it summarize the
 conversation and carry on from the summary. It is told not to reach for it

@@ -31,7 +31,8 @@ pub enum ModelFamily {
 }
 
 impl ModelFamily {
-    /// The family behind a tool dialect.
+    /// The family behind a tool dialect, or `None` for a dialect that is not
+    /// one of plank's families.
     ///
     /// The two enums answer the same question from different sides — the
     /// dialect is read from the engine's reported shape name after opening,
@@ -39,48 +40,23 @@ impl ModelFamily {
     /// different crates, so they cannot be one type. This is the single place
     /// they are reconciled, rather than a second string matcher.
     ///
-    /// Every dialect plank still speaks belongs to a family, so this is total.
-    /// It is **not** the right entry point for a model name read back off
-    /// disk: see [`ModelFamily::for_model_name`], which is the one that can
-    /// answer "no family this build serves".
+    /// It returns an `Option` rather than folding the unknown case into
+    /// [`ModelFamily::Ds4`] on purpose. `ToolSyntax::Qwen` still exists in
+    /// `trace-stream` (it goes away with the dialect in the next task), and
+    /// mapping it to `Ds4` would *misattribute* a Qwen KV blob left on disk to
+    /// the `DeepSeek` family — which would both list it in `/kvcache` and put
+    /// it under the live family's GC. `None` means "not a family this build
+    /// serves": inert, never swept, never fed to another model.
     #[must_use]
-    pub fn from_syntax(syntax: trace_stream::syntax::ToolSyntax) -> Self {
+    pub fn from_syntax(syntax: trace_stream::syntax::ToolSyntax) -> Option<Self> {
         match syntax {
-            trace_stream::syntax::ToolSyntax::Dsml41 => Self::Ds41,
-            trace_stream::syntax::ToolSyntax::Dsml => Self::Ds4,
+            trace_stream::syntax::ToolSyntax::Dsml41 => Some(Self::Ds41),
+            trace_stream::syntax::ToolSyntax::Dsml => Some(Self::Ds4),
+            // Unreachable-but-required until the dialect itself is removed.
+            trace_stream::syntax::ToolSyntax::Qwen => None,
         }
-    }
-
-    /// The family of a recorded model *name*, or `None` for one belonging to
-    /// no family this build serves.
-    ///
-    /// The difference from [`Self::from_syntax`] is the whole point: a name
-    /// read out of a KV sidecar may name a **retired** model, and
-    /// `ToolSyntax::for_model_name` now folds every unrecognized name into
-    /// `Dsml`. Left at that, a Qwen blob a user still holds would be
-    /// *misattributed* to the `DeepSeek` family — listed in `/kvcache`, put
-    /// under the live family's GC, and eventually swept or fed to another
-    /// model. That is silent data loss, so retired names are excluded here by
-    /// name, before the dialect is consulted at all. `None` means "not a
-    /// family this build serves": inert, never listed, never swept.
-    #[must_use]
-    pub fn for_model_name(name: &str) -> Option<Self> {
-        if RETIRED_MODEL_PREFIXES.iter().any(|p| name.starts_with(*p)) {
-            return None;
-        }
-        Some(Self::from_syntax(
-            trace_stream::syntax::ToolSyntax::for_model_name(name),
-        ))
     }
 }
-
-/// Shape-name prefixes of models plank once served and no longer does.
-///
-/// Kept as data rather than deleted with the rest of the support: KV blobs and
-/// transcripts captured under these names may still sit in a user's cache, and
-/// [`ModelFamily::for_model_name`] must be able to recognize them as belonging
-/// to no live family. Nothing else may consult this list.
-const RETIRED_MODEL_PREFIXES: &[&str] = &["Qwen3.8"];
 
 /// The `general.architecture` value the C matches for `DeepSeek` V4.1 Flash.
 ///
@@ -522,41 +498,27 @@ mod tests {
     #[test]
     fn the_dialect_and_the_family_agree() {
         use trace_stream::syntax::ToolSyntax;
-        assert_eq!(ModelFamily::from_syntax(ToolSyntax::Dsml), ModelFamily::Ds4);
         assert_eq!(
-            ModelFamily::from_syntax(ToolSyntax::for_model_name("DeepSeek V4 Flash")),
-            ModelFamily::Ds4
-        );
-    }
-
-    /// The Qwen dialect is gone, so `ToolSyntax::for_model_name` folds a Qwen
-    /// shape name into `Dsml`. `for_model_name` must still answer *no* family
-    /// for it: a leftover `.qwn.kv` blob attributed to `Ds4` would be listed,
-    /// and swept, as a `DeepSeek` one — and handed to a `DeepSeek` engine.
-    ///
-    /// This test is the guard on that exclusion: delete the retired-prefix
-    /// check and it fails on the first assertion.
-    #[test]
-    fn a_retired_model_name_maps_to_no_family() {
-        use trace_stream::syntax::ToolSyntax;
-        for name in ["Qwen3.8 Flash Next", "Qwen3.8 Flash Next mini"] {
-            assert_eq!(ModelFamily::for_model_name(name), None, "{name}");
-            // The dialect alone cannot answer this any more — which is
-            // precisely why the name-based exclusion has to exist.
-            assert_eq!(ToolSyntax::for_model_name(name), ToolSyntax::Dsml);
-        }
-        // And a live name still resolves, so the exclusion is not a blanket.
-        assert_eq!(
-            ModelFamily::for_model_name("DeepSeek V4 Flash"),
+            ModelFamily::from_syntax(ToolSyntax::Dsml),
             Some(ModelFamily::Ds4)
         );
         assert_eq!(
-            ModelFamily::for_model_name("DeepSeek V4.1 Flash"),
-            Some(ModelFamily::Ds41)
+            ModelFamily::from_syntax(ToolSyntax::for_model_name("DeepSeek V4 Flash")),
+            Some(ModelFamily::Ds4)
         );
-        // An empty or unknown name is a live `Ds4`, matching the `.kv` ->
-        // `.ds4.kv` migration.
-        assert_eq!(ModelFamily::for_model_name(""), Some(ModelFamily::Ds4));
+    }
+
+    /// The Qwen dialect outlives the Qwen family by one task. It must map to
+    /// *no* family rather than fold into `Ds4`: a leftover `.qwn.kv` blob
+    /// attributed to `Ds4` would be listed, and swept, as a `DeepSeek` one.
+    #[test]
+    fn the_qwen_dialect_maps_to_no_family() {
+        use trace_stream::syntax::ToolSyntax;
+        assert_eq!(ModelFamily::from_syntax(ToolSyntax::Qwen), None);
+        assert_eq!(
+            ModelFamily::from_syntax(ToolSyntax::for_model_name("Qwen3.8 Flash Next")),
+            None
+        );
     }
 
     #[test]
@@ -618,11 +580,11 @@ mod tests {
         use trace_stream::syntax::ToolSyntax;
         assert_eq!(
             ModelFamily::from_syntax(ToolSyntax::Dsml41),
-            ModelFamily::Ds41
+            Some(ModelFamily::Ds41)
         );
         assert_eq!(
             ModelFamily::from_syntax(ToolSyntax::for_model_name("DeepSeek V4.1 Flash")),
-            ModelFamily::Ds41
+            Some(ModelFamily::Ds41)
         );
     }
 

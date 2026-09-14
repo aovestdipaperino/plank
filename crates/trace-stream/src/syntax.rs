@@ -2,8 +2,7 @@
 //!
 //! The C picks this per engine in `agent_tool_syntax_for_engine`
 //! (`refs/ds4/ds4_agent.c`) and then uses it to choose a tools prompt, a
-//! parser, and a syntax reminder. plank carries the two DSML dialects it
-//! supports.
+//! parser, and a syntax reminder. plank carries the two dialects it supports.
 
 /// The tool-call dialect in force for a generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -11,6 +10,8 @@ pub enum ToolSyntax {
     /// `DeepSeek` V4's DSML markers, the dialect plank was built around.
     #[default]
     Dsml,
+    /// Qwen3.8-Flash-Next's `<tool_call>` / `<function=…>` / `<parameter=…>`.
+    Qwen,
     /// `DeepSeek` V4.1's DSML markers: the same dialect with a leading space
     /// and a shorter outer tag name.
     Dsml41,
@@ -47,21 +48,28 @@ impl ToolSyntax {
     /// file — a renamed or relocated model still resolves correctly.
     #[must_use]
     pub fn for_model_name(name: &str) -> Self {
-        if name.starts_with("DeepSeek V4.1") {
+        if name.starts_with("Qwen3.8") {
+            Self::Qwen
+        } else if name.starts_with("DeepSeek V4.1") {
             Self::Dsml41
         } else {
             Self::Dsml
         }
     }
 
-    /// The DSML tag spellings for this dialect.
-    ///
-    /// Every dialect plank speaks is DSML-shaped, so this is total: it was an
-    /// `Option` only while the Qwen dialect existed.
+    /// Whether a stanza in this dialect is delimited by plain XML-ish tags,
+    /// which is also what decides how the C injects the tools prompt.
     #[must_use]
-    pub fn dsml_tags(self) -> DsmlTags {
+    pub fn is_xml_tool_call(self) -> bool {
+        self == Self::Qwen
+    }
+
+    /// The DSML tag spellings for this dialect, or `None` for a dialect that
+    /// is not DSML at all.
+    #[must_use]
+    pub fn dsml_tags(self) -> Option<DsmlTags> {
         match self {
-            Self::Dsml => DsmlTags {
+            Self::Dsml => Some(DsmlTags {
                 start: "<｜DSML｜tool_calls>",
                 start_bar: "<｜DSML｜tool_calls｜",
                 invoke: "<｜DSML｜invoke",
@@ -69,8 +77,8 @@ impl ToolSyntax {
                 calls_name: "tool_calls",
                 invoke_name: "invoke",
                 param_name: "parameter",
-            },
-            Self::Dsml41 => DsmlTags {
+            }),
+            Self::Dsml41 => Some(DsmlTags {
                 start: "<｜DSML｜ calls>",
                 start_bar: "<｜DSML｜ calls｜",
                 invoke: "<｜DSML｜ invoke",
@@ -78,7 +86,8 @@ impl ToolSyntax {
                 calls_name: " calls",
                 invoke_name: " invoke",
                 param_name: " parameter",
-            },
+            }),
+            Self::Qwen => None,
         }
     }
 }
@@ -87,13 +96,19 @@ impl ToolSyntax {
 mod tests {
     use super::*;
 
-    /// Every name that is not a V4.1 shape lands on the V4 DSML dialect —
-    /// including the retired Qwen shapes, which no engine reports any more.
+    /// Both Qwen shapes the C declares — the full model and the `mini` — must
+    /// land on the Qwen dialect, and nothing else may.
     #[test]
     fn model_names_map_to_their_dialect() {
+        assert_eq!(
+            ToolSyntax::for_model_name("Qwen3.8 Flash Next"),
+            ToolSyntax::Qwen
+        );
+        assert_eq!(
+            ToolSyntax::for_model_name("Qwen3.8 Flash Next mini"),
+            ToolSyntax::Qwen
+        );
         for other in [
-            "Qwen3.8 Flash Next",
-            "Qwen3.8 Flash Next mini",
             "DeepSeek V4 Flash",
             "DeepSeek V4 Flash Vision Experimental",
             "DeepSeek V4 Pro",
@@ -104,7 +119,7 @@ mod tests {
             assert_eq!(
                 ToolSyntax::for_model_name(other),
                 ToolSyntax::Dsml,
-                "{other} is not a V4.1 shape"
+                "{other} is not Qwen"
             );
         }
     }
@@ -123,8 +138,8 @@ mod tests {
 
     #[test]
     fn v41_tags_carry_the_leading_space() {
-        let v4 = ToolSyntax::Dsml.dsml_tags();
-        let v41 = ToolSyntax::Dsml41.dsml_tags();
+        let v4 = ToolSyntax::Dsml.dsml_tags().expect("dsml has tags");
+        let v41 = ToolSyntax::Dsml41.dsml_tags().expect("dsml41 has tags");
         assert_eq!(v4.start, "<｜DSML｜tool_calls>");
         assert_eq!(v41.start, "<｜DSML｜ calls>");
         assert_eq!(v41.invoke, "<｜DSML｜ invoke");
@@ -133,10 +148,18 @@ mod tests {
             (v41.calls_name, v41.invoke_name, v41.param_name),
             (" calls", " invoke", " parameter")
         );
+        assert!(ToolSyntax::Qwen.dsml_tags().is_none());
     }
 
     #[test]
-    fn the_default_dialect_is_v4_dsml() {
+    fn v41_is_not_an_xml_dialect() {
+        assert!(!ToolSyntax::Dsml41.is_xml_tool_call());
+    }
+
+    #[test]
+    fn only_qwen_is_an_xml_dialect() {
+        assert!(ToolSyntax::Qwen.is_xml_tool_call());
+        assert!(!ToolSyntax::Dsml.is_xml_tool_call());
         assert_eq!(ToolSyntax::default(), ToolSyntax::Dsml);
     }
 }

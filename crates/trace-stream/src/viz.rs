@@ -17,6 +17,7 @@
 use crate::dsml::{
     DsmlParser, DsmlState, MARKER_NAMES, ToolCall, tag_prefix_len, tag_prefix_partial,
 };
+use crate::qwen::QwenParser;
 use crate::syntax::{DsmlTags, ToolSyntax};
 
 /// Told to the model when it emitted a tool call inside `<think>`.
@@ -40,6 +41,8 @@ const TREE_BRANCH: &str = "  ├─ ";
 /// Same column count as [`TREE_BRANCH`], so the rail sits directly under the
 /// branch glyph it continues.
 const TREE_RAIL: &str = "  │  ";
+/// The Qwen dialect's one and only stanza opener.
+const QWEN_START: &[u8] = b"<tool_call>";
 const DSML_BAR: &[u8] = "｜".as_bytes();
 
 const THINK_OPEN: &[u8] = b"<think>";
@@ -698,12 +701,13 @@ pub struct Finished<'a> {
 /// ```
 /// The active tool-call parser, one variant per dialect.
 ///
-/// A newtype rather than a trait object: the renderer needs a handful of small
-/// accessors and no extensibility. It stayed an enum only while a second,
-/// non-DSML dialect existed.
+/// An enum rather than a trait object: the renderer needs eight small
+/// accessors and no extensibility, and keeping it concrete means the DSML path
+/// compiles to exactly what it did before Qwen existed.
 #[derive(Debug)]
 enum Parser {
     Dsml(DsmlParser),
+    Qwen(QwenParser),
 }
 
 impl Parser {
@@ -714,47 +718,74 @@ impl Parser {
             // and every call is silently dropped.
             ToolSyntax::Dsml => Self::Dsml(DsmlParser::with_syntax(ToolSyntax::Dsml)),
             ToolSyntax::Dsml41 => Self::Dsml(DsmlParser::with_syntax(ToolSyntax::Dsml41)),
+            ToolSyntax::Qwen => Self::Qwen(QwenParser::new()),
         }
     }
 
     fn state(&self) -> DsmlState {
-        let Self::Dsml(p) = self;
-        p.state()
+        match self {
+            Self::Dsml(p) => p.state(),
+            Self::Qwen(p) => p.state(),
+        }
     }
 
     fn error(&self) -> &str {
-        let Self::Dsml(p) = self;
-        p.error()
+        match self {
+            Self::Dsml(p) => p.error(),
+            // The DSML parser always has a message at `Error`; this one keeps
+            // the same contract through a default rather than an unwrap.
+            Self::Qwen(p) => p.error().unwrap_or("malformed Qwen tool call"),
+        }
     }
 
     fn raw(&self) -> &[u8] {
-        let Self::Dsml(p) = self;
-        p.raw()
+        match self {
+            Self::Dsml(p) => p.raw(),
+            Self::Qwen(p) => p.raw(),
+        }
     }
 
     fn calls(&self) -> &[ToolCall] {
-        let Self::Dsml(p) = self;
-        p.calls()
+        match self {
+            Self::Dsml(p) => p.calls(),
+            Self::Qwen(p) => p.calls(),
+        }
     }
 
     fn pending_call(&self) -> Option<ToolCall> {
-        let Self::Dsml(p) = self;
-        p.pending_call()
+        match self {
+            Self::Dsml(p) => p.pending_call(),
+            Self::Qwen(p) => p.pending_call(),
+        }
     }
 
     fn param_close_prefix(&self) -> bool {
-        let Self::Dsml(p) = self;
-        p.param_close_prefix()
+        match self {
+            Self::Dsml(p) => p.param_close_prefix(),
+            Self::Qwen(p) => p.param_close_prefix(),
+        }
     }
 
     fn feed(&mut self, bytes: impl AsRef<[u8]>) {
-        let Self::Dsml(p) = self;
-        p.feed(bytes);
+        match self {
+            Self::Dsml(p) => p.feed(bytes),
+            Self::Qwen(p) => p.feed(bytes),
+        }
     }
 
     fn reset(&mut self) {
-        let Self::Dsml(p) = self;
-        p.reset();
+        match self {
+            Self::Dsml(p) => p.reset(),
+            Self::Qwen(p) => p.reset(),
+        }
+    }
+
+    /// End of generation. Only the Qwen dialect needs telling: it has no
+    /// terminator that ends a *run* of stanzas (see `QwenParser::finish`).
+    fn finish(&mut self) {
+        if let Self::Qwen(p) = self {
+            p.finish();
+        }
     }
 
     /// The dialect this parser is reading in.
@@ -1071,14 +1102,16 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// An interrupted tool call is closed with a `[tool call interrupted]`
     /// status line; DSML seen inside thinking is reported as ignored.
     pub fn finish(&mut self) {
-        // A stanza still open at end of generation is settled before the
-        // flush below, which would otherwise report it as interrupted.
+        // End of generation is what completes a Qwen stanza, so the parser is
+        // told *before* the flush below, which would otherwise treat the open
+        // stanza as interrupted and report it as incomplete.
         //
         // Guarded on a stanza still being open: both terminal arms of
         // `settle_parser_state` clear `dsml_active`, and the Done arm
-        // *accumulates* into `self.calls`, so settling an already-settled
+        // *accumulates* into `self.calls`, so settling an already-settled DSML
         // stanza here would dispatch every one of its calls twice.
         if self.dsml_active {
+            self.parser.finish();
             self.settle_parser_state();
         }
         self.stream_text(b"", true);
@@ -1133,7 +1166,10 @@ impl<S: RenderSink> StreamRenderer<S> {
                     self.parser.state(),
                     DsmlState::Structural | DsmlState::ParamValue
                 )
-                .then_some("incomplete DSML tool call")
+                .then_some(match self.syntax {
+                    ToolSyntax::Dsml | ToolSyntax::Dsml41 => "incomplete DSML tool call",
+                    ToolSyntax::Qwen => "incomplete tool call",
+                })
             });
         Finished {
             calls: &self.calls,
@@ -1798,10 +1834,15 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// The dialect's inner tag names for the display scan.
     ///
     /// V4 and V4.1 spell `invoke` and `parameter` differently (V4.1 carries a
-    /// leading space), and the banner scan matches them by name.
+    /// leading space), and the banner scan matches them by name. Qwen never
+    /// reaches these paths; it keeps the V4 names so its behaviour is
+    /// unchanged.
     fn dsml_tag_names(&self) -> (&'static str, &'static str) {
-        let tags = self.syntax.dsml_tags();
-        (tags.invoke_name, tags.param_name)
+        self.syntax
+            .dsml_tags()
+            .map_or(("invoke", "parameter"), |tags| {
+                (tags.invoke_name, tags.param_name)
+            })
     }
 
     fn scan_dsml_tag(&mut self, tag: &[u8]) {
@@ -1851,11 +1892,13 @@ impl<S: RenderSink> StreamRenderer<S> {
 
     /// Acts on a terminal parser state: banner, verdict, and collected calls.
     ///
-    /// Split out of [`Self::feed_dsml_byte`] because a stanza can reach a
-    /// terminal state at two moments: on the byte that closes it, or at end of
-    /// generation, where [`Self::finish`] settles whatever is still open. Both
-    /// routes have to do this same work. Idempotent, because `finish` calls it
-    /// after the byte loop already may have.
+    /// Split out of [`Self::feed_dsml_byte`] because the two dialects reach a
+    /// terminal state at different moments. DSML lands on `Done` on the byte
+    /// that closes its stanza; the Qwen dialect has no terminator that ends a
+    /// run of stanzas, so it is `finish` that settles it at end of generation
+    /// (see `QwenParser::finish`). Both routes have to do this same work, or a
+    /// Qwen call would parse cleanly and then never be collected. Idempotent,
+    /// because `finish` calls it after the byte loop already may have.
     fn settle_parser_state(&mut self) {
         match self.parser.state() {
             DsmlState::Done => {
@@ -1953,16 +1996,26 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// Whether the held tail is a prefix of this dialect's stanza opener.
     ///
     /// DSML accepts a spread of spellings: marker typos, a trailing bar, a
-    /// bare invoke standing in for the wrapper.
+    /// bare invoke standing in for the wrapper. Qwen has exactly one opener,
+    /// and no implicit-invoke form to stand in for it.
     fn start_match(
         &self,
         complete: &mut bool,
         implicit_invoke: &mut bool,
         matched: &mut ToolSyntax,
     ) -> bool {
-        // Every dialect answers `dsml_tags`, and the candidate openers are
+        // Every DSML dialect answers `dsml_tags`, and the candidate openers are
         // built from that table — no spelling is named here, so a new dialect
-        // cannot silently miss this site.
+        // cannot silently miss this site. Qwen has no table, and one opener, so
+        // it never joins the adoption scan: a Qwen stanza is only ever read by
+        // the dialect the model was loaded as.
+        if self.syntax.dsml_tags().is_none() {
+            *implicit_invoke = false;
+            *matched = ToolSyntax::Qwen;
+            let tail = &self.dsml_start_tail[..];
+            *complete = tail == QWEN_START;
+            return tail.len() <= QWEN_START.len() && QWEN_START[..tail.len()] == *tail;
+        }
         dsml_start_match(&self.dsml_start_tail, complete, implicit_invoke, matched)
     }
 
@@ -2000,7 +2053,10 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.post_think_gap = false;
         // The parser has its own opener scan, and it is fed the *canonical*
         // spelling rather than whichever accepted variant the model wrote.
-        self.parser.feed(self.syntax.dsml_tags().start.as_bytes());
+        self.parser.feed(match self.syntax.dsml_tags() {
+            Some(tags) => tags.start.as_bytes(),
+            None => QWEN_START,
+        });
         self.scan = DsmlScan::Between;
         if !self.dsml_ignored {
             self.viz_start();
@@ -2235,7 +2291,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                     if implicit_invoke {
                         // Same rule as the opener: replay the dialect's own
                         // canonical invoke, not the bytes the model wrote.
-                        let invoke = self.syntax.dsml_tags().invoke;
+                        let invoke = self.syntax.dsml_tags().map_or("", |tags| tags.invoke);
                         for &b in invoke.as_bytes() {
                             self.feed_dsml_byte(b);
                         }
@@ -4059,19 +4115,83 @@ mod dialect_tests {
         fn think_text(&mut self, _text: &str) {}
     }
 
-    /// Markup from the retired Qwen dialect. Kept as a sample of foreign
-    /// XML-ish tool markup that no dialect plank speaks may react to.
-    const FOREIGN_CALL: &str = "<tool_call>\n<function=read>\n<parameter=path>\nsrc/a.rs\n</parameter>\n</function>\n</tool_call>";
+    const CALL: &str = "<tool_call>\n<function=read>\n<parameter=path>\nsrc/a.rs\n</parameter>\n</function>\n</tool_call>";
 
     fn run(text: &str) -> StreamRenderer<Cap> {
-        let mut sr = StreamRenderer::new(Cap::default());
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Qwen);
         sr.push(text);
         sr.finish();
         sr
     }
 
+    /// The end-to-end shape this whole port exists for: a Qwen stanza reaches
+    /// dispatch as a call instead of the "invalid DSML tool call" a real
+    /// session got four times in a row.
+    #[test]
+    #[cfg(feature = "qwen")]
+    fn a_qwen_stanza_becomes_a_dispatchable_call() {
+        let sr = run(CALL);
+        let done = sr.finished();
+        assert_eq!(done.error, None, "no stream error");
+        assert_eq!(done.calls.len(), 1);
+        assert_eq!(done.calls[0].name, "read");
+        assert_eq!(done.calls[0].arg_value("path"), Some("src/a.rs"));
+    }
+
+    /// The stanza is markup, not prose: none of it may reach the terminal.
+    #[test]
+    fn the_stanza_is_not_echoed_as_visible_text() {
+        let sr = run(&format!("Reading it now.\n{CALL}"));
+        assert!(
+            sr.sink.visible.contains("Reading it now."),
+            "prose survives"
+        );
+        assert!(
+            !sr.sink.visible.contains("<function="),
+            "markup hidden: {}",
+            sr.sink.visible
+        );
+        assert!(
+            !sr.sink.visible.contains("<parameter="),
+            "markup hidden: {}",
+            sr.sink.visible
+        );
+    }
+
+    /// `finish` settles the stanza, and `settle_parser_state` *accumulates*
+    /// into `calls` — so a dialect whose stanza settles mid-stream must not be
+    /// settled again at end of generation. Two calls here would mean every
+    /// tool ran twice.
+    #[test]
+    #[cfg(feature = "qwen")]
+    fn calls_are_not_collected_twice_by_finish() {
+        let sr = run(CALL);
+        assert_eq!(sr.finished().calls.len(), 1, "settled exactly once");
+    }
+
+    #[test]
+    #[cfg(feature = "qwen")]
+    fn two_stanzas_in_one_generation_both_dispatch() {
+        let sr = run(&format!("{CALL}\n{CALL}"));
+        assert_eq!(sr.finished().calls.len(), 2);
+    }
+
+    /// A malformed stanza has to come back as a retryable tool error, not be
+    /// silently dropped.
+    #[test]
+    #[cfg(feature = "qwen")]
+    fn a_malformed_qwen_stanza_reports_an_error() {
+        let sr = run("<tool_call>\n<parameter=path>\na\n</parameter>\n</function>\n</tool_call>");
+        let done = sr.finished();
+        assert!(done.calls.is_empty());
+        assert!(
+            done.error.is_some_and(|e| e.contains("<function=")),
+            "expected a function-tag error"
+        );
+    }
+
     /// Ordinary prose that merely contains a `<` must stream through
-    /// untouched — the start detector holds from `<`.
+    /// untouched — the start detector holds from `<` for both dialects.
     #[test]
     fn prose_with_angle_brackets_is_untouched() {
         let sr = run("use a < b and Vec<String> here.");
@@ -4098,24 +4218,29 @@ mod dialect_tests {
         assert_eq!(done.error, None);
     }
 
-    /// Foreign XML-ish tool markup dispatches nothing in any dialect plank
-    /// speaks. It is not silently swallowed either: the pseudo-tool detector
-    /// tells the model to use DSML instead, which is the corrective the
-    /// `DeepSeek` path has always given for a `<tool_call>` opener.
+    /// Without the `qwen` feature the stanza is prose, not a half-recognised
+    /// call: the stub parser stays in `Search`, so nothing is dispatched and —
+    /// the part that matters — no incomplete-tool-call error is fed back to a
+    /// model that did nothing wrong.
     #[test]
-    fn foreign_xml_markup_dispatches_nothing_in_every_dialect() {
-        for syntax in [ToolSyntax::Dsml, ToolSyntax::Dsml41] {
-            let mut sr = StreamRenderer::with_syntax(Cap::default(), syntax);
-            sr.push(FOREIGN_CALL);
-            sr.finish();
-            let done = sr.finished();
-            assert!(done.calls.is_empty(), "{syntax:?}: nothing is dispatched");
-            assert!(
-                done.error
-                    .is_some_and(|e| e.contains("<tool_call> is not a tool call")),
-                "{syntax:?}: the model is told to use DSML instead"
-            );
-        }
+    #[cfg(not(feature = "qwen"))]
+    fn without_the_feature_a_qwen_stanza_is_inert() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Qwen);
+        sr.push(CALL);
+        sr.finish();
+        let done = sr.finished();
+        assert!(done.calls.is_empty(), "nothing is dispatched");
+        assert_eq!(done.error, None, "and nothing is reported as malformed");
+    }
+
+    /// A DSML-configured renderer must not react to Qwen markup, which is
+    /// what keeps the `DeepSeek` path exactly as it was.
+    #[test]
+    fn the_dsml_dialect_ignores_qwen_markup() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push(CALL);
+        sr.finish();
+        assert!(sr.finished().calls.is_empty(), "not a DSML call");
     }
 
     /// V4.1 speaks the same DSML shape with a leading space and a shorter
@@ -4255,7 +4380,7 @@ mod dialect_tests {
     #[test]
     fn post_think_gap_does_not_swallow_a_started_opener() {
         for syntax in [ToolSyntax::Dsml, ToolSyntax::Dsml41] {
-            let tags = syntax.dsml_tags();
+            let tags = syntax.dsml_tags().expect("dsml dialect");
             let mut sr = StreamRenderer::with_syntax(Cap::default(), syntax);
             sr.push("<think>reasoning</think>");
             sr.push(&tags.start[..tags.start.len() - 1]);

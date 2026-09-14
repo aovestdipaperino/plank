@@ -266,6 +266,20 @@ fn steady_rate(mark: Option<(std::time::Instant, i32)>, generated: i32) -> f64 {
 /// reported. A couple of tokens divided by a sliver of a second is noise.
 const STEADY_MIN_TOKENS: i32 = 8;
 
+/// Whether the engine is handed the vision encoder for this model.
+///
+/// The encoder GGUF sits beside the main model at
+/// `~/.plank/ds4flash.vision.gguf` and is downloaded at startup when the model
+/// can use it. It is passed only when the C would accept it: `ds4_engine_open`
+/// fails outright when `vision_path` is set and the main GGUF is not the pinned
+/// Vision-Exp checkpoint ("--vision requires ... the pinned `DeepSeek` V4 Flash
+/// Vision-Exp model"), so a language-only or re-quantized `DeepSeek`
+/// checkpoint must open with a null path and run text-only, with the
+/// `view_image` tool refusing at call time instead of the open failing.
+fn model_supports_vision(_family: crate::gguf::ModelFamily, path: &Path) -> bool {
+    crate::gguf::supports_vision(path)
+}
+
 /// Says at open time why the run is text-only, instead of letting the first
 /// `view_image` call be the only symptom several turns into a session.
 ///
@@ -274,7 +288,11 @@ const STEADY_MIN_TOKENS: i32 = 8;
 /// that knows. Each cause gets its own line, because naming the encoder path
 /// for a model plank deliberately never passed it to would report a failure to
 /// read a file that was never opened.
-fn report_text_only(model_supports_vision: bool, vision_path: &Path) {
+fn report_text_only(
+    _family: crate::gguf::ModelFamily,
+    model_supports_vision: bool,
+    vision_path: &Path,
+) {
     if model_supports_vision {
         eprintln!(
             "warning: vision encoder not loaded from {}; view_image will be refused",
@@ -351,12 +369,7 @@ impl Ds4Model {
         let c_mtp = c_opt_path(mtp_path, "mtp model")?;
         let c_steering = c_opt_path(tuning.dir_steering_file.as_deref(), "dir-steering file")?;
         let vision_path = crate::download::default_vision_path();
-        // Vision is passed only when the C would accept it: `ds4_engine_open`
-        // fails outright when `vision_path` is set and the main GGUF is not the
-        // pinned Vision-Exp checkpoint, so a language-only or re-quantized
-        // checkpoint must open with a null path and run text-only, with
-        // `view_image` refusing at call time instead of the open failing.
-        let model_supports_vision = crate::gguf::supports_vision(path);
+        let model_supports_vision = model_supports_vision(family, path);
         let c_vision = if model_supports_vision {
             c_opt_path(Some(&vision_path), "vision encoder")?
         } else {
@@ -445,7 +458,7 @@ impl Ds4Model {
         }
         // SAFETY: `engine` is non-null and valid, checked just above.
         if !unsafe { ffi::ds4_engine_has_vision(engine) } {
-            report_text_only(model_supports_vision, &vision_path);
+            report_text_only(family, model_supports_vision, &vision_path);
         }
         Ok(Self {
             engine,
