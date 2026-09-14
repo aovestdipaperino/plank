@@ -96,6 +96,22 @@ Speculative decoding verifies its drafts by argmax, so it only runs at temperatu
 
 `/loopguard off` silences every rung of every guard: the repetition guard with its draft rung and think budget, the repeated-tool-call guard and its no-progress budget, and the repeat advisory. Unlike other settings commands it takes effect on a turn that is already generating, because the moment you want the guards out of the way is usually while they are firing. `🔁` in the status bar means they are armed; `♻ looping` means one has actually seen a cycle. The switch is session-only and is never written to disk (the underlying setting is `tools.loopGuards`).
 
+### The no-progress budget
+
+One rung of the loop guard is off unless you ask for it. The no-progress budget watches a whole turn rather than a single pass: it counts the bytes the model generates and resets that count only when a file actually changes on disk. Cross 32 KB without a change and the turn ends with `guard: turn stopped: the model generated 32KB of output and changed no file.`
+
+What counts as a change is narrow on purpose. A successful `write` or `edit` counts. So does a shell command that left the git working tree different than it found it, which is how `sed -i`, `cargo fmt`, a codegen script and `git apply` get credit for work they do without plank ever seeing the edit. Reads, searches, builds and test runs do not count, however many of them succeed, and neither does an `edit` that failed to apply. That asymmetry is the whole point: the pattern this rung was built for is a turn whose every individual pass looks reasonable and which still, fifty minutes later, has written nothing.
+
+It is off by default because the count is a measure of output volume, not of looping, and there is a perfectly ordinary turn that trips it: a long read-only investigation. Ask plank why a test is flaky, or to explain how a subsystem fits together, and it will read, search, build and reason its way to a real answer without touching a file. The budget stops that turn too, and the notice tells you to narrow a request that was never too wide. Every other rung of the guard, which watches for genuine repetition instead, stays armed by default.
+
+Turn it on when you are handing plank a long autonomous task and you would rather it gave up than spent an afternoon:
+
+```json
+{ "tools": { "noProgressGuard": true } }
+```
+
+It is ANDed with `tools.loopGuards`, so `/loopguard off` silences it along with everything else, and arming it while the guards are off does nothing. There is no slash command of its own; `/config tools.noProgressGuard true` sets it for the project.
+
 `/config` changes write to `./.plank/settings.json` and apply immediately. In the TUI, a bare `/config` opens the form and `/config <key> <value>` sets and persists the value directly, the same as on the plain REPL. See [Configuration](08-configuration.md).
 
 ## Output and diagnostics

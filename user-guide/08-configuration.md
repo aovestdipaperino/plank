@@ -89,6 +89,7 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 |---|---|---|
 | `tools.bashNotify` | `false` | wake the model when a bash job it left running finishes, instead of having it poll with `bash_status`. Adds one sentence to the system prompt, so it takes effect in a new session. See [Background jobs](05-tools.md#background-jobs). |
 | `tools.loopGuards` | `true` | arm the loop guards (`/loopguard` flips it for the session) |
+| `tools.noProgressGuard` | `false` | also stop a turn that generates 32 KB of output without changing a file. Requires `tools.loopGuards`; see [The no-progress budget](04-slash-commands.md#the-no-progress-budget). |
 | `tools.recall`, `tools.fanout`, `tools.runCode` | `true` | offer the `recall`, `fanout` and `run_code` tools to the model |
 
 ### `mcp`, `ask`, `update`, `agents`

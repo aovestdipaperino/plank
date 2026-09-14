@@ -7,8 +7,21 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.1.0 is out**, and the beta channel is on 5.1.2. The patch number
+**v5.1.0 is out**, and the beta channel is on 5.1.3. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.1.3: a long read-only investigation is no longer mistaken for a stall.**
+One rung of the loop guard watched a whole turn and ended it after 32 KB of
+generated output with no file changed. It was built for a real failure — a turn
+whose every individual pass looks reasonable and which has still written nothing
+fifty minutes later — but what it actually measures is output volume, and a
+perfectly ordinary turn trips it too. Ask plank why a test is flaky, or to
+explain how a subsystem fits together, and it will read, search, build and reason
+its way to a real answer without touching a file. That turn was stopped with a
+notice telling you to narrow a request that was never too wide. The rung is now
+off unless you ask for it, with `"tools": {"noProgressGuard": true}`. Every other
+guard, which watches for genuine repetition rather than for silence, is unchanged
+and still armed by default.
 
 **5.1.2: sentences no longer finish themselves when a tool returns.** The TUI
 renders streaming markdown on a bounded cadence, so highlighting a long code

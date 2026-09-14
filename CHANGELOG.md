@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.1.3] - 2026-09-14
+
 ### Changed
 
 - **The no-progress budget is opt-in.** The turn-scale rung that stops a

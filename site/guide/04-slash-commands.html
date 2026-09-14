@@ -453,6 +453,40 @@ way is usually while they are firing. <code>🔁</code> in the status bar
 means they are armed; <code>♻ looping</code> means one has actually seen
 a cycle. The switch is session-only and is never written to disk (the
 underlying setting is <code>tools.loopGuards</code>).</p>
+<h3 id="the-no-progress-budget">The no-progress budget</h3>
+<p>One rung of the loop guard is off unless you ask for it. The
+no-progress budget watches a whole turn rather than a single pass: it
+counts the bytes the model generates and resets that count only when a
+file actually changes on disk. Cross 32 KB without a change and the turn
+ends with
+<code>guard: turn stopped: the model generated 32KB of output and changed no file.</code></p>
+<p>What counts as a change is narrow on purpose. A successful
+<code>write</code> or <code>edit</code> counts. So does a shell command
+that left the git working tree different than it found it, which is how
+<code>sed -i</code>, <code>cargo fmt</code>, a codegen script and
+<code>git apply</code> get credit for work they do without plank ever
+seeing the edit. Reads, searches, builds and test runs do not count,
+however many of them succeed, and neither does an <code>edit</code> that
+failed to apply. That asymmetry is the whole point: the pattern this
+rung was built for is a turn whose every individual pass looks
+reasonable and which still, fifty minutes later, has written
+nothing.</p>
+<p>It is off by default because the count is a measure of output volume,
+not of looping, and there is a perfectly ordinary turn that trips it: a
+long read-only investigation. Ask plank why a test is flaky, or to
+explain how a subsystem fits together, and it will read, search, build
+and reason its way to a real answer without touching a file. The budget
+stops that turn too, and the notice tells you to narrow a request that
+was never too wide. Every other rung of the guard, which watches for
+genuine repetition instead, stays armed by default.</p>
+<p>Turn it on when you are handing plank a long autonomous task and you
+would rather it gave up than spent an afternoon:</p>
+<pre class="json"><code>{ &quot;tools&quot;: { &quot;noProgressGuard&quot;: true } }</code></pre>
+<p>It is ANDed with <code>tools.loopGuards</code>, so
+<code>/loopguard off</code> silences it along with everything else, and
+arming it while the guards are off does nothing. There is no slash
+command of its own; <code>/config tools.noProgressGuard true</code> sets
+it for the project.</p>
 <p><code>/config</code> changes write to
 <code>./.plank/settings.json</code> and apply immediately. In the TUI, a
 bare <code>/config</code> opens the form and
