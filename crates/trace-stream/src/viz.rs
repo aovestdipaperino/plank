@@ -42,6 +42,22 @@ const TREE_BRANCH: &str = "  ├─ ";
 /// branch glyph it continues.
 const TREE_RAIL: &str = "  │  ";
 
+/// The Qwen parameter close tag, with the newline the syntax puts before it.
+///
+/// Held as one unit so that newline is recognized as syntax and never reaches
+/// the banner as a trailing blank line.
+const QWEN_PARAM_CLOSE: &[u8] = b"\n</parameter>";
+
+/// [`parameter_close_tail`] for the Qwen dialect, which has exactly one
+/// spelling and so needs only a prefix test.
+fn qwen_param_close_tail(tail: &[u8], complete: &mut bool) -> bool {
+    if tail.len() > QWEN_PARAM_CLOSE.len() || QWEN_PARAM_CLOSE[..tail.len()] != *tail {
+        return false;
+    }
+    *complete = tail.len() == QWEN_PARAM_CLOSE.len();
+    true
+}
+
 /// The Qwen dialect's one and only stanza opener.
 ///
 /// Unlike the DSML openers it carries no marker token, so it is also a string
@@ -668,6 +684,11 @@ struct ToolViz {
     tool_name: String,
     param_name: String,
     param_end_tail: Vec<u8>,
+    /// Qwen puts a newline between `<parameter=…>` and the value, and another
+    /// before `</parameter>`; both are syntax, not content (`QwenParser`
+    /// strips them from the parsed value). This suppresses the leading one so
+    /// the banner does not open every parameter with a blank rail line.
+    qwen_pending_lf: bool,
     read_style: bool,
     read_prefix_rendered: bool,
     read_line_rendered: bool,
@@ -1784,13 +1805,24 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// The visualizer must not wait for the whole parameter: large write/edit
     /// contents should show progress while still detecting the closing tag.
     fn viz_param_value_byte(&mut self, c: u8) {
-        if !self.viz.param_end_tail.is_empty() || c == b'<' {
+        let qwen = self.parser.is_qwen();
+        // The newline that opens a Qwen value is syntax; drop exactly one.
+        if qwen && self.viz.qwen_pending_lf {
+            self.viz.qwen_pending_lf = false;
+            if c == b'\n' {
+                return;
+            }
+        }
+        // Qwen's close tag is preceded by a newline that is syntax too, so the
+        // hold has to start one byte earlier than DSML's bare `<`.
+        let holds = if qwen { c == b'\n' } else { c == b'<' };
+        if !self.viz.param_end_tail.is_empty() || holds {
             if self.viz.param_end_tail.len() == ToolViz::END_TAIL_CAP {
                 let held = std::mem::take(&mut self.viz.param_end_tail);
                 for b in held {
                     self.viz_param_raw_byte(b);
                 }
-                if c != b'<' {
+                if !holds {
                     self.viz_param_raw_byte(c);
                     return;
                 }
@@ -1798,7 +1830,12 @@ impl<S: RenderSink> StreamRenderer<S> {
             self.viz.param_end_tail.push(c);
             let mut complete = false;
             let (_, param_name) = self.dsml_tag_names();
-            if parameter_close_tail(&self.viz.param_end_tail, param_name, &mut complete) {
+            let is_close_tail = if qwen {
+                qwen_param_close_tail(&self.viz.param_end_tail, &mut complete)
+            } else {
+                parameter_close_tail(&self.viz.param_end_tail, param_name, &mut complete)
+            };
+            if is_close_tail {
                 if complete {
                     self.viz_param_end();
                 }
@@ -1900,8 +1937,34 @@ impl<S: RenderSink> StreamRenderer<S> {
         (tags.invoke_name, tags.param_name)
     }
 
+    /// The Qwen dialect's display scan.
+    ///
+    /// Its tags carry the name in the tag itself (`<function=read>`) rather
+    /// than in a `name` attribute, so none of the DSML tag matching applies.
+    fn scan_qwen_tag(&mut self, tag: &str) {
+        let Some(body) = tag.strip_prefix('<').and_then(|t| t.strip_suffix('>')) else {
+            return;
+        };
+        if body == "/function" {
+            self.viz_invoke_end();
+        } else if let Some(name) = body.strip_prefix("function=") {
+            self.viz_tool(name);
+        } else if let Some(name) = body.strip_prefix("parameter=") {
+            self.viz_param_begin(name);
+            self.viz.qwen_pending_lf = true;
+            self.scan = DsmlScan::Value;
+        }
+        // `<tool_call>` and `</tool_call>` bound the stanza and have no banner
+        // of their own; anything else is malformed, and the strict parser is
+        // what reports it.
+    }
+
     fn scan_dsml_tag(&mut self, tag: &[u8]) {
         let tag = String::from_utf8_lossy(tag).into_owned();
+        if self.parser.is_qwen() {
+            self.scan_qwen_tag(&tag);
+            return;
+        }
         let b = tag.as_bytes();
         let (invoke_name, param_name) = self.dsml_tag_names();
         if tag_prefix_len(b, true, invoke_name).is_some() {
@@ -4524,6 +4587,39 @@ mod qwen_dialect_tests {
         let done = sr.finished();
         assert!(done.calls.is_empty());
         assert_eq!(done.error, None);
+    }
+
+    /// The banner, not just the parsed call.
+    ///
+    /// The display scan is a separate pass from the parser, keyed on the
+    /// dialect's own tag spellings — `<function=read>` carries its name in the
+    /// tag, where DSML uses a `name` attribute. Porting the parser alone left
+    /// a Qwen stanza parsing perfectly and rendering *nothing*: swallowed as
+    /// markup, with no banner behind it. That is invisible to any test that
+    /// only looks at `calls`, and it is the whole of what a renderer-only
+    /// caller like `plank-console` sees, so it is asserted here directly.
+    #[test]
+    fn a_qwen_stanza_renders_a_banner() {
+        let sr = run(CALL);
+        let out = &sr.sink.visible;
+        assert!(out.contains("read"), "the banner names the tool: {out:?}");
+        assert!(out.contains("src/a.rs"), "and the value: {out:?}");
+    }
+
+    /// Qwen wraps every value in newlines that belong to the syntax, not the
+    /// value (`QwenParser` strips them). They must not reach the banner as
+    /// blank lines either.
+    #[test]
+    fn the_syntax_newlines_around_a_value_are_not_rendered() {
+        let sr = run(
+            "<tool_call>\n<function=write>\n<parameter=path>\nsrc/new.rs\n</parameter>\n</function>\n</tool_call>",
+        );
+        let out = &sr.sink.visible;
+        assert!(out.contains("src/new.rs"), "the value renders: {out:?}");
+        assert!(
+            !out.contains("\n\nsrc/new.rs") && !out.contains("src/new.rs\n\n"),
+            "no blank line from the syntax newlines: {out:?}"
+        );
     }
 
     /// The console is handed bytes off a socket with no model name attached,
