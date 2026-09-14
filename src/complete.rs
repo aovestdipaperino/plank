@@ -673,6 +673,13 @@ impl Popup {
     /// directory keeps the popup open for drill-down, anything else closes it
     /// with exactly one trailing space. Esc dismisses without touching `buf`.
     pub fn handle_key(&mut self, key: KeyEvent, buf: &mut LineBuffer) -> PopupAction {
+        // With no rows the popup draws nothing, so from the user's side it is
+        // not open at all: every key but Esc must fall through to its normal
+        // binding. Consuming Enter here is what ate the first submit after a
+        // fruitless `@`.
+        if self.rows.is_empty() && key.code != KeyCode::Esc {
+            return PopupAction::Passthrough;
+        }
         match key.code {
             KeyCode::Esc => PopupAction::Dismissed,
             KeyCode::Up => {
@@ -739,6 +746,28 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn an_empty_popup_never_swallows_a_key() {
+        // The `@` popup renders nothing when it has no rows, so while it is
+        // invisibly open every binding must still reach the editor — most of
+        // all Enter, which otherwise silently eats the first submit.
+        let mut p = popup_with(&[], "@zzz");
+        let mut buf = LineBuffer::new();
+        buf.set_text("@zzz");
+        for code in [KeyCode::Enter, KeyCode::Down, KeyCode::Up, KeyCode::Tab] {
+            assert_eq!(
+                p.handle_key(key(code), &mut buf),
+                PopupAction::Passthrough,
+                "{code:?}"
+            );
+        }
+        // Esc still closes it, so the popup cannot get stuck open.
+        assert_eq!(
+            p.handle_key(key(KeyCode::Esc), &mut buf),
+            PopupAction::Dismissed
+        );
     }
 
     fn popup_with(rows: &[(&str, Kind)], token_text: &str) -> Popup {
