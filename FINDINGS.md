@@ -2698,3 +2698,42 @@ Two traps when doing so:
   Temporarily stubbing that one guard and re-dumping confirms the real behaviour:
   on V4, levels 25/50/100 are byte-identical to plain `--think` and level 0 to
   `--nothink`. No effort prefix on any of them.
+
+## A close tag bearing attributes is a fused close-and-open, not value text
+
+The model sometimes writes the *next* parameter's opening tag with a leading
+`/`, fusing two parameters into one tag pair:
+
+```
+<｜DSML｜parameter name="query" string="true">impl Rng</｜DSML｜parameter name="path" string="true">src/words.rs</｜DSML｜parameter｜>
+```
+
+`close_tag_at` accepts only the bare close tag (whitespace and an optional
+trailing `｜` before the `>`), so the attribute-bearing one is not a terminator
+and the value ran on to the final close. The dispatched call then had `query`
+equal to `impl Rng</｜DSML｜parameter name="path" …>src/words.rs` and **no
+`path` argument at all** — the parameter did not merely arrive wrong, it
+disappeared.
+
+That is the expensive failure shape, because nothing looks broken from the
+model's side: `search` answered "No matches", which was correct for that query,
+and the model concluded the search tool was ignoring the root folder it had
+been given. It spent two turns on that phantom bug before falling back to
+`bash grep` (`~/.plank/repro/repro-loop-1789365915.md:5084`). A parse error
+costs one re-emit; a plausible wrong answer costs the turn and can end up
+recorded as a bug in the wrong component.
+
+So this is now `DsmlState::Error` with a message naming both tags to write.
+Two details worth keeping:
+
+- **An attribute means an `=` before the `>`.** A bare word in that position
+  (`</｜DSML｜parameter x>`) is one of the adversarial payload values
+  `incremental_scan_matches_whole_value_rescan` requires to stay value text.
+  Keying on "any non-`>` byte after whitespace" is the obvious rule and it
+  breaks that test.
+- **The candidate has to be *held*, not ruled out, until the `=` or `>`
+  arrives.** The scan advances `param_scan_from` past a ruled-out candidate and
+  never revisits it, so deciding before the deciding byte has streamed in means
+  never deciding. Holding needs a bound (`ATTR_CLOSE_LOOKAHEAD`) or a value that
+  opens a close tag and never closes it pins the cursor and makes the scan
+  quadratic — the thing `param_scan_from` exists to prevent.

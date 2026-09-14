@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Two parameters fused into one tag pair are rejected instead of silently
+  merged.** When the model closes a parameter with a tag that carries the next
+  parameter's attributes — `</｜DSML｜parameter name="path" string="true">`, the
+  `/` being all that separates it from an opener — that is not a close tag, so
+  the value used to run on to the next one: the first parameter came out
+  carrying the markup, the second vanished, and the tool was dispatched with a
+  corrupted argument and a missing one. In `repro-loop-1789365915.md` a
+  `search` got a garbage `query` and no `path` at all, and the model read the
+  empty result as search ignoring the root folder. It is now a retryable tool
+  error naming both tags to write instead. A bare word where an attribute
+  would go (`</｜DSML｜parameter x>`) is unaffected and stays value text.
+
 - **A V4.1 stanza is recognized without being told the model first.** The
   dialect was fixed at renderer construction from the model name, so every
   consumer that has no model name — `turbo-debug-console`, which renders bytes

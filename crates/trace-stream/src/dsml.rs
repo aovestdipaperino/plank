@@ -711,6 +711,18 @@ impl DsmlParser {
             if names.iter().any(|n| close_tag_partial(tail, n)) {
                 return None;
             }
+            let attrs = names.iter().map(|n| (n, close_tag_has_attrs(tail, n)));
+            if let Some((n, verdict)) = attrs.max_by(|a, b| a.1.cmp(&b.1)) {
+                match verdict {
+                    AttrClose::Yes => {
+                        self.set_error(fused_close_tag_error(n));
+                        return None;
+                    }
+                    // Held at `at`, exactly as a partial close tag would be.
+                    AttrClose::Pending => return None,
+                    AttrClose::No => {}
+                }
+            }
             self.param_scan_from = at + 1;
         }
     }
@@ -883,6 +895,82 @@ fn close_tag_partial(s: &[u8], name: &str) -> bool {
         i += 1;
     }
     true
+}
+
+/// The tool error for a fused close-and-open tag, naming the mistake and both
+/// tags the model has to write instead.
+fn fused_close_tag_error(name: &str) -> String {
+    format!(
+        concat!(
+            "close tag </｜DSML｜{name}｜> carries attributes: it is a close tag ",
+            "and the next parameter's opening tag fused into one. Close the ",
+            "parameter with the bare </｜DSML｜{name}｜>, then open the next one ",
+            "with its own <｜DSML｜parameter name=\"…\"> tag."
+        ),
+        name = name
+    )
+}
+
+/// Whether `s` opens a closing tag for `name` that carries attributes, i.e.
+/// `</｜DSML｜parameter name="path" …>` — a close tag and the *next* opener
+/// fused into one, the `/` being all that separates the two readings.
+///
+/// This is not a tag [`close_tag_at`] accepts, and silently treating it as
+/// value text is what made `repro-loop-1789365915.md` so expensive: the value
+/// ran on to the next close tag, one parameter vanished, and the tool answered
+/// a question nobody asked. Reported as an error instead, the model re-emits.
+///
+/// An attribute means an `=` before the tag's `>`: a bare word after the name
+/// (`</｜DSML｜parameter x>`) is not one and stays value text, as does a name
+/// run on without whitespace. Check [`close_tag_at`] and [`close_tag_partial`]
+/// first; [`AttrClose::Pending`] means neither has arrived yet and the
+/// candidate must be held rather than ruled out.
+/// Ordered least to most conclusive: when several accepted close-tag names
+/// disagree about one candidate, `max` takes the strongest verdict.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum AttrClose {
+    /// Not this: rule the candidate out and move the scan past it.
+    No,
+    /// Still undecided; hold the candidate for more bytes.
+    Pending,
+    /// A fused close-and-open tag.
+    Yes,
+}
+
+/// Bytes past the tag name that [`close_tag_has_attrs`] will hold a candidate
+/// open for while waiting for an `=` or a `>`. Longer than any real attribute
+/// list, and a bound is what keeps the close-tag scan linear: without one, a
+/// value containing `</｜DSML｜parameter ` and no later `>` would pin the scan
+/// cursor and have every following byte rescan the whole value.
+const ATTR_CLOSE_LOOKAHEAD: usize = 120;
+
+fn close_tag_has_attrs(s: &[u8], name: &str) -> AttrClose {
+    let Some(mut i) = tag_prefix_len(s, true, name) else {
+        return AttrClose::No;
+    };
+    let mut saw_space = false;
+    loop {
+        while i < s.len() && s[i].is_ascii_whitespace() {
+            (i, saw_space) = (i + 1, true);
+        }
+        if !s[i..].starts_with(DSML_BAR) {
+            break;
+        }
+        i += DSML_BAR.len();
+    }
+    if !saw_space {
+        return AttrClose::No;
+    }
+    let end = i + ATTR_CLOSE_LOOKAHEAD;
+    for (at, &c) in s.iter().enumerate().skip(i) {
+        match c {
+            b'=' => return AttrClose::Yes,
+            b'>' => return AttrClose::No,
+            _ if at >= end => return AttrClose::No,
+            _ => {}
+        }
+    }
+    AttrClose::Pending
 }
 
 /// Finds the earliest DSML closing tag for any of `names`; returns
@@ -1508,6 +1596,79 @@ mod tests {
         assert_eq!(call.arg_value("missing"), None);
         assert!(call.args[0].is_string);
         assert!(!call.args[1].is_string);
+    }
+
+    /// Two parameters fused into one tag pair: the model closed `query` with a
+    /// tag that carries the *next* parameter's attributes, so the `/` is the
+    /// only thing separating it from an opener. Recorded in
+    /// `repro-loop-1789365915.md`, where a `search` call was dispatched with a
+    /// corrupted `query` and no `path` at all — the model read the empty result
+    /// as search ignoring the root folder and spent two turns on a phantom bug.
+    /// Failing loudly is what lets it re-emit instead.
+    const FUSED_PARAMS: &str = concat!(
+        "<｜DSML｜tool_calls>",
+        "<｜DSML｜invoke name=\"search\">",
+        "<｜DSML｜parameter name=\"query\" string=\"true\">impl Rng",
+        "</｜DSML｜parameter name=\"path\" string=\"true\">src/words.rs",
+        "</｜DSML｜parameter｜>",
+        "</｜DSML｜invoke｜>",
+        "</｜DSML｜tool_calls｜>",
+    );
+
+    #[test]
+    fn parameter_close_tag_with_attributes_is_an_error() {
+        for feed in [feed_all as fn(&mut DsmlParser, &str), feed_bytewise] {
+            let mut p = DsmlParser::new();
+            feed(&mut p, FUSED_PARAMS);
+            assert_eq!(p.state(), DsmlState::Error, "{}", p.error());
+            assert!(
+                p.error().contains("attributes"),
+                "unhelpful error: {}",
+                p.error()
+            );
+            assert!(p.calls().is_empty());
+        }
+    }
+
+    /// The error fires on the `=` that proves an attribute, not on the
+    /// whitespace or the name before it, so a close tag still streaming in
+    /// byte by byte is never rejected early.
+    #[test]
+    fn parameter_close_tag_stays_open_until_the_attribute_arrives() {
+        let eq = FUSED_PARAMS.find("name=\"path\"").unwrap() + "name".len();
+        let mut p = DsmlParser::new();
+        feed_bytewise(&mut p, &FUSED_PARAMS[..eq]);
+        assert_eq!(p.state(), DsmlState::ParamValue, "{}", p.error());
+        p.feed("=");
+        assert_eq!(p.state(), DsmlState::Error);
+    }
+
+    /// A bare word where an attribute would go is not a fused tag: it stays
+    /// value text, so a payload mentioning the delimiter is not an error.
+    /// The whole-value rescan agrees (`incremental_scan_matches_whole_value_rescan`).
+    #[test]
+    fn parameter_close_tag_without_an_attribute_stays_value_text() {
+        for value in ["</｜DSML｜parameter x>", "</｜DSML｜parameter ｜ x>"] {
+            let mut p = DsmlParser::new();
+            feed_bytewise(&mut p, &write_stanza(value));
+            assert_eq!(p.state(), DsmlState::Done, "{value:?}: {}", p.error());
+            assert_eq!(p.calls()[0].arg_value("content"), Some(value));
+        }
+    }
+
+    /// A candidate is held for at most [`ATTR_CLOSE_LOOKAHEAD`] bytes, so a
+    /// value that opens a close tag and never closes it cannot pin the scan
+    /// cursor and make the scan quadratic.
+    #[test]
+    fn attr_close_lookahead_is_bounded() {
+        let value = format!(
+            "</｜DSML｜parameter {}",
+            "x".repeat(ATTR_CLOSE_LOOKAHEAD * 2)
+        );
+        let mut p = DsmlParser::new();
+        feed_bytewise(&mut p, &write_stanza(&value));
+        assert_eq!(p.state(), DsmlState::Done, "{}", p.error());
+        assert_eq!(p.calls()[0].arg_value("content"), Some(value.as_str()));
     }
 
     #[test]
