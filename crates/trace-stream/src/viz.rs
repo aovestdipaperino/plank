@@ -1834,10 +1834,13 @@ impl<S: RenderSink> StreamRenderer<S> {
             }
             self.viz.param_end_tail.push(c);
             let mut complete = false;
-            let (_, param_name) = self.dsml_tag_names();
             let is_close_tail = if qwen {
                 qwen_param_close_tail(&self.viz.param_end_tail, &mut complete)
             } else {
+                // Only the DSML branch has tag names to match; asking for them
+                // on a Qwen stanza is what used to reach `dsml_tag_names` with
+                // `ToolSyntax::Qwen` and abort the render.
+                let (_, param_name) = self.dsml_tag_names();
                 parameter_close_tail(&self.viz.param_end_tail, param_name, &mut complete)
             };
             if is_close_tail {
@@ -1938,11 +1941,23 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// V4 and V4.1 spell `invoke` and `parameter` differently (V4.1 carries a
     /// leading space), and the banner scan matches them by name.
     fn dsml_tag_names(&self) -> (&'static str, &'static str) {
-        let tags = self
-            .syntax
-            .dsml_tags()
-            .expect("ToolSyntax::ALL lists only DSML dialects");
+        let tags = self.dsml_tags_or_v4();
         (tags.invoke_name, tags.param_name)
+    }
+
+    /// This renderer's DSML tag table, falling back to V4's.
+    ///
+    /// Every caller sits behind an `is_qwen` check, so the fallback is
+    /// unreachable by construction — but `ToolSyntax::Qwen` became reachable
+    /// here the moment the model family started selecting the dialect, and
+    /// these paths are driven by model bytes. A wrong banner is recoverable;
+    /// aborting the render mid-stanza is not, so this cannot be an `expect`.
+    fn dsml_tags_or_v4(&self) -> crate::syntax::DsmlTags {
+        self.syntax.dsml_tags().unwrap_or_else(|| {
+            ToolSyntax::Dsml
+                .dsml_tags()
+                .expect("Dsml is a DSML dialect")
+        })
     }
 
     /// The Qwen dialect's display scan.
@@ -2197,13 +2212,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         if self.parser.is_qwen() {
             self.parser.feed(QWEN_START);
         } else {
-            self.parser.feed(
-                self.syntax
-                    .dsml_tags()
-                    .expect("ToolSyntax::ALL lists only DSML dialects")
-                    .start
-                    .as_bytes(),
-            );
+            self.parser.feed(self.dsml_tags_or_v4().start.as_bytes());
         }
         self.scan = DsmlScan::Between;
         if !self.dsml_ignored {
@@ -2441,11 +2450,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                     if implicit_invoke {
                         // Same rule as the opener: replay the dialect's own
                         // canonical invoke, not the bytes the model wrote.
-                        let invoke = self
-                            .syntax
-                            .dsml_tags()
-                            .expect("ToolSyntax::ALL lists only DSML dialects")
-                            .invoke;
+                        let invoke = self.dsml_tags_or_v4().invoke;
                         for &b in invoke.as_bytes() {
                             self.feed_dsml_byte(b);
                         }
@@ -4519,6 +4524,28 @@ mod qwen_dialect_tests {
         sr.push(text);
         sr.finish();
         sr
+    }
+
+    /// A renderer built from the *model family* — `ToolSyntax::Qwen`, not just
+    /// a Qwen stanza arriving at an untold renderer — must render a parameter
+    /// value to completion.
+    ///
+    /// This is where the two Qwen efforts met. The dialect layer kept Qwen in
+    /// its own `Dialect` enum, so `self.syntax` could never be `Qwen` and the
+    /// display scan reached for a DSML tag table unconditionally. Once the
+    /// model family started selecting the dialect that became reachable and
+    /// aborted the render mid-stanza. Every unit test still passed; only
+    /// loading the model caught it, which is why this one exists.
+    #[test]
+    fn a_family_selected_qwen_renderer_completes_a_parameter_value() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Qwen);
+        sr.push(CALL);
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.calls.len(), 1, "{:?}", sr.sink().visible);
+        assert_eq!(done.calls[0].name, "read");
+        assert_eq!(done.calls[0].arg_value("path"), Some("src/a.rs"));
+        assert_eq!(done.error, None);
     }
 
     /// The end-to-end shape this whole port exists for: a Qwen stanza reaches
