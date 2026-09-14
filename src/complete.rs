@@ -234,6 +234,48 @@ fn lines_from(root: &Path, program: &str, args: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Recursively lists files under `root` as repo-relative paths.
+///
+/// The fallback for a directory that is neither a git tree nor reachable by
+/// `rg`: ripgrep is not installed on every machine, and without this the `@`
+/// popup is silently empty everywhere outside a repository. Hidden entries are
+/// skipped (the same thing `rg` does by default) and the walk is capped, so a
+/// stray `@` in a huge tree cannot stall the index thread.
+fn walk_files(root: &Path) -> BTreeSet<String> {
+    /// Upper bound on paths collected by one walk.
+    const CAP: usize = 20_000;
+    let mut out = BTreeSet::new();
+    let mut stack = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, prefix)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            // `file_type` does not follow symlinks, so a link loop cannot
+            // send the walk around forever.
+            let Ok(ft) = entry.file_type() else { continue };
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}{name}")
+            };
+            if ft.is_dir() {
+                stack.push((entry.path(), format!("{rel}/")));
+            } else if ft.is_file() {
+                out.insert(rel);
+                if out.len() >= CAP {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// True when `root` is inside a git working tree.
 fn is_git_repo(root: &Path) -> bool {
     !lines_from(root, "git", &["rev-parse", "--is-inside-work-tree"]).is_empty()
@@ -327,10 +369,18 @@ impl FileIndex {
             if !respect_gitignore {
                 args.push("--no-ignore");
             }
-            lines_from(root, "rg", &args)
+            let found: BTreeSet<String> = lines_from(root, "rg", &args)
                 .into_iter()
                 .map(|p| p.trim_start_matches("./").to_string())
-                .collect()
+                .collect();
+            // An empty result means `rg` is missing or failed (it is not
+            // installed by default on macOS); walk the tree ourselves rather
+            // than leave the popup blank.
+            if found.is_empty() {
+                walk_files(root)
+            } else {
+                found
+            }
         };
         let mut idx = Self {
             paths,
@@ -768,6 +818,27 @@ mod tests {
             p.handle_key(key(KeyCode::Esc), &mut buf),
             PopupAction::Dismissed
         );
+    }
+
+    #[test]
+    fn indexes_files_outside_a_git_repo_without_ripgrep() {
+        // `rg` is not installed on every machine; without a built-in walk the
+        // popup is silently empty in any directory that is not a git tree.
+        let dir = std::env::temp_dir().join(format!(
+            "plank-nogit-walk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("PAROLA-PROMPT.md"), b"x").unwrap();
+        std::fs::write(dir.join("sub/loose.txt"), b"x").unwrap();
+        let found = walk_files(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(found.contains("PAROLA-PROMPT.md"), "{found:?}");
+        assert!(found.contains("sub/loose.txt"), "{found:?}");
     }
 
     fn popup_with(rows: &[(&str, Kind)], token_text: &str) -> Popup {
