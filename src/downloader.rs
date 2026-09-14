@@ -1034,6 +1034,7 @@ pub fn job_path_in(root: &Path, set: crate::manifest::ModelSet) -> PathBuf {
     let name = match set {
         crate::manifest::ModelSet::Ds4 => "job.json",
         crate::manifest::ModelSet::Ds41 => "job-ds41.json",
+        crate::manifest::ModelSet::Qwen => "job-qwen.json",
     };
     crate::manifest::downloads_dir_in(root).join(name)
 }
@@ -1099,8 +1100,8 @@ pub fn read_job_in(
 /// The one pending job under `root`, and which set it belongs to.
 ///
 /// At most one download runs at a time, so at most one job file normally
-/// exists. The scan is ordered so it stays deterministic if more than one set
-/// ever has a job file; the helper each was written for still reads its own.
+/// exists. Qwen is checked first only to make the scan deterministic; if both
+/// somehow exist, the helper each was written for still reads its own.
 #[must_use]
 pub fn pending_job_in(
     root: &Path,

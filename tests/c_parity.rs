@@ -710,14 +710,17 @@ fn qwen_syntax_reminder_matches_c_source() {
     );
 }
 
-/// Every committed manifest must parse with plank's own parser.
+/// Both committed manifests must parse with plank's own parser.
 ///
 /// They are data files, so nothing else compiles them: a typo in a URL, a
 /// truncated hash, or a kind this build cannot install would otherwise only
 /// surface as a failed download on a user's machine.
 #[test]
 fn the_committed_manifests_parse_and_name_installable_kinds() {
-    for (set, name) in [(plank::manifest::ModelSet::Ds4, "ds4.manifest")] {
+    for (set, name) in [
+        (plank::manifest::ModelSet::Ds4, "ds4.manifest"),
+        (plank::manifest::ModelSet::Qwen, "qwen.manifest"),
+    ] {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
         let m = plank::manifest::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));

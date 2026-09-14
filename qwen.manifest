@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "released": "2026-09-08",
+  "notes": "Qwen3.8-Flash-Next DS4 Q4 (imatrix), initial manifest",
+  "files": {
+    "main": {
+      "name": "Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out-MTP.gguf",
+      "url": "https://huggingface.co/ivanfioravanti/Qwen3.8-Flash-Next-DS4-Q4/resolve/main/Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out-MTP.gguf",
+      "bytes": 74879771648,
+      "sha256": "36144db35ef663555b1838896748288d096b67d145e25e3b5ece3826491d69a8"
+    },
+    "mtp": {
+      "name": "Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+      "url": "https://huggingface.co/ivanfioravanti/Qwen3.8-Flash-Next-DS4-Q4/resolve/main/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+      "bytes": 32000157440,
+      "sha256": "66db3ab390f4dd5063ecc89cc180f4713898577682347001bf64ab8e328527a1"
+    }
+  }
+}

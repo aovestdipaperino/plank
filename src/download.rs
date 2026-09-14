@@ -299,6 +299,37 @@ pub fn default_dspark_path() -> PathBuf {
     home.join(".plank").join("ds4flash.dspark.gguf")
 }
 
+/// Default Qwen3.8-Flash-Next model location, selected by `--qwen`.
+///
+/// plank never downloads this one — the Qwen release is not in `ds4.manifest`
+/// — so it is expected to be a symlink the user points at whichever build they
+/// want:
+///
+/// ```text
+/// ln -sfn ~/models/qwen38-ds4-q4/Qwen3.8-...-MTP.gguf  ~/.plank/qwen.gguf
+/// ln -sfn ~/models/qwen38-ds4-q4/Qwen3.8-...-PLE-Q4_1.gguf ~/.plank/qwen.mtp.gguf
+/// ```
+///
+/// Deliberately outside the `ds4flash.*` family, which the manifest owns: a
+/// staged upgrade moves those three names into place, and a name it recognized
+/// would be replaced under the user's feet.
+#[must_use]
+pub fn default_qwen_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("qwen.gguf")
+}
+
+/// Default companion for [`default_qwen_path`] — the required PLE sidecar.
+///
+/// Named for the flag that carries it (`--mtp-model`) rather than for the
+/// tensor inside it, so the pairing reads the same way `ds4flash.dspark.gguf`
+/// pairs with `ds4flash.gguf`.
+#[must_use]
+pub fn default_qwen_mtp_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("qwen.mtp.gguf")
+}
+
 /// Default vision-encoder location. Loaded alongside the main model whenever
 /// the native engine opens the Vision-Exp checkpoint.
 ///
@@ -1745,6 +1776,7 @@ pub fn manifest_set_for_model_in(
         None => Some(crate::manifest::default_set_for_root(root)),
         Some(p) if p == default_model_path() => Some(crate::manifest::ModelSet::Ds4),
         Some(p) if p == default_ds41_model_path() => Some(crate::manifest::ModelSet::Ds41),
+        Some(p) if p == default_qwen_path() => Some(crate::manifest::ModelSet::Qwen),
         Some(_) => None,
     }
 }
@@ -2365,7 +2397,7 @@ mod tests {
     /// download is stubbed here on purpose — if the gate regressed, the ensure
     /// calls would try to prompt or fetch and fail.
     #[test]
-    fn a_non_ds4_model_skips_the_ds4_side_artifacts() {
+    fn a_qwen_model_skips_the_ds4_side_artifacts() {
         let model = stub_model("qwen", "qwen4exp");
         let mut e = crate::config::EngineTuning {
             mtp: true,
@@ -2373,20 +2405,24 @@ mod tests {
             ..Default::default()
         };
         assert!(ensure_side_artifacts(&model, &mut e).is_ok());
-        // Speculation stays on: under the unified `--mtp` such a run
+        // Speculation stays on: under the unified `--mtp` a Qwen run
         // speculates from the block embedded in its own main GGUF, which needs
         // neither a download nor a companion file.
-        assert!(e.mtp, "speculation is still meaningful here");
+        assert!(e.mtp, "speculation is still meaningful for Qwen");
         assert!(
             e.mtp_path.is_none(),
-            "no DeepSeek support model resolved for a non-DS4 run"
+            "no DeepSeek support model resolved for a Qwen run"
         );
         let _ = std::fs::remove_file(model);
     }
 
+    /// A missing model that is *not* the `DeepSeek` default must never trigger
+    /// the `DeepSeek` download offer. `--qwen` with an unlinked
+    /// `~/.plank/qwen.gguf` used to propose fetching 87 GB of `DeepSeek` into
+    /// the Qwen slot, and so did a mistyped `-m`.
     /// Which set a model path belongs to. The skip used to be "any `-m` at
-    /// all", which would have opted a flag resolving to a managed default path
-    /// out of upgrades entirely.
+    /// all", which would have opted `--qwen` out of Qwen upgrades entirely,
+    /// since the flag resolves to a default path.
     #[test]
     fn the_managed_paths_map_to_their_set() {
         use crate::manifest::ModelSet;
@@ -2398,6 +2434,10 @@ mod tests {
         assert_eq!(
             manifest_set_for_model_in(&root, Some(&default_ds41_model_path())),
             Some(ModelSet::Ds41)
+        );
+        assert_eq!(
+            manifest_set_for_model_in(&root, Some(&default_qwen_path())),
+            Some(ModelSet::Qwen)
         );
         // A path plank does not manage gets no manifest check at all: it is
         // the user's file, and plank must never propose replacing it.
@@ -2522,7 +2562,7 @@ mod tests {
     #[test]
     fn a_missing_non_default_model_is_an_error_not_a_download_offer() {
         let missing =
-            std::env::temp_dir().join(format!("plank-absent-{}.gguf", std::process::id()));
+            std::env::temp_dir().join(format!("plank-absent-{}-qwen.gguf", std::process::id()));
         assert!(!missing.exists());
         let err = ensure_model(&missing).expect_err("a missing model is an error");
         assert!(err.contains("no model at"), "{err}");

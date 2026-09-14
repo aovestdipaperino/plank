@@ -564,7 +564,8 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // Speculation is on by default; without `--mtp-model` a DeepSeek run
         // resolves the default support GGUF and fetches it on demand
         // (`--mtp-off` skips that). Kept local rather than written back into
-        // `cfg`: only the engine open needs it.
+        // `cfg`: only the engine open needs it. A Qwen model skips both side
+        // artifacts, since it opens neither.
         let mut tuning = cfg.engine.clone();
         plank::download::ensure_side_artifacts(&model, cfg.generation.ctx_size, &mut tuning)?;
 

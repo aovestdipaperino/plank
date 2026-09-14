@@ -704,7 +704,7 @@ mod tests {
             path: &model,
             rc: -3,
             engine_null: true,
-            family: ModelFamily::Ds4,
+            family: ModelFamily::Qwen,
             backend: "Metal",
             ctx_size: 1_048_576,
             companions: &[
@@ -716,7 +716,7 @@ mod tests {
         assert!(msg.starts_with("failed to open model "), "{msg}");
         assert!(msg.contains("returned -3"), "{msg}");
         assert!(
-            msg.contains("ds4 family, Metal backend, context 1048576 tokens"),
+            msg.contains("qwen family, Metal backend, context 1048576 tokens"),
             "{msg}"
         );
         assert!(msg.contains("- model file: "), "{msg}");
