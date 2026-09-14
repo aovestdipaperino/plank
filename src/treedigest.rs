@@ -36,9 +36,20 @@
 //!   the guard behaves exactly as it did before this module existed.
 //! - **Ignored paths do not count.** A write to `target/` is invisible here,
 //!   which is the right answer: build output is not the work.
-//! - **Untracked directories are not recursed.** Creating `src/new/mod.rs`
-//!   shows up as the new `src/new/` entry, which is difference enough, and
-//!   skipping the walk keeps the cost near `git status`'s.
+//! - **Untracked directories are recursed**, and have to be. The cheaper
+//!   setting was the original one, on the reasoning that creating
+//!   `src/new/mod.rs` shows up as the new `src/new/` entry and that is
+//!   difference enough. It is not: git collapses an untracked directory to a
+//!   single entry, so the stat that enters the hash is the *directory's*, and
+//!   a directory's size and mtime do not move when a file inside it is
+//!   rewritten in place. In a repository with nothing committed yet — a fresh
+//!   `git init`, which is where "build me an app" starts — that one entry is
+//!   the entire source tree, and every shell write into it was invisible
+//!   (`repro-1789367979`: four source files written through `sed` and a
+//!   codegen script, no witness, turn stopped at 32 KiB). `include_ignored`
+//!   stays off, so the walk skips `target/` and friends; an enormous
+//!   *unignored* untracked tree is the one case that pays for this, and it
+//!   pays twice per opaque call.
 //! - **An async `bash` job that lands between polls** is attributed to
 //!   whichever call happens to bracket the write, not to the call that
 //!   started the job.
@@ -71,7 +82,7 @@ pub fn capture(cwd: &Path) -> Option<TreeDigest> {
     let workdir = repo.workdir()?.to_path_buf();
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
-        .recurse_untracked_dirs(false)
+        .recurse_untracked_dirs(true)
         .include_ignored(false)
         // Never write the index from a guard: this runs inside a tool
         // dispatch, and a stat-cache refresh racing the user's own git is not
@@ -177,6 +188,30 @@ mod tests {
         std::fs::write(dir.join("tracked.txt"), "two\n").unwrap();
         let before = capture(&dir);
         std::fs::write(dir.join("tracked.txt"), "three and longer\n").unwrap();
+        assert!(changed(before, capture(&dir)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A repository with no commits and nothing tracked — a fresh
+    /// `git init`, which is what a "build me an app" session starts from.
+    fn repo_without_a_commit(dir: &Path) {
+        git2::Repository::init(dir).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/words.rs"), "one\n").unwrap();
+    }
+
+    #[test]
+    fn editing_inside_an_untracked_directory_moves_the_digest() {
+        // `repro-1789367979`: nothing is committed, so status collapses the
+        // whole source tree to the single entry `src/` and the stat that
+        // enters the hash is the *directory's*. Rewriting a file inside it
+        // leaves that stat alone, so every shell write the session made was
+        // invisible and the no-progress guard stopped a turn that was working.
+        let dir = scratch("untracked-dir");
+        repo_without_a_commit(&dir);
+        let before = capture(&dir);
+        assert!(before.is_some());
+        std::fs::write(dir.join("src/words.rs"), "two and rather longer\n").unwrap();
         assert!(changed(before, capture(&dir)));
         std::fs::remove_dir_all(&dir).ok();
     }

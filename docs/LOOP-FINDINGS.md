@@ -970,3 +970,50 @@ The rule this keeps arriving at: a guard's message and its presentation are
 part of its design, not decoration. A stop that removes work should be loud and
 should say what it removed; a stop that only redirects where the next bytes go
 should be quiet and should not accuse.
+
+## The progress witness was blind to the whole source tree
+
+`repro-1789367979` — session `turbo-euler`, working in a scratch project at
+`~/Code/parola-4.1` — is the first dump taken because the *no-progress* budget
+kept ending turns that were plainly getting somewhere. The model wrote four
+source files in that stretch and the guard counted none of them.
+
+The reason is one line of `StatusOptions`. `treedigest::capture` hashes, for
+each dirty entry, the path, the status bits and a `symlink_metadata` of the
+file. With `recurse_untracked_dirs(false)` git collapses an untracked directory
+to a single entry, so for `?? src/` the stat that enters the hash is the
+directory's, not any file's — and a directory's size and mtime do not move when
+a file inside it is rewritten in place. Measured on the live repository, before
+and after both a redirect and a `sed -i ''`:
+
+```
+before                          ??|src/|96:1789368342
+after rewriting src/words.rs    ??|src/|96:1789368342
+after sed -i '' on src/words.rs ??|src/|96:1789368342
+```
+
+The digest is constant. `touched_tree` is never set, and since `write` and
+`edit` were failing on this session's `&`-bearing parameters and the model had
+fallen back to `sed` and a codegen script, `last_written` was never set either.
+Both halves of `made_progress` were blind at once, `ungrounded` climbed through
+round after round of real work, and the turn died at 32 KiB.
+
+What makes this worse than a rare miss is where it bites. A repository with
+nothing committed yet has *every* directory collapsed to one entry, so the blind
+spot is the entire project — and "nothing committed yet" is precisely the state
+a "build me an app" session starts in and stays in for its first hour. The
+guard was at its most wrong exactly where a turn legitimately generates a lot of
+text before its first visible change.
+
+Fixed 2026-09-14: `recurse_untracked_dirs(true)`. `include_ignored` stays off,
+so the walk still skips `target/`, and on this repository `git status -uall` and
+`-unormal` time the same to two decimal places. The regression test builds a
+repository with no commits and nothing tracked, rewrites a file inside `src/`,
+and asserts the digest moves.
+
+The module's own doc had named the old setting as a deliberate limit costing "at
+most a missed budget reset", with the reasoning that creating `src/new/mod.rs`
+shows up as a new `src/new/` entry and that is difference enough. That reasoning
+is sound for *adding* a file and silently wrong for *changing* one, which is
+most of what an agent does. A limit that has been argued for in prose is not a
+limit that has been measured.
