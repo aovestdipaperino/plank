@@ -705,6 +705,13 @@ struct ToolViz {
     /// Destination captured from a `write` call's path param, for the dim
     /// content-preview header.
     write_path: String,
+    /// True when the current `write` streamed its `content` before its `path`,
+    /// so the preview header could not name the file. The `└ N lines` summary
+    /// is then held back to the end of the invoke, where the path is known,
+    /// and carries it.
+    write_pathless: bool,
+    /// The held-back summary line count for a `write_pathless` preview.
+    write_pending_summary: Option<usize>,
     /// True when the current `write` targets a file that does not yet exist:
     /// only then does the content stream as a dim preview (an overwrite is left
     /// to the post-edit diff card).
@@ -1719,14 +1726,21 @@ impl<S: RenderSink> StreamRenderer<S> {
                     // A dim header names the file for the content preview. Only
                     // when the banner is off, else the banner already shows it.
                     if self.viz.write_is_create && !self.show_tool_calls {
-                        let path = if self.viz.write_path.is_empty() {
-                            "<file>".to_string()
-                        } else if let Ok(cwd) = std::env::current_dir() {
-                            repo_relative(&self.viz.write_path, &cwd)
+                        // The path param usually precedes content. When the
+                        // model orders them the other way the destination is
+                        // simply not known yet: say "Writing" and let the
+                        // closing summary name the file, never a placeholder.
+                        if self.viz.write_path.is_empty() {
+                            self.viz.write_pathless = true;
+                            self.viz_preview_puts("● Writing\n");
                         } else {
-                            self.viz.write_path.clone()
-                        };
-                        self.viz_preview_puts(&format!("● Writing {path}\n"));
+                            let path = if let Ok(cwd) = std::env::current_dir() {
+                                repo_relative(&self.viz.write_path, &cwd)
+                            } else {
+                                self.viz.write_path.clone()
+                            };
+                            self.viz_preview_puts(&format!("● Writing {path}\n"));
+                        }
                     }
                 } else {
                     self.viz_puts(&format!("{TREE_BRANCH}{name} ─\n"));
@@ -1765,7 +1779,13 @@ impl<S: RenderSink> StreamRenderer<S> {
             } else if !self.viz.at_line_start {
                 self.viz_preview_puts("\n");
             }
-            self.viz_preview_puts(&format!("  └ {n} {unit}\n"));
+            if self.viz.write_pathless {
+                // The path is still unstreamed: hold the summary for the end
+                // of the invoke, where it can name the file.
+                self.viz.write_pending_summary = Some(n);
+            } else {
+                self.viz_preview_puts(&format!("  └ {n} {unit}\n"));
+            }
         }
         self.viz.param_end_tail.clear();
         if self.viz.code_param_active {
@@ -1875,6 +1895,22 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.viz.write_content_newlines = 0;
         self.viz.write_partial_line = false;
         self.viz.write_truncated = false;
+        if let Some(n) = self.viz.write_pending_summary.take() {
+            let unit = if n == 1 { "line" } else { "lines" };
+            let path = if self.viz.write_path.is_empty() {
+                String::new()
+            } else if let Ok(cwd) = std::env::current_dir() {
+                repo_relative(&self.viz.write_path, &cwd)
+            } else {
+                self.viz.write_path.clone()
+            };
+            if path.is_empty() {
+                self.viz_preview_puts(&format!("  └ {n} {unit}\n"));
+            } else {
+                self.viz_preview_puts(&format!("  └ {n} {unit} · {path}\n"));
+            }
+        }
+        self.viz.write_pathless = false;
         self.viz.write_path.clear();
         self.viz.tool_announced = false;
     }
@@ -2886,6 +2922,32 @@ mod tests {
         sr.push(&stanza);
         sr.finish();
         sr.sink().think.clone()
+    }
+
+    /// A `write` that streams `content` before `path` must never print the
+    /// literal `<file>`: the header says only "Writing" and the closing
+    /// summary names the file once the path has been streamed.
+    #[test]
+    fn write_preview_with_content_before_path_names_the_file_in_the_summary() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"content\">one\ntwo\n</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"path\">src/late_path.rs</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_tool_calls(false);
+        sr.push(stanza);
+        sr.finish();
+        let think = sr.sink().think.clone();
+        assert!(!think.contains("<file>"), "no placeholder: {think:?}");
+        assert!(think.contains("● Writing\n"), "bare header: {think:?}");
+        assert!(
+            think.contains("└ 2 lines · src/late_path.rs"),
+            "summary names the file: {think:?}"
+        );
     }
 
     #[test]
