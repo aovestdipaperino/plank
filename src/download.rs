@@ -39,9 +39,16 @@ const REPO: &str = "antirez/deepseek-v4-gguf";
 /// upstream (`refs/ds4/download_model.sh`).
 const DS41_REPO: &str = "antirez/deepseek-v4.1-flash-gguf";
 
+/// Hugging Face repository holding the Qwen3.8-Flash-Next release.
+const QWEN_REPO: &str = "antirez/qwen3.8-flash-next-gguf";
+
 /// V4.1 main model filename, mirroring `refs/ds4/download_model.sh`'s
 /// `DS41_Q2_FILE`.
 const DS41_FILE: &str = "DeepSeek-V4.1-Flash-Q2.gguf";
+
+/// The Qwen `main` artifact: the Q4 build, the one `refs/ds4`'s
+/// `download_model.sh qwen38-q4k` target fetches for a 128 GB Mac.
+const QWEN_FILE: &str = "Qwen3.8-Flash-Next-Q4.gguf";
 /// The recommended Vision-Experimental Flash quant (~81 GB) for 96–128 GB
 /// machines.
 ///
@@ -299,6 +306,30 @@ pub fn default_dspark_path() -> PathBuf {
     home.join(".plank").join("ds4flash.dspark.gguf")
 }
 
+/// Default Qwen3.8-Flash-Next model location, selected by `--qwen`.
+///
+/// Deliberately outside the `ds4flash.*` family, which the `DeepSeek` manifest
+/// owns: a staged upgrade moves those names into place, and a name it
+/// recognized would be replaced under the user's feet. Qwen has its own
+/// manifest (`qwen.manifest`), so this path is managed the same way V4 and
+/// V4.1 are — an existing symlink here is adopted by size rather than replaced.
+#[must_use]
+pub fn default_qwen_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("qwen.gguf")
+}
+
+/// Default Qwen vision-encoder location, beside its main model.
+///
+/// This replaced the old `qwen.mtp.gguf` PLE sidecar: upstream now ships the
+/// BF16 n-grams and the MTP block inside the main GGUF, so the second slot is
+/// free for the `mmproj` encoder `--vision` loads.
+#[must_use]
+pub fn default_qwen_vision_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("qwen.vision.gguf")
+}
+
 /// Default vision-encoder location. Loaded alongside the main model whenever
 /// the native engine opens the Vision-Exp checkpoint.
 ///
@@ -359,6 +390,11 @@ pub fn ds41_model_url() -> String {
     repo_file_url(DS41_REPO, DS41_FILE)
 }
 
+/// Hugging Face download URL for the Qwen3.8-Flash-Next `main` artifact.
+fn qwen_model_url() -> String {
+    repo_file_url(QWEN_REPO, QWEN_FILE)
+}
+
 /// Uncompiled-in size estimate for a set's `main` artifact, in GB, used only
 /// when no manifest is on hand to give an exact figure. From
 /// `refs/ds4/docs/MODELS.md`.
@@ -366,6 +402,7 @@ fn fallback_main_gb(set: crate::manifest::ModelSet) -> f64 {
     match set {
         crate::manifest::ModelSet::Ds4 => 87.0,
         crate::manifest::ModelSet::Ds41 => 341.0,
+        crate::manifest::ModelSet::Qwen => 177.0,
     }
 }
 
@@ -481,25 +518,47 @@ pub fn ensure_dspark_support(engine: &mut crate::config::EngineTuning) -> Result
     Ok(())
 }
 
-/// Fetches the DS4 side artifacts (vision encoder, `DSpark` support).
+/// Fetches the DS4 side artifacts (vision encoder, `DSpark` support) unless the
+/// model is a Qwen3.8-Flash-Next one.
 ///
-/// The vision encoder is skipped for a `DeepSeek` checkpoint that is not
+/// Both are `DeepSeek` V4 files, and a Qwen run opens neither: the engine is
+/// not handed the vision encoder, and Qwen speculates from the MTP block
+/// embedded in its own main GGUF rather than from a draft checkpoint. Fetching
+/// them would cost ~7 GB for files this run never reads.
+///
+/// The vision encoder is also skipped for a `DeepSeek` checkpoint that is not
 /// the pinned Vision-Exp model (`gguf::supports_vision`): the engine refuses
 /// to open such a model with an encoder, so plank never passes one and the run
 /// is text-only. Prompting for a ~0.9 GB download it could not use would be
 /// worse than useless.
 ///
+/// Speculation is *not* switched off here. Under the unified `--mtp` it stays
+/// meaningful for Qwen — it just runs off the embedded block, which needs no
+/// download and no companion file.
+///
 /// # Errors
-/// Propagates the underlying ensure failures.
+/// Propagates the underlying ensure failures for non-Qwen runs.
 pub fn ensure_side_artifacts(
     model_path: &Path,
     ctx: i32,
     engine: &mut crate::config::EngineTuning,
 ) -> Result<(), String> {
+    // Qwen takes none of this. The engine refuses to open a Qwen3.8 checkpoint
+    // with SSD streaming on ("requires single-host Metal ... SSD streaming ...
+    // not supported"), and the heuristic would enable it every time anyway: it
+    // weighs the *file* against the resident budget, and a Qwen GGUF is mostly
+    // BF16 n-grams the engine leaves on disk — 165 GiB on disk, ~70 GiB
+    // resident, which fits a 128 GB Mac that the file size says it cannot.
+    // Neither side artifact is Qwen's either: no `DeepSeek` vision encoder, and
+    // speculation runs off the block embedded in its own GGUF.
+    if crate::gguf::family_of(model_path) == crate::gguf::ModelFamily::Qwen {
+        crate::status::set_ssd_streaming(engine.ssd_streaming);
+        return Ok(());
+    }
     // A checkpoint too large to hold resident is streamed from SSD rather than
-    // failing to open; decided before anything else, since it applies to every
-    // family and does not depend on the companion resolution below. It needs
-    // the context size, which is why this function takes one.
+    // failing to open; decided before the companion resolution below, which it
+    // does not depend on. It needs the context size, which is why this function
+    // takes one.
     auto_enable_ssd_streaming(model_path, ctx, engine);
     // The streaming decision is final here — nothing below touches it — so
     // this is where the footer's `HD` marker learns about it. Published rather
@@ -795,6 +854,7 @@ fn ensure_model_in(root: &Path, path: &Path) -> Result<(), String> {
     let (label, url) = match set {
         crate::manifest::ModelSet::Ds4 => ("DeepSeek V4 Flash", model_url()),
         crate::manifest::ModelSet::Ds41 => ("DeepSeek V4.1 Flash", ds41_model_url()),
+        crate::manifest::ModelSet::Qwen => ("Qwen3.8 Flash Next", qwen_model_url()),
     };
     // A leftover .part file means a previous download can be resumed.
     let resuming = partial_bytes(path) > 0;
@@ -1732,6 +1792,7 @@ pub fn manifest_set_for_model_in(
         None => Some(crate::manifest::default_set_for_root(root)),
         Some(p) if p == default_model_path() => Some(crate::manifest::ModelSet::Ds4),
         Some(p) if p == default_ds41_model_path() => Some(crate::manifest::ModelSet::Ds41),
+        Some(p) if p == default_qwen_path() => Some(crate::manifest::ModelSet::Qwen),
         Some(_) => None,
     }
 }
@@ -2347,9 +2408,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A non-`DeepSeek` model must not reach for either side artifact: it
+    /// opens neither the DS4 vision encoder nor a DS4 draft checkpoint. No
+    /// download is stubbed here on purpose — if the gate regressed, the ensure
+    /// calls would try to prompt or fetch and fail.
+    #[test]
+    fn a_qwen_model_skips_the_ds4_side_artifacts() {
+        let model = stub_model("qwen", "qwen4exp");
+        let mut e = crate::config::EngineTuning {
+            mtp: true,
+            mtp_strict: true,
+            ..Default::default()
+        };
+        assert!(ensure_side_artifacts(&model, 32768, &mut e).is_ok());
+        // Speculation stays on: under the unified `--mtp` a Qwen run
+        // speculates from the block embedded in its own main GGUF, which needs
+        // neither a download nor a companion file.
+        assert!(e.mtp, "speculation is still meaningful for Qwen");
+        assert!(
+            e.mtp_path.is_none(),
+            "no DeepSeek support model resolved for a Qwen run"
+        );
+        // And SSD streaming is never auto-enabled: the engine refuses to open
+        // a Qwen checkpoint with it on, so leaving the heuristic to run here
+        // made `--qwen` fail to load at all on any machine whose RAM the file
+        // size exceeds — which, at 165 GiB on disk, is every machine.
+        assert!(
+            !e.ssd_streaming,
+            "the engine rejects a Qwen open with SSD streaming on"
+        );
+        let _ = std::fs::remove_file(model);
+    }
+
+    /// A missing model that is *not* the `DeepSeek` default must never trigger
+    /// the `DeepSeek` download offer. `--qwen` with an unlinked
+    /// `~/.plank/qwen.gguf` used to propose fetching 87 GB of `DeepSeek` into
+    /// the Qwen slot, and so did a mistyped `-m`.
     /// Which set a model path belongs to. The skip used to be "any `-m` at
-    /// all", which would have opted a flag resolving to a managed default path
-    /// out of upgrades entirely.
+    /// all", which would have opted `--qwen` out of Qwen upgrades entirely,
+    /// since the flag resolves to a default path.
     #[test]
     fn the_managed_paths_map_to_their_set() {
         use crate::manifest::ModelSet;
@@ -2361,6 +2458,10 @@ mod tests {
         assert_eq!(
             manifest_set_for_model_in(&root, Some(&default_ds41_model_path())),
             Some(ModelSet::Ds41)
+        );
+        assert_eq!(
+            manifest_set_for_model_in(&root, Some(&default_qwen_path())),
+            Some(ModelSet::Qwen)
         );
         // A path plank does not manage gets no manifest check at all: it is
         // the user's file, and plank must never propose replacing it.
@@ -2485,7 +2586,7 @@ mod tests {
     #[test]
     fn a_missing_non_default_model_is_an_error_not_a_download_offer() {
         let missing =
-            std::env::temp_dir().join(format!("plank-absent-{}.gguf", std::process::id()));
+            std::env::temp_dir().join(format!("plank-absent-{}-qwen.gguf", std::process::id()));
         assert!(!missing.exists());
         let err = ensure_model(&missing).expect_err("a missing model is an error");
         assert!(err.contains("no model at"), "{err}");

@@ -42,6 +42,97 @@ Use more for exact continuation; a byte-limited chunk can end within a line. \
 If the user explicitly asks you to read a complete file into context, call read with whole=true. \
 A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n";
 
+/// Tools prompt for the Qwen3.8-Flash-Next dialect (`ds4_agent.c`,
+/// `agent_build_qwen_tools_prompt` with `edit_upto`).
+///
+/// Qwen3.8 does not speak DSML. It is taught its own `<tool_call>` syntax and
+/// is handed JSON function schemas inside `<tools>`, which is why this is a
+/// separate prompt rather than a variation on [`TOOLS_PROMPT`]. Assembled from
+/// the C by decoding its string literals rather than retyping them, since
+/// every byte here is model-facing.
+///
+/// Two deliberate omissions from the C, both because the text would be false
+/// of plank rather than merely different:
+///
+/// - `AGENT_TOOL_CONTRACTS` is left out whole, exactly as the DSML prompt
+///   leaves it out. It asserts "Read output is limited to 128 KiB", which is
+///   the C's `AGENT_TOOL_MAX_BYTES` buffer limit and not plank's behaviour —
+///   plank bounds a read by context, as the rules below still say — and that
+///   write and edit "reject hard-linked files", which plank never checks.
+///   Its other claims do hold (bash `timeout_sec` 3600, `refresh_sec` 60,
+///   search `max_results` 50 in 1-500, `context` 0 in 0-5), so the block is a
+///   candidate for adoption sentence by sentence once those two are settled.
+/// - The vision schema, because a Qwen run is text-only here (see
+///   `Ds4Model::open`).
+pub const TOOLS_PROMPT_QWEN: &str = r#"You are a coding agent running in a local workspace. Use tools for local file and system work. Avoid printing large file contents or large code blocks as answers; create or edit files with tools, then summarize results briefly.
+
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name":"google_search","description":"Search web pages.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}
+{"type": "function", "function": {"name":"visit_page","description":"Read a URL in browser.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}
+{"type": "function", "function": {"name":"bash","description":"Run a shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_sec":{"type":"integer"},"refresh_sec":{"type":"integer"}},"required":["command"]}}}
+{"type": "function", "function": {"name":"bash_status","description":"Check a bash job.","parameters":{"type":"object","properties":{"job":{"type":"integer"},"pid":{"type":"integer"},"refresh_sec":{"type":"integer"}},"required":["job"]}}}
+{"type": "function", "function": {"name":"bash_stop","description":"Stop a bash job.","parameters":{"type":"object","properties":{"job":{"type":"integer"},"pid":{"type":"integer"},"refresh_sec":{"type":"integer"}},"required":["job"]}}}
+{"type": "function", "function": {"name":"read","description":"Read a text file/range.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"max_lines":{"type":"integer"},"whole":{"type":"boolean"},"raw":{"type":"boolean"}},"required":["path"]}}}
+{"type": "function", "function": {"name":"more","description":"Continue previous read-like output.","parameters":{"type":"object","properties":{"count":{"type":"integer"}}}}}
+{"type": "function", "function": {"name":"write","description":"Create or overwrite a file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}
+{"type": "function", "function": {"name":"edit","description":"Replace one exact old text match.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}}}
+{"type": "function", "function": {"name":"search","description":"Search files.","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"mode":{"type":"string","enum":["literal","regex"]},"glob":{"type":"string"},"context":{"type":"integer"},"max_results":{"type":"integer"},"case_sensitive":{"type":"boolean"}},"required":["query"]}}}
+{"type": "function", "function": {"name":"list","description":"List one directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}
+</tools>
+
+Inside string values only, escape a literal </parameter> as &lt;/parameter>. To write that escaped spelling literally, use &amp;lt;/parameter>. Other HTML entities are unchanged.
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+Tool calls are not allowed inside <think></think>; finish thinking before emitting <tool_call>.
+
+# Rules
+
+- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.
+- If read says more lines are available, call more with count=<lines> to read the next chunk.
+- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient for the task; add raw=true only when line numbers would corrupt the payload.
+- When editing files, state the target filename before the edit; for the edit tool, put path first.
+- Use edit with exact old text and replacement new text; old may contain one [upto] marker between unique anchors.
+- For long bash jobs, pass refresh_sec and then poll with bash_status or stop with bash_stop.
+- Preserve the current system configuration unless the user explicitly asks otherwise.
+"#;
+
+/// Returns the short Qwen tool-call syntax reminder (verbatim from C).
+///
+/// The counterpart of [`dsml_syntax_reminder`]: re-shown after a malformed
+/// call so the model has the shape in front of it.
+#[must_use]
+pub fn qwen_syntax_reminder() -> &'static str {
+    "Tool-call syntax reminder:\n\
+<tool_call>\n<function=$TOOL_NAME>\n<parameter=$PARAMETER_NAME>\n\
+$PARAMETER_VALUE\n</parameter>\n</function>\n</tool_call>\n"
+}
+
 /// Editing-instructions section of the tools prompt (verbatim from C).
 ///
 /// This is the C's `agent_tools_prompt_edit_upto` variant: plank's edit tool
@@ -516,6 +607,14 @@ fn build_tools_prompt_parts_with_wasm(
     parity: bool,
     syntax: ToolSyntax,
 ) -> (String, usize) {
+    // Unreachable without the feature: `Ds4Model::open` refuses a Qwen model
+    // before any prompt is built, so the dialect can never be selected. The
+    // arm is gated rather than left to fall through to DSML so that, if that
+    // refusal is ever bypassed, the build fails to compile instead of quietly
+    // handing a Qwen model the wrong prompt.
+    if syntax == ToolSyntax::Qwen {
+        return build_qwen_tools_prompt_parts(mcp_servers, wasm_tools);
+    }
     let mut out = build_tools_prompt_base(parity);
     insert_marker_spelling_note(&mut out);
     insert_document_read_note(&mut out);
@@ -534,6 +633,48 @@ fn build_tools_prompt_parts_with_wasm(
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     append_wasm_tool_schemas(&mut out, wasm_tools);
     (out, trusted_len)
+}
+
+/// [`TOOLS_PROMPT_QWEN`] with plank's own tools spliced into its schema list.
+///
+/// The dialects differ in shape here, not just in wording. The DSML prompt is
+/// a run of schemas that plank can append to, so its extras go on the end; the
+/// Qwen prompt fences its schemas inside `<tools>` … `</tools>` and puts the
+/// call-format instructions and rules *after* that, so appending would advertise
+/// tools below the rules that describe how to call them. They are inserted
+/// instead. The schema shape is the same `{"type": "function", …}` object in
+/// both, which is what makes the splice possible at all.
+///
+/// The trusted span is empty, unlike the DSML path. That span exists so the
+/// literal `｜DSML｜` in the prompt's examples tokenizes as the model's own
+/// marker token rather than as spelled-out BPE pieces; this prompt contains no
+/// DSML, so there is nothing to preserve, and the C agrees — it hands an
+/// XML-dialect tools prompt over as an ordinary system message rather than as
+/// rendered chat (`agent_syntax_is_xml_tool_call`).
+const QWEN_SCHEMA_FENCE: &str = "\n</tools>";
+
+fn build_qwen_tools_prompt_parts(
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    wasm_tools: &[&crate::wasmreg::WasmTool],
+) -> (String, usize) {
+    // Schemas belong inside the fence; server *instructions* are prose and
+    // belong after it, with the rest of the guidance.
+    let mut schemas = String::new();
+    append_native_extra_schemas(&mut schemas);
+    crate::tools::mcp::append_tool_schemas(&mut schemas, mcp_servers);
+    crate::tools::mcp::append_resource_tool_schemas(&mut schemas, mcp_servers);
+    append_wasm_tool_schemas(&mut schemas, wasm_tools);
+
+    let at = TOOLS_PROMPT_QWEN
+        .find(QWEN_SCHEMA_FENCE)
+        .expect("the Qwen tools prompt fences its schemas with </tools>");
+    let mut out = String::with_capacity(TOOLS_PROMPT_QWEN.len() + schemas.len());
+    out.push_str(&TOOLS_PROMPT_QWEN[..at]);
+    out.push_str(&schemas);
+    out.push_str(&TOOLS_PROMPT_QWEN[at..]);
+    crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
+    append_working_style(&mut out);
+    (out, 0)
 }
 
 /// Plank-owned guidance on how to spend turns, appended after the native tool
@@ -1056,11 +1197,19 @@ pub fn dsml41_syntax_reminder() -> &'static str {
 /// occurrence, replaces `tool_calls`, `invoke` or `parameter` with the V4.1
 /// name — but only when the word is followed by `>` or a space, so it is
 /// really a tag and not prose. A bare "parameter" in a sentence is untouched.
+/// # Panics
+/// Never in practice: both dialects named here are DSML ones, so both answer
+/// [`ToolSyntax::dsml_tags`] with a tag table. Only Qwen answers `None`, and it
+/// is not one of the two.
 #[must_use]
 pub fn dsml41_tools_prompt(source: &str) -> String {
     const MARKER: &str = "｜DSML｜";
-    let tags = ToolSyntax::Dsml41.dsml_tags();
-    let v4 = ToolSyntax::Dsml.dsml_tags();
+    let tags = ToolSyntax::Dsml41
+        .dsml_tags()
+        .expect("Dsml41 is a DSML dialect");
+    let v4 = ToolSyntax::Dsml
+        .dsml_tags()
+        .expect("Dsml is a DSML dialect");
     let names = [
         (v4.calls_name, tags.calls_name),
         (v4.invoke_name, tags.invoke_name),
@@ -1200,8 +1349,9 @@ pub fn build_system_prompt_parts_with_wasm(
     parity: bool,
     syntax: ToolSyntax,
 ) -> SplitSystemPrompt {
-    // Both dialects share one tools prompt; V4.1 differs only by the three tag
-    // names the builder respells inside the trusted span.
+    // The DSML dialects share one tools prompt, V4.1 differing only by the
+    // three tag names the builder respells inside the trusted span; Qwen is not
+    // DSML at all and takes its own.
     let (mut text, trusted_len) =
         build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity, syntax);
     if crate::settings::active().git.sign_commits {

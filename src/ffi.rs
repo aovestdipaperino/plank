@@ -404,8 +404,8 @@ unsafe extern "C" {
     /// The chunk-level prefill hook, distinct from `set_display_progress`.
     ///
     /// Both report an absolute prompt position. The `DeepSeek` graph paths emit
-    /// the finer `prefill_display` events; other paths emit only
-    /// `prefill_chunk` on this one, so such a run shows no prefill rate at all
+    /// the finer `prefill_display` events; the Qwen3.8 path emits only
+    /// `prefill_chunk` on this one, so a Qwen run shows no prefill rate at all
     /// unless plank listens here too.
     pub fn ds4_session_set_progress(
         s: *mut Ds4Session,

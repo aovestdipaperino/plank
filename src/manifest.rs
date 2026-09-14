@@ -28,14 +28,22 @@ pub const KINDS: [&str; 3] = ["main", "vision", "dspark"];
 /// drafter is not implemented for V4.1, so there is no such artifact to fetch.
 pub const DS41_KINDS: [&str; 2] = ["main", "vision"];
 
+/// The artifact kinds a Qwen3.8-Flash-Next release has.
+///
+/// The same two as V4.1, and for the same reason on each side: upstream now
+/// ships the BF16 n-grams and the MTP block inside the main GGUF, so the old
+/// `mtp` sidecar kind is gone, and `ggml-org` publishes an `mmproj` vision
+/// encoder that `--vision` loads.
+pub const QWEN_KINDS: [&str; 2] = ["main", "vision"];
+
 /// Which model set a manifest, staging area, and install location belong to.
 ///
-/// Every artifact path in this module is scoped by one of these. Sets are kept
-/// wholly separate on disk — separate manifest files, separate staging
-/// directories — because the invariant that makes a swap safe is per-set: the
-/// manifest moves *last*, so its presence proves that set landed. Sharing one
-/// staging area would let a half-staged download of one set be read as proof
-/// about another.
+/// Every artifact path in this module is scoped by one of these. The two sets
+/// are kept wholly separate on disk — separate manifest files, separate
+/// staging directories — because the invariant that makes a swap safe is
+/// per-set: the manifest moves *last*, so its presence proves that set landed.
+/// Sharing one staging area would let a half-staged Qwen download be read as
+/// proof about the `DeepSeek` set, or the reverse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModelSet {
     /// `DeepSeek` V4 Flash: main model, vision encoder, `DSpark` drafter.
@@ -43,6 +51,8 @@ pub enum ModelSet {
     Ds4,
     /// `DeepSeek` V4.1 Flash: main model and vision encoder only.
     Ds41,
+    /// Qwen3.8-Flash-Next: main model and vision encoder.
+    Qwen,
 }
 
 /// Every variant of [`ModelSet`], so the path-disjointness invariant can be
@@ -51,7 +61,7 @@ pub enum ModelSet {
 /// Adding a variant without adding it here would silently narrow that test,
 /// which is why `every_set_variant_is_listed` exhaustively matches on a
 /// variant to force this list to be revisited.
-pub const ALL_SETS: [ModelSet; 2] = [ModelSet::Ds4, ModelSet::Ds41];
+pub const ALL_SETS: [ModelSet; 3] = [ModelSet::Ds4, ModelSet::Ds41, ModelSet::Qwen];
 
 impl ModelSet {
     /// The set a model of this family belongs to.
@@ -60,6 +70,7 @@ impl ModelSet {
         match family {
             crate::gguf::ModelFamily::Ds4 => Self::Ds4,
             crate::gguf::ModelFamily::Ds41 => Self::Ds41,
+            crate::gguf::ModelFamily::Qwen => Self::Qwen,
         }
     }
 
@@ -69,6 +80,7 @@ impl ModelSet {
         match self {
             Self::Ds4 => &KINDS,
             Self::Ds41 => &DS41_KINDS,
+            Self::Qwen => &QWEN_KINDS,
         }
     }
 
@@ -86,6 +98,7 @@ impl ModelSet {
         match self {
             Self::Ds4 => "ds4.manifest",
             Self::Ds41 => "ds41.manifest",
+            Self::Qwen => "qwen.manifest",
         }
     }
 
@@ -95,6 +108,7 @@ impl ModelSet {
         match self {
             Self::Ds4 => "staging",
             Self::Ds41 => "staging-ds41",
+            Self::Qwen => "staging-qwen",
         }
     }
 
@@ -104,6 +118,7 @@ impl ModelSet {
         match self {
             Self::Ds4 => "ds4",
             Self::Ds41 => "ds41",
+            Self::Qwen => "qwen",
         }
     }
 
@@ -113,6 +128,7 @@ impl ModelSet {
     pub fn from_str_or_default(s: &str) -> Self {
         match s {
             "ds41" => Self::Ds41,
+            "qwen" => Self::Qwen,
             _ => Self::Ds4,
         }
     }
@@ -295,6 +311,11 @@ pub fn local_path_for_in(root: &Path, set: ModelSet, kind: &str) -> Option<PathB
         (ModelSet::Ds4, "dspark") => Some(root.join("ds4flash.dspark.gguf")),
         (ModelSet::Ds41, "main") => Some(root.join("ds41flash.gguf")),
         (ModelSet::Ds41, "vision") => Some(root.join("ds41flash.vision.gguf")),
+        // The same name `--qwen` defaults to, so a download installs exactly
+        // where the flag looks — and a user's existing symlink there is adopted
+        // by size rather than replaced.
+        (ModelSet::Qwen, "main") => Some(root.join("qwen.gguf")),
+        (ModelSet::Qwen, "vision") => Some(root.join("qwen.vision.gguf")),
         _ => None,
     }
 }
@@ -312,6 +333,8 @@ pub fn local_path_for(set: ModelSet, kind: &str) -> Option<PathBuf> {
         (ModelSet::Ds4, "dspark") => Some(crate::download::default_dspark_path()),
         (ModelSet::Ds41, "main") => Some(crate::download::default_ds41_model_path()),
         (ModelSet::Ds41, "vision") => Some(crate::download::default_ds41_vision_path()),
+        (ModelSet::Qwen, "main") => Some(crate::download::default_qwen_path()),
+        (ModelSet::Qwen, "vision") => Some(crate::download::default_qwen_vision_path()),
         _ => None,
     }
 }
@@ -643,13 +666,42 @@ mod tests {
         ));
     }
 
-    /// Each set installs only its own kinds. A kind a set does not publish
-    /// must not resolve to a path, or a swap would try to install an artifact
-    /// for a model that never loads one.
+    /// The two sets must not share a single byte of disk state. A swap is
+    /// only safe because the manifest moves last within its own staging area;
+    /// one shared area would let a half-staged Qwen download read as proof
+    /// about the `DeepSeek` set.
+    #[test]
+    fn the_two_sets_never_share_a_path() {
+        let root = Path::new("/tmp/plank-set-test");
+        for (a, b) in [
+            (
+                installed_path_in(root, ModelSet::Ds4),
+                installed_path_in(root, ModelSet::Qwen),
+            ),
+            (
+                staging_dir_in(root, ModelSet::Ds4),
+                staging_dir_in(root, ModelSet::Qwen),
+            ),
+        ] {
+            assert_ne!(a, b);
+        }
+        assert_ne!(
+            local_path_for_in(root, ModelSet::Ds4, "main"),
+            local_path_for_in(root, ModelSet::Qwen, "main"),
+        );
+    }
+
+    /// Each set installs only its own kinds. Qwen's old `mtp` sidecar is gone
+    /// — upstream ships the n-grams inside the main GGUF — so an `mtp` entry in
+    /// either manifest must resolve to nothing, and a `dspark` entry must not
+    /// install a `DeepSeek` drafter for a model that never loads one.
     #[test]
     fn a_set_resolves_only_its_own_kinds() {
         let root = Path::new("/tmp/plank-set-test");
         assert_eq!(ModelSet::Ds4.kinds(), &["main", "vision", "dspark"]);
+        assert_eq!(ModelSet::Qwen.kinds(), &["main", "vision"]);
+        assert!(local_path_for_in(root, ModelSet::Qwen, "mtp").is_none());
+        assert!(local_path_for_in(root, ModelSet::Qwen, "dspark").is_none());
         assert!(local_path_for_in(root, ModelSet::Ds4, "mtp").is_none());
         assert_eq!(ModelSet::Ds41.kinds(), &["main", "vision"]);
         // V4.1 has no `DSpark` drafter upstream, so it must not resolve one.
@@ -739,10 +791,10 @@ mod tests {
     fn every_set_variant_is_listed() {
         for set in ALL_SETS {
             match set {
-                ModelSet::Ds4 | ModelSet::Ds41 => {}
+                ModelSet::Ds4 | ModelSet::Ds41 | ModelSet::Qwen => {}
             }
         }
-        assert_eq!(ALL_SETS.len(), 2);
+        assert_eq!(ALL_SETS.len(), 3);
         // No duplicates, or the disjointness test would compare a set to
         // itself and pass vacuously.
         for (i, a) in ALL_SETS.iter().enumerate() {
@@ -816,10 +868,34 @@ mod tests {
             assert_eq!(ModelSet::from_str_or_default(set.as_str()), set, "{set:?}");
         }
         assert_eq!(ModelSet::from_str_or_default("ds41"), ModelSet::Ds41);
+        assert_eq!(ModelSet::from_str_or_default("qwen"), ModelSet::Qwen);
         assert_eq!(ModelSet::from_str_or_default("ds4"), ModelSet::Ds4);
         // An older helper passes nothing at all; that path must keep working.
         assert_eq!(ModelSet::from_str_or_default(""), ModelSet::Ds4);
         assert_eq!(ModelSet::from_str_or_default("glm"), ModelSet::Ds4);
+    }
+
+    /// Adoption is per-set, so a Qwen manifest is adopted on the two files it
+    /// names without a `DeepSeek` artifact in sight.
+    #[test]
+    fn a_qwen_manifest_adopts_on_its_own_two_kinds() {
+        let remote = parse(
+            r#"{"version":1,"released":"t","notes":"","files":{
+                "main": {"name":"q.gguf","url":"https://example.invalid/q","bytes":10,
+                         "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                "mtp":  {"name":"p.gguf","url":"https://example.invalid/p","bytes":20,
+                         "sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}"#,
+        )
+        .expect("parse");
+        let size_of = |kind: &str| match kind {
+            "main" => Some(10),
+            "mtp" => Some(20),
+            _ => None,
+        };
+        match decide(remote, None, ModelSet::Qwen.kinds(), &size_of) {
+            Decision::Adopt(m) => assert_eq!(m.version, 1),
+            other => panic!("expected adoption, got {other:?}"),
+        }
     }
 
     #[test]

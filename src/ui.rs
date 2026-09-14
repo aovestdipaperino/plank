@@ -600,22 +600,27 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
             ),
             sysprompt::IN_THINK_PROHIBITION
         ),
-        // Named for the dialect the model actually speaks. Telling a model
-        // its "DSML" was invalid, and handing it DSML to copy when it speaks
-        // something else, is how a recorded session ended with the model
-        // insisting the harness was broken rather than fixing its markup.
-        // Each dialect gets its own reminder text, both pinned against the C
-        // (`agent_dsml_syntax_reminder` / `agent_dsml41_syntax_reminder`):
-        // handing a model DSML to copy in a tag spelling it does not speak is
-        // how a recorded session ended with the model insisting the harness
-        // was broken rather than fixing its markup.
-        PassError::Dsml => format!(
-            "Tool error: invalid DSML tool call: {err}\n{}",
-            match syntax {
-                sysprompt::ToolSyntax::Dsml => sysprompt::dsml_syntax_reminder(),
-                sysprompt::ToolSyntax::Dsml41 => sysprompt::dsml41_syntax_reminder(),
-            }
-        ),
+        // Named for the dialect the model actually speaks, with its own
+        // reminder text, each pinned against the C (`agent_dsml_syntax_reminder`
+        // / `agent_dsml41_syntax_reminder` / `agent_qwen_syntax_reminder`) as is
+        // the per-dialect error prefix. Telling a model its "DSML" was invalid,
+        // and handing it DSML to copy when it speaks something else, is how a
+        // recorded session ended with the model insisting the harness was broken
+        // rather than fixing its markup.
+        PassError::Dsml => match syntax {
+            sysprompt::ToolSyntax::Qwen => format!(
+                "Tool error: invalid Qwen tool call: {err}\n{}",
+                sysprompt::qwen_syntax_reminder()
+            ),
+            sysprompt::ToolSyntax::Dsml => format!(
+                "Tool error: invalid DSML tool call: {err}\n{}",
+                sysprompt::dsml_syntax_reminder()
+            ),
+            sysprompt::ToolSyntax::Dsml41 => format!(
+                "Tool error: invalid DSML tool call: {err}\n{}",
+                sysprompt::dsml41_syntax_reminder()
+            ),
+        },
     }
 }
 
@@ -8914,8 +8919,7 @@ the original is frozen and listed in /tree"
         // the transcript.
         let model_name = self.engine.model_name();
         let syntax = self.tool_syntax();
-        let family =
-            crate::manifest::ModelSet::for_family(crate::gguf::ModelFamily::from_syntax(syntax));
+        let family = crate::manifest::ModelSet::for_family(crate::gguf::ModelFamily::from(syntax));
         let installed = crate::manifest::read_at(&crate::manifest::installed_path(family));
         let artifact_version = installed.as_ref().map(|m| m.version);
         // The `main` entry is the weights themselves; its URL carries the
@@ -8938,6 +8942,7 @@ the original is frozen and listed in /tree"
                 family: family.as_str(),
                 syntax: match syntax {
                     crate::sysprompt::ToolSyntax::Dsml => "dsml",
+                    crate::sysprompt::ToolSyntax::Qwen => "qwen",
                     crate::sysprompt::ToolSyntax::Dsml41 => "dsml41",
                 },
                 artifact_version,
@@ -17330,10 +17335,10 @@ fn new_agent(
         contribution_warnings.extend(warnings);
     }
     let wasm_tools = tool_ctx.wasm.registry.tools();
-    // The dialect the loaded model speaks decides which parser reads its
-    // output back (every dialect takes the same tools prompt, with V4.1
-    // respelling three tag names). Taken from the name the engine reports
-    // after detecting the file, not from the path.
+    // The dialect the loaded model speaks decides which tools prompt it gets,
+    // and which parser reads its output back (the DSML dialects share one
+    // prompt, with V4.1 respelling three tag names; Qwen has its own). Taken
+    // from the name the engine reports after detecting the file, not the path.
     let syntax = sysprompt::ToolSyntax::for_model_name(&engine.model_name());
     let system = sysprompt::build_system_prompt_parts_with_wasm(
         &cfg.system,
@@ -17357,7 +17362,7 @@ fn new_agent(
     // Which model this local engine is, for the footer's origin label. Taken
     // from the dialect already resolved above, so the tag can never disagree
     // with the syntax the parser is using.
-    crate::status::set_local_family(crate::gguf::ModelFamily::from_syntax(syntax));
+    crate::status::set_local_family(syntax.into());
     // The footer's mtp/temperature slot, seeded the same way: `/mtp` and
     // `/temp` publish to it later, but the first frame is drawn before either
     // can be typed. An engine with no support model reads as off however the
@@ -20039,7 +20044,7 @@ mod tests {
             "{section}"
         );
         // Dialect follows from the name, and the family follows from the
-        // dialect; the two must never disagree.
+        // dialect; a DSML model must never be labelled qwen.
         assert!(section.contains("- tool dialect: dsml"), "{section}");
         assert!(section.contains("- family: ds4"), "{section}");
         // The artifact set line is always present, in one of its two shapes,

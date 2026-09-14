@@ -46,7 +46,7 @@ cargo build --release
 
 - **With `refs/ds4` present:** `build.rs` builds `libds4core.a` from the Metal-backend objects and links the required frameworks, enabling the `ds4_engine` cfg.
 - **Missing submodule:** plank still builds, but without the native engine it uses the echo engine only (useful for development/CI).
-- **Two model families, one build.** DeepSeek V4 Flash and V4.1 Flash are both compiled in and told apart from the GGUF's own `general.architecture`; each has its own tool-call dialect, artifact set and transcript extension (`.ds4.kv` / `.ds41.kv`). Qwen3.8-Flash-Next was served once and is retired — upstream deleted its Metal kernels — so there is no `qwen` feature and no `--qwen` flag. Transcripts a Qwen build left behind are left strictly alone: a retired model name matches no live family, so those files are never listed, swept or restored.
+- **Three model families, one build.** DeepSeek V4 Flash, V4.1 Flash and Qwen3.8-Flash-Next are all compiled in and told apart from the GGUF's own `general.architecture`; each has its own tool-call dialect, artifact set and transcript extension (`.ds4.kv` / `.ds41.kv` / `.qwn.kv`). Qwen was retired once, when upstream deleted its Metal kernels; upstream has since merged it properly and publishes the weights, so it is back unconditionally — no cargo feature to enable, and `--qwen` is always there.
 
 You will also need a GGUF model file (e.g. `ds4flash.gguf`) for real inference; see the `download_model.sh` script in `refs/ds4`.
 
