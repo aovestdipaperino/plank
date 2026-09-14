@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The no-progress budget is opt-in.** The turn-scale rung that stops a
+  generation after 32 KiB of output with no observed file change now sits
+  behind its own setting, `tools.noProgressGuard`, which defaults to off and
+  is ANDed with `tools.loopGuards`. The budget measures output volume, so a
+  long read-only investigation — a turn that reads, searches and builds its
+  way to an answer without writing anything — was a legitimate turn it
+  stopped anyway. Every other loop guard is unchanged and still on by
+  default; set `"tools": {"noProgressGuard": true}` to get the old
+  behaviour back.
+
 ### Fixed
 
 - **Two parameters fused into one tag pair are rejected instead of silently

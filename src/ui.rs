@@ -4640,7 +4640,9 @@ impl Agent<'_> {
                 // dump and the next prompt both show what the turn did have.
                 if made_progress {
                     ungrounded = 0;
-                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET && crate::guard::guards_enabled() {
+                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET
+                    && crate::guard::no_progress_guard_enabled()
+                {
                     self.report_guard(NO_PROGRESS_NOTICE);
                     return Ok(());
                 }
@@ -13650,7 +13652,9 @@ impl Agent<'_> {
                 // dump and the next prompt both show what the turn did have.
                 if made_progress {
                     ungrounded = 0;
-                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET && crate::guard::guards_enabled() {
+                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET
+                    && crate::guard::no_progress_guard_enabled()
+                {
                     self.report_guard(NO_PROGRESS_NOTICE);
                     return Ok(());
                 }
@@ -26868,12 +26872,22 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Turns on `tools.noProgressGuard`, which is off by default, for the
+    /// no-progress budget tests. `install_for_test` is thread-local, so this
+    /// affects only the calling test.
+    fn enable_no_progress_guard() {
+        let mut on = crate::settings::Settings::default();
+        on.tools.no_progress_guard = true;
+        crate::settings::install_for_test(on);
+    }
+
     #[test]
     fn a_turn_that_changes_nothing_is_stopped() {
         // `repro-1788796284`'s main turn: four passes, none cyclic, every one
         // far under the per-pass budget, fifty minutes, nothing edited. Only
         // a turn-scale rung sees it, and only as an absence.
         let dir = scratch_dir("no-progress");
+        enable_no_progress_guard();
         let cfg = test_cfg();
         let read_call = concat!(
             "<｜DSML｜tool_calls>",
@@ -26909,6 +26923,7 @@ mod tests {
         // A failed edit used to count by its name alone, so it could reset the
         // budget forever. `last_written` stays empty on failure.
         let dir = scratch_dir("no-progress-failed-edit");
+        enable_no_progress_guard();
         let cfg = test_cfg();
         std::fs::write(dir.join("target.rs"), "present\n").unwrap();
         let edit_call = concat!(
@@ -26950,6 +26965,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
         git2::Repository::init(&dir).unwrap();
+        enable_no_progress_guard();
         let cfg = test_cfg();
         let bash_call = concat!(
             "<｜DSML｜tool_calls>",
@@ -26990,6 +27006,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
         git2::Repository::init(&dir).unwrap();
+        enable_no_progress_guard();
         let cfg = test_cfg();
         // Appends, so each round grows the file: the digest moves on every
         // pass without depending on filesystem timestamp resolution.

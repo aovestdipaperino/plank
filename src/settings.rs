@@ -363,6 +363,11 @@ pub struct ToolsSettings {
     /// Default off while the feature is in beta: on, it also appends one
     /// sentence to the shell rules, which churns the `fp1` fingerprint.
     pub bash_notify: bool,
+    /// Whether the no-progress budget ends a turn: a generation that emits
+    /// `NO_PROGRESS_BYTE_BUDGET` bytes without changing a file is stopped and the user told why. Default off — the byte budget is a
+    /// heuristic, and a long read-only investigation is a legitimate turn, so
+    /// this rung is opt-in even when the other loop guards are on.
+    pub no_progress_guard: bool,
 }
 
 impl Default for ToolsSettings {
@@ -377,6 +382,7 @@ impl Default for ToolsSettings {
             fanout: true,
             run_code: true,
             bash_notify: false,
+            no_progress_guard: false,
         }
     }
 }
@@ -716,6 +722,10 @@ impl Settings {
         if let Some(v) = boolean(tools, "loopGuards") {
             self.tools.loop_guards = v;
             self.note("tools.loopGuards", origin);
+        }
+        if let Some(v) = boolean(tools, "noProgressGuard") {
+            self.tools.no_progress_guard = v;
+            self.note("tools.noProgressGuard", origin);
         }
         if let Some(v) = num::<u64>(tools, "callTimeoutSec") {
             self.tools.call_timeout_sec = v;
@@ -1244,6 +1254,11 @@ impl Settings {
             let t = section(&mut root, "tools");
             upsert(t, "repeatAdvisory", Json::Bool(self.tools.repeat_advisory));
             upsert(t, "loopGuards", Json::Bool(self.tools.loop_guards));
+            upsert(
+                t,
+                "noProgressGuard",
+                Json::Bool(self.tools.no_progress_guard),
+            );
             upsert(t, "callTimeoutSec", unum(self.tools.call_timeout_sec));
             upsert(t, "spillMaxBytes", unum(self.tools.spill_max_bytes as u64));
             upsert(

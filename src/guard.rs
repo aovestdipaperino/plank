@@ -58,6 +58,17 @@ pub fn guards_enabled() -> bool {
     crate::settings::loop_guards_effective()
 }
 
+/// Whether the no-progress budget may end a turn (`tools.noProgressGuard`).
+///
+/// A separate switch from [`guards_enabled`], and off by default: the byte
+/// budget is a heuristic over *output volume*, and a long read-only
+/// investigation is a legitimate turn that it stops anyway. Both must be on
+/// for the turn to end. Read at the check, like [`guards_enabled`].
+#[must_use]
+pub fn no_progress_guard_enabled() -> bool {
+    guards_enabled() && crate::settings::active().tools.no_progress_guard
+}
+
 /// A tool call signature: the tool name plus a digest of its normalised args.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CallSig(String, String);
