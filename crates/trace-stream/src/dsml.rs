@@ -18,6 +18,10 @@
 /// the accepted marker/name spellings — so a bare `</` inside a parameter
 /// value (e.g. HTML written through a `write` or `edit` call) never
 /// terminates the parameter on its own.
+use std::sync::OnceLock;
+
+use crate::syntax::ToolSyntax;
+
 const CLOSE_SCAN_HEAD: &[u8] = "</".as_bytes();
 const DSML_BAR: &[u8] = "｜".as_bytes();
 
@@ -227,8 +231,11 @@ pub struct DsmlParser {
     /// True just after an opener that ended at its `｜`, so a `>` arriving
     /// next belongs to that opener and is not structural content.
     swallow_gt: bool,
-    /// The dialect this parser accepts.
-    syntax: crate::syntax::ToolSyntax,
+    /// The dialect in force: the initial guess until a stanza opener is seen,
+    /// then whichever dialect that opener was spelled in. Inner tags are
+    /// matched against this one table, so a stanza is never half-read in two
+    /// dialects at once.
+    syntax: ToolSyntax,
 }
 
 #[derive(Debug, Default)]
@@ -246,16 +253,77 @@ fn is_prompt_placeholder(name: &str) -> bool {
     matches!(name, "$TOOL_NAME" | "$PARAMETER_NAME" | "$PARAMETER_VALUE")
 }
 
+/// Every accepted stanza opener, paired with the dialect that spells it that
+/// way: each dialect's opener under every accepted marker name (`DSML`,
+/// `SSML`), in both the canonical and dropped-leading-bar spelling — the same
+/// tolerance inner tags get from [`tag_prefix_len`], applied here to the
+/// stanza opener itself.
+///
+/// Both dialects are matched at once, because which one a stream speaks is not
+/// knowable before its first stanza: the console renders bytes off a socket
+/// with no model name attached, and a transcript replay may hold either. Only
+/// the opener has to be ambiguous — the dialect it matched then holds for the
+/// whole stanza, so the inner tags stay as strict as they ever were.
+///
+/// Substituting into the tag table rather than hand-typed constants is what
+/// keeps this correct for V4.1's leading-space spelling: `base` is
+/// `"<｜DSML｜ calls>"`, and only the marker word `DSML` is replaced, never the
+/// space that follows the second bar.
+///
+/// Built once and cached: [`DsmlParser::feed`] tests the tail after every
+/// single byte of free text, and assembling eight `String`s per byte was pure
+/// allocation churn on the UI thread.
+fn start_markers(bar: bool) -> &'static [(ToolSyntax, String)] {
+    static CANONICAL: OnceLock<Vec<(ToolSyntax, String)>> = OnceLock::new();
+    static BAR: OnceLock<Vec<(ToolSyntax, String)>> = OnceLock::new();
+    let cell = if bar { &BAR } else { &CANONICAL };
+    cell.get_or_init(|| {
+        ToolSyntax::ALL
+            .iter()
+            .flat_map(|&syntax| {
+                let tags = syntax.dsml_tags();
+                let base = if bar { tags.start_bar } else { tags.start };
+                MARKER_NAMES.iter().flat_map(move |m| {
+                    let canonical = base.replace("DSML", m);
+                    // Drop only the leading `｜`, right after the `<`.
+                    let dropped = canonical.replacen(std::str::from_utf8(DSML_BAR).unwrap(), "", 1);
+                    [(syntax, canonical), (syntax, dropped)]
+                })
+            })
+            .collect()
+    })
+}
+
+/// The dialect whose stanza opener `tail` ends with, if any.
+///
+/// `bar` selects the spellings that stop at the opener's trailing `｜` instead
+/// of its `>`. The two dialects' openers share no spelling, so a hit names
+/// exactly one of them.
+fn match_start(tail: &[u8], bar: bool) -> Option<ToolSyntax> {
+    start_markers(bar)
+        .iter()
+        .find(|(_, f)| tail.ends_with(f.as_bytes()))
+        .map(|&(syntax, _)| syntax)
+}
+
 impl DsmlParser {
-    /// Creates a parser in the `Search` state, for the `Dsml` (V4) dialect.
+    /// Creates a parser in the `Search` state, starting from the `Dsml` (V4)
+    /// dialect and adopting whichever dialect its stanza opener is spelled in.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates a parser in the `Search` state for `syntax`.
+    /// Creates a parser in the `Search` state with `syntax` as its starting
+    /// dialect.
+    ///
+    /// The starting dialect only decides how a stanza already in progress is
+    /// read — one seeded by feeding canonical opener bytes, as
+    /// `StreamRenderer` does. An opener found in the fed text adopts its own
+    /// dialect regardless of this, so a caller that does not know the model
+    /// need not guess.
     #[must_use]
-    pub fn with_syntax(syntax: crate::syntax::ToolSyntax) -> Self {
+    pub fn with_syntax(syntax: ToolSyntax) -> Self {
         Self {
             syntax,
             ..Self::new()
@@ -265,6 +333,13 @@ impl DsmlParser {
     /// This parser's tag spellings.
     fn tags(&self) -> crate::syntax::DsmlTags {
         self.syntax.dsml_tags()
+    }
+
+    /// The dialect in force — the starting one until a stanza opener names
+    /// another.
+    #[must_use]
+    pub fn syntax(&self) -> ToolSyntax {
+        self.syntax
     }
 
     /// Current parser state.
@@ -308,8 +383,11 @@ impl DsmlParser {
     }
 
     /// Resets the parser to a fresh `Search` state, discarding all results.
+    ///
+    /// The starting dialect survives; the dialect adopted from the last
+    /// stanza's opener does not, since the next stanza names its own.
     pub fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self::with_syntax(self.syntax);
     }
 
     /// Feeds streamed bytes; no-op once the parser is `Done` or `Error`.
@@ -324,18 +402,12 @@ impl DsmlParser {
                     self.search_tail.remove(0);
                 }
                 self.search_tail.push(c);
-                if self
-                    .start_markers(false)
-                    .iter()
-                    .any(|f| self.search_tail.ends_with(f.as_bytes()))
-                {
+                if let Some(syntax) = match_start(&self.search_tail, false) {
+                    self.syntax = syntax;
                     self.start();
-                } else if self
-                    .start_markers(true)
-                    .iter()
-                    .any(|f| self.search_tail.ends_with(f.as_bytes()))
-                {
+                } else if let Some(syntax) = match_start(&self.search_tail, true) {
                     // Opened at the bar; a `>` may still follow.
+                    self.syntax = syntax;
                     self.start();
                     self.swallow_gt = true;
                 }
@@ -358,29 +430,6 @@ impl DsmlParser {
                 self.param_close_prefix = false;
             }
         }
-    }
-
-    /// The dialect's opener under every accepted marker name (`DSML`, `SSML`),
-    /// each in both the canonical and dropped-leading-bar spelling — the same
-    /// tolerance inner tags get from [`tag_prefix_len`], applied here to the
-    /// stanza opener itself.
-    ///
-    /// Substituting into the tag table rather than a hand-typed constant is
-    /// what keeps this correct for V4.1's leading-space spelling: `base` is
-    /// `"<｜DSML｜ calls>"`, and only the marker word `DSML` is replaced, never
-    /// the space that follows the second bar.
-    fn start_markers(&self, bar: bool) -> Vec<String> {
-        let tags = self.tags();
-        let base = if bar { tags.start_bar } else { tags.start };
-        MARKER_NAMES
-            .iter()
-            .flat_map(|m| {
-                let canonical = base.replace("DSML", m);
-                // Drop only the leading `｜`, right after the `<`.
-                let dropped = canonical.replacen(std::str::from_utf8(DSML_BAR).unwrap(), "", 1);
-                [canonical, dropped]
-            })
-            .collect()
     }
 
     fn start(&mut self) {
@@ -909,7 +958,35 @@ fn parse_attr(tag: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syntax::ToolSyntax;
+    use ToolSyntax;
+
+    /// A parser told nothing about the model still parses either dialect: the
+    /// opener names it, and the dialect it names holds for the inner tags.
+    #[test]
+    fn a_default_parser_adopts_the_dialect_its_opener_names() {
+        for syntax in ToolSyntax::ALL {
+            let tags = syntax.dsml_tags();
+            let bar = "\u{ff5c}";
+            let mut p = DsmlParser::new();
+            p.feed(format!(
+                "{start}\n{invoke} name=\"read\">\n\
+                 <{bar}DSML{bar}{param} name=\"path\" string=\"true\">src/a.rs\
+                 </{bar}DSML{bar}{param}>\n\
+                 </{bar}DSML{bar}{inv}>\n\
+                 </{bar}DSML{bar}{calls}>",
+                start = tags.start,
+                invoke = tags.invoke,
+                param = tags.param_name,
+                inv = tags.invoke_name,
+                calls = tags.calls_name,
+            ));
+            assert_eq!(p.state(), DsmlState::Done, "{syntax:?}: {}", p.error());
+            assert_eq!(p.syntax(), syntax, "{syntax:?}: dialect adopted");
+            assert_eq!(p.calls().len(), 1);
+            assert_eq!(p.calls()[0].name, "read");
+            assert_eq!(p.calls()[0].arg_value("path"), Some("src/a.rs"));
+        }
+    }
 
     #[test]
     fn v41_stanza_parses_like_its_v4_twin() {

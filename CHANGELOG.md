@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A V4.1 stanza is recognized without being told the model first.** The
+  dialect was fixed at renderer construction from the model name, so every
+  consumer that has no model name — `turbo-debug-console`, which renders bytes
+  off a socket, and transcript replay, which may hold either dialect — read a
+  V4.1 stanza with V4's tag table: the opener never matched, the markup
+  streamed to the screen as prose and the calls were dropped. Both stanza
+  openers are now matched at once and the dialect the opener was spelled in is
+  adopted for the whole stanza, so the inner tags stay exactly as strict as
+  before. The same fix makes a *second* V4.1 stanza work in a renderer that
+  outlives the first: `DsmlParser::reset` used to drop back to V4 and go deaf.
+  `trace-stream` 0.1.4.
+
 ## [5.1.2] - 2026-09-13
 
 ### Fixed

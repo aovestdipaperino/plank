@@ -364,9 +364,32 @@ fn parameter_close_tail(tail: &[u8], name: &str, complete: &mut bool) -> bool {
 /// V4 and V4.1 share one detector and neither can grow a hand-typed literal.
 ///
 /// Returns true while `tail` is a prefix of any accepted opening form; sets
-/// `complete` when a form matched fully and `implicit_invoke` when the form
-/// was a direct invoke opener without the outer wrapper.
+/// `complete` when a form matched fully, `implicit_invoke` when the form was a
+/// direct invoke opener without the outer wrapper, and `matched` to the
+/// dialect the form belongs to (meaningful only once `complete`).
+///
+/// Every dialect is tried, because a stream does not announce which one it
+/// speaks: the debug console renders bytes off a socket with no model name,
+/// and a replayed transcript may hold either. The dialect the opener matched
+/// is then adopted for the whole stanza, so every tag after it is read in one
+/// dialect and none of the inner matching loosens.
 fn dsml_start_match(
+    tail: &[u8],
+    complete: &mut bool,
+    implicit_invoke: &mut bool,
+    matched: &mut ToolSyntax,
+) -> bool {
+    for syntax in ToolSyntax::ALL {
+        if dsml_start_match_one(tail, syntax.dsml_tags(), complete, implicit_invoke) {
+            *matched = syntax;
+            return true;
+        }
+    }
+    false
+}
+
+/// [`dsml_start_match`] against one dialect's spellings.
+fn dsml_start_match_one(
     tail: &[u8],
     tags: DsmlTags,
     complete: &mut bool,
@@ -732,6 +755,12 @@ impl Parser {
     fn reset(&mut self) {
         let Self::Dsml(p) = self;
         p.reset();
+    }
+
+    /// The dialect this parser is reading in.
+    fn syntax(&self) -> ToolSyntax {
+        let Self::Dsml(p) = self;
+        p.syntax()
     }
 }
 
@@ -1925,16 +1954,16 @@ impl<S: RenderSink> StreamRenderer<S> {
     ///
     /// DSML accepts a spread of spellings: marker typos, a trailing bar, a
     /// bare invoke standing in for the wrapper.
-    fn start_match(&self, complete: &mut bool, implicit_invoke: &mut bool) -> bool {
+    fn start_match(
+        &self,
+        complete: &mut bool,
+        implicit_invoke: &mut bool,
+        matched: &mut ToolSyntax,
+    ) -> bool {
         // Every dialect answers `dsml_tags`, and the candidate openers are
         // built from that table — no spelling is named here, so a new dialect
         // cannot silently miss this site.
-        dsml_start_match(
-            &self.dsml_start_tail,
-            self.syntax.dsml_tags(),
-            complete,
-            implicit_invoke,
-        )
+        dsml_start_match(&self.dsml_start_tail, complete, implicit_invoke, matched)
     }
 
     fn start_dsml(&mut self) {
@@ -1953,6 +1982,14 @@ impl<S: RenderSink> StreamRenderer<S> {
         // reported, so resetting cannot lose the verdict either.
         if matches!(self.parser.state(), DsmlState::Done | DsmlState::Error) {
             self.parser.reset();
+        }
+        // The opener may have named a dialect other than the one the parser
+        // was built for — a console fed off a socket starts on the V4 default
+        // and learns what it is reading from the first stanza. Rebuilding is
+        // only ever a no-op or a fresh `Search` parser, since this runs before
+        // any of the stanza's own bytes reach it.
+        if self.parser.syntax() != self.syntax {
+            self.parser = Parser::new(self.syntax);
         }
         self.dsml_active = true;
         self.dsml_ignored = self.rejects_in_think();
@@ -2184,8 +2221,14 @@ impl<S: RenderSink> StreamRenderer<S> {
                 self.dsml_start_tail.push(c);
             }
             let (mut complete, mut implicit_invoke) = (false, false);
-            if self.start_match(&mut complete, &mut implicit_invoke) {
+            let mut matched = self.syntax;
+            if self.start_match(&mut complete, &mut implicit_invoke, &mut matched) {
                 if complete {
+                    // The opener names the dialect; everything downstream —
+                    // the parser's tag table, the banner scan, the wording of
+                    // a tool error — reads `self.syntax`, so adopting it here
+                    // is the whole of V4.1 support on this side.
+                    self.syntax = matched;
                     // Parity mode discards an in-think stanza; otherwise it is
                     // an ordinary tool call that happens to sit inside a thought.
                     self.start_dsml();
@@ -4111,6 +4154,75 @@ mod dialect_tests {
             visible.contains("src/a.rs"),
             "no parameter value: {visible:?}"
         );
+    }
+
+    /// A renderer that was never told which model it is reading picks the
+    /// dialect up from the opener. This is the case every consumer without a
+    /// model name is in — the debug console renders bytes off a socket, and a
+    /// replayed transcript may hold either dialect — and before the opener
+    /// carried the answer, a V4.1 stanza reaching a default renderer streamed
+    /// out as raw markup with its calls dropped.
+    #[test]
+    fn a_default_renderer_adopts_the_dialect_its_opener_names() {
+        for syntax in ToolSyntax::ALL {
+            let tags = syntax.dsml_tags();
+            let bar = "\u{ff5c}";
+            let mut sr = StreamRenderer::new(Cap::default());
+            sr.push(format!(
+                "{start}\n{invoke} name=\"read\">\n\
+                 <{bar}DSML{bar}{param} name=\"path\" string=\"true\">src/a.rs\
+                 </{bar}DSML{bar}{param}>\n\
+                 </{bar}DSML{bar}{inv}>\n\
+                 </{bar}DSML{bar}{calls}>",
+                start = tags.start,
+                invoke = tags.invoke,
+                param = tags.param_name,
+                inv = tags.invoke_name,
+                calls = tags.calls_name,
+            ));
+            sr.finish();
+            let calls = sr.finished().calls;
+            assert_eq!(calls.len(), 1, "{syntax:?}: {:?}", sr.sink().visible);
+            assert_eq!(calls[0].name, "read");
+            assert_eq!(calls[0].arg_value("path"), Some("src/a.rs"));
+            assert_eq!(sr.syntax(), syntax, "{syntax:?}: dialect adopted");
+            assert!(
+                !sr.sink().visible.contains("DSML"),
+                "{syntax:?}: markup leaked: {:?}",
+                sr.sink().visible
+            );
+        }
+    }
+
+    /// One renderer outlives one stanza — the debug console keeps one per
+    /// connection, and transcript replay streams a whole message through one —
+    /// so the dialect is re-read at every opener rather than latched at the
+    /// first. A V4 stanza following a V4.1 one must still parse.
+    #[test]
+    fn each_stanza_is_read_in_the_dialect_of_its_own_opener() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push(concat!(
+            "<\u{ff5c}DSML\u{ff5c} calls>\n",
+            "<\u{ff5c}DSML\u{ff5c} invoke name=\"read\">\n",
+            "<\u{ff5c}DSML\u{ff5c} parameter name=\"path\" string=\"true\">a",
+            "</\u{ff5c}DSML\u{ff5c} parameter>\n",
+            "</\u{ff5c}DSML\u{ff5c} invoke>\n",
+            "</\u{ff5c}DSML\u{ff5c} calls>"
+        ));
+        sr.push("between\n");
+        sr.push(concat!(
+            "<\u{ff5c}DSML\u{ff5c}tool_calls>\n",
+            "<\u{ff5c}DSML\u{ff5c}invoke name=\"list\">\n",
+            "<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">b",
+            "</\u{ff5c}DSML\u{ff5c}parameter>\n",
+            "</\u{ff5c}DSML\u{ff5c}invoke>\n",
+            "</\u{ff5c}DSML\u{ff5c}tool_calls>"
+        ));
+        sr.finish();
+        let calls = sr.finished().calls;
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["read", "list"], "{:?}", sr.sink().visible);
+        assert_eq!(calls[1].arg_value("path"), Some("b"));
     }
 
     /// The C accepts a bare invoke opener as an implicit `calls` wrapper

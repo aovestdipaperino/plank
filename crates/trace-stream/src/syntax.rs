@@ -32,6 +32,14 @@ pub struct DsmlTags {
 }
 
 impl ToolSyntax {
+    /// Every dialect, in the order a stanza opener is matched against them.
+    ///
+    /// The openers are distinct strings, so the order is not load-bearing for
+    /// correctness; V4 leads because it is the default and the spelling the
+    /// published tools prompt teaches. Anything that has to consider *all*
+    /// dialects iterates this, so adding one cannot silently miss a site.
+    pub const ALL: [Self; 2] = [Self::Dsml, Self::Dsml41];
+
     /// The dialect for a model, by the name the engine reports.
     ///
     /// Keyed on the C's shape name (`DS4_MODEL_SHAPE_NAME`) rather than on the
