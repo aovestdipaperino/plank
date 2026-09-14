@@ -2460,14 +2460,29 @@ because most int8 weights moved by 0 or ±1. Diff, then compress.
 
 ## Qwen3.8-Flash-Next — the traps that cost the most
 
-**Qwen is gone.** Upstream `bd66c40` (the V4.1 bump) deleted the Qwen Metal
-support outright, so plank removed the family, its CLI flag, its tool dialect
-and its `.qwn.kv` namespace with it. This section is kept because most of what
-it cost is not Qwen-specific — in particular the Metal-kernel trap immediately
-below is family-independent and still live, and the prefill-hook and dialect
-notes are the template for the next family plank adds.
+**Qwen is back, and official.** Upstream `bd66c40` (the V4.1 bump) had deleted
+the Qwen Metal support, so plank removed the family, its CLI flag, its tool
+dialect and its KV namespace with it. Upstream then merged Qwen3.8 Flash Next
+properly (PR #991, in `9139e2a`) and publishes the weights itself, so all of
+that is restored and the off-by-default `qwen` cargo feature — a compromise for
+a model that only existed in our fork — is gone. Read the notes below as live,
+not historical.
 
 Every one of these was found by running the model, not by reading the C.
+
+**SSD streaming is refused for Qwen, and the heuristic that turns it on is
+measuring the wrong thing.** `ds4_engine_open` rejects a Qwen3.8 checkpoint
+outright when streaming is set ("requires single-host Metal ... SSD streaming
+... not supported"), so a run that auto-enables it never loads at all. Worse,
+the auto-enable fires *every* time: it weighs the GGUF on disk against the
+resident budget, and a Qwen GGUF is mostly BF16 n-grams the engine never makes
+resident. For the Q4 build the engine's own accounting is 95.37 GiB of n-grams
+read from disk against 69.73 GiB resident, out of 165.11 GiB on disk — so the
+file size says it cannot fit a 128 GB Mac while the resident set fits with
+50 GiB to spare. `ensure_side_artifacts` therefore returns for Qwen *before*
+`auto_enable_ssd_streaming`, not after. Nothing in the unit tests or the parity
+suite can see this; it takes a real load, which is the whole lesson of this
+section.
 
 **The engine compiles one combined Metal source for every model.**
 `ds4_gpu_full_source` treats each entry of its `required_sources` array as
