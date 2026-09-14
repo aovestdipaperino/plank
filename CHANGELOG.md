@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Qwen3.8-Flash-Next is served again, by every build.** Upstream merged
+  Qwen3.8 Flash Next and now publishes the weights itself, so the family, the
+  `--qwen` flag, the `<tool_call>` dialect, the `.qwn.kv` transcript extension
+  and the `qwen` artifact set all return. The off-by-default `qwen` cargo
+  feature is removed rather than defaulted on: it existed to keep a model this
+  build could not honestly serve out of the default build, and nothing is left
+  to gate. Its two C-parity tests consequently run on every build.
+- **Qwen is downloadable.** `qwen.manifest` tracks the Q4 build from the
+  official release repository and an `mmproj` vision encoder, so `--qwen`
+  without the weights offers a download like any other set instead of
+  requiring a hand-made symlink.
+
+### Changed
+
+- **Qwen's PLE sidecar is gone.** Upstream now ships the BF16 n-grams and the
+  MTP block inside the main GGUF, so `~/.plank/qwen.mtp.gguf`, the `mtp`
+  artifact kind and the companion `--qwen` used to fill in are all removed.
+  `--mtp` speculates off the embedded block with no companion file.
+
+### Fixed
+
+- **`--qwen` could never load.** SSD streaming was auto-enabled for Qwen, and
+  the engine refuses to open a Qwen checkpoint with it on. The heuristic also
+  weighs the GGUF on disk against the resident budget, and a Qwen GGUF is
+  mostly n-grams the engine leaves on disk — 165 GiB on disk against 69.7 GiB
+  resident — so it fired on every machine. It is now skipped for Qwen.
+
+### Known limitations
+
+- Qwen runs text-only in plank: the vision encoder is installed but never
+  passed to the engine, so `view_image` is refused.
+
 ## [5.1.3] - 2026-09-14
 
 ### Changed

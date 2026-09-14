@@ -90,8 +90,8 @@ Without a model file plank runs against a built-in echo engine. Every command, t
 |---|---|
 | `~/.plank/ds4flash.gguf` | default model location |
 | `~/.plank/ds4flash.dspark.gguf` | DSpark draft model, for DeepSeek speculation (`--mtp`) |
-| `~/.plank/qwen.gguf` | Qwen3.8-Flash-Next main model, when `--qwen` is used (expected to be a symlink) |
-| `~/.plank/qwen.mtp.gguf` | Qwen3.8-Flash-Next PLE sidecar, required by that model |
+| `~/.plank/qwen.gguf` | Qwen3.8-Flash-Next main model, when `--qwen` is used |
+| `~/.plank/qwen.vision.gguf` | Qwen3.8-Flash-Next vision encoder (installed by the manifest; plank does not load one yet) |
 | `~/.plank/kvcache/` | saved sessions (`<name>.kv`) plus the KV snapshots (`*.kv_raw`) and their metadata (`*.json`). Browse it with `/kvcache`. |
 | `~/.plank/settings.json` | global preferences |
 | `~/.plank/.mcp.json` | global MCP server config |

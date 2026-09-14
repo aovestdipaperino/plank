@@ -45,11 +45,22 @@ plank retries without the drafter it chose for you and decodes target-only. A
 companion you named with `--mtp-model` is still never dropped. While a
 streaming model is loaded the footer carries a 💾, blinking while a pass runs.
 
-**Qwen3.8-Flash-Next is retired.** Upstream deleted its Metal kernels, so the
-family, the `--qwen` flag, its artifact set and its dialect are all gone. Your
-old `.qwn.kv` files are untouched and will stay that way: a retired model name
-matches no live family, so nothing lists them, sweeps them or hands them to a
-DeepSeek engine. They are also no longer loadable.
+**Qwen3.8-Flash-Next is back, and no longer optional.** It was retired when
+upstream deleted its Metal kernels. Upstream has since merged Qwen3.8 Flash
+Next properly and publishes the weights itself, so the family, the `--qwen`
+flag, its dialect and its artifact set all return — and the old off-by-default
+`qwen` cargo feature is gone with the reason for it. Every build serves it.
+
+Two things changed while it was away. The BF16 n-grams and the MTP block now
+live inside the main GGUF, so the `~/.plank/qwen.mtp.gguf` sidecar is gone and
+`--mtp` speculates with no companion file. And Qwen is downloadable now:
+`qwen.manifest` tracks it like any other set, so `--qwen` on a machine without
+the weights offers the download instead of pointing you at a symlink you had to
+make yourself. Your old `.qwn.kv` transcripts load again.
+
+One limit worth stating plainly: Qwen runs text-only in plank. The vision
+encoder exists upstream, but plank does not pass one, so `view_image` is
+refused.
 
 **plank gets out of the way when the Mac runs out of memory.** Under memory
 pressure it releases the KV cache and the engine session at a turn boundary,
