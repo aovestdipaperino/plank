@@ -543,19 +543,28 @@ pub fn ensure_side_artifacts(
     ctx: i32,
     engine: &mut crate::config::EngineTuning,
 ) -> Result<(), String> {
+    // Qwen takes none of this. The engine refuses to open a Qwen3.8 checkpoint
+    // with SSD streaming on ("requires single-host Metal ... SSD streaming ...
+    // not supported"), and the heuristic would enable it every time anyway: it
+    // weighs the *file* against the resident budget, and a Qwen GGUF is mostly
+    // BF16 n-grams the engine leaves on disk — 165 GiB on disk, ~70 GiB
+    // resident, which fits a 128 GB Mac that the file size says it cannot.
+    // Neither side artifact is Qwen's either: no `DeepSeek` vision encoder, and
+    // speculation runs off the block embedded in its own GGUF.
+    if crate::gguf::family_of(model_path) == crate::gguf::ModelFamily::Qwen {
+        crate::status::set_ssd_streaming(engine.ssd_streaming);
+        return Ok(());
+    }
     // A checkpoint too large to hold resident is streamed from SSD rather than
-    // failing to open; decided before anything else, since it applies to every
-    // family and does not depend on the companion resolution below. It needs
-    // the context size, which is why this function takes one.
+    // failing to open; decided before the companion resolution below, which it
+    // does not depend on. It needs the context size, which is why this function
+    // takes one.
     auto_enable_ssd_streaming(model_path, ctx, engine);
     // The streaming decision is final here — nothing below touches it — so
     // this is where the footer's `HD` marker learns about it. Published rather
     // than read off `cfg` by the bar, because the auto-enable lands on the
     // caller's local `EngineTuning` copy and never goes back into `cfg`.
     crate::status::set_ssd_streaming(engine.ssd_streaming);
-    if crate::gguf::family_of(model_path) == crate::gguf::ModelFamily::Qwen {
-        return Ok(());
-    }
     if crate::gguf::supports_vision(model_path) {
         ensure_vision_encoder()?;
     }
@@ -2419,6 +2428,14 @@ mod tests {
         assert!(
             e.mtp_path.is_none(),
             "no DeepSeek support model resolved for a Qwen run"
+        );
+        // And SSD streaming is never auto-enabled: the engine refuses to open
+        // a Qwen checkpoint with it on, so leaving the heuristic to run here
+        // made `--qwen` fail to load at all on any machine whose RAM the file
+        // size exceeds — which, at 165 GiB on disk, is every machine.
+        assert!(
+            !e.ssd_streaming,
+            "the engine rejects a Qwen open with SSD streaming on"
         );
         let _ = std::fs::remove_file(model);
     }
