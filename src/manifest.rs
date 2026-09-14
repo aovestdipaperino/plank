@@ -60,6 +60,7 @@ impl ModelSet {
         match family {
             crate::gguf::ModelFamily::Ds4 => Self::Ds4,
             crate::gguf::ModelFamily::Ds41 => Self::Ds41,
+            crate::gguf::ModelFamily::Qwen => Self::Qwen,
         }
     }
 

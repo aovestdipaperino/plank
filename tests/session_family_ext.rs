@@ -21,28 +21,27 @@ fn setting_the_family_changes_the_transcript_extension() {
     let before = store.path_for_id("cheeky-bell");
     assert!(before.to_string_lossy().ends_with(".ds4.kv"), "{before:?}");
 
-    set_family(ModelFamily::Ds41);
-    assert_eq!(family(), ModelFamily::Ds41);
+    set_family(ModelFamily::Qwen);
+    assert_eq!(family(), ModelFamily::Qwen);
     let after = store.path_for_id("cheeky-bell");
-    assert!(after.to_string_lossy().ends_with(".ds41.kv"), "{after:?}");
+    assert!(after.to_string_lossy().ends_with(".qwn.kv"), "{after:?}");
 
     // One directory, two names: the whole point of the tag.
     assert_eq!(before.parent(), after.parent());
     assert_ne!(before, after);
-    assert_eq!(family_ext(ModelFamily::Ds41), ".ds41.kv");
+    assert_eq!(family_ext(ModelFamily::Qwen), ".qwn.kv");
 
-    // The tag is a tag rather than a yes/no, so every family must round-trip
-    // through the global — including back to the unset default.
+    // V4.1 is a third family, so the tag can no longer be a Qwen yes/no: every
+    // family must round-trip through the global, not just the two extremes.
+    set_family(ModelFamily::Ds41);
+    assert_eq!(family(), ModelFamily::Ds41);
+    let v41 = store.path_for_id("cheeky-bell");
+    assert!(v41.to_string_lossy().ends_with(".ds41.kv"), "{v41:?}");
+    assert_ne!(v41, before);
+    assert_ne!(v41, after);
+
     set_family(ModelFamily::Ds4);
     assert_eq!(family(), ModelFamily::Ds4);
-    assert_eq!(store.path_for_id("cheeky-bell"), before);
-
-    // No live family can ever produce the retired Qwen extension, so a
-    // `.qwn.kv` transcript left on disk can never be opened, renamed or swept
-    // as one of theirs.
-    for f in [ModelFamily::Ds4, ModelFamily::Ds41] {
-        assert_ne!(family_ext(f), ".qwn.kv");
-    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

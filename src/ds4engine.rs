@@ -274,10 +274,13 @@ const STEADY_MIN_TOKENS: i32 = 8;
 /// fails outright when `vision_path` is set and the main GGUF is not the pinned
 /// Vision-Exp checkpoint ("--vision requires ... the pinned `DeepSeek` V4 Flash
 /// Vision-Exp model"), so a language-only or re-quantized `DeepSeek`
-/// checkpoint must open with a null path and run text-only, with the
-/// `view_image` tool refusing at call time instead of the open failing.
-fn model_supports_vision(_family: crate::gguf::ModelFamily, path: &Path) -> bool {
-    crate::gguf::supports_vision(path)
+/// checkpoint must open with a null path and run text-only. Likewise for a
+/// Qwen3.8-Flash-Next model: the DS4 encoder is not a Qwen encoder, and a Qwen
+/// run is text-only until a Qwen encoder is wired up (the C branch ships a
+/// separate `qwen38-vision` target). Either way the `view_image` tool refuses
+/// at call time instead of the open failing.
+fn model_supports_vision(family: crate::gguf::ModelFamily, path: &Path) -> bool {
+    family != crate::gguf::ModelFamily::Qwen && crate::gguf::supports_vision(path)
 }
 
 /// Says at open time why the run is text-only, instead of letting the first
@@ -289,19 +292,21 @@ fn model_supports_vision(_family: crate::gguf::ModelFamily, path: &Path) -> bool
 /// for a model plank deliberately never passed it to would report a failure to
 /// read a file that was never opened.
 fn report_text_only(
-    _family: crate::gguf::ModelFamily,
+    family: crate::gguf::ModelFamily,
     model_supports_vision: bool,
     vision_path: &Path,
 ) {
-    if model_supports_vision {
-        eprintln!(
-            "warning: vision encoder not loaded from {}; view_image will be refused",
-            vision_path.display()
-        );
-    } else {
+    if family == crate::gguf::ModelFamily::Qwen {
+        eprintln!("note: Qwen3.8 runs text-only in plank; view_image will be refused");
+    } else if !model_supports_vision {
         eprintln!(
             "note: this checkpoint is not the DeepSeek V4 Flash Vision-Exp model, \
              so it runs text-only; view_image will be refused"
+        );
+    } else {
+        eprintln!(
+            "warning: vision encoder not loaded from {}; view_image will be refused",
+            vision_path.display()
         );
     }
 }
@@ -402,15 +407,18 @@ impl Ds4Model {
             simulate_used_memory_bytes: tuning.simulate_used_memory_bytes,
             warm_weights: tuning.warm_weights,
             quality: tuning.quality,
-            // `--mtp` means "predict more than one token per step". The only
-            // mechanism plank still serves is a separate DSpark draft
-            // checkpoint (`dspark`); the engine's other one (`glm_mtp`, an MTP
-            // block inside the main GGUF) belonged to Qwen3.8 and is now never
-            // asked for.
+            // One switch, two mechanisms. `--mtp` means "predict more than
+            // one token per step", and the engine option that does it differs
+            // by family: DeepSeek speculates from a separate DSpark draft
+            // checkpoint (`dspark`), Qwen3.8 from the MTP block inside its own
+            // main GGUF (`glm_mtp`, which `qwen4_graph_alloc` reads at open).
             //
             // Gating matters, it is not tidiness: `dspark` with no `mtp_path`
-            // is a hard error in the C ("--dspark requires --mtp-model FILE").
-            glm_mtp: false,
+            // is a hard error in the C ("--dspark requires --mtp-model FILE"),
+            // and a Qwen run has no `mtp_path` by construction — its companion
+            // went to `ple_path`. Leaving both ungated meant Qwen could not
+            // load at all with speculation at its default-on.
+            glm_mtp: tuning.mtp && family == crate::gguf::ModelFamily::Qwen,
             glm_mtp_timing: false,
             dspark: tuning.mtp && family == crate::gguf::ModelFamily::Ds4,
             dspark_strict: tuning.mtp_strict && family == crate::gguf::ModelFamily::Ds4,
@@ -1586,7 +1594,7 @@ impl Engine for Ds4Session {
         // which outlives the sync call, and the callback is cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
-            // Some engines report prefill only on the chunk hook.
+            // Qwen3.8 prefill reports only on the chunk hook.
             ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         // SAFETY: session, tokens, and err buffer are valid for the call.
@@ -2153,7 +2161,7 @@ impl Engine for Ds4Session {
         // cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
-            // Some engines report prefill only on the chunk hook.
+            // Qwen3.8 prefill reports only on the chunk hook.
             ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         let mut err = [0_i8; 512];
@@ -2474,7 +2482,7 @@ impl Ds4HostSession {
         // SAFETY: session valid; progress outlives the sync; cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
-            // Some engines report prefill only on the chunk hook.
+            // Qwen3.8 prefill reports only on the chunk hook.
             ffi::ds4_session_set_progress(session, Some(progress_cb), progress_ptr);
         }
         // SAFETY: session, tokens, and err buffer valid.
@@ -2729,7 +2737,7 @@ impl Drop for Ds4TokensGuard {
 ///
 /// `metal_kernels_match_the_c_reference` in `tests/c_parity.rs` parses that
 /// table out of the C and fails on any drift — the comment alone was not
-/// enough, and a submodule bump that added two extra kernels shipped a build
+/// enough, and a submodule bump that added two Qwen kernels shipped a build
 /// that could not open a model at all.
 pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     // Keep this in lockstep with the C `required_sources` table in
@@ -2785,9 +2793,9 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
 /// companion is warned about here, ahead of `ds4_engine_open`.
 ///
 /// There used to be a second slot, `ple_path`, for the Qwen3.8 n-gram sidecar.
-/// `refs/ds4` bd66c40 deleted the field from `ds4_engine_options`, and plank
-/// had already stopped serving the only family that took one, so the pair
-/// collapsed to the drafter alone.
+/// Upstream now ships those n-grams inside the Qwen GGUF itself and deleted the
+/// field from `ds4_engine_options`, so every family Qwen included fills the one
+/// drafter slot or none.
 fn mtp_companion(family: crate::gguf::ModelFamily, companion: Option<&Path>) -> Option<&Path> {
     if let Some(c) = companion {
         warn_on_companion_mismatch(family, c);
@@ -2798,7 +2806,7 @@ fn mtp_companion(family: crate::gguf::ModelFamily, companion: Option<&Path>) -> 
 /// Warns when the `--mtp-model` companion is not the kind this family wants.
 ///
 /// The companion GGUFs name themselves: `deepseek4-dspark` for a `DSpark`
-/// draft checkpoint. Passing the
+/// draft checkpoint, `qwen4-exp-ple` for a Qwen n-gram sidecar. Passing the
 /// wrong one otherwise surfaces as the engine refusing a tensor it cannot
 /// find, several hundred lines from the flag that caused it.
 ///
@@ -2819,7 +2827,10 @@ fn warn_on_companion_mismatch(family: crate::gguf::ModelFamily, companion: &Path
         );
         return;
     }
-    let expected = "deepseek4-dspark";
+    let expected = match family {
+        crate::gguf::ModelFamily::Qwen => "qwen4-exp-ple",
+        crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41 => "deepseek4-dspark",
+    };
     if arch != expected {
         eprintln!(
             "warning: --mtp {} reports architecture {arch:?}, but this model wants {expected:?}",
@@ -3066,6 +3077,7 @@ mod tests {
         for family in [
             crate::gguf::ModelFamily::Ds4,
             crate::gguf::ModelFamily::Ds41,
+            crate::gguf::ModelFamily::Qwen,
         ] {
             assert_eq!(super::mtp_companion(family, None), None);
             assert_eq!(super::mtp_companion(family, Some(c)), Some(c));
@@ -3077,7 +3089,7 @@ mod tests {
     /// prompt position.
     #[test]
     fn only_prefill_events_drive_the_prefill_bar() {
-        assert!(is_prefill_event("prefill_chunk"), "the chunk hook");
+        assert!(is_prefill_event("prefill_chunk"), "the Qwen3.8 hook");
         assert!(
             is_prefill_event("prefill_display"),
             "the DeepSeek graph hook"
