@@ -83,7 +83,6 @@ plugins = ["dep:extism"]
 # refuses it by name rather than misparsing it as DeepSeek, and it still reads,
 # sweeps and GCs `.qwn.kv` transcripts left by a build that had the feature on.
 # On-disk compatibility is deliberately not part of the gate.
-qwen = ["trace-stream/qwen"]
 
 [dependencies]
 trace-stream = { path = "crates/trace-stream" }

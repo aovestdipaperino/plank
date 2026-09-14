@@ -691,15 +691,16 @@ mod tests {
         );
     }
 
-    /// Each set installs only its own kinds. A `vision` entry in a Qwen
-    /// manifest must not resolve to a path, or a swap would try to install a
-    /// `DeepSeek` encoder for a model that never loads one.
+    /// Each set installs only its own kinds. Qwen's old `mtp` sidecar is gone
+    /// — upstream ships the n-grams inside the main GGUF — so an `mtp` entry in
+    /// either manifest must resolve to nothing, and a `dspark` entry must not
+    /// install a `DeepSeek` drafter for a model that never loads one.
     #[test]
     fn a_set_resolves_only_its_own_kinds() {
         let root = Path::new("/tmp/plank-set-test");
         assert_eq!(ModelSet::Ds4.kinds(), &["main", "vision", "dspark"]);
-        assert_eq!(ModelSet::Qwen.kinds(), &["main", "mtp"]);
-        assert!(local_path_for_in(root, ModelSet::Qwen, "vision").is_none());
+        assert_eq!(ModelSet::Qwen.kinds(), &["main", "vision"]);
+        assert!(local_path_for_in(root, ModelSet::Qwen, "mtp").is_none());
         assert!(local_path_for_in(root, ModelSet::Qwen, "dspark").is_none());
         assert!(local_path_for_in(root, ModelSet::Ds4, "mtp").is_none());
         assert_eq!(ModelSet::Ds41.kinds(), &["main", "vision"]);
@@ -790,7 +791,7 @@ mod tests {
     fn every_set_variant_is_listed() {
         for set in ALL_SETS {
             match set {
-                ModelSet::Ds4 | ModelSet::Ds41 => {}
+                ModelSet::Ds4 | ModelSet::Ds41 | ModelSet::Qwen => {}
             }
         }
         assert_eq!(ALL_SETS.len(), 3);

@@ -64,7 +64,6 @@ A whole-file read may fail if the result would not fit the current context; then
 ///   candidate for adoption sentence by sentence once those two are settled.
 /// - The vision schema, because a Qwen run is text-only here (see
 ///   `Ds4Model::open`).
-#[cfg(feature = "qwen")]
 pub const TOOLS_PROMPT_QWEN: &str = r#"You are a coding agent running in a local workspace. Use tools for local file and system work. Avoid printing large file contents or large code blocks as answers; create or edit files with tools, then summarize results briefly.
 
 # Tools
@@ -128,7 +127,6 @@ Tool calls are not allowed inside <think></think>; finish thinking before emitti
 /// The counterpart of [`dsml_syntax_reminder`]: re-shown after a malformed
 /// call so the model has the shape in front of it.
 #[must_use]
-#[cfg(feature = "qwen")]
 pub fn qwen_syntax_reminder() -> &'static str {
     "Tool-call syntax reminder:\n\
 <tool_call>\n<function=$TOOL_NAME>\n<parameter=$PARAMETER_NAME>\n\
@@ -614,7 +612,6 @@ fn build_tools_prompt_parts_with_wasm(
     // arm is gated rather than left to fall through to DSML so that, if that
     // refusal is ever bypassed, the build fails to compile instead of quietly
     // handing a Qwen model the wrong prompt.
-    #[cfg(feature = "qwen")]
     if syntax == ToolSyntax::Qwen {
         return build_qwen_tools_prompt_parts(mcp_servers, wasm_tools);
     }
@@ -654,10 +651,8 @@ fn build_tools_prompt_parts_with_wasm(
 /// DSML, so there is nothing to preserve, and the C agrees — it hands an
 /// XML-dialect tools prompt over as an ordinary system message rather than as
 /// rendered chat (`agent_syntax_is_xml_tool_call`).
-#[cfg(feature = "qwen")]
 const QWEN_SCHEMA_FENCE: &str = "\n</tools>";
 
-#[cfg(feature = "qwen")]
 fn build_qwen_tools_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
@@ -1202,11 +1197,19 @@ pub fn dsml41_syntax_reminder() -> &'static str {
 /// occurrence, replaces `tool_calls`, `invoke` or `parameter` with the V4.1
 /// name — but only when the word is followed by `>` or a space, so it is
 /// really a tag and not prose. A bare "parameter" in a sentence is untouched.
+/// # Panics
+/// Never in practice: both dialects named here are DSML ones, so both answer
+/// [`ToolSyntax::dsml_tags`] with a tag table. Only Qwen answers `None`, and it
+/// is not one of the two.
 #[must_use]
 pub fn dsml41_tools_prompt(source: &str) -> String {
     const MARKER: &str = "｜DSML｜";
-    let tags = ToolSyntax::Dsml41.dsml_tags();
-    let v4 = ToolSyntax::Dsml.dsml_tags();
+    let tags = ToolSyntax::Dsml41
+        .dsml_tags()
+        .expect("Dsml41 is a DSML dialect");
+    let v4 = ToolSyntax::Dsml
+        .dsml_tags()
+        .expect("Dsml is a DSML dialect");
     let names = [
         (v4.calls_name, tags.calls_name),
         (v4.invoke_name, tags.invoke_name),

@@ -16,7 +16,6 @@ readme = "README.md"
 # Off by default: plank does not build Qwen support by default either, and with
 # it off `qwen_stub.rs` stands in for the parser so `viz.rs` needs no `#[cfg]`
 # on the dialect dispatch it runs for every generation.
-qwen = []
 
 [dependencies]
 

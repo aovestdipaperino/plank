@@ -281,7 +281,9 @@ fn start_markers(bar: bool) -> &'static [(ToolSyntax, String)] {
         ToolSyntax::ALL
             .iter()
             .flat_map(|&syntax| {
-                let tags = syntax.dsml_tags();
+                // `ALL` lists only the DSML dialects; Qwen has no tag table and
+                // is read by its own parser, never by this opener scan.
+                let tags = syntax.dsml_tags().expect("ALL lists only DSML dialects");
                 let base = if bar { tags.start_bar } else { tags.start };
                 MARKER_NAMES.iter().flat_map(move |m| {
                     let canonical = base.replace("DSML", m);
@@ -332,7 +334,11 @@ impl DsmlParser {
 
     /// This parser's tag spellings.
     fn tags(&self) -> crate::syntax::DsmlTags {
-        self.syntax.dsml_tags()
+        self.syntax.dsml_tags().unwrap_or_else(|| {
+            crate::syntax::ToolSyntax::Dsml
+                .dsml_tags()
+                .expect("dsml has tags")
+        })
     }
 
     /// The dialect in force — the starting one until a stanza opener names
@@ -1053,7 +1059,7 @@ mod tests {
     #[test]
     fn a_default_parser_adopts_the_dialect_its_opener_names() {
         for syntax in ToolSyntax::ALL {
-            let tags = syntax.dsml_tags();
+            let tags = syntax.dsml_tags().expect("ALL lists only DSML dialects");
             let bar = "\u{ff5c}";
             let mut p = DsmlParser::new();
             p.feed(format!(

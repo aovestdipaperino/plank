@@ -518,22 +518,14 @@ pub fn parse_backend(name: &str) -> Option<Backend> {
     }
 }
 
-/// The `--qwen` entry, present only in a build that carries the model.
-///
-/// Listing a flag the build refuses would send the reader to a fix that is not
-/// available to them; the flag's own error message names the feature instead.
-#[cfg(feature = "qwen")]
-const QWEN_USAGE: &str =
-    "      --qwen               run Qwen3.8-Flash-Next instead of DeepSeek V4 (off by
-                           default): shorthand for -m ~/.plank/qwen.gguf
-                           --mtp-model ~/.plank/qwen.mtp.gguf, both expected to be
-                           symlinks you point at your own build. An explicit -m or
-                           --mtp-model wins.
+/// The `--qwen` entry in the usage text.
+const QWEN_USAGE: &str = "      --qwen               run Qwen3.8-Flash-Next instead of DeepSeek V4:
+                           shorthand for -m ~/.plank/qwen.gguf, which plank
+                           downloads and upgrades from qwen.manifest like any
+                           other set. An explicit -m wins. The n-grams and MTP
+                           block live inside that GGUF, so --mtp needs no
+                           companion.
 ";
-
-/// See the gated [`QWEN_USAGE`].
-#[cfg(not(feature = "qwen"))]
-const QWEN_USAGE: &str = "";
 
 /// Returns the usage help text, close to the C agent's `-h` output.
 #[must_use]
@@ -1564,19 +1556,7 @@ pub fn parse_options_with(
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
             "--ssd-streaming-cold" => c.engine.ssd_streaming_cold = true,
-            #[cfg(feature = "qwen")]
             "--qwen" => c.qwen = true,
-            // Named rather than reported as unknown: the flag exists, this
-            // build just does not carry the model. Telling the user which
-            // build they have is the difference between a one-line fix and a
-            // hunt through the option list for a typo.
-            #[cfg(not(feature = "qwen"))]
-            "--qwen" => {
-                return Err(
-                    "--qwen: this build has no Qwen support; rebuild with --features qwen"
-                        .to_owned(),
-                );
-            }
             "--mtp" => c.engine.mtp = true,
             "--mtp-off" => c.engine.mtp = false,
             "--mtp-strict" => {
@@ -1648,9 +1628,9 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
     if c.qwen {
         c.model_path
             .get_or_insert_with(crate::download::default_qwen_path);
-        c.engine
-            .mtp_path
-            .get_or_insert_with(crate::download::default_qwen_mtp_path);
+        // No companion is filled in: upstream now ships the BF16 n-grams and
+        // the MTP block inside the main Qwen GGUF, so `--mtp` speculates with
+        // no sidecar and `--mtp-model` stays whatever the user passed.
     }
     // Speculative decoding only engages at temperature 0 (see `ds4engine`'s
     // draft gate), so DSpark defaults the temperature to 0. Done here rather
@@ -2305,7 +2285,6 @@ mod tests {
             text.contains("\n  -t, --threads N"),
             "the chunk after QWEN_USAGE is un-indented"
         );
-        #[cfg(feature = "qwen")]
         assert!(
             text.contains("\n      --qwen  "),
             "QWEN_USAGE itself is un-indented"
@@ -2532,30 +2511,16 @@ mod tests {
 
     /// One companion flag for both families. Which engine slot it lands in is
     /// decided at open time from the model's own architecture, not here — this
-    /// only pins that the flag carries a path and disturbs nothing else.
-    /// `--qwen` fills in both default paths, and nothing else: the flag is a
-    /// Without the feature the flag is refused *by name*, not swallowed as an
-    /// unknown option: the user needs to learn which build they have, not go
-    /// hunting for a typo.
-    #[cfg(not(feature = "qwen"))]
+    /// `--qwen` fills in the model path and nothing else: the flag is a
+    /// shorthand, so it must not touch the knobs around it. In particular it
+    /// no longer fills a companion — upstream ships the n-grams and the MTP
+    /// block inside the main GGUF, so speculation needs no sidecar.
     #[test]
-    fn the_qwen_flag_is_refused_by_name_without_the_feature() {
-        let err = parse_options(&args(&["--qwen"])).unwrap_err();
-        assert!(err.contains("--qwen"), "names the flag: {err}");
-        assert!(err.contains("--features qwen"), "names the fix: {err}");
-    }
-
-    /// shorthand, so it must not touch the knobs around it.
-    #[cfg(feature = "qwen")]
-    #[test]
-    fn qwen_flag_fills_in_both_default_paths() {
+    fn qwen_flag_fills_in_the_model_path_and_no_companion() {
         let c = parse_options(&args(&["--qwen"])).unwrap();
         assert!(c.qwen);
         assert_eq!(c.model_path, Some(crate::download::default_qwen_path()));
-        assert_eq!(
-            c.engine.mtp_path,
-            Some(crate::download::default_qwen_mtp_path())
-        );
+        assert!(c.engine.mtp_path.is_none(), "no companion is invented");
         assert!(c.engine.mtp, "speculation still defaults on");
     }
 
@@ -2569,7 +2534,6 @@ mod tests {
 
     /// An explicit path wins on either side of `--qwen`, which is the whole
     /// reason the flag is applied after parsing rather than at the flag.
-    #[cfg(feature = "qwen")]
     #[test]
     fn an_explicit_model_beats_qwen_in_either_order() {
         for order in [
@@ -2582,16 +2546,10 @@ mod tests {
                 Some(PathBuf::from("/custom.gguf")),
                 "{order:?}"
             );
-            // The companion still defaults, since only `-m` was overridden.
-            assert_eq!(
-                c.engine.mtp_path,
-                Some(crate::download::default_qwen_mtp_path()),
-                "{order:?}"
-            );
+            assert!(c.engine.mtp_path.is_none(), "{order:?}");
         }
     }
 
-    #[cfg(feature = "qwen")]
     #[test]
     fn an_explicit_companion_beats_qwen_in_either_order() {
         for order in [

@@ -39,9 +39,16 @@ const REPO: &str = "antirez/deepseek-v4-gguf";
 /// upstream (`refs/ds4/download_model.sh`).
 const DS41_REPO: &str = "antirez/deepseek-v4.1-flash-gguf";
 
+/// Hugging Face repository holding the Qwen3.8-Flash-Next release.
+const QWEN_REPO: &str = "antirez/qwen3.8-flash-next-gguf";
+
 /// V4.1 main model filename, mirroring `refs/ds4/download_model.sh`'s
 /// `DS41_Q2_FILE`.
 const DS41_FILE: &str = "DeepSeek-V4.1-Flash-Q2.gguf";
+
+/// The Qwen `main` artifact: the Q4 build, the one `refs/ds4`'s
+/// `download_model.sh qwen38-q4k` target fetches for a 128 GB Mac.
+const QWEN_FILE: &str = "Qwen3.8-Flash-Next-Q4.gguf";
 /// The recommended Vision-Experimental Flash quant (~81 GB) for 96–128 GB
 /// machines.
 ///
@@ -301,33 +308,26 @@ pub fn default_dspark_path() -> PathBuf {
 
 /// Default Qwen3.8-Flash-Next model location, selected by `--qwen`.
 ///
-/// plank never downloads this one — the Qwen release is not in `ds4.manifest`
-/// — so it is expected to be a symlink the user points at whichever build they
-/// want:
-///
-/// ```text
-/// ln -sfn ~/models/qwen38-ds4-q4/Qwen3.8-...-MTP.gguf  ~/.plank/qwen.gguf
-/// ln -sfn ~/models/qwen38-ds4-q4/Qwen3.8-...-PLE-Q4_1.gguf ~/.plank/qwen.mtp.gguf
-/// ```
-///
-/// Deliberately outside the `ds4flash.*` family, which the manifest owns: a
-/// staged upgrade moves those three names into place, and a name it recognized
-/// would be replaced under the user's feet.
+/// Deliberately outside the `ds4flash.*` family, which the `DeepSeek` manifest
+/// owns: a staged upgrade moves those names into place, and a name it
+/// recognized would be replaced under the user's feet. Qwen has its own
+/// manifest (`qwen.manifest`), so this path is managed the same way V4 and
+/// V4.1 are — an existing symlink here is adopted by size rather than replaced.
 #[must_use]
 pub fn default_qwen_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
     home.join(".plank").join("qwen.gguf")
 }
 
-/// Default companion for [`default_qwen_path`] — the required PLE sidecar.
+/// Default Qwen vision-encoder location, beside its main model.
 ///
-/// Named for the flag that carries it (`--mtp-model`) rather than for the
-/// tensor inside it, so the pairing reads the same way `ds4flash.dspark.gguf`
-/// pairs with `ds4flash.gguf`.
+/// This replaced the old `qwen.mtp.gguf` PLE sidecar: upstream now ships the
+/// BF16 n-grams and the MTP block inside the main GGUF, so the second slot is
+/// free for the `mmproj` encoder `--vision` loads.
 #[must_use]
-pub fn default_qwen_mtp_path() -> PathBuf {
+pub fn default_qwen_vision_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank").join("qwen.mtp.gguf")
+    home.join(".plank").join("qwen.vision.gguf")
 }
 
 /// Default vision-encoder location. Loaded alongside the main model whenever
@@ -390,6 +390,11 @@ pub fn ds41_model_url() -> String {
     repo_file_url(DS41_REPO, DS41_FILE)
 }
 
+/// Hugging Face download URL for the Qwen3.8-Flash-Next `main` artifact.
+fn qwen_model_url() -> String {
+    repo_file_url(QWEN_REPO, QWEN_FILE)
+}
+
 /// Uncompiled-in size estimate for a set's `main` artifact, in GB, used only
 /// when no manifest is on hand to give an exact figure. From
 /// `refs/ds4/docs/MODELS.md`.
@@ -397,6 +402,7 @@ fn fallback_main_gb(set: crate::manifest::ModelSet) -> f64 {
     match set {
         crate::manifest::ModelSet::Ds4 => 87.0,
         crate::manifest::ModelSet::Ds41 => 341.0,
+        crate::manifest::ModelSet::Qwen => 177.0,
     }
 }
 
@@ -839,6 +845,7 @@ fn ensure_model_in(root: &Path, path: &Path) -> Result<(), String> {
     let (label, url) = match set {
         crate::manifest::ModelSet::Ds4 => ("DeepSeek V4 Flash", model_url()),
         crate::manifest::ModelSet::Ds41 => ("DeepSeek V4.1 Flash", ds41_model_url()),
+        crate::manifest::ModelSet::Qwen => ("Qwen3.8 Flash Next", qwen_model_url()),
     };
     // A leftover .part file means a previous download can be resumed.
     let resuming = partial_bytes(path) > 0;
@@ -2404,7 +2411,7 @@ mod tests {
             mtp_strict: true,
             ..Default::default()
         };
-        assert!(ensure_side_artifacts(&model, &mut e).is_ok());
+        assert!(ensure_side_artifacts(&model, 32768, &mut e).is_ok());
         // Speculation stays on: under the unified `--mtp` a Qwen run
         // speculates from the block embedded in its own main GGUF, which needs
         // neither a download nor a companion file.
