@@ -146,6 +146,11 @@ pub struct AgentConfig {
     /// latency across multi-turn conversations by reusing the cached stable
     /// prefix (tools + system). Only consulted for `ProviderKind::Anthropic`.
     pub provider_cache: bool,
+    /// Whether skills are available this session (`--skills on|off`). On by
+    /// default. Off loads none: no built-in, user, project or plugin skill is
+    /// addressable as a slash command or resolvable by the `skill` tool, for a
+    /// session that wants only the model and the tools.
+    pub skills: bool,
     /// Whether the context size came from the user (`-c/--ctx` or the settings
     /// file) rather than [`DEFAULT_CTX_SIZE`]. Only consulted by the provider
     /// path: an untouched default is a guess sized for the local ds4 model, so
@@ -433,6 +438,7 @@ impl Default for AgentConfig {
             provider_base_url: None,
             provider_api_key: None,
             provider_cache: true,
+            skills: true,
             ctx_size_explicit: false,
             temp_explicit: false,
             cli_provenance: std::collections::BTreeMap::new(),
@@ -592,6 +598,9 @@ Options:
                            to ~/.plank/kvcache at exit
       --dump-config        print every effective setting with the layer it came
                            from (default, plugin, ~/.plank, ./.plank, CLI) and exit
+      --skills on|off      whether skills are available (default on); off loads
+                           none, built-in or otherwise, so no /skill slash
+                           command and nothing for the `skill` tool to resolve
       --minimal-prompt     start with the smallest prompt this build can make:
                            no MCP servers, skills, templates, plugin agents,
                            WASM components or session-start context. For
@@ -688,6 +697,19 @@ pub fn parse_ctx_size(s: &str, opt: &str) -> Result<i32, String> {
     n.checked_mul(mult)
         .and_then(|v| i32::try_from(v).ok())
         .ok_or_else(bad)
+}
+
+/// Parses an `on|off` switch, naming `opt` in the error message. `true`/`1`
+/// and `false`/`0` are accepted alongside the documented spellings.
+///
+/// # Errors
+/// Returns an error when `s` is none of those spellings.
+fn parse_on_off(s: &str, opt: &str) -> Result<bool, String> {
+    match s {
+        "on" | "true" | "1" => Ok(true),
+        "off" | "false" | "0" => Ok(false),
+        other => Err(format!("invalid {opt} value: {other} (use on|off)")),
+    }
 }
 
 /// Parses a positive `u64`, naming `opt` in the error message.
@@ -1412,15 +1434,10 @@ pub fn parse_options_with(
             "--base-url" => c.provider_base_url = Some(need_arg(&mut i)?.to_owned()),
             "--api-key" => c.provider_api_key = Some(need_arg(&mut i)?.to_owned()),
             "--provider-cache" => {
-                c.provider_cache = match need_arg(&mut i)? {
-                    "on" | "true" | "1" => true,
-                    "off" | "false" | "0" => false,
-                    other => {
-                        return Err(format!(
-                            "invalid --provider-cache value: {other} (use on|off)"
-                        ));
-                    }
-                };
+                c.provider_cache = parse_on_off(need_arg(&mut i)?, arg)?;
+            }
+            "--skills" => {
+                c.skills = parse_on_off(need_arg(&mut i)?, arg)?;
             }
             "--non-interactive" => c.non_interactive = true,
             "--debug" => c.debug = true,
@@ -1649,6 +1666,19 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn skills_flag_toggles_skill_loading() {
+        // Skills are on unless the session turns them off.
+        assert!(parse_options(&args(&[])).unwrap().skills);
+        assert!(parse_options(&args(&["--skills", "on"])).unwrap().skills);
+        assert!(!parse_options(&args(&["--skills", "off"])).unwrap().skills);
+        // The same spellings `--provider-cache` accepts, and nothing else.
+        assert!(!parse_options(&args(&["--skills", "false"])).unwrap().skills);
+        assert!(parse_options(&args(&["--skills", "1"])).unwrap().skills);
+        let err = parse_options(&args(&["--skills", "maybe"])).unwrap_err();
+        assert!(err.contains("on|off"), "{err}");
     }
 
     /// Settings with every engine and safety key set, for override tests.

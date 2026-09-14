@@ -272,8 +272,8 @@ pub fn render_list(skills: &[Skill]) -> String {
 pub fn render_names(skills: &[Skill]) -> String {
     if skills.is_empty() {
         // Only reachable when the caller passes an explicitly empty list (a
-        // sub-agent with no skills, say): the default paths always carry the
-        // built-ins.
+        // sub-agent with no skills, or `--skills off`): the default paths
+        // always carry the built-ins.
         return "No skills are installed (checked ~/.plank/skills and ./.plank/skills).\n"
             .to_string();
     }

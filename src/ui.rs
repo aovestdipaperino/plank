@@ -17141,12 +17141,20 @@ fn print_footer(st: &Status, color: bool) {
 /// The set is the accumulator because it is what `/plugins` renders, and these
 /// warnings are only knowable once the contributions are merged, which is after
 /// `main()` has already printed the load-time ones.
+///
+/// `skills` is `--skills`: when off, none are read off disk and none are
+/// merged, so the slash commands and the `skill` tool have nothing to resolve.
+/// Templates are a separate contribution and load either way.
 fn load_named_contributions(
     tool_ctx: &mut ToolContext,
     mut earlier: Vec<String>,
+    skills: bool,
 ) -> (Vec<crate::skills::Skill>, Vec<crate::templates::Template>) {
-    let (skills, skill_warnings, skill_claims) =
-        crate::plugins::skills_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
+    let (skills, skill_warnings, skill_claims) = if skills {
+        crate::plugins::skills_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
     let (templates, template_warnings, template_claims) =
         crate::plugins::templates_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     earlier.extend(skill_warnings);
@@ -17385,7 +17393,7 @@ fn new_agent(
         // offering what this session deliberately has no access to.
         (Vec::new(), Vec::new())
     } else {
-        load_named_contributions(&mut tool_ctx, contribution_warnings)
+        load_named_contributions(&mut tool_ctx, contribution_warnings, cfg.skills)
     };
     // The `skill` tool resolves names against the same set the slash command
     // uses; hand the dispatch context its own copy.
@@ -18064,6 +18072,28 @@ fn read_batched_from(
 
 #[cfg(test)]
 mod tests {
+    /// `--skills off` leaves the session with no skills at all — not even the
+    /// compiled-in ones, which is what makes the flag different from an empty
+    /// skills directory.
+    #[test]
+    fn skills_off_loads_no_skills() {
+        // A per-run directory: a fixed name is how the other temp-dir tests
+        // here learned to flake against a concurrent run.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let cwd = std::env::temp_dir().join(format!("plank-skills-off-{stamp}"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut on = crate::tools::ToolContext::new(cwd.clone());
+        let (skills, templates_on) = super::load_named_contributions(&mut on, Vec::new(), true);
+        assert!(!skills.is_empty(), "the built-ins should load by default");
+        let mut off = crate::tools::ToolContext::new(cwd);
+        let (skills, templates_off) = super::load_named_contributions(&mut off, Vec::new(), false);
+        assert!(skills.is_empty(), "{} skills survived", skills.len());
+        // Templates are a separate contribution and are untouched by the flag.
+        assert_eq!(templates_on.len(), templates_off.len());
+    }
+
     #[test]
     fn agentsmd_offer_line_parses_like_the_panel_order() {
         use crate::agentsmd::Offer;
