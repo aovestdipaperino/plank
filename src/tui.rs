@@ -1250,34 +1250,54 @@ impl OutputLog {
                 .sum::<usize>()
     }
 
-    /// The text to render when the first visible wrapped row is `top`, with
-    /// the residual row offset into its first logical line — the cached
-    /// counterpart of [`window_rows`], cloning only the lines at or below the
-    /// viewport instead of the whole log.
+    /// The text to render when the first visible wrapped row is `top` in a
+    /// pane `height` rows tall, with the residual row offset into its first
+    /// logical line — the cached counterpart of [`window_rows`], cloning only
+    /// the lines the pane can actually show instead of the whole log.
+    ///
+    /// Bounded at both ends on purpose. Skipping the lines above `top` is what
+    /// keeps the residual inside ratatui's `u16` scroll; stopping at the
+    /// bottom of the pane is what keeps a frame's cost independent of how much
+    /// conversation sits *below* the viewport, which is the scrolled-back case
+    /// (following the tail already clones almost nothing).
     #[must_use]
-    pub fn window(&self, width: u16, top: usize) -> (Text<'static>, u16) {
+    pub fn window(&self, width: u16, top: usize, height: u16) -> (Text<'static>, u16) {
         let width = width.max(1);
         self.ensure_rows(width);
         let tail = self.tail_lines();
         let tail_rows: Vec<usize> = tail.iter().map(|l| line_rows(l, width)).collect();
         let mut skipped = 0usize;
         let mut skip = 0usize;
+        let mut keep = 0usize;
         {
             let cache = self.row_cache.borrow();
-            for rows in cache.rows.iter().chain(tail_rows.iter()) {
-                if skipped + rows > top {
+            let rows = || cache.rows.iter().chain(tail_rows.iter());
+            for r in rows() {
+                if skipped + r > top {
                     break;
                 }
-                skipped += rows;
+                skipped += r;
                 skip += 1;
+            }
+            // The first kept line starts `residual` rows above the pane, so
+            // covering the pane takes `residual + height` rows of it.
+            let need = (top - skipped).saturating_add(usize::from(height));
+            let mut covered = 0usize;
+            for r in rows().skip(skip) {
+                if covered >= need {
+                    break;
+                }
+                covered += r;
+                keep += 1;
             }
         }
         let mut lines: Vec<Line<'static>> = Vec::new();
         if skip < self.lines.len() {
-            lines.extend_from_slice(&self.lines[skip..]);
-            lines.extend(tail);
+            let end = self.lines.len().min(skip + keep);
+            lines.extend_from_slice(&self.lines[skip..end]);
+            lines.extend(tail.into_iter().take(keep - (end - skip)));
         } else {
-            lines.extend(tail.into_iter().skip(skip - self.lines.len()));
+            lines.extend(tail.into_iter().skip(skip - self.lines.len()).take(keep));
         }
         (
             Text::from(lines),
@@ -1703,7 +1723,7 @@ pub fn selection_text_content(log: &OutputLog, width: u16, sel: ContentSelection
     let height = u16::try_from(ey - sy + 1).unwrap_or(u16::MAX);
     let rect = Rect::new(0, 0, width, height);
     let mut buf = Buffer::empty(rect);
-    let (text, scroll) = log.window(width, sy);
+    let (text, scroll) = log.window(width, sy, height);
     Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
@@ -1723,13 +1743,21 @@ pub fn selection_text_content(log: &OutputLog, width: u16, sel: ContentSelection
 /// Kept as a test-only reference: rendering itself uses the cache, and these
 /// two must never disagree (`row_cache_matches_a_full_rewrap_after_edits`).
 #[cfg(test)]
-fn window_rows(mut text: Text<'static>, width: u16, top: usize) -> (Text<'static>, u16) {
+fn window_rows(
+    mut text: Text<'static>,
+    width: u16,
+    top: usize,
+    height: u16,
+) -> (Text<'static>, u16) {
+    let measure = |line: &Line<'static>| {
+        Paragraph::new(Text::from(line.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+    };
     let mut skipped_rows = 0usize;
     let mut skip = 0usize;
     for line in &text.lines {
-        let rows = Paragraph::new(Text::from(line.clone()))
-            .wrap(Wrap { trim: false })
-            .line_count(width);
+        let rows = measure(line);
         if skipped_rows + rows > top {
             break;
         }
@@ -1737,6 +1765,17 @@ fn window_rows(mut text: Text<'static>, width: u16, top: usize) -> (Text<'static
         skip += 1;
     }
     text.lines.drain(..skip);
+    let need = (top - skipped_rows).saturating_add(usize::from(height));
+    let mut covered = 0usize;
+    let mut keep = 0usize;
+    for line in &text.lines {
+        if covered >= need {
+            break;
+        }
+        covered += measure(line);
+        keep += 1;
+    }
+    text.lines.truncate(keep);
     (text, u16::try_from(top - skipped_rows).unwrap_or(u16::MAX))
 }
 
@@ -4971,7 +5010,7 @@ fn render_output(
         view.follow = true;
     }
     // Skip whole lines above the viewport so the `u16` scroll stays small.
-    let (text, scroll) = log.window(width, view.top);
+    let (text, scroll) = log.window(width, view.top, area.height);
     let para = Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
@@ -7571,6 +7610,39 @@ mod tests {
         assert_eq!(d.release(), Release::None);
     }
 
+    /// `window` must hand back only the lines the pane can show. Cloning
+    /// every line below the viewport made a scrolled-back frame cost grow
+    /// with the length of the conversation.
+    #[test]
+    fn window_stops_at_the_bottom_of_the_viewport() {
+        use ratatui::widgets::Widget as _;
+        let mut log = OutputLog::new();
+        for i in 0..500 {
+            log.push_plain(format!("line {i:03}"));
+        }
+        let width = 20;
+        let height = 10u16;
+        let top = 100;
+        let (text, scroll) = log.window(width, top, height);
+        assert!(
+            text.lines.len() <= usize::from(height) + 1,
+            "{} lines cloned for a {height}-row pane",
+            text.lines.len()
+        );
+        // ...and the pane paints exactly what the unbounded window painted.
+        let rect = Rect::new(0, 0, width, height);
+        let paint = |text: Text<'static>, scroll: u16| {
+            let mut buf = Buffer::empty(rect);
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
+                .render(rect, &mut buf);
+            buf
+        };
+        let (full, full_scroll) = window_rows(log.to_text(), width, top, u16::MAX);
+        assert_eq!(paint(text, scroll), paint(full, full_scroll));
+    }
+
     #[test]
     fn row_cache_matches_a_full_rewrap_after_edits() {
         // The cached row heights must agree with measuring the whole text,
@@ -7596,10 +7668,15 @@ mod tests {
         let check = |log: &OutputLog| {
             assert_eq!(log.total_rows(width), full(log, width));
             for top in [0usize, 1, 5, 37, full(log, width).saturating_sub(1)] {
-                assert_eq!(
-                    log.window(width, top),
-                    window_rows(log.to_text(), width, top)
-                );
+                // Several pane heights, including one taller than the log, so
+                // the bound is exercised where it bites and where it does not.
+                for height in [0u16, 1, 7, 200] {
+                    assert_eq!(
+                        log.window(width, top, height),
+                        window_rows(log.to_text(), width, top, height),
+                        "top {top}, height {height}"
+                    );
+                }
             }
         };
         check(&log);
@@ -7666,7 +7743,7 @@ mod tests {
             .line_count(width);
         assert!(total >= 70_000, "log has {total} rows");
         let top = total - height;
-        let (text, residual) = window_rows(log.to_text(), width, top);
+        let (text, residual) = window_rows(log.to_text(), width, top, u16::MAX);
         assert!(usize::from(residual) < height, "residual {residual}");
         let last = text.lines.last().map(ToString::to_string);
         assert_eq!(last.as_deref(), Some("row 34999 second half"));
