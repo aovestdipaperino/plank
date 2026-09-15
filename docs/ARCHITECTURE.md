@@ -317,8 +317,11 @@ search), `bash.rs` (sync + async jobs), `web.rs` (`google_search`, `visit_page`)
 Output framing matches the C byte-for-byte. Every tool that writes a path
 resolves it through `ToolContext::resolve_for_write` (`tools/mod.rs`), the
 single write-containment choke point: with the sandbox enabled the target must
-sit under one of `Sandbox::write_roots` (cwd, the temp roots, configured
-`writablePaths`, `~/.plank` once granted) or the tool returns
+sit under one of `Sandbox::write_roots` (cwd, the temp roots, the toolchain
+caches such as `~/.cargo/registry` and `~/.npm/_cacache`, configured
+`writablePaths`, and the `Protected` families — `~/.plank`, and the `PATH`
+directories `~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin` — once granted) or
+the tool returns
 `Tool error: <tool> path escapes workspace: <path>`. The Seatbelt profile is
 built from the same list, so the two cannot drift; reads are deliberately not
 contained. `dispatch` also runs `BashJobs::sweep` first, so a timed-out async

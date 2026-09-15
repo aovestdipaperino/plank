@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The bash sandbox no longer breaks cargo, npm and go.** Package-manager and
+  compiler caches (`~/.cargo/registry`, `~/.cargo/git`, the rustup download
+  dirs, `~/.npm/_cacache`, the Go module cache, `~/.cache`,
+  `~/Library/Caches`) are writable by default: building the project the model
+  was pointed at is part of what it was told to do, and a build that has to
+  fetch a dependency writes there rather than into the project. Previously any
+  such write failed with a bare `Operation not permitted`, which looked like a
+  filesystem problem rather than a sandbox denial — `cargo build` worked only
+  as long as every dependency was already cached.
+- The `[sandbox blocked: ...]` hint pointed at `.plank/sandbox.json` for adding
+  a `writablePaths` entry, but a project-scoped sandbox file may only *tighten*
+  the policy, so following the hint did nothing. It now names
+  `~/.plank/sandbox.json` and says why.
+
+### Changed
+
+- **The `~/.plank` write prompt generalised to protected roots.** Directories on
+  the user's `PATH` — `~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin` — join
+  `~/.plank` as withheld-by-default and granted per command or per session
+  through the same prompt, because a binary installed there is one the user
+  later runs. This is why the cache grant above names `~/.cargo/registry` and
+  `~/.cargo/git` rather than `~/.cargo`, which would carry `bin` with it. So
+  `cargo install --path .` now asks instead of failing, and is recognised as
+  naming `~/.cargo/bin` even though the command never spells the path (unless
+  `--root` redirects it somewhere already writable).
+
 ## [5.1.4] - 2026-09-15
 
 ### Changed

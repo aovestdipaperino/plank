@@ -31,19 +31,217 @@
 //! security boundary — a `*`-glob match against the whole command line skips
 //! the sandbox for that command.
 //!
-//! `~/.plank` is deliberately *not* writable by default: it holds the session
-//! store, the KV cache, hooks and consent markers, so a model-chosen command
-//! that can rewrite it can rewrite plank's own behaviour. It is instead granted
-//! on request — when a sandboxed command names the plank home
-//! ([`mentions_plank_home`]) the bash tool asks the user, and an "always allow"
-//! answer sets [`Sandbox::plank_home_writable`] for the rest of the session
-//! only. Nothing about that grant is written to disk.
+//! Two families of directory get special treatment beyond that.
+//!
+//! **Toolchain caches** are writable by default: `~/.cargo/registry`,
+//! `~/.cargo/git`, the rustup download dirs, `~/.npm/_cacache`, the Go module
+//! cache, `~/.cache` and `~/Library/Caches`. Building the project the model was
+//! pointed at is part of what it was told to do, and a build that has to fetch
+//! a dependency writes there, not into the project. Only caches: the write
+//! costs disk and nothing else.
+//!
+//! **Protected roots** ([`Protected`]) are withheld and granted on request,
+//! because a write there escalates past the project:
+//!
+//! - `~/.plank` holds the session store, the KV cache, hooks and consent
+//!   markers, so a model-chosen command that can rewrite it can rewrite plank's
+//!   own behaviour.
+//! - `~/.cargo/bin`, `~/.local/bin` and `/usr/local/bin` are on the user's
+//!   `PATH`: a binary installed there is one the user later runs. This is why
+//!   the cache grant above names `~/.cargo/registry` and `~/.cargo/git` rather
+//!   than `~/.cargo`, which would carry `bin` with it.
+//!
+//! When a sandboxed command names one of them ([`Protected::mentioned_by`]) the
+//! bash tool asks the user, and an "always allow" answer records it in
+//! [`Sandbox::granted`] for the rest of the session only. Nothing about that
+//! grant is written to disk.
 //!
 //! `sandbox-exec` is deprecated by Apple but remains functional and is what
 //! the reference agents use on macOS.
 
 use crate::tools::mcp::{Json, json_parse};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+/// A directory kept out of the default write roots and granted only on the
+/// user's say-so, because a model-chosen write there reaches past the project.
+///
+/// Each variant is a *family* of directories rather than one path: the prompt,
+/// the mention check and the profile all speak in terms of the family, so a
+/// user answering once about "binaries on your PATH" is not asked again per
+/// directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Protected {
+    /// `~/.plank`: the session store, KV cache, hooks and consent markers.
+    PlankHome,
+    /// `~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin`: directories on the
+    /// user's `PATH`, where an installed binary is one the user later runs.
+    PathBin,
+}
+
+impl Protected {
+    /// Every protected family, in prompt order.
+    pub const ALL: [Self; 2] = [Self::PlankHome, Self::PathBin];
+
+    /// The directories this family covers. `user_home` is `$HOME` and
+    /// `plank_home` the resolved plank home (which is not always under
+    /// `$HOME` — see [`crate::home`]); `None` drops the roots that need it.
+    #[must_use]
+    fn roots(self, user_home: Option<&Path>, plank_home: Option<&Path>) -> Vec<PathBuf> {
+        match self {
+            Self::PlankHome => plank_home.map(PathBuf::from).into_iter().collect(),
+            Self::PathBin => {
+                let mut roots = vec![PathBuf::from("/usr/local/bin")];
+                if let Some(home) = user_home {
+                    roots.push(cargo_home(home).join("bin"));
+                    roots.push(home.join(".local/bin"));
+                }
+                roots
+            }
+        }
+    }
+
+    /// How this family is named in the permission prompt.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PlankHome => "~/.plank",
+            Self::PathBin => {
+                "a directory on your PATH (~/.cargo/bin, ~/.local/bin, /usr/local/bin)"
+            }
+        }
+    }
+
+    /// Why plank withholds it, shown under the prompt.
+    #[must_use]
+    pub fn why(self) -> &'static str {
+        match self {
+            Self::PlankHome => "it holds plank's sessions, hooks and consent markers",
+            Self::PathBin => "a binary installed there is one you later run",
+        }
+    }
+
+    /// True when `cmd` names this family, in any of the spellings a shell
+    /// command plausibly uses.
+    ///
+    /// This reads the command text because Seatbelt profiles are built before
+    /// the command runs, so there is no write to observe yet — which makes it a
+    /// heuristic in both directions: a command that only *reads* the directory
+    /// still prompts, and one that reaches it through a variable or a symlink
+    /// is not caught. It is not the security boundary; the boundary is the
+    /// profile, which withholds the write unless the user grants it.
+    #[must_use]
+    pub fn mentioned_by(self, cmd: &str) -> bool {
+        self.mentioned_by_at(cmd, user_home().as_deref(), plank_home().as_deref())
+    }
+
+    /// The mention check proper, with both homes passed in rather than read
+    /// from the environment, so tests need not mutate what other tests read.
+    fn mentioned_by_at(
+        self,
+        cmd: &str,
+        user_home: Option<&Path>,
+        plank_home: Option<&Path>,
+    ) -> bool {
+        let tildes: &[&str] = match self {
+            Self::PlankHome => &[".plank"],
+            Self::PathBin => &[".cargo/bin", ".local/bin"],
+        };
+        let mut needles: Vec<String> = Vec::new();
+        for t in tildes {
+            for prefix in ["~/", "$HOME/", "${HOME}/"] {
+                needles.push(format!("{prefix}{t}"));
+            }
+            if let Some(home) = user_home {
+                needles.push(home.join(t).to_string_lossy().into_owned());
+            }
+        }
+        if self == Self::PathBin {
+            needles.push("/usr/local/bin".to_string());
+            // `cargo install` with no `--root` lands in `$CARGO_HOME/bin`
+            // without ever naming it; catch the command instead of the path.
+            if cargo_install_without_root(cmd) {
+                return true;
+            }
+        }
+        // The plank home is not always under `$HOME` (the shared-home
+        // fallback), so match the resolved directory too.
+        if self == Self::PlankHome
+            && let Some(h) = plank_home
+        {
+            needles.push(h.to_string_lossy().into_owned());
+        }
+        needles.iter().any(|n| contains_path_prefix(cmd, n))
+    }
+}
+
+/// True when `cmd` runs `cargo install` (or `cargo binstall`) with no `--root`
+/// redirecting the installation, which means it writes `$CARGO_HOME/bin`.
+fn cargo_install_without_root(cmd: &str) -> bool {
+    cmd.split(['|', ';', '\n'])
+        .flat_map(|s| s.split("&&"))
+        .flat_map(|s| s.split("||"))
+        .any(|segment| {
+            let mut words = segment.split_whitespace().peekable();
+            let Some(prog) = words.find(|w| !w.contains('=')) else {
+                return false;
+            };
+            if prog.rsplit('/').next() != Some("cargo") {
+                return false;
+            }
+            let rest: Vec<&str> = words.collect();
+            let installs = rest
+                .iter()
+                .any(|w| *w == "install" || *w == "binstall" || *w == "uninstall");
+            installs
+                && !rest
+                    .iter()
+                    .any(|w| *w == "--root" || w.starts_with("--root="))
+        })
+}
+
+/// `$CARGO_HOME`, or `~/.cargo`.
+fn cargo_home(user_home: &Path) -> PathBuf {
+    env_dir("CARGO_HOME").unwrap_or_else(|| user_home.join(".cargo"))
+}
+
+/// An environment variable read as a non-empty absolute-ish directory path.
+fn env_dir(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// The package-manager and compiler caches a build legitimately writes.
+///
+/// These are granted by default: a `cargo build` that has to fetch a
+/// dependency, an `npm install`, a `go build` — all of them write here and
+/// none of them write anything the user runs by name. `~/.cargo` itself is
+/// deliberately *not* listed; `bin` lives under it and is
+/// [`Protected::PathBin`].
+///
+/// Paths need not exist: a non-existent `(subpath ...)` in the profile is
+/// inert, and listing it unconditionally keeps the root set deterministic.
+fn toolchain_cache_roots(user_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = user_home {
+        let cargo = cargo_home(home);
+        roots.push(cargo.join("registry"));
+        roots.push(cargo.join("git"));
+        let rustup = env_dir("RUSTUP_HOME").unwrap_or_else(|| home.join(".rustup"));
+        roots.push(rustup.join("downloads"));
+        roots.push(rustup.join("tmp"));
+        roots.push(home.join(".npm/_cacache"));
+        roots.push(home.join(".cache"));
+        roots.push(home.join("Library/Caches"));
+        let gopath = env_dir("GOPATH").unwrap_or_else(|| home.join("go"));
+        roots.push(env_dir("GOMODCACHE").unwrap_or_else(|| gopath.join("pkg/mod")));
+        if let Some(gocache) = env_dir("GOCACHE") {
+            roots.push(gocache);
+        }
+    }
+    roots
+}
 
 /// Sandbox policy for model-initiated bash commands.
 #[derive(Debug, Clone)]
@@ -54,10 +252,10 @@ pub struct Sandbox {
     pub writable_paths: Vec<PathBuf>,
     /// `*`-glob patterns for commands that skip the sandbox entirely.
     pub excluded_commands: Vec<String>,
-    /// Session-scoped grant for writes under `~/.plank`, set by an "always
+    /// Session-scoped grants for the [`Protected`] families, set by an "always
     /// allow" answer to the bash tool's prompt. In-memory only: a new session
     /// (or a `/resume` of this one) starts denied again.
-    pub plank_home_writable: bool,
+    pub granted: BTreeSet<Protected>,
 }
 
 impl Default for Sandbox {
@@ -69,7 +267,7 @@ impl Default for Sandbox {
             enabled: cfg!(target_os = "macos"),
             writable_paths: Vec::new(),
             excluded_commands: Vec::new(),
-            plank_home_writable: false,
+            granted: BTreeSet::new(),
         }
     }
 }
@@ -89,33 +287,43 @@ impl Sandbox {
     }
 
     /// Builds the Seatbelt (SBPL) profile: allow everything, deny all file
-    /// writes, then re-allow writes under cwd, temp roots, /dev, and the
-    /// configured extra paths. Later rules win in SBPL, so the allow list
-    /// punches holes in the write denial.
+    /// writes, then re-allow writes under cwd, temp roots, /dev, the toolchain
+    /// caches, and the configured extra paths. Later rules win in SBPL, so the
+    /// allow list punches holes in the write denial.
     ///
-    /// `~/.plank` is included only when [`plank_home_writable`](Self::plank_home_writable)
-    /// is set; see [`profile_allowing_plank_home`](Self::profile_allowing_plank_home)
-    /// for the single-command grant.
+    /// The [`Protected`] families are included only where
+    /// [`granted`](Self::granted) says so; see
+    /// [`profile_granting`](Self::profile_granting) for a single-command grant.
     #[must_use]
     pub fn profile(&self, cwd: &Path) -> String {
-        self.profile_allowing_plank_home(cwd, self.plank_home_writable)
+        self.profile_granting(cwd, &self.granted)
     }
 
-    /// Same as [`profile`](Self::profile) with the `~/.plank` write grant forced
-    /// on or off, for a user who answered "Allow" for one command without
-    /// granting the rest of the session.
+    /// Same as [`profile`](Self::profile) with an explicit grant set, for a user
+    /// who answered "Allow" for one command without granting the rest of the
+    /// session.
     #[must_use]
-    pub fn profile_allowing_plank_home(&self, cwd: &Path, allow_plank_home: bool) -> String {
-        self.profile_with_plank_home(cwd, allow_plank_home.then(plank_home).flatten().as_deref())
+    pub fn profile_granting(&self, cwd: &Path, granted: &BTreeSet<Protected>) -> String {
+        self.profile_at(
+            cwd,
+            user_home().as_deref(),
+            plank_home().as_deref(),
+            granted,
+        )
     }
 
-    /// The profile builder proper, with the plank home passed in rather than read
-    /// from `HOME`, so tests need not mutate the environment other tests read.
-    /// `None` withholds the grant.
-    fn profile_with_plank_home(&self, cwd: &Path, plank_home: Option<&Path>) -> String {
+    /// The profile builder proper, with both homes passed in rather than read
+    /// from the environment, so tests need not mutate what other tests read.
+    fn profile_at(
+        &self,
+        cwd: &Path,
+        user_home: Option<&Path>,
+        plank_home: Option<&Path>,
+        granted: &BTreeSet<Protected>,
+    ) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
         p.push_str("(allow file-write*\n");
-        for real in self.write_roots_with_plank_home(cwd, plank_home) {
+        for real in self.write_roots_at(cwd, user_home, plank_home, granted) {
             p.push_str("  (subpath \"");
             p.push_str(&sbpl_escape(&real.to_string_lossy()));
             p.push_str("\")\n");
@@ -125,23 +333,29 @@ impl Sandbox {
     }
 
     /// The directories a model-initiated write may land in: cwd, the temp
-    /// roots, `/dev`, the configured extra paths, and `~/.plank` once granted.
-    /// Symlinks are resolved where possible, so callers compare against
-    /// canonical paths. This is the one list both the Seatbelt profile and the
-    /// file tools' containment check ([`Sandbox::contains_write_target`]) are
-    /// built from, so the two can never disagree.
+    /// roots, `/dev`, the toolchain caches, the configured extra paths, and
+    /// whichever [`Protected`] families have been granted. Symlinks are
+    /// resolved where possible, so callers compare against canonical paths.
+    /// This is the one list both the Seatbelt profile and the file tools'
+    /// containment check ([`Sandbox::contains_write_target`]) are built from,
+    /// so the two can never disagree.
     #[must_use]
     pub fn write_roots(&self, cwd: &Path) -> Vec<PathBuf> {
-        self.write_roots_with_plank_home(
+        self.write_roots_at(
             cwd,
-            self.plank_home_writable
-                .then(plank_home)
-                .flatten()
-                .as_deref(),
+            user_home().as_deref(),
+            plank_home().as_deref(),
+            &self.granted,
         )
     }
 
-    fn write_roots_with_plank_home(&self, cwd: &Path, plank_home: Option<&Path>) -> Vec<PathBuf> {
+    fn write_roots_at(
+        &self,
+        cwd: &Path,
+        user_home: Option<&Path>,
+        plank_home: Option<&Path>,
+        granted: &BTreeSet<Protected>,
+    ) -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = vec![
             cwd.to_path_buf(),
             PathBuf::from("/tmp"),
@@ -151,10 +365,11 @@ impl Sandbox {
             PathBuf::from("/dev"),
             std::env::temp_dir(),
         ];
+        roots.extend(toolchain_cache_roots(user_home));
         roots.extend(self.writable_paths.iter().cloned());
         roots.extend(worktree_git_roots(cwd));
-        if let Some(home) = plank_home {
-            roots.push(home.to_path_buf());
+        for p in granted {
+            roots.extend(p.roots(user_home, plank_home));
         }
         // Resolve symlinks where possible: Seatbelt matches the real path,
         // and macOS cwds are often under the /tmp -> /private/tmp or
@@ -245,37 +460,26 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// The plank home directory, `$HOME/.plank`, or `None` when `HOME` is unset.
+/// The resolved plank home, or `None` when `HOME` is unset.
 #[must_use]
 pub fn plank_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(crate::home::plank_home_in)
+    crate::home::plank_home_opt()
 }
 
-/// True when `cmd` names the plank home, in any of the spellings a shell command
-/// plausibly uses: `~/.plank`, `$HOME/.plank`, `${HOME}/.plank`, or the expanded
-/// absolute path.
-///
-/// This is the trigger for the write-permission prompt. It reads the command
-/// text because Seatbelt profiles are built before the command runs, so there is
-/// no write to observe yet — which makes it a heuristic in both directions: a
-/// command that only *reads* `~/.plank` still prompts, and one that reaches the
-/// directory through a variable or a symlink is not caught. It is not the
-/// security boundary; the boundary is the profile, which withholds the write
-/// unless the user grants it.
+/// `$HOME`, or `None` when it is unset.
 #[must_use]
-pub fn mentions_plank_home(cmd: &str) -> bool {
-    mentions_plank_home_at(cmd, plank_home().as_deref())
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// The mention check proper, with the plank home passed in rather than read from
-/// `HOME`, so tests need not mutate the environment other tests read.
-fn mentions_plank_home_at(cmd: &str, plank_home: Option<&Path>) -> bool {
-    let mut needles = vec!["~/.plank", "$HOME/.plank", "${HOME}/.plank"];
-    let expanded = plank_home.map(|h| h.to_string_lossy().into_owned());
-    if let Some(e) = expanded.as_deref() {
-        needles.push(e);
-    }
-    needles.iter().any(|n| contains_path_prefix(cmd, n))
+/// The [`Protected`] families `cmd` names and `granted` does not already
+/// cover — the ones the bash tool must ask about before running it.
+#[must_use]
+pub fn protected_mentions(cmd: &str, granted: &BTreeSet<Protected>) -> Vec<Protected> {
+    Protected::ALL
+        .into_iter()
+        .filter(|p| !granted.contains(p) && p.mentioned_by(cmd))
+        .collect()
 }
 
 /// True when `cmd` is provably read-only: every simple command in the line
@@ -601,7 +805,7 @@ mod tests {
             enabled: true,
             writable_paths: Vec::new(),
             excluded_commands: vec!["git push*".to_string()],
-            plank_home_writable: false,
+            granted: BTreeSet::new(),
         };
         assert!(sb.should_sandbox("cargo build"));
         assert!(!sb.should_sandbox("git push origin main"));
@@ -614,7 +818,7 @@ mod tests {
             enabled: true,
             writable_paths: vec![PathBuf::from("/odd\"name")],
             excluded_commands: Vec::new(),
-            plank_home_writable: false,
+            granted: BTreeSet::new(),
         };
         let p = sb.profile(Path::new("/nonexistent/work dir"));
         assert!(p.starts_with("(version 1)\n(allow default)\n(deny file-write*)\n"));
@@ -623,46 +827,108 @@ mod tests {
         assert!(p.contains("(subpath \"/dev\")"));
     }
 
-    /// A plank home that cannot exist, so `canonicalize` is a no-op and the
-    /// profile carries the literal path.
+    /// Homes that cannot exist, so `canonicalize` is a no-op and the profile
+    /// carries the literal paths.
+    const FAKE_HOME: &str = "/nonexistent/home";
     const FAKE_PLANK_HOME: &str = "/nonexistent/home/.plank";
 
-    #[test]
-    fn plank_home_is_not_writable_until_granted() {
-        let mut sb = Sandbox {
+    fn test_sandbox() -> Sandbox {
+        Sandbox {
             enabled: true,
             writable_paths: Vec::new(),
             excluded_commands: Vec::new(),
-            plank_home_writable: false,
-        };
-        let cwd = Path::new("/nonexistent/work");
-        let home = Path::new(FAKE_PLANK_HOME);
-        let subpath = format!("(subpath \"{FAKE_PLANK_HOME}\")");
+            granted: BTreeSet::new(),
+        }
+    }
+
+    fn profile_for(sb: &Sandbox, granted: &[Protected]) -> String {
+        sb.profile_at(
+            Path::new("/nonexistent/work"),
+            Some(Path::new(FAKE_HOME)),
+            Some(Path::new(FAKE_PLANK_HOME)),
+            &granted.iter().copied().collect(),
+        )
+    }
+
+    #[test]
+    fn protected_roots_are_not_writable_until_granted() {
+        let mut sb = test_sandbox();
+        let plank = format!("(subpath \"{FAKE_PLANK_HOME}\")");
+        let cargo_bin = format!("(subpath \"{FAKE_HOME}/.cargo/bin\")");
 
         // Denied (and the default): no grant reaches the profile at all.
-        assert!(!sb.profile_with_plank_home(cwd, None).contains(".plank"));
-        // A one-command "Allow" punches the hole for that command only...
+        let none = profile_for(&sb, &[]);
+        assert!(!none.contains(&plank));
+        assert!(!none.contains(&cargo_bin));
+        assert!(!none.contains("(subpath \"/usr/local/bin\")"));
+
+        // A one-command "Allow" punches the hole for that family only...
+        let one = profile_for(&sb, &[Protected::PlankHome]);
+        assert!(one.contains(&plank));
         assert!(
-            sb.profile_with_plank_home(cwd, Some(home))
-                .contains(&subpath)
+            !one.contains(&cargo_bin),
+            "granting one family grants no other"
         );
         // ...without recording anything on the session.
-        assert!(!sb.plank_home_writable);
+        assert!(sb.granted.is_empty());
 
-        // "Always allow" sets the session flag, which is what `profile` reads.
-        sb.plank_home_writable = true;
-        assert!(sb.plank_home_writable);
-        assert!(
-            sb.profile_allowing_plank_home(cwd, false)
-                .contains("(allow file-write*"),
-            "an explicit false still builds a valid profile"
-        );
+        let bins = profile_for(&sb, &[Protected::PathBin]);
+        assert!(bins.contains(&cargo_bin));
+        assert!(bins.contains(&format!("(subpath \"{FAKE_HOME}/.local/bin\")")));
+        assert!(bins.contains("(subpath \"/usr/local/bin\")"));
+        assert!(!bins.contains(&plank));
+
+        // "Always allow" records the family, which is what `profile` reads.
+        sb.granted.insert(Protected::PlankHome);
+        assert!(profile_for(&sb, &sb.granted.iter().copied().collect::<Vec<_>>()).contains(&plank));
+    }
+
+    /// The bug this whole split exists for: a build that has to fetch a crate
+    /// writes `~/.cargo/registry`, which must be allowed, while
+    /// `cargo install` writes `~/.cargo/bin`, which must not — so the grant
+    /// cannot simply name `~/.cargo`.
+    #[test]
+    fn toolchain_caches_are_writable_but_path_bins_are_not() {
+        let sb = test_sandbox();
+        let p = profile_for(&sb, &[]);
+        for cache in [
+            ".cargo/registry",
+            ".cargo/git",
+            ".rustup/downloads",
+            ".rustup/tmp",
+            ".npm/_cacache",
+            ".cache",
+            "Library/Caches",
+            "go/pkg/mod",
+        ] {
+            assert!(
+                p.contains(&format!("(subpath \"{FAKE_HOME}/{cache}\")")),
+                "{cache} should be writable by default"
+            );
+        }
+        // Never the whole of ~/.cargo, which would carry bin with it.
+        assert!(!p.contains(&format!("(subpath \"{FAKE_HOME}/.cargo\")")));
+        assert!(!p.contains(&format!("(subpath \"{FAKE_HOME}/.cargo/bin\")")));
+
+        // And the containment check the file tools use agrees with the profile.
+        let cwd = Path::new("/nonexistent/work");
+        let granted = BTreeSet::new();
+        let roots = sb.write_roots_at(cwd, Some(Path::new(FAKE_HOME)), None, &granted);
+        let under = |p: &str| roots.iter().any(|r| Path::new(p).starts_with(r));
+        assert!(under("/nonexistent/home/.cargo/registry/cache/x"));
+        assert!(!under("/nonexistent/home/.cargo/bin/plank-replay"));
+        assert!(!under("/nonexistent/home/.cargo/config.toml"));
     }
 
     #[test]
     fn plank_home_mentions_match_whole_path_components() {
-        let home = Path::new(FAKE_PLANK_HOME);
-        let m = |cmd: &str| mentions_plank_home_at(cmd, Some(home));
+        let m = |cmd: &str| {
+            Protected::PlankHome.mentioned_by_at(
+                cmd,
+                Some(Path::new(FAKE_HOME)),
+                Some(Path::new(FAKE_PLANK_HOME)),
+            )
+        };
         assert!(m("cat ~/.plank/sandbox.json"));
         assert!(m("rm -rf $HOME/.plank"));
         assert!(m("ls ${HOME}/.plank/kvcache"));
@@ -676,12 +942,58 @@ mod tests {
         // Unrelated commands, including the project-local .plank directory.
         assert!(!m("cargo build"));
         assert!(!m("cat ./.plank/sandbox.json"));
-        // The tilde spellings are recognised even with no HOME to expand.
-        assert!(mentions_plank_home_at("cat ~/.plank/x", None));
-        assert!(!mentions_plank_home_at(
+        // The tilde spellings are recognised even with no homes to expand.
+        assert!(Protected::PlankHome.mentioned_by_at("cat ~/.plank/x", None, None));
+        assert!(!Protected::PlankHome.mentioned_by_at(
             "touch /nonexistent/home/.plank/x",
+            None,
             None
         ));
+    }
+
+    #[test]
+    fn path_bin_mentions_include_cargo_install() {
+        let m = |cmd: &str| {
+            Protected::PathBin.mentioned_by_at(
+                cmd,
+                Some(Path::new(FAKE_HOME)),
+                Some(Path::new(FAKE_PLANK_HOME)),
+            )
+        };
+        // Named outright, in every spelling.
+        assert!(m("cp x ~/.cargo/bin/"));
+        assert!(m("install -m755 x $HOME/.local/bin/x"));
+        assert!(m("mv x /usr/local/bin/x"));
+        assert!(m("touch /nonexistent/home/.cargo/bin/x"));
+        // Named by implication: `cargo install` with no --root writes
+        // $CARGO_HOME/bin without the command ever spelling the path.
+        assert!(m("cargo install --path ."));
+        assert!(m("cd sub && cargo install --locked ripgrep"));
+        // ...but not when redirected somewhere writable.
+        assert!(!m("cargo install --path . --root /tmp/plank-install"));
+        assert!(!m("cargo install --path . --root=/tmp/plank-install"));
+        // Ordinary builds are not install.
+        assert!(!m("cargo build --release"));
+        assert!(!m("cargo test --lib"));
+        assert!(!m("cat ~/.cargo/config.toml"));
+        assert!(!m("ls ~/.cargo/registry"));
+    }
+
+    /// The prompt loop asks about exactly the families a command names, and
+    /// stops asking about one already granted for the session.
+    #[test]
+    fn protected_mentions_skips_granted_families() {
+        let mut granted = BTreeSet::new();
+        assert_eq!(protected_mentions("cargo build", &granted), Vec::new());
+        assert_eq!(
+            protected_mentions("cargo install --path .", &granted),
+            vec![Protected::PathBin]
+        );
+        granted.insert(Protected::PathBin);
+        assert_eq!(
+            protected_mentions("cargo install --path .", &granted),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -728,7 +1040,7 @@ mod tests {
             enabled: true,
             writable_paths: vec![PathBuf::from("/nonexistent/extra")],
             excluded_commands: Vec::new(),
-            plank_home_writable: false,
+            granted: BTreeSet::new(),
         };
         let cwd = Path::new("/nonexistent/work");
         // Inside cwd, including a not-yet-existing file and nested dirs.
@@ -747,7 +1059,7 @@ mod tests {
         if let Some(home) = plank_home() {
             assert!(!sb.contains_write_target(cwd, &home.join("settings.json")));
             let granted = Sandbox {
-                plank_home_writable: true,
+                granted: [Protected::PlankHome].into_iter().collect(),
                 ..sb.clone()
             };
             assert!(granted.contains_write_target(cwd, &home.join("settings.json")));
@@ -784,7 +1096,7 @@ mod tests {
             enabled: true,
             writable_paths: Vec::new(),
             excluded_commands: Vec::new(),
-            plank_home_writable: false,
+            granted: BTreeSet::new(),
         };
         // Every relaxing key from a project file is ignored.
         apply_config(
@@ -803,7 +1115,7 @@ mod tests {
             enabled: false,
             writable_paths: Vec::new(),
             excluded_commands: Vec::new(),
-            plank_home_writable: false,
+            granted: BTreeSet::new(),
         };
         apply_config(&mut off, r#"{"enabled": true}"#, ConfigSource::Project);
         assert!(off.enabled);

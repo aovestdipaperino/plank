@@ -2795,3 +2795,53 @@ itself needs testing, split the body so the resolved path is a parameter
 (`append_entry`, `write_marker`) and let the public function stay the
 one-line `$HOME` wrapper. A red run in any `$HOME`-touching module is worth a
 `grep -rn 'set_var("HOME"' src/` before it is blamed on the diff.
+
+## The bash sandbox's write roots have to model the toolchain, not just the project
+
+A `cargo install --path .` inside a sandboxed plank fails with
+
+```
+error: failed to open: /Users/enzo/.cargo/.crates.toml
+Caused by: Operation not permitted (os error 1)
+```
+
+and the failure is easy to misread as a filesystem problem: the file is owned
+by the user, mode `0644`, with no `uchg` flag, on a writable volume. The tell
+is the errno. Seatbelt denies with **EPERM** (`Operation not permitted`,
+errno 1); an ordinary permission problem is **EACCES** (`Permission denied`,
+errno 13). A writable, owner-owned directory denied with EPERM for both an
+existing file and a new one is a sandbox profile, every time.
+
+The narrow reading — "`cargo install` is blocked" — is the wrong lesson. The
+same denial covers `~/.cargo/registry`, so `cargo build` worked only as long as
+every dependency happened to be cached already; the first `cargo add` of an
+uncached crate failed identically, as would `npm install` and `go build`. A
+sandbox whose write roots are cwd plus temp does not describe how build tools
+actually work: they write a machine-wide cache outside the project by design.
+
+The split the fix settled on is **cache versus `PATH`**, not "inside versus
+outside the project":
+
+- Caches are granted by default. A write there costs disk and nothing else.
+- Directories on the user's `PATH` (`~/.cargo/bin`, `~/.local/bin`,
+  `/usr/local/bin`) are withheld and granted on request, because a binary
+  installed there is one the user later runs.
+
+That distinction is why the cache grant names `~/.cargo/registry` and
+`~/.cargo/git` rather than `~/.cargo` — the parent carries `bin` with it, and
+granting it would hand the model the user's `PATH` while looking like a build
+fix. `~/.cargo/config.toml` stays denied for the same reason: it can redirect
+the registry or inject a linker flag.
+
+One detection wrinkle: the profile is built *before* the command runs, so the
+prompt reads the command text, and `cargo install` with no `--root` writes
+`$CARGO_HOME/bin` without ever spelling the path. The mention check therefore
+recognises the command shape, not just the path — and `--root /tmp/...`, which
+redirects the install somewhere already writable, is excluded so it does not
+prompt for nothing.
+
+Finally, the `[sandbox blocked: …]` hint had been telling the model to add the
+path to `writablePaths` in `.plank/sandbox.json` — but a *project*-scoped
+sandbox file may only tighten the policy (a cloned checkout must not be able to
+widen it), so `writablePaths` there is dropped silently. Following the hint did
+nothing at all. Only `~/.plank/sandbox.json` can widen the sandbox.

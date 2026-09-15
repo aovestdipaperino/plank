@@ -9,6 +9,7 @@
 //! head-biased so headers and early errors are visible; later observations
 //! are tail-biased.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::os::unix::process::CommandExt as _;
@@ -18,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::dsml::ToolCall;
+use crate::sandbox::Protected;
 
 use super::{ToolContext, parse_int_default, parse_timeout};
 
@@ -396,7 +398,8 @@ impl BashJob {
                 "[sandbox blocked: this command ran under plank's write sandbox \
                  (writes allowed only under the working directory and temp dirs). \
                  If the failure is a legitimate write elsewhere, ask the user to add \
-                 the path to writablePaths in .plank/sandbox.json.]"
+                 the path to writablePaths in ~/.plank/sandbox.json — the project's \
+                 own .plank/sandbox.json cannot widen the sandbox.]"
             );
         }
         if self.running {
@@ -728,10 +731,10 @@ pub fn render_notification(observations: &[String]) -> Option<String> {
     Some(out)
 }
 
-/// How far a user's answer to the `~/.plank` write prompt reaches.
+/// How far a user's answer to a protected-root write prompt reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlankHomeGrant {
-    /// "Allow": this command only; the session flag stays clear.
+enum WriteGrant {
+    /// "Allow": this command only; the session grant set stays untouched.
     Once,
     /// "Always allow": every sandboxed command for the rest of the session.
     Session,
@@ -739,33 +742,37 @@ enum PlankHomeGrant {
     Denied,
 }
 
-/// Asks whether a sandboxed command may write under `~/.plank`.
+/// Asks whether a sandboxed command may write under one [`Protected`] family.
 ///
 /// Routed through the [`Asker`](crate::tools::ask::Asker) each front end
 /// installs, so the TUI renders it in the input region and the plain REPL reads
 /// stdin — the same path the `ask` tool and the web approval gate use. In
-/// `--ui console` mode there is no asker and hence no one to grant: the
-/// answer is [`PlankHomeGrant::Denied`], leaving `~/.plank` read-only as it is
-/// by default.
-fn plank_home_grant(ctx: &mut ToolContext) -> PlankHomeGrant {
+/// `--ui console` mode there is no asker and hence no one to grant: the answer
+/// is [`WriteGrant::Denied`], leaving the directory read-only as it is by
+/// default.
+fn protected_grant(ctx: &mut ToolContext, what: Protected) -> WriteGrant {
     let Some(asker) = ctx.asker.as_mut() else {
-        return PlankHomeGrant::Denied;
+        return WriteGrant::Denied;
     };
+    let label = what.label();
     let req = crate::tools::ask::AskRequest {
-        question: "This command names ~/.plank. Allow it to write there?".to_string(),
+        question: format!(
+            "This command wants to write {label}, which plank keeps read-only because {}. Allow it?",
+            what.why()
+        ),
         header: "Sandbox".to_string(),
         options: vec![
             crate::tools::ask::AskOption {
                 label: "Allow".to_string(),
-                description: "Allow writes under ~/.plank for this command only".to_string(),
+                description: format!("Allow writes to {label} for this command only"),
             },
             crate::tools::ask::AskOption {
                 label: "Always allow".to_string(),
-                description: "Allow writes under ~/.plank for the rest of this session".to_string(),
+                description: format!("Allow writes to {label} for the rest of this session"),
             },
             crate::tools::ask::AskOption {
                 label: "Deny".to_string(),
-                description: "Run the command with ~/.plank read-only".to_string(),
+                description: format!("Run the command with {label} read-only"),
             },
         ],
         multi: false,
@@ -775,12 +782,12 @@ fn plank_home_grant(ctx: &mut ToolContext) -> PlankHomeGrant {
         crate::tools::ask::AskOutcome::Answered(labels)
             if labels.iter().any(|l| l == "Always allow") =>
         {
-            PlankHomeGrant::Session
+            WriteGrant::Session
         }
         crate::tools::ask::AskOutcome::Answered(labels) if labels.iter().any(|l| l == "Allow") => {
-            PlankHomeGrant::Once
+            WriteGrant::Once
         }
-        _ => PlankHomeGrant::Denied,
+        _ => WriteGrant::Denied,
     }
 }
 
@@ -798,28 +805,33 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
         3600,
     ))
     .unwrap_or(60);
-    // `~/.plank` is read-only under the sandbox unless the user says otherwise.
-    // Ask only when the command actually names it and is not provably
-    // read-only, so ordinary commands and `cat ~/.plank/...` never see a
-    // prompt, and only while the session grant is still unset.
-    let mut grant_once = false;
-    if ctx.sandbox.should_sandbox(cmd)
-        && !ctx.sandbox.plank_home_writable
-        && crate::sandbox::mentions_plank_home(cmd)
-        && !crate::sandbox::is_read_only_command(cmd)
-    {
-        match plank_home_grant(ctx) {
-            PlankHomeGrant::Session => ctx.sandbox.plank_home_writable = true,
-            PlankHomeGrant::Once => grant_once = true,
-            PlankHomeGrant::Denied => {
-                ctx.publish_status("~/.plank stays read-only for this command");
+    // The protected roots are read-only under the sandbox unless the user says
+    // otherwise. Ask only about the families the command actually names, and
+    // only when it is not provably read-only, so ordinary commands and
+    // `cat ~/.plank/...` never see a prompt.
+    let mut once: BTreeSet<Protected> = BTreeSet::new();
+    if ctx.sandbox.should_sandbox(cmd) && !crate::sandbox::is_read_only_command(cmd) {
+        for what in crate::sandbox::protected_mentions(cmd, &ctx.sandbox.granted) {
+            match protected_grant(ctx, what) {
+                WriteGrant::Session => {
+                    ctx.sandbox.granted.insert(what);
+                }
+                WriteGrant::Once => {
+                    once.insert(what);
+                }
+                WriteGrant::Denied => {
+                    ctx.publish_status(&format!(
+                        "{} stays read-only for this command",
+                        what.label()
+                    ));
+                }
             }
         }
     }
     // A one-command grant rides on a throwaway copy of the policy, leaving the
-    // session's own `plank_home_writable` clear.
-    let once_policy = grant_once.then(|| crate::sandbox::Sandbox {
-        plank_home_writable: true,
+    // session's own grant set clear.
+    let once_policy = (!once.is_empty()).then(|| crate::sandbox::Sandbox {
+        granted: ctx.sandbox.granted.union(&once).copied().collect(),
         ..ctx.sandbox.clone()
     });
     let sandbox = ctx
@@ -1238,6 +1250,35 @@ mod tests {
             "missing violation hint: {blocked}"
         );
         assert!(!outside.join("escape.txt").exists());
+
+        // A toolchain cache under the same $HOME is writable without any
+        // grant: this is the `cargo build fetches a crate` path, and the one
+        // the escape check above must not have closed off.
+        let cache = std::path::Path::new(&home).join(".cache/plank-sandbox-test");
+        std::fs::create_dir_all(&cache).unwrap();
+        let cmd_cache = format!("echo cached > '{}/probe.txt'", cache.display());
+        let cached = tool_bash(&mut ctx, &test_call("bash", &[("command", &cmd_cache)]));
+        assert!(
+            cached.contains("exit_status=0\n"),
+            "toolchain cache write should be allowed: {cached}"
+        );
+        std::fs::remove_dir_all(&cache).ok();
+
+        // ...while a PATH directory under the same $HOME stays denied, since
+        // no asker is installed in this test to grant it.
+        let bin = std::path::Path::new(&home).join(".cargo/bin");
+        if bin.is_dir() {
+            let cmd_bin = format!(
+                "echo nope > '{}/plank-sandbox-test-{}'",
+                bin.display(),
+                std::process::id()
+            );
+            let denied = tool_bash(&mut ctx, &test_call("bash", &[("command", &cmd_bin)]));
+            assert!(
+                !denied.contains("exit_status=0\n"),
+                "PATH bin write should be denied without a grant: {denied}"
+            );
+        }
 
         // Excluded commands bypass the sandbox entirely.
         ctx.sandbox.excluded_commands.push("echo *".to_string());
