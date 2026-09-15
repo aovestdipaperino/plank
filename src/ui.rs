@@ -17969,6 +17969,7 @@ pub fn run_non_interactive(
         agent.session.push(Message::user(prompt));
         let r = agent.run_turn();
         agent.save_headless_session(cfg.save_session);
+        headless_quit_repro(&mut agent);
         agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
         crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
         return r;
@@ -18009,9 +18010,23 @@ pub fn run_non_interactive(
         agent.run_turn()?;
     }
     agent.save_headless_session(cfg.save_session);
+    headless_quit_repro(&mut agent);
     agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
     crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
     Ok(())
+}
+
+/// The headless mirror of the TUI and plain-REPL quit dump (CLAUDE.md: a
+/// change to one front end needs the same change in the others): under
+/// `--debug`, the finished session lands in `~/.plank/repro` without anyone
+/// having to remember `/repro`, which headless has no way to type anyway.
+///
+/// The line goes to stderr, not stdout: a script consuming a headless run
+/// reads the model's output there and must not find a diagnostics line in it.
+fn headless_quit_repro(agent: &mut Agent<'_>) {
+    if let Some(line) = agent.quit_repro_line() {
+        eprintln!("{line}");
+    }
 }
 
 /// Reads one stdin batch: bytes accumulated until a 200 ms quiet window.
@@ -20053,6 +20068,37 @@ mod tests {
         assert!(!section.contains("/resolve/"), "no download URL: {section}");
         let _ = std::fs::remove_file(&path);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The headless front end has no `/repro` to type, so the `--debug` dump
+    /// at the end of the run is the only way its session reaches disk.
+    #[test]
+    fn a_headless_run_under_debug_saves_a_repro_at_the_end() {
+        let _console = crate::debugmirror::test_support::lock();
+        let dir = scratch_dir("headless-quit-repro");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+
+        let before = headless_debug_dumps();
+        crate::debugmirror::set_enabled(false);
+        headless_quit_repro(&mut agent);
+        assert_eq!(headless_debug_dumps(), before, "debug off writes nothing");
+
+        crate::debugmirror::set_enabled(true);
+        headless_quit_repro(&mut agent);
+        assert!(
+            headless_debug_dumps() > before,
+            "debug on writes a repro-debug dump"
+        );
+    }
+
+    fn headless_debug_dumps() -> usize {
+        std::fs::read_dir(test_repro_dir()).map_or(0, |d| {
+            d.filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("repro-debug-"))
+                .count()
+        })
     }
 
     #[test]

@@ -13,7 +13,9 @@
 //! named `repro-<unix-seconds>[-<n>].md`. When the repetition guard stops a
 //! looping pass the agent writes one automatically as
 //! `repro-loop-<unix-seconds>[-<n>].md`, so a stall is captured without
-//! anyone having to notice it. Nothing here touches the live session — it is
+//! anyone having to notice it. Every front end — TUI, plain REPL and the
+//! headless protocol — writes one the same way on the way out under `--debug`
+//! (`repro-debug-<unix-seconds>[-<n>].md`). Nothing here touches the live session — it is
 //! a read-only snapshot.
 //!
 //! Sub-agent sidechains are folded out of the transcript the moment they end,
