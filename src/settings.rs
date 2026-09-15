@@ -37,7 +37,8 @@
 //!   "ask":    { "maxOptions": 7 },
 //!   "agents": { "autoRoute": true, "maxParallel": 4 },
 //!   "git":    { "signCommits": true },
-//!   "context": { "microcompact": true }
+//!   "context": { "microcompact": true },
+//!   "memory": { "autoExtract": true, "extractEveryNTurns": 1 }
 //! }
 //! ```
 //!
@@ -61,7 +62,7 @@
 //! - `safety.sandbox`, `safety.btwSuspend` — copied into `AgentConfig` once at
 //!   startup.
 //! - `tools.recall`, `tools.fanout`, `tools.runCode`, `tools.bashNotify`,
-//!   `git.signCommits` — these
+//!   `tools.remember`, `git.signCommits` — these
 //!   feed the system prompt text, which is built once per session and then
 //!   KV-cached (see `docs/KV-CACHE.md`); applying a change live would silently
 //!   invalidate a cache the model's prefill is relying on to be exactly what it
@@ -368,6 +369,12 @@ pub struct ToolsSettings {
     /// heuristic, and a long read-only investigation is a legitimate turn, so
     /// this rung is opt-in even when the other loop guards are on.
     pub no_progress_guard: bool,
+    /// Whether the `remember` tool is offered to the model. Advertising it
+    /// changes the system prompt and churns the `fp1` fingerprint once, the
+    /// same price `recall` already paid. Its writes land on disk and take
+    /// effect at the next session start, so no Tier 2 checkpoint is
+    /// invalidated mid-session.
+    pub remember: bool,
 }
 
 impl Default for ToolsSettings {
@@ -383,6 +390,7 @@ impl Default for ToolsSettings {
             run_code: true,
             bash_notify: false,
             no_progress_guard: false,
+            remember: true,
         }
     }
 }
@@ -417,6 +425,8 @@ pub struct Settings {
     pub git: GitSettings,
     /// Tool-dispatch tuning: loop guards and call deadlines.
     pub tools: ToolsSettings,
+    /// How persistent memory maintains itself.
+    pub memory: MemorySettings,
     /// Values set for plugin-declared `config` options, keyed
     /// `<component-id>.<option>`.
     ///
@@ -462,6 +472,32 @@ pub struct ContextSettings {
 impl Default for ContextSettings {
     fn default() -> Self {
         Self { microcompact: true }
+    }
+}
+
+/// `memory` block: how persistent memory maintains itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySettings {
+    /// Whether the background extraction sidechain runs at all. On by
+    /// default. Off leaves the `remember` tool and `/remember` working —
+    /// only the passive pass stops, and rendering falls back to plain
+    /// budgeted display with counters that nothing ever bumps.
+    pub auto_extract: bool,
+    /// Run the pass every N eligible turns. An eligible turn is one that
+    /// ended with no tool calls and in which the model did not itself call
+    /// `remember`. `1` means every eligible turn.
+    pub extract_every_n_turns: u32,
+    /// Per-type character budgets for the rendered memory section.
+    pub budgets: crate::memory::Budgets,
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            auto_extract: true,
+            extract_every_n_turns: 1,
+            budgets: crate::memory::Budgets::default(),
+        }
     }
 }
 
@@ -755,6 +791,10 @@ impl Settings {
             self.tools.bash_notify = v;
             self.note("tools.bashNotify", origin);
         }
+        if let Some(v) = boolean(tools, "remember") {
+            self.tools.remember = v;
+            self.note("tools.remember", origin);
+        }
 
         self.overlay_agents_and_worktree(&root, origin);
     }
@@ -811,6 +851,27 @@ impl Settings {
         if let Some(v) = boolean(root.get("context"), "microcompact") {
             self.context.microcompact = v;
             self.note("context.microcompact", origin);
+        }
+
+        if let Some(v) = boolean(root.get("memory"), "autoExtract") {
+            self.memory.auto_extract = v;
+            self.note("memory.autoExtract", origin);
+        }
+        if let Some(v) = num::<u32>(root.get("memory"), "extractEveryNTurns") {
+            self.memory.extract_every_n_turns = v.max(1);
+            self.note("memory.extractEveryNTurns", origin);
+        }
+        if let Some(b) = root.get("memory").and_then(|m| m.get("budgets")) {
+            let set = |key: &str, field: &mut usize| {
+                if let Some(v) = num::<usize>(Some(b), key) {
+                    *field = v;
+                }
+            };
+            set("user", &mut self.memory.budgets.user);
+            set("feedback", &mut self.memory.budgets.feedback);
+            set("project", &mut self.memory.budgets.project);
+            set("reference", &mut self.memory.budgets.reference);
+            self.note("memory.budgets", origin);
         }
 
         if let Some(v) = boolean(root.get("git"), "signCommits") {
@@ -1251,6 +1312,15 @@ impl Settings {
             Json::Bool(self.context.microcompact),
         );
         {
+            let m = section(&mut root, "memory");
+            upsert(m, "autoExtract", Json::Bool(self.memory.auto_extract));
+            upsert(
+                m,
+                "extractEveryNTurns",
+                unum(u64::from(self.memory.extract_every_n_turns)),
+            );
+        }
+        {
             let t = section(&mut root, "tools");
             upsert(t, "repeatAdvisory", Json::Bool(self.tools.repeat_advisory));
             upsert(t, "loopGuards", Json::Bool(self.tools.loop_guards));
@@ -1270,6 +1340,7 @@ impl Settings {
             upsert(t, "fanout", Json::Bool(self.tools.fanout));
             upsert(t, "runCode", Json::Bool(self.tools.run_code));
             upsert(t, "bashNotify", Json::Bool(self.tools.bash_notify));
+            upsert(t, "remember", Json::Bool(self.tools.remember));
         }
 
         let mut out = String::new();
@@ -2195,6 +2266,25 @@ mod tests {
         let mut s2 = Settings::default();
         s2.overlay(r#"{"engine":{"thinkingToolCalls":"nope"}}"#);
         assert!(!s2.engine.thinking_tool_calls);
+    }
+
+    #[test]
+    fn memory_settings_default_on_and_round_trip() {
+        use crate::configform::set_from_path;
+
+        let s = Settings::default();
+        assert!(s.memory.auto_extract);
+        assert_eq!(s.memory.extract_every_n_turns, 1);
+        assert!(s.tools.remember);
+        assert_eq!(s.memory.budgets, crate::memory::Budgets::default());
+
+        let mut s = Settings::default();
+        set_from_path(&mut s, "memory.autoExtract", "false").unwrap();
+        set_from_path(&mut s, "memory.extractEveryNTurns", "4").unwrap();
+        set_from_path(&mut s, "tools.remember", "false").unwrap();
+        assert!(!s.memory.auto_extract);
+        assert_eq!(s.memory.extract_every_n_turns, 4);
+        assert!(!s.tools.remember);
     }
 
     #[test]

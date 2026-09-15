@@ -57,7 +57,10 @@ pub enum FieldId {
     ToolsFanout,
     ToolsRunCode,
     ToolsBashNotify,
+    ToolsRemember,
     ContextMicrocompact,
+    MemoryAutoExtract,
+    MemoryExtractEveryNTurns,
 }
 
 /// The editing shape of a field, which decides how a key press mutates it.
@@ -352,11 +355,32 @@ pub static FIELDS: &[Field] = &[
         Kind::Bool,
     ),
     f(
+        FieldId::ToolsRemember,
+        "tools",
+        "remember",
+        "offer the remember tool to the model",
+        Kind::Bool,
+    ),
+    f(
         FieldId::ContextMicrocompact,
         "context",
         "microcompact",
         "clear old tool-result bodies to reclaim context",
         Kind::Bool,
+    ),
+    f(
+        FieldId::MemoryAutoExtract,
+        "memory",
+        "autoExtract",
+        "run the background memory-extraction pass",
+        Kind::Bool,
+    ),
+    f(
+        FieldId::MemoryExtractEveryNTurns,
+        "memory",
+        "extractEveryNTurns",
+        "run the extraction pass every N eligible turns",
+        Kind::Count,
     ),
 ];
 
@@ -436,7 +460,10 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::ToolsFanout => s.tools.fanout.to_string(),
         FieldId::ToolsRunCode => s.tools.run_code.to_string(),
         FieldId::ToolsBashNotify => s.tools.bash_notify.to_string(),
+        FieldId::ToolsRemember => s.tools.remember.to_string(),
         FieldId::ContextMicrocompact => s.context.microcompact.to_string(),
+        FieldId::MemoryAutoExtract => s.memory.auto_extract.to_string(),
+        FieldId::MemoryExtractEveryNTurns => s.memory.extract_every_n_turns.to_string(),
     }
 }
 
@@ -474,6 +501,7 @@ fn toggle(s: &mut Settings, id: FieldId) {
         FieldId::UiEasterEggs => s.ui.easter_eggs = !s.ui.easter_eggs,
         FieldId::UiBuiltinEditor => s.ui.builtin_editor = !s.ui.builtin_editor,
         FieldId::ContextMicrocompact => s.context.microcompact = !s.context.microcompact,
+        FieldId::MemoryAutoExtract => s.memory.auto_extract = !s.memory.auto_extract,
         FieldId::SafetySandbox => s.safety.sandbox = cycle_tri(s.safety.sandbox),
         FieldId::SafetyBtwSuspend => s.safety.btw_suspend = cycle_tri(s.safety.btw_suspend),
         // `UiScreensaverFace` lands here deliberately: its cycle spans the
@@ -499,6 +527,7 @@ fn cycle_tri(v: Option<bool>) -> Option<bool> {
 /// # Errors
 /// Returns `Err` when the field expects a number and `raw` is not one (or is
 /// zero/negative where the field requires a positive value).
+#[allow(clippy::too_many_lines)] // flat flag-dispatch match; splitting hurts readability.
 pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String> {
     let raw = raw.trim();
     let empty = raw.is_empty();
@@ -557,6 +586,9 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         FieldId::ToolsSpillPreviewBytes => {
             s.tools.spill_preview_bytes = usize::try_from(parse_pos(1)?).unwrap_or(usize::MAX);
         }
+        FieldId::MemoryExtractEveryNTurns => {
+            s.memory.extract_every_n_turns = parse_extract_every_n_turns(raw)?;
+        }
         // Bool/Tri fields accept an explicit textual value from the REPL path.
         // Accepts always/unfocused/never, plus the legacy true/false.
         FieldId::UiNotifications => s.ui.notifications = parse_notify_mode(raw)?,
@@ -600,7 +632,9 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::ToolsFanout
         | FieldId::ToolsRunCode
         | FieldId::ToolsBashNotify
-        | FieldId::ContextMicrocompact => {
+        | FieldId::ToolsRemember
+        | FieldId::ContextMicrocompact
+        | FieldId::MemoryAutoExtract => {
             let b = parse_bool(raw)?;
             set_bool(s, id, b);
         }
@@ -616,6 +650,15 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
 fn parse_notify_mode(raw: &str) -> Result<crate::notify::NotifyMode, String> {
     crate::notify::NotifyMode::parse(raw)
         .ok_or_else(|| format!("notifications must be always, unfocused, or never (got {raw})"))
+}
+
+/// Parses `raw` as `memory.extractEveryNTurns`, clamped to a minimum of 1.
+/// Pulled out of `set_value` to keep that function's line count under
+/// clippy's `too_many_lines` threshold.
+fn parse_extract_every_n_turns(raw: &str) -> Result<u32, String> {
+    raw.parse::<u32>()
+        .map_err(|_| format!("not a number: {raw}"))
+        .map(|v| v.max(1))
 }
 
 fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
@@ -637,7 +680,9 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::ToolsFanout => s.tools.fanout = b,
         FieldId::ToolsRunCode => s.tools.run_code = b,
         FieldId::ToolsBashNotify => s.tools.bash_notify = b,
+        FieldId::ToolsRemember => s.tools.remember = b,
         FieldId::ContextMicrocompact => s.context.microcompact = b,
+        FieldId::MemoryAutoExtract => s.memory.auto_extract = b,
         _ => {}
     }
 }
@@ -1637,7 +1682,8 @@ mod tests {
         assert_eq!(
             headers,
             [
-                "engine", "ui", "safety", "mcp", "ask", "agents", "git", "tools", "context"
+                "engine", "ui", "safety", "mcp", "ask", "agents", "git", "tools", "context",
+                "memory"
             ]
         );
         assert_eq!(rows.iter().filter(|r| !r.header).count(), FIELDS.len());

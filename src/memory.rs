@@ -186,8 +186,7 @@ fn load_scope(scope: Scope, cwd: &Path) -> Option<String> {
         return None;
     }
     let meta = MetaStore::load(&meta_path_for(&path));
-    // TODO(task 4): read from `crate::settings::active().memory.budgets`.
-    let budgets = Budgets::default();
+    let budgets = crate::settings::active().memory.budgets;
     let (kept, dropped) = select_for_render(&entries, &meta, &budgets);
     if kept.is_empty() {
         return None;
