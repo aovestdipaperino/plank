@@ -692,4 +692,17 @@ mod tests {
         let parsed = parse_entries(&e.render());
         assert_eq!(parsed, vec![e]);
     }
+
+    #[test]
+    fn an_unrecognised_bracket_stays_in_the_entry_text() {
+        // A bracket that is not one of the four kinds is the user's own
+        // prose, not a failed tag: stripping `[WIP]` would silently delete
+        // something they typed. So it is kept verbatim, and the entry reads
+        // as untagged. Deliberate, and pinned here because the asymmetry
+        // with a genuinely untagged line looks like an oversight otherwise.
+        let entries = parse_entries("- (2026-01-01) [WIP] ship it\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, Kind::Project);
+        assert_eq!(entries[0].text, "[WIP] ship it");
+    }
 }
