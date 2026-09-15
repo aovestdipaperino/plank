@@ -10,8 +10,33 @@ it.
 
 ## In the betas
 
-Riding ahead of stable 5.1.0 in the 5.1.2 beta. Install with `brew install
+Riding ahead of stable 5.1.0 in the 5.1.5 beta. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
+
+### 5.1.5
+
+**`cargo`, `npm` and `go` work under the sandbox again.** A build that had to
+fetch a dependency was denied with a bare `Operation not permitted`, because
+the sandbox let a model-chosen command write the project and temp dirs and
+nothing else — while every package manager writes a machine-wide cache outside
+the project by design. Those caches are writable now. Directories on your
+`PATH` are not: `~/.cargo/bin`, `~/.local/bin` and `/usr/local/bin` are
+withheld and granted on request, the same prompt `~/.plank` has always used,
+because a binary installed there is one you later run. So `cargo install` asks
+instead of failing, and `cargo build` no longer depends on every crate
+happening to be cached already.
+
+**`/init` is not a loop.** Its phases re-read and re-survey the same tree by
+design — the interview, the survey and the write all revisit it — which is
+exactly the pattern the loop guards refuse, so a setup run the user asked for
+could be blocked mid-phase for following its own prompt. `/init` now runs with
+the guards suspended for the duration of that turn, and only that turn; a
+`/loopguard` you typed yourself still wins.
+
+**A headless `-p` run says how long it took.** `plank -p ...` closes with
+`total time: 8.4s` on stderr. Stdout is untouched, so anything piping the reply
+sees exactly what it saw before, and `--ui chart`'s chart and `--ui quiet`'s
+single line of notes stay as they are.
 
 ### 5.1.2
 

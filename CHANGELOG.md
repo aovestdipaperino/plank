@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.1.5] - 2026-09-15
+
 ### Added
 
 - **A headless `-p` run says how long it took.** `plank -p ...` under `--ui
