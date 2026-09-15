@@ -21,10 +21,6 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-/// Byte cap per memory file when injecting into context; oversized files are
-/// tail-truncated (newest entries are appended, so the tail wins).
-const MEMORY_INJECT_MAX_BYTES: usize = 16 * 1024;
-
 /// Template written when a memory file is first created.
 const TEMPLATE: &str = "\
 # Memory
@@ -85,21 +81,137 @@ pub fn remember(scope: Scope, cwd: &Path, text: &str, date: &str) -> Result<Path
     Ok(path)
 }
 
-/// Reads one scope's memory file, tail-truncated to the injection cap.
+/// Per-type character budgets for the rendered memory section. These replace
+/// the single file-level cap: a runaway `project` block can no longer
+/// silently evict the `user` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budgets {
+    /// Budget for `[user]` entries.
+    pub user: usize,
+    /// Budget for `[feedback]` entries.
+    pub feedback: usize,
+    /// Budget for `[project]` entries.
+    pub project: usize,
+    /// Budget for `[reference]` entries.
+    pub reference: usize,
+}
+
+impl Default for Budgets {
+    fn default() -> Self {
+        Self {
+            user: 4096,
+            feedback: 4096,
+            project: 6144,
+            reference: 2048,
+        }
+    }
+}
+
+impl Budgets {
+    /// The budget for one kind.
+    #[must_use]
+    pub fn for_kind(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::User => self.user,
+            Kind::Feedback => self.feedback,
+            Kind::Project => self.project,
+            Kind::Reference => self.reference,
+        }
+    }
+}
+
+/// Chooses which entries render, per type, under the budgets.
+///
+/// Retracted entries are filtered out first and are never reported as
+/// dropped — retraction is a model decision, not budget pressure, and the
+/// bytes survive until a reconciliation pass removes the line.
+///
+/// Within a type, entries are ranked pinned-first, then by descending `uses`,
+/// then by most recent `last_used`. Age is the last tiebreak rather than the
+/// only rule, which inverts the old tail truncation: the oldest facts about a
+/// user are usually the most durable ones.
+///
+/// Returns `(kept in file order, dropped)`.
+#[must_use]
+pub fn select_for_render(
+    entries: &[Entry],
+    meta: &MetaStore,
+    budgets: &Budgets,
+) -> (Vec<Entry>, Vec<Entry>) {
+    let mut kept_ids: Vec<String> = Vec::new();
+    let mut dropped: Vec<Entry> = Vec::new();
+
+    for kind in Kind::ALL {
+        let mut block: Vec<&Entry> = entries
+            .iter()
+            .filter(|e| e.kind == kind && !meta.get(&e.id()).retracted)
+            .collect();
+        block.sort_by(|a, b| {
+            let (ma, mb) = (meta.get(&a.id()), meta.get(&b.id()));
+            mb.pinned
+                .cmp(&ma.pinned)
+                .then(mb.uses.cmp(&ma.uses))
+                .then(mb.last_used.cmp(&ma.last_used))
+        });
+        let budget = budgets.for_kind(kind);
+        let mut used = 0usize;
+        for e in block {
+            let cost = e.render().len();
+            if used + cost <= budget {
+                used += cost;
+                kept_ids.push(e.id());
+            } else {
+                dropped.push(e.clone());
+            }
+        }
+    }
+
+    let kept = entries
+        .iter()
+        .filter(|e| kept_ids.iter().any(|id| id == &e.id()))
+        .cloned()
+        .collect();
+    (kept, dropped)
+}
+
+/// Reads one scope's memory file and selects what renders under the budgets.
 fn load_scope(scope: Scope, cwd: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path_for(scope, cwd)?).ok()?;
-    let text = text.trim();
-    if text.is_empty() {
+    let path = path_for(scope, cwd)?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    if text.trim().is_empty() {
         return None;
     }
-    if text.len() <= MEMORY_INJECT_MAX_BYTES {
-        return Some(text.to_string());
+    let entries = parse_entries(&text);
+    if entries.is_empty() {
+        return None;
     }
-    // Keep the newest tail, starting at a line boundary.
-    let cut = crate::session::ceil_char_boundary(text, text.len() - MEMORY_INJECT_MAX_BYTES);
-    let tail = &text[cut..];
-    let tail = tail.find('\n').map_or(tail, |nl| &tail[nl + 1..]);
-    Some(format!("(older entries truncated)\n{tail}"))
+    let meta = MetaStore::load(&meta_path_for(&path));
+    // TODO(task 4): read from `crate::settings::active().memory.budgets`.
+    let budgets = Budgets::default();
+    let (kept, dropped) = select_for_render(&entries, &meta, &budgets);
+    if kept.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for kind in Kind::ALL {
+        let block: Vec<&Entry> = kept.iter().filter(|e| e.kind == kind).collect();
+        if block.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "### {}", kind.tag());
+        for e in block {
+            out.push_str(&e.render());
+        }
+        out.push('\n');
+    }
+    if !dropped.is_empty() {
+        let _ = writeln!(
+            out,
+            "({} older entries omitted under the type budgets; /memory shows the full file)",
+            dropped.len()
+        );
+    }
+    Some(out.trim_end().to_string())
 }
 
 /// Renders the session-start memory section: user scope first, then project.
@@ -329,10 +441,7 @@ impl MetaStore {
                 match value.get(k) {
                     Some(crate::tools::mcp::Json::Num(n)) => {
                         if *n >= 0.0 && *n <= f64::from(u32::MAX) {
-                            #[allow(
-                                clippy::cast_possible_truncation,
-                                clippy::cast_sign_loss
-                            )]
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             {
                                 *n as u32
                             }
@@ -633,6 +742,57 @@ pub fn apply(sources: &[Source], edited: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
 
+    fn entry(text: &str, kind: Kind) -> Entry {
+        Entry {
+            date: "2026-09-15".into(),
+            kind,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn eviction_prefers_pinned_then_most_used_then_most_recent() {
+        let entries = vec![
+            entry("aaaa", Kind::Project),
+            entry("bbbb", Kind::Project),
+            entry("cccc", Kind::Project),
+        ];
+        let mut meta = MetaStore::default();
+        meta.set_pinned(&entries[0].id(), true); // pinned, never used
+        meta.bump(&entries[1].id(), "2026-09-15"); // used once
+        // entries[2] unused and unpinned — the first to go.
+
+        let budgets = Budgets {
+            project: 2 * entries[0].render().len(),
+            ..Budgets::default()
+        };
+        let (kept, dropped) = select_for_render(&entries, &meta, &budgets);
+        let kept: Vec<_> = kept.iter().map(|e| e.text.clone()).collect();
+        assert_eq!(kept, vec!["aaaa".to_string(), "bbbb".to_string()]);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].text, "cccc");
+    }
+
+    #[test]
+    fn a_retracted_entry_is_not_rendered_but_is_not_dropped_data() {
+        let entries = vec![entry("gone", Kind::User), entry("stays", Kind::User)];
+        let mut meta = MetaStore::default();
+        meta.set_retracted(&entries[0].id(), true);
+        let (kept, dropped) = select_for_render(&entries, &meta, &Budgets::default());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, "stays");
+        assert!(dropped.is_empty(), "retraction is not a budget eviction");
+    }
+
+    #[test]
+    fn a_block_within_budget_keeps_every_entry_in_file_order() {
+        let entries = vec![entry("one", Kind::Feedback), entry("two", Kind::Feedback)];
+        let (kept, dropped) =
+            select_for_render(&entries, &MetaStore::default(), &Budgets::default());
+        assert_eq!(kept, entries);
+        assert!(dropped.is_empty());
+    }
+
     fn two_sources(dir: &Path) -> Vec<Source> {
         vec![
             Source {
@@ -751,47 +911,25 @@ mod tests {
         std::fs::remove_dir_all(&cwd).ok();
     }
 
+    /// `load_scope` now evicts per type under `Budgets::default()` instead of
+    /// tail-truncating the raw file; a runaway `[project]` block reports the
+    /// omission rather than silently swallowing the whole file.
     #[test]
-    fn oversized_memory_is_tail_truncated() {
+    fn oversized_scope_is_evicted_by_budget_not_tail_truncated() {
         let cwd = scratch("trunc");
         let path = path_for(Scope::Project, &cwd).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut big = String::new();
+        let mut big = String::from("# Memory\n");
         for i in 0..2000 {
-            let _ = writeln!(big, "- entry number {i} with some padding text");
+            let _ = writeln!(
+                big,
+                "- (2026-07-19) [project] entry number {i} with padding"
+            );
         }
         std::fs::write(&path, &big).unwrap();
         let out = load_scope(Scope::Project, &cwd).unwrap();
-        assert!(out.len() <= MEMORY_INJECT_MAX_BYTES + 64);
-        assert!(out.starts_with("(older entries truncated)\n- "));
-        assert!(out.contains("entry number 1999"));
-        assert!(!out.contains("entry number 0 "));
-        std::fs::remove_dir_all(&cwd).ok();
-    }
-
-    /// The tail cut lands on a byte offset; when that byte is inside a
-    /// multibyte character the slice must snap forward rather than panic.
-    #[test]
-    fn oversized_multibyte_memory_is_truncated_on_a_char_boundary() {
-        let cwd = scratch("trunc-multibyte");
-        let path = path_for(Scope::Project, &cwd).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // One long line of em dashes (3 bytes each) so every offset that is not
-        // a multiple of three falls inside a character, with no newline to
-        // rescue the slice.
-        let mut big = String::new();
-        for _ in 0..(MEMORY_INJECT_MAX_BYTES / 3 + 500) {
-            big.push('\u{2014}');
-        }
-        // Make `len - MAX` land mid-character: the cap is 1 mod 3, so two
-        // trailing ASCII bytes put the cut one byte into an em dash.
-        big.push_str("xy");
-        assert_eq!((big.len() - MEMORY_INJECT_MAX_BYTES) % 3, 1);
-        std::fs::write(&path, &big).unwrap();
-        let out = load_scope(Scope::Project, &cwd).unwrap();
-        assert!(out.starts_with("(older entries truncated)\n"));
-        assert!(out.ends_with("xy"));
-        assert!(out.len() <= MEMORY_INJECT_MAX_BYTES + 64);
+        assert!(out.contains("### project"));
+        assert!(out.contains("older entries omitted under the type budgets"));
         std::fs::remove_dir_all(&cwd).ok();
     }
 
