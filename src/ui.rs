@@ -18233,14 +18233,22 @@ const QUIET_START: &str = "Started working... ";
 /// See [`QUIET_PROMPTING`].
 const QUIET_DONE: &str = "done.\n";
 
-/// Watches for the start of generation during a `--ui quiet` turn and writes
-/// [`QUIET_START`] when it arrives.
+/// Watches for the start of generation during a `--ui quiet` turn, writes
+/// [`QUIET_START`] when it arrives, and then ticks a running time in place
+/// until the turn ends.
 ///
 /// "Generation has started" is read off the first prefill sample: prefill is
 /// what precedes the first token and `toks` records its rate at the moment the
 /// pass completes, so that sample is the handover. A turn that finishes before
 /// either ring sees anything still gets the note on drop, so the line always
 /// has the same three parts.
+///
+/// The clock runs only on a terminal ([`InlineClock`] repaints with
+/// backspaces, which belong on a screen and not in a captured file), and it
+/// counts from the turn's start rather than from the handover — what the user
+/// is timing is the wait, not the generation. The last reading is left on the
+/// line, so a finished run reads
+/// `Prompting. Started working... 12.4s done.`
 struct QuietLive {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -18253,9 +18261,14 @@ impl QuietLive {
 
     fn start(fd: std::os::fd::RawFd) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A redirected stdout has nothing to backspace over: it gets the three
+        // notes and no clock, so a captured run stays one clean line.
+        // SAFETY: `isatty` only inspects the descriptor.
+        let tty = unsafe { libc::isatty(fd) } == 1;
         let handle = {
             let stop = std::sync::Arc::clone(&stop);
             std::thread::spawn(move || {
+                let started = std::time::Instant::now();
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     if !crate::toks::prefill_snapshot().is_empty()
                         || !crate::toks::snapshot().is_empty()
@@ -18265,6 +18278,22 @@ impl QuietLive {
                     std::thread::sleep(Self::TICK);
                 }
                 write_fd(fd, QUIET_START);
+                if !tty {
+                    return;
+                }
+                let mut clock = InlineClock::default();
+                loop {
+                    if let Some(bytes) = clock.update(&fmt_secs(started.elapsed().as_secs_f64())) {
+                        write_fd(fd, &bytes);
+                    }
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Self::TICK);
+                }
+                // The line continues with `done.`, which needs the gap the
+                // clock has been occupying.
+                write_fd(fd, " ");
             })
         };
         Self {
@@ -18345,15 +18374,25 @@ impl ChartLive {
     }
 
     /// One frame: the report once there is anything to chart, else the note.
+    ///
+    /// Both carry the running time. The pre-sample note always did — a blank
+    /// screen during a long prefill reads as a hang — and the chart needs it
+    /// for the same reason once the note goes away: throughput says how fast
+    /// the model is going, never how long you have been waiting.
     fn frame(color: bool, started: std::time::Instant, tick: usize) -> String {
         if crate::toks::snapshot().is_empty() && crate::toks::prefill_snapshot().is_empty() {
             let spin = Self::SPINNER[tick % Self::SPINNER.len()];
             return format!(
-                "{spin} prefilling... {:.1}s\n",
-                started.elapsed().as_secs_f64()
+                "{spin} prefilling... {}\n",
+                fmt_secs(started.elapsed().as_secs_f64())
             );
         }
-        toks_report(color)
+        let mut out = toks_report(color);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&elapsed_footer(started.elapsed(), color));
+        out
     }
 }
 
@@ -18363,6 +18402,61 @@ impl Drop for ChartLive {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// The chart's running-time footer, dim when the descriptor takes colour.
+///
+/// Its own line under the panels rather than a cell inside them: the panels are
+/// a fixed-width grid built by [`crate::toks::render_report`], which `/toks`
+/// renders too, and a wall clock means nothing in a report printed after the
+/// fact.
+fn elapsed_footer(d: std::time::Duration, color: bool) -> String {
+    let (dim, reset) = if color {
+        ("\x1b[38;5;238m", ANSI_RESET)
+    } else {
+        ("", "")
+    };
+    format!("{dim}elapsed{reset} {}\n", fmt_secs(d.as_secs_f64()))
+}
+
+/// A clock that rewrites itself in place at the end of a line already written.
+///
+/// `--ui quiet` puts its whole run on one line, so the running time cannot have
+/// a line of its own and cannot be repainted with a carriage return either —
+/// that would take `Prompting. Started working... ` with it. Backspaces erase
+/// exactly what this wrote and nothing before it.
+///
+/// Emits nothing while the rendered text is unchanged, so a 50 ms poll costs
+/// one write every tenth of a second rather than twenty.
+#[derive(Debug, Default)]
+struct InlineClock {
+    shown: String,
+}
+
+impl InlineClock {
+    /// The bytes that turn what is on screen into `next`, or `None` when it is
+    /// already there. The erase is backspace-space-backspace per character, so
+    /// a shorter reading (`59.9s` → `1:00`) leaves nothing of the longer one
+    /// behind.
+    fn update(&mut self, next: &str) -> Option<String> {
+        if next == self.shown {
+            return None;
+        }
+        let mut out = String::new();
+        let n = self.shown.chars().count();
+        for _ in 0..n {
+            out.push('\u{8}');
+        }
+        for _ in 0..n {
+            out.push(' ');
+        }
+        for _ in 0..n {
+            out.push('\u{8}');
+        }
+        out.push_str(next);
+        self.shown = next.to_string();
+        Some(out)
     }
 }
 
@@ -26343,6 +26437,49 @@ mod tests {
             "a local engine is marked as such: {alt_label}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `--ui quiet` clock shares one line with the notes around it, so it
+    /// may only ever erase what it wrote itself — and it must erase all of it,
+    /// including when a reading gets *shorter* crossing the minute.
+    #[test]
+    fn the_inline_clock_erases_exactly_what_it_wrote() {
+        let mut clock = InlineClock::default();
+        // First reading: nothing to erase yet.
+        assert_eq!(clock.update("1.2s").as_deref(), Some("1.2s"));
+        // Unchanged: no write at all, so a 50 ms poll is not 20 writes a second.
+        assert_eq!(clock.update("1.2s"), None);
+        // Same width: four characters back, blanked, back again.
+        assert_eq!(
+            clock.update("1.3s").as_deref(),
+            Some("\u{8}\u{8}\u{8}\u{8}    \u{8}\u{8}\u{8}\u{8}1.3s")
+        );
+        // Shorter reading: the erase is sized to what is on screen (5), not to
+        // what replaces it (4), or the tail of `59.9s` would survive.
+        assert_eq!(
+            clock.update("59.9s").as_deref(),
+            Some("\u{8}\u{8}\u{8}\u{8}    \u{8}\u{8}\u{8}\u{8}59.9s")
+        );
+        let shrink = clock.update("1:00").expect("a changed reading writes");
+        assert_eq!(shrink.chars().filter(|c| *c == '\u{8}').count(), 10);
+        assert!(shrink.ends_with("1:00"));
+    }
+
+    /// The chart's footer, which is the only thing in `--ui chart` that says
+    /// how long the run has been going once the prefill note is gone.
+    #[test]
+    fn the_chart_elapsed_footer_is_one_dim_line() {
+        let plain = elapsed_footer(std::time::Duration::from_millis(8_412), false);
+        assert_eq!(plain, "elapsed 8.4s\n");
+        let colored = elapsed_footer(std::time::Duration::from_secs(90), true);
+        assert!(colored.contains("1:30"), "{colored:?}");
+        assert!(colored.starts_with("\x1b[38;5;238melapsed"), "{colored:?}");
+        assert!(colored.ends_with('\n'));
+        assert_eq!(
+            colored.lines().count(),
+            1,
+            "the painter sizes its erase off the frame's line count"
+        );
     }
 
     /// The headless `-p` closing line: seconds keep a decimal because a

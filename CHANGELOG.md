@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`--ui chart` and `--ui quiet` show a live running time.** The chart gains a
+  dim `elapsed 12.4s` footer under the panels, updated with every repaint:
+  throughput says how fast the model is going, never how long you have been
+  waiting, and the pre-sample "prefilling" note was the only thing that ever
+  answered that. Quiet's clock ticks in place at the end of its single line and
+  leaves its last reading there, so a finished run reads `Prompting. Started
+  working... 12.4s done.` It repaints with backspaces and so runs only on a
+  terminal; a redirected run captures the same clean line it always did.
+
 ## [5.1.5] - 2026-09-15
 
 ### Added

@@ -744,6 +744,18 @@ atomic (`interrupt.rs`) directly.
 The TUI uses the alternate screen, so block-based terminals (Warp) render it as
 a proper full-screen app rather than reflowing it.
 
+`--ui chart` and `--ui quiet` also show the time *while* the turn runs, each
+in the one place its mode leaves free. The chart gets a dim `elapsed 12.4s`
+footer under the panels (`ui::elapsed_footer`) — its own line, because the
+panels are the fixed grid `toks::render_report` also draws for `/toks`, where a
+wall clock printed after the fact would mean nothing. Quiet has no line to
+spare, so its clock rewrites itself in place at the end of the one line the
+mode prints (`ui::InlineClock`, backspaces rather than a carriage return, which
+would take `Prompting. Started working... ` with it), leaving its last reading
+where it stops: `Prompting. Started working... 12.4s done.`. Both clocks run
+from the turn's start, and quiet's runs only on a TTY — a redirected run keeps
+the three notes and no backspaces.
+
 A headless run given `-p` is a one-shot: it runs the single turn and exits,
 closing with `total time: <elapsed>` on **stderr** (`ui::total_time_line`),
 measured from the agent being built — so the model load and the warm are in it
