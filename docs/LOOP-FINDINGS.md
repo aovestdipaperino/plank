@@ -53,6 +53,14 @@ The guards, for orientation:
   behind `tools.noProgressGuard` (`guard::no_progress_guard_enabled`), which
   is ANDed with `tools.loopGuards`: the budget measures output volume, and a
   long read-only investigation is a legitimate turn it stops anyway.
+- **Scoped suspension** — `settings::suspend_loop_guards()`: an RAII scope that
+  silences every rung above for as long as it is held, used by `/init` (both
+  front-end paths) and nothing else. It is a scope rather than a flag so the
+  restore survives a failed turn — leaving the guards down after `/init` errored
+  would disarm the protection for the rest of the session with nothing on screen
+  saying so — and it loses to an explicit `/loopguard` either way, since a user
+  who typed one said something about this session that a canned prompt does not
+  get to overrule.
 - **Sub-agent trip cap** — `SUBAGENT_REPEAT_TRIP_CAP = 2`: a sidechain stopped
   twice running is pushed to its report; a third loop fails it.
 
@@ -86,6 +94,7 @@ argument for the design.
 | 2026-09-10 | `1a09915` | `NumberedCycle` inside `DraftScan`: numbered reasoning lines hashed with the leading ordinal stripped, a bounded 256-item history independent of the byte window, reported as a cycle through `RepeatGuard::feed` at `REPEAT_CYCLES` copies; a cycle must carry three distinct substantial bodies and 256 bytes | `repro-1789068543`: a 26-item cycle, over 7 KiB per copy, that no byte rung could match — see "A cycle that renumbers itself is not byte-exact", below |
 | 2026-09-11 | `4dde15d` | a repro shutter (camera glyph) at the end of the footer's dir prefix, writing the same `/repro` dump and clipboard copy the typed command produces | hand-saved dumps were the only record of a loop no rung fired on, and typing `/repro` mid-stall is the thing a user does last |
 | 2026-09-11 | `13b75cc` | `DRAFT_PAUSE_TEXT`: a draft stop is worded as a pause and mirrored to the debug console instead of printed as a red `guard:` line on the front ends; `DRAFT_ERROR` reworded around delivery rather than accusation | the draft rung is the one stop that loses nothing — see "A draft stop is a pause, not news", below |
+| 2026-09-15 | *(this change)* | `settings::suspend_loop_guards()`, a scope that silences every rung for the duration of a turn plank drives from a canned multi-phase prompt; `/init` is the only caller. Layered *below* the `/loopguard` session override and *above* the persisted `tools.loopGuards`, so a user who said something explicit still outranks a canned prompt | the `/init` phases re-read and re-survey by design — the interview, the `task` survey and the write all revisit the same tree — which is precisely the shape `LoopGuard::observe` refuses; a turn the user asked for was being blocked mid-phase for following its own prompt |
 | 2026-09-14 | *(this change)* | the no-progress budget moved behind its own `tools.noProgressGuard`, default **off**, ANDed with `tools.loopGuards` in `guard::no_progress_guard_enabled` | the byte budget is a volume heuristic, and read-only investigation turns are legitimate; opting in keeps the other rungs on by default |
 | 2026-09-08 | *(this change)* | `tools.loopGuards` and `/loopguard` (alias `/lg`): one switch over every rung — `LoopGuard::observe`/`tripped`, the gated `RepeatGuard` (cycles and think budget), the no-progress budget. Read through `guard::guards_enabled()` at each check, never captured at turn start, so the switch lands on a generation already streaming; `🔁` in the footer while armed, and the tripped marker moved to `♻ looping` | diagnosing the guards themselves, where every rung fires before the behaviour under study can be observed |
 

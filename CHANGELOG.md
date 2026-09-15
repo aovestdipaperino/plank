@@ -24,6 +24,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`/init` runs with the loop guards suspended.** Its phases re-read and
+  re-survey the same tree by design — the interview, the `task` survey and the
+  write all revisit it — which is exactly the shape the tool-call guard refuses,
+  so a turn the user asked for was being blocked mid-phase for following its own
+  prompt. The suspension is a scope (`settings::suspend_loop_guards`), so the
+  guards come back even when the turn fails, and it loses to an explicit
+  `/loopguard`: a user who typed one said something about this session that a
+  canned prompt does not get to overrule. No other command suspends them.
 - **The `~/.plank` write prompt generalised to protected roots.** Directories on
   the user's `PATH` — `~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin` — join
   `~/.plank` as withheld-by-default and granted per command or per session

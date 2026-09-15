@@ -1421,14 +1421,90 @@ pub fn set_loop_guards_override(value: Option<bool>) {
     LOOP_GUARDS_OVERRIDE.store(raw, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether the loop guards are armed *right now*: the session override if
-/// one is set, else the persisted `tools.loopGuards`.
+/// Whether a scoped suspension of the loop guards is in force; see
+/// [`suspend_loop_guards`].
+#[cfg(not(test))]
+static LOOP_GUARDS_SUSPENDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Thread-scoped in tests for the same reason as `LOOP_GUARDS_OVERRIDE`.
+#[cfg(test)]
+thread_local! {
+    static LOOP_GUARDS_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[must_use]
+fn loop_guards_suspended() -> bool {
+    #[cfg(test)]
+    {
+        LOOP_GUARDS_SUSPENDED.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        LOOP_GUARDS_SUSPENDED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn set_loop_guards_suspended(value: bool) {
+    #[cfg(test)]
+    LOOP_GUARDS_SUSPENDED.with(|c| c.set(value));
+    #[cfg(not(test))]
+    LOOP_GUARDS_SUSPENDED.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Silences the loop guards until the returned value is dropped.
+///
+/// For a turn plank drives from a canned multi-phase prompt rather than from
+/// something the user typed — `/init` is the one today. Those phases repeat
+/// tool calls *by design*: the survey re-reads the tree the interview asked
+/// about, and the guards read that as the loop they exist to stop, so a turn
+/// the user asked for is refused mid-phase for doing exactly what its prompt
+/// told it to.
+///
+/// A scope rather than a flag, because the restore has to survive the early
+/// return on a failed turn: leaving the guards down after `/init` errored
+/// would disarm the protection for the rest of the session with nothing on
+/// screen saying so. Re-entrant: the previous value is restored, not `false`.
+///
+/// This is deliberately *below* the `/loopguard` session override in
+/// [`loop_guards_effective`]. A user who typed `/loopguard on` said something
+/// about this session that a canned prompt does not get to overrule, and one
+/// who typed `/loopguard off` is already where the suspension would put them.
+#[must_use = "the guards are re-armed when this value is dropped"]
+pub fn suspend_loop_guards() -> LoopGuardsSuspended {
+    let previous = loop_guards_suspended();
+    set_loop_guards_suspended(true);
+    LoopGuardsSuspended { previous }
+}
+
+/// The scope handle returned by [`suspend_loop_guards`]; re-arms the guards on
+/// drop.
+#[derive(Debug)]
+pub struct LoopGuardsSuspended {
+    previous: bool,
+}
+
+impl Drop for LoopGuardsSuspended {
+    fn drop(&mut self) {
+        set_loop_guards_suspended(self.previous);
+    }
+}
+
+/// Whether the loop guards are armed *right now*: the `/loopguard` session
+/// override if one is set, else off inside a [`suspend_loop_guards`] scope,
+/// else the persisted `tools.loopGuards`.
 ///
 /// [`crate::guard::guards_enabled`] is the sole reader of this; every guard
 /// check goes through it rather than reading `tools.loop_guards` directly.
 #[must_use]
 pub fn loop_guards_effective() -> bool {
-    loop_guards_override().unwrap_or_else(|| active().tools.loop_guards)
+    if let Some(explicit) = loop_guards_override() {
+        return explicit;
+    }
+    if loop_guards_suspended() {
+        return false;
+    }
+    active().tools.loop_guards
 }
 
 /// Sets (or with `None` clears) the session override, then reconciles the
@@ -2355,5 +2431,56 @@ mod tests {
         s.overlay(r#"{"kvcache":{"maxBytes":"soon"}}"#);
         assert!(!s.provenance.contains_key("kvcache.maxBytes"));
         assert_eq!(s.kvcache.max_bytes, 21_474_836_480);
+    }
+}
+
+#[cfg(test)]
+mod loop_guard_suspension_tests {
+    use super::*;
+
+    /// The suspension layers *under* the `/loopguard` override and *over* the
+    /// persisted setting, and — the part that matters when a turn fails — it
+    /// lifts on drop rather than on a matching call someone has to remember.
+    #[test]
+    fn suspension_is_scoped_and_loses_to_an_explicit_override() {
+        set_loop_guards_override(None);
+        assert!(loop_guards_effective(), "default is armed");
+
+        {
+            let _scope = suspend_loop_guards();
+            assert!(!loop_guards_effective(), "suspended inside the scope");
+
+            // A user who said something explicit outranks a canned prompt, in
+            // both directions.
+            set_loop_guards_override(Some(true));
+            assert!(loop_guards_effective(), "/loopguard on wins over a scope");
+            set_loop_guards_override(Some(false));
+            assert!(!loop_guards_effective());
+            set_loop_guards_override(None);
+
+            // Re-entrant: an inner scope restores the outer one, not "armed".
+            {
+                let _inner = suspend_loop_guards();
+                assert!(!loop_guards_effective());
+            }
+            assert!(!loop_guards_effective(), "inner drop kept the outer scope");
+        }
+        assert!(loop_guards_effective(), "re-armed on drop");
+    }
+
+    /// Dropping the scope on the error path is the whole reason it is a scope:
+    /// a turn that fails must not leave the protection off for the session.
+    #[test]
+    fn suspension_lifts_even_when_the_scope_body_fails() {
+        fn turn_that_fails() -> Result<(), &'static str> {
+            let _scope = suspend_loop_guards();
+            assert!(!loop_guards_effective());
+            Err("the turn failed")?;
+            unreachable!("the early return above is the point of the test")
+        }
+
+        set_loop_guards_override(None);
+        assert!(turn_that_fails().is_err());
+        assert!(loop_guards_effective(), "re-armed despite the early return");
     }
 }

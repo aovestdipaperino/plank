@@ -5988,7 +5988,11 @@ impl Agent<'_> {
 
         self.session.push(Message::user(Self::INIT_PROMPT));
         self.quiet_tools = true;
+        // The phases re-read and re-survey by design; the guards read that as
+        // a loop. Dropped at the end of the turn, error or not.
+        let guards = crate::settings::suspend_loop_guards();
         let result = self.run_turn();
+        drop(guards);
         self.quiet_tools = false;
         if let Err(e) = result {
             println!("/init failed: {e}");
@@ -6039,7 +6043,10 @@ impl Agent<'_> {
 
         self.session.push(Message::user(Self::INIT_PROMPT));
         self.quiet_tools = true;
+        // See `run_init`: the init phases are not the loop the guards hunt.
+        let guards = crate::settings::suspend_loop_guards();
         let result = self.tui_turn(terminal, log, view, input, btw, arcade, sub);
+        drop(guards);
         self.quiet_tools = false;
         if let Err(e) = result {
             log.push_plain(format!("/init failed: {e}"));
@@ -19890,6 +19897,10 @@ mod tests {
         /// `generate`, so a test can assert the pass marked itself while it was
         /// actually generating rather than merely before or after.
         saw_local_pass: Option<std::sync::Arc<AtomicBool>>,
+        /// Records `guard::guards_enabled()` as observed from *inside*
+        /// `generate`, so a test can assert a scoped suspension was in force
+        /// while the turn ran rather than merely set and cleared around it.
+        saw_loop_guards: Option<std::sync::Arc<std::sync::Mutex<Vec<bool>>>>,
         /// Records every `set_think_mode` call, so a test can assert the level
         /// change reached the engine (where it drops cached tokens and KV).
         think_modes: Option<std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>>>,
@@ -19978,6 +19989,9 @@ mod tests {
             }
             if let Some(seen) = &self.saw_local_pass {
                 seen.store(crate::status::local_pass_active(), Ordering::Relaxed);
+            }
+            if let Some(seen) = &self.saw_loop_guards {
+                seen.lock().unwrap().push(crate::guard::guards_enabled());
             }
             if let Some(msg) = &self.fail_with {
                 return Err(EngineError::new(msg.clone()));
@@ -21495,6 +21509,42 @@ mod tests {
     /// is the thing that puts the new `AGENTS.md` in front of the model, which
     /// is why the fresh transcript is checked for it here. A `/init` the user
     /// typed has a conversation behind it and must keep it.
+    /// `/init` drives a canned multi-phase prompt whose phases re-read and
+    /// re-survey by design, which is exactly the shape the loop guards refuse.
+    /// The suspension has to be observable from *inside* the turn — a flag set
+    /// and cleared around one would pass a before/after check while doing
+    /// nothing — and it has to lift again afterwards.
+    #[test]
+    fn init_runs_with_the_loop_guards_suspended_and_re_arms_after() {
+        let dir = scratch_dir("init-loopguards");
+        let cfg = test_cfg();
+        crate::settings::set_loop_guards_override(None);
+        assert!(
+            crate::guard::guards_enabled(),
+            "precondition: the guards are armed by default"
+        );
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            saw_loop_guards: Some(std::sync::Arc::clone(&seen)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.run_init(InitSource::UserCommand);
+
+        let observed = seen.lock().unwrap().clone();
+        assert!(!observed.is_empty(), "the init turn never reached generate");
+        assert!(
+            observed.iter().all(|armed| !armed),
+            "the guards were armed during /init: {observed:?}"
+        );
+        assert!(
+            crate::guard::guards_enabled(),
+            "the guards must be armed again once /init returns"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn init_clears_the_session_only_for_the_launch_offer() {
         let dir = scratch_dir("init-clear-source");
