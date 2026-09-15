@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A headless `-p` run says how long it took.** `plank -p ...` under `--ui
+  console`, `chart` or `quiet` now closes with `total time: 8.4s` on stderr,
+  measured from the agent being built (model load and warm included) to after
+  the session is saved. Stderr keeps stdout exactly as it was for anything
+  piping the reply, and leaves `--ui chart`'s chart and `--ui quiet`'s single
+  line of notes alone. The interactive front ends already reported the same
+  wall clock through their end-of-session stats; only the one-shot had nothing.
+
 ### Fixed
 
 - **The bash sandbox no longer breaks cargo, npm and go.** Package-manager and

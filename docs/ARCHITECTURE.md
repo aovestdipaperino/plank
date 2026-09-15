@@ -744,6 +744,15 @@ atomic (`interrupt.rs`) directly.
 The TUI uses the alternate screen, so block-based terminals (Warp) render it as
 a proper full-screen app rather than reflowing it.
 
+A headless run given `-p` is a one-shot: it runs the single turn and exits,
+closing with `total time: <elapsed>` on **stderr** (`ui::total_time_line`),
+measured from the agent being built — so the model load and the warm are in it
+— to after the session save and `SessionEnd`. Stderr because stdout carries the
+reply a caller is piping, and under `--ui chart` and `--ui quiet` it carries
+that mode's one deliberate piece of output. The interactive paths need nothing
+here: both already close with `Agent::report_run_stats`, which prints the same
+wall clock beside the token totals.
+
 ## Build
 
 `build.rs` compiles the ds4 C engine from the `refs/ds4` submodule on macOS

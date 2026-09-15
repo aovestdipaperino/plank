@@ -18103,6 +18103,13 @@ pub fn run_headless(
         headless_quit_repro(&mut agent);
         agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
         crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
+        // What the `-p` user actually waited, measured from the agent being
+        // built (so the model load and the warm are in it) to here. On stderr,
+        // like every other headless diagnostic: stdout carries the reply a
+        // caller is piping, and under `--ui chart` and `--ui quiet` it carries
+        // that mode's one deliberate piece of output, neither of which wants a
+        // line appended to it.
+        eprintln!("{}", total_time_line(agent.session_start.elapsed()));
         return r;
     }
     // Stdin protocol, like the C: announce readiness on stderr, collect bytes
@@ -18145,6 +18152,15 @@ pub fn run_headless(
     agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
     crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
     Ok(())
+}
+
+/// The closing line of a headless `-p` run: how long the whole thing took.
+///
+/// Reuses [`fmt_secs`], so a run under a minute keeps a decimal (`8.4s`) —
+/// a one-shot is often seconds long and rounding those to `0:08` throws away
+/// the part worth reading — and a longer one reads as `M:SS`.
+fn total_time_line(d: std::time::Duration) -> String {
+    format!("total time: {}", fmt_secs(d.as_secs_f64()))
 }
 
 /// Redirects the process's stdout to `/dev/null` for as long as it lives, and
@@ -26327,6 +26343,27 @@ mod tests {
             "a local engine is marked as such: {alt_label}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The headless `-p` closing line: seconds keep a decimal because a
+    /// one-shot is usually seconds long, and anything past a minute reads as
+    /// `M:SS` like the rest of the stats.
+    #[test]
+    fn the_headless_total_time_line_keeps_sub_minute_precision() {
+        use std::time::Duration;
+        assert_eq!(
+            total_time_line(Duration::from_millis(8_412)),
+            "total time: 8.4s"
+        );
+        assert_eq!(
+            total_time_line(Duration::from_millis(0)),
+            "total time: 0.0s"
+        );
+        assert_eq!(total_time_line(Duration::from_secs(90)), "total time: 1:30");
+        assert_eq!(
+            total_time_line(Duration::from_secs(3729)),
+            "total time: 1:02:09"
+        );
     }
 
     #[test]
