@@ -162,6 +162,119 @@ impl Scope {
     }
 }
 
+/// The closed taxonomy of memory entry types. Content derivable from the
+/// repository is deliberately not representable here — those facts are
+/// re-derived more accurately by looking, and they are what makes a memory
+/// file rot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Who the user is: role, expertise, preferences.
+    User,
+    /// Corrections and confirmed approaches on how to work.
+    Feedback,
+    /// Goals and constraints not derivable from code or git history.
+    Project,
+    /// Pointers to external URLs, tickets, dashboards.
+    Reference,
+}
+
+impl Kind {
+    /// Every kind, in rendering order.
+    pub const ALL: [Kind; 4] = [Kind::User, Kind::Feedback, Kind::Project, Kind::Reference];
+
+    /// The word inside the `[...]` tag.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Feedback => "feedback",
+            Self::Project => "project",
+            Self::Reference => "reference",
+        }
+    }
+
+    /// Parses a tag word. `None` for anything unrecognised, which callers
+    /// treat as an untagged entry rather than an error.
+    #[must_use]
+    pub fn from_tag(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.tag() == name)
+    }
+}
+
+/// One parsed memory bullet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The `(YYYY-MM-DD)` stamp.
+    pub date: String,
+    /// The `[type]` tag; `Project` when the line carried none.
+    pub kind: Kind,
+    /// The entry text, tag and date stripped.
+    pub text: String,
+}
+
+impl Entry {
+    /// A short content hash. Computed, never stored: nothing in `MEMORY.md`
+    /// becomes machine-owned, so a hand edit merely orphans a sidecar row
+    /// rather than corrupting anything.
+    ///
+    /// Deliberately over the text only. Re-tagging or re-dating an entry
+    /// keeps its identity, and therefore its accumulated usage.
+    #[must_use]
+    pub fn id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.text.as_bytes());
+        let digest = hasher.finalize();
+        digest
+            .iter()
+            .take(6)
+            .fold(String::new(), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+    }
+
+    /// The canonical bullet form.
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!("- ({}) [{}] {}\n", self.date, self.kind.tag(), self.text)
+    }
+}
+
+/// Parses every bullet in a memory file body. Lines that are not bullets
+/// (the template header, blank lines, prose) are skipped.
+#[must_use]
+pub fn parse_entries(body: &str) -> Vec<Entry> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("- (") else {
+            continue;
+        };
+        let Some((date, rest)) = rest.split_once(')') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let (kind, text) = match rest.strip_prefix('[').and_then(|r| r.split_once(']')) {
+            Some((tag, after)) => match Kind::from_tag(tag) {
+                Some(k) => (k, after),
+                None => (Kind::Project, rest),
+            },
+            None => (Kind::Project, rest),
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push(Entry {
+            date: date.trim().to_string(),
+            kind,
+            text: text.to_string(),
+        });
+    }
+    out
+}
+
 /// The memory sources for a checkout, user scope first. The user scope is
 /// absent only when `HOME` is unset.
 #[must_use]
@@ -526,5 +639,57 @@ mod tests {
         assert!(out.ends_with("xy"));
         assert!(out.len() <= MEMORY_INJECT_MAX_BYTES + 64);
         std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn tagged_and_untagged_entries_both_parse() {
+        let body = "# Memory\n\n\
+                    - (2026-09-15) [feedback] Don't force-add generated docs.\n\
+                    - (2026-09-14) plain untagged entry\n\
+                    not a bullet at all\n";
+        let entries = parse_entries(body);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, Kind::Feedback);
+        assert_eq!(entries[0].date, "2026-09-15");
+        assert_eq!(entries[0].text, "Don't force-add generated docs.");
+        assert_eq!(
+            entries[1].kind,
+            Kind::Project,
+            "untagged falls back to project"
+        );
+        assert_eq!(entries[1].text, "plain untagged entry");
+    }
+
+    #[test]
+    fn entry_id_is_stable_over_text_and_ignores_date() {
+        let a = Entry {
+            date: "2026-09-15".into(),
+            kind: Kind::User,
+            text: "prefers tabs".into(),
+        };
+        let b = Entry {
+            date: "2026-01-01".into(),
+            kind: Kind::Project,
+            text: "prefers tabs".into(),
+        };
+        let c = Entry {
+            date: "2026-09-15".into(),
+            kind: Kind::User,
+            text: "prefers spaces".into(),
+        };
+        assert_eq!(a.id(), b.id(), "id is a hash of text only");
+        assert_ne!(a.id(), c.id());
+        assert_eq!(a.id().len(), 12);
+    }
+
+    #[test]
+    fn render_round_trips_through_parse() {
+        let e = Entry {
+            date: "2026-09-15".into(),
+            kind: Kind::Reference,
+            text: "dashboard at example".into(),
+        };
+        let parsed = parse_entries(&e.render());
+        assert_eq!(parsed, vec![e]);
     }
 }
