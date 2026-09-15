@@ -1040,7 +1040,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/init",
         args: "",
-        desc: "write an AGENTS.md describing this repository",
+        desc: "set this repository up: survey it, then write AGENTS.md",
     },
     SlashCommand {
         name: "/remember",

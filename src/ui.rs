@@ -5796,28 +5796,96 @@ impl Agent<'_> {
         crate::ctxreport::render(&self.context_breakdown(), self.last_ctx_used, color)
     }
 
-    /// The `/init` prompt: asks the model to analyze the codebase and write an
-    /// `AGENTS.md` for future sessions. Shared by the plain REPL and TUI paths
-    /// so the wording lives in one place.
+    /// The `/init` prompt: drives a multi-phase, interactive setup that ends
+    /// with an `AGENTS.md` (and optionally an `AGENTS.local.md`) written for
+    /// future sessions. Shared by the plain REPL and TUI paths so the wording
+    /// lives in one place.
+    ///
+    /// The phases are the model's to run, not the front end's: plank supplies
+    /// the tools (`ask` for the two interview phases, `task` for the survey)
+    /// and the prompt supplies the order. That keeps both front ends on one
+    /// code path — whatever the model asks, the front end's installed
+    /// [`Asker`](crate::tools::ask::Asker) renders. Under `--ui console` the
+    /// `ask` tool fast-fails, and the prompt tells the model what to do then.
     const INIT_PROMPT: &'static str = concat!(
-        "Analyze this codebase and create an AGENTS.md file for future agent sessions.\n\n",
-        "Include:\n",
-        "1. Build, lint, and test commands (especially non-standard ones)\n",
-        "2. High-level architecture and structure\n",
-        "3. Required setup or environment variables\n",
-        "4. Non-obvious gotchas or workflow quirks\n\n",
+        "Set up this repository for future agent sessions. Work through the\n",
+        "phases below in order. Keep your visible narration to one short line\n",
+        "per phase; the interesting output is the files you write and the\n",
+        "summary at the end.\n\n",
+        "PHASE 1 — ask what to set up.\n",
+        "Use the `ask` tool, with multi set to true, to ask which files to\n",
+        "write. Offer exactly these options:\n",
+        "- \"Project AGENTS.md\" — shared guidance, committed to the repo\n",
+        "- \"Personal AGENTS.local.md\" — your own notes, not committed\n",
+        "If the `ask` tool reports that no user is available, skip every `ask`\n",
+        "in this prompt and write the project AGENTS.md only, using your own\n",
+        "judgement for anything you would have asked about.\n\n",
+        "PHASE 2 — survey the codebase.\n",
+        "Delegate the survey to a single `task` sub-agent so the findings come\n",
+        "back condensed. Ask it to report:\n",
+        "- manifest files (package.json, Cargo.toml, pyproject.toml, go.mod, ...)\n",
+        "- README, Makefile, build config, CI config\n",
+        "- any existing AGENTS.md, CLAUDE.md, or .plank/rules/ files\n",
+        "- configs written for other AI coding tools: .cursor/rules, .cursorrules,\n",
+        "  .github/copilot-instructions.md, .windsurfrules, .clinerules\n",
+        "- the real build, test, lint and format commands, and the package manager\n",
+        "- languages, frameworks, and whether this is a monorepo or one project\n",
+        "- code style rules that differ from the language default\n",
+        "- required environment variables and setup steps\n",
+        "- non-obvious gotchas: things that would waste an hour if unknown\n",
+        "- whether the repo uses git worktrees, and if so whether they are nested\n",
+        "  inside the checkout or siblings of it\n\n",
+        "PHASE 3 — fill in the gaps.\n",
+        "Anything the survey could not settle, and that matters, ask the user\n",
+        "about with `ask`. Prefer a few sharp questions to many shallow ones,\n",
+        "and skip a question whose answer you already have. Good candidates:\n",
+        "commands that exist but are not the obvious ones, gotchas worth\n",
+        "recording, branch naming and PR conventions. When writing the personal\n",
+        "file, also ask about the user's role and familiarity with the codebase,\n",
+        "and any personal sandbox URLs, test accounts or local setup.\n\n",
+        "PHASE 4 — write AGENTS.md, if it was chosen.\n",
+        "Write it to the project root. Keep it minimal and specific to this\n",
+        "repository. Include:\n",
+        "- build, test, lint and format commands an agent could not guess\n",
+        "- code style rules that DIFFER from the language default\n",
+        "- testing instructions and quirks\n",
+        "- repo etiquette: branch naming, PR conventions\n",
+        "- required environment variables or setup steps\n",
+        "- non-obvious gotchas and architectural decisions\n",
+        "- whatever still matters from the other AI tools' configs found above\n",
         "Exclude:\n",
-        "- File-by-file listings the agent can discover\n",
-        "- Standard language conventions\n",
-        "- Generic advice\n",
-        "- Information from README unless essential\n\n",
-        "Preface with:\n",
+        "- file-by-file structure or component lists\n",
+        "- standard language conventions\n",
+        "- generic advice (\"write clean code\", \"handle errors\")\n",
+        "- detailed API documentation: point at the file instead\n",
+        "- anything that changes frequently\n",
+        "- long tutorials or walkthroughs\n",
+        "Preface the file with exactly:\n",
         "```",
         "# AGENTS.md\n\n",
         "This file provides guidance to the agent when working with code in this repository.",
         "```",
         "\n\n",
-        "Write the AGENTS.md file to the current directory."
+        "If an AGENTS.md already exists, read it first and update it in place\n",
+        "rather than discarding what it says. If the project has several\n",
+        "distinct concerns, say so in the summary and suggest splitting them\n",
+        "into separate focused files under .plank/rules/.\n\n",
+        "PHASE 5 — write AGENTS.local.md, if it was chosen.\n",
+        "Write it to the project root, minimal, covering only what is personal:\n",
+        "the user's role and familiarity, their sandbox URLs or test accounts,\n",
+        "and any workflow or communication preferences they gave you. Nothing\n",
+        "that belongs in the shared file goes here.\n",
+        "This file is not meant to be committed. Check .gitignore; if it does\n",
+        "not already cover AGENTS.local.md, append a line for it.\n",
+        "If phase 2 found sibling (external) worktrees, the file would be\n",
+        "invisible from them, so instead write the prose to\n",
+        "~/.plank/<project-name>-instructions.md and make AGENTS.local.md a\n",
+        "one-line pointer to that path. Nested worktrees need no such stub.\n\n",
+        "PHASE 6 — summarise.\n",
+        "In a few lines: which files you wrote, and the two or three points in\n",
+        "them most worth a second look. Say plainly that these are a starting\n",
+        "point meant to be edited, and that /init can be run again later to\n",
+        "re-scan and update them."
     );
 
     /// Draw the next label for an unnamed sub-agent, advancing the session's
@@ -5910,12 +5978,13 @@ impl Agent<'_> {
         stream.set_preflight(edit_preflight(&self.tool_ctx));
     }
 
-    /// Runs the /init command: prompts the model to create AGENTS.md, then —
-    /// for the launch offer only — clears the session (the plain REPL never
-    /// clears the screen) so the init exchange does not carry into later turns.
+    /// Runs the /init command: drives the multi-phase setup in
+    /// [`Agent::INIT_PROMPT`], then — for the launch offer only — clears the
+    /// session (the plain REPL never clears the screen) so the init exchange
+    /// does not carry into later turns.
     fn run_init(&mut self, source: InitSource) {
-        println!("Initializing AGENTS.md...");
-        println!("The model will now analyze the codebase and generate documentation.\n");
+        println!("Setting up this repository for future sessions...");
+        println!("The model will survey the codebase and ask you a few questions.\n");
 
         self.session.push(Message::user(Self::INIT_PROMPT));
         self.quiet_tools = true;
@@ -5924,8 +5993,8 @@ impl Agent<'_> {
         if let Err(e) = result {
             println!("/init failed: {e}");
         }
-        // The init prompt and the model's AGENTS.md draft are scaffolding for
-        // the file write, not part of the conversation — clear the session so
+        // The init prompt and the model's survey are scaffolding for the file
+        // write, not part of the conversation — clear the session so
         // the next turn starts fresh. The clear also rebuilds the session
         // context (`ContextContent::new_with_agents` re-reads `AGENTS.md` from
         // disk), which is how the file just written reaches the model at all:
@@ -5941,11 +6010,18 @@ impl Agent<'_> {
 
     /// Runs the /init command in TUI mode.
     ///
-    /// The init prompt is not echoed and the model's AGENTS.md draft is not
-    /// left in the log: the turn's output is truncated back to a checkpoint
-    /// taken before it, then — for the launch offer only — the session is
-    /// cleared without wiping the screen so the exchange does not carry into
-    /// later turns. See [`Agent::run_init`] for why the source matters.
+    /// The init prompt is not echoed, but — unlike the single-turn flow this
+    /// replaced — the turn's output is *kept*: the phases interview the user
+    /// through the `ask` panel and end with a summary, and truncating the log
+    /// back to a pre-turn checkpoint would erase exactly the part worth
+    /// reading. What used to justify the truncation (the model dictating the
+    /// whole AGENTS.md into the log) is handled by `quiet_tools`, which
+    /// suppresses the write preview, plus the prompt's instruction to narrate
+    /// one line per phase.
+    ///
+    /// For the launch offer only, the session is then cleared without wiping
+    /// the screen so the exchange does not carry into later turns. See
+    /// [`Agent::run_init`] for why the source matters.
     #[allow(clippy::too_many_arguments)]
     fn tui_run_init(
         &mut self,
@@ -5958,18 +6034,13 @@ impl Agent<'_> {
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
     ) {
-        log.push_plain("Initializing AGENTS.md...");
-        log.push_plain("The model will now analyze the codebase and generate documentation.\n");
+        log.push_plain("Setting up this repository for future sessions...");
+        log.push_plain("The model will survey the codebase and ask you a few questions.\n");
 
         self.session.push(Message::user(Self::INIT_PROMPT));
-        // Drop everything the turn renders (the AGENTS.md draft, tool banners,
-        // the turn footer) so it never stays in the TUI log. The file write
-        // itself still happens during the turn.
-        let mark = log.checkpoint();
         self.quiet_tools = true;
         let result = self.tui_turn(terminal, log, view, input, btw, arcade, sub);
         self.quiet_tools = false;
-        log.truncate_to(mark);
         if let Err(e) = result {
             log.push_plain(format!("/init failed: {e}"));
         }
@@ -21376,6 +21447,45 @@ mod tests {
         );
 
         crate::settings::install_for_test(crate::settings::Settings::default());
+    }
+
+    /// The init prompt drives its phases entirely through tools plank
+    /// actually ships: the two interview phases through `ask`, the survey
+    /// through `task`. Renaming or dropping one of those tools without
+    /// touching the prompt would leave `/init` instructing the model to call
+    /// something that does not exist, and the failure would be a silently
+    /// degraded setup rather than an error — so the prompt's tool names are
+    /// checked against the live registry here.
+    #[test]
+    fn the_init_prompt_only_names_tools_that_exist() {
+        let names = sysprompt::tool_names(&[]);
+        for tool in ["ask", "task"] {
+            assert!(
+                names.iter().any(|n| n == tool),
+                "/init tells the model to use `{tool}`, which is not a tool: {names:?}"
+            );
+            assert!(
+                Agent::INIT_PROMPT.contains(&format!("`{tool}`")),
+                "the prompt no longer names `{tool}`"
+            );
+        }
+        // Every phase has to survive an edit to the prompt: dropping one
+        // silently shortens the flow rather than breaking it.
+        for phase in [
+            "PHASE 1", "PHASE 2", "PHASE 3", "PHASE 4", "PHASE 5", "PHASE 6",
+        ] {
+            assert!(Agent::INIT_PROMPT.contains(phase), "{phase} went missing");
+        }
+        // The two files the flow can write, and the header AGENTS.md must
+        // carry — the same one `context::discover_agents_md_files` looks for.
+        assert!(Agent::INIT_PROMPT.contains("AGENTS.local.md"));
+        assert!(Agent::INIT_PROMPT.contains("# AGENTS.md\n"));
+        // Headless has no user to interview; the prompt must say so itself,
+        // because `ask` under `--ui console` returns a refusal, not an error.
+        assert!(
+            Agent::INIT_PROMPT.contains("no user is available"),
+            "the prompt must tell the model what to do when `ask` fast-fails"
+        );
     }
 
     /// `/init` clears the session only when the launch offer ran it.
