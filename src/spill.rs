@@ -45,7 +45,7 @@ pub fn spill_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank").join("spill")
+    crate::home::plank_home_in(home).join("spill")
 }
 
 /// Applies the spill policy to one tool result: writes the full payload to

@@ -254,7 +254,7 @@ fn is_sha256_hex(s: &str) -> bool {
 #[must_use]
 pub fn plank_dir() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank")
+    crate::home::plank_home_in(home)
 }
 
 /// The installed manifest: what the files currently under `root` are.

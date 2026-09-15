@@ -49,7 +49,7 @@ pub enum Scope {
 pub fn path_for(scope: Scope, cwd: &Path) -> Option<PathBuf> {
     match scope {
         Scope::User => {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".plank").join("MEMORY.md"))
+            std::env::var_os("HOME").map(|h| crate::home::plank_home_in(h).join("MEMORY.md"))
         }
         Scope::Project => Some(cwd.join(".plank").join("MEMORY.md")),
     }

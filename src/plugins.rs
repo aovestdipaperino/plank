@@ -320,7 +320,7 @@ pub fn load_in(home: Option<&Path>, cwd: &Path, cli_dirs: &[PathBuf]) -> PluginS
         // `--plugin-dir` entries follow and outrank both.
         let root = crate::claudeplugin::install_dir(home);
         candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserClaude)));
-        let root = home.join(".plank").join("plugins").join("dev");
+        let root = crate::home::plank_home_in(home).join("plugins").join("dev");
         candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserScan)));
     }
     let project = cwd.join(".plank").join("plugins");
@@ -592,7 +592,7 @@ pub fn render_list(set: &PluginSet) -> String {
 /// auto-scans.
 #[must_use]
 pub fn user_plugin_dir(home: &Path) -> PathBuf {
-    home.join(".plank").join("plugins").join("dev")
+    crate::home::plank_home_in(home).join("plugins").join("dev")
 }
 
 /// Installs the plugin directory at `src` for the current user.
@@ -1092,7 +1092,7 @@ pub fn skills_in(
 ) {
     let mut roots = Vec::new();
     if let Some(home) = home {
-        roots.push(home.join(".plank").join("skills"));
+        roots.push(crate::home::plank_home_in(home).join("skills"));
     }
     roots.push(cwd.join(".plank").join("skills"));
     // The built-ins sit under the user and project directories (`load_layered`),
@@ -1134,7 +1134,7 @@ pub fn agents_in(
 ) {
     let mut roots = Vec::new();
     if let Some(home) = home {
-        roots.push(home.join(".plank").join("agents"));
+        roots.push(crate::home::plank_home_in(home).join("agents"));
     }
     roots.push(cwd.join(".plank").join("agents"));
     let local = crate::agents::load_from(&roots);
@@ -1173,7 +1173,7 @@ pub fn templates_in(
 ) {
     let mut roots = Vec::new();
     if let Some(home) = home {
-        roots.push(home.join(".plank").join("templates"));
+        roots.push(crate::home::plank_home_in(home).join("templates"));
     }
     roots.push(cwd.join(".plank").join("templates"));
     let local = crate::templates::load_from(&roots);
@@ -1206,7 +1206,7 @@ pub fn templates_with_plugins(
 pub fn hooks_in(home: Option<&Path>, cwd: &Path, set: &PluginSet) -> crate::hooks::Hooks {
     let mut paths = Vec::new();
     if let Some(home) = home {
-        paths.push(home.join(".plank").join("hooks.json"));
+        paths.push(crate::home::plank_home_in(home).join("hooks.json"));
     }
     for plugin in &set.plugins {
         if let Some(path) = component_root(plugin, "hooks.json", "hooks/hooks.json") {

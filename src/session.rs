@@ -644,7 +644,7 @@ impl SessionStore {
         let home = std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
             .map_or_else(|| PathBuf::from("."), PathBuf::from);
-        home.join(".plank").join("kvcache")
+        crate::home::plank_home_in(home).join("kvcache")
     }
 
     /// Directory this store persists sessions in.

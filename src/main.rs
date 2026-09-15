@@ -267,7 +267,7 @@ fn main() -> ExitCode {
     // First launch after an upgrade: the KV caches self-validate and survive,
     // but a major version change drops the image cache (see upgrade.rs).
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-        let plank_dir = std::path::PathBuf::from(home).join(".plank");
+        let plank_dir = plank::home::plank_home_in(home);
         let t = plank::upgrade::run_startup_maintenance(&plank_dir, env!("CARGO_PKG_VERSION"));
         if t == plank::upgrade::Transition::Major {
             eprintln!("plank: major version change detected; cleared the image cache");

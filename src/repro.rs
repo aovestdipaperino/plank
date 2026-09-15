@@ -263,7 +263,7 @@ pub fn save_sidecar(main: &Path, ordinal: usize, report: &str) -> Result<PathBuf
 pub fn repro_dir(cwd: &Path) -> PathBuf {
     std::env::var_os("HOME").map_or_else(
         || cwd.join(".plank").join("repro"),
-        |h| PathBuf::from(h).join(".plank").join("repro"),
+        |h| crate::home::plank_home_in(h).join("repro"),
     )
 }
 

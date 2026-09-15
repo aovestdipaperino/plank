@@ -100,7 +100,7 @@ const SKIP_LIST_FILE: &str = "agentsmd-skip";
 #[must_use]
 pub fn skip_list_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
-    Some(PathBuf::from(home).join(".plank").join(SKIP_LIST_FILE))
+    Some(crate::home::plank_home_in(home).join(SKIP_LIST_FILE))
 }
 
 /// The folder's identity in the skip list: its canonical path when the OS can

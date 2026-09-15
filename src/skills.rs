@@ -207,7 +207,7 @@ pub fn load_layered(roots: &[PathBuf]) -> Vec<Skill> {
 pub fn load_default(cwd: &Path) -> Vec<Skill> {
     let mut roots = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".plank").join("skills"));
+        roots.push(crate::home::plank_home_in(home).join("skills"));
     }
     roots.push(cwd.join(".plank").join("skills"));
     load_layered(&roots)

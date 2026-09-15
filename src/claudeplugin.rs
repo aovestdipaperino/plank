@@ -169,7 +169,9 @@ fn parse_github_tree_url(arg: &str) -> Option<(String, String, String)> {
 /// deciding what to trust or remove.
 #[must_use]
 pub fn install_dir(home: &Path) -> PathBuf {
-    home.join(".plank").join("plugins").join("claude")
+    crate::home::plank_home_in(home)
+        .join("plugins")
+        .join("claude")
 }
 
 /// Substitutes `${CLAUDE_PLUGIN_ROOT}` with `dest` in the two files whose
@@ -544,7 +546,7 @@ pub(crate) fn staging_dir(home: &Path) -> Result<PathBuf, String> {
 /// was cleaned up.
 #[must_use]
 pub(crate) fn staging_dir_path(home: &Path) -> PathBuf {
-    home.join(".plank").join(".claude-staging")
+    crate::home::plank_home_in(home).join(".claude-staging")
 }
 
 /// Puts the named plugin's tree inside `staging` and returns its root.

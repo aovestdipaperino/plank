@@ -28,6 +28,7 @@ use crate::context::{ContextContent, ContextTokens};
 use crate::dsml::ToolCall;
 use crate::editor::{History, LineBuffer, default_history_path};
 use crate::engine::{Engine, EngineEvent};
+use crate::home::plank_home_in;
 use crate::remote::control::RemoteState;
 use crate::render::{RenderOptions, TokenRenderer};
 use crate::session::{Message, Session, SessionEntry, SessionStore};
@@ -10198,7 +10199,7 @@ the original is frozen and listed in /tree"
         let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
             return "no HOME, so there is no trust store\n".to_string();
         };
-        let plank_home = home.join(".plank");
+        let plank_home = plank_home_in(&home);
         if verb == "info" {
             let trust = crate::wasmreg::TrustStore::load(&plank_home);
             return match self.tool_ctx.wasm.registry.describe(id, &trust) {
@@ -10309,7 +10310,7 @@ the original is frozen and listed in /tree"
                             .rfind(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
                             .unwrap_or("")
                             .to_string();
-                        let mut trust = crate::wasmreg::TrustStore::load(&home.join(".plank"));
+                        let mut trust = crate::wasmreg::TrustStore::load(&plank_home_in(&home));
                         match trust.add_publisher(&key, &encoded) {
                             Ok(()) => format!(
                                 "trusting publisher {}\nsigned updates from it will not re-prompt; \
@@ -10326,7 +10327,7 @@ the original is frozen and listed in /tree"
                 let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
                     return "no HOME, so no publishers are recorded\n".to_string();
                 };
-                let trust = crate::wasmreg::TrustStore::load(&home.join(".plank"));
+                let trust = crate::wasmreg::TrustStore::load(&plank_home_in(&home));
                 if trust.publishers().is_empty() {
                     "no trusted publishers\nusage: /plugins publisher <key-file|base64-key>\n"
                         .to_string()
@@ -17267,7 +17268,7 @@ fn new_agent(
     // prompt the session does not actually use.
     {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let plank_home = home.as_ref().map(|h| h.join(".plank"));
+        let plank_home = home.as_ref().map(plank_home_in);
         let project = tool_ctx.cwd.clone();
         // Built with the home *before* activation, not after: the runtime is
         // what owns a component's `state` directory, and a host constructed

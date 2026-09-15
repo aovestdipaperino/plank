@@ -248,7 +248,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 /// The plank home directory, `$HOME/.plank`, or `None` when `HOME` is unset.
 #[must_use]
 pub fn plank_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".plank"))
+    std::env::var_os("HOME").map(crate::home::plank_home_in)
 }
 
 /// True when `cmd` names the plank home, in any of the spellings a shell command

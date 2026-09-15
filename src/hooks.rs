@@ -452,7 +452,7 @@ pub fn load_from(paths: &[PathBuf]) -> Hooks {
 pub fn load_default(cwd: &Path) -> Hooks {
     let mut paths = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".plank").join("hooks.json"));
+        paths.push(crate::home::plank_home_in(home).join("hooks.json"));
     }
     paths.push(cwd.join(".plank").join("hooks.json"));
     load_from(&paths)

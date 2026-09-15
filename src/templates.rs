@@ -200,7 +200,7 @@ pub fn load_from(roots: &[PathBuf]) -> Vec<Template> {
 pub fn load_default(cwd: &Path) -> Vec<Template> {
     let mut roots = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".plank").join("templates"));
+        roots.push(crate::home::plank_home_in(home).join("templates"));
     }
     roots.push(cwd.join(".plank").join("templates"));
     load_from(&roots)

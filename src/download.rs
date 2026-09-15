@@ -282,7 +282,7 @@ const MESSAGES: [&str; 200] = [
 #[must_use]
 pub fn default_model_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank").join("ds4flash.gguf")
+    crate::home::plank_home_in(home).join("ds4flash.gguf")
 }
 
 /// Hugging Face download URL for `file` in [`REPO`].
@@ -303,7 +303,7 @@ fn repo_file_url(repo: &str, file: &str) -> String {
 #[must_use]
 pub fn default_dspark_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank").join("ds4flash.dspark.gguf")
+    crate::home::plank_home_in(home).join("ds4flash.dspark.gguf")
 }
 
 /// Default Qwen3.8-Flash-Next model location, selected by `--qwen`.
@@ -316,7 +316,7 @@ pub fn default_dspark_path() -> PathBuf {
 #[must_use]
 pub fn default_qwen_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank").join("qwen.gguf")
+    crate::home::plank_home_in(home).join("qwen.gguf")
 }
 
 /// Default Qwen vision-encoder location, beside its main model.
@@ -327,7 +327,7 @@ pub fn default_qwen_path() -> PathBuf {
 #[must_use]
 pub fn default_qwen_vision_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank").join("qwen.vision.gguf")
+    crate::home::plank_home_in(home).join("qwen.vision.gguf")
 }
 
 /// Default vision-encoder location. Loaded alongside the main model whenever
@@ -337,7 +337,7 @@ pub fn default_qwen_vision_path() -> PathBuf {
 #[must_use]
 pub fn default_vision_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank").join("ds4flash.vision.gguf")
+    crate::home::plank_home_in(home).join("ds4flash.vision.gguf")
 }
 
 /// Default `DeepSeek` V4.1 Flash model location.
@@ -347,14 +347,14 @@ pub fn default_vision_path() -> PathBuf {
 #[must_use]
 pub fn default_ds41_model_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank").join("ds41flash.gguf")
+    crate::home::plank_home_in(home).join("ds41flash.gguf")
 }
 
 /// Default V4.1 vision-encoder location, beside its main model.
 #[must_use]
 pub fn default_ds41_vision_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".plank").join("ds41flash.vision.gguf")
+    crate::home::plank_home_in(home).join("ds41flash.vision.gguf")
 }
 
 /// The `main` model path of the set this machine manages by default, under

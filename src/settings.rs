@@ -889,7 +889,7 @@ impl Settings {
         match std::env::current_dir() {
             Ok(cwd) => Self::paths_in(home.as_deref(), &cwd),
             Err(_) => home
-                .map(|home| home.join(".plank").join("settings.json"))
+                .map(|home| crate::home::plank_home_in(home).join("settings.json"))
                 .into_iter()
                 .collect(),
         }
@@ -901,7 +901,7 @@ impl Settings {
     pub fn paths_in(home: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Some(home) = home {
-            paths.push(home.join(".plank").join("settings.json"));
+            paths.push(crate::home::plank_home_in(home).join("settings.json"));
         }
         paths.push(cwd.join(".plank").join("settings.json"));
         paths

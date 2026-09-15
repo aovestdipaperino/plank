@@ -95,6 +95,26 @@ sequenceDiagram
     end
 ```
 
+
+## Where `~/.plank` lives (`home.rs`)
+
+Everything user-scoped — models, sessions, plugins, skills, settings, the
+trust store, logs — hangs off one directory, and `home::plank_home_in` is the
+only place that decides where it is. Normally it is `$HOME/.plank`. When a
+machine has no `$HOME/.plank` but does have a shared `/Users/.plank`, plank
+uses that instead, so several accounts on one box share a single ~87 GB model
+set and one plugin install. The shared directory is never created: with
+neither present, a fresh install still lands in `$HOME/.plank`, so plank never
+writes outside the user's own home unless an administrator put the shared
+directory there first.
+
+The fallback applies only when the caller's `home` really is this process's
+`$HOME`. Every function that takes a `home` parameter as a hermetic test seam
+keeps getting `home/.plank` verbatim, so a test with a temp home can never
+pick up the machine's shared directory and pass or fail by accident.
+
+Project-scoped `./.plank` is a different thing and is unaffected.
+
 ## Module reference
 
 ### Model families (`gguf.rs`, `manifest::ModelSet`, `trace_stream::syntax`)
