@@ -17,6 +17,7 @@
 //! `project` (goals/constraints not in the code), `reference` (external
 //! URLs/tickets/dashboards).
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -225,14 +226,11 @@ impl Entry {
         let mut hasher = Sha256::new();
         hasher.update(self.text.as_bytes());
         let digest = hasher.finalize();
-        digest
-            .iter()
-            .take(6)
-            .fold(String::new(), |mut acc, b| {
-                use std::fmt::Write;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            })
+        digest.iter().take(6).fold(String::new(), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
     }
 
     /// The canonical bullet form.
@@ -273,6 +271,162 @@ pub fn parse_entries(body: &str) -> Vec<Entry> {
         });
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// MetaStore: per-entry sidecar with usage counters and pin state
+// ---------------------------------------------------------------------------
+
+/// Per-entry bookkeeping. Every field is advisory: the memory file renders
+/// correctly with all of this at its default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Meta {
+    /// How many extraction passes judged this entry to have borne on the work.
+    pub uses: u32,
+    /// The date of the most recent such pass.
+    pub last_used: String,
+    /// Never evict, whatever the counters say. Some facts are used rarely and
+    /// are catastrophic to lose.
+    pub pinned: bool,
+    /// Retracted by a model `forget`: hidden from rendering, bytes kept until
+    /// a reconciliation pass drops the line.
+    pub retracted: bool,
+}
+
+/// The sidecar for one memory file, keyed by [`Entry::id`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetaStore {
+    rows: BTreeMap<String, Meta>,
+}
+
+/// The sidecar path for a memory file: the file's own path plus
+/// `.meta.json`, so `/memory` never sees it as a source.
+#[must_use]
+pub fn meta_path_for(memory_path: &Path) -> PathBuf {
+    let mut name = memory_path.as_os_str().to_os_string();
+    name.push(".meta.json");
+    PathBuf::from(name)
+}
+
+impl MetaStore {
+    /// Reads a sidecar. Every failure — missing file, unreadable file,
+    /// malformed JSON, wrong shape — yields an empty store, because the
+    /// sidecar is never allowed to break memory loading.
+    #[must_use]
+    pub fn load(path: &Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        let Some(json) = crate::tools::mcp::json_parse(&text) else {
+            return Self::default();
+        };
+        let crate::tools::mcp::Json::Obj(members) = json else {
+            return Self::default();
+        };
+        let mut rows = BTreeMap::new();
+        for (id, value) in members {
+            let num = |k: &str| -> u32 {
+                match value.get(k) {
+                    Some(crate::tools::mcp::Json::Num(n)) => {
+                        if *n >= 0.0 && *n <= f64::from(u32::MAX) {
+                            #[allow(
+                                clippy::cast_possible_truncation,
+                                clippy::cast_sign_loss
+                            )]
+                            {
+                                *n as u32
+                            }
+                        } else if *n > 0.0 {
+                            u32::MAX
+                        } else {
+                            0
+                        }
+                    }
+                    _ => 0,
+                }
+            };
+            let flag = |k: &str| matches!(value.get(k), Some(crate::tools::mcp::Json::Bool(true)));
+            rows.insert(
+                id,
+                Meta {
+                    uses: num("uses"),
+                    last_used: value.str_or("last_used", "").to_string(),
+                    pinned: flag("pinned"),
+                    retracted: flag("retracted"),
+                },
+            );
+        }
+        Self { rows }
+    }
+
+    /// Writes the sidecar, creating the parent directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the directory or file cannot be written.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        use crate::tools::mcp::json_escape;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut out = String::from("{\n");
+        for (i, (id, meta)) in self.rows.iter().enumerate() {
+            if i > 0 {
+                out.push_str(",\n");
+            }
+            out.push_str("  ");
+            json_escape(&mut out, id);
+            out.push_str(": {\"uses\": ");
+            let _ = write!(out, "{}", meta.uses);
+            out.push_str(", \"last_used\": ");
+            json_escape(&mut out, &meta.last_used);
+            let _ = write!(
+                out,
+                ", \"pinned\": {}, \"retracted\": {}}}",
+                meta.pinned, meta.retracted
+            );
+        }
+        out.push_str("\n}\n");
+        std::fs::write(path, out).map_err(|e| e.to_string())
+    }
+
+    /// The row for an id, defaulted when absent.
+    #[must_use]
+    pub fn get(&self, id: &str) -> Meta {
+        self.rows.get(id).cloned().unwrap_or_default()
+    }
+
+    /// Credits an entry with one use on `date`.
+    pub fn bump(&mut self, id: &str, date: &str) {
+        let row = self.rows.entry(id.to_string()).or_default();
+        row.uses = row.uses.saturating_add(1);
+        row.last_used = date.to_string();
+    }
+
+    /// Sets or clears retraction.
+    pub fn set_retracted(&mut self, id: &str, value: bool) {
+        self.rows.entry(id.to_string()).or_default().retracted = value;
+    }
+
+    /// Sets or clears the pin.
+    pub fn set_pinned(&mut self, id: &str, value: bool) {
+        self.rows.entry(id.to_string()).or_default().pinned = value;
+    }
+
+    /// Moves a row to a new id, which is what makes an `UPDATE` worth more
+    /// than a delete-plus-add: an entry rephrased six times over a month
+    /// keeps its accumulated usage instead of resetting to zero each time.
+    pub fn carry(&mut self, old: &str, new: &str) {
+        if let Some(row) = self.rows.remove(old) {
+            self.rows.insert(new.to_string(), row);
+        }
+    }
+
+    /// Drops rows with no corresponding live entry — the debris left behind
+    /// when the user edits `MEMORY.md` by hand.
+    pub fn gc(&mut self, live_ids: &[String]) {
+        self.rows.retain(|id, _| live_ids.iter().any(|l| l == id));
+    }
 }
 
 /// The memory sources for a checkout, user scope first. The user scope is
@@ -704,5 +858,56 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, Kind::Project);
         assert_eq!(entries[0].text, "[WIP] ship it");
+    }
+
+    #[test]
+    fn meta_store_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("plank-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("MEMORY.md");
+        let mut store = MetaStore::default();
+        store.bump("abc123", "2026-09-15");
+        store.bump("abc123", "2026-09-16");
+        store.set_retracted("dead99", true);
+        store.save(&meta_path_for(&path)).unwrap();
+
+        let reloaded = MetaStore::load(&meta_path_for(&path));
+        assert_eq!(reloaded.get("abc123").uses, 2);
+        assert_eq!(reloaded.get("abc123").last_used, "2026-09-16");
+        assert!(reloaded.get("dead99").retracted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_sidecar_degrades_to_zeroed_counters() {
+        let missing = MetaStore::load(std::path::Path::new("/nonexistent/MEMORY.md.meta.json"));
+        assert_eq!(missing.get("anything").uses, 0);
+        assert!(!missing.get("anything").pinned);
+
+        let dir = std::env::temp_dir().join(format!("plank-meta-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("x.meta.json");
+        std::fs::write(&bad, "{ this is not json").unwrap();
+        assert_eq!(MetaStore::load(&bad).get("anything").uses, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_moves_a_row_to_a_new_id_and_gc_drops_orphans() {
+        let mut store = MetaStore::default();
+        store.bump("old", "2026-09-15");
+        store.bump("old", "2026-09-15");
+        store.carry("old", "new");
+        assert_eq!(store.get("new").uses, 2, "usage survives a rephrasing");
+        assert_eq!(store.get("old").uses, 0);
+
+        store.bump("orphan", "2026-09-15");
+        store.gc(&["new".to_string()]);
+        assert_eq!(
+            store.get("orphan").uses,
+            0,
+            "rows with no live entry are dropped"
+        );
+        assert_eq!(store.get("new").uses, 2);
     }
 }
