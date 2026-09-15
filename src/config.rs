@@ -60,8 +60,8 @@ pub struct AgentConfig {
     pub mcp_config_path: Option<PathBuf>,
     /// Directories named by `--plugin-dir`, loaded as session-only plugins.
     pub plugin_dirs: Vec<PathBuf>,
-    /// True when `--non-interactive` was given.
-    pub non_interactive: bool,
+    /// Front end selected by `--ui` (default [`UiMode::Tui`]).
+    pub ui: UiMode,
     /// True when `--debug` was given: the only case in which plank looks for
     /// a `turbo-debug-console` and mirrors the raw model stream to it (see
     /// `debugmirror`). Off, plank never probes for a console at all.
@@ -183,7 +183,7 @@ pub struct AgentConfig {
     pub cli_provenance: std::collections::BTreeMap<String, crate::provenance::Origin>,
     /// True when `--dump-config` was given: print the resolved configuration
     /// (every effective key with its origin) and exit, without starting a
-    /// session. Works under `--non-interactive`.
+    /// session. Works under `--ui console`.
     pub dump_config: bool,
 }
 
@@ -391,6 +391,32 @@ impl Default for EngineTuning {
     }
 }
 
+/// Front end selected by `--ui`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiMode {
+    /// Full interactive front end: the Ratatui TUI on a TTY, the plain line
+    /// REPL when either end is a pipe (`main::run_interactive` decides).
+    #[default]
+    Tui,
+    /// Headless: with `-p`, one prompt and exit; without one, the stdin-driven
+    /// protocol loop. No TUI, no REPL prompt.
+    Console,
+    /// Headless one-shot that prints nothing but the `/toks` chart for the run.
+    /// Requires `-p`.
+    Chart,
+    /// Headless one-shot that prints nothing but a start and a finish note.
+    /// Requires `-p`.
+    Quiet,
+}
+
+impl UiMode {
+    /// True for the front ends that run headless (no TUI, no REPL prompt).
+    #[must_use]
+    pub fn is_headless(self) -> bool {
+        !matches!(self, Self::Tui)
+    }
+}
+
 /// Inference backend selector, mirroring `ds4_backend`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -425,7 +451,7 @@ impl Default for AgentConfig {
             worktree_pr: None,
             mcp_config_path: None,
             plugin_dirs: Vec::new(),
-            non_interactive: false,
+            ui: UiMode::Tui,
             debug: false,
             save_session: true,
             minimal_prompt: false,
@@ -623,8 +649,13 @@ Options:
   /insights [fast]         report on how you have been using plank, from every
                            saved session; writes ~/.plank/usage-data/report.html
                            (\"fast\" skips the written sections)
-      --non-interactive    disable the interactive UI
-      --no-session         with --non-interactive: do not save the transcript
+      --ui MODE            front end: tui (default, the interactive UI),
+                           console (headless: one-shot with -p, else the stdin
+                           protocol), chart (headless; prints only the /toks
+                           chart for the run, live) or quiet (headless; prints
+                           only a start and a finish note). chart and quiet
+                           need a -p prompt
+      --no-session         with --ui console: do not save the transcript
                            to ~/.plank/kvcache at exit
       --dump-config        print every effective setting with the layer it came
                            from (default, plugin, ~/.plank, ./.plank, CLI) and exit
@@ -1469,7 +1500,19 @@ pub fn parse_options_with(
             "--skills" => {
                 c.skills = parse_on_off(need_arg(&mut i)?, arg)?;
             }
-            "--non-interactive" => c.non_interactive = true,
+            "--ui" => {
+                c.ui = match need_arg(&mut i)? {
+                    "tui" => UiMode::Tui,
+                    "console" => UiMode::Console,
+                    "chart" => UiMode::Chart,
+                    "quiet" => UiMode::Quiet,
+                    other => {
+                        return Err(format!(
+                            "--ui: invalid mode {other:?} (tui|console|chart|quiet)"
+                        ));
+                    }
+                };
+            }
             "--debug" => c.debug = true,
             "--no-session" => c.save_session = false,
             "--dump-config" => c.dump_config = true,
@@ -1655,6 +1698,17 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
             c.generation.ctx_size
         ));
     }
+    // `chart` and `quiet` have nowhere to read a prompt from: they print their
+    // one thing and exit, so without `-p` they would run no turn at all.
+    // `--ui console` needs no prompt — without one it runs the stdin protocol.
+    if matches!(c.ui, UiMode::Chart | UiMode::Quiet) && c.prompt.is_none() {
+        let mode = if c.ui == UiMode::Chart {
+            "chart"
+        } else {
+            "quiet"
+        };
+        return Err(format!("--ui {mode} requires a prompt (-p TEXT)"));
+    }
     // --provider (flavor b) selects a third-party API engine. Mutually
     // exclusive with the local selectors and with --remote (§4.7).
     if let Some(provider) = c.provider {
@@ -1815,7 +1869,7 @@ mod tests {
             Some(&Origin::Cli)
         );
         // A flag that shadows no settings key records nothing.
-        let c = parse_options(&args(&["--non-interactive"])).unwrap();
+        let c = parse_options(&args(&["--ui", "console"])).unwrap();
         assert!(c.cli_provenance.is_empty());
     }
 
@@ -1889,7 +1943,7 @@ mod tests {
         assert!(c.prompt.is_none());
         // In-pass /btw suspend is on by default; --disable-btw-suspend opts out.
         assert!(c.btw.suspend);
-        assert!(!c.non_interactive);
+        assert_eq!(c.ui, UiMode::Tui);
         assert!(!c.show_help);
         // Shared engine is opt-in (issue #28); off by default.
         assert!(!c.shared_engine);
@@ -2059,7 +2113,7 @@ mod tests {
         assert!(err.contains("--ui-remote=7777"), "{err}");
         // A non-numeric follower is someone else's argument, not a port.
         assert_eq!(
-            parse_options(&args(&["--ui-remote", "--non-interactive"]))
+            parse_options(&args(&["--ui-remote", "--ui", "console"]))
                 .unwrap()
                 .ui_remote,
             Some(0)
@@ -2067,13 +2121,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_ui_modes_and_guards_chart() {
+        assert_eq!(parse_options(&args(&[])).unwrap().ui, UiMode::Tui);
+        assert_eq!(
+            parse_options(&args(&["--ui", "tui"])).unwrap().ui,
+            UiMode::Tui
+        );
+        assert_eq!(
+            parse_options(&args(&["--ui", "console"])).unwrap().ui,
+            UiMode::Console
+        );
+        let err = parse_options(&args(&["--ui", "repl"])).unwrap_err();
+        assert!(err.contains("tui|console|chart|quiet"), "{err}");
+        // `console` runs the stdin protocol without a prompt; `chart` has no
+        // such fallback, so it must be refused rather than chart nothing.
+        assert!(parse_options(&args(&["--ui", "console"])).is_ok());
+        let err = parse_options(&args(&["--ui", "chart"])).unwrap_err();
+        assert!(err.contains("-p"), "{err}");
+        let c = parse_options(&args(&["--ui", "chart", "-p", "hi"])).unwrap();
+        assert_eq!(c.ui, UiMode::Chart);
+        assert!(c.ui.is_headless() && !UiMode::Tui.is_headless());
+        // `quiet` is the same shape as `chart`: one prompt, one line of output.
+        let err = parse_options(&args(&["--ui", "quiet"])).unwrap_err();
+        assert!(err.contains("--ui quiet requires a prompt"), "{err}");
+        let c = parse_options(&args(&["--ui", "quiet", "-p", "hi"])).unwrap();
+        assert_eq!(c.ui, UiMode::Quiet);
+        assert!(c.ui.is_headless());
+    }
+
+    #[test]
     fn no_session_flag_disables_the_headless_save() {
         assert!(
-            parse_options(&args(&["--non-interactive"]))
+            parse_options(&args(&["--ui", "console"]))
                 .unwrap()
                 .save_session
         );
-        let c = parse_options(&args(&["--non-interactive", "--no-session"])).unwrap();
+        let c = parse_options(&args(&["--ui", "console", "--no-session"])).unwrap();
         assert!(!c.save_session);
     }
 
@@ -2082,7 +2165,8 @@ mod tests {
         let c = parse_options(&args(&[
             "-p",
             "hi",
-            "--non-interactive",
+            "--ui",
+            "console",
             "-sys",
             "sys",
             "--trace",
@@ -2105,7 +2189,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.prompt.as_deref(), Some("hi"));
-        assert!(c.non_interactive);
+        assert_eq!(c.ui, UiMode::Console);
         assert_eq!(c.system, "sys");
         assert_eq!(c.trace_path, Some(PathBuf::from("/tmp/t.log")));
         assert_eq!(c.generation.ctx_size, 4096);
@@ -2236,14 +2320,15 @@ mod tests {
         // Composes with the flags a benchmark actually uses.
         let e = parse_options(&args(&[
             "--minimal-prompt",
-            "--non-interactive",
+            "--ui",
+            "console",
             "--provider",
             "openai",
             "--model",
             "m",
         ]))
         .unwrap();
-        assert!(e.minimal_prompt && e.non_interactive);
+        assert!(e.minimal_prompt && e.ui == UiMode::Console);
     }
 
     #[test]

@@ -513,10 +513,10 @@ sits inside your working tree and is easy to commit by accident, so
 there is no API-key setting. Keep keys on <code>--api-key</code> or the
 provider's environment variable.</li>
 <li><strong>No per-run choices.</strong> <code>--prompt</code>,
-<code>--non-interactive</code>, <code>--ui-remote</code>,
-<code>--trace</code>, <code>--chdir</code>, <code>--seed</code>,
-<code>--worktree</code>, and the serve/control options describe one
-invocation, not a preference, so they have no settings key.</li>
+<code>--ui</code>, <code>--ui-remote</code>, <code>--trace</code>,
+<code>--chdir</code>, <code>--seed</code>, <code>--worktree</code>, and
+the serve/control options describe one invocation, not a preference, so
+they have no settings key.</li>
 </ul>
 <h3 id="when-it-goes-wrong">When it goes wrong</h3>
 <p>A broken settings file never stops plank from starting. Malformed
@@ -628,8 +628,12 @@ suffix: <code>-c 128k</code>, <code>-c 1m</code></td>
 <td>run one prompt and exit</td>
 </tr>
 <tr>
-<td><code>--non-interactive</code></td>
-<td>disable the interactive UI</td>
+<td><code>--ui MODE</code></td>
+<td>front end: <code>tui</code> (default), <code>console</code>
+(headless), <code>chart</code> (headless, prints only the live
+<code>/toks</code> chart) or <code>quiet</code> (headless, prints only a
+start and a finish note); <code>chart</code> and <code>quiet</code> need
+<code>-p</code></td>
 </tr>
 <tr>
 <td><code>-sys, --system TEXT</code></td>

@@ -287,7 +287,7 @@ screen directly: it is routed by `ui::SubSinkTarget` through a channel to
 TUI event loop applies it to the run's own buffer in `tui::SubPane` (the
 roster), the plain
 REPL prints it inline, or — for `SubSinkTarget::Null` under
-`--non-interactive` — it is discarded so the headless stdout protocol stays
+`--ui console` — it is discarded so the headless stdout protocol stays
 uncorrupted.
 
 ### Tools (`tools/`)
@@ -573,7 +573,7 @@ built-in defaults < ~/.plank/settings.json < ./.plank/settings.json < env < CLI 
 ```
 
 The file holds only *stable preferences*, never per-run choices — `--prompt`,
-`--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`,
+`--ui`, `--ui-remote`, `--trace`, `--chdir`, `--seed`,
 `--worktree`, and the serve/control options deliberately have no key. Seven
 groups:
 
@@ -712,7 +712,7 @@ atomic (`interrupt.rs`) directly.
 
 `main::run` picks the path from the terminal:
 
-| stdin & stdout are a TTY | `--non-interactive` | Front-end |
+| stdin & stdout are a TTY | `--ui console` / `--ui chart` | Front-end |
 | --- | --- | --- |
 | yes | no | Ratatui TUI (`run_tui`) |
 | no | no | Plain line REPL (`run_repl_plain`) |

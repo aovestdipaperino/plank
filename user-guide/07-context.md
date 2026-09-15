@@ -27,7 +27,7 @@ The system prompt is cached on disk as a fingerprinted snapshot, so restarts do 
 
 ## `AGENTS.md`
 
-The conventional place for "things anyone working in this repo needs to know": build commands, architecture, house style, gotchas. plank finds it and injects it at session start. It is the only instructions file plank reads: a project root that has a `CLAUDE.md` but no `AGENTS.md` gets an `AGENTS.md` symlink to it the first time you start plank there, and a project with neither is asked whether to generate one. Headless runs (`--non-interactive`) do neither.
+The conventional place for "things anyone working in this repo needs to know": build commands, architecture, house style, gotchas. plank finds it and injects it at session start. It is the only instructions file plank reads: a project root that has a `CLAUDE.md` but no `AGENTS.md` gets an `AGENTS.md` symlink to it the first time you start plank there, and a project with neither is asked whether to generate one. Headless runs (`--ui console`) do neither.
 
 ```
 /init

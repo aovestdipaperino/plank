@@ -20,14 +20,14 @@ and ask, instead of firing off a run that either fails or walks over theirs.
 ## Pick the Front End the Change Touches
 
 `main.rs` decides which one you get: TTYs on both ends bring up the Ratatui
-TUI, a pipe drops to the plain line REPL, `--non-interactive` runs the
+TUI, a pipe drops to the plain line REPL, `--ui console` runs the
 headless stdin protocol. Exercise whichever one your change lands in, keeping
 in mind that a slash command is normally written twice - checking it in the
 TUI leaves the other half unproven.
 
 **Headless** (the default choice - scriptable, no terminal to drive):
 
-    ./target/debug/plank --non-interactive -p "<prompt that exercises it>"
+    ./target/debug/plank --ui console -p "<prompt that exercises it>"
 
 Session transcripts land in `~/.plank/kvcache/<id>.<family>.kv`; grep them to
 prove what actually entered the context. Add `--no-session` when you do not

@@ -186,7 +186,7 @@ fn log_tool_error(reason: &str, raw: &[u8]) {
 /// This trait is also the animation boundary. Motion is Ratatui-only: the
 /// Ratatui sink drives `plank`'s animation module effects (throbber, shimmer, pulse,
 /// flash, stall-fade) off the shared 20 Hz clock, while the plain-stdout and
-/// `--non-interactive` sinks render the static/reduced-motion form. The stream
+/// `--ui console` sinks render the static/reduced-motion form. The stream
 /// renderer feeds bytes through here without knowing which sink animates, so the
 /// plain path stays untouched.
 pub trait RenderSink {

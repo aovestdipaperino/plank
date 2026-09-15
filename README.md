@@ -255,7 +255,7 @@ It lists only settings actually in effect: a value a command-line flag overrode 
 Two things the file deliberately does **not** do:
 
 - **It holds no secrets.** `./.plank/settings.json` sits inside your working tree and is easy to commit by accident, so there is no API-key setting — keep it on `--api-key` or the provider's environment variable.
-- **It holds no per-run choices.** `--prompt`, `--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, `--worktree`, and `serve` describe one invocation rather than a preference, so they have no settings key.
+- **It holds no per-run choices.** `--prompt`, `--ui`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, `--worktree`, and `serve` describe one invocation rather than a preference, so they have no settings key.
 
 A broken settings file never stops plank from starting: malformed JSON, a wrongly-typed value, an unknown key, or an unrecognised backend name each fall back to that key's default. (The same unrecognised name passed to `--backend` is still an error — a flag is an explicit instruction, a config file is a preference.) One limitation: settings are read from the directory plank launches in, so project-scoped settings do not follow `--chdir`.
 

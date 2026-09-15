@@ -744,7 +744,7 @@ enum PlankHomeGrant {
 /// Routed through the [`Asker`](crate::tools::ask::Asker) each front end
 /// installs, so the TUI renders it in the input region and the plain REPL reads
 /// stdin — the same path the `ask` tool and the web approval gate use. In
-/// `--non-interactive` mode there is no asker and hence no one to grant: the
+/// `--ui console` mode there is no asker and hence no one to grant: the
 /// answer is [`PlankHomeGrant::Denied`], leaving `~/.plank` read-only as it is
 /// by default.
 fn plank_home_grant(ctx: &mut ToolContext) -> PlankHomeGrant {

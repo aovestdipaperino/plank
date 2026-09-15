@@ -7,8 +7,21 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.1.0 is out**, and the beta channel is on 5.1.3. The patch number
+**v5.1.0 is out**, and the beta channel is on 5.1.4. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.1.4: `--non-interactive` is now `--ui`, and two of its modes print almost
+nothing.** The flag that picked a front end only ever had two answers, on or
+off, so it becomes one flag with four: `--ui tui` is the default you already
+have, `--ui console` is exactly what `--non-interactive` was, and the two new
+ones are for runs you are not reading. `--ui chart` swallows the turn's output
+and paints the `/toks` throughput chart in its place, live, filling in as the
+model generates, which is what you want when the question is how fast the
+engine is rather than what it said. `--ui quiet` prints one line and no more:
+`Prompting.` when the turn starts, `Started working...` when the first token is
+imminent, `done.` at the end. Both need a `-p` prompt. `--non-interactive` is
+gone rather than kept as an alias, so a script that used it wants `--ui
+console`.
 
 **5.1.3: a long read-only investigation is no longer mistaken for a stall.**
 One rung of the loop guard watched a whole turn and ended it after 32 KB of

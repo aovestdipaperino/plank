@@ -131,7 +131,7 @@ Three things always survive both passes: anything you have pinned in `/kvcache`,
 ### Two things the file deliberately will not do
 
 - **No secrets.** `./.plank/settings.json` sits inside your working tree and is easy to commit by accident, so there is no API-key setting. Keep keys on `--api-key` or the provider's environment variable.
-- **No per-run choices.** `--prompt`, `--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, `--worktree`, and the serve/control options describe one invocation, not a preference, so they have no settings key.
+- **No per-run choices.** `--prompt`, `--ui`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, `--worktree`, and the serve/control options describe one invocation, not a preference, so they have no settings key.
 
 ### When it goes wrong
 
@@ -174,7 +174,7 @@ One limitation: settings come from the directory plank launches in, so project s
 | Flag | What |
 |---|---|
 | `-p, --prompt TEXT` | run one prompt and exit |
-| `--non-interactive` | disable the interactive UI |
+| `--ui MODE` | front end: `tui` (default), `console` (headless), `chart` (headless, prints only the live `/toks` chart) or `quiet` (headless, prints only a start and a finish note); `chart` and `quiet` need `-p` |
 | `-sys, --system TEXT` | override the system prompt |
 | `--chdir PATH` | change working directory before starting |
 | `--worktree NAME` | start inside an isolated git worktree of this repository |

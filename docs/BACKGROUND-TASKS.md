@@ -126,7 +126,7 @@ Delivery happens at two kinds of boundary:
 |---|---|---|
 | TUI | `run_tui` redraws on a 200 ms tick | On each tick, if no turn is running and no modal pane is open, call `take_finished_unannounced`. If non-empty, build the notification and start a turn with it exactly as if the user had submitted that text, but rendered in the log as a dim system line instead of a user prompt. |
 | Plain REPL | `read_line` blocks the thread | Move stdin reading onto a helper thread that sends lines over an mpsc channel. The REPL loop then does `recv_timeout(250 ms)`, checking jobs on timeout. Same start-a-turn path as the TUI. |
-| Headless (`--non-interactive`) | stdin protocol | Do **not** auto-start a turn: the driver owns the loop. Instead emit a `{"type":"job_finished", ...}` event on stdout and let the driver decide. The notification text is still appended to the transcript so a following `run_turn` sees it. |
+| Headless (`--ui console`) | stdin protocol | Do **not** auto-start a turn: the driver owns the loop. Instead emit a `{"type":"job_finished", ...}` event on stdout and let the driver decide. The notification text is still appended to the transcript so a following `run_turn` sees it. |
 
 Both interactive paths funnel into one new `Agent` entry point:
 

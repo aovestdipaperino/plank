@@ -5,7 +5,7 @@
 //!
 //! Holds the settings that are *stable preferences* rather than per-run
 //! choices: engine defaults, UI tuning, safety defaults, and the MCP handshake
-//! timeout. Operational flags (`--prompt`, `--non-interactive`, `--ui-remote`,
+//! timeout. Operational flags (`--prompt`, `--ui console`, `--ui-remote`,
 //! `--trace`, `--chdir`, `--seed`, and the serve/control options) describe one
 //! invocation and deliberately have no settings key.
 //!

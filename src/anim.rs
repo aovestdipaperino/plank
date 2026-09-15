@@ -19,7 +19,7 @@
 //!
 //! # Front-end boundary
 //!
-//! Motion is Ratatui-only. The plain line REPL and `--non-interactive` paths
+//! Motion is Ratatui-only. The plain line REPL and `--ui console` paths
 //! render the static/reduced-motion form. These functions live behind the
 //! `viz.rs` / `tui.rs` render sink so the plain path stays untouched.
 

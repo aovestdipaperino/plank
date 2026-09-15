@@ -23,7 +23,7 @@ use ratatui::crossterm::event::{
 };
 
 use crate::compact;
-use crate::config::{AgentConfig, slash_command_known};
+use crate::config::{AgentConfig, UiMode, slash_command_known};
 use crate::context::{ContextContent, ContextTokens};
 use crate::dsml::ToolCall;
 use crate::editor::{History, LineBuffer, default_history_path};
@@ -550,11 +550,11 @@ impl RenderSink for NullSink {
 /// Where a headless sub-agent's rendered output goes. Sub-agents run
 /// synchronously inside a turn, so this is set by whichever front end can
 /// display the result: the TUI routes it over the worker→UI channel, the plain
-/// REPL prints it inline, and the `--non-interactive` protocol path discards it
+/// REPL prints it inline, and the `--ui console` protocol path discards it
 /// (its stdout carries a machine protocol that model text would corrupt).
 #[derive(Debug, Default)]
 pub enum SubSinkTarget {
-    /// Discard sub-agent output (the default, and the non-interactive path).
+    /// Discard sub-agent output (the default, and the headless path).
     #[default]
     Null,
     /// Forward over the worker→UI channel as [`crate::worker::UiEvent::Sub`].
@@ -17952,9 +17952,13 @@ fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
 
 /// Runs headless mode: one-shot with `-p`, else a stdin-driven protocol.
 ///
+/// Under `--ui chart` the run is a one-shot whose stdout is swallowed for the
+/// duration of the turn (see [`SilencedStdout`]) so the only thing the process
+/// prints is the `/toks` chart for what it just generated.
+///
 /// # Errors
 /// Returns an error string on unrecoverable I/O or engine failure.
-pub fn run_non_interactive(
+pub fn run_headless(
     engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     local_engine: Option<Box<dyn Engine>>,
@@ -17967,7 +17971,55 @@ pub fn run_non_interactive(
     agent.fire_session_start("startup", &mut |w| eprintln!("{w}"));
     if let Some(prompt) = cfg.prompt.as_deref() {
         agent.session.push(Message::user(prompt));
-        let r = agent.run_turn();
+        let color = agent.color;
+        let r = match cfg.ui {
+            // Both of these swallow the turn's own stdout and put one thing of
+            // their own on the descriptor underneath it.
+            mode @ (UiMode::Chart | UiMode::Quiet) => {
+                let silenced = SilencedStdout::open();
+                // With no descriptor to silence there is nothing to paint on,
+                // so the turn prints as `--ui console` would and the mode's
+                // own output simply follows it.
+                let say = |text: &str| {
+                    if let Some(s) = &silenced {
+                        s.write_real(text);
+                    } else {
+                        print!("{text}");
+                        let _ = std::io::stdout().flush();
+                    }
+                };
+                let live = (mode == UiMode::Chart)
+                    .then(|| silenced.as_ref().map(|s| ChartLive::start(s.saved, color)))
+                    .flatten();
+                let quiet_note = if mode == UiMode::Quiet {
+                    say(QUIET_PROMPTING);
+                    if let Some(s) = silenced.as_ref() {
+                        Some(QuietLive::start(s.saved))
+                    } else {
+                        // Nothing silenced, so nothing to wait for a quiet
+                        // moment to say: the note goes out now and the turn
+                        // prints over it as `--ui console` would.
+                        say(QUIET_START);
+                        None
+                    }
+                } else {
+                    None
+                };
+                let r = agent.run_turn();
+                // Both of these write the last of what their mode puts on
+                // screen, so they have to land before anything follows.
+                drop(live);
+                drop(quiet_note);
+                match mode {
+                    UiMode::Quiet => say(QUIET_DONE),
+                    // The painter already drew it, unless there was none.
+                    _ if silenced.is_none() => say(&toks_report(color)),
+                    _ => {}
+                }
+                r
+            }
+            _ => agent.run_turn(),
+        };
         agent.save_headless_session(cfg.save_session);
         headless_quit_repro(&mut agent);
         agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
@@ -18014,6 +18066,260 @@ pub fn run_non_interactive(
     agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
     crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
     Ok(())
+}
+
+/// Redirects the process's stdout to `/dev/null` for as long as it lives, and
+/// restores the real one on drop.
+///
+/// `--ui chart` prints one thing and one thing only. The turn it runs first
+/// streams model text, tool banners and status lines to stdout from several
+/// layers (the stream renderer, the status sink, tool output), so silencing it
+/// at the file descriptor is both the complete answer and the small one — and
+/// it leaves stderr, where headless diagnostics belong, untouched.
+///
+/// `open` returning `None` (no `/dev/null`, no spare descriptor) means the run
+/// simply prints its turn as `--ui console` would; it is not worth failing over.
+struct SilencedStdout {
+    saved: std::os::fd::RawFd,
+}
+
+impl SilencedStdout {
+    fn open() -> Option<Self> {
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .ok()?;
+        // SAFETY: plain descriptor duplication on stdout; `saved` is restored
+        // and closed in `drop`, and `devnull` closes at the end of this scope.
+        unsafe {
+            let saved = libc::dup(libc::STDOUT_FILENO);
+            if saved < 0 {
+                return None;
+            }
+            if libc::dup2(
+                std::os::fd::AsRawFd::as_raw_fd(&devnull),
+                libc::STDOUT_FILENO,
+            ) < 0
+            {
+                libc::close(saved);
+                return None;
+            }
+            Some(Self { saved })
+        }
+    }
+
+    /// Writes to the saved (real) stdout, past the silencing.
+    fn write_real(&self, text: &str) {
+        write_fd(self.saved, text);
+    }
+}
+
+impl Drop for SilencedStdout {
+    fn drop(&mut self) {
+        // Anything the turn buffered belongs to the silenced stdout, not to the
+        // chart that is about to be written.
+        let _ = std::io::stdout().flush();
+        // SAFETY: `self.saved` is the descriptor `open` duplicated and nobody
+        // else holds it.
+        unsafe {
+            libc::dup2(self.saved, libc::STDOUT_FILENO);
+            libc::close(self.saved);
+        }
+    }
+}
+
+/// The three things `--ui quiet` prints, in order, on one line: the turn has
+/// begun and is prefilling, the model has started generating, the turn is over.
+/// The mode exists for a script or a person who wants to know a run is alive
+/// and then that it is finished, and nothing else.
+const QUIET_PROMPTING: &str = "Prompting. ";
+/// See [`QUIET_PROMPTING`].
+const QUIET_START: &str = "Started working... ";
+/// See [`QUIET_PROMPTING`].
+const QUIET_DONE: &str = "done.\n";
+
+/// Watches for the start of generation during a `--ui quiet` turn and writes
+/// [`QUIET_START`] when it arrives.
+///
+/// "Generation has started" is read off the first prefill sample: prefill is
+/// what precedes the first token and `toks` records its rate at the moment the
+/// pass completes, so that sample is the handover. A turn that finishes before
+/// either ring sees anything still gets the note on drop, so the line always
+/// has the same three parts.
+struct QuietLive {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl QuietLive {
+    /// Poll interval. Short: this note is the only sign of life the mode gives
+    /// between a long prefill and the first token.
+    const TICK: std::time::Duration = std::time::Duration::from_millis(50);
+
+    fn start(fd: std::os::fd::RawFd) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !crate::toks::prefill_snapshot().is_empty()
+                        || !crate::toks::snapshot().is_empty()
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Self::TICK);
+                }
+                write_fd(fd, QUIET_START);
+            })
+        };
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for QuietLive {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Paints the `/toks` report onto the real stdout while a `--ui chart` turn
+/// runs, redrawing it in place a few times a second so the charts fill as the
+/// model generates rather than appearing only once the turn is over.
+///
+/// The painter is a thread because the turn it reports on owns the calling
+/// one. It writes to the descriptor [`SilencedStdout`] saved — the process's
+/// stdout is pointed at `/dev/null` for the duration, which is what keeps the
+/// screen to the chart alone — with raw `write`, since that fd is deliberately
+/// not owned by anything that would close it.
+///
+/// Before the first throughput sample lands there is no chart to draw, so the
+/// frame is a one-line "prefilling" note: an engine loading and prefilling a
+/// long prompt is the slowest part of a short run, and a blank screen there
+/// reads as a hang.
+struct ChartLive {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ChartLive {
+    /// How often the painter redraws. Fast enough that the line grows visibly,
+    /// slow enough that it costs nothing beside a generation pass.
+    const TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// Spinner frames for the pre-sample note, as elsewhere in plank.
+    const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+
+    fn start(fd: std::os::fd::RawFd, color: bool) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A piped stdout has no cursor to move: it gets the final frame only,
+        // so a redirected run captures one report rather than a flipbook.
+        // SAFETY: `isatty` only inspects the descriptor.
+        let tty = unsafe { libc::isatty(fd) } == 1;
+        let handle = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let mut painter = ChartPainter { fd, tty, lines: 0 };
+                if tty {
+                    painter.write("\x1b[?25l");
+                }
+                let mut tick = 0_usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if tty {
+                        painter.paint(&Self::frame(color, started, tick));
+                    }
+                    tick += 1;
+                    std::thread::sleep(Self::TICK);
+                }
+                painter.paint(&Self::frame(color, started, tick));
+                if tty {
+                    painter.write("\x1b[?25h");
+                }
+            })
+        };
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// One frame: the report once there is anything to chart, else the note.
+    fn frame(color: bool, started: std::time::Instant, tick: usize) -> String {
+        if crate::toks::snapshot().is_empty() && crate::toks::prefill_snapshot().is_empty() {
+            let spin = Self::SPINNER[tick % Self::SPINNER.len()];
+            return format!(
+                "{spin} prefilling... {:.1}s\n",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        toks_report(color)
+    }
+}
+
+impl Drop for ChartLive {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Writes frames to a raw descriptor, erasing the previous one first.
+///
+/// The frame's height is read off the frame itself rather than assumed from
+/// [`TOKS_CHART_HEIGHT`], because the painter switches between the one-line
+/// prefill note and the full report mid-run.
+struct ChartPainter {
+    fd: std::os::fd::RawFd,
+    tty: bool,
+    /// Lines the previous frame occupied, 0 before the first one.
+    lines: usize,
+}
+
+impl ChartPainter {
+    fn paint(&mut self, frame: &str) {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        if self.tty && self.lines > 0 {
+            // Back to the top of the last frame, then clear to end of screen:
+            // frames differ in height, so erasing line by line would leave the
+            // tail of a taller predecessor behind.
+            let _ = write!(out, "\x1b[{}A\x1b[0J", self.lines);
+        }
+        out.push_str(frame);
+        if !frame.ends_with('\n') {
+            out.push('\n');
+        }
+        self.lines = frame.trim_end_matches('\n').split('\n').count();
+        self.write(&out);
+    }
+
+    fn write(&self, text: &str) {
+        write_fd(self.fd, text);
+    }
+}
+
+/// Writes `text` to a raw descriptor, retrying short writes and giving up on
+/// error. Used for the descriptor [`SilencedStdout`] saved, which is
+/// deliberately owned by nothing that would close or buffer it.
+fn write_fd(fd: std::os::fd::RawFd, text: &str) {
+    let mut buf = text.as_bytes();
+    while !buf.is_empty() {
+        // SAFETY: writing `buf.len()` bytes from a live slice to a descriptor
+        // the caller keeps open for the duration of the call.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            return;
+        }
+        buf = &buf[usize::try_from(n).unwrap_or(buf.len())..];
+    }
 }
 
 /// The headless mirror of the TUI and plain-REPL quit dump (CLAUDE.md: a
@@ -18656,11 +18962,11 @@ mod tests {
     }
 
     /// Regression: `run_turn` must not force `sub_sink` to `Stdout`. It is
-    /// called by both the plain REPL and `run_non_interactive` (the `-p`
+    /// called by both the plain REPL and `run_headless` (the `-p`
     /// one-shot path and the stdin-protocol loop), and the headless path's
     /// stdout carries the `+DWARFSTAR_WAITING` / one-shot machine protocol
     /// that interleaved sub-agent model text would corrupt. An `Agent` built
-    /// the way `run_non_interactive` builds it (default `sub_sink`, i.e.
+    /// the way `run_headless` builds it (default `sub_sink`, i.e.
     /// `Null`) must still have `sub_sink == Null` after a turn runs, and any
     /// sub-agent output emitted through that sink must be silently dropped
     /// rather than printed.
@@ -18674,7 +18980,7 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, engine, &cfg);
 
-        // Sanity: this is the same default `new_agent`/`run_non_interactive`
+        // Sanity: this is the same default `new_agent`/`run_headless`
         // leave in place (no assignment on the non-interactive path).
         assert!(matches!(agent.sub_sink, SubSinkTarget::Null));
 

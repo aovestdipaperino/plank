@@ -107,7 +107,7 @@ transcript no longer looks like it is the one generating.
 
 It is a live readout: it appears with the first agent and goes away with the last, staying put only while you are reading it, and `←` brings a finished roster back so a report you delegated is still reachable. The last eight runs are kept. The transcript itself gets only a one-line signpost, which is the point of delegating in the first place — see [Extending plank](09-extending.md).
 
-The plain REPL has no roster and prints subagent output inline instead; `--non-interactive` stays silent so its stdout protocol is not corrupted.
+The plain REPL has no roster and prints subagent output inline instead; `--ui console` stays silent so its stdout protocol is not corrupted.
 
 ## `@` file completion
 

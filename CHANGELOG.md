@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.1.4] - 2026-09-15
+
+### Changed
+
+- **`--non-interactive` is now `--ui MODE`.** The front end is chosen by one
+  flag with three values: `tui` (the default — the full interactive UI, or the
+  plain REPL when either end is piped), `console` (exactly what
+  `--non-interactive` did: one prompt and exit with `-p`, the stdin protocol
+  without one) and `chart`, a headless one-shot that swallows the turn's stdout
+  and prints nothing but the `/toks` throughput chart for what it just
+  generated — for measuring the engine rather than reading the reply. The chart is
+  live: it is repainted in place a few times a second while the turn runs, so
+  the lines grow as the model generates instead of appearing only at the end,
+  and before the first sample lands the frame is a `prefilling...` note rather
+  than a blank screen. Piped, it prints the final report once. `quiet` is
+  the smallest of them: it prints `Prompting. ` when the turn begins,
+  `Started working... ` when generation starts (read off the first prefill
+  sample, the handover into decoding) and `done.` at the end — one line, for a
+  script or a person who only wants to see that the run is alive and then that
+  it finished. `chart` and `quiet`
+  need a `-p` prompt and refuse to start without one. `--non-interactive` is
+  gone rather than kept as an alias; scripts need `--ui console`.
+
 ### Added
 
 - **Qwen3.8-Flash-Next is served again, by every build.** Upstream merged

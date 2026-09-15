@@ -14,7 +14,7 @@
 //! then delegates the actual prompting to an [`Asker`] carried on the
 //! [`ToolContext`](crate::tools::ToolContext). The three front ends install
 //! different askers — the Ratatui TUI an [`AskBridge`]-backed one that renders
-//! into the input region, the plain REPL a stdin reader, and `--non-interactive`
+//! into the input region, the plain REPL a stdin reader, and `--ui console`
 //! none at all (fast-fail). The rendering-independent pieces (validation,
 //! option-list navigation, result formatting) live here so they can be
 //! unit-tested without a live terminal.
@@ -136,7 +136,7 @@ pub fn tool_ask(asker: Option<&mut Box<dyn Asker>>, call: &ToolCall) -> String {
         multi,
         allow_chat: true,
     };
-    // No interactive front end (`--non-interactive` / headless): there is no
+    // No interactive front end (`--ui console` / headless): there is no
     // user to ask, so tell the model to proceed rather than blocking forever.
     let Some(asker) = asker else {
         return "No interactive user is available to answer (non-interactive mode); \

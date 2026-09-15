@@ -15,7 +15,7 @@
 //! stderr reaches the same tty as stdout but bypasses the Ratatui frame
 //! buffer, so a title change can never tear a frame even when emitted from the
 //! worker thread. No-op when stderr is not a terminal (piped runs, tests,
-//! `--non-interactive` under a harness).
+//! `--ui console` under a harness).
 
 use std::io::{IsTerminal, Write};
 

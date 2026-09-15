@@ -216,17 +216,18 @@ it). See <a
 href="08-configuration.html#speculative-decoding">Configuration</a>.</p>
 <h2 id="staying-on-the-current-model">Staying on the current model</h2>
 <p>Once a model is installed, plank checks for a newer one at most once
-a day by fetching <code>ds4.manifest</code>, a small file naming the
-artifact set and a version number. When a newer version appears, plank
-asks first: <code>Download it in the background? [y/N]</code>,
-defaulting to no. Say yes and it starts in a detached background process
-rather than blocking the session: it keeps running even if you quit
-plank or close the terminal, so closing the laptop lid mid-transfer
-costs nothing but time. Say no (or just press Enter) and nothing
-downloads yet; run <code>/model download</code> whenever you are ready
-to start it. A dropped connection or a stopped helper leaves verified
-artifacts and partial files in <code>~/.plank/staging/</code>; nothing
-resumes it automatically, but accepting the next daily offer or running
+a day by fetching a manifest — <code>ds4.manifest</code> for DeepSeek,
+<code>qwen.manifest</code> for Qwen — a small file naming that set's
+artifacts and a version number. When a newer version appears, plank asks
+first: <code>Download it in the background? [y/N]</code>, defaulting to
+no. Say yes and it starts in a detached background process rather than
+blocking the session: it keeps running even if you quit plank or close
+the terminal, so closing the laptop lid mid-transfer costs nothing but
+time. Say no (or just press Enter) and nothing downloads yet; run
+<code>/model download</code> whenever you are ready to start it. A
+dropped connection or a stopped helper leaves verified artifacts and
+partial files in <code>~/.plank/staging/</code>; nothing resumes it
+automatically, but accepting the next daily offer or running
 <code>/model download</code> picks up right where it left off,
 re-downloading only what wasn't finished. Only one such download runs
 per machine, whichever plank noticed the update first.</p>
@@ -270,6 +271,15 @@ it is what you will see if you launch on an unsupported platform.</p>
 <td><code>~/.plank/ds4flash.dspark.gguf</code></td>
 <td>DSpark draft model, for DeepSeek speculation
 (<code>--mtp</code>)</td>
+</tr>
+<tr>
+<td><code>~/.plank/qwen.gguf</code></td>
+<td>Qwen3.8-Flash-Next main model, when <code>--qwen</code> is used</td>
+</tr>
+<tr>
+<td><code>~/.plank/qwen.vision.gguf</code></td>
+<td>Qwen3.8-Flash-Next vision encoder (installed by the manifest; plank
+does not load one yet)</td>
 </tr>
 <tr>
 <td><code>~/.plank/kvcache/</code></td>

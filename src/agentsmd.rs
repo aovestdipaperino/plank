@@ -6,7 +6,7 @@
 //! plank reads `AGENTS.md` and nothing else (see `context::discover_agents_md_files`).
 //! Many projects carry a `CLAUDE.md` instead, so an interactive start with a
 //! `CLAUDE.md` and no `AGENTS.md` links the one to the other; a project with
-//! neither is offered `/init`. Headless runs (`--non-interactive`) do none of
+//! neither is offered `/init`. Headless runs (`--ui console`) do none of
 //! this: they must not write into a checkout or block on a question.
 
 use std::path::{Path, PathBuf};

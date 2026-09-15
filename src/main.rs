@@ -8,7 +8,7 @@
 //! 1. **Interactive agent** (default, TUI or plain stdout): the main agent loop
 //!    that drives inference, tool dispatch, and user interaction. Uses Ratatui
 //!    when both stdin and stdout are real terminals, otherwise a plain line REPL.
-//! 2. **Non-interactive / headless** (`--non-interactive`): reads commands from
+//! 2. **Non-interactive / headless** (`--ui console`, `--ui chart`): reads commands from
 //!    stdin and prints structured output, for scripting and CI integration.
 //! 3. **Remote server** (`plank serve`): hosts the engine over a WebSocket
 //!    control interface. Supports single-tenant and shared-engine modes.
@@ -222,7 +222,7 @@ fn main() -> ExitCode {
     }
     // `--dump-config` prints the resolved configuration (every effective key
     // with the layer it came from) and exits, without starting a session. It
-    // works under `--non-interactive` because it needs no UI.
+    // works under `--ui console` because it needs no UI.
     if cfg.dump_config {
         print!("{}", plank::provenance::render_resolved(&settings, &cfg));
         return ExitCode::SUCCESS;
@@ -234,7 +234,7 @@ fn main() -> ExitCode {
     }
     // One-shot wipe of pre-`.kv_raw` KV blobs, before any terminal setup so
     // the note prints as a plain line on every front end (TUI, plain REPL,
-    // and `--non-interactive` all funnel through here). Best-effort: a store
+    // and `--ui console` all funnel through here). Best-effort: a store
     // that fails to open is skipped silently, and the next launch retries.
     //
     // Gated on the cache directory already existing, and deliberately not
@@ -896,8 +896,8 @@ fn run(
         return Err(plank::engine::THINK_LEVEL_REQUIRES_V41.to_string());
     }
     let color = std::io::stdout().is_terminal();
-    if cfg.non_interactive {
-        return plank::ui::run_non_interactive(engine, cfg, local_engine, plugins);
+    if cfg.ui.is_headless() {
+        return plank::ui::run_headless(engine, cfg, local_engine, plugins);
     }
     plank::title::set(plank::title::State::Loading);
     // The full-screen TUI (a real terminal on both ends) draws its own header,
