@@ -2752,3 +2752,46 @@ Two details worth keeping:
   never deciding. Holding needs a bound (`ATTR_CLOSE_LOOKAHEAD`) or a value that
   opens a close tag and never closes it pins the cursor and makes the scan
   quadratic — the thing `param_scan_from` exists to prevent.
+
+## `set_var("HOME")` in a test re-enables the shared-home fallback it was avoiding
+
+Two tests (`consent`, `errlog`) scoped themselves by pointing `$HOME` at a
+scratch directory, restoring it at the end. Both wrote to the user's real
+`~/.plank` anyway, and took four unrelated `tools::` sandbox tests down with
+them.
+
+The race is the obvious half: `HOME` is process-global and `cargo test` runs
+threads in parallel, so for as long as one test held the scratch value every
+other test resolving a plank path got it too. That is why the failures moved
+around and why each test passed when run alone.
+
+The other half is specific to `home::plank_home_in`, and it inverts the
+intent of the test:
+
+```rust
+fn resolve(home: &Path, shared: &Path, allow_shared: bool) -> PathBuf { … }
+fn is_real_home(home: &Path) -> bool {
+    std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == home)
+}
+```
+
+The shared `/Users/.plank` fallback is gated on *the root being this process's
+own `$HOME`* — precisely so an injected root (a test, a worktree copy) can
+never reach the machine's state. Setting `HOME` to the scratch directory makes
+`is_real_home` true again, so the guard opens: the scratch `.plank` does not
+exist yet, `/Users/.plank` does, and the fallback wins. The test resolves to
+the shared directory, which on a developer box is typically a symlink to the
+user's own `~/.plank`.
+
+So the two tests were not merely unhermetic, they were operating on live user
+state: the errlog test appended to the real `errors.log` (it asserted two
+timestamped lines and counted 6657), and the consent test called `remove_file`
+on the real `web-consent` marker, revoking standing web consent.
+
+The rule this leaves behind, already the one `spill` arrived at independently:
+**a function that resolves a path from `$HOME` gets an explicit-root `_in`
+variant for tests, and the environment is never touched.** Where the write
+itself needs testing, split the body so the resolved path is a parameter
+(`append_entry`, `write_marker`) and let the public function stay the
+one-line `$HOME` wrapper. A red run in any `$HOME`-touching module is worth a
+`grep -rn 'set_var("HOME"' src/` before it is blamed on the diff.
