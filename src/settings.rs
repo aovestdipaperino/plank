@@ -2288,6 +2288,55 @@ mod tests {
     }
 
     #[test]
+    fn memory_settings_overlay_from_json() {
+        let mut s = Settings::default();
+        s.overlay(
+            r#"{"memory":{"autoExtract":false,"extractEveryNTurns":7,"budgets":{"user":10,"feedback":20,"project":30,"reference":40}},"tools":{"remember":false}}"#,
+        );
+        assert!(!s.memory.auto_extract);
+        assert_eq!(s.memory.extract_every_n_turns, 7);
+        assert_eq!(s.memory.budgets.user, 10);
+        assert_eq!(s.memory.budgets.feedback, 20);
+        assert_eq!(s.memory.budgets.project, 30);
+        assert_eq!(s.memory.budgets.reference, 40);
+        assert!(!s.tools.remember);
+    }
+
+    #[test]
+    fn memory_extract_every_n_turns_overlay_clamps_zero_to_one() {
+        // The default is already 1, so overlaying anything other than 0
+        // would leave this vacuously true. Use a non-1 baseline, overlay 0,
+        // and confirm the clamp — not the default — produced the 1.
+        let mut s = Settings::default();
+        s.memory.extract_every_n_turns = 9;
+        s.overlay(r#"{"memory":{"extractEveryNTurns":0}}"#);
+        assert_eq!(
+            s.memory.extract_every_n_turns, 1,
+            "0 must clamp to 1, not pass through"
+        );
+    }
+
+    #[test]
+    fn memory_settings_round_trip_through_save_to() {
+        let dir = std::env::temp_dir().join(format!("plank-memory-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        s.memory.auto_extract = false;
+        s.memory.extract_every_n_turns = 6;
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert!(!reloaded.memory.auto_extract);
+        assert_eq!(reloaded.memory.extract_every_n_turns, 6);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn microcompact_defaults_true_and_overlays_false() {
         let s = Settings::default();
         assert!(s.context.microcompact, "on by default");
