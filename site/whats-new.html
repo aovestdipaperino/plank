@@ -138,9 +138,43 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v5.1.0 is out</strong>, and the beta channel is on 5.1.4. The
+<p><strong>v5.1.0 is out</strong>, and the beta channel is on 5.1.5. The
 patch number is still the channel: <code>.0</code> is stable, anything
 above it is beta.</p>
+<p><strong>5.1.5: <code>cargo</code>, <code>npm</code> and
+<code>go</code> work under the sandbox again.</strong> Model-run shell
+commands are sandboxed to the project and the temp dirs, which is the
+right default right up until a build has to fetch a dependency — because
+every package manager writes a machine-wide cache outside the project by
+design. Until now that write was denied with a bare
+<code>Operation not permitted</code>, which reads like a broken
+filesystem rather than a sandbox saying no, and it meant
+<code>cargo build</code> worked only as long as every crate happened to
+be cached already. The caches are writable now:
+<code>~/.cargo/registry</code>, <code>~/.cargo/git</code>, the rustup
+download dirs, <code>~/.npm/_cacache</code>, the Go module cache,
+<code>~/.cache</code>, <code>~/Library/Caches</code>. What is still
+withheld is anything on your <code>PATH</code> —
+<code>~/.cargo/bin</code>, <code>~/.local/bin</code>,
+<code>/usr/local/bin</code> — because a binary installed there is one
+you later run, so those get the same one-question prompt
+<code>~/.plank</code> has always had. <code>cargo install</code> asks
+instead of failing. This is also why the grant names
+<code>~/.cargo/registry</code> rather than <code>~/.cargo</code>: the
+parent carries <code>bin</code> with it.</p>
+<p><strong>5.1.5: <code>/init</code> is not a loop.</strong> Its phases
+re-read and re-survey the same tree on purpose — the interview, the
+codebase survey and the write all revisit it — which is precisely the
+pattern the loop guards exist to stop. So a setup run you asked for
+could be refused halfway through for doing exactly what its own prompt
+told it to. <code>/init</code> now runs with the guards down for that
+one turn and no longer; a <code>/loopguard</code> you typed yourself
+still outranks it, in either direction.</p>
+<p><strong>5.1.5: a headless run says how long it took.</strong>
+<code>plank -p ...</code> ends with <code>total time: 8.4s</code>. It
+goes to stderr, so anything piping the reply sees exactly what it saw
+before, and <code>--ui chart</code> and <code>--ui quiet</code> keep
+printing their one deliberate thing and nothing else.</p>
 <p><strong>5.1.4: <code>--non-interactive</code> is now
 <code>--ui</code>, and two of its modes print almost nothing.</strong>
 The flag that picked a front end only ever had two answers, on or off,

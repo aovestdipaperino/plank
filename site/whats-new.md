@@ -7,8 +7,35 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.1.0 is out**, and the beta channel is on 5.1.4. The patch number
+**v5.1.0 is out**, and the beta channel is on 5.1.5. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.1.5: `cargo`, `npm` and `go` work under the sandbox again.** Model-run shell
+commands are sandboxed to the project and the temp dirs, which is the right
+default right up until a build has to fetch a dependency — because every package
+manager writes a machine-wide cache outside the project by design. Until now
+that write was denied with a bare `Operation not permitted`, which reads like a
+broken filesystem rather than a sandbox saying no, and it meant `cargo build`
+worked only as long as every crate happened to be cached already. The caches are
+writable now: `~/.cargo/registry`, `~/.cargo/git`, the rustup download dirs,
+`~/.npm/_cacache`, the Go module cache, `~/.cache`, `~/Library/Caches`. What is
+still withheld is anything on your `PATH` — `~/.cargo/bin`, `~/.local/bin`,
+`/usr/local/bin` — because a binary installed there is one you later run, so
+those get the same one-question prompt `~/.plank` has always had. `cargo install`
+asks instead of failing. This is also why the grant names `~/.cargo/registry`
+rather than `~/.cargo`: the parent carries `bin` with it.
+
+**5.1.5: `/init` is not a loop.** Its phases re-read and re-survey the same tree
+on purpose — the interview, the codebase survey and the write all revisit it —
+which is precisely the pattern the loop guards exist to stop. So a setup run you
+asked for could be refused halfway through for doing exactly what its own prompt
+told it to. `/init` now runs with the guards down for that one turn and no
+longer; a `/loopguard` you typed yourself still outranks it, in either direction.
+
+**5.1.5: a headless run says how long it took.** `plank -p ...` ends with
+`total time: 8.4s`. It goes to stderr, so anything piping the reply sees exactly
+what it saw before, and `--ui chart` and `--ui quiet` keep printing their one
+deliberate thing and nothing else.
 
 **5.1.4: `--non-interactive` is now `--ui`, and two of its modes print almost
 nothing.** The flag that picked a front end only ever had two answers, on or
