@@ -372,7 +372,7 @@ pub static FIELDS: &[Field] = &[
         FieldId::MemoryAutoExtract,
         "memory",
         "autoExtract",
-        "run the background memory-extraction pass",
+        "extract memories at turn end (costs a generation per turn)",
         Kind::Bool,
     ),
     f(
