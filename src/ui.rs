@@ -14118,22 +14118,28 @@ impl Agent<'_> {
         }
     }
 
-    /// Runs the background memory extraction pass if every gate allows it.
-    /// Returns whether a pass ran.
+    /// Runs the memory extraction pass if every gate allows it. Returns
+    /// whether a pass ran.
     ///
     /// Called only at a turn boundary — after a generation that ended with no
-    /// tool calls — never mid-pass. Settings are sampled fresh every call so
-    /// a `/config` change takes effect on the next eligible turn.
+    /// tool calls — never mid-pass, and *synchronously on the turn thread*:
+    /// both call sites sit after `fire_turn_end`, so the pass's KV snapshot,
+    /// prefill, generation and restore are neither overlapped with the next
+    /// prompt nor counted in the turn stats. Settings are sampled fresh every
+    /// call so a `/config` change takes effect on the next eligible turn.
     ///
-    /// The pass runs through the sub-agent fork (`begin_subagent_fork` /
-    /// `run_subagent_loop` / `end_subagent_fork`), which is why it leaves no
-    /// checkpoint debris: under `in_sidechain()` the KV ladder pushes no
-    /// rungs and stores no payload. Two invariants follow: this never starts
-    /// a pass while already inside a sidechain (no nesting), and every exit
-    /// path below goes through `end_subagent_fork`, so `sidechain_depth`
-    /// always returns to 0 — including the interrupted/error path, where
-    /// nothing is applied and `ExtractState::cancel` leaves the work to be
-    /// redone later rather than recording partial progress.
+    /// The pass is a sidechain opened with `begin_sidechain` (the prompt goes
+    /// in verbatim, not through the sub-agent task framing), driven by a
+    /// single tool-free generation (`run_memory_round`, via
+    /// `run_sidechain_quietly`) and closed by `end_subagent_fork`. Running
+    /// under `in_sidechain()` is why it leaves no checkpoint debris: the KV
+    /// ladder pushes no rungs and stores no payload. Two invariants follow:
+    /// this never starts a pass while already inside a sidechain (no
+    /// nesting), and every exit path below goes through `end_subagent_fork`,
+    /// so `sidechain_depth` always returns to 0 — including the
+    /// interrupted/error path, where nothing is applied and
+    /// `ExtractState::cancel` leaves the work to be redone later rather than
+    /// recording partial progress.
     fn maybe_extract_memories(&mut self) -> bool {
         let settings = crate::settings::active();
         self.extract_state.enabled = settings.memory.auto_extract;

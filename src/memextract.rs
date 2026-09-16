@@ -1,20 +1,23 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! The background memory extraction pass.
+//! The memory extraction pass: gating state and prompt construction.
 //!
 //! Fires at the end of the query loop — a generation that produced a final
-//! response with no tool calls — subject to three gates, in order: mutual
-//! exclusion with the model's own `remember` call, a throttle over eligible
-//! turns, and depth keying so the pass reads only the transcript it has not
-//! already seen.
+//! response with no tool calls — subject to four gates, in order
+//! ([`ExtractState::should_run`]): enabled and not suppressed by the model's
+//! own `remember`/`forget` call this turn, depth keying so the pass reads
+//! only the transcript it has not already seen, not already running, and a
+//! throttle over eligible turns. Off by default (`memory.autoExtract`).
 //!
 //! The depth keying is the same shape as a `kvladder` rung, and carries the
 //! same warning: the recorded depth is what makes the resume correct, and
 //! getting it wrong degrades *silently* into reprocessing the whole
 //! transcript on every pass, at exactly the moment the user is idle.
 //!
-//! The pass runs through the sub-agent fork, so `in_sidechain()` holds: no
+//! The pass itself runs synchronously on the turn thread as a sidechain
+//! (`Agent::maybe_extract_memories` in `ui.rs`: `begin_sidechain`, one
+//! tool-free generation, `end_subagent_fork`), so `in_sidechain()` holds: no
 //! rungs pushed, no payload stored, no checkpoint debris.
 
 use crate::memory::{Entry, Scope};

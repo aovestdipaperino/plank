@@ -3,12 +3,15 @@
 plank can remember things about you and about a project across sessions, and
 it can maintain that memory itself instead of relying entirely on you typing
 `/remember`. This document explains what gets saved, how it is stored, why it
-is stored that way, and every setting that controls it.
+is stored that way, what each part costs, and every setting that controls it.
 
-Status: shipped, on by default (`memory.autoExtract: true`, `tools.remember:
-true`). The design choices below all trace back to one constraint: a memory
-rewrite must never force a mid-session KV re-prefill. Part 1 covers why. The
-rest is mechanics.
+Status: shipped. The `remember`/`forget` tools are on by default
+(`tools.remember: true`); the automatic extraction pass is **off** by default
+(`memory.autoExtract: false`), because each run stalls the front end for a
+KV snapshot, a prefill and a generation after the answer — see "The
+extraction pass" and "Cache accounting" before turning it on. The design
+choices below all trace back to one constraint: a memory rewrite must never
+force a mid-session KV re-prefill. Part 1 covers why. The rest is mechanics.
 
 ## Part 1: why writes land on disk instead of in the conversation
 
@@ -78,9 +81,9 @@ anything already stated in `AGENTS.md`. A memory file that accumulates
 re-derivable facts rots the same way any cache rots when nothing ever
 invalidates it: it goes stale, and by the time someone notices, several other
 entries near it are stale too and nobody trusts the file. The extraction
-pass's own prompt states this rule to the model in those terms; see Part 4.
+pass's own prompt states this rule to the model in those terms; see Part 3.
 
-### The file format, and that untagged entries still work
+### The file format, and that untagged entries still parse
 
 A memory file is a template header followed by dated bullets:
 
@@ -103,20 +106,35 @@ note that isn't a bullet is simply invisible to memory without breaking
 anything.
 
 A bullet written or edited without a `[type]` tag still parses: it falls back
-to `Kind::Project`. This is not a fallback bolted on for compatibility — it
-is the same code path every entry goes through, so a memory file written by
-an older plank build, or hand-edited without the tag syntax, renders
-identically to a freshly tagged one. `docs/MEMORY.md`'s companion test,
-`an_untagged_legacy_file_renders_every_entry_when_nothing_is_configured` in
-`src/memory.rs`, pins exactly this: an untagged file at default settings
-renders every entry, with nothing evicted. That test is the project's
-off-by-default equivalence proof — see "The off-by-default guarantee" below.
+to `Kind::Project`. This is the same code path every entry goes through, so
+a memory file written by an older plank build, or hand-edited without the tag
+syntax, is read exactly like a freshly tagged one. What it is *not* is a
+promise that such a file renders as it did before this feature existed; see
+"What an old file gets after the upgrade" below for what actually changes.
 
 A bracket that isn't one of the four recognized tag words (say, a
 hand-written `[WIP]`) is not stripped or treated as a parse error; it stays
 in the entry's text verbatim, and the entry reads as untagged. Silently
 deleting text a person typed because it happened to look like a tag would be
 worse than leaving it alone.
+
+### What the model actually sees
+
+The text injected into Tier 2 is not the file. `load_scope` regroups the kept
+entries under one `### <type>` heading per type, in the fixed order `user`,
+`feedback`, `project`, `reference`, and writes each bullet back out with its
+id inserted after the tag:
+
+```markdown
+### project
+- (2026-01-01) [project] {3f9a1c02b7de} an old untagged fact
+```
+
+The `{id}` is there so the model can name an entry in a `forget` call or an
+extraction verdict without quoting its text back; the headings make the
+per-type grouping the budgets work on visible to the model. Neither is
+written to `MEMORY.md`, which stays a plain list of dated bullets a person
+can edit.
 
 ### The sidecar, and why it is advisory
 
@@ -126,7 +144,12 @@ holding per-entry bookkeeping, keyed by [`Entry::id`](#entry-identity):
 - `uses` — how many extraction passes judged the entry to have borne on the
   work.
 - `last_used` — the date of the most recent such pass.
-- `pinned` — never evict, whatever the counters say.
+- `pinned` — ranks the entry ahead of every unpinned one in its type, so it
+  is the last to be evicted. **Reserved, not yet settable**: `MetaStore` can
+  read and write the flag, and the ranking honours it, but nothing in plank
+  sets it — there is no `/memory pin`, no tool argument, and no verdict for
+  it. Today the only way to pin an entry is to edit the sidecar by hand and
+  write `"pinned": true` on its row.
 
 A sidecar written by an earlier build of this branch may also carry a
 `retracted` key, from a since-dropped design in which a model `forget` only
@@ -138,59 +161,97 @@ file, an unreadable file, malformed JSON, or the wrong shape identically: an
 empty store. Nothing in `MEMORY.md` itself is ever machine-owned — a person
 can edit, reorder, or delete lines by hand, and the worst that happens is an
 orphaned sidecar row, cleaned up the next time anything calls `MetaStore::gc`
-against the live entry ids. Losing the sidecar file entirely — deleted,
-corrupted, never created — must leave memory loading and rendering exactly
-as if every entry had a fresh row: every counter at zero, nothing pinned,
-nothing missing. That correctness is what "advisory"
-means here, and it is worth stating explicitly because it is easy to design
-a cache that quietly becomes load-bearing; this one is tested not to.
+against the live entry ids — the pass's `apply_verdicts` and both `forget`
+paths do; a plain `remember` does not touch the sidecar at all. Losing the
+sidecar file
+entirely — deleted, corrupted, never created — must leave memory loading and
+rendering exactly as if every entry had a fresh row: every counter at zero,
+nothing pinned, nothing missing. That correctness is what "advisory" means
+here, and it is worth stating explicitly because it is easy to design a cache
+that quietly becomes load-bearing; this one is tested not to.
 
 #### Entry identity
 
-`Entry::id()` is a truncated SHA-256 hash of the entry's text alone — not its
-date, not its type tag. That is deliberate: re-tagging or re-dating a line
-keeps the same id, so it keeps its accumulated usage. The consequence is that
-rewriting an entry's *text* — which is exactly what an `UPDATE` verdict from
-the extraction pass does — changes its id, and something has to carry the old
-row's counters onto the new one or a fact reworded six times over a month
-would reset to zero usage every time. `MetaStore::carry(old_id, new_id)` is
-that something; `apply_one_verdict`'s `Update` arm calls it in the same step
-that rewrites the line. See `FINDINGS.md` for the failure mode this guards
-against.
+`Entry::id()` is the first 12 hex characters of a SHA-256 hash of the
+entry's text alone — not its date, not its type tag. That is deliberate:
+re-tagging or re-dating a line keeps the same id, so it keeps its accumulated
+usage. The consequence is that rewriting an entry's *text* — which is exactly
+what an `UPDATE` verdict from the extraction pass does — changes its id, and
+something has to carry the old row's counters onto the new one or a fact
+reworded six times over a month would reset to zero usage every time.
+`MetaStore::carry(old_id, new_id)` is that something; `apply_one_verdict`'s
+`Update` arm calls it in the same step that rewrites the line.
+
+Because the id is a hash of the text, two entries with identical text in the
+same file are one id: an `ADD` whose text already exists is a no-op, and a
+`forget` of that id removes every line carrying it.
 
 ### Budgets and eviction
 
-Rendering is governed by per-type character budgets (`memory::Budgets`), not
-a single file-level cap — a runaway `project` block can no longer silently
-crowd out the `user` block the way one shared budget would let it:
+Rendering is governed by per-type budgets (`memory::Budgets`), not a single
+file-level cap — a runaway `project` block cannot silently crowd out the
+`user` block the way one shared budget would let it:
 
 | Type | Default budget |
 |---|---|
-| `user` | 4096 characters |
-| `feedback` | 4096 characters |
-| `project` | 6144 characters |
-| `reference` | 2048 characters |
+| `user` | 4096 bytes |
+| `feedback` | 4096 bytes |
+| `project` | 6144 bytes |
+| `reference` | 2048 bytes |
 
-`select_for_render` applies each type's budget independently. Within a type,
-entries are ranked **pinned first, then by descending `uses`, then by most recent
-`last_used`**, and kept in that order until the budget is spent; whatever
-doesn't fit is reported as dropped, not silently discarded — `load_scope`
-appends a line noting how many older entries were omitted under the type
-budget, so nothing disappears without a trace. Age is the *last* tiebreak
-rather than the whole rule, on purpose: it inverts a naive tail-truncation
-scheme, because the oldest facts about a user are usually the most durable
-ones, not the ones most due for eviction.
+The unit is **bytes**, not characters: `select_for_render` charges each entry
+`Entry::render().len()`, the UTF-8 length of its canonical
+`- (date) [type] text` line. For ASCII the two coincide; an entry written in
+a multi-byte script costs more than its character count. The accounting is
+also slightly optimistic: what is charged is the canonical line, while what
+is injected (see "What the model actually sees") carries an extra `{id} ` per
+entry and a `### type` heading per block, none of which is counted. A block
+that exactly fills its budget therefore overruns it by roughly 15 bytes per
+entry plus the heading, which is why the budgets are best read as "about
+this much", not a hard cap on the injected bytes.
 
-### The off-by-default guarantee
+Within a type, entries are ranked **pinned first, then by descending `uses`,
+then by most recent `last_used`, then by most recent date, then by position
+in the file (later wins)**, and kept in that order until the budget is spent;
+whatever doesn't fit is reported as dropped, not silently discarded —
+`load_scope` appends a line noting how many lower-ranked entries were omitted
+under the type budgets, so nothing disappears without a trace. The kept
+entries are then emitted in file order, so the ranking decides *what*
+survives, not the order the model reads it in. The date and position
+tiebreaks matter most on a file that has no sidecar yet: every entry ties on
+the counters, and without them the sort would keep the *oldest* lines — the
+exact inverse of the tail truncation this replaces.
 
-The property that makes all of the above shippable on by default: an
-untagged legacy memory file, with every setting left at its default,
-renders every one of its entries, with nothing evicted and no `omitted`
-line. Turn the tagging and budgeting machinery off — which is exactly what
-an old file with no `[type]` tags does — and you are back to the plain
-behavior memory had before this feature existed. This is pinned as a test in
-`src/memory.rs`:
-`an_untagged_legacy_file_renders_every_entry_when_nothing_is_configured`.
+The budgets can be changed only by hand, in the `memory.budgets` object of
+`settings.json`; they are not in the `/config` form and `/config` does not
+write them back (it rewrites only the keys it owns, so a hand-set budget
+survives a `/config` save).
+
+### What an old file gets after the upgrade
+
+A memory file written before this feature — untagged bullets, no sidecar —
+is read by the same parser as a new one, and with the settings at their
+defaults **no counter is ever bumped and no pass ever runs**, so the sidecar
+stays empty and ranking degrades to "newest first". Three things do change
+for that file, and none of them is a setting:
+
+1. Every entry renders as `[project]` under a `### project` heading, with
+   an `{id}` after the tag, instead of as the raw line.
+2. The old rule — inject the newest 16 KiB of the file and drop whatever
+   older text lay above it, behind an `(older entries truncated)` line — is
+   replaced by the `project` budget, 6144 bytes by default, applied to the
+   canonical lines. The survivors are still the newest entries (see the
+   tiebreaks above), but a legacy file between 6 KiB and 16 KiB that used
+   to render whole now loses its oldest entries and gains the `omitted`
+   line. Raising `memory.budgets.project` by hand restores the old
+   capacity.
+3. An unrecognised `[tag]` is kept in the text, as described above.
+
+The test `an_untagged_legacy_file_renders_every_entry_when_nothing_is_configured`
+in `src/memory.rs` pins the narrow guarantee that holds: a small untagged
+file at default settings renders every entry and emits no `omitted` line. It
+does not, and cannot, show that the injected text is byte-identical to the
+previous behaviour — it is not, per points 1 and 2.
 
 ## Part 3: writing memory
 
@@ -203,40 +264,67 @@ tool` if called anyway):
 
 - **`remember(text, type, scope)`** appends a dated, tagged bullet to the
   named scope's file (default `project`). It writes immediately and logs the
-  change, but — per Part 1 — the entry is not visible in context until the
-  next session start; the tool's own reply says so.
+  change under the reason `remember tool`, but — per Part 1 — the entry is
+  not visible in context until the next session start; the tool's own reply
+  says so.
 - **`forget(id)`** deletes the entry with that id from whichever scope holds
   it, through the same atomic, audited write path as `/forget`
   (`memory::forget_by_id_to`, sharing `forget_where_to` with
   `forget_matching_to`). There is no hidden "retracted" state: what is in
-  `MEMORY.md` is what the model sees, and what the user reads in their own
-  file is live. Recoverability comes from the audit log instead — the
-  `~/.plank/memory-log.jsonl` line records the entry's full text under the
-  reason `forget tool`, distinct from a user's `/forget` (`user /forget`),
-  so a wrong model call can be found in `/memory log` and re-added.
+  `MEMORY.md` is what the model sees at the next start, and what the user
+  reads in their own file is live. Recoverability comes from the audit log
+  instead — the `~/.plank/memory-log.jsonl` line records the entry's full
+  text under the reason `forget tool`, distinct from a user's `/forget`
+  (`user /forget`), so a wrong model call can be found in `/memory log` and
+  re-added by hand.
+
+Either tool call also suppresses the extraction pass for that turn (see
+below): the model's explicit judgement wins over a second reading of the same
+turn.
 
 ### `/remember` and `/forget`
 
 The user-typed equivalents, on both front ends:
 
 - `/remember [user] <text>` — default scope is `project`; prefixing `user `
-  writes to the user scope instead.
+  writes to the user scope instead. Writes through `memory::remember`
+  directly and is **not** logged to the audit log; only the tools and the
+  pass write there.
 - `/forget <pattern>` — a case-insensitive substring match against every
-  entry's text in both scopes. Unlike the model's `forget`, this is a real,
-  confirmed deletion (`forget_matching`): the command previews every entry
-  that would be removed and asks before touching anything, because a person
-  asking to forget something wants it gone, not hidden.
+  entry's text in both scopes. The command previews every entry that would
+  be removed and asks before touching anything (a yes/no panel in the TUI, a
+  `[y/N]` prompt on the plain REPL, declined automatically when stdin is not
+  a terminal), then deletes through `forget_matching`, logging each removal
+  under `user /forget`.
 
 ### The extraction pass
 
-The passive half of memory maintenance: a background pass that reads the
-turn's transcript and proposes changes, without the model having to think to
-call `remember` itself. It runs at the end of a turn that produced a final
-response with no tool calls (`Agent::maybe_extract_memories` in `src/ui.rs`),
-through the same sub-agent sidechain other background work uses, so it leaves
-no KV checkpoint debris.
+The passive half of memory maintenance: a pass that reads the turn's
+transcript and proposes changes, without the model having to think to call
+`remember` itself. **Off by default.** What follows is what you are buying
+when you turn it on.
 
-**The pass is gated by four checks, in this order** (`ExtractState::should_run`):
+**When and where it runs.** At the end of a turn that produced a final
+response with no tool calls (`Agent::maybe_extract_memories` in `src/ui.rs`,
+called from both `run_turn` and `tui_turn_inner`), **synchronously, on the
+turn thread**, after the answer has been printed and after `fire_turn_end`
+has already reported the turn's stats. It is not a background thread and it
+does not overlap with your next prompt: the front end is back at the prompt
+only when the pass has finished. Each run is one sidechain
+(`begin_sidechain(prompt, true)` … `end_subagent_fork`), which means, in
+order: a snapshot of the whole session's KV (`engine.get_kv()`), a prefill of
+the pass prompt on top of the live context, one generation with no tool
+dispatch (`run_memory_round` — the sidechain can never touch a tool), and a
+KV restore back to the parent prefix. Because `fire_turn_end` has already
+fired, none of that time or those tokens appears in the turn stats, the
+status bar or `/toks`; the only visible trace is the stall, plus a dim line
+when the pass changed something. On a local Metal model this is seconds per
+answer. The sidechain runs under `in_sidechain()`, so it pushes no KV ladder
+rungs and stores no payload: it leaves no checkpoint debris.
+
+**The pass is gated by four checks, in this order** (`ExtractState::should_run`;
+`maybe_extract_memories` also refuses to start while already inside another
+sidechain, so a sub-agent's turn never triggers it):
 
 1. **Enabled, and mutual exclusion.** `memory.autoExtract` must be on, and
    the model must not have called `remember` or `forget` itself this turn.
@@ -271,54 +359,87 @@ means every pass after the mistake re-derives verdicts for text it already
 saw, wasting the model's time and risking duplicate or contradictory
 verdicts, with nothing in the logs pointing at the cause. `ExtractState`
 guards this from both directions: `finish(depth)` clamps `processed_depth` to
-never move backward even if called with a stale depth, and a trigger that
-arrives while a pass is already running is simply dropped — not queued, not
-recorded — because the next `should_run` call after the running pass finishes
-recomputes its span from `processed_depth` against whatever depth it is
-given *then*, which necessarily covers everything that arrived in between, in
-one trailing run.
+never move backward even if called with a stale depth, and transcript
+rewrites re-anchor it — `rebase` after compaction, `truncate_to` after a
+rollback or fork end, `reset_to` on `/clear`, `/new`, `/resume` and
+`/switch`, so a restored session is never shipped wholesale to the model on
+its first idle turn.
 
-If the pass is cancelled (interrupted, or its sub-agent turn errors),
-`ExtractState::cancel` clears the running flag without advancing
-`processed_depth`, so the unprocessed span is simply picked up by the next
-eligible turn. Nothing is ever half-applied: verdicts are parsed and applied
-only after the pass returns cleanly.
+**What the pass reads.** The prompt (`memextract::build_prompt`) is the
+current entries of both scopes with their ids, the verdict contract, and an
+excerpt of the transcript above `processed_depth` (`render_excerpt`). The
+excerpt is capped at 32 KiB (`EXCERPT_MAX_BYTES`), tool-result bodies are
+replaced by a one-line size placeholder, and when the span is still too long
+the *oldest* messages are dropped first with a note saying how many. Before
+the KV snapshot is taken, the prompt is preflighted against the context
+headroom the session leaves (`last_ctx_used` plus the prompt plus
+`REPLY_RESERVE_TOKENS`, 1024); a span that does not fit is retired unrun with
+a one-time notice, because nothing about it would shrink on a retry.
+
+**How a pass ends.** Three outcomes, and they advance the depth differently:
+
+- A clean reply, whether or not it holds verdicts, retires the span
+  (`finish`). A reply that is not a JSON array — prose, or a tool call —
+  also retires it, with a one-time "unusable reply" notice and a repro dump:
+  re-reading the same span every idle turn would cost a growing prompt
+  forever and never do better.
+- An engine error or an interrupt cancels (`ExtractState::cancel`) without
+  advancing `processed_depth`, so the unprocessed span is picked up by the
+  next eligible turn.
+- Nothing is ever half-applied: verdicts are parsed and applied only after
+  the sidechain has been folded back out of the transcript and the KV
+  restored.
 
 **Verdicts.** The pass replies with a JSON array of verdicts
 (`memory::parse_verdicts`), each one of:
 
-- `ADD` — a brand-new entry, with its type and scope.
+- `ADD` — a brand-new entry, with its type and scope. Logged as `add`,
+  reason `extracted`.
 - `UPDATE` — supersede an existing entry's text (carries usage via
-  `MetaStore::carry`, see "Entry identity" above).
+  `MetaStore::carry`, see "Entry identity" above). Logged as `update`,
+  reason `reconciled`.
 - `DELETE` — remove an entry outright, because it's redundant or wrong. Same
   audited outcome as a model `forget`, reached from the pass's verdicts
-  rather than a tool call.
+  rather than a tool call. Logged as `delete`, reason `reconciled`.
 - `USED` — credit an existing entry with having borne on the work in this
-  excerpt, bumping its `uses`/`last_used`.
+  excerpt, bumping its `uses`/`last_used`. Logged as `used`, reason
+  `reused`.
 
 Every verdict naming an id with no live matching entry is silently
 discarded: the file always wins, because a person may have hand-edited
-`MEMORY.md` between the pass reading it and this write landing.
-`apply_verdicts` / `apply_verdicts_to` is the single write path for every
-automatic change (from both the pass and the tools' logging), and it stages
-audit-log lines and sidecar mutations in memory while walking a batch,
-flushing both only after the scope's file write has actually succeeded — see
-`FINDINGS.md` for why that ordering matters.
+`MEMORY.md` between the pass reading it and this write landing. Within one
+batch, verdicts apply in order against the file as rewritten so far, so a
+`USED` or `DELETE` that names the *pre-update* id of an entry an earlier
+`UPDATE` in the same batch rewrote no longer finds it and no-ops.
+`apply_verdicts` / `apply_verdicts_to` is the single write path for the
+pass, and it stages audit-log lines and sidecar mutations in memory while
+walking a batch, flushing both only after the scope's file write has actually
+succeeded: a log that says an entry was added when the write failed would be
+worse than no log.
 
 ### `/memory` and `/memory log`
 
 - **`/memory`** opens every source in one editable buffer (`memory::combine`
   / `memory::apply`), marked with `<!-- plank-memory: begin/end SCOPE -->`
-  comments so edits route back to the right file on save. Requires the
-  interactive TUI's built-in editor; the plain-stdout REPL prints a message
-  pointing at `/memory log` instead.
-- **`/memory log`** prints the last 20 entries from the audit log
-  (`~/.plank/memory-log.jsonl`), human-rendered, on both front ends. Every
-  automatic change — from `remember`/`forget`, from `/forget`, and from the
-  extraction pass's verdicts — is appended there as one JSON line
-  (`action`, `scope`, `id`, `text`, `reason`), regardless of whether `/memory
-  log` is ever opened. It is a write-only audit trail: nothing reads it back
-  except this command.
+  comments so edits route back to the right file on save. Editing requires
+  the interactive TUI's built-in editor; the plain-stdout REPL prints the
+  same combined view read-only, followed by a line pointing at the TUI and
+  `/memory log`.
+- **`/memory log`** prints the last 20 lines of the audit log
+  (`~/.plank/memory-log.jsonl`), oldest first, human-rendered, on both front
+  ends. Every write by the tools (`remember`, `forget`), by `/forget`, and by
+  the extraction pass's verdicts is appended there as one JSON line with five
+  fields: `action` (`add`, `update`, `delete`, `used`, `forget`), `scope`,
+  `id`, the entry's full `text`, and `reason`. The `reason` is **a fixed
+  label chosen by the code path** — `remember tool`, `forget tool`,
+  `user /forget`, `extracted`, `reconciled`, `reused` — that says *which
+  mechanism* made the change. It is not the model's rationale, which is
+  never captured: the pass replies with bare verdicts, and `forget` takes
+  only an id. So `/memory log` answers "what changed, by which hand, and
+  what did the text say", which is enough to re-add a wrongly removed entry,
+  but it cannot answer "why did the model think this was wrong". It is a
+  write-only trail: nothing reads it back except this command. Writing to it
+  is best-effort — a failed append never fails the change it describes.
 
 ## Part 4: settings
 
@@ -327,31 +448,33 @@ All under the `memory` and `tools` blocks in `~/.plank/settings.json` /
 
 | Setting | Default | Effect |
 |---|---|---|
-| `memory.autoExtract` | `true` | Whether the background extraction sidechain runs at all. Off leaves the `remember`/`forget` tools and `/remember` working — only the passive pass stops, and rendering falls back to plain budgeted display with counters nothing ever bumps. |
-| `memory.extractEveryNTurns` | `1` | Run the pass every N *eligible* turns (a turn with no tool calls and no model `remember`). `1` means every eligible turn. A configured `0` is clamped to `1`. |
-| `memory.budgets.user` | `4096` | Character budget for `[user]` entries. |
-| `memory.budgets.feedback` | `4096` | Character budget for `[feedback]` entries. |
-| `memory.budgets.project` | `6144` | Character budget for `[project]` entries. |
-| `memory.budgets.reference` | `2048` | Character budget for `[reference]` entries. |
-| `tools.remember` | `true` | Whether the `remember`/`forget` tools are advertised to the model at all. `/remember` and `/forget` are unaffected — they are user-typed commands, not model tool calls. |
+| `memory.autoExtract` | `false` | Whether the extraction pass runs at all. On, every eligible turn ends with a synchronous stall for a KV snapshot, a prefill of the excerpt, a generation and a restore, none of it counted in the turn stats. Off leaves the `remember`/`forget` tools and `/remember` working — only the passive pass stops, and the sidecar counters are never bumped, so eviction ranks by date alone. Also in the `/config` form. |
+| `memory.extractEveryNTurns` | `1` | Run the pass every N *eligible* turns (a turn with no tool calls and no model `remember`/`forget`). `1` means every eligible turn. A configured `0` is clamped to `1`. Also in the `/config` form. |
+| `memory.budgets.user` | `4096` | Byte budget for `[user]` entries (see "Budgets and eviction" for what is counted). Hand-edit only. |
+| `memory.budgets.feedback` | `4096` | Byte budget for `[feedback]` entries. Hand-edit only. |
+| `memory.budgets.project` | `6144` | Byte budget for `[project]` entries, including every untagged legacy entry. Hand-edit only. |
+| `memory.budgets.reference` | `2048` | Byte budget for `[reference]` entries. Hand-edit only. |
+| `tools.remember` | `true` | Whether the `remember`/`forget` tools are advertised to the model at all. Flipping it changes the system prompt and so churns the `fp1` fingerprint once. `/remember` and `/forget` are unaffected — they are user-typed commands, not model tool calls. |
 
 ## Cache accounting
 
-How memory's cost is actually paid, tying together Part 1's placement and
-Part 4's budgets — the numbers that matter for judging whether memory is
-cheap in practice:
+How memory's cost is actually paid, tying together Part 1's placement, Part
+3's pass and Part 4's budgets — the numbers that matter for judging whether
+memory is cheap in practice:
 
 | Event | What gets prefilled | Tier |
 |---|---|---|
 | First turn of a session | Full Tier 2 (`AGENTS.md` set + memory + agent roster) plus Tier 3 (git status, date) | Tier 2 cached to `project.kv` keyed by `stable_hash`; Tier 3 always fresh |
 | Every later turn in the same session | Nothing from memory — it is part of the already-cached prefix | Reused |
-| A memory file edited (`/remember`, `/forget`, the pass, a hand edit) | Nothing, until the *next session* | The new content changes `stable_hash`, so the next session's first turn re-prefills Tier 2 once |
+| A memory file edited (`/remember`, `/forget`, the tools, the pass, a hand edit) | Nothing, until the *next session* | The new content changes `stable_hash`, so the next session's first turn re-prefills Tier 2 once |
 | `/memory` opened and saved with no actual change | Nothing | `apply` only writes files whose body changed; an unchanged section reports `unchanged` and touches no cache |
 | The sidecar (`MEMORY.md.meta.json`) changing | Nothing, ever | It is never part of any prompt tier — only `MEMORY.md`'s own text is |
+| **The extraction pass** (`memory.autoExtract` on), once per eligible turn | The pass prompt — current entries plus up to 32 KiB of excerpt — on top of the whole live session, then one generation of up to `REPLY_RESERVE_TOKENS` | Sidechain: `get_kv()` of the full session before, restore after, so the live prefix is unchanged for the next turn. **Unmetered**: it runs after `fire_turn_end`, so its time and tokens are in neither the turn stats nor `/toks`. |
 
-The number that actually governs prefill cost is `ContextTokens::memory`
-(`src/context.rs`), reported alongside `git`/`agents_md`/`date` in the
-context-token breakdown shown by the status bar and `/toks`. Because memory
-lives entirely in Tier 2, that number is amortized once per session, not
-once per turn — which is the whole point of keeping it out of the live
-conversation in the first place.
+The number that governs memory's *resident* prefill cost is
+`ContextTokens::memory` (`src/context.rs`), reported alongside
+`git`/`agents_md`/`date` in the context-token breakdown shown by `/toks`.
+Because memory lives entirely in Tier 2, that number is amortized once per
+session, not once per turn — which is the whole point of keeping it out of
+the live conversation in the first place. The pass is the one exception to
+"once per session", and it is the exception you opt into.
