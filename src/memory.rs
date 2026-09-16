@@ -1029,7 +1029,7 @@ pub fn apply_verdicts(cwd: &Path, verdicts: &[Verdict], date: &str) -> Vec<Strin
 /// which is what lets a test redirect the audit log without ever setting
 /// `HOME` itself. `None` keeps production behavior.
 #[must_use]
-pub fn apply_verdicts_to(
+pub(crate) fn apply_verdicts_to(
     cwd: &Path,
     verdicts: &[Verdict],
     date: &str,
