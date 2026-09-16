@@ -869,10 +869,139 @@ pub fn parse_verdicts(json: &str) -> Result<Vec<Verdict>, String> {
 /// Finds the line index holding the live entry with this id, if any. The
 /// file always wins: a verdict naming an id with no matching line is simply
 /// not found here, and callers skip it silently.
+///
+/// This also governs same-batch ordering: verdicts are applied in order
+/// against `lines` as rewritten so far, so if a batch contains
+/// `UPDATE{id:X}` followed by `USED{id:X}` or `DELETE{id:X}` naming the
+/// *pre-update* id, the later verdict's `locate` call no longer finds `X`
+/// (the line now holds the new text, with a new id) and silently no-ops.
+/// That is deterministic and consistent with "the file always wins", but is
+/// easy to be surprised by when triaging a batch that looks like it should
+/// have applied.
 fn locate(lines: &[String], id: &str) -> Option<usize> {
     lines
         .iter()
         .position(|l| parse_entries(l).first().is_some_and(|e| e.id() == id))
+}
+
+/// One audit line staged during a scope's verdict loop, flushed only once
+/// the scope's file write (if any) has actually succeeded. See
+/// [`apply_verdicts`].
+struct PendingLog {
+    action: &'static str,
+    id: String,
+    text: String,
+    reason: &'static str,
+}
+
+/// Mutable state threaded through one scope's verdict loop by
+/// [`apply_one_verdict`]: the in-progress file lines, the sidecar, and the
+/// staged (not-yet-flushed) audit entries and notes.
+struct ScopeState<'a> {
+    lines: &'a mut Vec<String>,
+    meta: &'a mut MetaStore,
+    changed: &'a mut bool,
+    meta_dirty: &'a mut bool,
+    audit: &'a mut Vec<PendingLog>,
+    notes: &'a mut Vec<String>,
+}
+
+/// Applies one verdict against `scope`'s in-progress state, staging any
+/// resulting file line change, sidecar mutation, audit entry, and note.
+/// Nothing here touches disk; see [`apply_verdicts`] for why.
+fn apply_one_verdict(state: &mut ScopeState<'_>, scope: Scope, v: &Verdict, date: &str) {
+    match v {
+        Verdict::Add {
+            text,
+            kind,
+            scope: s,
+        } if *s == scope => {
+            let entry = Entry {
+                date: date.to_string(),
+                kind: *kind,
+                text: text.clone(),
+            };
+            if locate(state.lines, &entry.id()).is_some() {
+                return; // already present; re-adding is a no-op
+            }
+            state.lines.push(entry.render().trim_end().to_string());
+            *state.changed = true;
+            state.audit.push(PendingLog {
+                action: "add",
+                id: entry.id(),
+                text: text.clone(),
+                reason: "extracted",
+            });
+            state.notes.push(format!("added [{}] {text}", kind.tag()));
+        }
+        // An `Add` destined for the *other* scope. The loop visits both
+        // files, so the matching iteration writes it.
+        Verdict::Add { .. } => {}
+        Verdict::Update { id, text } => {
+            // See the comment on `locate`: a later verdict in this same
+            // batch naming the pre-update id will not resolve.
+            let Some(i) = locate(state.lines, id) else {
+                return;
+            };
+            let Some(old) = parse_entries(&state.lines[i]).into_iter().next() else {
+                return;
+            };
+            let new = Entry {
+                date: old.date.clone(),
+                kind: old.kind,
+                text: text.clone(),
+            };
+            state.lines[i] = new.render().trim_end().to_string();
+            state.meta.carry(id, &new.id());
+            *state.meta_dirty = true;
+            *state.changed = true;
+            state.audit.push(PendingLog {
+                action: "update",
+                id: new.id(),
+                text: text.clone(),
+                reason: "reconciled",
+            });
+            state
+                .notes
+                .push(format!("updated [{}] {text}", new.kind.tag()));
+        }
+        Verdict::Delete { id } => {
+            let Some(i) = locate(state.lines, id) else {
+                return;
+            };
+            let Some(old) = parse_entries(&state.lines[i]).into_iter().next() else {
+                return;
+            };
+            state.lines.remove(i);
+            *state.changed = true;
+            state.audit.push(PendingLog {
+                action: "delete",
+                id: id.clone(),
+                text: old.text.clone(),
+                reason: "reconciled",
+            });
+            state
+                .notes
+                .push(format!("removed [{}] {}", old.kind.tag(), old.text));
+        }
+        Verdict::Used { id } => {
+            let Some(i) = locate(state.lines, id) else {
+                return;
+            };
+            let text = parse_entries(&state.lines[i])
+                .into_iter()
+                .next()
+                .map_or_else(String::new, |e| e.text);
+            state.meta.bump(id, date);
+            *state.meta_dirty = true;
+            state.audit.push(PendingLog {
+                action: "used",
+                id: id.clone(),
+                text,
+                reason: "reused",
+            });
+        }
+    }
 }
 
 /// Applies a batch of verdicts to both scopes' files and sidecars.
@@ -880,6 +1009,13 @@ fn locate(lines: &[String], id: &str) -> Option<usize> {
 /// Every verdict naming an id with no live entry is discarded silently: the
 /// user may have edited `MEMORY.md` by hand between the pass reading it and
 /// this write, and the file always wins.
+///
+/// Nothing durable is recorded unless it actually reached disk: audit lines
+/// and sidecar (`MetaStore`) changes are staged in memory while verdicts are
+/// applied, then flushed together only after a needed file write succeeds
+/// (or when there was nothing to write). If the write fails, the audit log
+/// and sidecar for that scope are left exactly as they were, and the loop
+/// moves on to the next scope.
 ///
 /// Returns one human-readable note per applied change; each is also written
 /// to the audit log.
@@ -893,84 +1029,53 @@ pub fn apply_verdicts(cwd: &Path, verdicts: &[Verdict], date: &str) -> Vec<Strin
         let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
         let mut meta = MetaStore::load(&meta_path_for(&path));
         let mut changed = false;
+        let mut meta_dirty = false;
+        let mut audit: Vec<PendingLog> = Vec::new();
+        let mut scope_notes: Vec<String> = Vec::new();
 
+        let mut state = ScopeState {
+            lines: &mut lines,
+            meta: &mut meta,
+            changed: &mut changed,
+            meta_dirty: &mut meta_dirty,
+            audit: &mut audit,
+            notes: &mut scope_notes,
+        };
         for v in verdicts {
-            match v {
-                Verdict::Add {
-                    text,
-                    kind,
-                    scope: s,
-                } if *s == scope => {
-                    let entry = Entry {
-                        date: date.to_string(),
-                        kind: *kind,
-                        text: text.clone(),
-                    };
-                    if locate(&lines, &entry.id()).is_some() {
-                        continue; // already present; re-adding is a no-op
-                    }
-                    lines.push(entry.render().trim_end().to_string());
-                    changed = true;
-                    log_change("add", scope, &entry.id(), text, "extracted");
-                    notes.push(format!("added [{}] {text}", kind.tag()));
-                }
-                // An `Add` destined for the *other* scope. The loop visits
-                // both files, so the matching iteration writes it.
-                Verdict::Add { .. } => {}
-                Verdict::Update { id, text } => {
-                    let Some(i) = locate(&lines, id) else {
-                        continue;
-                    };
-                    let Some(old) = parse_entries(&lines[i]).into_iter().next() else {
-                        continue;
-                    };
-                    let new = Entry {
-                        date: old.date.clone(),
-                        kind: old.kind,
-                        text: text.clone(),
-                    };
-                    lines[i] = new.render().trim_end().to_string();
-                    meta.carry(id, &new.id());
-                    changed = true;
-                    log_change("update", scope, &new.id(), text, "reconciled");
-                    notes.push(format!("updated [{}] {text}", new.kind.tag()));
-                }
-                Verdict::Delete { id } => {
-                    let Some(i) = locate(&lines, id) else {
-                        continue;
-                    };
-                    let Some(old) = parse_entries(&lines[i]).into_iter().next() else {
-                        continue;
-                    };
-                    lines.remove(i);
-                    changed = true;
-                    log_change("delete", scope, id, &old.text, "reconciled");
-                    notes.push(format!("removed [{}] {}", old.kind.tag(), old.text));
-                }
-                Verdict::Used { id } => {
-                    if locate(&lines, id).is_some() {
-                        meta.bump(id, date);
-                    }
-                }
-            }
+            apply_one_verdict(&mut state, scope, v, date);
         }
 
-        if changed {
+        let write_ok = if changed {
             let mut out = lines.join("\n");
             out.push('\n');
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if std::fs::write(&path, out).is_err() {
-                continue; // leave the sidecar alone if the file did not land
-            }
+            std::fs::write(&path, out).is_ok()
+        } else {
+            true
+        };
+
+        if !write_ok {
+            // The file write failed: nothing durable happened for this
+            // scope, so neither the audit log nor the sidecar may record
+            // anything either. Leave both untouched and move on.
+            continue;
         }
-        let live: Vec<String> = parse_entries(&lines.join("\n"))
-            .iter()
-            .map(Entry::id)
-            .collect();
-        meta.gc(&live);
-        let _ = meta.save(&meta_path_for(&path));
+
+        for entry in &audit {
+            log_change(entry.action, scope, &entry.id, &entry.text, entry.reason);
+        }
+        notes.extend(scope_notes);
+
+        if changed || meta_dirty {
+            let live: Vec<String> = parse_entries(&lines.join("\n"))
+                .iter()
+                .map(Entry::id)
+                .collect();
+            meta.gc(&live);
+            let _ = meta.save(&meta_path_for(&path));
+        }
     }
     notes
 }
@@ -1511,6 +1616,140 @@ mod tests {
             2,
             "usage accumulated across two rewrites"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_file_write_leaves_the_sidecar_and_its_counters_untouched() {
+        // Finding 1: if the memory file write fails, neither the sidecar nor
+        // the audit log may record the change. We force the write to fail
+        // portably by making the memory file's own path a directory, which
+        // `fs::write` always refuses.
+        let dir = std::env::temp_dir().join(format!(
+            "plank-verdict-write-fails-{}-{}",
+            std::process::id(),
+            "a"
+        ));
+        let plank_dir = dir.join(".plank");
+        let path = plank_dir.join("MEMORY.md");
+        std::fs::create_dir_all(&path).unwrap(); // path is a directory, not a file
+
+        // Seed the sidecar with a counter that must survive untouched.
+        let existing_id = "0123456789ab";
+        let mut meta = MetaStore::default();
+        meta.bump(existing_id, "2026-09-01");
+        meta.bump(existing_id, "2026-09-02");
+        meta.save(&meta_path_for(&path)).unwrap();
+
+        let notes = apply_verdicts(
+            &dir,
+            &[Verdict::Add {
+                text: "should never land".into(),
+                kind: Kind::Project,
+                scope: Scope::Project,
+            }],
+            "2026-09-15",
+        );
+
+        assert!(
+            notes.is_empty(),
+            "no note should be produced when the write fails"
+        );
+        assert!(
+            std::fs::read_to_string(&path).is_err(),
+            "the path is still a directory: no file was ever written"
+        );
+        let reloaded = MetaStore::load(&meta_path_for(&path));
+        assert_eq!(
+            reloaded.get(existing_id).uses,
+            2,
+            "sidecar counters must survive a failed write untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_used_verdict_produces_an_audit_log_entry() {
+        // Finding 2: USED must be logged like every other verdict. `HOME` is
+        // never set by this test; `log_path`/`log_change` resolve against
+        // whatever `HOME` the test process already has, exactly like the
+        // other tests in this module that exercise ADD/UPDATE/DELETE
+        // logging via `apply_verdicts`.
+        let dir =
+            std::env::temp_dir().join(format!("plank-verdict-used-logs-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        let path = dir.join(".plank").join("MEMORY.md");
+        // The marker text must be unique to this run (the log is a real,
+        // shared, append-only `~/.plank` file, so a fixed id could
+        // accidentally be satisfied by a line a previous test run left
+        // behind).
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let marker_text = format!("used-log-marker-text-{}-{nonce}", std::process::id());
+        std::fs::write(
+            &path,
+            format!("# Memory\n\n- (2026-09-01) [project] {marker_text}\n"),
+        )
+        .unwrap();
+        let id = Entry {
+            date: "2026-09-01".into(),
+            kind: Kind::Project,
+            text: marker_text,
+        }
+        .id();
+
+        apply_verdicts(&dir, &[Verdict::Used { id: id.clone() }], "2026-09-15");
+
+        let Some(log_path) = log_path() else {
+            panic!("HOME must be set for this test to observe the audit log");
+        };
+        let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log_text
+                .lines()
+                .any(|l| l.contains(&id) && l.contains("\"action\": \"used\"")),
+            "expected a used-action audit line for id {id}, got: {log_text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_used_only_batch_still_persists_the_bumped_counter() {
+        // Finding 3 subtlety: USED bumps the sidecar without touching
+        // `lines`, so `changed` stays false for a USED-only batch — but the
+        // sidecar must still be saved, or the bump is silently lost.
+        let dir = std::env::temp_dir().join(format!(
+            "plank-verdict-used-only-persists-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        let path = dir.join(".plank").join("MEMORY.md");
+        std::fs::write(&path, "# Memory\n\n- (2026-09-01) [project] kept as-is\n").unwrap();
+        let id = Entry {
+            date: "2026-09-01".into(),
+            kind: Kind::Project,
+            text: "kept as-is".into(),
+        }
+        .id();
+
+        apply_verdicts(&dir, &[Verdict::Used { id: id.clone() }], "2026-09-15");
+
+        let body_after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body_after.contains("kept as-is"),
+            "USED must never rewrite the line"
+        );
+        let reloaded = MetaStore::load(&meta_path_for(&path));
+        assert_eq!(
+            reloaded.get(&id).uses,
+            1,
+            "the bump must be persisted even though no line changed"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
