@@ -199,7 +199,14 @@ fn load_scope(scope: Scope, cwd: &Path) -> Option<String> {
         }
         let _ = writeln!(out, "### {}", kind.tag());
         for e in block {
-            out.push_str(&e.render());
+            let _ = writeln!(
+                out,
+                "- ({}) [{}] {{{}}} {}",
+                e.date,
+                e.kind.tag(),
+                e.id(),
+                e.text
+            );
         }
         out.push('\n');
     }
@@ -776,6 +783,25 @@ fn append_log_line(path: &Path, action: &str, scope: Scope, id: &str, text: &str
 pub fn log_change(action: &str, scope: Scope, id: &str, text: &str, reason: &str) {
     if let Some(path) = log_path() {
         append_log_line(&path, action, scope, id, text, reason);
+    }
+}
+
+/// As [`log_change`], but `log_dest` overrides where the audit line lands:
+/// `Some(path)` writes there instead of resolving `~/.plank` from `HOME`.
+/// Mirrors `apply_verdicts_to`'s `log_dest`, and exists for the same reason —
+/// it lets the `remember`/`forget` tools be tested without ever touching the
+/// real `~/.plank` or setting `HOME`.
+pub(crate) fn log_change_to(
+    log_dest: Option<&Path>,
+    action: &str,
+    scope: Scope,
+    id: &str,
+    text: &str,
+    reason: &str,
+) {
+    match log_dest {
+        Some(path) => append_log_line(path, action, scope, id, text, reason),
+        None => log_change(action, scope, id, text, reason),
     }
 }
 

@@ -79,6 +79,7 @@ pub type WebConfirmFn = Box<dyn FnMut(&str) -> bool + Send>;
 pub type StatusSinkFn = Box<dyn Fn(&str) + Send>;
 
 /// Mutable state shared by all tools of one agent worker.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ToolContext {
     /// Working directory relative paths are resolved against.
     pub cwd: PathBuf,
@@ -188,6 +189,16 @@ pub struct ToolContext {
     /// `ds4_engine` builds; the curl path needs no handle.
     #[cfg(ds4_engine)]
     pub web_browser: Option<crate::ds4web::WebBrowser>,
+    /// Set by `remember`/`forget` (Task 7) after a successful write, for Task
+    /// 9's mutual exclusion with a background extraction pass — memory is a
+    /// KV-cached tier, so a model write and a background rewrite must never
+    /// land in the same turn.
+    pub wrote_memory: bool,
+    /// Overrides where `remember`/`forget` write their audit log line;
+    /// `None` uses the real `~/.plank` (production behavior). Analogous to
+    /// `memory::apply_verdicts_to`'s `log_dest`, and for the same reason: it
+    /// lets a test redirect the audit log without ever setting `HOME`.
+    pub memory_log_path: Option<PathBuf>,
 }
 
 /// Most `skill` invocations allowed within one turn before the tool refuses,
@@ -293,6 +304,8 @@ impl ToolContext {
             ask_bridge: None,
             #[cfg(ds4_engine)]
             web_browser: None,
+            wrote_memory: false,
+            memory_log_path: None,
         }
     }
 
@@ -482,6 +495,8 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "task" => crate::tasks::tool_task(&mut ctx.tasks, &mut ctx.task_completions, call),
         "ask" => ask::tool_ask(ctx.asker.as_mut(), call),
         "recall" => tool_recall(ctx, call),
+        "remember" => tool_remember(ctx, call),
+        "forget" => tool_forget(ctx, call),
         "run_code" => tool_run_code(ctx, call),
         name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
         // A WASM component's tool. Checked before the unknown-tool fallthrough
@@ -910,6 +925,107 @@ fn tool_recall(ctx: &mut ToolContext, call: &ToolCall) -> String {
     let (preview, spilled) = crate::spill::apply(&policy, &ctx.session_id, "recall", out);
     ctx.spill = spilled;
     preview
+}
+
+/// `remember` — save a durable fact to persistent memory (Task 7).
+///
+/// Writes to disk only: the in-context memory text is deliberately left
+/// untouched until the next session start, which is what keeps this free
+/// against the KV cache (see `docs/KV-CACHE.md`).
+fn tool_remember(ctx: &mut ToolContext, call: &ToolCall) -> String {
+    if !crate::settings::active().tools.remember {
+        return "Tool error: unknown tool: remember\n".to_string();
+    }
+    let text = call.arg_value("text").unwrap_or("").trim();
+    if text.is_empty() {
+        return "Tool error: remember requires a non-empty 'text'\n".to_string();
+    }
+    let Some(kind) = crate::memory::Kind::from_tag(call.arg_value("type").unwrap_or("").trim())
+    else {
+        return "Tool error: remember requires 'type' to be one of: user, feedback, project, reference\n"
+            .to_string();
+    };
+    let scope = if call.arg_value("scope").unwrap_or("project").trim() == "user" {
+        crate::memory::Scope::User
+    } else {
+        crate::memory::Scope::Project
+    };
+    let date = crate::context::current_local_iso_date();
+    let entry = crate::memory::Entry {
+        date,
+        kind,
+        text: text.to_string(),
+    };
+    match crate::memory::remember(
+        scope,
+        &ctx.cwd,
+        &format!("[{}] {text}", kind.tag()),
+        &entry.date,
+    ) {
+        Ok(path) => {
+            crate::memory::log_change_to(
+                ctx.memory_log_path.as_deref(),
+                "add",
+                scope,
+                &entry.id(),
+                text,
+                "remember tool",
+            );
+            ctx.wrote_memory = true;
+            format!(
+                "remembered [{}] in {} (it joins your context at the next session start)\n",
+                kind.tag(),
+                path.display()
+            )
+        }
+        Err(e) => format!("Tool error: remember failed: {e}\n"),
+    }
+}
+
+/// `forget` — retract a memory entry (Task 7).
+///
+/// Sets retraction in the sidecar rather than deleting the line: the entry
+/// stops rendering at once, but its bytes survive until a reconciliation
+/// pass removes them, so a wrong `forget` call is undoable.
+fn tool_forget(ctx: &mut ToolContext, call: &ToolCall) -> String {
+    if !crate::settings::active().tools.remember {
+        return "Tool error: unknown tool: forget\n".to_string();
+    }
+    let id = call.arg_value("id").unwrap_or("").trim();
+    if id.is_empty() {
+        return "Tool error: forget requires an 'id'\n".to_string();
+    }
+    for scope in [crate::memory::Scope::User, crate::memory::Scope::Project] {
+        let Some(path) = crate::memory::path_for(scope, &ctx.cwd) else {
+            continue;
+        };
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(entry) = crate::memory::parse_entries(&body)
+            .into_iter()
+            .find(|e| e.id() == id)
+        else {
+            continue;
+        };
+        let meta_path = crate::memory::meta_path_for(&path);
+        let mut meta = crate::memory::MetaStore::load(&meta_path);
+        meta.set_retracted(id, true);
+        if let Err(e) = meta.save(&meta_path) {
+            return format!("Tool error: forget failed: {e}\n");
+        }
+        crate::memory::log_change_to(
+            ctx.memory_log_path.as_deref(),
+            "retract",
+            scope,
+            id,
+            &entry.text,
+            "forget tool",
+        );
+        ctx.wrote_memory = true;
+        return format!("retracted: {}\n", entry.text);
+    }
+    format!("Tool error: no memory entry with id {id}\n")
 }
 
 /// Implements the `run_code` tool (M10): a small script of named operations
@@ -1435,6 +1551,48 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn remember_writes_to_disk_and_forget_only_retracts() {
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        let (mut ctx, dir) = test_ctx();
+        // Route the audit log to a scratch file instead of the real
+        // `~/.plank`, the same way `apply_verdicts_to`'s `log_dest` does.
+        ctx.memory_log_path = Some(dir.join("memory-log.jsonl"));
+
+        let res = dispatch(
+            &test_call(
+                "remember",
+                &[
+                    ("text", "prefers tabs"),
+                    ("type", "user"),
+                    ("scope", "project"),
+                ],
+            ),
+            &mut ctx,
+        );
+        assert!(res.output.contains("remembered"), "{}", res.output);
+        let path = crate::memory::path_for(crate::memory::Scope::Project, &dir).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("[user] prefers tabs"));
+
+        let entry = crate::memory::parse_entries(&body)
+            .into_iter()
+            .next()
+            .unwrap();
+        let res = dispatch(&test_call("forget", &[("id", &entry.id())]), &mut ctx);
+        assert!(res.output.contains("retracted"), "{}", res.output);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("prefers tabs"),
+            "forget must not erase the bytes"
+        );
+        let meta = crate::memory::MetaStore::load(&crate::memory::meta_path_for(&path));
+        assert!(meta.get(&entry.id()).retracted);
+        assert!(ctx.wrote_memory);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

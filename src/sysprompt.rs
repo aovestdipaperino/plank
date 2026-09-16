@@ -964,6 +964,48 @@ fn append_native_extra_schemas(out: &mut String) {
     if crate::settings::active().tools.run_code {
         append_run_code_schema(out);
     }
+    if crate::settings::active().tools.remember {
+        append_remember_schema(out);
+    }
+}
+
+/// Appends the `remember` and `forget` tool schemas. Writes land on disk and
+/// take effect at the *next* session start, which is what keeps them free
+/// against the KV cache: the Tier 2 prefix holding memory is never rewritten
+/// mid-session.
+fn append_remember_schema(out: &mut String) {
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"remember\",\n\
+         \x20   \"description\": \"Save a durable fact to persistent memory. Use it for things you could not re-derive by reading the repository: who the user is, corrections they have given you, project constraints, and pointers to external systems. Do not save code patterns, architecture, git history, or anything already in AGENTS.md. The fact is written immediately and appears in context from the next session on.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"text\": {\"type\": \"string\", \"description\": \"the fact, one sentence\"},\n\
+         \x20       \"type\": {\"type\": \"string\", \"description\": \"one of: user, feedback, project, reference\"},\n\
+         \x20       \"scope\": {\"type\": \"string\", \"description\": \"'user' to follow the user across projects, 'project' for this checkout; defaults to project\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"text\", \"type\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         {\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"forget\",\n\
+         \x20   \"description\": \"Retract a memory entry that has turned out to be wrong. Give the id shown beside the entry in context. The entry stops being used at once; it is removed from the file by the next maintenance pass, so a retraction can be undone until then.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"id\": {\"type\": \"string\", \"description\": \"the entry id\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"id\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
 }
 
 /// Appends the `recall` tool schema (M8): search prior sessions and the
@@ -1503,6 +1545,17 @@ mod tests {
             !text.contains("\"recall\""),
             "tools.recall = false removes the schema"
         );
+    }
+
+    /// The `remember`/`forget` tools (Task 7) go through the same extra-
+    /// schemas mechanism as `recall`, so appending them can never touch the
+    /// frozen prompt region that `tests/c_parity.rs` pins byte-for-byte.
+    #[test]
+    fn remember_schema_is_advertised_by_default_and_can_be_disabled() {
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(text.contains("\"name\": \"remember\""));
+        assert!(text.contains("\"name\": \"forget\""));
     }
 
     #[test]

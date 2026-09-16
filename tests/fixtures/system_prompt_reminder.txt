@@ -437,6 +437,36 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
     }
   }
 }
+{
+  "type": "function",
+  "function": {
+    "name": "remember",
+    "description": "Save a durable fact to persistent memory. Use it for things you could not re-derive by reading the repository: who the user is, corrections they have given you, project constraints, and pointers to external systems. Do not save code patterns, architecture, git history, or anything already in AGENTS.md. The fact is written immediately and appears in context from the next session on.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "text": {"type": "string", "description": "the fact, one sentence"},
+        "type": {"type": "string", "description": "one of: user, feedback, project, reference"},
+        "scope": {"type": "string", "description": "'user' to follow the user across projects, 'project' for this checkout; defaults to project"}
+      },
+      "required": ["text", "type"]
+    }
+  }
+}
+{
+  "type": "function",
+  "function": {
+    "name": "forget",
+    "description": "Retract a memory entry that has turned out to be wrong. Give the id shown beside the entry in context. The entry stops being used at once; it is removed from the file by the next maintenance pass, so a retraction can be undone until then.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string", "description": "the entry id"}
+      },
+      "required": ["id"]
+    }
+  }
+}
 
 # Working style
 
