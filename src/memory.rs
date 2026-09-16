@@ -737,6 +737,65 @@ pub fn apply(sources: &[Source], edited: &str) -> Result<Vec<String>, String> {
     Ok(report)
 }
 
+/// Where the maintenance audit log lives. `None` when `HOME` is unset.
+#[must_use]
+pub fn log_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| crate::home::plank_home_in(h).join("memory-log.jsonl"))
+}
+
+/// Appends one audit line to an explicit path. Best-effort: a write failure
+/// is swallowed, because failing to log must never fail the operation being
+/// logged.
+fn append_log_line(path: &Path, action: &str, scope: Scope, id: &str, text: &str, reason: &str) {
+    use crate::tools::mcp::json_escape;
+    use std::io::Write as _;
+    let mut line = String::from("{\"action\": ");
+    json_escape(&mut line, action);
+    line.push_str(", \"scope\": ");
+    json_escape(&mut line, scope.marker_name());
+    line.push_str(", \"id\": ");
+    json_escape(&mut line, id);
+    line.push_str(", \"text\": ");
+    json_escape(&mut line, text);
+    line.push_str(", \"reason\": ");
+    json_escape(&mut line, reason);
+    line.push_str("}\n");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Records one memory change. Best-effort, as above.
+pub fn log_change(action: &str, scope: Scope, id: &str, text: &str, reason: &str) {
+    if let Some(path) = log_path() {
+        append_log_line(&path, action, scope, id, text, reason);
+    }
+}
+
+/// The last `limit` audit lines from an explicit path, oldest first.
+#[must_use]
+fn read_log_from(path: &Path, limit: usize) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = all.len().saturating_sub(limit);
+    all[start..].iter().map(|s| (*s).to_string()).collect()
+}
+
+/// The last `limit` audit lines, oldest first.
+#[must_use]
+pub fn read_log(limit: usize) -> Vec<String> {
+    log_path().map_or_else(Vec::new, |p| read_log_from(&p, limit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,5 +1105,49 @@ mod tests {
             "rows with no live entry are dropped"
         );
         assert_eq!(store.get("new").uses, 2);
+    }
+
+    #[test]
+    fn audit_lines_are_json_and_read_back_newest_last() {
+        let dir = std::env::temp_dir().join(format!("plank-auditlog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-log.jsonl");
+        append_log_line(
+            &path,
+            "delete",
+            Scope::Project,
+            "abc123",
+            "stale fact",
+            "over budget",
+        );
+        append_log_line(
+            &path,
+            "add",
+            Scope::User,
+            "def456",
+            "prefers tabs",
+            "extracted",
+        );
+
+        let lines = read_log_from(&path, 10);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[1].contains("\"action\": \"add\""),
+            "newest last: {}",
+            lines[1]
+        );
+        assert!(lines[0].contains("over budget"));
+        assert!(
+            crate::tools::mcp::json_parse(&lines[0]).is_some(),
+            "each line parses as JSON"
+        );
+
+        let capped = read_log_from(&path, 1);
+        assert_eq!(capped.len(), 1);
+        assert!(
+            capped[0].contains("\"action\": \"add\""),
+            "the cap keeps the newest"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
