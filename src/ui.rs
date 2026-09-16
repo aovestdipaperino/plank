@@ -3655,6 +3655,16 @@ impl Agent<'_> {
     /// forever. Nested `agent` calls route through [`run_tool_calls`], so the
     /// [`SUBAGENT_DEPTH_CAP`](crate::tools::SUBAGENT_DEPTH_CAP) guard applies.
     fn run_subagent_loop(&mut self) -> (SubagentDone, Result<(), String>) {
+        self.run_sidechain_quietly(Self::run_subagent_rounds)
+    }
+
+    /// The sink swap and console window shared by every quiet sidechain,
+    /// around `body` — the full agentic rounds for a sub-agent, or the single
+    /// generation of the memory pass.
+    fn run_sidechain_quietly<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> (SubagentDone, Result<T, String>) {
         // The parent turn's status sink writes bare `SystemStatus` events into
         // the MAIN log; leaving it installed would scatter the sub-agent's
         // "Searching Google for …" notices across the parent transcript while
@@ -3695,7 +3705,7 @@ impl Agent<'_> {
         let mirror = crate::debugmirror::open_subagent();
         let result = {
             let _active = mirror.activate();
-            self.run_subagent_rounds()
+            body(self)
         };
         self.tool_ctx.status_sink = parent_sink;
         self.tool_ctx.markdown_sink = parent_md;
@@ -5326,6 +5336,7 @@ impl Agent<'_> {
             tail_start -= 1;
         }
         let tail: Vec<Message> = self.session.transcript[tail_start..].to_vec();
+        let old_len = self.session.transcript.len();
         self.session.transcript = Vec::new();
         // Off-path branches index into the transcript being replaced here, so
         // they cannot survive the rewrite; drop them rather than let them
@@ -5338,6 +5349,9 @@ impl Agent<'_> {
         // The transcript just shrank; `console_seen` is an index into it (see
         // the field doc), so a stale mark would silently disable the backfill.
         self.console_seen = self.console_seen.min(self.session.transcript.len());
+        // Same for the memory pass's depth: keep its unread tail unread.
+        self.extract_state
+            .rebase(old_len, self.session.transcript.len());
         let reinject = compact::build_reinjection(
             &self.tool_ctx.recent_reads,
             compact::reinject_budget(self.engine.ctx_size()),
@@ -5925,6 +5939,7 @@ impl Agent<'_> {
     fn reset_session_state(&mut self) {
         self.discard_ladder();
         self.session = Session::new();
+        self.extract_state.reset_to(0);
         // A new session, a new name — minted here for the same reason
         // `new_agent` mints one at launch (see `SessionStore::mint_id`).
         self.session.id = self.store.mint_id();
@@ -6747,6 +6762,8 @@ impl Agent<'_> {
         let note = self.load_session_payload(&session);
         self.discard_ladder();
         self.session = session;
+        // A restored transcript is history, not new material for the pass.
+        self.extract_state.reset_to(self.session.transcript.len());
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
@@ -6920,6 +6937,8 @@ impl Agent<'_> {
         self.payload_dirty = true;
         crate::checkpoint::restore_transcript(&mut self.session, &cp);
         self.console_seen = self.console_seen.min(self.session.transcript.len());
+        self.extract_state
+            .truncate_to(self.session.transcript.len());
         self.last_ctx_used = 0;
         let note = match &cp.kv {
             Some(cache) if self.engine.set_kv(cache).is_ok() => {
@@ -7609,6 +7628,8 @@ the original is frozen and listed in /tree"
         let note = self.load_session_payload(&s);
         self.discard_ladder();
         self.session = s;
+        // A restored transcript is history, not new material for the pass.
+        self.extract_state.reset_to(self.session.transcript.len());
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
@@ -9419,6 +9440,18 @@ the original is frozen and listed in /tree"
         task: &str,
         snapshot_kv: bool,
     ) -> usize {
+        let message = crate::agents::task_message(instructions, task, self.active_goal());
+        self.begin_sidechain(message, snapshot_kv)
+    }
+
+    /// The fork bookkeeping behind [`begin_subagent_fork`](Self::begin_subagent_fork)
+    /// with `message` pushed verbatim as the sidechain's user turn. The
+    /// memory pass uses this directly: its prompt carries its own contract
+    /// ("reply with a JSON array and nothing else"), and the generic
+    /// sub-agent framing — "complete the task using your tools, then end with
+    /// a final report" — would contradict it and steer the model toward tool
+    /// calls and prose.
+    fn begin_sidechain(&mut self, message: String, snapshot_kv: bool) -> usize {
         let fork_at = self.session.transcript.len();
         // Capture the live KV before the sidechain diverges it; the matching
         // restore is `restore_fork_kv`, called by every fork-end path. `None`
@@ -9431,11 +9464,7 @@ the original is frozen and listed in /tree"
         });
         self.sidechain_depth += 1;
         self.fork_points.push(fork_at);
-        self.session.push(Message::user(crate::agents::task_message(
-            instructions,
-            task,
-            self.active_goal(),
-        )));
+        self.session.push(Message::user(message));
         fork_at
     }
 
@@ -9472,6 +9501,7 @@ the original is frozen and listed in /tree"
         self.remember_sidechain(dump);
         self.session.transcript.truncate(fork_at);
         self.truncate_ladder_to(fork_at);
+        self.extract_state.truncate_to(fork_at);
         self.sidechain_depth = self.sidechain_depth.saturating_sub(1);
         self.fork_points.pop();
         // The sidechain's tail is gone from the transcript, so the parent
@@ -10178,6 +10208,10 @@ the original is frozen and listed in /tree"
     ) -> T {
         let parent_engine = std::mem::replace(&mut self.engine, engine);
         // The framed task is the last message; keep it, hide everything before.
+        // `extract_state.processed_depth` is left alone across the stash: the
+        // fork opened by the caller keeps `in_sidechain()` true for the whole
+        // of `run`, so the memory pass cannot observe the short transcript,
+        // and the restore below puts every index back where it was.
         let stashed = {
             let mut prefix = std::mem::take(&mut self.session.transcript);
             let task = prefix.pop();
@@ -14115,31 +14149,94 @@ impl Agent<'_> {
         let slice = self.session.transcript[from.min(depth)..depth].to_vec();
         let task = crate::memextract::build_prompt(&slice, &entries);
 
-        let fork_at = self.begin_subagent_fork(None, &task, true);
-        let (done, result) = self.run_subagent_loop();
+        // The prompt goes in verbatim — not through `task_message`, whose
+        // "use your tools, then report" framing contradicts the JSON-only
+        // contract — and the sidechain is exactly one generation with no
+        // dispatch (`run_memory_round`), so the pass can never touch a tool.
+        let fork_at = self.begin_sidechain(task.clone(), true);
+        let (done, result) = self.run_sidechain_quietly(Self::run_memory_round);
         let report = self.end_subagent_fork(fork_at, "memory", &task, done);
 
-        if result.is_err() || crate::interrupt::pending() {
+        let Ok(usable) = result else {
+            self.extract_state.cancel();
+            return false;
+        };
+        if crate::interrupt::pending() {
             self.extract_state.cancel();
             return false;
         }
-        if let Some(text) = report
-            && let Ok(verdicts) = crate::memory::parse_verdicts(text.trim())
-        {
-            let date = crate::context::current_local_iso_date();
-            let notes = crate::memory::apply_verdicts_to(
-                &self.tool_ctx.cwd,
-                &verdicts,
-                &date,
-                self.tool_ctx.memory_log_path.as_deref(),
-                None,
-            );
-            if !notes.is_empty() {
-                self.report_memory_changes(&notes);
+        let verdicts = if usable {
+            report
+                .as_deref()
+                .and_then(crate::memextract::extract_verdict_array)
+                .and_then(|json| crate::memory::parse_verdicts(json).ok())
+        } else {
+            None
+        };
+        match verdicts {
+            Some(verdicts) => {
+                let date = crate::context::current_local_iso_date();
+                let notes = crate::memory::apply_verdicts_to(
+                    &self.tool_ctx.cwd,
+                    &verdicts,
+                    &date,
+                    self.tool_ctx.memory_log_path.as_deref(),
+                    None,
+                );
+                if !notes.is_empty() {
+                    self.report_memory_changes(&notes);
+                }
             }
+            None => self.note_unusable_memory_reply(),
         }
+        // The span advances even when nothing could be read from the reply.
+        // A reply that is not a JSON array is a property of the model on this
+        // prompt, not a transient fault (those — engine error, interrupt —
+        // cancel above and are retried): re-reading the same span every idle
+        // turn would cost a growing prompt forever and never do better. The
+        // repro dump and the one-time notice below are the diagnostic.
         self.extract_state.finish(depth);
         true
+    }
+
+    /// The memory pass's whole sidechain: one quiet generation, its text
+    /// pushed for the fork end to extract, and **no tool dispatch** — the
+    /// parsed calls are never handed to `run_tool_calls`. Returns whether the
+    /// reply is usable as a verdict list: a reply that asked for a tool, or
+    /// failed preflight, is not.
+    fn run_memory_round(&mut self) -> Result<bool, String> {
+        let prompt_text = render_transcript(&recovery_session(&self.session), &self.system);
+        let pass = match self.generate_quiet(&prompt_text, Instant::now()) {
+            Ok(pass) => pass,
+            Err(abort) => {
+                if !abort.partial.is_empty() {
+                    self.session.push(Message::assistant(abort.partial));
+                }
+                return Err(abort.error);
+            }
+        };
+        let usable = pass.calls.is_empty() && pass.tool_error.is_none();
+        self.session.push(Message::assistant(pass.assistant_text));
+        self.note_pass(
+            None,
+            &pass.stats,
+            pass.guard.clone(),
+            pass_stop_text(false, pass.tool_error.as_deref(), pass.calls.len()),
+        );
+        Ok(usable)
+    }
+
+    /// Records a memory pass whose reply yielded no verdicts: always in the
+    /// sidechain's repro dump (`/repro`), and once per session as a dim
+    /// front-end line through the same channel as the change summary, so a
+    /// model that never answers in JSON is visible without a line every turn.
+    fn note_unusable_memory_reply(&mut self) {
+        self.note_sidechain_outcome("no usable verdicts");
+        if self.extract_state.note_unusable_reply() {
+            self.pending_memory_notice = Some(
+                "memory: the extraction pass produced no usable verdicts (see /repro)".to_owned(),
+            );
+        }
     }
 
     /// Queues one quiet summary line for the next turn boundary to print,
@@ -30292,6 +30389,244 @@ or the user's next message aborts before its first token"
             "sidechains push no rungs"
         );
         assert_eq!(agent.sidechain_depth, 0, "the fork is closed on every path");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bash stanza that, if dispatched, leaves a file behind — the one
+    /// observation that distinguishes "the tool ran" from "the model asked".
+    fn bash_marker_stanza(marker: &std::path::Path) -> String {
+        format!(
+            concat!(
+                "Updating memory.\n",
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"bash\">",
+                "<｜DSML｜parameter name=\"command\" string=\"true\">echo ran > {}</｜DSML｜parameter｜>",
+                "</｜DSML｜invoke｜>",
+                "</｜DSML｜tool_calls｜>",
+            ),
+            marker.display()
+        )
+    }
+
+    #[test]
+    fn the_pass_cannot_dispatch_a_tool_call() {
+        let dir = scratch_dir("memextract-no-tools");
+        let cfg = test_cfg();
+        let marker = dir.join("tool-ran");
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            // Every reply asks for the tool: an agentic loop would dispatch
+            // it on round one and generate again on the observation.
+            replies: vec![bash_marker_stanza(&marker); 3],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.extract_state.enabled = true;
+        agent.extract_state.every_n = 1;
+        agent.tool_ctx.memory_log_path = Some(dir.join("memory-log.jsonl"));
+        agent.session.push(Message::user("run something for me"));
+        agent.session.push(Message::assistant("done"));
+
+        assert!(agent.maybe_extract_memories(), "the pass ran");
+        assert!(
+            !marker.exists(),
+            "the memory pass dispatched a tool call: {}",
+            marker.display()
+        );
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "exactly one generation — no tool round, no report round"
+        );
+        assert_eq!(agent.sidechain_depth, 0);
+        assert_eq!(agent.session.transcript.len(), 2, "sidechain folded out");
+        assert!(
+            !agent.maybe_extract_memories(),
+            "an unusable reply still advances the span (no retry loop)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_pass_prompt_is_the_verdict_contract_not_the_task_framing() {
+        let dir = scratch_dir("memextract-framing");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.extract_state.enabled = true;
+        agent.extract_state.every_n = 1;
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.maybe_extract_memories());
+        let prompts = prompts.lock().unwrap();
+        let prompt = prompts.last().expect("one generation");
+        assert!(
+            prompt.contains("Reply with a JSON array and nothing else"),
+            "the model must see build_prompt's contract"
+        );
+        assert!(
+            !prompt.contains("acting as a subagent"),
+            "the generic task framing contradicts the JSON-only contract"
+        );
+        assert!(
+            agent.pending_memory_notice.is_none(),
+            "an empty array is a silent, valid outcome"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_fenced_reply_with_a_lead_in_still_applies_its_verdicts() {
+        let dir = scratch_dir("memextract-fenced");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec![
+                concat!(
+                    "Here is what I would save:\n```json\n",
+                    "[{\"verdict\": \"ADD\", \"text\": \"prefers tabs\", ",
+                    "\"type\": \"user\", \"scope\": \"project\"}]\n```\n"
+                )
+                .to_string(),
+            ],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.extract_state.enabled = true;
+        agent.extract_state.every_n = 1;
+        agent.tool_ctx.memory_log_path = Some(dir.join("memory-log.jsonl"));
+        agent.session.push(Message::user("I prefer tabs"));
+        agent.session.push(Message::assistant("noted"));
+        assert!(agent.maybe_extract_memories());
+        let saved = std::fs::read_to_string(dir.join(".plank").join("MEMORY.md"))
+            .expect("project memory written");
+        assert!(saved.contains("prefers tabs"), "{saved}");
+        let notice = agent
+            .pending_memory_notice
+            .take()
+            .expect("a change summary");
+        assert!(notice.starts_with("memory: "), "{notice}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_prose_reply_is_noted_once_and_never_as_an_error() {
+        let dir = scratch_dir("memextract-prose");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec![
+                "Nothing here is worth remembering.".to_string(),
+                "Still nothing.".to_string(),
+            ],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.extract_state.enabled = true;
+        agent.extract_state.every_n = 1;
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.maybe_extract_memories());
+        let notice = agent.pending_memory_notice.take().expect("noted once");
+        assert!(notice.contains("no usable verdicts"), "{notice}");
+        assert_eq!(
+            agent.sidechain_dumps.back().map(|d| d.outcome.as_str()),
+            Some("no usable verdicts")
+        );
+        agent.session.push(Message::user("more"));
+        agent.session.push(Message::assistant("ok"));
+        assert!(
+            agent.maybe_extract_memories(),
+            "the span advanced, so it runs again"
+        );
+        assert!(
+            agent.pending_memory_notice.is_none(),
+            "the second unusable reply is not announced again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_shrinking_the_transcript_neither_disables_nor_skips_the_pass() {
+        let dir = scratch_dir("memextract-compact");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string(), "[]".to_string()],
+            prompts: prompts.clone(),
+            // `tail_budget(80)` is 10 tokens at ~4 bytes each: the two short
+            // new messages fit the verbatim tail, the long processed ones
+            // do not and are folded into the summary.
+            ctx_override: Some(80),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.extract_state.enabled = true;
+        agent.extract_state.every_n = 1;
+        for i in 0..3 {
+            agent.session.push(Message::user(format!(
+                "old-question-{i} {}",
+                "x".repeat(200)
+            )));
+            agent.session.push(Message::assistant(format!(
+                "old-answer-{i} {}",
+                "y".repeat(200)
+            )));
+        }
+        assert!(agent.maybe_extract_memories(), "covers depth 0..6");
+        agent.session.push(Message::user("new-q"));
+        agent.session.push(Message::assistant("new-a"));
+        agent.rebuild_after_compact("<summary>did things</summary>");
+        let depth = agent.session.transcript.len();
+        assert!(
+            depth < 6,
+            "the transcript must have shrunk beneath the processed depth (got {depth})"
+        );
+        assert!(
+            agent.session.transcript.iter().any(|m| m.text == "new-q"),
+            "the unread pair survives in the verbatim tail"
+        );
+        assert!(
+            agent.maybe_extract_memories(),
+            "the shrink must not silently stop the pass"
+        );
+        let prompts = prompts.lock().unwrap();
+        let prompt = prompts.last().expect("second generation");
+        assert!(
+            prompt.contains("user: new-q"),
+            "the unread message was skipped"
+        );
+        assert!(
+            prompt.contains("assistant: new-a"),
+            "the unread message was skipped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_resumed_transcript_is_not_shipped_wholesale_on_the_first_idle_turn() {
+        let dir = scratch_dir("memextract-resume");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.extract_state.enabled = true;
+        agent.extract_state.every_n = 1;
+        let mut restored = Session::new();
+        for i in 0..6 {
+            restored.push(Message::user(format!("old-{i}")));
+            restored.push(Message::assistant("ok"));
+        }
+        agent.reset_for_adopted_session(restored);
+        assert!(
+            !agent.maybe_extract_memories(),
+            "a restored transcript is history, not new material"
+        );
+        agent.session.push(Message::user("new"));
+        agent.session.push(Message::assistant("ok"));
+        assert!(agent.maybe_extract_memories(), "new turns are still read");
         std::fs::remove_dir_all(&dir).ok();
     }
 

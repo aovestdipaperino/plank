@@ -35,6 +35,9 @@ pub struct ExtractState {
     eligible: u32,
     /// Whether the model called `remember` or `forget` this turn.
     wrote_this_turn: bool,
+    /// Passes whose reply yielded no verdicts; the front end announces
+    /// only the first.
+    unusable_replies: u32,
 }
 
 impl ExtractState {
@@ -95,6 +98,67 @@ impl ExtractState {
     pub fn cancel(&mut self) {
         self.running = false;
     }
+
+    /// Re-anchors after a rewrite that kept the transcript's *tail* but
+    /// changed its length — compaction replaces the head with a summary and
+    /// keeps the last messages verbatim. The number of unprocessed trailing
+    /// messages is preserved: whatever sat above `processed_depth` before the
+    /// rewrite is still above it afterwards, and the new head (the summary)
+    /// counts as processed, since it condenses text the pass already read.
+    ///
+    /// Without this the shrunken transcript satisfies
+    /// `depth <= processed_depth` and the pass silently stops, then skips the
+    /// post-rewrite messages once the depth grows back past the stale value —
+    /// the same hazard `kvladder` guards against with `truncate_to`.
+    pub fn rebase(&mut self, old_len: usize, new_len: usize) {
+        let unseen = old_len.saturating_sub(self.processed_depth);
+        self.processed_depth = new_len.saturating_sub(unseen);
+    }
+
+    /// Clamps the recorded depth after the transcript was truncated to
+    /// `depth` (fork end, rollback): messages past the cut no longer exist,
+    /// so a depth pointing past it would skip whatever replaces them.
+    pub fn truncate_to(&mut self, depth: usize) {
+        self.processed_depth = self.processed_depth.min(depth);
+    }
+
+    /// Adopts a transcript the pass has no history with (`/clear`, `/new`,
+    /// `/resume`, `/switch`): everything up to `depth` counts as processed,
+    /// so a restored session is never shipped wholesale to the model on the
+    /// first idle turn, and the throttle and in-flight flag start over.
+    pub fn reset_to(&mut self, depth: usize) {
+        self.processed_depth = depth;
+        self.running = false;
+        self.eligible = 0;
+    }
+
+    /// Records that a pass replied with something no verdict could be read
+    /// from. Returns `true` the first time in this state's lifetime, so the
+    /// front end can say so once rather than on every idle turn.
+    pub fn note_unusable_reply(&mut self) -> bool {
+        self.unusable_replies = self.unusable_replies.saturating_add(1);
+        self.unusable_replies == 1
+    }
+}
+
+/// Locates the verdict array in a model reply. A local model told to answer
+/// with "a JSON array and nothing else" still tends to wrap it in a markdown
+/// fence or lead in with a sentence; `memory::parse_verdicts` parses from
+/// position 0 and would reject both. This returns the outermost `[` … `]`
+/// span, with any surrounding code fence removed first, or `None` when the
+/// reply holds no array at all. An empty `[]` is returned as is: it is the
+/// common, valid answer.
+#[must_use]
+pub fn extract_verdict_array(reply: &str) -> Option<&str> {
+    let mut body = reply.trim();
+    if let Some(rest) = body.strip_prefix("```") {
+        // Drop the info string (```json) up to the end of the fence line.
+        let rest = rest.split_once('\n').map_or("", |(_, after)| after);
+        body = rest.strip_suffix("```").unwrap_or(rest).trim();
+    }
+    let start = body.find('[')?;
+    let end = body.rfind(']')?;
+    (end > start).then(|| &body[start..=end])
 }
 
 /// Renders a message's role for the prompt. `Role` is not `Display`, so this
@@ -258,6 +322,100 @@ mod tests {
         assert_eq!(s.should_run(10), Some(0));
         s.cancel();
         assert_eq!(s.should_run(10), Some(0), "the work is simply redone later");
+    }
+
+    #[test]
+    fn a_rewrite_that_shrinks_the_transcript_neither_disables_nor_skips() {
+        let mut s = state();
+        assert_eq!(s.should_run(10), Some(0));
+        s.finish(10);
+        // Two more messages arrive, then compaction folds the 12-message
+        // transcript into a 1-message summary plus a 4-message verbatim tail.
+        s.rebase(12, 5);
+        assert_eq!(
+            s.should_run(5),
+            Some(3),
+            "the two unprocessed tail messages are still above the depth"
+        );
+        s.finish(5);
+        assert_eq!(s.should_run(5), None);
+        assert_eq!(
+            s.should_run(7),
+            Some(5),
+            "the pass keeps running afterwards"
+        );
+    }
+
+    #[test]
+    fn rebase_with_nothing_unseen_marks_the_whole_rewrite_processed() {
+        let mut s = state();
+        assert_eq!(s.should_run(10), Some(0));
+        s.finish(10);
+        s.rebase(10, 3);
+        assert_eq!(s.should_run(3), None, "summary only — nothing new to read");
+        assert_eq!(s.should_run(4), Some(3));
+    }
+
+    #[test]
+    fn truncate_to_clamps_and_reset_to_adopts() {
+        let mut s = state();
+        assert_eq!(s.should_run(10), Some(0));
+        s.finish(10);
+        s.truncate_to(6);
+        assert_eq!(
+            s.should_run(8),
+            Some(6),
+            "clamped to the cut, not left at 10"
+        );
+        s.finish(8);
+        s.reset_to(40);
+        assert_eq!(
+            s.should_run(40),
+            None,
+            "a restored transcript is not shipped wholesale"
+        );
+        assert_eq!(s.should_run(42), Some(40));
+        s.reset_to(0);
+        assert_eq!(s.should_run(2), Some(0), "/clear starts over");
+    }
+
+    #[test]
+    fn an_unusable_reply_is_reported_once() {
+        let mut s = state();
+        assert!(s.note_unusable_reply());
+        assert!(!s.note_unusable_reply());
+    }
+
+    #[test]
+    fn extract_verdict_array_tolerates_fences_and_prose() {
+        assert_eq!(extract_verdict_array("[]"), Some("[]"));
+        assert_eq!(extract_verdict_array("  [ ]\n"), Some("[ ]"));
+        assert_eq!(
+            extract_verdict_array("```json\n[{\"verdict\": \"DELETE\", \"id\": \"a\"}]\n```"),
+            Some("[{\"verdict\": \"DELETE\", \"id\": \"a\"}]")
+        );
+        assert_eq!(
+            extract_verdict_array(
+                "Here are my verdicts:\n[{\"verdict\": \"USED\", \"id\": \"b\"}]\nDone."
+            ),
+            Some("[{\"verdict\": \"USED\", \"id\": \"b\"}]")
+        );
+        assert_eq!(extract_verdict_array("Nothing worth saving."), None);
+        assert_eq!(extract_verdict_array("]["), None);
+    }
+
+    #[test]
+    fn a_fenced_reply_round_trips_through_parse_verdicts() {
+        use crate::memory::{Verdict, parse_verdicts};
+        let reply = "```json\n[{\"verdict\": \"DELETE\", \"id\": \"def456\"}]\n```";
+        let json = extract_verdict_array(reply).expect("array found");
+        let verdicts = parse_verdicts(json).expect("parses");
+        assert_eq!(
+            verdicts,
+            vec![Verdict::Delete {
+                id: "def456".to_string()
+            }]
+        );
     }
 
     #[test]
