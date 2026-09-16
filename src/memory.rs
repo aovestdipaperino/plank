@@ -2068,7 +2068,10 @@ mod tests {
             "# Memory\n\n- (2026-09-01) [user] also contains beta keyword\n".to_string();
         std::fs::write(&decoy_path, &decoy_before).unwrap();
 
-        let removed = forget_matching_to(&dir, "beta", None, Some(&user_root)).unwrap();
+        // The audit log is redirected too: a test proving hermeticity must not
+        // itself append to the real ~/.plank/memory-log.jsonl.
+        let log = dir.join("audit.jsonl");
+        let removed = forget_matching_to(&dir, "beta", Some(&log), Some(&user_root)).unwrap();
 
         assert_eq!(
             removed.len(),
