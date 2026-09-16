@@ -2081,8 +2081,19 @@ impl RepeatGuard {
             return false;
         }
         self.since_check = 0;
-        if self.cycle_period(REPEAT_CYCLES).is_some() {
+        if let Some(period) = self.cycle_period(REPEAT_CYCLES) {
             self.repeating = true;
+            // A period short enough to show four copies at once never went
+            // through the warn rung, so latch it here or the dump's `cycle`
+            // column reads `-` on a `guard: cycle` row (repro-1789554852).
+            if self.latched.is_none() {
+                let bytes = self.tail.as_bytes();
+                self.latched = Some(Latched {
+                    block: bytes[bytes.len() - period..].to_vec(),
+                    end: self.total,
+                    cycles: REPEAT_CYCLES,
+                });
+            }
             return true;
         }
         // Advance an already-latched cycle before looking for a new one: a
@@ -3049,6 +3060,28 @@ pub fn write_report(
 
 #[cfg(test)]
 mod tests {
+
+    /// `repro-loop-1789554852`: a 20-byte bullet repeated 11 times fired the
+    /// stop rung on a direct four-copy match, and the dump printed `cycle: -`
+    /// because only the warn-then-extend path latched. A stop must always
+    /// leave the period and copy count in the snapshot.
+    #[test]
+    fn direct_stop_records_its_cycle_in_the_snapshot() {
+        let mut guard = RepeatGuard::with_window(8192);
+        assert!(!guard.feed("Each grammar's parser.c contains:\n"));
+        let item = "- `ts_lex_actions`\n";
+        let mut hit = false;
+        for _ in 0..40 {
+            hit |= guard.feed(item);
+        }
+        assert!(hit, "eleven copies of a short bullet are a loop");
+        let (period, copies) = guard
+            .snapshot()
+            .cycle
+            .expect("a direct stop must record its cycle");
+        assert_eq!(period, item.len());
+        assert!(copies >= REPEAT_CYCLES, "{copies} copies");
+    }
     use super::*;
     use crate::session::Message;
 

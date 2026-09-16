@@ -1040,3 +1040,44 @@ shows up as a new `src/new/` entry and that is difference enough. That reasoning
 is sound for *adding* a file and silently wrong for *changing* one, which is
 most of what an agent does. A limit that has been argued for in prose is not a
 limit that has been measured.
+
+## A list enumeration collapses to one item
+
+`repro-loop-1789554852` — session `groovy-oppenheimer`, asked to analyze three
+tokensave issues and propose fixes — is a different loop shape from the
+paragraph cycles above. In pass 30 the model began listing the tables inside a
+tree-sitter `parser.c` (`ts_lex_table`, `ts_lex_actions`, …) and, at
+temperature 0, greedy decoding collapsed the list into the same 20-byte bullet
+eleven times over. The byte rung saw four copies at once inside its 8 KiB
+window and stopped the pass after 2568 bytes of reasoning. Detection is fine
+here; nothing to tune.
+
+Two things about the dump were not fine.
+
+First, the guarded row read `cycle: -` next to `stop: guard: cycle`.
+`RepeatGuard::snapshot` reports only the latched block, and until 2026-09-16 a
+latch was created only on the warn-then-extend path. A period short enough to
+show `REPEAT_CYCLES` copies in one check returned true from `cycle_period`
+without ever latching, so exactly the loops that are cheapest to catch were the
+ones the table could not describe. The direct hit now latches the block it
+matched, with `REPEAT_CYCLES` as the copy count (a floor: the guard does not
+count further copies once it has stopped), and the regression test feeds the
+dump's bullet and asserts the snapshot carries its period.
+
+Second, the loop was the least expensive part of the turn. Thirty passes and
+18m47s went by with nothing written to the user: passes 6–9 on one issue,
+10–24 on the second, 25–30 on the third, and passes 22 through 30 each
+re-derived the same four facts about the binary size — no `[profile.release]`,
+a stale README claim, a 178 MB local build, a 136 MB `__const` section — at 4
+to 8 KB of reasoning per pass under `--think-low`. That is the semantic circle
+of "An hour-long turn was one thinking loop" again, and the byte rungs are not
+the instrument for it. The prompt rule for intermediate findings (above, under
+"The review that was written in the wrong place") would have produced a partial
+deliverable by pass 10; that this session did not shows it needs to trigger per
+sub-task, not only per turn.
+
+Throughput also fell from about 37 to about 21 tokens per second between passes
+8 and 9, when three large `tokensave_context` results landed. The transcript
+was at 87k tokens by the end. That is the context penalty measured in
+`FINDINGS.md`, not a loop symptom, but it doubles the wall-clock cost of every
+re-derivation that follows.
