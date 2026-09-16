@@ -67,6 +67,31 @@ fn scoped_path_for(scope: Scope, cwd: &Path, user_root: Option<&Path>) -> Option
     }
 }
 
+/// Replaces `path` with `bytes` atomically: the bytes go to a sibling temp
+/// file (`<name>.tmp.<pid>`, same directory so the rename never crosses a
+/// filesystem), are fsynced, and the temp file is then renamed over the
+/// target. A reader sees either the old complete file or the new complete
+/// one, never a truncated one — the same idiom `session.rs` uses for
+/// transcripts. On any failure the temp file is removed and the target is
+/// left exactly as it was.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let name = path.file_name().map_or_else(
+        || "memory".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let tmp = path.with_file_name(format!("{name}.tmp.{}", std::process::id()));
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(bytes)?;
+        f.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Reads a memory file for a read-modify-write cycle. A file that does not
 /// exist yet starts from [`TEMPLATE`]; any *other* failure (invalid UTF-8, a
 /// permission or I/O error) is returned as an error, never papered over.
@@ -106,7 +131,7 @@ pub fn remember(scope: Scope, cwd: &Path, text: &str, date: &str) -> Result<Path
         body.push('\n');
     }
     let _ = writeln!(body, "- ({date}) {text}");
-    std::fs::write(&path, body).map_err(|e| e.to_string())?;
+    write_atomic(&path, body.as_bytes()).map_err(|e| e.to_string())?;
     Ok(path)
 }
 
@@ -543,7 +568,7 @@ impl MetaStore {
             );
         }
         out.push_str("\n}\n");
-        std::fs::write(path, out).map_err(|e| e.to_string())
+        write_atomic(path, out.as_bytes()).map_err(|e| e.to_string())
     }
 
     /// The row for an id, defaulted when absent.
@@ -790,7 +815,8 @@ pub fn apply(sources: &[Source], edited: &str) -> Result<Vec<String>, String> {
         if let Some(parent) = src.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&src.path, body).map_err(|e| format!("{}: {e}", src.path.display()))?;
+        write_atomic(&src.path, body.as_bytes())
+            .map_err(|e| format!("{}: {e}", src.path.display()))?;
         report.push(format!(
             "{}: wrote {} line(s)",
             src.path.display(),
@@ -1192,7 +1218,8 @@ pub(crate) fn apply_verdicts_to(
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            std::fs::write(&path, out).is_ok()
+            // A failed rename is a failed write: nothing reached disk.
+            write_atomic(&path, out.as_bytes()).is_ok()
         } else {
             true
         };
@@ -1318,7 +1345,7 @@ pub(crate) fn forget_matching_to(
         }
         let mut out = kept.join("\n");
         out.push('\n');
-        std::fs::write(&path, out).map_err(|e| e.to_string())?;
+        write_atomic(&path, out.as_bytes()).map_err(|e| e.to_string())?;
 
         for e in &hits {
             let id = e.id();
@@ -1982,7 +2009,10 @@ mod tests {
         // The sibling test above makes the memory path a *directory*, which
         // now fails at the read, so it no longer reaches the write at all.
         // This one keeps the write-failure branch covered: a real, readable
-        // file that `fs::write` cannot replace because it is read-only.
+        // file in a read-only *directory*. A read-only file alone would not
+        // do since writes went atomic: rename replaces the directory entry,
+        // which the file's own mode never guards, so the write must be
+        // refused at the temp-file creation, and that needs the directory.
         use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("plank-verdict-readonly-{}", std::process::id()));
@@ -2001,7 +2031,7 @@ mod tests {
         meta.bump(&existing.id(), "2026-09-02");
         meta.save(&meta_path_for(&path)).unwrap();
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&plank_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let log = dir.join("audit.jsonl");
         let user = dir.join("userhome");
@@ -2038,7 +2068,100 @@ mod tests {
             "the sidecar counter survives the failed write"
         );
 
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::set_permissions(&plank_dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every name left in `dir` that carries the atomic-write temp marker.
+    fn temp_debris(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.contains(".tmp."))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_failed_atomic_write_leaves_the_original_byte_identical_and_no_debris() {
+        // The automatic pass rewrites the user's notes with no backup, so a
+        // write that cannot complete must leave the old file exactly as it
+        // was: no truncation, no partial content, and no temp file behind.
+        // The failure is forced with a read-only directory, which refuses the
+        // temp file the atomic write starts from.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("plank-atomic-fails-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plank_dir = dir.join(".plank");
+        std::fs::create_dir_all(&plank_dir).unwrap();
+        let path = plank_dir.join("MEMORY.md");
+        let before: &[u8] =
+            b"# Memory\n\n- (2026-09-01) [project] precious\n- (2026-09-02) [user] me\n";
+        std::fs::write(&path, before).unwrap();
+        std::fs::set_permissions(&plank_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // The explicit-verdict path.
+        let user = dir.join("userhome");
+        let notes = apply_verdicts_to(
+            &dir,
+            &[Verdict::Add {
+                text: "never lands".into(),
+                kind: Kind::Project,
+                scope: Scope::Project,
+            }],
+            "2026-09-16",
+            Some(&dir.join("audit.jsonl")),
+            Some(&user),
+        );
+        assert!(
+            notes.is_empty(),
+            "a failed write produces no note: {notes:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "byte-identical");
+
+        // The `/forget` path reports the failure and changes nothing.
+        let err = forget_matching_to(
+            &dir,
+            "precious",
+            Some(&dir.join("audit.jsonl")),
+            Some(&user),
+        )
+        .expect_err("a write the directory refuses must surface as an error");
+        assert!(!err.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before, "byte-identical");
+
+        // The `/remember` path, the same.
+        remember(Scope::Project, &dir, "never lands", "2026-09-16")
+            .expect_err("a write the directory refuses must surface as an error");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "byte-identical");
+
+        assert_eq!(
+            temp_debris(&plank_dir),
+            Vec::<String>::new(),
+            "a failed write must not leave a temp file behind"
+        );
+
+        let _ = std::fs::set_permissions(&plank_dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_atomic_write_leaves_no_temp_file_behind() {
+        let dir = std::env::temp_dir().join(format!("plank-atomic-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plank_dir = dir.join(".plank");
+        std::fs::create_dir_all(&plank_dir).unwrap();
+        let path = plank_dir.join("MEMORY.md");
+        remember(Scope::Project, &dir, "first", "2026-09-16").unwrap();
+        remember(Scope::Project, &dir, "second", "2026-09-16").unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("- (2026-09-16) first\n- (2026-09-16) second\n"),
+            "{body}"
+        );
+        assert_eq!(temp_debris(&plank_dir), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
