@@ -174,11 +174,8 @@ impl Budgets {
     }
 }
 
-/// Chooses which entries render, per type, under the budgets.
-///
-/// Retracted entries are filtered out first and are never reported as
-/// dropped — retraction is a model decision, not budget pressure, and the
-/// bytes survive until a reconciliation pass removes the line.
+/// Chooses which entries render, per type, under the budgets. Every entry
+/// in the file is a candidate: there is no hidden state that excludes one.
 ///
 /// Within a type, entries are ranked pinned-first, then by descending `uses`,
 /// then by most recent `last_used`, then by most recent `date`. The final
@@ -207,7 +204,7 @@ pub fn select_for_render(
         let mut block: Vec<(usize, &Entry)> = entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.kind == kind && !meta.get(&e.id()).retracted)
+            .filter(|(_, e)| e.kind == kind)
             .collect();
         block.sort_by(|(ia, a), (ib, b)| {
             let (ma, mb) = (meta.get(&a.id()), meta.get(&b.id()));
@@ -472,9 +469,6 @@ pub struct Meta {
     /// Never evict, whatever the counters say. Some facts are used rarely and
     /// are catastrophic to lose.
     pub pinned: bool,
-    /// Retracted by a model `forget`: hidden from rendering, bytes kept until
-    /// a reconciliation pass drops the line.
-    pub retracted: bool,
 }
 
 /// The sidecar for one memory file, keyed by [`Entry::id`].
@@ -533,7 +527,6 @@ impl MetaStore {
                     uses: num("uses"),
                     last_used: value.str_or("last_used", "").to_string(),
                     pinned: flag("pinned"),
-                    retracted: flag("retracted"),
                 },
             );
         }
@@ -561,11 +554,7 @@ impl MetaStore {
             let _ = write!(out, "{}", meta.uses);
             out.push_str(", \"last_used\": ");
             json_escape(&mut out, &meta.last_used);
-            let _ = write!(
-                out,
-                ", \"pinned\": {}, \"retracted\": {}}}",
-                meta.pinned, meta.retracted
-            );
+            let _ = write!(out, ", \"pinned\": {}}}", meta.pinned);
         }
         out.push_str("\n}\n");
         write_atomic(path, out.as_bytes()).map_err(|e| e.to_string())
@@ -582,11 +571,6 @@ impl MetaStore {
         let row = self.rows.entry(id.to_string()).or_default();
         row.uses = row.uses.saturating_add(1);
         row.last_used = date.to_string();
-    }
-
-    /// Sets or clears retraction.
-    pub fn set_retracted(&mut self, id: &str, value: bool) {
-        self.rows.entry(id.to_string()).or_default().retracted = value;
     }
 
     /// Sets or clears the pin.
@@ -923,8 +907,8 @@ pub enum Verdict {
         /// The replacement text.
         text: String,
     },
-    /// Remove an entry outright. The pass is the audited path, so this is a
-    /// real deletion; a model `forget` sets retraction instead.
+    /// Remove an entry outright: an audited deletion, the same outcome a
+    /// model `forget` reaches through [`forget_by_id_to`].
     Delete {
         /// The existing entry's id.
         id: String,
@@ -1296,9 +1280,10 @@ pub fn forget_preview_to(cwd: &Path, pattern: &str, user_root: Option<&Path>) ->
 /// from both scopes. Returns the removed entries' rendered `[kind] text`
 /// form.
 ///
-/// Unlike a model `forget` ([`MetaStore::set_retracted`]), this deletes the
-/// bytes outright: the user asked, so there is nothing to keep recoverable.
-/// Callers are expected to confirm with the user before calling this.
+/// This deletes the bytes outright, through the same audited, atomic path
+/// the model's `forget` tool ([`forget_by_id_to`]) uses: recovery is the
+/// audit log, which records every removed entry's full text. Callers are
+/// expected to confirm with the user before calling this.
 ///
 /// # Errors
 ///
@@ -1324,6 +1309,49 @@ pub(crate) fn forget_matching_to(
     if needle.is_empty() {
         return Err("give a pattern to forget".to_string());
     }
+    forget_where_to(
+        cwd,
+        |e| e.text.to_lowercase().contains(&needle),
+        "user /forget",
+        log_dest,
+        user_root,
+    )
+}
+
+/// Removes the one entry whose [`Entry::id`] is `id`, searching both scopes.
+/// This is the model's `forget` tool: a real deletion through the same
+/// audited, atomic path as [`forget_matching_to`], logged with the reason
+/// `forget tool` so a model-issued removal reads apart from a user's
+/// `/forget` in `/memory log`. Returns the removed entry's rendered `[kind]
+/// text` form, or `Ok(None)` when no live entry carries that id.
+///
+/// # Errors
+///
+/// Returns a message when a file write fails.
+pub(crate) fn forget_by_id_to(
+    cwd: &Path,
+    id: &str,
+    log_dest: Option<&Path>,
+    user_root: Option<&Path>,
+) -> Result<Option<String>, String> {
+    let removed = forget_where_to(cwd, |e| e.id() == id, "forget tool", log_dest, user_root)?;
+    Ok(removed.into_iter().next())
+}
+
+/// The one deletion path behind [`forget_matching_to`] and
+/// [`forget_by_id_to`]: rewrites each scope's file without the entries
+/// `hit` selects (atomically, so a reader never sees a torn file), then
+/// appends one audit line per removed entry — with its full text, which is
+/// what makes a wrong removal recoverable — and prunes the sidecar. An
+/// unreadable file is skipped, never overwritten. Nothing is logged unless
+/// the rewrite landed.
+fn forget_where_to(
+    cwd: &Path,
+    hit: impl Fn(&Entry) -> bool,
+    reason: &str,
+    log_dest: Option<&Path>,
+    user_root: Option<&Path>,
+) -> Result<Vec<String>, String> {
     let mut removed = Vec::new();
     for scope in [Scope::User, Scope::Project] {
         let Some(path) = scoped_path_for(scope, cwd, user_root) else {
@@ -1336,7 +1364,7 @@ pub(crate) fn forget_matching_to(
         let mut hits: Vec<Entry> = Vec::new();
         for line in body.lines() {
             match parse_entries(line).into_iter().next() {
-                Some(e) if e.text.to_lowercase().contains(&needle) => hits.push(e),
+                Some(e) if hit(&e) => hits.push(e),
                 _ => kept.push(line),
             }
         }
@@ -1349,7 +1377,7 @@ pub(crate) fn forget_matching_to(
 
         for e in &hits {
             let id = e.id();
-            log_change_to(log_dest, "forget", scope, &id, &e.text, "user /forget");
+            log_change_to(log_dest, "forget", scope, &id, &e.text, reason);
             removed.push(format!("[{}] {}", e.kind.tag(), e.text));
         }
 
@@ -1398,17 +1426,6 @@ mod tests {
         assert_eq!(kept, vec!["aaaa".to_string(), "bbbb".to_string()]);
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].text, "cccc");
-    }
-
-    #[test]
-    fn a_retracted_entry_is_not_rendered_but_is_not_dropped_data() {
-        let entries = vec![entry("gone", Kind::User), entry("stays", Kind::User)];
-        let mut meta = MetaStore::default();
-        meta.set_retracted(&entries[0].id(), true);
-        let (kept, dropped) = select_for_render(&entries, &meta, &Budgets::default());
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].text, "stays");
-        assert!(dropped.is_empty(), "retraction is not a budget eviction");
     }
 
     #[test]
@@ -1657,13 +1674,41 @@ mod tests {
         let mut store = MetaStore::default();
         store.bump("abc123", "2026-09-15");
         store.bump("abc123", "2026-09-16");
-        store.set_retracted("dead99", true);
+        store.set_pinned("dead99", true);
         store.save(&meta_path_for(&path)).unwrap();
 
         let reloaded = MetaStore::load(&meta_path_for(&path));
         assert_eq!(reloaded.get("abc123").uses, 2);
         assert_eq!(reloaded.get("abc123").last_used, "2026-09-16");
-        assert!(reloaded.get("dead99").retracted);
+        assert!(reloaded.get("dead99").pinned);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sidecar_with_an_unknown_key_loads_and_ignores_it() {
+        // Sidecars written before retraction was dropped carry a
+        // `retracted` key. They are on users' disks; loading one must not
+        // fail and must not lose the fields that are still meaningful.
+        let dir = std::env::temp_dir().join(format!("plank-meta-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.meta.json");
+        std::fs::write(
+            &path,
+            "{\n  \"abc123\": {\"uses\": 3, \"last_used\": \"2026-09-01\", \"pinned\": true, \"retracted\": true},\n  \"def456\": {\"uses\": 0, \"last_used\": \"\", \"pinned\": false, \"retracted\": false, \"future\": [1, 2]}\n}\n",
+        )
+        .unwrap();
+        let store = MetaStore::load(&path);
+        assert_eq!(store.get("abc123").uses, 3);
+        assert_eq!(store.get("abc123").last_used, "2026-09-01");
+        assert!(store.get("abc123").pinned);
+        assert_eq!(store.get("def456"), Meta::default());
+        // Re-saving drops the unknown key rather than carrying it forward.
+        store.save(&path).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("retracted")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -454,7 +454,7 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
   "type": "function",
   "function": {
     "name": "forget",
-    "description": "Retract a memory entry that has turned out to be wrong. Give the id shown beside the entry in context. The entry stops being used at once; it is removed from the file by the next maintenance pass, so a retraction can be undone until then.",
+    "description": "Remove a memory entry that has turned out to be wrong. Give the id shown beside the entry in context. The entry is deleted from the memory file immediately; the removal, with the entry text, is recorded in the memory log.",
     "parameters": {
       "type": "object",
       "properties": {

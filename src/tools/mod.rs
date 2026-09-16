@@ -982,11 +982,12 @@ fn tool_remember(ctx: &mut ToolContext, call: &ToolCall) -> String {
     }
 }
 
-/// `forget` — retract a memory entry (Task 7).
+/// `forget` — delete a memory entry (Task 7).
 ///
-/// Sets retraction in the sidecar rather than deleting the line: the entry
-/// stops rendering at once, but its bytes survive until a reconciliation
-/// pass removes them, so a wrong `forget` call is undoable.
+/// A real deletion through the same audited, atomic write path as the
+/// user's `/forget` ([`crate::memory::forget_by_id_to`]): the line leaves
+/// the file at once, and the audit log keeps its full text under the reason
+/// `forget tool`, which is where a wrongly forgotten entry is recovered from.
 fn tool_forget(ctx: &mut ToolContext, call: &ToolCall) -> String {
     if !crate::settings::active().tools.remember {
         return "Tool error: unknown tool: forget\n".to_string();
@@ -995,37 +996,14 @@ fn tool_forget(ctx: &mut ToolContext, call: &ToolCall) -> String {
     if id.is_empty() {
         return "Tool error: forget requires an 'id'\n".to_string();
     }
-    for scope in [crate::memory::Scope::User, crate::memory::Scope::Project] {
-        let Some(path) = crate::memory::path_for(scope, &ctx.cwd) else {
-            continue;
-        };
-        let Ok(body) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Some(entry) = crate::memory::parse_entries(&body)
-            .into_iter()
-            .find(|e| e.id() == id)
-        else {
-            continue;
-        };
-        let meta_path = crate::memory::meta_path_for(&path);
-        let mut meta = crate::memory::MetaStore::load(&meta_path);
-        meta.set_retracted(id, true);
-        if let Err(e) = meta.save(&meta_path) {
-            return format!("Tool error: forget failed: {e}\n");
+    match crate::memory::forget_by_id_to(&ctx.cwd, id, ctx.memory_log_path.as_deref(), None) {
+        Ok(Some(removed)) => {
+            ctx.wrote_memory = true;
+            format!("forgot {removed} (recorded in the memory log)\n")
         }
-        crate::memory::log_change_to(
-            ctx.memory_log_path.as_deref(),
-            "retract",
-            scope,
-            id,
-            &entry.text,
-            "forget tool",
-        );
-        ctx.wrote_memory = true;
-        return format!("retracted: {}\n", entry.text);
+        Ok(None) => format!("Tool error: no memory entry with id {id}\n"),
+        Err(e) => format!("Tool error: forget failed: {e}\n"),
     }
-    format!("Tool error: no memory entry with id {id}\n")
 }
 
 /// Implements the `run_code` tool (M10): a small script of named operations
@@ -1554,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn remember_writes_to_disk_and_forget_only_retracts() {
+    fn remember_writes_to_disk_and_forget_deletes_through_the_audited_path() {
         crate::settings::install_for_test(crate::settings::Settings::default());
         let (mut ctx, dir) = test_ctx();
         // Route the audit log to a scratch file instead of the real
@@ -1581,17 +1559,37 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
+        ctx.wrote_memory = false;
         let res = dispatch(&test_call("forget", &[("id", &entry.id())]), &mut ctx);
-        assert!(res.output.contains("retracted"), "{}", res.output);
         assert!(
-            std::fs::read_to_string(&path)
+            res.output.contains("forgot [user] prefers tabs"),
+            "{}",
+            res.output
+        );
+        assert!(
+            !std::fs::read_to_string(&path)
                 .unwrap()
                 .contains("prefers tabs"),
-            "forget must not erase the bytes"
+            "a model forget deletes the line outright"
         );
-        let meta = crate::memory::MetaStore::load(&crate::memory::meta_path_for(&path));
-        assert!(meta.get(&entry.id()).retracted);
         assert!(ctx.wrote_memory);
+
+        // The deletion is recoverable from the audit log: the line carries
+        // the entry's full text, and its reason tells a model-issued forget
+        // apart from a user's `/forget`.
+        let log = std::fs::read_to_string(dir.join("memory-log.jsonl")).unwrap();
+        let forget_line = log
+            .lines()
+            .find(|l| l.contains("\"action\": \"forget\""))
+            .unwrap_or_else(|| panic!("no forget line in log:\n{log}"));
+        assert!(forget_line.contains(&entry.id()), "{forget_line}");
+        assert!(forget_line.contains("prefers tabs"), "{forget_line}");
+        assert!(forget_line.contains("forget tool"), "{forget_line}");
+        assert!(!forget_line.contains("user /forget"), "{forget_line}");
+
+        // A second forget of the same id finds nothing: the entry is gone.
+        let res = dispatch(&test_call("forget", &[("id", &entry.id())]), &mut ctx);
+        assert!(res.output.contains("no memory entry"), "{}", res.output);
         std::fs::remove_dir_all(&dir).ok();
     }
 

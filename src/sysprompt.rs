@@ -995,7 +995,7 @@ fn append_remember_schema(out: &mut String) {
          \x20 \"type\": \"function\",\n\
          \x20 \"function\": {\n\
          \x20   \"name\": \"forget\",\n\
-         \x20   \"description\": \"Retract a memory entry that has turned out to be wrong. Give the id shown beside the entry in context. The entry stops being used at once; it is removed from the file by the next maintenance pass, so a retraction can be undone until then.\",\n\
+         \x20   \"description\": \"Remove a memory entry that has turned out to be wrong. Give the id shown beside the entry in context. The entry is deleted from the memory file immediately; the removal, with the entry text, is recorded in the memory log.\",\n\
          \x20   \"parameters\": {\n\
          \x20     \"type\": \"object\",\n\
          \x20     \"properties\": {\n\

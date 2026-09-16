@@ -127,8 +127,11 @@ holding per-entry bookkeeping, keyed by [`Entry::id`](#entry-identity):
   work.
 - `last_used` — the date of the most recent such pass.
 - `pinned` — never evict, whatever the counters say.
-- `retracted` — hidden from rendering by a model `forget` call; the bytes
-  survive in `MEMORY.md` until a reconciliation pass removes the line.
+
+A sidecar written by an earlier build of this branch may also carry a
+`retracted` key, from a since-dropped design in which a model `forget` only
+hid an entry. `MetaStore::load` ignores any key it does not know, so such a
+file loads normally and the stray key disappears at the next save.
 
 Every field defaults to zero/false, and `MetaStore::load` treats a missing
 file, an unreadable file, malformed JSON, or the wrong shape identically: an
@@ -138,7 +141,7 @@ orphaned sidecar row, cleaned up the next time anything calls `MetaStore::gc`
 against the live entry ids. Losing the sidecar file entirely — deleted,
 corrupted, never created — must leave memory loading and rendering exactly
 as if every entry had a fresh row: every counter at zero, nothing pinned,
-nothing retracted, nothing missing. That correctness is what "advisory"
+nothing missing. That correctness is what "advisory"
 means here, and it is worth stating explicitly because it is easy to design
 a cache that quietly becomes load-bearing; this one is tested not to.
 
@@ -169,9 +172,7 @@ crowd out the `user` block the way one shared budget would let it:
 | `reference` | 2048 characters |
 
 `select_for_render` applies each type's budget independently. Within a type,
-retracted entries are dropped first and are never counted as evicted —
-retraction is a model decision, not budget pressure. The remaining entries
-are ranked **pinned first, then by descending `uses`, then by most recent
+entries are ranked **pinned first, then by descending `uses`, then by most recent
 `last_used`**, and kept in that order until the budget is spent; whatever
 doesn't fit is reported as dropped, not silently discarded — `load_scope`
 appends a line noting how many older entries were omitted under the type
@@ -204,10 +205,15 @@ tool` if called anyway):
   named scope's file (default `project`). It writes immediately and logs the
   change, but — per Part 1 — the entry is not visible in context until the
   next session start; the tool's own reply says so.
-- **`forget(id)`** sets `retracted: true` in the sidecar for that id. It does
-  not delete the line. This is what makes a wrong model-issued `forget`
-  undoable: the text is still in the file, invisible to rendering, until a
-  later reconciliation pass (a `DELETE` verdict) removes it outright.
+- **`forget(id)`** deletes the entry with that id from whichever scope holds
+  it, through the same atomic, audited write path as `/forget`
+  (`memory::forget_by_id_to`, sharing `forget_where_to` with
+  `forget_matching_to`). There is no hidden "retracted" state: what is in
+  `MEMORY.md` is what the model sees, and what the user reads in their own
+  file is live. Recoverability comes from the audit log instead — the
+  `~/.plank/memory-log.jsonl` line records the entry's full text under the
+  reason `forget tool`, distinct from a user's `/forget` (`user /forget`),
+  so a wrong model call can be found in `/memory log` and re-added.
 
 ### `/remember` and `/forget`
 
@@ -284,9 +290,9 @@ only after the pass returns cleanly.
 - `ADD` — a brand-new entry, with its type and scope.
 - `UPDATE` — supersede an existing entry's text (carries usage via
   `MetaStore::carry`, see "Entry identity" above).
-- `DELETE` — remove an entry outright, because it's redundant or wrong. This
-  is the real, audited deletion path — as opposed to a model `forget`, which
-  only retracts.
+- `DELETE` — remove an entry outright, because it's redundant or wrong. Same
+  audited outcome as a model `forget`, reached from the pass's verdicts
+  rather than a tool call.
 - `USED` — credit an existing entry with having borne on the work in this
   excerpt, bumping its `uses`/`last_used`.
 

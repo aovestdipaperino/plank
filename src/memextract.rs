@@ -17,7 +17,7 @@
 //! The pass runs through the sub-agent fork, so `in_sidechain()` holds: no
 //! rungs pushed, no payload stored, no checkpoint debris.
 
-use crate::memory::{Entry, MetaStore, Scope};
+use crate::memory::{Entry, Scope};
 use crate::session::{Message, Role};
 
 /// Gating state for the pass, owned by the `Agent`.
@@ -314,9 +314,9 @@ pub fn build_prompt(slice: &[Message], entries: &[(Scope, Entry)]) -> String {
     out
 }
 
-/// Reads every non-retracted entry from both scopes, for the prompt. A
-/// retracted entry is one the model already decided was wrong via `forget`,
-/// so the pass must not be shown it as still live.
+/// Reads every entry from both scopes, for the prompt. The file is the
+/// whole truth here: a model `forget` deletes its entry outright, so there
+/// is no hidden state to filter against.
 #[must_use]
 pub fn current_entries(cwd: &std::path::Path) -> Vec<(Scope, Entry)> {
     let mut out = Vec::new();
@@ -327,11 +327,8 @@ pub fn current_entries(cwd: &std::path::Path) -> Vec<(Scope, Entry)> {
         let Ok(body) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let meta = MetaStore::load(&crate::memory::meta_path_for(&path));
         for e in crate::memory::parse_entries(&body) {
-            if !meta.get(&e.id()).retracted {
-                out.push((scope, e));
-            }
+            out.push((scope, e));
         }
     }
     out
