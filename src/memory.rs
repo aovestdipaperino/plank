@@ -1892,6 +1892,71 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn a_readable_but_unwritable_file_still_leaves_the_sidecar_untouched() {
+        // The sibling test above makes the memory path a *directory*, which
+        // now fails at the read, so it no longer reaches the write at all.
+        // This one keeps the write-failure branch covered: a real, readable
+        // file that `fs::write` cannot replace because it is read-only.
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("plank-verdict-readonly-{}", std::process::id()));
+        let plank_dir = dir.join(".plank");
+        std::fs::create_dir_all(&plank_dir).unwrap();
+        let path = plank_dir.join("MEMORY.md");
+        let before = "# Memory\n\n- (2026-09-01) [project] keep me\n";
+        std::fs::write(&path, before).unwrap();
+
+        let existing = Entry {
+            date: "2026-09-01".into(),
+            kind: Kind::Project,
+            text: "keep me".into(),
+        };
+        let mut meta = MetaStore::default();
+        meta.bump(&existing.id(), "2026-09-02");
+        meta.save(&meta_path_for(&path)).unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let log = dir.join("audit.jsonl");
+        let user = dir.join("userhome");
+        let notes = apply_verdicts_to(
+            &dir,
+            &[Verdict::Add {
+                text: "should never land".into(),
+                kind: Kind::Project,
+                scope: Scope::Project,
+            }],
+            "2026-09-15",
+            Some(&log),
+            Some(&user),
+        );
+
+        assert!(notes.is_empty(), "a failed write produces no note");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the file is readable and unchanged"
+        );
+        assert!(
+            !log.exists()
+                || !std::fs::read_to_string(&log)
+                    .unwrap()
+                    .contains("should never land"),
+            "the audit log must not claim a change that never landed"
+        );
+        assert_eq!(
+            MetaStore::load(&meta_path_for(&path))
+                .get(&existing.id())
+                .uses,
+            1,
+            "the sidecar counter survives the failed write"
+        );
+
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn a_failed_file_write_leaves_the_sidecar_and_its_counters_untouched() {
         // Finding 1: if the memory file write fails, neither the sidecar nor
         // the audit log may record the change. We force the write to fail
