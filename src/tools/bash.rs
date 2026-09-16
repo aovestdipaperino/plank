@@ -662,13 +662,16 @@ pub struct JobRow {
     pub path: PathBuf,
 }
 
+/// What `render_rows` says for an empty table.
+pub const NO_JOBS_TEXT: &str = "no background jobs";
+
 /// Renders job rows as the `/jobs` text: one line per job, a fixed sentence
 /// when there are none. Pure, so both the live table and a shared snapshot
 /// render identically.
 #[must_use]
 pub fn render_rows(rows: &[JobRow]) -> String {
     if rows.is_empty() {
-        return "no background jobs".to_string();
+        return NO_JOBS_TEXT.to_string();
     }
     let mut out = String::new();
     for job in rows {

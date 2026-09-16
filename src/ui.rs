@@ -3998,9 +3998,43 @@ struct PassDisplay {
 /// click toggle and the per-tick refresh.
 const JOBS_REPORT_TITLE: &str = "jobs";
 
+/// Replaces an open `/jobs` panel's text with `text`, or closes the panel when
+/// the table it was showing has just emptied. A panel left open past the last
+/// job would only say "no background jobs" while taking rows from the log, so
+/// the last job's exit dismisses it. A panel *opened* onto an empty table stays
+/// put: `/jobs` with nothing running still deserves its answer.
+fn refresh_jobs_panel(report: &mut Option<tui::ReportPanel>, text: &str) {
+    let Some(panel) = report.as_mut() else {
+        return;
+    };
+    let now_empty = text == crate::tools::bash::NO_JOBS_TEXT;
+    let was_empty = panel.text() == crate::tools::bash::NO_JOBS_TEXT;
+    if now_empty && !was_empty {
+        *report = None;
+    } else {
+        panel.set_text(text);
+    }
+}
+
 /// Title of the `/context` report panel; how the loops recognise it for the
 /// ctx-gauge click toggle.
 const CONTEXT_REPORT_TITLE: &str = "context";
+
+/// Title of the `/tasks` panel, which the footer's task counter also opens.
+const TASKS_REPORT_TITLE: &str = "tasks";
+
+/// Opens the `/tasks` panel over `report_text`, or closes it when it is the one
+/// showing: the footer's task counter toggles it on click, at idle and mid-turn.
+fn toggle_tasks_report(report: &mut Option<tui::ReportPanel>, report_text: &str) {
+    if report
+        .as_ref()
+        .is_some_and(|r| r.title() == TASKS_REPORT_TITLE)
+    {
+        *report = None;
+    } else {
+        *report = Some(tui::ReportPanel::new(TASKS_REPORT_TITLE, report_text));
+    }
+}
 
 /// Title of the `/mcp` report panel; the mid-turn loop names it to reopen the
 /// turn-start snapshot.
@@ -11503,7 +11537,8 @@ impl Agent<'_> {
             if clip_has_image {
                 status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
             }
-            let task_view = tui::TaskView::from(&self.session.tasks);
+            let task_view =
+                tui::TaskView::with_goal(&self.session.tasks, self.session.goal.as_ref());
             // Same pane selection as the busy loop, hoisted out of the draw
             // closure: a Ctrl-O pressed while idle has to be visible here too.
             // Retired first (`repaint_idle` does it too, and it is idempotent)
@@ -11803,6 +11838,15 @@ impl Agent<'_> {
                         let v = sub_pane.active_view(&mut view);
                         v.top = v.top.saturating_add(3);
                     }
+                    // The report panel's `[■]` close box dismisses it, as Esc
+                    // does; ahead of every other surface because the panel is
+                    // drawn over them.
+                    MouseEventKind::Down(MouseButton::Left)
+                        if report.is_some() && tui::report_close_click(m.column, m.row) =>
+                    {
+                        input_drag = false;
+                        report = None;
+                    }
                     MouseEventKind::Down(MouseButton::Left) => {
                         // Every press decides afresh which surface the gesture
                         // belongs to, so a release lost off-window cannot leave
@@ -11869,6 +11913,12 @@ impl Agent<'_> {
                             // panel: the gauge is the one-number summary, the
                             // panel is the breakdown behind it.
                             self.toggle_context_report(&mut report);
+                            selection.cancel();
+                        } else if tui::tasks_click(m.column, m.row) {
+                            // The footer's task counter toggles the `/tasks`
+                            // panel: the counter is the tally, the panel the
+                            // list behind it.
+                            toggle_tasks_report(&mut report, task_view.report());
                             selection.cancel();
                         } else if let Some(run) = roster_hit {
                             sub_pane.click_run(run);
@@ -13828,7 +13878,10 @@ impl Agent<'_> {
                 for line in std::mem::take(&mut self.tool_ctx.task_completions) {
                     let _ = tx.send(UiEvent::Dim(format!("✓ {line}")));
                 }
-                let _ = tx.send(UiEvent::Tasks(tui::TaskView::from(&self.session.tasks)));
+                let _ = tx.send(UiEvent::Tasks(tui::TaskView::with_goal(
+                    &self.session.tasks,
+                    self.session.goal.as_ref(),
+                )));
                 for warning in self.tool_ctx.hook_warnings.drain(..) {
                     let _ = tx.send(UiEvent::Dim(warning));
                 }
@@ -14374,9 +14427,12 @@ impl Agent<'_> {
     /// Keeps an open `/jobs` panel current: elapsed times count and finished
     /// jobs change state without the user reopening it.
     fn refresh_jobs_report(&mut self, report: &mut Option<tui::ReportPanel>) {
-        if let Some(panel) = report.as_mut().filter(|r| r.title() == JOBS_REPORT_TITLE) {
+        if report
+            .as_ref()
+            .is_some_and(|r| r.title() == JOBS_REPORT_TITLE)
+        {
             let text = self.jobs_command();
-            panel.set_text(&text);
+            refresh_jobs_panel(report, &text);
         }
     }
 
@@ -15324,7 +15380,7 @@ impl Agent<'_> {
             }
             "/tasks" => {
                 *report = Some(tui::ReportPanel::new(
-                    "tasks",
+                    TASKS_REPORT_TITLE,
                     &self.session.tasks.render_list(self.session.goal.as_ref()),
                 ));
             }
@@ -16757,7 +16813,14 @@ fn busy_ui_loop(
                         panel.set_text(&live_context_report(shared, live_ctx_used));
                     }
                 }
-                UiEvent::Tasks(tv) => task_view = tv,
+                UiEvent::Tasks(tv) => {
+                    task_view = tv;
+                    // An open `/tasks` panel follows the list as tools rewrite it.
+                    if let Some(panel) = report.as_mut().filter(|r| r.title() == TASKS_REPORT_TITLE)
+                    {
+                        panel.set_text(task_view.report());
+                    }
+                }
                 UiEvent::BtwBegin => {
                     if btw.is_none() {
                         *btw = Some((OutputLog::new(), tui::OutputView::default()));
@@ -16870,8 +16933,11 @@ fn busy_ui_loop(
         sub.expire_rows(now);
         // An open `/jobs` panel follows the worker's latest snapshot, with
         // elapsed times counted at draw time.
-        if let Some(panel) = report.as_mut().filter(|r| r.title() == JOBS_REPORT_TITLE) {
-            panel.set_text(&shared.jobs_report());
+        if report
+            .as_ref()
+            .is_some_and(|r| r.title() == JOBS_REPORT_TITLE)
+        {
+            refresh_jobs_panel(&mut report, &shared.jobs_report());
         }
         // Commit any markdown tail the render throttle deferred, on the draw
         // clock. A generation that stops emitting visible text to open a tool
@@ -17434,6 +17500,13 @@ fn busy_ui_loop(
                 // click-and-drag has to place and select in it here too.
                 // Every press decides afresh which surface the gesture belongs
                 // to, so a release lost off-window cannot strand the next drag.
+                // The report panel's `[■]` close box dismisses it, as at idle.
+                MouseEventKind::Down(MouseButton::Left)
+                    if report.is_some() && tui::report_close_click(m.column, m.row) =>
+                {
+                    report = None;
+                    selection.cancel();
+                }
                 // The footer's jobs segment toggles the `/jobs` panel, as at idle.
                 MouseEventKind::Down(MouseButton::Left) if tui::jobs_click(m.column, m.row) => {
                     if report
@@ -17493,6 +17566,12 @@ fn busy_ui_loop(
                             &live_context_report(shared, live_ctx_used),
                         ));
                     }
+                    selection.cancel();
+                }
+                // The footer's task counter toggles the `/tasks` panel, as at
+                // idle, over the list the worker last published.
+                MouseEventKind::Down(MouseButton::Left) if tui::tasks_click(m.column, m.row) => {
+                    toggle_tasks_report(&mut report, task_view.report());
                     selection.cancel();
                 }
                 // A click on a roster row selects it and opens its output.
@@ -18960,6 +19039,26 @@ fn read_batched_from(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn jobs_panel_closes_when_its_last_job_finishes() {
+        use crate::tools::bash::NO_JOBS_TEXT;
+        // Showing a job, then the table empties: the panel goes away.
+        let mut report = Some(tui::ReportPanel::new(JOBS_REPORT_TITLE, "1 pid 10 running"));
+        refresh_jobs_panel(&mut report, NO_JOBS_TEXT);
+        assert!(report.is_none(), "last job done should close the panel");
+        // Opened onto an empty table: it stays and keeps answering.
+        let mut report = Some(tui::ReportPanel::new(JOBS_REPORT_TITLE, NO_JOBS_TEXT));
+        refresh_jobs_panel(&mut report, NO_JOBS_TEXT);
+        assert!(report.is_some(), "an empty panel the user opened must stay");
+        // A table that is still populated is refreshed in place.
+        let mut report = Some(tui::ReportPanel::new(JOBS_REPORT_TITLE, "1 pid 10 running"));
+        refresh_jobs_panel(&mut report, "1 pid 10 done, exit 0");
+        assert_eq!(
+            report.as_ref().map(tui::ReportPanel::text),
+            Some("1 pid 10 done, exit 0")
+        );
+    }
     /// `--skills off` leaves the session with no skills at all — not even the
     /// compiled-in ones, which is what makes the flag different from an empty
     /// skills directory.
@@ -30652,39 +30751,35 @@ or the user's next message aborts before its first token"
     }
 
     #[test]
-    fn the_pass_does_not_run_under_default_settings() {
+    fn the_pass_runs_under_default_settings() {
         // No guard installed: `settings::active()` is the built-in default,
-        // and `memory.autoExtract` defaults to off. Poking the field the way
-        // the pass tests used to is deliberately shown to be inert.
-        let dir = scratch_dir("memextract-default-off");
+        // and since 5.1.7 `memory.autoExtract` defaults to on. The field on
+        // `extract_state` is re-sampled from the setting on every call, so
+        // poking it off is deliberately shown to be inert: the setting, not
+        // the field, decides.
+        let dir = scratch_dir("memextract-default-on");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let engine = ScriptedEngine {
             replies: vec!["[]".to_string()],
             prompts: prompts.clone(),
-            kv_events: Some(kv_events.clone()),
             ..ScriptedEngine::default()
         };
         let mut agent = test_agent(&dir, engine, &cfg);
         assert!(
-            !crate::settings::active().memory.auto_extract,
-            "the pass must be opt-in"
+            crate::settings::active().memory.auto_extract,
+            "the pass must be on by default"
         );
-        agent.extract_state.enabled = true;
+        agent.extract_state.enabled = false;
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
-        assert!(!agent.maybe_extract_memories(), "off by default: no pass");
+        assert!(agent.maybe_extract_memories(), "on by default: the pass runs");
         assert!(
-            !agent.extract_state.enabled,
+            agent.extract_state.enabled,
             "the setting, not the field, decides"
         );
-        assert!(prompts.lock().unwrap().is_empty(), "no generation");
-        assert!(
-            kv_events.lock().unwrap().is_empty(),
-            "no KV snapshot either"
-        );
-        assert_eq!(agent.sidechain_depth, 0);
+        assert_eq!(prompts.lock().unwrap().len(), 1, "exactly one generation");
+        assert_eq!(agent.sidechain_depth, 0, "the fork is closed again");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -1890,20 +1890,37 @@ pub struct TaskView {
     total: usize,
     /// `(text, is_active)` rows for the contextual strip, already capped.
     rows: Vec<(String, bool)>,
+    /// The full `/tasks` text, so a click on the footer's counter can open
+    /// the list mid-turn, when the UI thread has no session to render it from.
+    report: String,
 }
 
 impl From<&crate::tasks::TaskList> for TaskView {
     fn from(list: &crate::tasks::TaskList) -> Self {
+        Self::with_goal(list, None)
+    }
+}
+
+impl TaskView {
+    /// A view whose `/tasks` report also carries the durable goal, exactly as
+    /// the typed `/tasks` renders it.
+    #[must_use]
+    pub fn with_goal(list: &crate::tasks::TaskList, goal: Option<&crate::goal::GoalState>) -> Self {
         let (completed, total) = list.counter().unwrap_or((0, 0));
         Self {
             completed,
             total,
             rows: list.strip_rows(),
+            report: list.render_list(goal),
         }
     }
-}
 
-impl TaskView {
+    /// The `/tasks` text for the panel the footer's counter opens.
+    #[must_use]
+    pub fn report(&self) -> &str {
+        &self.report
+    }
+
     /// `(completed, total)` for the status-bar counter, or `None` when empty.
     #[must_use]
     pub fn counter(&self) -> Option<(usize, usize)> {
@@ -2415,8 +2432,12 @@ pub fn popup_rect(output: Rect, input: Rect, rows: u16) -> Rect {
 /// scroll on its own, and disappears on Esc without leaving a trace in the log.
 #[derive(Debug)]
 pub struct ReportPanel {
-    /// Shown in the border title, before the ` · Esc closes ` hint.
+    /// Shown in the border title, before the ` · Esc closes ` hint; the
+    /// `[■]` close box sits left of it, on the frame's top-left corner.
     title: String,
+    /// The raw report text, kept so a refreshing panel can tell what it was
+    /// showing before the refresh.
+    text: String,
     /// The report text, parsed once into styled lines.
     log: OutputLog,
     view: OutputView,
@@ -2430,6 +2451,7 @@ impl ReportPanel {
         log.push_ansi(report);
         Self {
             title: title.into(),
+            text: report.to_string(),
             log,
             // Reports read top-down, so start at the top instead of following
             // the tail the way a streaming log does.
@@ -2453,6 +2475,13 @@ impl ReportPanel {
         let mut log = OutputLog::new();
         log.push_ansi(report);
         self.log = log;
+        self.text = report.to_string();
+    }
+
+    /// The raw report text currently shown.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
     }
 
     /// Scrolls the report by `delta` rows (negative scrolls up).
@@ -2514,7 +2543,8 @@ pub fn draw_report(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Indexed(238)))
         .title(Span::styled(
-            format!(" {} · Esc closes ", panel.title),
+            // Leading room for the `[■]` close box drawn over the corner below.
+            format!("    {} · Esc closes ", panel.title),
             Style::default()
                 .fg(THEME_GREEN)
                 .add_modifier(Modifier::BOLD),
@@ -2522,6 +2552,51 @@ pub fn draw_report(
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     render_output(frame, inner, &panel.log, &mut panel.view, None);
+    // The Turbo Vision close box: `[■]` in the top-left corner of the frame,
+    // over the border, where a click dismisses the panel the way Esc does.
+    let close = Rect::new(rect.x + 1, rect.y, 3, 1);
+    if close.right() < rect.right() {
+        let buf = frame.buffer_mut();
+        for (x, ch) in (close.left()..close.right()).zip(REPORT_CLOSE_BOX) {
+            let cell = &mut buf[(x, close.y)];
+            cell.set_symbol(ch);
+            cell.set_style(
+                Style::default()
+                    .fg(THEME_GREEN)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+        set_report_close_rect(Some(close));
+    } else {
+        set_report_close_rect(None);
+    }
+}
+
+/// The glyphs of the report panel's close box, one per cell.
+const REPORT_CLOSE_BOX: [&str; 3] = ["[", "■", "]"];
+
+/// Screen rect the report panel's close box last occupied. It is never
+/// cleared when the panel goes away, because the only callers check that a
+/// panel is open first: a click on the box's old cells with no panel drawn
+/// there is just a click on the log.
+static REPORT_CLOSE_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+fn set_report_close_rect(rect: Option<Rect>) {
+    if let Ok(mut slot) = REPORT_CLOSE_RECT.lock() {
+        *slot = rect;
+    }
+}
+
+/// Whether a click at (`column`, `row`) landed on the report panel's close
+/// box. Meaningful only while a [`ReportPanel`] is open: the rect is the one
+/// from the last frame that drew a panel.
+#[must_use]
+pub fn report_close_click(column: u16, row: u16) -> bool {
+    REPORT_CLOSE_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
 }
 
 /// Draws the `@` suggestion popup over the output pane.
@@ -2953,6 +3028,20 @@ static JOBS_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 /// hit-testing; `None` when the row it was drawn on held no gauge.
 static CTX_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 
+/// The footer's task counter (`✓ Tasks: N/M`) from the last drawn frame, for
+/// mouse hit-testing; `None` when the task list was empty on that frame.
+static TASKS_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// Whether a click at (`column`, `row`) landed on the footer's task counter.
+#[must_use]
+pub fn tasks_click(column: u16, row: u16) -> bool {
+    TASKS_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
 /// Screen rect the footer's micro-compaction segment last occupied, so a
 /// double-click on the wastebasket can be mapped to it.
 static MC_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
@@ -3057,6 +3146,32 @@ fn segment_bounds(cells: &[&str], anchor: usize) -> (usize, usize) {
         end += 1;
     }
     (start, end)
+}
+
+/// Finds the task counter in the status rows just drawn into `buf` and records
+/// its rect. The anchor is the literal `Tasks:` so a path or branch name that
+/// merely contains `tasks` cannot claim the hit box; the segment bounds are the
+/// ` | ` separators around it, as for the jobs segment. Called after every
+/// status render, so a frame drawn with an empty list forgets the rect.
+pub fn record_tasks_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    const ANCHOR: [&str; 6] = ["T", "a", "s", "k", "s", ":"];
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        let Some(anchor) =
+            (0..cells.len()).find(|&i| cells.get(i..i + ANCHOR.len()) == Some(&ANCHOR[..]))
+        else {
+            continue;
+        };
+        let (start, end) = segment_bounds(&cells, anchor);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = TASKS_RECT.lock() {
+        *g = found;
+    }
 }
 
 /// Finds the ctx gauge in the status rows just drawn into `buf` and records its
@@ -4854,6 +4969,7 @@ pub fn draw(
     );
     record_jobs_rect(frame.buffer_mut(), status_row);
     record_ctx_rect(frame.buffer_mut(), status_row);
+    record_tasks_rect(frame.buffer_mut(), status_row);
     record_toks_rect(frame.buffer_mut(), status_row);
     record_mc_rect(frame.buffer_mut(), status_row);
     record_camera_rect(frame.buffer_mut(), status_row);
@@ -4905,6 +5021,7 @@ pub fn draw_ask(
     );
     record_jobs_rect(frame.buffer_mut(), r[2]);
     record_ctx_rect(frame.buffer_mut(), r[2]);
+    record_tasks_rect(frame.buffer_mut(), r[2]);
     record_toks_rect(frame.buffer_mut(), r[2]);
     record_mc_rect(frame.buffer_mut(), r[2]);
     record_camera_rect(frame.buffer_mut(), r[2]);
@@ -5101,6 +5218,7 @@ pub fn draw_btw_split(
     );
     record_jobs_rect(frame.buffer_mut(), status_row);
     record_ctx_rect(frame.buffer_mut(), status_row);
+    record_tasks_rect(frame.buffer_mut(), status_row);
     record_toks_rect(frame.buffer_mut(), status_row);
     record_mc_rect(frame.buffer_mut(), status_row);
     record_camera_rect(frame.buffer_mut(), status_row);
@@ -5796,6 +5914,36 @@ mod tests {
         let quiet = Buffer::empty(area);
         super::record_ctx_rect(&quiet, area);
         assert!(!super::ctx_click(13, 0), "no gauge, no hit box");
+    }
+
+    /// The task counter gets the same segment-wide click box, anchored on the
+    /// literal `Tasks:` so a directory named after tasks cannot claim it, and
+    /// forgotten on a frame whose list is empty.
+    #[test]
+    fn tasks_rect_spans_the_counter_and_ignores_lookalike_text() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 40, 1);
+        let text = "my tasks | idle | ✓ Tasks: 4/8 | tip";
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, text, ratatui::style::Style::default());
+        super::record_tasks_rect(&buf, area);
+        assert!(super::tasks_click(18, 0), "the check mark");
+        assert!(super::tasks_click(22, 0), "the label");
+        assert!(super::tasks_click(29, 0), "through the tally");
+        assert!(
+            !super::tasks_click(3, 0),
+            "the lookalike text is not the box"
+        );
+        assert!(
+            !super::tasks_click(17, 0),
+            "the separator is not the segment"
+        );
+        assert!(!super::tasks_click(30, 0));
+        assert!(!super::tasks_click(22, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_tasks_rect(&quiet, area);
+        assert!(!super::tasks_click(22, 0), "no counter, no hit box");
     }
 
     #[test]
@@ -7129,6 +7277,20 @@ mod tests {
         );
         // The report reads from its first line, not from its tail.
         assert!(rows[top + 1].contains("row 0"), "got {:?}", rows[top + 1]);
+        // The Turbo Vision close box sits on the top-left corner of the frame,
+        // and a click on any of its three cells is the close gesture; one cell
+        // to the right of it (the title) is not.
+        assert!(
+            rows[top].starts_with("\u{250c}[\u{25a0}]"),
+            "close box on the top border: {:?}",
+            rows[top]
+        );
+        let y = u16::try_from(top).unwrap();
+        assert!(report_close_click(1, y));
+        assert!(report_close_click(3, y));
+        assert!(!report_close_click(0, y));
+        assert!(!report_close_click(4, y));
+        assert!(!report_close_click(2, y + 1));
     }
 
     /// The colours that actually reach the screen for `input`, as
