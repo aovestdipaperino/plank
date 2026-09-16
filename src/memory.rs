@@ -1153,13 +1153,25 @@ pub(crate) fn apply_verdicts_to(
 /// remove, before asking them to confirm it.
 #[must_use]
 pub fn forget_preview(cwd: &Path, pattern: &str) -> Vec<String> {
+    forget_preview_to(cwd, pattern, None)
+}
+
+/// As [`forget_preview`], but with [`forget_matching_to`]'s `user_root`
+/// override for where the user scope lives.
+///
+/// The preview takes the same override as the deletion for one reason: the
+/// two must always describe the same set of entries. A preview that read the
+/// real `~/.plank/MEMORY.md` while the deletion ran against a redirected root
+/// would show the user one thing and remove another.
+#[must_use]
+pub fn forget_preview_to(cwd: &Path, pattern: &str, user_root: Option<&Path>) -> Vec<String> {
     let needle = pattern.trim().to_lowercase();
     if needle.is_empty() {
         return Vec::new();
     }
     let mut hits = Vec::new();
     for scope in [Scope::User, Scope::Project] {
-        let Some(path) = path_for(scope, cwd) else {
+        let Some(path) = scoped_path_for(scope, cwd, user_root) else {
             continue;
         };
         let Ok(body) = std::fs::read_to_string(&path) else {
