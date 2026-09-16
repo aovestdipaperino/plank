@@ -2223,6 +2223,13 @@ struct Agent<'a> {
     /// so nothing captured against it — payload, rung, micro-compaction — may
     /// be written as if it were the session's own (see [`Agent::in_sidechain`]).
     sidechain_depth: usize,
+    /// Open clean-room sidechains running on an alternate engine
+    /// ([`run_sidechain_on`](Self::run_sidechain_on)). While it is non-zero
+    /// `self.engine` is not the session's own, so nothing about the
+    /// session's KV — the fork snapshots, the ladder rungs — may be fed to
+    /// it. Kept separately from `fork_kv` because a `None` there also means
+    /// a failed snapshot, which is a different situation.
+    alt_engine_depth: usize,
     /// Gating for the background memory extraction pass; sampled from
     /// `settings.memory` at the top of every `maybe_extract_memories` call.
     extract_state: crate::memextract::ExtractState,
@@ -10256,7 +10263,9 @@ the original is frozen and listed in /tree"
             self.session.transcript = task.into_iter().collect();
             prefix
         };
+        self.alt_engine_depth += 1;
         let result = run(self);
+        self.alt_engine_depth -= 1;
         // Unconditional, and with no `?` between the swap in and the swap out: a
         // leaked swap would leave the whole session pointed at the wrong engine,
         // which is the worst failure this design can produce.
@@ -17962,6 +17971,7 @@ fn new_agent(
         first_turn_done: false,
         pressure_stop: false,
         sidechain_depth: 0,
+        alt_engine_depth: 0,
         extract_state: crate::memextract::ExtractState::default(),
         pending_memory_notice: None,
         repro_dir,
@@ -20701,6 +20711,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -25756,6 +25767,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -25882,6 +25894,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -27075,6 +27088,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -27347,6 +27361,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -27458,6 +27473,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -27556,6 +27572,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -27677,6 +27694,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -30261,6 +30279,7 @@ or the user's next message aborts before its first token"
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -30401,6 +30420,7 @@ or the user's next message aborts before its first token"
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -30965,6 +30985,27 @@ or the user's next message aborts before its first token"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `run_sidechain_on` marks the alt engine live for exactly the span of
+    /// `run`, on the same unconditional path as the engine swap, so the KV
+    /// rescue can tell a clean-room sidechain from a failed snapshot.
+    #[test]
+    fn a_clean_room_sidechain_marks_the_alt_engine_live_only_while_it_runs() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-alt-depth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("task"));
+        assert_eq!(agent.alt_engine_depth, 0);
+        let seen =
+            agent.run_sidechain_on(EngineKey::Local, Box::new(ScriptedEngine::default()), |a| {
+                a.alt_engine_depth
+            });
+        assert_eq!(seen, 1, "depth is one inside the sidechain");
+        assert_eq!(agent.alt_engine_depth, 0, "and back to zero after it");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Nested forks restore LIFO: each finish rolls the KV back to the state
     /// its own begin captured. Also covers the no-report path — the restore
     /// must fire even when the sidechain produced nothing.
@@ -31041,6 +31082,7 @@ or the user's next message aborts before its first token"
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
