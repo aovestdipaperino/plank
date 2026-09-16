@@ -7444,9 +7444,14 @@ the original is frozen and listed in /tree"
     ///
     /// Three tiers, in order:
     ///
-    /// 1. Inside a sidechain, the innermost fork snapshot (`fork_kv`, peeked,
-    ///    never popped: the fork end still owns it). It sits at exactly
-    ///    `fork_at`, and every divergence inside the sidechain is at or past
+    /// 1. Inside a sidechain, the innermost fork snapshot that exists
+    ///    (`fork_kv`, peeked, never popped: the fork end still owns it). A
+    ///    failed capture leaves `None` on the stack, so this is not simply
+    ///    the last entry: it is the innermost `Some`, found by walking the
+    ///    stack from the top down. An outer snapshot found this way is still
+    ///    a valid restore point — it sits at that outer fork's `fork_at`,
+    ///    which is at or below the divergence, same as the innermost one
+    ///    would be. Every divergence inside the sidechain is at or past
     ///    `fork_at`, so only the sidechain's own transcript re-prefills. This
     ///    is what a reasoning-cycle stop in a sub-agent used to pay in full:
     ///    `recovery_session` stubs the stopped `<think>` block, the next
@@ -7480,7 +7485,7 @@ the original is frozen and listed in /tree"
             return None;
         }
         if self.in_sidechain()
-            && let Some(Some(kv)) = self.fork_kv.last()
+            && let Some(kv) = self.fork_kv.iter().rev().flatten().next()
         {
             match self.engine.set_kv(kv) {
                 Ok(()) => {
@@ -20556,6 +20561,12 @@ mod tests {
         /// tests can exercise the error paths (e.g. that a swapped-in sub-agent
         /// engine is still returned to its cache when the sidechain dies).
         fail_with: Option<String>,
+        /// When true, the *next* `set_kv` call still logs `restore:<tag>` but
+        /// then returns an error and clears this flag, so a test can exercise
+        /// exactly one failed restore (e.g. the fork-tier restore failing and
+        /// falling through to the ladder) without every later `set_kv` call —
+        /// including the one inside `restore_rung` itself — failing too.
+        set_kv_fails_once: bool,
     }
 
     impl ScriptedEngine {
@@ -20680,6 +20691,9 @@ mod tests {
             if let Some(events) = &self.kv_events {
                 let tag = cache.kv().first().copied().unwrap_or(0);
                 events.lock().unwrap().push(format!("restore:{tag}"));
+            }
+            if std::mem::take(&mut self.set_kv_fails_once) {
+                return Err(EngineError::new("scripted set_kv failure".to_string()));
             }
             Ok(())
         }
@@ -26742,6 +26756,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Nested forks where the innermost capture failed: the outer snapshot
+    /// still sits at or below the divergence, so it beats any rung and must
+    /// be the one restored, not skipped in favor of falling through.
+    #[test]
+    fn a_nested_sidechain_rescue_restores_the_outer_fork_snapshot_when_the_inner_one_failed() {
+        let dir = scratch_dir("fork-rescue-nested-inner-failed");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(9_000, 8_500);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let outer = agent.begin_subagent_fork(None, "outer", true);
+        let inner = agent.begin_subagent_fork(None, "inner", false);
+        assert_eq!(agent.rescue_prefix_before_rebuild("prompt"), Some(0));
+        assert_eq!(
+            events.lock().unwrap().last().map(String::as_str),
+            Some("restore:1"),
+            "the outer capture is restored, not skipped"
+        );
+        assert_eq!(agent.fork_kv.len(), 2);
+        assert!(!agent.finish_subagent_fork(inner, "inner"));
+        assert!(!agent.finish_subagent_fork(outer, "outer"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// With no snapshot on the fork stack (a failed `get_kv` at fork start)
     /// the sidechain falls back to the parent's ladder: the rungs describe
     /// intact parent prefix, so the deepest one below the divergence is
@@ -26767,6 +26804,41 @@ mod tests {
             events.lock().unwrap().last().map(String::as_str),
             Some("restore:1"),
             "the rung blob reached the engine"
+        );
+        assert!(!agent.finish_subagent_fork(fork_at, "task"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The fork tier can fail its restore (`set_kv` errors) even with a
+    /// snapshot on the stack; the rescue must fall through to the ladder
+    /// instead of giving up.
+    #[test]
+    fn a_failed_fork_restore_falls_through_to_the_ladder() {
+        let dir = scratch_dir("fork-rescue-restore-failed");
+        let cfg = test_cfg();
+        let (mut engine, events) = rebuild_probe_engine(117_369, 117_368);
+        engine.set_kv_fails_once = true;
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        let rung = agent.capture_first_rung();
+        let fork_at = agent.begin_subagent_fork(None, "task", true);
+        assert_eq!(
+            agent.rescue_prefix_before_rebuild("prompt"),
+            Some(rung.tokens),
+            "the ladder rescues the turn after the fork restore fails"
+        );
+        let events = events.lock().unwrap().clone();
+        // The rung was captured first (tag 1, saved to the store) and the
+        // fork snapshot second (tag 2, kept only in `fork_kv`), so the failed
+        // fork restore logs `restore:2` before the rung's `restore:1`
+        // succeeds — not two identical tags in a row, since the two
+        // snapshots are genuinely different captures here.
+        assert_eq!(
+            events[events.len() - 2..],
+            ["restore:2".to_string(), "restore:1".to_string()],
+            "the failed fork restore (tag 2), then the rung restore (tag 1): {events:?}"
         );
         assert!(!agent.finish_subagent_fork(fork_at, "task"));
         std::fs::remove_dir_all(&dir).ok();
