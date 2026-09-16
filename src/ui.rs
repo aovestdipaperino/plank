@@ -2223,6 +2223,12 @@ struct Agent<'a> {
     /// so nothing captured against it — payload, rung, micro-compaction — may
     /// be written as if it were the session's own (see [`Agent::in_sidechain`]).
     sidechain_depth: usize,
+    /// Gating for the background memory extraction pass; sampled from
+    /// `settings.memory` at the top of every `maybe_extract_memories` call.
+    extract_state: crate::memextract::ExtractState,
+    /// One quiet summary line queued by `report_memory_changes`, drained by
+    /// the turn loop right after `maybe_extract_memories` returns.
+    pending_memory_notice: Option<String>,
     /// Where `/repro` and the automatic loop dumps are written. Resolved once
     /// at construction (`repro::repro_dir`, under `$HOME/.plank`), so a test
     /// agent can point it at a scratch directory instead of the real folder.
@@ -3313,7 +3319,14 @@ impl Agent<'_> {
         // per-call path alongside `agent`/`fanout`, which has `&mut self.engine`.
         let needs_engine =
             |c: &ToolCall| c.name == "agent" || c.name == "fanout" || c.name == "view_image";
-        self.dispatch_stanza(calls, &nudges, has_block, needs_engine)
+        let out = self.dispatch_stanza(calls, &nudges, has_block, needs_engine);
+        // The `remember`/`forget` tools set this when they run; consumed here
+        // so a turn in which the model wrote memory itself suppresses the
+        // passive extraction pass exactly once (`ExtractState::note_tool_write`).
+        if std::mem::take(&mut self.tool_ctx.wrote_memory) {
+            self.extract_state.note_tool_write();
+        }
+        out
     }
 
     /// The dispatch half of [`Self::run_tool_calls`]: routes the stanza to
@@ -4699,6 +4712,13 @@ impl Agent<'_> {
             crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
             self.fire_turn_end(stats.generated, turn_start.elapsed());
+            // Memory extraction: this is the genuine no-tool-calls turn exit,
+            // never the tool-round `continue` above — the pass must not fire
+            // mid-turn (CLAUDE.md: mirror the TUI's equivalent site).
+            self.maybe_extract_memories();
+            if let Some(notice) = self.pending_memory_notice.take() {
+                println!("{}", crate::status::system_line(&notice, self.color));
+            }
             return Ok(());
         }
     }
@@ -13226,6 +13246,12 @@ impl Agent<'_> {
                 // here — this path reports elapsed time only — so the field is
                 // sent as -1 rather than as a plausible-looking zero.
                 self.fire_turn_end(-1, turn_started.elapsed());
+                // Memory extraction: same turn-boundary rule as the plain
+                // path — the genuine no-tool-calls exit, never a tool round.
+                self.maybe_extract_memories();
+                if let Some(notice) = self.pending_memory_notice.take() {
+                    log.push_dim(notice);
+                }
                 return Ok(());
             }
             run_main = !leftover.is_empty();
@@ -13991,6 +14017,78 @@ impl Agent<'_> {
         if n > 0 {
             println!("{}", self.debug_line(&Self::job_wake_line(n)));
         }
+    }
+
+    /// Runs the background memory extraction pass if every gate allows it.
+    /// Returns whether a pass ran.
+    ///
+    /// Called only at a turn boundary — after a generation that ended with no
+    /// tool calls — never mid-pass. Settings are sampled fresh every call so
+    /// a `/config` change takes effect on the next eligible turn.
+    ///
+    /// The pass runs through the sub-agent fork (`begin_subagent_fork` /
+    /// `run_subagent_loop` / `end_subagent_fork`), which is why it leaves no
+    /// checkpoint debris: under `in_sidechain()` the KV ladder pushes no
+    /// rungs and stores no payload. Two invariants follow: this never starts
+    /// a pass while already inside a sidechain (no nesting), and every exit
+    /// path below goes through `end_subagent_fork`, so `sidechain_depth`
+    /// always returns to 0 — including the interrupted/error path, where
+    /// nothing is applied and `ExtractState::cancel` leaves the work to be
+    /// redone later rather than recording partial progress.
+    fn maybe_extract_memories(&mut self) -> bool {
+        let settings = crate::settings::active();
+        self.extract_state.enabled = settings.memory.auto_extract;
+        self.extract_state.every_n = settings.memory.extract_every_n_turns;
+        if self.in_sidechain() {
+            return false; // never nest a pass inside another sidechain
+        }
+        let depth = self.session.transcript.len();
+        let Some(from) = self.extract_state.should_run(depth) else {
+            return false;
+        };
+        let entries = crate::memextract::current_entries(&self.tool_ctx.cwd);
+        let slice = self.session.transcript[from.min(depth)..depth].to_vec();
+        let task = crate::memextract::build_prompt(&slice, &entries);
+
+        let fork_at = self.begin_subagent_fork(None, &task, true);
+        let (done, result) = self.run_subagent_loop();
+        let report = self.end_subagent_fork(fork_at, "memory", &task, done);
+
+        if result.is_err() || crate::interrupt::pending() {
+            self.extract_state.cancel();
+            return false;
+        }
+        if let Some(text) = report
+            && let Ok(verdicts) = crate::memory::parse_verdicts(text.trim())
+        {
+            let date = crate::context::current_local_iso_date();
+            let notes = crate::memory::apply_verdicts_to(
+                &self.tool_ctx.cwd,
+                &verdicts,
+                &date,
+                self.tool_ctx.memory_log_path.as_deref(),
+            );
+            if !notes.is_empty() {
+                self.report_memory_changes(&notes);
+            }
+        }
+        self.extract_state.finish(depth);
+        true
+    }
+
+    /// Queues one quiet summary line for the next turn boundary to print,
+    /// instead of one line per change — mirrors how `print_job_wake` and its
+    /// TUI counterpart each render their own front end's version of a shared
+    /// event. `run_turn` and `tui_turn_inner` drain
+    /// `pending_memory_notice` right after calling
+    /// [`maybe_extract_memories`](Self::maybe_extract_memories).
+    fn report_memory_changes(&mut self, notes: &[String]) {
+        let summary = if notes.len() == 1 {
+            format!("memory: {}", notes[0])
+        } else {
+            format!("memory: {} update(s)", notes.len())
+        };
+        self.pending_memory_notice = Some(summary);
     }
 
     /// Starts a turn driven by finished background jobs rather than a user
@@ -17512,6 +17610,8 @@ fn new_agent(
         first_turn_done: false,
         pressure_stop: false,
         sidechain_depth: 0,
+        extract_state: crate::memextract::ExtractState::default(),
+        pending_memory_notice: None,
         repro_dir,
         quiet_tools: false,
         pending_images: Vec::new(),
@@ -20229,6 +20329,8 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
@@ -20294,6 +20396,22 @@ mod tests {
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
         cfg
+    }
+
+    /// Turns off the background memory extraction pass for the current
+    /// thread (`settings::install_for_test` is thread-local; the caller
+    /// restores with `install_for_test(Settings::default())` when done).
+    ///
+    /// `memory.auto_extract` defaults to `true`, so any test driving a
+    /// `ScriptedEngine` through a tool-free turn boundary — a fixed reply
+    /// script indexed by call order — would otherwise have the pass steal an
+    /// unrelated reply meant for the test's own next turn. Tests that
+    /// exercise the pass itself (see `the_pass_*` below) opt back in
+    /// explicitly via `agent.extract_state`.
+    fn disable_auto_extract_for_test() {
+        let mut off = crate::settings::Settings::default();
+        off.memory.auto_extract = false;
+        crate::settings::install_for_test(off);
     }
 
     /// An agent whose engine reports a loaded `MTP` support model, so the
@@ -21853,6 +21971,7 @@ mod tests {
     /// is why `store.save` runs first below).
     #[test]
     fn drive_goal_loop_saves_the_payload_on_a_settled_verdict() {
+        disable_auto_extract_for_test();
         let dir = scratch_dir("goal-loop-saves-on-verdict");
         let cfg = test_cfg();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -21881,6 +22000,7 @@ mod tests {
         let (outcome, _iters, _reason) = agent
             .drive_goal_loop()
             .expect("scripted engine always replies, so the loop settles");
+        crate::settings::install_for_test(crate::settings::Settings::default());
         assert_eq!(outcome, crate::goal::Outcome::Attained);
         // `run_turn`'s own end-of-turn handling produces ONE capture for the
         // main pass's tool-free reply: `flush_kv_end_of_turn` serves both the
@@ -25234,6 +25354,8 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
@@ -25358,6 +25480,8 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
@@ -26549,6 +26673,8 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
@@ -26819,6 +26945,8 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
@@ -26928,6 +27056,8 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
@@ -27024,6 +27154,8 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
@@ -27143,6 +27275,8 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
@@ -28865,6 +28999,7 @@ mod tests {
             "alt engine returned to the cache"
         );
         unsafe { std::env::remove_var(KEY) };
+        crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
     /// Regression: `/subagent` used to resolve only the definition's *persona*
@@ -28874,6 +29009,7 @@ mod tests {
     #[test]
     fn slash_subagent_honours_the_definitions_engine() {
         const KEY: &str = "PLANK_TEST_SLASH_ALT_KEY";
+        disable_auto_extract_for_test();
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -28943,6 +29079,7 @@ mod tests {
 
     #[test]
     fn goal_stops_on_the_first_attained_verdict() {
+        disable_auto_extract_for_test();
         let dir = scratch_dir("goal-attained");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -28984,6 +29121,7 @@ mod tests {
 
     #[test]
     fn goal_stops_at_the_iteration_cap() {
+        disable_auto_extract_for_test();
         let dir = scratch_dir("goal-cap");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -29018,6 +29156,7 @@ mod tests {
     /// another full iteration (and not be reported as a cap).
     #[test]
     fn goal_stops_on_an_interrupt_during_the_adjudication() {
+        disable_auto_extract_for_test();
         let dir = scratch_dir("goal-interrupt-adjudication");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -29172,6 +29311,7 @@ or the user's next message aborts before its first token"
     /// report as a tool result.
     #[test]
     fn slash_subagent_runs_a_turn_on_the_report() {
+        disable_auto_extract_for_test();
         let dir = scratch_dir("slash-subagent-followup");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -29206,6 +29346,7 @@ or the user's next message aborts before its first token"
             .text
             .clone();
         assert!(last.contains("acting on it"), "{last}");
+        crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
     /// A definition whose engine this session cannot provide must fail *before*
@@ -29664,6 +29805,7 @@ or the user's next message aborts before its first token"
     #[test]
     #[allow(clippy::too_many_lines)]
     fn agent_tool_delegates_and_returns_only_the_report() {
+        disable_auto_extract_for_test();
         let dir = std::env::temp_dir().join(format!("plank-ui-agenttool-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Main turn delegates via the `agent` tool.
@@ -29718,6 +29860,8 @@ or the user's next message aborts before its first token"
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
@@ -29813,6 +29957,7 @@ or the user's next message aborts before its first token"
         let last = agent.session.transcript.last().unwrap();
         assert!(last.text.contains("Done: the sub-agent counted 42."));
         std::fs::remove_dir_all(&dir).ok();
+        crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
     #[test]
@@ -29856,6 +30001,8 @@ or the user's next message aborts before its first token"
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
@@ -29917,6 +30064,53 @@ or the user's next message aborts before its first token"
         let fork_at = agent.begin_subagent_fork(None, "noop", true);
         assert!(!agent.finish_subagent_fork(fork_at, "noop"));
         assert_eq!(agent.session.transcript.len(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_pass_is_suppressed_by_a_remember_call_in_the_same_turn() {
+        let dir = scratch_dir("memextract-suppress");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.extract_state.enabled = true;
+        agent.extract_state.every_n = 1;
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+
+        // What `run_tool_calls` does when `remember`/`forget` sets
+        // `tool_ctx.wrote_memory` mid-turn: forward it to `extract_state`
+        // before the turn boundary calls `maybe_extract_memories`.
+        agent.tool_ctx.wrote_memory = true;
+        assert!(std::mem::take(&mut agent.tool_ctx.wrote_memory));
+        agent.extract_state.note_tool_write();
+        assert!(
+            !agent.maybe_extract_memories(),
+            "the model already wrote memory this turn"
+        );
+        assert!(
+            agent.maybe_extract_memories(),
+            "the next turn is eligible again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_pass_never_pushes_a_ladder_rung() {
+        let dir = scratch_dir("memextract-no-rung");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.extract_state.enabled = true;
+        agent.extract_state.every_n = 1;
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        let before = agent.ladder.rungs().len();
+        agent.maybe_extract_memories();
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            before,
+            "sidechains push no rungs"
+        );
+        assert_eq!(agent.sidechain_depth, 0, "the fork is closed on every path");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -30028,6 +30222,8 @@ or the user's next message aborts before its first token"
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             pending_images: Vec::new(),
