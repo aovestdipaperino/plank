@@ -161,8 +161,10 @@ setting), a context-usage gauge, a wastebasket with an indicator light
 for micro-compaction (<code>🗑 🟢</code> on, <code>🗑 🔴</code> off —
 double-click it to flip, a single click reports the state),
 <code>⧗ N jobs</code> while background shell jobs are running (click it
-for the <code>/jobs</code> panel), a 💾 while the loaded model is
-streaming its experts from SSD (blinking while a pass is in flight),
+for the <code>/jobs</code> panel), a 🐞 while a debug console is
+actually connected to the session (not merely <code>--debug</code> on
+the command line), a 💾 while the loaded model is streaming its experts
+from SSD (blinking while a pass is in flight),
 <code>⏸ paused: memory</code> while plank has released the engine under
 memory pressure and is waiting to take it back, an activity throbber,
 what the model is doing, generation stats, the task counter, and the
@@ -355,7 +357,10 @@ agents never overwrite one another. <code>←</code> on an empty prompt
 steps into the roster, <code>←</code>/<code>→</code> walk the rows,
 <code>Enter</code> expands the selected agent's output over the
 transcript with its own scroll position, and <code>Esc</code> comes
-back.</p>
+back. A finished row leaves the roster a minute after it ends, and
+stepping back in does not bring it back: the roster shows what is
+running now, not what ran. Only the row under your cursor is kept until
+you move off it, so nothing vanishes while you are reading it.</p>
 <p>While a sub-agent is working, the progress line under the transcript
 reads <code>Waiting… (for sub-agent &lt;name&gt; to complete)</code>.
 The live counters — the verb, the clock, the tokens and the tokens per

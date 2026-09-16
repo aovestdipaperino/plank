@@ -154,8 +154,9 @@ pub struct SidechainDump {
     pub fork_at: usize,
     /// The sidechain's messages, framed task first, in order.
     pub messages: Vec<crate::session::Message>,
-    /// The `subagent-<ordinal>` of the console window this sidechain streamed
-    /// to, so a console attaching later can reopen the same window.
+    /// The ordinal of the console window this sidechain streamed to (its name
+    /// is `label`, or `subagent-<ordinal>` when the label was empty), so a
+    /// console attaching later can reopen the same window.
     pub ordinal: usize,
     /// Whether that window was connected when the sidechain ended. A dump
     /// that was never mirrored is what a late console gets backfilled with;

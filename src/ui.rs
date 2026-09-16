@@ -3702,7 +3702,11 @@ impl Agent<'_> {
         // discipline as the status sink above. The guard is scoped to the
         // rounds, so nesting works for free: guards stack LIFO, matching
         // `fork_kv`.
-        let mirror = crate::debugmirror::open_subagent();
+        // Named after the roster label so the console window and the roster
+        // row agree; a sidechain with no label (the memory pass) falls back
+        // to the ordinal name.
+        let label = self.tool_ctx.subagent_label.clone().unwrap_or_default();
+        let mirror = crate::debugmirror::open_subagent(&label);
         let result = {
             let _active = mirror.activate();
             body(self)
@@ -9646,7 +9650,7 @@ the original is frozen and listed in /tree"
                         texts.iter().map(String::as_str),
                         reinject,
                     ) {
-                        crate::debugmirror::replay_finished_subagent(dump.ordinal, &p);
+                        crate::debugmirror::replay_finished_subagent(&dump.label, dump.ordinal, &p);
                     }
                 }
                 dump.mirrored = true;
@@ -9751,7 +9755,7 @@ the original is frozen and listed in /tree"
                         error: None,
                         trips: 0,
                         force_final: false,
-                        mirror: crate::debugmirror::open_subagent(),
+                        mirror: crate::debugmirror::open_subagent(label),
                     });
                 }
                 Ok((key, engine)) => {
@@ -12198,7 +12202,7 @@ impl Agent<'_> {
                 KeyCode::Left
                     if input.buf.text().is_empty() && !word_mod && !sub_pane.selecting =>
                 {
-                    if !sub_pane.move_cursor(0) {
+                    if !sub_pane.move_cursor(0, tui::roster_clock_ms()) {
                         log.push_dim("[no sub-agent has run yet]");
                     }
                     selection.cancel();
@@ -12207,7 +12211,7 @@ impl Agent<'_> {
                     if sub_pane.selecting && input.buf.text().is_empty() && !word_mod =>
                 {
                     let delta = if key.code == KeyCode::Up { -1 } else { 1 };
-                    if !sub_pane.move_cursor(delta) {
+                    if !sub_pane.move_cursor(delta, tui::roster_clock_ms()) {
                         log.push_dim("[no sub-agent has run yet]");
                     }
                     // A selection belongs to the pane it was dragged over, so it
@@ -12228,7 +12232,7 @@ impl Agent<'_> {
                 // Tab moves focus between the prompt and the roster (the
                 // completion popup, when open, has already taken it above).
                 KeyCode::Tab if !word_mod => {
-                    if !sub_pane.toggle_focus() {
+                    if !sub_pane.toggle_focus(tui::roster_clock_ms()) {
                         log.push_dim("[no sub-agent has run yet]");
                     }
                     selection.cancel();
@@ -17157,7 +17161,7 @@ fn busy_ui_loop(
                             && (sub.selecting || key.code == KeyCode::Left) =>
                     {
                         let delta = if key.code == KeyCode::Left { -1 } else { 1 };
-                        if !sub.move_cursor(delta) {
+                        if !sub.move_cursor(delta, tui::roster_clock_ms()) {
                             log.push_dim("[no sub-agent has run yet]");
                         }
                     }
@@ -17167,7 +17171,7 @@ fn busy_ui_loop(
                         }
                     }
                     KeyCode::Tab if !word_mod => {
-                        if !sub.toggle_focus() {
+                        if !sub.toggle_focus(tui::roster_clock_ms()) {
                             log.push_dim("[no sub-agent has run yet]");
                         }
                     }
@@ -24322,10 +24326,9 @@ mod tests {
 
         let (_parent_hello, _parent) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         let (hello, mut sub) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-        assert!(
-            hello.contains("plank:bouncy-phelps:subagent-2"),
-            "{hello:?}"
-        );
+        // Replayed under its roster label, the same name the live window
+        // would have carried, not a bare ordinal.
+        assert!(hello.contains("plank:bouncy-phelps:reviewer"), "{hello:?}");
         let got = dm::read_available(&mut sub);
         assert!(got.contains("sub answer\n"), "{got:?}");
         assert!(
@@ -24355,7 +24358,7 @@ mod tests {
         let fork_at = agent.begin_subagent_fork(None, "delegated", false);
         assert_eq!(agent.fork_points, vec![fork_at]);
         agent.session.push(Message::assistant("child answer"));
-        let mirror = crate::debugmirror::open_subagent();
+        let mirror = crate::debugmirror::open_subagent("");
         let _active = mirror.activate();
 
         let (port, rx) = dm::fake_console_keeping_sockets();
@@ -24398,7 +24401,7 @@ mod tests {
         agent.session.push(Message::assistant("parent answer"));
         let fork_at = agent.begin_subagent_fork(None, "delegated", false);
         assert_eq!(agent.fork_points, vec![fork_at]);
-        let mirror = crate::debugmirror::open_subagent();
+        let mirror = crate::debugmirror::open_subagent("");
         let _active = mirror.activate();
         // The stash: the parent transcript is gone, only the framed task
         // remains, so `fork_points[0]` is past the end.
@@ -29003,9 +29006,9 @@ mod tests {
     /// whichever thread happens to start first.
     #[test]
     fn fanout_slots_take_distinct_ordinals_in_block_order() {
-        let a = crate::debugmirror::open_subagent();
-        let b = crate::debugmirror::open_subagent();
-        let c = crate::debugmirror::open_subagent();
+        let a = crate::debugmirror::open_subagent("");
+        let b = crate::debugmirror::open_subagent("");
+        let c = crate::debugmirror::open_subagent("");
         let mut ids = vec![a.id(), b.id(), c.id()];
         ids.dedup();
         assert_eq!(ids.len(), 3, "every slot needs its own window");
@@ -29016,7 +29019,7 @@ mod tests {
     /// streams on this same thread.
     #[test]
     fn a_serial_sidechain_restores_the_parent_mirror_target() {
-        let sub = crate::debugmirror::open_subagent();
+        let sub = crate::debugmirror::open_subagent("");
         assert_ne!(sub.id(), crate::debugmirror::MirrorId::PARENT);
         {
             let _active = sub.activate();
@@ -30773,7 +30776,10 @@ or the user's next message aborts before its first token"
         agent.extract_state.enabled = false;
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
-        assert!(agent.maybe_extract_memories(), "on by default: the pass runs");
+        assert!(
+            agent.maybe_extract_memories(),
+            "on by default: the pass runs"
+        );
         assert!(
             agent.extract_state.enabled,
             "the setting, not the field, decides"

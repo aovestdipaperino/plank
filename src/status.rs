@@ -340,6 +340,11 @@ const PRESSURE_MARK: &str = "⏸\u{fe0f}";
 /// Distinct from [`LOOP_MARK`], which says a guard has actually seen a cycle.
 const GUARD_MARK: &str = "🔁";
 
+/// Marks the footer's debugger segment: the raw model stream is being mirrored
+/// to a live debug console right now. Connection, not capability: `--debug`
+/// alone earns nothing, only a console that actually answered the dial.
+const DEBUG_MARK: &str = "🐞";
+
 /// Marks the footer's micro-compaction segment. Public so the TUI can find the
 /// segment for mouse hit-testing, the same reason [`JOBS_MARK`] is.
 ///
@@ -1940,6 +1945,12 @@ fn build_status_text_with_cells(
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
     };
+    // Beside the guard segment: a connected console is a session-wide fact
+    // about how the run is being watched, not a reading from this pass.
+    let ctx = match debug_segment(crate::debugmirror::parent_connected()) {
+        Some(seg) => format!("{ctx} | {}", theme(&seg)),
+        None => ctx,
+    };
     // Beside the guard segment, and for the same reason: both are session-wide
     // switches that change how every following turn is built, and both are
     // thrown from the footer itself — the guard with `/loopguard`, this one
@@ -2037,6 +2048,20 @@ pub fn spec_segment(st: &Status) -> Option<String> {
 #[must_use]
 pub fn guard_segment() -> Option<String> {
     crate::guard::guards_enabled().then(|| GUARD_MARK.to_owned())
+}
+
+/// The debugger segment: [`DEBUG_MARK`] while the session's window on the
+/// debug console is connected, `None` otherwise so an ordinary footer is
+/// unchanged.
+///
+/// Keyed on the live connection, not on `--debug`: the switch only permits
+/// the dial, and a developer who started plank with it but no console open
+/// has nothing watching. Takes the state as a parameter for the reason
+/// [`microcompact_segment`] gives — the registry behind it is process-global,
+/// and a test must be able to ask for both states under parallel threads.
+#[must_use]
+pub fn debug_segment(connected: bool) -> Option<String> {
+    connected.then(|| DEBUG_MARK.to_owned())
 }
 
 /// The micro-compaction segment: `🗑 🟢` when on, `🗑 🔴` when off.
@@ -2672,6 +2697,19 @@ mod tests {
         // so the mark the TUI hit-tests against is exactly the one the footer
         // draws, VS16 included (see MICROCOMPACT_MARK's doc comment).
         assert!(line.contains('\u{fe0f}'), "{line:?}");
+    }
+
+    #[test]
+    fn the_debug_segment_shows_only_while_a_console_is_connected() {
+        assert_eq!(
+            debug_segment(false),
+            None,
+            "an ordinary footer is unchanged"
+        );
+        assert_eq!(debug_segment(true).as_deref(), Some("🐞"));
+        // No test thread owns a console here, so the built line has no bug.
+        let line = build_status_text(&Status::default(), false, true);
+        assert!(!line.contains(DEBUG_MARK), "{line}");
     }
 
     #[test]

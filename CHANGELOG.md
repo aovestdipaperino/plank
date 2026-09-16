@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`bash_status` honours `refresh_sec`.** The port passed the tool's *stop*
+  flag where the C passes its *wait* flag, so every `bash_status` returned at
+  once and a model asking for `refresh_sec=300` polled in a tight loop, one
+  generation per poll. It now mirrors the C: `refresh_sec` defaults to `0` and
+  the call returns immediately without it, a positive value waits up to that
+  long for the job to finish, and `bash_stop` always waits at least a second
+  so its observation reflects the kill.
+- **Sub-agent debug windows are named after the roster.** A sidechain's
+  console window is `plank:<session>:<label>` (`alpha`, `reviewer`), the same
+  name its roster row shows, instead of `subagent-<n>`; the ordinal remains
+  only as the fallback for a sidechain with no label, and a late console's
+  `/repro` replay reopens the labelled window.
+
+### Changed
+
+- **Finished agents stay off the roster.** A completed run's row still leaves
+  the roster a minute after it ends, but stepping back in with `←` or Tab no
+  longer brings every expired row back, and `↑`/`↓` step over hidden runs.
+  Only the row under the cursor is exempt, so nothing vanishes mid-read. The
+  roster shows what is running; a finished agent's full stream is the debug
+  console's job.
+- **A 🐞 in the status line while a debug console is connected.** Keyed on the
+  live connection, not on `--debug`: the switch alone shows nothing, a console
+  that answered the dial does.
+
 ## [5.1.7] - 2026-09-16
 
 ### Changed

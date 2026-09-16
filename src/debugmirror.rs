@@ -11,8 +11,10 @@
 //!   the parent, so code that knows nothing about sub-agents is unaffected.
 //!   Sub-agents need this because a fan-out generates several at once
 //!   (`generate_fanout_round` spawns a thread per slot) and each wants its own
-//!   named window: `plank:<session>:subagent-<ordinal>`, ordinal monotonic
-//!   within a session and reset when the session changes.
+//!   named window: `plank:<session>:<label>`, the roster label the agent runs
+//!   under (`alpha`, `reviewer`), so the console shows the same name the
+//!   roster does. An unlabelled sidechain falls back to `subagent-<ordinal>`,
+//!   ordinal monotonic within a session and reset when the session changes.
 //! - Nothing here runs unless plank was started with `--debug`
 //!   ([`set_enabled`], called from `main` before settings are installed).
 //!   Without the switch [`reconcile`] does not even probe for a console: a
@@ -252,15 +254,33 @@ fn sanitize_name(raw: &str) -> String {
     name_with_suffix(raw, "")
 }
 
-/// The window name for one sub-agent: the parent's name plus `:subagent-<n>`.
+/// The window name for one sub-agent: the parent's name plus `:<label>` — the
+/// roster label (`alpha`, `reviewer`), so the console and the roster call the
+/// agent the same thing. An empty label (nothing on the roster, e.g. the
+/// memory pass before it had a name) falls back to `:subagent-<ordinal>`.
 ///
-/// The suffix is budgeted *before* the session is truncated, for the same
-/// reason the prefix is (see [`name_with_suffix`]): a wire name over 64 bytes
-/// gets the handshake refused, which shows up as a missing window rather than
-/// an error.
-fn subagent_name(raw: &str, ordinal: usize) -> String {
-    name_with_suffix(raw, &format!(":subagent-{ordinal}"))
+/// The label is clipped to [`LABEL_BUDGET`] graphic ASCII characters so a
+/// long agent name cannot eat the whole session part; and the suffix is
+/// budgeted *before* the session is truncated, for the same reason the prefix
+/// is (see [`name_with_suffix`]): a wire name over 64 bytes gets the handshake
+/// refused, which shows up as a missing window rather than an error.
+fn subagent_name(raw: &str, label: &str, ordinal: usize) -> String {
+    let label: String = label
+        .chars()
+        .filter(char::is_ascii_graphic)
+        .take(LABEL_BUDGET)
+        .collect();
+    if label.is_empty() {
+        name_with_suffix(raw, &format!(":subagent-{ordinal}"))
+    } else {
+        name_with_suffix(raw, &format!(":{label}"))
+    }
 }
+
+/// Most characters of a sub-agent label that go on the wire. Long enough for
+/// any NATO word or a sensible definition name, short enough that the session
+/// part keeps at least ~30 bytes of the console's 64-byte name limit.
+const LABEL_BUDGET: usize = 24;
 
 /// Builds `<prefix><session><suffix>`, truncating only the session part so the
 /// whole thing fits the console's 64-byte limit. An empty session falls back to
@@ -567,8 +587,9 @@ impl SubagentMirror {
         self.id
     }
 
-    /// The ordinal in this window's name (`subagent-<ordinal>`), recorded in
-    /// the `/repro` dump so a backfill can reopen the same window.
+    /// This window's ordinal within the session — its identity in the
+    /// registry, and the name's fallback when the agent had no label.
+    /// Recorded in the `/repro` dump so a backfill can reopen the same window.
     #[must_use]
     pub fn ordinal(&self) -> usize {
         self.id.0
@@ -620,14 +641,14 @@ impl Drop for ActiveMirror {
 }
 
 /// Opens a console window for the next sub-agent of this session, named
-/// `plank:<session>:subagent-<ordinal>`.
+/// `plank:<session>:<label>` (or `:subagent-<ordinal>` when `label` is empty).
 ///
 /// Best-effort and single-attempt, exactly like [`reconcile`]: no console
 /// means no connection and no complaint. Honours the same `ui.showThinking`
 /// gate as the parent mirror, so turning thinking display on stops sub-agent
 /// mirroring too.
 #[must_use]
-pub fn open_subagent() -> SubagentMirror {
+pub fn open_subagent(label: &str) -> SubagentMirror {
     // Hermeticity (compiles away outside `cfg(test)`): a test that has not
     // claimed the fake console must not touch the shared registry or the
     // session ordinal. Before this guard, such a test's sub-agent took the
@@ -644,7 +665,7 @@ pub fn open_subagent() -> SubagentMirror {
     }
     let ordinal = NEXT_ORDINAL.fetch_add(1, Ordering::Relaxed);
     let id = MirrorId(ordinal);
-    let name = subagent_name(&raw_session_name(), ordinal);
+    let name = subagent_name(&raw_session_name(), label, ordinal);
     LIVE.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(id, name.clone());
@@ -667,14 +688,14 @@ pub fn open_subagent() -> SubagentMirror {
 /// name, writes `payload`, and closes the socket again. Single attempt like
 /// everything else here; the sub-agent is gone, so there is nothing to keep
 /// the connection for.
-pub fn replay_finished_subagent(ordinal: usize, payload: &str) {
+pub fn replay_finished_subagent(label: &str, ordinal: usize, payload: &str) {
     if crate::settings::show_thinking_effective() {
         return;
     }
     let Some(port) = console_port() else {
         return;
     };
-    let name = subagent_name(&raw_session_name(), ordinal);
+    let name = subagent_name(&raw_session_name(), label, ordinal);
     if let Ok(mut stream) = turbo_debug_client::connect_on(port, StreamKind::Tokens, &name) {
         let _ = stream.write_all(payload.as_bytes());
         let _ = stream.flush();
@@ -832,7 +853,7 @@ mod tests {
     #[test]
     fn a_subagent_name_carries_the_session_and_the_ordinal() {
         assert_eq!(
-            subagent_name("mellow-pauling", 3),
+            subagent_name("mellow-pauling", "", 3),
             "plank:mellow-pauling:subagent-3"
         );
     }
@@ -843,7 +864,7 @@ mod tests {
     /// refused -- a silently missing window rather than an error.
     #[test]
     fn a_long_session_id_still_fits_once_the_subagent_suffix_is_added() {
-        let name = subagent_name(&"x".repeat(200), 12);
+        let name = subagent_name(&"x".repeat(200), "", 12);
         assert!(name.starts_with(NAME_PREFIX), "{name}");
         assert!(name.ends_with(":subagent-12"), "{name}");
         assert!(
@@ -857,8 +878,29 @@ mod tests {
     /// window per sub-agent rather than collapsing onto the parent's fallback.
     #[test]
     fn a_subagent_of_an_unnamed_session_still_gets_its_own_name() {
-        let name = subagent_name("   ", 1);
+        let name = subagent_name("   ", "", 1);
         assert_eq!(name, "plank:unnamed:subagent-1");
+    }
+
+    /// The console window carries the roster label, so the user finds
+    /// `alpha` in both places rather than `alpha` on screen and `subagent-1`
+    /// in the console. A long or exotic label is clipped, never refused.
+    #[test]
+    fn a_labelled_subagent_window_is_named_after_its_roster_label() {
+        assert_eq!(
+            subagent_name("mellow-pauling", "alpha", 1),
+            "plank:mellow-pauling:alpha"
+        );
+        assert_eq!(
+            subagent_name("mellow-pauling", "code reviewer ✨", 2),
+            "plank:mellow-pauling:codereviewer"
+        );
+        let name = subagent_name(&"x".repeat(200), &"y".repeat(100), 3);
+        assert!(name.len() <= 64, "{name}");
+        assert!(
+            name.ends_with(&format!(":{}", "y".repeat(LABEL_BUDGET))),
+            "{name}"
+        );
     }
 
     #[test]
@@ -965,7 +1007,7 @@ mod tests {
         crate::settings::install_for_test(s);
 
         reconcile();
-        let sub = open_subagent();
+        let sub = open_subagent("");
         assert_eq!(MIRRORS.lock().unwrap().len(), 2);
 
         disconnect(REASON_EXIT);
@@ -1034,8 +1076,8 @@ mod tests {
         // Drain the parent's handshake so the two below are the sub-agents'.
         let _parent = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
 
-        let a = open_subagent();
-        let b = open_subagent();
+        let a = open_subagent("");
+        let b = open_subagent("");
         assert_ne!(a.id(), b.id(), "ordinals must not repeat");
 
         let (hello_a, _sa) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
@@ -1068,7 +1110,7 @@ mod tests {
         set_session_id("bouncy-phelps");
         let (_h, mut parent_sock) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
 
-        let sub = open_subagent();
+        let sub = open_subagent("");
         let (_h2, mut sub_sock) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
 
         {
@@ -1103,7 +1145,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
 
-        let sub = open_subagent();
+        let sub = open_subagent("");
         let id = sub.id();
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _active = sub.activate();
@@ -1136,7 +1178,7 @@ mod tests {
         set_session_id("bouncy-phelps");
         let _parent = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
 
-        let sub = open_subagent();
+        let sub = open_subagent("");
         let id = sub.id();
         let _s = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert!(MIRRORS.lock().unwrap().contains_key(&id));
@@ -1166,7 +1208,7 @@ mod tests {
 
         set_session_id("first-session");
         let _p1 = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-        let first = open_subagent();
+        let first = open_subagent("");
         let _s1 = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         let first_id = first.id();
         std::mem::forget(first); // Simulate a handle still held across the switch.
@@ -1178,7 +1220,7 @@ mod tests {
             "the previous session's sub-agent windows must be retired"
         );
 
-        let next = open_subagent();
+        let next = open_subagent("");
         let (hello, _sock) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert!(
             hello.contains("plank:second-session:subagent-1"),
@@ -1537,7 +1579,7 @@ mod tests {
         crate::settings::install_for_test(s);
 
         // No console yet: the window opens unconnected.
-        let sub = open_subagent();
+        let sub = open_subagent("");
         assert!(!is_connected(sub.id()));
 
         let (control_port, rx) = fake_console_keeping_sockets();
@@ -1582,7 +1624,7 @@ mod tests {
 
         reconcile();
         let (_hello, mut parent) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-        let sub = open_subagent();
+        let sub = open_subagent("");
         let (_hello, mut child) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
 
         push_to(sub.id(), "to the child");

@@ -231,11 +231,13 @@ REPL, Esc in the TUI) kills its group and reports exit status 143.</p>
 <h4 id="background-jobs">Background jobs</h4>
 <p><code>refresh_sec</code> is how long a <code>bash</code> or
 <code>bash_status</code> call waits before it gives up and reports
-<code>status=running</code>. Out of the box the model then has to poll:
-every <code>bash_status</code> is a generation pass that reads "still
-running" and asks again. With <code>tools.bashNotify</code> on, the wait
-moves to plank. The model leaves the job running and ends its turn, you
-get the prompt back, and when the job exits plank appends a
+<code>status=running</code>. <code>bash</code> waits 60 seconds by
+default; <code>bash_status</code> returns at once unless
+<code>refresh_sec</code> is given. Out of the box the model then has to
+poll: every <code>bash_status</code> is a generation pass that reads
+"still running" and asks again. With <code>tools.bashNotify</code> on,
+the wait moves to plank. The model leaves the job running and ends its
+turn, you get the prompt back, and when the job exits plank appends a
 <code>[BACKGROUND JOB NOTIFICATION]</code> message carrying the same
 observation <code>bash_status</code> would have returned, then starts a
 turn so the model can report. Each job is announced once, and never if

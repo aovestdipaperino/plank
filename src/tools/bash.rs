@@ -863,14 +863,16 @@ pub fn tool_bash_status_or_stop(ctx: &mut ToolContext, call: &ToolCall, stop: bo
     let Some(idx) = ctx.bash.find(job_id, pid) else {
         return format!("Tool error: bash job not found: job={job_id} pid={pid}\n");
     };
-    let refresh = u64::try_from(parse_int_default(
-        call.arg_value("refresh_sec"),
-        60,
-        1,
-        3600,
-    ))
-    .unwrap_or(60);
-    ctx.bash.job_tool_result(idx, stop, refresh, stop, true)
+    // Mirrors the C: `bash_status` returns immediately unless a positive
+    // refresh_sec asks it to wait; `bash_stop` always waits at least 1 s so
+    // the observation reflects the termination.
+    let mut refresh =
+        u64::try_from(parse_int_default(call.arg_value("refresh_sec"), 0, 0, 3600)).unwrap_or(0);
+    let wait = stop || refresh > 0;
+    if stop && refresh == 0 {
+        refresh = 1;
+    }
+    ctx.bash.job_tool_result(idx, wait, refresh, stop, true)
 }
 
 /// Outcome of an immediate (`!`-prefixed) shell command.
@@ -1336,6 +1338,48 @@ mod tests {
         let out =
             tool_bash_status_or_stop(&mut ctx, &test_call("bash_status", &[("job", "1")]), false);
         assert_eq!(out, "Tool error: bash job not found: job=1 pid=0\n");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn bash_status_waits_for_refresh_sec() {
+        let (mut ctx, dir) = test_ctx();
+        let out = tool_bash(
+            &mut ctx,
+            &test_call(
+                "bash",
+                &[("command", "sleep 2; echo finished"), ("refresh_sec", "1")],
+            ),
+        );
+        assert!(out.contains("status=running"), "got: {out}");
+
+        // A positive refresh_sec waits, so the job finishes within the poll.
+        let started = std::time::Instant::now();
+        let out = tool_bash_status_or_stop(
+            &mut ctx,
+            &test_call("bash_status", &[("job", "1"), ("refresh_sec", "5")]),
+            false,
+        );
+        assert!(out.contains("status=done"), "got: {out}");
+        assert!(out.contains("finished"), "got: {out}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn bash_status_without_refresh_returns_immediately() {
+        let (mut ctx, dir) = test_ctx();
+        tool_bash(
+            &mut ctx,
+            &test_call("bash", &[("command", "sleep 30"), ("refresh_sec", "1")]),
+        );
+        let started = std::time::Instant::now();
+        let out =
+            tool_bash_status_or_stop(&mut ctx, &test_call("bash_status", &[("job", "1")]), false);
+        assert!(out.contains("status=running"), "got: {out}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        tool_bash_status_or_stop(&mut ctx, &test_call("bash_stop", &[("job", "1")]), true);
+        assert!(ctx.bash.jobs.is_empty());
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -575,25 +575,39 @@ impl SubPane {
     }
 
     /// Moves the roster cursor by `delta` rows (negative is up, toward `main`),
-    /// entering selection mode. Returns `false` (changing nothing) when no
-    /// sub-agent has ever run, so there is nothing to select.
+    /// entering selection mode. Returns `false` (changing nothing) when the
+    /// roster has no row to select at `now` — no sub-agent has run, or every
+    /// finished one has already left it.
     ///
-    /// The first call only reveals the cursor where it rests, whatever `delta`
-    /// says — that is how `←` enters the roster; `↑`/`↓` then walk it. Moving
-    /// off a row that was expanded collapses back to the transcript: the
-    /// cursor and what is on screen never disagree.
-    pub fn move_cursor(&mut self, delta: isize) -> bool {
-        if self.runs.is_empty() {
+    /// The cursor walks the rows the roster *draws* (see
+    /// [`Self::visible_runs`]), stepping over the runs whose row has expired,
+    /// so `↑`/`↓` never land on an agent the user cannot see. The first call
+    /// only reveals the cursor where it rests, whatever `delta` says — that is
+    /// how `←` enters the roster; `↑`/`↓` then walk it. Moving off a row that
+    /// was expanded collapses back to the transcript: the cursor and what is on
+    /// screen never disagree.
+    pub fn move_cursor(&mut self, delta: isize, now: u64) -> bool {
+        let visible = self.visible_runs(now);
+        if visible.is_empty() {
             return false;
         }
-        let last = isize::try_from(self.runs.len()).unwrap_or(isize::MAX);
-        let from = isize::try_from(self.cursor).unwrap_or(0);
+        // Row positions the cursor may take: `main`, then each drawn run.
+        let mut stops: Vec<usize> = vec![0];
+        stops.extend(visible.iter().map(|&i| i + 1));
+        let from = self.cursor;
+        let at = stops.iter().position(|&c| c == from).unwrap_or(0);
         // First `←` only reveals the cursor where it already rests; it does not
         // also jump a row, or the roster would twitch under the user's hand.
-        let to = if self.selecting { from + delta } else { from };
+        let to = if self.selecting {
+            let last = isize::try_from(stops.len() - 1).unwrap_or(isize::MAX);
+            let want = isize::try_from(at).unwrap_or(0) + delta;
+            usize::try_from(want.clamp(0, last)).unwrap_or(0)
+        } else {
+            at
+        };
         self.selecting = true;
-        self.cursor = usize::try_from(to.clamp(0, last)).unwrap_or(0);
-        if self.cursor != usize::try_from(from).unwrap_or(0) {
+        self.cursor = stops[to];
+        if self.cursor != from {
             self.active = false;
         }
         true
@@ -641,9 +655,10 @@ impl SubPane {
     /// Tab: moves focus between the prompt and the roster. Entering the roster
     /// reveals its cursor; leaving it hides the cursor but keeps an expanded
     /// pane on screen, so the user can type while watching an agent. Returns
-    /// `false` when no sub-agent has ever run, so there is nothing to focus.
-    pub fn toggle_focus(&mut self) -> bool {
-        if self.runs.is_empty() {
+    /// `false` when the roster has no row at `now`, so there is nothing to
+    /// focus.
+    pub fn toggle_focus(&mut self, now: u64) -> bool {
+        if self.visible_runs(now).is_empty() {
             return false;
         }
         self.selecting = !self.selecting;
@@ -668,18 +683,20 @@ impl SubPane {
     /// dead rows pinned under the status bar, and a pane left expanded sat over
     /// the transcript for the rest of the session.
     ///
-    /// The run itself is kept, only its row goes. Its output is the whole point
-    /// of having delegated, and the main log holds just a one-line signpost, so
-    /// a delegated report must stay reachable — which is why, while the user is
-    /// *in* the roster (`selecting`), every row is shown however long ago it
-    /// finished. That is both what the left arrow brings back and what stops a
-    /// row vanishing from under the cursor mid-read. An expanded pane with
-    /// focus back on the prompt is deliberately not exempt: the user is typing,
-    /// not reading, and that is the case the linger exists for.
+    /// Gone is gone: entering the roster does *not* bring expired rows back.
+    /// It used to — every row showed while the user was in the roster, so a
+    /// delegated report stayed reachable — but a `←` that resurrected eight
+    /// finished agents was the very pile the linger exists to clear, and a
+    /// finished run's report is not what the roster is for. The one exemption
+    /// left is the row under the cursor while the user is in the roster: a row
+    /// must not vanish from under a reader mid-read. Once the cursor moves off
+    /// it, it is gone like the rest. An expanded pane with focus back on the
+    /// prompt is deliberately not exempt: the user is typing, not reading, and
+    /// that is the case the linger exists for.
     #[must_use]
     pub fn visible_runs(&self, now: u64) -> Vec<usize> {
         (0..self.runs.len())
-            .filter(|&i| self.selecting || !self.runs[i].row_expired(now))
+            .filter(|&i| !self.runs[i].row_expired(now) || (self.selecting && self.cursor == i + 1))
             .collect()
     }
 
@@ -694,12 +711,11 @@ impl SubPane {
     /// paths, so a row goes on its own clock instead of waiting for the next
     /// keystroke.
     ///
-    /// Being *in* the roster exempts its rows from the linger — that is what
-    /// stops a row vanishing from under the cursor mid-read — but the `main`
-    /// row is not a run being read. A cursor left resting there (a click on
-    /// `main`, or a `←` never followed by `Esc`) would otherwise pin every
-    /// finished row on screen for the rest of the session, which is exactly the
-    /// pile the linger exists to clear. So once nothing is left to read — the
+    /// Being *in* the roster exempts the row under the cursor from the linger
+    /// — that is what stops a row vanishing from under a reader mid-read — but
+    /// the `main` row is not a run being read. A cursor left resting there (a
+    /// click on `main`, or a `←` never followed by `Esc`) would otherwise hold
+    /// the panel open with nothing on it. So once nothing is left to read — the
     /// cursor is on `main` and every run has outlived its linger — the roster
     /// leaves selection mode and retires as it would have with the cursor
     /// hidden.
@@ -6052,7 +6068,7 @@ mod tests {
     fn a_run_opens_a_row_and_selection_needs_one() {
         let mut pane = SubPane::default();
         // Nothing has run yet: there is nothing to select.
-        assert!(!pane.move_cursor(-1));
+        assert!(!pane.move_cursor(-1, 0));
         assert!(!pane.active);
 
         pane.begin("research".to_string(), "", 0);
@@ -6260,8 +6276,8 @@ mod tests {
         pane.begin("research".to_string(), "", 0);
         pane.current_log_mut().unwrap().push_plain("old output");
         pane.adopt_turn = true;
-        assert!(pane.move_cursor(-1));
-        assert!(pane.move_cursor(1));
+        assert!(pane.move_cursor(-1, 0));
+        assert!(pane.move_cursor(1, 0));
         assert!(pane.expand());
         assert!(pane.active);
 
@@ -6276,7 +6292,7 @@ mod tests {
         assert!(!pane.running());
         assert!(!pane.adopt_turn);
         // Nothing to select again, exactly as at launch.
-        assert!(!pane.move_cursor(-1));
+        assert!(!pane.move_cursor(-1, 0));
         assert!(!pane.expand());
     }
 
@@ -6287,19 +6303,19 @@ mod tests {
         pane.begin("beta".to_string(), "", 0);
 
         // The first `←` only reveals the cursor where it rests, without moving.
-        assert!(pane.move_cursor(-1));
+        assert!(pane.move_cursor(-1, 0));
         assert!(pane.selecting);
         assert_eq!(pane.cursor, 0, "starts on the `main` row");
 
-        pane.move_cursor(1);
+        pane.move_cursor(1, 0);
         assert_eq!(pane.cursor, 1);
-        pane.move_cursor(1);
+        pane.move_cursor(1, 0);
         assert_eq!(pane.cursor, 2);
-        pane.move_cursor(1);
+        pane.move_cursor(1, 0);
         assert_eq!(pane.cursor, 2, "clamped at the last agent");
-        pane.move_cursor(-1);
-        pane.move_cursor(-1);
-        pane.move_cursor(-1);
+        pane.move_cursor(-1, 0);
+        pane.move_cursor(-1, 0);
+        pane.move_cursor(-1, 0);
         assert_eq!(pane.cursor, 0, "clamped at `main`");
     }
 
@@ -6309,12 +6325,12 @@ mod tests {
         // from an expanded agent puts the transcript back.
         let mut pane = SubPane::default();
         pane.begin("alpha".to_string(), "", 0);
-        pane.move_cursor(-1);
-        pane.move_cursor(1);
+        pane.move_cursor(-1, 0);
+        pane.move_cursor(1, 0);
         assert!(pane.expand());
         assert!(pane.active);
 
-        pane.move_cursor(-1);
+        pane.move_cursor(-1, 0);
         assert!(!pane.active, "collapsed by moving to another row");
 
         // `main` has nothing to expand, and Esc leaves the roster entirely.
@@ -6478,8 +6494,8 @@ mod tests {
         assert!(main.expanded, "the transcript is what is on screen");
 
         // Expanding the sub-agent hands the highlight over to it.
-        assert!(pane.move_cursor(0));
-        assert!(pane.move_cursor(1));
+        assert!(pane.move_cursor(0, 0));
+        assert!(pane.move_cursor(1, 0));
         assert!(pane.expand());
         let rows = pane.roster_view(2_000).rows;
         assert!(!rows[0].expanded);
@@ -6599,16 +6615,16 @@ mod tests {
     #[test]
     fn tab_moves_focus_in_and_out_of_the_roster_keeping_the_pane_open() {
         let mut pane = SubPane::default();
-        assert!(!pane.toggle_focus(), "nothing to focus before any run");
+        assert!(!pane.toggle_focus(0), "nothing to focus before any run");
         pane.begin("alpha".to_string(), "", 0);
-        assert!(pane.toggle_focus());
+        assert!(pane.toggle_focus(0));
         assert!(pane.selecting);
         pane.cursor = 1;
         assert!(pane.expand());
-        assert!(pane.toggle_focus());
+        assert!(pane.toggle_focus(0));
         assert!(!pane.selecting, "focus is back on the prompt");
         assert!(pane.active, "the expanded pane stays on screen");
-        assert!(pane.toggle_focus());
+        assert!(pane.toggle_focus(0));
         assert!(pane.selecting && pane.active);
     }
 
@@ -6652,9 +6668,11 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_roster_stays_on_screen_while_the_user_is_in_it() {
-        // Rows must not vanish from under the cursor: `←` brings the finished
-        // roster back, and an expanded pane keeps its row visible while read.
+    fn entering_the_roster_does_not_bring_expired_rows_back() {
+        // Gone is gone: `←` after the linger finds nothing, and Tab has nothing
+        // to focus. Completed agents used to reappear the moment the user
+        // reached into the roster, which was the pile the linger exists to
+        // clear.
         let mut pane = SubPane::default();
         pane.begin("alpha".to_string(), "", 0);
         pane.end(1_000);
@@ -6662,10 +6680,14 @@ mod tests {
         assert_eq!(pane.roster_view(2_000).rows.len(), 2, "a moment to land");
         assert!(pane.roster_view(late).rows.is_empty(), "then it expires");
 
-        assert!(pane.move_cursor(-1), "still reachable after it hid");
-        assert_eq!(pane.roster_view(late).rows.len(), 2);
+        assert!(!pane.move_cursor(-1, late), "nothing left to select");
+        assert!(!pane.selecting);
+        assert!(pane.roster_view(late).rows.is_empty());
+        assert!(!pane.toggle_focus(late), "and nothing to focus");
 
-        pane.move_cursor(1);
+        // Inside the linger it is still there to enter and expand.
+        assert!(pane.move_cursor(-1, 2_000));
+        pane.move_cursor(1, 2_000);
         assert!(pane.expand());
         pane.selecting = false;
         assert_eq!(
@@ -6673,9 +6695,33 @@ mod tests {
             2,
             "an expanded row stays on screen even with the cursor hidden"
         );
-
         pane.collapse();
         assert!(pane.roster_view(late).rows.is_empty(), "Esc puts it away");
+    }
+
+    #[test]
+    fn the_cursor_steps_over_expired_rows() {
+        // With alpha gone, `↓` from `main` lands on beta, never on the hidden
+        // run in between.
+        let mut pane = SubPane::default();
+        pane.begin("alpha".to_string(), "", 0);
+        pane.begin("beta".to_string(), "", 0);
+        pane.begin("gamma".to_string(), "", 0);
+        pane.current = 0;
+        pane.end(1_000);
+        let late = 1_000 + ROSTER_LINGER_MS;
+        assert!(pane.move_cursor(-1, late));
+        assert_eq!(pane.cursor, 0);
+        pane.move_cursor(1, late);
+        assert_eq!(pane.cursor, 2, "beta: alpha's row is not there to stop on");
+        pane.move_cursor(1, late);
+        assert_eq!(pane.cursor, 3, "gamma");
+        pane.move_cursor(1, late);
+        assert_eq!(pane.cursor, 3, "clamped at the last drawn row");
+        pane.move_cursor(-1, late);
+        pane.move_cursor(-1, late);
+        assert_eq!(pane.cursor, 0, "back on `main`, skipping alpha again");
+        assert_eq!(pane.roster_view(late).rows.len(), 3, "main, beta, gamma");
     }
 
     #[test]
@@ -6777,21 +6823,16 @@ mod tests {
             "only `main` would be left, so the whole panel goes"
         );
         assert_eq!(pane.roster_view(late).height(), 0);
-
-        // Hidden, not destroyed: the delegated report is still reachable.
-        assert!(pane.move_cursor(-1));
-        assert_eq!(
-            pane.roster_view(late).rows.len(),
-            2,
-            "`←` brings a finished roster back"
+        assert!(
+            !pane.move_cursor(-1, late),
+            "and `←` does not bring it back"
         );
     }
 
     #[test]
     fn a_row_being_read_never_expires_from_under_the_cursor() {
-        // While the user is in the roster every row shows, however long ago it
-        // finished — that is both what makes a report reachable again and what
-        // keeps rows from moving under the cursor mid-read.
+        // Only the row under the cursor is exempt from the linger: it must not
+        // vanish mid-read, but its finished siblings go on schedule.
         let mut pane = SubPane::default();
         pane.begin("alpha".to_string(), "", 0);
         pane.begin("beta".to_string(), "", 0);
@@ -6799,18 +6840,22 @@ mod tests {
         pane.end(1_000);
         pane.current = 1;
         pane.end(1_000);
-        pane.move_cursor(-1);
-        pane.move_cursor(1);
+        pane.move_cursor(-1, 2_000);
+        pane.move_cursor(1, 2_000);
         assert_eq!(pane.cursor, 1, "on alpha");
 
         let late = 1_000 + ROSTER_LINGER_MS;
         pane.expire_rows(late);
         assert_eq!(pane.cursor, 1, "still on alpha");
-        assert_eq!(pane.roster_view(late).rows.len(), 3, "and every row shows");
+        let rows = pane.roster_view(late).rows;
+        assert_eq!(rows.len(), 2, "main and alpha: beta left on schedule");
+        assert_eq!(rows[1].label, "alpha");
 
-        // Leaving the roster releases them.
-        pane.collapse();
+        // Stepping off alpha releases it too.
+        pane.move_cursor(-1, late);
+        assert_eq!(pane.cursor, 0);
         pane.expire_rows(late);
+        assert!(!pane.selecting, "nothing left to read: the roster retires");
         assert!(pane.roster_view(late).rows.is_empty());
     }
 
@@ -7017,7 +7062,7 @@ mod tests {
             pane.roster_view(0).rows.iter().all(|r| !r.cursor),
             "a quiet status readout until `←` is pressed"
         );
-        pane.move_cursor(-1);
+        pane.move_cursor(-1, 0);
         assert!(pane.roster_view(0).rows[0].cursor, "on `main` first");
     }
 
@@ -7052,8 +7097,8 @@ mod tests {
         assert_eq!(pane.active_log(&main_log).line_count(), 1);
         assert_eq!(pane.active_view(&mut main_view).top, 7);
 
-        pane.move_cursor(-1);
-        pane.move_cursor(1);
+        pane.move_cursor(-1, 0);
+        pane.move_cursor(1, 0);
         assert!(pane.expand());
         assert_eq!(pane.active_log(&main_log).line_count(), 2);
         let v = pane.active_view(&mut main_view);

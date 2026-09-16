@@ -2905,3 +2905,18 @@ the file rewrite — and every `UPDATE` verdict silently resets the entry's
 usage history to zero, which looks like nothing broke (the text is still
 there, still renders) until someone asks why a fact reworded six times over a
 month keeps evicting as if it were brand new.
+
+## `bash_status` never waited: the port passed `stop` for `wait`
+
+`agent_bash_job_tool_result` in the C takes `wait`, `refresh_sec` and `stop`
+as three separate arguments, and its `bash_status`/`bash_stop` caller derives
+`wait = stop || refresh > 0` with `refresh_sec` defaulting to `0` (and forced to
+`1` for `bash_stop`). The port collapsed that to `job_tool_result(idx, stop,
+refresh, stop, true)` and gave `refresh_sec` the `bash` tool's default of 60
+with a floor of 1. Net effect: `bash_status` did a single non-blocking poll no
+matter what `refresh_sec` said, and the model looped `bash_status refresh_sec=300`
+once per generation while a long test ran. The C prompt line "bash_status
+returns immediately unless refresh_sec is given" was accurate to the C and false
+for plank. When mirroring a C function that takes flags derived from each other,
+port the derivation at the call site too, not just the callee's signature.
+
