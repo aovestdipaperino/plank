@@ -7,8 +7,13 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.1.0 is out**, and the beta channel is on 5.1.9. The patch number
+**v5.1.0 is out**, and the beta channel is on 5.1.10. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.1.10: a quiet rule.** The figures a turn floats on the rule under the
+prompt are cleared the moment the turn ends, and the row is repainted whole
+so no notch is left where they were. The memory pass keeps its own figures
+off that rule unless you start plank with `--show-memory-stats`.
 
 **5.1.9: notes are taken at idle, and the status bar holds still.** The
 memory extraction pass no longer holds your prompt. A turn end only snapshots

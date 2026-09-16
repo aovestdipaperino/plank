@@ -172,9 +172,12 @@ says the model is waiting. The figures that change many times a second —
 prefill and generation tokens and rates, the MTP per-step numbers — are
 not in the status bar at all; they float at the right end of the rule
 <em>below</em> the prompt, the way the session name floats on the rule
-above it, and the last values stay up after the turn. The line pinned
-under the output while the model works carries the throbber, what the
-model is doing, and the clock.</p>
+above it, and the rule goes back to a plain line when the turn ends. The
+memory extraction pass keeps its figures to itself unless plank was
+started with <code>--show-memory-stats</code>: by default the rule looks
+idle while notes are taken and the footer's <code>✍️</code> is the only
+sign. The line pinned under the output while the model works carries the
+throbber, what the model is doing, and the clock.</p>
 <p><strong>Where inference runs</strong> is named on the second row, and
 there can be more than one answer:</p>
 <pre><code>api.regolo.ai, (local ⚡100%)</code></pre>

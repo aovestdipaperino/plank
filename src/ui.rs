@@ -16927,6 +16927,15 @@ fn run_worker_ui<T: Send>(
         let out = handle
             .join()
             .map_err(|_| "worker thread panicked".to_owned());
+        // The worker is gone, so the figures it published are history: the
+        // rule below the prompt goes back to a plain line at idle. The row is
+        // then rewritten straight to the terminal (`repaint_rule_bottom`)
+        // rather than left to the frame diff: a label glyph the terminal
+        // draws wider than ratatui measures leaves a cell the diff believes
+        // unchanged and the terminal shows blank — a notch in the rule where
+        // the figures were. Only that row; a whole-screen clear flickers.
+        tui::set_perf_text("");
+        tui::repaint_rule_bottom(terminal);
         ui?;
         out
     })
@@ -17217,8 +17226,8 @@ fn busy_ui_loop(
                     status_line = status::build_status_text(&st, false, false);
                     // The figures that move go to the rule below the prompt;
                     // the pinned line keeps the throbber, the verb and the
-                    // clock. A pass that publishes no figures leaves the last
-                    // ones up, so the MTP numbers can be read after the turn.
+                    // clock. Cleared when the worker ends (`run_worker_ui`),
+                    // so an idle prompt sits over a plain rule.
                     if let Some(perf) = status::perf_segment(&st) {
                         tui::set_perf_text(&perf);
                     }
@@ -18383,6 +18392,7 @@ fn new_agent(
         engine.spec_capable(),
     );
     crate::status::set_mtp(cfg.generation.mtp && engine.spec_capable());
+    crate::status::set_show_memory_stats(cfg.show_memory_stats);
     crate::status::set_temperature(settled_temperature);
     // The alt local engine needs both for the same reasons, and it cannot be
     // skipped as an optimization: `warm_reset` builds its system tokens from

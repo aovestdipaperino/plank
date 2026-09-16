@@ -624,6 +624,22 @@ static DSPARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// The sampling temperature, as `f32` bits — `AtomicF32` does not exist.
 static TEMPERATURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f19_999a); // 0.6
 
+/// Whether the memory pass's figures ride on the rule (`--show-memory-stats`).
+/// Off by default: the pass is housekeeping, and the rule looks idle while it
+/// runs. Process-global for the same reason as the speculation marker.
+static SHOW_MEMORY_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records `--show-memory-stats` from startup config.
+pub fn set_show_memory_stats(on: bool) {
+    SHOW_MEMORY_STATS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`perf_segment`] reports the memory pass's figures.
+#[must_use]
+pub fn show_memory_stats() -> bool {
+    SHOW_MEMORY_STATS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Records whether speculative decoding is on, from startup config or
 /// `/mtp`.
 pub fn set_mtp(on: bool) {
@@ -1794,11 +1810,17 @@ pub(crate) fn prefill_eta(done: i32, total: i32, tps: f64) -> Option<String> {
 ///
 /// Prefill: `↑ done/total tokens · t/s · ~eta left`; generation: `↓ n tokens
 /// · t/s`; with MTP on and a pass that has speculated, `✨ 1.2t/step 4%` is
-/// appended — and stays alone once the turn is over, since those figures are
-/// only readable after the answer lands. The memory pass's figures ride here
-/// too, under the same arrows. `None` when there is nothing to show.
+/// appended. The memory pass's figures ride here too, under the same arrows.
+/// `None` when there is nothing to show, and for the memory pass unless
+/// `--show-memory-stats` was given. The TUI clears the rule when the worker
+/// ends, so at idle the line is plain.
 #[must_use]
 pub fn perf_segment(st: &Status) -> Option<String> {
+    // The memory pass reports its figures only on request
+    // (`--show-memory-stats`); by default the rule looks idle while it runs.
+    if st.memory_pass && !show_memory_stats() {
+        return None;
+    }
     let mut parts: Vec<String> = Vec::new();
     match st.state {
         WorkerState::Prefill => {
@@ -3227,12 +3249,17 @@ mod tests {
             let line = build_status_text(&st, false, true);
             assert!(line.ends_with(&format!("| {MEMORY_MARK}")), "{line}");
             assert!(!line.contains("tokens"), "figures ride on the rule: {line}");
-            let perf = perf_segment(&st).expect("figures on the rule");
+            // Off by default: the rule looks idle while notes are taken.
+            set_show_memory_stats(false);
+            assert_eq!(perf_segment(&st), None, "no figures without the flag");
+            set_show_memory_stats(true);
+            let perf = perf_segment(&st).expect("figures on the rule, on request");
             let expect = match state {
                 WorkerState::Prefill => "↑ 3.3k/4k tokens · 0.0 t/s",
                 _ => "↓ 12 tokens · 0.0 t/s",
             };
             assert_eq!(perf, expect);
+            set_show_memory_stats(false);
         }
         // A backlog: one mark per queued span, the running one included.
         let backlog = Status {

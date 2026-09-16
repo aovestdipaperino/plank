@@ -1894,6 +1894,8 @@ impl Default for OutputView {
 }
 
 /// Theme green, used for the prompt separator rule and panel accents.
+/// Also spelled `AnsiValue(114)` where crossterm is written to directly
+/// (`repaint_rule_bottom`); keep the two in step.
 const THEME_GREEN: Color = Color::Indexed(114);
 
 /// A cheap, cloneable snapshot of the task list for rendering (issue #35): the
@@ -2045,7 +2047,45 @@ fn frame_rows(
     if let Some(rule) = rule_bottom {
         render_perf_text(frame, rule);
     }
+    set_rule_bottom_rect(rule_bottom);
     (output, input, status)
+}
+
+/// Where the last drawn frame put the rule below the prompt, for
+/// [`repaint_rule_bottom`]. `None` when the frame had no prompt.
+static RULE_BOTTOM_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+fn set_rule_bottom_rect(rect: Option<Rect>) {
+    if let Ok(mut slot) = RULE_BOTTOM_RECT.lock() {
+        *slot = rect;
+    }
+}
+
+/// Rewrites the rule below the prompt straight to the terminal, every cell,
+/// bypassing the frame diff. Called once the figures label has been cleared
+/// (`set_perf_text("")`): a glyph the terminal draws wider than ratatui
+/// measures leaves a cell the diff believes unchanged and the terminal shows
+/// blank — a notch where the label was — and a full `Terminal::clear` fixes
+/// it at the price of a whole-screen flicker. This repaints the one row the
+/// artefact can be on. The buffer already holds a plain rule for the row, so
+/// the next frame's diff agrees with what is now on screen; the cursor is
+/// repositioned by that frame as every frame does.
+pub fn repaint_rule_bottom(terminal: &mut ratatui::DefaultTerminal) {
+    use ratatui::crossterm::style::{Color as CColor, ResetColor, SetForegroundColor};
+    use ratatui::crossterm::{cursor::MoveTo, queue, style::Print};
+    use std::io::Write as _;
+    let Some(rule) = RULE_BOTTOM_RECT.lock().ok().and_then(|r| *r) else {
+        return;
+    };
+    let backend = terminal.backend_mut();
+    let _ = queue!(
+        backend,
+        MoveTo(rule.x, rule.y),
+        SetForegroundColor(CColor::AnsiValue(114)),
+        Print("─".repeat(rule.width as usize)),
+        ResetColor
+    );
+    let _ = backend.flush();
 }
 
 /// Columns of bare rule kept to the right of the session name, so the label

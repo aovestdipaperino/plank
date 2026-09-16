@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.1.10] - 2026-09-16
+
+### Added
+
+- **`--show-memory-stats`.** Off by default: the rule below the prompt stays
+  plain while the memory pass takes notes, and the footer's `✍️` is its only
+  trace. On, the pass's prefill and generation figures float on the rule like
+  a turn's do.
+
+### Fixed
+
+- **The rule below the prompt is plain again at idle.** The figures a turn
+  floated there are cleared when the worker ends, and the row is rewritten
+  whole rather than left to the frame diff: a label glyph the terminal draws
+  wider than the renderer measures used to leave a blank notch in the rule
+  where the figures had been. Only that row is repainted, so nothing flickers.
+
 ## [5.1.9] - 2026-09-16
 
 ### Changed

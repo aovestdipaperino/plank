@@ -66,6 +66,11 @@ pub struct AgentConfig {
     /// a `turbo-debug-console` and mirrors the raw model stream to it (see
     /// `debugmirror`). Off, plank never probes for a console at all.
     pub debug: bool,
+    /// True when `--show-memory-stats` was given: the memory extraction
+    /// pass's prefill and generation figures float on the rule below the
+    /// prompt like a turn's do. Off, the rule stays plain while notes are
+    /// taken and the footer's `✍️` is the pass's only trace.
+    pub show_memory_stats: bool,
     /// False when `--no-session` was given: the headless run leaves no
     /// transcript under `~/.plank/kvcache`. Interactive runs always save.
     pub save_session: bool,
@@ -453,6 +458,7 @@ impl Default for AgentConfig {
             plugin_dirs: Vec::new(),
             ui: UiMode::Tui,
             debug: false,
+            show_memory_stats: false,
             save_session: true,
             minimal_prompt: false,
             ui_remote: None,
@@ -565,6 +571,9 @@ Options:
   -V, --version            show the version and commit id, then exit
       --debug              look for a running turbo-debug-console and mirror the
                            raw model stream to it while ui.showThinking is off
+      --show-memory-stats  float the memory pass's prefill/generation figures on
+                           the rule below the prompt (default: the rule stays
+                           plain while notes are taken)
   -m, --model PATH         load a ds4 GGUF model (real inference); a .ggd
                            weight delta loads as the model it derives, by
                            cloning its base into ~/.plank/models/patched/
@@ -1520,6 +1529,7 @@ pub fn parse_options_with(
                 };
             }
             "--debug" => c.debug = true,
+            "--show-memory-stats" => c.show_memory_stats = true,
             "--no-session" => c.save_session = false,
             "--dump-config" => c.dump_config = true,
             "--minimal-prompt" => c.minimal_prompt = true,
@@ -1883,6 +1893,12 @@ mod tests {
     fn debug_flag_is_parsed_and_off_by_default() {
         assert!(!parse_options(&args(&[])).unwrap().debug);
         assert!(parse_options(&args(&["--debug"])).unwrap().debug);
+        assert!(!parse_options(&args(&[])).unwrap().show_memory_stats);
+        assert!(
+            parse_options(&args(&["--show-memory-stats"]))
+                .unwrap()
+                .show_memory_stats
+        );
     }
 
     #[test]

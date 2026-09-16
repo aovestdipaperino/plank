@@ -329,9 +329,10 @@ a keystroke. It runs on a worker thread behind the same busy UI loop as a
 turn, and typing keeps working. Its only trace while it runs is a `✍️` in
 the footer (`Status::memory_pass`, `status::MEMORY_MARK`) in place of the
 state word — one mark per queued span, the running one included, so
-`✍️✍️` means one more is waiting — with the bare figures of its phase
+`✍️✍️` means one more is waiting — and, only with `--show-memory-stats`, the bare figures of its phase
 (`↑ 3.3k/4k tokens · 392 t/s`, then `↓ 12 tokens · 20 t/s`) floated at the
-right end of the rule below the prompt, where every pass's figures go: no throbber or verb, no progress
+right end of the rule below the prompt, where a turn's figures go; without
+the flag the rule stays plain while notes are taken: no throbber or verb, no progress
 line under the output, no scrollback line, no window title change, and the
 JSON reply itself is never rendered (`sub_sink_render_sink` is null for the
 pass), because this is housekeeping the user did not ask for, and the
