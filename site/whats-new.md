@@ -7,10 +7,10 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.1.0 is out**, and the beta channel is on 5.1.5. The patch number
+**v5.1.0 is out**, and the beta channel is on 5.1.6. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
 
-**On `main`, ahead of the next beta: memory that maintains itself.** Until now
+**5.1.6: memory that maintains itself.** Until now
 the two `MEMORY.md` files only ever changed when you typed `/remember` or opened
 `/memory`. The model now has a `remember` tool and a `forget` tool of its own,
 and an optional extraction pass (`memory.autoExtract`, off by default because it

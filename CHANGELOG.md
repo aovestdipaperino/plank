@@ -6,8 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.1.6] - 2026-09-16
+
 ### Added
 
+- **Memory maintains itself.** The model gains `remember` and `forget` tools,
+  gated on `tools.remember`, whose writes land in the memory files on disk and
+  join the context at the next session start, so nothing rewrites the cached
+  prompt mid-session. Entries carry a `[type]` tag (`user`, `feedback`,
+  `project`, `reference`; untagged legacy lines read as `project`), an advisory
+  `MEMORY.md.meta.json` sidecar tracks per-entry usage and pin state, and each
+  type has its own byte budget for what renders, evicting pinned last, then
+  least used, then least recent, with the newest entry winning a full tie. An
+  optional extraction pass (`memory.autoExtract`, off by default because it
+  costs a generation and a KV snapshot after each answer;
+  `memory.extractEveryNTurns` thins it) reads only the part of the transcript
+  it has not seen, asks for ADD/UPDATE/DELETE/USED verdicts as a single
+  tool-free generation, and applies them through one audited, atomic write
+  path. `/forget <pattern>` previews and confirms before deleting, `/memory log`
+  reads the audit log at `~/.plank/memory-log.jsonl`, and every memory file is
+  written atomically. Design and failure modes in `docs/MEMORY.md`.
 - **`--ui chart` and `--ui quiet` show a live running time.** The chart gains a
   dim `elapsed 12.4s` footer under the panels, updated with every repaint:
   throughput says how fast the model is going, never how long you have been
