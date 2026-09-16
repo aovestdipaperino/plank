@@ -2189,6 +2189,23 @@ now converts LF to CRLF in both `old` and `new` when the whole file is CRLF
 and the text carries no `\r` of its own; mixed-ending files are left alone,
 because guessing there would corrupt the other kind of line.
 
+## `search` must clip, or one minified asset prefills for seven minutes
+
+A literal `search` for `566` over a repo hit two single-line minified SVGs of
+238 KB each under a Claude Code agent worktree. The tool printed both lines in
+full: a 480 KB tool result, roughly 300k tokens, which then prefilled for seven
+minutes at local speeds and is baked into that session's transcript for good.
+The C never gets there: `agent_search_read_line` skips a file whose line
+reaches `AGENT_TOOL_MAX_BYTES` (128 KiB, reported as "line exceeds 128 KiB"),
+and every tool writes through an `agent_buf` whose `.limit` clips the whole
+result at the same size with "[Output truncated at the tool byte limit. Narrow
+the request.]". plank had neither for `search`. It now has both, scoped to
+`search` (`SEARCH_MAX_BYTES`): `read` deliberately bounds by context instead of
+128 KiB (see "`AGENT_TOOL_CONTRACTS` is not adopted"), so the C's global limit
+is not adopted wholesale. A skipped file is reported with the C's "Search
+incomplete" footer even when nothing else matched, so the model learns the
+coverage hole instead of reading "No matches".
+
 ## `search` must skip `target/`, or Cargo's package copy drowns the real matches
 
 `cargo package` leaves a full copy of the crate under `target/package/<crate>/`.

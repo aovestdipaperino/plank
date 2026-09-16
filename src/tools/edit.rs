@@ -624,6 +624,19 @@ fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
     }
 }
 
+/// Byte budget of one `search` result, and the longest line it will print:
+/// the C's `AGENT_TOOL_MAX_BYTES`. The C reads each line into a buffer capped
+/// at this size and skips the file when a line reaches it ("line exceeds
+/// 128 KiB"), and its output buffer clips at the same limit. plank once
+/// lacked both: a literal query matched two single-line minified SVGs of
+/// 238 KB each, and the 480 KB result prefilled for seven minutes (see
+/// FINDINGS.md, "search must clip").
+pub(crate) const SEARCH_MAX_BYTES: usize = 128 * 1024;
+
+/// The C's note when a tool result hits its byte budget.
+pub(crate) const SEARCH_TRUNCATED_NOTE: &str =
+    "\n[Output truncated at the tool byte limit. Narrow the request.]\n";
+
 #[derive(Debug)]
 struct SearchCtx {
     query: String,
@@ -634,6 +647,12 @@ struct SearchCtx {
     max_results: usize,
     results: usize,
     out: String,
+    /// Files skipped for an oversized line, and the first one with the reason,
+    /// so the result reports incomplete coverage the way the C does.
+    skipped: usize,
+    first_skip: Option<String>,
+    /// Set once `out` reached [`SEARCH_MAX_BYTES`]; nothing more is appended.
+    truncated: bool,
 }
 
 fn literal_match(line: &[u8], query: &[u8], case_sensitive: bool) -> bool {
@@ -663,11 +682,30 @@ impl SearchCtx {
         }
     }
 
+    /// Appends to the result within [`SEARCH_MAX_BYTES`]; once the budget is
+    /// spent the rest is dropped and `truncated` is set, as the C's
+    /// `agent_buf_append` does.
+    fn push(&mut self, s: &str) {
+        if self.truncated {
+            return;
+        }
+        let room = SEARCH_MAX_BYTES.saturating_sub(self.out.len());
+        if s.len() <= room {
+            self.out.push_str(s);
+            return;
+        }
+        let mut cut = room;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        self.out.push_str(&s[..cut]);
+        self.truncated = true;
+    }
+
     fn emit_line(&mut self, data: &[u8], sp: LineSpan, line_no: usize) {
-        let _ = write!(self.out, "  {line_no} ");
-        self.out
-            .push_str(&String::from_utf8_lossy(&data[sp.start..sp.content_end]));
-        self.out.push('\n');
+        self.push(&format!("  {line_no} "));
+        self.push(&String::from_utf8_lossy(&data[sp.start..sp.content_end]));
+        self.push("\n");
     }
 
     /// Searches one text file and emits matching lines with line numbers.
@@ -692,10 +730,23 @@ impl SearchCtx {
             return;
         }
         let spans = split_lines(&data);
+        // The C reads a line into a buffer capped at `AGENT_TOOL_MAX_BYTES` and
+        // skips the file when one fills it: a minified asset is never worth
+        // its weight in the transcript, and a match on it is noise anyway.
+        if spans
+            .iter()
+            .any(|sp| sp.content_end - sp.start >= SEARCH_MAX_BYTES)
+        {
+            self.skipped += 1;
+            if self.first_skip.is_none() {
+                self.first_skip = Some(format!("{display}: line exceeds 128 KiB"));
+            }
+            return;
+        }
         let mut printed_file = false;
         let mut last_context_line: Option<usize> = None;
         for i in 0..spans.len() {
-            if self.results >= self.max_results {
+            if self.results >= self.max_results || self.truncated {
                 break;
             }
             let sp = spans[i];
@@ -703,8 +754,8 @@ impl SearchCtx {
                 continue;
             }
             if !printed_file {
-                self.out.push_str(display);
-                self.out.push('\n');
+                self.push(display);
+                self.push("\n");
                 printed_file = true;
             }
             let mut from = i.saturating_sub(self.context);
@@ -721,15 +772,14 @@ impl SearchCtx {
             self.results += 1;
         }
         if printed_file {
-            self.out.push('\n');
+            self.push("\n");
         }
-        let _ = spans;
     }
 
     /// Recursively searches a path, skipping VCS metadata and build output,
     /// and honoring the cap.
     fn search_path(&mut self, path: &Path, display: &str, depth: usize) {
-        if self.results >= self.max_results || depth > 24 {
+        if self.results >= self.max_results || self.truncated || depth > 24 {
             return;
         }
         let Ok(meta) = std::fs::symlink_metadata(path) else {
@@ -746,7 +796,7 @@ impl SearchCtx {
             return;
         };
         for entry in entries.flatten() {
-            if self.results >= self.max_results {
+            if self.results >= self.max_results || self.truncated {
                 break;
             }
             let name = entry.file_name();
@@ -796,6 +846,9 @@ pub fn tool_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
             .unwrap_or(50),
         results: 0,
         out: String::new(),
+        skipped: 0,
+        first_skip: None,
+        truncated: false,
     };
     if use_regex {
         match MiniRegex::compile(query, case_sensitive) {
@@ -804,7 +857,7 @@ pub fn tool_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
         }
     }
     sctx.search_path(&ctx.resolve(path), path, 0);
-    if sctx.out.is_empty() {
+    if sctx.out.is_empty() && sctx.skipped == 0 {
         // A literal query full of regex metacharacters almost always meant a
         // regex: say so, or the model concludes the symbols do not exist.
         if !use_regex && looks_like_regex(query) {
@@ -817,7 +870,27 @@ pub fn tool_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
         sctx.results,
         if sctx.results == 1 { "" } else { "es" }
     );
-    format!("{header}{}", sctx.out)
+    let mut out = format!("{header}{}", sctx.out);
+    // Coverage note, as the C's: the skip count, whether the match cap also
+    // fired, and the first skipped path with its reason.
+    if sctx.skipped > 0 || sctx.results >= sctx.max_results {
+        let _ = write!(
+            out,
+            "\nSearch incomplete: {} skipped path{}{}. {}\n",
+            sctx.skipped,
+            if sctx.skipped == 1 { "" } else { "s" },
+            if sctx.results >= sctx.max_results {
+                "; match limit reached"
+            } else {
+                ""
+            },
+            sctx.first_skip.as_deref().unwrap_or("")
+        );
+    }
+    if sctx.truncated {
+        out.push_str(SEARCH_TRUNCATED_NOTE);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1023,6 +1096,64 @@ mod tests {
             std::ffi::OsStr::new("src")
         ));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_skips_files_with_an_oversized_line_and_says_so() {
+        let (mut ctx, dir) = test_ctx();
+        // A single-line minified asset containing the needle, over the C's
+        // 128 KiB line limit: skipped and reported, never printed.
+        let mut svg = "<svg>".repeat(SEARCH_MAX_BYTES / 5);
+        svg.push_str("needle_566");
+        std::fs::write(dir.join("big.svg"), &svg).unwrap();
+        std::fs::write(dir.join("real.rs"), "let x = needle_566;\n").unwrap();
+        let out = tool_search(&mut ctx, &test_call("search", &[("query", "needle_566")]));
+        assert!(out.starts_with("1 match shown\n\n"), "{out}");
+        assert!(out.contains("real.rs\n  1 let x = needle_566;\n"), "{out}");
+        assert!(!out.contains("<svg>"), "{out}");
+        assert!(
+            out.contains("Search incomplete: 1 skipped path. ./big.svg: line exceeds 128 KiB\n"),
+            "{out}"
+        );
+        assert!(out.len() < 1024, "{}", out.len());
+        // A skip with no matches at all is still reported, not "No matches".
+        std::fs::remove_file(dir.join("real.rs")).unwrap();
+        let out = tool_search(&mut ctx, &test_call("search", &[("query", "needle_566")]));
+        assert!(out.starts_with("0 matches shown\n\n"), "{out}");
+        assert!(out.contains("Search incomplete: 1 skipped path."), "{out}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn search_output_is_clipped_at_the_tool_byte_limit() {
+        let (mut ctx, dir) = test_ctx();
+        // Many files of many 1 KiB matching lines, well past 128 KiB in total
+        // while every single line stays under the per-line limit.
+        let line = format!("{} needle_clip\n", "x".repeat(1000));
+        for f in 0..4 {
+            std::fs::write(dir.join(format!("f{f}.txt")), line.repeat(100)).unwrap();
+        }
+        let out = tool_search(
+            &mut ctx,
+            &test_call(
+                "search",
+                &[("query", "needle_clip"), ("max_results", "500")],
+            ),
+        );
+        assert!(
+            out.ends_with(SEARCH_TRUNCATED_NOTE),
+            "{}",
+            &out[out.len() - 200..]
+        );
+        assert!(
+            out.len() <= SEARCH_MAX_BYTES + 256 + SEARCH_TRUNCATED_NOTE.len(),
+            "{}",
+            out.len()
+        );
+        // Match count reflects what was printed, not the whole tree.
+        let shown: usize = out.split(' ').next().unwrap().parse().unwrap();
+        assert!(shown < 400 && shown > 0, "{shown}");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
