@@ -290,11 +290,17 @@ pub struct Status {
     /// memory pressure. Drives [`pressure_segment`], the one marker that says
     /// a wait of up to `RESUME_DWELL_SECS` is a pause and not a hang.
     pub pressure_yielded: bool,
-    /// The pass generating is the passive memory extraction pass, run at a
-    /// turn boundary after the reply the user asked for is complete. The
-    /// verb says so ([`MEMORY_VERB`]) instead of drawing from a phase pool,
-    /// so the footer does not look like the model is still answering.
+    /// The pass generating is the passive memory extraction pass, read from
+    /// the idle queue after the reply the user asked for is complete. It
+    /// draws no progress line ([`progress_segment`] is `None`); the footer
+    /// shows [`MEMORY_MARK`] with the phase's bare figures in place of the
+    /// state word: housekeeping the user did not ask for gets a glyph and
+    /// numbers, not a verb.
     pub memory_pass: bool,
+    /// Spans waiting to be read, the running one included, while
+    /// `memory_pass` is set: the footer draws one [`MEMORY_MARK`] per job,
+    /// so a backlog is visible at a glance.
+    pub memory_queue: usize,
 }
 
 /// Marks the speculative-decoding segment, mirroring how `THINK_MARK` labels
@@ -340,6 +346,14 @@ const HD_MARK_OFF: &str = "  ";
 /// text-default emoji need the selector to measure the two columns
 /// terminals actually render them in.
 const PRESSURE_MARK: &str = "⏸\u{fe0f}";
+
+/// Marks the footer while the memory extraction pass is running
+/// (`Status::memory_pass`): the whole of what the pass shows.
+///
+/// U+270D followed by U+FE0F (VS16), for the same reason as [`TEMP_MARK`]:
+/// text-default emoji need the selector to measure the two columns
+/// terminals actually render them in.
+pub const MEMORY_MARK: &str = "✍\u{fe0f}";
 
 /// Marks the footer's debugger segment: the raw model stream is being mirrored
 /// to a live debug console right now. Connection, not capability: `--debug`
@@ -1043,11 +1057,6 @@ pub const FUN_VERBS: [&str; 20] = [
     "Moonwalking 🌙",
 ];
 
-/// The one fixed verb of the memory extraction pass (`Status::memory_pass`):
-/// a fixed word rather than a pool because the pass is a background chore the
-/// user did not ask for, and the footer should say plainly what it is doing.
-pub const MEMORY_VERB: &str = "taking notes";
-
 /// One turn in this many draws from [`FUN_VERBS`] instead of the phase pool.
 /// Rare enough to stay a surprise, common enough to actually be seen.
 pub const FUN_ODDS: u32 = 20;
@@ -1103,9 +1112,6 @@ pub fn verb_phase(st: &Status) -> VerbPhase {
 /// index 0.
 #[must_use]
 pub fn prefill_label(st: &Status) -> &'static str {
-    if st.memory_pass {
-        return MEMORY_VERB;
-    }
     let phase = verb_phase(st);
     let pool = verbs_for(phase);
     let idx = if phase == VerbPhase::Fun {
@@ -1787,6 +1793,11 @@ pub(crate) fn prefill_eta(done: i32, total: i32, tps: f64) -> Option<String> {
 /// below the output instead of in the footer.
 #[must_use]
 pub fn progress_segment(st: &Status, color: bool) -> Option<String> {
+    // The memory pass has no progress line at all: the footer's
+    // `MEMORY_MARK` is its only trace.
+    if st.memory_pass {
+        return None;
+    }
     let theme = |text: &str| {
         if color {
             format!("\x1b[38;5;{THEME_COLOR};1m{text}{STATUS_STYLE_START}")
@@ -1962,6 +1973,9 @@ fn build_status_text_with_cells(
     // suffix is the line's right anchor and must stay last.
     let power = format!("{}{power}", wasm_segment_text_keeping(cells, color));
     let body = match st.state {
+        WorkerState::Prefill | WorkerState::Generating if st.memory_pass => {
+            format!("{ctx} | {}{power}", memory_segment(st))
+        }
         WorkerState::Prefill | WorkerState::Generating => {
             let looping = loop_segment(st);
             match progress_segment(st, color).filter(|_| progress_in_bar) {
@@ -1984,7 +1998,9 @@ fn build_status_text_with_cells(
             }
         ),
         WorkerState::Stopped => format!("{ctx} | interrupted{power}"),
-        WorkerState::Idle => format!("{ctx} | idle{power}"),
+        // No state word at idle: the prompt caret's colour already says the
+        // model is waiting, and a word repeating it costs a footer slot.
+        WorkerState::Idle => format!("{ctx}{power}"),
     };
     format!("{dir}{body}")
 }
@@ -2015,6 +2031,30 @@ pub fn spec_segment(st: &Status) -> Option<String> {
         st.spec.tokens_per_step(),
         100.0 * st.spec.block_fill()
     ))
+}
+
+/// The memory pass's footer segment: [`MEMORY_MARK`], then the bare figures
+/// of the phase it is in — no throbber and no verb, so it reads as the
+/// background chore it is rather than as the model answering.
+fn memory_segment(st: &Status) -> String {
+    // One mark per queued span, the running one included; never fewer than
+    // one, since a pass is running.
+    let marks = MEMORY_MARK.repeat(st.memory_queue.max(1));
+    if st.state == WorkerState::Prefill {
+        let total = st.prefill_total.max(1);
+        format!(
+            "{marks} ↑ {}/{} tokens · {:.1} t/s",
+            format_ctx_size(st.prefill_done.min(total)),
+            format_ctx_size(total),
+            st.prefill_tps
+        )
+    } else {
+        format!(
+            "{marks} ↓ {} tokens · {:.1} t/s",
+            format_ctx_size(st.generated),
+            st.gen_tps
+        )
+    }
 }
 
 /// The debugger segment: [`DEBUG_MARK`] while the session's window on the
@@ -2563,7 +2603,7 @@ mod tests {
     /// change to any of these constants (adding/dropping VS16, swapping the
     /// glyph) cannot silently reintroduce an undercount. See
     /// `visible_width_counts_wide_emoji_as_two_columns` for why `TEMP_MARK`,
-    /// `PRESSURE_MARK` and `LOOP_MARK` carry an explicit
+    /// `PRESSURE_MARK`, `MEMORY_MARK` and `LOOP_MARK` carry an explicit
     /// VS16 while the others don't need one.
     ///
     /// Exhaustive over every footer mark constant: each is listed once, with
@@ -2583,6 +2623,7 @@ mod tests {
             ("JOBS_MARK", JOBS_MARK, 1), // deliberate exception: math symbol, not emoji
             ("HD_MARK", HD_MARK, 2),
             ("PRESSURE_MARK", PRESSURE_MARK, 2),
+            ("MEMORY_MARK", MEMORY_MARK, 2),
             ("TOKS_MARK", TOKS_MARK, 2),
             ("CAMERA_MARK", CAMERA_MARK, 2),
             ("LOOP_MARK", LOOP_MARK, 2),
@@ -2660,10 +2701,11 @@ mod tests {
         // wait, and without this it reads as a hang.
         st.state = WorkerState::Idle;
         let text = build_status_text(&st, false, true);
-        assert!(
-            text.contains(" | ⏸\u{fe0f} paused: memory | "),
-            "got: {text}"
-        );
+        // With no idle word after it, the marker closes the line.
+        // `contains`, not `ends_with`: other tests toggle process-global footer
+        // state (contributed cells, the power suffix) that may trail the
+        // segment in a parallel run.
+        assert!(text.contains(" | ⏸\u{fe0f} paused: memory"), "got: {text}");
     }
 
     #[test]
@@ -2675,7 +2717,8 @@ mod tests {
         st.running_jobs = 3;
         assert_eq!(jobs_segment(&st).as_deref(), Some("⧗ 3 jobs"));
         let text = build_status_text(&st, false, true);
-        assert!(text.contains(" | ⧗ 3 jobs | "), "got: {text}");
+        // `contains`, not `ends_with`, for the same reason as the pressure test.
+        assert!(text.contains(" | ⧗ 3 jobs"), "got: {text}");
         let quiet = build_status_text(&Status::default(), false, true);
         assert!(!quiet.contains('⧗'), "got: {quiet}");
     }
@@ -2727,7 +2770,7 @@ mod tests {
             ..Status::default()
         };
         assert!(
-            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡\u{fe0f} 0.00 | 📈 | idle"),
+            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡\u{fe0f} 0.00 | 📈"),
             "{}",
             build_status_text(&st, false, true)
         );
@@ -2820,7 +2863,7 @@ mod tests {
         // question the slot exists to answer.
         let line = build_status_text(&plain, false, true);
         assert!(
-            line.ends_with(&format!("ctx 12% | {MTP_MARK} | {TOKS_MARK} | idle")),
+            line.ends_with(&format!("ctx 12% | {MTP_MARK} | {TOKS_MARK}")),
             "{line}"
         );
         assert!(!line.contains(TEMP_MARK), "{line}");
@@ -2836,9 +2879,7 @@ mod tests {
         };
         let line = build_status_text(&spark, false, true);
         assert!(
-            line.ends_with(&format!(
-                "ctx 12% | {MTP_MARK} 3.0t/step 50% | {TOKS_MARK} | idle"
-            )),
+            line.ends_with(&format!("ctx 12% | {MTP_MARK} 3.0t/step 50% | {TOKS_MARK}")),
             "{line}"
         );
     }
@@ -3074,34 +3115,57 @@ mod tests {
     ];
 
     #[test]
-    fn memory_pass_pins_the_verb_in_every_phase() {
-        for seed in 0..(FUN_ODDS * 3) {
-            for state in [WorkerState::Prefill, WorkerState::Generating] {
-                for thinking in [false, true] {
-                    let st = Status {
-                        state,
-                        thinking,
-                        prefill_label: seed,
-                        memory_pass: true,
-                        ..Status::default()
-                    };
-                    assert_eq!(prefill_label(&st), MEMORY_VERB);
-                }
-            }
+    fn memory_pass_shows_the_mark_and_no_progress_line() {
+        let _lock = quiet_footer();
+        for state in [WorkerState::Prefill, WorkerState::Generating] {
+            let st = Status {
+                state,
+                ctx_used: 1000,
+                ctx_size: 8000,
+                prefill_total: 4000,
+                prefill_done: 3300,
+                generated: 12,
+                memory_pass: true,
+                ..Status::default()
+            };
+            assert_eq!(
+                progress_segment(&st, false),
+                None,
+                "no readout under the output"
+            );
+            let line = build_status_text(&st, false, true);
+            let expect = match state {
+                WorkerState::Prefill => format!("| {MEMORY_MARK} ↑ 3.3k/4k tokens · 0.0 t/s"),
+                _ => format!("| {MEMORY_MARK} ↓ 12 tokens · 0.0 t/s"),
+            };
+            assert!(line.ends_with(&expect), "{line}");
+            assert!(!line.contains('…'), "no verb: {line}");
         }
-        let st = Status {
+        // A backlog: one mark per queued span, the running one included.
+        let backlog = Status {
             state: WorkerState::Generating,
-            prefill_label: 1,
+            generated: 12,
+            memory_pass: true,
+            memory_queue: 3,
             ..Status::default()
         };
-        assert_ne!(prefill_label(&st), MEMORY_VERB, "off by default");
+        let line = build_status_text(&backlog, false, true);
         assert!(
-            !ALL_PHASES
-                .iter()
-                .flat_map(|p| verbs_for(*p).iter())
-                .any(|v| *v == MEMORY_VERB),
-            "the pinned verb is not also a pool entry"
+            line.ends_with(&format!(
+                "| {MEMORY_MARK}{MEMORY_MARK}{MEMORY_MARK} ↓ 12 tokens · 0.0 t/s"
+            )),
+            "{line}"
         );
+        let plain = Status {
+            state: WorkerState::Generating,
+            generated: 12,
+            ..Status::default()
+        };
+        assert!(
+            progress_segment(&plain, false).is_some(),
+            "an ordinary pass keeps its readout"
+        );
+        assert!(!build_status_text(&plain, false, true).contains(MEMORY_MARK));
     }
 
     #[test]

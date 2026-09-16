@@ -27,7 +27,7 @@ use crate::session::{Message, Role};
 /// will run, built from the transcript as it stood when the turn ended, so
 /// the pass reads exactly what the model said then whatever the session does
 /// meanwhile (`/clear`, a follow-up turn, compaction).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MemoryJob {
     /// The complete extraction prompt (`build_prompt`), self-contained.
     pub task: String,
@@ -36,6 +36,26 @@ pub struct MemoryJob {
     /// Run-time faults (engine errors) seen so far; the job is dropped at
     /// [`MAX_JOB_ATTEMPTS`] so a broken engine cannot pin the idle loop.
     pub attempts: u8,
+    /// The prefilled prompt of an earlier attempt, kept when that attempt
+    /// was interrupted so the retry does not start from zero.
+    pub resume: Option<MemoryResume>,
+}
+
+/// A local engine's KV after the pass prompt was prefilled and before a
+/// single token was sampled, with the exact prompt text it covers.
+///
+/// Why *before* sampling: the engine reuses a live KV only when the next
+/// prompt extends its end, and rebuilds from zero when the prompt is a
+/// strict prefix of it. A snapshot taken at the interrupt would hold the
+/// partial reply, and the retry's prompt (the same task, a fresh assistant
+/// turn) would be a strict prefix of that — worthless. So the pass prefills
+/// first with `n_predict: 0`, snapshots, and only then samples; a retry
+/// restores the snapshot and re-issues the stored prompt, which the KV
+/// covers to the last token. Held in memory only while the job waits.
+#[derive(Debug, Clone)]
+pub struct MemoryResume {
+    pub kv: crate::kvcache::KVCache,
+    pub prompt: String,
 }
 
 /// Engine failures a queued job survives before it is dropped.

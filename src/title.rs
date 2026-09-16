@@ -45,13 +45,6 @@ pub enum State<'a> {
     /// asked for, takes long enough to be worth naming, and is the one phase
     /// where a background window should say "not your turn yet".
     Compacting,
-    /// Running the passive memory extraction pass at a turn boundary. Its own
-    /// state for the same reason as [`State::Compacting`]: no user prompt is
-    /// being answered, and the pass takes a whole generation, so a
-    /// backgrounded window should say that plank is filing memories rather
-    /// than idle or stuck. Set through [`Scoped`] so the idle title the turn
-    /// end already wrote comes back when the pass ends, however it ends.
-    Remembering,
 }
 
 /// Longest prompt (in characters) kept in a [`State::Busy`] title before it is
@@ -68,9 +61,6 @@ const INTROSPECTING: &str = "👀 introspecting...";
 /// Title shown while a compaction pass is summarizing the transcript.
 const COMPACTING: &str = "🗑️ compacting...";
 
-/// Title shown while the memory extraction pass is reading the transcript.
-const REMEMBERING: &str = "✍️ taking notes...";
-
 /// Title shown while the `ask` tool is waiting on the user's choice.
 const ASKING: &str = "❓ waiting for you...";
 
@@ -84,7 +74,6 @@ pub fn window_title(state: State<'_>) -> String {
         State::Idle => "🪵 Plank - READY.".to_string(),
         State::Introspecting => INTROSPECTING.to_string(),
         State::Compacting => COMPACTING.to_string(),
-        State::Remembering => REMEMBERING.to_string(),
         State::Asking => ASKING.to_string(),
         State::Busy(p) => match collapse_prompt(p) {
             Some(prompt) => busy_title(&prompt, 0),
@@ -249,30 +238,6 @@ mod tests {
     /// The `ask` tool's contract with the window title: the question mark is up
     /// only while the user is being asked, and the busy title the turn was
     /// showing comes back afterwards — whichever way the question ended.
-    #[test]
-    fn remembering_is_its_own_title_and_restores_idle() {
-        assert_eq!(window_title(State::Remembering), REMEMBERING);
-        assert_ne!(REMEMBERING, COMPACTING);
-        assert_ne!(REMEMBERING, INTROSPECTING);
-        let _serial = TITLE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let idle = window_title(State::Idle);
-        set_text(&idle);
-        let guard = Scoped::set(State::Remembering);
-        let during = LAST
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        assert_eq!(during.as_deref(), Some(REMEMBERING));
-        drop(guard);
-        let after = LAST
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        assert_eq!(after.as_deref(), Some(idle.as_str()));
-    }
-
     #[test]
     fn asking_displaces_the_busy_title_and_gives_it_back() {
         let _serial = TITLE_TEST_LOCK

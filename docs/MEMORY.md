@@ -326,11 +326,15 @@ one job per call, oldest first). In the TUI that is the idle loop's poll
 timeout (`tui_memory_pass`), with the same guards as the background-job
 wake — no draft in the editor, no modal pane — so a pass never starts under
 a keystroke. It runs on a worker thread behind the same busy UI loop as a
-turn: a dim `memory: taking notes on the last turn…` line announces it
-(`Agent::MEMORY_PASS_LINE`), the footer shows `taking notes…` with the
-pass's own elapsed/token figures (`Status::memory_pass`,
-`status::MEMORY_VERB`), the window title reads `✍️ taking notes...`, and
-typing keeps working. **A prompt submitted during the pass interrupts it**
+turn, and typing keeps working. Its only trace while it runs is a `✍️` in
+the footer (`Status::memory_pass`, `status::MEMORY_MARK`) in place of the
+state word — one mark per queued span, the running one included, so
+`✍️✍️` means one more is waiting — followed by the bare figures of its phase
+(`↑ 3.3k/4k tokens · 392 t/s`, then `↓ 12 tokens · 20 t/s`): no throbber or verb, no progress
+line under the output, no scrollback line, no window title change, and the
+JSON reply itself is never rendered (`sub_sink_render_sink` is null for the
+pass), because this is housekeeping the user did not ask for, and the
+conversation should not fill with it. **A prompt submitted during the pass interrupts it**
 (`TurnShared::memory_pass` makes the busy loop raise the worker interrupt
 as it queues the line): the job goes back to the front of the queue,
 uncounted, and the typed line starts its turn at once — the user never waits
@@ -348,11 +352,29 @@ session's KV (`engine.get_kv()`), a prefill of the pass prompt on top of the
 live context, one generation with no tool dispatch (`run_memory_round` — the
 sidechain can never touch a tool), and a KV restore back to the parent
 prefix. None of that time or those tokens appears in any turn's stats: the
-traces are the announcement, the footer verb, and a dim line when the pass
-changed something. A pass whose reply held no verdicts is silent: it is
+traces are the footer mark and one dim `memory completed in 1m 12s` line
+when the pass succeeds, carrying the change summary when it changed
+something. A pass whose reply held no verdicts is silent: it is
 recorded in the sidechain dump (`/repro`) and nowhere else. The sidechain
 runs under `in_sidechain()`, so it pushes no KV ladder rungs and stores no
 payload: it leaves no checkpoint debris.
+
+**Not from zero after an interrupt.** On a local engine the pass first
+prefills the prompt alone (a `n_predict: 0` generation), snapshots that KV
+into the job (`MemoryResume`: the KV plus the exact prompt text it covers),
+and only then samples. An interrupted attempt keeps the snapshot; the retry
+restores it (`engine.set_kv`) and re-issues the stored prompt byte for byte,
+so it prefills only the assistant prefix. An interrupt that lands *during*
+the prefill — the long phase on a local model, so the common case — keeps a
+snapshot too: the engine stops at a token boundary and leaves a valid
+shorter prefix behind, and the retry continues the prefill from there rather
+than from zero. The order is forced by the
+engine: a live KV is reused only when the prompt *extends* it, and a prompt
+that is a strict prefix rebuilds from zero, so a snapshot taken at the
+interrupt (which would hold the partial reply) would be worthless. Engines
+with no KV to snapshot (providers, the echo stub) skip the prefill-only
+step as well. The snapshot is held in memory only while the job waits and
+goes with the job when it leaves the queue.
 
 **How a job leaves the queue:** applied; unusable (a reply that is not a
 JSON array is a property of the model on this prompt, not a transient

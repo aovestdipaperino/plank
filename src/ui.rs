@@ -3887,7 +3887,20 @@ impl Agent<'_> {
     fn generate_quiet(
         &mut self,
         prompt_text: &str,
+        turn_start: Instant,
+    ) -> Result<QuietPass, QuietAbort> {
+        let live_opts = self.pass_opts();
+        self.generate_quiet_with(prompt_text, turn_start, &live_opts)
+    }
+
+    /// [`generate_quiet`](Self::generate_quiet) with the generation options
+    /// spelled out, for the one caller that wants something other than the
+    /// live options: the memory pass's prefill-only step (`n_predict: 0`).
+    fn generate_quiet_with(
+        &mut self,
+        prompt_text: &str,
         _turn_start: Instant,
+        live_opts: &crate::engine::GenerationOptions,
     ) -> Result<QuietPass, QuietAbort> {
         // A console that appeared since the last pass: pick it up here too, so
         // a sub-agent's window is backfilled with its own slice.
@@ -3898,12 +3911,8 @@ impl Agent<'_> {
             .engine
             .wants_structured()
             .then(|| self.build_structured_for(&recovery_session(&self.session), prompt_text));
-        // Cloned rather than borrowed: the live options are `self`'s now (they
-        // used to hang off the immutably-shared `cfg`), and this function goes
-        // on to touch `self` mutably.
-        let live_opts = self.pass_opts();
         let ctx = PassCtx {
-            opts: &live_opts,
+            opts: live_opts,
             think_off: matches!(live_opts.think_mode, crate::engine::ThinkMode::Off),
             // Read here, not inside the pass: `settings::install_for_test` is
             // thread-local, so a spawned pass would silently see defaults.
@@ -3957,12 +3966,27 @@ impl Agent<'_> {
             // pass and cleared by its `finish`/`cancel`, so it is true for
             // exactly the generation the memory pass drives and no other.
             memory_pass: self.extract_state.is_running(),
+            // The running job was popped from the queue, so it counts as one
+            // on top of whatever still waits.
+            memory_queue: if self.extract_state.is_running() {
+                self.memory_jobs.len() + 1
+            } else {
+                0
+            },
         })
     }
 
     /// Builds the render sink a sub-agent pass writes through, per the current
     /// [`SubSinkTarget`]. Shared by the serial loop and the parallel fan-out.
     fn sub_sink_render_sink(&self) -> Box<dyn crate::viz::RenderSink + Send> {
+        // The memory pass's reply is a verdict array for `apply_verdicts`,
+        // not something to show: on the TUI the sub-agent sink would land it
+        // in the main log as model text, on the plain REPL it would print.
+        // Its footer status still flows, through `pass_status_ctx`, which
+        // reads `sub_sink` directly rather than this sink.
+        if self.extract_state.is_running() {
+            return Box::new(NullSink);
+        }
         match &self.sub_sink {
             SubSinkTarget::Null => Box::new(NullSink),
             SubSinkTarget::Events(tx) => Box::new(crate::worker::SubAgentSink(tx.clone())),
@@ -4174,8 +4198,10 @@ struct PassStatusCtx {
     power_percent: i32,
     think: crate::engine::ThinkMode,
     running_jobs: usize,
-    /// The pass is the memory extraction pass; the footer verb says so.
+    /// The pass is the memory extraction pass; the footer mark says so.
     memory_pass: bool,
+    /// Spans queued behind it plus itself, one footer mark each.
+    memory_queue: usize,
 }
 
 /// Builds the [`Status`] snapshots a generation pass publishes as it runs, from
@@ -4210,6 +4236,8 @@ struct LiveStatus {
     running_jobs: usize,
     /// Copied onto every snapshot; see `Status::memory_pass`.
     memory_pass: bool,
+    /// Copied onto every snapshot; see `Status::memory_queue`.
+    memory_queue: usize,
 }
 
 impl LiveStatus {
@@ -4239,6 +4267,7 @@ impl LiveStatus {
             model_name,
             running_jobs,
             memory_pass: false,
+            memory_queue: 0,
         }
     }
 
@@ -4276,6 +4305,7 @@ impl LiveStatus {
                     looping,
                     running_jobs: self.running_jobs,
                     memory_pass: self.memory_pass,
+                    memory_queue: self.memory_queue,
                     ..Status::default()
                 })
             }
@@ -4302,6 +4332,7 @@ impl LiveStatus {
                     think: self.think,
                     running_jobs: self.running_jobs,
                     memory_pass: self.memory_pass,
+                    memory_queue: self.memory_queue,
                     ..Status::default()
                 })
             }
@@ -4374,6 +4405,7 @@ fn generate_pass(
             sc.running_jobs,
         );
         live.memory_pass = sc.memory_pass;
+        live.memory_queue = sc.memory_queue;
         live
     });
     let st;
@@ -4434,6 +4466,22 @@ fn generate_pass(
 
 /// Shapes a finished quiet pass into what the sub-agent loops act on: an
 /// interrupt (with the partial text), a tool error to feed back, or the calls.
+/// What the memory pass's prefill-only step left behind; see
+/// `Agent::prefill_memory_prompt`.
+enum MemoryPrefill {
+    /// The whole prompt is in the KV; the snapshot covers it exactly.
+    Done(Option<crate::kvcache::KVCache>),
+    /// Cut short by the user; the snapshot covers the prefix that landed.
+    Interrupted(Option<crate::kvcache::KVCache>),
+    /// An engine error; nothing worth keeping.
+    Failed,
+}
+
+/// The `QuietAbort::error` text of a generation the user cut short, as
+/// opposed to an engine fault. The memory pass reads it to tell "put the job
+/// back, uncounted" from "count a failed attempt".
+const QUIET_ABORT_INTERRUPTED: &str = "interrupted";
+
 fn finish_quiet_pass<S: RenderSink>(
     stream: &StreamRenderer<S>,
     mut assistant_text: String,
@@ -4449,7 +4497,7 @@ fn finish_quiet_pass<S: RenderSink>(
     {
         crate::interrupt::clear();
         return Err(QuietAbort {
-            error: "interrupted".to_string(),
+            error: QUIET_ABORT_INTERRUPTED.to_string(),
             partial: assistant_text,
         });
     }
@@ -13253,7 +13301,9 @@ impl Agent<'_> {
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
     ) -> Result<(), String> {
-        log.push_dim(Self::MEMORY_PASS_LINE.to_owned());
+        // No scrollback line: the footer mark (`status::MEMORY_MARK`) is the
+        // whole announcement. Housekeeping the user did not ask for should
+        // not write into the conversation.
         // The remote bridge's persistent `TurnShared` when there is one, so
         // a remote prompt typed during the pass lands in the same queue a
         // local one does, exactly as in `tui_turn_inner`.
@@ -14393,14 +14443,18 @@ impl Agent<'_> {
         finished.len()
     }
 
-    /// Plain-stdout mirror of `tui_memory_pass`: announces, runs one queued
-    /// job, prints its one-line outcome when there is one.
-    fn plain_memory_pass(&mut self) {
-        println!("{}", self.debug_line(Self::MEMORY_PASS_LINE));
+    /// Plain-stdout mirror of `tui_memory_pass`: runs one queued job and
+    /// prints its one-line outcome when there is one. Silent otherwise, like
+    /// the TUI, which has only its footer verb; the plain REPL has no footer
+    /// at idle, so here the pass leaves no trace unless it changed something.
+    fn plain_memory_pass(&mut self) -> bool {
         self.process_memory_job();
         if let Some(notice) = self.pending_memory_notice.take() {
+            println!();
             println!("{}", crate::status::system_line(&notice, self.color));
+            return true;
         }
+        false
     }
 
     /// Plain-stdout mirror of the TUI's dim wake line; silent for `0`.
@@ -14453,6 +14507,7 @@ impl Agent<'_> {
             task,
             depth,
             attempts: 0,
+            resume: None,
         });
         true
     }
@@ -14492,6 +14547,9 @@ impl Agent<'_> {
         let Some(mut job) = self.memory_jobs.pop_front() else {
             return false;
         };
+        // This attempt's own wall time, for the completion line; an earlier
+        // interrupted attempt is not counted, since its prefill was kept.
+        let started = Instant::now();
         // Preflight, before the KV snapshot the fork takes: the sidechain
         // prompt is the whole live session plus the task, so it must fit the
         // headroom the session leaves (`last_ctx_used`, the same figure the
@@ -14517,27 +14575,41 @@ impl Agent<'_> {
         // The prompt goes in verbatim — not through `task_message`, whose
         // "use your tools, then report" framing contradicts the JSON-only
         // contract — and the sidechain is exactly one generation with no
-        // dispatch (`run_memory_round`), so the pass can never touch a tool.
-        // The scoped title displaces whatever the front end shows at idle
-        // and puts it back on every exit path.
+        // dispatch (`run_memory_round_with`), so the pass can never touch a
+        // tool. The only visible trace is the footer verb
+        // (`Status::memory_pass`): no title change and no scrollback line,
+        // because this is housekeeping, not something the user asked for.
         self.extract_state.begin_pass();
-        let _title = crate::title::Scoped::set(crate::title::State::Remembering);
         let fork_at = self.begin_sidechain(job.task.clone(), true);
-        let (done, result) = self.run_sidechain_quietly(Self::run_memory_round);
+        let prompt = match self.memory_pass_prompt(&mut job) {
+            Ok(prompt) => prompt,
+            Err(interrupted) => {
+                // Cut off (or failed) during the prefill itself. The partial
+                // prefill, when there is one, is already on the job; the
+                // fork closes as always.
+                let done = self.close_quiet_sidechain();
+                self.end_subagent_fork(fork_at, "memory", &job.task, done);
+                self.extract_state.end_pass();
+                self.requeue_memory_job(job, interrupted);
+                return false;
+            }
+        };
+        let (done, result) =
+            self.run_sidechain_quietly(|agent| agent.run_memory_round_with(&prompt));
         let report = self.end_subagent_fork(fork_at, "memory", &job.task, done);
         self.extract_state.end_pass();
 
-        let Ok(usable) = result else {
-            job.attempts = job.attempts.saturating_add(1);
-            if job.attempts < crate::memextract::MAX_JOB_ATTEMPTS {
-                self.memory_jobs.push_front(job);
-            } else {
-                self.note_sidechain_outcome("dropped after repeated engine errors");
+        let (usable, interrupted) = match result {
+            Ok(round) => round,
+            // A cut-off generation surfaces here as an abort, not through the
+            // stats (`finish_quiet_pass`); it is not a fault.
+            Err(e) => {
+                self.requeue_memory_job(job, e == QUIET_ABORT_INTERRUPTED);
+                return false;
             }
-            return false;
         };
-        if crate::interrupt::pending() {
-            self.memory_jobs.push_front(job);
+        if interrupted || crate::interrupt::pending() {
+            self.requeue_memory_job(job, true);
             return false;
         }
         let verdicts = if usable {
@@ -14558,13 +14630,79 @@ impl Agent<'_> {
                     self.tool_ctx.memory_log_path.as_deref(),
                     None,
                 );
-                if !notes.is_empty() {
-                    self.report_memory_changes(&notes);
-                }
+                // Reported on every successful pass, changes or not: the
+                // mark in the footer said notes were being taken, and this
+                // is the one line that says the taking is over.
+                self.report_memory_changes(&notes, started.elapsed());
             }
             None => self.note_unusable_memory_reply(),
         }
         true
+    }
+
+    /// The prompt a job's generation runs, with the engine's KV positioned
+    /// for it. A retry with a snapshot restores it and re-issues the stored
+    /// prompt byte for byte, so the KV is reused to its last token. A first
+    /// attempt (or a retry whose restore failed) renders the live session
+    /// plus the task, prefills it alone, and snapshots that into the job for
+    /// a possible retry — `MemoryResume` says why the order matters. The
+    /// generation's reply still lands on the live transcript and is folded
+    /// away by `end_subagent_fork` as before; only the prompt text differs.
+    /// `Err(interrupted)` mirrors `prefill_memory_prompt`.
+    fn memory_pass_prompt(
+        &mut self,
+        job: &mut crate::memextract::MemoryJob,
+    ) -> Result<String, bool> {
+        if let Some(resume) = job.resume.as_ref() {
+            match self.engine.set_kv(&resume.kv) {
+                Ok(()) => {
+                    crate::engine::kv_debug(|| {
+                        "memory pass: restored the interrupted attempt's prefill".to_owned()
+                    });
+                    return Ok(resume.prompt.clone());
+                }
+                Err(e) => crate::engine::kv_debug(|| {
+                    format!("memory pass: snapshot restore failed ({e}); prefilling afresh")
+                }),
+            }
+            job.resume = None;
+        }
+        let prompt = render_transcript(&recovery_session(&self.session), &self.system);
+        let keep = |kv: Option<crate::kvcache::KVCache>| {
+            kv.map(|kv| crate::memextract::MemoryResume {
+                kv,
+                prompt: prompt.clone(),
+            })
+        };
+        match self.prefill_memory_prompt(&prompt) {
+            MemoryPrefill::Done(kv) => {
+                job.resume = keep(kv);
+                Ok(prompt)
+            }
+            // The partial prefill is kept too: the retry extends it.
+            MemoryPrefill::Interrupted(kv) => {
+                job.resume = keep(kv);
+                Err(true)
+            }
+            MemoryPrefill::Failed => Err(false),
+        }
+    }
+
+    /// Puts a job that did not complete back at the front of the queue: an
+    /// interrupt is not a fault and is not counted; an engine error is, and
+    /// the job is dropped at `MAX_JOB_ATTEMPTS` so a broken engine cannot
+    /// pin the idle loop on one span.
+    fn requeue_memory_job(&mut self, mut job: crate::memextract::MemoryJob, interrupted: bool) {
+        if interrupted {
+            self.memory_jobs.push_front(job);
+            return;
+        }
+        job.attempts = job.attempts.saturating_add(1);
+        if job.attempts < crate::memextract::MAX_JOB_ATTEMPTS {
+            self.memory_jobs.push_front(job);
+        } else {
+            self.note_sidechain_outcome("dropped after repeated engine errors");
+        }
     }
 
     /// Runs every queued job to completion, synchronously. For the headless
@@ -14602,11 +14740,12 @@ impl Agent<'_> {
     /// The memory pass's whole sidechain: one quiet generation, its text
     /// pushed for the fork end to extract, and **no tool dispatch** — the
     /// parsed calls are never handed to `run_tool_calls`. Returns whether the
-    /// reply is usable as a verdict list: a reply that asked for a tool, or
-    /// failed preflight, is not.
-    fn run_memory_round(&mut self) -> Result<bool, String> {
-        let prompt_text = render_transcript(&recovery_session(&self.session), &self.system);
-        let pass = match self.generate_quiet(&prompt_text, Instant::now()) {
+    /// reply is usable as a verdict list — a reply that asked for a tool, or
+    /// failed preflight, is not — and whether the generation was cut short,
+    /// which the caller reads from the stats because `generate_pass` clears
+    /// the process-wide interrupt flag as it reports it.
+    fn run_memory_round_with(&mut self, prompt_text: &str) -> Result<(bool, bool), String> {
+        let pass = match self.generate_quiet(prompt_text, Instant::now()) {
             Ok(pass) => pass,
             Err(abort) => {
                 if !abort.partial.is_empty() {
@@ -14616,6 +14755,7 @@ impl Agent<'_> {
             }
         };
         let usable = pass.calls.is_empty() && pass.tool_error.is_none();
+        let interrupted = pass.stats.interrupted;
         self.session.push(Message::assistant(pass.assistant_text));
         self.note_pass(
             None,
@@ -14623,7 +14763,56 @@ impl Agent<'_> {
             pass.guard.clone(),
             pass_stop_text(false, pass.tool_error.as_deref(), pass.calls.len()),
         );
-        Ok(usable)
+        Ok((usable, interrupted))
+    }
+
+    /// Prefills `prompt_text` without sampling a token and returns the KV
+    /// that covers it, for a retry after an interrupt. `Done(None)` on an
+    /// engine with no KV to snapshot (providers, the echo stub), where the
+    /// prefill is skipped as well — a provider call that produces nothing
+    /// would be a round trip for no gain.
+    ///
+    /// An interrupt mid-prefill still yields a snapshot: the engine stops at
+    /// a token boundary and leaves a valid *shorter* KV prefix behind
+    /// (`SYNC_INTERRUPTED`), with the token transcript already reconciled to
+    /// the whole prompt, so a retry that restores it and re-issues the same
+    /// prompt continues the prefill from where it stopped rather than from
+    /// zero. The prefill is the long phase of the pass on a local model, so
+    /// this is the case that matters most.
+    ///
+    /// Runs inside the sidechain's quiet window so its footer status and
+    /// console routing match the generation that follows.
+    fn prefill_memory_prompt(&mut self, prompt_text: &str) -> MemoryPrefill {
+        if self
+            .engine
+            .kv_reuse_probe(prompt_text, self.think)
+            .is_none()
+        {
+            return MemoryPrefill::Done(None);
+        }
+        let mut opts = self.pass_opts();
+        opts.n_predict = 0;
+        let (_done, result) = self.run_sidechain_quietly(|agent| {
+            agent
+                .generate_quiet_with(prompt_text, Instant::now(), &opts)
+                .map(|pass| pass.stats.interrupted)
+                .map_err(|abort| abort.error)
+        });
+        match result {
+            Ok(false) if !crate::interrupt::pending() => MemoryPrefill::Done(self.engine.get_kv()),
+            Ok(_) => MemoryPrefill::Interrupted(self.engine.get_kv()),
+            Err(e) if e == QUIET_ABORT_INTERRUPTED => {
+                MemoryPrefill::Interrupted(self.engine.get_kv())
+            }
+            Err(_) => MemoryPrefill::Failed,
+        }
+    }
+
+    /// The console window a sidechain that never generated still owes its
+    /// fork end, so the dump records an empty window rather than none.
+    fn close_quiet_sidechain(&mut self) -> SubagentDone {
+        let (done, _unit) = self.run_sidechain_quietly(|_agent| Ok::<(), String>(()));
+        done
     }
 
     /// Records a memory pass whose reply yielded no verdicts, in the
@@ -14650,17 +14839,12 @@ impl Agent<'_> {
         !self.last_turn_interrupted && !crate::interrupt::pending()
     }
 
-    /// The dim line both front ends show as a queued memory job starts
-    /// running at idle, so the generation is not mistaken for a hang. The
-    /// TUI footer carries the live verb (`status::MEMORY_VERB`) on top; the
-    /// plain REPL has only this line.
-    const MEMORY_PASS_LINE: &'static str = "memory: taking notes on the last turn…";
-
-    fn report_memory_changes(&mut self, notes: &[String]) {
-        let summary = if notes.len() == 1 {
-            format!("memory: {}", notes[0])
-        } else {
-            format!("memory: {} update(s)", notes.len())
+    fn report_memory_changes(&mut self, notes: &[String], elapsed: Duration) {
+        let took = crate::status::format_elapsed(elapsed.as_secs_f64());
+        let summary = match notes {
+            [] => format!("memory completed in {took}"),
+            [one] => format!("memory completed in {took}: {one}"),
+            many => format!("memory completed in {took}: {} update(s)", many.len()),
         };
         self.pending_memory_notice = Some(summary);
     }
@@ -18763,10 +18947,13 @@ fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
                         // typed meanwhile is picked up between jobs; the
                         // plain REPL cannot cut a generation short on
                         // keystrokes, so a typed line waits out this one.
-                        println!();
-                        agent.plain_memory_pass();
-                        print!("{}", status::prompt_text());
-                        std::io::stdout().flush().map_err(|e| e.to_string())?;
+                        // The prompt is reprinted only when the pass left a
+                        // line, so a silent pass leaves the screen untouched.
+                        let notice = agent.plain_memory_pass();
+                        if notice {
+                            print!("{}", status::prompt_text());
+                            std::io::stdout().flush().map_err(|e| e.to_string())?;
+                        }
                     }
                 }
             }
@@ -31213,9 +31400,10 @@ or the user's next message aborts before its first token"
             !prompt.contains("acting as a subagent"),
             "the generic task framing contradicts the JSON-only contract"
         );
+        let notice = agent.pending_memory_notice.take().expect("reported");
         assert!(
-            agent.pending_memory_notice.is_none(),
-            "an empty array is a silent, valid outcome"
+            notice.starts_with("memory completed in ") && !notice.contains(':'),
+            "an empty array is a valid outcome, reported without a change summary: {notice}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -31248,7 +31436,11 @@ or the user's next message aborts before its first token"
             .pending_memory_notice
             .take()
             .expect("a change summary");
-        assert!(notice.starts_with("memory: "), "{notice}");
+        assert!(notice.starts_with("memory completed in "), "{notice}");
+        assert!(
+            notice.contains(": "),
+            "carries the change summary: {notice}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -31294,6 +31486,11 @@ or the user's next message aborts before its first token"
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let engine = ScriptedEngine {
             replies: vec!["[]".to_string(), "[]".to_string()],
+            // The engine reports the first generation cut short, the way a
+            // real one does when the busy loop raises the interrupt; the
+            // process-wide flag is deliberately not touched here, because
+            // it is shared with every other test on the run.
+            interrupt_at: Some(0),
             prompts: prompts.clone(),
             ..ScriptedEngine::default()
         };
@@ -31302,9 +31499,7 @@ or the user's next message aborts before its first token"
         agent.session.push(Message::assistant("hi"));
         assert!(agent.enqueue_memory_job());
         let task = agent.memory_jobs.front().unwrap().task.clone();
-        crate::interrupt::request();
         assert!(!agent.process_memory_job(), "cut short: not applied");
-        crate::interrupt::clear();
         assert_eq!(agent.memory_jobs.len(), 1, "back on the queue");
         let job = agent.memory_jobs.front().unwrap();
         assert_eq!(job.task, task, "the same job, not a new span");
@@ -31375,6 +31570,193 @@ or the user's next message aborts before its first token"
             agent.session.transcript.is_empty(),
             "the sidechain folded away"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On a KV-capable engine the pass prefills the prompt alone, snapshots
+    /// that KV into the job, then generates; an interrupted attempt keeps
+    /// the snapshot and the retry restores it instead of prefilling again.
+    #[test]
+    fn an_interrupted_attempt_resumes_from_its_prefill_snapshot() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-resume");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            // Call 0 is the prefill-only pass, call 1 the generation the
+            // user cuts short (`interrupt_at`), call 2 the retry's generation.
+            replies: vec![String::new(), "[]".to_string(), "[]".to_string()],
+            interrupt_at: Some(1),
+            prompts: prompts.clone(),
+            kv_events: Some(kv_events.clone()),
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 10,
+                common: 10,
+            }),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job());
+        assert!(agent.memory_jobs.front().unwrap().resume.is_none());
+
+        // First attempt: the generation after the prefill snapshot is cut
+        // short by the engine reporting an interrupt.
+        assert!(!agent.process_memory_job());
+        let job = agent.memory_jobs.front().expect("back on the queue");
+        assert_eq!(job.attempts, 0, "an interrupt is not a fault");
+        let resume = job.resume.as_ref().expect("the prefill was kept");
+        assert!(resume.prompt.contains("user: hello"));
+        let stored_prompt = resume.prompt.clone();
+        {
+            let ev = kv_events.lock().unwrap();
+            // One capture for the fork, one for the resume, in that order;
+            // the fork's (tag 1) is what the fork end restores.
+            let captures = ev.iter().filter(|e| *e == "capture").count();
+            assert_eq!(captures, 2, "{ev:?}");
+            assert_eq!(ev.last().map(String::as_str), Some("restore:1"), "{ev:?}");
+        }
+        let generated_before = prompts.lock().unwrap().len();
+        assert_eq!(
+            generated_before, 2,
+            "prefill-only pass, then the cut-off generation"
+        );
+
+        // Retry: the snapshot is restored, no prefill-only pass runs, and
+        // the prompt is the stored one byte for byte.
+        kv_events.lock().unwrap().clear();
+        assert!(agent.process_memory_job());
+        assert!(!agent.memory_jobs_pending());
+        let ev = kv_events.lock().unwrap().clone();
+        assert!(
+            ev.iter().any(|e| e == "restore:2"),
+            "the resume snapshot (second capture) is restored: {ev:?}"
+        );
+        assert_eq!(
+            ev.iter().filter(|e| *e == "capture").count(),
+            1,
+            "only the fork snapshot; no new prefill snapshot: {ev:?}"
+        );
+        let seen = prompts.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            generated_before + 1,
+            "one generation, no prefill pass"
+        );
+        assert_eq!(
+            seen[seen.len() - 1],
+            stored_prompt,
+            "the stored prompt is re-issued"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The pass's JSON reply never reaches a front end: the render sink is
+    /// null while it runs, whatever `sub_sink` says, so the TUI log and the
+    /// plain REPL show only the completion line.
+    #[test]
+    fn the_memory_pass_renders_nothing_to_the_front_end() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-quiet");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job());
+        assert!(agent.process_memory_job());
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            !events.iter().any(|e| matches!(e, UiEvent::Sub(_))),
+            "no model text or banners for the pass: {events:?}"
+        );
+        assert!(
+            agent
+                .pending_memory_notice
+                .take()
+                .is_some_and(|n| n.starts_with("memory completed in ")),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An interrupt that lands during the prefill itself — the long phase on
+    /// a local model — still leaves a snapshot: the engine keeps the prefix
+    /// it prefilled, and the retry restores it and continues from there.
+    #[test]
+    fn an_interrupt_during_the_prefill_keeps_the_partial_snapshot() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-prefill-interrupt");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            // Call 0 is the prefill-only pass, cut short; call 1 the retry's
+            // generation straight on the restored prefix.
+            replies: vec![String::new(), "[]".to_string()],
+            interrupt_at: Some(0),
+            prompts: prompts.clone(),
+            kv_events: Some(kv_events.clone()),
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 10,
+                common: 10,
+            }),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job());
+        assert!(!agent.process_memory_job(), "cut short during the prefill");
+        let job = agent.memory_jobs.front().expect("back on the queue");
+        assert_eq!(job.attempts, 0, "an interrupt is not a fault");
+        let resume = job.resume.as_ref().expect("the partial prefill was kept");
+        let stored_prompt = resume.prompt.clone();
+        assert_eq!(prompts.lock().unwrap().len(), 1, "no generation ran");
+
+        kv_events.lock().unwrap().clear();
+        assert!(agent.process_memory_job());
+        assert!(!agent.memory_jobs_pending());
+        let ev = kv_events.lock().unwrap().clone();
+        assert!(
+            ev.iter().any(|e| e == "restore:2"),
+            "the partial snapshot is restored: {ev:?}"
+        );
+        assert_eq!(
+            ev.iter().filter(|e| *e == "capture").count(),
+            1,
+            "only the fork snapshot; no new prefill-only pass: {ev:?}"
+        );
+        let seen = prompts.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one generation, straight on the prefix");
+        assert_eq!(seen[1], stored_prompt, "the stored prompt is re-issued");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An engine with no KV to snapshot pays no prefill-only pass either.
+    #[test]
+    fn an_engine_without_kv_skips_the_prefill_snapshot() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-nokv");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job());
+        assert!(agent.process_memory_job());
+        assert_eq!(prompts.lock().unwrap().len(), 1, "the generation alone");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -31612,9 +31994,10 @@ or the user's next message aborts before its first token"
             "the retired span is not re-read: {excerpt}"
         );
         assert!(excerpt.contains("user: more"), "{excerpt}");
+        let notice = agent.pending_memory_notice.take().expect("reported");
         assert!(
-            agent.pending_memory_notice.is_none(),
-            "the notice is not repeated"
+            notice.starts_with("memory completed in "),
+            "the oversized notice is not repeated; only the pass's own report: {notice}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
