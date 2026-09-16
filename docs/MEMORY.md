@@ -230,18 +230,32 @@ response with no tool calls (`Agent::maybe_extract_memories` in `src/ui.rs`),
 through the same sub-agent sidechain other background work uses, so it leaves
 no KV checkpoint debris.
 
-**The pass is gated by three checks, in order** (`ExtractState::should_run`):
+**The pass is gated by four checks, in this order** (`ExtractState::should_run`):
 
-1. **Mutual exclusion.** If the model itself called `remember` or `forget`
-   this turn, the passive pass is suppressed for that turn only — the
-   model's own judgment wins, and the suppression does not carry into the
-   next turn.
-2. **Throttle.** The pass runs only every `memory.extractEveryNTurns`
-   *eligible* turns (a turn that ended with no tool calls and no model
-   `remember`), counted independently of turns that don't qualify.
-3. **Depth keying.** The pass tracks `processed_depth`, the transcript
-   length its last completed run covered, and only fires when the current
+1. **Enabled, and mutual exclusion.** `memory.autoExtract` must be on, and
+   the model must not have called `remember` or `forget` itself this turn.
+   A model write suppresses the passive pass for that turn only: the
+   model's own judgment wins over a second reading of the same turn, and
+   the suppression does not carry into the next turn. The flag is consumed
+   at the top of the function, before any other check, so a turn cannot
+   stay suppressed because a later gate returned first.
+2. **Depth keying.** The pass tracks `processed_depth`, the transcript
+   length its last completed run covered, and fires only when the current
    depth has grown past it.
+3. **Not already running.** A trigger that arrives while a pass is in
+   flight is dropped outright. Nothing is recorded about it, because
+   nothing needs to be: once `finish` clears the flag and advances
+   `processed_depth`, the next call re-derives the span from
+   `processed_depth` against the then-current depth, which necessarily
+   covers everything that arrived meanwhile, in one trailing run.
+4. **Throttle.** The pass runs only every `memory.extractEveryNTurns`
+   *eligible* turns.
+
+The order is what makes "eligible" mean something. The throttle counter is
+reached last, so a turn skipped for suppression, for having nothing new, or
+for arriving mid-pass does not count against it. Only a turn that genuinely
+had new transcript to look at, and could have been acted on, advances the
+count.
 
 **The invariant that makes depth keying correct, stated the way the code
 states it:** a pass must read only the transcript above its recorded depth,
