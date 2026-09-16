@@ -173,18 +173,27 @@ pub fn select_for_render(
     let mut dropped: Vec<Entry> = Vec::new();
 
     for kind in Kind::ALL {
-        let mut block: Vec<&Entry> = entries
+        // Position is carried so it can serve as the final tiebreak. Entries
+        // are appended, so a later position is a newer entry: without this,
+        // a block whose entries all share one date ties completely, the
+        // stable sort preserves file order, and the budget loop keeps the
+        // *oldest* -- the inversion the date tiebreak above exists to fix,
+        // surviving in the one case a date cannot separate.
+        let mut block: Vec<(usize, &Entry)> = entries
             .iter()
-            .filter(|e| e.kind == kind && !meta.get(&e.id()).retracted)
+            .enumerate()
+            .filter(|(_, e)| e.kind == kind && !meta.get(&e.id()).retracted)
             .collect();
-        block.sort_by(|a, b| {
+        block.sort_by(|(ia, a), (ib, b)| {
             let (ma, mb) = (meta.get(&a.id()), meta.get(&b.id()));
             mb.pinned
                 .cmp(&ma.pinned)
                 .then(mb.uses.cmp(&ma.uses))
                 .then(mb.last_used.cmp(&ma.last_used))
                 .then(b.date.cmp(&a.date))
+                .then(ib.cmp(ia))
         });
+        let block: Vec<&Entry> = block.into_iter().map(|(_, e)| e).collect();
         let budget = budgets.for_kind(kind);
         let mut used = 0usize;
         for e in block {
@@ -754,7 +763,22 @@ pub fn apply(sources: &[Source], edited: &str) -> Result<Vec<String>, String> {
             ));
             continue;
         };
-        let current = std::fs::read_to_string(&src.path).unwrap_or_default();
+        // An unreadable file is not an empty one. Treating it as empty here
+        // would compare the edited body against "" , decide it changed, and
+        // write the editor's view over a file whose real contents were never
+        // loaded -- the same way an unreadable file used to be overwritten by
+        // the template on the automatic path.
+        let current = match std::fs::read_to_string(&src.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                report.push(format!(
+                    "{}: unreadable, left untouched ({e})",
+                    src.path.display()
+                ));
+                continue;
+            }
+        };
         let unchanged = current.trim_end_matches('\n') == body.trim_end_matches('\n');
         if unchanged {
             report.push(format!("{}: unchanged", src.path.display()));
@@ -1887,6 +1911,68 @@ mod tests {
             reloaded.get(&v3.id()).uses,
             2,
             "usage accumulated across two rewrites"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_date_legacy_entries_over_budget_still_keep_the_newest() {
+        // The date tiebreak cannot separate entries that share a date, which
+        // is exactly what a file written in one sitting looks like. Position
+        // is the last resort, and without it the stable sort would keep the
+        // oldest -- the upgrade regression this ordering exists to prevent.
+        let entries: Vec<Entry> = (0..40)
+            .map(|i| Entry {
+                date: "2026-01-01".into(),
+                kind: Kind::Project,
+                text: format!("entry number {i:02}"),
+            })
+            .collect();
+        let budgets = Budgets {
+            project: entries[0].render().len() * 5,
+            ..Budgets::default()
+        };
+        let (kept, dropped) = select_for_render(&entries, &MetaStore::default(), &budgets);
+        assert!(
+            !kept.is_empty() && !dropped.is_empty(),
+            "the budget must bite"
+        );
+        let newest_kept = kept.iter().any(|e| e.text.contains("39"));
+        let oldest_dropped = dropped.iter().any(|e| e.text.contains("00"));
+        assert!(newest_kept, "the newest entry must survive: kept {kept:?}");
+        assert!(oldest_dropped, "the oldest entry is the one to drop");
+    }
+
+    #[test]
+    fn the_memory_editor_refuses_to_write_over_an_unreadable_file() {
+        // The /memory editor reads every source, shows them as one document,
+        // and writes the edited sections back. An unreadable file must not
+        // render as an empty section that then overwrites the real contents.
+        let dir =
+            std::env::temp_dir().join(format!("plank-apply-unreadable-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        let path = dir.join(".plank").join("MEMORY.md");
+        let raw: &[u8] = b"# Memory\n\n- (2026-09-01) [project] \xff\xfe not utf-8\n";
+        std::fs::write(&path, raw).unwrap();
+
+        let sources = vec![Source {
+            scope: Scope::Project,
+            path: path.clone(),
+        }];
+        let edited = format!(
+            "<!-- plank-memory: begin project {} -->\nreplacement body\n<!-- plank-memory: end project -->\n",
+            path.display()
+        );
+        let report = apply(&sources, &edited).unwrap();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            raw,
+            "the unreadable file must survive byte-for-byte"
+        );
+        assert!(
+            report.iter().any(|line| line.contains("unreadable")),
+            "the user must be told why nothing was written: {report:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
