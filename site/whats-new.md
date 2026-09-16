@@ -7,8 +7,19 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.1.0 is out**, and the beta channel is on 5.1.8. The patch number
+**v5.1.0 is out**, and the beta channel is on 5.1.9. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.1.9: notes are taken at idle, and the status bar holds still.** The
+memory extraction pass no longer holds your prompt. A turn end only snapshots
+the new part of the conversation into a queue; the reading happens at the
+next idle moment, with a `✍️` per queued span in the footer and one dim
+`memory completed in 12s` line at the end. Type while it runs and it stops,
+goes back on the queue and your turn starts at once; the retry resumes from
+the prefill it already did. The figures that used to churn in the status bar
+(prefill and generation rates, the MTP per-step numbers) now float at the
+right end of the rule under the prompt, like the session name above it, and
+the loop-guard and micro-compaction icons and the `idle` word are gone.
 
 **5.1.8: a lighter system-prompt reminder.** Every 50K tokens plank reminds
 the model of its system prompt so a long session does not drift. Until now that

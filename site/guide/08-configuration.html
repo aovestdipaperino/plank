@@ -414,9 +414,9 @@ the C reference does.</td>
 <tr>
 <td><code>memory.autoExtract</code></td>
 <td><code>true</code></td>
-<td>run the extraction pass at the end of turns with no tool calls. It
-costs a generation and a KV snapshot each time, so it is a visible pause
-on a local model.</td>
+<td>queue the extraction pass at the end of turns with no tool calls; it
+runs at the next idle moment and a typed prompt interrupts it. It costs
+a generation and a KV snapshot each time, at idle.</td>
 </tr>
 <tr>
 <td><code>memory.extractEveryNTurns</code></td>

@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.1.9] - 2026-09-16
+
+### Changed
+
+- **The memory extraction pass no longer holds the prompt.** A turn end now
+  only snapshots the new part of the conversation into a queue; the reading
+  happens at the next idle moment, on a worker with the screen live. Typing a
+  prompt while notes are being taken interrupts the pass, puts the job back on
+  the queue and starts your turn at once. In the TUI the pass used to run on
+  the UI thread after the worker was joined, so nothing repainted and no key
+  was read until it finished. An interrupted turn queues nothing, and the
+  Stop hooks now fire after the snapshot, right before the prompt comes back.
+- **An interrupted pass resumes where it stopped.** The pass prefills its
+  prompt first, snapshots that KV into the job, then generates; an interrupt,
+  including one mid-prefill, keeps the snapshot and the retry continues from
+  it instead of prefilling from zero.
+- **What a pass shows.** One `✍️` per queued span in the footer, in place of
+  the state word, and one dim `memory completed in <elapsed>` line on success
+  with the change summary when it wrote something. No window title change, no
+  progress line, no `no usable verdicts` notice, and the pass's own JSON reply
+  is never rendered into the log.
+- **Transient figures move to the rule below the prompt.** Prefill and
+  generation tokens and rates, the MTP per-step figures and the memory pass's
+  numbers now float at the right end of the rule under the prompt, the way the
+  session name floats on the rule above it, so the status bar holds still. The
+  line pinned under the output keeps only the throbber, the verb and the
+  clock; the footer's MTP slot shows the mark alone.
+
+### Removed
+
+- **The loop-guard and micro-compaction footer icons**, with the wastebasket
+  double-click. `/loopguard` and `/mc` remain the way to read and flip both.
+- **The footer's `idle` state word.** The prompt caret already says so.
+
 ## [5.1.8] - 2026-09-16
 
 ### Added
