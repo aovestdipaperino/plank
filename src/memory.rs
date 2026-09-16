@@ -52,6 +52,21 @@ pub fn path_for(scope: Scope, cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+/// As [`path_for`], but for [`Scope::User`] an explicit `user_root` (when
+/// given) is used in place of resolving `HOME`: the path becomes
+/// `user_root.join("MEMORY.md")`. This is what lets the mutating,
+/// both-scope functions (`forget_matching_to`, `apply_verdicts_to`) be
+/// exercised in tests without ever reading or writing the real
+/// `~/.plank/MEMORY.md` — the `Scope::Project` branch is untouched, since
+/// that scope already gets its own hermetic redirection through `cwd`.
+#[must_use]
+fn scoped_path_for(scope: Scope, cwd: &Path, user_root: Option<&Path>) -> Option<PathBuf> {
+    match (scope, user_root) {
+        (Scope::User, Some(root)) => Some(root.join("MEMORY.md")),
+        _ => path_for(scope, cwd),
+    }
+}
+
 /// Appends a dated bullet to the scope's memory file, creating it (with the
 /// template header) on first use. Returns the file written.
 ///
@@ -1047,23 +1062,29 @@ fn apply_one_verdict(state: &mut ScopeState<'_>, scope: Scope, v: &Verdict, date
 /// to the audit log.
 #[must_use]
 pub fn apply_verdicts(cwd: &Path, verdicts: &[Verdict], date: &str) -> Vec<String> {
-    apply_verdicts_to(cwd, verdicts, date, None)
+    apply_verdicts_to(cwd, verdicts, date, None, None)
 }
 
 /// As [`apply_verdicts`], but `log_path` overrides where audit lines land:
 /// `Some(path)` writes there instead of resolving `~/.plank` from `HOME`,
 /// which is what lets a test redirect the audit log without ever setting
-/// `HOME` itself. `None` keeps production behavior.
+/// `HOME` itself. `user_root` is the analogous override for *where the user
+/// scope's `MEMORY.md` itself lives*: `Some(root)` resolves it as
+/// `root.join("MEMORY.md")` instead of following `HOME`, so a test can
+/// exercise the user-scope branch of this loop — including its deletions and
+/// rewrites — without ever touching or setting up the real `~/.plank`.
+/// `None` for either keeps production behavior.
 #[must_use]
 pub(crate) fn apply_verdicts_to(
     cwd: &Path,
     verdicts: &[Verdict],
     date: &str,
     log_dest: Option<&Path>,
+    user_root: Option<&Path>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
     for scope in [Scope::User, Scope::Project] {
-        let Some(path) = path_for(scope, cwd) else {
+        let Some(path) = scoped_path_for(scope, cwd, user_root) else {
             continue;
         };
         let body = std::fs::read_to_string(&path).unwrap_or_else(|_| TEMPLATE.to_string());
@@ -1165,16 +1186,21 @@ pub fn forget_preview(cwd: &Path, pattern: &str) -> Vec<String> {
 ///
 /// Returns a message when `pattern` is empty or a file write fails.
 pub fn forget_matching(cwd: &Path, pattern: &str) -> Result<Vec<String>, String> {
-    forget_matching_to(cwd, pattern, None)
+    forget_matching_to(cwd, pattern, None, None)
 }
 
 /// As [`forget_matching`], but `log_dest` overrides where audit lines land,
 /// same as [`apply_verdicts_to`]'s `log_dest` — it lets tests exercise this
 /// without ever touching the real `~/.plank` audit log or setting `HOME`.
+/// `user_root` is [`apply_verdicts_to`]'s same override for where the user
+/// scope's `MEMORY.md` itself lives: without it, this function — which
+/// *deletes* matching lines — would silently mutate the real
+/// `~/.plank/MEMORY.md` in any test that redirects only `cwd`.
 pub(crate) fn forget_matching_to(
     cwd: &Path,
     pattern: &str,
     log_dest: Option<&Path>,
+    user_root: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     let needle = pattern.trim().to_lowercase();
     if needle.is_empty() {
@@ -1182,7 +1208,7 @@ pub(crate) fn forget_matching_to(
     }
     let mut removed = Vec::new();
     for scope in [Scope::User, Scope::Project] {
-        let Some(path) = path_for(scope, cwd) else {
+        let Some(path) = scoped_path_for(scope, cwd, user_root) else {
             continue;
         };
         let Ok(body) = std::fs::read_to_string(&path) else {
@@ -1637,6 +1663,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-verdict-update-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".plank")).unwrap();
         let path = dir.join(".plank").join("MEMORY.md");
+        let user = dir.join("userhome");
         std::fs::write(&path, "# Memory\n\n- (2026-09-01) [project] old wording\n").unwrap();
 
         let old = Entry {
@@ -1658,6 +1685,7 @@ mod tests {
             }],
             "2026-09-15",
             Some(&log),
+            Some(&user),
         );
 
         let body = std::fs::read_to_string(&path).unwrap();
@@ -1687,6 +1715,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-verdict-ghost-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".plank")).unwrap();
         let path = dir.join(".plank").join("MEMORY.md");
+        let user = dir.join("userhome");
         std::fs::write(&path, "# Memory\n\n- (2026-09-01) [project] kept\n").unwrap();
 
         let log = dir.join("audit.jsonl");
@@ -1697,6 +1726,7 @@ mod tests {
             }],
             "2026-09-15",
             Some(&log),
+            Some(&user),
         );
 
         assert!(std::fs::read_to_string(&path).unwrap().contains("kept"));
@@ -1715,6 +1745,7 @@ mod tests {
             std::env::temp_dir().join(format!("plank-verdict-update-chain-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".plank")).unwrap();
         let path = dir.join(".plank").join("MEMORY.md");
+        let user = dir.join("userhome");
         std::fs::write(&path, "# Memory\n\n- (2026-09-01) [project] v1\n").unwrap();
 
         let v1 = Entry {
@@ -1735,6 +1766,7 @@ mod tests {
             }],
             "2026-09-10",
             Some(&log),
+            Some(&user),
         );
         let v2 = Entry {
             date: "2026-09-01".into(),
@@ -1752,6 +1784,7 @@ mod tests {
             ],
             "2026-09-12",
             Some(&log),
+            Some(&user),
         );
         let v3 = Entry {
             date: "2026-09-01".into(),
@@ -1780,6 +1813,7 @@ mod tests {
         ));
         let plank_dir = dir.join(".plank");
         let path = plank_dir.join("MEMORY.md");
+        let user = dir.join("userhome");
         std::fs::create_dir_all(&path).unwrap(); // path is a directory, not a file
 
         // Seed the sidecar with a counter that must survive untouched.
@@ -1799,6 +1833,7 @@ mod tests {
             }],
             "2026-09-15",
             Some(&log),
+            Some(&user),
         );
 
         assert!(
@@ -1828,6 +1863,7 @@ mod tests {
             std::env::temp_dir().join(format!("plank-verdict-used-logs-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".plank")).unwrap();
         let path = dir.join(".plank").join("MEMORY.md");
+        let user = dir.join("userhome");
         let text = "kept";
         std::fs::write(
             &path,
@@ -1847,6 +1883,7 @@ mod tests {
             &[Verdict::Used { id: id.clone() }],
             "2026-09-15",
             Some(&log),
+            Some(&user),
         );
 
         let log_text = std::fs::read_to_string(&log).unwrap_or_default();
@@ -1871,6 +1908,7 @@ mod tests {
             std::env::temp_dir().join(format!("plank-verdict-hermetic-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".plank")).unwrap();
         let path = dir.join(".plank").join("MEMORY.md");
+        let user = dir.join("userhome");
         std::fs::write(
             &path,
             "# Memory\n\n- (2026-09-01) [project] hermetic fact\n",
@@ -1891,6 +1929,7 @@ mod tests {
             &[Verdict::Used { id: id.clone() }],
             "2026-09-15",
             Some(&log),
+            Some(&user),
         );
 
         assert!(
@@ -1914,6 +1953,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-forgetcmd-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".plank")).unwrap();
         let path = dir.join(".plank").join("MEMORY.md");
+        let user = dir.join("userhome");
         std::fs::write(
             &path,
             "# Memory\n\n\
@@ -1923,7 +1963,7 @@ mod tests {
         .unwrap();
 
         let log = dir.join("audit.jsonl");
-        let removed = forget_matching_to(&dir, "beta", Some(&log)).unwrap();
+        let removed = forget_matching_to(&dir, "beta", Some(&log), Some(&user)).unwrap();
         assert_eq!(removed.len(), 1);
         assert!(removed[0].contains("Ship the BETA"));
 
@@ -1936,7 +1976,7 @@ mod tests {
         assert!(log_text.contains("Ship the BETA"));
 
         assert!(
-            forget_matching_to(&dir, "nothing here", Some(&log))
+            forget_matching_to(&dir, "nothing here", Some(&log), Some(&user))
                 .unwrap()
                 .is_empty()
         );
@@ -1955,6 +1995,7 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join(".plank")).unwrap();
         let path = dir.join(".plank").join("MEMORY.md");
+        let user = dir.join("userhome");
         std::fs::write(&path, "# Memory\n\n- (2026-09-01) [project] kept as-is\n").unwrap();
         let id = Entry {
             date: "2026-09-01".into(),
@@ -1969,6 +2010,7 @@ mod tests {
             &[Verdict::Used { id: id.clone() }],
             "2026-09-15",
             Some(&log),
+            Some(&user),
         );
 
         let body_after = std::fs::read_to_string(&path).unwrap();
@@ -1981,6 +2023,76 @@ mod tests {
             reloaded.get(&id).uses,
             1,
             "the bump must be persisted even though no line changed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forget_matching_with_an_explicit_user_root_never_touches_the_default_user_scope_location() {
+        // The hermetic property for the *user-scope memory file itself*
+        // (companion to `apply_verdicts_never_touches_the_real_audit_log`,
+        // which only covers the audit log). `forget_matching_to` deletes
+        // matching lines, so if it ever fell back to resolving `HOME` for
+        // the user scope despite an explicit `user_root`, this would catch
+        // it: a "beta" line planted under a decoy default-location stand-in
+        // must survive completely untouched, while the same line planted
+        // under the explicit `user_root` is deleted.
+        let dir = std::env::temp_dir().join(format!(
+            "plank-forget-user-root-hermetic-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        let project_path = dir.join(".plank").join("MEMORY.md");
+        std::fs::write(
+            &project_path,
+            "# Memory\n\n- (2026-09-01) [project] project scope entry\n",
+        )
+        .unwrap();
+
+        let user_root = dir.join("userhome");
+        std::fs::create_dir_all(&user_root).unwrap();
+        let user_path = user_root.join("MEMORY.md");
+        std::fs::write(
+            &user_path,
+            "# Memory\n\n- (2026-09-01) [user] contains beta keyword\n",
+        )
+        .unwrap();
+
+        // A decoy standing in for "the default user-scope location" — never
+        // passed as `user_root`, so it must be left byte-for-byte alone.
+        let decoy_default = dir.join("decoy-default-userhome");
+        std::fs::create_dir_all(&decoy_default).unwrap();
+        let decoy_path = decoy_default.join("MEMORY.md");
+        let decoy_before =
+            "# Memory\n\n- (2026-09-01) [user] also contains beta keyword\n".to_string();
+        std::fs::write(&decoy_path, &decoy_before).unwrap();
+
+        let removed = forget_matching_to(&dir, "beta", None, Some(&user_root)).unwrap();
+
+        assert_eq!(
+            removed.len(),
+            1,
+            "only the entry under the explicit user_root is matched and removed"
+        );
+        assert!(removed[0].contains("contains beta keyword"));
+
+        let user_body = std::fs::read_to_string(&user_path).unwrap();
+        assert!(
+            !user_body.contains("beta"),
+            "the explicit user_root's file must have had the match deleted"
+        );
+
+        let decoy_after = std::fs::read_to_string(&decoy_path).unwrap();
+        assert_eq!(
+            decoy_after, decoy_before,
+            "a location that was never passed as user_root must be left byte-for-byte untouched"
+        );
+
+        let project_body = std::fs::read_to_string(&project_path).unwrap();
+        assert!(
+            project_body.contains("project scope entry"),
+            "the project scope is unaffected by the user-scope redirection"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

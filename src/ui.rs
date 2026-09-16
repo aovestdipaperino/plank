@@ -14132,6 +14132,7 @@ impl Agent<'_> {
                 &verdicts,
                 &date,
                 self.tool_ctx.memory_log_path.as_deref(),
+                None,
             );
             if !notes.is_empty() {
                 self.report_memory_changes(&notes);
