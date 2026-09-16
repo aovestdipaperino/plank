@@ -67,6 +67,7 @@ pub mod kvtier;
 pub mod kvtree;
 pub mod logo;
 pub mod manifest;
+pub mod memextract;
 pub mod memory;
 pub mod mempressure;
 #[cfg(feature = "builtin_editor")]
