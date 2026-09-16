@@ -1048,9 +1048,14 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "append a durable note to project or user memory",
     },
     SlashCommand {
+        name: "/forget",
+        args: "<pattern>",
+        desc: "delete memory entries matching pattern, after confirming",
+    },
+    SlashCommand {
         name: "/memory",
-        args: "",
-        desc: "edit user and project memory together in the built-in editor",
+        args: "[log]",
+        desc: "edit user and project memory, or show the memory change log",
     },
     SlashCommand {
         name: "/think",
@@ -1250,6 +1255,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         // model as an ordinary prompt.
         || crate::agents::is_subagent_command(first_token(cmd))
         || slash_command_with_args(cmd, "/remember")
+        || slash_command_with_args(cmd, "/forget")
         || slash_command_with_args(cmd, "/repro")
         || slash_command_with_args(cmd, "/debug")
         || slash_command_with_args(cmd, "/mtp")

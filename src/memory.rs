@@ -1126,6 +1126,101 @@ pub(crate) fn apply_verdicts_to(
     notes
 }
 
+/// Entries in either scope whose text contains `pattern`, case-insensitively,
+/// rendered as `[kind] text`, without modifying anything. Callers use this to
+/// show the user exactly what a following [`forget_matching`] call would
+/// remove, before asking them to confirm it.
+#[must_use]
+pub fn forget_preview(cwd: &Path, pattern: &str) -> Vec<String> {
+    let needle = pattern.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for scope in [Scope::User, Scope::Project] {
+        let Some(path) = path_for(scope, cwd) else {
+            continue;
+        };
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for e in parse_entries(&body) {
+            if e.text.to_lowercase().contains(&needle) {
+                hits.push(format!("[{}] {}", e.kind.tag(), e.text));
+            }
+        }
+    }
+    hits
+}
+
+/// Removes every entry whose text contains `pattern`, case-insensitively,
+/// from both scopes. Returns the removed entries' rendered `[kind] text`
+/// form.
+///
+/// Unlike a model `forget` ([`MetaStore::set_retracted`]), this deletes the
+/// bytes outright: the user asked, so there is nothing to keep recoverable.
+/// Callers are expected to confirm with the user before calling this.
+///
+/// # Errors
+///
+/// Returns a message when `pattern` is empty or a file write fails.
+pub fn forget_matching(cwd: &Path, pattern: &str) -> Result<Vec<String>, String> {
+    forget_matching_to(cwd, pattern, None)
+}
+
+/// As [`forget_matching`], but `log_dest` overrides where audit lines land,
+/// same as [`apply_verdicts_to`]'s `log_dest` — it lets tests exercise this
+/// without ever touching the real `~/.plank` audit log or setting `HOME`.
+pub(crate) fn forget_matching_to(
+    cwd: &Path,
+    pattern: &str,
+    log_dest: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let needle = pattern.trim().to_lowercase();
+    if needle.is_empty() {
+        return Err("give a pattern to forget".to_string());
+    }
+    let mut removed = Vec::new();
+    for scope in [Scope::User, Scope::Project] {
+        let Some(path) = path_for(scope, cwd) else {
+            continue;
+        };
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut kept: Vec<&str> = Vec::new();
+        let mut hits: Vec<Entry> = Vec::new();
+        for line in body.lines() {
+            match parse_entries(line).into_iter().next() {
+                Some(e) if e.text.to_lowercase().contains(&needle) => hits.push(e),
+                _ => kept.push(line),
+            }
+        }
+        if hits.is_empty() {
+            continue;
+        }
+        let mut out = kept.join("\n");
+        out.push('\n');
+        std::fs::write(&path, out).map_err(|e| e.to_string())?;
+
+        for e in &hits {
+            let id = e.id();
+            log_change_to(log_dest, "forget", scope, &id, &e.text, "user /forget");
+            removed.push(format!("[{}] {}", e.kind.tag(), e.text));
+        }
+
+        let meta_path = meta_path_for(&path);
+        let mut meta = MetaStore::load(&meta_path);
+        let live: Vec<String> = parse_entries(&kept.join("\n"))
+            .iter()
+            .map(Entry::id)
+            .collect();
+        meta.gc(&live);
+        let _ = meta.save(&meta_path);
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1809,6 +1904,41 @@ mod tests {
         assert_eq!(
             real_before, real_after,
             "the real ~/.plank audit log must be untouched by a redirected call"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forget_matching_removes_case_insensitive_hits_and_leaves_the_rest() {
+        let dir = std::env::temp_dir().join(format!("plank-forgetcmd-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        let path = dir.join(".plank").join("MEMORY.md");
+        std::fs::write(
+            &path,
+            "# Memory\n\n\
+             - (2026-09-01) [project] Ship the BETA on Friday\n\
+             - (2026-09-02) [user] prefers tabs\n",
+        )
+        .unwrap();
+
+        let log = dir.join("audit.jsonl");
+        let removed = forget_matching_to(&dir, "beta", Some(&log)).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].contains("Ship the BETA"));
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("BETA"));
+        assert!(body.contains("prefers tabs"));
+
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert!(log_text.contains("\"action\": \"forget\""));
+        assert!(log_text.contains("Ship the BETA"));
+
+        assert!(
+            forget_matching_to(&dir, "nothing here", Some(&log))
+                .unwrap()
+                .is_empty()
         );
 
         let _ = std::fs::remove_dir_all(&dir);

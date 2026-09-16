@@ -6445,14 +6445,62 @@ impl Agent<'_> {
                 ),
                 Err(e) => println!("{e}\nusage: /remember [user] <text> (default scope: project)"),
             },
+            "/forget" => {
+                let pattern = arg.trim();
+                if pattern.is_empty() {
+                    println!("usage: /forget <pattern>");
+                } else {
+                    let hits = crate::memory::forget_preview(&self.tool_ctx.cwd, pattern);
+                    if hits.is_empty() {
+                        println!("nothing matched {pattern:?}");
+                    } else {
+                        println!("this will remove:");
+                        for h in &hits {
+                            println!("  {h}");
+                        }
+                        if ask_yes_no_on_stdin(
+                            &format!(
+                                "remove {} matching {pattern:?}?",
+                                if hits.len() == 1 {
+                                    "this entry"
+                                } else {
+                                    "these entries"
+                                }
+                            ),
+                            "remove? [y/N] ",
+                        ) {
+                            match crate::memory::forget_matching(&self.tool_ctx.cwd, pattern) {
+                                Ok(removed) => {
+                                    for r in &removed {
+                                        println!("forgot {r}");
+                                    }
+                                }
+                                Err(e) => println!("{e}"),
+                            }
+                        } else {
+                            println!("forget cancelled");
+                        }
+                    }
+                }
+            }
             // Static equivalent of the TUI editor: print the combined view so
             // the sources and their bounds are at least visible here.
+            "/memory" if arg.trim() == "log" => {
+                let entries = crate::memory::read_log(20);
+                if entries.is_empty() {
+                    println!("no memory changes logged yet");
+                } else {
+                    for line in entries {
+                        println!("{}", render_memory_log_line(&line));
+                    }
+                }
+            }
             "/memory" => {
                 print!(
                     "{}",
                     crate::memory::combine(&crate::memory::sources_for(&self.tool_ctx.cwd))
                 );
-                println!("/memory editing requires the interactive TUI");
+                println!("/memory editing requires the interactive TUI (or /memory log)");
             }
             "/rate" => println!("{}", self.rate_command(arg)),
             "/search" => {
@@ -15186,6 +15234,64 @@ impl Agent<'_> {
                     log.push_plain("usage: /remember [user] <text> (default scope: project)");
                 }
             },
+            "/forget" => {
+                let pattern = arg.trim();
+                if pattern.is_empty() {
+                    log.push_plain("usage: /forget <pattern>");
+                } else {
+                    let hits = crate::memory::forget_preview(&self.tool_ctx.cwd, pattern);
+                    if hits.is_empty() {
+                        log.push_plain(format!("nothing matched {pattern:?}"));
+                    } else {
+                        log.push_plain("this will remove:");
+                        for h in &hits {
+                            log.push_dim(format!("  {h}"));
+                        }
+                        let question = format!(
+                            "remove {} matching {pattern:?}?",
+                            if hits.len() == 1 {
+                                "this entry"
+                            } else {
+                                "these entries"
+                            }
+                        );
+                        let confirmed = run_yes_no_panel(
+                            terminal,
+                            &*log,
+                            view,
+                            "Forget",
+                            &question,
+                            ("Keep it", "cancel and leave memory unchanged"),
+                            ("Forget", "remove the matching entries now"),
+                        );
+                        if confirmed {
+                            match crate::memory::forget_matching(&self.tool_ctx.cwd, pattern) {
+                                Ok(removed) => {
+                                    for r in &removed {
+                                        log.push_dim(format!("forgot {r}"));
+                                    }
+                                }
+                                Err(e) => log.push_plain(e),
+                            }
+                        } else {
+                            log.push_plain("forget cancelled");
+                        }
+                    }
+                }
+            }
+            // `/memory log` is static text, on both front ends: it is the
+            // static-text equivalent the plain-stdout path relies on, so it
+            // must not gain a pane the plain path lacks.
+            "/memory" if arg.trim() == "log" => {
+                let entries = crate::memory::read_log(20);
+                if entries.is_empty() {
+                    log.push_plain("no memory changes logged yet");
+                } else {
+                    for line in entries {
+                        log.push_plain(render_memory_log_line(&line));
+                    }
+                }
+            }
             "/memory" => self.tui_memory(log, terminal),
             "/search" => {
                 if arg.trim().is_empty() {
@@ -15547,6 +15653,23 @@ impl Agent<'_> {
             "/open needs the built-in editor (build with --features builtin_editor)".to_owned(),
         );
     }
+}
+
+/// Renders one `memory-log.jsonl` line (as written by
+/// [`crate::memory::log_change`]) as a single human-readable line, for
+/// `/memory log` on both front ends. Falls back to the raw line if it is not
+/// the expected JSON shape, so a hand-edited or malformed line still shows.
+fn render_memory_log_line(line: &str) -> String {
+    use crate::tools::mcp::json_parse;
+    let Some(json) = json_parse(line) else {
+        return line.to_string();
+    };
+    let action = json.str_or("action", "?");
+    let scope = json.str_or("scope", "?");
+    let id = json.str_or("id", "?");
+    let text = json.str_or("text", "");
+    let reason = json.str_or("reason", "");
+    format!("{action:<7} [{scope}] {id} — {text} ({reason})")
 }
 
 /// Asks a yes/no question at the plain-stdout prompt and returns the answer.
