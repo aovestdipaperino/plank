@@ -3886,6 +3886,11 @@ impl Agent<'_> {
         };
         let preflight = edit_preflight(&self.tool_ctx);
         self.sync_engine_images();
+        // Same rescue as both main-turn paths: a prompt that diverges behind
+        // the live KV end would rebuild from zero. In a sub-agent that is the
+        // recovery pass after a reasoning-cycle stop, whose stubbed `<think>`
+        // block diverges from the KV the stopped pass left behind.
+        self.rescue_prefix_before_rebuild(prompt_text);
         let pass = generate_pass(
             self.engine.as_mut(),
             prompt_text,
@@ -31148,6 +31153,46 @@ or the user's next message aborts before its first token"
         assert_eq!(
             events.lock().unwrap().as_slice(),
             ["capture", "probe", "generate", "restore:1"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The sub-agent's quiet pass runs the same pre-generation rescue as the
+    /// main turn: with the divergence shape staged, the fork snapshot is
+    /// restored *before* the generate, and the fork end restores it again.
+    #[test]
+    fn a_quiet_sub_agent_pass_rescues_the_prefix_before_generating() {
+        let dir =
+            std::env::temp_dir().join(format!("plank-ui-quiet-rescue-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["Report: done.\n".to_string()],
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 9_000,
+                common: 8_500,
+            }),
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hi"));
+        agent.session.push(Message::assistant("hello"));
+
+        let fork_at = agent.begin_subagent_fork(None, "count the tests", true);
+        let (done, result) = agent.run_subagent_loop();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            agent
+                .end_subagent_fork(fork_at, "sub", "count the tests", done)
+                .is_some()
+        );
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["capture", "probe", "restore:1", "generate", "restore:1"]
         );
         std::fs::remove_dir_all(&dir).ok();
     }
