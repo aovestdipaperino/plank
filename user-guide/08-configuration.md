@@ -93,6 +93,13 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 | `tools.recall`, `tools.fanout`, `tools.runCode` | `true` | offer the `recall`, `fanout` and `run_code` tools to the model |
 | `tools.remember` | `true` | offer the `remember` and `forget` tools, which write memory to disk for the next session. See [Memory](07-context.md#memory). |
 
+### `context`
+
+| Key | Default | What |
+|---|---|---|
+| `context.microcompact` | `true` | let micro-compaction clear old tool-result bodies in place to reclaim context. `/mc off` is the session equivalent. |
+| `context.shortReminder` | `true` | make the system-prompt reminder plank re-injects every 50K tokens the short form: tool-call syntax, tool names, and a pointer to the original prompt. `false` re-injects the whole tools prompt as the C reference does. |
+
 ### `memory`
 
 | Key | Default | What |

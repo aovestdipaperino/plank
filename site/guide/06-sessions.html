@@ -274,6 +274,14 @@ context size, sampling settings, think mode, and engine tuning. Hand
 that to a maintainer and the state that triggered your bug is
 reproducible without your live session. It is a read-only snapshot;
 nothing about the running session changes.</p>
+<p>You can run it while the model is still generating, either by typing
+it or by clicking the camera glyph in the footer. The dump then ends
+with an <code>## In-progress pass</code> section: the transcript above
+it is exactly what the running pass was given, and the section holds
+what the pass has produced so far, so a stall is captured as it happens.
+<code>/repro &lt;note&gt;</code> still records your description of the
+bug; without one, the dump is marked
+<code>manually triggered mid turn</code>.</p>
 <h2 id="insights">Insights</h2>
 <pre><code>/insights          # full report
 /insights fast     # statistics only, no model-written prose</code></pre>

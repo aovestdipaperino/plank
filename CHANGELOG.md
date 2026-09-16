@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.1.8] - 2026-09-16
+
+### Added
+
+- **A short system-prompt reminder, on by default.** Every 50K tokens plank
+  re-injects a reminder of the system prompt so a long session does not drift.
+  It used to be the whole tools prompt, several thousand tokens prefilled once
+  and then held in context for good. The new `context.shortReminder` (default
+  `true`) sends only the tool-call syntax in the model's dialect, the roster
+  of tool names, and one line saying the original prompt still applies, a few
+  hundred tokens. `"context": {"shortReminder": false}` restores the full
+  reminder, byte-identical to the C reference, so the two can be compared
+  with one setting.
+
 ### Fixed
 
 - **`bash_status` honours `refresh_sec`.** The port passed the tool's *stop*

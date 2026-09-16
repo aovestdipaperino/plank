@@ -7,8 +7,16 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.1.0 is out**, and the beta channel is on 5.1.7. The patch number
+**v5.1.0 is out**, and the beta channel is on 5.1.8. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.1.8: a lighter system-prompt reminder.** Every 50K tokens plank reminds
+the model of its system prompt so a long session does not drift. Until now that
+meant re-sending the whole tools prompt, thousands of tokens prefilled and then
+kept in context for the rest of the session. The reminder is now the short
+form by default: the tool-call syntax, the list of tools, and a line saying the
+original prompt still applies. `"context": {"shortReminder": false}` brings
+the full reminder back.
 
 **5.1.7: the extraction pass is on by default.** 5.1.6 shipped it off, so
 you had to opt in. Now a fresh install keeps its own memory from the first

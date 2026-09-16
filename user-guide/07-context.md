@@ -113,6 +113,12 @@ Two things deliberately survive compaction: the **task list** (that is what the 
 
 And one thing makes compaction reversible: a `/checkpoint` taken before it stores the whole transcript, so `/rollback` reconstructs the pre-compaction conversation exactly. See [Sessions](06-sessions.md).
 
+## The system-prompt reminder
+
+The system prompt sits at the very start of the transcript, and after tens of thousands of tokens the model attends to it less than it should: tool calls get sloppier, a house rule slips. Once 50K tokens have passed since the prompt was last seen, plank appends a short reminder as a user turn, bracketed by `[System prompt reminder follows.]` and `[End system prompt reminder.]`: the tool-call syntax in the model's dialect, the list of tools it may call, one line saying the original prompt still applies, and your `-sys` text if you gave one. It is pressure-based, not periodic, so a short session never sees one, and `/new` resets the count.
+
+The reminder cannot be cached the way the system prompt itself is, because its KV entries depend on where it lands and on everything before it; each one is a real prefill and then permanent context. That is why the default is the short form. `"context": {"shortReminder": false}` in `settings.json` re-injects the entire tools prompt instead, exactly as the C reference agent does.
+
 ## Context size
 
 The window defaults to 1048576 tokens. Set it with `-c N` or `engine.ctx`. Bigger costs memory; smaller compacts sooner.

@@ -375,6 +375,32 @@ href="07-context.html#memory">Memory</a>.</td>
 </tr>
 </tbody>
 </table>
+<h3 id="context"><code>context</code></h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>context.microcompact</code></td>
+<td><code>true</code></td>
+<td>let micro-compaction clear old tool-result bodies in place to
+reclaim context. <code>/mc off</code> is the session equivalent.</td>
+</tr>
+<tr>
+<td><code>context.shortReminder</code></td>
+<td><code>true</code></td>
+<td>make the system-prompt reminder plank re-injects every 50K tokens
+the short form: tool-call syntax, tool names, and a pointer to the
+original prompt. <code>false</code> re-injects the whole tools prompt as
+the C reference does.</td>
+</tr>
+</tbody>
+</table>
 <h3 id="memory"><code>memory</code></h3>
 <table>
 <thead>

@@ -313,6 +313,24 @@ list</strong> (that is what the <code>task</code> tool is for) and
 taken before it stores the whole transcript, so <code>/rollback</code>
 reconstructs the pre-compaction conversation exactly. See <a
 href="06-sessions.html">Sessions</a>.</p>
+<h2 id="the-system-prompt-reminder">The system-prompt reminder</h2>
+<p>The system prompt sits at the very start of the transcript, and after
+tens of thousands of tokens the model attends to it less than it should:
+tool calls get sloppier, a house rule slips. Once 50K tokens have passed
+since the prompt was last seen, plank appends a short reminder as a user
+turn, bracketed by <code>[System prompt reminder follows.]</code> and
+<code>[End system prompt reminder.]</code>: the tool-call syntax in the
+model's dialect, the list of tools it may call, one line saying the
+original prompt still applies, and your <code>-sys</code> text if you
+gave one. It is pressure-based, not periodic, so a short session never
+sees one, and <code>/new</code> resets the count.</p>
+<p>The reminder cannot be cached the way the system prompt itself is,
+because its KV entries depend on where it lands and on everything before
+it; each one is a real prefill and then permanent context. That is why
+the default is the short form.
+<code>"context": {"shortReminder": false}</code> in
+<code>settings.json</code> re-injects the entire tools prompt instead,
+exactly as the C reference agent does.</p>
 <h2 id="context-size">Context size</h2>
 <p>The window defaults to 1048576 tokens. Set it with <code>-c N</code>
 or <code>engine.ctx</code>. Bigger costs memory; smaller compacts
