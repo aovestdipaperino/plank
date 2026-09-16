@@ -17215,7 +17215,14 @@ fn busy_ui_loop(
                     // lives on a line pinned below the output, not in the
                     // footer — independent of showThinking.
                     status_line = status::build_status_text(&st, false, false);
-                    let progress = status::progress_segment(&st, false);
+                    // The figures that move go to the rule below the prompt;
+                    // the pinned line keeps the throbber, the verb and the
+                    // clock. A pass that publishes no figures leaves the last
+                    // ones up, so the MTP numbers can be read after the turn.
+                    if let Some(perf) = status::perf_segment(&st) {
+                        tui::set_perf_text(&perf);
+                    }
+                    let progress = status::progress_brief(&st);
                     // While a sub-agent holds the engine the live readout —
                     // verb, elapsed, tokens, t/s — is *its* pass, so it belongs
                     // on its own pane. The main transcript only reports that it

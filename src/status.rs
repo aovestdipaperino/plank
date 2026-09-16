@@ -292,10 +292,10 @@ pub struct Status {
     pub pressure_yielded: bool,
     /// The pass generating is the passive memory extraction pass, read from
     /// the idle queue after the reply the user asked for is complete. It
-    /// draws no progress line ([`progress_segment`] is `None`); the footer
-    /// shows [`MEMORY_MARK`] with the phase's bare figures in place of the
-    /// state word: housekeeping the user did not ask for gets a glyph and
-    /// numbers, not a verb.
+    /// draws no progress line ([`progress_brief`] is `None`); the footer
+    /// shows [`MEMORY_MARK`] in place of the state word and the phase's
+    /// figures ride on the rule ([`perf_segment`]): housekeeping the user
+    /// did not ask for gets a glyph, not a verb.
     pub memory_pass: bool,
     /// Spans waiting to be read, the running one included, while
     /// `memory_pass` is set: the footer draws one [`MEMORY_MARK`] per job,
@@ -1787,10 +1787,76 @@ pub(crate) fn prefill_eta(done: i32, total: i32, tps: f64) -> Option<String> {
     Some(format_elapsed(f64::from(remaining) / tps))
 }
 
+/// The transient performance readout — the figures that change many times a
+/// second while the engine works — for the TUI to float at the right end of
+/// the rule *below* the prompt, the way the session name floats on the rule
+/// above it. Keeping them off the footer is what lets the footer stay still.
+///
+/// Prefill: `↑ done/total tokens · t/s · ~eta left`; generation: `↓ n tokens
+/// · t/s`; with MTP on and a pass that has speculated, `✨ 1.2t/step 4%` is
+/// appended — and stays alone once the turn is over, since those figures are
+/// only readable after the answer lands. The memory pass's figures ride here
+/// too, under the same arrows. `None` when there is nothing to show.
+#[must_use]
+pub fn perf_segment(st: &Status) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    match st.state {
+        WorkerState::Prefill => {
+            let total = st.prefill_total.max(1);
+            let done = st.prefill_done.min(total);
+            parts.push(format!(
+                "↑ {}/{} tokens · {:.1} t/s{}",
+                format_ctx_size(done),
+                format_ctx_size(total),
+                st.prefill_tps,
+                prefill_eta(done, total, st.prefill_tps)
+                    .map(|eta| format!(" · ~{eta} left"))
+                    .unwrap_or_default()
+            ));
+        }
+        WorkerState::Generating => parts.push(format!(
+            "↓ {} tokens{} · {:.1} t/s",
+            format_ctx_size(st.generated),
+            if st.greedy_sampling { " ❄️" } else { "" },
+            st.gen_tps
+        )),
+        _ => {}
+    }
+    if mtp() && st.spec.active() {
+        parts.push(format!(
+            "{MTP_MARK} {:.1}t/step {:.0}%",
+            st.spec.tokens_per_step(),
+            100.0 * st.spec.block_fill()
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The progress line the TUI pins below the output: throbber, spinner verb
+/// and elapsed time only — the figures live on the rule (`perf_segment`).
+/// `None` outside prefill and generation, and for the memory pass, whose only
+/// trace is the footer mark.
+#[must_use]
+pub fn progress_brief(st: &Status) -> Option<String> {
+    if st.memory_pass {
+        return None;
+    }
+    match st.state {
+        WorkerState::Prefill | WorkerState::Generating => Some(format!(
+            "{} {}… ({})",
+            throbber(),
+            prefill_label(st),
+            format_elapsed(st.elapsed_secs)
+        )),
+        _ => None,
+    }
+}
+
 /// The animated progress segment — throbber, spinner verb, and the
 /// elapsed/tokens/throughput readout — for the prefill and generating states.
-/// `None` in every other state. Split out so the TUI can render it on a line
-/// below the output instead of in the footer.
+/// `None` in every other state. The plain REPL's footer, which has no rule to
+/// float figures on, shows it whole; the TUI splits it into `progress_brief`
+/// (pinned below the output) and `perf_segment` (on the rule).
 #[must_use]
 pub fn progress_segment(st: &Status, color: bool) -> Option<String> {
     // The memory pass has no progress line at all: the footer's
@@ -2005,56 +2071,34 @@ fn build_status_text_with_cells(
     format!("{dir}{body}")
 }
 
-/// The `--mtp` segment: mean tokens committed per speculative step, then the
-/// share of the offered draft capacity that survived verification.
-///
-/// `None` when the pass never speculated, so a plain run's footer is unchanged.
-///
-/// Rendered `1.5t/step`, never `1.5x`: it is a per-step token count, not a
-/// wall-clock speedup, and the two diverge badly. See
-/// [`SpecStats::tokens_per_step`](crate::engine::SpecStats::tokens_per_step).
+/// The `--mtp` slot: the MTP mark while speculation is on, the temperature
+/// while it is off (the two states are exclusive, so they share the slot).
+/// The per-step figures — mean tokens committed per speculative step, then
+/// the share of the offered draft capacity that survived verification,
+/// rendered `1.5t/step` and never `1.5x` because it is a per-step token
+/// count, not a wall-clock speedup — belong to [`perf_segment`].
 #[must_use]
-pub fn spec_segment(st: &Status) -> Option<String> {
+pub fn spec_segment(_st: &Status) -> Option<String> {
     if !mtp() {
         // Speculation off: the temperature is back in play, so show it. It is
         // the same slot because the two states are exclusive — under MTP
         // the temperature is pinned at 0 and says nothing.
         return Some(format!("{TEMP_MARK} {:.2}", temperature()));
     }
-    if !st.spec.active() {
-        // On, but nothing to count yet (idle, or a pass that has not reached
-        // its first block): the mark alone still answers "is MTP on?".
-        return Some(MTP_MARK.to_owned());
-    }
-    Some(format!(
-        "{MTP_MARK} {:.1}t/step {:.0}%",
-        st.spec.tokens_per_step(),
-        100.0 * st.spec.block_fill()
-    ))
+    // The mark alone: it answers "is MTP on?", which is all a footer that
+    // holds still can say. The per-step figures are transient and ride on the
+    // rule below the prompt (`perf_segment`).
+    Some(MTP_MARK.to_owned())
 }
 
-/// The memory pass's footer segment: [`MEMORY_MARK`], then the bare figures
-/// of the phase it is in — no throbber and no verb, so it reads as the
-/// background chore it is rather than as the model answering.
+/// The memory pass's footer segment: one [`MEMORY_MARK`] per queued span —
+/// no throbber, no verb, no figures, so it reads as the background chore it
+/// is rather than as the model answering.
 fn memory_segment(st: &Status) -> String {
     // One mark per queued span, the running one included; never fewer than
-    // one, since a pass is running.
-    let marks = MEMORY_MARK.repeat(st.memory_queue.max(1));
-    if st.state == WorkerState::Prefill {
-        let total = st.prefill_total.max(1);
-        format!(
-            "{marks} ↑ {}/{} tokens · {:.1} t/s",
-            format_ctx_size(st.prefill_done.min(total)),
-            format_ctx_size(total),
-            st.prefill_tps
-        )
-    } else {
-        format!(
-            "{marks} ↓ {} tokens · {:.1} t/s",
-            format_ctx_size(st.generated),
-            st.gen_tps
-        )
-    }
+    // one, since a pass is running. The figures ride on the rule
+    // (`perf_segment`), so this slot holds still.
+    MEMORY_MARK.repeat(st.memory_queue.max(1))
 }
 
 /// The debugger segment: [`DEBUG_MARK`] while the session's window on the
@@ -2879,9 +2923,50 @@ mod tests {
         };
         let line = build_status_text(&spark, false, true);
         assert!(
-            line.ends_with(&format!("ctx 12% | {MTP_MARK} 3.0t/step 50% | {TOKS_MARK}")),
-            "{line}"
+            line.ends_with(&format!("ctx 12% | {MTP_MARK} | {TOKS_MARK}")),
+            "the footer holds still; the figures ride on the rule: {line}"
         );
+        assert_eq!(
+            perf_segment(&spark).as_deref(),
+            Some(format!("{MTP_MARK} 3.0t/step 50%").as_str())
+        );
+    }
+
+    #[test]
+    fn perf_segment_carries_the_transient_figures() {
+        let _lock = quiet_footer();
+        set_mtp(false);
+        assert_eq!(
+            perf_segment(&Status::default()),
+            None,
+            "idle, nothing to say"
+        );
+        let prefill = Status {
+            state: WorkerState::Prefill,
+            prefill_done: 500,
+            prefill_total: 2000,
+            prefill_tps: 100.0,
+            ..Status::default()
+        };
+        assert_eq!(
+            perf_segment(&prefill).as_deref(),
+            Some("↑ 500/2k tokens · 100.0 t/s · ~15s left")
+        );
+        let sampling = Status {
+            state: WorkerState::Generating,
+            generated: 237,
+            gen_tps: 20.7,
+            greedy_sampling: true,
+            ..Status::default()
+        };
+        assert_eq!(
+            perf_segment(&sampling).as_deref(),
+            Some("↓ 237 tokens ❄️ · 20.7 t/s")
+        );
+        // The pinned line keeps only the throbber, the verb and the clock.
+        let brief = progress_brief(&sampling).expect("a pass is running");
+        assert!(brief.ends_with("… (0s)"), "{brief}");
+        assert!(!brief.contains("tokens"), "{brief}");
     }
 
     #[test]
@@ -2902,9 +2987,14 @@ mod tests {
             ..Status::default()
         };
         let line = build_status_text(&st, false, true);
-        // Every draft rejected: 1.0 per step and 0%, still shown — "speculation is on
-        // and buying nothing" is exactly what a user needs to see.
-        assert!(line.contains(&format!("{MTP_MARK} 1.0t/step 0%")), "{line}");
+        assert!(line.contains(MTP_MARK), "{line}");
+        // Every draft rejected: 1.0 per step and 0%, still shown — on the
+        // rule, at idle — "speculation is on and buying nothing" is exactly
+        // what a user needs to see.
+        assert_eq!(
+            perf_segment(&st).as_deref(),
+            Some(format!("{MTP_MARK} 1.0t/step 0%").as_str())
+        );
     }
 
     #[test]
@@ -3133,13 +3223,16 @@ mod tests {
                 None,
                 "no readout under the output"
             );
+            assert_eq!(progress_brief(&st), None, "no pinned line either");
             let line = build_status_text(&st, false, true);
+            assert!(line.ends_with(&format!("| {MEMORY_MARK}")), "{line}");
+            assert!(!line.contains("tokens"), "figures ride on the rule: {line}");
+            let perf = perf_segment(&st).expect("figures on the rule");
             let expect = match state {
-                WorkerState::Prefill => format!("| {MEMORY_MARK} ↑ 3.3k/4k tokens · 0.0 t/s"),
-                _ => format!("| {MEMORY_MARK} ↓ 12 tokens · 0.0 t/s"),
+                WorkerState::Prefill => "↑ 3.3k/4k tokens · 0.0 t/s",
+                _ => "↓ 12 tokens · 0.0 t/s",
             };
-            assert!(line.ends_with(&expect), "{line}");
-            assert!(!line.contains('…'), "no verb: {line}");
+            assert_eq!(perf, expect);
         }
         // A backlog: one mark per queued span, the running one included.
         let backlog = Status {
@@ -3151,9 +3244,7 @@ mod tests {
         };
         let line = build_status_text(&backlog, false, true);
         assert!(
-            line.ends_with(&format!(
-                "| {MEMORY_MARK}{MEMORY_MARK}{MEMORY_MARK} ↓ 12 tokens · 0.0 t/s"
-            )),
+            line.ends_with(&format!("| {MEMORY_MARK}{MEMORY_MARK}{MEMORY_MARK}")),
             "{line}"
         );
         let plain = Status {

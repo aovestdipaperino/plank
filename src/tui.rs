@@ -2036,9 +2036,14 @@ fn frame_rows(
             rule,
         );
     }
-    // Drawn over the top rule, so it needs the rule painted first.
+    // Drawn over the rules, so they need the rules painted first: the session
+    // name on the rule above the prompt, the transient figures on the one
+    // below it.
     if let Some(rule) = rule_top {
         render_session_name(frame, rule);
+    }
+    if let Some(rule) = rule_bottom {
+        render_perf_text(frame, rule);
     }
     (output, input, status)
 }
@@ -2056,20 +2061,38 @@ const SESSION_NAME_MIN_RULE: u16 = 8;
 /// instead of only being announced on exit.
 fn render_session_name(frame: &mut Frame, rule: Rect) {
     let name = session_name();
-    if name.is_empty() {
+    render_rule_label(frame, rule, &name, "session_name", "name");
+}
+
+/// Floats the transient performance figures (`status::perf_segment`) at the
+/// right end of the rule *below* the prompt: prefill and generation rates,
+/// the MTP per-step figures. They change many times a second, so they live
+/// here rather than in the footer, which is what lets the footer hold still.
+fn render_perf_text(frame: &mut Frame, rule: Rect) {
+    let text = perf_text();
+    render_rule_label(frame, rule, &text, "perf", "text");
+}
+
+/// Floats `text` at the right end of `rule`, in a gap cut into the rule, with
+/// [`SESSION_NAME_GAP`] columns of rule to its right; dropped entirely when
+/// fewer than [`SESSION_NAME_MIN_RULE`] columns of rule would be left of it,
+/// so a narrow terminal keeps its line rather than losing it to a label.
+/// `region` and `field` name the UI-tree region for remote inspection.
+fn render_rule_label(frame: &mut Frame, rule: Rect, text: &str, region: &str, field: &str) {
+    if text.is_empty() {
         return;
     }
     // Spaces on both sides: the label sits in a gap in the rule, not on top of it.
-    let label = format!(" {name} ");
-    let w = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+    let label = format!(" {text} ");
+    let w = u16::try_from(crate::status::visible_width(&label)).unwrap_or(u16::MAX);
     if rule.width < w.saturating_add(SESSION_NAME_GAP + SESSION_NAME_MIN_RULE) {
         return;
     }
     let area = Rect::new(rule.right() - SESSION_NAME_GAP - w, rule.y, w, 1);
     crate::uiremote::region(
-        "session_name",
+        region,
         area,
-        &[("name", crate::tools::mcp::Json::Str(name.clone()))],
+        &[(field, crate::tools::mcp::Json::Str(text.to_owned()))],
     );
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -2078,6 +2101,26 @@ fn render_session_name(frame: &mut Frame, rule: Rect) {
         )),
         area,
     );
+}
+
+/// The transient figures the next frame floats on the rule below the prompt.
+/// A process global for the same reason as [`SESSION_NAME`].
+static PERF_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Publishes the transient figures for later frames to draw; empty clears.
+pub fn set_perf_text(text: &str) {
+    if let Ok(mut slot) = PERF_TEXT.lock()
+        && *slot != text
+    {
+        slot.clear();
+        slot.push_str(text);
+    }
+}
+
+/// The published transient figures, empty when none.
+#[must_use]
+pub fn perf_text() -> String {
+    PERF_TEXT.lock().map(|s| s.clone()).unwrap_or_default()
 }
 
 /// The session name the next frame will float on the rule above the prompt.
@@ -9209,6 +9252,58 @@ mod tests {
         set_session_name("");
         let bare = render(40, &mut view);
         assert_eq!(bare, "─".repeat(40), "no name published, plain rule");
+    }
+
+    #[test]
+    fn perf_text_floats_right_on_the_rule_below_the_prompt() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let log = OutputLog::new();
+        let mut view = OutputView::default();
+        let row_at = |buf: &ratatui::buffer::Buffer, y: u16| -> String {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let render = |w: u16, view: &mut OutputView| {
+            let mut term = Terminal::new(TestBackend::new(w, 8)).unwrap();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &log,
+                    Some(InputState::new("hi", 2)),
+                    "ctx 0%",
+                    view,
+                    None,
+                    &TaskView::default(),
+                    None,
+                    &RosterView::default(),
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            let y = input_row(buf).expect("prompt row present") + 1;
+            row_at(buf, y)
+        };
+
+        set_perf_text("↓ 237 tokens · 20.7 t/s");
+        let rule = render(60, &mut view);
+        assert!(
+            rule.ends_with("─ ↓ 237 tokens · 20.7 t/s ──"),
+            "figures float right with a two-column tail of rule: {rule:?}"
+        );
+        assert!(rule.starts_with("──────"), "rule still leads: {rule:?}");
+
+        let narrow = render(20, &mut view);
+        assert_eq!(narrow, "─".repeat(20), "no room for the figures");
+
+        set_perf_text("");
+        let bare = render(60, &mut view);
+        assert_eq!(bare, "─".repeat(60), "nothing published, plain rule");
     }
 
     #[test]
