@@ -47,9 +47,9 @@ pub const POWERLINE_BRANCH: char = '\u{e0a0}';
 /// and the body, so [`crate::tui`] peels it as its own span rather than letting
 /// `push_dir_prefix` mistake it for part of the branch name.
 ///
-/// The bare codepoint, without the U+FE0F variation selector, for the reason
-/// [`MICROCOMPACT_MARK`] spells out: here the measurement is also the click
-/// box, since [`crate::tui::record_think_rect`] locates the segment by finding
+/// The bare codepoint, without the U+FE0F variation selector: `unicode_width`
+/// and the terminal agree on two columns for it, and the measurement is also
+/// the click box, since [`crate::tui::record_think_rect`] locates the segment by finding
 /// this symbol in the drawn buffer.
 pub const THINK_MARK: &str = "🧠";
 
@@ -290,6 +290,11 @@ pub struct Status {
     /// memory pressure. Drives [`pressure_segment`], the one marker that says
     /// a wait of up to `RESUME_DWELL_SECS` is a pause and not a hang.
     pub pressure_yielded: bool,
+    /// The pass generating is the passive memory extraction pass, run at a
+    /// turn boundary after the reply the user asked for is complete. The
+    /// verb says so ([`MEMORY_VERB`]) instead of drawing from a phase pool,
+    /// so the footer does not look like the model is still answering.
+    pub memory_pass: bool,
 }
 
 /// Marks the speculative-decoding segment, mirroring how `THINK_MARK` labels
@@ -336,42 +341,18 @@ const HD_MARK_OFF: &str = "  ";
 /// terminals actually render them in.
 const PRESSURE_MARK: &str = "⏸\u{fe0f}";
 
-/// Marks the footer's loop-guard segment: the guards are armed and watching.
-/// Distinct from [`LOOP_MARK`], which says a guard has actually seen a cycle.
-const GUARD_MARK: &str = "🔁";
-
 /// Marks the footer's debugger segment: the raw model stream is being mirrored
 /// to a live debug console right now. Connection, not capability: `--debug`
 /// alone earns nothing, only a console that actually answered the dial.
 const DEBUG_MARK: &str = "🐞";
 
-/// Marks the footer's micro-compaction segment. Public so the TUI can find the
-/// segment for mouse hit-testing, the same reason [`JOBS_MARK`] is.
-///
-/// U+1F5D1 followed by U+FE0F (VS16), for the same reason as [`TEMP_MARK`]:
-/// the bare codepoint is text-default and `unicode_width` reports 1 column
-/// for it, but terminals draw it in colour at 2 columns regardless, so VS16
-/// makes the two agree. This is also the click box, since
-/// [`crate::tui::record_mc_rect`] locates the segment by finding this exact
-/// symbol (VS16 included) in the drawn buffer — ratatui keeps the whole
-/// grapheme cluster in one cell, so the lookup still matches.
-pub const MICROCOMPACT_MARK: &str = "🗑\u{fe0f}";
-
-/// Beside [`MICROCOMPACT_MARK`] when micro-compaction is on: it is rewriting
-/// old tool results in place to reclaim context.
-const MICROCOMPACT_ON: &str = "🟢";
-
-/// Beside [`MICROCOMPACT_MARK`] when micro-compaction is off (`/mc off`), so
-/// the transcript is kept verbatim until a full compaction.
-const MICROCOMPACT_OFF: &str = "🔴";
-
 /// Marks the footer's throughput segment, which toggles the `/toks` panel on
 /// click. Public so the TUI can find the segment for mouse hit-testing, the
 /// same reason [`JOBS_MARK`] is.
 ///
-/// The bare codepoint, without the U+FE0F variation selector, for the reason
-/// [`MICROCOMPACT_MARK`] spells out: here the measurement is also the click
-/// box, since [`crate::tui::record_toks_rect`] locates the segment by finding
+/// The bare codepoint, without the U+FE0F variation selector: `unicode_width`
+/// and the terminal agree on two columns for it, and the measurement is also
+/// the click box, since [`crate::tui::record_toks_rect`] locates the segment by finding
 /// this symbol in the drawn buffer.
 pub const TOKS_MARK: &str = "📈";
 
@@ -382,18 +363,18 @@ pub const TOKS_MARK: &str = "📈";
 /// It rides in the dir prefix, on the row that answers "which tree am I in",
 /// because a repro is a snapshot of *this* session in *this* tree.
 ///
-/// The bare codepoint, without the U+FE0F variation selector, for the reason
-/// [`MICROCOMPACT_MARK`] spells out: here the measurement is also the click
-/// box, since [`crate::tui::record_camera_rect`] locates the segment by
+/// The bare codepoint, without the U+FE0F variation selector: `unicode_width`
+/// and the terminal agree on two columns for it, and the measurement is also
+/// the click box, since [`crate::tui::record_camera_rect`] locates the segment by
 /// finding this symbol in the drawn buffer.
 pub const CAMERA_MARK: &str = "\u{1f4f7}";
 
 /// Marks the footer's loop segment, shown while the repetition guard sees the
 /// reasoning cycling (`♻ looping`).
 ///
-/// Deliberately not [`GUARD_MARK`]: that one means the guards are armed, which
-/// is the resting state of every session, and one glyph for "watching" and
-/// "caught something" would be read as the same news twice.
+/// Deliberately not the `🔁` the armed guards used to show: that was the
+/// resting state of every session, and one glyph for "watching" and "caught
+/// something" would be read as the same news twice.
 const LOOP_MARK: &str = "♻\u{fe0f}";
 
 /// The loop segment: ` | 🔁 looping` while `st.looping`, empty otherwise. Rides
@@ -1062,6 +1043,11 @@ pub const FUN_VERBS: [&str; 20] = [
     "Moonwalking 🌙",
 ];
 
+/// The one fixed verb of the memory extraction pass (`Status::memory_pass`):
+/// a fixed word rather than a pool because the pass is a background chore the
+/// user did not ask for, and the footer should say plainly what it is doing.
+pub const MEMORY_VERB: &str = "taking notes";
+
 /// One turn in this many draws from [`FUN_VERBS`] instead of the phase pool.
 /// Rare enough to stay a surprise, common enough to actually be seen.
 pub const FUN_ODDS: u32 = 20;
@@ -1117,6 +1103,9 @@ pub fn verb_phase(st: &Status) -> VerbPhase {
 /// index 0.
 #[must_use]
 pub fn prefill_label(st: &Status) -> &'static str {
+    if st.memory_pass {
+        return MEMORY_VERB;
+    }
     let phase = verb_phase(st);
     let pool = verbs_for(phase);
     let idx = if phase == VerbPhase::Fun {
@@ -1941,28 +1930,17 @@ fn build_status_text_with_cells(
         Some(seg) => format!("{ctx} | {seg}"),
         None => ctx,
     };
-    let ctx = match guard_segment() {
-        Some(seg) => format!("{ctx} | {}", theme(&seg)),
-        None => ctx,
-    };
-    // Beside the guard segment: a connected console is a session-wide fact
-    // about how the run is being watched, not a reading from this pass.
+    // A connected console is a session-wide fact about how the run is being
+    // watched, not a reading from this pass, so it rides with the ctx gauge.
+    // The loop-guard and micro-compaction switches used to sit here too;
+    // both are now `/loopguard` and `/mc` only, and their state is answered
+    // by those commands rather than by a permanent glyph.
     let ctx = match debug_segment(crate::debugmirror::parent_connected()) {
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
     };
-    // Beside the guard segment, and for the same reason: both are session-wide
-    // switches that change how every following turn is built, and both are
-    // thrown from the footer itself — the guard with `/loopguard`, this one
-    // with a double-click on the wastebasket.
-    let ctx = format!(
-        "{ctx} | {}",
-        theme(&microcompact_segment(
-            crate::settings::active().context.microcompact
-        ))
-    );
-    // Beside the wastebasket: both are footer glyphs whose whole purpose is
-    // to be clicked, and neither belongs to the running turn.
+    // A footer glyph whose whole purpose is to be clicked; it does not
+    // belong to the running turn.
     let ctx = format!("{ctx} | {}", theme(&toks_segment()));
     let ctx = match jobs_segment(st) {
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
@@ -2039,54 +2017,25 @@ pub fn spec_segment(st: &Status) -> Option<String> {
     ))
 }
 
-/// The loop-guard segment: [`GUARD_MARK`] while the guards are armed, empty
-/// when `/loopguard off` has silenced them.
-///
-/// Rides with the ctx gauge rather than in the state word, so it is visible in
-/// every worker state — the switch is a property of the session, not of the
-/// turn, and `/loopguard` can be typed at idle.
-#[must_use]
-pub fn guard_segment() -> Option<String> {
-    crate::guard::guards_enabled().then(|| GUARD_MARK.to_owned())
-}
-
 /// The debugger segment: [`DEBUG_MARK`] while the session's window on the
 /// debug console is connected, `None` otherwise so an ordinary footer is
 /// unchanged.
 ///
 /// Keyed on the live connection, not on `--debug`: the switch only permits
 /// the dial, and a developer who started plank with it but no console open
-/// has nothing watching. Takes the state as a parameter for the reason
-/// [`microcompact_segment`] gives — the registry behind it is process-global,
-/// and a test must be able to ask for both states under parallel threads.
+/// has nothing watching. Takes the state as a parameter because the
+/// registry behind it is process-global, and a test must be able to ask for
+/// both states under parallel threads.
 #[must_use]
 pub fn debug_segment(connected: bool) -> Option<String> {
     connected.then(|| DEBUG_MARK.to_owned())
 }
 
-/// The micro-compaction segment: `🗑 🟢` when on, `🗑 🔴` when off.
-///
-/// Always drawn, both states, unlike the conditional segments around it: the
-/// footer is where the switch is thrown, so the box has to be there to be
-/// double-clicked even when the answer is "off". Takes the state as a
-/// parameter rather than reading the live settings, for the reason
-/// [`splice_download_segment`] spells out — a test must be able to ask for
-/// both states without writing a process-global under parallel test threads.
-#[must_use]
-pub fn microcompact_segment(on: bool) -> String {
-    let light = if on {
-        MICROCOMPACT_ON
-    } else {
-        MICROCOMPACT_OFF
-    };
-    format!("{MICROCOMPACT_MARK} {light}")
-}
-
 /// The throughput segment: [`TOKS_MARK`] alone, a click target that toggles
 /// the `/toks` panel.
 ///
-/// Always drawn, like [`microcompact_segment`] and for the same reason: the
-/// glyph *is* the affordance, so it has to be there to be clicked. It carries
+/// Always drawn: the glyph *is* the affordance, so it has to be there to be
+/// clicked. It carries
 /// no reading of its own — the chart behind it needs more room than the footer
 /// has, and a bare icon keeps the bar's width unchanged whatever the rate.
 #[must_use]
@@ -2614,7 +2563,7 @@ mod tests {
     /// change to any of these constants (adding/dropping VS16, swapping the
     /// glyph) cannot silently reintroduce an undercount. See
     /// `visible_width_counts_wide_emoji_as_two_columns` for why `TEMP_MARK`,
-    /// `MICROCOMPACT_MARK`, `PRESSURE_MARK` and `LOOP_MARK` carry an explicit
+    /// `PRESSURE_MARK` and `LOOP_MARK` carry an explicit
     /// VS16 while the others don't need one.
     ///
     /// Exhaustive over every footer mark constant: each is listed once, with
@@ -2634,9 +2583,6 @@ mod tests {
             ("JOBS_MARK", JOBS_MARK, 1), // deliberate exception: math symbol, not emoji
             ("HD_MARK", HD_MARK, 2),
             ("PRESSURE_MARK", PRESSURE_MARK, 2),
-            ("GUARD_MARK", GUARD_MARK, 2),
-            ("MICROCOMPACT_MARK", MICROCOMPACT_MARK, 2),
-            ("MICROCOMPACT_ON", MICROCOMPACT_ON, 2),
             ("TOKS_MARK", TOKS_MARK, 2),
             ("CAMERA_MARK", CAMERA_MARK, 2),
             ("LOOP_MARK", LOOP_MARK, 2),
@@ -2683,21 +2629,6 @@ mod tests {
         );
     }
     use super::*;
-
-    #[test]
-    fn the_microcompact_segment_shows_both_states() {
-        assert_eq!(microcompact_segment(true), "🗑\u{fe0f} 🟢");
-        assert_eq!(microcompact_segment(false), "🗑\u{fe0f} 🔴");
-        // Off is a state, not an absence: the box stays on the line so it can
-        // be double-clicked back on.
-        let st = Status::default();
-        let line = build_status_text(&st, false, true);
-        assert!(line.contains(MICROCOMPACT_MARK), "{line}");
-        // The VS16 is deliberate now: it is part of MICROCOMPACT_MARK itself,
-        // so the mark the TUI hit-tests against is exactly the one the footer
-        // draws, VS16 included (see MICROCOMPACT_MARK's doc comment).
-        assert!(line.contains('\u{fe0f}'), "{line:?}");
-    }
 
     #[test]
     fn the_debug_segment_shows_only_while_a_console_is_connected() {
@@ -2796,8 +2727,7 @@ mod tests {
             ..Status::default()
         };
         assert!(
-            build_status_text(&st, false, true)
-                .ends_with("ctx 12% | 🌡\u{fe0f} 0.00 | 🗑\u{fe0f} 🟢 | 📈 | idle"),
+            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡\u{fe0f} 0.00 | 📈 | idle"),
             "{}",
             build_status_text(&st, false, true)
         );
@@ -2878,23 +2808,6 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_marks_the_loop_guards_while_they_are_armed() {
-        let _lock = quiet_footer();
-        let st = Status {
-            ctx_used: 1000,
-            ctx_size: 8000,
-            ..Status::default()
-        };
-        assert!(!build_status_text(&st, false, true).contains(GUARD_MARK));
-        crate::settings::install_for_test(crate::settings::Settings::default());
-        let line = build_status_text(&st, false, true);
-        assert!(line.contains(GUARD_MARK), "{line}");
-        // Armed is not the same news as caught: the tripped marker is its own
-        // glyph and appears only while a guard has actually seen a cycle.
-        assert!(!line.contains(LOOP_MARK), "{line}");
-    }
-
-    #[test]
     fn mtp_shows_its_mark_before_a_pass_has_speculated() {
         let _lock = quiet_footer();
         set_mtp(true);
@@ -2907,10 +2820,7 @@ mod tests {
         // question the slot exists to answer.
         let line = build_status_text(&plain, false, true);
         assert!(
-            line.ends_with(&format!(
-                "ctx 12% | {MTP_MARK} | {} | {TOKS_MARK} | idle",
-                microcompact_segment(true)
-            )),
+            line.ends_with(&format!("ctx 12% | {MTP_MARK} | {TOKS_MARK} | idle")),
             "{line}"
         );
         assert!(!line.contains(TEMP_MARK), "{line}");
@@ -2927,8 +2837,7 @@ mod tests {
         let line = build_status_text(&spark, false, true);
         assert!(
             line.ends_with(&format!(
-                "ctx 12% | {MTP_MARK} 3.0t/step 50% | {} | {TOKS_MARK} | idle",
-                microcompact_segment(true)
+                "ctx 12% | {MTP_MARK} 3.0t/step 50% | {TOKS_MARK} | idle"
             )),
             "{line}"
         );
@@ -3163,6 +3072,37 @@ mod tests {
         VerbPhase::Prefill,
         VerbPhase::Fun,
     ];
+
+    #[test]
+    fn memory_pass_pins_the_verb_in_every_phase() {
+        for seed in 0..(FUN_ODDS * 3) {
+            for state in [WorkerState::Prefill, WorkerState::Generating] {
+                for thinking in [false, true] {
+                    let st = Status {
+                        state,
+                        thinking,
+                        prefill_label: seed,
+                        memory_pass: true,
+                        ..Status::default()
+                    };
+                    assert_eq!(prefill_label(&st), MEMORY_VERB);
+                }
+            }
+        }
+        let st = Status {
+            state: WorkerState::Generating,
+            prefill_label: 1,
+            ..Status::default()
+        };
+        assert_ne!(prefill_label(&st), MEMORY_VERB, "off by default");
+        assert!(
+            !ALL_PHASES
+                .iter()
+                .flat_map(|p| verbs_for(*p).iter())
+                .any(|v| *v == MEMORY_VERB),
+            "the pinned verb is not also a pool entry"
+        );
+    }
 
     #[test]
     fn spinner_verbs_are_200_and_unique_across_pools() {

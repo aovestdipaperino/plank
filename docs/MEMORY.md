@@ -306,26 +306,62 @@ transcript and proposes changes, without the model having to think to call
 `remember` itself. **On by default since 5.1.7**, so what follows is what
 you are paying for unless you turn it off.
 
-**When and where it runs.** At the end of a turn that produced a final
-response with no tool calls (`Agent::maybe_extract_memories` in `src/ui.rs`,
-called from both `run_turn` and `tui_turn_inner`), **synchronously, on the
-turn thread**, after the answer has been printed and after `fire_turn_end`
-has already reported the turn's stats. It is not a background thread and it
-does not overlap with your next prompt: the front end is back at the prompt
-only when the pass has finished. Each run is one sidechain
-(`begin_sidechain(prompt, true)` … `end_subagent_fork`), which means, in
-order: a snapshot of the whole session's KV (`engine.get_kv()`), a prefill of
-the pass prompt on top of the live context, one generation with no tool
-dispatch (`run_memory_round` — the sidechain can never touch a tool), and a
-KV restore back to the parent prefix. Because `fire_turn_end` has already
-fired, none of that time or those tokens appears in the turn stats, the
-status bar or `/toks`; the only visible trace is the stall, plus a dim line
-when the pass changed something. On a local Metal model this is seconds per
-answer. The sidechain runs under `in_sidechain()`, so it pushes no KV ladder
-rungs and stores no payload: it leaves no checkpoint debris.
+**When and where it runs.** In two steps. At the end of a turn that
+produced a final response with no tool calls (`Agent::enqueue_memory_job` in
+`src/ui.rs`, called from `run_turn` on the plain path and `worker_turn` in
+the TUI), the span since the last pass is **snapshotted** into a
+`MemoryJob`: the complete extraction prompt, built from the transcript as it
+stands, pushed onto a queue on the `Agent`. Nothing is generated at that
+point, so the prompt comes back the moment the answer is done, the Stop
+hooks fire right then, and the idle window title is set last of all. The
+span is retired (`ExtractState::finish`) as it is captured: the job carries
+everything it needs, so the next turn opens a new span from there and a
+`/clear`, a follow-up turn or a compaction between the turn end and the
+reading cannot lose what was captured. A turn the user interrupted (Esc,
+Ctrl-C) queues nothing, and its span is left for the next turn that
+completes (`Agent::memory_pass_allowed`).
 
-**The pass is gated by four checks, in this order** (`ExtractState::should_run`;
-`maybe_extract_memories` also refuses to start while already inside another
+The **reading** happens at the next idle moment (`Agent::process_memory_job`,
+one job per call, oldest first). In the TUI that is the idle loop's poll
+timeout (`tui_memory_pass`), with the same guards as the background-job
+wake — no draft in the editor, no modal pane — so a pass never starts under
+a keystroke. It runs on a worker thread behind the same busy UI loop as a
+turn: a dim `memory: taking notes on the last turn…` line announces it
+(`Agent::MEMORY_PASS_LINE`), the footer shows `taking notes…` with the
+pass's own elapsed/token figures (`Status::memory_pass`,
+`status::MEMORY_VERB`), the window title reads `✍️ taking notes...`, and
+typing keeps working. **A prompt submitted during the pass interrupts it**
+(`TurnShared::memory_pass` makes the busy loop raise the worker interrupt
+as it queues the line): the job goes back to the front of the queue,
+uncounted, and the typed line starts its turn at once — the user never waits
+for the notes. `/btw` is refused during a pass, with a hint to just type the
+prompt, because there is no main task to ask beside. The plain REPL reads
+one job per 250 ms idle tick of its stdin wait (`run_repl_plain_local`); it
+cannot cut a generation short on keystrokes, so a line typed meanwhile
+waits out the job that is running. The headless paths have no idle loop to
+come back to, so they drain the queue synchronously before exit
+(`drain_memory_jobs`); the stdin protocol also reads one job per idle tick.
+
+Each reading is one sidechain (`begin_sidechain(prompt, true)` …
+`end_subagent_fork`), which means, in order: a snapshot of the whole
+session's KV (`engine.get_kv()`), a prefill of the pass prompt on top of the
+live context, one generation with no tool dispatch (`run_memory_round` — the
+sidechain can never touch a tool), and a KV restore back to the parent
+prefix. None of that time or those tokens appears in any turn's stats: the
+traces are the announcement, the footer verb, and a dim line when the pass
+changed something. A pass whose reply held no verdicts is silent: it is
+recorded in the sidechain dump (`/repro`) and nowhere else. The sidechain
+runs under `in_sidechain()`, so it pushes no KV ladder rungs and stores no
+payload: it leaves no checkpoint debris.
+
+**How a job leaves the queue:** applied; unusable (a reply that is not a
+JSON array is a property of the model on this prompt, not a transient
+fault, so it is not retried); too big for the remaining context (dropped,
+with a one-time notice); or after `MAX_JOB_ATTEMPTS` engine errors, which
+is what keeps a broken engine from pinning the idle loop on one span.
+
+**The snapshot is gated by four checks, in this order** (`ExtractState::should_run`;
+`enqueue_memory_job` also refuses to run while already inside another
 sidechain, so a sub-agent's turn never triggers it):
 
 1. **Enabled, and mutual exclusion.** `memory.autoExtract` must be on, and

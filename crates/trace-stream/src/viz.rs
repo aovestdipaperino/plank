@@ -30,17 +30,52 @@ pub const IN_THINK_PROHIBITION: &str =
 
 /// Tree glyphs for the tool-call banner.
 ///
+/// Each tool line sits two columns under the `🛠️ tool_calls` root, and its
+/// parameter branches sit two further columns in, so the banner reads as a
+/// three-level tree: stanza, tool, parameter.
+///
 /// Every parameter branch is `├─`; the last one is never `└─`. Values stream
 /// in byte by byte, and nothing tells this renderer a parameter was the final
 /// one until the invoke's close tag arrives — long after the connector was
 /// painted and flushed. A uniform connector is the only shape that stays
 /// honest without buffering the whole call, which is the one thing a
 /// streaming renderer must not do.
-const TREE_BRANCH: &str = "  ├─ ";
+const TREE_BRANCH: &str = "    ├─ ";
 /// Continuation rail under a branch, for a value spanning several lines.
 /// Same column count as [`TREE_BRANCH`], so the rail sits directly under the
 /// branch glyph it continues.
-const TREE_RAIL: &str = "  │  ";
+const TREE_RAIL: &str = "    │  ";
+/// Indent of a tool line under the `🛠️ tool_calls` root.
+const TOOL_INDENT: &str = "  ";
+
+/// The emoji that heads a tool's line in the banner, so a glance at the tree
+/// tells the kind of call before the name is read. Unknown tools (WASM
+/// components, provider-specific extras) fall back to the generic wrench.
+fn tool_emoji(name: &str) -> &'static str {
+    match name {
+        "read" | "more" => "📖",
+        "write" => "📝",
+        "edit" => "✏️",
+        "search" => "🔍",
+        "glob" => "🔎",
+        "list" => "📂",
+        "bash" => "💻",
+        "bash_status" => "⏳",
+        "bash_stop" => "⏹️",
+        "run_code" => "🧪",
+        "google_search" | "visit_page" => "🌐",
+        "view_image" => "🖼️",
+        "skill" => "🎓",
+        "task" => "✅",
+        "ask" => "❓",
+        "recall" | "remember" | "forget" => "🧠",
+        "compact" => "🗜️",
+        "EnterPlanMode" | "ExitPlanMode" => "📋",
+        "EnterWorktree" | "ExitWorktree" => "🌳",
+        n if n.starts_with("mcp") => "🔌",
+        _ => "🔧",
+    }
+}
 
 /// The Qwen parameter close tag, with the newline the syntax puts before it.
 ///
@@ -1496,10 +1531,11 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
     }
 
-    /// Starts a tool banner line: "🛠️ ".
+    /// Starts a tool line under the root: indent, then the tool's emoji.
     fn viz_line_prefix(&mut self) {
         self.viz_newline_if_open();
-        self.viz_puts("🔧 ");
+        let emoji = tool_emoji(&self.viz.tool_name);
+        self.viz_puts(&format!("{TOOL_INDENT}{emoji} "));
         self.viz.at_line_start = false;
     }
 
@@ -3096,7 +3132,7 @@ mod tests {
         );
     }
 
-    /// With banners on the tree names the tool (`🔧 write`) rather than a
+    /// With banners on the tree names the tool (`  📝 write`) rather than a
     /// verb; the `Writing <path>` phrasing survives only in the banners-off
     /// preview header, which `write_preview_header_*` covers.
     #[test]
@@ -3116,7 +3152,7 @@ mod tests {
         assert!(
             sr.sink()
                 .visible
-                .contains("🔧 write\n  ├─ path ─ src/foo.rs"),
+                .contains("  📝 write\n    ├─ path ─ src/foo.rs"),
             "banner node: {:?}",
             sr.sink().visible
         );
@@ -3354,7 +3390,7 @@ mod tests {
         for sr in [run_chunked(text), run_charwise(text)] {
             let vis = &sr.sink().visible;
             assert!(
-                vis.contains("🔧 bash\n  ├─ command ─ cat documents.rs"),
+                vis.contains("  💻 bash\n    ├─ command ─ cat documents.rs"),
                 "{vis:?}"
             );
             assert!(!vis.contains("SSML"), "{vis:?}");
@@ -3413,7 +3449,10 @@ mod tests {
         for sr in [run_chunked(&text), run_charwise(&text)] {
             let vis = &sr.sink().visible;
             assert!(vis.starts_with("Let me look.\n"), "{vis:?}");
-            assert!(vis.contains("🔧 bash\n  ├─ command ─ ls -la"), "{vis:?}");
+            assert!(
+                vis.contains("  💻 bash\n    ├─ command ─ ls -la"),
+                "{vis:?}"
+            );
             assert!(!vis.contains("DSML"), "{vis:?}");
             let fin = sr.finished();
             assert_eq!(fin.calls.len(), 1);
@@ -3435,7 +3474,7 @@ mod tests {
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
             assert!(
-                vis.contains("🔧 read\n  ├─ Reading src/main.rs 1:500...\n"),
+                vis.contains("  📖 read\n    ├─ Reading src/main.rs 1:500...\n"),
                 "{vis:?}"
             );
             assert!(!vis.contains("DSML"), "{vis:?}");
@@ -3456,7 +3495,7 @@ mod tests {
         assert!(
             sr.sink()
                 .visible
-                .contains("🔧 read\n  ├─ Reading a.c (whole file)...\n"),
+                .contains("  📖 read\n    ├─ Reading a.c (whole file)...\n"),
             "{:?}",
             sr.sink().visible
         );
@@ -3475,7 +3514,7 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🔧 edit\n  ├─ path ─ a.rs"), "{vis:?}");
+            assert!(vis.contains("  ✏️ edit\n    ├─ path ─ a.rs"), "{vis:?}");
             assert!(vis.contains("- let a = 1;"), "{vis:?}");
             assert!(vis.contains("+ let a = 2;"), "{vis:?}");
             assert!(!vis.contains("DSML"), "{vis:?}");
@@ -3706,7 +3745,9 @@ mod tests {
         assert_eq!(fin.calls.len(), 1, "{:?}", fin.calls);
         assert_eq!(fin.calls[0].name, "bash");
         assert!(
-            sr.sink().visible.contains("🔧 bash\n  ├─ command ─ ls -la"),
+            sr.sink()
+                .visible
+                .contains("  💻 bash\n    ├─ command ─ ls -la"),
             "{:?}",
             sr.sink().visible
         );
@@ -3730,7 +3771,9 @@ mod tests {
         assert_eq!(fin.calls.len(), 1, "{:?}", fin.calls);
         assert_eq!(fin.calls[0].arg_value("command"), Some("ls -la"));
         assert!(
-            sr.sink().visible.contains("🔧 bash\n  ├─ command ─ ls -la"),
+            sr.sink()
+                .visible
+                .contains("  💻 bash\n    ├─ command ─ ls -la"),
             "{:?}",
             sr.sink().visible
         );
@@ -3783,7 +3826,9 @@ mod tests {
             // The banner renders like any other tool call, and raw DSML never
             // reaches either sink.
             assert!(
-                sr.sink().visible.contains("🔧 bash\n  ├─ command ─ ls -la"),
+                sr.sink()
+                    .visible
+                    .contains("  💻 bash\n    ├─ command ─ ls -la"),
                 "{:?}",
                 sr.sink().visible
             );
@@ -3823,7 +3868,10 @@ mod tests {
         sr.push("<｜DSML｜parameter name=\"command\">sleep 1");
         sr.finish();
         let vis = &sr.sink().visible;
-        assert!(vis.contains("🔧 bash\n  ├─ command ─ sleep 1"), "{vis:?}");
+        assert!(
+            vis.contains("  💻 bash\n    ├─ command ─ sleep 1"),
+            "{vis:?}"
+        );
         assert!(vis.contains("[tool call interrupted]\n"), "{vis:?}");
         assert!(sr.finished().calls.is_empty());
     }
@@ -4065,14 +4113,14 @@ mod tests {
         );
         let want = concat!(
             "🛠️ tool_calls\n",
-            "🔧 glob\n",
-            "  ├─ pattern ─ src/settings.rs\n",
-            "🔧 mcp__tokensave__tokensave_search\n",
-            "  ├─ query ─ Settings\n",
-            "  ├─ limit ─ 15\n",
-            "🔧 bash\n",
-            "  ├─ command ─ cargo test\n",
-            "  │  cargo build\n",
+            "  🔎 glob\n",
+            "    ├─ pattern ─ src/settings.rs\n",
+            "  🔌 mcp__tokensave__tokensave_search\n",
+            "    ├─ query ─ Settings\n",
+            "    ├─ limit ─ 15\n",
+            "  💻 bash\n",
+            "    ├─ command ─ cargo test\n",
+            "    │  cargo build\n",
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             assert_eq!(sr.sink().visible, want);
@@ -4089,7 +4137,9 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             assert!(
-                sr.sink().visible.contains("🔧 bash\n  ├─ command ─ pwd"),
+                sr.sink()
+                    .visible
+                    .contains("  💻 bash\n    ├─ command ─ pwd"),
                 "{:?}",
                 sr.sink().visible
             );
@@ -4154,7 +4204,7 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🔧 write\n  ├─ path ─ x.txt"), "{vis:?}");
+            assert!(vis.contains("  📝 write\n    ├─ path ─ x.txt"), "{vis:?}");
             // The content now previews on the dim (think) channel, not visible.
             assert!(!vis.contains("line one"), "{vis:?}");
             assert!(

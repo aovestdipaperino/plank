@@ -398,6 +398,11 @@ pub struct TurnShared {
     /// Set by the UI (Esc / Ctrl-C / SIGINT) to stop the worker at the next
     /// sampling or prefill checkpoint.
     pub interrupt: AtomicBool,
+    /// Set by the front end while the worker is running a queued memory
+    /// pass rather than a turn. The busy loop then treats a submitted prompt
+    /// as an interrupt as well as a queued line: the user wants the model,
+    /// and the pass goes back on the queue for the next idle moment.
+    pub memory_pass: AtomicBool,
     /// Set by the UI when a `/btw` is submitted mid-turn: the current main
     /// generation pass stops immediately so the side question is answered
     /// with priority, then the interrupted pass is re-run (nothing is

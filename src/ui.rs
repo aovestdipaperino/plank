@@ -2266,8 +2266,12 @@ struct Agent<'a> {
     /// Gating for the background memory extraction pass; sampled from
     /// `settings.memory` at the top of every `maybe_extract_memories` call.
     extract_state: crate::memextract::ExtractState,
+    /// Spans snapshotted at turn ends and waiting for an idle moment to be
+    /// read (`enqueue_memory_job` / `process_memory_job`). Front of the
+    /// queue is oldest; an interrupted job goes back to the front.
+    memory_jobs: std::collections::VecDeque<crate::memextract::MemoryJob>,
     /// One quiet summary line queued by `report_memory_changes`, drained by
-    /// the turn loop right after `maybe_extract_memories` returns.
+    /// whoever ran `process_memory_job`.
     pending_memory_notice: Option<String>,
     /// Where `/repro` and the automatic loop dumps are written. Resolved once
     /// at construction (`repro::repro_dir`, under `$HOME/.plank`), so a test
@@ -3949,6 +3953,10 @@ impl Agent<'_> {
             power_percent: self.power_percent,
             think: self.think,
             running_jobs: self.tool_ctx.bash.running_count(),
+            // `running` is set by the positive `should_run` that opened the
+            // pass and cleared by its `finish`/`cancel`, so it is true for
+            // exactly the generation the memory pass drives and no other.
+            memory_pass: self.extract_state.is_running(),
         })
     }
 
@@ -4166,6 +4174,8 @@ struct PassStatusCtx {
     power_percent: i32,
     think: crate::engine::ThinkMode,
     running_jobs: usize,
+    /// The pass is the memory extraction pass; the footer verb says so.
+    memory_pass: bool,
 }
 
 /// Builds the [`Status`] snapshots a generation pass publishes as it runs, from
@@ -4198,6 +4208,8 @@ struct LiveStatus {
     /// segment. A job started by this pass's own tool round shows from the
     /// next snapshot that is built after dispatch.
     running_jobs: usize,
+    /// Copied onto every snapshot; see `Status::memory_pass`.
+    memory_pass: bool,
 }
 
 impl LiveStatus {
@@ -4226,6 +4238,7 @@ impl LiveStatus {
             think: think.for_display(crate::engine::numeric_thinking_model(&model_name)),
             model_name,
             running_jobs,
+            memory_pass: false,
         }
     }
 
@@ -4262,6 +4275,7 @@ impl LiveStatus {
                     greedy_sampling: greedy,
                     looping,
                     running_jobs: self.running_jobs,
+                    memory_pass: self.memory_pass,
                     ..Status::default()
                 })
             }
@@ -4287,6 +4301,7 @@ impl LiveStatus {
                     power_percent: self.power_percent,
                     think: self.think,
                     running_jobs: self.running_jobs,
+                    memory_pass: self.memory_pass,
                     ..Status::default()
                 })
             }
@@ -4349,7 +4364,7 @@ fn generate_pass(
     // Counting the prompt only when someone is listening: it tokenizes the
     // whole rendered transcript.
     let mut live = ctx.status.as_ref().map(|sc| {
-        LiveStatus::new(
+        let mut live = LiveStatus::new(
             engine.count_tokens(prompt_text),
             Instant::now(),
             engine.ctx_size(),
@@ -4357,7 +4372,9 @@ fn generate_pass(
             sc.think,
             engine.model_name(),
             sc.running_jobs,
-        )
+        );
+        live.memory_pass = sc.memory_pass;
+        live
     });
     let st;
     let prompt = match bufs {
@@ -4780,16 +4797,6 @@ impl Agent<'_> {
             if !renderer.last_output_newline() {
                 println!();
             }
-            // Stop hooks: exit 2 feeds stderr to the model and the turn
-            // continues (at most once).
-            if !stop_hook_ran && let Some(feedback) = self.run_stop_hooks(&mut |w| println!("{w}"))
-            {
-                stop_hook_ran = true;
-                self.session.push(Message::user(format!(
-                    "<tool_result>Stop hook feedback:\n{feedback}</tool_result>"
-                )));
-                continue;
-            }
             // Before the footer, not after: the bar is rendered from the
             // published cells, so refreshing afterwards would show every cell
             // one turn stale and leave the first turn's bar empty.
@@ -4815,16 +4822,28 @@ impl Agent<'_> {
                 );
             }
             self.flush_kv_end_of_turn();
+            // Memory extraction: this is the genuine no-tool-calls turn exit,
+            // never the tool-round `continue` above — the span must not be
+            // cut mid-turn (CLAUDE.md: mirror the TUI's site in
+            // `worker_turn`). Only a snapshot: the reading happens from the
+            // REPL's idle tick (`run_repl_plain_local`), so the prompt comes
+            // back now.
+            self.enqueue_memory_job();
+            // Stop hooks: exit 2 feeds stderr to the model and the turn
+            // continues (at most once).
+            if !stop_hook_ran && let Some(feedback) = self.run_stop_hooks(&mut |w| println!("{w}"))
+            {
+                stop_hook_ran = true;
+                self.session.push(Message::user(format!(
+                    "<tool_result>Stop hook feedback:\n{feedback}</tool_result>"
+                )));
+                continue;
+            }
+            self.fire_turn_end(stats.generated, turn_start.elapsed());
+            // The idle title is the last thing: everything above is still
+            // part of the turn as far as a watching window is concerned.
             crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
-            self.fire_turn_end(stats.generated, turn_start.elapsed());
-            // Memory extraction: this is the genuine no-tool-calls turn exit,
-            // never the tool-round `continue` above — the pass must not fire
-            // mid-turn (CLAUDE.md: mirror the TUI's equivalent site).
-            self.maybe_extract_memories();
-            if let Some(notice) = self.pending_memory_notice.take() {
-                println!("{}", crate::status::system_line(&notice, self.color));
-            }
             return Ok(());
         }
     }
@@ -11550,9 +11569,6 @@ impl Agent<'_> {
             last_activity = Instant::now();
         }
 
-        // Presses on the footer's wastebasket, so the second inside the window
-        // toggles micro-compaction. The mid-turn loop keeps its own.
-        let mut mc_clicks = SegmentDoubleClick::default();
         // Endpoints of a mouse drag selection over the output area, in content
         // space: `(column, absolute-wrapped-row)`. Anchoring the row to content
         // (not the screen) lets the selection survive scrolling. Copied to the
@@ -11879,6 +11895,29 @@ impl Agent<'_> {
                         last_activity = Instant::now();
                     }
                 }
+                // A memory span snapshotted at the last turn end waits for
+                // exactly this: a quiet prompt. Same guards as the job wake,
+                // for the same reasons, plus the poll timeout above, so the
+                // pass never starts under a keystroke. Deliberately not an
+                // activity for the screensaver clock: nobody is here.
+                if input.buf.text().is_empty()
+                    && config_form.is_none()
+                    && kv_pane.is_none()
+                    && resume_pane.is_none()
+                    && !arcade.is_open()
+                    && wasm_frame.is_none()
+                    && self.memory_jobs_pending()
+                {
+                    self.tui_memory_pass(
+                        terminal,
+                        &mut log,
+                        &mut view,
+                        &mut input,
+                        &mut btw_panel,
+                        &mut arcade,
+                        &mut sub_pane,
+                    )?;
+                }
                 continue;
             };
             // What counts as the user being here: keys, mouse, and pastes.
@@ -12000,16 +12039,6 @@ impl Agent<'_> {
                             // The footer's jobs segment toggles the `/jobs` panel.
                             self.toggle_jobs_report(&mut report);
                             selection.cancel();
-                        } else if tui::mc_click(m.column, m.row) {
-                            // The footer's wastebasket: a double-click flips
-                            // micro-compaction, a single press says what it is.
-                            if mc_clicks.press(Instant::now()) {
-                                log.push_plain(microcompact_toggle());
-                            } else {
-                                log.push_dim(microcompact_click_hint());
-                            }
-                            view.follow = true;
-                            selection.cancel();
                         } else if tui::toks_click(m.column, m.row) {
                             // The footer's chart glyph toggles the `/toks`
                             // panel: the bar has no room for the chart, so the
@@ -12033,9 +12062,9 @@ impl Agent<'_> {
                             selection.cancel();
                         } else if tui::think_click(m.column, m.row) {
                             // The footer's brain flips thinking visibility for
-                            // this session. A single click, unlike the
-                            // wastebasket's double: this changes only what the
-                            // next pass prints, and clicking again undoes it.
+                            // this session. A single click: this changes only
+                            // what the next pass prints, and clicking again
+                            // undoes it.
                             think_show_click();
                             selection.cancel();
                         } else if tui::ctx_click(m.column, m.row) {
@@ -13205,6 +13234,81 @@ impl Agent<'_> {
     /// `?` (or at the call sites that swallow the error) makes the invariant
     /// hold by construction: a future error path added inside the body cannot
     /// forget it.
+    /// Runs one queued memory job from the idle loop, on a worker thread
+    /// behind the same busy UI loop as a turn, so the footer shows
+    /// `taking notes…` with the pass's own figures and the prompt stays
+    /// editable. `TurnShared::memory_pass` tells the busy loop that a
+    /// submitted prompt is also an interrupt: the pass stops at its next
+    /// token, `process_memory_job` puts the job back at the front of the
+    /// queue, and the typed line becomes the next turn right here — the
+    /// user never waits for the notes.
+    #[allow(clippy::too_many_arguments)]
+    fn tui_memory_pass(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        log: &mut OutputLog,
+        view: &mut tui::OutputView,
+        input: &mut TuiInput,
+        btw: &mut BtwPanel,
+        arcade: &mut crate::arcade::Arcade,
+        sub: &mut tui::SubPane,
+    ) -> Result<(), String> {
+        log.push_dim(Self::MEMORY_PASS_LINE.to_owned());
+        // The remote bridge's persistent `TurnShared` when there is one, so
+        // a remote prompt typed during the pass lands in the same queue a
+        // local one does, exactly as in `tui_turn_inner`.
+        let remote = self.remote.clone();
+        let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
+        let ui_remote = self.ui_remote.clone();
+        let local_shared = TurnShared::default();
+        let shared: &TurnShared = remote
+            .as_deref()
+            .map_or(&local_shared, |r| r.shared.as_ref());
+        shared.memory_pass.store(true, Ordering::Relaxed);
+        let live = LiveCommands::capture(self);
+        let run = run_worker_ui(
+            terminal,
+            log,
+            view,
+            input,
+            btw,
+            arcade,
+            sub,
+            shared,
+            bus.as_deref(),
+            ui_remote.as_deref(),
+            None,
+            &live,
+            |tx| {
+                // The quiet pass publishes its footer status through
+                // `sub_sink`, which still points at the last turn's dead
+                // channel: install this one.
+                self.sub_sink = SubSinkTarget::Events(tx.clone());
+                self.process_memory_job();
+                if let Some(notice) = self.pending_memory_notice.take() {
+                    let _ = tx.send(UiEvent::Dim(notice));
+                }
+            },
+        );
+        shared.memory_pass.store(false, Ordering::Relaxed);
+        // The interrupt a typed prompt raised has done its job. Both flags
+        // are cleared here, not left for the next turn to trip over: the
+        // worker clears the process flag only where it reports a cut-off
+        // generation, and this pass may have ended before it noticed.
+        shared.interrupt.store(false, Ordering::Relaxed);
+        crate::interrupt::clear();
+        if let Err(e) = run {
+            return Err(self.reconcile_and_fail(log, shared, e));
+        }
+        // The prompt that cut the pass short is the next turn, now.
+        let leftover = shared.take_queued();
+        if !leftover.is_empty() {
+            self.absorb_leftover(log, leftover);
+            self.tui_turn(terminal, log, view, input, btw, arcade, sub)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn tui_turn(
         &mut self,
@@ -13507,37 +13611,19 @@ impl Agent<'_> {
                     ));
                 }
                 self.flush_kv_end_of_turn();
-                crate::title::set(crate::title::State::Idle);
-                crate::warp::emit("stop", &self.session.id);
                 // Mirrored from the plain path: a component must not observe a
                 // different number of turns depending on which front end the
                 // user happens to be running. The token count is not available
                 // here — this path reports elapsed time only — so the field is
                 // sent as -1 rather than as a plausible-looking zero.
                 self.fire_turn_end(-1, turn_started.elapsed());
-                // Memory extraction: same turn-boundary rule as the plain
-                // path — the genuine no-tool-calls exit, never a tool round.
-                //
-                // The idle loop's wake-for-jobs guards (`input.buf.text()
-                // .is_empty() && config_form.is_none() && …`, `tui_loop`)
-                // are deliberately not repeated here. Those guard a *decision
-                // to start* generation from the idle loop, which polls
-                // terminal events between turns and could see a draft or an
-                // open modal while nothing else is running. This call sits
-                // instead at the tail of an already-running `tui_turn_inner`,
-                // itself called synchronously and un-spawned from every call
-                // site (`grep -n '\.tui_turn(' src/ui.rs`) — there is no
-                // worker thread and no interleaved `crossterm` event read
-                // between the top of the turn and this point, so the event
-                // loop (and whatever draft/modal state predates the turn)
-                // cannot change underneath it. `tui_loop` says as much for
-                // the whole turn: "A running turn never reaches this loop,
-                // so a long generation cannot be mistaken for an idle user."
-                // The same blocking call chain carries the memory pass.
-                self.maybe_extract_memories();
-                if let Some(notice) = self.pending_memory_notice.take() {
-                    log.push_dim(notice);
-                }
+                // The idle title is the last thing: everything above is still
+                // part of the turn as far as a watching window is concerned.
+                crate::title::set(crate::title::State::Idle);
+                crate::warp::emit("stop", &self.session.id);
+                // The Stop hooks have already run inside `worker_turn`; the
+                // memory span was snapshotted there too, and is read from the
+                // idle loop (`tui_memory_pass`) once the prompt is back.
                 return Ok(());
             }
             run_main = !leftover.is_empty();
@@ -14069,6 +14155,12 @@ impl Agent<'_> {
                 shared.set_context(self.context_breakdown());
                 continue;
             }
+            // Memory extraction: the genuine no-tool-calls exit, never a tool
+            // round — the mirror of the plain path's site in `run_turn`
+            // (CLAUDE.md). Only a snapshot: the reading happens from the
+            // idle loop (`tui_memory_pass`), on a worker with the footer
+            // live, and a prompt typed meanwhile cuts it short.
+            self.enqueue_memory_job();
             // Stop hooks: exit 2 feeds stderr to the model and the turn
             // continues (at most once).
             if !stop_hook_ran {
@@ -14301,6 +14393,16 @@ impl Agent<'_> {
         finished.len()
     }
 
+    /// Plain-stdout mirror of `tui_memory_pass`: announces, runs one queued
+    /// job, prints its one-line outcome when there is one.
+    fn plain_memory_pass(&mut self) {
+        println!("{}", self.debug_line(Self::MEMORY_PASS_LINE));
+        self.process_memory_job();
+        if let Some(notice) = self.pending_memory_notice.take() {
+            println!("{}", crate::status::system_line(&notice, self.color));
+        }
+    }
+
     /// Plain-stdout mirror of the TUI's dim wake line; silent for `0`.
     fn print_job_wake(&self, n: usize) {
         if n > 0 {
@@ -14308,15 +14410,62 @@ impl Agent<'_> {
         }
     }
 
-    /// Runs the memory extraction pass if every gate allows it. Returns
-    /// whether a pass ran.
+    /// Snapshots the span since the last pass into a [`MemoryJob`] if every
+    /// gate allows it, and returns whether one was queued. Nothing is
+    /// generated here: this is what a turn end does, so the prompt comes
+    /// back the moment the answer is done and the reading happens at the
+    /// next idle moment (`process_memory_job`).
     ///
     /// Called only at a turn boundary — after a generation that ended with no
-    /// tool calls — never mid-pass, and *synchronously on the turn thread*:
-    /// both call sites sit after `fire_turn_end`, so the pass's KV snapshot,
-    /// prefill, generation and restore are neither overlapped with the next
-    /// prompt nor counted in the turn stats. Settings are sampled fresh every
-    /// call so a `/config` change takes effect on the next eligible turn.
+    /// tool calls — never mid-pass (`run_turn` on the plain path,
+    /// `worker_turn` in the TUI), and never for a turn the user interrupted
+    /// (`memory_pass_allowed`). The span is retired (`ExtractState::finish`)
+    /// as it is snapshotted: the job carries the whole prompt, so the live
+    /// transcript is free to move on — the next turn opens a new span from
+    /// here, and a `/clear` cannot lose what was already captured. Settings
+    /// are sampled fresh every call so a `/config` change takes effect on
+    /// the next eligible turn.
+    fn enqueue_memory_job(&mut self) -> bool {
+        let settings = crate::settings::active();
+        self.extract_state.enabled = settings.memory.auto_extract;
+        self.extract_state.every_n = settings.memory.extract_every_n_turns;
+        if self.in_sidechain() {
+            return false; // a sub-agent's turn end is not a turn boundary
+        }
+        let depth = self.session.transcript.len();
+        let Some(from) = self.extract_state.should_run(depth) else {
+            return false;
+        };
+        // An interrupted turn is not a finished one: the user cut the model
+        // off and wants the prompt back. `cancel` rather than `finish`, so
+        // the span is read by the next turn that does complete. Checked after
+        // `should_run` so the model's own `remember` suppression is still
+        // consumed for this turn.
+        if !self.memory_pass_allowed() {
+            self.extract_state.cancel();
+            return false;
+        }
+        let entries = crate::memextract::current_entries(&self.tool_ctx.cwd);
+        let slice = self.session.transcript[from.min(depth)..depth].to_vec();
+        let task = crate::memextract::build_prompt(&slice, &entries);
+        self.extract_state.finish(depth);
+        self.memory_jobs.push_back(crate::memextract::MemoryJob {
+            task,
+            depth,
+            attempts: 0,
+        });
+        true
+    }
+
+    /// Whether a queued span is waiting to be read.
+    fn memory_jobs_pending(&self) -> bool {
+        !self.memory_jobs.is_empty()
+    }
+
+    /// Runs the oldest queued job: one sidechain generation against the live
+    /// session, then the verdicts are applied. Returns whether a generation
+    /// ran. Called from each front end's idle loop, and synchronously by the
+    /// headless paths before they exit.
     ///
     /// The pass is a sidechain opened with `begin_sidechain` (the prompt goes
     /// in verbatim, not through the sub-agent task framing), driven by a
@@ -14326,40 +14475,35 @@ impl Agent<'_> {
     /// ladder pushes no rungs and stores no payload. Two invariants follow:
     /// this never starts a pass while already inside a sidechain (no
     /// nesting), and every exit path below goes through `end_subagent_fork`,
-    /// so `sidechain_depth` always returns to 0 — including the
-    /// interrupted/error path, where nothing is applied and
-    /// `ExtractState::cancel` leaves the work to be redone later rather than
-    /// recording partial progress.
-    fn maybe_extract_memories(&mut self) -> bool {
-        let settings = crate::settings::active();
-        self.extract_state.enabled = settings.memory.auto_extract;
-        self.extract_state.every_n = settings.memory.extract_every_n_turns;
+    /// so `sidechain_depth` always returns to 0.
+    ///
+    /// How a job leaves the queue: applied (or unusable — a reply that is not
+    /// a JSON array is a property of the model on this prompt, not a
+    /// transient fault, and re-reading the same span forever would never do
+    /// better; the repro dump is the diagnostic), too big for the context
+    /// (dropped with a one-time notice), or after `MAX_JOB_ATTEMPTS` engine
+    /// errors. An interrupt — the user typed a prompt, or pressed Esc — puts
+    /// it back at the front, uncounted: the work is simply redone at the
+    /// next idle moment.
+    fn process_memory_job(&mut self) -> bool {
         if self.in_sidechain() {
             return false; // never nest a pass inside another sidechain
         }
-        let depth = self.session.transcript.len();
-        let Some(from) = self.extract_state.should_run(depth) else {
+        let Some(mut job) = self.memory_jobs.pop_front() else {
             return false;
         };
-        let entries = crate::memextract::current_entries(&self.tool_ctx.cwd);
-        let slice = self.session.transcript[from.min(depth)..depth].to_vec();
-        let task = crate::memextract::build_prompt(&slice, &entries);
-
         // Preflight, before the KV snapshot the fork takes: the sidechain
-        // prompt is the whole live session plus `task`, so it must fit the
+        // prompt is the whole live session plus the task, so it must fit the
         // headroom the session leaves (`last_ctx_used`, the same figure the
         // `/think` room guard uses) with space for the reply. A span that
-        // does not fit is a property of *this span* — the excerpt is already
-        // capped by `build_prompt`, so nothing about it shrinks on a retry —
-        // and is retired with `finish`, exactly like an unusable reply below.
-        // Only run-time faults (engine error, interrupt) `cancel` and retry.
+        // does not fit is a property of *this job* — the excerpt is already
+        // capped by `build_prompt`, so nothing about it shrinks on a retry.
         let need = self
             .engine
-            .count_tokens(&task)
+            .count_tokens(&job.task)
             .saturating_add(crate::memextract::REPLY_RESERVE_TOKENS);
         let ctx = self.engine.ctx_size();
         if self.last_ctx_used.saturating_add(need) > ctx {
-            self.extract_state.finish(depth);
             if self.extract_state.note_oversized_span() {
                 self.pending_memory_notice = Some(format!(
                     "memory: the extraction pass skipped a span that would not fit \
@@ -14374,16 +14518,26 @@ impl Agent<'_> {
         // "use your tools, then report" framing contradicts the JSON-only
         // contract — and the sidechain is exactly one generation with no
         // dispatch (`run_memory_round`), so the pass can never touch a tool.
-        let fork_at = self.begin_sidechain(task.clone(), true);
+        // The scoped title displaces whatever the front end shows at idle
+        // and puts it back on every exit path.
+        self.extract_state.begin_pass();
+        let _title = crate::title::Scoped::set(crate::title::State::Remembering);
+        let fork_at = self.begin_sidechain(job.task.clone(), true);
         let (done, result) = self.run_sidechain_quietly(Self::run_memory_round);
-        let report = self.end_subagent_fork(fork_at, "memory", &task, done);
+        let report = self.end_subagent_fork(fork_at, "memory", &job.task, done);
+        self.extract_state.end_pass();
 
         let Ok(usable) = result else {
-            self.extract_state.cancel();
+            job.attempts = job.attempts.saturating_add(1);
+            if job.attempts < crate::memextract::MAX_JOB_ATTEMPTS {
+                self.memory_jobs.push_front(job);
+            } else {
+                self.note_sidechain_outcome("dropped after repeated engine errors");
+            }
             return false;
         };
         if crate::interrupt::pending() {
-            self.extract_state.cancel();
+            self.memory_jobs.push_front(job);
             return false;
         }
         let verdicts = if usable {
@@ -14410,14 +14564,39 @@ impl Agent<'_> {
             }
             None => self.note_unusable_memory_reply(),
         }
-        // The span advances even when nothing could be read from the reply.
-        // A reply that is not a JSON array is a property of the model on this
-        // prompt, not a transient fault (those — engine error, interrupt —
-        // cancel above and are retried): re-reading the same span every idle
-        // turn would cost a growing prompt forever and never do better. The
-        // repro dump and the one-time notice below are the diagnostic.
-        self.extract_state.finish(depth);
         true
+    }
+
+    /// Runs every queued job to completion, synchronously. For the headless
+    /// paths, which have no idle loop to come back to before they exit; the
+    /// attempt cap and the drop rules in `process_memory_job` are what make
+    /// this terminate. An interrupt abandons the rest of the queue.
+    fn drain_memory_jobs(&mut self) {
+        while self.memory_jobs_pending() {
+            let before = self.memory_jobs.len();
+            self.process_memory_job();
+            if crate::interrupt::pending() {
+                return;
+            }
+            // A job put back at the front without a fault of its own (an
+            // interrupt) would spin here; the check above catches that, and
+            // the attempt cap bounds the fault case.
+            if self.memory_jobs.len() >= before && self.memory_jobs_pending() {
+                let stuck = self.memory_jobs.front().is_some_and(|j| j.attempts == 0);
+                if stuck {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Snapshot and read in one step: the synchronous behaviour, kept for the
+    /// tests, which exercise the gates and the pass together. Returns whether
+    /// a generation ran.
+    #[cfg(test)]
+    fn maybe_extract_memories(&mut self) -> bool {
+        self.enqueue_memory_job();
+        self.process_memory_job()
     }
 
     /// The memory pass's whole sidechain: one quiet generation, its text
@@ -14447,17 +14626,13 @@ impl Agent<'_> {
         Ok(usable)
     }
 
-    /// Records a memory pass whose reply yielded no verdicts: always in the
-    /// sidechain's repro dump (`/repro`), and once per session as a dim
-    /// front-end line through the same channel as the change summary, so a
-    /// model that never answers in JSON is visible without a line every turn.
+    /// Records a memory pass whose reply yielded no verdicts, in the
+    /// sidechain's repro dump (`/repro`) and the per-session counter only.
+    /// Nothing is printed: a pass that found nothing worth keeping is the
+    /// ordinary outcome of most turns, and a line for it was noise.
     fn note_unusable_memory_reply(&mut self) {
         self.note_sidechain_outcome("no usable verdicts");
-        if self.extract_state.note_unusable_reply() {
-            self.pending_memory_notice = Some(
-                "memory: the extraction pass produced no usable verdicts (see /repro)".to_owned(),
-            );
-        }
+        self.extract_state.note_unusable_reply();
     }
 
     /// Queues one quiet summary line for the next turn boundary to print,
@@ -14466,6 +14641,21 @@ impl Agent<'_> {
     /// event. `run_turn` and `tui_turn_inner` drain
     /// `pending_memory_notice` right after calling
     /// [`maybe_extract_memories`](Self::maybe_extract_memories).
+    /// Whether the turn that just ended may be followed by the memory pass:
+    /// not one the user interrupted (`last_turn_interrupted`, set by both
+    /// front ends' cut-off paths), and not one with an interrupt still
+    /// pending from Esc or Ctrl-C. Shared by the pass itself and by the two
+    /// call sites' announcement, so the line and the pass always agree.
+    fn memory_pass_allowed(&self) -> bool {
+        !self.last_turn_interrupted && !crate::interrupt::pending()
+    }
+
+    /// The dim line both front ends show as a queued memory job starts
+    /// running at idle, so the generation is not mistaken for a hang. The
+    /// TUI footer carries the live verb (`status::MEMORY_VERB`) on top; the
+    /// plain REPL has only this line.
+    const MEMORY_PASS_LINE: &'static str = "memory: taking notes on the last turn…";
+
     fn report_memory_changes(&mut self, notes: &[String]) {
         let summary = if notes.len() == 1 {
             format!("memory: {}", notes[0])
@@ -16558,50 +16748,6 @@ fn run_worker_ui<T: Send>(
     })
 }
 
-/// Tracks repeated left-presses on one footer segment, so a double-click can
-/// be told from two unrelated clicks.
-///
-/// One instance per clickable target per key loop, rather than a screen-wide
-/// gesture recognizer: crossterm reports presses, not clicks, and the only
-/// thing that needs the distinction is the wastebasket. Position is
-/// deliberately *not* compared — the caller has already established that both
-/// presses landed on the same segment, and the segment is a few columns of
-/// wide glyphs, so a one-cell drift between the two presses of a real
-/// double-click must not disarm it.
-#[derive(Debug, Default)]
-struct SegmentDoubleClick {
-    /// When the unpaired press landed, if one is waiting for its partner.
-    pending: Option<Instant>,
-}
-
-impl SegmentDoubleClick {
-    /// How long the second press has to arrive. The macOS default double-click
-    /// interval is 500 ms; this is a little under it, because the cost of
-    /// missing one is a repeated click and the cost of pairing two deliberate
-    /// separate clicks is a setting flipped by surprise.
-    const WINDOW: Duration = Duration::from_millis(400);
-
-    /// Records a press on the segment and reports whether it completed a
-    /// double-click.
-    fn press(&mut self, now: Instant) -> bool {
-        let paired = self
-            .pending
-            .is_some_and(|at| now.duration_since(at) <= Self::WINDOW);
-        // Consumed on a pair, so a third press opens a fresh one instead of
-        // reporting a second double-click off the same first press.
-        self.pending = if paired { None } else { Some(now) };
-        paired
-    }
-}
-
-/// Flips micro-compaction, for the footer's wastebasket double-click. Goes
-/// through [`microcompact_command`] rather than writing the setting itself, so
-/// the gesture and the typed `/mc on|off` cannot drift.
-fn microcompact_toggle() -> String {
-    let on = crate::settings::active().context.microcompact;
-    microcompact_command(if on { "off" } else { "on" })
-}
-
 /// The override a click on the footer's brain installs, and the flash tip it
 /// leaves behind.
 ///
@@ -16643,25 +16789,6 @@ fn think_show_click() {
     let (next, tip) = think_show_toggled(crate::settings::show_thinking_effective());
     crate::settings::set_show_thinking_override(Some(next));
     crate::status::set_flash_tip(tip);
-}
-
-/// What a single click on the wastebasket leaves in the log: the state, and the
-/// gesture that changes it.
-///
-/// A single click deliberately does not toggle. Micro-compaction rewrites old
-/// tool results in place and costs a rung restore when it does, so it is not a
-/// thing to flip on a stray press in the status bar — and a footer where one
-/// glyph answers a click by changing the session is a footer nobody clicks
-/// twice.
-fn microcompact_click_hint() -> String {
-    format!(
-        "micro-compaction: {} (double-click to toggle)",
-        if crate::settings::active().context.microcompact {
-            "on"
-        } else {
-            "off"
-        }
-    )
 }
 
 /// How long an unacknowledged interrupt waits before a second Ctrl-C is taken
@@ -16830,8 +16957,6 @@ fn busy_ui_loop(
     // it. Rows are absolute wrapped-row indices, so the selection stays on its
     // text as new output arrives underneath it.
     let mut selection = tui::DragSelect::default();
-    // Presses on the footer's wastebasket; see the idle loop's own tracker.
-    let mut mc_clicks = SegmentDoubleClick::default();
     // Context tokens resident as of the last status snapshot, which counts up
     // with every generated token. What makes an open `/context` panel fill
     // live rather than sitting on the last boundary's figure.
@@ -17387,6 +17512,16 @@ fn busy_ui_loop(
                         // Submitting anything retires an open `/usage` report.
                         report = None;
                         if line.is_empty() {
+                        } else if shared.memory_pass.load(Ordering::Relaxed)
+                            && btw_question(&line).is_some()
+                        {
+                            // No main task to ask beside during a memory
+                            // pass, and nothing to preempt that would resume:
+                            // a plain prompt is the way to have the model now.
+                            log.push_dim(
+                                "[/btw has nothing to run beside while notes are taken — \
+                                 just type your prompt; it starts at once]",
+                            );
                         } else if btw_question(&line).is_some() {
                             // A `/btw` gets priority: it preempts the running
                             // main pass so the side question is answered now,
@@ -17560,6 +17695,13 @@ fn busy_ui_loop(
                             input.history.add(&line);
                             log.push_pending(&line);
                             shared.push_queued(line);
+                            // During a memory pass the queued line is also
+                            // the signal to stop taking notes: the pass goes
+                            // back on the queue and this line runs next
+                            // (`tui_memory_pass`).
+                            if shared.memory_pass.load(Ordering::Relaxed) {
+                                raise_worker_interrupt(shared);
+                            }
                             view.follow = true;
                             sub.follow_all();
                         }
@@ -17674,21 +17816,6 @@ fn busy_ui_loop(
                     }
                     selection.cancel();
                 }
-                // The footer's wastebasket, as at idle. The one *mutating*
-                // gesture that works mid-turn, for the same reason
-                // `/loopguard` is: every micro-compaction check reads the
-                // setting afresh, so the switch lands on the turn already
-                // running — which is when you want it.
-                MouseEventKind::Down(MouseButton::Left) if tui::mc_click(m.column, m.row) => {
-                    if mc_clicks.press(Instant::now()) {
-                        log.push_plain(microcompact_toggle());
-                    } else {
-                        log.push_dim(microcompact_click_hint());
-                    }
-                    view.follow = true;
-                    sub.follow_all();
-                    selection.cancel();
-                }
                 // The footer's chart glyph toggles the `/toks` panel, as at
                 // idle. The samples are process-wide, so this needs no agent.
                 MouseEventKind::Down(MouseButton::Left) if tui::toks_click(m.column, m.row) => {
@@ -17704,10 +17831,10 @@ fn busy_ui_loop(
                     sub.follow_all();
                     selection.cancel();
                 }
-                // The footer's brain, as at idle. Safe mid-turn for the reason
-                // the wastebasket is: each pass re-reads the setting when it
-                // configures its renderer, so the flip lands on the next pass
-                // of the turn already running rather than being lost.
+                // The footer's brain, as at idle. Safe mid-turn: each pass
+                // re-reads the setting when it configures its renderer, so the
+                // flip lands on the next pass of the turn already running
+                // rather than being lost.
                 MouseEventKind::Down(MouseButton::Left) if tui::think_click(m.column, m.row) => {
                     think_show_click();
                     selection.cancel();
@@ -18121,6 +18248,7 @@ fn new_agent(
         sidechain_depth: 0,
         alt_engine_depth: 0,
         extract_state: crate::memextract::ExtractState::default(),
+        memory_jobs: std::collections::VecDeque::new(),
         pending_memory_notice: None,
         repro_dir,
         quiet_tools: false,
@@ -18629,6 +18757,16 @@ fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
                         agent.wake_for_jobs()?;
                         print!("{}", status::prompt_text());
                         std::io::stdout().flush().map_err(|e| e.to_string())?;
+                    } else if agent.memory_jobs_pending() {
+                        // The quiet prompt is the moment to read the span the
+                        // last turn snapshotted. One job per tick, so a line
+                        // typed meanwhile is picked up between jobs; the
+                        // plain REPL cannot cut a generation short on
+                        // keystrokes, so a typed line waits out this one.
+                        println!();
+                        agent.plain_memory_pass();
+                        print!("{}", status::prompt_text());
+                        std::io::stdout().flush().map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -18709,6 +18847,9 @@ pub fn run_headless(
             }
             _ => agent.run_turn(),
         };
+        // No idle loop to come back to: read the snapshotted span now, so a
+        // one-shot run still leaves its notes.
+        agent.drain_memory_jobs();
         agent.save_headless_session(cfg.save_session);
         headless_quit_repro(&mut agent);
         agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
@@ -18748,6 +18889,9 @@ pub fn run_headless(
                     eprintln!("+DWARFSTAR_JOBS_FINISHED {n}");
                     agent.run_turn()?;
                 }
+            } else if agent.memory_jobs_pending() {
+                agent.process_memory_job();
+                agent.pending_memory_notice = None;
             }
             continue;
         };
@@ -18757,6 +18901,7 @@ pub fn run_headless(
         agent.session.push(Message::user(prompt.trim_end()));
         agent.run_turn()?;
     }
+    agent.drain_memory_jobs();
     agent.save_headless_session(cfg.save_session);
     headless_quit_repro(&mut agent);
     agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
@@ -20870,6 +21015,7 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -21554,27 +21700,6 @@ mod tests {
         assert_eq!(crate::settings::loop_guards_override(), Some(false));
         assert!(!crate::guard::guards_enabled());
         crate::settings::set_loop_guards_override(None);
-    }
-
-    /// The wastebasket's gesture: two presses inside the window are a
-    /// double-click, a slow second press is not, and a pair is consumed so a
-    /// third press cannot ride the first one.
-    #[test]
-    fn a_second_press_inside_the_window_is_a_double_click() {
-        let mut g = SegmentDoubleClick::default();
-        let t0 = Instant::now();
-        assert!(!g.press(t0), "the first press is never a double-click");
-        assert!(g.press(t0 + Duration::from_millis(120)));
-        // Consumed: the next press opens a fresh pair rather than pairing with
-        // the press that already fired.
-        assert!(!g.press(t0 + Duration::from_millis(140)));
-        // Too slow: it becomes the start of the next pair instead.
-        assert!(!g.press(t0 + Duration::from_secs(5)));
-        assert!(g.press(t0 + Duration::from_secs(5) + SegmentDoubleClick::WINDOW));
-        // Exactly at the edge counted above; a hair past it does not.
-        let mut g = SegmentDoubleClick::default();
-        assert!(!g.press(t0));
-        assert!(!g.press(t0 + SegmentDoubleClick::WINDOW + Duration::from_millis(1)));
     }
 
     /// Regression: the screensaver's idle clock must not be reset by focus or
@@ -23300,6 +23425,7 @@ mod tests {
         let shared = TurnShared::default();
         shared.push_btw("what is 3+4?".to_owned());
         let (tx, _rx) = std::sync::mpsc::channel();
+        let _no_extract = disable_auto_extract_for_test();
         agent.worker_turn(&tx, &shared).unwrap();
         drop(tx);
 
@@ -23348,6 +23474,7 @@ mod tests {
         shared.push_btw("what language?".to_owned());
         shared.preempt.store(true, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
+        let _no_extract = disable_auto_extract_for_test();
         agent.worker_turn(&tx, &shared).unwrap();
         drop(tx);
 
@@ -23415,6 +23542,7 @@ mod tests {
         shared.push_btw("what language?".to_owned());
         shared.preempt.store(true, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
+        let _no_extract = disable_auto_extract_for_test();
         agent.worker_turn(&tx, &shared).unwrap();
         drop(tx);
 
@@ -26016,6 +26144,7 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -26110,6 +26239,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn usage_report_tallies_provider_turns() {
         let dir = std::env::temp_dir().join(format!("plank-usage-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -26143,6 +26273,7 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -27523,6 +27654,7 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -27796,6 +27928,7 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -27908,6 +28041,7 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -28007,6 +28141,7 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -28129,6 +28264,7 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -28817,6 +28953,7 @@ mod tests {
         agent.session.push(Message::user("do the task"));
         let shared = TurnShared::default();
         let (tx, _rx) = std::sync::mpsc::channel();
+        let _no_extract = disable_auto_extract_for_test();
         agent.worker_turn(&tx, &shared).unwrap();
 
         let seen = prompts.lock().unwrap().clone();
@@ -28857,6 +28994,7 @@ mod tests {
         agent.session.push(Message::user("do a code review"));
         let shared = TurnShared::default();
         let (tx, rx) = std::sync::mpsc::channel();
+        let _no_extract = disable_auto_extract_for_test();
         agent.worker_turn(&tx, &shared).unwrap();
         drop(tx);
         let events: Vec<UiEvent> = rx.try_iter().collect();
@@ -30714,6 +30852,7 @@ or the user's next message aborts before its first token"
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -30855,6 +30994,7 @@ or the user's next message aborts before its first token"
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
@@ -31112,6 +31252,159 @@ or the user's next message aborts before its first token"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A turn end snapshots the span and generates nothing; the reading is
+    /// the idle loop's job, and it retires the span as it is captured.
+    #[test]
+    fn a_turn_end_only_queues_the_span() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job(), "the span is queued");
+        assert!(prompts.lock().unwrap().is_empty(), "nothing generated yet");
+        assert_eq!(agent.memory_jobs.len(), 1);
+        assert!(
+            !agent.enqueue_memory_job(),
+            "the span is retired as it is snapshotted, so nothing new to queue"
+        );
+        assert!(agent.memory_jobs_pending());
+        assert!(agent.process_memory_job(), "the idle moment reads it");
+        assert_eq!(prompts.lock().unwrap().len(), 1);
+        assert!(prompts.lock().unwrap()[0].contains("user: hello"));
+        assert!(!agent.memory_jobs_pending());
+        assert!(!agent.process_memory_job(), "an empty queue runs nothing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A prompt typed while a job runs interrupts it; the job goes back to
+    /// the front, uncounted, and runs at the next idle moment.
+    #[test]
+    fn an_interrupted_job_goes_back_to_the_front_of_the_queue() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-interrupt");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string(), "[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job());
+        let task = agent.memory_jobs.front().unwrap().task.clone();
+        crate::interrupt::request();
+        assert!(!agent.process_memory_job(), "cut short: not applied");
+        crate::interrupt::clear();
+        assert_eq!(agent.memory_jobs.len(), 1, "back on the queue");
+        let job = agent.memory_jobs.front().unwrap();
+        assert_eq!(job.task, task, "the same job, not a new span");
+        assert_eq!(job.attempts, 0, "an interrupt is not a fault");
+        assert_eq!(agent.sidechain_depth, 0, "the fork is closed");
+        assert!(agent.process_memory_job(), "runs at the next idle moment");
+        assert!(!agent.memory_jobs_pending());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A job whose engine keeps failing is dropped after the attempt cap, so
+    /// a broken engine cannot pin the idle loop on the same span forever.
+    #[test]
+    fn a_job_is_dropped_after_repeated_engine_errors() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-drop");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            fail_with: Some("provider exploded".to_string()),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job());
+        for attempt in 1..crate::memextract::MAX_JOB_ATTEMPTS {
+            assert!(!agent.process_memory_job());
+            assert_eq!(agent.memory_jobs.len(), 1, "attempt {attempt} keeps it");
+            assert_eq!(agent.memory_jobs.front().unwrap().attempts, attempt);
+        }
+        assert!(!agent.process_memory_job());
+        assert!(!agent.memory_jobs_pending(), "dropped at the cap");
+        assert_eq!(
+            agent.sidechain_dumps.back().map(|d| d.outcome.as_str()),
+            Some("dropped after repeated engine errors")
+        );
+        // The headless drain terminates on the same rule.
+        assert!(agent.enqueue_memory_job() || !agent.memory_jobs_pending());
+        agent.drain_memory_jobs();
+        assert!(!agent.memory_jobs_pending());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The job carries the whole prompt, so what the session does between
+    /// the turn end and the idle moment cannot lose the captured span.
+    #[test]
+    fn a_clear_between_turn_end_and_idle_does_not_lose_the_span() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-clear");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent
+            .session
+            .push(Message::user("remember the port is 8080"));
+        agent.session.push(Message::assistant("noted"));
+        assert!(agent.enqueue_memory_job());
+        agent.session.transcript.clear();
+        assert!(agent.process_memory_job());
+        let prompt = prompts.lock().unwrap()[0].clone();
+        assert!(prompt.contains("the port is 8080"), "{prompt}");
+        assert!(
+            agent.session.transcript.is_empty(),
+            "the sidechain folded away"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An interrupted turn runs no pass, and the span is not retired: the
+    /// next completed turn reads it.
+    #[test]
+    fn an_interrupted_turn_skips_the_memory_pass() {
+        let dir = scratch_dir("memextract-interrupted");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let _auto_extract_on = enable_auto_extract_for_test();
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.last_turn_interrupted = true;
+        assert!(
+            !agent.maybe_extract_memories(),
+            "the user cut the turn off: no extra generation"
+        );
+        assert!(!agent.extract_state.is_running());
+        agent.last_turn_interrupted = false;
+        assert!(
+            agent.maybe_extract_memories(),
+            "the span was cancelled, not retired, so the next turn reads it"
+        );
+    }
+
     #[test]
     fn a_prose_reply_is_noted_once_and_never_as_an_error() {
         let dir = scratch_dir("memextract-prose");
@@ -31128,8 +31421,10 @@ or the user's next message aborts before its first token"
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
         assert!(agent.maybe_extract_memories());
-        let notice = agent.pending_memory_notice.take().expect("noted once");
-        assert!(notice.contains("no usable verdicts"), "{notice}");
+        assert!(
+            agent.pending_memory_notice.is_none(),
+            "an empty pass is silent: the dump is the diagnostic"
+        );
         assert_eq!(
             agent.sidechain_dumps.back().map(|d| d.outcome.as_str()),
             Some("no usable verdicts")
@@ -31559,6 +31854,7 @@ or the user's next message aborts before its first token"
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,

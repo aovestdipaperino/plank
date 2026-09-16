@@ -23,7 +23,30 @@
 use crate::memory::{Entry, Scope};
 use crate::session::{Message, Role};
 
+/// One snapshotted span waiting for an idle moment: the prompt the pass
+/// will run, built from the transcript as it stood when the turn ended, so
+/// the pass reads exactly what the model said then whatever the session does
+/// meanwhile (`/clear`, a follow-up turn, compaction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryJob {
+    /// The complete extraction prompt (`build_prompt`), self-contained.
+    pub task: String,
+    /// Transcript depth the span ran to, for the sidechain dump's label.
+    pub depth: usize,
+    /// Run-time faults (engine errors) seen so far; the job is dropped at
+    /// [`MAX_JOB_ATTEMPTS`] so a broken engine cannot pin the idle loop.
+    pub attempts: u8,
+}
+
+/// Engine failures a queued job survives before it is dropped.
+pub const MAX_JOB_ATTEMPTS: u8 = 3;
+
 /// Gating state for the pass, owned by the `Agent`.
+///
+/// The bools are independent switches read side by side, not a state
+/// machine in disguise: two settings mirrors, an open span, a running
+/// generation, and the model's own write this turn.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct ExtractState {
     /// Mirror of `settings.memory.auto_extract`, sampled per turn.
@@ -32,8 +55,13 @@ pub struct ExtractState {
     pub every_n: u32,
     /// Transcript depth the last completed pass covered.
     processed_depth: usize,
-    /// Set while a pass is in flight.
+    /// Set between a positive `should_run` and the `finish`/`cancel` that
+    /// closes the span — with the idle queue that is only the moment the
+    /// span is snapshotted into a [`MemoryJob`].
     running: bool,
+    /// Set while a queued job's generation is actually running, so the
+    /// footer can name the pass (`Status::memory_pass`).
+    processing: bool,
     /// Eligible turns seen since the last run, for the throttle.
     eligible: u32,
     /// Whether the model called `remember` or `forget` this turn.
@@ -80,6 +108,39 @@ impl ExtractState {
         self.eligible = 0;
         self.running = true;
         Some(self.processed_depth)
+    }
+
+    /// Whether the next [`should_run`](Self::should_run) call at `depth`
+    /// would start a pass. A pure peek: it takes nothing and counts nothing,
+    /// so a front end can decide *how* to run the pass (on a worker thread,
+    /// behind a status line) before committing to it. A `false` here does
+    /// not excuse the caller from calling `should_run` anyway: that call is
+    /// what consumes the model's own `remember` suppression and advances the
+    /// throttle.
+    #[must_use]
+    pub fn would_run(&self, depth: usize) -> bool {
+        self.enabled
+            && !self.wrote_this_turn
+            && depth > self.processed_depth
+            && !self.running
+            && self.eligible.saturating_add(1) >= self.every_n.max(1)
+    }
+
+    /// Whether a queued job's generation is running right now (between
+    /// `begin_pass` and `end_pass`): the footer's cue to say `taking notes…`.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.processing
+    }
+
+    /// Marks a queued job's generation as running; see [`is_running`](Self::is_running).
+    pub fn begin_pass(&mut self) {
+        self.processing = true;
+    }
+
+    /// The end of that generation, however it ended.
+    pub fn end_pass(&mut self) {
+        self.processing = false;
     }
 
     /// Records a completed pass covering up to `depth`. Callers should
@@ -340,6 +401,51 @@ pub fn current_entries(cwd: &std::path::Path) -> Vec<(Scope, Entry)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn would_run_peeks_without_consuming() {
+        let mut s = state();
+        assert!(s.would_run(10), "the first eligible turn");
+        assert!(s.would_run(10), "a peek changes nothing");
+        assert_eq!(s.should_run(10), Some(0));
+        assert!(!s.would_run(12), "a span is open");
+        s.finish(10);
+        assert!(!s.would_run(10), "nothing new");
+        assert!(s.would_run(11));
+        // The model's own write suppresses the pass, and the peek agrees
+        // without clearing the suppression: `should_run` still does that.
+        s.note_tool_write();
+        assert!(!s.would_run(11));
+        assert_eq!(s.should_run(11), None);
+        assert!(s.would_run(11), "suppression consumed by should_run alone");
+    }
+
+    #[test]
+    fn is_running_tracks_the_generation_not_the_span() {
+        let mut s = state();
+        assert_eq!(s.should_run(10), Some(0));
+        assert!(!s.is_running(), "an open span is not a running generation");
+        s.finish(10);
+        s.begin_pass();
+        assert!(s.is_running());
+        s.end_pass();
+        assert!(!s.is_running());
+    }
+
+    #[test]
+    fn would_run_agrees_with_the_throttle() {
+        let mut s = ExtractState {
+            enabled: true,
+            every_n: 3,
+            ..ExtractState::default()
+        };
+        assert!(!s.would_run(4));
+        assert_eq!(s.should_run(4), None);
+        assert!(!s.would_run(6));
+        assert_eq!(s.should_run(6), None);
+        assert!(s.would_run(8), "the third eligible turn");
+        assert_eq!(s.should_run(8), Some(0));
+    }
 
     fn state() -> ExtractState {
         ExtractState {
