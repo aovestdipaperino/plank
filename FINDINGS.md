@@ -2845,3 +2845,63 @@ path to `writablePaths` in `.plank/sandbox.json` — but a *project*-scoped
 sandbox file may only tighten the policy (a cloned checkout must not be able to
 widen it), so `writablePaths` there is dropped silently. Following the hint did
 nothing at all. Only `~/.plank/sandbox.json` can widen the sandbox.
+
+## Memory's three separate non-hermetic-test holes, and the rule they confirm
+
+Automatic memory management (`src/memory.rs`, `src/memextract.rs`) touched
+`~/.plank` from three different call sites during development — `remember`'s
+writer, the audit log, and the verdict-application loop that both writes
+`MEMORY.md` and deletes lines from it — and each one needed its own hermetic
+test hole plugged before `cargo test` stopped mutating the developer's real
+files. The worst of the three: a test exercising `forget_matching` against a
+pattern common enough to appear in a real memory file would have deleted real
+user entries the moment it ran without an explicit root.
+
+This confirms the rule `spill` already left behind (see "A function that
+resolves a path from `$HOME`…" above), but memory's shape made it easy to miss
+twice more even after fixing it once: `remember` writes, `apply_verdicts`
+writes *and* logs *and* touches the sidecar, and `forget_matching` writes and
+logs and touches the sidecar from a different function. Each needed its own
+`_to`/`_from` variant (`apply_verdicts_to`, `forget_matching_to`,
+`forget_preview_to`, `log_change_to`, `read_log_from`) taking an explicit
+`log_dest` and, for the user scope specifically, a `user_root` override —
+`Scope::Project` already redirects safely through `cwd`, so only the user
+scope's `$HOME`-resolved path needed the second override. The lesson: when a
+module has several functions that each independently resolve `~/.plank`,
+budget for one hermetic hole per function, not one for the module.
+
+## Nothing durable is recorded until the memory file write actually lands
+
+`apply_verdicts_to` stages every audit-log line and every `MetaStore` mutation
+in memory while it walks a batch of verdicts, and flushes both only after the
+scope's file write (if there was one) has succeeded — see `ScopeState` and the
+`write_ok` check in `apply_verdicts_to`. The first version wrote the audit log
+and bumped usage counters as verdicts were applied, before the file write at
+the end of the scope loop. A failed write (permissions, disk full, a
+directory that vanished) then left three sources of truth disagreeing: the
+audit log said an entry was added or deleted, the sidecar had usage counters
+for an id that was never written, and `MEMORY.md` itself had neither. Nothing
+downstream can reconcile that after the fact, because the audit log's whole
+purpose is to be the log of what actually happened.
+
+The fix is the general shape, not specific to memory: when a batch of
+mutations spans an audit trail, a cache, and the actual write, order the
+flush so the audit trail and cache are only ever behind the write, never
+ahead of it. Staging in memory and flushing on success is cheap; a scope
+whose write failed is left exactly as it was, and the loop moves on to the
+next scope rather than aborting the whole batch.
+
+## An entry's identity is a hash of its text alone, so `carry` is what saves its usage across an edit
+
+`Entry::id` hashes only `self.text` — not the date, not the `[kind]` tag —
+deliberately, so re-tagging or re-dating a line does not orphan its sidecar
+row. But that also means a `Verdict::Update`, which rewrites an entry's text
+in place, produces a *new* id: the old row in `MetaStore` and the new line in
+`MEMORY.md` no longer agree. `apply_one_verdict`'s `Update` arm calls
+`state.meta.carry(id, &new.id())` immediately after computing the new entry,
+moving the accumulated `uses`/`last_used`/`pinned` row across to the new key
+before anything is saved. Skip that call — or get the order wrong relative to
+the file rewrite — and every `UPDATE` verdict silently resets the entry's
+usage history to zero, which looks like nothing broke (the text is still
+there, still renders) until someone asks why a fact reworded six times over a
+month keeps evicting as if it were brand new.

@@ -1506,6 +1506,30 @@ mod tests {
         assert_eq!(parsed, vec![e]);
     }
 
+    /// The off-by-default equivalence property: turn everything off (no
+    /// tags, defaults everywhere) and rendering is exactly what it was
+    /// before this feature existed — every entry, nothing evicted, nothing
+    /// annotated. This is what makes the feature shippable on by default.
+    #[test]
+    fn an_untagged_legacy_file_renders_every_entry_when_nothing_is_configured() {
+        let dir = std::env::temp_dir().join(format!("plank-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        std::fs::write(
+            dir.join(".plank").join("MEMORY.md"),
+            "# Memory\n\n- (2026-01-01) an old untagged fact\n- (2026-01-02) another one\n",
+        )
+        .unwrap();
+
+        let rendered = load_default(&dir).unwrap();
+        assert!(rendered.contains("an old untagged fact"));
+        assert!(rendered.contains("another one"));
+        assert!(
+            !rendered.contains("omitted"),
+            "nothing is evicted at default budgets"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_unrecognised_bracket_stays_in_the_entry_text() {
         // A bracket that is not one of the four kinds is the user's own
