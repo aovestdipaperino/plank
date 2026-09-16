@@ -1404,6 +1404,39 @@ fn arcade_command(line: &str) -> Option<&'static str> {
     crate::arcade::command_of(line)
 }
 
+/// Undoes everything `Agent::run_tui` switched on, then hands the terminal
+/// back through `ratatui::restore`.
+///
+/// `ratatui::restore` alone leaves the alternate screen and raw mode but keeps
+/// mouse reporting (DECSET 1000/1002/1003/1006), bracketed paste and focus
+/// events on, so an exit that called only it left the shell prompt filling
+/// with `ESC[<35;38;32M` motion reports at every pointer move. This is the
+/// one teardown for the clean exit, the force quit and the panic hook, so
+/// no path can forget a mode. Idempotent: every write is best-effort and a
+/// mode already off stays off.
+fn restore_terminal() {
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        PopKeyboardEnhancementFlags,
+        event::DisableFocusChange,
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
+    ratatui::restore();
+    // Drop whatever the terminal sent while the modes were still on and no
+    // event loop was reading: motion reports, a focus event, a late paste
+    // bracket. Left in the tty buffer, the shell would read them as typed
+    // input the moment it prints its prompt. Only on a real terminal — a
+    // pipe's pending bytes are someone's data, not stale reports.
+    if std::io::stdin().is_terminal() {
+        // SAFETY: `tcflush` takes a descriptor and a queue selector and touches
+        // no memory; stdin is open for the life of the process.
+        unsafe {
+            libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+        }
+    }
+}
+
 /// Turns any-motion mouse reporting (DECSET 1003) on or off.
 ///
 /// `EnableMouseCapture` asks for buttons and drags but not free hover, which is
@@ -11273,6 +11306,17 @@ impl Agent<'_> {
             self.ui_remote = Some(Arc::new(Mutex::new(UiRemote::new(handle))));
         }
         let mut terminal = ratatui::init();
+        // `ratatui::init` installs a panic hook that only leaves the alternate
+        // screen and raw mode. Chain the full teardown in front of it, so a
+        // panic does not leave the shell reading `ESC[<35;x;yM` mouse-motion
+        // reports at every pointer move (see `restore_terminal`).
+        {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                restore_terminal();
+                previous(info);
+            }));
+        }
         // Capture the mouse so wheel events scroll the output buffer instead
         // of being translated by the terminal into arrow keys (history moves),
         // and drags select text for copying. Bracketed paste makes Cmd-V
@@ -11300,6 +11344,12 @@ impl Agent<'_> {
         // the last frame it drew (already captured pre-buffer-swap); skipped on
         // error exits (keep error text readable), non-TTY stdout, or when
         // disabled (in which case the image is `None`).
+        // Mouse reporting off *before* the animation: it runs for about a
+        // second and a half with nobody reading events, so a pointer moved
+        // during it would otherwise queue `ESC[<35;x;yM` motion reports in the
+        // tty that the shell then reads as typed text. Raw mode stays on for
+        // the effect; the two are independent modes.
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
         if let Ok(Some(img)) = &result {
             let cfg = crt_off::Config {
                 hold_secs: 0.0,
@@ -11317,14 +11367,7 @@ impl Agent<'_> {
             // drop before our own teardown runs.
             let _ = crt_off::animate(img, false, &cfg);
         }
-        let _ = ratatui::crossterm::execute!(
-            std::io::stdout(),
-            PopKeyboardEnhancementFlags,
-            event::DisableFocusChange,
-            DisableBracketedPaste,
-            DisableMouseCapture
-        );
-        ratatui::restore();
+        restore_terminal();
         // Printed after the screen is restored: inside the alternate screen it
         // would be wiped by the teardown it is meant to outlive.
         if let Some(line) = quit_repro {
@@ -16659,7 +16702,7 @@ const EXIT_CONFIRM_TEXT: &str =
 /// and with the stream idle timeout in [`crate::remote`] it should never be
 /// reached in the network-drop case that motivated it.
 fn force_quit() -> ! {
-    ratatui::restore();
+    restore_terminal();
     // No destructor here can run (see above), so the mirror gets its farewell
     // explicitly or not at all — and this is the exit where a console left
     // hanging mid-stream most needs to be told what happened.
