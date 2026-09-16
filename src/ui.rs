@@ -2371,7 +2371,9 @@ struct Agent<'a> {
     /// turn — parent prefix plus the small report — diverges behind the
     /// sidechain's live end and the whole parent context re-prefills from
     /// token zero. `None` entries are engines without KV support (Echo),
-    /// where the restore no-ops.
+    /// where the restore no-ops. The innermost entry doubles as the
+    /// sidechain's rescue checkpoint (`rescue_prefix_before_rebuild`, tier 1),
+    /// peeked without popping.
     fork_kv: Vec<Option<crate::kvcache::KVCache>>,
     /// Transcript index of each open sub-agent fork, innermost last, parallel
     /// to `fork_kv`. The console backfill needs the boundary: the parent window
@@ -7432,21 +7434,35 @@ the original is frozen and listed in /tree"
     /// from token zero, which on a long session is minutes of prefill (one
     /// recorded session re-prefilled 117k tokens with a rung at 112k sitting
     /// unused). Here the engine is asked how the prompt lines up first; when
-    /// it reports that shape, the deepest rung below the divergence is
-    /// restored, so the sync extends from the rung and prefills only the
-    /// tail. Returns the tokens the restored rung covers.
+    /// it reports that shape, the deepest checkpoint below the divergence is
+    /// restored so the sync extends from it and prefills only the tail.
     ///
-    /// Never inside a sidechain: the engine there may not be the session's,
-    /// and its rungs describe a transcript about to be truncated away.
+    /// Three tiers, in order:
+    ///
+    /// 1. Inside a sidechain, the innermost fork snapshot (`fork_kv`, peeked,
+    ///    never popped: the fork end still owns it). It sits at exactly
+    ///    `fork_at`, and every divergence inside the sidechain is at or past
+    ///    `fork_at`, so only the sidechain's own transcript re-prefills. This
+    ///    is what a reasoning-cycle stop in a sub-agent used to pay in full:
+    ///    `recovery_session` stubs the stopped `<think>` block, the next
+    ///    prompt diverges behind the live end, and with no rescue the whole
+    ///    parent context re-prefilled from zero (`docs/LOOP-FINDINGS.md`).
+    /// 2. The deepest ladder rung below the divergence. Valid inside a
+    ///    sidechain too: `restore_rung` fingerprints the transcript truncated
+    ///    to the rung's depth, which is intact parent prefix.
+    /// 3. Nothing: log it, and the sync rebuilds.
+    ///
+    /// Never while a clean-room alt engine is live (`alt_engine_depth`): its
+    /// KV is not the session's, and its prompt is small enough to rebuild.
     fn rescue_prefix_before_rebuild(&mut self, prompt_text: &str) -> Option<i32> {
-        if self.session.id.is_empty() || self.in_sidechain() {
+        if self.alt_engine_depth > 0 {
             return None;
         }
         let probe = self.engine.kv_reuse_probe(prompt_text, self.think)?;
         if probe.live > 0 && probe.common == 0 {
             // Not a divergence but an invalidated checkpoint (the C probe
-            // returns 0 for one): no rung sits below token zero, so nothing
-            // can be rescued — but say so, or the rebuild is silent.
+            // returns 0 for one): no checkpoint sits below token zero, so
+            // nothing can be rescued — but say so, or the rebuild is silent.
             crate::engine::kv_debug(|| {
                 format!(
                     "ladder fallback: live checkpoint invalid (live={}); rebuilding from zero",
@@ -7456,6 +7472,27 @@ the original is frozen and listed in /tree"
             return None;
         }
         if !probe.rebuilds_from_zero() {
+            return None;
+        }
+        if self.in_sidechain()
+            && let Some(Some(kv)) = self.fork_kv.last()
+        {
+            match self.engine.set_kv(kv) {
+                Ok(()) => {
+                    crate::engine::kv_debug(|| {
+                        format!(
+                            "fork restore: innermost snapshot for rebuild avoidance (live={} common={})",
+                            probe.live, probe.common
+                        )
+                    });
+                    return Some(0);
+                }
+                Err(e) => crate::engine::kv_debug(|| {
+                    format!("fork restore failed ({e}); trying the ladder")
+                }),
+            }
+        }
+        if self.session.id.is_empty() {
             return None;
         }
         let Some(rung) = self.ladder.select_below_tokens(probe.common).copied() else {
@@ -26646,6 +26683,134 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Inside a sub-agent the fork snapshot is a checkpoint at exactly
+    /// `fork_at`, and every divergence in the sidechain sits at or past it.
+    /// The rescue restores it — peeked, not popped, so the fork end still
+    /// finds it — instead of letting the sync rebuild from token zero.
+    #[test]
+    fn a_sidechain_prompt_diverging_behind_the_live_end_restores_the_fork_snapshot() {
+        let dir = scratch_dir("fork-rescue");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(9_000, 8_500);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        let fork_at = agent.begin_subagent_fork(None, "task", true);
+        assert_eq!(agent.fork_kv.len(), 1);
+
+        let restored = agent.rescue_prefix_before_rebuild("prompt");
+        assert_eq!(restored, Some(0), "the fork snapshot is restored");
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["capture", "probe", "restore:1"],
+            "the snapshot the fork captured reached the engine"
+        );
+        assert_eq!(agent.fork_kv.len(), 1, "peeked, not popped");
+        assert!(!agent.finish_subagent_fork(fork_at, "task"));
+        assert_eq!(
+            events.lock().unwrap().last().map(String::as_str),
+            Some("restore:1"),
+            "the fork end still restores the parent"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Nested forks: the innermost snapshot is the one at the innermost
+    /// `fork_at`, which is the shallowest checkpoint that still covers the
+    /// divergence.
+    #[test]
+    fn a_nested_sidechain_rescue_restores_the_innermost_fork_snapshot() {
+        let dir = scratch_dir("fork-rescue-nested");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(9_000, 8_500);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let outer = agent.begin_subagent_fork(None, "outer", true);
+        let inner = agent.begin_subagent_fork(None, "inner", true);
+        assert_eq!(agent.rescue_prefix_before_rebuild("prompt"), Some(0));
+        assert_eq!(
+            events.lock().unwrap().last().map(String::as_str),
+            Some("restore:2")
+        );
+        assert_eq!(agent.fork_kv.len(), 2);
+        assert!(!agent.finish_subagent_fork(inner, "inner"));
+        assert!(!agent.finish_subagent_fork(outer, "outer"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no snapshot on the fork stack (a failed `get_kv` at fork start)
+    /// the sidechain falls back to the parent's ladder: the rungs describe
+    /// intact parent prefix, so the deepest one below the divergence is
+    /// still a valid restore point.
+    #[test]
+    fn a_sidechain_without_a_fork_snapshot_falls_back_to_the_ladder() {
+        let dir = scratch_dir("fork-rescue-ladder");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(117_369, 117_368);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        let rung = agent.capture_first_rung();
+        // `snapshot_kv = false` stands in for a failed capture: a `None` on
+        // the stack at alt depth zero.
+        let fork_at = agent.begin_subagent_fork(None, "task", false);
+        assert_eq!(
+            agent.rescue_prefix_before_rebuild("prompt"),
+            Some(rung.tokens)
+        );
+        assert_eq!(
+            events.lock().unwrap().last().map(String::as_str),
+            Some("restore:1"),
+            "the rung blob reached the engine"
+        );
+        assert!(!agent.finish_subagent_fork(fork_at, "task"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A clean-room sidechain runs on an engine that is not the session's:
+    /// neither the fork snapshot nor a rung may be fed to it.
+    #[test]
+    fn a_clean_room_sidechain_is_never_rescued_with_the_sessions_kv() {
+        let dir = scratch_dir("fork-rescue-alt");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(9_000, 8_500);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        agent.capture_first_rung();
+        let fork_at = agent.begin_subagent_fork(None, "task", true);
+        agent.alt_engine_depth = 1;
+        assert_eq!(agent.rescue_prefix_before_rebuild("prompt"), None);
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore")),
+            "nothing restored onto the alt engine: {:?}",
+            events.lock().unwrap()
+        );
+        agent.alt_engine_depth = 0;
+        assert!(!agent.finish_subagent_fork(fork_at, "task"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An extending prompt inside a sidechain is left alone, exactly as on
+    /// the main path.
+    #[test]
+    fn a_sidechain_prompt_that_extends_the_live_end_is_not_rescued() {
+        let dir = scratch_dir("fork-rescue-extend");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(500, 500);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let fork_at = agent.begin_subagent_fork(None, "task", true);
+        assert_eq!(agent.rescue_prefix_before_rebuild("prompt"), None);
+        assert_eq!(events.lock().unwrap().as_slice(), ["capture", "probe"]);
+        assert!(!agent.finish_subagent_fork(fork_at, "task"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `/kvcache gc` under a tight budget must not take the running session's
     /// own accelerators. Their fingerprints are over the transcript truncated
     /// to each rung's depth, exactly as `restore_rung_below` looks them up.
@@ -30978,9 +31143,11 @@ or the user's next message aborts before its first token"
         agent.run_turn().unwrap();
         assert!(agent.finish_subagent_fork(fork_at, "count the tests"));
 
+        // The probe is the sidechain rescue looking for a checkpoint; this
+        // engine reports none, so nothing is restored before the generation.
         assert_eq!(
             events.lock().unwrap().as_slice(),
-            ["capture", "generate", "restore:1"]
+            ["capture", "probe", "generate", "restore:1"]
         );
         std::fs::remove_dir_all(&dir).ok();
     }
