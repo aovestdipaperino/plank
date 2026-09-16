@@ -585,6 +585,17 @@ the transcript the moment they end, so the agent keeps the last
 captured in `end_subagent_fork` and after a fan-out) and `/repro` writes each
 beside the main file as `repro-<secs>.sub-<n>.md`, with the sub-agent's label,
 task and outcome (`report`, `no report`, or `failed: interrupted`).
+`/repro` also works mid-turn in the TUI, typed or from the footer's camera
+shutter, although the worker owns the agent for the whole turn: at every main
+pass start `worker_generate_kind` builds the full report (`Agent::repro_base`)
+and publishes it as a `repro::ReproBase` on `TurnShared`
+(`begin_repro_pass`), then streams the pass's text into `TurnShared::live_pass`;
+the UI thread's `TurnShared::write_repro` saves that base with an
+`## In-progress pass` section carrying the note and the partial output. An
+untyped note defaults to `repro::MID_TURN_NOTE` (`manually triggered mid
+turn`), stamped onto the header too. Sidechain and `/btw` passes never
+publish, the base is dropped at turn end (`end_repro`), and the written path
+is handed to `last_edited` when the turn ends so a bare `/open` finds it.
 
 ### Settings (`settings.rs`)
 Persistent user preferences, read from `~/.plank/settings.json` then

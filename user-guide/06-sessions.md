@@ -114,6 +114,8 @@ HTML output is self-contained — inline CSS, no external assets — and every b
 
 writes `~/.plank/repro/repro-<timestamp>.md`: the exact rendered prompt the engine would see, plus the model, backend, context size, sampling settings, think mode, and engine tuning. Hand that to a maintainer and the state that triggered your bug is reproducible without your live session. It is a read-only snapshot; nothing about the running session changes.
 
+You can run it while the model is still generating, either by typing it or by clicking the camera glyph in the footer. The dump then ends with an `## In-progress pass` section: the transcript above it is exactly what the running pass was given, and the section holds what the pass has produced so far, so a stall is captured as it happens. `/repro <note>` still records your description of the bug; without one, the dump is marked `manually triggered mid turn`.
+
 ## Insights
 
 ```

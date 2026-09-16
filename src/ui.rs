@@ -4105,6 +4105,17 @@ fn live_context_report(shared: &TurnShared, used: i32) -> String {
     crate::ctxreport::render(&shared.context(), used, true)
 }
 
+/// The mid-turn `/repro`: writes the dump from the base the worker published
+/// at pass start plus the pass's output so far, copies the path to the
+/// clipboard as the idle command does, and returns the line to show. A
+/// failure (no pass started yet, or the write failed) is the line instead.
+fn live_repro_line(shared: &TurnShared, note: &str) -> String {
+    match shared.write_repro(note, "repro", now_secs()) {
+        Ok((path, sidecars)) => Agent::repro_copied_line(&path, sidecars),
+        Err(e) => format!("repro failed: {e}"),
+    }
+}
+
 /// The `/toks` report over the process-wide sample ring. Needs no agent, so
 /// the UI thread can redraw it mid-turn while the worker owns `self`.
 fn toks_report(color: bool) -> String {
@@ -9157,6 +9168,20 @@ the original is frozen and listed in /tree"
         note: &str,
         prefix: &str,
     ) -> Result<(std::path::PathBuf, usize), String> {
+        let base = self.repro_base(note);
+        let out = base.save(prefix, now_secs(), &base.report)?;
+        // `self.repro_dir` is already absolute, so unlike
+        // `openfile::note_edited` there is nothing to resolve.
+        self.last_edited = Some(out.0.clone());
+        Ok(out)
+    }
+
+    /// The agent-side half of a `/repro` dump: the full report (transcript,
+    /// knobs, pass notes) plus the sidechain dumps to write beside it. Shared
+    /// by the idle `/repro`, the automatic dumps, and the worker, which
+    /// publishes one at every main pass start so the UI thread can take a
+    /// `/repro` mid-turn (`TurnShared::write_repro`).
+    fn repro_base(&mut self, note: &str) -> crate::repro::ReproBase {
         // `rendered` is the exact engine input (no timestamp markers) — used
         // for the token count so that figure stays accurate. `rendered_for_repro`
         // is the same transcript with periodic `[timestamp]` markers for the
@@ -9232,25 +9257,14 @@ the original is frozen and listed in /tree"
         let mut cfg = self.cfg.clone();
         cfg.generation = self.gen_opts.clone();
         let report = crate::repro::build_report(&meta, &cfg, &rendered_for_repro);
-        let path = crate::repro::save_in(&self.repro_dir, prefix, now_secs(), &report)?;
         // Sub-agent sidechains are gone from the transcript by now; the
         // remembered dumps go beside the main file, oldest first.
-        let main_file = path
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let mut sidecars = 0usize;
-        for (i, dump) in self.sidechain_dumps.iter().enumerate() {
-            let rendered = render_messages_for_repro(&dump.messages, None);
-            let side =
-                crate::repro::build_sidecar_report(&version, &main_file, i + 1, dump, &rendered);
-            crate::repro::save_sidecar(&path, i + 1, &side)?;
-            sidecars += 1;
+        crate::repro::ReproBase {
+            dir: self.repro_dir.clone(),
+            version,
+            report,
+            sidecars: self.sidechain_dumps.iter().cloned().collect(),
         }
-        // `self.repro_dir` is already absolute, so unlike
-        // `openfile::note_edited` there is nothing to resolve.
-        self.last_edited = Some(path.clone());
-        Ok((path, sidecars))
     }
 
     /// The explicit `/repro` variant: copies the dump's path to the system
@@ -11950,9 +11964,9 @@ impl Agent<'_> {
                             // The dir prefix's camera takes a `/repro` of the
                             // session as it stands, and says where it landed —
                             // the same line, and the same clipboard copy, the
-                            // typed command produces. Idle only: the dump
-                            // renders the transcript, which a running turn is
-                            // still writing.
+                            // typed command produces. Mid-turn the busy loop
+                            // answers the same click from the worker's
+                            // published base (`live_repro_line`).
                             match self.write_repro("") {
                                 Ok((path, sidecars)) => {
                                     log.push_dim(Self::repro_copied_line(&path, sidecars));
@@ -13246,6 +13260,13 @@ impl Agent<'_> {
                         return Err(self.reconcile_and_fail(log, shared, outer_err));
                     }
                 };
+                // A mid-turn `/repro` aims a bare `/open` at its dump, as an
+                // idle one does; the base is dropped so a shared `TurnShared`
+                // (the remote bridge's) cannot serve it to the next turn.
+                shared.end_repro();
+                if let Some(path) = shared.take_repro_written() {
+                    self.last_edited = Some(path);
+                }
                 if let Err(e) = worker_result {
                     // The turn never reached the leftover loop, so reconcile
                     // here for the same reason as the outer-error branch
@@ -14548,6 +14569,13 @@ impl Agent<'_> {
         if is_main {
             let _ = tx.send(UiEvent::MainCheckpoint);
         }
+        // What a mid-turn `/repro` on the UI thread writes: this pass's exact
+        // input, published before the engine takes `self`. Main passes only —
+        // a sub-agent sidechain's transcript is not the user's session, and
+        // is captured as a sidecar of the next main dump instead.
+        if is_main && !self.in_sidechain() {
+            shared.begin_repro_pass(self.repro_base(""));
+        }
         // Held for the whole pass — prefill included, which is most of the wait
         // — so the status bar's brain blinks while *this* engine works. Taken
         // here rather than only in `generate_pass`: that one covers the quiet
@@ -14625,6 +14653,9 @@ impl Agent<'_> {
             if let EngineEvent::Text(t) = &ev {
                 assistant_text.push_str(t);
                 stream.push(t);
+                if is_main {
+                    shared.push_live_pass(t);
+                }
                 // See `stream_generation`: same tee, TUI side.
                 crate::debugmirror::push(t);
                 if stream_chunk_must_stop(&mut repeat, &mut stream, t, &greedy).is_some() {
@@ -17336,6 +17367,19 @@ fn busy_ui_loop(
                             }
                             view.follow = true;
                             sub.follow_all();
+                        } else if let Some(note) = line
+                            .strip_prefix("/repro")
+                            .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+                        {
+                            // A dump of the model's state *now*: the pass's
+                            // input the worker published at its start, plus
+                            // the output streamed since. The same line and
+                            // clipboard copy as at idle.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            log.push_dim(live_repro_line(shared, note));
+                            view.follow = true;
+                            sub.follow_all();
                         } else if line.split_whitespace().next() == Some("/mcp") {
                             // Same panel as at idle, over the turn-start
                             // snapshot the worker cannot re-render mid-turn.
@@ -17601,6 +17645,15 @@ fn busy_ui_loop(
                 // idle. The samples are process-wide, so this needs no agent.
                 MouseEventKind::Down(MouseButton::Left) if tui::toks_click(m.column, m.row) => {
                     toggle_toks_report(&mut report);
+                    selection.cancel();
+                }
+                // The repro shutter, as at idle: the dump is what a `/repro`
+                // typed now would write, and a stall is exactly when the
+                // shutter is worth pressing.
+                MouseEventKind::Down(MouseButton::Left) if tui::camera_click(m.column, m.row) => {
+                    log.push_dim(live_repro_line(shared, ""));
+                    view.follow = true;
+                    sub.follow_all();
                     selection.cancel();
                 }
                 // The footer's brain, as at idle. Safe mid-turn for the reason
@@ -21218,6 +21271,96 @@ mod tests {
             "debug off writes nothing"
         );
         crate::debugmirror::set_enabled(true);
+    }
+
+    /// A mid-turn `/repro` pairs the base the worker published at pass start
+    /// with the output streamed since, carries the note the user typed, and
+    /// leaves the path for `/open` to pick up when the turn ends.
+    #[test]
+    fn a_mid_turn_repro_pairs_the_published_base_with_the_live_pass() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("repro-mid-turn");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("why is the sky blue"));
+
+        let shared = TurnShared::default();
+        assert!(
+            shared
+                .write_repro("", "repro", 1)
+                .is_err_and(|e| e.contains("not started")),
+            "before the first pass there is nothing to dump"
+        );
+        shared.begin_repro_pass(agent.repro_base(""));
+        shared.push_live_pass("Rayleigh ");
+        shared.push_live_pass("scattering, because");
+        let (path, sidecars) = shared
+            .write_repro("stalls here", "repro", 1)
+            .expect("dump written");
+        assert_eq!(sidecars, 0);
+        assert_eq!(shared.take_repro_written().as_deref(), Some(path.as_path()));
+        assert!(shared.take_repro_written().is_none(), "taken once");
+
+        let text = std::fs::read_to_string(&path).expect("dump readable");
+        assert!(text.contains("why is the sky blue"), "{text}");
+        assert!(text.contains("## In-progress pass"), "{text}");
+        assert_eq!(text.matches("- note: stalls here").count(), 2, "{text}");
+        assert!(!text.contains("- note: (none)"), "{text}");
+        assert!(
+            text.contains("----- BEGIN PARTIAL OUTPUT -----\nRayleigh scattering, because\n"),
+            "{text}"
+        );
+
+        // The next pass starts a fresh buffer: its dump carries only its own
+        // output, and the base is gone once the turn ends.
+        shared.begin_repro_pass(agent.repro_base(""));
+        let (path, _) = shared.write_repro("", "repro", 2).expect("dump written");
+        let text = std::fs::read_to_string(&path).expect("dump readable");
+        assert!(!text.contains("Rayleigh"), "{text}");
+        assert!(text.contains("- generated so far: 0 bytes"), "{text}");
+        assert!(
+            text.starts_with(&format!(
+                "# plank repro {}\n\n- date: ",
+                crate::logo::version_label()
+            )) && text.contains(&format!("- note: {}\n", crate::repro::MID_TURN_NOTE)),
+            "an untyped note defaults to the mid-turn marker: {text}"
+        );
+        shared.end_repro();
+        assert!(shared.write_repro("", "repro", 3).is_err());
+    }
+
+    /// The worker publishes the base before each main pass and streams that
+    /// pass's text into the live buffer, so the UI thread's `/repro` is never
+    /// behind by more than a token.
+    #[test]
+    fn the_worker_publishes_the_repro_base_and_streams_the_live_pass() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("repro-worker-publish");
+        let engine = ScriptedEngine {
+            replies: vec!["The answer is 7.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("what is 3+4?"));
+
+        let shared = TurnShared::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+
+        let base = shared
+            .repro
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("base published");
+        assert!(base.report.contains("what is 3+4?"), "{}", base.report);
+        assert_eq!(base.dir, agent.repro_dir);
+        assert_eq!(
+            shared.live_pass.lock().unwrap().as_str(),
+            "The answer is 7.\n"
+        );
     }
 
     /// The dump reports the temperature the *next pass* would use, not the one

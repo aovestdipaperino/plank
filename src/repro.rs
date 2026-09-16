@@ -238,6 +238,87 @@ pub fn build_sidecar_report(
     out
 }
 
+/// The note a mid-turn `/repro` carries when the user typed none: the dump
+/// was asked for by hand while the model was generating, which is worth
+/// telling apart from the automatic `repro-loop` dumps and from an idle one.
+pub const MID_TURN_NOTE: &str = "manually triggered mid turn";
+
+/// Everything a `/repro` dump needs that only the agent can supply, captured
+/// on the worker thread at the start of a main generation pass so the UI
+/// thread can write a dump *during* the pass, while the worker owns the agent.
+///
+/// The report is built in full at capture time (with `note` empty); a
+/// mid-turn dump appends a `## In-progress pass` section carrying the user's
+/// note and the text the pass has produced so far ([`append_live_pass`]).
+/// Sidecars are kept as dumps rather than rendered reports because a sidecar
+/// names the main file it belongs to, which is only known once the main file
+/// is saved.
+#[derive(Debug, Clone, Default)]
+pub struct ReproBase {
+    /// Where the dump goes (`Agent::repro_dir`).
+    pub dir: PathBuf,
+    /// The version label the sidecar headers carry.
+    pub version: String,
+    /// The complete main report, transcript included, with an empty note.
+    pub report: String,
+    /// The finished sidechains to write beside the main file, oldest first.
+    pub sidecars: Vec<SidechainDump>,
+}
+
+impl ReproBase {
+    /// Saves the main report as `<prefix>-<secs>.md` in `dir` with every
+    /// sidecar beside it; returns the main path and the number of sidecars.
+    ///
+    /// # Errors
+    /// Returns the OS error message when a file cannot be written.
+    pub fn save(&self, prefix: &str, secs: u64, report: &str) -> Result<(PathBuf, usize), String> {
+        let path = save_in(&self.dir, prefix, secs, report)?;
+        let main_file = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for (i, dump) in self.sidecars.iter().enumerate() {
+            let rendered = crate::ui::render_messages_for_repro(&dump.messages, None);
+            let side = build_sidecar_report(&self.version, &main_file, i + 1, dump, &rendered);
+            save_sidecar(&path, i + 1, &side)?;
+        }
+        Ok((path, self.sidecars.len()))
+    }
+}
+
+/// Appends the section a mid-turn dump adds to a [`ReproBase`] report: the
+/// user's note (the header's `note:` line says `(none)`, having been rendered
+/// before the note existed) and the text the running pass had generated when
+/// the dump was taken, between the same fences the transcript uses. The
+/// rendered transcript above it is exactly that pass's engine input, so the
+/// two together are the state of the model at the moment of the `/repro`.
+pub fn append_live_pass(report: &mut String, note: &str, partial: &str) {
+    let _ = writeln!(report);
+    let _ = writeln!(report, "## In-progress pass");
+    let _ = writeln!(report);
+    let _ = writeln!(
+        report,
+        "Taken mid-turn: the transcript above is the engine input of the pass \
+         that was generating when `/repro` ran, and below is what that pass had \
+         produced so far. The `## Passes` table stops at the previous pass."
+    );
+    let _ = writeln!(report);
+    let note = note.trim();
+    let _ = writeln!(
+        report,
+        "- note: {}",
+        if note.is_empty() { "(none)" } else { note }
+    );
+    let _ = writeln!(report, "- generated so far: {} bytes", partial.len());
+    let _ = writeln!(report);
+    let _ = writeln!(report, "----- BEGIN PARTIAL OUTPUT -----");
+    report.push_str(partial);
+    if !partial.is_empty() && !partial.ends_with('\n') {
+        report.push('\n');
+    }
+    let _ = writeln!(report, "----- END PARTIAL OUTPUT -----");
+}
+
 /// The path of sidecar `ordinal` for the main dump at `main`: the main file's
 /// stem plus `.sub-<ordinal>.md`, in the same directory.
 #[must_use]
