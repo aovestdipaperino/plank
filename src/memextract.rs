@@ -31,9 +31,6 @@ pub struct ExtractState {
     processed_depth: usize,
     /// Set while a pass is in flight.
     running: bool,
-    /// Depth requested while a pass was running; at most one, because a
-    /// trailing run covers everything up to the newest depth anyway.
-    stashed: Option<usize>,
     /// Eligible turns seen since the last run, for the throttle.
     eligible: u32,
     /// Whether the model called `remember` or `forget` this turn.
@@ -50,12 +47,12 @@ impl ExtractState {
     /// Decides whether to run, given the current transcript depth. Returns
     /// the depth to start reading from, or `None` to skip.
     ///
-    /// A call while a pass is already running stashes the new depth and
-    /// returns `None`; the stash is a flag, not a queue — a second trigger
-    /// while still running just overwrites it. Once `finish` clears
-    /// `running`, the next `should_run` call resumes from
-    /// `processed_depth` (which `finish` has just advanced), covering
-    /// everything that arrived while the pass was busy in one trailing run.
+    /// A call while a pass is already running is simply dropped — nothing is
+    /// recorded about it. That is not a lost trigger: once `finish` clears
+    /// `running` and advances `processed_depth`, the next `should_run` call
+    /// re-derives the span from `processed_depth` against whatever depth it
+    /// is given then, which necessarily covers everything that arrived while
+    /// the pass was busy, in one trailing run.
     pub fn should_run(&mut self, depth: usize) -> Option<usize> {
         let suppressed = std::mem::take(&mut self.wrote_this_turn);
         if !self.enabled || suppressed {
@@ -65,7 +62,6 @@ impl ExtractState {
             return None;
         }
         if self.running {
-            self.stashed = Some(depth);
             return None;
         }
         self.eligible = self.eligible.saturating_add(1);
@@ -77,19 +73,20 @@ impl ExtractState {
         Some(self.processed_depth)
     }
 
-    /// Records a completed pass covering up to `depth`. `depth` is expected
-    /// to be at least the depth most recently handed out by `should_run`;
-    /// a caller that passes something lower would move `processed_depth`
-    /// backwards and cause the next pass to reprocess transcript it has
-    /// already seen — callers must always pass the depth observed at the
-    /// time the pass was started, never an earlier one.
+    /// Records a completed pass covering up to `depth`. Callers should
+    /// always pass the depth observed at the time the pass was started,
+    /// never an earlier one — but `processed_depth` is clamped to never
+    /// move backwards regardless, because a clamp does not hide caller
+    /// misuse, it makes it harmless. This module is supposed to guarantee
+    /// the "read only above the recorded depth" invariant on its own rather
+    /// than trusting every call site to get it right (two separate
+    /// front-end turn loops will call this).
     pub fn finish(&mut self, depth: usize) {
-        self.processed_depth = depth;
+        self.processed_depth = self.processed_depth.max(depth);
         self.running = false;
-        // A trailing run is enabled by clearing `running`; the stash is only
-        // a record that more arrived, and the next `should_run` recomputes
-        // the span from `processed_depth` anyway.
-        self.stashed = None;
+        // A trailing run is enabled purely by clearing `running`: the next
+        // `should_run` recomputes the span from `processed_depth` against
+        // whatever depth it is given then.
     }
 
     /// Abandons an in-flight pass without recording progress, so the work is
@@ -224,20 +221,34 @@ mod tests {
     }
 
     #[test]
-    fn a_trigger_while_running_stashes_and_yields_one_trailing_run() {
+    fn a_trigger_while_running_is_dropped_and_yields_one_trailing_run() {
         let mut s = state();
         assert_eq!(s.should_run(10), Some(0));
         assert_eq!(s.should_run(12), None, "a pass is already running");
         assert_eq!(
             s.should_run(14),
             None,
-            "still running; the stash is overwritten, not queued"
+            "still running; later triggers are simply dropped"
         );
         s.finish(10);
         assert_eq!(
             s.should_run(14),
             Some(10),
-            "one trailing run picks up the stash"
+            "one trailing run re-derives the span and covers everything that arrived"
+        );
+    }
+
+    #[test]
+    fn finish_never_regresses_processed_depth() {
+        let mut s = state();
+        assert_eq!(s.should_run(10), Some(0));
+        s.finish(10);
+        // A stale, lower depth must not move processed_depth backwards.
+        s.finish(4);
+        assert_eq!(
+            s.should_run(12),
+            Some(10),
+            "processed_depth stayed at 10, not regressed to 4"
         );
     }
 
@@ -247,6 +258,56 @@ mod tests {
         assert_eq!(s.should_run(10), Some(0));
         s.cancel();
         assert_eq!(s.should_run(10), Some(0), "the work is simply redone later");
+    }
+
+    #[test]
+    fn build_prompt_documents_the_four_verdict_words() {
+        let out = build_prompt(&[], &[]);
+        for word in ["ADD", "UPDATE", "DELETE", "USED"] {
+            assert!(out.contains(word), "prompt should mention verdict {word}");
+        }
+    }
+
+    #[test]
+    fn the_prompts_json_contract_round_trips_through_parse_verdicts() {
+        use crate::memory::{Kind, Scope, Verdict, parse_verdicts};
+
+        let json = r#"[
+            {"verdict": "ADD", "text": "prefers tabs", "type": "user", "scope": "user"},
+            {"verdict": "UPDATE", "id": "abc123", "text": "updated text"},
+            {"verdict": "DELETE", "id": "def456"},
+            {"verdict": "USED", "id": "aaa111"}
+        ]"#;
+
+        let verdicts = parse_verdicts(json).expect("valid JSON contract parses");
+        assert_eq!(verdicts.len(), 4);
+        assert_eq!(
+            verdicts[0],
+            Verdict::Add {
+                text: "prefers tabs".to_string(),
+                kind: Kind::User,
+                scope: Scope::User,
+            }
+        );
+        assert_eq!(
+            verdicts[1],
+            Verdict::Update {
+                id: "abc123".to_string(),
+                text: "updated text".to_string(),
+            }
+        );
+        assert_eq!(
+            verdicts[2],
+            Verdict::Delete {
+                id: "def456".to_string(),
+            }
+        );
+        assert_eq!(
+            verdicts[3],
+            Verdict::Used {
+                id: "aaa111".to_string(),
+            }
+        );
     }
 
     #[test]
