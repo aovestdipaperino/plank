@@ -1150,4 +1150,32 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn a_logged_entry_survives_quotes_backslashes_and_newlines() {
+        // The JSONL invariant is one object per line, so an embedded newline
+        // in the entry text must be escaped rather than ending the line. And
+        // json_escape emits its own surrounding quotes, so wrapping its
+        // output by hand would double-quote and produce malformed JSON --
+        // a bug this plan already hit once elsewhere.
+        let dir = std::env::temp_dir().join(format!("plank-auditlog-esc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-log.jsonl");
+        let nasty = "he said \"hi\"\nthen C:\\path";
+        append_log_line(&path, "delete", Scope::User, "abc123", nasty, "reconciled");
+
+        let lines = read_log_from(&path, 10);
+        assert_eq!(
+            lines.len(),
+            1,
+            "an embedded newline must not split the record"
+        );
+        let parsed = crate::tools::mcp::json_parse(&lines[0]).expect("line parses as JSON");
+        assert_eq!(
+            parsed.str_or("text", ""),
+            nasty,
+            "the text round-trips verbatim"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
