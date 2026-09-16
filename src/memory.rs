@@ -1892,7 +1892,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn a_readable_but_unwritable_file_still_leaves_the_sidecar_untouched() {
         // The sibling test above makes the memory path a *directory*, which
         // now fails at the read, so it no longer reaches the write at all.
@@ -1957,6 +1956,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
     fn a_failed_file_write_leaves_the_sidecar_and_its_counters_untouched() {
         // Finding 1: if the memory file write fails, neither the sidecar nor
         // the audit log may record the change. We force the write to fail
