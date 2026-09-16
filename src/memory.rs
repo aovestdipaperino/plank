@@ -67,12 +67,29 @@ fn scoped_path_for(scope: Scope, cwd: &Path, user_root: Option<&Path>) -> Option
     }
 }
 
+/// Reads a memory file for a read-modify-write cycle. A file that does not
+/// exist yet starts from [`TEMPLATE`]; any *other* failure (invalid UTF-8, a
+/// permission or I/O error) is returned as an error, never papered over.
+///
+/// The distinction is what keeps a write from destroying the file: an
+/// unreadable `MEMORY.md` is exactly the one the caller must not overwrite,
+/// because the rewrite would be the template plus whatever it was about to
+/// add, and there is no backup to recover the rest from.
+fn read_body_or_template(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) => Ok(existing),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TEMPLATE.to_string()),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
 /// Appends a dated bullet to the scope's memory file, creating it (with the
 /// template header) on first use. Returns the file written.
 ///
 /// # Errors
 ///
-/// Returns a message when the file cannot be created or written.
+/// Returns a message when the file cannot be created or written, or when an
+/// existing file cannot be read (it is then left untouched).
 pub fn remember(scope: Scope, cwd: &Path, text: &str, date: &str) -> Result<PathBuf, String> {
     let text = text.trim();
     if text.is_empty() {
@@ -84,10 +101,7 @@ pub fn remember(scope: Scope, cwd: &Path, text: &str, date: &str) -> Result<Path
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let mut body = match std::fs::read_to_string(&path) {
-        Ok(existing) => existing,
-        Err(_) => TEMPLATE.to_string(),
-    };
+    let mut body = read_body_or_template(&path)?;
     if !body.ends_with('\n') {
         body.push('\n');
     }
@@ -142,9 +156,11 @@ impl Budgets {
 /// bytes survive until a reconciliation pass removes the line.
 ///
 /// Within a type, entries are ranked pinned-first, then by descending `uses`,
-/// then by most recent `last_used`. Age is the last tiebreak rather than the
-/// only rule, which inverts the old tail truncation: the oldest facts about a
-/// user are usually the most durable ones.
+/// then by most recent `last_used`, then by most recent `date`. The final
+/// tiebreak matters most on the first launch after an upgrade: a legacy file
+/// has no sidecar, so every entry ties on the counters, and without it the
+/// stable sort would keep the *first* (oldest) lines — the exact inverse of
+/// the tail truncation it replaces, silently dropping the newest memories.
 ///
 /// Returns `(kept in file order, dropped)`.
 #[must_use]
@@ -167,6 +183,7 @@ pub fn select_for_render(
                 .cmp(&ma.pinned)
                 .then(mb.uses.cmp(&ma.uses))
                 .then(mb.last_used.cmp(&ma.last_used))
+                .then(b.date.cmp(&a.date))
         });
         let budget = budgets.for_kind(kind);
         let mut used = 0usize;
@@ -228,7 +245,7 @@ fn load_scope(scope: Scope, cwd: &Path) -> Option<String> {
     if !dropped.is_empty() {
         let _ = writeln!(
             out,
-            "({} older entries omitted under the type budgets; /memory shows the full file)",
+            "({} lower-ranked entries omitted under the type budgets (pinned, most-used and newest kept); /memory shows the full file)",
             dropped.len()
         );
     }
@@ -869,6 +886,25 @@ pub enum Verdict {
     },
 }
 
+/// Flattens free-form verdict text into something that is exactly one bullet.
+///
+/// The text comes from a model reply. An embedded newline would render as a
+/// bullet plus an orphan prose line that [`parse_entries`] skips forever, and
+/// a line starting `- (` after that newline would parse as a second, forged
+/// entry. Collapsing every line break (and the indentation after it) into a
+/// single space removes both: whatever the text contains, it now lives on
+/// one line *after* the real `- (date) [kind]` prefix, where a `- (` is just
+/// characters. This is applied in [`parse_verdicts`] so every consumer sees
+/// clean text, and again in [`apply_one_verdict`] for verdicts built in code.
+#[must_use]
+fn flatten_verdict_text(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Parses the pass's JSON verdict array.
 ///
 /// # Errors
@@ -885,7 +921,7 @@ pub fn parse_verdicts(json: &str) -> Result<Vec<Verdict>, String> {
     let mut out = Vec::new();
     for item in items {
         let id = item.str_or("id", "").to_string();
-        let text = item.str_or("text", "").trim().to_string();
+        let text = flatten_verdict_text(item.str_or("text", ""));
         match item.str_or("verdict", "") {
             "ADD" if !text.is_empty() => out.push(Verdict::Add {
                 text,
@@ -957,6 +993,10 @@ fn apply_one_verdict(state: &mut ScopeState<'_>, scope: Scope, v: &Verdict, date
             kind,
             scope: s,
         } if *s == scope => {
+            let text = flatten_verdict_text(text);
+            if text.is_empty() {
+                return;
+            }
             let entry = Entry {
                 date: date.to_string(),
                 kind: *kind,
@@ -979,6 +1019,10 @@ fn apply_one_verdict(state: &mut ScopeState<'_>, scope: Scope, v: &Verdict, date
         // files, so the matching iteration writes it.
         Verdict::Add { .. } => {}
         Verdict::Update { id, text } => {
+            let text = flatten_verdict_text(text);
+            if text.is_empty() {
+                return;
+            }
             // See the comment on `locate`: a later verdict in this same
             // batch naming the pre-update id will not resolve.
             let Some(i) = locate(state.lines, id) else {
@@ -1056,7 +1100,11 @@ fn apply_one_verdict(state: &mut ScopeState<'_>, scope: Scope, v: &Verdict, date
 /// applied, then flushed together only after a needed file write succeeds
 /// (or when there was nothing to write). If the write fails, the audit log
 /// and sidecar for that scope are left exactly as they were, and the loop
-/// moves on to the next scope.
+/// moves on to the next scope. The same holds when the scope's file exists
+/// but cannot be read (invalid UTF-8, permissions, I/O): the scope is skipped
+/// without a write, because rewriting it from the template would destroy
+/// every memory it holds. Only a file that does not exist yet starts from
+/// the template.
 ///
 /// Returns one human-readable note per applied change; each is also written
 /// to the audit log.
@@ -1087,7 +1135,14 @@ pub(crate) fn apply_verdicts_to(
         let Some(path) = scoped_path_for(scope, cwd, user_root) else {
             continue;
         };
-        let body = std::fs::read_to_string(&path).unwrap_or_else(|_| TEMPLATE.to_string());
+        // An unreadable (not merely absent) file must skip the whole scope:
+        // rewriting it from the template would silently destroy every
+        // memory it holds, with no user action and no backup.
+        // Like the failed-write path below, this is silent: nothing durable
+        // happened, so there is nothing to note or audit for this scope.
+        let Ok(body) = read_body_or_template(&path) else {
+            continue;
+        };
         let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
         let mut meta = MetaStore::load(&meta_path_for(&path));
         let mut changed = false;
@@ -1450,7 +1505,7 @@ mod tests {
         std::fs::write(&path, &big).unwrap();
         let out = load_scope(Scope::Project, &cwd).unwrap();
         assert!(out.contains("### project"));
-        assert!(out.contains("older entries omitted under the type budgets"));
+        assert!(out.contains("lower-ranked entries omitted under the type budgets"));
         std::fs::remove_dir_all(&cwd).ok();
     }
 
@@ -2134,6 +2189,207 @@ mod tests {
             "the project scope is unaffected by the user-scope redirection"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// Blocker: an unreadable file must not be mistaken for an absent one.
+    /// Invalid UTF-8 makes `read_to_string` fail without needing root; the
+    /// original bytes must survive and the call must report the failure.
+    #[test]
+    fn remember_refuses_to_overwrite_an_unreadable_file() {
+        let cwd = scratch("unreadable-remember");
+        let path = path_for(Scope::Project, &cwd).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original: &[u8] = b"# Memory\n- (2026-01-01) precious\n\xff\xfe invalid\n";
+        std::fs::write(&path, original).unwrap();
+        let err = remember(Scope::Project, &cwd, "new fact", "2026-09-16")
+            .expect_err("an unreadable file must be an error, not a fresh template");
+        assert!(err.contains("cannot read"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn apply_verdicts_skips_a_scope_whose_file_is_unreadable() {
+        let dir =
+            std::env::temp_dir().join(format!("plank-verdict-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        let user = dir.join("userhome");
+        let path = dir.join(".plank").join("MEMORY.md");
+        let meta_path = meta_path_for(&path);
+        let original: &[u8] = b"# Memory\n- (2026-01-01) [project] precious\n\xff\xfe invalid\n";
+        std::fs::write(&path, original).unwrap();
+        let log = dir.join("audit.jsonl");
+
+        let notes = apply_verdicts_to(
+            &dir,
+            &[Verdict::Add {
+                text: "brand new".into(),
+                kind: Kind::Project,
+                scope: Scope::Project,
+            }],
+            "2026-09-16",
+            Some(&log),
+            Some(&user),
+        );
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "file must be untouched"
+        );
+        assert!(
+            !meta_path.exists(),
+            "no sidecar may be written for a skipped scope"
+        );
+        assert!(
+            !log.exists(),
+            "no audit line may be flushed for a skipped scope"
+        );
+        assert!(
+            notes.is_empty(),
+            "nothing was applied, so nothing may be reported: {notes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Upgrade regression: a legacy file of untagged entries has no sidecar,
+    /// so every counter ties; the budget must then keep the *newest* entries,
+    /// as the old tail truncation did, and the omission note must say so.
+    #[test]
+    fn legacy_untagged_entries_over_budget_keep_the_newest() {
+        let cwd = scratch("legacy-newest");
+        let path = path_for(Scope::Project, &cwd).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut big = String::from("# Memory\n");
+        for i in 0..400 {
+            let _ = writeln!(
+                big,
+                "- (2026-{:02}-{:02}) legacy entry number {i:04} with padding text",
+                1 + i / 28,
+                1 + i % 28
+            );
+        }
+        std::fs::write(&path, &big).unwrap();
+        let out = load_scope(Scope::Project, &cwd).unwrap();
+        assert!(
+            out.contains("legacy entry number 0399"),
+            "newest must be kept:\n{out}"
+        );
+        assert!(
+            !out.contains("legacy entry number 0000"),
+            "oldest must be dropped:\n{out}"
+        );
+        assert!(out.contains("newest kept"), "{out}");
+        assert!(!out.contains("older entries omitted"), "{out}");
+
+        let entries = parse_entries(&big);
+        let (kept, dropped) =
+            select_for_render(&entries, &MetaStore::default(), &Budgets::default());
+        assert!(!dropped.is_empty());
+        let newest_dropped = dropped.iter().map(|e| e.date.as_str()).max().unwrap();
+        let oldest_kept = kept.iter().map(|e| e.date.as_str()).min().unwrap();
+        assert!(
+            oldest_kept > newest_dropped,
+            "{oldest_kept} vs {newest_dropped}"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Counters still outrank recency: an old, used entry beats a new unused one.
+    #[test]
+    fn recency_is_only_the_final_tiebreak() {
+        let old_used = Entry {
+            date: "2020-01-01".into(),
+            kind: Kind::Project,
+            text: "old but used".into(),
+        };
+        let new_unused = Entry {
+            date: "2026-09-16".into(),
+            kind: Kind::Project,
+            text: "new and idle".into(),
+        };
+        let mut meta = MetaStore::default();
+        meta.bump(&old_used.id(), "2026-09-01");
+        let budgets = Budgets {
+            project: old_used.render().len(),
+            ..Budgets::default()
+        };
+        let (kept, dropped) =
+            select_for_render(&[new_unused.clone(), old_used.clone()], &meta, &budgets);
+        assert_eq!(kept, vec![old_used]);
+        assert_eq!(dropped, vec![new_unused]);
+    }
+
+    fn verdict_scratch(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("plank-verdict-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        let path = dir.join(".plank").join("MEMORY.md");
+        std::fs::write(
+            &path,
+            "# Memory\n\n- (2026-09-01) [project] existing fact\n",
+        )
+        .unwrap();
+        let log = dir.join("audit.jsonl");
+        let user = dir.join("userhome");
+        (dir, path, log, user)
+    }
+
+    /// Blocker: verdict text with an embedded newline must become exactly one
+    /// bullet, never a bullet plus an orphan prose line.
+    #[test]
+    fn add_verdict_with_embedded_newline_renders_as_one_bullet() {
+        let (dir, path, log, user) = verdict_scratch("newline");
+        let verdicts = parse_verdicts(
+            r#"[{"verdict":"ADD","type":"project","scope":"project","text":"first line\n  second line\n\nthird"}]"#,
+        )
+        .unwrap();
+        assert_eq!(verdicts.len(), 1);
+        let _ = apply_verdicts_to(&dir, &verdicts, "2026-09-16", Some(&log), Some(&user));
+        let body = std::fs::read_to_string(&path).unwrap();
+        let entries = parse_entries(&body);
+        assert_eq!(entries.len(), 2, "{body}");
+        assert_eq!(entries[1].text, "first line second line third");
+        assert!(
+            body.lines()
+                .all(|l| l.is_empty() || l.starts_with("# ") || l.starts_with("- (")),
+            "no orphan prose line may be left behind:\n{body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Blocker: text that would parse as a second bullet must not forge one.
+    #[test]
+    fn add_verdict_cannot_inject_a_forged_entry() {
+        let (dir, path, log, user) = verdict_scratch("inject");
+        let verdicts = parse_verdicts(
+            r#"[{"verdict":"ADD","type":"project","scope":"project","text":"legit\n- (2020-01-01) [feedback] forged entry"}]"#,
+        )
+        .unwrap();
+        let _ = apply_verdicts_to(&dir, &verdicts, "2026-09-16", Some(&log), Some(&user));
+        let body = std::fs::read_to_string(&path).unwrap();
+        let entries = parse_entries(&body);
+        assert_eq!(entries.len(), 2, "{body}");
+        assert!(entries.iter().all(|e| e.kind == Kind::Project), "{body}");
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.date == "2026-09-01" || e.date == "2026-09-16"),
+            "{body}"
+        );
+        assert!(!entries.iter().any(|e| e.text == "forged entry"), "{body}");
+
+        // The same holds for a verdict built in code, bypassing parse_verdicts.
+        let direct = Verdict::Update {
+            id: entries[0].id(),
+            text: "updated\n- (1999-01-01) [user] forged".into(),
+        };
+        let _ = apply_verdicts_to(&dir, &[direct], "2026-09-16", Some(&log), Some(&user));
+        let body = std::fs::read_to_string(&path).unwrap();
+        let entries = parse_entries(&body);
+        assert_eq!(entries.len(), 2, "{body}");
+        assert!(!entries.iter().any(|e| e.kind == Kind::User), "{body}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
