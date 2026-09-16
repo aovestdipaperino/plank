@@ -10,6 +10,22 @@ has every last fix; this page has the ones you will actually notice.
 **v5.1.0 is out**, and the beta channel is on 5.1.5. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
 
+**On `main`, ahead of the next beta: memory that maintains itself.** Until now
+the two `MEMORY.md` files only ever changed when you typed `/remember` or opened
+`/memory`. The model now has a `remember` tool and a `forget` tool of its own,
+and an optional extraction pass (`memory.autoExtract`, off by default because it
+costs a generation after each answer) that reads the new part of a conversation
+and proposes adds, updates and deletions, which plank applies itself. Entries
+carry a type tag, each type has its own budget for what reaches the prompt, and
+eviction goes by how often an entry has actually mattered rather than by age, so
+the oldest fact about you is no longer the first one to fall off the end. Every
+automatic change is written to `~/.plank/memory-log.jsonl`, `/memory log` reads
+it back, and `/forget <pattern>` removes entries after showing you what matched.
+Nothing rewrites the cached prompt mid-session: model writes land on disk and
+join the context at the next session start, which is what keeps the whole
+feature cheap. The design, and what took four rounds of review to get right, is
+in [`docs/MEMORY.md`](https://github.com/aovestdipaperino/plank/blob/main/docs/MEMORY.md).
+
 **5.1.5: `cargo`, `npm` and `go` work under the sandbox again.** Model-run shell
 commands are sandboxed to the project and the temp dirs, which is the right
 default right up until a build has to fetch a dependency — because every package

@@ -91,6 +91,15 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 | `tools.loopGuards` | `true` | arm the loop guards (`/loopguard` flips it for the session) |
 | `tools.noProgressGuard` | `false` | also stop a turn that generates 32 KB of output without changing a file. Requires `tools.loopGuards`; see [The no-progress budget](04-slash-commands.md#the-no-progress-budget). |
 | `tools.recall`, `tools.fanout`, `tools.runCode` | `true` | offer the `recall`, `fanout` and `run_code` tools to the model |
+| `tools.remember` | `true` | offer the `remember` and `forget` tools, which write memory to disk for the next session. See [Memory](07-context.md#memory). |
+
+### `memory`
+
+| Key | Default | What |
+|---|---|---|
+| `memory.autoExtract` | `false` | run the extraction pass at the end of turns with no tool calls. It costs a generation and a KV snapshot each time, so it is a visible pause on a local model. |
+| `memory.extractEveryNTurns` | `1` | run the pass only every N eligible turns; `0` is treated as `1` |
+| `memory.budgets` | `4096` / `4096` / `6144` / `2048` | bytes of `user`, `feedback`, `project` and `reference` entries rendered into context. Hand-edit only; not exposed in `/config`. |
 
 ### `mcp`, `ask`, `update`, `agents`
 

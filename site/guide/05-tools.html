@@ -256,6 +256,37 @@ open and works mid-turn. The setting is off by default because turning
 it on adds one sentence to the system prompt (telling the model it need
 not poll), which starts a fresh prompt cache; enable it in
 <code>settings.json</code> and start a new session.</p>
+<h3 id="memory">Memory</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>remember</code></td>
+<td>append a typed entry to user or project memory</td>
+</tr>
+<tr>
+<td><code>forget</code></td>
+<td>delete a memory entry by the short id shown beside it in
+context</td>
+</tr>
+<tr>
+<td><code>recall</code></td>
+<td>search earlier sessions of this project, and the pre-compaction part
+of this one</td>
+</tr>
+</tbody>
+</table>
+<p><code>remember</code> and <code>forget</code> write to the memory
+files on disk and take effect at the next session start; nothing
+rewrites the cached prompt mid-conversation. Both are gated on
+<code>tools.remember</code>, and every change lands in
+<code>~/.plank/memory-log.jsonl</code>. See <a
+href="07-context.html#memory">Memory</a>.</p>
 <h3 id="documents">Documents</h3>
 <p><code>read</code> on a <code>.pdf</code> transparently converts the
 file to Markdown first, so a PDF is just a readable file:</p>

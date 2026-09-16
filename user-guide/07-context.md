@@ -49,9 +49,13 @@ Both load at session start. Append to them from the prompt:
 /remember user I work in Rust and TypeScript, mostly on macOS
 ```
 
-Without `user`, the entry goes to project memory. Entries are dated bullets.
+Without `user`, the entry goes to project memory. Entries are dated bullets, each carrying a type tag:
 
-To edit them rather than append, `/memory` opens both files as one buffer in the built-in editor, each between markers naming its scope and path; on save the buffer is split back along those markers and only the files whose text changed are written.
+```
+- (2026-09-15) [feedback] don't force-add generated docs
+```
+
+To edit them rather than append, `/memory` opens both files as one buffer in the built-in editor, each between markers naming its scope and path; on save the buffer is split back along those markers and only the files whose text changed are written. `/forget <pattern>` removes every entry whose text contains the pattern, case-insensitively, after showing you exactly what will go.
 
 Four kinds of entry are worth keeping, and they share one test: **facts the model cannot re-derive from the repository.**
 
@@ -62,7 +66,21 @@ Four kinds of entry are worth keeping, and they share one test: **facts the mode
 | `project` | goals and constraints not visible in the code |
 | `reference` | external URLs, tickets, dashboards |
 
-Do not record what the code, the git history, or `AGENTS.md` already says. That is context you are paying for twice.
+Do not record what the code, the git history, or `AGENTS.md` already says. That is context you are paying for twice. A bullet without a tag still works and reads as `project`, so a memory file from an older plank needs no migration.
+
+### The model can write memory too
+
+The model has a `remember` tool and a `forget` tool (gated on `tools.remember`, on by default). `remember` appends an entry exactly as `/remember` would; `forget` deletes one by the short id shown beside it in context. Both write to the file on disk and **take effect at the next session start**, not mid-conversation. That is deliberate: memory sits in the cached, project-stable part of the prompt, and rewriting it mid-session would force a full re-prefill of everything after it, which on a local model is the most expensive thing plank can do. The tool's own reply says so, so a model that just saved something and sees no change in its context knows that is expected.
+
+### Budgets, not truncation
+
+Each type has its own byte budget for what renders into context (4096 for `user` and `feedback`, 6144 for `project`, 2048 for `reference`, set under `memory.budgets`). When a type is over budget, entries are dropped least-valuable first: pinned entries never go, then the least-used, then the least recently used, and among entries the counters cannot separate the newest wins. The usage counters live in a `MEMORY.md.meta.json` sidecar beside each file. It is advisory: delete it and memory loads exactly as before, with every counter at zero.
+
+### The extraction pass
+
+With `memory.autoExtract` on (it is **off by default**), plank runs a pass at the end of any turn that produced no tool calls. It hands the model the new part of the conversation and the current entries, and asks for a JSON list of verdicts: add an entry, update one, delete one, or mark one as having been useful. plank applies the verdicts itself; the pass cannot run tools, cannot touch anything but memory, and reads only the part of the transcript it has not already seen. Every change it makes is appended to `~/.plank/memory-log.jsonl`, which `/memory log` prints.
+
+The pass is off by default because it is not free. It runs synchronously at the end of the turn and costs one extra generation plus a KV snapshot each time, which on a local model is a visible pause after each answer. `memory.extractEveryNTurns` thins it out. The full design, including what each failure mode looks like, is in [`docs/MEMORY.md`](https://github.com/aovestdipaperino/plank/blob/main/docs/MEMORY.md).
 
 ## Compaction
 

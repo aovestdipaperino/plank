@@ -366,6 +366,46 @@ budget</a>.</td>
 <td>offer the <code>recall</code>, <code>fanout</code> and
 <code>run_code</code> tools to the model</td>
 </tr>
+<tr>
+<td><code>tools.remember</code></td>
+<td><code>true</code></td>
+<td>offer the <code>remember</code> and <code>forget</code> tools, which
+write memory to disk for the next session. See <a
+href="07-context.html#memory">Memory</a>.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="memory"><code>memory</code></h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>memory.autoExtract</code></td>
+<td><code>false</code></td>
+<td>run the extraction pass at the end of turns with no tool calls. It
+costs a generation and a KV snapshot each time, so it is a visible pause
+on a local model.</td>
+</tr>
+<tr>
+<td><code>memory.extractEveryNTurns</code></td>
+<td><code>1</code></td>
+<td>run the pass only every N eligible turns; <code>0</code> is treated
+as <code>1</code></td>
+</tr>
+<tr>
+<td><code>memory.budgets</code></td>
+<td><code>4096</code> / <code>4096</code> / <code>6144</code> /
+<code>2048</code></td>
+<td>bytes of <code>user</code>, <code>feedback</code>,
+<code>project</code> and <code>reference</code> entries rendered into
+context. Hand-edit only; not exposed in <code>/config</code>.</td>
+</tr>
 </tbody>
 </table>
 <h3 id="mcp-ask-update-agents"><code>mcp</code>, <code>ask</code>,

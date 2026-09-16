@@ -185,11 +185,15 @@ goals and constraints of this checkout.</li>
 <pre><code>/remember prefers small commits with imperative subject lines
 /remember user I work in Rust and TypeScript, mostly on macOS</code></pre>
 <p>Without <code>user</code>, the entry goes to project memory. Entries
-are dated bullets.</p>
+are dated bullets, each carrying a type tag:</p>
+<pre><code>- (2026-09-15) [feedback] don&#39;t force-add generated docs</code></pre>
 <p>To edit them rather than append, <code>/memory</code> opens both
 files as one buffer in the built-in editor, each between markers naming
 its scope and path; on save the buffer is split back along those markers
-and only the files whose text changed are written.</p>
+and only the files whose text changed are written.
+<code>/forget &lt;pattern&gt;</code> removes every entry whose text
+contains the pattern, case-insensitively, after showing you exactly what
+will go.</p>
 <p>Four kinds of entry are worth keeping, and they share one test:
 <strong>facts the model cannot re-derive from the
 repository.</strong></p>
@@ -221,7 +225,50 @@ repository.</strong></p>
 </table>
 <p>Do not record what the code, the git history, or
 <code>AGENTS.md</code> already says. That is context you are paying for
-twice.</p>
+twice. A bullet without a tag still works and reads as
+<code>project</code>, so a memory file from an older plank needs no
+migration.</p>
+<h3 id="the-model-can-write-memory-too">The model can write memory
+too</h3>
+<p>The model has a <code>remember</code> tool and a <code>forget</code>
+tool (gated on <code>tools.remember</code>, on by default).
+<code>remember</code> appends an entry exactly as <code>/remember</code>
+would; <code>forget</code> deletes one by the short id shown beside it
+in context. Both write to the file on disk and <strong>take effect at
+the next session start</strong>, not mid-conversation. That is
+deliberate: memory sits in the cached, project-stable part of the
+prompt, and rewriting it mid-session would force a full re-prefill of
+everything after it, which on a local model is the most expensive thing
+plank can do. The tool's own reply says so, so a model that just saved
+something and sees no change in its context knows that is expected.</p>
+<h3 id="budgets-not-truncation">Budgets, not truncation</h3>
+<p>Each type has its own byte budget for what renders into context (4096
+for <code>user</code> and <code>feedback</code>, 6144 for
+<code>project</code>, 2048 for <code>reference</code>, set under
+<code>memory.budgets</code>). When a type is over budget, entries are
+dropped least-valuable first: pinned entries never go, then the
+least-used, then the least recently used, and among entries the counters
+cannot separate the newest wins. The usage counters live in a
+<code>MEMORY.md.meta.json</code> sidecar beside each file. It is
+advisory: delete it and memory loads exactly as before, with every
+counter at zero.</p>
+<h3 id="the-extraction-pass">The extraction pass</h3>
+<p>With <code>memory.autoExtract</code> on (it is <strong>off by
+default</strong>), plank runs a pass at the end of any turn that
+produced no tool calls. It hands the model the new part of the
+conversation and the current entries, and asks for a JSON list of
+verdicts: add an entry, update one, delete one, or mark one as having
+been useful. plank applies the verdicts itself; the pass cannot run
+tools, cannot touch anything but memory, and reads only the part of the
+transcript it has not already seen. Every change it makes is appended to
+<code>~/.plank/memory-log.jsonl</code>, which <code>/memory log</code>
+prints.</p>
+<p>The pass is off by default because it is not free. It runs
+synchronously at the end of the turn and costs one extra generation plus
+a KV snapshot each time, which on a local model is a visible pause after
+each answer. <code>memory.extractEveryNTurns</code> thins it out. The
+full design, including what each failure mode looks like, is in <a
+href="https://github.com/aovestdipaperino/plank/blob/main/docs/MEMORY.md"><code>docs/MEMORY.md</code></a>.</p>
 <h2 id="compaction">Compaction</h2>
 <p>When the conversation approaches the window, plank reclaims space in
 escalating steps, cheapest first.</p>

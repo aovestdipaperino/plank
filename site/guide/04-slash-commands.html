@@ -284,6 +284,16 @@ works in the TUI and the plain REPL alike</td>
 edits are split back to the right file on save</td>
 </tr>
 <tr>
+<td><code>/memory log</code></td>
+<td>print the recent entries of the memory audit log: what the model or
+the extraction pass added, changed or removed, and why</td>
+</tr>
+<tr>
+<td><code>/forget &lt;pattern&gt;</code></td>
+<td>delete every memory entry whose text contains the pattern,
+case-insensitively, after previewing the matches and asking</td>
+</tr>
+<tr>
 <td><code>/init</code></td>
 <td>have the model read the repo and generate an
 <code>AGENTS.md</code></td>

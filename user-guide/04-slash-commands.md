@@ -46,6 +46,8 @@ See [Sessions](06-sessions.md).
 | `/rate [+\|-] [note]` | rate the last turn (thumbs up by default) with an optional note; works in the TUI and the plain REPL alike |
 | `/remember [user] <fact>` | append a dated entry to project memory (or user memory with `user`) |
 | `/memory` | open user and project memory as one buffer in the built-in editor; edits are split back to the right file on save |
+| `/memory log` | print the recent entries of the memory audit log: what the model or the extraction pass added, changed or removed, and why |
+| `/forget <pattern>` | delete every memory entry whose text contains the pattern, case-insensitively, after previewing the matches and asking |
 | `/init` | have the model read the repo and generate an `AGENTS.md` |
 
 See [Context](07-context.md).

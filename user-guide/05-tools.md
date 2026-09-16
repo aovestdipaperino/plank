@@ -44,6 +44,16 @@ The wake is careful about your prompt: in the TUI it waits while you have unsent
 
 While any job runs the status bar shows `⧗ N jobs`. Click it, or type `/jobs`, for the job table: id, pid, elapsed time, state and output file, in a panel that keeps counting while it is open and works mid-turn. The setting is off by default because turning it on adds one sentence to the system prompt (telling the model it need not poll), which starts a fresh prompt cache; enable it in `settings.json` and start a new session.
 
+### Memory
+
+| Tool | What it does |
+|---|---|
+| `remember` | append a typed entry to user or project memory |
+| `forget` | delete a memory entry by the short id shown beside it in context |
+| `recall` | search earlier sessions of this project, and the pre-compaction part of this one |
+
+`remember` and `forget` write to the memory files on disk and take effect at the next session start; nothing rewrites the cached prompt mid-conversation. Both are gated on `tools.remember`, and every change lands in `~/.plank/memory-log.jsonl`. See [Memory](07-context.md#memory).
+
 ### Documents
 
 `read` on a `.pdf` transparently converts the file to Markdown first, so a PDF is just a readable file:
