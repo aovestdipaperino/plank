@@ -796,6 +796,185 @@ pub fn read_log(limit: usize) -> Vec<String> {
     log_path().map_or_else(Vec::new, |p| read_log_from(&p, limit))
 }
 
+/// One decision from the extraction pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// A new entry.
+    Add {
+        /// The entry text.
+        text: String,
+        /// Its type.
+        kind: Kind,
+        /// Which file it belongs in.
+        scope: Scope,
+    },
+    /// Replace an existing entry's text in place, carrying its sidecar row.
+    Update {
+        /// The existing entry's id.
+        id: String,
+        /// The replacement text.
+        text: String,
+    },
+    /// Remove an entry outright. The pass is the audited path, so this is a
+    /// real deletion; a model `forget` sets retraction instead.
+    Delete {
+        /// The existing entry's id.
+        id: String,
+    },
+    /// Credit an entry with having borne on the work.
+    Used {
+        /// The existing entry's id.
+        id: String,
+    },
+}
+
+/// Parses the pass's JSON verdict array.
+///
+/// # Errors
+///
+/// Returns a message when the text is not JSON or is not an array. A single
+/// malformed element is skipped rather than failing the batch, because one
+/// bad verdict should not discard a whole pass's work.
+pub fn parse_verdicts(json: &str) -> Result<Vec<Verdict>, String> {
+    use crate::tools::mcp::{Json, json_parse};
+    let parsed = json_parse(json).ok_or_else(|| "verdicts are not valid JSON".to_string())?;
+    let Json::Arr(items) = parsed else {
+        return Err("verdicts must be a JSON array".to_string());
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let id = item.str_or("id", "").to_string();
+        let text = item.str_or("text", "").trim().to_string();
+        match item.str_or("verdict", "") {
+            "ADD" if !text.is_empty() => out.push(Verdict::Add {
+                text,
+                kind: Kind::from_tag(item.str_or("type", "project")).unwrap_or(Kind::Project),
+                scope: if item.str_or("scope", "project") == "user" {
+                    Scope::User
+                } else {
+                    Scope::Project
+                },
+            }),
+            "UPDATE" if !id.is_empty() && !text.is_empty() => {
+                out.push(Verdict::Update { id, text });
+            }
+            "DELETE" if !id.is_empty() => out.push(Verdict::Delete { id }),
+            "USED" if !id.is_empty() => out.push(Verdict::Used { id }),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Finds the line index holding the live entry with this id, if any. The
+/// file always wins: a verdict naming an id with no matching line is simply
+/// not found here, and callers skip it silently.
+fn locate(lines: &[String], id: &str) -> Option<usize> {
+    lines
+        .iter()
+        .position(|l| parse_entries(l).first().is_some_and(|e| e.id() == id))
+}
+
+/// Applies a batch of verdicts to both scopes' files and sidecars.
+///
+/// Every verdict naming an id with no live entry is discarded silently: the
+/// user may have edited `MEMORY.md` by hand between the pass reading it and
+/// this write, and the file always wins.
+///
+/// Returns one human-readable note per applied change; each is also written
+/// to the audit log.
+pub fn apply_verdicts(cwd: &Path, verdicts: &[Verdict], date: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    for scope in [Scope::User, Scope::Project] {
+        let Some(path) = path_for(scope, cwd) else {
+            continue;
+        };
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|_| TEMPLATE.to_string());
+        let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
+        let mut meta = MetaStore::load(&meta_path_for(&path));
+        let mut changed = false;
+
+        for v in verdicts {
+            match v {
+                Verdict::Add {
+                    text,
+                    kind,
+                    scope: s,
+                } if *s == scope => {
+                    let entry = Entry {
+                        date: date.to_string(),
+                        kind: *kind,
+                        text: text.clone(),
+                    };
+                    if locate(&lines, &entry.id()).is_some() {
+                        continue; // already present; re-adding is a no-op
+                    }
+                    lines.push(entry.render().trim_end().to_string());
+                    changed = true;
+                    log_change("add", scope, &entry.id(), text, "extracted");
+                    notes.push(format!("added [{}] {text}", kind.tag()));
+                }
+                // An `Add` destined for the *other* scope. The loop visits
+                // both files, so the matching iteration writes it.
+                Verdict::Add { .. } => {}
+                Verdict::Update { id, text } => {
+                    let Some(i) = locate(&lines, id) else {
+                        continue;
+                    };
+                    let Some(old) = parse_entries(&lines[i]).into_iter().next() else {
+                        continue;
+                    };
+                    let new = Entry {
+                        date: old.date.clone(),
+                        kind: old.kind,
+                        text: text.clone(),
+                    };
+                    lines[i] = new.render().trim_end().to_string();
+                    meta.carry(id, &new.id());
+                    changed = true;
+                    log_change("update", scope, &new.id(), text, "reconciled");
+                    notes.push(format!("updated [{}] {text}", new.kind.tag()));
+                }
+                Verdict::Delete { id } => {
+                    let Some(i) = locate(&lines, id) else {
+                        continue;
+                    };
+                    let Some(old) = parse_entries(&lines[i]).into_iter().next() else {
+                        continue;
+                    };
+                    lines.remove(i);
+                    changed = true;
+                    log_change("delete", scope, id, &old.text, "reconciled");
+                    notes.push(format!("removed [{}] {}", old.kind.tag(), old.text));
+                }
+                Verdict::Used { id } => {
+                    if locate(&lines, id).is_some() {
+                        meta.bump(id, date);
+                    }
+                }
+            }
+        }
+
+        if changed {
+            let mut out = lines.join("\n");
+            out.push('\n');
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::write(&path, out).is_err() {
+                continue; // leave the sidecar alone if the file did not land
+            }
+        }
+        let live: Vec<String> = parse_entries(&lines.join("\n"))
+            .iter()
+            .map(Entry::id)
+            .collect();
+        meta.gc(&live);
+        let _ = meta.save(&meta_path_for(&path));
+    }
+    notes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1175,6 +1354,162 @@ mod tests {
             parsed.str_or("text", ""),
             nasty,
             "the text round-trips verbatim"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verdicts_parse_from_the_pass_json() {
+        let json = r#"[
+            {"verdict": "ADD", "text": "prefers tabs", "type": "user", "scope": "user"},
+            {"verdict": "UPDATE", "id": "abc123", "text": "prefers tabs, width 4"},
+            {"verdict": "DELETE", "id": "def456"},
+            {"verdict": "USED", "id": "aaa111"},
+            {"verdict": "NOOP"}
+        ]"#;
+        let v = parse_verdicts(json).unwrap();
+        assert_eq!(v.len(), 4, "NOOP is dropped, not an error");
+        assert!(
+            matches!(&v[0], Verdict::Add { kind: Kind::User, scope: Scope::User, text } if text == "prefers tabs")
+        );
+        assert!(matches!(&v[1], Verdict::Update { id, .. } if id == "abc123"));
+        assert!(matches!(&v[2], Verdict::Delete { id } if id == "def456"));
+        assert!(matches!(&v[3], Verdict::Used { id } if id == "aaa111"));
+    }
+
+    #[test]
+    fn malformed_verdict_json_is_an_error_not_a_partial_write() {
+        assert!(parse_verdicts("not json at all").is_err());
+        assert!(
+            parse_verdicts(r#"{"verdict": "ADD"}"#).is_err(),
+            "must be an array"
+        );
+    }
+
+    #[test]
+    fn update_rewrites_the_line_in_place_and_carries_usage() {
+        let dir = std::env::temp_dir().join(format!("plank-verdict-update-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        let path = dir.join(".plank").join("MEMORY.md");
+        std::fs::write(&path, "# Memory\n\n- (2026-09-01) [project] old wording\n").unwrap();
+
+        let old = Entry {
+            date: "2026-09-01".into(),
+            kind: Kind::Project,
+            text: "old wording".into(),
+        };
+        let mut meta = MetaStore::default();
+        meta.bump(&old.id(), "2026-09-10");
+        meta.bump(&old.id(), "2026-09-11");
+        meta.save(&meta_path_for(&path)).unwrap();
+
+        apply_verdicts(
+            &dir,
+            &[Verdict::Update {
+                id: old.id(),
+                text: "new wording".into(),
+            }],
+            "2026-09-15",
+        );
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("new wording"));
+        assert!(!body.contains("old wording"));
+        assert!(
+            body.contains("(2026-09-01)"),
+            "the original date is preserved"
+        );
+
+        let new = Entry {
+            date: "2026-09-01".into(),
+            kind: Kind::Project,
+            text: "new wording".into(),
+        };
+        let reloaded = MetaStore::load(&meta_path_for(&path));
+        assert_eq!(
+            reloaded.get(&new.id()).uses,
+            2,
+            "usage survived the rewrite"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_verdict_naming_an_unknown_id_is_discarded_silently() {
+        let dir = std::env::temp_dir().join(format!("plank-verdict-ghost-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        let path = dir.join(".plank").join("MEMORY.md");
+        std::fs::write(&path, "# Memory\n\n- (2026-09-01) [project] kept\n").unwrap();
+
+        let notes = apply_verdicts(
+            &dir,
+            &[Verdict::Delete {
+                id: "0000deadbeef".into(),
+            }],
+            "2026-09-15",
+        );
+
+        assert!(std::fs::read_to_string(&path).unwrap().contains("kept"));
+        assert!(
+            notes.iter().all(|n| !n.contains("0000deadbeef")),
+            "no write, no note"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_preserves_usage_across_repeated_rewrites() {
+        // Beyond the brief: rephrase the same entry twice in a row and check
+        // usage keeps accumulating rather than resetting on the second carry.
+        let dir =
+            std::env::temp_dir().join(format!("plank-verdict-update-chain-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        let path = dir.join(".plank").join("MEMORY.md");
+        std::fs::write(&path, "# Memory\n\n- (2026-09-01) [project] v1\n").unwrap();
+
+        let v1 = Entry {
+            date: "2026-09-01".into(),
+            kind: Kind::Project,
+            text: "v1".into(),
+        };
+        let mut meta = MetaStore::default();
+        meta.bump(&v1.id(), "2026-09-05");
+        meta.save(&meta_path_for(&path)).unwrap();
+
+        apply_verdicts(
+            &dir,
+            &[Verdict::Update {
+                id: v1.id(),
+                text: "v2".into(),
+            }],
+            "2026-09-10",
+        );
+        let v2 = Entry {
+            date: "2026-09-01".into(),
+            kind: Kind::Project,
+            text: "v2".into(),
+        };
+        apply_verdicts(
+            &dir,
+            &[
+                Verdict::Used { id: v2.id() },
+                Verdict::Update {
+                    id: v2.id(),
+                    text: "v3".into(),
+                },
+            ],
+            "2026-09-12",
+        );
+        let v3 = Entry {
+            date: "2026-09-01".into(),
+            kind: Kind::Project,
+            text: "v3".into(),
+        };
+        let reloaded = MetaStore::load(&meta_path_for(&path));
+        assert_eq!(
+            reloaded.get(&v3.id()).uses,
+            2,
+            "usage accumulated across two rewrites"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
