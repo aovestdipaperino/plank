@@ -63,6 +63,15 @@ test` and review the diff before committing.
   re-injected only once the token-estimate distance since it was last seen
   exceeds 50,000 (`AGENT_SYSTEM_PROMPT_REMINDER_TOKENS` in the C,
   `SYSTEM_PROMPT_REMINDER_TOKENS` in `src/sysprompt.rs`).
+- **The reminder's cost is prefill, not tokenization, and it cannot be
+  cached.** Tokenizing the reminder text is milliseconds; running its tokens
+  through the model is the seconds, and those KV rows are only valid at the
+  position and after the transcript they were computed for, so unlike the
+  position-zero `sysprompt.kv` snapshot there is nothing to save. The lever is
+  the size of the text: `context.shortReminder` (default `true`) injects the
+  dialect's syntax reminder plus the tool-name roster
+  (`build_short_system_prompt_reminder`) instead of the C's full tools prompt,
+  which remains available as `"shortReminder": false`.
 - **The datetime context line falls back to raw Unix seconds.** Local time is
   formatted with `strftime("%Y-%m-%d %H:%M:%S %Z")`; if that fails, the raw
   seconds are printed instead — the surrounding sentence is fixed either way

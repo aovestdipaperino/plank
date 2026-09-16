@@ -37,7 +37,7 @@
 //!   "ask":    { "maxOptions": 7 },
 //!   "agents": { "autoRoute": true, "maxParallel": 4 },
 //!   "git":    { "signCommits": true },
-//!   "context": { "microcompact": true },
+//!   "context": { "microcompact": true, "shortReminder": true },
 //!   "memory": { "autoExtract": true, "extractEveryNTurns": 1 }
 //! }
 //! ```
@@ -467,11 +467,22 @@ pub struct ContextSettings {
     /// stops every in-place rewrite, at the cost of relying on full
     /// summary-based compaction alone to reclaim context under pressure.
     pub microcompact: bool,
+    /// Whether the pressure-based system-prompt reminder (re-injected once
+    /// 50K tokens have passed since the prompt was last seen) is the short
+    /// form: the tool-call syntax reminder plus the roster of tool names,
+    /// instead of the C's full tools prompt. On by default: the short form is
+    /// a few hundred tokens against several thousand, and every one of them
+    /// is prefilled once and then occupies context for the rest of the
+    /// session. Turning it off restores the C reference behaviour.
+    pub short_reminder: bool,
 }
 
 impl Default for ContextSettings {
     fn default() -> Self {
-        Self { microcompact: true }
+        Self {
+            microcompact: true,
+            short_reminder: true,
+        }
     }
 }
 
@@ -857,6 +868,10 @@ impl Settings {
         if let Some(v) = boolean(root.get("context"), "microcompact") {
             self.context.microcompact = v;
             self.note("context.microcompact", origin);
+        }
+        if let Some(v) = boolean(root.get("context"), "shortReminder") {
+            self.context.short_reminder = v;
+            self.note("context.shortReminder", origin);
         }
 
         if let Some(v) = boolean(root.get("memory"), "autoExtract") {
@@ -1316,6 +1331,11 @@ impl Settings {
             section(&mut root, "context"),
             "microcompact",
             Json::Bool(self.context.microcompact),
+        );
+        upsert(
+            section(&mut root, "context"),
+            "shortReminder",
+            Json::Bool(self.context.short_reminder),
         );
         {
             let m = section(&mut root, "memory");
@@ -2363,6 +2383,32 @@ mod tests {
         let mut s3 = Settings::default();
         s3.overlay(r#"{"context":{"microcompact":"nope"}}"#);
         assert!(s3.context.microcompact);
+    }
+
+    #[test]
+    fn short_reminder_defaults_true_overlays_false_and_round_trips() {
+        let s = Settings::default();
+        assert!(s.context.short_reminder, "on by default");
+        let mut s2 = Settings::default();
+        s2.overlay(r#"{"context":{"shortReminder":false}}"#);
+        assert!(!s2.context.short_reminder);
+        // A non-boolean value is ignored rather than flipping the default.
+        let mut s3 = Settings::default();
+        s3.overlay(r#"{"context":{"shortReminder":"nope"}}"#);
+        assert!(s3.context.short_reminder);
+
+        let dir = std::env::temp_dir().join(format!("plank-short-reminder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let mut s = Settings::default();
+        s.context.short_reminder = false;
+        s.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"shortReminder\": false"), "{text}");
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert!(!reloaded.context.short_reminder);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

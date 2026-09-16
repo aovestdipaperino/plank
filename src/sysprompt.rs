@@ -1293,6 +1293,38 @@ pub fn build_system_prompt_reminder(
     out
 }
 
+/// Builds the short system prompt reminder (`context.shortReminder`, the
+/// default).
+///
+/// Same framing markers as [`build_system_prompt_reminder`], but the body is
+/// cut to what a reminder is for: the tool-call syntax in the dialect the
+/// model speaks, the roster of tool names it may call, and a pointer back to
+/// the rules already in context. Nothing here is re-taught; the full prompt
+/// is still at the head of the transcript, this only pulls its shape back
+/// into the model's attention at a fraction of the prefill and context cost.
+/// Deliberately not a C-parity text: the C has no short form.
+#[must_use]
+pub fn build_short_system_prompt_reminder(
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    syntax: ToolSyntax,
+) -> String {
+    let mut out = String::from("\n\n[System prompt reminder follows.]\n");
+    out.push_str(match syntax {
+        ToolSyntax::Qwen => qwen_syntax_reminder(),
+        ToolSyntax::Dsml => dsml_syntax_reminder(),
+        ToolSyntax::Dsml41 => dsml41_syntax_reminder(),
+    });
+    out.push_str("Available tools: ");
+    out.push_str(&tool_names(mcp_servers).join(", "));
+    out.push_str(".\n");
+    out.push_str(
+        "The system prompt at the start of this conversation still applies in full: \
+its tool schemas, editing rules, shell and git rules, and working style.\n",
+    );
+    out.push_str("[End system prompt reminder.]\n\n");
+    out
+}
+
 /// The attribution trailer plank asks the model to end its commit messages
 /// with, disabled by `git.signCommits` in `settings.json`.
 pub const COMMIT_SIGNATURE_TRAILER: &str = "--Co-Authored by Plank (https://plank-agent.dev)";
@@ -1528,6 +1560,36 @@ mod tests {
     /// fingerprint for every session. What parity still guarantees is that the
     /// C-*derived* text is byte-identical, which `tools_prompt_matches_c_source`
     /// checks independently of this schema list.
+    /// The short reminder keeps the C's framing markers, carries the dialect's
+    /// own syntax reminder and every advertised tool name, and stays a small
+    /// fraction of the full reminder it replaces by default.
+    #[test]
+    fn short_reminder_is_framed_dialect_aware_and_small() {
+        let short = build_short_system_prompt_reminder(&[], ToolSyntax::Dsml);
+        assert!(short.starts_with("\n\n[System prompt reminder follows.]\n"));
+        assert!(short.ends_with("[End system prompt reminder.]\n\n"));
+        assert!(short.contains(dsml_syntax_reminder()));
+        for name in ["read", "edit", "bash", "task", "agent", "glob"] {
+            assert!(
+                short.contains(name),
+                "short reminder omits tool {name}: {short}"
+            );
+        }
+        let full = build_system_prompt_reminder(&[], true);
+        assert!(
+            short.len() * 4 < full.len(),
+            "short={} full={}",
+            short.len(),
+            full.len()
+        );
+
+        let v41 = build_short_system_prompt_reminder(&[], ToolSyntax::Dsml41);
+        assert!(v41.contains(dsml41_syntax_reminder()));
+        assert!(!v41.contains("<｜DSML｜tool_calls>"));
+        let qwen = build_short_system_prompt_reminder(&[], ToolSyntax::Qwen);
+        assert!(qwen.contains(qwen_syntax_reminder()));
+    }
+
     #[test]
     fn recall_schema_is_advertised_by_default_and_can_be_disabled() {
         let mut text = String::new();

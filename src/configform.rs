@@ -59,6 +59,7 @@ pub enum FieldId {
     ToolsBashNotify,
     ToolsRemember,
     ContextMicrocompact,
+    ContextShortReminder,
     MemoryAutoExtract,
     MemoryExtractEveryNTurns,
 }
@@ -369,6 +370,13 @@ pub static FIELDS: &[Field] = &[
         Kind::Bool,
     ),
     f(
+        FieldId::ContextShortReminder,
+        "context",
+        "shortReminder",
+        "re-inject only the tool syntax and tool names, not the full prompt",
+        Kind::Bool,
+    ),
+    f(
         FieldId::MemoryAutoExtract,
         "memory",
         "autoExtract",
@@ -462,6 +470,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::ToolsBashNotify => s.tools.bash_notify.to_string(),
         FieldId::ToolsRemember => s.tools.remember.to_string(),
         FieldId::ContextMicrocompact => s.context.microcompact.to_string(),
+        FieldId::ContextShortReminder => s.context.short_reminder.to_string(),
         FieldId::MemoryAutoExtract => s.memory.auto_extract.to_string(),
         FieldId::MemoryExtractEveryNTurns => s.memory.extract_every_n_turns.to_string(),
     }
@@ -501,6 +510,7 @@ fn toggle(s: &mut Settings, id: FieldId) {
         FieldId::UiEasterEggs => s.ui.easter_eggs = !s.ui.easter_eggs,
         FieldId::UiBuiltinEditor => s.ui.builtin_editor = !s.ui.builtin_editor,
         FieldId::ContextMicrocompact => s.context.microcompact = !s.context.microcompact,
+        FieldId::ContextShortReminder => s.context.short_reminder = !s.context.short_reminder,
         FieldId::MemoryAutoExtract => s.memory.auto_extract = !s.memory.auto_extract,
         FieldId::SafetySandbox => s.safety.sandbox = cycle_tri(s.safety.sandbox),
         FieldId::SafetyBtwSuspend => s.safety.btw_suspend = cycle_tri(s.safety.btw_suspend),
@@ -634,6 +644,7 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::ToolsBashNotify
         | FieldId::ToolsRemember
         | FieldId::ContextMicrocompact
+        | FieldId::ContextShortReminder
         | FieldId::MemoryAutoExtract => {
             let b = parse_bool(raw)?;
             set_bool(s, id, b);
@@ -682,6 +693,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::ToolsBashNotify => s.tools.bash_notify = b,
         FieldId::ToolsRemember => s.tools.remember = b,
         FieldId::ContextMicrocompact => s.context.microcompact = b,
+        FieldId::ContextShortReminder => s.context.short_reminder = b,
         FieldId::MemoryAutoExtract => s.memory.auto_extract = b,
         _ => {}
     }
@@ -1652,6 +1664,15 @@ mod tests {
         let field = set_from_path(&mut s, "context.microcompact", "false").unwrap();
         assert_eq!(field.id, FieldId::ContextMicrocompact);
         assert!(!s.context.microcompact);
+    }
+
+    #[test]
+    fn context_short_reminder_is_a_known_config_key() {
+        let mut s = Settings::default();
+        assert!(s.context.short_reminder, "on by default");
+        let field = set_from_path(&mut s, "context.shortReminder", "false").unwrap();
+        assert_eq!(field.id, FieldId::ContextShortReminder);
+        assert!(!s.context.short_reminder);
     }
 
     #[test]

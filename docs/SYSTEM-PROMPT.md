@@ -58,10 +58,24 @@ different days.
 
 ### The pressure-based reminder
 
-The tools prompt is re-injected mid-session as a user-turn "system prompt
-reminder" (`build_system_prompt_reminder`) once the token-estimate distance
-since it was last seen exceeds `SYSTEM_PROMPT_REMINDER_TOKENS` (50,000) —
-pressure-based, not periodic, mirroring the C. `/new` resets the tracker.
+A "system prompt reminder" is re-injected mid-session as a user turn once the
+token-estimate distance since the prompt was last seen exceeds
+`SYSTEM_PROMPT_REMINDER_TOKENS` (50,000) — pressure-based, not periodic,
+mirroring the C. `/new` resets the tracker. Its body comes in two forms,
+chosen by `context.shortReminder`:
+
+- **short** (default, `build_short_system_prompt_reminder`): the tool-call
+  syntax reminder in the model's dialect, the roster of advertised tool
+  names, and one line saying the original prompt still applies. A few hundred
+  tokens. This is plank's own text, not under C parity.
+- **full** (`"shortReminder": false`, `build_system_prompt_reminder`): the
+  whole tools prompt wrapped in the reminder markers, byte-identical to the
+  C's `agent_build_system_prompt_reminder`. Several thousand tokens.
+
+Both are followed by the user's `-sys` text when there is one. The reminder
+cannot be cached as KV: it lands at a different position after a different
+transcript every time, so its cost is a real prefill plus permanent context
+occupancy, which is what the short form cuts.
 
 ## The `sysprompt.kv` checkpoint
 

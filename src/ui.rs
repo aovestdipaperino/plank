@@ -5203,16 +5203,29 @@ impl Agent<'_> {
         self.trace.line(&format!(
             "system prompt reminder injected at transcript={pos}"
         ));
-        let mut text = sysprompt::build_system_prompt_reminder(
-            &self.tool_ctx.mcp,
-            !crate::settings::active().engine.thinking_tool_calls,
-        );
+        let text = self.system_prompt_reminder_text();
+        self.session.push(Message::user(text));
+    }
+
+    /// The reminder message both front ends inject: the short form
+    /// (`context.shortReminder`, default) or the C's full tools prompt, each
+    /// followed by the user's `-sys` text when there is one.
+    fn system_prompt_reminder_text(&self) -> String {
+        let settings = crate::settings::active();
+        let mut text = if settings.context.short_reminder {
+            sysprompt::build_short_system_prompt_reminder(&self.tool_ctx.mcp, self.tool_syntax())
+        } else {
+            sysprompt::build_system_prompt_reminder(
+                &self.tool_ctx.mcp,
+                !settings.engine.thinking_tool_calls,
+            )
+        };
         if !self.cfg.system.is_empty() {
             text.push_str("\nAdditional system instructions reminder:\n");
             text.push_str(&self.cfg.system);
             text.push_str("\n[End additional system instructions reminder.]\n\n");
         }
-        self.session.push(Message::user(text));
+        text
     }
 
     /// Compacts the transcript when the rendered context is nearly full.
@@ -14970,15 +14983,7 @@ impl Agent<'_> {
         self.trace.line(&format!(
             "system prompt reminder injected at transcript={pos}"
         ));
-        let mut text = sysprompt::build_system_prompt_reminder(
-            &self.tool_ctx.mcp,
-            !crate::settings::active().engine.thinking_tool_calls,
-        );
-        if !self.cfg.system.is_empty() {
-            text.push_str("\nAdditional system instructions reminder:\n");
-            text.push_str(&self.cfg.system);
-            text.push_str("\n[End additional system instructions reminder.]\n\n");
-        }
+        let text = self.system_prompt_reminder_text();
         self.session.push(Message::user(text));
     }
 
