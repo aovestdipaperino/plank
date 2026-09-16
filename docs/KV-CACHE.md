@@ -1028,6 +1028,24 @@ parent context from token zero rather than just the report. The stack is LIFO
 and pushes `None` rather than skipping, so a nested fork cannot pop the parent's
 snapshot.
 
+**The fork snapshot doubles as the sidechain's rescue checkpoint.** A quiet
+sub-agent pass runs the same pre-generation probe as the main turn
+(`rescue_prefix_before_rebuild`, called from `generate_quiet`). When the prompt
+diverges behind the live end — the recovery pass after a reasoning-cycle stop,
+whose `recovery_session` stub rewrites the tail of the message the KV ran past —
+the rescue restores, in order: the innermost `fork_kv` entry (peeked, never
+popped; it sits at exactly `fork_at`, so only the sidechain's own transcript
+re-prefills), then the deepest ladder rung below the divergence (valid in a
+sidechain because rungs are fingerprinted over intact parent prefix), then
+nothing. `alt_engine_depth`, maintained by `run_sidechain_on`, disables both
+tiers while a clean-room alt engine is live: its KV is not the session's, and
+its prompt is small enough to rebuild. Before this, a cycle stop inside a
+sub-agent re-prefilled the whole parent context from token zero, once per trip
+up to `SUBAGENT_REPEAT_TRIP_CAP`. One consequence worth noting: every sidechain
+generation now makes one `kv_reuse_probe` call it did not before, on top of the
+generate that follows — one prompt tokenization, which the following generate
+reconciles idempotently.
+
 **Sidechains never write the live session's cache.** A `sidechain_depth`
 counter, raised by `/subagent` and the `agent` tool and read through
 `in_sidechain()`, gates `store_payload`, `save_payload_if_dirty`, rung anchoring

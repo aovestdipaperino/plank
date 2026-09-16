@@ -89,6 +89,7 @@ argument for the design.
 | 2026-09-11 | *(this change)* | closed-think recovery (`Agent::pass_opts`): the pass after any reasoning stop is generated with `ThinkMode::Off`, so it can only deliver; and a draft stop counts on its own tally (`MAIN_DRAFT_TRIP_CAP` = 3) instead of against `MAIN_REPEAT_TRIP_CAP` | `repro-loop-1789108509` / `-1789108726`: a turn ended for obeying the draft rung twice — see "The recovery had nowhere to write", below |
 | 2026-09-11 | *(this change)* | `NO_PROGRESS_NOTICE` reworded: it no longer claims a shell command would have reset the budget, and it names what does | `repro-1789107544`: the tripping pass had just run `cargo test` and `cargo clippy` successfully — see "The no-progress notice named the wrong evidence", below |
 | 2026-09-13 | *(this change)* | `treedigest`: a git working-tree fingerprint taken before and after every opaque tool (`bash` family, `run_code`, MCP, WASM), whose difference sets `ToolContext::touched_tree` and resets the no-progress budget; `NO_PROGRESS_NOTICE` reworded again to name it | shell-driven work (`sed -i`, `cargo fmt`, codegen, `git apply`) scored zero progress and could trip the budget for doing the job — see "An attempted mutation is not progress", below |
+| 2026-09-16 | *(this change)* | `rescue_prefix_before_rebuild` gains a fork-snapshot tier and runs before every quiet sub-agent pass | a cycle stop inside a sub-agent re-prefilled the whole parent context from token zero — see "The KV cost", below |
 | 2026-09-10 | *(this change)* | draft rung (`RepeatGuard::drafting`, `DRAFT_ERROR`): numbered deliverable headings or fenced code accumulating inside `<think>` past 8 KiB stop the pass with "write this as your answer, not in reasoning"; and a `WORKING_STYLE` rule, "Write findings as you find them", so list-shaped answers are emitted item by item after `</think>` | `repro-loop-1789060243` and the seven 2026-09-10 dumps: deliverables drafted in reasoning, never emitted |
 | 2026-09-10 | *(no code change)* | counter-case to the raised budget recorded: a 30 KB review drafted inside `<think>` under the ~102 KB budget, interrupted by the user at 12m42s; the `resume` pass redrafted and fell into a 5-line cycle the exact-cycle rung caught | `repro-loop-1789060243`: `do a code review`, 18 minutes, no visible output — see "The review that was written in the wrong place", below |
 | 2026-09-10 | `1a09915` | `NumberedCycle` inside `DraftScan`: numbered reasoning lines hashed with the leading ordinal stripped, a bounded 256-item history independent of the byte window, reported as a cycle through `RepeatGuard::feed` at `REPEAT_CYCLES` copies; a cycle must carry three distinct substantial bodies and 256 bytes | `repro-1789068543`: a 26-item cycle, over 7 KiB per copy, that no byte rung could match — see "A cycle that renumbers itself is not byte-exact", below |
@@ -554,16 +555,25 @@ cap stays as the backstop, unchanged. Anything the pass emitted *after* leaving
 `<think>` is visible output the user has already been shown and is kept, so a
 partial answer is not silently withdrawn from the model's own context.
 
-The KV cost is the part that turned out to be free, and it is worth recording
-why, because the obvious reading is that this is microcompact's mid-transcript
-rewrite and has to pay microcompact's rung restore. It is not: the rewritten
-message is the transcript's *last*, so every earlier section still matches
-byte for byte, `ds4_session_common_prefix` reuses the whole prefix, and the
-recovery pass prefills the stub plus the guard's tool result and nothing else.
-No rung is invalidated either — every rung sits at a shallower depth and still
-describes an intact prefix — so neither `discard_ladder` nor
-`truncate_ladder_to` is called. A tail rewrite is cheap by construction; the
-expensive rewrites are the ones with transcript behind them.
+The KV cost is cheap, but not for the reason first recorded here. The obvious
+reading was that the rewritten message is the transcript's *last*, so
+`ds4_session_common_prefix` reuses everything before it. That is only half the
+story: the live KV ran *past* the stopped message by the tokens the pass
+generated, so the stubbed prompt diverges *behind* the live end, and
+`ds4_session_sync` is extend-only — that shape rebuilds from token zero
+(`engine::reusable_prefix`). What makes it cheap on the main paths is
+`rescue_prefix_before_rebuild`, which sees the shape and restores the deepest
+ladder rung below the divergence first; the sync then extends from the rung.
+No rung is invalidated by the rewrite, so neither `discard_ladder` nor
+`truncate_ladder_to` is called.
+
+Sub-agents did not have that rescue (2026-09-16): `generate_quiet` never
+called it and it refused under `in_sidechain()`, so the recovery pass after a
+cycle stop inside a sub-agent re-prefilled the whole parent context plus the
+sidechain from zero, up to `SUBAGENT_REPEAT_TRIP_CAP` times. Fixed by making
+the rescue three-tiered — innermost fork snapshot, then ladder rung, then
+rebuild — and calling it from the quiet pass; `docs/KV-CACHE.md` Layer 6 has
+the mechanics.
 
 What it trades is the property that the recovery prompt can see what looped.
 The guard's tool result still says *that* the reasoning was stopped and why, so
