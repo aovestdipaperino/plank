@@ -13248,6 +13248,23 @@ impl Agent<'_> {
                 self.fire_turn_end(-1, turn_started.elapsed());
                 // Memory extraction: same turn-boundary rule as the plain
                 // path — the genuine no-tool-calls exit, never a tool round.
+                //
+                // The idle loop's wake-for-jobs guards (`input.buf.text()
+                // .is_empty() && config_form.is_none() && …`, `tui_loop`)
+                // are deliberately not repeated here. Those guard a *decision
+                // to start* generation from the idle loop, which polls
+                // terminal events between turns and could see a draft or an
+                // open modal while nothing else is running. This call sits
+                // instead at the tail of an already-running `tui_turn_inner`,
+                // itself called synchronously and un-spawned from every call
+                // site (`grep -n '\.tui_turn(' src/ui.rs`) — there is no
+                // worker thread and no interleaved `crossterm` event read
+                // between the top of the turn and this point, so the event
+                // loop (and whatever draft/modal state predates the turn)
+                // cannot change underneath it. `tui_loop` says as much for
+                // the whole turn: "A running turn never reaches this loop,
+                // so a long generation cannot be mistaken for an idle user."
+                // The same blocking call chain carries the memory pass.
                 self.maybe_extract_memories();
                 if let Some(notice) = self.pending_memory_notice.take() {
                     log.push_dim(notice);
@@ -20398,9 +20415,23 @@ mod tests {
         cfg
     }
 
+    /// RAII guard restoring the process-wide (thread-local, in tests)
+    /// settings to the default on drop, so a test that returns early or
+    /// panics mid-body cannot leak its override onto whatever test libtest
+    /// schedules next on the same OS thread.
+    #[must_use = "dropping this immediately re-enables auto_extract"]
+    struct AutoExtractGuard;
+
+    impl Drop for AutoExtractGuard {
+        fn drop(&mut self) {
+            crate::settings::install_for_test(crate::settings::Settings::default());
+        }
+    }
+
     /// Turns off the background memory extraction pass for the current
-    /// thread (`settings::install_for_test` is thread-local; the caller
-    /// restores with `install_for_test(Settings::default())` when done).
+    /// thread (`settings::install_for_test` is thread-local) and returns a
+    /// guard that restores the default settings when it drops — including
+    /// on an early return or a panic in the caller's test body.
     ///
     /// `memory.auto_extract` defaults to `true`, so any test driving a
     /// `ScriptedEngine` through a tool-free turn boundary — a fixed reply
@@ -20408,10 +20439,11 @@ mod tests {
     /// unrelated reply meant for the test's own next turn. Tests that
     /// exercise the pass itself (see `the_pass_*` below) opt back in
     /// explicitly via `agent.extract_state`.
-    fn disable_auto_extract_for_test() {
+    fn disable_auto_extract_for_test() -> AutoExtractGuard {
         let mut off = crate::settings::Settings::default();
         off.memory.auto_extract = false;
         crate::settings::install_for_test(off);
+        AutoExtractGuard
     }
 
     /// An agent whose engine reports a loaded `MTP` support model, so the
@@ -21971,7 +22003,7 @@ mod tests {
     /// is why `store.save` runs first below).
     #[test]
     fn drive_goal_loop_saves_the_payload_on_a_settled_verdict() {
-        disable_auto_extract_for_test();
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = scratch_dir("goal-loop-saves-on-verdict");
         let cfg = test_cfg();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -22000,7 +22032,6 @@ mod tests {
         let (outcome, _iters, _reason) = agent
             .drive_goal_loop()
             .expect("scripted engine always replies, so the loop settles");
-        crate::settings::install_for_test(crate::settings::Settings::default());
         assert_eq!(outcome, crate::goal::Outcome::Attained);
         // `run_turn`'s own end-of-turn handling produces ONE capture for the
         // main pass's tool-free reply: `flush_kv_end_of_turn` serves both the
@@ -29009,7 +29040,7 @@ mod tests {
     #[test]
     fn slash_subagent_honours_the_definitions_engine() {
         const KEY: &str = "PLANK_TEST_SLASH_ALT_KEY";
-        disable_auto_extract_for_test();
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -29079,7 +29110,7 @@ mod tests {
 
     #[test]
     fn goal_stops_on_the_first_attained_verdict() {
-        disable_auto_extract_for_test();
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = scratch_dir("goal-attained");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -29121,7 +29152,7 @@ mod tests {
 
     #[test]
     fn goal_stops_at_the_iteration_cap() {
-        disable_auto_extract_for_test();
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = scratch_dir("goal-cap");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -29156,7 +29187,7 @@ mod tests {
     /// another full iteration (and not be reported as a cap).
     #[test]
     fn goal_stops_on_an_interrupt_during_the_adjudication() {
-        disable_auto_extract_for_test();
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = scratch_dir("goal-interrupt-adjudication");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -29311,7 +29342,7 @@ or the user's next message aborts before its first token"
     /// report as a tool result.
     #[test]
     fn slash_subagent_runs_a_turn_on_the_report() {
-        disable_auto_extract_for_test();
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = scratch_dir("slash-subagent-followup");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -29346,7 +29377,6 @@ or the user's next message aborts before its first token"
             .text
             .clone();
         assert!(last.contains("acting on it"), "{last}");
-        crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
     /// A definition whose engine this session cannot provide must fail *before*
@@ -29805,7 +29835,7 @@ or the user's next message aborts before its first token"
     #[test]
     #[allow(clippy::too_many_lines)]
     fn agent_tool_delegates_and_returns_only_the_report() {
-        disable_auto_extract_for_test();
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = std::env::temp_dir().join(format!("plank-ui-agenttool-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Main turn delegates via the `agent` tool.
@@ -29957,7 +29987,6 @@ or the user's next message aborts before its first token"
         let last = agent.session.transcript.last().unwrap();
         assert!(last.text.contains("Done: the sub-agent counted 42."));
         std::fs::remove_dir_all(&dir).ok();
-        crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
     #[test]
@@ -30076,13 +30105,26 @@ or the user's next message aborts before its first token"
         agent.extract_state.every_n = 1;
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
+        // Route the audit log to a scratch file instead of the real
+        // `~/.plank`, the same way `dispatch`'s own `remember` test does.
+        agent.tool_ctx.memory_log_path = Some(dir.join("memory-log.jsonl"));
 
-        // What `run_tool_calls` does when `remember`/`forget` sets
-        // `tool_ctx.wrote_memory` mid-turn: forward it to `extract_state`
-        // before the turn boundary calls `maybe_extract_memories`.
-        agent.tool_ctx.wrote_memory = true;
-        assert!(std::mem::take(&mut agent.tool_ctx.wrote_memory));
-        agent.extract_state.note_tool_write();
+        // Drive the real `remember` dispatch through `run_tool_calls` — the
+        // production path — rather than poking `tool_ctx.wrote_memory` and
+        // `extract_state.note_tool_write()` by hand. This is the integration
+        // under test: that `run_tool_calls` itself takes `wrote_memory` and
+        // forwards it. If that forwarding were deleted, this test would now
+        // fail, where the old inlined version would not have noticed.
+        let out = agent.run_tool_calls(&[crate::tools::test_call(
+            "remember",
+            &[
+                ("text", "prefers tabs"),
+                ("type", "user"),
+                ("scope", "project"),
+            ],
+        )]);
+        assert!(out.contains("remembered"), "{out}");
+
         assert!(
             !agent.maybe_extract_memories(),
             "the model already wrote memory this turn"
@@ -30104,7 +30146,22 @@ or the user's next message aborts before its first token"
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
         let before = agent.ladder.rungs().len();
-        agent.maybe_extract_memories();
+        // A no-op `maybe_extract_memories` (returns `false`, touches nothing)
+        // would pass the rung/depth assertions below trivially, proving
+        // nothing about the property this test is named for. Pin that the
+        // pass actually ran, and that it had an observable effect: `true`
+        // is the direct signal, and an immediate rerun at the same
+        // transcript depth being ineligible (`ExtractState::should_run`
+        // rejects `depth <= processed_depth`) is indirect proof that
+        // `processed_depth` genuinely advanced, since `ExtractState`'s
+        // fields are private to this test's module.
+        assert!(agent.maybe_extract_memories(), "the pass must actually run");
+        assert!(
+            !agent.maybe_extract_memories(),
+            "processed_depth must have advanced past the current transcript \
+             depth, so an immediate rerun with no new messages is not \
+             eligible"
+        );
         assert_eq!(
             agent.ladder.rungs().len(),
             before,
