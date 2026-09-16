@@ -38,7 +38,7 @@
 //!   "agents": { "autoRoute": true, "maxParallel": 4 },
 //!   "git":    { "signCommits": true },
 //!   "context": { "microcompact": true },
-//!   "memory": { "autoExtract": true, "extractEveryNTurns": 1 }
+//!   "memory": { "autoExtract": false, "extractEveryNTurns": 1 }
 //! }
 //! ```
 //!
@@ -478,10 +478,15 @@ impl Default for ContextSettings {
 /// `memory` block: how persistent memory maintains itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemorySettings {
-    /// Whether the background extraction sidechain runs at all. On by
-    /// default. Off leaves the `remember` tool and `/remember` working —
-    /// only the passive pass stops, and rendering falls back to plain
-    /// budgeted display with counters that nothing ever bumps.
+    /// Whether the extraction sidechain runs at all. **Off by default**:
+    /// the pass is not a background job in any useful sense — it runs
+    /// synchronously on the turn thread after the model's final answer, and
+    /// each run costs a whole-session KV snapshot, a prefill of the excerpt,
+    /// a generation and a KV restore, none of which shows in the turn stats.
+    /// On a local Metal model that is seconds of visible stall per answer,
+    /// so it is opt-in. Off leaves the `remember` tool and `/remember`
+    /// working — only the passive pass stops, and rendering falls back to
+    /// plain budgeted display with counters that nothing ever bumps.
     pub auto_extract: bool,
     /// Run the pass every N eligible turns. An eligible turn is one that
     /// ended with no tool calls and in which the model did not itself call
@@ -494,7 +499,7 @@ pub struct MemorySettings {
 impl Default for MemorySettings {
     fn default() -> Self {
         Self {
-            auto_extract: true,
+            auto_extract: false,
             extract_every_n_turns: 1,
             budgets: crate::memory::Budgets::default(),
         }
@@ -2269,20 +2274,27 @@ mod tests {
     }
 
     #[test]
-    fn memory_settings_default_on_and_round_trip() {
+    fn memory_settings_default_pass_off_tools_on_and_round_trip() {
         use crate::configform::set_from_path;
 
+        // The passive pass is opt-in (it stalls the turn thread); the
+        // `remember`/`forget` tools stay on.
         let s = Settings::default();
-        assert!(s.memory.auto_extract);
+        assert!(
+            !s.memory.auto_extract,
+            "the extraction pass must default to off"
+        );
         assert_eq!(s.memory.extract_every_n_turns, 1);
         assert!(s.tools.remember);
         assert_eq!(s.memory.budgets, crate::memory::Budgets::default());
 
+        // Every value set here is the non-default one, so a stale default
+        // cannot make the assertions vacuously true.
         let mut s = Settings::default();
-        set_from_path(&mut s, "memory.autoExtract", "false").unwrap();
+        set_from_path(&mut s, "memory.autoExtract", "true").unwrap();
         set_from_path(&mut s, "memory.extractEveryNTurns", "4").unwrap();
         set_from_path(&mut s, "tools.remember", "false").unwrap();
-        assert!(!s.memory.auto_extract);
+        assert!(s.memory.auto_extract);
         assert_eq!(s.memory.extract_every_n_turns, 4);
         assert!(!s.tools.remember);
     }
@@ -2291,9 +2303,12 @@ mod tests {
     fn memory_settings_overlay_from_json() {
         let mut s = Settings::default();
         s.overlay(
-            r#"{"memory":{"autoExtract":false,"extractEveryNTurns":7,"budgets":{"user":10,"feedback":20,"project":30,"reference":40}},"tools":{"remember":false}}"#,
+            r#"{"memory":{"autoExtract":true,"extractEveryNTurns":7,"budgets":{"user":10,"feedback":20,"project":30,"reference":40}},"tools":{"remember":false}}"#,
         );
-        assert!(!s.memory.auto_extract);
+        assert!(
+            s.memory.auto_extract,
+            "overlay must flip the off default on"
+        );
         assert_eq!(s.memory.extract_every_n_turns, 7);
         assert_eq!(s.memory.budgets.user, 10);
         assert_eq!(s.memory.budgets.feedback, 20);
@@ -2323,14 +2338,14 @@ mod tests {
         let path = dir.join("settings.json");
 
         let mut s = Settings::default();
-        s.memory.auto_extract = false;
+        s.memory.auto_extract = true; // the non-default value
         s.memory.extract_every_n_turns = 6;
         s.save_to(&path).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         let mut reloaded = Settings::default();
         reloaded.overlay(&text);
-        assert!(!reloaded.memory.auto_extract);
+        assert!(reloaded.memory.auto_extract);
         assert_eq!(reloaded.memory.extract_every_n_turns, 6);
 
         std::fs::remove_dir_all(&dir).ok();

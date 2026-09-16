@@ -14149,6 +14149,31 @@ impl Agent<'_> {
         let slice = self.session.transcript[from.min(depth)..depth].to_vec();
         let task = crate::memextract::build_prompt(&slice, &entries);
 
+        // Preflight, before the KV snapshot the fork takes: the sidechain
+        // prompt is the whole live session plus `task`, so it must fit the
+        // headroom the session leaves (`last_ctx_used`, the same figure the
+        // `/think` room guard uses) with space for the reply. A span that
+        // does not fit is a property of *this span* — the excerpt is already
+        // capped by `build_prompt`, so nothing about it shrinks on a retry —
+        // and is retired with `finish`, exactly like an unusable reply below.
+        // Only run-time faults (engine error, interrupt) `cancel` and retry.
+        let need = self
+            .engine
+            .count_tokens(&task)
+            .saturating_add(crate::memextract::REPLY_RESERVE_TOKENS);
+        let ctx = self.engine.ctx_size();
+        if self.last_ctx_used.saturating_add(need) > ctx {
+            self.extract_state.finish(depth);
+            if self.extract_state.note_oversized_span() {
+                self.pending_memory_notice = Some(format!(
+                    "memory: the extraction pass skipped a span that would not fit \
+                     the context ({} of {ctx} tokens in use, {need} more needed)",
+                    self.last_ctx_used
+                ));
+            }
+            return false;
+        }
+
         // The prompt goes in verbatim — not through `task_message`, whose
         // "use your tools, then report" framing contradicts the JSON-only
         // contract — and the sidechain is exactly one generation with no
@@ -20640,7 +20665,7 @@ mod tests {
     /// settings to the default on drop, so a test that returns early or
     /// panics mid-body cannot leak its override onto whatever test libtest
     /// schedules next on the same OS thread.
-    #[must_use = "dropping this immediately re-enables auto_extract"]
+    #[must_use = "dropping this immediately restores the default auto_extract"]
     struct AutoExtractGuard;
 
     impl Drop for AutoExtractGuard {
@@ -20654,16 +20679,33 @@ mod tests {
     /// guard that restores the default settings when it drops — including
     /// on an early return or a panic in the caller's test body.
     ///
-    /// `memory.auto_extract` defaults to `true`, so any test driving a
-    /// `ScriptedEngine` through a tool-free turn boundary — a fixed reply
-    /// script indexed by call order — would otherwise have the pass steal an
-    /// unrelated reply meant for the test's own next turn. Tests that
-    /// exercise the pass itself (see `the_pass_*` below) opt back in
-    /// explicitly via `agent.extract_state`.
+    /// `memory.auto_extract` now defaults to `false`, so this is redundant
+    /// with the default — it is kept because a test driving a
+    /// `ScriptedEngine` through a tool-free turn boundary (a fixed reply
+    /// script indexed by call order) depends on the pass *not* stealing a
+    /// reply meant for its own next turn, and saying so at the call site
+    /// keeps that intent explicit and correct if the default ever flips
+    /// back. Tests that exercise the pass itself (see `the_pass_*` below)
+    /// opt in through [`enable_auto_extract_for_test`].
     fn disable_auto_extract_for_test() -> AutoExtractGuard {
         let mut off = crate::settings::Settings::default();
         off.memory.auto_extract = false;
         crate::settings::install_for_test(off);
+        AutoExtractGuard
+    }
+
+    /// Turns the extraction pass *on* for the current thread, with the same
+    /// restore-on-drop guard. `maybe_extract_memories` samples
+    /// `settings::active()` on every call and overwrites
+    /// `extract_state.enabled` with it, so poking the field directly does
+    /// nothing: a pass test that forgets this guard silently tests a pass
+    /// that never runs (its positive `assert!(agent.maybe_extract_memories())`
+    /// is what catches the omission).
+    fn enable_auto_extract_for_test() -> AutoExtractGuard {
+        let mut on = crate::settings::Settings::default();
+        on.memory.auto_extract = true;
+        on.memory.extract_every_n_turns = 1;
+        crate::settings::install_for_test(on);
         AutoExtractGuard
     }
 
@@ -30322,8 +30364,7 @@ or the user's next message aborts before its first token"
         let dir = scratch_dir("memextract-suppress");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        agent.extract_state.enabled = true;
-        agent.extract_state.every_n = 1;
+        let _auto_extract_on = enable_auto_extract_for_test();
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
         // Route the audit log to a scratch file instead of the real
@@ -30362,8 +30403,7 @@ or the user's next message aborts before its first token"
         let dir = scratch_dir("memextract-no-rung");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        agent.extract_state.enabled = true;
-        agent.extract_state.every_n = 1;
+        let _auto_extract_on = enable_auto_extract_for_test();
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
         let before = agent.ladder.rungs().len();
@@ -30422,8 +30462,7 @@ or the user's next message aborts before its first token"
             ..ScriptedEngine::default()
         };
         let mut agent = test_agent(&dir, engine, &cfg);
-        agent.extract_state.enabled = true;
-        agent.extract_state.every_n = 1;
+        let _auto_extract_on = enable_auto_extract_for_test();
         agent.tool_ctx.memory_log_path = Some(dir.join("memory-log.jsonl"));
         agent.session.push(Message::user("run something for me"));
         agent.session.push(Message::assistant("done"));
@@ -30459,8 +30498,7 @@ or the user's next message aborts before its first token"
             ..ScriptedEngine::default()
         };
         let mut agent = test_agent(&dir, engine, &cfg);
-        agent.extract_state.enabled = true;
-        agent.extract_state.every_n = 1;
+        let _auto_extract_on = enable_auto_extract_for_test();
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
         assert!(agent.maybe_extract_memories());
@@ -30497,8 +30535,7 @@ or the user's next message aborts before its first token"
             ..ScriptedEngine::default()
         };
         let mut agent = test_agent(&dir, engine, &cfg);
-        agent.extract_state.enabled = true;
-        agent.extract_state.every_n = 1;
+        let _auto_extract_on = enable_auto_extract_for_test();
         agent.tool_ctx.memory_log_path = Some(dir.join("memory-log.jsonl"));
         agent.session.push(Message::user("I prefer tabs"));
         agent.session.push(Message::assistant("noted"));
@@ -30526,8 +30563,7 @@ or the user's next message aborts before its first token"
             ..ScriptedEngine::default()
         };
         let mut agent = test_agent(&dir, engine, &cfg);
-        agent.extract_state.enabled = true;
-        agent.extract_state.every_n = 1;
+        let _auto_extract_on = enable_auto_extract_for_test();
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
         assert!(agent.maybe_extract_memories());
@@ -30558,23 +30594,25 @@ or the user's next message aborts before its first token"
         let engine = ScriptedEngine {
             replies: vec!["[]".to_string(), "[]".to_string()],
             prompts: prompts.clone(),
-            // `tail_budget(80)` is 10 tokens at ~4 bytes each: the two short
-            // new messages fit the verbatim tail, the long processed ones
-            // do not and are folded into the summary.
-            ctx_override: Some(80),
+            // `tail_budget(8000)` is 1000 tokens at ~4 bytes each: the two
+            // short new messages fit the verbatim tail, the long processed
+            // ones (3 KiB each) mostly do not and are folded into the
+            // summary. Large enough that the size preflight in
+            // `maybe_extract_memories` lets the first pass (six 3 KiB
+            // messages, ~4.8k tokens plus the reply reserve) run.
+            ctx_override: Some(8000),
             ..ScriptedEngine::default()
         };
         let mut agent = test_agent(&dir, engine, &cfg);
-        agent.extract_state.enabled = true;
-        agent.extract_state.every_n = 1;
+        let _auto_extract_on = enable_auto_extract_for_test();
         for i in 0..3 {
             agent.session.push(Message::user(format!(
                 "old-question-{i} {}",
-                "x".repeat(200)
+                "x".repeat(3000)
             )));
             agent.session.push(Message::assistant(format!(
                 "old-answer-{i} {}",
-                "y".repeat(200)
+                "y".repeat(3000)
             )));
         }
         assert!(agent.maybe_extract_memories(), "covers depth 0..6");
@@ -30608,12 +30646,170 @@ or the user's next message aborts before its first token"
     }
 
     #[test]
+    fn the_pass_does_not_run_under_default_settings() {
+        // No guard installed: `settings::active()` is the built-in default,
+        // and `memory.autoExtract` defaults to off. Poking the field the way
+        // the pass tests used to is deliberately shown to be inert.
+        let dir = scratch_dir("memextract-default-off");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            kv_events: Some(kv_events.clone()),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        assert!(
+            !crate::settings::active().memory.auto_extract,
+            "the pass must be opt-in"
+        );
+        agent.extract_state.enabled = true;
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(!agent.maybe_extract_memories(), "off by default: no pass");
+        assert!(
+            !agent.extract_state.enabled,
+            "the setting, not the field, decides"
+        );
+        assert!(prompts.lock().unwrap().is_empty(), "no generation");
+        assert!(
+            kv_events.lock().unwrap().is_empty(),
+            "no KV snapshot either"
+        );
+        assert_eq!(agent.sidechain_depth, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Swaps in a fresh engine that has room for anything, sharing the
+    /// prompt log, so a follow-up call can tell "retired" (nothing runs even
+    /// with room) from "cancelled" (runs as soon as it can).
+    fn give_agent_room(
+        agent: &mut Agent<'_>,
+        prompts: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        agent.engine = Box::new(ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        });
+    }
+
+    #[test]
+    fn a_span_that_cannot_fit_the_context_is_retired_not_retried() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-oversized");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            kv_events: Some(kv_events.clone()),
+            // Smaller than the verdict contract alone: no span fits.
+            ctx_override: Some(200),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent
+            .session
+            .push(Message::user(format!("notes {}", "n".repeat(4000))));
+        agent.session.push(Message::assistant("ok"));
+
+        assert!(!agent.maybe_extract_memories(), "the span does not fit");
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "the engine was never asked to generate"
+        );
+        assert!(
+            kv_events.lock().unwrap().is_empty(),
+            "the preflight runs before the fork takes its KV snapshot"
+        );
+        let notice = agent.pending_memory_notice.take().expect("noted once");
+        assert!(notice.contains("would not fit"), "{notice}");
+        assert_eq!(agent.sidechain_depth, 0);
+
+        // Same depth, now with room: a cancelled span would run here, a
+        // retired one is done.
+        give_agent_room(&mut agent, &prompts);
+        assert!(
+            !agent.maybe_extract_memories(),
+            "the oversized span was retired, not left for a retry"
+        );
+        assert!(prompts.lock().unwrap().is_empty());
+
+        // New material above the retired depth is still read.
+        agent.session.push(Message::user("more"));
+        agent.session.push(Message::assistant("ok"));
+        assert!(agent.maybe_extract_memories(), "later spans still run");
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        // The sidechain prompt is the whole live transcript plus the task,
+        // so the retired message is present as history; what must not
+        // happen is its reappearance in the *excerpt* the pass reads.
+        let excerpt = prompts[0]
+            .rsplit("Conversation excerpt:\n")
+            .next()
+            .expect("the task ends with the excerpt");
+        assert!(
+            !excerpt.contains("nnnn"),
+            "the retired span is not re-read: {excerpt}"
+        );
+        assert!(excerpt.contains("user: more"), "{excerpt}");
+        assert!(
+            agent.pending_memory_notice.is_none(),
+            "the notice is not repeated"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_transient_engine_error_cancels_and_the_span_is_retried() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-transient");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            fail_with: Some("provider exploded".to_string()),
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+
+        assert!(!agent.maybe_extract_memories(), "the engine failed");
+        assert_eq!(
+            agent.sidechain_depth, 0,
+            "the fork is closed on the error path"
+        );
+        assert!(agent.pending_memory_notice.is_none());
+
+        // Same depth, engine healthy again: the span was only cancelled.
+        give_agent_room(&mut agent, &prompts);
+        assert!(
+            agent.maybe_extract_memories(),
+            "a transient fault leaves the span to be redone"
+        );
+        assert!(
+            prompts
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .contains("user: hello"),
+            "the retried span is the same one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_resumed_transcript_is_not_shipped_wholesale_on_the_first_idle_turn() {
         let dir = scratch_dir("memextract-resume");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        agent.extract_state.enabled = true;
-        agent.extract_state.every_n = 1;
+        let _auto_extract_on = enable_auto_extract_for_test();
         let mut restored = Session::new();
         for i in 0..6 {
             restored.push(Message::user(format!("old-{i}")));
