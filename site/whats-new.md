@@ -7,14 +7,21 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.1.0 is out**, and the beta channel is on 5.1.6. The patch number
+**v5.1.0 is out**, and the beta channel is on 5.1.7. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**5.1.7: the extraction pass is on by default.** 5.1.6 shipped it off, so
+you had to opt in. Now a fresh install keeps its own memory from the first
+session. The price is the same as before: a pause after each tool-free answer
+while the pass takes a KV snapshot, prefills the new part of the conversation
+and generates its verdicts. `memory.extractEveryNTurns` makes it rarer, and
+`"memory": {"autoExtract": false}` in `settings.json` turns it back off.
 
 **5.1.6: memory that maintains itself.** Until now
 the two `MEMORY.md` files only ever changed when you typed `/remember` or opened
 `/memory`. The model now has a `remember` tool and a `forget` tool of its own,
-and an optional extraction pass (`memory.autoExtract`, off by default because it
-costs a generation after each answer) that reads the new part of a conversation
+and an extraction pass (`memory.autoExtract`, off in 5.1.6 and on from 5.1.7;
+it costs a generation after each answer) that reads the new part of a conversation
 and proposes adds, updates and deletions, which plank applies itself. Entries
 carry a type tag, each type has its own budget for what reaches the prompt, and
 eviction goes by how often an entry has actually mattered rather than by age, so

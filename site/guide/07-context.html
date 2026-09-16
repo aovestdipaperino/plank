@@ -253,9 +253,9 @@ cannot separate the newest wins. The usage counters live in a
 advisory: delete it and memory loads exactly as before, with every
 counter at zero.</p>
 <h3 id="the-extraction-pass">The extraction pass</h3>
-<p>With <code>memory.autoExtract</code> on (it is <strong>off by
-default</strong>), plank runs a pass at the end of any turn that
-produced no tool calls. It hands the model the new part of the
+<p>With <code>memory.autoExtract</code> on (it is <strong>on by
+default</strong> since 5.1.7), plank runs a pass at the end of any turn
+that produced no tool calls. It hands the model the new part of the
 conversation and the current entries, and asks for a JSON list of
 verdicts: add an entry, update one, delete one, or mark one as having
 been useful. plank applies the verdicts itself; the pass cannot run
@@ -263,11 +263,13 @@ tools, cannot touch anything but memory, and reads only the part of the
 transcript it has not already seen. Every change it makes is appended to
 <code>~/.plank/memory-log.jsonl</code>, which <code>/memory log</code>
 prints.</p>
-<p>The pass is off by default because it is not free. It runs
-synchronously at the end of the turn and costs one extra generation plus
-a KV snapshot each time, which on a local model is a visible pause after
-each answer. <code>memory.extractEveryNTurns</code> thins it out. The
-full design, including what each failure mode looks like, is in <a
+<p>The pass is not free, and it is worth knowing what you are paying
+for. It runs synchronously at the end of the turn and costs one extra
+generation plus a KV snapshot each time, which on a local model is a
+visible pause after each answer. <code>memory.extractEveryNTurns</code>
+thins it out, and <code>"memory": {"autoExtract": false}</code> in
+<code>settings.json</code> turns it off entirely. The full design,
+including what each failure mode looks like, is in <a
 href="https://github.com/aovestdipaperino/plank/blob/main/docs/MEMORY.md"><code>docs/MEMORY.md</code></a>.</p>
 <h2 id="compaction">Compaction</h2>
 <p>When the conversation approaches the window, plank reclaims space in

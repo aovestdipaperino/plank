@@ -97,7 +97,7 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 
 | Key | Default | What |
 |---|---|---|
-| `memory.autoExtract` | `false` | run the extraction pass at the end of turns with no tool calls. It costs a generation and a KV snapshot each time, so it is a visible pause on a local model. |
+| `memory.autoExtract` | `true` | run the extraction pass at the end of turns with no tool calls. It costs a generation and a KV snapshot each time, so it is a visible pause on a local model. |
 | `memory.extractEveryNTurns` | `1` | run the pass only every N eligible turns; `0` is treated as `1` |
 | `memory.budgets` | `4096` / `4096` / `6144` / `2048` | bytes of `user`, `feedback`, `project` and `reference` entries rendered into context. Hand-edit only; not exposed in `/config`. |
 

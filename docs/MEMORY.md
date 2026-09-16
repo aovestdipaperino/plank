@@ -6,10 +6,12 @@ it can maintain that memory itself instead of relying entirely on you typing
 is stored that way, what each part costs, and every setting that controls it.
 
 Status: shipped. The `remember`/`forget` tools are on by default
-(`tools.remember: true`); the automatic extraction pass is **off** by default
-(`memory.autoExtract: false`), because each run stalls the front end for a
-KV snapshot, a prefill and a generation after the answer — see "The
-extraction pass" and "Cache accounting" before turning it on. The design
+(`tools.remember: true`), and since 5.1.7 so is the automatic extraction pass
+(`memory.autoExtract: true`). The pass is not free: each run stalls the front
+end for a KV snapshot, a prefill and a generation after the answer — see "The
+extraction pass" and "Cache accounting" for what it costs and
+`memory.extractEveryNTurns` for how to thin it, or set `memory.autoExtract` to
+`false` to turn it off. The design
 choices below all trace back to one constraint: a memory rewrite must never
 force a mid-session KV re-prefill. Part 1 covers why. The rest is mechanics.
 
@@ -301,8 +303,8 @@ The user-typed equivalents, on both front ends:
 
 The passive half of memory maintenance: a pass that reads the turn's
 transcript and proposes changes, without the model having to think to call
-`remember` itself. **Off by default.** What follows is what you are buying
-when you turn it on.
+`remember` itself. **On by default since 5.1.7**, so what follows is what
+you are paying for unless you turn it off.
 
 **When and where it runs.** At the end of a turn that produced a final
 response with no tool calls (`Agent::maybe_extract_memories` in `src/ui.rs`,
@@ -448,7 +450,7 @@ All under the `memory` and `tools` blocks in `~/.plank/settings.json` /
 
 | Setting | Default | Effect |
 |---|---|---|
-| `memory.autoExtract` | `false` | Whether the extraction pass runs at all. On, every eligible turn ends with a synchronous stall for a KV snapshot, a prefill of the excerpt, a generation and a restore, none of it counted in the turn stats. Off leaves the `remember`/`forget` tools and `/remember` working — only the passive pass stops, and the sidecar counters are never bumped, so eviction ranks by date alone. Also in the `/config` form. |
+| `memory.autoExtract` | `true` | Whether the extraction pass runs at all. On, every eligible turn ends with a synchronous stall for a KV snapshot, a prefill of the excerpt, a generation and a restore, none of it counted in the turn stats. Off leaves the `remember`/`forget` tools and `/remember` working — only the passive pass stops, and the sidecar counters are never bumped, so eviction ranks by date alone. Also in the `/config` form. |
 | `memory.extractEveryNTurns` | `1` | Run the pass every N *eligible* turns (a turn with no tool calls and no model `remember`/`forget`). `1` means every eligible turn. A configured `0` is clamped to `1`. Also in the `/config` form. |
 | `memory.budgets.user` | `4096` | Byte budget for `[user]` entries (see "Budgets and eviction" for what is counted). Hand-edit only. |
 | `memory.budgets.feedback` | `4096` | Byte budget for `[feedback]` entries. Hand-edit only. |

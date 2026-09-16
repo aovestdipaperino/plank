@@ -78,9 +78,9 @@ Each type has its own byte budget for what renders into context (4096 for `user`
 
 ### The extraction pass
 
-With `memory.autoExtract` on (it is **off by default**), plank runs a pass at the end of any turn that produced no tool calls. It hands the model the new part of the conversation and the current entries, and asks for a JSON list of verdicts: add an entry, update one, delete one, or mark one as having been useful. plank applies the verdicts itself; the pass cannot run tools, cannot touch anything but memory, and reads only the part of the transcript it has not already seen. Every change it makes is appended to `~/.plank/memory-log.jsonl`, which `/memory log` prints.
+With `memory.autoExtract` on (it is **on by default** since 5.1.7), plank runs a pass at the end of any turn that produced no tool calls. It hands the model the new part of the conversation and the current entries, and asks for a JSON list of verdicts: add an entry, update one, delete one, or mark one as having been useful. plank applies the verdicts itself; the pass cannot run tools, cannot touch anything but memory, and reads only the part of the transcript it has not already seen. Every change it makes is appended to `~/.plank/memory-log.jsonl`, which `/memory log` prints.
 
-The pass is off by default because it is not free. It runs synchronously at the end of the turn and costs one extra generation plus a KV snapshot each time, which on a local model is a visible pause after each answer. `memory.extractEveryNTurns` thins it out. The full design, including what each failure mode looks like, is in [`docs/MEMORY.md`](https://github.com/aovestdipaperino/plank/blob/main/docs/MEMORY.md).
+The pass is not free, and it is worth knowing what you are paying for. It runs synchronously at the end of the turn and costs one extra generation plus a KV snapshot each time, which on a local model is a visible pause after each answer. `memory.extractEveryNTurns` thins it out, and `"memory": {"autoExtract": false}` in `settings.json` turns it off entirely. The full design, including what each failure mode looks like, is in [`docs/MEMORY.md`](https://github.com/aovestdipaperino/plank/blob/main/docs/MEMORY.md).
 
 ## Compaction
 

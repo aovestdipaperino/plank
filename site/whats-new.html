@@ -138,16 +138,24 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v5.1.0 is out</strong>, and the beta channel is on 5.1.6. The
+<p><strong>v5.1.0 is out</strong>, and the beta channel is on 5.1.7. The
 patch number is still the channel: <code>.0</code> is stable, anything
 above it is beta.</p>
+<p><strong>5.1.7: the extraction pass is on by default.</strong> 5.1.6
+shipped it off, so you had to opt in. Now a fresh install keeps its own
+memory from the first session. The price is the same as before: a pause
+after each tool-free answer while the pass takes a KV snapshot, prefills
+the new part of the conversation and generates its verdicts.
+<code>memory.extractEveryNTurns</code> makes it rarer, and
+<code>"memory": {"autoExtract": false}</code> in
+<code>settings.json</code> turns it back off.</p>
 <p><strong>5.1.6: memory that maintains itself.</strong> Until now the
 two <code>MEMORY.md</code> files only ever changed when you typed
 <code>/remember</code> or opened <code>/memory</code>. The model now has
 a <code>remember</code> tool and a <code>forget</code> tool of its own,
-and an optional extraction pass (<code>memory.autoExtract</code>, off by
-default because it costs a generation after each answer) that reads the
-new part of a conversation and proposes adds, updates and deletions,
+and an extraction pass (<code>memory.autoExtract</code>, off in 5.1.6
+and on from 5.1.7; it costs a generation after each answer) that reads
+the new part of a conversation and proposes adds, updates and deletions,
 which plank applies itself. Entries carry a type tag, each type has its
 own budget for what reaches the prompt, and eviction goes by how often
 an entry has actually mattered rather than by age, so the oldest fact

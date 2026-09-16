@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.1.7] - 2026-09-16
+
+### Changed
+
+- **The extraction pass is on by default.** `memory.autoExtract` now defaults
+  to `true`, so a fresh install gets self-maintaining memory without touching
+  `settings.json`. The cost is unchanged and worth knowing: the pass runs
+  synchronously after each tool-free answer and buys a KV snapshot, a prefill
+  and a generation. `memory.extractEveryNTurns` thins it, and
+  `"memory": {"autoExtract": false}` restores the 5.1.6 behaviour.
+- **TUI report panels close cleanly, `/jobs` auto-dismisses, and the task
+  counter is clickable.** Landed alongside this beta in `e90a17e`.
+
 ## [5.1.6] - 2026-09-16
 
 ### Added
