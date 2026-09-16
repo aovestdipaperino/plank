@@ -1019,7 +1019,22 @@ fn apply_one_verdict(state: &mut ScopeState<'_>, scope: Scope, v: &Verdict, date
 ///
 /// Returns one human-readable note per applied change; each is also written
 /// to the audit log.
+#[must_use]
 pub fn apply_verdicts(cwd: &Path, verdicts: &[Verdict], date: &str) -> Vec<String> {
+    apply_verdicts_to(cwd, verdicts, date, None)
+}
+
+/// As [`apply_verdicts`], but `log_path` overrides where audit lines land:
+/// `Some(path)` writes there instead of resolving `~/.plank` from `HOME`,
+/// which is what lets a test redirect the audit log without ever setting
+/// `HOME` itself. `None` keeps production behavior.
+#[must_use]
+pub fn apply_verdicts_to(
+    cwd: &Path,
+    verdicts: &[Verdict],
+    date: &str,
+    log_dest: Option<&Path>,
+) -> Vec<String> {
     let mut notes = Vec::new();
     for scope in [Scope::User, Scope::Project] {
         let Some(path) = path_for(scope, cwd) else {
@@ -1064,7 +1079,12 @@ pub fn apply_verdicts(cwd: &Path, verdicts: &[Verdict], date: &str) -> Vec<Strin
         }
 
         for entry in &audit {
-            log_change(entry.action, scope, &entry.id, &entry.text, entry.reason);
+            match log_dest {
+                Some(p) => {
+                    append_log_line(p, entry.action, scope, &entry.id, &entry.text, entry.reason);
+                }
+                None => log_change(entry.action, scope, &entry.id, &entry.text, entry.reason),
+            }
         }
         notes.extend(scope_notes);
 
@@ -1508,13 +1528,15 @@ mod tests {
         meta.bump(&old.id(), "2026-09-11");
         meta.save(&meta_path_for(&path)).unwrap();
 
-        apply_verdicts(
+        let log = dir.join("audit.jsonl");
+        let _ = apply_verdicts_to(
             &dir,
             &[Verdict::Update {
                 id: old.id(),
                 text: "new wording".into(),
             }],
             "2026-09-15",
+            Some(&log),
         );
 
         let body = std::fs::read_to_string(&path).unwrap();
@@ -1546,12 +1568,14 @@ mod tests {
         let path = dir.join(".plank").join("MEMORY.md");
         std::fs::write(&path, "# Memory\n\n- (2026-09-01) [project] kept\n").unwrap();
 
-        let notes = apply_verdicts(
+        let log = dir.join("audit.jsonl");
+        let notes = apply_verdicts_to(
             &dir,
             &[Verdict::Delete {
                 id: "0000deadbeef".into(),
             }],
             "2026-09-15",
+            Some(&log),
         );
 
         assert!(std::fs::read_to_string(&path).unwrap().contains("kept"));
@@ -1581,20 +1605,22 @@ mod tests {
         meta.bump(&v1.id(), "2026-09-05");
         meta.save(&meta_path_for(&path)).unwrap();
 
-        apply_verdicts(
+        let log = dir.join("audit.jsonl");
+        let _ = apply_verdicts_to(
             &dir,
             &[Verdict::Update {
                 id: v1.id(),
                 text: "v2".into(),
             }],
             "2026-09-10",
+            Some(&log),
         );
         let v2 = Entry {
             date: "2026-09-01".into(),
             kind: Kind::Project,
             text: "v2".into(),
         };
-        apply_verdicts(
+        let _ = apply_verdicts_to(
             &dir,
             &[
                 Verdict::Used { id: v2.id() },
@@ -1604,6 +1630,7 @@ mod tests {
                 },
             ],
             "2026-09-12",
+            Some(&log),
         );
         let v3 = Entry {
             date: "2026-09-01".into(),
@@ -1641,7 +1668,8 @@ mod tests {
         meta.bump(existing_id, "2026-09-02");
         meta.save(&meta_path_for(&path)).unwrap();
 
-        let notes = apply_verdicts(
+        let log = dir.join("audit.jsonl");
+        let notes = apply_verdicts_to(
             &dir,
             &[Verdict::Add {
                 text: "should never land".into(),
@@ -1649,6 +1677,7 @@ mod tests {
                 scope: Scope::Project,
             }],
             "2026-09-15",
+            Some(&log),
         );
 
         assert!(
@@ -1671,47 +1700,89 @@ mod tests {
 
     #[test]
     fn a_used_verdict_produces_an_audit_log_entry() {
-        // Finding 2: USED must be logged like every other verdict. `HOME` is
-        // never set by this test; `log_path`/`log_change` resolve against
-        // whatever `HOME` the test process already has, exactly like the
-        // other tests in this module that exercise ADD/UPDATE/DELETE
-        // logging via `apply_verdicts`.
+        // Finding 2: USED must be logged like every other verdict. The audit
+        // log is redirected to a private temp file via `apply_verdicts_to`,
+        // so this never touches `~/.plank`.
         let dir =
             std::env::temp_dir().join(format!("plank-verdict-used-logs-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".plank")).unwrap();
         let path = dir.join(".plank").join("MEMORY.md");
-        // The marker text must be unique to this run (the log is a real,
-        // shared, append-only `~/.plank` file, so a fixed id could
-        // accidentally be satisfied by a line a previous test run left
-        // behind).
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let marker_text = format!("used-log-marker-text-{}-{nonce}", std::process::id());
+        let text = "kept";
         std::fs::write(
             &path,
-            format!("# Memory\n\n- (2026-09-01) [project] {marker_text}\n"),
+            format!("# Memory\n\n- (2026-09-01) [project] {text}\n"),
         )
         .unwrap();
         let id = Entry {
             date: "2026-09-01".into(),
             kind: Kind::Project,
-            text: marker_text,
+            text: text.into(),
         }
         .id();
 
-        apply_verdicts(&dir, &[Verdict::Used { id: id.clone() }], "2026-09-15");
+        let log = dir.join("audit.jsonl");
+        let _ = apply_verdicts_to(
+            &dir,
+            &[Verdict::Used { id: id.clone() }],
+            "2026-09-15",
+            Some(&log),
+        );
 
-        let Some(log_path) = log_path() else {
-            panic!("HOME must be set for this test to observe the audit log");
-        };
-        let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        let expected = format!(
+            "{{\"action\": \"used\", \"scope\": \"project\", \"id\": \"{id}\", \"text\": \"{text}\", \"reason\": \"reused\"}}\n"
+        );
+        assert_eq!(
+            log_text, expected,
+            "expected exactly one used-action audit line for id {id}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_verdicts_never_touches_the_real_audit_log() {
+        // The hermetic property itself: routing the audit log to an explicit
+        // temp path writes there, and leaves whatever `~/.plank` holds
+        // (present, absent, any size) completely unchanged. This must hold
+        // without ever setting `HOME` in a test.
+        let dir =
+            std::env::temp_dir().join(format!("plank-verdict-hermetic-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".plank")).unwrap();
+        let path = dir.join(".plank").join("MEMORY.md");
+        std::fs::write(
+            &path,
+            "# Memory\n\n- (2026-09-01) [project] hermetic fact\n",
+        )
+        .unwrap();
+        let id = Entry {
+            date: "2026-09-01".into(),
+            kind: Kind::Project,
+            text: "hermetic fact".into(),
+        }
+        .id();
+
+        let real_before = log_path().and_then(|p| std::fs::read_to_string(&p).ok());
+
+        let log = dir.join("audit.jsonl");
+        let _ = apply_verdicts_to(
+            &dir,
+            &[Verdict::Used { id: id.clone() }],
+            "2026-09-15",
+            Some(&log),
+        );
+
         assert!(
-            log_text
-                .lines()
-                .any(|l| l.contains(&id) && l.contains("\"action\": \"used\"")),
-            "expected a used-action audit line for id {id}, got: {log_text}"
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains(&id),
+            "the redirected log must have received the entry"
+        );
+
+        let real_after = log_path().and_then(|p| std::fs::read_to_string(&p).ok());
+        assert_eq!(
+            real_before, real_after,
+            "the real ~/.plank audit log must be untouched by a redirected call"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1736,7 +1807,13 @@ mod tests {
         }
         .id();
 
-        apply_verdicts(&dir, &[Verdict::Used { id: id.clone() }], "2026-09-15");
+        let log = dir.join("audit.jsonl");
+        let _ = apply_verdicts_to(
+            &dir,
+            &[Verdict::Used { id: id.clone() }],
+            "2026-09-15",
+            Some(&log),
+        );
 
         let body_after = std::fs::read_to_string(&path).unwrap();
         assert!(
