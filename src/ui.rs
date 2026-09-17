@@ -6207,14 +6207,15 @@ impl Agent<'_> {
         stream.set_preflight(edit_preflight(&self.tool_ctx));
     }
 
-    /// Runs the /init command: drives the multi-phase setup in
-    /// [`Agent::INIT_PROMPT`], then — for the launch offer only — clears the
-    /// session (the plain REPL never clears the screen) so the init exchange
-    /// does not carry into later turns.
-    fn run_init(&mut self, source: InitSource) {
-        println!("Setting up this repository for future sessions...");
-        println!("The model will survey the codebase and ask you a few questions.\n");
-
+    /// The generation turn behind `/init`, without any front end around it:
+    /// the canned prompt, quiet tools, and the loop guards suspended for its
+    /// duration. Shared by the two interactive `/init` paths and by the
+    /// headless one-shot, so all three benchmark and behave alike.
+    ///
+    /// `tui_run_init` is this method's TUI mirror (it calls `tui_turn`
+    /// instead of `run_turn`, so it cannot share this code) — a change to one
+    /// usually needs the same change in the other.
+    fn init_turn(&mut self) -> Result<(), String> {
         self.session.push(Message::user(Self::INIT_PROMPT));
         self.quiet_tools = true;
         // The phases re-read and re-survey by design; the guards read that as
@@ -6223,7 +6224,18 @@ impl Agent<'_> {
         let result = self.run_turn();
         drop(guards);
         self.quiet_tools = false;
-        if let Err(e) = result {
+        result
+    }
+
+    /// Runs the /init command: drives the multi-phase setup in
+    /// [`Agent::INIT_PROMPT`], then — for the launch offer only — clears the
+    /// session (the plain REPL never clears the screen) so the init exchange
+    /// does not carry into later turns.
+    fn run_init(&mut self, source: InitSource) {
+        println!("Setting up this repository for future sessions...");
+        println!("The model will survey the codebase and ask you a few questions.\n");
+
+        if let Err(e) = self.init_turn() {
             println!("/init failed: {e}");
         }
         // The init prompt and the model's survey are scaffolding for the file
@@ -18996,6 +19008,13 @@ fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
     }
 }
 
+/// Whether a headless `-p` prompt is the `/init` command rather than text for
+/// the model. Exactly `/init`, surrounding whitespace aside: a general slash
+/// dispatcher on this path is not wanted, and `/initialise` is a word.
+fn headless_prompt_is_init(prompt: &str) -> bool {
+    prompt.trim() == "/init"
+}
+
 /// Runs headless mode: one-shot with `-p`, else a stdin-driven protocol.
 ///
 /// Under `--ui chart` the run is a one-shot whose stdout is swallowed for the
@@ -19016,7 +19035,15 @@ pub fn run_headless(
     agent.warm_plain()?;
     agent.fire_session_start("startup", &mut |w| eprintln!("{w}"));
     if let Some(prompt) = cfg.prompt.as_deref() {
-        agent.session.push(Message::user(prompt));
+        // `/init` is the one command this path understands. It is not text
+        // for the model: it runs the canned phases with the loop guards
+        // suspended, which is the only way to measure or use it headlessly.
+        // There is no Asker here, so the interview phase fast-fails and the
+        // prompt tells the model to proceed on its own judgement.
+        let is_init = headless_prompt_is_init(prompt);
+        if !is_init {
+            agent.session.push(Message::user(prompt));
+        }
         let color = agent.color;
         let r = match cfg.ui {
             // Both of these swallow the turn's own stdout and put one thing of
@@ -19051,7 +19078,11 @@ pub fn run_headless(
                 } else {
                     None
                 };
-                let r = agent.run_turn();
+                let r = if is_init {
+                    agent.init_turn()
+                } else {
+                    agent.run_turn()
+                };
                 // Both of these write the last of what their mode puts on
                 // screen, so they have to land before anything follows.
                 drop(live);
@@ -19064,7 +19095,13 @@ pub fn run_headless(
                 }
                 r
             }
-            _ => agent.run_turn(),
+            _ => {
+                if is_init {
+                    agent.init_turn()
+                } else {
+                    agent.run_turn()
+                }
+            }
         };
         // No idle loop to come back to: read the snapshotted span now, so a
         // one-shot run still leaves its notes.
@@ -21960,6 +21997,47 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-ui-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn init_turn_pushes_the_init_prompt_and_suspends_the_guards() {
+        // `/init`'s phases re-read and re-survey the same tree on purpose,
+        // which is the shape LoopGuard refuses. A headless `/init` that ran
+        // with the guards armed would be stopped for obeying its own prompt.
+        let dir = scratch_dir("init-turn");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.init_turn().unwrap();
+        assert!(
+            agent
+                .session
+                .transcript
+                .iter()
+                .any(|m| m.text == Agent::INIT_PROMPT),
+            "the canned prompt, not the four characters the user typed"
+        );
+        assert!(
+            !agent.quiet_tools,
+            "quiet_tools is restored when the turn ends"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_the_exact_init_prompt_is_a_command() {
+        // The narrow rule this change is allowed to have: `/init` and nothing
+        // else. `-p "/initialise"` is a prompt about a word that starts with
+        // a slash, and must still reach the model verbatim.
+        assert!(headless_prompt_is_init("/init"));
+        assert!(headless_prompt_is_init("  /init  "));
+        assert!(!headless_prompt_is_init("/initialise"));
+        assert!(!headless_prompt_is_init("/init the repo"));
+        assert!(!headless_prompt_is_init("hello"));
+        assert!(!headless_prompt_is_init("/clear"));
     }
 
     /// `ScriptedEngine::default()` leaves `kv_events` unset, so `get_kv`
