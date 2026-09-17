@@ -6,6 +6,9 @@
 #   PLANK=/path/to/plank ./bench-matrix.sh bench.json
 #   DRY_RUN=1 ./bench-matrix.sh bench.json     # expand the matrix, run nothing
 #
+# Needs bash 4.4+, jq and bc. A definition that sets a timeout also needs
+# timeout(1), which macOS does not ship: brew install coreutils.
+#
 # Unlike scripts/bench-dspark.sh this does not use hyperfine: hyperfine owns
 # loop, and every iteration here has to be captured before the next one wipes
 # the tree. See docs/superpowers/specs/2026-09-17-bench-matrix-design.md.
@@ -180,6 +183,7 @@ run_iteration() {
   init_at_end=$(jq -r --arg p "$prompt" '.prompts[]|select(.id==$p)|.runInitAtEnd // false' "$SPEC")
   init_tmo=$(jq -r --arg p "$prompt" '.prompts[]|select(.id==$p)|.initTimeoutSecs // ""' "$SPEC")
 
+  local -a margs
   mapfile -t margs < <(jq -r --arg m "$model" \
     '.models[]|select(.id==$m)|.args[]? // empty' "$SPEC")
   # ~ is not expanded inside JSON strings; plank is given a real path.
@@ -196,27 +200,44 @@ run_iteration() {
   METADIR=$metadir
 }
 
+# Copy the phase records the last run_iteration produced into $1, prefixed
+# with $2. A phase's run.json is named for its phase alone, so without the
+# prefix every iteration would overwrite the last in one directory.
+archive_records() {
+  local dest=$1 label=$2 f
+  for f in "$METADIR"/*.run.json; do
+    [ -e "$f" ] || continue
+    cp "$f" "$dest/$label.$(basename "$f")"
+  done
+}
+
 # Models outermost, so each model is loaded once per sweep rather than once
 # per run.
-for model in $(jq -r '.models[].id' "$SPEC"); do
+mapfile -t MODEL_IDS < <(jq -r '.models[].id' "$SPEC")
+mapfile -t PROMPT_IDS < <(jq -r '.prompts[].id' "$SPEC")
+# mapfile, not $(jq ...): an unquoted command substitution word-splits, so an
+# id containing a space became two tokens that each passed validate_id and each
+# became a directory -- the matrix quietly ran something other than the spec.
+for model in "${MODEL_IDS[@]}"; do
   validate_id "$model"
-  for prompt in $(jq -r '.prompts[].id' "$SPEC"); do
+  for prompt in "${PROMPT_IDS[@]}"; do
     validate_id "$prompt"
     keep=""
     mkdir -p "$OUTDIR/$model/$prompt"
     if [ "$SNAPSHOT_PASS" = true ]; then
       run_iteration "$model" "$prompt" 0 snapshot
       keep=$RUNDIR
+      # Archived like any other pass. It is untimed in the sense that its tree
+      # is the one kept, not in the sense that it is free: with the example's
+      # 1800s init cap it can be tens of minutes per model, and leaving it out
+      # of the records made "total wall time" a summary of only part of the
+      # session. It records as iter 0, which sorts before iteration 1.
+      archive_records "$OUTDIR/$model/$prompt" "snapshot"
     fi
     for ((n = 1; n <= ITERATIONS; n++)); do
       run_iteration "$model" "$prompt" "$n" "iter$n"
       [ -z "$keep" ] && [ "$n" = 1 ] && keep=$RUNDIR
-      # A phase's run.json is named for its phase, so iterations would collide
-      # in one directory. The iteration prefix is what keeps them apart.
-      for f in "$METADIR"/*.run.json; do
-        [ -e "$f" ] || continue
-        cp "$f" "$OUTDIR/$model/$prompt/iter$n.$(basename "$f")"
-      done
+      archive_records "$OUTDIR/$model/$prompt" "iter$n"
     done
     # The snapshot: the tree as the model left it, code and AGENTS.md together.
     # $keep is the model's tree, which now holds nothing the harness wrote, so

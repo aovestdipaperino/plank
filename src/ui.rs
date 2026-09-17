@@ -2288,6 +2288,13 @@ struct Agent<'a> {
     /// one-shot reads this instead to choose its exit code. A benchmark that
     /// cannot tell a stopped turn from a finished one reports work that never
     /// happened.
+    ///
+    /// Scope: the main-turn guard stops only, the ones that go through
+    /// [`Agent::stop_turn`]. A sub-agent's guard trip does not set it -- that
+    /// sidechain failing is not the outer turn failing -- and neither does a
+    /// hook halting the turn with `continue:false`, nor a memory-pressure
+    /// stop. Those are not loop guards, so a run they end still reports as
+    /// completed.
     guard_stopped: bool,
     /// Image embeddings collected by `view_image` during the current
     /// `run_tool_calls` dispatch, drained by the caller when it pushes the
@@ -19021,6 +19028,10 @@ fn headless_exit_code(guard_stopped: bool) -> u8 {
 /// Whether a headless `-p` prompt is the `/init` command rather than text for
 /// the model. Exactly `/init`, surrounding whitespace aside: a general slash
 /// dispatcher on this path is not wanted, and `/initialise` is a word.
+///
+/// There is deliberately no escape: `-p "/init"` cannot send those five
+/// characters to the model as text. Someone who wants to talk *about* the
+/// command can write it into a sentence, which is the ordinary case anyway.
 fn headless_prompt_is_init(prompt: &str) -> bool {
     prompt.trim() == "/init"
 }
