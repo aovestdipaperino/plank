@@ -19008,6 +19008,16 @@ fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
     }
 }
 
+/// Exit code for a headless one-shot whose turn a guard stopped. Distinct
+/// from 1 so a caller can tell a stopped turn from plank failing outright,
+/// and from 124, which `timeout(1)` uses for a run it killed.
+pub const GUARD_STOP_EXIT: u8 = 3;
+
+/// The exit code a finished headless one-shot reports.
+fn headless_exit_code(guard_stopped: bool) -> u8 {
+    if guard_stopped { GUARD_STOP_EXIT } else { 0 }
+}
+
 /// Whether a headless `-p` prompt is the `/init` command rather than text for
 /// the model. Exactly `/init`, surrounding whitespace aside: a general slash
 /// dispatcher on this path is not wanted, and `/initialise` is a word.
@@ -19022,13 +19032,15 @@ fn headless_prompt_is_init(prompt: &str) -> bool {
 /// prints is the `/toks` chart for what it just generated.
 ///
 /// # Errors
-/// Returns an error string on unrecoverable I/O or engine failure.
+/// Returns an error string on unrecoverable I/O or engine failure. On
+/// success, the `Ok` value is the process exit code.
+#[allow(clippy::too_many_lines)]
 pub fn run_headless(
     engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     local_engine: Option<Box<dyn Engine>>,
     plugins: crate::plugins::PluginSet,
-) -> Result<(), String> {
+) -> Result<u8, String> {
     let mut agent = new_agent(engine, cfg, false, local_engine, plugins)?;
     // The notification mode is seeded (and kept live) by
     // `settings::install`/`reinstall`, not here — see their doc comments.
@@ -19117,7 +19129,8 @@ pub fn run_headless(
         // that mode's one deliberate piece of output, neither of which wants a
         // line appended to it.
         eprintln!("{}", total_time_line(agent.session_start.elapsed()));
-        return r;
+        r?;
+        return Ok(headless_exit_code(agent.guard_stopped));
     }
     // Stdin protocol, like the C: announce readiness on stderr, collect bytes
     // until stdin has been quiet for 200 ms, submit that buffer as one prompt,
@@ -19162,7 +19175,7 @@ pub fn run_headless(
     headless_quit_repro(&mut agent);
     agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
     crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
-    Ok(())
+    Ok(0)
 }
 
 /// The closing line of a headless `-p` run: how long the whole thing took.
@@ -22038,6 +22051,15 @@ mod tests {
         assert!(!headless_prompt_is_init("/init the repo"));
         assert!(!headless_prompt_is_init("hello"));
         assert!(!headless_prompt_is_init("/clear"));
+    }
+
+    #[test]
+    fn a_guard_stopped_one_shot_exits_three() {
+        // 3, not 1: a benchmark needs to tell "plank errored" from "the
+        // guards stopped the turn", and both from a clean run.
+        assert_eq!(headless_exit_code(false), 0);
+        assert_eq!(headless_exit_code(true), GUARD_STOP_EXIT);
+        assert_eq!(GUARD_STOP_EXIT, 3);
     }
 
     /// `ScriptedEngine::default()` leaves `kv_events` unset, so `get_kv`

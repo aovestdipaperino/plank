@@ -291,7 +291,7 @@ fn main() -> ExitCode {
         }
     };
     match run(engine.main, engine.local, &cfg, plugins) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("plank: {e}");
             ExitCode::FAILURE
@@ -888,7 +888,7 @@ fn run(
     local_engine: Option<Box<dyn Engine>>,
     cfg: &AgentConfig,
     plugins: plank::plugins::PluginSet,
-) -> Result<(), String> {
+) -> Result<u8, String> {
     // The family check the C makes right after opening the engine: a numeric
     // effort is meaningless to anything but V4.1, and falling back to `high`
     // silently would be worse than refusing.
@@ -920,5 +920,5 @@ fn run(
         }
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
-    plank::ui::run_interactive(engine, cfg, local_engine, plugins)
+    plank::ui::run_interactive(engine, cfg, local_engine, plugins).map(|()| 0)
 }
