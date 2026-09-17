@@ -142,6 +142,56 @@ mkdir -p "$RUNROOT" "$OUTDIR"
 # the first run of each model per session pays a full prefill of it.
 REAL_HOME=$HOME
 BENCH_HOME=$RUNROOT/home
+# Ctrl-C has to end the session, not just the run in front of it. A terminal
+# SIGINT reaches the whole foreground process group, so plank takes it as
+# "interrupt the generation", saves, and exits -- and the loop then started the
+# NEXT of 45 runs, with the model reloaded, as if nothing had happened. Worse,
+# killing this script on its own left plank orphaned with the weights still
+# mapped.
+#
+# So the signal is caught here and the child is stopped deliberately: SIGINT
+# first, because that is what makes plank save its transcript and write its
+# repro, then SIGKILL once it has had its chance. A second Ctrl-C skips the
+# waiting. `wait` is what makes this work at all: bash defers a trap until the
+# foreground command returns, so the run is started in the background and
+# waited on, which a signal can interrupt.
+INTERRUPTED=0
+CHILD_PID=""
+on_interrupt() {
+  if [ "$INTERRUPTED" = 1 ]; then
+    echo "" >&2; echo "bench-matrix: second interrupt; killing now." >&2
+    [ -n "$CHILD_PID" ] && kill_tree "$CHILD_PID" KILL
+    exit 130
+  fi
+  INTERRUPTED=1
+  echo "" >&2
+  echo "bench-matrix: interrupted; stopping plank and ending the session." >&2
+  echo "  (Ctrl-C again to skip waiting for it to save.)" >&2
+  if [ -n "$CHILD_PID" ]; then
+    kill_tree "$CHILD_PID" INT
+    local i
+    for ((i = 0; i < 300; i++)); do
+      kill -0 "$CHILD_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill_tree "$CHILD_PID" KILL
+  fi
+  echo "bench-matrix: partial results in $OUTDIR" >&2
+  exit 130
+}
+
+# Signal $1's whole tree with $2. timeout(1) is usually the direct child and
+# relays signals to plank, but when a prompt sets no timeout plank is the child
+# itself, and on a KILL nothing relays anything -- so the descendants are
+# signalled explicitly rather than trusting the middleman.
+kill_tree() {
+  local pid=$1 sig=$2 kid
+  for kid in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$kid" "$sig"; done
+  kill -"$sig" "$pid" 2>/dev/null || true
+}
+
+trap on_interrupt INT TERM
+
 KVDIR=$BENCH_HOME/.plank/kvcache
 REPRODIR=$BENCH_HOME/.plank/repro
 build_bench_home() {
@@ -221,7 +271,12 @@ run_phase() {
   if [ "$DRY_RUN" = 1 ]; then
     printf '%q ' "${cmd[@]}" > "$metadir/$phase.log"; echo >> "$metadir/$phase.log"
   else
-    HOME=$BENCH_HOME "${cmd[@]}" > "$metadir/$phase.log" 2>&1 || exit_code=$?
+    # Backgrounded and waited on, not run in the foreground: bash holds a
+    # trap until a foreground command returns, and a run here lasts an hour.
+    HOME=$BENCH_HOME "${cmd[@]}" > "$metadir/$phase.log" 2>&1 &
+    CHILD_PID=$!
+    wait "$CHILD_PID" || exit_code=$?
+    CHILD_PID=""
   fi
   end=$(date +%s.%N)
 
