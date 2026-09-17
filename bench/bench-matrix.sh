@@ -13,8 +13,11 @@ set -euo pipefail
 
 # mapfile is bash 4+, and macOS ships 3.2 as /bin/bash. Checked here rather
 # than left to fail as `mapfile: command not found` forty minutes into a run.
-if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
-  echo "bench-matrix: needs bash 4 or newer, found ${BASH_VERSION:-unknown}." >&2
+# 4.4 specifically: this script expands possibly-empty arrays (e.g. a model's
+# `args` being `[]`) as "${arr[@]}" under set -u, which is only safe from 4.4
+# onward -- 4.0-4.3 throw "unbound variable" on an empty array there.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -lt 4 ]; }; then
+  echo "bench-matrix: needs bash 4.4 or newer, found ${BASH_VERSION:-unknown}." >&2
   echo "  macOS ships bash 3.2; install a current one with: brew install bash" >&2
   exit 2
 fi
@@ -25,7 +28,37 @@ DRY_RUN=${DRY_RUN:-0}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 command -v jq >/dev/null || { echo "bench-matrix: jq is required" >&2; exit 2; }
+command -v bc >/dev/null || { echo "bench-matrix: bc is required" >&2; exit 2; }
 [ -r "$SPEC" ] || { echo "bench-matrix: cannot read '$SPEC'" >&2; exit 2; }
+
+# Resolved lazily, only if some prompt actually sets a timeout: stock macOS
+# ships neither timeout(1) nor gtimeout(1), and a benchmark definition with no
+# timeouts at all must still run on such a machine.
+TIMEOUT_BIN=""
+resolve_timeout_bin() {
+  [ -n "$TIMEOUT_BIN" ] && return 0
+  if command -v timeout >/dev/null; then
+    TIMEOUT_BIN=$(command -v timeout)
+  elif command -v gtimeout >/dev/null; then
+    TIMEOUT_BIN=$(command -v gtimeout)
+  else
+    echo "bench-matrix: this benchmark sets a timeout but neither 'timeout' nor 'gtimeout' is on PATH." >&2
+    echo "  install coreutils to get gtimeout: brew install coreutils" >&2
+    exit 2
+  fi
+}
+
+# Ids from the JSON become path components (rundir, OUTDIR entries) that are
+# later rm -rf'd; keep them to a safe character set before any directory is
+# built from one.
+validate_id() {
+  case $1 in
+    *[!A-Za-z0-9._-]*|'')
+      echo "bench-matrix: invalid id '$1' (allowed: letters, digits, '.', '_', '-')" >&2
+      exit 2
+      ;;
+  esac
+}
 
 # Resolve the binary up front. A benchmark whose provenance is "some plank" is
 # worthless a week later, and this also fails before an hour of inference.
@@ -67,7 +100,16 @@ run_phase() {
   ls "$KVDIR"/*.kv 2>/dev/null | sort > "$before"
 
   local -a cmd=("$PLANK" "${PLANK_ARGS[@]}" "${margs[@]}" --chdir "$rundir" -p "$text")
-  [ -n "$tmo" ] && cmd=(timeout "$tmo" "${cmd[@]}")
+  if [ -n "$tmo" ]; then
+    # Real runs need a real timeout(1)/gtimeout(1); a dry run only prints the
+    # command it would have run, so it can proceed without one.
+    if [ "$DRY_RUN" = 1 ]; then
+      cmd=("timeout" "$tmo" "${cmd[@]}")
+    else
+      resolve_timeout_bin
+      cmd=("$TIMEOUT_BIN" "$tmo" "${cmd[@]}")
+    fi
+  fi
 
   echo "--- $model/$prompt iter$iter $phase"
   local start end exit_code=0
@@ -87,7 +129,7 @@ run_phase() {
     *)   status=failed ;;
   esac
 
-  local transcript tools
+  local transcript tools seconds
   transcript=$(new_transcript "$before"); rm -f "$before"
   if [ -n "$transcript" ] && [ -r "$transcript" ]; then
     # The same marker session::Message::is_tool_user keys on, so this survives
@@ -96,12 +138,15 @@ run_phase() {
   else
     transcript=""; tools=0
   fi
+  # printf, not raw bc output: bc emits a leading-dot number for sub-second
+  # phases (".052"), which is not a valid JSON number.
+  seconds=$(printf '%.3f' "$(echo "$end - $start" | bc)")
 
   jq -n \
     --arg model "$model" --arg prompt "$prompt" --arg phase "$phase" \
     --arg status "$status" --arg transcript "$transcript" --arg rundir "$rundir" \
     --argjson iter "$iter" --argjson exit "$exit_code" \
-    --argjson seconds "$(echo "$end - $start" | bc)" \
+    --argjson seconds "$seconds" \
     --argjson toolCalls "${tools:-0}" \
     --argjson files "$(find "$rundir" -type f -not -name '*.log' -not -name '*.run.json' | wc -l | tr -d ' ')" \
     '{model:$model,prompt:$prompt,iter:$iter,phase:$phase,status:$status,
@@ -109,7 +154,7 @@ run_phase() {
       transcript:$transcript,rundir:$rundir}' \
     > "$rundir/$phase.run.json"
 
-  echo "    $status  $(printf '%.1f' "$(echo "$end - $start" | bc)")s  ${tools:-0} tool calls"
+  echo "    $status  $(printf '%.1f' "$seconds")s  ${tools:-0} tool calls"
 }
 
 mapfile -t PLANK_ARGS < <(jq -r '.plankArgs[]? // empty' "$SPEC")
@@ -146,7 +191,9 @@ run_iteration() {
 # Models outermost, so each model is loaded once per sweep rather than once
 # per run.
 for model in $(jq -r '.models[].id' "$SPEC"); do
+  validate_id "$model"
   for prompt in $(jq -r '.prompts[].id' "$SPEC"); do
+    validate_id "$prompt"
     keep=""
     mkdir -p "$OUTDIR/$model/$prompt"
     if [ "$SNAPSHOT_PASS" = true ]; then
