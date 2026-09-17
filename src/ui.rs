@@ -2281,6 +2281,14 @@ struct Agent<'a> {
     /// content preview and tool results are all suppressed regardless of the
     /// `ui.show*` settings, so the AGENTS.md draft never scrolls past.
     quiet_tools: bool,
+    /// Set when a main turn ended because a guard stopped it rather than
+    /// because the model finished. Every one of those stops returns
+    /// `Ok(())` — the session continues in the TUI and the plain REPL, which
+    /// is why they cannot report it as an error — so the headless `-p`
+    /// one-shot reads this instead to choose its exit code. A benchmark that
+    /// cannot tell a stopped turn from a finished one reports work that never
+    /// happened.
+    guard_stopped: bool,
     /// Image embeddings collected by `view_image` during the current
     /// `run_tool_calls` dispatch, drained by the caller when it pushes the
     /// tool-result message so they ride on that message into the transcript.
@@ -3012,6 +3020,20 @@ impl Agent<'_> {
             SubSinkTarget::Stdout => println!("{}", self.error_line(&line)),
             SubSinkTarget::Null => {}
         }
+    }
+
+    /// Ends a main turn because a guard stopped it: reports the notice and
+    /// records the stop. The `Ok(())` is deliberate and unchanged — the
+    /// interactive front ends carry on after a stop, so the turn did not
+    /// fail. [`Agent::guard_stopped`] is how the news leaves the turn.
+    // The `Result` return is deliberate, matching the call sites' `return
+    // self.stop_turn(...)` in a function that returns `Result<(), String>`;
+    // it always succeeds today because the turn does not fail here.
+    #[allow(clippy::unnecessary_wraps)]
+    fn stop_turn(&mut self, notice: &str) -> Result<(), String> {
+        self.report_guard(notice);
+        self.guard_stopped = true;
+        Ok(())
     }
 
     /// The generation options for the next pass, with the one-pass
@@ -4756,12 +4778,10 @@ impl Agent<'_> {
                     "<tool_result>{payload}</tool_result>"
                 )));
                 if repeat_trips >= MAIN_REPEAT_TRIP_CAP {
-                    self.report_guard(MAIN_REPEAT_TRIPS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(MAIN_REPEAT_TRIPS_NOTICE);
                 }
                 if draft_trips >= MAIN_DRAFT_TRIP_CAP {
-                    self.report_guard(MAIN_DRAFT_TRIPS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(MAIN_DRAFT_TRIPS_NOTICE);
                 }
                 let woke = self.drain_job_notifications();
                 self.print_job_wake(woke);
@@ -4823,8 +4843,7 @@ impl Agent<'_> {
                     if let Some(line) = self.loop_repro_line() {
                         println!("{}", self.debug_line(&line));
                     }
-                    self.report_guard(LOOP_TRIPPED_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(LOOP_TRIPPED_NOTICE);
                 }
                 // Checked after the results are in the transcript, so the
                 // dump and the next prompt both show what the turn did have.
@@ -4833,8 +4852,7 @@ impl Agent<'_> {
                 } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET
                     && crate::guard::no_progress_guard_enabled()
                 {
-                    self.report_guard(NO_PROGRESS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(NO_PROGRESS_NOTICE);
                 }
                 let woke = self.drain_job_notifications();
                 self.print_job_wake(woke);
@@ -14110,12 +14128,10 @@ impl Agent<'_> {
                     "<tool_result>{payload}</tool_result>"
                 )));
                 if repeat_trips >= MAIN_REPEAT_TRIP_CAP {
-                    self.report_guard(MAIN_REPEAT_TRIPS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(MAIN_REPEAT_TRIPS_NOTICE);
                 }
                 if draft_trips >= MAIN_DRAFT_TRIP_CAP {
-                    self.report_guard(MAIN_DRAFT_TRIPS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(MAIN_DRAFT_TRIPS_NOTICE);
                 }
                 self.drain_queued(shared, tx);
                 let woke = self.drain_job_notifications();
@@ -14180,8 +14196,7 @@ impl Agent<'_> {
                     if let Some(line) = self.loop_repro_line() {
                         let _ = tx.send(UiEvent::Dim(line));
                     }
-                    self.report_guard(LOOP_TRIPPED_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(LOOP_TRIPPED_NOTICE);
                 }
                 // Checked after the results are in the transcript, so the
                 // dump and the next prompt both show what the turn did have.
@@ -14190,8 +14205,7 @@ impl Agent<'_> {
                 } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET
                     && crate::guard::no_progress_guard_enabled()
                 {
-                    self.report_guard(NO_PROGRESS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(NO_PROGRESS_NOTICE);
                 }
                 self.drain_queued(shared, tx);
                 let woke = self.drain_job_notifications();
@@ -18453,6 +18467,7 @@ fn new_agent(
         pending_memory_notice: None,
         repro_dir,
         quiet_tools: false,
+        guard_stopped: false,
         pending_images: Vec::new(),
         btw_diverged_engine: false,
         trusted_system_len,
@@ -21223,6 +21238,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -26352,6 +26368,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -26481,6 +26498,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -27862,6 +27880,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -28136,6 +28155,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -28249,6 +28269,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -28349,6 +28370,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -28472,6 +28494,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -28934,6 +28957,57 @@ mod tests {
             vec![format!("guard: {NO_PROGRESS_NOTICE}")],
             "{events:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_guard_hard_stop_is_recorded_on_the_agent() {
+        // The same turn as `a_turn_that_changes_nothing_is_stopped`: three
+        // passes that read, change nothing and generate 12 KB each, so the
+        // third crosses the 32 KiB no-progress budget. That turn returns
+        // `Ok(())`, which is why the flag has to carry the news instead.
+        let dir = scratch_dir("guard-stop-flag");
+        enable_no_progress_guard();
+        let cfg = test_cfg();
+        let read_call = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"list\">",
+            "<｜DSML｜parameter name=\"path\">.</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let pass = format!("{}{read_call}", "x".repeat(12 * 1024));
+        let engine = ScriptedEngine {
+            replies: vec![pass.clone(), pass.clone(), pass, "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        assert!(!agent.guard_stopped, "a fresh agent has not been stopped");
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        assert!(
+            agent.guard_stopped,
+            "the no-progress stop must be recorded, not just printed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_clean_turn_records_no_guard_stop() {
+        // The control: without it, a flag wired to `true` unconditionally
+        // would pass the test above.
+        let dir = scratch_dir("guard-stop-clean");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        agent.run_turn().unwrap();
+        assert!(!agent.guard_stopped, "nothing stopped this turn");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -31060,6 +31134,7 @@ or the user's next message aborts before its first token"
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -31202,6 +31277,7 @@ or the user's next message aborts before its first token"
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -32258,6 +32334,7 @@ or the user's next message aborts before its first token"
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
