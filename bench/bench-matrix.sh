@@ -84,14 +84,58 @@ RUNROOT=/tmp/plank-bench-$STAMP
 OUTDIR=${OUTDIR:-$HERE/../local/bench-$NAME-$STAMP}
 mkdir -p "$RUNROOT" "$OUTDIR"
 
-KVDIR=$HOME/.plank/kvcache
+# plank reads everything it knows about this machine from $HOME/.plank:
+# skills and their hooks, plugins, memory, the MCP config, settings.json.
+# Left in, they become part of what is measured. The first run showed all
+# three models spending passes on the user's brainstorming skill, and DS4
+# writing its first draft to a project path lifted from the cached MCP server
+# instructions. So plank runs under a scratch HOME whose .plank holds the
+# model artifacts and nothing else: the ggufs and models/ are symlinked (the
+# ~87 GB stays where it is), the manifests and check stamps are copied so no
+# download or network check is triggered. Skills and MCP are simply absent,
+# not disabled, so a plank built-in skill is still available -- that is part
+# of plank, not of this machine.
+#
+# One caveat for timing: the system-prompt KV snapshot lives in the home, so
+# the first run of each model per session pays a full prefill of it.
+REAL_HOME=$HOME
+BENCH_HOME=$RUNROOT/home
+KVDIR=$BENCH_HOME/.plank/kvcache
+REPRODIR=$BENCH_HOME/.plank/repro
+build_bench_home() {
+  local src=$REAL_HOME/.plank dst=$BENCH_HOME/.plank f
+  mkdir -p "$dst/kvcache" "$dst/repro"
+  # -L as well as -e: a dangling link in the real home is reproduced as a
+  # dangling link, so a model that would not load there does not load here.
+  for f in "$src"/*.gguf "$src"/*.ggd "$src"/models; do
+    if [ -e "$f" ] || [ -L "$f" ]; then ln -s "$f" "$dst/$(basename "$f")"; fi
+  done
+  for f in "$src"/*.manifest "$src"/*.source "$src"/model-speeds.json \
+           "$src"/manifest-check "$src"/update-check "$src"/model-check "$src"/version; do
+    if [ -e "$f" ]; then cp "$f" "$dst/"; fi
+  done
+}
+build_bench_home
+
+# Sorted listings of the transcripts and repros plank has written so far. In a
+# function, not inline: under pipefail an `ls` with nothing to match fails the
+# pipeline and set -e ends the whole session. The real kvcache was never empty,
+# so that only surfaced once plank ran under a fresh home.
+list_transcripts() { { ls "$KVDIR"/*.kv 2>/dev/null || true; } | sort; }
+list_repros() { { ls "$REPRODIR"/* 2>/dev/null || true; } | sort; }
 
 # The .kv file that appeared since $1 was taken, or empty. The transcript is
 # how tool calls are counted, and it is the only per-run artifact plank leaves
 # outside the working directory.
 new_transcript() {
-  local before=$1
-  comm -13 "$before" <(ls "$KVDIR"/*.kv 2>/dev/null | sort) | head -1
+  comm -13 "$1" <(list_transcripts) | head -1
+}
+
+# Every file under $REPRODIR that appeared since $1 was taken: the repro and
+# its sub-agent sidecars. Under --debug plank writes one per run, and it is
+# what plank-replay reads, so it is worth more than the transcript afterwards.
+new_repros() {
+  comm -13 "$1" <(list_repros)
 }
 
 # One phase: $1 rundir, $2 metadir, $3 model id, $4 prompt id, $5 iter,
@@ -106,17 +150,26 @@ run_phase() {
   local rundir=$1 metadir=$2 model=$3 prompt=$4 iter=$5 phase=$6 tmo=$7 text=$8; shift 8
   local margs=("$@")
   local before; before=$(mktemp)
-  ls "$KVDIR"/*.kv 2>/dev/null | sort > "$before"
+  list_transcripts > "$before"
+  local repros_before; repros_before=$(mktemp)
+  list_repros > "$repros_before"
 
   local -a cmd=("$PLANK" "${PLANK_ARGS[@]}" "${margs[@]}" --chdir "$rundir" -p "$text")
   if [ -n "$tmo" ]; then
     # Real runs need a real timeout(1)/gtimeout(1); a dry run only prints the
     # command it would have run, so it can proceed without one.
+    # SIGINT, not the default SIGTERM: plank treats SIGINT as "interrupt the
+    # generation", ends the turn, and still saves the transcript and writes
+    # the repro before exiting. A SIGTERM kill left nothing behind, so every
+    # timed-out run in the first session recorded 0 tool calls and could not
+    # be analysed at all -- when in fact two of them had finished the file
+    # seconds before the kill. -k is the backstop if plank ignores the INT.
+    # timeout(1) still exits 124 on expiry, whatever plank returned after it.
     if [ "$DRY_RUN" = 1 ]; then
-      cmd=("timeout" "$tmo" "${cmd[@]}")
+      cmd=("timeout" "-s" "INT" "-k" "30" "$tmo" "${cmd[@]}")
     else
       resolve_timeout_bin
-      cmd=("$TIMEOUT_BIN" "$tmo" "${cmd[@]}")
+      cmd=("$TIMEOUT_BIN" "-s" "INT" "-k" "30" "$tmo" "${cmd[@]}")
     fi
   fi
 
@@ -126,7 +179,7 @@ run_phase() {
   if [ "$DRY_RUN" = 1 ]; then
     printf '%q ' "${cmd[@]}" > "$metadir/$phase.log"; echo >> "$metadir/$phase.log"
   else
-    "${cmd[@]}" > "$metadir/$phase.log" 2>&1 || exit_code=$?
+    HOME=$BENCH_HOME "${cmd[@]}" > "$metadir/$phase.log" 2>&1 || exit_code=$?
   fi
   end=$(date +%s.%N)
 
@@ -144,9 +197,18 @@ run_phase() {
     # The same marker session::Message::is_tool_user keys on, so this survives
     # a front-end change.
     tools=$(grep -c '<tool_result>' "$transcript" || true)
+    cp "$transcript" "$metadir/$phase.transcript.kv"
   else
-    transcript=""; tools=0
+    # No transcript means plank never got to save one, so the count is
+    # unknown, not zero: null keeps the summariser from averaging it in.
+    transcript=""; tools=null
   fi
+  # The repro plank wrote for this phase, and its sidecars, kept beside the
+  # log under the phase's name so a run can be replayed from the archive.
+  local r; for r in $(new_repros "$repros_before"); do
+    cp "$r" "$metadir/$phase.$(basename "$r")"
+  done
+  rm -f "$repros_before"
   # printf, not raw bc output: bc emits a leading-dot number for sub-second
   # phases (".052"), which is not a valid JSON number.
   seconds=$(printf '%.3f' "$(echo "$end - $start" | bc)")
@@ -156,14 +218,14 @@ run_phase() {
     --arg status "$status" --arg transcript "$transcript" --arg rundir "$rundir" \
     --argjson iter "$iter" --argjson exit "$exit_code" \
     --argjson seconds "$seconds" \
-    --argjson toolCalls "${tools:-0}" \
+    --argjson toolCalls "$tools" \
     --argjson files "$(find "$rundir" -type f | wc -l | tr -d ' ')" \
     '{model:$model,prompt:$prompt,iter:$iter,phase:$phase,status:$status,
       exit:$exit,seconds:$seconds,toolCalls:$toolCalls,files:$files,
       transcript:$transcript,rundir:$rundir}' \
     > "$metadir/$phase.run.json"
 
-  echo "    $status  $(printf '%.1f' "$seconds")s  ${tools:-0} tool calls"
+  echo "    $status  $(printf '%.1f' "$seconds")s  $tools tool calls"
 }
 
 mapfile -t PLANK_ARGS < <(jq -r '.plankArgs[]? // empty' "$SPEC")
@@ -186,8 +248,10 @@ run_iteration() {
   local -a margs
   mapfile -t margs < <(jq -r --arg m "$model" \
     '.models[]|select(.id==$m)|.args[]? // empty' "$SPEC")
-  # ~ is not expanded inside JSON strings; plank is given a real path.
-  local i; for i in "${!margs[@]}"; do margs[$i]=${margs[$i]/#\~/$HOME}; done
+  # ~ is not expanded inside JSON strings; plank is given a real path. The
+  # real home, because plank runs under $BENCH_HOME, where models/ is only a
+  # link back here.
+  local i; for i in "${!margs[@]}"; do margs[$i]=${margs[$i]/#\~/$REAL_HOME}; done
 
   run_phase "$rundir" "$metadir" "$model" "$prompt" "$iter" work "$tmo" "$text" "${margs[@]}"
   if [ "$init_at_end" = true ]; then
@@ -200,12 +264,15 @@ run_iteration() {
   METADIR=$metadir
 }
 
-# Copy the phase records the last run_iteration produced into $1, prefixed
-# with $2. A phase's run.json is named for its phase alone, so without the
-# prefix every iteration would overwrite the last in one directory.
+# Copy everything the last run_iteration's phases left in the meta directory
+# -- run.json, log, transcript, repro -- into $1, prefixed with $2. A phase's
+# files are named for the phase alone, so without the prefix every iteration
+# would overwrite the last in one directory. The whole set goes because the
+# run tree in /tmp does not survive a reboot and the run.json alone cannot
+# answer why a run took as long as it did.
 archive_records() {
   local dest=$1 label=$2 f
-  for f in "$METADIR"/*.run.json; do
+  for f in "$METADIR"/*; do
     [ -e "$f" ] || continue
     cp "$f" "$dest/$label.$(basename "$f")"
   done

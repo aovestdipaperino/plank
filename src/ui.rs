@@ -6037,7 +6037,7 @@ impl Agent<'_> {
     /// lives in one place.
     ///
     /// The phases are the model's to run, not the front end's: plank supplies
-    /// the tools (`ask` for the two interview phases, `task` for the survey)
+    /// the tools (`ask` for the two interview phases, `agent` for the survey)
     /// and the prompt supplies the order. That keeps both front ends on one
     /// code path — whatever the model asks, the front end's installed
     /// [`Asker`](crate::tools::ask::Asker) renders. Under `--ui console` the
@@ -6056,8 +6056,12 @@ impl Agent<'_> {
         "in this prompt and write the project AGENTS.md only, using your own\n",
         "judgement for anything you would have asked about.\n\n",
         "PHASE 2 — survey the codebase.\n",
-        "Delegate the survey to a single `task` sub-agent so the findings come\n",
-        "back condensed. Ask it to report:\n",
+        "First list the tree (`git ls-files`, or `ls -R` when there is no git).\n",
+        "If it holds fewer than about thirty files, survey it yourself in this\n",
+        "turn: read the manifests and configs directly, and skip the sub-agent.\n",
+        "For a larger tree, delegate the survey to one sub-agent with the\n",
+        "`agent` tool (leave its `name` unset) so the findings come back\n",
+        "condensed. Either way, establish:\n",
         "- manifest files (package.json, Cargo.toml, pyproject.toml, go.mod, ...)\n",
         "- README, Makefile, build config, CI config\n",
         "- any existing AGENTS.md, CLAUDE.md, or .plank/rules/ files\n",
@@ -6117,10 +6121,11 @@ impl Agent<'_> {
         "~/.plank/<project-name>-instructions.md and make AGENTS.local.md a\n",
         "one-line pointer to that path. Nested worktrees need no such stub.\n\n",
         "PHASE 6 — summarise.\n",
-        "In a few lines: which files you wrote, and the two or three points in\n",
-        "them most worth a second look. Say plainly that these are a starting\n",
-        "point meant to be edited, and that /init can be run again later to\n",
-        "re-scan and update them."
+        "Do this in the same turn as the last file you write, right after the\n",
+        "write call, not as a separate pass. In a few lines: which files you\n",
+        "wrote, and the two or three points in them most worth a second look.\n",
+        "Say plainly that these are a starting point meant to be edited, and\n",
+        "that /init can be run again later to re-scan and update them."
     );
 
     /// Draw the next label for an unnamed sub-agent, advancing the session's
@@ -22811,7 +22816,7 @@ mod tests {
 
     /// The init prompt drives its phases entirely through tools plank
     /// actually ships: the two interview phases through `ask`, the survey
-    /// through `task`. Renaming or dropping one of those tools without
+    /// through `agent`. Renaming or dropping one of those tools without
     /// touching the prompt would leave `/init` instructing the model to call
     /// something that does not exist, and the failure would be a silently
     /// degraded setup rather than an error — so the prompt's tool names are
@@ -22819,7 +22824,7 @@ mod tests {
     #[test]
     fn the_init_prompt_only_names_tools_that_exist() {
         let names = sysprompt::tool_names(&[]);
-        for tool in ["ask", "task"] {
+        for tool in ["ask", "agent"] {
             assert!(
                 names.iter().any(|n| n == tool),
                 "/init tells the model to use `{tool}`, which is not a tool: {names:?}"
@@ -22829,6 +22834,14 @@ mod tests {
                 "the prompt no longer names `{tool}`"
             );
         }
+        // The todo tool is also called `task`. The prompt used to say "a
+        // `task` sub-agent", and every model in the first bench-matrix run
+        // dispatched the survey to the todo tool, got "task requires 'op'"
+        // back, and only then found `agent`: one wasted round per /init.
+        assert!(
+            !Agent::INIT_PROMPT.contains("`task`"),
+            "the prompt names `task`, which is the todo tool, not the sub-agent"
+        );
         // Every phase has to survive an edit to the prompt: dropping one
         // silently shortens the flow rather than breaking it.
         for phase in [

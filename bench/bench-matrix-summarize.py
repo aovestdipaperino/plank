@@ -28,8 +28,14 @@ REQUIRED_KEYS = (
 # just 1), so it is deliberately accepted wherever an int is -- not worth
 # special-casing.
 STR_KEYS = ("model", "prompt", "phase", "status")
-INT_KEYS = ("iter", "exit", "toolCalls", "files")
+INT_KEYS = ("iter", "exit", "files")
 NUM_KEYS = ("seconds",)
+# toolCalls is an int, or null when the harness found no transcript to count
+# from -- plank never got to save one. That is "unknown", not 0: the first
+# session's report showed every timed-out run at 0 tools and a median of 0,
+# while two of those runs had in fact written the file seconds before the
+# kill. Unknowns are left out of medians and sums and counted separately.
+NULLABLE_INT_KEYS = ("toolCalls",)
 
 
 def _shape_errors(record):
@@ -50,6 +56,9 @@ def _shape_errors(record):
     for k in NUM_KEYS:
         if k in record and not isinstance(record[k], (int, float)):
             errors.append(f"{k} is {type(record[k]).__name__}, not a number")
+    for k in NULLABLE_INT_KEYS:
+        if k in record and record[k] is not None and not isinstance(record[k], int):
+            errors.append(f"{k} is {type(record[k]).__name__}, not an integer or null")
     return errors
 
 
@@ -86,8 +95,17 @@ def tally(runs):
 
 
 def med(runs, key):
-    vals = [r[key] for r in runs]
+    vals = [r[key] for r in runs if r[key] is not None]
     return statistics.median(vals) if vals else 0
+
+
+def tools(runs):
+    """Total tool calls over the runs whose count is known, rendered with a
+    trailing `+?` when some run's count is unknown, so a total never reads as
+    exact when it is a floor."""
+    known = [r["toolCalls"] for r in runs if r["toolCalls"] is not None]
+    unknown = len(runs) - len(known)
+    return f"{sum(known)}" + (f" (+{unknown} unknown)" if unknown else "")
 
 
 def detail(runs):
@@ -122,7 +140,7 @@ def rollup(runs):
         print(f"| {model} | {len(group)} | {t['completed']} | {t['failed']} "
               f"| {t['guard-stopped']} | {t['timeout']} | {t.get('other', 0)} "
               f"| {sum(r['seconds'] for r in group):.0f} "
-              f"| {sum(r['toolCalls'] for r in group)} |")
+              f"| {tools(group)} |")
     print()
 
 
@@ -138,7 +156,7 @@ def footer(runs):
     if "other" in t:
         print(f"- other status: {t['other']}")
     print(f"- total wall time: {total / 3600:.2f} h ({total:.0f} s)")
-    print(f"- total tool calls: {sum(r['toolCalls'] for r in runs)}")
+    print(f"- total tool calls: {tools(runs)}")
     print()
 
 

@@ -2981,3 +2981,43 @@ work phase from 100s and 1 tool call to 318s and 9.
 characters to the model. Pasting `INIT_PROMPT` in as text is not a substitute:
 `/init` is the only caller of `settings::suspend_loop_guards()`, and its phases
 re-read the same tree by design, which is the shape `LoopGuard` refuses.
+
+## What the second bench-matrix session showed (`local/bench-coding-baseline-20260917-131726`)
+
+Three findings, none of them about the models.
+
+**The bench measured this machine's `~/.plank`, not the prompt.** plank reads
+skills, plugin hooks, memory, the MCP config and settings from its home, and
+every one of them reached the model. All three models opened the LRU task with
+two `skill` calls (a probe, then the user's `superpowers:brainstorming` or
+`test-driven-development`) and DS4 spent passes classifying the task as
+"bounded or architectural" before writing a line. Every DS4 LRU run first wrote
+to `/Users/enzo/Code/CC-Lab-1/lru.rs` and was refused for escaping the
+workspace: that path was lifted from the cached tokensave MCP server
+instructions, which list the user's other projects. The harness now runs plank
+under a scratch `HOME` whose `.plank` holds the model artifacts (symlinked) and
+the manifests (copied) and nothing else. The symptom that led there is worth
+keeping: a refused write to a path the prompt never mentioned means the path
+came from context, and the repro shows exactly which line.
+
+**A run killed by `timeout(1)` left nothing behind.** SIGTERM ends plank
+without saving, so every timed-out run recorded `toolCalls: 0`, no transcript
+and no repro, and the report's median of 0 tools looked like a model that never
+started. Two of the five were in fact finished: `quicksort.rs` was on disk six
+seconds before the kill. plank treats SIGINT as "interrupt the generation" and
+then saves and writes the repro like any other exit, so the harness now sends
+`-s INT -k 30`; `timeout` still exits 124 on expiry. A missing transcript is
+recorded as `toolCalls: null`, and the summariser leaves unknowns out of the
+medians and says how many there were, because a floor printed as a total is a
+number nobody questions. The other three timeouts were DS4.1 at 11 tok/s never
+reaching its first tool call inside 300 s; a limit has to be set for the
+slowest model in the matrix, not the fastest.
+
+**`/init` told the model to use a `task` sub-agent, and `task` is the todo
+tool.** All nine init runs, all three models, dispatched the survey to `task`,
+got `task requires 'op' set to add, update, or list` back, and only then found
+`agent`. One wasted round per `/init`, identical everywhere, invisible in a
+"completed" status. The prompt now names `agent`, and the parity test that
+checks the prompt's tool names against the registry also asserts it never names
+`task` again. The general lesson: when two tools share a word, a prompt that
+uses the word informally will be read as the tool name.

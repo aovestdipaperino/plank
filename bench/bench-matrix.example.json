@@ -1,8 +1,8 @@
 {
-  "name": "coding-baseline",
+  "name": "coding-baseline-no-skills",
   "iterations": 3,
   "snapshotPass": false,
-  "plankArgs": ["--ui", "chart", "--temp", "0", "--seed", "1", "-n", "8000"],
+  "plankArgs": ["--ui", "chart", "--temp", "0", "--seed", "1", "-n", "8000", "--debug", "--no-skills"],
   "models": [
     { "id": "qwen", "args": ["--qwen"] },
     { "id": "ds4",  "args": [] },
@@ -11,11 +11,17 @@
   "prompts": [
     { "id": "quicksort",
       "text": "Write a quick sort implementation in Rust to a file named quicksort.rs in the current directory, with unit tests.",
-      "timeoutSecs": 300,
+      "timeoutSecs": 900,
       "runInitAtEnd": true,
       "initTimeoutSecs": 1800 },
     { "id": "lru",
       "text": "Write a thread-safe LRU cache in Rust to a file named lru.rs in the current directory, with unit tests.",
-      "timeoutSecs": 600 }
+      "timeoutSecs": 2700 },
+    { "id": "life",
+      "text": "Build Conway's Game of Life as a TUI app in Rust: a Cargo project in the current directory (Cargo.toml and src/), rendering the grid in the terminal with play, pause and single-step controls, with unit tests for the rules.",
+      "timeoutSecs": 3600 },
+    { "id": "sudoku",
+      "text": "Build a sudoku solver in Rust as a Cargo project in the current directory (Cargo.toml and src/), with a command-line interface that generates and solves puzzles at three difficulty levels (easy, medium, hard), with unit tests.",
+      "timeoutSecs": 3600 }
   ]
 }
