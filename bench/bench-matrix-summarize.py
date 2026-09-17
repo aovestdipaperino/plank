@@ -14,21 +14,44 @@ import sys
 
 STATUSES = ("completed", "failed", "guard-stopped", "timeout")
 
+# Keys every record must have to be rendered. `transcript` and `rundir` are
+# also written by bench-matrix.sh but nothing here reads them, so they are
+# deliberately not required -- a record missing only those still renders.
+REQUIRED_KEYS = (
+    "model", "prompt", "iter", "phase", "status", "exit",
+    "seconds", "toolCalls", "files",
+)
+
 
 def load(outdir):
-    """Every run record under outdir, skipping any that did not parse."""
+    """Every run record under outdir, skipping any that did not parse or
+    is missing a required key."""
     runs = []
     for path in sorted(outdir.rglob("*.run.json")):
         try:
             with path.open() as fh:
-                runs.append(json.load(fh))
+                record = json.load(fh)
         except (json.JSONDecodeError, OSError):
-            print(f"<!-- unreadable: {path} -->")
+            print(f"<!-- unreadable: {path} -->", file=sys.stderr)
+            continue
+        missing = [k for k in REQUIRED_KEYS if k not in record]
+        if missing:
+            print(f"<!-- incomplete: {path} missing {', '.join(missing)} -->",
+                  file=sys.stderr)
+            continue
+        runs.append(record)
     return runs
 
 
 def tally(runs):
-    return {s: sum(1 for r in runs if r["status"] == s) for s in STATUSES}
+    t = {s: sum(1 for r in runs if r["status"] == s) for s in STATUSES}
+    other = [r for r in runs if r["status"] not in STATUSES]
+    if other:
+        for r in other:
+            print(f"<!-- unexpected status: {r['status']!r} "
+                  f"({r['model']}/{r['prompt']}/{r['phase']}) -->", file=sys.stderr)
+        t["other"] = len(other)
+    return t
 
 
 def med(runs, key):
@@ -38,9 +61,9 @@ def med(runs, key):
 
 def detail(runs):
     print("## per model, prompt and phase\n")
-    print("| model | prompt | phase | ok | fail | guard | timeout "
+    print("| model | prompt | phase | ok | fail | guard | timeout | other "
           "| median s | median tools | seconds |")
-    print("|---|---|---|---|---|---|---|---|---|---|")
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
     seen = []
     for r in runs:
         key = (r["model"], r["prompt"], r["phase"])
@@ -52,20 +75,21 @@ def detail(runs):
         t = tally(group)
         each = " ".join(f"{r['seconds']:.0f}" for r in sorted(group, key=lambda r: r["iter"]))
         print(f"| {model} | {prompt} | {phase} | {t['completed']} | {t['failed']} "
-              f"| {t['guard-stopped']} | {t['timeout']} | {med(group, 'seconds'):.1f} "
+              f"| {t['guard-stopped']} | {t['timeout']} | {t.get('other', 0)} "
+              f"| {med(group, 'seconds'):.1f} "
               f"| {med(group, 'toolCalls'):.0f} | {each} |")
     print()
 
 
 def rollup(runs):
     print("## per model\n")
-    print("| model | runs | ok | fail | guard | timeout | total s | tool calls |")
-    print("|---|---|---|---|---|---|---|---|")
+    print("| model | runs | ok | fail | guard | timeout | other | total s | tool calls |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for model in dict.fromkeys(r["model"] for r in runs):
         group = [r for r in runs if r["model"] == model]
         t = tally(group)
         print(f"| {model} | {len(group)} | {t['completed']} | {t['failed']} "
-              f"| {t['guard-stopped']} | {t['timeout']} "
+              f"| {t['guard-stopped']} | {t['timeout']} | {t.get('other', 0)} "
               f"| {sum(r['seconds'] for r in group):.0f} "
               f"| {sum(r['toolCalls'] for r in group)} |")
     print()
@@ -80,6 +104,8 @@ def footer(runs):
     print(f"- failed: {t['failed']}")
     print(f"- guard-stopped: {t['guard-stopped']}")
     print(f"- timed out: {t['timeout']}")
+    if "other" in t:
+        print(f"- other status: {t['other']}")
     print(f"- total wall time: {total / 3600:.2f} h ({total:.0f} s)")
     print(f"- total tool calls: {sum(r['toolCalls'] for r in runs)}")
     print()
