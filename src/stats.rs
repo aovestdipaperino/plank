@@ -405,9 +405,7 @@ fn render_grid(stats: &Stats, color: bool) -> Vec<String> {
     lines
 }
 
-/// The `Less ■ ■ ■ ■ More` legend, shown only alongside the panel hint —
-/// otherwise it would put every shade in the output regardless of what the
-/// grid actually contains, defeating tests that check a single day's shade.
+/// The `Less ■ ■ ■ ■ More` legend explaining the heatmap's shading.
 fn render_legend(color: bool) -> String {
     const GUTTER: &str = "     ";
     let mut legend = String::from(GUTTER);
@@ -426,6 +424,7 @@ fn render_legend(color: bool) -> String {
 pub fn render(stats: &Stats, scope: Scope, color: bool, hint: bool) -> String {
     let f = stats.figures(scope);
     let mut out = render_grid(stats, color);
+    out.push(render_legend(color));
     out.push(String::new());
 
     let scopes: Vec<String> = [Scope::AllTime, Scope::Last7, Scope::Last30]
@@ -489,7 +488,6 @@ pub fn render(stats: &Stats, scope: Scope, color: bool, hint: bool) -> String {
     ));
     if hint {
         out.push(String::new());
-        out.push(render_legend(color));
         out.push(fg(color, MUTED, "/stats cycles range · Esc closes"));
     }
     let mut s = out.join("\n");
@@ -795,8 +793,13 @@ mod tests {
         let today = 20_713;
         let st = Stats::build(&[meta("a", today * DAY, 40, 0)], &[], today * DAY, 0);
         let out = render(&st, Scope::AllTime, true, false);
-        assert!(out.contains(&format!("\x1b[38;5;{}m■", SHADES[3])));
-        assert!(!out.contains(&format!("\x1b[38;5;{}m■", SHADES[0])));
+        let grid = out
+            .lines()
+            .take_while(|l| !l.contains("Less"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(grid.contains(&format!("\x1b[38;5;{}m■", SHADES[3])));
+        assert!(!grid.contains(&format!("\x1b[38;5;{}m■", SHADES[0])));
     }
 
     #[test]
