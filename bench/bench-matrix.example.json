@@ -2,7 +2,7 @@
   "name": "coding-baseline-no-skills",
   "iterations": 3,
   "snapshotPass": false,
-  "plankArgs": ["--ui", "chart", "--temp", "0", "--seed", "1", "-n", "8000", "--debug", "--no-skills"],
+  "plankArgs": ["--ui", "chart", "--temp", "0", "--seed", "1", "-n", "8000", "--debug", "--skills", "off"],
   "models": [
     { "id": "qwen", "args": ["--qwen"] },
     { "id": "ds4",  "args": [] },

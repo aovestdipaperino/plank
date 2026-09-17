@@ -72,6 +72,48 @@ else
 fi
 echo "benchmarking: $PLANK_VERSION"
 
+# A bad argument in plankArgs is 45 identical 16ms failures and an empty
+# report -- which is what `--no-skills` (plank spells it `--skills off`) did to
+# a whole session. --dump-config parses the arguments, prints the resolved
+# settings and exits without loading a model, so checking each model's full
+# vector up front turns hours of nothing into a two-second error. The dummy
+# `-p` is required: `--ui chart` and `--ui quiet` reject a run without one,
+# and the harness only supplies the real prompt per phase.
+#
+# It parses arguments; it does not resolve them. --dump-config echoes a `-m`
+# path back whether or not a file is there, so that is checked separately --
+# the one in the example definition is hand-written and easy to mistype.
+preflight_args() {
+  [ "$DRY_RUN" = 1 ] && return 0
+  local model out i
+  mapfile -t MODEL_IDS < <(jq -r '.models[].id' "$SPEC")
+  for model in "${MODEL_IDS[@]}"; do
+    local -a margs
+    mapfile -t margs < <(jq -r --arg m "$model" \
+      '.models[]|select(.id==$m)|.args[]? // empty' "$SPEC")
+    for i in "${!margs[@]}"; do margs[$i]=${margs[$i]/#\~/$REAL_HOME}; done
+    if ! out=$(HOME=$BENCH_HOME "$PLANK" "${PLANK_ARGS[@]}" "${margs[@]}" \
+                 -p preflight --dump-config 2>&1 >/dev/null); then
+      echo "bench-matrix: plank rejects the arguments for model '$model':" >&2
+      echo "  ${PLANK_ARGS[*]} ${margs[*]}" >&2
+      echo "$out" | sed 's/^/  /' >&2
+      exit 2
+    fi
+    for i in "${!margs[@]}"; do
+      case ${margs[$i]} in
+        -m|--model)
+          local path=${margs[$((i + 1))]:-}
+          if [ -n "$path" ] && [ ! -e "$path" ]; then
+            echo "bench-matrix: model '$model' points at a file that is not there:" >&2
+            echo "  $path" >&2
+            exit 2
+          fi
+          ;;
+      esac
+    done
+  done
+}
+
 NAME=$(jq -r '.name // "bench"' "$SPEC")
 ITERATIONS=$(jq -r '.iterations // 3' "$SPEC")
 SNAPSHOT_PASS=$(jq -r '.snapshotPass // false' "$SPEC")
@@ -229,6 +271,7 @@ run_phase() {
 }
 
 mapfile -t PLANK_ARGS < <(jq -r '.plankArgs[]? // empty' "$SPEC")
+preflight_args
 
 # One iteration: work phase, then the init phase when the prompt asks for it.
 # The init phase runs even when the work phase failed -- measuring /init
