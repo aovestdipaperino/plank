@@ -1,0 +1,21 @@
+{
+  "name": "coding-baseline",
+  "iterations": 3,
+  "snapshotPass": false,
+  "plankArgs": ["--ui", "chart", "--temp", "0", "--seed", "1", "-n", "8000"],
+  "models": [
+    { "id": "qwen", "args": ["--qwen"] },
+    { "id": "ds4",  "args": [] },
+    { "id": "ds41", "args": ["-m", "~/.plank/models/DeepSeek-V4.1-Flash-Q2.gguf"] }
+  ],
+  "prompts": [
+    { "id": "quicksort",
+      "text": "Generate a quick sort algorithm in Rust",
+      "timeoutSecs": 300,
+      "runInitAtEnd": true,
+      "initTimeoutSecs": 1800 },
+    { "id": "lru",
+      "text": "Write a thread-safe LRU cache in Rust",
+      "timeoutSecs": 600 }
+  ]
+}
