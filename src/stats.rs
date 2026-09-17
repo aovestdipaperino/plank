@@ -189,6 +189,7 @@ impl Stats {
             .iter()
             .map(|e| (e.id.as_str(), model_name(e)))
             .collect();
+        let today = day_of(now, tz_offset);
         let rows: Vec<Row> = metas
             .iter()
             .map(|m| Row {
@@ -200,9 +201,8 @@ impl Stats {
                     .cloned()
                     .unwrap_or_else(|| "unknown".to_string()),
             })
-            .filter(|r| r.day <= day_of(now, tz_offset)) // clock-skewed future stamps must not exist
+            .filter(|r| r.day <= today) // clock-skewed future stamps must not exist
             .collect();
-        let today = day_of(now, tz_offset);
         let this_monday = today - i64::try_from(weekday_mon0(today)).unwrap_or(0);
         let grid_start = this_monday - i64::try_from((WEEKS - 1) * 7).unwrap_or(0);
         let mut grid = vec![[0u64; 7]; WEEKS];
