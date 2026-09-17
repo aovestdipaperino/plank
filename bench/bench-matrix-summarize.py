@@ -23,9 +23,40 @@ REQUIRED_KEYS = (
 )
 
 
+# Expected Python type for each required key. `bool` is a subclass of
+# `int` in Python and arithmetic/formatting on a bool works fine (True is
+# just 1), so it is deliberately accepted wherever an int is -- not worth
+# special-casing.
+STR_KEYS = ("model", "prompt", "phase", "status")
+INT_KEYS = ("iter", "exit", "toolCalls", "files")
+NUM_KEYS = ("seconds",)
+
+
+def _shape_errors(record):
+    """List of human-readable problems with record, or [] if it is safe to
+    pass to tally/med/detail/rollup/footer."""
+    if not isinstance(record, dict):
+        return [f"record is {type(record).__name__}, not an object"]
+    errors = []
+    missing = [k for k in REQUIRED_KEYS if k not in record]
+    if missing:
+        errors.append(f"missing {', '.join(missing)}")
+    for k in STR_KEYS:
+        if k in record and not isinstance(record[k], str):
+            errors.append(f"{k} is {type(record[k]).__name__}, not a string")
+    for k in INT_KEYS:
+        if k in record and not isinstance(record[k], int):
+            errors.append(f"{k} is {type(record[k]).__name__}, not an integer")
+    for k in NUM_KEYS:
+        if k in record and not isinstance(record[k], (int, float)):
+            errors.append(f"{k} is {type(record[k]).__name__}, not a number")
+    return errors
+
+
 def load(outdir):
     """Every run record under outdir, skipping any that did not parse or
-    is missing a required key."""
+    is not a well-shaped record: not a dict, missing a required key, or a
+    required key holding a type that would crash rendering."""
     runs = []
     for path in sorted(outdir.rglob("*.run.json")):
         try:
@@ -34,9 +65,9 @@ def load(outdir):
         except (json.JSONDecodeError, OSError):
             print(f"<!-- unreadable: {path} -->", file=sys.stderr)
             continue
-        missing = [k for k in REQUIRED_KEYS if k not in record]
-        if missing:
-            print(f"<!-- incomplete: {path} missing {', '.join(missing)} -->",
+        errors = _shape_errors(record)
+        if errors:
+            print(f"<!-- invalid record: {path}: {'; '.join(errors)} -->",
                   file=sys.stderr)
             continue
         runs.append(record)
