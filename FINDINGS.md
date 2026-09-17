@@ -2946,3 +2946,38 @@ returns immediately unless refresh_sec is given" was accurate to the C and false
 for plank. When mirroring a C function that takes flags derived from each other,
 port the derivation at the call site too, not just the callee's signature.
 
+
+## Benchmarking plank against itself (`bench/bench-matrix.sh`)
+
+A harness that runs plank in a scratch directory has to keep its own files out
+of that directory. Writing the phase log and the per-run JSON record into the
+model's working directory looks harmless and is not: a `/init` phase then
+surveys the harness's bookkeeping and writes an `AGENTS.md` about "a transient
+benchmark scratch directory" instead of about the code, and the `files` count
+has to be filtered by filename to mean anything. The model's tree and the
+harness's metadata belong in sibling directories, and then "every file here is
+model output" is true rather than approximately true.
+
+Two consequences of that split are worth stating separately, because each one
+produced a plausible-looking report that was wrong:
+
+- A snapshot taken by copying the run directory copies the run records too, and
+  a summariser that finds records by recursive glob then counts every one twice.
+  One iteration reported as four runs, with every second and every tool call
+  doubled. Nothing in the numbers looked anomalous.
+- `timeout(1)` does not exist on macOS, and neither does `gtimeout` without
+  coreutils. A harness that wraps runs in it does not fail loudly: the wrapper
+  exits 127, every run records as a failure, and no timeout is ever enforced.
+  Resolve the binary up front, and only demand it when a definition actually
+  asks for a timeout.
+
+On prompts: "Generate a quick sort algorithm in Rust" gets an answer in the
+chat, not a file, and a benchmark that means to snapshot generated code gets
+`files: 0`. Naming the target file in the prompt is what makes the work
+observable on disk. Measured on DS4 Flash at temp 0, that one change took the
+work phase from 100s and 1 tool call to 318s and 9.
+
+`-p` never consulted the slash dispatcher, so `-p "/init"` sent four literal
+characters to the model. Pasting `INIT_PROMPT` in as text is not a substitute:
+`/init` is the only caller of `settings::suspend_loop_guards()`, and its phases
+re-read the same tree by design, which is the shape `LoopGuard` refuses.
