@@ -282,6 +282,236 @@ fn streaks(days: &BTreeSet<i64>, today: i64) -> (usize, usize) {
     (longest, current)
 }
 
+/// Heatmap shades, dimmest first; the last is `THEME_GREEN`.
+pub const SHADES: [u8; 4] = [22, 28, 71, 114];
+const DIM: u8 = 238;
+const MUTED: u8 = 245;
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+fn fg(color: bool, idx: u8, text: &str) -> String {
+    if color {
+        format!("\x1b[38;5;{idx}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn bold_green(color: bool, text: &str) -> String {
+    if color {
+        format!("\x1b[1;38;5;{}m{text}\x1b[0m", SHADES[3])
+    } else {
+        text.to_string()
+    }
+}
+
+/// `k`/`m`/`b` with one decimal above 999.
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // token counts are already approximate
+pub fn fmt_count(n: u64) -> String {
+    let f = n as f64;
+    if n >= 1_000_000_000 {
+        format!("{:.1}b", f / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{:.1}m", f / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}k", f / 1e3)
+    } else {
+        n.to_string()
+    }
+}
+
+/// `Nd Nh Nm`, dropping leading zero units; never empty.
+#[must_use]
+pub fn fmt_duration(secs: u64) -> String {
+    let d = secs / 86_400;
+    let h = secs % 86_400 / 3_600;
+    let m = secs % 3_600 / 60;
+    if d > 0 {
+        format!("{d}d {h}h {m}m")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+fn fmt_day(day: i64) -> String {
+    let (_, m, d) = civil(day);
+    format!("{} {d}", MONTHS[usize::try_from(m).unwrap_or(1) - 1])
+}
+
+/// Shade index for a day's tokens given the sorted non-zero daily totals.
+fn shade_for(tokens: u64, sorted: &[u64]) -> usize {
+    if sorted.len() < 2 {
+        return 3;
+    }
+    let rank = sorted.partition_point(|&v| v < tokens);
+    (rank * 4 / sorted.len()).min(3)
+}
+
+fn render_grid(stats: &Stats, color: bool) -> Vec<String> {
+    const GUTTER: &str = "     ";
+    let mut sorted: Vec<u64> = stats
+        .grid
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&v| v > 0)
+        .collect();
+    sorted.sort_unstable();
+    let mut lines = Vec::with_capacity(9);
+
+    let mut header = String::from(GUTTER);
+    let mut last_month = 0;
+    for (col, _) in stats.grid.iter().enumerate() {
+        let monday = stats.grid_start + i64::try_from(col * 7).unwrap_or(0);
+        let (_, m, _) = civil(monday);
+        if m != last_month && header.len() <= GUTTER.len() + col * 2 {
+            header.push_str(MONTHS[usize::try_from(m).unwrap_or(1) - 1]);
+            header.push(' ');
+            last_month = m;
+        } else if header.len() < GUTTER.len() + col * 2 + 2 {
+            while header.len() < GUTTER.len() + col * 2 + 2 {
+                header.push(' ');
+            }
+        }
+    }
+    lines.push(header.trim_end().to_string());
+
+    for row in 0..7 {
+        let label = match row {
+            0 => "Mon  ",
+            2 => "Wed  ",
+            4 => "Fri  ",
+            _ => GUTTER,
+        };
+        let mut line = String::from(label);
+        for (col, week) in stats.grid.iter().enumerate() {
+            let day = stats.grid_start + i64::try_from(col * 7 + row).unwrap_or(0);
+            let cell = if day > stats.today {
+                " ".to_string()
+            } else if week[row] == 0 {
+                fg(color, DIM, "·")
+            } else {
+                fg(color, SHADES[shade_for(week[row], &sorted)], "■")
+            };
+            line.push_str(&cell);
+            line.push(' ');
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    lines
+}
+
+/// The `Less ■ ■ ■ ■ More` legend, shown only alongside the panel hint —
+/// otherwise it would put every shade in the output regardless of what the
+/// grid actually contains, defeating tests that check a single day's shade.
+fn render_legend(color: bool) -> String {
+    const GUTTER: &str = "     ";
+    let mut legend = String::from(GUTTER);
+    legend.push_str("Less ");
+    for s in SHADES {
+        legend.push_str(&fg(color, s, "■"));
+        legend.push(' ');
+    }
+    legend.push_str("More");
+    legend
+}
+
+/// The whole `/stats` report as text, ANSI-colored when `color`, with the
+/// panel footer hint when `hint`.
+#[must_use]
+pub fn render(stats: &Stats, scope: Scope, color: bool, hint: bool) -> String {
+    let f = stats.figures(scope);
+    let mut out = render_grid(stats, color);
+    out.push(String::new());
+
+    let scopes: Vec<String> = [Scope::AllTime, Scope::Last7, Scope::Last30]
+        .iter()
+        .map(|s| {
+            if *s == scope {
+                bold_green(color, s.label())
+            } else {
+                fg(color, MUTED, s.label())
+            }
+        })
+        .collect();
+    out.push(scopes.join(&fg(color, MUTED, " · ")));
+    out.push(String::new());
+
+    let val = |s: &str| fg(color, SHADES[3], s);
+    let dash = "-".to_string();
+    let left = [
+        format!(
+            "Favorite model: {}",
+            val(f.favorite_model.as_deref().unwrap_or("-"))
+        ),
+        format!("Sessions: {}", val(&f.sessions.to_string())),
+        format!(
+            "Active days: {}{}",
+            val(&f.active_days.to_string()),
+            fg(color, MUTED, &format!("/{}", f.span_days))
+        ),
+        format!(
+            "Most active day: {}",
+            val(&f.most_active_day.map_or(dash.clone(), fmt_day))
+        ),
+    ];
+    let right = [
+        format!(
+            "Total tokens: {} {}",
+            val(&fmt_count(f.approx_tokens)),
+            fg(color, MUTED, "(approx)")
+        ),
+        format!(
+            "Longest session: {}",
+            val(&fmt_duration(f.longest_session_secs))
+        ),
+        format!(
+            "Longest streak: {} days",
+            val(&f.longest_streak.to_string())
+        ),
+        format!(
+            "Current streak: {} days",
+            val(&f.current_streak.to_string())
+        ),
+    ];
+    for (l, r) in left.iter().zip(right.iter()) {
+        let pad = 34usize.saturating_sub(visible_len(l));
+        out.push(format!("{l}{}{r}", " ".repeat(pad)));
+    }
+    out.push(fg(
+        color,
+        MUTED,
+        "tokens are approximate (transcript bytes / 4)",
+    ));
+    if hint {
+        out.push(String::new());
+        out.push(render_legend(color));
+        out.push(fg(color, MUTED, "/stats cycles range · Esc closes"));
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+/// Characters shown once ANSI escapes are dropped.
+fn visible_len(s: &str) -> usize {
+    let mut n = 0;
+    let mut in_esc = false;
+    for c in s.chars() {
+        match (in_esc, c) {
+            (true, 'm') => in_esc = false,
+            (true, _) => {}
+            (false, '\x1b') => in_esc = true,
+            (false, _) => n += 1,
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +691,126 @@ mod tests {
         assert_eq!(f.most_active_day, None);
         assert_eq!(f.favorite_model, None);
         assert_eq!(st.first_day, None);
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn counts_and_durations_format_compactly() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1_500), "1.5k");
+        assert_eq!(fmt_count(34_300_000_000), "34.3b");
+        assert_eq!(fmt_count(119_200_000), "119.2m");
+        assert_eq!(fmt_duration(0), "0m");
+        assert_eq!(fmt_duration(59), "0m");
+        assert_eq!(fmt_duration(3_600 + 120), "1h 2m");
+        assert_eq!(
+            fmt_duration(31 * 86_400 + 20 * 3_600 + 4 * 60),
+            "31d 20h 4m"
+        );
+    }
+
+    #[test]
+    fn plain_render_has_no_escapes_and_names_every_figure() {
+        let today = 20_713;
+        let now = today * DAY;
+        let metas = [meta("a", (today - 1) * DAY, 4_000, 3_600)];
+        let st = Stats::build(&metas, &[entry("a", "ds4")], now, 0);
+        let out = render(&st, Scope::AllTime, false, true);
+        assert!(!out.contains('\x1b'));
+        for needle in [
+            "Favorite model: DeepSeek V4 Flash",
+            "Total tokens: 1.0k (approx)",
+            "Sessions: 1",
+            "Active days: 1/2",
+            "Most active day: Sep 16",
+            "Longest session: 1h 0m",
+            "Longest streak: 1 days",
+            "Current streak: 1 days",
+            "tokens are approximate (transcript bytes / 4)",
+            "/stats cycles range · Esc closes",
+            "Less ",
+            " More",
+            "Mon",
+            "Wed",
+            "Fri",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+        }
+        assert!(!render(&st, Scope::AllTime, false, false).contains("Esc closes"));
+    }
+
+    #[test]
+    fn the_active_scope_is_marked_and_the_others_listed() {
+        let st = Stats::build(&[], &[], 20_713 * DAY, 0);
+        let out = strip_ansi(&render(&st, Scope::Last7, true, false));
+        assert!(out.contains("All time · Last 7 days · Last 30 days"));
+        assert!(out.contains("Most active day: -"));
+        assert!(out.contains("Favorite model: -"));
+    }
+
+    #[test]
+    fn colored_render_uses_only_green_shades_and_dim_greys() {
+        let today = 20_713;
+        let now = today * DAY;
+        let metas: Vec<_> = (0..8)
+            .map(|i| meta(&format!("s{i}"), (today - i) * DAY, 400 * (i + 1), 0))
+            .collect();
+        let st = Stats::build(&metas, &[], now, 0);
+        let out = render(&st, Scope::AllTime, true, true);
+        let mut seen = std::collections::BTreeSet::new();
+        for part in out.split("\x1b[38;5;").skip(1) {
+            let n: u32 = part.split('m').next().unwrap().parse().unwrap();
+            seen.insert(n);
+        }
+        for n in &seen {
+            assert!(
+                [22, 28, 71, 114, 238, 245].contains(n),
+                "unexpected color index {n}"
+            );
+        }
+        for shade in SHADES {
+            assert!(seen.contains(&u32::from(shade)), "shade {shade} unused");
+        }
+    }
+
+    #[test]
+    fn a_single_active_day_gets_the_brightest_shade() {
+        let today = 20_713;
+        let st = Stats::build(&[meta("a", today * DAY, 40, 0)], &[], today * DAY, 0);
+        let out = render(&st, Scope::AllTime, true, false);
+        assert!(out.contains(&format!("\x1b[38;5;{}m■", SHADES[3])));
+        assert!(!out.contains(&format!("\x1b[38;5;{}m■", SHADES[0])));
+    }
+
+    #[test]
+    fn month_labels_appear_in_calendar_order_across_a_year_boundary() {
+        let today = 20_713; // 2026-09-17
+        let st = Stats::build(&[], &[], today * DAY, 0);
+        let out = render(&st, Scope::AllTime, false, false);
+        let header = out.lines().next().unwrap();
+        let months: Vec<&str> = header.split_whitespace().collect();
+        assert_eq!(months.first(), Some(&"Sep"));
+        assert_eq!(months.last(), Some(&"Sep"));
+        let pos = |m: &str| months.iter().position(|x| *x == m).unwrap();
+        assert!(pos("Dec") < pos("Jan"));
+        assert!(pos("Jan") < pos("Feb"));
+        assert_eq!(months.len(), 13);
     }
 }
