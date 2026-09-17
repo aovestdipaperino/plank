@@ -200,6 +200,7 @@ impl Stats {
                     .cloned()
                     .unwrap_or_else(|| "unknown".to_string()),
             })
+            .filter(|r| r.day <= day_of(now, tz_offset)) // clock-skewed future stamps must not exist
             .collect();
         let today = day_of(now, tz_offset);
         let this_monday = today - i64::try_from(weekday_mon0(today)).unwrap_or(0);
@@ -433,6 +434,22 @@ mod tests {
         assert_eq!(f.most_active_day, Some(today - 3));
         assert_eq!(f.longest_session_secs, 7200);
         assert_eq!(f.favorite_model.as_deref(), Some("DeepSeek V4.1 Flash"));
+    }
+
+    #[test]
+    fn a_session_dated_in_the_future_is_ignored_everywhere() {
+        let today: i64 = 20_713;
+        let now = today.cast_unsigned() * DAY;
+        let metas = [
+            meta("future", (today + 5).cast_unsigned() * DAY, 4000, 60),
+            meta("todays", today.cast_unsigned() * DAY, 400, 30),
+        ];
+        let st = Stats::build(&metas, &[], now, 0);
+        let f = st.figures(Scope::AllTime);
+        assert_eq!(f.sessions, 1);
+        assert_eq!(f.most_active_day, Some(today));
+        assert_eq!(f.current_streak, 1);
+        assert_eq!(f.approx_tokens, 100);
     }
 
     #[test]
