@@ -83,6 +83,25 @@ echo "benchmarking: $PLANK_VERSION"
 # It parses arguments; it does not resolve them. --dump-config echoes a `-m`
 # path back whether or not a file is there, so that is checked separately --
 # the one in the example definition is hand-written and easy to mistype.
+# plank flocks a model lock file and refuses to start while another instance
+# holds it, because only one process can map the ~82 GB of weights. A single
+# plank left over from an earlier session therefore fails every run in this
+# one -- 45 records reading "failed" with the reason buried in a per-phase log
+# nobody opens until the session is over. That happened today, and it is why
+# the interrupt trap exists. Checked here as well, because the leftover is not
+# always this harness's doing.
+preflight_no_other_plank() {
+  [ "$DRY_RUN" = 1 ] && return 0
+  local others
+  others=$(pgrep -x plank 2>/dev/null || true)
+  [ -z "$others" ] && return 0
+  echo "bench-matrix: another plank is already running; it holds the model lock" >&2
+  echo "  and every run in this session would fail against it:" >&2
+  ps -o pid,etime,command -p $(echo "$others" | tr '\n' ',' | sed 's/,$//') 2>/dev/null |
+    sed 's/^/  /' >&2
+  exit 2
+}
+
 preflight_args() {
   [ "$DRY_RUN" = 1 ] && return 0
   local model out i
@@ -326,6 +345,7 @@ run_phase() {
 }
 
 mapfile -t PLANK_ARGS < <(jq -r '.plankArgs[]? // empty' "$SPEC")
+preflight_no_other_plank
 preflight_args
 
 # One iteration: work phase, then the init phase when the prompt asks for it.

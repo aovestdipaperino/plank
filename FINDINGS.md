@@ -3021,3 +3021,39 @@ got `task requires 'op' set to add, update, or list` back, and only then found
 checks the prompt's tool names against the registry also asserts it never names
 `task` again. The general lesson: when two tools share a word, a prompt that
 uses the word informally will be read as the tool name.
+
+## A leftover plank fails a whole benchmark session, and Ctrl-C used to make one
+
+Three bench-matrix sessions died in a row today, and only the first died of
+what the report said. A bad `plankArgs` entry killed the first; the second
+recorded 45 runs "failed" with a reason visible only inside a per-phase log:
+
+```
+plank: another plank (ds4) instance is already running (PID 22850).
+```
+
+`singleton.rs` flocks a model lock file because only one process can map the
+~82 GB of weights, so a single orphan fails every run behind it. The orphan
+came from the harness itself. A terminal SIGINT reaches the whole foreground
+process group, so plank took Ctrl-C as "interrupt the generation", saved and
+exited, and the loop started the next of 45 runs as if nothing had happened;
+killing the script instead left plank alive with the weights mapped, working
+in a directory that had already been deleted. Either way the next session
+found the lock held.
+
+So the harness now traps the signal and stops the child deliberately — SIGINT
+first, since that is what makes plank save its transcript and write its repro,
+then SIGKILL after a grace period — and refuses to start at all while another
+plank is running. Two things made that trap work that are easy to get wrong:
+bash defers a trap until the foreground command returns, so the run has to be
+backgrounded and `wait`ed on; and `timeout(1)` relays signals only while it is
+alive, so a KILL has to be delivered to the whole child tree rather than
+through the middleman.
+
+One consequence is worth knowing rather than fixing: a plank that exits after
+an interrupt exits 0, so a run killed from outside the harness records as
+`completed` with whatever partial work it had done. Under `timeout(1)` this
+never shows, because 124 overrides it, and the trap exits before writing a
+record. But a `kill -INT` aimed at plank by hand produces a record that says
+completed and means interrupted — the repro is the place that says so, under
+`outcome`.
