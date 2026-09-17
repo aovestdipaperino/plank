@@ -538,7 +538,7 @@ impl Default for Session {
 }
 
 /// Lightweight listing record for one saved session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionEntry {
     /// Session id (memorable name, or a legacy 40-hex id).
     pub id: String,
