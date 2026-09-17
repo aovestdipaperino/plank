@@ -10,12 +10,12 @@
   ],
   "prompts": [
     { "id": "quicksort",
-      "text": "Generate a quick sort algorithm in Rust",
+      "text": "Write a quick sort implementation in Rust to a file named quicksort.rs in the current directory, with unit tests.",
       "timeoutSecs": 300,
       "runInitAtEnd": true,
       "initTimeoutSecs": 1800 },
     { "id": "lru",
-      "text": "Write a thread-safe LRU cache in Rust",
+      "text": "Write a thread-safe LRU cache in Rust to a file named lru.rs in the current directory, with unit tests.",
       "timeoutSecs": 600 }
   ]
 }

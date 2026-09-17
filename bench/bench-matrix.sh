@@ -91,10 +91,16 @@ new_transcript() {
   comm -13 "$before" <(ls "$KVDIR"/*.kv 2>/dev/null | sort) | head -1
 }
 
-# One phase: $1 rundir, $2 model id, $3 prompt id, $4 iter, $5 phase name,
-# $6 timeout (empty = none), $7 prompt text, rest = model args.
+# One phase: $1 rundir, $2 metadir, $3 model id, $4 prompt id, $5 iter,
+# $6 phase name, $7 timeout (empty = none), $8 prompt text, rest = model args.
+#
+# rundir is the model's working tree and holds nothing else -- the log and the
+# run.json go to metadir, a sibling. They used to land in rundir, where /init
+# surveyed them and wrote an AGENTS.md about "a transient benchmark scratch
+# directory" instead of about the code, and where they had to be excluded by
+# name from the `files` count. An empty tree is the whole point of the run.
 run_phase() {
-  local rundir=$1 model=$2 prompt=$3 iter=$4 phase=$5 tmo=$6 text=$7; shift 7
+  local rundir=$1 metadir=$2 model=$3 prompt=$4 iter=$5 phase=$6 tmo=$7 text=$8; shift 8
   local margs=("$@")
   local before; before=$(mktemp)
   ls "$KVDIR"/*.kv 2>/dev/null | sort > "$before"
@@ -115,9 +121,9 @@ run_phase() {
   local start end exit_code=0
   start=$(date +%s.%N)
   if [ "$DRY_RUN" = 1 ]; then
-    printf '%q ' "${cmd[@]}" > "$rundir/$phase.log"; echo >> "$rundir/$phase.log"
+    printf '%q ' "${cmd[@]}" > "$metadir/$phase.log"; echo >> "$metadir/$phase.log"
   else
-    "${cmd[@]}" > "$rundir/$phase.log" 2>&1 || exit_code=$?
+    "${cmd[@]}" > "$metadir/$phase.log" 2>&1 || exit_code=$?
   fi
   end=$(date +%s.%N)
 
@@ -148,11 +154,11 @@ run_phase() {
     --argjson iter "$iter" --argjson exit "$exit_code" \
     --argjson seconds "$seconds" \
     --argjson toolCalls "${tools:-0}" \
-    --argjson files "$(find "$rundir" -type f -not -name '*.log' -not -name '*.run.json' | wc -l | tr -d ' ')" \
+    --argjson files "$(find "$rundir" -type f | wc -l | tr -d ' ')" \
     '{model:$model,prompt:$prompt,iter:$iter,phase:$phase,status:$status,
       exit:$exit,seconds:$seconds,toolCalls:$toolCalls,files:$files,
       transcript:$transcript,rundir:$rundir}' \
-    > "$rundir/$phase.run.json"
+    > "$metadir/$phase.run.json"
 
   echo "    $status  $(printf '%.1f' "$seconds")s  ${tools:-0} tool calls"
 }
@@ -164,8 +170,9 @@ mapfile -t PLANK_ARGS < <(jq -r '.plankArgs[]? // empty' "$SPEC")
 # against a half-built tree beats leaving a hole in the matrix.
 run_iteration() {
   local model=$1 prompt=$2 iter=$3 label=$4; shift 4
-  local rundir=$RUNROOT/$model/$prompt/$label
-  rm -rf -- "$rundir"; mkdir -p "$rundir"
+  local rundir=$RUNROOT/$model/$prompt/$label/tree
+  local metadir=$RUNROOT/$model/$prompt/$label/meta
+  rm -rf -- "$RUNROOT/$model/$prompt/$label"; mkdir -p "$rundir" "$metadir"
 
   local text tmo init_at_end init_tmo
   text=$(jq -r --arg p "$prompt" '.prompts[]|select(.id==$p)|.text' "$SPEC")
@@ -178,14 +185,15 @@ run_iteration() {
   # ~ is not expanded inside JSON strings; plank is given a real path.
   local i; for i in "${!margs[@]}"; do margs[$i]=${margs[$i]/#\~/$HOME}; done
 
-  run_phase "$rundir" "$model" "$prompt" "$iter" work "$tmo" "$text" "${margs[@]}"
+  run_phase "$rundir" "$metadir" "$model" "$prompt" "$iter" work "$tmo" "$text" "${margs[@]}"
   if [ "$init_at_end" = true ]; then
-    run_phase "$rundir" "$model" "$prompt" "$iter" init "$init_tmo" "/init" "${margs[@]}"
+    run_phase "$rundir" "$metadir" "$model" "$prompt" "$iter" init "$init_tmo" "/init" "${margs[@]}"
   fi
   # Returned in a variable, not on stdout: run_phase's progress lines go to
   # the terminal as they happen, and capturing this function would swallow
   # them for the length of a run that takes minutes.
   RUNDIR=$rundir
+  METADIR=$metadir
 }
 
 # Models outermost, so each model is loaded once per sweep rather than once
@@ -205,13 +213,19 @@ for model in $(jq -r '.models[].id' "$SPEC"); do
       [ -z "$keep" ] && [ "$n" = 1 ] && keep=$RUNDIR
       # A phase's run.json is named for its phase, so iterations would collide
       # in one directory. The iteration prefix is what keeps them apart.
-      for f in "$RUNDIR"/*.run.json; do
+      for f in "$METADIR"/*.run.json; do
         [ -e "$f" ] || continue
         cp "$f" "$OUTDIR/$model/$prompt/iter$n.$(basename "$f")"
       done
     done
     # The snapshot: the tree as the model left it, code and AGENTS.md together.
+    # $keep is the model's tree, which now holds nothing the harness wrote, so
+    # this copies model output and only model output. When it held the logs and
+    # the run.json too, the summariser's recursive glob found every record a
+    # second time inside the snapshot and double-counted every run, second and
+    # tool call.
     [ -n "$keep" ] && cp -R "$keep" "$OUTDIR/$model/$prompt/snapshot"
+    true
   done
 done
 
