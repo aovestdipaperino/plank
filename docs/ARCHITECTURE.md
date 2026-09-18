@@ -603,8 +603,10 @@ is handed to `last_edited` when the turn ends so a bare `/open` finds it.
 longest streak, most active day, current streak), computed deterministically
 from the per-session metadata `insights::collect_metas` already caches under
 `~/.plank/usage-data/session-meta/` — the model is never called. Token counts
-are approximate (transcript bytes / 4, plank keeps no real per-session token
-count) and the report says so. The heatmap is always all-time; only the
+are transcript bytes / 4, because plank keeps no real per-session token count;
+the report states the figure without the caveat, since a number nobody can act
+on is not made more useful by doubting it in the margin. The heatmap is always
+all-time; only the
 figures below it take a scope (all time, last 7 days, last 30 days). In the
 TUI it opens in the same dismissable `ReportPanel` as `/usage`, with the scope
 carried in the panel title so re-issuing `/stats` with no argument can cycle

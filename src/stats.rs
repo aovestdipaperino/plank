@@ -292,7 +292,10 @@ fn streaks(days: &BTreeSet<i64>, today: i64) -> (usize, usize) {
 
 /// Heatmap shades, dimmest first; the last is `THEME_GREEN`.
 pub const SHADES: [u8; 4] = [22, 28, 71, 114];
-const DIM: u8 = 238;
+/// A day with no activity. Darker than it would need to be on its own: the
+/// cells sit edge to edge, so a lighter grey reads as one slab of background
+/// rather than as a calendar the green sits on.
+const DIM: u8 = 236;
 const MUTED: u8 = 245;
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -370,6 +373,47 @@ fn shade_for(tokens: u64, distinct: &[u64]) -> usize {
     (rank * 3 / (distinct.len() - 1)).min(3)
 }
 
+/// Colour index a day's cell paints in, or `None` for a day that has not
+/// happened yet (the last column runs past today).
+fn day_shade(stats: &Stats, distinct: &[u64], col: usize, row: usize) -> Option<u8> {
+    let day = stats.grid_start + i64::try_from(col * 7 + row).unwrap_or(0);
+    if day > stats.today {
+        return None;
+    }
+    let tokens = stats.grid[col][row];
+    Some(if tokens == 0 {
+        DIM
+    } else {
+        SHADES[shade_for(tokens, distinct)]
+    })
+}
+
+/// One character holding two weekdays, the upper half `top` and the lower half
+/// `bottom`, as `▀` over a background. An absent day leaves its half at the
+/// terminal default rather than painting it.
+fn half_block(top: Option<u8>, bottom: Option<u8>) -> String {
+    use std::fmt::Write as _;
+    if top.is_none() && bottom.is_none() {
+        return " ".to_string();
+    }
+    let mut s = String::new();
+    match top {
+        Some(idx) => {
+            let _ = write!(s, "\x1b[38;5;{idx}m");
+        }
+        None => s.push_str("\x1b[39m"),
+    }
+    match bottom {
+        Some(idx) => {
+            let _ = write!(s, "\x1b[48;5;{idx}m");
+        }
+        None => s.push_str("\x1b[49m"),
+    }
+    s.push('▀');
+    s.push_str("\x1b[0m");
+    s
+}
+
 fn render_grid(stats: &Stats, color: bool) -> Vec<String> {
     const GUTTER: &str = "     ";
     let mut distinct: Vec<u64> = stats
@@ -383,42 +427,62 @@ fn render_grid(stats: &Stats, color: bool) -> Vec<String> {
     distinct.dedup();
     let mut lines = Vec::with_capacity(9);
 
+    // One character per week, not two: at two the 53 columns overflow a normal
+    // terminal and the panel wraps every row. The cells stay square because a
+    // character cell is about twice as tall as it is wide, and the coloured
+    // grid packs two weekdays into each one.
     let mut header = String::from(GUTTER);
     let mut last_month = 0;
     for (col, _) in stats.grid.iter().enumerate() {
         let monday = stats.grid_start + i64::try_from(col * 7).unwrap_or(0);
         let (_, m, _) = civil(monday);
-        if m != last_month && header.len() <= GUTTER.len() + col * 2 {
+        if m != last_month && header.len() <= GUTTER.len() + col {
             header.push_str(MONTHS[usize::try_from(m).unwrap_or(1) - 1]);
             header.push(' ');
             last_month = m;
         } else {
-            while header.len() < GUTTER.len() + col * 2 + 2 {
+            while header.len() < GUTTER.len() + col + 1 {
                 header.push(' ');
             }
         }
     }
     lines.push(header.trim_end().to_string());
 
-    for row in 0..7 {
-        let label = match row {
-            0 => "Mon  ",
-            2 => "Wed  ",
-            4 => "Fri  ",
-            _ => GUTTER,
-        };
-        let mut line = String::from(label);
-        for (col, week) in stats.grid.iter().enumerate() {
-            let day = stats.grid_start + i64::try_from(col * 7 + row).unwrap_or(0);
-            let cell = if day > stats.today {
-                " ".to_string()
-            } else if week[row] == 0 {
-                fg(color, DIM, "·")
-            } else {
-                fg(color, SHADES[shade_for(week[row], &distinct)], "■")
+    if !color {
+        // Without colour a half block cannot say what its two halves are, so
+        // the plain report keeps one row per weekday.
+        for row in 0..7 {
+            let label = match row {
+                0 => "Mon  ",
+                2 => "Wed  ",
+                4 => "Fri  ",
+                _ => GUTTER,
             };
-            line.push_str(&cell);
-            line.push(' ');
+            let mut line = String::from(label);
+            for col in 0..stats.grid.len() {
+                line.push(match day_shade(stats, &distinct, col, row) {
+                    None => ' ',
+                    Some(DIM) => '·',
+                    Some(_) => '■',
+                });
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        return lines;
+    }
+
+    // Monday over Tuesday, Wednesday over Thursday, and so on, so each row
+    // label names the weekday of its upper half and Sunday rides alone.
+    for (row, label) in [(0, "Mon  "), (2, "Wed  "), (4, "Fri  "), (6, "Sun  ")] {
+        let mut line = String::from(label);
+        for col in 0..stats.grid.len() {
+            let top = day_shade(stats, &distinct, col, row);
+            let bottom = if row + 1 < 7 {
+                day_shade(stats, &distinct, col, row + 1)
+            } else {
+                None
+            };
+            line.push_str(&half_block(top, bottom));
         }
         lines.push(line.trim_end().to_string());
     }
@@ -479,11 +543,7 @@ pub fn render(stats: &Stats, scope: Scope, color: bool, hint: bool) -> String {
         ),
     ];
     let right = [
-        format!(
-            "Total tokens: {} {}",
-            val(&fmt_count(f.approx_tokens)),
-            fg(color, MUTED, "(approx)")
-        ),
+        format!("Total tokens: {}", val(&fmt_count(f.approx_tokens))),
         format!(
             "Longest span: {}",
             val(&fmt_duration(f.longest_session_secs))
@@ -509,11 +569,6 @@ pub fn render(stats: &Stats, scope: Scope, color: bool, hint: bool) -> String {
     for (l, r) in left.iter().zip(right.iter()) {
         out.push(format!("{l}{}{r}", " ".repeat(col - visible_len(l))));
     }
-    out.push(fg(
-        color,
-        MUTED,
-        "tokens are approximate (transcript bytes / 4)",
-    ));
     if hint {
         out.push(String::new());
         out.push(fg(color, MUTED, "/stats cycles range · Esc closes"));
@@ -806,14 +861,13 @@ mod tests {
         assert!(!out.contains('\x1b'));
         for needle in [
             "Favorite model: DeepSeek V4 Flash",
-            "Total tokens: 1.0k (approx)",
+            "Total tokens: 1.0k",
             "Sessions: 1",
             "Days started: 1/2",
             "Most active day: Sep 16",
             "Longest span: 1h 0m",
             "Longest streak: 1 days",
             "Current streak: 1 days",
-            "tokens are approximate (transcript bytes / 4)",
             "/stats cycles range · Esc closes",
             "Less ",
             " More",
@@ -851,7 +905,7 @@ mod tests {
         }
         for n in &seen {
             assert!(
-                [22, 28, 71, 114, 238, 245].contains(n),
+                [22, 28, 71, 114, 236, 245].contains(n),
                 "unexpected color index {n}"
             );
         }
@@ -860,18 +914,58 @@ mod tests {
         }
     }
 
+    /// The grid rows of a coloured report, which is everything above the
+    /// legend.
+    fn grid_of(out: &str) -> String {
+        out.lines()
+            .take_while(|l| !l.contains("Less"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// How many cells paint `shade`. A day is the upper half of its character
+    /// (a foreground colour) or the lower half (a background one), so both
+    /// spellings count.
+    fn cells_shaded(grid: &str, shade: u8) -> usize {
+        grid.matches(&format!("\x1b[38;5;{shade}m")).count()
+            + grid.matches(&format!("\x1b[48;5;{shade}m")).count()
+    }
+
     #[test]
     fn a_single_active_day_gets_the_brightest_shade() {
         let today = 20_713;
         let st = Stats::build(&[meta("a", today * DAY, 40, 0)], &[], today * DAY, 0);
-        let out = render(&st, Scope::AllTime, true, false);
-        let grid = out
-            .lines()
-            .take_while(|l| !l.contains("Less"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(grid.contains(&format!("\x1b[38;5;{}m■", SHADES[3])));
-        assert!(!grid.contains(&format!("\x1b[38;5;{}m■", SHADES[0])));
+        let grid = grid_of(&render(&st, Scope::AllTime, true, false));
+        assert_eq!(cells_shaded(&grid, SHADES[3]), 1);
+        assert_eq!(cells_shaded(&grid, SHADES[0]), 0);
+    }
+
+    #[test]
+    fn the_colored_grid_packs_two_weekdays_into_each_row() {
+        let today = 20_713;
+        let st = Stats::build(&[meta("a", today * DAY, 40, 0)], &[], today * DAY, 0);
+        let colored = grid_of(&render(&st, Scope::AllTime, true, false));
+        // Four rows of half blocks, labelled by the weekday on top, against
+        // seven rows when there is no colour to tell the halves apart. The
+        // first line either way is the month header.
+        assert_eq!(colored.lines().count(), 1 + 4);
+        for label in ["Mon", "Wed", "Fri", "Sun"] {
+            assert!(colored.contains(label), "missing {label} in:\n{colored}");
+        }
+        assert!(colored.contains('▀'));
+        let plain = grid_of(&render(&st, Scope::AllTime, false, false));
+        assert_eq!(plain.lines().count(), 1 + 7);
+        // One character per week either way, so 53 columns plus the label
+        // gutter stay inside a normal terminal instead of wrapping. The month
+        // header may overhang by its last label, which is text, not a cell.
+        for line in plain.lines().skip(1) {
+            assert!(line.chars().count() <= 5 + WEEKS, "too wide: {line:?}");
+        }
+        let header = plain.lines().next().unwrap();
+        assert!(
+            header.chars().count() <= 5 + WEEKS + 4,
+            "header: {header:?}"
+        );
     }
 
     #[test]
@@ -907,27 +1001,18 @@ mod tests {
                 })
                 .collect();
             let st = Stats::build(&metas, &[], now, 0);
-            let out = render(&st, Scope::AllTime, true, false);
-            let grid = out
-                .lines()
-                .take_while(|l| !l.contains("Less"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                grid.contains(&format!("\x1b[38;5;{}m■", SHADES[3])),
-                "brightest shade missing for {totals:?}:\n{grid}"
-            );
+            let grid = grid_of(&render(&st, Scope::AllTime, true, false));
             // Every day tied for busiest is brightest, and no other day is.
             let max = totals.iter().max().copied().unwrap_or(0);
             let tied = totals.iter().filter(|&&t| t == max).count();
-            let brightest = grid.matches(&format!("\x1b[38;5;{}m■", SHADES[3])).count();
             assert_eq!(
-                brightest, tied,
-                "brightest cells != busiest days {totals:?}"
+                cells_shaded(&grid, SHADES[3]),
+                tied,
+                "brightest cells != busiest days {totals:?}:\n{grid}"
             );
             // The quietest day earns the dimmest shade.
             assert!(
-                grid.contains(&format!("\x1b[38;5;{}m■", SHADES[0])),
+                cells_shaded(&grid, SHADES[0]) > 0,
                 "quietest day should take the dimmest shade in {totals:?}:\n{grid}"
             );
         }
