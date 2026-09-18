@@ -907,6 +907,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "chart the generation speed of every pass this session",
     },
     SlashCommand {
+        name: "/stats",
+        args: "[7|30|all]",
+        desc: "your plank activity: heatmap, streaks, sessions",
+    },
+    SlashCommand {
         name: "/config",
         args: "[section.key value]",
         desc: "edit settings in a form, or set one inline",
@@ -1275,6 +1280,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/export")
         || slash_command_with_args(cmd, "/open")
         || slash_command_with_args(cmd, "/insights")
+        || slash_command_with_args(cmd, "/stats")
         || slash_command_with_args(cmd, "/resume")
         || slash_command_with_args(cmd, "/tag")
         || slash_command_with_args(cmd, "/rename")
@@ -2913,6 +2919,10 @@ mod tests {
         assert!(slash_command_known("/insights"));
         assert!(slash_command_known("/insights fast"));
         assert!(!slash_command_known("/insightsx"));
+        assert!(slash_command_known("/stats"));
+        assert!(slash_command_known("/stats 7"));
+        assert!(slash_command_known("/stats 30"));
+        assert!(!slash_command_known("/statsx"));
         assert!(slash_command_known("/open"));
         assert!(slash_command_known("/open src/ui.rs"));
         assert!(!slash_command_known("/opened"));
