@@ -597,7 +597,7 @@ turn`), stamped onto the header too. Sidechain and `/btw` passes never
 publish, the base is dropped at turn end (`end_repro`), and the written path
 is handed to `last_edited` when the turn ends so a bare `/open` finds it.
 
-### Usage reports (`insights.rs`, `stats.rs`)
+### Activity report (`stats.rs`)
 `stats.rs` is `/stats`'s GitHub-style activity heatmap and headline figures
 (favorite model, total tokens, sessions, longest session, active days,
 longest streak, most active day, current streak), computed deterministically
