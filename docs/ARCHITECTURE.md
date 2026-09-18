@@ -597,6 +597,21 @@ turn`), stamped onto the header too. Sidechain and `/btw` passes never
 publish, the base is dropped at turn end (`end_repro`), and the written path
 is handed to `last_edited` when the turn ends so a bare `/open` finds it.
 
+### Usage reports (`insights.rs`, `stats.rs`)
+`stats.rs` is `/stats`'s GitHub-style activity heatmap and headline figures
+(favorite model, total tokens, sessions, longest session, active days,
+longest streak, most active day, current streak), computed deterministically
+from the per-session metadata `insights::collect_metas` already caches under
+`~/.plank/usage-data/session-meta/` — the model is never called. Token counts
+are approximate (transcript bytes / 4, plank keeps no real per-session token
+count) and the report says so. The heatmap is always all-time; only the
+figures below it take a scope (all time, last 7 days, last 30 days). In the
+TUI it opens in the same dismissable `ReportPanel` as `/usage`, with the scope
+carried in the panel title so re-issuing `/stats` with no argument can cycle
+it and `/stats 7`/`/stats 30`/`/stats all` jump directly; the plain REPL
+prints the same report as text. Like `/insights`, it is handled only while
+plank is idle, not mid-turn.
+
 ### Settings (`settings.rs`)
 Persistent user preferences, read from `~/.plank/settings.json` then
 `./.plank/settings.json` with the later file winning key by key. The precedence
