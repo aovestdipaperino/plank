@@ -343,12 +343,16 @@ fn fmt_day(day: i64) -> String {
 }
 
 /// Shade index for a day's tokens given the sorted non-zero daily totals.
+///
+/// The ranks are spread over `len - 1` so the busiest day always takes the
+/// brightest shade: scaling by `len` leaves [`SHADES`]`[3]` unreachable below
+/// four distinct totals, which is most of a new user's history.
 fn shade_for(tokens: u64, sorted: &[u64]) -> usize {
-    if sorted.len() < 2 {
+    if sorted.len() < 2 || sorted.first() == sorted.last() {
         return 3;
     }
     let rank = sorted.partition_point(|&v| v < tokens);
-    (rank * 4 / sorted.len()).min(3)
+    (rank * 3 / (sorted.len() - 1)).min(3)
 }
 
 fn render_grid(stats: &Stats, color: bool) -> Vec<String> {
@@ -477,9 +481,17 @@ pub fn render(stats: &Stats, scope: Scope, color: bool, hint: bool) -> String {
             val(&f.current_streak.to_string())
         ),
     ];
+    // The right column starts past the widest left cell, never at a fixed
+    // offset: "Favorite model: DeepSeek V4.1 Flash" overruns 34 columns and
+    // would otherwise run straight into "Total tokens:".
+    let col = left
+        .iter()
+        .map(|l| visible_len(l) + 2)
+        .max()
+        .unwrap_or(0)
+        .max(34);
     for (l, r) in left.iter().zip(right.iter()) {
-        let pad = 34usize.saturating_sub(visible_len(l));
-        out.push(format!("{l}{}{r}", " ".repeat(pad)));
+        out.push(format!("{l}{}{r}", " ".repeat(col - visible_len(l))));
     }
     out.push(fg(
         color,
@@ -800,6 +812,91 @@ mod tests {
             .join("\n");
         assert!(grid.contains(&format!("\x1b[38;5;{}m■", SHADES[3])));
         assert!(!grid.contains(&format!("\x1b[38;5;{}m■", SHADES[0])));
+    }
+
+    #[test]
+    fn long_model_name_does_not_collide_with_the_right_column() {
+        let today = 20_713;
+        let now = today * DAY;
+        let metas = [meta("a", (today - 1) * DAY, 4_000, 3_600)];
+        let st = Stats::build(&metas, &[entry("a", "ds41")], now, 0);
+        let out = render(&st, Scope::AllTime, false, true);
+        assert!(out.contains("Favorite model: DeepSeek V4.1 Flash"));
+        assert!(out.contains("  Total tokens:"), "columns collided:\n{out}");
+    }
+
+    #[test]
+    fn busiest_day_is_always_the_brightest_shade() {
+        for totals in [
+            vec![10u64, 40],
+            vec![10u64, 20, 40],
+            vec![10u64, 20, 30, 40],
+        ] {
+            let today: i64 = 20_713;
+            let now = today.cast_unsigned() * DAY;
+            let metas: Vec<_> = totals
+                .iter()
+                .enumerate()
+                .map(|(i, &t)| {
+                    let day = today - i64::try_from(i).unwrap_or(0);
+                    meta(&format!("s{i}"), day.cast_unsigned() * DAY, t * 4, 0)
+                })
+                .collect();
+            let st = Stats::build(&metas, &[], now, 0);
+            let out = render(&st, Scope::AllTime, true, false);
+            let grid = out
+                .lines()
+                .take_while(|l| !l.contains("Less"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                grid.contains(&format!("\x1b[38;5;{}m■", SHADES[3])),
+                "brightest shade missing for {totals:?}:\n{grid}"
+            );
+            // The quietest day earns the dimmest shade; what it must never do
+            // is share the brightest one with the busiest day.
+            let brightest = grid.matches(&format!("\x1b[38;5;{}m■", SHADES[3])).count();
+            assert_eq!(brightest, 1, "only the busiest day is brightest {totals:?}");
+            assert!(
+                grid.contains(&format!("\x1b[38;5;{}m■", SHADES[0])),
+                "quietest day should take the dimmest shade in {totals:?}:\n{grid}"
+            );
+        }
+    }
+
+    #[test]
+    fn month_header_never_drops_a_label_across_many_years() {
+        for today in [18_000i64, 18_500, 19_200, 19_900, 20_400, 20_713] {
+            let st = Stats::build(&[], &[], today.cast_unsigned() * DAY, 0);
+            let out = render(&st, Scope::AllTime, false, false);
+            let header = out.lines().next().unwrap();
+            let months: Vec<&str> = header.split_whitespace().collect();
+            assert!(
+                months.len() == 12 || months.len() == 13,
+                "today={today}: got {} labels: {months:?}",
+                months.len()
+            );
+            for w in months.windows(2) {
+                assert_ne!(
+                    w[0], w[1],
+                    "today={today}: adjacent duplicate in {months:?}"
+                );
+            }
+            // Expected calendar sequence starting from the grid's first column.
+            let this_monday = today - i64::try_from(weekday_mon0(today)).unwrap_or(0);
+            let grid_start = this_monday - i64::try_from((WEEKS - 1) * 7).unwrap_or(0);
+            let mut expected = Vec::new();
+            let mut last_m = 0u32;
+            for col in 0..WEEKS {
+                let monday = grid_start + i64::try_from(col * 7).unwrap_or(0);
+                let (_, m, _) = civil(monday);
+                if m != last_m {
+                    expected.push(MONTHS[usize::try_from(m).unwrap_or(1) - 1]);
+                    last_m = m;
+                }
+            }
+            assert_eq!(months, expected, "today={today}");
+        }
     }
 
     #[test]
