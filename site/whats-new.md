@@ -7,7 +7,7 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.1.0 is out**, and the beta channel is on 5.1.10. The patch number
+**v5.2.0 is out**, and the beta channel is on 5.2.1. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
 
 **`/stats`: a year of your work, in one panel.** A heatmap of the last 53
