@@ -192,6 +192,7 @@ impl Stats {
         let today = day_of(now, tz_offset);
         let rows: Vec<Row> = metas
             .iter()
+            .filter(|m| m.created_at != 0) // 0 means "unknown", not 1970 (see insights.rs's own `!= 0` guard)
             .map(|m| Row {
                 day: day_of(m.created_at, tz_offset),
                 tokens: approx_tokens(m.bytes),
@@ -207,7 +208,7 @@ impl Stats {
         let grid_start = this_monday - i64::try_from((WEEKS - 1) * 7).unwrap_or(0);
         let mut grid = vec![[0u64; 7]; WEEKS];
         for r in &rows {
-            if r.day < grid_start || r.day > today {
+            if r.day < grid_start {
                 continue;
             }
             let off = usize::try_from(r.day - grid_start).unwrap_or(0);
@@ -350,7 +351,10 @@ fn fmt_day(day: i64) -> String {
 /// the days tie. Ranking over every day's total instead pulls both ends toward
 /// the middle as soon as two days match, and scaling by `len` rather than
 /// `len - 1` leaves [`SHADES`]`[3]` unreachable below four distinct totals —
-/// most of a new user's history.
+/// most of a new user's history. With exactly three distinct totals, integer
+/// division makes rank 1's `3 / 2` truncate to 1 rather than reach 2, so
+/// shade index 2 is unreachable and the gradient coarsens to three tones with
+/// the endpoints still correct.
 fn shade_for(tokens: u64, distinct: &[u64]) -> usize {
     if distinct.len() < 2 {
         return 3;
@@ -381,7 +385,7 @@ fn render_grid(stats: &Stats, color: bool) -> Vec<String> {
             header.push_str(MONTHS[usize::try_from(m).unwrap_or(1) - 1]);
             header.push(' ');
             last_month = m;
-        } else if header.len() < GUTTER.len() + col * 2 + 2 {
+        } else {
             while header.len() < GUTTER.len() + col * 2 + 2 {
                 header.push(' ');
             }
@@ -695,6 +699,50 @@ mod tests {
         assert_eq!(f.most_active_day, Some(today));
         assert_eq!(f.current_streak, 1);
         assert_eq!(f.approx_tokens, 100);
+    }
+
+    #[test]
+    fn a_zero_created_at_is_excluded_from_grid_figures_and_first_day() {
+        let today: i64 = 20_713;
+        let now = today.cast_unsigned() * DAY;
+        let metas = [
+            meta("unknown_stamp", 0, 4_000, 60),
+            meta("real", (today - 1).cast_unsigned() * DAY, 400, 30),
+        ];
+        let st = Stats::build(&metas, &[], now, 0);
+        assert_eq!(st.first_day, Some(today - 1));
+        let f = st.figures(Scope::AllTime);
+        assert_eq!(f.sessions, 1);
+        assert_eq!(f.approx_tokens, 100);
+        assert_eq!(f.span_days, 2);
+        let lit: u64 = st.grid.iter().flatten().sum();
+        assert_eq!(lit, 100);
+    }
+
+    #[test]
+    fn a_meta_with_no_matching_entry_falls_back_to_unknown_model_and_renders() {
+        let today = 20_713;
+        let now = today * DAY;
+        let metas = [meta("orphan_meta", (today - 1) * DAY, 400, 30)];
+        let st = Stats::build(&metas, &[], now, 0);
+        let f = st.figures(Scope::AllTime);
+        assert_eq!(f.favorite_model.as_deref(), Some("unknown"));
+        let out = render(&st, Scope::AllTime, false, false);
+        assert!(out.contains("Favorite model: unknown"));
+    }
+
+    #[test]
+    fn an_entry_with_no_matching_meta_is_ignored() {
+        let today = 20_713;
+        let now = today * DAY;
+        // Only an entry, no meta for it at all: it must contribute nothing,
+        // and the report must still render without panicking.
+        let st = Stats::build(&[], &[entry("orphan_entry", "ds4")], now, 0);
+        let f = st.figures(Scope::AllTime);
+        assert_eq!(f.sessions, 0);
+        assert_eq!(f.favorite_model, None);
+        let out = render(&st, Scope::AllTime, false, false);
+        assert!(out.contains("Favorite model: -"));
     }
 
     #[test]

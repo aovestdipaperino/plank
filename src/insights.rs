@@ -608,8 +608,10 @@ fn write_private(path: &Path, body: &str) -> std::io::Result<()> {
 /// run that much shorter rather than being wasted.
 #[derive(Debug)]
 pub enum Scan {
-    /// Every session was read.
-    Done(Vec<SessionMeta>),
+    /// Every session was read, alongside the session list it was read from
+    /// (the same `store.list()` call fed the scan), so a caller that also
+    /// needs the entries does not have to list the store a second time.
+    Done(Vec<SessionMeta>, Vec<SessionEntry>),
     /// The user interrupted partway through.
     Cancelled,
 }
@@ -661,7 +663,7 @@ pub fn collect_metas(
         out.push(meta);
     }
     progress(total, total);
-    Ok(Scan::Done(out))
+    Ok(Scan::Done(out, entries))
 }
 
 // ---------------------------------------------------------------------------

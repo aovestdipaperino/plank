@@ -5908,11 +5908,10 @@ impl Agent<'_> {
     ) -> Result<String, String> {
         let root = crate::insights::usage_dir();
         let scan = crate::insights::collect_metas(&self.store, &root, &mut |_, _| {}, &|| false)?;
-        let metas = match scan {
-            crate::insights::Scan::Done(m) => m,
-            crate::insights::Scan::Cancelled => Vec::new(),
+        let (metas, entries) = match scan {
+            crate::insights::Scan::Done(m, e) => (m, e),
+            crate::insights::Scan::Cancelled => (Vec::new(), Vec::new()),
         };
-        let entries = self.store.list().map_err(|e| e.to_string())?;
         let stats = crate::stats::Stats::build(
             &metas,
             &entries,
@@ -8782,7 +8781,7 @@ the original is frozen and listed in /tree"
             },
             &|| crate::interrupt::pending(),
         )?;
-        let insights::Scan::Done(metas) = scan else {
+        let insights::Scan::Done(metas, _entries) = scan else {
             // Stopped during the scan: nothing has been computed worth
             // showing, and the half-filled cache makes the next run shorter.
             crate::interrupt::clear();
