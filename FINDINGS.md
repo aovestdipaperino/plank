@@ -2946,3 +2946,114 @@ returns immediately unless refresh_sec is given" was accurate to the C and false
 for plank. When mirroring a C function that takes flags derived from each other,
 port the derivation at the call site too, not just the callee's signature.
 
+
+## Benchmarking plank against itself (`bench/bench-matrix.sh`)
+
+A harness that runs plank in a scratch directory has to keep its own files out
+of that directory. Writing the phase log and the per-run JSON record into the
+model's working directory looks harmless and is not: a `/init` phase then
+surveys the harness's bookkeeping and writes an `AGENTS.md` about "a transient
+benchmark scratch directory" instead of about the code, and the `files` count
+has to be filtered by filename to mean anything. The model's tree and the
+harness's metadata belong in sibling directories, and then "every file here is
+model output" is true rather than approximately true.
+
+Two consequences of that split are worth stating separately, because each one
+produced a plausible-looking report that was wrong:
+
+- A snapshot taken by copying the run directory copies the run records too, and
+  a summariser that finds records by recursive glob then counts every one twice.
+  One iteration reported as four runs, with every second and every tool call
+  doubled. Nothing in the numbers looked anomalous.
+- `timeout(1)` does not exist on macOS, and neither does `gtimeout` without
+  coreutils. A harness that wraps runs in it does not fail loudly: the wrapper
+  exits 127, every run records as a failure, and no timeout is ever enforced.
+  Resolve the binary up front, and only demand it when a definition actually
+  asks for a timeout.
+
+On prompts: "Generate a quick sort algorithm in Rust" gets an answer in the
+chat, not a file, and a benchmark that means to snapshot generated code gets
+`files: 0`. Naming the target file in the prompt is what makes the work
+observable on disk. Measured on DS4 Flash at temp 0, that one change took the
+work phase from 100s and 1 tool call to 318s and 9.
+
+`-p` never consulted the slash dispatcher, so `-p "/init"` sent four literal
+characters to the model. Pasting `INIT_PROMPT` in as text is not a substitute:
+`/init` is the only caller of `settings::suspend_loop_guards()`, and its phases
+re-read the same tree by design, which is the shape `LoopGuard` refuses.
+
+## What the second bench-matrix session showed (`local/bench-coding-baseline-20260917-131726`)
+
+Three findings, none of them about the models.
+
+**The bench measured this machine's `~/.plank`, not the prompt.** plank reads
+skills, plugin hooks, memory, the MCP config and settings from its home, and
+every one of them reached the model. All three models opened the LRU task with
+two `skill` calls (a probe, then the user's `superpowers:brainstorming` or
+`test-driven-development`) and DS4 spent passes classifying the task as
+"bounded or architectural" before writing a line. Every DS4 LRU run first wrote
+to `/Users/enzo/Code/CC-Lab-1/lru.rs` and was refused for escaping the
+workspace: that path was lifted from the cached tokensave MCP server
+instructions, which list the user's other projects. The harness now runs plank
+under a scratch `HOME` whose `.plank` holds the model artifacts (symlinked) and
+the manifests (copied) and nothing else. The symptom that led there is worth
+keeping: a refused write to a path the prompt never mentioned means the path
+came from context, and the repro shows exactly which line.
+
+**A run killed by `timeout(1)` left nothing behind.** SIGTERM ends plank
+without saving, so every timed-out run recorded `toolCalls: 0`, no transcript
+and no repro, and the report's median of 0 tools looked like a model that never
+started. Two of the five were in fact finished: `quicksort.rs` was on disk six
+seconds before the kill. plank treats SIGINT as "interrupt the generation" and
+then saves and writes the repro like any other exit, so the harness now sends
+`-s INT -k 30`; `timeout` still exits 124 on expiry. A missing transcript is
+recorded as `toolCalls: null`, and the summariser leaves unknowns out of the
+medians and says how many there were, because a floor printed as a total is a
+number nobody questions. The other three timeouts were DS4.1 at 11 tok/s never
+reaching its first tool call inside 300 s; a limit has to be set for the
+slowest model in the matrix, not the fastest.
+
+**`/init` told the model to use a `task` sub-agent, and `task` is the todo
+tool.** All nine init runs, all three models, dispatched the survey to `task`,
+got `task requires 'op' set to add, update, or list` back, and only then found
+`agent`. One wasted round per `/init`, identical everywhere, invisible in a
+"completed" status. The prompt now names `agent`, and the parity test that
+checks the prompt's tool names against the registry also asserts it never names
+`task` again. The general lesson: when two tools share a word, a prompt that
+uses the word informally will be read as the tool name.
+
+## A leftover plank fails a whole benchmark session, and Ctrl-C used to make one
+
+Three bench-matrix sessions died in a row today, and only the first died of
+what the report said. A bad `plankArgs` entry killed the first; the second
+recorded 45 runs "failed" with a reason visible only inside a per-phase log:
+
+```
+plank: another plank (ds4) instance is already running (PID 22850).
+```
+
+`singleton.rs` flocks a model lock file because only one process can map the
+~82 GB of weights, so a single orphan fails every run behind it. The orphan
+came from the harness itself. A terminal SIGINT reaches the whole foreground
+process group, so plank took Ctrl-C as "interrupt the generation", saved and
+exited, and the loop started the next of 45 runs as if nothing had happened;
+killing the script instead left plank alive with the weights mapped, working
+in a directory that had already been deleted. Either way the next session
+found the lock held.
+
+So the harness now traps the signal and stops the child deliberately — SIGINT
+first, since that is what makes plank save its transcript and write its repro,
+then SIGKILL after a grace period — and refuses to start at all while another
+plank is running. Two things made that trap work that are easy to get wrong:
+bash defers a trap until the foreground command returns, so the run has to be
+backgrounded and `wait`ed on; and `timeout(1)` relays signals only while it is
+alive, so a KILL has to be delivered to the whole child tree rather than
+through the middleman.
+
+One consequence is worth knowing rather than fixing: a plank that exits after
+an interrupt exits 0, so a run killed from outside the harness records as
+`completed` with whatever partial work it had done. Under `timeout(1)` this
+never shows, because 124 overrides it, and the trap exits before writing a
+record. But a `kill -INT` aimed at plank by hand produces a record that says
+completed and means interrupted — the repro is the place that says so, under
+`outcome`.

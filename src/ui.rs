@@ -2281,6 +2281,21 @@ struct Agent<'a> {
     /// content preview and tool results are all suppressed regardless of the
     /// `ui.show*` settings, so the AGENTS.md draft never scrolls past.
     quiet_tools: bool,
+    /// Set when a main turn ended because a guard stopped it rather than
+    /// because the model finished. Every one of those stops returns
+    /// `Ok(())` — the session continues in the TUI and the plain REPL, which
+    /// is why they cannot report it as an error — so the headless `-p`
+    /// one-shot reads this instead to choose its exit code. A benchmark that
+    /// cannot tell a stopped turn from a finished one reports work that never
+    /// happened.
+    ///
+    /// Scope: the main-turn guard stops only, the ones that go through
+    /// [`Agent::stop_turn`]. A sub-agent's guard trip does not set it -- that
+    /// sidechain failing is not the outer turn failing -- and neither does a
+    /// hook halting the turn with `continue:false`, nor a memory-pressure
+    /// stop. Those are not loop guards, so a run they end still reports as
+    /// completed.
+    guard_stopped: bool,
     /// Image embeddings collected by `view_image` during the current
     /// `run_tool_calls` dispatch, drained by the caller when it pushes the
     /// tool-result message so they ride on that message into the transcript.
@@ -3012,6 +3027,20 @@ impl Agent<'_> {
             SubSinkTarget::Stdout => println!("{}", self.error_line(&line)),
             SubSinkTarget::Null => {}
         }
+    }
+
+    /// Ends a main turn because a guard stopped it: reports the notice and
+    /// records the stop. The `Ok(())` is deliberate and unchanged — the
+    /// interactive front ends carry on after a stop, so the turn did not
+    /// fail. [`Agent::guard_stopped`] is how the news leaves the turn.
+    // The `Result` return is deliberate, matching the call sites' `return
+    // self.stop_turn(...)` in a function that returns `Result<(), String>`;
+    // it always succeeds today because the turn does not fail here.
+    #[allow(clippy::unnecessary_wraps)]
+    fn stop_turn(&mut self, notice: &str) -> Result<(), String> {
+        self.report_guard(notice);
+        self.guard_stopped = true;
+        Ok(())
     }
 
     /// The generation options for the next pass, with the one-pass
@@ -4756,12 +4785,10 @@ impl Agent<'_> {
                     "<tool_result>{payload}</tool_result>"
                 )));
                 if repeat_trips >= MAIN_REPEAT_TRIP_CAP {
-                    self.report_guard(MAIN_REPEAT_TRIPS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(MAIN_REPEAT_TRIPS_NOTICE);
                 }
                 if draft_trips >= MAIN_DRAFT_TRIP_CAP {
-                    self.report_guard(MAIN_DRAFT_TRIPS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(MAIN_DRAFT_TRIPS_NOTICE);
                 }
                 let woke = self.drain_job_notifications();
                 self.print_job_wake(woke);
@@ -4823,8 +4850,7 @@ impl Agent<'_> {
                     if let Some(line) = self.loop_repro_line() {
                         println!("{}", self.debug_line(&line));
                     }
-                    self.report_guard(LOOP_TRIPPED_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(LOOP_TRIPPED_NOTICE);
                 }
                 // Checked after the results are in the transcript, so the
                 // dump and the next prompt both show what the turn did have.
@@ -4833,8 +4859,7 @@ impl Agent<'_> {
                 } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET
                     && crate::guard::no_progress_guard_enabled()
                 {
-                    self.report_guard(NO_PROGRESS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(NO_PROGRESS_NOTICE);
                 }
                 let woke = self.drain_job_notifications();
                 self.print_job_wake(woke);
@@ -6012,7 +6037,7 @@ impl Agent<'_> {
     /// lives in one place.
     ///
     /// The phases are the model's to run, not the front end's: plank supplies
-    /// the tools (`ask` for the two interview phases, `task` for the survey)
+    /// the tools (`ask` for the two interview phases, `agent` for the survey)
     /// and the prompt supplies the order. That keeps both front ends on one
     /// code path — whatever the model asks, the front end's installed
     /// [`Asker`](crate::tools::ask::Asker) renders. Under `--ui console` the
@@ -6031,8 +6056,12 @@ impl Agent<'_> {
         "in this prompt and write the project AGENTS.md only, using your own\n",
         "judgement for anything you would have asked about.\n\n",
         "PHASE 2 — survey the codebase.\n",
-        "Delegate the survey to a single `task` sub-agent so the findings come\n",
-        "back condensed. Ask it to report:\n",
+        "First list the tree (`git ls-files`, or `ls -R` when there is no git).\n",
+        "If it holds fewer than about thirty files, survey it yourself in this\n",
+        "turn: read the manifests and configs directly, and skip the sub-agent.\n",
+        "For a larger tree, delegate the survey to one sub-agent with the\n",
+        "`agent` tool (leave its `name` unset) so the findings come back\n",
+        "condensed. Either way, establish:\n",
         "- manifest files (package.json, Cargo.toml, pyproject.toml, go.mod, ...)\n",
         "- README, Makefile, build config, CI config\n",
         "- any existing AGENTS.md, CLAUDE.md, or .plank/rules/ files\n",
@@ -6092,10 +6121,11 @@ impl Agent<'_> {
         "~/.plank/<project-name>-instructions.md and make AGENTS.local.md a\n",
         "one-line pointer to that path. Nested worktrees need no such stub.\n\n",
         "PHASE 6 — summarise.\n",
-        "In a few lines: which files you wrote, and the two or three points in\n",
-        "them most worth a second look. Say plainly that these are a starting\n",
-        "point meant to be edited, and that /init can be run again later to\n",
-        "re-scan and update them."
+        "Do this in the same turn as the last file you write, right after the\n",
+        "write call, not as a separate pass. In a few lines: which files you\n",
+        "wrote, and the two or three points in them most worth a second look.\n",
+        "Say plainly that these are a starting point meant to be edited, and\n",
+        "that /init can be run again later to re-scan and update them."
     );
 
     /// Draw the next label for an unnamed sub-agent, advancing the session's
@@ -6189,14 +6219,15 @@ impl Agent<'_> {
         stream.set_preflight(edit_preflight(&self.tool_ctx));
     }
 
-    /// Runs the /init command: drives the multi-phase setup in
-    /// [`Agent::INIT_PROMPT`], then — for the launch offer only — clears the
-    /// session (the plain REPL never clears the screen) so the init exchange
-    /// does not carry into later turns.
-    fn run_init(&mut self, source: InitSource) {
-        println!("Setting up this repository for future sessions...");
-        println!("The model will survey the codebase and ask you a few questions.\n");
-
+    /// The generation turn behind `/init`, without any front end around it:
+    /// the canned prompt, quiet tools, and the loop guards suspended for its
+    /// duration. Shared by the two interactive `/init` paths and by the
+    /// headless one-shot, so all three benchmark and behave alike.
+    ///
+    /// `tui_run_init` is this method's TUI mirror (it calls `tui_turn`
+    /// instead of `run_turn`, so it cannot share this code) — a change to one
+    /// usually needs the same change in the other.
+    fn init_turn(&mut self) -> Result<(), String> {
         self.session.push(Message::user(Self::INIT_PROMPT));
         self.quiet_tools = true;
         // The phases re-read and re-survey by design; the guards read that as
@@ -6205,7 +6236,18 @@ impl Agent<'_> {
         let result = self.run_turn();
         drop(guards);
         self.quiet_tools = false;
-        if let Err(e) = result {
+        result
+    }
+
+    /// Runs the /init command: drives the multi-phase setup in
+    /// [`Agent::INIT_PROMPT`], then — for the launch offer only — clears the
+    /// session (the plain REPL never clears the screen) so the init exchange
+    /// does not carry into later turns.
+    fn run_init(&mut self, source: InitSource) {
+        println!("Setting up this repository for future sessions...");
+        println!("The model will survey the codebase and ask you a few questions.\n");
+
+        if let Err(e) = self.init_turn() {
             println!("/init failed: {e}");
         }
         // The init prompt and the model's survey are scaffolding for the file
@@ -14110,12 +14152,10 @@ impl Agent<'_> {
                     "<tool_result>{payload}</tool_result>"
                 )));
                 if repeat_trips >= MAIN_REPEAT_TRIP_CAP {
-                    self.report_guard(MAIN_REPEAT_TRIPS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(MAIN_REPEAT_TRIPS_NOTICE);
                 }
                 if draft_trips >= MAIN_DRAFT_TRIP_CAP {
-                    self.report_guard(MAIN_DRAFT_TRIPS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(MAIN_DRAFT_TRIPS_NOTICE);
                 }
                 self.drain_queued(shared, tx);
                 let woke = self.drain_job_notifications();
@@ -14180,8 +14220,7 @@ impl Agent<'_> {
                     if let Some(line) = self.loop_repro_line() {
                         let _ = tx.send(UiEvent::Dim(line));
                     }
-                    self.report_guard(LOOP_TRIPPED_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(LOOP_TRIPPED_NOTICE);
                 }
                 // Checked after the results are in the transcript, so the
                 // dump and the next prompt both show what the turn did have.
@@ -14190,8 +14229,7 @@ impl Agent<'_> {
                 } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET
                     && crate::guard::no_progress_guard_enabled()
                 {
-                    self.report_guard(NO_PROGRESS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(NO_PROGRESS_NOTICE);
                 }
                 self.drain_queued(shared, tx);
                 let woke = self.drain_job_notifications();
@@ -18453,6 +18491,7 @@ fn new_agent(
         pending_memory_notice: None,
         repro_dir,
         quiet_tools: false,
+        guard_stopped: false,
         pending_images: Vec::new(),
         btw_diverged_engine: false,
         trusted_system_len,
@@ -18981,6 +19020,27 @@ fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
     }
 }
 
+/// Exit code for a headless one-shot whose turn a guard stopped. Distinct
+/// from 1 so a caller can tell a stopped turn from plank failing outright,
+/// and from 124, which `timeout(1)` uses for a run it killed.
+pub const GUARD_STOP_EXIT: u8 = 3;
+
+/// The exit code a finished headless one-shot reports.
+fn headless_exit_code(guard_stopped: bool) -> u8 {
+    if guard_stopped { GUARD_STOP_EXIT } else { 0 }
+}
+
+/// Whether a headless `-p` prompt is the `/init` command rather than text for
+/// the model. Exactly `/init`, surrounding whitespace aside: a general slash
+/// dispatcher on this path is not wanted, and `/initialise` is a word.
+///
+/// There is deliberately no escape: `-p "/init"` cannot send those five
+/// characters to the model as text. Someone who wants to talk *about* the
+/// command can write it into a sentence, which is the ordinary case anyway.
+fn headless_prompt_is_init(prompt: &str) -> bool {
+    prompt.trim() == "/init"
+}
+
 /// Runs headless mode: one-shot with `-p`, else a stdin-driven protocol.
 ///
 /// Under `--ui chart` the run is a one-shot whose stdout is swallowed for the
@@ -18988,20 +19048,30 @@ fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
 /// prints is the `/toks` chart for what it just generated.
 ///
 /// # Errors
-/// Returns an error string on unrecoverable I/O or engine failure.
+/// Returns an error string on unrecoverable I/O or engine failure. On
+/// success, the `Ok` value is the process exit code.
+#[allow(clippy::too_many_lines)]
 pub fn run_headless(
     engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     local_engine: Option<Box<dyn Engine>>,
     plugins: crate::plugins::PluginSet,
-) -> Result<(), String> {
+) -> Result<u8, String> {
     let mut agent = new_agent(engine, cfg, false, local_engine, plugins)?;
     // The notification mode is seeded (and kept live) by
     // `settings::install`/`reinstall`, not here — see their doc comments.
     agent.warm_plain()?;
     agent.fire_session_start("startup", &mut |w| eprintln!("{w}"));
     if let Some(prompt) = cfg.prompt.as_deref() {
-        agent.session.push(Message::user(prompt));
+        // `/init` is the one command this path understands. It is not text
+        // for the model: it runs the canned phases with the loop guards
+        // suspended, which is the only way to measure or use it headlessly.
+        // There is no Asker here, so the interview phase fast-fails and the
+        // prompt tells the model to proceed on its own judgement.
+        let is_init = headless_prompt_is_init(prompt);
+        if !is_init {
+            agent.session.push(Message::user(prompt));
+        }
         let color = agent.color;
         let r = match cfg.ui {
             // Both of these swallow the turn's own stdout and put one thing of
@@ -19036,7 +19106,11 @@ pub fn run_headless(
                 } else {
                     None
                 };
-                let r = agent.run_turn();
+                let r = if is_init {
+                    agent.init_turn()
+                } else {
+                    agent.run_turn()
+                };
                 // Both of these write the last of what their mode puts on
                 // screen, so they have to land before anything follows.
                 drop(live);
@@ -19049,7 +19123,13 @@ pub fn run_headless(
                 }
                 r
             }
-            _ => agent.run_turn(),
+            _ => {
+                if is_init {
+                    agent.init_turn()
+                } else {
+                    agent.run_turn()
+                }
+            }
         };
         // No idle loop to come back to: read the snapshotted span now, so a
         // one-shot run still leaves its notes.
@@ -19065,7 +19145,8 @@ pub fn run_headless(
         // that mode's one deliberate piece of output, neither of which wants a
         // line appended to it.
         eprintln!("{}", total_time_line(agent.session_start.elapsed()));
-        return r;
+        r?;
+        return Ok(headless_exit_code(agent.guard_stopped));
     }
     // Stdin protocol, like the C: announce readiness on stderr, collect bytes
     // until stdin has been quiet for 200 ms, submit that buffer as one prompt,
@@ -19110,7 +19191,7 @@ pub fn run_headless(
     headless_quit_repro(&mut agent);
     agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
     crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
-    Ok(())
+    Ok(0)
 }
 
 /// The closing line of a headless `-p` run: how long the whole thing took.
@@ -21223,6 +21304,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -21944,6 +22026,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-ui-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn init_turn_pushes_the_init_prompt_and_suspends_the_guards() {
+        // `/init`'s phases re-read and re-survey the same tree on purpose,
+        // which is the shape LoopGuard refuses. A headless `/init` that ran
+        // with the guards armed would be stopped for obeying its own prompt.
+        let dir = scratch_dir("init-turn");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.init_turn().unwrap();
+        assert!(
+            agent
+                .session
+                .transcript
+                .iter()
+                .any(|m| m.text == Agent::INIT_PROMPT),
+            "the canned prompt, not the four characters the user typed"
+        );
+        assert!(
+            !agent.quiet_tools,
+            "quiet_tools is restored when the turn ends"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_the_exact_init_prompt_is_a_command() {
+        // The narrow rule this change is allowed to have: `/init` and nothing
+        // else. `-p "/initialise"` is a prompt about a word that starts with
+        // a slash, and must still reach the model verbatim.
+        assert!(headless_prompt_is_init("/init"));
+        assert!(headless_prompt_is_init("  /init  "));
+        assert!(!headless_prompt_is_init("/initialise"));
+        assert!(!headless_prompt_is_init("/init the repo"));
+        assert!(!headless_prompt_is_init("hello"));
+        assert!(!headless_prompt_is_init("/clear"));
+    }
+
+    #[test]
+    fn a_guard_stopped_one_shot_exits_three() {
+        // 3, not 1: a benchmark needs to tell "plank errored" from "the
+        // guards stopped the turn", and both from a clean run.
+        assert_eq!(headless_exit_code(false), 0);
+        assert_eq!(headless_exit_code(true), GUARD_STOP_EXIT);
+        assert_eq!(GUARD_STOP_EXIT, 3);
     }
 
     /// `ScriptedEngine::default()` leaves `kv_events` unset, so `get_kv`
@@ -22684,7 +22816,7 @@ mod tests {
 
     /// The init prompt drives its phases entirely through tools plank
     /// actually ships: the two interview phases through `ask`, the survey
-    /// through `task`. Renaming or dropping one of those tools without
+    /// through `agent`. Renaming or dropping one of those tools without
     /// touching the prompt would leave `/init` instructing the model to call
     /// something that does not exist, and the failure would be a silently
     /// degraded setup rather than an error — so the prompt's tool names are
@@ -22692,7 +22824,7 @@ mod tests {
     #[test]
     fn the_init_prompt_only_names_tools_that_exist() {
         let names = sysprompt::tool_names(&[]);
-        for tool in ["ask", "task"] {
+        for tool in ["ask", "agent"] {
             assert!(
                 names.iter().any(|n| n == tool),
                 "/init tells the model to use `{tool}`, which is not a tool: {names:?}"
@@ -22702,6 +22834,14 @@ mod tests {
                 "the prompt no longer names `{tool}`"
             );
         }
+        // The todo tool is also called `task`. The prompt used to say "a
+        // `task` sub-agent", and every model in the first bench-matrix run
+        // dispatched the survey to the todo tool, got "task requires 'op'"
+        // back, and only then found `agent`: one wasted round per /init.
+        assert!(
+            !Agent::INIT_PROMPT.contains("`task`"),
+            "the prompt names `task`, which is the todo tool, not the sub-agent"
+        );
         // Every phase has to survive an edit to the prompt: dropping one
         // silently shortens the flow rather than breaking it.
         for phase in [
@@ -26352,6 +26492,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -26481,6 +26622,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -27862,6 +28004,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -28136,6 +28279,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -28249,6 +28393,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -28349,6 +28494,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -28472,6 +28618,7 @@ mod tests {
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -28934,6 +29081,57 @@ mod tests {
             vec![format!("guard: {NO_PROGRESS_NOTICE}")],
             "{events:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_guard_hard_stop_is_recorded_on_the_agent() {
+        // The same turn as `a_turn_that_changes_nothing_is_stopped`: three
+        // passes that read, change nothing and generate 12 KB each, so the
+        // third crosses the 32 KiB no-progress budget. That turn returns
+        // `Ok(())`, which is why the flag has to carry the news instead.
+        let dir = scratch_dir("guard-stop-flag");
+        enable_no_progress_guard();
+        let cfg = test_cfg();
+        let read_call = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"list\">",
+            "<｜DSML｜parameter name=\"path\">.</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let pass = format!("{}{read_call}", "x".repeat(12 * 1024));
+        let engine = ScriptedEngine {
+            replies: vec![pass.clone(), pass.clone(), pass, "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        assert!(!agent.guard_stopped, "a fresh agent has not been stopped");
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        assert!(
+            agent.guard_stopped,
+            "the no-progress stop must be recorded, not just printed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_clean_turn_records_no_guard_stop() {
+        // The control: without it, a flag wired to `true` unconditionally
+        // would pass the test above.
+        let dir = scratch_dir("guard-stop-clean");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        agent.run_turn().unwrap();
+        assert!(!agent.guard_stopped, "nothing stopped this turn");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -31060,6 +31258,7 @@ or the user's next message aborts before its first token"
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -31202,6 +31401,7 @@ or the user's next message aborts before its first token"
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -32258,6 +32458,7 @@ or the user's next message aborts before its first token"
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.5
+
+- Qwen3.8's tool-call dialect (`<tool_call>` / `<function=…>` /
+  `<parameter=…>`) is parsed and rendered as a banner, adopted from the
+  stanza opener like the two DSML spellings, so a stream with no model name
+  attached still renders it. Over-escaped HTML entities in Qwen arguments are
+  decoded, and selecting the Qwen dialect no longer aborts the render.
+- A write whose content streams before its path no longer prints `<file>`.
+
 ## 0.1.2
 
 - A DSML error no longer freezes output permanently. `StreamRenderer` used to
