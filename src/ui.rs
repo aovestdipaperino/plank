@@ -5898,6 +5898,30 @@ impl Agent<'_> {
         }
     }
 
+    /// The `/stats` report: deterministic over the cached session metadata
+    /// `/insights` keeps, so it never touches the model.
+    fn stats_report(
+        &self,
+        scope: crate::stats::Scope,
+        color: bool,
+        hint: bool,
+    ) -> Result<String, String> {
+        let root = crate::insights::usage_dir();
+        let scan = crate::insights::collect_metas(&self.store, &root, &mut |_, _| {}, &|| false)?;
+        let metas = match scan {
+            crate::insights::Scan::Done(m) => m,
+            crate::insights::Scan::Cancelled => Vec::new(),
+        };
+        let entries = self.store.list().map_err(|e| e.to_string())?;
+        let stats = crate::stats::Stats::build(
+            &metas,
+            &entries,
+            now_secs(),
+            crate::insights::local_utc_offset(),
+        );
+        Ok(crate::stats::render(&stats, scope, color, hint))
+    }
+
     fn render_usage_report(&self, color: bool) -> String {
         use std::fmt::Write as _;
         let dim = |s: &str| {
@@ -6561,6 +6585,13 @@ impl Agent<'_> {
             "/context" => print!("{}", self.render_context_report(self.color)),
             "/usage" => print!("{}", self.render_usage_report(self.color)),
             "/toks" => print!("{}", toks_report(self.color)),
+            "/stats" => match crate::stats::Scope::parse(arg) {
+                Some(scope) => match self.stats_report(scope, self.color, false) {
+                    Ok(text) => print!("{text}"),
+                    Err(e) => println!("stats failed: {e}"),
+                },
+                None => println!("usage: /stats [7|30|all]"),
+            },
             "/goal" => {
                 let arg = arg.trim();
                 if arg.is_empty() {
@@ -15652,6 +15683,24 @@ impl Agent<'_> {
             "/toks" => {
                 *report = Some(tui::ReportPanel::new(TOKS_REPORT_TITLE, &toks_report(true)));
             }
+            // Re-issuing `/stats` with the panel up cycles the range; an
+            // explicit argument jumps straight to it.
+            "/stats" => {
+                let showing = report
+                    .as_ref()
+                    .and_then(|r| crate::stats::Scope::from_title(r.title()));
+                let scope = match (arg.trim().is_empty(), showing) {
+                    (true, Some(s)) => Some(s.next()),
+                    _ => crate::stats::Scope::parse(arg),
+                };
+                match scope {
+                    Some(scope) => match self.stats_report(scope, true, true) {
+                        Ok(text) => *report = Some(tui::ReportPanel::new(scope.title(), &text)),
+                        Err(e) => log.push_plain(format!("stats failed: {e}")),
+                    },
+                    None => log.push_plain("usage: /stats [7|30|all]".to_string()),
+                }
+            }
             "/init" => self.tui_run_init(
                 InitSource::UserCommand,
                 log,
@@ -21434,6 +21483,21 @@ mod tests {
     /// turns out to have no drafter (`DSpark` is V4-only, or the companion was
     /// refused), the pin is serving nothing and the session would sample
     /// greedily for no reason: the 0.6 default comes back.
+    #[test]
+    fn stats_report_renders_for_an_empty_store_and_a_bad_arg_is_refused() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("stats-report-empty-store");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let text = agent
+            .stats_report(crate::stats::Scope::AllTime, false, false)
+            .unwrap();
+        assert!(text.contains("Sessions: 0"));
+        assert!(!text.contains('\x1b'));
+        assert_eq!(crate::stats::Scope::parse("yesterday"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_run_that_cannot_speculate_gets_its_default_temperature_back() {
         let _lock = crate::status::origin_test_guard();
