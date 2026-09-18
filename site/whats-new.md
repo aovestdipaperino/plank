@@ -10,6 +10,26 @@ has every last fix; this page has the ones you will actually notice.
 **v5.1.0 is out**, and the beta channel is on 5.1.10. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
 
+**`/stats`: a year of your work, in one panel.** A heatmap of the last 53
+weeks, four green tones from your quietest day to your busiest, with the
+figures that go with it underneath: favourite model, total tokens, sessions,
+longest span, days started, longest and current streak, most active day.
+
+![The /stats panel: a 53-week heatmap in four green tones with Mon, Wed, Fri and Sun down the left and month names across the top, a Less-to-More legend under it, then All time · Last 7 days · Last 30 days, and eight figures reading favorite model DeepSeek V4 Flash, total tokens 11.1m, sessions 718, longest span 14h 15m, days started 50/62, longest streak 16 days, most active day Sep 5, current streak 16 days](/assets/stats.png)
+
+It reads the same per-session cache `/insights` already fills, so it costs
+nothing after the first run and never calls the model. The heatmap always
+shows the full year; the figures under it take a range, so `/stats 7` and
+`/stats 30` narrow them and re-issuing bare `/stats` cycles the three. Esc
+closes it.
+
+Two of the figures are named for exactly what they count rather than what you
+might wish they counted. *Days started* counts days a session began, so a
+session opened on Monday and resumed through Thursday lights one square and
+not four. *Longest span* is wall-clock between a session's first and last
+message, which is not time spent working: resume something a month later and
+the span is a month.
+
 **5.1.10: a quiet rule.** The figures a turn floats on the rule under the
 prompt are cleared the moment the turn ends, and the row is repainted whole
 so no notch is left where they were. The memory pass keeps its own figures

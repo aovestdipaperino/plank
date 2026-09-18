@@ -124,6 +124,7 @@ It is ANDed with `tools.loopGuards`, so `/loopguard off` silences it along with 
 | `/kvcache` | browse the KV cache as a tree: what each snapshot is, what it was built on, its size, how often it has been used, and when it expires |
 | `/kvcache gc\|pin\|unpin\|rm` | sweep expired entries now, or pin, unpin or delete one by fingerprint prefix |
 | `/insights [fast\|fresh]` | a usage report computed from every saved session, written to `~/.plank/usage-data/report.html` (`fast` skips the model-written prose, `fresh` forces it to be written again) |
+| `/stats [7\|30\|all]` | a year of activity as a heatmap, with streaks and totals under it; re-issue bare `/stats` to cycle the range |
 | `/repro [note]` | dump the exact engine input and runtime knobs to `~/.plank/repro/` for a bug report; the file's path is copied to the clipboard |
 
 `/repro` is the one to reach for when you want to report a problem: it captures the rendered prompt the engine would see plus the model, backend, context size, sampling settings and think mode, in a single self-contained file. It never touches the live session.
@@ -135,6 +136,12 @@ Under `--debug` (or after `/debug on`) plank dumps on its own as well: quitting 
 The report is **differential**. Per-session statistics have always been cached and recomputed only for sessions that changed; the written sections now work the same way. plank remembers the last report in `~/.plank/usage-data/last-report.json` and reuses its prose until ten sessions — or a tenth of your history, whichever is smaller — are new or have been written to since. A section the previous run failed to produce is not reused, so it gets written on the next run rather than staying missing. `/insights fresh` writes everything again regardless, for when the last answer was wrong rather than stale.
 
 When there is a previous report to compare against, the new one opens with a **Since** strip: sessions new or updated, prompts, lines, files, commits, and any tool or friction category that was not there last time. It is subtraction of two deterministic aggregates, so it costs nothing and cannot be wrong the way a written summary could.
+
+`/stats` is the quick look `/insights` is not: a year of weeks as a heatmap, four green tones from your quietest day to your busiest, and eight figures under it — favourite model, total tokens, sessions, longest span, days started, longest and current streak, most active day. It reads the same per-session cache `/insights` fills, so it costs nothing after the first run and never calls the model.
+
+Two of those figures are named for exactly what they count. **Days started** counts days a session began, so a session opened on Monday and resumed through Thursday lights one square, not four. **Longest span** is wall-clock between a session's first and last message, which is not time spent working — resume something a month later and the span is a month. Token totals are transcript bytes divided by four, since plank keeps no true per-session count.
+
+The heatmap always shows the full year. The figures under it take a range: `/stats 7` and `/stats 30` jump straight to the last week or month, `/stats all` goes back, and re-issuing bare `/stats` while the panel is open cycles the three. Esc closes it. Like `/insights`, it is answered only while plank is idle.
 
 Suggestions are made to be used, not read: every snippet, prompt and instruction in the report has a **Copy** button, and the **Worth putting in AGENTS.md** list arrives as a checklist — untick what you disagree with, press **Copy all checked**, and paste the rest into plank. The report stays a single self-contained local file: the clipboard handler is inlined next to the stylesheet, with a fallback for `file://`, where the browser clipboard API is unavailable.
 

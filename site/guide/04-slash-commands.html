@@ -534,6 +534,11 @@ the model-written prose, <code>fresh</code> forces it to be written
 again)</td>
 </tr>
 <tr>
+<td><code>/stats [7|30|all]</code></td>
+<td>a year of activity as a heatmap, with streaks and totals under it;
+re-issue bare <code>/stats</code> to cycle the range</td>
+</tr>
+<tr>
 <td><code>/repro [note]</code></td>
 <td>dump the exact engine input and runtime knobs to
 <code>~/.plank/repro/</code> for a bug report; the file's path is copied
@@ -571,6 +576,27 @@ lines, files, commits, and any tool or friction category that was not
 there last time. It is subtraction of two deterministic aggregates, so
 it costs nothing and cannot be wrong the way a written summary
 could.</p>
+<p><code>/stats</code> is the quick look <code>/insights</code> is not:
+a year of weeks as a heatmap, four green tones from your quietest day to
+your busiest, and eight figures under it — favourite model, total
+tokens, sessions, longest span, days started, longest and current
+streak, most active day. It reads the same per-session cache
+<code>/insights</code> fills, so it costs nothing after the first run
+and never calls the model.</p>
+<p>Two of those figures are named for exactly what they count.
+<strong>Days started</strong> counts days a session began, so a session
+opened on Monday and resumed through Thursday lights one square, not
+four. <strong>Longest span</strong> is wall-clock between a session's
+first and last message, which is not time spent working — resume
+something a month later and the span is a month. Token totals are
+transcript bytes divided by four, since plank keeps no true per-session
+count.</p>
+<p>The heatmap always shows the full year. The figures under it take a
+range: <code>/stats 7</code> and <code>/stats 30</code> jump straight to
+the last week or month, <code>/stats all</code> goes back, and
+re-issuing bare <code>/stats</code> while the panel is open cycles the
+three. Esc closes it. Like <code>/insights</code>, it is answered only
+while plank is idle.</p>
 <p>Suggestions are made to be used, not read: every snippet, prompt and
 instruction in the report has a <strong>Copy</strong> button, and the
 <strong>Worth putting in AGENTS.md</strong> list arrives as a checklist
