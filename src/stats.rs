@@ -120,12 +120,19 @@ pub fn civil(day: i64) -> (i64, u32, u32) {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Figures {
     pub sessions: usize,
+    /// Distinct days a session was *started*, which is not the same as days
+    /// worked: a session begun Monday and resumed through Thursday counts once,
+    /// where `/insights` counts four. Rendered as "Days started" so the two
+    /// reports cannot be read as disagreeing about the same word.
     pub active_days: usize,
     /// Days the scope covers: the window, or all-time days since the first
     /// session, inclusive.
     pub span_days: i64,
     /// Day index of the day with the most approx tokens; ties go to the latest.
     pub most_active_day: Option<i64>,
+    /// Wall-clock span of the longest session, last stamp minus first — not
+    /// time spent working. A session resumed a month later spans a month, which
+    /// is why this renders as "Longest span".
     pub longest_session_secs: u64,
     pub longest_streak: usize,
     /// Consecutive active days ending today or yesterday.
@@ -462,7 +469,7 @@ pub fn render(stats: &Stats, scope: Scope, color: bool, hint: bool) -> String {
         ),
         format!("Sessions: {}", val(&f.sessions.to_string())),
         format!(
-            "Active days: {}{}",
+            "Days started: {}{}",
             val(&f.active_days.to_string()),
             fg(color, MUTED, &format!("/{}", f.span_days))
         ),
@@ -478,7 +485,7 @@ pub fn render(stats: &Stats, scope: Scope, color: bool, hint: bool) -> String {
             fg(color, MUTED, "(approx)")
         ),
         format!(
-            "Longest session: {}",
+            "Longest span: {}",
             val(&fmt_duration(f.longest_session_secs))
         ),
         format!(
@@ -801,9 +808,9 @@ mod tests {
             "Favorite model: DeepSeek V4 Flash",
             "Total tokens: 1.0k (approx)",
             "Sessions: 1",
-            "Active days: 1/2",
+            "Days started: 1/2",
             "Most active day: Sep 16",
-            "Longest session: 1h 0m",
+            "Longest span: 1h 0m",
             "Longest streak: 1 days",
             "Current streak: 1 days",
             "tokens are approximate (transcript bytes / 4)",

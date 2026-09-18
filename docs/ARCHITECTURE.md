@@ -599,7 +599,7 @@ is handed to `last_edited` when the turn ends so a bare `/open` finds it.
 
 ### Activity report (`stats.rs`)
 `stats.rs` is `/stats`'s GitHub-style activity heatmap and headline figures
-(favorite model, total tokens, sessions, longest session, active days,
+(favorite model, total tokens, sessions, longest span, days started,
 longest streak, most active day, current streak), computed deterministically
 from the per-session metadata `insights::collect_metas` already caches under
 `~/.plank/usage-data/session-meta/` — the model is never called. Token counts
