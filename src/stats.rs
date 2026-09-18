@@ -342,29 +342,34 @@ fn fmt_day(day: i64) -> String {
     format!("{} {d}", MONTHS[usize::try_from(m).unwrap_or(1) - 1])
 }
 
-/// Shade index for a day's tokens given the sorted non-zero daily totals.
+/// Shade index for a day's tokens, given the ascending *distinct* non-zero
+/// daily totals.
 ///
-/// The ranks are spread over `len - 1` so the busiest day always takes the
-/// brightest shade: scaling by `len` leaves [`SHADES`]`[3]` unreachable below
-/// four distinct totals, which is most of a new user's history.
-fn shade_for(tokens: u64, sorted: &[u64]) -> usize {
-    if sorted.len() < 2 || sorted.first() == sorted.last() {
+/// Ranking over distinct totals spread across `len - 1` is what puts the
+/// busiest day in the brightest shade and the quietest in the dimmest, however
+/// the days tie. Ranking over every day's total instead pulls both ends toward
+/// the middle as soon as two days match, and scaling by `len` rather than
+/// `len - 1` leaves [`SHADES`]`[3]` unreachable below four distinct totals —
+/// most of a new user's history.
+fn shade_for(tokens: u64, distinct: &[u64]) -> usize {
+    if distinct.len() < 2 {
         return 3;
     }
-    let rank = sorted.partition_point(|&v| v < tokens);
-    (rank * 3 / (sorted.len() - 1)).min(3)
+    let rank = distinct.partition_point(|&v| v < tokens);
+    (rank * 3 / (distinct.len() - 1)).min(3)
 }
 
 fn render_grid(stats: &Stats, color: bool) -> Vec<String> {
     const GUTTER: &str = "     ";
-    let mut sorted: Vec<u64> = stats
+    let mut distinct: Vec<u64> = stats
         .grid
         .iter()
         .flatten()
         .copied()
         .filter(|&v| v > 0)
         .collect();
-    sorted.sort_unstable();
+    distinct.sort_unstable();
+    distinct.dedup();
     let mut lines = Vec::with_capacity(9);
 
     let mut header = String::from(GUTTER);
@@ -399,7 +404,7 @@ fn render_grid(stats: &Stats, color: bool) -> Vec<String> {
             } else if week[row] == 0 {
                 fg(color, DIM, "·")
             } else {
-                fg(color, SHADES[shade_for(week[row], &sorted)], "■")
+                fg(color, SHADES[shade_for(week[row], &distinct)], "■")
             };
             line.push_str(&cell);
             line.push(' ');
@@ -831,6 +836,10 @@ mod tests {
             vec![10u64, 40],
             vec![10u64, 20, 40],
             vec![10u64, 20, 30, 40],
+            // Days tied for busiest must all be brightest, not share the rank
+            // of the first of them.
+            vec![10u64, 40, 40, 40],
+            vec![10u64, 10, 20, 40],
         ] {
             let today: i64 = 20_713;
             let now = today.cast_unsigned() * DAY;
@@ -853,10 +862,15 @@ mod tests {
                 grid.contains(&format!("\x1b[38;5;{}m■", SHADES[3])),
                 "brightest shade missing for {totals:?}:\n{grid}"
             );
-            // The quietest day earns the dimmest shade; what it must never do
-            // is share the brightest one with the busiest day.
+            // Every day tied for busiest is brightest, and no other day is.
+            let max = totals.iter().max().copied().unwrap_or(0);
+            let tied = totals.iter().filter(|&&t| t == max).count();
             let brightest = grid.matches(&format!("\x1b[38;5;{}m■", SHADES[3])).count();
-            assert_eq!(brightest, 1, "only the busiest day is brightest {totals:?}");
+            assert_eq!(
+                brightest, tied,
+                "brightest cells != busiest days {totals:?}"
+            );
+            // The quietest day earns the dimmest shade.
             assert!(
                 grid.contains(&format!("\x1b[38;5;{}m■", SHADES[0])),
                 "quietest day should take the dimmest shade in {totals:?}:\n{grid}"
