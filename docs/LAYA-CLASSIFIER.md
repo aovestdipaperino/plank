@@ -177,10 +177,15 @@ must not be in the default build.
 
 ```toml
 [dependencies]
-laya = { version = "0.1", optional = true, default-features = false }
+# Not on crates.io yet, so take it from git and pin a revision. Once it is
+# published this becomes laya = { version = "0.1", ... }.
+laya = { git = "https://github.com/aovestdipaperino/laya-rust", rev = "5104bf2", \
+         optional = true, default-features = false }
 
 [features]
 laya = ["dep:laya"]
+# Match plank's own backend: the crate exposes metal and cuda features.
+laya-metal = ["laya", "laya/metal"]
 ```
 
 Extend the sandbox config (`~/.plank/sandbox.json`, overlaid by `./.plank/sandbox.json`) with an
@@ -204,10 +209,25 @@ already is.
 `mode` is `shadow` (log only) or `advise` (may add a prompt). There is deliberately no mode that
 removes one.
 
+The checkpoint is not bundled. Fetch it once into the path named above, Apache-2.0 and ungated,
+no token:
+
+```sh
+D=~/.plank/laya-typed-decisions
+mkdir -p $D/encoder $D/tokenizer
+B=https://huggingface.co/convaiinnovations/laya-typed-decisions/resolve/main
+for f in model.safetensors encoder/config.json tokenizer/tokenizer.json \
+         tokenizer/tokenizer_config.json rl_agent_config.json; do
+  curl -sL -o $D/$f "$B/$f"
+done
+```
+
+Treat a missing checkpoint exactly like a failed load: warn once, run the command.
+
 ### Stage 2: load the model once, off the hot path
 
-The checkpoint is ~847 MB on disk and about 2.4 GB resident once upcast to f32. Load it at most
-once per process, lazily, on first use, so a session that never runs a bash command never pays.
+The checkpoint is ~847 MB on disk and 0.84 GB resident in f16. Load it at most once per
+process, lazily, on first use, so a session that never runs a bash command never pays.
 
 - Hold it in a `OnceCell<Option<Agent>>` on the session, not a global.
 - A load failure is not fatal. Log once, set `None`, and every later call is a no-op. A missing
@@ -222,6 +242,21 @@ On CPU the same decision is roughly ten times slower and is felt before every co
 another reason for the default-off flag.
 
 ### Stage 3: shadow mode
+
+The hook goes in `src/tools/bash.rs`, in the block that already decides whether to prompt:
+
+```rust
+if ctx.sandbox.should_sandbox(cmd) && !crate::sandbox::is_read_only_command(cmd) {
+    for what in crate::sandbox::protected_mentions(cmd, &ctx.sandbox.granted) {
+        // ... existing protected-root prompts
+    }
+}
+```
+
+Score the command alongside that block, not inside it. The existing condition is the wrong
+guard for this: `is_read_only_command` short-circuits pure readers, and a read is exactly half
+of an exfiltration. `should_sandbox` is the right gate, since it already excludes user-typed
+commands and the configured `excludedCommands`.
 
 Run the score, write it to the session log, change nothing:
 
