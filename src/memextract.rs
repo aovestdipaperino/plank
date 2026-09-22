@@ -10,7 +10,7 @@
 //! only the transcript it has not already seen, a turn-duration floor
 //! (`memory.minTurnSeconds`) below which the turn's span is deferred rather
 //! than dropped, not already running, and a throttle over eligible turns.
-//! Off by default (`memory.autoExtract`).
+//! On by default since 5.1.7 (`memory.autoExtract`).
 //!
 //! The depth keying is the same shape as a `kvladder` rung, and carries the
 //! same warning: the recorded depth is what makes the resume correct, and

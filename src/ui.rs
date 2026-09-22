@@ -14633,6 +14633,7 @@ impl Agent<'_> {
     /// here, and a `/clear` cannot lose what was already captured. Settings
     /// are sampled fresh every call so a `/config` change takes effect on
     /// the next eligible turn.
+    ///
     /// `turn` is how long the turn that just ended took, measured by the
     /// caller. It is passed in rather than clocked here on purpose: both
     /// call sites already hold a `turn_start`, and a parameter is what keeps

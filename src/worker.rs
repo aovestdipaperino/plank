@@ -408,6 +408,11 @@ pub struct TurnShared {
     /// the door shut. `tui_memory_pass` reads it once the worker has stopped
     /// and hands the quit to the idle loop, which takes its normal exit path.
     /// Never set during a real turn — see the arm's `memory_pass` guard.
+    ///
+    /// Distinct from the file-scope `QUIT_REQUESTED` static in `ui.rs` and
+    /// its same-named reader `quit_requested()`, which belong to the
+    /// mid-turn `/exit` confirmation pane. The two quit channels are
+    /// disjoint; only the name is shared.
     pub quit_requested: AtomicBool,
     /// Set by the UI when a `/btw` is submitted mid-turn: the current main
     /// generation pass stops immediately so the side question is answered
