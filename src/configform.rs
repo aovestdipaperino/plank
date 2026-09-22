@@ -62,6 +62,7 @@ pub enum FieldId {
     ContextShortReminder,
     MemoryAutoExtract,
     MemoryExtractEveryNTurns,
+    MemoryMinTurnSeconds,
 }
 
 /// The editing shape of a field, which decides how a key press mutates it.
@@ -390,6 +391,13 @@ pub static FIELDS: &[Field] = &[
         "run the extraction pass every N eligible turns",
         Kind::Count,
     ),
+    f(
+        FieldId::MemoryMinTurnSeconds,
+        "memory",
+        "minTurnSeconds",
+        "skip the extraction pass after turns shorter than N seconds (0: no floor)",
+        Kind::Count,
+    ),
 ];
 
 const fn f(
@@ -473,6 +481,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::ContextShortReminder => s.context.short_reminder.to_string(),
         FieldId::MemoryAutoExtract => s.memory.auto_extract.to_string(),
         FieldId::MemoryExtractEveryNTurns => s.memory.extract_every_n_turns.to_string(),
+        FieldId::MemoryMinTurnSeconds => s.memory.min_turn_seconds.to_string(),
     }
 }
 
@@ -598,6 +607,10 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         }
         FieldId::MemoryExtractEveryNTurns => {
             s.memory.extract_every_n_turns = parse_extract_every_n_turns(raw)?;
+        }
+        FieldId::MemoryMinTurnSeconds => {
+            // Floor of 0, not 1: no floor is a legitimate setting here.
+            s.memory.min_turn_seconds = u32::try_from(parse_pos(0)?).unwrap_or(u32::MAX);
         }
         // Bool/Tri fields accept an explicit textual value from the REPL path.
         // Accepts always/unfocused/never, plus the legacy true/false.

@@ -320,6 +320,64 @@ fn repaint_idle(
     Ok(completed.buffer.clone())
 }
 
+/// The idle loop's quit confirmation, shared by every path that leaves it.
+///
+/// A live background download is worth one line before quitting, so nobody
+/// closes the terminal wondering whether they just threw away 40 GB.
+///
+/// Returns `true` when the caller should quit and `false` when the user
+/// declined, so a call site reads `if confirm_quit_idle(..)? { break } else
+/// { continue }`. With no background download in flight there is nothing to
+/// warn about and nothing to ask, so it returns `true` without drawing.
+///
+/// The repaint is not optional: the frame is only drawn at the top of the
+/// idle loop, so without it the warning would be invisible behind a stale
+/// frame and the user's answering keystroke would be silently consumed by
+/// the confirmation they never saw.
+#[allow(clippy::too_many_arguments)]
+fn confirm_quit_idle(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &mut OutputLog,
+    view: &mut tui::OutputView,
+    sub_pane: &mut tui::SubPane,
+    btw_panel: &mut BtwPanel,
+    report: &mut Option<tui::ReportPanel>,
+    input: &TuiInput,
+    idle_status: &str,
+    selection: Option<tui::ContentSelection>,
+    task_view: &tui::TaskView,
+    config_form: Option<&crate::configform::ConfigForm>,
+    kv_pane: Option<&crate::kvpane::KvPane>,
+    resume_pane: Option<&crate::resumepane::ResumePane>,
+    arcade: &crate::arcade::Arcade,
+    wasm_frame: Option<&crate::wasmreg::OpenFrame>,
+    rem: Option<&Mutex<UiRemote>>,
+) -> Result<bool, String> {
+    let Some(warning) = crate::downloader::quit_warning() else {
+        return Ok(true);
+    };
+    log.push_dim(warning);
+    repaint_idle(
+        terminal,
+        log,
+        view,
+        sub_pane,
+        btw_panel,
+        report,
+        input,
+        idle_status,
+        selection,
+        task_view,
+        config_form,
+        kv_pane,
+        resume_pane,
+        arcade,
+        wasm_frame,
+        rem,
+    )?;
+    await_yes_default()
+}
+
 /// Answers deferred remote requests. Call right after `terminal.draw` returns.
 fn remote_service(remote: Option<&Mutex<UiRemote>>) {
     if let Some(m) = remote
@@ -4901,7 +4959,7 @@ impl Agent<'_> {
             // `worker_turn`). Only a snapshot: the reading happens from the
             // REPL's idle tick (`run_repl_plain_local`), so the prompt comes
             // back now.
-            self.enqueue_memory_job();
+            self.enqueue_memory_job(turn_start.elapsed());
             // Stop hooks: exit 2 feeds stderr to the model and the turn
             // continues (at most once).
             if !stop_hook_ran && let Some(feedback) = self.run_stop_hooks(&mut |w| println!("{w}"))
@@ -12028,7 +12086,7 @@ impl Agent<'_> {
                     && wasm_frame.is_none()
                     && self.memory_jobs_pending()
                 {
-                    self.tui_memory_pass(
+                    let quit = self.tui_memory_pass(
                         terminal,
                         &mut log,
                         &mut view,
@@ -12037,6 +12095,32 @@ impl Agent<'_> {
                         &mut arcade,
                         &mut sub_pane,
                     )?;
+                    if quit {
+                        // Ctrl-D during the pass leaves through exactly the
+                        // same door as Ctrl-D at the prompt, download warning
+                        // and all.
+                        if !confirm_quit_idle(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut sub_pane,
+                            &mut btw_panel,
+                            &mut report,
+                            &input,
+                            &idle_status,
+                            selection.current(),
+                            &task_view,
+                            config_form.as_ref(),
+                            kv_pane.as_ref(),
+                            resume_pane.as_ref(),
+                            &arcade,
+                            wasm_frame.as_ref(),
+                            rem,
+                        )? {
+                            continue;
+                        }
+                        break;
+                    }
                 }
                 continue;
             };
@@ -12530,37 +12614,25 @@ impl Agent<'_> {
                 }
                 KeyCode::Char('d') if ctrl => {
                     if input.buf.text().is_empty() {
-                        // A live background download is worth one line before
-                        // quitting, so nobody closes the terminal wondering
-                        // whether they just threw away 40 GB.
-                        if let Some(warning) = crate::downloader::quit_warning() {
-                            log.push_dim(warning);
-                            // Repaint before blocking: the frame is only drawn
-                            // at the top of this loop, so without this the
-                            // terminal would look frozen with the warning
-                            // invisible, and the user's next keystroke would
-                            // be silently consumed as the answer.
-                            repaint_idle(
-                                terminal,
-                                &log,
-                                &mut view,
-                                &mut sub_pane,
-                                &mut btw_panel,
-                                &mut report,
-                                &input,
-                                &idle_status,
-                                selection.current(),
-                                &task_view,
-                                config_form.as_ref(),
-                                kv_pane.as_ref(),
-                                resume_pane.as_ref(),
-                                &arcade,
-                                wasm_frame.as_ref(),
-                                rem,
-                            )?;
-                            if !await_yes_default()? {
-                                continue;
-                            }
+                        if !confirm_quit_idle(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut sub_pane,
+                            &mut btw_panel,
+                            &mut report,
+                            &input,
+                            &idle_status,
+                            selection.current(),
+                            &task_view,
+                            config_form.as_ref(),
+                            kv_pane.as_ref(),
+                            resume_pane.as_ref(),
+                            &arcade,
+                            wasm_frame.as_ref(),
+                            rem,
+                        )? {
+                            continue;
                         }
                         break;
                     }
@@ -13362,6 +13434,10 @@ impl Agent<'_> {
     /// token, `process_memory_job` puts the job back at the front of the
     /// queue, and the typed line becomes the next turn right here — the
     /// user never waits for the notes.
+    ///
+    /// Returns `true` when the user pressed Ctrl-D during the pass: the
+    /// caller quits. Queued memory jobs are dropped rather than drained —
+    /// the user asked to leave.
     #[allow(clippy::too_many_arguments)]
     fn tui_memory_pass(
         &mut self,
@@ -13372,7 +13448,7 @@ impl Agent<'_> {
         btw: &mut BtwPanel,
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         // No scrollback line: the footer mark (`status::MEMORY_MARK`) is the
         // whole announcement. Housekeeping the user did not ask for should
         // not write into the conversation.
@@ -13413,6 +13489,11 @@ impl Agent<'_> {
             },
         );
         shared.memory_pass.store(false, Ordering::Relaxed);
+        // Read before the interrupt reset below: the Ctrl-D arm raised that
+        // interrupt to stop the pass, and clearing it must not lose the
+        // reason. Taken rather than peeked, so a persistent remote
+        // `TurnShared` does not carry the quit into the next pass.
+        let quit = shared.quit_requested.swap(false, Ordering::Relaxed);
         // The interrupt a typed prompt raised has done its job. Both flags
         // are cleared here, not left for the next turn to trip over: the
         // worker clears the process flag only where it reports a cut-off
@@ -13422,13 +13503,18 @@ impl Agent<'_> {
         if let Err(e) = run {
             return Err(self.reconcile_and_fail(log, shared, e));
         }
-        // The prompt that cut the pass short is the next turn, now.
+        // The prompt that cut the pass short is the next turn, now — unless
+        // the thing that cut it short was Ctrl-D, in which case there is no
+        // next turn and the leftover goes with the session.
+        if quit {
+            return Ok(true);
+        }
         let leftover = shared.take_queued();
         if !leftover.is_empty() {
             self.absorb_leftover(log, leftover);
             self.tui_turn(terminal, log, view, input, btw, arcade, sub)?;
         }
-        Ok(())
+        Ok(false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14278,7 +14364,7 @@ impl Agent<'_> {
             // (CLAUDE.md). Only a snapshot: the reading happens from the
             // idle loop (`tui_memory_pass`), on a worker with the footer
             // live, and a prompt typed meanwhile cuts it short.
-            self.enqueue_memory_job();
+            self.enqueue_memory_job(turn_start.elapsed());
             // Stop hooks: exit 2 feeds stderr to the model and the turn
             // continues (at most once).
             if !stop_hook_ran {
@@ -14547,15 +14633,23 @@ impl Agent<'_> {
     /// here, and a `/clear` cannot lose what was already captured. Settings
     /// are sampled fresh every call so a `/config` change takes effect on
     /// the next eligible turn.
-    fn enqueue_memory_job(&mut self) -> bool {
+    ///
+    /// `turn` is how long the turn that just ended took, measured by the
+    /// caller. It is passed in rather than clocked here on purpose: both
+    /// call sites already hold a `turn_start`, and a parameter is what keeps
+    /// a sub-agent's turn from clobbering the main turn's clock — a
+    /// sidechain's own `turn_start` never reaches this call.
+    fn enqueue_memory_job(&mut self, turn: std::time::Duration) -> bool {
         let settings = crate::settings::active();
         self.extract_state.enabled = settings.memory.auto_extract;
         self.extract_state.every_n = settings.memory.extract_every_n_turns;
+        self.extract_state.min_turn =
+            std::time::Duration::from_secs(u64::from(settings.memory.min_turn_seconds));
         if self.in_sidechain() {
             return false; // a sub-agent's turn end is not a turn boundary
         }
         let depth = self.session.transcript.len();
-        let Some(from) = self.extract_state.should_run(depth) else {
+        let Some(from) = self.extract_state.should_run(depth, turn) else {
             return false;
         };
         // An interrupted turn is not a finished one: the user cut the model
@@ -14800,8 +14894,8 @@ impl Agent<'_> {
     /// tests, which exercise the gates and the pass together. Returns whether
     /// a generation ran.
     #[cfg(test)]
-    fn maybe_extract_memories(&mut self) -> bool {
-        self.enqueue_memory_job();
+    fn maybe_extract_memories(&mut self, turn: std::time::Duration) -> bool {
+        self.enqueue_memory_job(turn);
         self.process_memory_job()
     }
 
@@ -17991,6 +18085,21 @@ fn busy_ui_loop(
                             view.follow = true;
                             sub.follow_all();
                         }
+                    }
+                    // Ctrl-D quits, but only out of a memory pass: that is
+                    // housekeeping the user never asked for, and at a glance
+                    // the screen looks like an idle prompt. Mid-turn Ctrl-D
+                    // stays inert, as it always has — this must never be the
+                    // reason somebody loses a generation in flight. The empty
+                    // -buffer guard matches the idle loop's Ctrl-D, where a
+                    // non-empty line is a delete, not a quit.
+                    KeyCode::Char('d')
+                        if ctrl
+                            && input.buf.text().is_empty()
+                            && shared.memory_pass.load(Ordering::Relaxed) =>
+                    {
+                        shared.quit_requested.store(true, Ordering::Relaxed);
+                        raise_worker_interrupt(shared);
                     }
                     KeyCode::Char('u') if ctrl => input.buf.kill_to_start(),
                     KeyCode::Char('k') if ctrl => input.buf.kill_to_end(),
@@ -21456,7 +21565,7 @@ mod tests {
     /// `settings::active()` on every call and overwrites
     /// `extract_state.enabled` with it, so poking the field directly does
     /// nothing: a pass test that forgets this guard silently tests a pass
-    /// that never runs (its positive `assert!(agent.maybe_extract_memories())`
+    /// that never runs (its positive `assert!(agent.maybe_extract_memories(std::time::Duration::MAX))`
     /// is what catches the omission).
     fn enable_auto_extract_for_test() -> AutoExtractGuard {
         let mut on = crate::settings::Settings::default();
@@ -31556,11 +31665,11 @@ or the user's next message aborts before its first token"
         assert!(out.contains("remembered"), "{out}");
 
         assert!(
-            !agent.maybe_extract_memories(),
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
             "the model already wrote memory this turn"
         );
         assert!(
-            agent.maybe_extract_memories(),
+            agent.maybe_extract_memories(std::time::Duration::MAX),
             "the next turn is eligible again"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -31584,9 +31693,12 @@ or the user's next message aborts before its first token"
         // rejects `depth <= processed_depth`) is indirect proof that
         // `processed_depth` genuinely advanced, since `ExtractState`'s
         // fields are private to this test's module.
-        assert!(agent.maybe_extract_memories(), "the pass must actually run");
         assert!(
-            !agent.maybe_extract_memories(),
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the pass must actually run"
+        );
+        assert!(
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
             "processed_depth must have advanced past the current transcript \
              depth, so an immediate rerun with no new messages is not \
              eligible"
@@ -31635,7 +31747,10 @@ or the user's next message aborts before its first token"
         agent.session.push(Message::user("run something for me"));
         agent.session.push(Message::assistant("done"));
 
-        assert!(agent.maybe_extract_memories(), "the pass ran");
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the pass ran"
+        );
         assert!(
             !marker.exists(),
             "the memory pass dispatched a tool call: {}",
@@ -31649,7 +31764,7 @@ or the user's next message aborts before its first token"
         assert_eq!(agent.sidechain_depth, 0);
         assert_eq!(agent.session.transcript.len(), 2, "sidechain folded out");
         assert!(
-            !agent.maybe_extract_memories(),
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
             "an unusable reply still advances the span (no retry loop)"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -31669,7 +31784,7 @@ or the user's next message aborts before its first token"
         let _auto_extract_on = enable_auto_extract_for_test();
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
-        assert!(agent.maybe_extract_memories());
+        assert!(agent.maybe_extract_memories(std::time::Duration::MAX));
         let prompts = prompts.lock().unwrap();
         let prompt = prompts.last().expect("one generation");
         assert!(
@@ -31708,7 +31823,7 @@ or the user's next message aborts before its first token"
         agent.tool_ctx.memory_log_path = Some(dir.join("memory-log.jsonl"));
         agent.session.push(Message::user("I prefer tabs"));
         agent.session.push(Message::assistant("noted"));
-        assert!(agent.maybe_extract_memories());
+        assert!(agent.maybe_extract_memories(std::time::Duration::MAX));
         let saved = std::fs::read_to_string(dir.join(".plank").join("MEMORY.md"))
             .expect("project memory written");
         assert!(saved.contains("prefers tabs"), "{saved}");
@@ -31740,11 +31855,16 @@ or the user's next message aborts before its first token"
         let mut agent = test_agent(&dir, engine, &cfg);
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
-        assert!(agent.enqueue_memory_job(), "the span is queued");
+        // Duration::MAX clears any floor: these tests exercise the other
+        // gates, not the turn-length one, and have no turn clock in scope.
+        assert!(
+            agent.enqueue_memory_job(std::time::Duration::MAX),
+            "the span is queued"
+        );
         assert!(prompts.lock().unwrap().is_empty(), "nothing generated yet");
         assert_eq!(agent.memory_jobs.len(), 1);
         assert!(
-            !agent.enqueue_memory_job(),
+            !agent.enqueue_memory_job(std::time::Duration::MAX),
             "the span is retired as it is snapshotted, so nothing new to queue"
         );
         assert!(agent.memory_jobs_pending());
@@ -31777,7 +31897,7 @@ or the user's next message aborts before its first token"
         let mut agent = test_agent(&dir, engine, &cfg);
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
-        assert!(agent.enqueue_memory_job());
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
         let task = agent.memory_jobs.front().unwrap().task.clone();
         assert!(!agent.process_memory_job(), "cut short: not applied");
         assert_eq!(agent.memory_jobs.len(), 1, "back on the queue");
@@ -31804,7 +31924,7 @@ or the user's next message aborts before its first token"
         let mut agent = test_agent(&dir, engine, &cfg);
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
-        assert!(agent.enqueue_memory_job());
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
         for attempt in 1..crate::memextract::MAX_JOB_ATTEMPTS {
             assert!(!agent.process_memory_job());
             assert_eq!(agent.memory_jobs.len(), 1, "attempt {attempt} keeps it");
@@ -31817,7 +31937,7 @@ or the user's next message aborts before its first token"
             Some("dropped after repeated engine errors")
         );
         // The headless drain terminates on the same rule.
-        assert!(agent.enqueue_memory_job() || !agent.memory_jobs_pending());
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX) || !agent.memory_jobs_pending());
         agent.drain_memory_jobs();
         assert!(!agent.memory_jobs_pending());
         std::fs::remove_dir_all(&dir).ok();
@@ -31841,7 +31961,7 @@ or the user's next message aborts before its first token"
             .session
             .push(Message::user("remember the port is 8080"));
         agent.session.push(Message::assistant("noted"));
-        assert!(agent.enqueue_memory_job());
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
         agent.session.transcript.clear();
         assert!(agent.process_memory_job());
         let prompt = prompts.lock().unwrap()[0].clone();
@@ -31879,7 +31999,7 @@ or the user's next message aborts before its first token"
         let mut agent = test_agent(&dir, engine, &cfg);
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
-        assert!(agent.enqueue_memory_job());
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
         assert!(agent.memory_jobs.front().unwrap().resume.is_none());
 
         // First attempt: the generation after the prefill snapshot is cut
@@ -31950,7 +32070,7 @@ or the user's next message aborts before its first token"
         agent.sub_sink = SubSinkTarget::Events(tx);
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
-        assert!(agent.enqueue_memory_job());
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
         assert!(agent.process_memory_job());
         let events: Vec<UiEvent> = rx.try_iter().collect();
         assert!(
@@ -31992,7 +32112,7 @@ or the user's next message aborts before its first token"
         let mut agent = test_agent(&dir, engine, &cfg);
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
-        assert!(agent.enqueue_memory_job());
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
         assert!(!agent.process_memory_job(), "cut short during the prefill");
         let job = agent.memory_jobs.front().expect("back on the queue");
         assert_eq!(job.attempts, 0, "an interrupt is not a fault");
@@ -32034,7 +32154,7 @@ or the user's next message aborts before its first token"
         let mut agent = test_agent(&dir, engine, &cfg);
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
-        assert!(agent.enqueue_memory_job());
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
         assert!(agent.process_memory_job());
         assert_eq!(prompts.lock().unwrap().len(), 1, "the generation alone");
         std::fs::remove_dir_all(&dir).ok();
@@ -32056,13 +32176,13 @@ or the user's next message aborts before its first token"
         agent.session.push(Message::assistant("hi"));
         agent.last_turn_interrupted = true;
         assert!(
-            !agent.maybe_extract_memories(),
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
             "the user cut the turn off: no extra generation"
         );
         assert!(!agent.extract_state.is_running());
         agent.last_turn_interrupted = false;
         assert!(
-            agent.maybe_extract_memories(),
+            agent.maybe_extract_memories(std::time::Duration::MAX),
             "the span was cancelled, not retired, so the next turn reads it"
         );
     }
@@ -32082,7 +32202,7 @@ or the user's next message aborts before its first token"
         let _auto_extract_on = enable_auto_extract_for_test();
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
-        assert!(agent.maybe_extract_memories());
+        assert!(agent.maybe_extract_memories(std::time::Duration::MAX));
         assert!(
             agent.pending_memory_notice.is_none(),
             "an empty pass is silent: the dump is the diagnostic"
@@ -32094,7 +32214,7 @@ or the user's next message aborts before its first token"
         agent.session.push(Message::user("more"));
         agent.session.push(Message::assistant("ok"));
         assert!(
-            agent.maybe_extract_memories(),
+            agent.maybe_extract_memories(std::time::Duration::MAX),
             "the span advanced, so it runs again"
         );
         assert!(
@@ -32133,7 +32253,10 @@ or the user's next message aborts before its first token"
                 "y".repeat(3000)
             )));
         }
-        assert!(agent.maybe_extract_memories(), "covers depth 0..6");
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "covers depth 0..6"
+        );
         agent.session.push(Message::user("new-q"));
         agent.session.push(Message::assistant("new-a"));
         agent.rebuild_after_compact("<summary>did things</summary>");
@@ -32147,7 +32270,7 @@ or the user's next message aborts before its first token"
             "the unread pair survives in the verbatim tail"
         );
         assert!(
-            agent.maybe_extract_memories(),
+            agent.maybe_extract_memories(std::time::Duration::MAX),
             "the shrink must not silently stop the pass"
         );
         let prompts = prompts.lock().unwrap();
@@ -32187,7 +32310,7 @@ or the user's next message aborts before its first token"
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
         assert!(
-            agent.maybe_extract_memories(),
+            agent.maybe_extract_memories(std::time::Duration::MAX),
             "on by default: the pass runs"
         );
         assert!(
@@ -32234,7 +32357,10 @@ or the user's next message aborts before its first token"
             .push(Message::user(format!("notes {}", "n".repeat(4000))));
         agent.session.push(Message::assistant("ok"));
 
-        assert!(!agent.maybe_extract_memories(), "the span does not fit");
+        assert!(
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the span does not fit"
+        );
         assert!(
             prompts.lock().unwrap().is_empty(),
             "the engine was never asked to generate"
@@ -32251,7 +32377,7 @@ or the user's next message aborts before its first token"
         // retired one is done.
         give_agent_room(&mut agent, &prompts);
         assert!(
-            !agent.maybe_extract_memories(),
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
             "the oversized span was retired, not left for a retry"
         );
         assert!(prompts.lock().unwrap().is_empty());
@@ -32259,7 +32385,10 @@ or the user's next message aborts before its first token"
         // New material above the retired depth is still read.
         agent.session.push(Message::user("more"));
         agent.session.push(Message::assistant("ok"));
-        assert!(agent.maybe_extract_memories(), "later spans still run");
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "later spans still run"
+        );
         let prompts = prompts.lock().unwrap();
         assert_eq!(prompts.len(), 1);
         // The sidechain prompt is the whole live transcript plus the task,
@@ -32297,7 +32426,10 @@ or the user's next message aborts before its first token"
         agent.session.push(Message::user("hello"));
         agent.session.push(Message::assistant("hi"));
 
-        assert!(!agent.maybe_extract_memories(), "the engine failed");
+        assert!(
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the engine failed"
+        );
         assert_eq!(
             agent.sidechain_depth, 0,
             "the fork is closed on the error path"
@@ -32307,7 +32439,7 @@ or the user's next message aborts before its first token"
         // Same depth, engine healthy again: the span was only cancelled.
         give_agent_room(&mut agent, &prompts);
         assert!(
-            agent.maybe_extract_memories(),
+            agent.maybe_extract_memories(std::time::Duration::MAX),
             "a transient fault leaves the span to be redone"
         );
         assert!(
@@ -32335,12 +32467,15 @@ or the user's next message aborts before its first token"
         }
         agent.reset_for_adopted_session(restored);
         assert!(
-            !agent.maybe_extract_memories(),
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
             "a restored transcript is history, not new material"
         );
         agent.session.push(Message::user("new"));
         agent.session.push(Message::assistant("ok"));
-        assert!(agent.maybe_extract_memories(), "new turns are still read");
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "new turns are still read"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
