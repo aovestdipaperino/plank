@@ -401,25 +401,25 @@ sidechain, so a sub-agent's turn never triggers it):
 2. **Depth keying.** The pass tracks `processed_depth`, the transcript
    length its last completed run covered, and fires only when the current
    depth has grown past it.
-3. **Not already running.** A trigger that arrives while a pass is in
+3. **Turn duration floor.** The turn must have taken at least
+   `memory.minTurnSeconds`. A turn that misses the floor does not advance
+   `processed_depth`, so its span is deferred rather than discarded: the
+   next turn that clears the floor reads it too.
+4. **Not already running.** A trigger that arrives while a pass is in
    flight is dropped outright. Nothing is recorded about it, because
    nothing needs to be: once `finish` clears the flag and advances
    `processed_depth`, the next call re-derives the span from
    `processed_depth` against the then-current depth, which necessarily
    covers everything that arrived meanwhile, in one trailing run.
-4. **Turn duration floor.** The turn must have taken at least
-   `memory.minTurnSeconds`. A turn that misses the floor does not advance
-   `processed_depth`, so its span is deferred rather than discarded: the
-   next turn that clears the floor reads it too.
 5. **Throttle.** The pass runs only every `memory.extractEveryNTurns`
    *eligible* turns.
 
-The order is what makes "eligible" mean something. The floor and the
-throttle counter are both reached late, so a turn skipped for suppression,
-for having nothing new, or for arriving mid-pass does not count against
-either of them. Only a turn that genuinely had new transcript to look at,
-cleared the duration floor, and could have been acted on, advances the
-count.
+The order is what makes "eligible" mean something. The floor sits above the
+"already running" check and the throttle counter, so a turn skipped for
+suppression, for having nothing new, for missing the duration floor, or for
+arriving mid-pass does not count against the throttle. Only a turn that
+genuinely had new transcript to look at, cleared the duration floor, and
+could have been acted on, advances the count.
 
 **The invariant that makes depth keying correct, stated the way the code
 states it:** a pass must read only the transcript above its recorded depth,

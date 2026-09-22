@@ -4,11 +4,13 @@
 //! The memory extraction pass: gating state and prompt construction.
 //!
 //! Fires at the end of the query loop — a generation that produced a final
-//! response with no tool calls — subject to four gates, in order
+//! response with no tool calls — subject to five gates, in order
 //! ([`ExtractState::should_run`]): enabled and not suppressed by the model's
 //! own `remember`/`forget` call this turn, depth keying so the pass reads
-//! only the transcript it has not already seen, not already running, and a
-//! throttle over eligible turns. Off by default (`memory.autoExtract`).
+//! only the transcript it has not already seen, a turn-duration floor
+//! (`memory.minTurnSeconds`) below which the turn's span is deferred rather
+//! than dropped, not already running, and a throttle over eligible turns.
+//! Off by default (`memory.autoExtract`).
 //!
 //! The depth keying is the same shape as a `kvladder` rung, and carries the
 //! same warning: the recorded depth is what makes the resume correct, and
