@@ -340,7 +340,10 @@ conversation should not fill with it. **A prompt submitted during the pass inter
 (`TurnShared::memory_pass` makes the busy loop raise the worker interrupt
 as it queues the line): the job goes back to the front of the queue,
 uncounted, and the typed line starts its turn at once — the user never waits
-for the notes. `/btw` is refused during a pass, with a hint to just type the
+for the notes. Ctrl-D on an empty prompt during the pass quits plank, exactly
+as it does at an idle prompt: the pass stops at its next token and the queued
+job is dropped. Mid-*turn* Ctrl-D remains inert — nobody should lose a
+generation in flight to a stray keystroke. `/btw` is refused during a pass, with a hint to just type the
 prompt, because there is no main task to ask beside. The plain REPL reads
 one job per 250 ms idle tick of its stdin wait (`run_repl_plain_local`); it
 cannot cut a generation short on keystrokes, so a line typed meanwhile
@@ -384,7 +387,7 @@ fault, so it is not retried); too big for the remaining context (dropped,
 with a one-time notice); or after `MAX_JOB_ATTEMPTS` engine errors, which
 is what keeps a broken engine from pinning the idle loop on one span.
 
-**The snapshot is gated by four checks, in this order** (`ExtractState::should_run`;
+**The snapshot is gated by five checks, in this order** (`ExtractState::should_run`;
 `enqueue_memory_job` also refuses to run while already inside another
 sidechain, so a sub-agent's turn never triggers it):
 
@@ -404,13 +407,18 @@ sidechain, so a sub-agent's turn never triggers it):
    `processed_depth`, the next call re-derives the span from
    `processed_depth` against the then-current depth, which necessarily
    covers everything that arrived meanwhile, in one trailing run.
-4. **Throttle.** The pass runs only every `memory.extractEveryNTurns`
+4. **Turn duration floor.** The turn must have taken at least
+   `memory.minTurnSeconds`. A turn that misses the floor does not advance
+   `processed_depth`, so its span is deferred rather than discarded: the
+   next turn that clears the floor reads it too.
+5. **Throttle.** The pass runs only every `memory.extractEveryNTurns`
    *eligible* turns.
 
-The order is what makes "eligible" mean something. The throttle counter is
-reached last, so a turn skipped for suppression, for having nothing new, or
-for arriving mid-pass does not count against it. Only a turn that genuinely
-had new transcript to look at, and could have been acted on, advances the
+The order is what makes "eligible" mean something. The floor and the
+throttle counter are both reached late, so a turn skipped for suppression,
+for having nothing new, or for arriving mid-pass does not count against
+either of them. Only a turn that genuinely had new transcript to look at,
+cleared the duration floor, and could have been acted on, advances the
 count.
 
 **The invariant that makes depth keying correct, stated the way the code
@@ -512,6 +520,7 @@ All under the `memory` and `tools` blocks in `~/.plank/settings.json` /
 |---|---|---|
 | `memory.autoExtract` | `true` | Whether the extraction pass runs at all. On, every eligible turn ends with a synchronous stall for a KV snapshot, a prefill of the excerpt, a generation and a restore, none of it counted in the turn stats. Off leaves the `remember`/`forget` tools and `/remember` working — only the passive pass stops, and the sidecar counters are never bumped, so eviction ranks by date alone. Also in the `/config` form. |
 | `memory.extractEveryNTurns` | `1` | Run the pass every N *eligible* turns (a turn with no tool calls and no model `remember`/`forget`). `1` means every eligible turn. A configured `0` is clamped to `1`. Also in the `/config` form. |
+| `memory.minTurnSeconds` | `120` | A floor on how long a turn must have taken for it to trigger the pass. The pass costs a KV snapshot, a prefill, a generation and a restore; a four-second exchange rarely produces anything worth that. Set it to `0` to remove the floor. A short turn **defers** its span rather than discarding it. The pass reads the transcript from the depth the last completed pass recorded, and a turn under the floor does not move that depth, so the next turn that does clear the floor reads the short turns too. Nothing said to the model is lost to this gate — the only effect is when the reading happens. The consequence to be aware of is the mirror image: a session made entirely of short turns accumulates an unread span and extracts nothing until one long turn arrives. The floor is checked before the `extractEveryNTurns` counter, so a short turn does not count as an eligible turn either: `extractEveryNTurns: 3` means every third turn *worth* extracting from. |
 | `memory.budgets.user` | `4096` | Byte budget for `[user]` entries (see "Budgets and eviction" for what is counted). Hand-edit only. |
 | `memory.budgets.feedback` | `4096` | Byte budget for `[feedback]` entries. Hand-edit only. |
 | `memory.budgets.project` | `6144` | Byte budget for `[project]` entries, including every untagged legacy entry. Hand-edit only. |
