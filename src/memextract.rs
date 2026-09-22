@@ -73,6 +73,10 @@ pub struct ExtractState {
     pub enabled: bool,
     /// Mirror of `settings.memory.extract_every_n_turns`.
     pub every_n: u32,
+    /// Mirror of `settings.memory.min_turn_seconds`, as a `Duration`. A turn
+    /// shorter than this defers the span instead of triggering a pass.
+    /// `Duration::ZERO` (the default) is no floor.
+    pub min_turn: std::time::Duration,
     /// Transcript depth the last completed pass covered.
     processed_depth: usize,
     /// Set between a positive `should_run` and the `finish`/`cancel` that
@@ -110,12 +114,25 @@ impl ExtractState {
     /// re-derives the span from `processed_depth` against whatever depth it
     /// is given then, which necessarily covers everything that arrived while
     /// the pass was busy, in one trailing run.
-    pub fn should_run(&mut self, depth: usize) -> Option<usize> {
+    ///
+    /// A turn shorter than `min_turn` returns `None` without recording
+    /// anything: the span is deferred to the next turn that clears the
+    /// floor, never discarded.
+    pub fn should_run(&mut self, depth: usize, turn: std::time::Duration) -> Option<usize> {
         let suppressed = std::mem::take(&mut self.wrote_this_turn);
         if !self.enabled || suppressed {
             return None;
         }
         if depth <= self.processed_depth {
+            return None;
+        }
+        // A turn too short to be worth a pass. Deliberately *before* the
+        // `eligible` increment, so a short turn is not merely throttled but
+        // never counts as an eligible turn: `every_n` keeps meaning "every
+        // Nth turn worth extracting from". Just as deliberately, nothing is
+        // recorded here — `processed_depth` does not move and the span stays
+        // open, so the next turn that clears the floor reads these turns too.
+        if turn < self.min_turn {
             return None;
         }
         if self.running {
@@ -138,10 +155,11 @@ impl ExtractState {
     /// what consumes the model's own `remember` suppression and advances the
     /// throttle.
     #[must_use]
-    pub fn would_run(&self, depth: usize) -> bool {
+    pub fn would_run(&self, depth: usize, turn: std::time::Duration) -> bool {
         self.enabled
             && !self.wrote_this_turn
             && depth > self.processed_depth
+            && turn >= self.min_turn
             && !self.running
             && self.eligible.saturating_add(1) >= self.every_n.max(1)
     }
@@ -422,28 +440,34 @@ pub fn current_entries(cwd: &std::path::Path) -> Vec<(Scope, Entry)> {
 mod tests {
     use super::*;
 
+    /// A turn comfortably over any floor these tests set.
+    const LONG: std::time::Duration = std::time::Duration::from_secs(600);
+
     #[test]
     fn would_run_peeks_without_consuming() {
         let mut s = state();
-        assert!(s.would_run(10), "the first eligible turn");
-        assert!(s.would_run(10), "a peek changes nothing");
-        assert_eq!(s.should_run(10), Some(0));
-        assert!(!s.would_run(12), "a span is open");
+        assert!(s.would_run(10, LONG), "the first eligible turn");
+        assert!(s.would_run(10, LONG), "a peek changes nothing");
+        assert_eq!(s.should_run(10, LONG), Some(0));
+        assert!(!s.would_run(12, LONG), "a span is open");
         s.finish(10);
-        assert!(!s.would_run(10), "nothing new");
-        assert!(s.would_run(11));
+        assert!(!s.would_run(10, LONG), "nothing new");
+        assert!(s.would_run(11, LONG));
         // The model's own write suppresses the pass, and the peek agrees
         // without clearing the suppression: `should_run` still does that.
         s.note_tool_write();
-        assert!(!s.would_run(11));
-        assert_eq!(s.should_run(11), None);
-        assert!(s.would_run(11), "suppression consumed by should_run alone");
+        assert!(!s.would_run(11, LONG));
+        assert_eq!(s.should_run(11, LONG), None);
+        assert!(
+            s.would_run(11, LONG),
+            "suppression consumed by should_run alone"
+        );
     }
 
     #[test]
     fn is_running_tracks_the_generation_not_the_span() {
         let mut s = state();
-        assert_eq!(s.should_run(10), Some(0));
+        assert_eq!(s.should_run(10, LONG), Some(0));
         assert!(!s.is_running(), "an open span is not a running generation");
         s.finish(10);
         s.begin_pass();
@@ -459,12 +483,12 @@ mod tests {
             every_n: 3,
             ..ExtractState::default()
         };
-        assert!(!s.would_run(4));
-        assert_eq!(s.should_run(4), None);
-        assert!(!s.would_run(6));
-        assert_eq!(s.should_run(6), None);
-        assert!(s.would_run(8), "the third eligible turn");
-        assert_eq!(s.should_run(8), Some(0));
+        assert!(!s.would_run(4, LONG));
+        assert_eq!(s.should_run(4, LONG), None);
+        assert!(!s.would_run(6, LONG));
+        assert_eq!(s.should_run(6, LONG), None);
+        assert!(s.would_run(8, LONG), "the third eligible turn");
+        assert_eq!(s.should_run(8, LONG), Some(0));
     }
 
     fn state() -> ExtractState {
@@ -478,11 +502,15 @@ mod tests {
     #[test]
     fn a_second_pass_over_an_unchanged_transcript_processes_nothing() {
         let mut s = state();
-        assert_eq!(s.should_run(10), Some(0), "first pass covers depth 0..10");
-        s.finish(10);
-        assert_eq!(s.should_run(10), None, "nothing new — no pass");
         assert_eq!(
-            s.should_run(14),
+            s.should_run(10, LONG),
+            Some(0),
+            "first pass covers depth 0..10"
+        );
+        s.finish(10);
+        assert_eq!(s.should_run(10, LONG), None, "nothing new — no pass");
+        assert_eq!(
+            s.should_run(14, LONG),
             Some(10),
             "resumes from the recorded depth"
         );
@@ -492,9 +520,13 @@ mod tests {
     fn a_remember_call_in_the_turn_suppresses_the_pass() {
         let mut s = state();
         s.note_tool_write();
-        assert_eq!(s.should_run(10), None, "the model's own judgment wins");
         assert_eq!(
-            s.should_run(10),
+            s.should_run(10, LONG),
+            None,
+            "the model's own judgment wins"
+        );
+        assert_eq!(
+            s.should_run(10, LONG),
             Some(0),
             "the suppression lasts one turn only"
         );
@@ -507,24 +539,24 @@ mod tests {
             every_n: 3,
             ..ExtractState::default()
         };
-        assert_eq!(s.should_run(4), None);
-        assert_eq!(s.should_run(6), None);
-        assert_eq!(s.should_run(8), Some(0), "every third eligible turn");
+        assert_eq!(s.should_run(4, LONG), None);
+        assert_eq!(s.should_run(6, LONG), None);
+        assert_eq!(s.should_run(8, LONG), Some(0), "every third eligible turn");
     }
 
     #[test]
     fn a_trigger_while_running_is_dropped_and_yields_one_trailing_run() {
         let mut s = state();
-        assert_eq!(s.should_run(10), Some(0));
-        assert_eq!(s.should_run(12), None, "a pass is already running");
+        assert_eq!(s.should_run(10, LONG), Some(0));
+        assert_eq!(s.should_run(12, LONG), None, "a pass is already running");
         assert_eq!(
-            s.should_run(14),
+            s.should_run(14, LONG),
             None,
             "still running; later triggers are simply dropped"
         );
         s.finish(10);
         assert_eq!(
-            s.should_run(14),
+            s.should_run(14, LONG),
             Some(10),
             "one trailing run re-derives the span and covers everything that arrived"
         );
@@ -533,12 +565,12 @@ mod tests {
     #[test]
     fn finish_never_regresses_processed_depth() {
         let mut s = state();
-        assert_eq!(s.should_run(10), Some(0));
+        assert_eq!(s.should_run(10, LONG), Some(0));
         s.finish(10);
         // A stale, lower depth must not move processed_depth backwards.
         s.finish(4);
         assert_eq!(
-            s.should_run(12),
+            s.should_run(12, LONG),
             Some(10),
             "processed_depth stayed at 10, not regressed to 4"
         );
@@ -547,28 +579,32 @@ mod tests {
     #[test]
     fn cancelling_leaves_the_recorded_depth_untouched() {
         let mut s = state();
-        assert_eq!(s.should_run(10), Some(0));
+        assert_eq!(s.should_run(10, LONG), Some(0));
         s.cancel();
-        assert_eq!(s.should_run(10), Some(0), "the work is simply redone later");
+        assert_eq!(
+            s.should_run(10, LONG),
+            Some(0),
+            "the work is simply redone later"
+        );
     }
 
     #[test]
     fn a_rewrite_that_shrinks_the_transcript_neither_disables_nor_skips() {
         let mut s = state();
-        assert_eq!(s.should_run(10), Some(0));
+        assert_eq!(s.should_run(10, LONG), Some(0));
         s.finish(10);
         // Two more messages arrive, then compaction folds the 12-message
         // transcript into a 1-message summary plus a 4-message verbatim tail.
         s.rebase(12, 5);
         assert_eq!(
-            s.should_run(5),
+            s.should_run(5, LONG),
             Some(3),
             "the two unprocessed tail messages are still above the depth"
         );
         s.finish(5);
-        assert_eq!(s.should_run(5), None);
+        assert_eq!(s.should_run(5, LONG), None);
         assert_eq!(
-            s.should_run(7),
+            s.should_run(7, LONG),
             Some(5),
             "the pass keeps running afterwards"
         );
@@ -577,34 +613,38 @@ mod tests {
     #[test]
     fn rebase_with_nothing_unseen_marks_the_whole_rewrite_processed() {
         let mut s = state();
-        assert_eq!(s.should_run(10), Some(0));
+        assert_eq!(s.should_run(10, LONG), Some(0));
         s.finish(10);
         s.rebase(10, 3);
-        assert_eq!(s.should_run(3), None, "summary only — nothing new to read");
-        assert_eq!(s.should_run(4), Some(3));
+        assert_eq!(
+            s.should_run(3, LONG),
+            None,
+            "summary only — nothing new to read"
+        );
+        assert_eq!(s.should_run(4, LONG), Some(3));
     }
 
     #[test]
     fn truncate_to_clamps_and_reset_to_adopts() {
         let mut s = state();
-        assert_eq!(s.should_run(10), Some(0));
+        assert_eq!(s.should_run(10, LONG), Some(0));
         s.finish(10);
         s.truncate_to(6);
         assert_eq!(
-            s.should_run(8),
+            s.should_run(8, LONG),
             Some(6),
             "clamped to the cut, not left at 10"
         );
         s.finish(8);
         s.reset_to(40);
         assert_eq!(
-            s.should_run(40),
+            s.should_run(40, LONG),
             None,
             "a restored transcript is not shipped wholesale"
         );
-        assert_eq!(s.should_run(42), Some(40));
+        assert_eq!(s.should_run(42, LONG), Some(40));
         s.reset_to(0);
-        assert_eq!(s.should_run(2), Some(0), "/clear starts over");
+        assert_eq!(s.should_run(2, LONG), Some(0), "/clear starts over");
     }
 
     #[test]
@@ -782,6 +822,95 @@ mod tests {
             every_n: 1,
             ..ExtractState::default()
         };
-        assert_eq!(s.should_run(100), None);
+        assert_eq!(s.should_run(100, LONG), None);
+    }
+
+    #[test]
+    fn a_short_turn_does_not_run_and_leaves_the_span_open() {
+        let mut s = ExtractState {
+            min_turn: std::time::Duration::from_secs(120),
+            ..state()
+        };
+        assert_eq!(
+            s.should_run(10, std::time::Duration::from_secs(4)),
+            None,
+            "a four-second turn is not worth a pass"
+        );
+        // Deferred, not discarded: the span is still open at depth 0, and
+        // the state is not left mid-pass.
+        assert_eq!(
+            s.should_run(10, LONG),
+            Some(0),
+            "the very next long turn reads the span the short turn left"
+        );
+    }
+
+    #[test]
+    fn a_long_turn_reads_back_across_deferred_short_turns() {
+        let mut s = ExtractState {
+            min_turn: std::time::Duration::from_secs(120),
+            ..state()
+        };
+        assert_eq!(s.should_run(10, LONG), Some(0));
+        s.finish(10);
+        // Three short turns grow the transcript but trigger nothing.
+        for depth in [12, 14, 16] {
+            assert_eq!(s.should_run(depth, std::time::Duration::from_secs(5)), None);
+        }
+        // The long turn that follows starts from the last *completed* pass,
+        // not from the last short turn, so nothing said in between is lost.
+        assert_eq!(
+            s.should_run(18, LONG),
+            Some(10),
+            "the deferred span must be read in full"
+        );
+    }
+
+    #[test]
+    fn a_short_turn_does_not_consume_a_throttle_tick() {
+        let mut s = ExtractState {
+            enabled: true,
+            every_n: 2,
+            min_turn: std::time::Duration::from_secs(120),
+            ..ExtractState::default()
+        };
+        assert_eq!(
+            s.should_run(4, std::time::Duration::from_secs(3)),
+            None,
+            "short: not a pass, and not an eligible turn either"
+        );
+        assert_eq!(
+            s.should_run(6, LONG),
+            None,
+            "the first eligible turn — the short one did not count"
+        );
+        assert_eq!(s.should_run(8, LONG), Some(0), "the second eligible turn");
+    }
+
+    #[test]
+    fn a_zero_floor_reproduces_the_old_behavior() {
+        let mut s = state();
+        assert_eq!(s.min_turn, std::time::Duration::ZERO, "the default floor");
+        assert_eq!(
+            s.should_run(10, std::time::Duration::ZERO),
+            Some(0),
+            "with no floor even an instantaneous turn runs"
+        );
+    }
+
+    #[test]
+    fn would_run_agrees_with_the_floor() {
+        let mut s = ExtractState {
+            min_turn: std::time::Duration::from_secs(120),
+            ..state()
+        };
+        let short = std::time::Duration::from_secs(4);
+        assert!(!s.would_run(10, short), "the peek must see the floor too");
+        assert!(s.would_run(10, LONG));
+        assert_eq!(s.should_run(10, short), None);
+        assert!(
+            s.would_run(10, LONG),
+            "a rejected short turn leaves the peek unchanged"
+        );
     }
 }
