@@ -320,6 +320,64 @@ fn repaint_idle(
     Ok(completed.buffer.clone())
 }
 
+/// The idle loop's quit confirmation, shared by every path that leaves it.
+///
+/// A live background download is worth one line before quitting, so nobody
+/// closes the terminal wondering whether they just threw away 40 GB.
+///
+/// Returns `true` when the caller should quit and `false` when the user
+/// declined, so a call site reads `if confirm_quit_idle(..)? { break } else
+/// { continue }`. With no background download in flight there is nothing to
+/// warn about and nothing to ask, so it returns `true` without drawing.
+///
+/// The repaint is not optional: the frame is only drawn at the top of the
+/// idle loop, so without it the warning would be invisible behind a stale
+/// frame and the user's answering keystroke would be silently consumed by
+/// the confirmation they never saw.
+#[allow(clippy::too_many_arguments)]
+fn confirm_quit_idle(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &mut OutputLog,
+    view: &mut tui::OutputView,
+    sub_pane: &mut tui::SubPane,
+    btw_panel: &mut BtwPanel,
+    report: &mut Option<tui::ReportPanel>,
+    input: &TuiInput,
+    idle_status: &str,
+    selection: Option<tui::ContentSelection>,
+    task_view: &tui::TaskView,
+    config_form: Option<&crate::configform::ConfigForm>,
+    kv_pane: Option<&crate::kvpane::KvPane>,
+    resume_pane: Option<&crate::resumepane::ResumePane>,
+    arcade: &crate::arcade::Arcade,
+    wasm_frame: Option<&crate::wasmreg::OpenFrame>,
+    rem: Option<&Mutex<UiRemote>>,
+) -> Result<bool, String> {
+    let Some(warning) = crate::downloader::quit_warning() else {
+        return Ok(true);
+    };
+    log.push_dim(warning);
+    repaint_idle(
+        terminal,
+        log,
+        view,
+        sub_pane,
+        btw_panel,
+        report,
+        input,
+        idle_status,
+        selection,
+        task_view,
+        config_form,
+        kv_pane,
+        resume_pane,
+        arcade,
+        wasm_frame,
+        rem,
+    )?;
+    await_yes_default()
+}
+
 /// Answers deferred remote requests. Call right after `terminal.draw` returns.
 fn remote_service(remote: Option<&Mutex<UiRemote>>) {
     if let Some(m) = remote
@@ -12028,7 +12086,7 @@ impl Agent<'_> {
                     && wasm_frame.is_none()
                     && self.memory_jobs_pending()
                 {
-                    self.tui_memory_pass(
+                    let quit = self.tui_memory_pass(
                         terminal,
                         &mut log,
                         &mut view,
@@ -12037,6 +12095,32 @@ impl Agent<'_> {
                         &mut arcade,
                         &mut sub_pane,
                     )?;
+                    if quit {
+                        // Ctrl-D during the pass leaves through exactly the
+                        // same door as Ctrl-D at the prompt, download warning
+                        // and all.
+                        if !confirm_quit_idle(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut sub_pane,
+                            &mut btw_panel,
+                            &mut report,
+                            &input,
+                            &idle_status,
+                            selection.current(),
+                            &task_view,
+                            config_form.as_ref(),
+                            kv_pane.as_ref(),
+                            resume_pane.as_ref(),
+                            &arcade,
+                            wasm_frame.as_ref(),
+                            rem,
+                        )? {
+                            continue;
+                        }
+                        break;
+                    }
                 }
                 continue;
             };
@@ -12530,37 +12614,25 @@ impl Agent<'_> {
                 }
                 KeyCode::Char('d') if ctrl => {
                     if input.buf.text().is_empty() {
-                        // A live background download is worth one line before
-                        // quitting, so nobody closes the terminal wondering
-                        // whether they just threw away 40 GB.
-                        if let Some(warning) = crate::downloader::quit_warning() {
-                            log.push_dim(warning);
-                            // Repaint before blocking: the frame is only drawn
-                            // at the top of this loop, so without this the
-                            // terminal would look frozen with the warning
-                            // invisible, and the user's next keystroke would
-                            // be silently consumed as the answer.
-                            repaint_idle(
-                                terminal,
-                                &log,
-                                &mut view,
-                                &mut sub_pane,
-                                &mut btw_panel,
-                                &mut report,
-                                &input,
-                                &idle_status,
-                                selection.current(),
-                                &task_view,
-                                config_form.as_ref(),
-                                kv_pane.as_ref(),
-                                resume_pane.as_ref(),
-                                &arcade,
-                                wasm_frame.as_ref(),
-                                rem,
-                            )?;
-                            if !await_yes_default()? {
-                                continue;
-                            }
+                        if !confirm_quit_idle(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut sub_pane,
+                            &mut btw_panel,
+                            &mut report,
+                            &input,
+                            &idle_status,
+                            selection.current(),
+                            &task_view,
+                            config_form.as_ref(),
+                            kv_pane.as_ref(),
+                            resume_pane.as_ref(),
+                            &arcade,
+                            wasm_frame.as_ref(),
+                            rem,
+                        )? {
+                            continue;
                         }
                         break;
                     }
@@ -13362,6 +13434,10 @@ impl Agent<'_> {
     /// token, `process_memory_job` puts the job back at the front of the
     /// queue, and the typed line becomes the next turn right here — the
     /// user never waits for the notes.
+    ///
+    /// Returns `true` when the user pressed Ctrl-D during the pass: the
+    /// caller quits. Queued memory jobs are dropped rather than drained —
+    /// the user asked to leave.
     #[allow(clippy::too_many_arguments)]
     fn tui_memory_pass(
         &mut self,
@@ -13372,7 +13448,7 @@ impl Agent<'_> {
         btw: &mut BtwPanel,
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         // No scrollback line: the footer mark (`status::MEMORY_MARK`) is the
         // whole announcement. Housekeeping the user did not ask for should
         // not write into the conversation.
@@ -13413,6 +13489,11 @@ impl Agent<'_> {
             },
         );
         shared.memory_pass.store(false, Ordering::Relaxed);
+        // Read before the interrupt reset below: the Ctrl-D arm raised that
+        // interrupt to stop the pass, and clearing it must not lose the
+        // reason. Taken rather than peeked, so a persistent remote
+        // `TurnShared` does not carry the quit into the next pass.
+        let quit = shared.quit_requested.swap(false, Ordering::Relaxed);
         // The interrupt a typed prompt raised has done its job. Both flags
         // are cleared here, not left for the next turn to trip over: the
         // worker clears the process flag only where it reports a cut-off
@@ -13422,13 +13503,18 @@ impl Agent<'_> {
         if let Err(e) = run {
             return Err(self.reconcile_and_fail(log, shared, e));
         }
-        // The prompt that cut the pass short is the next turn, now.
+        // The prompt that cut the pass short is the next turn, now — unless
+        // the thing that cut it short was Ctrl-D, in which case there is no
+        // next turn and the leftover goes with the session.
+        if quit {
+            return Ok(true);
+        }
         let leftover = shared.take_queued();
         if !leftover.is_empty() {
             self.absorb_leftover(log, leftover);
             self.tui_turn(terminal, log, view, input, btw, arcade, sub)?;
         }
-        Ok(())
+        Ok(false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -17998,6 +18084,21 @@ fn busy_ui_loop(
                             view.follow = true;
                             sub.follow_all();
                         }
+                    }
+                    // Ctrl-D quits, but only out of a memory pass: that is
+                    // housekeeping the user never asked for, and at a glance
+                    // the screen looks like an idle prompt. Mid-turn Ctrl-D
+                    // stays inert, as it always has — this must never be the
+                    // reason somebody loses a generation in flight. The empty
+                    // -buffer guard matches the idle loop's Ctrl-D, where a
+                    // non-empty line is a delete, not a quit.
+                    KeyCode::Char('d')
+                        if ctrl
+                            && input.buf.text().is_empty()
+                            && shared.memory_pass.load(Ordering::Relaxed) =>
+                    {
+                        shared.quit_requested.store(true, Ordering::Relaxed);
+                        raise_worker_interrupt(shared);
                     }
                     KeyCode::Char('u') if ctrl => input.buf.kill_to_start(),
                     KeyCode::Char('k') if ctrl => input.buf.kill_to_end(),
