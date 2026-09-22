@@ -504,6 +504,15 @@ pub struct MemorySettings {
     /// ended with no tool calls and in which the model did not itself call
     /// `remember`. `1` means every eligible turn.
     pub extract_every_n_turns: u32,
+    /// A turn shorter than this does not trigger the extraction pass. The
+    /// pass costs a KV snapshot, a prefill, a generation and a restore, and
+    /// a four-second exchange is rarely worth that. `0` disables the floor.
+    ///
+    /// A turn under the floor *defers* its span rather than discarding it:
+    /// `ExtractState::should_run` returns without advancing
+    /// `processed_depth`, so the next turn that clears the floor reads the
+    /// short turns too. Nothing said to the model is ever lost to this gate.
+    pub min_turn_seconds: u32,
     /// Per-type character budgets for the rendered memory section.
     pub budgets: crate::memory::Budgets,
 }
@@ -513,6 +522,7 @@ impl Default for MemorySettings {
         Self {
             auto_extract: true,
             extract_every_n_turns: 1,
+            min_turn_seconds: 120,
             budgets: crate::memory::Budgets::default(),
         }
     }
@@ -881,6 +891,10 @@ impl Settings {
         if let Some(v) = num::<u32>(root.get("memory"), "extractEveryNTurns") {
             self.memory.extract_every_n_turns = v.max(1);
             self.note("memory.extractEveryNTurns", origin);
+        }
+        if let Some(v) = num::<u32>(root.get("memory"), "minTurnSeconds") {
+            self.memory.min_turn_seconds = v;
+            self.note("memory.minTurnSeconds", origin);
         }
         if let Some(b) = root.get("memory").and_then(|m| m.get("budgets")) {
             let set = |key: &str, field: &mut usize| {
@@ -1344,6 +1358,11 @@ impl Settings {
                 m,
                 "extractEveryNTurns",
                 unum(u64::from(self.memory.extract_every_n_turns)),
+            );
+            upsert(
+                m,
+                "minTurnSeconds",
+                unum(u64::from(self.memory.min_turn_seconds)),
             );
         }
         {
@@ -2314,9 +2333,11 @@ mod tests {
         let mut s = Settings::default();
         set_from_path(&mut s, "memory.autoExtract", "false").unwrap();
         set_from_path(&mut s, "memory.extractEveryNTurns", "4").unwrap();
+        set_from_path(&mut s, "memory.minTurnSeconds", "45").unwrap();
         set_from_path(&mut s, "tools.remember", "false").unwrap();
         assert!(!s.memory.auto_extract);
         assert_eq!(s.memory.extract_every_n_turns, 4);
+        assert_eq!(s.memory.min_turn_seconds, 45);
         assert!(!s.tools.remember);
     }
 
@@ -2350,6 +2371,56 @@ mod tests {
             s.memory.extract_every_n_turns, 1,
             "0 must clamp to 1, not pass through"
         );
+    }
+
+    #[test]
+    fn memory_min_turn_seconds_defaults_to_two_minutes() {
+        let s = Settings::default();
+        assert_eq!(
+            s.memory.min_turn_seconds, 120,
+            "a turn shorter than two minutes must not trigger the pass by default"
+        );
+    }
+
+    #[test]
+    fn memory_min_turn_seconds_overlay_keeps_zero() {
+        // 0 means "no floor" and is a real value here, unlike
+        // extractEveryNTurns where 0 clamps to 1. Start from a non-zero,
+        // non-default baseline so neither the default nor a clamp can make
+        // this vacuously true.
+        let mut s = Settings::default();
+        s.memory.min_turn_seconds = 45;
+        s.overlay(r#"{"memory":{"minTurnSeconds":0}}"#);
+        assert_eq!(
+            s.memory.min_turn_seconds, 0,
+            "0 must pass through as 'no floor', not clamp"
+        );
+
+        let mut s = Settings::default();
+        s.overlay(r#"{"memory":{"minTurnSeconds":300}}"#);
+        assert_eq!(s.memory.min_turn_seconds, 300);
+    }
+
+    #[test]
+    fn memory_min_turn_seconds_round_trips_through_save_to() {
+        let dir = std::env::temp_dir().join(format!(
+            "plank-memory-floor-cfg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        s.memory.min_turn_seconds = 30; // the non-default value
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert_eq!(reloaded.memory.min_turn_seconds, 30);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
