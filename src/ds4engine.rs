@@ -1579,6 +1579,24 @@ impl Ds4Session {
         Ok(s)
     }
 
+    /// Frees the decision session and forgets it, so the next decision builds
+    /// a fresh one.
+    ///
+    /// Called when a prefill or eval fails part-way. The C may have cleared
+    /// `checkpoint_valid` on that session, and a session kept in that state
+    /// would poison every later decision on this engine — the failure would
+    /// stop being per-call and become permanent, silently, since nothing
+    /// upstream distinguishes "this engine cannot decide" from "this one call
+    /// went wrong". Throwing the session away keeps the blast radius at one
+    /// call.
+    fn discard_decide_session(&mut self) {
+        if let Some(s) = self.decide_session.take() {
+            // SAFETY: created by `decide_session` and not yet freed; taking it
+            // out of the option is what guarantees it is freed only once.
+            unsafe { ffi::ds4_session_free(s) };
+        }
+    }
+
     /// Prefills `state` plus one question's suffix onto the decision session
     /// in a single `ds4_session_sync`, so the letters are read at the final
     /// position.
@@ -2544,7 +2562,14 @@ impl Engine for Ds4Session {
             )));
         }
         let s = self.decide_session()?;
-        self.decide_prefill(s, state, question)?;
+        // Both failure paths below drop the decision session rather than
+        // leaving it cached: a part-way prefill or a refused logprob read can
+        // leave the C's `checkpoint_valid` clear, and reusing that session
+        // would turn one bad call into a permanently broken capability.
+        if let Err(e) = self.decide_prefill(s, state, question) {
+            self.discard_decide_session();
+            return Err(e);
+        }
 
         let mut logprobs = Vec::with_capacity(question.options.len());
         for i in 0..question.options.len() {
@@ -2554,6 +2579,7 @@ impl Engine for Ds4Session {
             let mut sc = ffi::Ds4TokenScore::default();
             // SAFETY: session is valid; sc is a valid out-ptr.
             if unsafe { ffi::ds4_session_token_logprob(s, tok, &raw mut sc) } != 1 {
+                self.discard_decide_session();
                 return Err(EngineError::new("decision logprob read failed"));
             }
             logprobs.push(sc.logprob);
@@ -3824,6 +3850,16 @@ mod tests {
             .expect("decide must succeed once supported");
         assert!(out.p.is_finite());
         assert!((0.0..=1.0).contains(&out.p));
+        // `Question::boolean` puts "yes" at index 0, and the state plainly
+        // does state a name. Asserting the answer — not merely that the call
+        // returned — is what makes this catch a logprob read taken at the
+        // wrong position, which would otherwise look like a healthy but
+        // meaningless probability.
+        assert!(
+            !out.abstained,
+            "a plain question about an explicit fact should not abstain"
+        );
+        assert_eq!(out.index, 0, "expected yes; p was {}", out.p);
 
         // SAFETY: session is still valid.
         let after_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };
@@ -3871,6 +3907,16 @@ mod tests {
             .unwrap();
         assert!(travel.p.is_finite());
         assert!(food.p.is_finite());
+        // The two questions must produce DIFFERENT answers about the same
+        // state. Asserting only that both calls returned would pass even if
+        // the second call read a stale distribution left by the first — which
+        // is exactly the failure mode the old rewind design had, and the one
+        // thing these two calls exist to rule out.
+        assert_ne!(
+            (travel.index, travel.abstained),
+            (food.index, food.abstained),
+            "travel={travel:?} food={food:?}: the second call looks stale"
+        );
 
         // SAFETY: session is still valid.
         let after_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };

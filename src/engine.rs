@@ -1000,6 +1000,11 @@ pub trait Engine: Debug + Send {
 
     /// Answers one `question` against `state` without generating any tokens.
     ///
+    /// One question per call: the obvious batching — prefill the state once
+    /// and branch several questions off it — is unsound on this repo's main
+    /// model family, and `ds4engine`'s `decide_prefill` carries the full
+    /// explanation and the way to do it properly if it is ever wanted.
+    ///
     /// One question per call, deliberately: an earlier design answered several
     /// questions off one prefilled state by rewinding between them, which is
     /// unsound on plank's main model family (see the annotation on
