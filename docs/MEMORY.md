@@ -487,6 +487,55 @@ walking a batch, flushing both only after the scope's file write has actually
 succeeded: a log that says an entry was added when the write failed would be
 worse than no log.
 
+### The System-1 gate
+
+Behind `memory.gate` (default off), `enqueue_memory_job` asks one extra
+question before a job is ever built: is this span worth extracting at all?
+The check sits at `enqueue_memory_job`, after `should_run` has already
+decided the turn is eligible and before the span is turned into a
+`MemoryJob` — never at `process_memory_job`, which only ever reads what was
+already queued. A `Yes` (or the gate being off, or the check being
+bypassed) falls through to the same `build_prompt` / `finish` / enqueue path
+described above; a confident `No` calls `ExtractState::reject` instead and
+returns without queuing anything.
+
+The question runs on `Engine::decide` (see `decide.rs` in `CLAUDE.md`'s
+architecture list), which prefills the rendered excerpt plus a short
+boolean question onto a **dedicated decision session** and reads the
+logprobs of the answer letters — no tokens generated, no tool call, and
+critically no contact with the live turn session: the decision session is
+created lazily and torn down independently, so this check never rewinds or
+otherwise disturbs the KV rung ladder or the fingerprinted live prefix.
+
+Every uncertain outcome runs the pass rather than skipping it
+(`memory_gate_says_worthy`): an engine that does not `supports_decide()`,
+a `decide` that returns an error, and an abstained verdict all read as
+"worth extracting". The gate can only suppress a pass it is *confident*
+found nothing; it must never be the reason a memory is lost. Only a
+`Worthy::Yes` verdict whose probability clears `memory.gatePercent` (as a
+fraction of 1) counts as a rejection.
+
+Three settings govern it, all under `memory` in settings.json:
+
+- **`memory.gate`** (`bool`, default `false`) — the gate is off by default;
+  every eligible turn's span goes straight to the extraction pass exactly
+  as before this feature existed.
+- **`memory.gatePercent`** (`u32`, default `60`) — the confidence threshold,
+  as a percentage, a `Yes` verdict's probability must clear to count as a
+  rejection.
+- **`memory.heldSpanCap`** (`u32`, default `0`) — see below.
+
+**What a rejection does to the span** depends on `heldSpanCap`. With the
+shipped default of `0`, `ExtractState::reject` calls `finish`: the span is
+retired outright, exactly like a completed pass, and its content is
+permanently discarded — never re-read, never re-judged. With a positive
+cap, `reject` calls `cancel` instead: `processed_depth` does not advance,
+so the span stays unread and is folded into the next eligible turn's span
+for a fresh judgment — unless by then it has grown past the cap
+(`ExtractState::gate_bypassed`), in which case the gate is skipped
+entirely and the pass runs unconditionally, so a span can never be held
+forever.
+
 ### `/memory` and `/memory log`
 
 - **`/memory`** opens every source in one editable buffer (`memory::combine`
@@ -526,6 +575,9 @@ All under the `memory` and `tools` blocks in `~/.plank/settings.json` /
 | `memory.budgets.project` | `6144` | Byte budget for `[project]` entries, including every untagged legacy entry. Hand-edit only. |
 | `memory.budgets.reference` | `2048` | Byte budget for `[reference]` entries. Hand-edit only. |
 | `tools.remember` | `true` | Whether the `remember`/`forget` tools are advertised to the model at all. Flipping it changes the system prompt and so churns the `fp1` fingerprint once. `/remember` and `/forget` are unaffected — they are user-typed commands, not model tool calls. |
+| `memory.gate` | `false` | Whether the System-1 gate (see above) runs before a span is enqueued. Off by default — no behavior change from before the gate existed. |
+| `memory.gatePercent` | `60` | The confidence threshold, as a percentage, a `Yes` verdict must clear to reject a span. Out-of-range values are clamped to 0–100 rather than rejected. |
+| `memory.heldSpanCap` | `0` | Transcript-depth span size past which the gate is bypassed and the pass runs unconditionally. `0` (the default) means a rejected span is finished outright rather than held for re-judging. |
 
 ## Cache accounting
 
