@@ -14936,30 +14936,40 @@ impl Agent<'_> {
         }
         let text = crate::suggest::prompt();
 
-        // The cold-KV skip: a session whose KV would rebuild from zero pays a
-        // full prefill for a one-line guess. That is the case this feature
-        // cannot afford, and declining it is what makes the default-on
-        // setting defensible.
+        // Probe with the real prompt prefix, not the bare instruction: whether
+        // the KV rebuilds is decided by the transcript prefix, and probing
+        // with a string that shares no leading tokens makes the guard fire
+        // never. Done before the fork so the cold path costs nothing.
+        let base = render_transcript(&recovery_session(&self.session), &self.system);
         if self
             .engine
-            .kv_reuse_probe(&text, self.think)
+            .kv_reuse_probe(&base, self.think)
             .is_some_and(crate::engine::KvReuse::rebuilds_from_zero)
         {
             return false;
         }
 
         let depth = self.session.transcript.len();
-        let fork_at = self.begin_sidechain(text.clone(), false);
+        // `true`, as the memory pass does: the sidechain diverges the live KV
+        // and `restore_fork_kv` puts it back. With `false` the restore no-ops
+        // and the next real turn re-prefills the whole conversation — the
+        // exact cost the probe above exists to avoid.
+        let fork_at = self.begin_sidechain(text.clone(), true);
+        // The prompt is the whole live session plus the instruction that
+        // `begin_sidechain` just pushed, exactly as `process_memory_job`
+        // builds it. Passing the bare instruction would ask the model to
+        // guess the next prompt with no conversation at all.
+        let prompt = render_transcript(&recovery_session(&self.session), &self.system);
         let mut opts = self.pass_opts();
         opts.n_predict =
             i32::try_from(crate::settings::active().suggestions.max_tokens).unwrap_or(40);
         let (done, result) = self.run_sidechain_quietly(|agent| {
             agent
-                .generate_quiet_with(&text, Instant::now(), &opts)
+                .generate_quiet_with(&prompt, Instant::now(), &opts)
                 .map(|pass| pass.assistant_text)
                 .map_err(|abort| abort.error)
         });
-        self.end_subagent_fork(fork_at, "suggest", &text, done);
+        self.end_subagent_fork(fork_at, "suggest", &prompt, done);
 
         let reply = result.unwrap_or_default();
 
@@ -21945,6 +21955,37 @@ mod tests {
             before,
             "a suggestion is housekeeping, not conversation"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed generation must still close the fork: a leaked sidechain
+    /// silently disables every feature that checks `in_sidechain()`,
+    /// including the memory pass and this feature's own skip condition.
+    #[test]
+    fn a_failed_suggestion_generation_still_closes_the_fork() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-fail");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            fail_with: Some("scripted generation failure".to_string()),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        let before = agent.session.transcript.len();
+        agent.suggestion_pending = true;
+
+        assert!(
+            !agent.generate_suggestion(),
+            "a failed generation stores nothing"
+        );
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "the fork leaves no trace even on failure"
+        );
+        assert_eq!(agent.sidechain_depth, 0, "the fork is closed");
         std::fs::remove_dir_all(&dir).ok();
     }
 
