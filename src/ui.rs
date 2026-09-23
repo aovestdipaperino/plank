@@ -31978,6 +31978,45 @@ or the user's next message aborts before its first token"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The shipped default's consequence, pinned where it is actually
+    /// decided. `heldSpanCap` is 0 out of the box, so a gate "no" calls
+    /// `finish` and the span is retired permanently — the messages are never
+    /// offered to a later pass. `ExtractState` unit-tests that branch, but
+    /// nothing at this level proved `enqueue_memory_job` takes it, and the
+    /// difference between "discarded" and "deferred" is the whole risk of
+    /// turning the gate on.
+    #[test]
+    fn under_the_default_cap_a_rejected_span_is_discarded_not_deferred() {
+        let _gate = enable_memory_gate_for_test(60);
+        let dir = scratch_dir("memgate-discard");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Two verdicts: a "no" for the first span, and a "yes" that must never
+        // be reached for those same messages if the first one retired them.
+        let mut agent = gate_agent(
+            &dir,
+            &cfg,
+            vec![verdict(1, 0.95), verdict(0, 0.95)],
+            asked.clone(),
+        );
+
+        assert!(!agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(
+            !agent.memory_jobs_pending(),
+            "nothing queued for a rejection"
+        );
+
+        // No new messages: the span is empty now, so there is nothing to ask
+        // about and the gate is not consulted a second time.
+        assert!(!agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            1,
+            "the rejected span was retired, not held for a re-judgement"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn the_gate_lets_a_worthy_span_through() {
         let _gate = enable_memory_gate_for_test(60);
