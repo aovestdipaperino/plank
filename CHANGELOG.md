@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.3.0] - 2026-09-23
+
 ### Added
 
 - **System-1 typed decisions (`Engine::decide`).** A typed, probabilistic

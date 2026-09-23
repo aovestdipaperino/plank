@@ -7,7 +7,7 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.2.0 is out**, and the beta channel is on 5.2.1. The patch number
+**v5.3.0 is out**, and the beta channel is on 5.3.1. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
 
 **Plank guesses your next prompt.** After an answer, a short background pass
