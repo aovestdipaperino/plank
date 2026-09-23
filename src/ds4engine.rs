@@ -951,6 +951,10 @@ impl ModelHandle for Ds4Model {
             trusted_system_len: 0,
             pending_images: Vec::new(),
             vision_spans: Vec::new(),
+            #[cfg(ds4_engine)]
+            decide_session: None,
+            #[cfg(ds4_engine)]
+            decide_letters: Vec::new(),
         };
         Ok(Box::new(Ds4HostSession {
             inner,
@@ -1010,6 +1014,21 @@ pub struct Ds4Session {
     /// by `reconcile` and consumed by `generate` to call
     /// `ds4_session_sync_multimodal`.
     vision_spans: Vec<ffi::Ds4VisionSpan>,
+    /// Lazily created session used only for System-1 decisions
+    /// (`Engine::decide`). Separate from `session` on purpose: a decision
+    /// evaluates a question suffix and rewinds, and doing that to the live
+    /// session would disturb state guarded by the prefix fingerprints and the
+    /// KV ladder. `None` until the first decision; `Some(None)` is not
+    /// modelled — a failed setup leaves it `None` and
+    /// `decide_letters` stays empty, so `supports_decide` reports false.
+    #[cfg(ds4_engine)]
+    decide_session: Option<*mut ffi::Ds4Session>,
+    /// The single token each answer letter tokenizes to, in
+    /// [`crate::decide::LETTERS`] order. Empty when the family does not give
+    /// every letter exactly one token, which switches the whole capability
+    /// off.
+    #[cfg(ds4_engine)]
+    decide_letters: Vec<i32>,
 }
 
 /// Back-compatible alias: the single-owner engine callers used before the split
@@ -1059,6 +1078,10 @@ impl Ds4Session {
             trusted_system_len: 0,
             pending_images: Vec::new(),
             vision_spans: Vec::new(),
+            #[cfg(ds4_engine)]
+            decide_session: None,
+            #[cfg(ds4_engine)]
+            decide_letters: Vec::new(),
         }
     }
 
@@ -1494,6 +1517,64 @@ impl Ds4Session {
             self.transcript
                 .push_span(SpanRole::Assistant, think_span_tag(think), text, &span);
         }
+    }
+}
+
+#[cfg(ds4_engine)]
+impl Ds4Session {
+    /// Context window for the decision session. The largest state a caller
+    /// passes is the memory gate's excerpt, bounded by
+    /// `memextract::EXCERPT_MAX_BYTES` (32 KiB), plus a short question
+    /// suffix. 16k tokens covers that with room to spare and costs a
+    /// fraction of the live session's KV.
+    const DECIDE_CTX: i32 = 16_384;
+
+    /// Tokenizes each answer letter and keeps it only if it is exactly one
+    /// token. A family that splits any letter turns the capability off
+    /// wholesale rather than answering from a partial letter set.
+    fn init_decide_letters(&mut self) {
+        if !self.decide_letters.is_empty() {
+            return;
+        }
+        let mut ids = Vec::with_capacity(crate::decide::LETTERS.len());
+        for letter in crate::decide::LETTERS {
+            let toks = self.model.tokenize_rendered(letter);
+            if toks.len() != 1 {
+                return; // leaves decide_letters empty: unsupported
+            }
+            ids.push(toks[0]);
+        }
+        self.decide_letters = ids;
+    }
+
+    /// The decision session, created on first use.
+    fn decide_session(&mut self) -> Result<*mut ffi::Ds4Session, EngineError> {
+        if let Some(s) = self.decide_session {
+            return Ok(s);
+        }
+        let s = self.model.create_session(Self::DECIDE_CTX)?;
+        self.decide_session = Some(s);
+        Ok(s)
+    }
+
+    /// Prefills `state` onto the decision session and returns the position to
+    /// rewind to between questions.
+    fn decide_prefill(&mut self, s: *mut ffi::Ds4Session, state: &str) -> Result<i32, EngineError> {
+        let mut tokens = Ds4TokensGuard::new();
+        tokens.push_all(&self.model.tokenize_rendered(state));
+        let mut err = [0_i8; 256];
+        // SAFETY: session and tokens are valid for the call; err is sized.
+        let rc = unsafe { ffi::ds4_session_sync(s, tokens.as_ptr(), err.as_mut_ptr(), err.len()) };
+        if rc != 0 {
+            return Err(EngineError::new("decision state prefill failed"));
+        }
+        // SAFETY: session is valid.
+        Ok(unsafe { ffi::ds4_session_pos(s) })
+    }
+
+    #[cfg(test)]
+    fn raw_session(&self) -> *mut ffi::Ds4Session {
+        self.session
     }
 }
 
@@ -2378,6 +2459,74 @@ impl Engine for Ds4Session {
     fn set_pending_images(&mut self, images: Vec<(String, crate::engine::VisionImage)>) {
         self.pending_images = images;
     }
+
+    #[cfg(ds4_engine)]
+    fn supports_decide(&self) -> bool {
+        !self.decide_letters.is_empty()
+    }
+
+    #[cfg(ds4_engine)]
+    fn decide(
+        &mut self,
+        state: &str,
+        questions: &[crate::decide::Question],
+    ) -> Result<Vec<crate::decide::RawVerdict>, EngineError> {
+        self.init_decide_letters();
+        if self.decide_letters.is_empty() {
+            return Err(EngineError::unsupported());
+        }
+        let s = self.decide_session()?;
+        let base = self.decide_prefill(s, state)?;
+
+        let mut out = Vec::with_capacity(questions.len());
+        for q in questions {
+            let suffix = crate::decide::render_question(q);
+            let mut err = [0_i8; 256];
+            for tok in self.model.tokenize_rendered(&suffix) {
+                // SAFETY: session is valid; err is sized.
+                let rc = unsafe { ffi::ds4_session_eval(s, tok, err.as_mut_ptr(), err.len()) };
+                if rc != 0 {
+                    // SAFETY: session is valid.
+                    unsafe { ffi::ds4_session_rewind(s, base) };
+                    return Err(EngineError::new("decision question eval failed"));
+                }
+            }
+
+            let mut logprobs = Vec::with_capacity(q.options.len());
+            let mut ok = true;
+            for i in 0..q.options.len() {
+                let Some(&tok) = self.decide_letters.get(i) else {
+                    ok = false;
+                    break;
+                };
+                let mut sc = ffi::Ds4TokenScore::default();
+                // SAFETY: session is valid; sc is a valid out-ptr.
+                if unsafe { ffi::ds4_session_token_logprob(s, tok, &raw mut sc) } != 1 {
+                    ok = false;
+                    break;
+                }
+                logprobs.push(sc.logprob);
+            }
+
+            // How much of the model's probability sat on the letters at all.
+            // A question it wanted to answer in prose leaves this near zero,
+            // and `score` abstains rather than reading a ranking off noise.
+            let letter_mass: f32 = logprobs.iter().map(|lp| lp.exp()).sum();
+
+            // SAFETY: session is valid; `base` is a position it held.
+            unsafe { ffi::ds4_session_rewind(s, base) };
+
+            if !ok {
+                return Err(EngineError::new("decision logprob read failed"));
+            }
+            out.push(crate::decide::score(
+                &logprobs,
+                crate::decide::DEFAULT_ABSTAIN_FLOOR,
+                letter_mass,
+            ));
+        }
+        Ok(out)
+    }
 }
 
 impl Drop for Ds4Session {
@@ -2387,6 +2536,11 @@ impl Drop for Ds4Session {
             // model (weights + Metal context) is dropped separately when its
             // Arc refcount reaches zero (design §4).
             unsafe { ffi::ds4_session_free(self.session) };
+        }
+        #[cfg(ds4_engine)]
+        if let Some(d) = self.decide_session.take() {
+            // SAFETY: created by `decide_session()` and not yet freed.
+            unsafe { ffi::ds4_session_free(d) };
         }
         // Free any vision span embedding buffers still owned by this session.
         self.free_vision_spans();
@@ -3575,6 +3729,88 @@ mod tests {
             )
             .unwrap();
         assert!(stats.generated > 0);
+    }
+
+    /// Opens a bare `Ds4Session` (not host-wrapped) over `PLANK_TEST_MODEL`,
+    /// for tests that call `Engine` methods directly on it.
+    #[cfg(ds4_engine)]
+    fn open_test_session(model_path: &std::ffi::OsStr) -> super::Ds4Session {
+        use crate::ffi::Ds4Backend;
+
+        let tuning = crate::config::EngineTuning::default();
+        let model = super::Ds4Model::open_shared(
+            model_path,
+            Ds4Backend::Metal,
+            4096,
+            0,
+            100,
+            &tuning,
+            "you are a helpful assistant",
+        )
+        .unwrap();
+        super::Ds4Session::from_model(model)
+    }
+
+    #[cfg(ds4_engine)]
+    #[test]
+    fn decide_answers_a_boolean_and_leaves_the_live_session_untouched() {
+        use crate::engine::Engine;
+
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let mut e = open_test_session(&model_path);
+        if !e.supports_decide() {
+            eprintln!("skipping: answer letters are not single tokens on this family");
+            return;
+        }
+        // Take the live session to a non-trivial position first, so a rewind
+        // bug would show up as a changed position rather than a no-op.
+        e.warm_reset("You are a helpful assistant.").unwrap();
+        e.warm_append(Some("Hello there.")).unwrap();
+        e.warm_sync(&mut |_| {}).unwrap();
+        // SAFETY: session was just synced above.
+        let before_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };
+
+        let q = crate::decide::Question::boolean(
+            "Does the text above state a person's name? Answer yes or no.",
+        );
+        let out = e
+            .decide("The user's name is Enzo and he lives in Milan.", &[q])
+            .expect("decide must succeed once supported");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].p.is_finite());
+        assert!((0.0..=1.0).contains(&out[0].p));
+
+        // SAFETY: session is still valid.
+        let after_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };
+        assert_eq!(
+            before_pos, after_pos,
+            "a decision must not move the live session"
+        );
+    }
+
+    #[cfg(ds4_engine)]
+    #[test]
+    fn two_questions_share_one_state_prefill() {
+        use crate::engine::Engine;
+
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let mut e = open_test_session(&model_path);
+        if !e.supports_decide() {
+            eprintln!("skipping: answer letters are not single tokens on this family");
+            return;
+        }
+        let qs = [
+            crate::decide::Question::boolean("Is the text about travel?"),
+            crate::decide::Question::boolean("Is the text about food?"),
+        ];
+        let out = e.decide("I flew to Rome last week.", &qs).unwrap();
+        assert_eq!(out.len(), 2, "one verdict per question");
     }
 
     #[cfg(ds4_engine)]
