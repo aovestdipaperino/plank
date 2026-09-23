@@ -511,9 +511,21 @@ Every uncertain outcome runs the pass rather than skipping it
 (`memory_gate_says_worthy`): an engine that does not `supports_decide()`,
 a `decide` that returns an error, and an abstained verdict all read as
 "worth extracting". The gate can only suppress a pass it is *confident*
-found nothing; it must never be the reason a memory is lost. Only a
-`Worthy::Yes` verdict whose probability clears `memory.gatePercent` (as a
-fraction of 1) counts as a rejection.
+found nothing; it must never be the reason a memory is lost. The pass runs
+only on a non-abstained `Worthy::Yes` whose probability clears
+`memory.gatePercent`; everything else — a confident `No`, or a `Yes` the
+model is not sure enough about — suppresses it.
+
+One cost to know before turning the gate on: the decision is taken
+*synchronously at turn exit*, in `enqueue_memory_job`, whose whole design
+property otherwise is that it only snapshots and generates nothing, so the
+prompt comes back the moment the answer is done. Asking the gate means
+prefilling the span excerpt — up to `EXCERPT_MAX_BYTES` (32 KiB) — on the
+decision session before the prompt returns. The excerpt is a rolling tail,
+so the session's longest-common-prefix reuse will often miss and the prefill
+is paid in full. It is still far cheaper than the generation it avoids, but
+it is not free, and it lands in the one place the design says nothing
+happens. This is a large part of why the gate ships off.
 
 Three settings govern it, all under `memory` in settings.json:
 
