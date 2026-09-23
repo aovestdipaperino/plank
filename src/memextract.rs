@@ -280,8 +280,16 @@ impl ExtractState {
     /// the span is gone. With a cap the span is held: `processed_depth` stays
     /// put, so the next eligible turn re-reads these messages together with
     /// the new ones.
-    pub fn reject(&mut self, _from: usize, depth: usize) {
-        if self.held_span_cap == 0 {
+    ///
+    /// A span already past its cap is finished rather than held, even though
+    /// the intended caller never gets here with one (it checks
+    /// [`gate_bypassed`](Self::gate_bypassed) first and skips the gate
+    /// entirely). The check is repeated because this is a public method and
+    /// the alternative failure is silent: hold a span that has outgrown its
+    /// cap and it is never finished by any path, so it grows without bound
+    /// while everything upstream still looks healthy.
+    pub fn reject(&mut self, from: usize, depth: usize) {
+        if self.gate_bypassed(from, depth) || self.held_span_cap == 0 {
             self.finish(depth);
         } else {
             self.cancel();
@@ -963,14 +971,20 @@ mod tests {
         );
     }
 
+    /// The span must sit *within* the cap for holding to apply: 4 messages
+    /// against a cap of 5. A span already past its cap takes the bypass
+    /// branch instead, which
+    /// `rejecting_a_span_already_past_the_cap_finishes_it_rather_than_holding`
+    /// pins.
     #[test]
     fn with_a_cap_a_rejected_span_is_held_for_the_next_turn() {
         let mut s = state();
         s.held_span_cap = 5;
-        assert_eq!(s.should_run(10, LONG), Some(0));
-        s.reject(0, 10);
+        assert_eq!(s.should_run(4, LONG), Some(0));
+        assert!(!s.gate_bypassed(0, 4), "precondition: within the cap");
+        s.reject(0, 4);
         assert_eq!(
-            s.should_run(12, LONG),
+            s.should_run(6, LONG),
             Some(0),
             "the held span is re-read as part of a larger one"
         );
@@ -985,6 +999,26 @@ mod tests {
         };
         assert!(!s.gate_bypassed(0, 5), "exactly at the cap still asks");
         assert!(s.gate_bypassed(0, 6), "past the cap runs unconditionally");
+    }
+
+    /// The one input where dropping `reject`'s `gate_bypassed` clause changes
+    /// behaviour: without it this span is held forever instead of finished,
+    /// and no other test in this file can tell the two versions apart.
+    #[test]
+    fn rejecting_a_span_already_past_the_cap_finishes_it_rather_than_holding() {
+        let mut s = state();
+        s.held_span_cap = 5;
+        assert_eq!(s.should_run(6, LONG), Some(0));
+        assert!(
+            s.gate_bypassed(0, 6),
+            "precondition: 6 messages past a cap of 5"
+        );
+        s.reject(0, 6);
+        assert_eq!(
+            s.should_run(6, LONG),
+            None,
+            "an over-cap span must be retired, not held to grow further"
+        );
     }
 
     #[test]
