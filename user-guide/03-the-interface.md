@@ -117,6 +117,18 @@ Type `@` in the prompt and a fuzzy-completion popup offers file paths from the w
 - `ui.respectGitignore` decides whether untracked files that `.gitignore` excludes are offered (default `true`).
 - `ui.indexRefreshSecs` is how long the file index is trusted before it is rebuilt (default 5).
 
+## Prompt suggestions
+
+After an answer, plank works out the most likely thing you are about to type and shows it as grey ghost text on the empty prompt. `Tab` or `Right` places it in the line so you can edit it before sending, `Enter` sends it as it stands, and any other keystroke dismisses it. It only ever appears on an empty prompt, so it cannot land on top of something you are writing.
+
+The guess is a short generation against the conversation already held in the KV cache, run in the background on a quiet moment rather than while you wait, so the prompt stays live and typing interrupts it. It skips itself when the cache would have to be rebuilt from scratch, which is the one case where it would be expensive.
+
+A suggestion is only ever text. A line beginning with `/` or `!` is discarded rather than offered, since `Enter` over a placed suggestion sends it straight away.
+
+- `suggestions.enabled` turns it off (default `true`).
+- `suggestions.maxTokens` bounds the guess (default 160).
+- `suggestions.memoryStarvationSeconds` (default 300) is how long a queued memory pass may wait behind suggestions before it takes the idle moment back.
+
 ## `!` and `!!` — run a shell command yourself
 
 Prefix a line with `!` and it runs in your shell, in plank's working directory, with the output streaming into the screen as it is produced:

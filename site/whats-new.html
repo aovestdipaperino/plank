@@ -141,6 +141,48 @@ actually notice.</p>
 <p><strong>v5.2.0 is out</strong>, and the beta channel is on 5.2.1. The
 patch number is still the channel: <code>.0</code> is stable, anything
 above it is beta.</p>
+<p><strong>Plank guesses your next prompt.</strong> After an answer, a
+short background pass works out the most likely thing you are about to
+type and offers it as grey ghost text on the empty prompt.
+<strong>Tab</strong> or <strong>Right arrow</strong> drops it into the
+line so you can edit it, <strong>Enter</strong> sends it as it stands,
+and typing anything else makes it disappear. It rides the conversation
+already sitting in the KV cache, so it costs a suffix rather than a
+fresh read of everything, and it skips itself entirely on the one
+occasion it would be expensive: a session whose cache would have to be
+rebuilt from scratch. Turn it off with
+<code>"suggestions": {"enabled": false}</code>.</p>
+<p>A suggestion never runs anything. A line starting with <code>/</code>
+or <code>!</code> is thrown away rather than offered, because Enter over
+a placed suggestion sends it immediately, and one keystroke away from
+<code>/clear</code> is not a place to be relaxed.</p>
+<p><strong>Typed decisions, read straight out of the logits.</strong>
+Plank can now ask the model a multiple-choice question and get the
+answer back without generating a single token. The question is appended
+to the conversation already in the cache, one forward pass runs, and the
+probabilities of the answer letters are read directly from the output
+layer. No sampling loop, no JSON to parse, and a real number for how
+sure the model was rather than a guess dressed as one.</p>
+<p>The first thing using it is a gate in front of the memory pass. Most
+turns hold nothing worth remembering, and until now plank spent a full
+generation discovering that. Now it asks one yes/no question first and
+only runs the expensive pass when the answer is a confident yes. It is
+off while its threshold is still being calibrated:
+<code>"memory": {"gate": true}</code> turns it on,
+<code>memory.gatePercent</code> sets the bar. If the model is unsure, or
+cannot answer at all, the pass runs anyway. A gate that is not certain
+is never allowed to be the reason a memory is lost.</p>
+<p><strong>Short turns no longer trigger the memory pass.</strong> A
+four-second exchange is rarely worth a snapshot, a prefill, a generation
+and a restore, so <code>memory.minTurnSeconds</code> (120 by default)
+skips it. The turn's span is not thrown away, just deferred: the next
+turn that clears the floor reads the short ones too.</p>
+<p><strong>The prompt stays green while plank works in the
+background.</strong> Prompt prediction and the memory pass are not turns
+you asked for, and typing during one stops it and starts your turn
+straight away, so the cursor no longer turns red as though you had to
+wait. <strong>Ctrl-D</strong> on an empty prompt during a memory pass
+quits, too, instead of being quietly swallowed.</p>
 <p><strong><code>/stats</code>: a year of your work, in one
 panel.</strong> A heatmap of the last 53 weeks, four green tones from
 your quietest day to your busiest, with the figures that go with it

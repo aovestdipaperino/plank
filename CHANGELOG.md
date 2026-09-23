@@ -6,6 +6,87 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **System-1 typed decisions (`Engine::decide`).** A typed, probabilistic
+  answer out of the model with **zero generated tokens**: the state and a short
+  question suffix are prefilled, and the logprobs of pre-tokenized answer
+  letters are read directly. No sampling loop at all, and roughly the cost
+  of the suffix alone, because the live session's KV already holds the
+  conversation. `decide.rs` is the pure layer (max-shifted softmax over the
+  letters, an abstention floor, a letter-mass floor, and the mapping from the
+  winning index back onto a caller's enum); `ds4engine` implements it on a
+  **dedicated decision session**, never the live turn session, so it sits
+  outside the KV-cache discipline entirely. One question per call: branching
+  several questions off one prefill by rewinding is unsound on DeepSeek, where
+  `ds4_session_rewind` clears `checkpoint_valid` and the next eval refuses.
+  The code carries the correct way to batch if it is ever wanted.
+- **A content gate in front of the memory extraction pass** (`memory.gate`,
+  default **off**). The pass costs a KV snapshot, a prefill, a generation and a
+  restore, and most turns hold nothing durable, so most of that is spent to be
+  told there was nothing to write down. The gate asks one boolean first and
+  skips the pass on a confident no. Every uncertain outcome runs the pass: no
+  capability, an engine error, or an abstention all mean "extract anyway", so
+  the gate can never be the reason a memory is lost. `memory.gatePercent`
+  (default 60) is the threshold; `memory.heldSpanCap` (default 0) decides
+  whether a rejected span is retired at once or held to be re-judged as part of
+  a larger one.
+- **Predictive prompt suggestions in the TUI** (`suggestions.enabled`, default
+  **on**). After a turn, a short sidechain generation guesses the next thing
+  you are likely to type and shows it as dim ghost text: **Tab** or **Right**
+  places it in the buffer to edit, **Enter** sends it, any other key dismisses
+  it. It rides the warm KV the way the memory pass does, runs on a worker
+  thread through a shared quiet-pass path, and is **skipped when the KV would
+  rebuild from zero**, which is what makes it affordable on by default. A
+  suggestion never reaches the command dispatcher or a shell: a leading `/` or
+  `!` is rejected outright, because Enter over a placed suggestion submits
+  immediately. `suggestions.maxTokens` (160) bounds the generation and
+  `suggestions.memoryStarvationSeconds` (300) stops a fast back-and-forth from
+  locking the memory pass out of the idle slot.
+- **`memory.minTurnSeconds`** (default 120). A turn shorter than this does not
+  trigger the extraction pass. The short turn's span is **deferred, not
+  discarded**, so nothing said to the model is lost to the gate.
+- **`PLANK_SUGGEST_DEBUG` and `PLANK_DECIDE_DEBUG`.** The first prints a
+  suggestion's raw reply before sanitizing, the second prints a decision's
+  letter mass and logprobs. Both exist because these features fail silently by
+  construction: without them, "the model returned nothing" and "the sanitizer
+  rejected everything" look identical from outside.
+
+### Changed
+
+- **The idle moment is now shared.** A pending prompt suggestion takes it ahead
+  of a queued memory job, because a suggestion is worthless once you start
+  typing while a memory pass is explicitly allowed to defer. The starvation
+  window above bounds that.
+- **The cursor stays green during a quiet background pass.** Prompt prediction
+  and the memory pass are not turns you asked for, and a keystroke during one
+  interrupts it rather than queueing behind it, so painting the prompt red said
+  "wait for me" about work you never started.
+
+### Fixed
+
+- **Ctrl-D on an empty prompt during the memory pass quits.** It was being
+  dropped by the busy UI loop. Mid-turn Ctrl-D stays inert.
+
+## [5.2.1] - 2026-09-18
+
+Beta channel opened on the 5.2 series. No functional change against 5.2.0.
+
+## [5.2.0] - 2026-09-18
+
+### Added
+
+- **`/stats`, an activity report.** A GitHub-style heatmap in theme-green
+  shades plus eight headline figures, computed from the per-session metadata
+  cache `/insights` already maintains and shown in the existing dismissable
+  panel. Re-issuing the command cycles the range. Token counts are approximate,
+  transcript bytes over four, and say so; two figures are named for exactly
+  what they count, days started and longest span.
+- **A benchmarking harness.** `bench/bench-matrix.sh` and its report script,
+  plus the agent-side support they needed: a guard hard stop recorded on the
+  agent, `-p "/init"` running the real `/init`, and a guard-stopped headless
+  run exiting 3.
+
 ## [5.1.10] - 2026-09-16
 
 ### Added

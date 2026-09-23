@@ -10,6 +10,49 @@ has every last fix; this page has the ones you will actually notice.
 **v5.2.0 is out**, and the beta channel is on 5.2.1. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
 
+**Plank guesses your next prompt.** After an answer, a short background pass
+works out the most likely thing you are about to type and offers it as grey
+ghost text on the empty prompt. **Tab** or **Right arrow** drops it into the
+line so you can edit it, **Enter** sends it as it stands, and typing anything
+else makes it disappear. It rides the conversation already sitting in the KV
+cache, so it costs a suffix rather than a fresh read of everything, and it
+skips itself entirely on the one occasion it would be expensive: a session
+whose cache would have to be rebuilt from scratch. Turn it off with
+`"suggestions": {"enabled": false}`.
+
+A suggestion never runs anything. A line starting with `/` or `!` is thrown
+away rather than offered, because Enter over a placed suggestion sends it
+immediately, and one keystroke away from `/clear` is not a place to be
+relaxed.
+
+**Typed decisions, read straight out of the logits.** Plank can now ask the
+model a multiple-choice question and get the answer back without generating a
+single token. The question is appended to the conversation already in the
+cache, one forward pass runs, and the probabilities of the answer letters are
+read directly from the output layer. No sampling loop, no JSON to parse, and a
+real number for how sure the model was rather than a guess dressed as one.
+
+The first thing using it is a gate in front of the memory pass. Most turns
+hold nothing worth remembering, and until now plank spent a full generation
+discovering that. Now it asks one yes/no question first and only runs the
+expensive pass when the answer is a confident yes. It is off while its
+threshold is still being calibrated: `"memory": {"gate": true}` turns it on,
+`memory.gatePercent` sets the bar. If the model is unsure, or cannot answer at
+all, the pass runs anyway. A gate that is not certain is never allowed to be
+the reason a memory is lost.
+
+**Short turns no longer trigger the memory pass.** A four-second exchange is
+rarely worth a snapshot, a prefill, a generation and a restore, so
+`memory.minTurnSeconds` (120 by default) skips it. The turn's span is not
+thrown away, just deferred: the next turn that clears the floor reads the
+short ones too.
+
+**The prompt stays green while plank works in the background.** Prompt
+prediction and the memory pass are not turns you asked for, and typing during
+one stops it and starts your turn straight away, so the cursor no longer turns
+red as though you had to wait. **Ctrl-D** on an empty prompt during a memory
+pass quits, too, instead of being quietly swallowed.
+
 **`/stats`: a year of your work, in one panel.** A heatmap of the last 53
 weeks, four green tones from your quietest day to your busiest, with the
 figures that go with it underneath: favourite model, total tokens, sessions,

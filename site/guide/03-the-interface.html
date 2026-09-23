@@ -397,6 +397,30 @@ that <code>.gitignore</code> excludes are offered (default
 <li><code>ui.indexRefreshSecs</code> is how long the file index is
 trusted before it is rebuilt (default 5).</li>
 </ul>
+<h2 id="prompt-suggestions">Prompt suggestions</h2>
+<p>After an answer, plank works out the most likely thing you are about
+to type and shows it as grey ghost text on the empty prompt.
+<code>Tab</code> or <code>Right</code> places it in the line so you can
+edit it before sending, <code>Enter</code> sends it as it stands, and
+any other keystroke dismisses it. It only ever appears on an empty
+prompt, so it cannot land on top of something you are writing.</p>
+<p>The guess is a short generation against the conversation already held
+in the KV cache, run in the background on a quiet moment rather than
+while you wait, so the prompt stays live and typing interrupts it. It
+skips itself when the cache would have to be rebuilt from scratch, which
+is the one case where it would be expensive.</p>
+<p>A suggestion is only ever text. A line beginning with <code>/</code>
+or <code>!</code> is discarded rather than offered, since
+<code>Enter</code> over a placed suggestion sends it straight away.</p>
+<ul>
+<li><code>suggestions.enabled</code> turns it off (default
+<code>true</code>).</li>
+<li><code>suggestions.maxTokens</code> bounds the guess (default
+160).</li>
+<li><code>suggestions.memoryStarvationSeconds</code> (default 300) is
+how long a queued memory pass may wait behind suggestions before it
+takes the idle moment back.</li>
+</ul>
 <h2 id="-and---run-a-shell-command-yourself"><code>!</code> and
 <code>!!</code> — run a shell command yourself</h2>
 <p>Prefix a line with <code>!</code> and it runs in your shell, in
