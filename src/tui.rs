@@ -3095,6 +3095,9 @@ pub struct InputState<'a> {
     pub cursor: usize,
     /// Selected char range (half-open), when one is active.
     pub sel: Option<(usize, usize)>,
+    /// Ghost text shown dim after the cursor: the prompt suggestion, when
+    /// one is offered and the buffer is empty. Never drawn over typed text.
+    pub ghost: Option<&'a str>,
 }
 
 impl<'a> InputState<'a> {
@@ -3105,6 +3108,7 @@ impl<'a> InputState<'a> {
             text,
             cursor,
             sel: None,
+            ghost: None,
         }
     }
 }
@@ -3554,6 +3558,21 @@ fn render_input(frame: &mut Frame, input_area: Rect, state: InputState<'_>) {
     };
     set_input_rect(Some(text_area));
     let (lines, cur_row, cur_col) = wrap_input(input, text_area.width, state.cursor, state.sel);
+    // The ghost is drawn only over an empty buffer, and the check lives here
+    // rather than at the call site on purpose: this is the last point before
+    // the pixels, so no earlier mistake can paint a suggestion over something
+    // the user typed.
+    let lines = match state.ghost {
+        Some(ghost) if input.is_empty() && !ghost.is_empty() => {
+            vec![Line::from(Span::styled(
+                ghost.to_owned(),
+                Style::default()
+                    .fg(Color::Indexed(245))
+                    .add_modifier(Modifier::DIM),
+            ))]
+        }
+        _ => lines,
+    };
     frame.render_widget(Paragraph::new(lines), text_area);
 
     let caret = Position::new(
@@ -7372,6 +7391,41 @@ mod tests {
                 (cell.symbol().chars().next().unwrap_or(' '), cell.fg)
             })
             .collect()
+    }
+
+    /// Draws the input row with `ghost` offered and returns its text, so a
+    /// test can assert on what actually reached the cells rather than on the
+    /// branch that chose them.
+    fn drawn_input_with_ghost(input: &str, ghost: &str) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        term.draw(|f| {
+            let mut state = InputState::new(input, input.chars().count());
+            state.ghost = Some(ghost);
+            render_input(f, Rect::new(0, 0, 60, 1), state);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..60)
+            .map(|x| buf[(x, 0)].symbol().to_owned())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn ghost_text_is_drawn_only_over_an_empty_prompt() {
+        assert!(
+            drawn_input_with_ghost("", "run the tests").contains("run the tests"),
+            "an empty prompt shows the suggestion"
+        );
+        let typed = drawn_input_with_ghost("hello", "run the tests");
+        assert!(typed.contains("hello"));
+        assert!(
+            !typed.contains("run the tests"),
+            "typed text is never painted over"
+        );
     }
 
     /// The full styled cells of the drawn input row, as

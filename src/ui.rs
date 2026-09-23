@@ -2342,8 +2342,6 @@ struct Agent<'a> {
     suggestion_pending: bool,
     /// The suggestion currently offered as ghost text, if any. Bound to the
     /// transcript depth it was generated at — see `suggest::Suggestion`.
-    // Consumed by Task 7. Remove this allow there.
-    #[allow(dead_code)]
     suggestion: Option<crate::suggest::Suggestion>,
     /// One quiet summary line queued by `report_memory_changes`, drained by
     /// whoever ran `process_memory_job`.
@@ -11071,6 +11069,12 @@ struct TuiInput {
     /// worker, so a server that connects mid-session starts contributing
     /// completions (issue #41).
     mcp_extra: Vec<crate::complete::Candidate>,
+    /// The suggestion to paint as ghost text on the next frame, cached here
+    /// for the same reason as `mcp_extra`: the idle repaint is a free
+    /// function, so the agent is not in scope where the frame is composed.
+    /// Refreshed from `Agent::current_suggestion` once per idle tick and
+    /// cleared when a turn starts.
+    ghost: Option<String>,
 }
 
 impl TuiInput {
@@ -11087,6 +11091,7 @@ impl TuiInput {
             slash_catalog: crate::slashmenu::catalog(&[], &[], &[]),
             worker: None,
             mcp_extra: Vec::new(),
+            ghost: None,
         }
     }
 
@@ -11108,6 +11113,7 @@ impl TuiInput {
             text: self.buf.text(),
             cursor: self.cursor_char(),
             sel: self.selection_chars(),
+            ghost: self.ghost.as_deref(),
         }
     }
 
@@ -11930,6 +11936,10 @@ impl Agent<'_> {
                 Some(label) => format!("[sub-agent: {label}] {status}"),
                 None => status,
             };
+            // One refresh per idle frame: the ghost is a cached copy, so it
+            // is re-read here (depth check and all) rather than left to go
+            // stale behind a transcript that moved.
+            input.ghost = self.current_suggestion().map(str::to_owned);
             let completed_buffer = repaint_idle(
                 terminal,
                 &log,
@@ -12126,48 +12136,60 @@ impl Agent<'_> {
                 // for the same reasons, plus the poll timeout above, so the
                 // pass never starts under a keystroke. Deliberately not an
                 // activity for the screensaver clock: nobody is here.
+                //
+                // The guards are shared with the prompt suggestion: an empty
+                // input buffer and no modal pane is exactly when ghost text
+                // is showable, so one condition gates both and
+                // `idle_work` decides which of them this quiet moment buys.
                 if input.buf.text().is_empty()
                     && config_form.is_none()
                     && kv_pane.is_none()
                     && resume_pane.is_none()
                     && !arcade.is_open()
                     && wasm_frame.is_none()
-                    && self.memory_jobs_pending()
                 {
-                    let quit = self.tui_memory_pass(
-                        terminal,
-                        &mut log,
-                        &mut view,
-                        &mut input,
-                        &mut btw_panel,
-                        &mut arcade,
-                        &mut sub_pane,
-                    )?;
-                    if quit {
-                        // Ctrl-D during the pass leaves through exactly the
-                        // same door as Ctrl-D at the prompt, download warning
-                        // and all.
-                        if !confirm_quit_idle(
-                            terminal,
-                            &mut log,
-                            &mut view,
-                            &mut sub_pane,
-                            &mut btw_panel,
-                            &mut report,
-                            &input,
-                            &idle_status,
-                            selection.current(),
-                            &task_view,
-                            config_form.as_ref(),
-                            kv_pane.as_ref(),
-                            resume_pane.as_ref(),
-                            &arcade,
-                            wasm_frame.as_ref(),
-                            rem,
-                        )? {
-                            continue;
+                    match self.idle_work() {
+                        crate::suggest::IdleWork::Suggestion => {
+                            self.generate_suggestion();
                         }
-                        break;
+                        crate::suggest::IdleWork::Nothing => {}
+                        crate::suggest::IdleWork::MemoryPass => {
+                            let quit = self.tui_memory_pass(
+                                terminal,
+                                &mut log,
+                                &mut view,
+                                &mut input,
+                                &mut btw_panel,
+                                &mut arcade,
+                                &mut sub_pane,
+                            )?;
+                            if quit {
+                                // Ctrl-D during the pass leaves through exactly the
+                                // same door as Ctrl-D at the prompt, download warning
+                                // and all.
+                                if !confirm_quit_idle(
+                                    terminal,
+                                    &mut log,
+                                    &mut view,
+                                    &mut sub_pane,
+                                    &mut btw_panel,
+                                    &mut report,
+                                    &input,
+                                    &idle_status,
+                                    selection.current(),
+                                    &task_view,
+                                    config_form.as_ref(),
+                                    kv_pane.as_ref(),
+                                    resume_pane.as_ref(),
+                                    &arcade,
+                                    wasm_frame.as_ref(),
+                                    rem,
+                                )? {
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
                 continue;
@@ -12598,7 +12620,32 @@ impl Agent<'_> {
             // Alt (Option on macOS) or Ctrl turns arrows and Backspace/Delete
             // into word-wise operations.
             let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
+            // A live suggestion is offered to exactly three keys. Everything
+            // else dismisses it, and that dismissal is done here, once,
+            // rather than in every arm: one place, so no arm can forget it.
+            let accepts_suggestion =
+                self.suggestion_accept_key(key, &input, word_mod, sub_pane.selecting);
+            if accepts_suggestion {
+                // Enter accepts *and* sends: place the text here and let the
+                // plain Enter arm below submit it, rather than duplicating
+                // everything that arm does.
+                if key.code == KeyCode::Enter {
+                    self.place_suggestion(&mut input);
+                }
+            } else {
+                self.clear_suggestion();
+                input.ghost = None;
+            }
             match key.code {
+                // Placing an offered suggestion into the prompt, leaving it
+                // editable. Guarded on an empty buffer, so it can never
+                // overwrite typed text, and placed before the plain
+                // Tab/Right arms (roster focus and cursor motion) but after
+                // the popup and slash menu, which own these keys while open.
+                KeyCode::Tab | KeyCode::Right if accepts_suggestion => {
+                    self.place_suggestion(&mut input);
+                    input.sync_popup();
+                }
                 // `←` on an empty prompt reaches into the sub-agent roster below
                 // the status bar and reveals its cursor. Once the roster is
                 // selected, `↑`/`↓` walk the rows the way they are drawn (`↑`
@@ -13576,6 +13623,8 @@ impl Agent<'_> {
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
     ) -> Result<(), String> {
+        // A turn is starting: whatever ghost the prompt was showing is over.
+        input.ghost = None;
         let r = self.tui_turn_inner(terminal, log, view, input, btw, arcade, sub);
         if r.is_err() {
             self.goal = None;
@@ -14799,15 +14848,11 @@ impl Agent<'_> {
     }
 
     /// How long the oldest queued memory job has been waiting.
-    // Consumed by Task 7. Remove this allow there.
-    #[allow(dead_code)]
     fn oldest_memory_wait(&self) -> Option<std::time::Duration> {
         self.memory_jobs.front().map(|j| j.queued_at.elapsed())
     }
 
     /// What the idle moment should spend itself on.
-    // Consumed by Task 7. Remove this allow there.
-    #[allow(dead_code)]
     fn idle_work(&self) -> crate::suggest::IdleWork {
         let starvation = std::time::Duration::from_secs(u64::from(
             crate::settings::active()
@@ -14958,8 +15003,6 @@ impl Agent<'_> {
     /// raw reply before sanitizing: without it, "the model returned nothing"
     /// and "the sanitizer rejected everything" are indistinguishable from
     /// outside, and those need different fixes.
-    // Consumed by Task 7. Remove this allow there.
-    #[allow(dead_code)]
     fn generate_suggestion(&mut self) -> bool {
         self.suggestion_pending = false;
         if !self.suggestion_allowed() {
@@ -15026,6 +15069,50 @@ impl Agent<'_> {
         self.suggestion = None;
     }
 
+    /// Whether this keystroke accepts the live suggestion rather than doing
+    /// its ordinary job.
+    ///
+    /// Only over an empty buffer with neither menu open: the completion popup
+    /// and the slash menu own Tab and Enter while they are up, and both have
+    /// already had their turn by the time the key loop asks this. The
+    /// empty-buffer guard is what makes an accept unable to overwrite typed
+    /// text, and Shift/Alt+Enter (newline) and the roster's Enter keep their
+    /// meanings.
+    fn suggestion_accept_key(
+        &self,
+        key: KeyEvent,
+        input: &TuiInput,
+        word_mod: bool,
+        roster_selecting: bool,
+    ) -> bool {
+        input.buf.text().is_empty()
+            && input.popup.is_none()
+            && input.slash.is_none()
+            && self.current_suggestion().is_some()
+            && match key.code {
+                KeyCode::Tab | KeyCode::Right => !word_mod,
+                KeyCode::Enter => {
+                    !key.modifiers.contains(KeyModifiers::SHIFT)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && !roster_selecting
+                }
+                _ => false,
+            }
+    }
+
+    /// Puts the offered suggestion into the prompt, cursor at the end, and
+    /// consumes it. The buffer stays editable: Tab places, Enter places and
+    /// then falls through to the ordinary submit arm.
+    fn place_suggestion(&mut self, input: &mut TuiInput) {
+        if let Some(text) = self.current_suggestion().map(str::to_owned) {
+            input.hist_idx = None;
+            input.buf.set_text(&text);
+            input.buf.move_end();
+        }
+        self.clear_suggestion();
+        input.ghost = None;
+    }
+
     /// The suggestion to offer right now, or `None`.
     ///
     /// Depth-checked on every read rather than invalidated by every mutation
@@ -15034,8 +15121,6 @@ impl Agent<'_> {
     /// transcript-moving path cannot forget to invalidate. The explicit
     /// `clear_suggestion` calls remain for the paths that rewrite history
     /// *without* changing its length.
-    // Consumed by Task 7. Remove this allow there.
-    #[allow(dead_code)]
     fn current_suggestion(&self) -> Option<&str> {
         self.suggestion
             .as_ref()
@@ -22195,6 +22280,122 @@ mod tests {
         let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
 
         assert_eq!(agent.idle_work(), crate::suggest::IdleWork::Nothing);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Arms a live suggestion at the agent's current transcript depth, which
+    /// is what `current_suggestion`'s staleness check compares against.
+    fn offer_suggestion(agent: &mut Agent<'_>, text: &str) {
+        agent.suggestion = Some(crate::suggest::Suggestion {
+            text: text.to_string(),
+            depth: agent.session.transcript.len(),
+        });
+    }
+
+    #[test]
+    fn tab_places_the_suggestion_and_leaves_it_editable() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-tab");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "run the tests");
+        let mut input = TuiInput::new();
+
+        assert!(agent.suggestion_accept_key(key(KeyCode::Tab), &input, false, false));
+        agent.place_suggestion(&mut input);
+
+        assert_eq!(input.buf.text(), "run the tests");
+        assert_eq!(
+            input.buf.cursor(),
+            "run the tests".len(),
+            "cursor at the end"
+        );
+        assert!(
+            agent.current_suggestion().is_none(),
+            "the offer is consumed"
+        );
+        assert!(input.ghost.is_none(), "and the ghost with it");
+        // Nothing was submitted: the text is sitting in the prompt.
+        assert!(agent.session.transcript.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enter_accepts_the_suggestion_on_the_way_to_the_submit_arm() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-enter");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "explain the parser");
+        let mut input = TuiInput::new();
+
+        assert!(agent.suggestion_accept_key(key(KeyCode::Enter), &input, false, false));
+        agent.place_suggestion(&mut input);
+        // The plain `KeyCode::Enter` arm then reads the buffer, which is the
+        // whole point of placing rather than duplicating the submit path.
+        assert_eq!(input.buf.text().trim(), "explain the parser");
+        assert!(agent.current_suggestion().is_none());
+
+        // Shift+Enter still means newline, and the roster still owns Enter.
+        offer_suggestion(&mut agent, "x");
+        let empty = TuiInput::new();
+        assert!(!agent.suggestion_accept_key(shift(KeyCode::Enter), &empty, false, false));
+        assert!(!agent.suggestion_accept_key(key(KeyCode::Enter), &empty, false, true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_printable_keystroke_dismisses_the_suggestion() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-dismiss");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "run the tests");
+        let mut input = TuiInput::new();
+
+        let k = key(KeyCode::Char('h'));
+        assert!(
+            !agent.suggestion_accept_key(k, &input, false, false),
+            "a printable key is not an accept key"
+        );
+        // What the key loop does for every non-accept key, in one place.
+        agent.clear_suggestion();
+        input.ghost = None;
+        input.buf.insert("h");
+
+        assert!(agent.current_suggestion().is_none());
+        assert_eq!(input.buf.text(), "h", "and the key still did its own job");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_completion_popup_keeps_tab_and_the_suggestion_is_untouched() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-popup");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "run the tests");
+
+        // The key loop's real order: `popup_key` runs before the suggestion
+        // check, and takes the Tab while the popup is open.
+        let mut input = input_with_popup("@src", 0);
+        assert!(input.popup.is_some(), "the `@` popup is open");
+        assert!(
+            input.popup_key(key(KeyCode::Tab)),
+            "the popup takes the Tab"
+        );
+        assert_eq!(
+            agent.current_suggestion(),
+            Some("run the tests"),
+            "the offer survives a key it never saw"
+        );
+
+        // And the guard is the popup itself, not merely the typed text:
+        // an empty buffer with a popup still is not an accept.
+        let popup = input.popup.take();
+        input.buf.clear();
+        input.popup = popup;
+        assert!(!agent.suggestion_accept_key(key(KeyCode::Tab), &input, false, false));
         std::fs::remove_dir_all(&dir).ok();
     }
 
