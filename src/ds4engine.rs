@@ -942,7 +942,7 @@ impl ModelHandle for Ds4Model {
             unsafe { ffi::ds4_session_free(session) };
             return Err(e);
         }
-        let inner = Ds4Session {
+        let mut inner = Ds4Session {
             model: Arc::clone(&self),
             session,
             transcript: TokenTranscript::new(),
@@ -951,7 +951,15 @@ impl ModelHandle for Ds4Model {
             trusted_system_len: 0,
             pending_images: Vec::new(),
             vision_spans: Vec::new(),
+            #[cfg(ds4_engine)]
+            decide_session: None,
+            #[cfg(ds4_engine)]
+            decide_letters: Vec::new(),
+            #[cfg(ds4_engine)]
+            decide_letters_tried: false,
         };
+        #[cfg(ds4_engine)]
+        inner.init_decide_letters();
         Ok(Box::new(Ds4HostSession {
             inner,
             pending: None,
@@ -1010,6 +1018,26 @@ pub struct Ds4Session {
     /// by `reconcile` and consumed by `generate` to call
     /// `ds4_session_sync_multimodal`.
     vision_spans: Vec<ffi::Ds4VisionSpan>,
+    /// Lazily created session used only for System-1 decisions
+    /// (`Engine::decide`). Separate from `session` on purpose: a decision
+    /// evaluates a question suffix, and doing that on the live session would
+    /// disturb state guarded by the prefix fingerprints and the KV ladder.
+    /// `None` until the first decision.
+    #[cfg(ds4_engine)]
+    decide_session: Option<*mut ffi::Ds4Session>,
+    /// The single token each answer letter tokenizes to, in
+    /// [`crate::decide::LETTERS`] order. Empty when the family does not give
+    /// every letter exactly one token, which switches the whole capability
+    /// off. Populated eagerly at construction (`spawn`/`from_model`), not
+    /// lazily from inside `decide`, so `supports_decide` — which only reads
+    /// this — is accurate before `decide` is ever called (see
+    /// `init_decide_letters`).
+    #[cfg(ds4_engine)]
+    decide_letters: Vec<i32>,
+    /// Whether [`Ds4Session::init_decide_letters`] has already probed the
+    /// letters, so an unsupported family is not re-tokenized on every call.
+    #[cfg(ds4_engine)]
+    decide_letters_tried: bool,
 }
 
 /// Back-compatible alias: the single-owner engine callers used before the split
@@ -1050,7 +1078,7 @@ impl Ds4Session {
     /// Wraps a shared model in a session whose FFI session is created lazily.
     #[must_use]
     pub fn from_model(model: Arc<Ds4Model>) -> Self {
-        Self {
+        let mut session = Self {
             model,
             session: std::ptr::null_mut(),
             transcript: TokenTranscript::new(),
@@ -1059,7 +1087,16 @@ impl Ds4Session {
             trusted_system_len: 0,
             pending_images: Vec::new(),
             vision_spans: Vec::new(),
-        }
+            #[cfg(ds4_engine)]
+            decide_session: None,
+            #[cfg(ds4_engine)]
+            decide_letters: Vec::new(),
+            #[cfg(ds4_engine)]
+            decide_letters_tried: false,
+        };
+        #[cfg(ds4_engine)]
+        session.init_decide_letters();
+        session
     }
 
     /// Forks this session: a sibling over the *same* weights, pre-loaded with
@@ -1494,6 +1531,128 @@ impl Ds4Session {
             self.transcript
                 .push_span(SpanRole::Assistant, think_span_tag(think), text, &span);
         }
+    }
+}
+
+#[cfg(ds4_engine)]
+impl Ds4Session {
+    /// Context window for the decision session. The largest state a caller
+    /// passes is the memory gate's excerpt, bounded by
+    /// `memextract::EXCERPT_MAX_BYTES` (32 KiB), plus a short question
+    /// suffix. 16k tokens covers that with room to spare and costs a
+    /// fraction of the live session's KV.
+    const DECIDE_CTX: i32 = 16_384;
+
+    /// Tokenizes each answer letter and keeps it only if it is exactly one
+    /// token. A family that splits any letter turns the capability off
+    /// wholesale rather than answering from a partial letter set.
+    ///
+    /// Called once, from construction (`ModelHandle::spawn` and
+    /// `Ds4Session::from_model`), so `supports_decide` is accurate before
+    /// `decide` is ever called. Idempotent via `tried` rather than by
+    /// re-probing on an empty `decide_letters`: an unsupported family would
+    /// otherwise leave `decide_letters` empty forever and re-tokenize all four
+    /// letters on every call.
+    fn init_decide_letters(&mut self) {
+        if self.decide_letters_tried {
+            return;
+        }
+        self.decide_letters_tried = true;
+        let mut ids = Vec::with_capacity(crate::decide::LETTERS.len());
+        for i in 0..crate::decide::LETTERS.len() {
+            let Some(text) = crate::decide::letter_token_text(i) else {
+                return;
+            };
+            let toks = self.model.tokenize_rendered(&text);
+            if toks.len() != 1 {
+                return; // leaves decide_letters empty: unsupported
+            }
+            ids.push(toks[0]);
+        }
+        self.decide_letters = ids;
+    }
+
+    /// The decision session, created on first use.
+    fn decide_session(&mut self) -> Result<*mut ffi::Ds4Session, EngineError> {
+        if let Some(s) = self.decide_session {
+            return Ok(s);
+        }
+        let s = self.model.create_session(Self::DECIDE_CTX)?;
+        self.decide_session = Some(s);
+        Ok(s)
+    }
+
+    /// Frees the decision session and forgets it, so the next decision builds
+    /// a fresh one.
+    ///
+    /// Called when a prefill or eval fails part-way. The C may have cleared
+    /// `checkpoint_valid` on that session, and a session kept in that state
+    /// would poison every later decision on this engine — the failure would
+    /// stop being per-call and become permanent, silently, since nothing
+    /// upstream distinguishes "this engine cannot decide" from "this one call
+    /// went wrong". Throwing the session away keeps the blast radius at one
+    /// call.
+    fn discard_decide_session(&mut self) {
+        if let Some(s) = self.decide_session.take() {
+            // SAFETY: created by `decide_session` and not yet freed; taking it
+            // out of the option is what guarantees it is freed only once.
+            unsafe { ffi::ds4_session_free(s) };
+        }
+    }
+
+    /// Prefills `state` plus one question's suffix onto the decision session
+    /// in a single `ds4_session_sync`, so the letters are read at the final
+    /// position.
+    ///
+    /// # Multi-question batching, if ever wanted
+    ///
+    /// Do **not** reintroduce `ds4_session_rewind` between questions. The C's
+    /// `ds4_session_rewind` (`refs/ds4/ds4.c:83658`) only sets `state_ok` on
+    /// the Qwen4 and GLM paths; every other family — including plank's main
+    /// `DeepSeek` target — falls through to `if (!state_ok) s->checkpoint_valid
+    /// = false;` (the comment there: "`DeepSeek` compressors cannot be rolled
+    /// back by truncating their row counts"). The next `ds4_session_eval` or
+    /// `ds4_session_sync` then refuses with "decode requires a synchronized
+    /// checkpoint" — so a first question answers correctly and every
+    /// subsequent one on the same rewound session fails.
+    ///
+    /// The sound way to answer several questions about one state is: keep the
+    /// state's token vector on the Rust side, and for each question call
+    /// `ds4_session_sync` with `state_tokens ++ question_suffix_tokens` (one
+    /// sync per question, not a rewind). `sync` reuses the longest common
+    /// prefix against whatever the session currently holds, so on a family
+    /// where `checkpoint_valid` survives (Qwen4, GLM) each subsequent question
+    /// costs only its own suffix tokens, and on `DeepSeek` it costs a full
+    /// re-prefill of the state — slower, but always a *correct* answer rather
+    /// than a silently wrong one from a corrupted checkpoint.
+    fn decide_prefill(
+        &mut self,
+        s: *mut ffi::Ds4Session,
+        state: &str,
+        question: &crate::decide::Question,
+    ) -> Result<(), EngineError> {
+        let mut tokens = Ds4TokensGuard::new();
+        tokens.push_all(&self.model.tokenize_rendered(state));
+        tokens.push_all(
+            &self
+                .model
+                .tokenize_rendered(&crate::decide::render_question(question)),
+        );
+        let mut err = [0_i8; 256];
+        // SAFETY: session and tokens are valid for the call; err is sized.
+        let rc = unsafe { ffi::ds4_session_sync(s, tokens.as_ptr(), err.as_mut_ptr(), err.len()) };
+        if rc != 0 {
+            return Err(EngineError::new(cstr_message(
+                &err,
+                "decision state prefill failed",
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn raw_session(&self) -> *mut ffi::Ds4Session {
+        self.session
     }
 }
 
@@ -2378,6 +2537,81 @@ impl Engine for Ds4Session {
     fn set_pending_images(&mut self, images: Vec<(String, crate::engine::VisionImage)>) {
         self.pending_images = images;
     }
+
+    #[cfg(ds4_engine)]
+    fn supports_decide(&self) -> bool {
+        !self.decide_letters.is_empty()
+    }
+
+    #[cfg(ds4_engine)]
+    fn decide(
+        &mut self,
+        state: &str,
+        question: &crate::decide::Question,
+    ) -> Result<crate::decide::RawVerdict, EngineError> {
+        if self.decide_letters.is_empty() {
+            return Err(EngineError::unsupported());
+        }
+        // An option list longer than the answer-letter set is a caller/type
+        // mismatch, not a model failure — reject it before touching the
+        // session so the error names the real problem instead of surfacing
+        // as a bogus "logprob read failed" once the loop below runs dry on
+        // `decide_letters`.
+        if question.options.len() > self.decide_letters.len() {
+            return Err(EngineError::new(format!(
+                "question has {} options but only {} answer letters are available",
+                question.options.len(),
+                self.decide_letters.len()
+            )));
+        }
+        let s = self.decide_session()?;
+        // Both failure paths below drop the decision session rather than
+        // leaving it cached: a part-way prefill or a refused logprob read can
+        // leave the C's `checkpoint_valid` clear, and reusing that session
+        // would turn one bad call into a permanently broken capability.
+        if let Err(e) = self.decide_prefill(s, state, question) {
+            self.discard_decide_session();
+            return Err(e);
+        }
+
+        let mut logprobs = Vec::with_capacity(question.options.len());
+        for i in 0..question.options.len() {
+            // `decide_letters.len() >= options.len()` was checked above, so
+            // this is always `Some`.
+            let tok = self.decide_letters[i];
+            let mut sc = ffi::Ds4TokenScore::default();
+            // SAFETY: session is valid; sc is a valid out-ptr.
+            if unsafe { ffi::ds4_session_token_logprob(s, tok, &raw mut sc) } != 1 {
+                self.discard_decide_session();
+                return Err(EngineError::new("decision logprob read failed"));
+            }
+            logprobs.push(sc.logprob);
+        }
+
+        // How much of the model's probability sat on the letters at all.
+        // A question it wanted to answer in prose leaves this near zero,
+        // and `score` abstains rather than reading a ranking off noise.
+        let letter_mass: f32 = logprobs.iter().map(|lp| lp.exp()).sum();
+
+        // `letter_mass` decides whether the answer is trusted at all, and it
+        // is the one quantity no test without a real model can observe: if it
+        // routinely lands under `MIN_LETTER_MASS` the gate abstains on
+        // everything and is a silent no-op — working exactly as written and
+        // achieving nothing. Set `PLANK_DECIDE_DEBUG` to watch it on a real
+        // model before trusting a threshold.
+        if std::env::var_os("PLANK_DECIDE_DEBUG").is_some() {
+            eprintln!(
+                "[decide] letter_mass={letter_mass:.4} logprobs={logprobs:?} q={:?}",
+                question.text
+            );
+        }
+
+        Ok(crate::decide::score(
+            &logprobs,
+            crate::decide::DEFAULT_ABSTAIN_FLOOR,
+            letter_mass,
+        ))
+    }
 }
 
 impl Drop for Ds4Session {
@@ -2387,6 +2621,11 @@ impl Drop for Ds4Session {
             // model (weights + Metal context) is dropped separately when its
             // Arc refcount reaches zero (design §4).
             unsafe { ffi::ds4_session_free(self.session) };
+        }
+        #[cfg(ds4_engine)]
+        if let Some(d) = self.decide_session.take() {
+            // SAFETY: created by `decide_session()` and not yet freed.
+            unsafe { ffi::ds4_session_free(d) };
         }
         // Free any vision span embedding buffers still owned by this session.
         self.free_vision_spans();
@@ -3575,6 +3814,148 @@ mod tests {
             )
             .unwrap();
         assert!(stats.generated > 0);
+    }
+
+    /// Opens a bare `Ds4Session` (not host-wrapped) over `PLANK_TEST_MODEL`,
+    /// for tests that call `Engine` methods directly on it.
+    #[cfg(ds4_engine)]
+    fn open_test_session(model_path: &std::ffi::OsStr) -> super::Ds4Session {
+        use crate::ffi::Ds4Backend;
+
+        // `mtp` defaults to true, and on a DeepSeek model with no companion
+        // the C refuses to open at all ("--dspark requires --mtp-model
+        // FILE"), so the default tuning cannot load a plain ds4 GGUF.
+        // Speculative decoding is irrelevant to a decision — nothing is
+        // generated — so turn it off rather than making whoever runs this
+        // test supply a draft checkpoint.
+        //
+        // `PLANK_TEST_SSD_STREAMING=1` additionally turns on SSD streaming,
+        // which a model too large for the machine needs to open at all — on a
+        // 128 GiB box V4.1 refuses with "needs 155.55 GiB before the expert
+        // cache; safe budget 107.52 GiB". Off by default because a model that
+        // fits should not pay for streaming.
+        let tuning = crate::config::EngineTuning {
+            mtp: false,
+            ssd_streaming: std::env::var_os("PLANK_TEST_SSD_STREAMING").is_some(),
+            ..Default::default()
+        };
+        let model = super::Ds4Model::open_shared(
+            model_path,
+            Ds4Backend::Metal,
+            4096,
+            0,
+            100,
+            &tuning,
+            "you are a helpful assistant",
+        )
+        .unwrap();
+        super::Ds4Session::from_model(model)
+    }
+
+    #[cfg(ds4_engine)]
+    #[test]
+    fn decide_answers_a_boolean_and_leaves_the_live_session_untouched() {
+        use crate::engine::Engine;
+
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let mut e = open_test_session(&model_path);
+        if !e.supports_decide() {
+            eprintln!("skipping: answer letters are not single tokens on this family");
+            return;
+        }
+        // Take the live session to a non-trivial position first, so a rewind
+        // bug would show up as a changed position rather than a no-op.
+        e.warm_reset("You are a helpful assistant.").unwrap();
+        e.warm_append(Some("Hello there.")).unwrap();
+        e.warm_sync(&mut |_| {}).unwrap();
+        // SAFETY: session was just synced above.
+        let before_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };
+
+        let q = crate::decide::Question::boolean(
+            "Does the text above state a person's name? Answer yes or no.",
+        );
+        let out = e
+            .decide("The user's name is Enzo and he lives in Milan.", &q)
+            .expect("decide must succeed once supported");
+        assert!(out.p.is_finite());
+        assert!((0.0..=1.0).contains(&out.p));
+        // `Question::boolean` puts "yes" at index 0, and the state plainly
+        // does state a name. Asserting the answer — not merely that the call
+        // returned — is what makes this catch a logprob read taken at the
+        // wrong position, which would otherwise look like a healthy but
+        // meaningless probability.
+        assert!(
+            !out.abstained,
+            "a plain question about an explicit fact should not abstain"
+        );
+        assert_eq!(out.index, 0, "expected yes; p was {}", out.p);
+
+        // SAFETY: session is still valid.
+        let after_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };
+        assert_eq!(
+            before_pos, after_pos,
+            "a decision must not move the live session"
+        );
+    }
+
+    #[cfg(ds4_engine)]
+    #[test]
+    fn two_separate_decide_calls_both_succeed_and_leave_position_unchanged() {
+        use crate::engine::Engine;
+
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let mut e = open_test_session(&model_path);
+        if !e.supports_decide() {
+            eprintln!("skipping: answer letters are not single tokens on this family");
+            return;
+        }
+        e.warm_reset("You are a helpful assistant.").unwrap();
+        e.warm_append(Some("Hello there.")).unwrap();
+        e.warm_sync(&mut |_| {}).unwrap();
+        // SAFETY: session was just synced above.
+        let before_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };
+
+        // Two separate `decide` calls on the same session — the single-question
+        // API's replacement for the old rewind-between-questions batching,
+        // which was unsound on DeepSeek (see the annotation on
+        // `Ds4Session::decide_prefill`).
+        let travel = e
+            .decide(
+                "I flew to Rome last week.",
+                &crate::decide::Question::boolean("Is the text about travel?"),
+            )
+            .unwrap();
+        let food = e
+            .decide(
+                "I flew to Rome last week.",
+                &crate::decide::Question::boolean("Is the text about food?"),
+            )
+            .unwrap();
+        assert!(travel.p.is_finite());
+        assert!(food.p.is_finite());
+        // The two questions must produce DIFFERENT answers about the same
+        // state. Asserting only that both calls returned would pass even if
+        // the second call read a stale distribution left by the first — which
+        // is exactly the failure mode the old rewind design had, and the one
+        // thing these two calls exist to rule out.
+        assert_ne!(
+            (travel.index, travel.abstained),
+            (food.index, food.abstained),
+            "travel={travel:?} food={food:?}: the second call looks stale"
+        );
+
+        // SAFETY: session is still valid.
+        let after_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };
+        assert_eq!(
+            before_pos, after_pos,
+            "two decide calls in a row must not move the live session"
+        );
     }
 
     #[cfg(ds4_engine)]

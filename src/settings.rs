@@ -513,6 +513,21 @@ pub struct MemorySettings {
     /// `processed_depth`, so the next turn that clears the floor reads the
     /// short turns too. Nothing said to the model is ever lost to this gate.
     pub min_turn_seconds: u32,
+    /// Ask the model, before enqueuing an extraction pass, whether the span
+    /// contains anything worth remembering (`Engine::decide`). Off by
+    /// default: the threshold below has not been calibrated against real
+    /// extraction outcomes, and a gate that wrongly says no loses a memory
+    /// silently. Off leaves the pass behaving exactly as it did before the
+    /// gate existed, and an engine without `supports_decide` ignores this.
+    pub gate: bool,
+    /// Probability of "yes", as a percent, at or above which the gate lets
+    /// the pass run. An abstention — the model did not commit to a letter —
+    /// always runs the pass: an unsure gate must not suppress a memory.
+    pub gate_percent: u32,
+    /// Messages a gate-rejected span may accumulate before an extraction pass
+    /// runs anyway. `0` (the default) means a rejected span is finished
+    /// immediately and never reconsidered. See `ExtractState::held_span_cap`.
+    pub held_span_cap: u32,
     /// Per-type character budgets for the rendered memory section.
     pub budgets: crate::memory::Budgets,
 }
@@ -523,6 +538,9 @@ impl Default for MemorySettings {
             auto_extract: true,
             extract_every_n_turns: 1,
             min_turn_seconds: 120,
+            gate: false,
+            gate_percent: 60,
+            held_span_cap: 0,
             budgets: crate::memory::Budgets::default(),
         }
     }
@@ -895,6 +913,18 @@ impl Settings {
         if let Some(v) = num::<u32>(root.get("memory"), "minTurnSeconds") {
             self.memory.min_turn_seconds = v;
             self.note("memory.minTurnSeconds", origin);
+        }
+        if let Some(v) = boolean(root.get("memory"), "gate") {
+            self.memory.gate = v;
+            self.note("memory.gate", origin);
+        }
+        if let Some(v) = num::<u32>(root.get("memory"), "gatePercent") {
+            self.memory.gate_percent = v.min(100);
+            self.note("memory.gatePercent", origin);
+        }
+        if let Some(v) = num::<u32>(root.get("memory"), "heldSpanCap") {
+            self.memory.held_span_cap = v;
+            self.note("memory.heldSpanCap", origin);
         }
         if let Some(b) = root.get("memory").and_then(|m| m.get("budgets")) {
             let set = |key: &str, field: &mut usize| {
@@ -1364,6 +1394,9 @@ impl Settings {
                 "minTurnSeconds",
                 unum(u64::from(self.memory.min_turn_seconds)),
             );
+            upsert(m, "gate", Json::Bool(self.memory.gate));
+            upsert(m, "gatePercent", unum(u64::from(self.memory.gate_percent)));
+            upsert(m, "heldSpanCap", unum(u64::from(self.memory.held_span_cap)));
         }
         {
             let t = section(&mut root, "tools");
@@ -1711,6 +1744,32 @@ mod tests {
         assert_eq!(s.mcp.timeout_secs, 30);
         assert_eq!(s.engine.model, None);
         assert_eq!(s.safety.sandbox, None);
+        assert!(!s.memory.gate);
+        assert_eq!(s.memory.gate_percent, 60);
+        assert_eq!(s.memory.held_span_cap, 0);
+    }
+
+    #[test]
+    fn the_memory_gate_defaults_to_off_and_holds_nothing() {
+        let s = Settings::default();
+        assert!(!s.memory.gate, "the gate ships off");
+        assert_eq!(s.memory.gate_percent, 60);
+        assert_eq!(s.memory.held_span_cap, 0, "no holding by default");
+    }
+
+    #[test]
+    fn the_memory_gate_keys_are_read_from_json() {
+        let s =
+            from_json(r#"{ "memory": { "gate": true, "gatePercent": 80, "heldSpanCap": 12 } }"#);
+        assert!(s.memory.gate);
+        assert_eq!(s.memory.gate_percent, 80);
+        assert_eq!(s.memory.held_span_cap, 12);
+    }
+
+    #[test]
+    fn an_out_of_range_gate_percent_is_clamped_rather_than_rejected() {
+        let s = from_json(r#"{ "memory": { "gatePercent": 400 } }"#);
+        assert_eq!(s.memory.gate_percent, 100);
     }
 
     #[test]
@@ -1989,6 +2048,31 @@ mod tests {
         assert!(note.contains("popupRows=4"), "{note}");
         assert!(note.contains("historySize=7"), "{note}");
         assert!(note.contains("timeoutSecs=45"), "{note}");
+    }
+
+    /// A key that parses but never serialises is lost the next time anything
+    /// saves the settings, silently and permanently. Parsing tests cannot
+    /// catch that, so the three gate keys get a real write-then-read-back.
+    #[test]
+    fn the_memory_gate_keys_survive_a_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("plank-cfg-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut s = Settings::default();
+        s.memory.gate = true;
+        s.memory.gate_percent = 85;
+        s.memory.held_span_cap = 7;
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let back = from_json(&text);
+        assert!(back.memory.gate, "gate lost on save:\n{text}");
+        assert_eq!(back.memory.gate_percent, 85, "gatePercent lost:\n{text}");
+        assert_eq!(back.memory.held_span_cap, 7, "heldSpanCap lost:\n{text}");
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

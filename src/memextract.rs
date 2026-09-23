@@ -63,6 +63,28 @@ pub struct MemoryResume {
 /// Engine failures a queued job survives before it is dropped.
 pub const MAX_JOB_ATTEMPTS: u8 = 3;
 
+/// The System-1 gate's answer: is the span worth an extraction pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Worthy {
+    Yes,
+    No,
+}
+
+impl crate::decide::Decision for Worthy {
+    const OPTIONS: &'static [&'static str] = &["yes", "no"];
+    fn from_index(i: usize) -> Option<Self> {
+        match i {
+            0 => Some(Self::Yes),
+            1 => Some(Self::No),
+            _ => None,
+        }
+    }
+}
+
+/// The gate's question. Kept here next to [`build_prompt`] so the two pieces
+/// of extraction prompt text live together.
+pub const GATE_QUESTION: &str = "Does the conversation above contain anything worth remembering for future sessions - a stable fact about the user, a durable preference, an ongoing project, or a reference? Answer no for routine work with nothing lasting in it.";
+
 /// Gating state for the pass, owned by the `Agent`.
 ///
 /// The bools are independent switches read side by side, not a state
@@ -98,6 +120,15 @@ pub struct ExtractState {
     /// Spans retired without a run because the prompt would not fit the
     /// context; the front end announces only the first.
     oversized_spans: u32,
+    /// Messages a span rejected by the System-1 gate may accumulate before an
+    /// extraction pass runs anyway, bypassing the gate.
+    ///
+    /// `0`, the default, means no holding at all: a rejected span is finished
+    /// on the spot and never reconsidered, which bounds the cost and makes a
+    /// false negative permanent. A positive value trades that for recovery —
+    /// the span is held and re-judged as part of a larger one — while
+    /// capping how large the held span can grow.
+    pub held_span_cap: usize,
 }
 
 impl ExtractState {
@@ -252,6 +283,39 @@ impl ExtractState {
     pub fn note_oversized_span(&mut self) -> bool {
         self.oversized_spans = self.oversized_spans.saturating_add(1);
         self.oversized_spans == 1
+    }
+
+    /// Whether the span `from..depth` has outgrown [`held_span_cap`] and must
+    /// run an extraction pass without consulting the gate. Always false when
+    /// the cap is `0`, because nothing is ever held in that mode.
+    ///
+    /// [`held_span_cap`]: Self::held_span_cap
+    #[must_use]
+    pub fn gate_bypassed(&self, from: usize, depth: usize) -> bool {
+        self.held_span_cap > 0 && depth.saturating_sub(from) > self.held_span_cap
+    }
+
+    /// Records that the System-1 gate judged `from..depth` not worth
+    /// extracting.
+    ///
+    /// With no cap this is a completed pass — `processed_depth` advances and
+    /// the span is gone. With a cap the span is held: `processed_depth` stays
+    /// put, so the next eligible turn re-reads these messages together with
+    /// the new ones.
+    ///
+    /// A span already past its cap is finished rather than held, even though
+    /// the intended caller never gets here with one (it checks
+    /// [`gate_bypassed`](Self::gate_bypassed) first and skips the gate
+    /// entirely). The check is repeated because this is a public method and
+    /// the alternative failure is silent: hold a span that has outgrown its
+    /// cap and it is never finished by any path, so it grows without bound
+    /// while everything upstream still looks healthy.
+    pub fn reject(&mut self, from: usize, depth: usize) {
+        if self.gate_bypassed(from, depth) || self.held_span_cap == 0 {
+            self.finish(depth);
+        } else {
+            self.cancel();
+        }
     }
 }
 
@@ -914,5 +978,79 @@ mod tests {
             s.would_run(10, LONG),
             "a rejected short turn leaves the peek unchanged"
         );
+    }
+
+    #[test]
+    fn with_no_cap_a_rejected_span_is_finished_and_never_seen_again() {
+        let mut s = state();
+        s.held_span_cap = 0;
+        assert_eq!(s.should_run(10, LONG), Some(0));
+        s.reject(0, 10);
+        assert_eq!(
+            s.should_run(10, LONG),
+            None,
+            "the span is done: processed_depth advanced past it"
+        );
+    }
+
+    /// The span must sit *within* the cap for holding to apply: 4 messages
+    /// against a cap of 5. A span already past its cap takes the bypass
+    /// branch instead, which
+    /// `rejecting_a_span_already_past_the_cap_finishes_it_rather_than_holding`
+    /// pins.
+    #[test]
+    fn with_a_cap_a_rejected_span_is_held_for_the_next_turn() {
+        let mut s = state();
+        s.held_span_cap = 5;
+        assert_eq!(s.should_run(4, LONG), Some(0));
+        assert!(!s.gate_bypassed(0, 4), "precondition: within the cap");
+        s.reject(0, 4);
+        assert_eq!(
+            s.should_run(6, LONG),
+            Some(0),
+            "the held span is re-read as part of a larger one"
+        );
+    }
+
+    #[test]
+    fn the_gate_is_bypassed_once_a_held_span_outgrows_the_cap() {
+        let s = {
+            let mut s = state();
+            s.held_span_cap = 5;
+            s
+        };
+        assert!(!s.gate_bypassed(0, 5), "exactly at the cap still asks");
+        assert!(s.gate_bypassed(0, 6), "past the cap runs unconditionally");
+    }
+
+    /// The one input where dropping `reject`'s `gate_bypassed` clause changes
+    /// behaviour: without it this span is held forever instead of finished,
+    /// and no other test in this file can tell the two versions apart.
+    #[test]
+    fn rejecting_a_span_already_past_the_cap_finishes_it_rather_than_holding() {
+        let mut s = state();
+        s.held_span_cap = 5;
+        assert_eq!(s.should_run(6, LONG), Some(0));
+        assert!(
+            s.gate_bypassed(0, 6),
+            "precondition: 6 messages past a cap of 5"
+        );
+        s.reject(0, 6);
+        assert_eq!(
+            s.should_run(6, LONG),
+            None,
+            "an over-cap span must be retired, not held to grow further"
+        );
+    }
+
+    #[test]
+    fn a_zero_cap_never_bypasses_the_gate() {
+        let mut s = state();
+        s.held_span_cap = 0;
+        assert!(!s.gate_bypassed(0, 10_000));
+        // And a rejection still finishes rather than holding.
+        assert_eq!(s.should_run(10, LONG), Some(0));
+        s.reject(0, 10);
+        assert_eq!(s.should_run(10, LONG), None);
     }
 }

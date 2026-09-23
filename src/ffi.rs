@@ -66,6 +66,18 @@ impl Default for Ds4Tokens {
     }
 }
 
+/// Mirrors `ds4_token_score` (`refs/ds4/ds4.h:53`): one token's identity and
+/// its score at the session's current position. `logprob` is already
+/// normalised by the C over the full vocabulary, so scoring a handful of
+/// known tokens needs no vocabulary-wide copy.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ds4TokenScore {
+    pub id: c_int,
+    pub logit: f32,
+    pub logprob: f32,
+}
+
 /// Serialized session KV state, mirroring `ds4_session_snapshot`.
 #[repr(C)]
 #[derive(Debug)]
@@ -446,6 +458,53 @@ unsafe extern "C" {
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;
+    /// Score of one known token at the session's current position.
+    ///
+    /// Returns **1 on success** and writes `out`; **0 on failure** — a null
+    /// session or `out`, a `token` outside the vocabulary, or logits that are
+    /// entirely non-finite (`ds4.c:76079`). Note the polarity: this is the
+    /// opposite of the `0 == ok` convention most of the other `ds4_*` entry
+    /// points in this file use, so test it as `== 1`, never as `!= 0`.
+    ///
+    /// `out.logprob` is normalised over the **full** vocabulary — the C takes
+    /// a max-shifted log-sum-exp across all `DS4_N_VOCAB` logits before
+    /// subtracting — so the exponentials of several of these scores can be
+    /// summed to learn what share of the model's probability those tokens
+    /// hold.
+    ///
+    /// This is the System-1 read path: the answer letters are known ahead of
+    /// time, so asking for exactly those beats copying a vocabulary-wide
+    /// logit slab through [`ds4_session_copy_logits`] and normalising here.
+    pub fn ds4_session_token_logprob(
+        s: *mut Ds4Session,
+        token: c_int,
+        out: *mut Ds4TokenScore,
+    ) -> c_int;
+
+    /// Writes the `k` highest-scoring tokens into `out`, best first.
+    ///
+    /// Returns **`k`** (clamped to the vocabulary size) on success and **0 on
+    /// failure** (`ds4.c:76042`). The return is therefore not a count of
+    /// meaningful entries: `out` is pre-filled with `id = -1`, and a slot
+    /// still holding `-1` was never filled. Callers must stop at the first
+    /// negative `id` rather than trusting the return.
+    ///
+    /// `logprob` is normalised over the full vocabulary, as in
+    /// [`ds4_session_token_logprob`]. `out` must have room for `k` entries.
+    pub fn ds4_session_top_logprobs(s: *mut Ds4Session, out: *mut Ds4TokenScore, k: c_int)
+    -> c_int;
+
+    /// Copies the raw logits for the current position into `out`.
+    ///
+    /// All-or-nothing: `cap` must be **at least** the full vocabulary size or
+    /// the call writes nothing and returns 0. On success it returns the
+    /// vocabulary size, which is how many floats it wrote (`ds4.c:76101`).
+    /// It is not a partial copy of the first `cap` logits.
+    ///
+    /// Diagnostics only — the decision path uses
+    /// [`ds4_session_token_logprob`], which avoids the vocabulary-wide copy.
+    pub fn ds4_session_copy_logits(s: *mut Ds4Session, out: *mut f32, cap: c_int) -> c_int;
+
     /// Draft-block size the loaded support model can propose per step, or 0
     /// when there is none. `> 1` is the C's own test for "speculation is worth
     /// attempting" — under `DSpark` it is the checkpoint's block size.
@@ -899,5 +958,13 @@ mod tests {
         assert_eq!(size_of::<Ds4VisionSpan>(), 80, "struct size");
         assert_eq!(offset_of!(Ds4VisionSpan, token_start), 0);
         assert_eq!(offset_of!(Ds4VisionSpan, embedding), 8);
+    }
+
+    #[test]
+    fn token_score_matches_the_c_layout() {
+        // `ds4_token_score` in refs/ds4/ds4.h:53-57 is { int id; float logit;
+        // float logprob; } — three 4-byte fields, no padding.
+        assert_eq!(std::mem::size_of::<Ds4TokenScore>(), 12);
+        assert_eq!(std::mem::align_of::<Ds4TokenScore>(), 4);
     }
 }
