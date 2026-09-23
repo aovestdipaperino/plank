@@ -2335,6 +2335,16 @@ struct Agent<'a> {
     /// read (`enqueue_memory_job` / `process_memory_job`). Front of the
     /// queue is oldest; an interrupted job goes back to the front.
     memory_jobs: std::collections::VecDeque<crate::memextract::MemoryJob>,
+    /// A turn ended and a suggestion should be generated at the next quiet
+    /// moment. Set at the turn boundary and read at the idle wake: the turn
+    /// exit itself must stay a snapshot, so the prompt comes back the moment
+    /// the answer is done.
+    suggestion_pending: bool,
+    /// The suggestion currently offered as ghost text, if any. Bound to the
+    /// transcript depth it was generated at — see `suggest::Suggestion`.
+    // Consumed by Task 7. Remove this allow there.
+    #[allow(dead_code)]
+    suggestion: Option<crate::suggest::Suggestion>,
     /// One quiet summary line queued by `report_memory_changes`, drained by
     /// whoever ran `process_memory_job`.
     pending_memory_notice: Option<String>,
@@ -14372,6 +14382,7 @@ impl Agent<'_> {
             // idle loop (`tui_memory_pass`), on a worker with the footer
             // live, and a prompt typed meanwhile cuts it short.
             self.enqueue_memory_job(turn_start.elapsed());
+            self.note_turn_end_for_suggestion(false);
             // Stop hooks: exit 2 feeds stderr to the model and the turn
             // continues (at most once).
             if !stop_hook_ran {
@@ -14728,6 +14739,56 @@ impl Agent<'_> {
     /// Whether a queued span is waiting to be read.
     fn memory_jobs_pending(&self) -> bool {
         !self.memory_jobs.is_empty()
+    }
+
+    /// Records that a turn just ended, so the next quiet moment generates a
+    /// suggestion.
+    ///
+    /// Queues a flag and nothing more. The generation is deliberately not run
+    /// here: turn exit is a snapshot, and paying a generation on this path
+    /// would delay the prompt coming back after every single answer.
+    fn note_turn_end_for_suggestion(&mut self, errored: bool) {
+        if errored || !self.suggestion_allowed() {
+            return;
+        }
+        self.suggestion_pending = true;
+    }
+
+    /// Whether this session should suggest at all right now.
+    ///
+    /// The skip list, mapped from the design's table: off by setting, a
+    /// sub-agent turn, an interrupted turn, or `/init` running. The cold-KV
+    /// skip is not here — it needs the prompt text, so it is checked at
+    /// generation time.
+    fn suggestion_allowed(&self) -> bool {
+        crate::settings::active().suggestions.enabled
+            && !self.in_sidechain()
+            && !self.quiet_tools
+            && self.memory_pass_allowed()
+    }
+
+    /// How long the oldest queued memory job has been waiting.
+    // Consumed by Task 7. Remove this allow there.
+    #[allow(dead_code)]
+    fn oldest_memory_wait(&self) -> Option<std::time::Duration> {
+        self.memory_jobs.front().map(|j| j.queued_at.elapsed())
+    }
+
+    /// What the idle moment should spend itself on.
+    // Consumed by Task 7. Remove this allow there.
+    #[allow(dead_code)]
+    fn idle_work(&self) -> crate::suggest::IdleWork {
+        let starvation = std::time::Duration::from_secs(u64::from(
+            crate::settings::active()
+                .suggestions
+                .memory_starvation_seconds,
+        ));
+        crate::suggest::idle_work(
+            self.suggestion_pending,
+            self.memory_jobs_pending(),
+            self.oldest_memory_wait(),
+            starvation,
+        )
     }
 
     /// Runs the oldest queued job: one sidechain generation against the live
@@ -18699,6 +18760,8 @@ fn new_agent(
         memory_gate_percent: 60,
         memory_jobs: std::collections::VecDeque::new(),
         pending_memory_notice: None,
+        suggestion_pending: false,
+        suggestion: None,
         repro_dir,
         quiet_tools: false,
         guard_stopped: false,
@@ -21539,6 +21602,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -21653,6 +21718,123 @@ mod tests {
         on.memory.extract_every_n_turns = 1;
         crate::settings::install_for_test(on);
         AutoExtractGuard
+    }
+
+    /// Suggestions on, with an explicit starvation window. Installed through
+    /// the same `install_for_test` path and torn down by the same guard.
+    fn enable_suggestions_for_test(starvation_secs: u32) -> AutoExtractGuard {
+        let mut on = crate::settings::Settings::default();
+        on.suggestions.enabled = true;
+        on.suggestions.memory_starvation_seconds = starvation_secs;
+        crate::settings::install_for_test(on);
+        AutoExtractGuard
+    }
+
+    /// Suggestions explicitly off, everything else default.
+    fn disable_suggestions_for_test() -> AutoExtractGuard {
+        let mut off = crate::settings::Settings::default();
+        off.suggestions.enabled = false;
+        crate::settings::install_for_test(off);
+        AutoExtractGuard
+    }
+
+    #[test]
+    fn a_clean_turn_end_queues_a_suggestion() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-queue");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(agent.suggestion_pending);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_turn_that_errored_queues_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-err");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        agent.note_turn_end_for_suggestion(true);
+        assert!(
+            !agent.suggestion_pending,
+            "an errored turn suggests nothing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn suggestions_off_queue_nothing() {
+        let _s = disable_suggestions_for_test();
+        let dir = scratch_dir("sugg-off");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(!agent.suggestion_pending);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sidechain_turn_queues_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-side");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.begin_sidechain("sub".to_string(), false);
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(
+            !agent.suggestion_pending,
+            "a sub-agent turn suggests nothing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pending_suggestion_wins_the_idle_slot() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-slot");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.suggestion_pending = true;
+
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::Suggestion);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_starved_memory_job_takes_the_idle_slot_back() {
+        let _s = enable_suggestions_for_test(0); // everything is starved at once
+        let dir = scratch_dir("sugg-starve");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.suggestion_pending = true;
+        agent.memory_jobs.push_back(crate::memextract::MemoryJob {
+            task: "x".to_string(),
+            depth: 1,
+            attempts: 0,
+            resume: None,
+            queued_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::MemoryPass);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nothing_pending_means_the_idle_moment_does_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-nowork");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::Nothing);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Auto-extraction on *and* the System-1 gate on at `percent`, installed
@@ -26799,6 +26981,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -26931,6 +27115,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -28315,6 +28501,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -28592,6 +28780,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -28708,6 +28898,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -28811,6 +29003,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -28937,6 +29131,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -31579,6 +31775,8 @@ or the user's next message aborts before its first token"
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -32948,6 +33146,8 @@ or the user's next message aborts before its first token"
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
