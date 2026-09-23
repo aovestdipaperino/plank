@@ -458,8 +458,19 @@ unsafe extern "C" {
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;
-    /// Score of one known token at the session's current position. Returns 0
-    /// on success and writes `out`; negative on error.
+    /// Score of one known token at the session's current position.
+    ///
+    /// Returns **1 on success** and writes `out`; **0 on failure** — a null
+    /// session or `out`, a `token` outside the vocabulary, or logits that are
+    /// entirely non-finite (`ds4.c:76079`). Note the polarity: this is the
+    /// opposite of the `0 == ok` convention most of the other `ds4_*` entry
+    /// points in this file use, so test it as `== 1`, never as `!= 0`.
+    ///
+    /// `out.logprob` is normalised over the **full** vocabulary — the C takes
+    /// a max-shifted log-sum-exp across all `DS4_N_VOCAB` logits before
+    /// subtracting — so the exponentials of several of these scores can be
+    /// summed to learn what share of the model's probability those tokens
+    /// hold.
     ///
     /// This is the System-1 read path: the answer letters are known ahead of
     /// time, so asking for exactly those beats copying a vocabulary-wide
@@ -470,15 +481,28 @@ unsafe extern "C" {
         out: *mut Ds4TokenScore,
     ) -> c_int;
 
-    /// Writes up to `k` highest-scoring tokens into `out`, returning how many
-    /// it wrote, or negative on error. Used to detect a distribution whose
-    /// mass sits outside the answer letters entirely.
+    /// Writes the `k` highest-scoring tokens into `out`, best first.
+    ///
+    /// Returns **`k`** (clamped to the vocabulary size) on success and **0 on
+    /// failure** (`ds4.c:76042`). The return is therefore not a count of
+    /// meaningful entries: `out` is pre-filled with `id = -1`, and a slot
+    /// still holding `-1` was never filled. Callers must stop at the first
+    /// negative `id` rather than trusting the return.
+    ///
+    /// `logprob` is normalised over the full vocabulary, as in
+    /// [`ds4_session_token_logprob`]. `out` must have room for `k` entries.
     pub fn ds4_session_top_logprobs(s: *mut Ds4Session, out: *mut Ds4TokenScore, k: c_int)
     -> c_int;
 
-    /// Copies up to `cap` raw logits for the current position into `out`,
-    /// returning how many it wrote, or negative on error. Diagnostics only —
-    /// the decision path uses [`ds4_session_token_logprob`].
+    /// Copies the raw logits for the current position into `out`.
+    ///
+    /// All-or-nothing: `cap` must be **at least** the full vocabulary size or
+    /// the call writes nothing and returns 0. On success it returns the
+    /// vocabulary size, which is how many floats it wrote (`ds4.c:76101`).
+    /// It is not a partial copy of the first `cap` logits.
+    ///
+    /// Diagnostics only — the decision path uses
+    /// [`ds4_session_token_logprob`], which avoids the vocabulary-wide copy.
     pub fn ds4_session_copy_logits(s: *mut Ds4Session, out: *mut f32, cap: c_int) -> c_int;
 
     /// Draft-block size the loaded support model can propose per step, or 0
