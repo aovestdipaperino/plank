@@ -1559,8 +1559,11 @@ impl Ds4Session {
         }
         self.decide_letters_tried = true;
         let mut ids = Vec::with_capacity(crate::decide::LETTERS.len());
-        for letter in crate::decide::LETTERS {
-            let toks = self.model.tokenize_rendered(letter);
+        for i in 0..crate::decide::LETTERS.len() {
+            let Some(text) = crate::decide::letter_token_text(i) else {
+                return;
+            };
+            let toks = self.model.tokenize_rendered(&text);
             if toks.len() != 1 {
                 return; // leaves decide_letters empty: unsupported
             }
@@ -3819,7 +3822,16 @@ mod tests {
     fn open_test_session(model_path: &std::ffi::OsStr) -> super::Ds4Session {
         use crate::ffi::Ds4Backend;
 
-        let tuning = crate::config::EngineTuning::default();
+        // `mtp` defaults to true, and on a DeepSeek model with no companion
+        // the C refuses to open at all ("--dspark requires --mtp-model
+        // FILE"), so the default tuning cannot load a plain ds4 GGUF.
+        // Speculative decoding is irrelevant to a decision — nothing is
+        // generated — so turn it off rather than making whoever runs this
+        // test supply a draft checkpoint.
+        let tuning = crate::config::EngineTuning {
+            mtp: false,
+            ..Default::default()
+        };
         let model = super::Ds4Model::open_shared(
             model_path,
             Ds4Backend::Metal,

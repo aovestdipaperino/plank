@@ -8,11 +8,28 @@
 //!
 //! Design: `docs/superpowers/specs/2026-09-23-system-1-typed-decisions-design.md`.
 
-/// The answer letters, in option order. Four is the cap on a question's
-/// options; every letter must tokenize to exactly one token on the loaded
-/// family or the whole capability reports unsupported
-/// (`Engine::supports_decide`).
+/// The answer letters, in option order, as they are *displayed* to the model.
+/// Four is the cap on a question's options.
+///
+/// What gets *scored* is [`letter_token_text`], not these — see there.
 pub const LETTERS: [&str; 4] = ["A", "B", "C", "D"];
+
+/// The text whose token is scored for option `i`: the letter with a **leading
+/// space**.
+///
+/// This is not cosmetic, and it is the single easiest thing to get wrong here.
+/// On the ds4 tokenizer `" A"` and `"A"` are different tokens (334 vs 35), and
+/// after a prompt ending in `Answer:` the model puts essentially all of its
+/// letter mass on `" A"`. Measured on `DeepSeek` V4 Flash: `" A"` at p=0.402,
+/// `"A"` at p≈9e-8. Score the bare letter and every verdict abstains for want
+/// of letter mass — the capability reports itself healthy and decides nothing.
+///
+/// Every scored variant must still be exactly one token on the loaded family,
+/// or the whole capability reports unsupported (`Engine::supports_decide`).
+#[must_use]
+pub fn letter_token_text(i: usize) -> Option<String> {
+    LETTERS.get(i).map(|l| format!(" {l}"))
+}
 
 /// Below this probability the top letter is not trusted and the verdict
 /// abstains. Callers treat an abstention as "no answer", never as a "no".
@@ -187,7 +204,10 @@ pub fn render_question(q: &Question) -> String {
         out.push('\n');
     }
     out.push_str("Reply with a single letter.\n");
-    out.push_str("Answer: ");
+    // No trailing space: the scored token carries the leading space itself
+    // (`letter_token_text`), and emitting one here too would leave the model
+    // choosing between a double space and a token we do not score.
+    out.push_str("Answer:");
     out
 }
 
@@ -282,8 +302,8 @@ mod tests {
         assert!(text.contains("A. yes"));
         assert!(text.contains("B. no"));
         assert!(
-            text.ends_with("Answer: "),
-            "the suffix must leave the model one token to place, got {text:?}"
+            text.ends_with("Answer:"),
+            "no trailing space: the scored token carries it, got {text:?}"
         );
     }
 
