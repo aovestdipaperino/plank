@@ -2590,6 +2590,19 @@ impl Engine for Ds4Session {
         // and `score` abstains rather than reading a ranking off noise.
         let letter_mass: f32 = logprobs.iter().map(|lp| lp.exp()).sum();
 
+        // `letter_mass` decides whether the answer is trusted at all, and it
+        // is the one quantity no test without a real model can observe: if it
+        // routinely lands under `MIN_LETTER_MASS` the gate abstains on
+        // everything and is a silent no-op — working exactly as written and
+        // achieving nothing. Set `PLANK_DECIDE_DEBUG` to watch it on a real
+        // model before trusting a threshold.
+        if std::env::var_os("PLANK_DECIDE_DEBUG").is_some() {
+            eprintln!(
+                "[decide] letter_mass={letter_mass:.4} logprobs={logprobs:?} q={:?}",
+                question.text
+            );
+        }
+
         Ok(crate::decide::score(
             &logprobs,
             crate::decide::DEFAULT_ABSTAIN_FLOOR,
