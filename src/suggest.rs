@@ -81,7 +81,11 @@ pub fn sanitize(reply: &str) -> Option<String> {
         .trim_matches(|c| c == '"' || c == '\'' || c == '`')
         .trim();
 
-    if line.is_empty() || line.len() > MAX_LEN {
+    // Characters, not bytes. `len()` would reject a perfectly short
+    // suggestion written in any language whose letters are multi-byte —
+    // "rivedi le modifiche all'interfaccia" costs more bytes than chars, and
+    // the cap is about how much fits on one line, not how much it weighs.
+    if line.is_empty() || line.chars().count() > MAX_LEN {
         return None;
     }
     let lowered = line.to_ascii_lowercase();
@@ -156,6 +160,19 @@ mod tests {
         assert_eq!(sanitize(""), None);
         assert_eq!(sanitize("   \n  \n"), None);
         assert_eq!(sanitize("\"\""), None);
+    }
+
+    /// The cap counts characters, not bytes: a suggestion in a language with
+    /// multi-byte letters must not be rejected for a length it never had.
+    #[test]
+    fn the_length_cap_counts_characters_not_bytes() {
+        // 120 accented chars — 240 bytes, so a byte cap would reject it.
+        let accented = "à".repeat(MAX_LEN);
+        assert_eq!(accented.len(), MAX_LEN * 2, "precondition: multi-byte");
+        assert_eq!(sanitize(&accented), Some(accented.clone()));
+
+        let too_long = "à".repeat(MAX_LEN + 1);
+        assert_eq!(sanitize(&too_long), None, "still capped, just in chars");
     }
 
     #[test]
