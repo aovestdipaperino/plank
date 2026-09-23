@@ -322,11 +322,21 @@ Ctrl-C) queues nothing, and its span is left for the next turn that
 completes (`Agent::memory_pass_allowed`).
 
 The **reading** happens at the next idle moment (`Agent::process_memory_job`,
-one job per call, oldest first). In the TUI that is the idle loop's poll
-timeout (`tui_memory_pass`), with the same guards as the background-job
-wake — no draft in the editor, no modal pane — so a pass never starts under
-a keystroke. It runs on a worker thread behind the same busy UI loop as a
-turn, and typing keeps working. Its only trace while it runs is a `✍️` in
+one job per call, oldest first). In the TUI that idle moment is now shared
+with prompt suggestions (`suggest.rs`, `docs/superpowers/specs/2026-09-23-prompt-suggestions-design.md`):
+`Agent::idle_work` (`crate::suggest::idle_work`) decides which of the two
+queued background jobs the slot goes to. A pending suggestion wins by
+default — a suggestion that lands after the user starts typing is wasted,
+while a deferred memory pass is explicitly tolerated
+(`memory.minTurnSeconds`) — but `suggestions.memoryStarvationSeconds`
+(default 300s) hands the slot back to the oldest queued memory job once it
+has waited that long, so a fast back-and-forth cannot lock memory extraction
+out forever. Once the slot is granted to the memory pass, reading proceeds
+exactly as before: the idle loop's poll timeout (`tui_memory_pass`), with
+the same guards as the background-job wake — no draft in the editor, no
+modal pane — so a pass never starts under a keystroke. It runs on a worker
+thread behind the same busy UI loop as a turn, and typing keeps working.
+Its only trace while it runs is a `✍️` in
 the footer (`Status::memory_pass`, `status::MEMORY_MARK`) in place of the
 state word — one mark per queued span, the running one included, so
 `✍️✍️` means one more is waiting — and, only with `--show-memory-stats`, the bare figures of its phase
