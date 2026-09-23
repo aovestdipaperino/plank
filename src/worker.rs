@@ -398,15 +398,20 @@ pub struct TurnShared {
     /// Set by the UI (Esc / Ctrl-C / SIGINT) to stop the worker at the next
     /// sampling or prefill checkpoint.
     pub interrupt: AtomicBool,
-    /// Set by the front end while the worker is running a queued memory
-    /// pass rather than a turn. The busy loop then treats a submitted prompt
-    /// as an interrupt as well as a queued line: the user wants the model,
-    /// and the pass goes back on the queue for the next idle moment.
+    /// Set by the front end while the worker is running a *quiet background
+    /// pass* rather than a turn — the memory pass, or a prompt suggestion.
+    /// (The name predates the second one; the flag has never meant that a
+    /// memory job exists, and nothing that reads it assumes one does. The
+    /// footer's notes mark comes from `extract_state`, not from here.) The
+    /// busy loop then treats a submitted prompt as an interrupt as well as a
+    /// queued line: the user wants the model, and the pass goes back where it
+    /// came from for the next idle moment.
     pub memory_pass: AtomicBool,
-    /// Set by the busy loop's Ctrl-D arm while a memory pass is running: the
-    /// user wants out, and housekeeping they never asked for must not hold
-    /// the door shut. `tui_memory_pass` reads it once the worker has stopped
-    /// and hands the quit to the idle loop, which takes its normal exit path.
+    /// Set by the busy loop's Ctrl-D arm while a quiet background pass is
+    /// running: the user wants out, and work they never asked for must not
+    /// hold the door shut. `tui_quiet_pass` reads it once the worker has
+    /// stopped and hands the quit to the idle loop, which takes its normal
+    /// exit path.
     /// Never set during a real turn — see the arm's `memory_pass` guard.
     ///
     /// Distinct from the file-scope `QUIT_REQUESTED` static in `ui.rs` and

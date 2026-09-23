@@ -12158,78 +12158,27 @@ impl Agent<'_> {
                             // repaint, no interrupt, no Ctrl-D — at precisely
                             // the moment the user is idle and about to type.
                             // So it goes on a worker behind the busy UI loop,
-                            // exactly as `tui_memory_pass` does.
-                            //
-                            // `TurnShared::memory_pass` is the busy loop's
-                            // name for "a quiet background pass", not
-                            // something the footer reads: the notes mark comes
-                            // from `extract_state`. Setting it here therefore
-                            // buys the two behaviours this pass wants — a
-                            // typed prompt interrupts it, and Ctrl-D quits out
-                            // of it — without mislabelling the footer.
-                            //
-                            // The ghost goes dark first: a suggestion painted
-                            // over a prompt that is busy looks like a prompt
-                            // taking input.
-                            input.ghost = None;
-                            let remote = self.remote.clone();
-                            let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
-                            let ui_remote = self.ui_remote.clone();
-                            let local_shared = TurnShared::default();
-                            let shared: &TurnShared = remote
-                                .as_deref()
-                                .map_or(&local_shared, |r| r.shared.as_ref());
-                            shared.memory_pass.store(true, Ordering::Relaxed);
-                            let live = LiveCommands::capture(self);
-                            let run = run_worker_ui(
+                            // through the same `tui_quiet_pass` the memory
+                            // pass uses.
+                            self.tui_quiet_pass(
                                 terminal,
-                                &mut log,
-                                &mut view,
-                                &mut input,
-                                &mut btw_panel,
-                                &mut arcade,
-                                &mut sub_pane,
-                                shared,
-                                bus.as_deref(),
-                                ui_remote.as_deref(),
-                                None,
-                                &live,
-                                |tx| {
-                                    // As in the memory pass: `sub_sink` still
-                                    // points at the last turn's dead channel.
-                                    self.sub_sink = SubSinkTarget::Events(tx.clone());
-                                    self.generate_suggestion();
+                                &mut TuiHandles {
+                                    log: &mut log,
+                                    view: &mut view,
+                                    input: &mut input,
+                                    btw: &mut btw_panel,
+                                    arcade: &mut arcade,
+                                    sub: &mut sub_pane,
                                 },
-                            );
-                            shared.memory_pass.store(false, Ordering::Relaxed);
-                            // Read before the reset below, for the same reason
-                            // the memory pass reads it there: the Ctrl-D arm
-                            // raised the interrupt, and clearing it must not
-                            // lose why.
-                            let quit = shared.quit_requested.swap(false, Ordering::Relaxed);
-                            shared.interrupt.store(false, Ordering::Relaxed);
-                            crate::interrupt::clear();
-                            if let Err(e) = run {
-                                return Err(self.reconcile_and_fail(&mut log, shared, e));
-                            }
-                            if !quit {
-                                // A prompt typed during the generation is the
-                                // next turn, now.
-                                let leftover = shared.take_queued();
-                                if !leftover.is_empty() {
-                                    self.absorb_leftover(&mut log, leftover);
-                                    self.tui_turn(
-                                        terminal,
-                                        &mut log,
-                                        &mut view,
-                                        &mut input,
-                                        &mut btw_panel,
-                                        &mut arcade,
-                                        &mut sub_pane,
-                                    )?;
-                                }
-                            }
-                            quit
+                                |agent, _tx| {
+                                    // Deliberately no `sub_sink` installed,
+                                    // unlike the memory pass: a suggestion is
+                                    // ghost text and must stay invisible.
+                                    // `generate_suggestion` silences the sink
+                                    // itself, so every route into it is quiet.
+                                    agent.generate_suggestion();
+                                },
+                            )?
                         }
                         crate::suggest::IdleWork::MemoryPass => self.tui_memory_pass(
                             terminal,
@@ -13597,14 +13546,11 @@ impl Agent<'_> {
     /// `?` (or at the call sites that swallow the error) makes the invariant
     /// hold by construction: a future error path added inside the body cannot
     /// forget it.
-    /// Runs one queued memory job from the idle loop, on a worker thread
-    /// behind the same busy UI loop as a turn, so the footer shows
-    /// `taking notes…` with the pass's own figures and the prompt stays
-    /// editable. `TurnShared::memory_pass` tells the busy loop that a
-    /// submitted prompt is also an interrupt: the pass stops at its next
-    /// token, `process_memory_job` puts the job back at the front of the
-    /// queue, and the typed line becomes the next turn right here — the
-    /// user never waits for the notes.
+    /// Runs one queued memory job from the idle loop through
+    /// [`Self::tui_quiet_pass`], so the footer shows `taking notes…` with the
+    /// pass's own figures and the prompt stays editable. A submitted prompt
+    /// interrupts it: `process_memory_job` puts the job back at the front of
+    /// the queue and the typed line becomes the next turn.
     ///
     /// Returns `true` when the user pressed Ctrl-D during the pass: the
     /// caller quits. Queued memory jobs are dropped rather than drained —
@@ -13623,14 +13569,56 @@ impl Agent<'_> {
         // No scrollback line: the footer mark (`status::MEMORY_MARK`) is the
         // whole announcement. Housekeeping the user did not ask for should
         // not write into the conversation.
-        // The remote bridge's persistent `TurnShared` when there is one, so
-        // a remote prompt typed during the pass lands in the same queue a
-        // local one does, exactly as in `tui_turn_inner`.
+        self.tui_quiet_pass(
+            terminal,
+            &mut TuiHandles {
+                log,
+                view,
+                input,
+                btw,
+                arcade,
+                sub,
+            },
+            |agent, tx| {
+                // The memory pass publishes its footer status through
+                // `sub_sink`, which still points at the last turn's dead
+                // channel: install this one. Its model text is still held
+                // back, by `sub_sink_render_sink`'s `extract_state` check.
+                agent.sub_sink = SubSinkTarget::Events(tx.clone());
+                agent.process_memory_job();
+                if let Some(notice) = agent.pending_memory_notice.take() {
+                    let _ = tx.send(UiEvent::Dim(notice));
+                }
+            },
+        )
+    }
+
+    /// Runs `body` on a worker thread behind the same busy UI loop as a turn,
+    /// for a quiet background pass — the memory pass, or a prompt suggestion.
+    /// `TurnShared::memory_pass` tells the busy loop that a submitted prompt
+    /// is also an interrupt: the pass stops at its next token, puts its work
+    /// back where it found it, and the typed line becomes the next turn right
+    /// here — the user never waits for housekeeping.
+    ///
+    /// Returns `true` when the user pressed Ctrl-D during the pass: the
+    /// caller quits, and whatever was queued goes with the session.
+    ///
+    /// The six front-end handles travel in [`TuiHandles`] rather than as
+    /// arguments so this keeps the same arity as its callers.
+    fn tui_quiet_pass(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        h: &mut TuiHandles<'_>,
+        body: impl FnOnce(&mut Self, &Sender<UiEvent>) + Send,
+    ) -> Result<bool, String> {
         // The busy loop below repaints with the live `input`, so a ghost left
         // on it would stay lit for the whole pass — a prompt that looks like
         // it is taking input while plank is busy. Clear it here rather than
-        // at each caller: every route into the pass wants it dark.
-        input.ghost = None;
+        // at each caller: every route into a quiet pass wants it dark.
+        h.input.ghost = None;
+        // The remote bridge's persistent `TurnShared` when there is one, so
+        // a remote prompt typed during the pass lands in the same queue a
+        // local one does, exactly as in `tui_turn_inner`.
         let remote = self.remote.clone();
         let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
         let ui_remote = self.ui_remote.clone();
@@ -13642,27 +13630,18 @@ impl Agent<'_> {
         let live = LiveCommands::capture(self);
         let run = run_worker_ui(
             terminal,
-            log,
-            view,
-            input,
-            btw,
-            arcade,
-            sub,
+            &mut *h.log,
+            &mut *h.view,
+            &mut *h.input,
+            &mut *h.btw,
+            &mut *h.arcade,
+            &mut *h.sub,
             shared,
             bus.as_deref(),
             ui_remote.as_deref(),
             None,
             &live,
-            |tx| {
-                // The quiet pass publishes its footer status through
-                // `sub_sink`, which still points at the last turn's dead
-                // channel: install this one.
-                self.sub_sink = SubSinkTarget::Events(tx.clone());
-                self.process_memory_job();
-                if let Some(notice) = self.pending_memory_notice.take() {
-                    let _ = tx.send(UiEvent::Dim(notice));
-                }
-            },
+            |tx| body(self, &tx),
         );
         shared.memory_pass.store(false, Ordering::Relaxed);
         // Read before the interrupt reset below: the Ctrl-D arm raised that
@@ -13677,7 +13656,7 @@ impl Agent<'_> {
         shared.interrupt.store(false, Ordering::Relaxed);
         crate::interrupt::clear();
         if let Err(e) = run {
-            return Err(self.reconcile_and_fail(log, shared, e));
+            return Err(self.reconcile_and_fail(&mut *h.log, shared, e));
         }
         // The prompt that cut the pass short is the next turn, now — unless
         // the thing that cut it short was Ctrl-D, in which case there is no
@@ -13687,8 +13666,8 @@ impl Agent<'_> {
         }
         let leftover = shared.take_queued();
         if !leftover.is_empty() {
-            self.absorb_leftover(log, leftover);
-            self.tui_turn(terminal, log, view, input, btw, arcade, sub)?;
+            self.absorb_leftover(&mut *h.log, leftover);
+            self.tui_turn(terminal, h.log, h.view, h.input, h.btw, h.arcade, h.sub)?;
         }
         Ok(false)
     }
@@ -15089,6 +15068,26 @@ impl Agent<'_> {
         if !self.suggestion_allowed() {
             return false;
         }
+        // A suggestion is ghost text: nothing about the generation may reach
+        // the front end. The memory pass is kept quiet by
+        // `sub_sink_render_sink`'s `extract_state.is_running()` check, which
+        // a suggestion never trips — so it silences its own sink instead.
+        // Left on the last turn's live channel, the suggestion would stream
+        // token by token into the sub-agent pane and, through
+        // `pass_status_ctx`, paint a throbber, a "generating…" verb and a
+        // throughput readout at an idle prompt, for work the user never
+        // asked for. `Null` makes `pass_status_ctx` return `None`, so neither
+        // text nor status leaves the pass. Restored on the way out so the
+        // caller's sink is the caller's business.
+        let sink = std::mem::replace(&mut self.sub_sink, SubSinkTarget::Null);
+        let done = self.generate_suggestion_inner();
+        self.sub_sink = sink;
+        done
+    }
+
+    /// The body of [`Self::generate_suggestion`], which owns silencing the
+    /// sub-agent sink around it.
+    fn generate_suggestion_inner(&mut self) -> bool {
         let text = crate::suggest::prompt();
 
         // Probe with the real prompt prefix, not the bare instruction: whether
@@ -17467,6 +17466,18 @@ impl LiveCommands {
     }
 }
 
+/// The six front-end handles a quiet background pass hands on to
+/// [`run_worker_ui`], bundled so [`Agent::tui_quiet_pass`] can take them
+/// alongside a body closure without growing its argument list.
+struct TuiHandles<'a> {
+    log: &'a mut OutputLog,
+    view: &'a mut tui::OutputView,
+    input: &'a mut TuiInput,
+    btw: &'a mut BtwPanel,
+    arcade: &'a mut crate::arcade::Arcade,
+    sub: &'a mut tui::SubPane,
+}
+
 /// Runs `job` on a scoped worker thread while the UI thread keeps the
 /// terminal live (the C's worker/UI split). The worker owns the agent for
 /// the duration of the job and reports through the channel; the UI applies
@@ -18310,11 +18321,12 @@ fn busy_ui_loop(
                         } else if shared.memory_pass.load(Ordering::Relaxed)
                             && btw_question(&line).is_some()
                         {
-                            // No main task to ask beside during a memory
-                            // pass, and nothing to preempt that would resume:
-                            // a plain prompt is the way to have the model now.
+                            // No main task to ask beside during a quiet
+                            // background pass, and nothing to preempt that
+                            // would resume: a plain prompt is the way to have
+                            // the model now.
                             log.push_dim(
-                                "[/btw has nothing to run beside while notes are taken — \
+                                "[/btw has nothing to run beside right now — \
                                  just type your prompt; it starts at once]",
                             );
                         } else if btw_question(&line).is_some() {
@@ -18490,10 +18502,10 @@ fn busy_ui_loop(
                             input.history.add(&line);
                             log.push_pending(&line);
                             shared.push_queued(line);
-                            // During a memory pass the queued line is also
-                            // the signal to stop taking notes: the pass goes
+                            // During a quiet background pass the queued line
+                            // is also the signal to stop it: the pass goes
                             // back on the queue and this line runs next
-                            // (`tui_memory_pass`).
+                            // (`tui_quiet_pass`).
                             if shared.memory_pass.load(Ordering::Relaxed) {
                                 raise_worker_interrupt(shared);
                             }
@@ -18501,8 +18513,8 @@ fn busy_ui_loop(
                             sub.follow_all();
                         }
                     }
-                    // Ctrl-D quits, but only out of a memory pass: that is
-                    // housekeeping the user never asked for, and at a glance
+                    // Ctrl-D quits, but only out of a quiet background pass:
+                    // that is work the user never asked for, and at a glance
                     // the screen looks like an idle prompt. Mid-turn Ctrl-D
                     // stays inert, as it always has — this must never be the
                     // reason somebody loses a generation in flight. The empty
@@ -33239,6 +33251,44 @@ or the user's next message aborts before its first token"
                 .pending_memory_notice
                 .take()
                 .is_some_and(|n| n.starts_with("memory completed in ")),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A prompt suggestion is ghost text, not a turn: nothing about it may
+    /// reach the front end. It has no `extract_state` flag to make
+    /// `sub_sink_render_sink` fall back to a `NullSink`, so the pass must
+    /// leave `sub_sink` at `Null` itself — install a live sink here and the
+    /// suggestion streams into the sub-agent pane while `pass_status_ctx`
+    /// paints a throbber and a "generating…" footer at an idle prompt.
+    #[test]
+    fn the_suggestion_pass_renders_nothing_to_the_front_end() {
+        let dir = scratch_dir("suggest-quiet");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["write the tests".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Exactly what the idle worker leaves behind: the previous turn's
+        // live channel. The pass must not publish through it.
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+        agent.generate_suggestion();
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            !events.iter().any(|e| matches!(e, UiEvent::Sub(_))),
+            "no suggestion text or banners reach the front end: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                UiEvent::Status(s) if s.state == crate::status::WorkerState::Generating
+            )),
+            "no throbber or generating footer at an idle prompt: {events:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
