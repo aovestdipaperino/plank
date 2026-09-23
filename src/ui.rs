@@ -14625,27 +14625,6 @@ impl Agent<'_> {
         }
     }
 
-    /// Snapshots the span since the last pass into a [`MemoryJob`] if every
-    /// gate allows it, and returns whether one was queued. Nothing is
-    /// generated here: this is what a turn end does, so the prompt comes
-    /// back the moment the answer is done and the reading happens at the
-    /// next idle moment (`process_memory_job`).
-    ///
-    /// Called only at a turn boundary — after a generation that ended with no
-    /// tool calls — never mid-pass (`run_turn` on the plain path,
-    /// `worker_turn` in the TUI), and never for a turn the user interrupted
-    /// (`memory_pass_allowed`). The span is retired (`ExtractState::finish`)
-    /// as it is snapshotted: the job carries the whole prompt, so the live
-    /// transcript is free to move on — the next turn opens a new span from
-    /// here, and a `/clear` cannot lose what was already captured. Settings
-    /// are sampled fresh every call so a `/config` change takes effect on
-    /// the next eligible turn.
-    ///
-    /// `turn` is how long the turn that just ended took, measured by the
-    /// caller. It is passed in rather than clocked here on purpose: both
-    /// call sites already hold a `turn_start`, and a parameter is what keeps
-    /// a sub-agent's turn from clobbering the main turn's clock — a
-    /// sidechain's own `turn_start` never reaches this call.
     /// Asks the model whether `slice` holds anything worth remembering.
     ///
     /// Returns `true` to run the extraction pass. Every uncertain path
@@ -14668,11 +14647,33 @@ impl Agent<'_> {
         if v.abstained {
             return true;
         }
-        #[allow(clippy::cast_precision_loss)]
-        let threshold = self.memory_gate_percent as f32 / 100.0;
-        v.value == crate::memextract::Worthy::Yes && v.p >= threshold
+        // `u32 -> f64` and `f32 -> f64` are both lossless, so this needs no
+        // cast and no lint suppression.
+        let threshold = f64::from(self.memory_gate_percent) / 100.0;
+        v.value == crate::memextract::Worthy::Yes && f64::from(v.p) >= threshold
     }
 
+    /// Snapshots the span since the last pass into a [`MemoryJob`] if every
+    /// gate allows it, and returns whether one was queued. Nothing is
+    /// generated here: this is what a turn end does, so the prompt comes
+    /// back the moment the answer is done and the reading happens at the
+    /// next idle moment (`process_memory_job`).
+    ///
+    /// Called only at a turn boundary — after a generation that ended with no
+    /// tool calls — never mid-pass (`run_turn` on the plain path,
+    /// `worker_turn` in the TUI), and never for a turn the user interrupted
+    /// (`memory_pass_allowed`). The span is retired (`ExtractState::finish`)
+    /// as it is snapshotted: the job carries the whole prompt, so the live
+    /// transcript is free to move on — the next turn opens a new span from
+    /// here, and a `/clear` cannot lose what was already captured. Settings
+    /// are sampled fresh every call so a `/config` change takes effect on
+    /// the next eligible turn.
+    ///
+    /// `turn` is how long the turn that just ended took, measured by the
+    /// caller. It is passed in rather than clocked here on purpose: both
+    /// call sites already hold a `turn_start`, and a parameter is what keeps
+    /// a sub-agent's turn from clobbering the main turn's clock — a
+    /// sidechain's own `turn_start` never reaches this call.
     fn enqueue_memory_job(&mut self, turn: std::time::Duration) -> bool {
         let settings = crate::settings::active();
         self.extract_state.enabled = settings.memory.auto_extract;
