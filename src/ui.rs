@@ -2335,6 +2335,14 @@ struct Agent<'a> {
     /// read (`enqueue_memory_job` / `process_memory_job`). Front of the
     /// queue is oldest; an interrupted job goes back to the front.
     memory_jobs: std::collections::VecDeque<crate::memextract::MemoryJob>,
+    /// A turn ended and a suggestion should be generated at the next quiet
+    /// moment. Set at the turn boundary and read at the idle wake: the turn
+    /// exit itself must stay a snapshot, so the prompt comes back the moment
+    /// the answer is done.
+    suggestion_pending: bool,
+    /// The suggestion currently offered as ghost text, if any. Bound to the
+    /// transcript depth it was generated at — see `suggest::Suggestion`.
+    suggestion: Option<crate::suggest::Suggestion>,
     /// One quiet summary line queued by `report_memory_changes`, drained by
     /// whoever ran `process_memory_job`.
     pending_memory_notice: Option<String>,
@@ -5474,6 +5482,12 @@ impl Agent<'_> {
             compact::microcompact(&mut self.session.transcript, budget_tokens, &mut |s| {
                 engine.count_tokens(s)
             });
+        if cleared > 0 {
+            // Rewrites tool-result text in place without changing the
+            // message count, so the depth check in `current_suggestion`
+            // would not catch a suggestion made stale by this edit.
+            self.clear_suggestion();
+        }
         cleared
     }
 
@@ -5508,6 +5522,10 @@ impl Agent<'_> {
             return;
         }
         self.payload_dirty = true;
+        // Rewrites the last message's text in place without changing the
+        // transcript length, which the depth check in `current_suggestion`
+        // cannot see.
+        self.clear_suggestion();
         crate::engine::kv_debug(|| {
             format!("guard: stubbed {before}B of stopped reasoning down to {after}B")
         });
@@ -5646,6 +5664,10 @@ impl Agent<'_> {
         // — the ladder would be permanently dead from the first full compaction
         // onward, the moment it is most needed.
         self.discard_ladder();
+        // The rebuilt transcript can coincidentally land at the same length as
+        // before (summary + tail vs. the original span), which the depth
+        // check in `current_suggestion` cannot see.
+        self.clear_suggestion();
     }
 
     /// The `trigger` value compaction hooks receive: `manual` for a user-driven
@@ -6232,6 +6254,7 @@ impl Agent<'_> {
     /// the screen.
     fn reset_session_state(&mut self) {
         self.discard_ladder();
+        self.clear_suggestion();
         self.session = Session::new();
         self.extract_state.reset_to(0);
         // A new session, a new name — minted here for the same reason
@@ -7247,6 +7270,7 @@ impl Agent<'_> {
         // snapshot of the one being discarded, and the payload on disk no
         // longer matches (same as `/clear` and `/switch`).
         self.discard_ladder();
+        self.clear_suggestion();
         self.payload_dirty = true;
         crate::checkpoint::restore_transcript(&mut self.session, &cp);
         self.console_seen = self.console_seen.min(self.session.transcript.len());
@@ -9855,6 +9879,13 @@ the original is frozen and listed in /tree"
             "no report".to_owned()
         };
         self.remember_sidechain(dump);
+        // Deliberately no `clear_suggestion()` here, and adding one would be
+        // a bug. This truncation restores the transcript to exactly the
+        // content and length it had before the sidechain opened, so a prompt
+        // suggestion that was depth-valid beforehand is depth-valid again
+        // afterwards — the real conversation never moved. Clearing here would
+        // drop a good suggestion every time *any* sidechain ends, including
+        // every memory-extraction pass.
         self.session.transcript.truncate(fork_at);
         self.truncate_ladder_to(fork_at);
         self.extract_state.truncate_to(fork_at);
@@ -10582,6 +10613,14 @@ the original is frozen and listed in /tree"
         // which is the worst failure this design can produce.
         let alt = std::mem::replace(&mut self.engine, parent_engine);
         self.alt_engines.insert(key, alt);
+        // No `clear_suggestion()` needed: the restore is the stashed prefix
+        // followed by whatever the run left, so everything before the stash
+        // point is byte-identical and the length only ever grows. A prompt
+        // suggestion is therefore either still valid (the run appended
+        // nothing) or correctly invalidated by `current_suggestion`'s depth
+        // check. This path stashes rather than truncating, so it is worth
+        // saying so explicitly — the reasoning that covers `fork_branch` does
+        // not obviously transfer.
         let mut restored = stashed;
         restored.append(&mut self.session.transcript);
         self.session.transcript = restored;
@@ -11030,6 +11069,12 @@ struct TuiInput {
     /// worker, so a server that connects mid-session starts contributing
     /// completions (issue #41).
     mcp_extra: Vec<crate::complete::Candidate>,
+    /// The suggestion to paint as ghost text on the next frame, cached here
+    /// for the same reason as `mcp_extra`: the idle repaint is a free
+    /// function, so the agent is not in scope where the frame is composed.
+    /// Refreshed from `Agent::current_suggestion` once per idle tick and
+    /// cleared when a turn starts.
+    ghost: Option<String>,
 }
 
 impl TuiInput {
@@ -11046,6 +11091,7 @@ impl TuiInput {
             slash_catalog: crate::slashmenu::catalog(&[], &[], &[]),
             worker: None,
             mcp_extra: Vec::new(),
+            ghost: None,
         }
     }
 
@@ -11067,6 +11113,7 @@ impl TuiInput {
             text: self.buf.text(),
             cursor: self.cursor_char(),
             sel: self.selection_chars(),
+            ghost: self.ghost.as_deref(),
         }
     }
 
@@ -11889,6 +11936,10 @@ impl Agent<'_> {
                 Some(label) => format!("[sub-agent: {label}] {status}"),
                 None => status,
             };
+            // One refresh per idle frame: the ghost is a cached copy, so it
+            // is re-read here (depth check and all) rather than left to go
+            // stale behind a transcript that moved.
+            input.ghost = self.current_suggestion().map(str::to_owned);
             let completed_buffer = repaint_idle(
                 terminal,
                 &log,
@@ -12085,24 +12136,61 @@ impl Agent<'_> {
                 // for the same reasons, plus the poll timeout above, so the
                 // pass never starts under a keystroke. Deliberately not an
                 // activity for the screensaver clock: nobody is here.
+                //
+                // The guards are shared with the prompt suggestion: an empty
+                // input buffer and no modal pane is exactly when ghost text
+                // is showable, so one condition gates both and
+                // `idle_work` decides which of them this quiet moment buys.
                 if input.buf.text().is_empty()
                     && config_form.is_none()
                     && kv_pane.is_none()
                     && resume_pane.is_none()
                     && !arcade.is_open()
                     && wasm_frame.is_none()
-                    && self.memory_jobs_pending()
                 {
-                    let quit = self.tui_memory_pass(
-                        terminal,
-                        &mut log,
-                        &mut view,
-                        &mut input,
-                        &mut btw_panel,
-                        &mut arcade,
-                        &mut sub_pane,
-                    )?;
-                    if quit {
+                    let idle_quit = match self.idle_work() {
+                        crate::suggest::IdleWork::Nothing => false,
+                        crate::suggest::IdleWork::Suggestion => {
+                            // Generating a suggestion is a real generation: a
+                            // KV probe, a sidechain fork and a
+                            // `generate_quiet_with`. Run inline here it would
+                            // freeze the whole TUI for its duration — no
+                            // repaint, no interrupt, no Ctrl-D — at precisely
+                            // the moment the user is idle and about to type.
+                            // So it goes on a worker behind the busy UI loop,
+                            // through the same `tui_quiet_pass` the memory
+                            // pass uses.
+                            self.tui_quiet_pass(
+                                terminal,
+                                &mut TuiHandles {
+                                    log: &mut log,
+                                    view: &mut view,
+                                    input: &mut input,
+                                    btw: &mut btw_panel,
+                                    arcade: &mut arcade,
+                                    sub: &mut sub_pane,
+                                },
+                                |agent, _tx| {
+                                    // Deliberately no `sub_sink` installed,
+                                    // unlike the memory pass: a suggestion is
+                                    // ghost text and must stay invisible.
+                                    // `generate_suggestion` silences the sink
+                                    // itself, so every route into it is quiet.
+                                    agent.generate_suggestion();
+                                },
+                            )?
+                        }
+                        crate::suggest::IdleWork::MemoryPass => self.tui_memory_pass(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut input,
+                            &mut btw_panel,
+                            &mut arcade,
+                            &mut sub_pane,
+                        )?,
+                    };
+                    if idle_quit {
                         // Ctrl-D during the pass leaves through exactly the
                         // same door as Ctrl-D at the prompt, download warning
                         // and all.
@@ -12557,7 +12645,32 @@ impl Agent<'_> {
             // Alt (Option on macOS) or Ctrl turns arrows and Backspace/Delete
             // into word-wise operations.
             let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
+            // A live suggestion is offered to exactly three keys. Everything
+            // else dismisses it, and that dismissal is done here, once,
+            // rather than in every arm: one place, so no arm can forget it.
+            let accepts_suggestion =
+                self.suggestion_accept_key(key, &input, word_mod, sub_pane.selecting);
+            if accepts_suggestion {
+                // Enter accepts *and* sends: place the text here and let the
+                // plain Enter arm below submit it, rather than duplicating
+                // everything that arm does.
+                if key.code == KeyCode::Enter {
+                    self.place_suggestion(&mut input);
+                }
+            } else {
+                self.clear_suggestion();
+                input.ghost = None;
+            }
             match key.code {
+                // Placing an offered suggestion into the prompt, leaving it
+                // editable. Guarded on an empty buffer, so it can never
+                // overwrite typed text, and placed before the plain
+                // Tab/Right arms (roster focus and cursor motion) but after
+                // the popup and slash menu, which own these keys while open.
+                KeyCode::Tab | KeyCode::Right if accepts_suggestion => {
+                    self.place_suggestion(&mut input);
+                    input.sync_popup();
+                }
                 // `←` on an empty prompt reaches into the sub-agent roster below
                 // the status bar and reveals its cursor. Once the roster is
                 // selected, `↑`/`↓` walk the rows the way they are drawn (`↑`
@@ -13433,14 +13546,11 @@ impl Agent<'_> {
     /// `?` (or at the call sites that swallow the error) makes the invariant
     /// hold by construction: a future error path added inside the body cannot
     /// forget it.
-    /// Runs one queued memory job from the idle loop, on a worker thread
-    /// behind the same busy UI loop as a turn, so the footer shows
-    /// `taking notes…` with the pass's own figures and the prompt stays
-    /// editable. `TurnShared::memory_pass` tells the busy loop that a
-    /// submitted prompt is also an interrupt: the pass stops at its next
-    /// token, `process_memory_job` puts the job back at the front of the
-    /// queue, and the typed line becomes the next turn right here — the
-    /// user never waits for the notes.
+    /// Runs one queued memory job from the idle loop through
+    /// [`Self::tui_quiet_pass`], so the footer shows `taking notes…` with the
+    /// pass's own figures and the prompt stays editable. A submitted prompt
+    /// interrupts it: `process_memory_job` puts the job back at the front of
+    /// the queue and the typed line becomes the next turn.
     ///
     /// Returns `true` when the user pressed Ctrl-D during the pass: the
     /// caller quits. Queued memory jobs are dropped rather than drained —
@@ -13459,6 +13569,53 @@ impl Agent<'_> {
         // No scrollback line: the footer mark (`status::MEMORY_MARK`) is the
         // whole announcement. Housekeeping the user did not ask for should
         // not write into the conversation.
+        self.tui_quiet_pass(
+            terminal,
+            &mut TuiHandles {
+                log,
+                view,
+                input,
+                btw,
+                arcade,
+                sub,
+            },
+            |agent, tx| {
+                // The memory pass publishes its footer status through
+                // `sub_sink`, which still points at the last turn's dead
+                // channel: install this one. Its model text is still held
+                // back, by `sub_sink_render_sink`'s `extract_state` check.
+                agent.sub_sink = SubSinkTarget::Events(tx.clone());
+                agent.process_memory_job();
+                if let Some(notice) = agent.pending_memory_notice.take() {
+                    let _ = tx.send(UiEvent::Dim(notice));
+                }
+            },
+        )
+    }
+
+    /// Runs `body` on a worker thread behind the same busy UI loop as a turn,
+    /// for a quiet background pass — the memory pass, or a prompt suggestion.
+    /// `TurnShared::memory_pass` tells the busy loop that a submitted prompt
+    /// is also an interrupt: the pass stops at its next token, puts its work
+    /// back where it found it, and the typed line becomes the next turn right
+    /// here — the user never waits for housekeeping.
+    ///
+    /// Returns `true` when the user pressed Ctrl-D during the pass: the
+    /// caller quits, and whatever was queued goes with the session.
+    ///
+    /// The six front-end handles travel in [`TuiHandles`] rather than as
+    /// arguments so this keeps the same arity as its callers.
+    fn tui_quiet_pass(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        h: &mut TuiHandles<'_>,
+        body: impl FnOnce(&mut Self, &Sender<UiEvent>) + Send,
+    ) -> Result<bool, String> {
+        // The busy loop below repaints with the live `input`, so a ghost left
+        // on it would stay lit for the whole pass — a prompt that looks like
+        // it is taking input while plank is busy. Clear it here rather than
+        // at each caller: every route into a quiet pass wants it dark.
+        h.input.ghost = None;
         // The remote bridge's persistent `TurnShared` when there is one, so
         // a remote prompt typed during the pass lands in the same queue a
         // local one does, exactly as in `tui_turn_inner`.
@@ -13473,27 +13630,18 @@ impl Agent<'_> {
         let live = LiveCommands::capture(self);
         let run = run_worker_ui(
             terminal,
-            log,
-            view,
-            input,
-            btw,
-            arcade,
-            sub,
+            &mut *h.log,
+            &mut *h.view,
+            &mut *h.input,
+            &mut *h.btw,
+            &mut *h.arcade,
+            &mut *h.sub,
             shared,
             bus.as_deref(),
             ui_remote.as_deref(),
             None,
             &live,
-            |tx| {
-                // The quiet pass publishes its footer status through
-                // `sub_sink`, which still points at the last turn's dead
-                // channel: install this one.
-                self.sub_sink = SubSinkTarget::Events(tx.clone());
-                self.process_memory_job();
-                if let Some(notice) = self.pending_memory_notice.take() {
-                    let _ = tx.send(UiEvent::Dim(notice));
-                }
-            },
+            |tx| body(self, &tx),
         );
         shared.memory_pass.store(false, Ordering::Relaxed);
         // Read before the interrupt reset below: the Ctrl-D arm raised that
@@ -13508,7 +13656,7 @@ impl Agent<'_> {
         shared.interrupt.store(false, Ordering::Relaxed);
         crate::interrupt::clear();
         if let Err(e) = run {
-            return Err(self.reconcile_and_fail(log, shared, e));
+            return Err(self.reconcile_and_fail(&mut *h.log, shared, e));
         }
         // The prompt that cut the pass short is the next turn, now — unless
         // the thing that cut it short was Ctrl-D, in which case there is no
@@ -13518,8 +13666,8 @@ impl Agent<'_> {
         }
         let leftover = shared.take_queued();
         if !leftover.is_empty() {
-            self.absorb_leftover(log, leftover);
-            self.tui_turn(terminal, log, view, input, btw, arcade, sub)?;
+            self.absorb_leftover(&mut *h.log, leftover);
+            self.tui_turn(terminal, h.log, h.view, h.input, h.btw, h.arcade, h.sub)?;
         }
         Ok(false)
     }
@@ -13535,6 +13683,8 @@ impl Agent<'_> {
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
     ) -> Result<(), String> {
+        // A turn is starting: whatever ghost the prompt was showing is over.
+        input.ghost = None;
         let r = self.tui_turn_inner(terminal, log, view, input, btw, arcade, sub);
         if r.is_err() {
             self.goal = None;
@@ -14372,6 +14522,7 @@ impl Agent<'_> {
             // idle loop (`tui_memory_pass`), on a worker with the footer
             // live, and a prompt typed meanwhile cuts it short.
             self.enqueue_memory_job(turn_start.elapsed());
+            self.note_turn_end_for_suggestion(false);
             // Stop hooks: exit 2 feeds stderr to the model and the turn
             // continues (at most once).
             if !stop_hook_ran {
@@ -14720,6 +14871,7 @@ impl Agent<'_> {
             depth,
             attempts: 0,
             resume: None,
+            queued_at: std::time::Instant::now(),
         });
         true
     }
@@ -14727,6 +14879,52 @@ impl Agent<'_> {
     /// Whether a queued span is waiting to be read.
     fn memory_jobs_pending(&self) -> bool {
         !self.memory_jobs.is_empty()
+    }
+
+    /// Records that a turn just ended, so the next quiet moment generates a
+    /// suggestion.
+    ///
+    /// Queues a flag and nothing more. The generation is deliberately not run
+    /// here: turn exit is a snapshot, and paying a generation on this path
+    /// would delay the prompt coming back after every single answer.
+    fn note_turn_end_for_suggestion(&mut self, errored: bool) {
+        if errored || !self.suggestion_allowed() {
+            return;
+        }
+        self.suggestion_pending = true;
+    }
+
+    /// Whether this session should suggest at all right now.
+    ///
+    /// The skip list, mapped from the design's table: off by setting, a
+    /// sub-agent turn, an interrupted turn, or `/init` running. The cold-KV
+    /// skip is not here — it needs the prompt text, so it is checked at
+    /// generation time.
+    fn suggestion_allowed(&self) -> bool {
+        crate::settings::active().suggestions.enabled
+            && !self.in_sidechain()
+            && !self.quiet_tools
+            && self.memory_pass_allowed()
+    }
+
+    /// How long the oldest queued memory job has been waiting.
+    fn oldest_memory_wait(&self) -> Option<std::time::Duration> {
+        self.memory_jobs.front().map(|j| j.queued_at.elapsed())
+    }
+
+    /// What the idle moment should spend itself on.
+    fn idle_work(&self) -> crate::suggest::IdleWork {
+        let starvation = std::time::Duration::from_secs(u64::from(
+            crate::settings::active()
+                .suggestions
+                .memory_starvation_seconds,
+        ));
+        crate::suggest::idle_work(
+            self.suggestion_pending,
+            self.memory_jobs_pending(),
+            self.oldest_memory_wait(),
+            starvation,
+        )
     }
 
     /// Runs the oldest queued job: one sidechain generation against the live
@@ -14850,6 +15048,172 @@ impl Agent<'_> {
             None => self.note_unusable_memory_reply(),
         }
         true
+    }
+
+    /// Generates one suggestion as a sidechain and stores it.
+    ///
+    /// Returns whether a suggestion was stored. The pending flag is consumed
+    /// either way: a rejected suggestion is not retried, because a second
+    /// generation to rescue a failed guess costs more than the guess is
+    /// worth.
+    ///
+    /// Runs under `begin_sidechain` / `end_subagent_fork` exactly as the
+    /// memory pass does (`process_memory_job`), which is what keeps it out of
+    /// the transcript and off the KV ladder. `PLANK_SUGGEST_DEBUG` prints the
+    /// raw reply before sanitizing: without it, "the model returned nothing"
+    /// and "the sanitizer rejected everything" are indistinguishable from
+    /// outside, and those need different fixes.
+    fn generate_suggestion(&mut self) -> bool {
+        self.suggestion_pending = false;
+        if !self.suggestion_allowed() {
+            return false;
+        }
+        // A suggestion is ghost text: nothing about the generation may reach
+        // the front end. The memory pass is kept quiet by
+        // `sub_sink_render_sink`'s `extract_state.is_running()` check, which
+        // a suggestion never trips — so it silences its own sink instead.
+        // Left on the last turn's live channel, the suggestion would stream
+        // token by token into the sub-agent pane and, through
+        // `pass_status_ctx`, paint a throbber, a "generating…" verb and a
+        // throughput readout at an idle prompt, for work the user never
+        // asked for. `Null` makes `pass_status_ctx` return `None`, so neither
+        // text nor status leaves the pass. Restored on the way out so the
+        // caller's sink is the caller's business.
+        let sink = std::mem::replace(&mut self.sub_sink, SubSinkTarget::Null);
+        let done = self.generate_suggestion_inner();
+        self.sub_sink = sink;
+        done
+    }
+
+    /// The body of [`Self::generate_suggestion`], which owns silencing the
+    /// sub-agent sink around it.
+    fn generate_suggestion_inner(&mut self) -> bool {
+        let text = crate::suggest::prompt();
+
+        // Probe with the real prompt prefix, not the bare instruction: whether
+        // the KV rebuilds is decided by the transcript prefix, and probing
+        // with a string that shares no leading tokens makes the guard fire
+        // never. Done before the fork so the cold path costs nothing.
+        let base = render_transcript(&recovery_session(&self.session), &self.system);
+        if self
+            .engine
+            .kv_reuse_probe(&base, self.think)
+            .is_some_and(crate::engine::KvReuse::rebuilds_from_zero)
+        {
+            return false;
+        }
+
+        let depth = self.session.transcript.len();
+        // `true`, as the memory pass does: the sidechain diverges the live KV
+        // and `restore_fork_kv` puts it back. With `false` the restore no-ops
+        // and the next real turn re-prefills the whole conversation — the
+        // exact cost the probe above exists to avoid.
+        let fork_at = self.begin_sidechain(text.clone(), true);
+        // The prompt is the whole live session plus the instruction that
+        // `begin_sidechain` just pushed, exactly as `process_memory_job`
+        // builds it. Passing the bare instruction would ask the model to
+        // guess the next prompt with no conversation at all.
+        let prompt = render_transcript(&recovery_session(&self.session), &self.system);
+        let mut opts = self.pass_opts();
+        opts.n_predict =
+            i32::try_from(crate::settings::active().suggestions.max_tokens).unwrap_or(40);
+        let (done, result) = self.run_sidechain_quietly(|agent| {
+            agent
+                .generate_quiet_with(&prompt, Instant::now(), &opts)
+                .map(|pass| pass.assistant_text)
+                .map_err(|abort| abort.error)
+        });
+        // `&text`, not `&prompt`: this argument is only used to label the
+        // repro dump, and `process_memory_job` passes its bare task there
+        // too. Passing the rendered prompt would record the entire
+        // conversation as the "task" of every suggestion dump.
+        self.end_subagent_fork(fork_at, "suggest", &text, done);
+
+        let reply = result.unwrap_or_default();
+
+        if std::env::var_os("PLANK_SUGGEST_DEBUG").is_some() {
+            eprintln!("[suggest] raw={reply:?}");
+        }
+
+        match crate::suggest::sanitize(&reply) {
+            Some(text) => {
+                self.suggestion = Some(crate::suggest::Suggestion { text, depth });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forgets any offered suggestion.
+    fn clear_suggestion(&mut self) {
+        self.suggestion = None;
+    }
+
+    /// Whether this keystroke accepts the live suggestion rather than doing
+    /// its ordinary job.
+    ///
+    /// Only over an empty buffer with neither menu open: the completion popup
+    /// and the slash menu own Tab and Enter while they are up, and both have
+    /// already had their turn by the time the key loop asks this. The
+    /// empty-buffer guard is what makes an accept unable to overwrite typed
+    /// text, and Shift/Alt+Enter (newline) and the roster's Enter keep their
+    /// meanings.
+    fn suggestion_accept_key(
+        &self,
+        key: KeyEvent,
+        input: &TuiInput,
+        word_mod: bool,
+        roster_selecting: bool,
+    ) -> bool {
+        input.buf.text().is_empty()
+            && input.popup.is_none()
+            && input.slash.is_none()
+            && self.current_suggestion().is_some()
+            && match key.code {
+                // `roster_selecting` excludes Tab for the same reason it
+                // excludes Enter: with the sub-agent roster selected, Tab
+                // toggles roster focus. Placing the suggestion there would
+                // leave Tab and Enter disagreeing about whose key it is.
+                KeyCode::Tab | KeyCode::Right => !word_mod && !roster_selecting,
+                KeyCode::Enter => {
+                    // CONTROL alongside SHIFT and ALT: Ctrl+Enter submitted
+                    // nothing over an empty prompt before this feature, and
+                    // an accept-and-send is not what it should start meaning.
+                    !key.modifiers.contains(KeyModifiers::SHIFT)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !roster_selecting
+                }
+                _ => false,
+            }
+    }
+
+    /// Puts the offered suggestion into the prompt, cursor at the end, and
+    /// consumes it. The buffer stays editable: Tab places, Enter places and
+    /// then falls through to the ordinary submit arm.
+    fn place_suggestion(&mut self, input: &mut TuiInput) {
+        if let Some(text) = self.current_suggestion().map(str::to_owned) {
+            input.hist_idx = None;
+            input.buf.set_text(&text);
+            input.buf.move_end();
+        }
+        self.clear_suggestion();
+        input.ghost = None;
+    }
+
+    /// The suggestion to offer right now, or `None`.
+    ///
+    /// Depth-checked on every read rather than invalidated by every mutation
+    /// site: a suggestion generated against a different transcript is stale
+    /// even if no explicit clear ran, and checking here means a new
+    /// transcript-moving path cannot forget to invalidate. The explicit
+    /// `clear_suggestion` calls remain for the paths that rewrite history
+    /// *without* changing its length.
+    fn current_suggestion(&self) -> Option<&str> {
+        self.suggestion
+            .as_ref()
+            .filter(|s| s.depth == self.session.transcript.len())
+            .map(|s| s.text.as_str())
     }
 
     /// The prompt a job's generation runs, with the engine's KV positioned
@@ -17102,6 +17466,18 @@ impl LiveCommands {
     }
 }
 
+/// The six front-end handles a quiet background pass hands on to
+/// [`run_worker_ui`], bundled so [`Agent::tui_quiet_pass`] can take them
+/// alongside a body closure without growing its argument list.
+struct TuiHandles<'a> {
+    log: &'a mut OutputLog,
+    view: &'a mut tui::OutputView,
+    input: &'a mut TuiInput,
+    btw: &'a mut BtwPanel,
+    arcade: &'a mut crate::arcade::Arcade,
+    sub: &'a mut tui::SubPane,
+}
+
 /// Runs `job` on a scoped worker thread while the UI thread keeps the
 /// terminal live (the C's worker/UI split). The worker owns the agent for
 /// the duration of the job and reports through the channel; the UI applies
@@ -17945,11 +18321,12 @@ fn busy_ui_loop(
                         } else if shared.memory_pass.load(Ordering::Relaxed)
                             && btw_question(&line).is_some()
                         {
-                            // No main task to ask beside during a memory
-                            // pass, and nothing to preempt that would resume:
-                            // a plain prompt is the way to have the model now.
+                            // No main task to ask beside during a quiet
+                            // background pass, and nothing to preempt that
+                            // would resume: a plain prompt is the way to have
+                            // the model now.
                             log.push_dim(
-                                "[/btw has nothing to run beside while notes are taken — \
+                                "[/btw has nothing to run beside right now — \
                                  just type your prompt; it starts at once]",
                             );
                         } else if btw_question(&line).is_some() {
@@ -18125,10 +18502,10 @@ fn busy_ui_loop(
                             input.history.add(&line);
                             log.push_pending(&line);
                             shared.push_queued(line);
-                            // During a memory pass the queued line is also
-                            // the signal to stop taking notes: the pass goes
+                            // During a quiet background pass the queued line
+                            // is also the signal to stop it: the pass goes
                             // back on the queue and this line runs next
-                            // (`tui_memory_pass`).
+                            // (`tui_quiet_pass`).
                             if shared.memory_pass.load(Ordering::Relaxed) {
                                 raise_worker_interrupt(shared);
                             }
@@ -18136,8 +18513,8 @@ fn busy_ui_loop(
                             sub.follow_all();
                         }
                     }
-                    // Ctrl-D quits, but only out of a memory pass: that is
-                    // housekeeping the user never asked for, and at a glance
+                    // Ctrl-D quits, but only out of a quiet background pass:
+                    // that is work the user never asked for, and at a glance
                     // the screen looks like an idle prompt. Mid-turn Ctrl-D
                     // stays inert, as it always has — this must never be the
                     // reason somebody loses a generation in flight. The empty
@@ -18698,6 +19075,8 @@ fn new_agent(
         memory_gate_percent: 60,
         memory_jobs: std::collections::VecDeque::new(),
         pending_memory_notice: None,
+        suggestion_pending: false,
+        suggestion: None,
         repro_dir,
         quiet_tools: false,
         guard_stopped: false,
@@ -21506,8 +21885,18 @@ mod tests {
         engine: ScriptedEngine,
         cfg: &'a crate::config::AgentConfig,
     ) -> Agent<'a> {
+        test_agent_boxed(dir, Box::new(engine), cfg)
+    }
+
+    /// `test_agent` over any engine, so a Metal-only test can drive the real
+    /// one. Everything else is identical.
+    fn test_agent_boxed<'a>(
+        dir: &std::path::Path,
+        engine: Box<dyn Engine>,
+        cfg: &'a crate::config::AgentConfig,
+    ) -> Agent<'a> {
         let mut agent = Agent {
-            engine: Box::new(engine),
+            engine,
             cfg,
             gen_opts: cfg.generation.clone(),
             resume_temp: crate::engine::GenerationOptions::default().temperature,
@@ -21538,6 +21927,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -21652,6 +22043,487 @@ mod tests {
         on.memory.extract_every_n_turns = 1;
         crate::settings::install_for_test(on);
         AutoExtractGuard
+    }
+
+    /// Suggestions on, with an explicit starvation window. Installed through
+    /// the same `install_for_test` path and torn down by the same guard.
+    fn enable_suggestions_for_test(starvation_secs: u32) -> AutoExtractGuard {
+        let mut on = crate::settings::Settings::default();
+        on.suggestions.enabled = true;
+        on.suggestions.memory_starvation_seconds = starvation_secs;
+        crate::settings::install_for_test(on);
+        AutoExtractGuard
+    }
+
+    /// Suggestions explicitly off, everything else default.
+    fn disable_suggestions_for_test() -> AutoExtractGuard {
+        let mut off = crate::settings::Settings::default();
+        off.suggestions.enabled = false;
+        crate::settings::install_for_test(off);
+        AutoExtractGuard
+    }
+
+    /// `/init` is writing an AGENTS.md draft; guessing at the user's next
+    /// prompt over the top of it is noise. Pins the `!quiet_tools` conjunct,
+    /// which is otherwise present but never decisive.
+    #[test]
+    fn a_turn_while_init_is_running_queues_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-init");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.quiet_tools = true;
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(
+            !agent.suggestion_pending,
+            "/init owns the screen; do not suggest over its draft"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The user cut the model off and wants the prompt back, not a guess
+    /// about a turn they abandoned. Pins the `memory_pass_allowed()`
+    /// conjunct, which is otherwise present but never decisive.
+    #[test]
+    fn a_turn_the_user_interrupted_queues_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-interrupted");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.last_turn_interrupted = true;
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(
+            !agent.suggestion_pending,
+            "an interrupted turn is not a finished one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_suggestion_is_dropped_when_the_transcript_moves() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-stale");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.suggestion = Some(crate::suggest::Suggestion {
+            text: "run the tests".to_string(),
+            depth: agent.session.transcript.len(),
+        });
+        assert_eq!(agent.current_suggestion(), Some("run the tests"));
+
+        agent.session.push(Message::user("something else"));
+        assert_eq!(
+            agent.current_suggestion(),
+            None,
+            "a guess about a conversation that has since moved is not a suggestion"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clearing_the_session_clears_the_suggestion() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-clear");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.suggestion = Some(crate::suggest::Suggestion {
+            text: "run the tests".to_string(),
+            depth: 0,
+        });
+
+        agent.clear_suggestion();
+        assert!(agent.suggestion.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_clean_turn_end_queues_a_suggestion() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-queue");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(agent.suggestion_pending);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_turn_that_errored_queues_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-err");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        agent.note_turn_end_for_suggestion(true);
+        assert!(
+            !agent.suggestion_pending,
+            "an errored turn suggests nothing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn suggestions_off_queue_nothing() {
+        let _s = disable_suggestions_for_test();
+        let dir = scratch_dir("sugg-off");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(!agent.suggestion_pending);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_generated_suggestion_is_sanitized_and_stored_with_its_depth() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-gen");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["add tests for the parser".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+
+        assert!(agent.generate_suggestion());
+        let s = agent.suggestion.as_ref().expect("stored");
+        assert_eq!(s.text, "add tests for the parser");
+        assert_eq!(s.depth, agent.session.transcript.len());
+        assert!(!agent.suggestion_pending, "the flag is consumed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_reply_the_sanitizer_rejects_stores_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-reject");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["I've added the tests you asked for.".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.suggestion_pending = true;
+
+        assert!(!agent.generate_suggestion(), "the model answered as itself");
+        assert!(agent.suggestion.is_none());
+        assert!(
+            !agent.suggestion_pending,
+            "consumed even on rejection: no retry"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The generation must leave no trace in the conversation.
+    #[test]
+    fn generating_a_suggestion_does_not_grow_the_transcript() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-notrace");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["run the tests".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        let before = agent.session.transcript.len();
+        agent.suggestion_pending = true;
+
+        agent.generate_suggestion();
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "a suggestion is housekeeping, not conversation"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed generation must still close the fork: a leaked sidechain
+    /// The cold-KV skip is what makes this feature affordable on by default,
+    /// and nothing exercised it: `ScriptedEngine` returns `None` from
+    /// `kv_reuse_probe` unless a test stages one, so the guard had never been
+    /// seen to fire. `live: 10, common: 5` is a prompt diverging behind the
+    /// live end, which is exactly the rebuild-from-zero case.
+    #[test]
+    fn a_cold_kv_skips_the_generation_without_opening_a_fork() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-coldkv");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["run the tests".to_string()],
+            kv_events: Some(kv_events.clone()),
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 10,
+                common: 5,
+            }),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+
+        assert!(
+            !agent.generate_suggestion(),
+            "a cold KV is the one case this feature cannot afford"
+        );
+        assert!(agent.suggestion.is_none());
+        // The probe itself logs `probe`, so the list is not empty — the claim
+        // is that no FORK was opened, i.e. no `capture`. Asserting emptiness
+        // here would be asserting something untrue about the double.
+        let events = kv_events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e == "capture"),
+            "skipped before the fork, so nothing was captured: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e == "probe"),
+            "the guard did consult the probe: {events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// silently disables every feature that checks `in_sidechain()`,
+    /// including the memory pass and this feature's own skip condition.
+    #[test]
+    fn a_failed_suggestion_generation_still_closes_the_fork() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-fail");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            fail_with: Some("scripted generation failure".to_string()),
+            kv_events: Some(kv_events.clone()),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        let before = agent.session.transcript.len();
+        agent.suggestion_pending = true;
+
+        assert!(
+            !agent.generate_suggestion(),
+            "a failed generation stores nothing"
+        );
+        // Without this the three assertions below would also pass if the
+        // function had returned before ever opening a fork — which a future
+        // change to the skip conditions could easily cause. `capture` proves
+        // `begin_sidechain` ran with snapshot_kv true.
+        let events = kv_events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e == "capture"),
+            "a fork was actually opened: {events:?}"
+        );
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "the fork leaves no trace even on failure"
+        );
+        assert_eq!(agent.sidechain_depth, 0, "the fork is closed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sidechain_turn_queues_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-side");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.begin_sidechain("sub".to_string(), false);
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(
+            !agent.suggestion_pending,
+            "a sub-agent turn suggests nothing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pending_suggestion_wins_the_idle_slot() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-slot");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.suggestion_pending = true;
+
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::Suggestion);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_starved_memory_job_takes_the_idle_slot_back() {
+        let _s = enable_suggestions_for_test(0); // everything is starved at once
+        let dir = scratch_dir("sugg-starve");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.suggestion_pending = true;
+        agent.memory_jobs.push_back(crate::memextract::MemoryJob {
+            task: "x".to_string(),
+            depth: 1,
+            attempts: 0,
+            resume: None,
+            queued_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::MemoryPass);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nothing_pending_means_the_idle_moment_does_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-nowork");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::Nothing);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Arms a live suggestion at the agent's current transcript depth, which
+    /// is what `current_suggestion`'s staleness check compares against.
+    fn offer_suggestion(agent: &mut Agent<'_>, text: &str) {
+        agent.suggestion = Some(crate::suggest::Suggestion {
+            text: text.to_string(),
+            depth: agent.session.transcript.len(),
+        });
+    }
+
+    #[test]
+    fn tab_places_the_suggestion_and_leaves_it_editable() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-tab");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "run the tests");
+        let mut input = TuiInput::new();
+
+        assert!(agent.suggestion_accept_key(key(KeyCode::Tab), &input, false, false));
+        agent.place_suggestion(&mut input);
+
+        assert_eq!(input.buf.text(), "run the tests");
+        assert_eq!(
+            input.buf.cursor(),
+            "run the tests".len(),
+            "cursor at the end"
+        );
+        assert!(
+            agent.current_suggestion().is_none(),
+            "the offer is consumed"
+        );
+        assert!(input.ghost.is_none(), "and the ghost with it");
+        // Nothing was submitted: the text is sitting in the prompt.
+        assert!(agent.session.transcript.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enter_accepts_the_suggestion_on_the_way_to_the_submit_arm() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-enter");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "explain the parser");
+        let mut input = TuiInput::new();
+
+        assert!(agent.suggestion_accept_key(key(KeyCode::Enter), &input, false, false));
+        agent.place_suggestion(&mut input);
+        // The plain `KeyCode::Enter` arm then reads the buffer, which is the
+        // whole point of placing rather than duplicating the submit path.
+        assert_eq!(input.buf.text().trim(), "explain the parser");
+        assert!(agent.current_suggestion().is_none());
+
+        // Shift+Enter still means newline, and the roster still owns Enter.
+        offer_suggestion(&mut agent, "x");
+        let empty = TuiInput::new();
+        assert!(!agent.suggestion_accept_key(shift(KeyCode::Enter), &empty, false, false));
+        assert!(!agent.suggestion_accept_key(key(KeyCode::Enter), &empty, false, true));
+        // Ctrl+Enter submitted nothing before suggestions existed; it must
+        // not start meaning accept-and-send.
+        assert!(!agent.suggestion_accept_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            &empty,
+            false,
+            false
+        ));
+        // And the roster owns Tab in that same state, exactly as it owns
+        // Enter: otherwise the two keys disagree about whose they are.
+        assert!(!agent.suggestion_accept_key(key(KeyCode::Tab), &empty, false, true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_printable_keystroke_dismisses_the_suggestion() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-dismiss");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "run the tests");
+        let mut input = TuiInput::new();
+
+        let k = key(KeyCode::Char('h'));
+        assert!(
+            !agent.suggestion_accept_key(k, &input, false, false),
+            "a printable key is not an accept key"
+        );
+        // What the key loop does for every non-accept key, in one place.
+        agent.clear_suggestion();
+        input.ghost = None;
+        input.buf.insert("h");
+
+        assert!(agent.current_suggestion().is_none());
+        assert_eq!(input.buf.text(), "h", "and the key still did its own job");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Named for the guard, not for arm ordering: `suggestion_accept_key`
+    /// refuses while a popup is open, which is precisely what makes the order
+    /// of the two arms immaterial. There is no seam that would let a test
+    /// observe that order without reshaping the key loop around the test, so
+    /// the guard is what is asserted and what the name promises.
+    #[test]
+    fn the_suggestion_is_refused_while_the_completion_popup_is_open() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-popup");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "run the tests");
+
+        // The key loop's real order: `popup_key` runs before the suggestion
+        // check, and takes the Tab while the popup is open.
+        let mut input = input_with_popup("@src", 0);
+        assert!(input.popup.is_some(), "the `@` popup is open");
+        assert!(
+            input.popup_key(key(KeyCode::Tab)),
+            "the popup takes the Tab"
+        );
+        assert_eq!(
+            agent.current_suggestion(),
+            Some("run the tests"),
+            "the offer survives a key it never saw"
+        );
+
+        // And the guard is the popup itself, not merely the typed text:
+        // an empty buffer with a popup still is not an accept.
+        let popup = input.popup.take();
+        input.buf.clear();
+        input.popup = popup;
+        assert!(!agent.suggestion_accept_key(key(KeyCode::Tab), &input, false, false));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Auto-extraction on *and* the System-1 gate on at `percent`, installed
@@ -26798,6 +27670,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -26930,6 +27804,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -28314,6 +29190,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -28591,6 +29469,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -28707,6 +29587,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -28810,6 +29692,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -28936,6 +29820,8 @@ mod tests {
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -31578,6 +32464,8 @@ or the user's next message aborts before its first token"
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
@@ -31922,6 +32810,47 @@ or the user's next message aborts before its first token"
             notice.contains(": "),
             "carries the change summary: {notice}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A requeued job keeps the moment it FIRST started waiting.
+    ///
+    /// The starvation guard reads `queued_at` to decide when a memory job
+    /// takes the idle slot back from prompt suggestions. Re-stamping on
+    /// requeue would mean a job that keeps getting interrupted never
+    /// registers as starved — the guard would be present and permanently
+    /// inert, with nothing anywhere to say so.
+    #[test]
+    fn requeueing_a_job_does_not_reset_how_long_it_has_waited() {
+        let dir = scratch_dir("memjob-requeue-stamp");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        let stamped = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .expect("600s before now is representable");
+        let job = crate::memextract::MemoryJob {
+            task: "x".to_string(),
+            depth: 1,
+            attempts: 0,
+            resume: None,
+            queued_at: stamped,
+        };
+
+        agent.requeue_memory_job(job, true);
+        let back = agent.memory_jobs.front().expect("pushed back");
+        assert_eq!(
+            back.queued_at, stamped,
+            "an interrupted job has still been waiting since it was first queued"
+        );
+
+        // The same must hold on the error path, which bumps `attempts`.
+        let job = agent.memory_jobs.pop_front().unwrap();
+        agent.requeue_memory_job(job, false);
+        let back = agent.memory_jobs.front().expect("pushed back");
+        assert_eq!(back.attempts, 1, "precondition: the error path ran");
+        assert_eq!(back.queued_at, stamped, "still the original stamp");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -32332,6 +33261,117 @@ or the user's next message aborts before its first token"
                 .pending_memory_notice
                 .take()
                 .is_some_and(|n| n.starts_with("memory completed in ")),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A prompt suggestion is ghost text, not a turn: nothing about it may
+    /// reach the front end. It has no `extract_state` flag to make
+    /// `sub_sink_render_sink` fall back to a `NullSink`, so the pass must
+    /// leave `sub_sink` at `Null` itself — install a live sink here and the
+    /// suggestion streams into the sub-agent pane while `pass_status_ctx`
+    /// paints a throbber and a "generating…" footer at an idle prompt.
+    /// The check no scripted test can make: does a REAL model, given a real
+    /// conversation, produce something a user would plausibly type — and does
+    /// the sanitizer let it through?
+    ///
+    /// `ScriptedEngine` supplies the reply, so every other suggestion test is
+    /// blind to the two failure modes that matter: the model answering as
+    /// itself, and the sanitizer rejecting everything. Either would leave the
+    /// feature fully wired, fully green and producing nothing. That exact
+    /// shape shipped once on the System-1 branch before a real-model run
+    /// caught it.
+    ///
+    /// Run with `PLANK_TEST_MODEL=<gguf> cargo test --lib a_real_model_suggests -- --nocapture`.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn a_real_model_suggests_something_a_user_would_type() {
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-realmodel");
+        let cfg = test_cfg();
+
+        let tuning = crate::config::EngineTuning {
+            mtp: false,
+            ssd_streaming: std::env::var_os("PLANK_TEST_SSD_STREAMING").is_some(),
+            ..Default::default()
+        };
+        let model = crate::ds4engine::Ds4Model::open_shared(
+            &model_path,
+            crate::ffi::Ds4Backend::Metal,
+            8192,
+            0,
+            100,
+            &tuning,
+            "you are a helpful coding assistant",
+        )
+        .expect("open the model");
+        let engine = crate::ds4engine::Ds4Session::from_model(model);
+        let mut agent = test_agent_boxed(&dir, Box::new(engine), &cfg);
+
+        // A conversation with an obvious next move, so a good suggestion is
+        // recognisable and a bad one is too.
+        agent
+            .session
+            .push(Message::user("add a parse_port function to src/net.rs"));
+        agent.session.push(Message::assistant(
+            "Added `parse_port` to src/net.rs. It takes a &str,              returns Result<u16, ParseError>, and rejects 0.",
+        ));
+        agent.suggestion_pending = true;
+
+        let stored = agent.generate_suggestion();
+        match agent.suggestion.as_ref() {
+            Some(s) => eprintln!("[suggest] ACCEPTED {:?}", s.text),
+            None => eprintln!(
+                "[suggest] REJECTED or empty (set PLANK_SUGGEST_DEBUG=1 for the raw reply)"
+            ),
+        }
+        assert!(
+            stored,
+            "a real model on a clear conversation should produce a usable \
+             suggestion; if this fails, read the raw reply under \
+             PLANK_SUGGEST_DEBUG=1 and fix the PROMPT, not the sanitizer"
+        );
+        let text = agent.suggestion.as_ref().unwrap().text.clone();
+        assert!(!text.is_empty());
+        assert!(
+            !text.starts_with('/'),
+            "a slash command must never reach the input line: {text:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_suggestion_pass_renders_nothing_to_the_front_end() {
+        let dir = scratch_dir("suggest-quiet");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["write the tests".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Exactly what the idle worker leaves behind: the previous turn's
+        // live channel. The pass must not publish through it.
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+        agent.generate_suggestion();
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            !events.iter().any(|e| matches!(e, UiEvent::Sub(_))),
+            "no suggestion text or banners reach the front end: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                UiEvent::Status(s) if s.state == crate::status::WorkerState::Generating
+            )),
+            "no throbber or generating footer at an idle prompt: {events:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -32906,6 +33946,8 @@ or the user's next message aborts before its first token"
             memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
             guard_stopped: false,
