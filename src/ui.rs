@@ -18062,7 +18062,17 @@ fn busy_ui_loop(
             };
         // The turn owns the engine: the prompt still takes keystrokes (they
         // queue), but plank is not waiting on you, so the cursor goes red.
-        crate::cursor::set(crate::cursor::State::Busy);
+        //
+        // A quiet background pass — prompt prediction, the memory pass — is
+        // the opposite case and keeps the cursor green. Nothing was asked
+        // for, plank *is* waiting on you, and a keystroke does not merely
+        // queue: it interrupts the pass and becomes the next turn. Painting
+        // it red says "wait for me" about work the user never started.
+        crate::cursor::set(if shared.memory_pass.load(Ordering::Relaxed) {
+            crate::cursor::State::Idle
+        } else {
+            crate::cursor::State::Busy
+        });
         terminal
             .draw(|f| {
                 // The `/btw` split is about the main task, so it steps aside
