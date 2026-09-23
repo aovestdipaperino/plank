@@ -57,6 +57,26 @@ pub enum IdleWork {
     Nothing,
 }
 
+/// True when the model was reasoning and never got to the answer.
+///
+/// A reasoning family generates inside an implicit think block and emits
+/// only the closing tag, so the absence of `</think>` in a reply produced
+/// with thinking on means the token budget ran out mid-thought. What is
+/// there is reasoning, not a suggestion — a real run produced "The user
+/// asked me to add a `parse_port` function. I did. Now they ask for the
+/// single next thing…", cut off, and only the length cap kept it off the
+/// input line. A shorter ramble would have been shown as a suggestion.
+///
+/// Switching the pass to `ThinkMode::Off` would avoid this, but it is not
+/// free: on a numeric-thinking family `Off` and `Medium` carry different
+/// effort preambles, so changing it invalidates the KV and forces a full
+/// re-prefill. Rejecting the truncated reply is the cheap half; the budget
+/// (`suggestions.maxTokens`) is the other.
+#[must_use]
+pub fn reasoning_unfinished(reply: &str, thinking: bool) -> bool {
+    thinking && !reply.contains("</think>")
+}
+
 /// Turns a raw generation into something showable, or `None`.
 ///
 /// `None` shows nothing. There is deliberately no fallback text and no retry:
@@ -204,6 +224,18 @@ mod tests {
     /// only the closing tag, so the reply arrives with `</think>` glued to
     /// the front of the real answer — on the same line, which is why taking
     /// the first line was not enough.
+    #[test]
+    fn a_reply_with_no_reasoning_close_is_a_budget_that_ran_out() {
+        assert!(reasoning_unfinished(
+            "The user asked me to add a parse_port",
+            true
+        ));
+        assert!(!reasoning_unfinished("thought</think>add tests", true));
+        // With thinking off the prefix closes the block, so there is no tag
+        // to look for and every reply is a real answer.
+        assert!(!reasoning_unfinished("add tests", false));
+    }
+
     #[test]
     fn sanitize_drops_the_reasoning_close_glued_to_the_answer() {
         assert_eq!(

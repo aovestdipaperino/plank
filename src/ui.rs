@@ -15085,28 +15085,17 @@ impl Agent<'_> {
         // text nor status leaves the pass. Restored on the way out so the
         // caller's sink is the caller's business.
         let sink = std::mem::replace(&mut self.sub_sink, SubSinkTarget::Null);
-        // And no thinking. On a reasoning family the assistant otherwise
-        // reasons first, which with a ~40-token budget means the budget is
-        // spent before any suggestion is reached: a real run produced
-        // "The user asked me to add a parse_port function. I did. Now they
-        // ask for the single next thing…", cut off mid-thought, and only the
-        // length cap kept it off the input line. Where the reasoning *did*
-        // fit, the reply arrived as "</think>Write out the …" and the tag
-        // was shown to the user.
-        //
-        // `ThinkMode::Off` makes the assistant prefix open with `</think>`
-        // itself, so the model starts at the answer and the whole budget
-        // goes to it. Free: `Off` and `Medium` share an effort preamble, so
-        // `set_think_mode` changes only the per-turn assistant prefix and
-        // leaves the cached prompt prefix — and the KV — untouched.
-        let think = self.think;
-        self.think = crate::engine::ThinkMode::Off;
-        self.engine.set_think_mode(crate::engine::ThinkMode::Off);
-
+        // NOT a think-mode switch. `ThinkMode::Off` would stop the model
+        // reasoning here, but it is not free: on a numeric-thinking family
+        // (V4.1) `Off` and `Medium` have *different* effort preambles
+        // (`engine::effort_prefix`), so `set_think_mode` drops the token
+        // transcript and calls `ds4_session_invalidate` — a full re-prefill
+        // of the whole conversation, twice per turn once the mode is
+        // restored. That is exactly the cost this feature exists to avoid.
+        // The budget and the `</think>` handling below deal with reasoning
+        // instead.
         let done = self.generate_suggestion_inner();
 
-        self.think = think;
-        self.engine.set_think_mode(think);
         self.sub_sink = sink;
         done
     }
@@ -15159,6 +15148,13 @@ impl Agent<'_> {
 
         if std::env::var_os("PLANK_SUGGEST_DEBUG").is_some() {
             eprintln!("[suggest] raw={reply:?}");
+        }
+
+        // The budget ran out while the model was still reasoning, so what
+        // came back is a thought, not a suggestion.
+        if crate::suggest::reasoning_unfinished(&reply, self.think != crate::engine::ThinkMode::Off)
+        {
+            return false;
         }
 
         match crate::suggest::sanitize(&reply) {

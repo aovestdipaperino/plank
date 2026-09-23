@@ -570,7 +570,7 @@ impl Default for SuggestionSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_tokens: 40,
+            max_tokens: 160,
             memory_starvation_seconds: 300,
         }
     }
@@ -1807,7 +1807,7 @@ mod tests {
         assert_eq!(s.memory.gate_percent, 60);
         assert_eq!(s.memory.held_span_cap, 0);
         assert!(s.suggestions.enabled);
-        assert_eq!(s.suggestions.max_tokens, 40);
+        assert_eq!(s.suggestions.max_tokens, 160);
         assert_eq!(s.suggestions.memory_starvation_seconds, 300);
     }
 
@@ -2144,7 +2144,7 @@ mod tests {
             s.suggestions.enabled,
             "on by default, with the cold-KV skip carrying the cost"
         );
-        assert_eq!(s.suggestions.max_tokens, 40);
+        assert_eq!(s.suggestions.max_tokens, 160);
         assert_eq!(s.suggestions.memory_starvation_seconds, 300);
     }
 
