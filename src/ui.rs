@@ -14969,7 +14969,11 @@ impl Agent<'_> {
                 .map(|pass| pass.assistant_text)
                 .map_err(|abort| abort.error)
         });
-        self.end_subagent_fork(fork_at, "suggest", &prompt, done);
+        // `&text`, not `&prompt`: this argument is only used to label the
+        // repro dump, and `process_memory_job` passes its bare task there
+        // too. Passing the rendered prompt would record the entire
+        // conversation as the "task" of every suggestion dump.
+        self.end_subagent_fork(fork_at, "suggest", &text, done);
 
         let reply = result.unwrap_or_default();
 
@@ -21959,6 +21963,51 @@ mod tests {
     }
 
     /// A failed generation must still close the fork: a leaked sidechain
+    /// The cold-KV skip is what makes this feature affordable on by default,
+    /// and nothing exercised it: `ScriptedEngine` returns `None` from
+    /// `kv_reuse_probe` unless a test stages one, so the guard had never been
+    /// seen to fire. `live: 10, common: 5` is a prompt diverging behind the
+    /// live end, which is exactly the rebuild-from-zero case.
+    #[test]
+    fn a_cold_kv_skips_the_generation_without_opening_a_fork() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-coldkv");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["run the tests".to_string()],
+            kv_events: Some(kv_events.clone()),
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 10,
+                common: 5,
+            }),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+
+        assert!(
+            !agent.generate_suggestion(),
+            "a cold KV is the one case this feature cannot afford"
+        );
+        assert!(agent.suggestion.is_none());
+        // The probe itself logs `probe`, so the list is not empty — the claim
+        // is that no FORK was opened, i.e. no `capture`. Asserting emptiness
+        // here would be asserting something untrue about the double.
+        let events = kv_events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e == "capture"),
+            "skipped before the fork, so nothing was captured: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e == "probe"),
+            "the guard did consult the probe: {events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// silently disables every feature that checks `in_sidechain()`,
     /// including the memory pass and this feature's own skip condition.
     #[test]
@@ -21966,8 +22015,10 @@ mod tests {
         let _s = enable_suggestions_for_test(300);
         let dir = scratch_dir("sugg-fail");
         let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let engine = ScriptedEngine {
             fail_with: Some("scripted generation failure".to_string()),
+            kv_events: Some(kv_events.clone()),
             ..ScriptedEngine::default()
         };
         let mut agent = test_agent(&dir, engine, &cfg);
@@ -21979,6 +22030,15 @@ mod tests {
         assert!(
             !agent.generate_suggestion(),
             "a failed generation stores nothing"
+        );
+        // Without this the three assertions below would also pass if the
+        // function had returned before ever opening a fork — which a future
+        // change to the skip conditions could easily cause. `capture` proves
+        // `begin_sidechain` ran with snapshot_kv true.
+        let events = kv_events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e == "capture"),
+            "a fork was actually opened: {events:?}"
         );
         assert_eq!(
             agent.session.transcript.len(),
