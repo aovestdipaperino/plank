@@ -14914,6 +14914,68 @@ impl Agent<'_> {
         true
     }
 
+    /// Generates one suggestion as a sidechain and stores it.
+    ///
+    /// Returns whether a suggestion was stored. The pending flag is consumed
+    /// either way: a rejected suggestion is not retried, because a second
+    /// generation to rescue a failed guess costs more than the guess is
+    /// worth.
+    ///
+    /// Runs under `begin_sidechain` / `end_subagent_fork` exactly as the
+    /// memory pass does (`process_memory_job`), which is what keeps it out of
+    /// the transcript and off the KV ladder. `PLANK_SUGGEST_DEBUG` prints the
+    /// raw reply before sanitizing: without it, "the model returned nothing"
+    /// and "the sanitizer rejected everything" are indistinguishable from
+    /// outside, and those need different fixes.
+    // Consumed by Task 7. Remove this allow there.
+    #[allow(dead_code)]
+    fn generate_suggestion(&mut self) -> bool {
+        self.suggestion_pending = false;
+        if !self.suggestion_allowed() {
+            return false;
+        }
+        let text = crate::suggest::prompt();
+
+        // The cold-KV skip: a session whose KV would rebuild from zero pays a
+        // full prefill for a one-line guess. That is the case this feature
+        // cannot afford, and declining it is what makes the default-on
+        // setting defensible.
+        if self
+            .engine
+            .kv_reuse_probe(&text, self.think)
+            .is_some_and(crate::engine::KvReuse::rebuilds_from_zero)
+        {
+            return false;
+        }
+
+        let depth = self.session.transcript.len();
+        let fork_at = self.begin_sidechain(text.clone(), false);
+        let mut opts = self.pass_opts();
+        opts.n_predict =
+            i32::try_from(crate::settings::active().suggestions.max_tokens).unwrap_or(40);
+        let (done, result) = self.run_sidechain_quietly(|agent| {
+            agent
+                .generate_quiet_with(&text, Instant::now(), &opts)
+                .map(|pass| pass.assistant_text)
+                .map_err(|abort| abort.error)
+        });
+        self.end_subagent_fork(fork_at, "suggest", &text, done);
+
+        let reply = result.unwrap_or_default();
+
+        if std::env::var_os("PLANK_SUGGEST_DEBUG").is_some() {
+            eprintln!("[suggest] raw={reply:?}");
+        }
+
+        match crate::suggest::sanitize(&reply) {
+            Some(text) => {
+                self.suggestion = Some(crate::suggest::Suggestion { text, depth });
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The prompt a job's generation runs, with the engine's KV positioned
     /// for it. A retry with a snapshot restores it and re-issues the stored
     /// prompt byte for byte, so the KV is reused to its last token. A first
@@ -21814,6 +21876,75 @@ mod tests {
 
         agent.note_turn_end_for_suggestion(false);
         assert!(!agent.suggestion_pending);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_generated_suggestion_is_sanitized_and_stored_with_its_depth() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-gen");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["add tests for the parser".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+
+        assert!(agent.generate_suggestion());
+        let s = agent.suggestion.as_ref().expect("stored");
+        assert_eq!(s.text, "add tests for the parser");
+        assert_eq!(s.depth, agent.session.transcript.len());
+        assert!(!agent.suggestion_pending, "the flag is consumed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_reply_the_sanitizer_rejects_stores_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-reject");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["I've added the tests you asked for.".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.suggestion_pending = true;
+
+        assert!(!agent.generate_suggestion(), "the model answered as itself");
+        assert!(agent.suggestion.is_none());
+        assert!(
+            !agent.suggestion_pending,
+            "consumed even on rejection: no retry"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The generation must leave no trace in the conversation.
+    #[test]
+    fn generating_a_suggestion_does_not_grow_the_transcript() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-notrace");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["run the tests".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        let before = agent.session.transcript.len();
+        agent.suggestion_pending = true;
+
+        agent.generate_suggestion();
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "a suggestion is housekeeping, not conversation"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
