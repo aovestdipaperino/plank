@@ -3057,3 +3057,21 @@ never shows, because 124 overrides it, and the trap exits before writing a
 record. But a `kill -INT` aimed at plank by hand produces a record that says
 completed and means interrupted — the repro is the place that says so, under
 `outcome`.
+
+## DeepSeek V4 Flash leans toward answer A on the memory gate, by about 9 points
+
+Measured with `/memory calibrate 30` on 2026-09-23, over 30 turn spans from
+saved `.ds4.kv` sessions, each asked the gate question with `yes` as A and
+again with `yes` as B. Mean P(yes) was 0.240 as the live gate asks it and 0.062
+swapped, a letter bias of +0.089 ± 0.012 toward A: far outside two standard
+errors, so the prior is real, not noise. `letter_mass` never saw it; across all
+60 asks it ranged 0.60 to 0.98 (median 0.78), healthy every time. That is the
+blind spot the calibration exists for: mass on the letters says the model
+answered with a letter, not why it chose that one.
+
+At the default 60% the bias changed 1 of 30 verdicts, because almost every
+span sat far below the bar either way. The bigger finding is that the gate,
+bias or not, says "not worth remembering" to nearly every turn: a debiased mean
+P(yes) of about 0.15. Whether that is right is not something this run can tell:
+there is no ground truth here for which spans actually held a memory.
+Suggested correction: `memory.gateBias.ds4 = 9`. V4.1 and Qwen are unmeasured.

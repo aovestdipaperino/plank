@@ -543,9 +543,55 @@ Three settings govern it, all under `memory` in settings.json:
   every eligible turn's span goes straight to the extraction pass exactly
   as before this feature existed.
 - **`memory.gatePercent`** (`u32`, default `60`) — the confidence threshold,
-  as a percentage, a `Yes` verdict's probability must clear to count as a
-  rejection.
+  as a percentage, a `Yes` verdict's probability must clear for the pass to
+  run. Anything below it, and any confident `No`, rejects the span.
+- **`memory.gateBias`** (object of `i32`, all `0` by default) — a per-family
+  correction in percentage points added to `gatePercent`, keyed `ds4`,
+  `ds41` and `qwen`, measured by `/memory calibrate` (see "Letter bias"
+  below). The effective bar is `gatePercent + gateBias.<family>`, clamped to
+  0–100; each value is clamped to ±50 on load.
 - **`memory.heldSpanCap`** (`u32`, default `0`) — see below.
+
+**Letter bias, and why it is calibrated offline.** `letter_mass` tells the
+gate whether the model answered with a letter at all; it cannot tell it why
+the model chose the letter it did. Models carry a prior toward specific
+option labels as such (Zheng et al., "Large Language Models Are Not Robust
+Multiple Choice Selectors", ICLR 2024): permute the options and the answer
+moves with the letter. The gate always shows `yes` as A, so a family that
+leans toward A reads more `Yes` than the span deserves, with letter mass
+still near 1 — and since a `Yes` runs the pass, the error is in the safe
+direction but makes `gatePercent` mean less than it says.
+
+The measurement is to ask the same question twice, the second time with the
+letters swapped (`Question::boolean_swapped`: A = no, B = yes). Half the
+difference in P(yes) between the two asks is the letter bias on that span
+(`decide::OrderPair::bias`) and their mean is the answer with the bias
+averaged out. Doing that live would double the gate's cost where it hurts
+most: on DeepSeek a decision session cannot be rewound (`decide_prefill`
+documents why), so the second ask re-prefills the whole excerpt, at turn
+exit. So the live gate keeps one ask, and the correction is measured once,
+offline, and folded into the threshold: the gate reads the as-asked
+P(yes), and `P(yes) >= t + bias` is the same test as `debiased >= t`.
+
+`/memory calibrate [N]` (default 20 spans, at most 200) runs that
+measurement on the loaded family. It takes turn-sized spans from that
+family's saved sessions, newest first (`memextract::calibration_spans`: one
+span per real user prompt, tool rounds included, unanswered prompts
+dropped), rendered exactly as the gate sees them, and asks each both ways.
+The report (`decide::bias_report`) gives mean P(yes) each way, the mean bias
+with its standard error, how many verdicts at the current `gatePercent`
+would change once the bias is averaged out, and the suggested
+`memory.gateBias.<family>`. It suggests a correction only from at least 10
+usable spans (`MIN_CALIBRATION_PAIRS`) and only when the bias is more than
+two standard errors from zero; otherwise it says why not. Spans where
+either ask had thin letter mass are dropped rather than counted. Nothing is
+written: the suggestion is a line to put in `settings.json` by hand, because
+a measurement nobody looked at should not move a gate that decides what gets
+remembered. It costs two decision prefills per span, so on DeepSeek a
+20-span run is 40 excerpt prefills; the TUI hands the screen back to plain
+stdout for its progress lines while it runs. It works whether or not
+`memory.gate` is on, so the correction can be measured before the gate is
+trusted.
 
 **What a rejection does to the span** depends on `heldSpanCap`. With the
 shipped default of `0`, `ExtractState::reject` calls `finish`: the span is
@@ -558,7 +604,7 @@ for a fresh judgment — unless by then it has grown past the cap
 entirely and the pass runs unconditionally, so a span can never be held
 forever.
 
-### `/memory` and `/memory log`
+### `/memory`, `/memory log` and `/memory calibrate`
 
 - **`/memory`** opens every source in one editable buffer (`memory::combine`
   / `memory::apply`), marked with `<!-- plank-memory: begin/end SCOPE -->`
@@ -581,6 +627,9 @@ forever.
   but it cannot answer "why did the model think this was wrong". It is a
   write-only trail: nothing reads it back except this command. Writing to it
   is best-effort — a failed append never fails the change it describes.
+- **`/memory calibrate [N]`** measures the System-1 gate's letter bias on the
+  loaded family and suggests a `memory.gateBias` value; static text on both
+  front ends. See "Letter bias" under the System-1 gate.
 
 ## Part 4: settings
 
@@ -591,14 +640,15 @@ All under the `memory` and `tools` blocks in `~/.plank/settings.json` /
 |---|---|---|
 | `memory.autoExtract` | `true` | Whether the extraction pass runs at all. On, every eligible turn ends with a synchronous stall for a KV snapshot, a prefill of the excerpt, a generation and a restore, none of it counted in the turn stats. Off leaves the `remember`/`forget` tools and `/remember` working — only the passive pass stops, and the sidecar counters are never bumped, so eviction ranks by date alone. Also in the `/config` form. |
 | `memory.extractEveryNTurns` | `1` | Run the pass every N *eligible* turns (a turn with no tool calls and no model `remember`/`forget`). `1` means every eligible turn. A configured `0` is clamped to `1`. Also in the `/config` form. |
-| `memory.minTurnSeconds` | `120` | A floor on how long a turn must have taken for it to trigger the pass. The pass costs a KV snapshot, a prefill, a generation and a restore; a four-second exchange rarely produces anything worth that. Set it to `0` to remove the floor. A short turn **defers** its span rather than discarding it. The pass reads the transcript from the depth the last completed pass recorded, and a turn under the floor does not move that depth, so the next turn that does clear the floor reads the short turns too. Nothing said to the model is lost to this gate — the only effect is when the reading happens. The consequence to be aware of is the mirror image: a session made entirely of short turns accumulates an unread span and extracts nothing until one long turn arrives. The floor is checked before the `extractEveryNTurns` counter, so a short turn does not count as an eligible turn either: `extractEveryNTurns: 3` means every third turn *worth* extracting from. |
+| `memory.minTurnSeconds` | `30` | A floor on how long a turn must have taken for it to trigger the pass. The pass costs a KV snapshot, a prefill, a generation and a restore; a four-second exchange rarely produces anything worth that. Set it to `0` to remove the floor. A short turn **defers** its span rather than discarding it. The pass reads the transcript from the depth the last completed pass recorded, and a turn under the floor does not move that depth, so the next turn that does clear the floor reads the short turns too. Nothing said to the model is lost to this gate — the only effect is when the reading happens. The consequence to be aware of is the mirror image: a session made entirely of short turns accumulates an unread span and extracts nothing until one long turn arrives. The floor is checked before the `extractEveryNTurns` counter, so a short turn does not count as an eligible turn either: `extractEveryNTurns: 3` means every third turn *worth* extracting from. |
 | `memory.budgets.user` | `4096` | Byte budget for `[user]` entries (see "Budgets and eviction" for what is counted). Hand-edit only. |
 | `memory.budgets.feedback` | `4096` | Byte budget for `[feedback]` entries. Hand-edit only. |
 | `memory.budgets.project` | `6144` | Byte budget for `[project]` entries, including every untagged legacy entry. Hand-edit only. |
 | `memory.budgets.reference` | `2048` | Byte budget for `[reference]` entries. Hand-edit only. |
 | `tools.remember` | `true` | Whether the `remember`/`forget` tools are advertised to the model at all. Flipping it changes the system prompt and so churns the `fp1` fingerprint once. `/remember` and `/forget` are unaffected — they are user-typed commands, not model tool calls. |
 | `memory.gate` | `false` | Whether the System-1 gate (see above) runs before a span is enqueued. Off by default — no behavior change from before the gate existed. |
-| `memory.gatePercent` | `60` | The confidence threshold, as a percentage, a `Yes` verdict must clear to reject a span. Out-of-range values are clamped to 0–100 rather than rejected. |
+| `memory.gatePercent` | `60` | The confidence threshold, as a percentage, a `Yes` verdict must clear for the pass to run; below it the span is rejected. Out-of-range values are clamped to 0–100 rather than rejected. |
+| `memory.gateBias` | `{}` (all `0`) | Per-family correction in percentage points (`ds4`, `ds41`, `qwen`) added to `gatePercent`, cancelling the family's prior toward the letter `yes` is shown under. Measured by `/memory calibrate`; hand-edit only. Each value is clamped to ±50 and the sum to 0–100. Written back only when non-zero. |
 | `memory.heldSpanCap` | `0` | Transcript-depth span size past which the gate is bypassed and the pass runs unconditionally. `0` (the default) means a rejected span is finished outright rather than held for re-judging. |
 
 ## Cache accounting

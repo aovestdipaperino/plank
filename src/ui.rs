@@ -7006,6 +7006,14 @@ impl Agent<'_> {
             }
             // Static equivalent of the TUI editor: print the combined view so
             // the sources and their bounds are at least visible here.
+            "/memory" if arg.trim() == "calibrate" || arg.trim().starts_with("calibrate ") => {
+                let rest = arg.trim().strip_prefix("calibrate").unwrap_or("");
+                let color = self.color;
+                let text = self.gate_calibrate_command(rest, &mut |line| {
+                    println!("{}", crate::status::system_line(line, color));
+                });
+                println!("{text}");
+            }
             "/memory" if arg.trim() == "log" => {
                 let entries = crate::memory::read_log(20);
                 if entries.is_empty() {
@@ -10078,8 +10086,7 @@ the original is frozen and listed in /tree"
         if crate::debugmirror::parent_connected() {
             "debug console mirror on (connected)".to_owned()
         } else {
-            "debug console mirror on (no tdk running; will connect when one is)"
-                .to_owned()
+            "debug console mirror on (no tdk running; will connect when one is)".to_owned()
         }
     }
 
@@ -14930,6 +14937,90 @@ impl Agent<'_> {
         v.value == crate::memextract::Worthy::Yes && f64::from(v.p) >= threshold
     }
 
+    /// `/memory calibrate [N]`: measures the loaded family's letter bias on
+    /// the memory gate's own question, offline, and says what
+    /// `memory.gateBias` should be.
+    ///
+    /// The live gate always shows "yes" as A. A model with a prior toward A
+    /// as such reads more "yes" than the span warrants, and `letter_mass`
+    /// cannot see it. So this asks each of up to `N` saved turn spans twice,
+    /// with the letters swapped the second time, and reports the mean
+    /// difference (`decide::bias_report`). It is a command rather than part
+    /// of the gate because the second ask is not cheap everywhere: on
+    /// `DeepSeek` a decision session cannot be rewound (`decide_prefill`), so
+    /// each ask re-prefills the span. Paying that once, here, and folding the
+    /// result into the threshold keeps the live gate at one ask per span.
+    ///
+    /// Spans come from this family's saved sessions, newest first. Nothing
+    /// is written: the result is a line to put in `settings.json`, because a
+    /// calibration a user has not looked at should not move a gate that
+    /// decides what gets remembered.
+    fn gate_calibrate_command(&mut self, arg: &str, progress: &mut dyn FnMut(&str)) -> String {
+        const DEFAULT_SPANS: usize = 20;
+        const MAX_SPANS: usize = 200;
+        let want = match arg.trim() {
+            "" => DEFAULT_SPANS,
+            n => match n.parse::<usize>() {
+                Ok(n) if n > 0 => n.min(MAX_SPANS),
+                _ => return "usage: /memory calibrate [spans, default 20]".to_owned(),
+            },
+        };
+        if !self.engine.supports_decide() {
+            return "/memory calibrate: this engine cannot answer typed decisions, so the gate never runs on it".to_owned();
+        }
+        let family = crate::gguf::ModelFamily::from(self.tool_syntax());
+        let key = crate::settings::GateBias::key(family);
+
+        let mut spans: Vec<String> = Vec::new();
+        let entries = self.store.list().unwrap_or_default();
+        for e in &entries {
+            if spans.len() >= want {
+                break;
+            }
+            let Ok(saved) = self.store.load(&e.id) else {
+                continue;
+            };
+            spans.extend(crate::memextract::calibration_spans(&saved.transcript));
+        }
+        spans.truncate(want);
+        if spans.is_empty() {
+            return format!(
+                "/memory calibrate: no saved {key} sessions with an answered turn to ask about"
+            );
+        }
+
+        let settings = crate::settings::active();
+        let q_ab = crate::decide::Question::boolean(crate::memextract::GATE_QUESTION);
+        let q_ba = crate::decide::Question::boolean_swapped(crate::memextract::GATE_QUESTION);
+        let mut pairs = Vec::with_capacity(spans.len());
+        let mut unusable = 0usize;
+        let mut failed = 0usize;
+        let total = spans.len();
+        for (i, span) in spans.iter().enumerate() {
+            progress(&format!("[calibrate] span {}/{total}", i + 1));
+            let ab = self.engine.decide(span, &q_ab);
+            let ba = self.engine.decide(span, &q_ba);
+            match (ab, ba) {
+                (Ok(ab), Ok(ba)) => match crate::decide::OrderPair::from_verdicts(&ab, &ba) {
+                    Some(p) => pairs.push(p),
+                    None => unusable += 1,
+                },
+                _ => failed += 1,
+            }
+        }
+        let threshold = f64::from(settings.memory.gate_percent) / 100.0;
+        #[allow(clippy::cast_possible_truncation)] // a percent, back to f32
+        let report = crate::decide::bias_report(&pairs, threshold as f32);
+        gate_calibration_text(
+            key,
+            &report,
+            settings.memory.gate_percent,
+            settings.memory.gate_bias.for_family(family),
+            unusable,
+            failed,
+        )
+    }
+
     /// Snapshots the span since the last pass into a [`MemoryJob`] if every
     /// gate allows it, and returns whether one was queued. Nothing is
     /// generated here: this is what a turn end does, so the prompt comes
@@ -14958,7 +15049,12 @@ impl Agent<'_> {
         self.extract_state.min_turn =
             std::time::Duration::from_secs(u64::from(settings.memory.min_turn_seconds));
         self.memory_gate = settings.memory.gate;
-        self.memory_gate_percent = settings.memory.gate_percent;
+        // Moved by the family's calibrated letter bias (`memory.gateBias`,
+        // measured by `/memory calibrate`), so the as-asked P(yes) the gate
+        // reads is held to the bar the debiased one would have been.
+        self.memory_gate_percent = settings
+            .memory
+            .gate_threshold_percent(crate::gguf::ModelFamily::from(self.tool_syntax()));
         self.extract_state.held_span_cap = settings.memory.held_span_cap as usize;
         if self.in_sidechain() {
             return false; // a sub-agent's turn end is not a turn boundary
@@ -16717,6 +16813,19 @@ impl Agent<'_> {
             // `/memory log` is static text, on both front ends: it is the
             // static-text equivalent the plain-stdout path relies on, so it
             // must not gain a pane the plain path lacks.
+            // Static text like `/memory log`. The run is long (two asks per
+            // span, each a re-prefill on DeepSeek), so the screen is handed
+            // back to plain stdout for its progress lines rather than leaving
+            // a frozen frame.
+            "/memory" if arg.trim() == "calibrate" || arg.trim().starts_with("calibrate ") => {
+                let rest = arg.trim().strip_prefix("calibrate").unwrap_or("");
+                let text = with_tui_suspended(terminal, || {
+                    self.gate_calibrate_command(rest, &mut |line| println!("{line}"))
+                });
+                for line in text.lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
             "/memory" if arg.trim() == "log" => {
                 let entries = crate::memory::read_log(20);
                 if entries.is_empty() {
@@ -19767,6 +19876,72 @@ fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
 pub const GUARD_STOP_EXIT: u8 = 3;
 
 /// The exit code a finished headless one-shot reports.
+/// The static text `/memory calibrate` prints, on both front ends.
+///
+/// Kept apart from the run so the wording, the sign convention and the
+/// no-suggestion cases are tested without a model.
+fn gate_calibration_text(
+    key: &str,
+    r: &crate::decide::BiasReport,
+    gate_percent: u32,
+    current: i32,
+    unusable: usize,
+    failed: usize,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "gate calibration on {key}: {} span(s) asked both ways",
+        r.pairs
+    );
+    if unusable + failed > 0 {
+        let _ = write!(
+            out,
+            " ({unusable} dropped for thin letter mass, {failed} failed)"
+        );
+    }
+    out.push('\n');
+    if r.pairs == 0 {
+        out.push_str("  nothing usable to measure; memory.gateBias left as it is");
+        return out;
+    }
+    let lean = if r.mean_bias >= 0.0 { "A" } else { "B" };
+    let _ = writeln!(
+        out,
+        "  P(yes) with yes as A: {:.3}   with yes as B: {:.3}",
+        r.mean_ab, r.mean_ba
+    );
+    let _ = writeln!(
+        out,
+        "  letter bias: {:+.3} \u{b1} {:.3} (leans toward {lean})",
+        r.mean_bias, r.stderr
+    );
+    let _ = writeln!(
+        out,
+        "  at {gate_percent}%: {} of {} verdict(s) change once the order is averaged out",
+        r.flips, r.pairs
+    );
+    if r.shift_pp == 0 {
+        let why = if r.pairs < crate::decide::MIN_CALIBRATION_PAIRS {
+            format!("fewer than {} spans", crate::decide::MIN_CALIBRATION_PAIRS)
+        } else {
+            "within two standard errors of zero".to_owned()
+        };
+        let _ = write!(
+            out,
+            "  no correction supported ({why}); current memory.gateBias.{key} is {current}"
+        );
+    } else {
+        let _ = write!(
+            out,
+            "  suggested memory.gateBias.{key}: {} (current {current}); in ~/.plank/settings.json:\n    \"memory\": {{ \"gateBias\": {{ \"{key}\": {} }} }}",
+            r.shift_pp, r.shift_pp
+        );
+    }
+    out
+}
+
 fn headless_exit_code(guard_stopped: bool) -> u8 {
     if guard_stopped { GUARD_STOP_EXIT } else { 0 }
 }
@@ -22794,6 +22969,7 @@ mod tests {
             p,
             runner_up: Some((1 - index.min(1), 1.0 - p)),
             abstained: false,
+            letter_mass: 0.0,
         }
     }
 
@@ -33163,6 +33339,107 @@ or the user's next message aborts before its first token"
     }
 
     #[test]
+    fn the_gate_holds_a_yes_to_the_family_corrected_threshold() {
+        // 0.8 clears the raw 60%, but a calibrated +30 on ds4 moves the bar to
+        // 90%, and the same verdict is now a rejection.
+        let mut on = crate::settings::Settings::default();
+        on.memory.auto_extract = true;
+        on.memory.extract_every_n_turns = 1;
+        on.memory.gate = true;
+        on.memory.gate_percent = 60;
+        on.memory.gate_bias.ds4 = 30;
+        crate::settings::install_for_test(on);
+        let _restore = AutoExtractGuard;
+        let dir = scratch_dir("memgate-bias");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(0, 0.8)], asked);
+
+        assert!(!agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert_eq!(agent.memory_gate_percent, 90);
+        assert!(!agent.memory_jobs_pending());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A saved session of `turns` answered prompts, so `/memory calibrate`
+    /// has spans to ask about.
+    fn save_calibration_session(agent: &mut Agent<'_>, turns: usize) {
+        agent.session = Session::new();
+        for i in 0..turns {
+            agent.session.push(Message::user(format!("prompt {i}")));
+            agent
+                .session
+                .push(Message::assistant(format!("answer {i}")));
+        }
+        agent.store.save(&mut agent.session).unwrap();
+    }
+
+    #[test]
+    fn calibrate_asks_each_span_both_ways_and_suggests_the_bias() {
+        let _settings = disable_auto_extract_for_test();
+        let dir = scratch_dir("memgate-calibrate");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Per span: yes-as-A wins at 0.8, then no-as-A wins at 0.6, so
+        // P(yes) is 0.8 one way and 0.4 the other: a bias of +0.2 toward A.
+        let script: Vec<_> = (0..12)
+            .flat_map(|_| [verdict(0, 0.8), verdict(0, 0.6)])
+            .collect();
+        let mut agent = gate_agent(&dir, &cfg, script, asked.clone());
+        save_calibration_session(&mut agent, 12);
+
+        let mut lines = Vec::new();
+        let text = agent.gate_calibrate_command("12", &mut |l| lines.push(l.to_owned()));
+        assert_eq!(asked.lock().unwrap().len(), 24, "two asks per span");
+        assert_eq!(lines.len(), 12, "one progress line per span");
+        assert!(text.contains("12 span(s) asked both ways"), "{text}");
+        assert!(text.contains("letter bias: +0.200"), "{text}");
+        assert!(text.contains("suggested memory.gateBias.ds4: 20"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn calibrate_refuses_a_bad_count_and_an_empty_store() {
+        let _settings = disable_auto_extract_for_test();
+        let dir = scratch_dir("memgate-calibrate-empty");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(0, 0.8)], asked.clone());
+
+        let text = agent.gate_calibrate_command("zero", &mut |_| {});
+        assert!(text.starts_with("usage:"), "{text}");
+        let text = agent.gate_calibrate_command("", &mut |_| {});
+        assert!(text.contains("no saved ds4 sessions"), "{text}");
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "nothing asked without spans"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn calibration_text_explains_why_it_suggests_nothing() {
+        let few = crate::decide::bias_report(
+            &[crate::decide::OrderPair {
+                p_yes_ab: 0.9,
+                p_yes_ba: 0.5,
+            }],
+            0.6,
+        );
+        let text = gate_calibration_text("ds4", &few, 60, 3, 1, 0);
+        assert!(text.contains("1 dropped for thin letter mass"), "{text}");
+        assert!(
+            text.contains("no correction supported (fewer than 10 spans)"),
+            "{text}"
+        );
+        assert!(text.contains("memory.gateBias.ds4 is 3"), "{text}");
+
+        let none = crate::decide::bias_report(&[], 0.6);
+        let text = gate_calibration_text("qwen", &none, 60, 0, 0, 4);
+        assert!(text.contains("nothing usable to measure"), "{text}");
+    }
+
+    #[test]
     fn the_gate_lets_a_worthy_span_through() {
         let _gate = enable_memory_gate_for_test(60);
         let dir = scratch_dir("memgate-accept");
@@ -33186,6 +33463,7 @@ or the user's next message aborts before its first token"
             p: 0.52,
             runner_up: Some((0, 0.48)),
             abstained: true,
+            letter_mass: 0.0,
         };
         let mut agent = gate_agent(&dir, &cfg, vec![abstained], asked);
 

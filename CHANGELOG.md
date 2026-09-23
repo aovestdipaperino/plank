@@ -6,7 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`/memory calibrate [N]` and `memory.gateBias`.** The System-1 memory gate
+  always shows "yes" as answer A, and a model that leans toward a letter for
+  its own sake reads more "yes" than a span deserves, while its letter mass
+  still looks healthy. `/memory calibrate` asks the gate's question about up
+  to N saved turns (default 20) of the loaded family twice, the second time
+  with yes and no swapped, and reports the mean letter bias, its standard
+  error, how many verdicts it flips at the current `gatePercent`, and a
+  suggested `memory.gateBias.<family>` (`ds4`, `ds41`, `qwen`) in percentage
+  points, which the live gate adds to `gatePercent`. It runs offline rather
+  than in the gate because on DeepSeek the second ask re-prefills the span.
+  Nothing is written; the suggestion is copied into `settings.json` by hand.
+
+### Fixed
+
+- **`docs/MEMORY.md` had `memory.gatePercent` backwards.** It said a "yes"
+  above the threshold rejects the span; it is what lets the pass run.
+
 ### Changed
+
+- **`memory.minTurnSeconds` now defaults to 30** (was 120). Two minutes kept
+  most ordinary exchanges from ever reaching the extraction pass; thirty
+  seconds still skips the quick back-and-forth while letting a real turn of
+  work be read. A short turn still defers its span rather than discarding it.
 
 - **`turbo-debug-console` is now `tdk`.** The external debug console plank
   mirrors its raw model stream to was renamed upstream, so the install lines,

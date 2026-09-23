@@ -1068,8 +1068,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/memory",
-        args: "[log]",
-        desc: "edit user and project memory, or show the memory change log",
+        args: "[log|calibrate [N]]",
+        desc: "edit user and project memory, show the memory change log, or calibrate the memory gate",
     },
     SlashCommand {
         name: "/think",

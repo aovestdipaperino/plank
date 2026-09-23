@@ -1725,12 +1725,14 @@ mod tests {
             p: 0.9,
             runner_up: Some((1, 0.1)),
             abstained: false,
+            letter_mass: 0.0,
         };
         let no = crate::decide::RawVerdict {
             index: 1,
             p: 0.8,
             runner_up: Some((0, 0.2)),
             abstained: false,
+            letter_mass: 0.0,
         };
         let mut e = EchoEngine::new(4096);
         e.script_decisions(vec![yes, no]);
@@ -1753,6 +1755,7 @@ mod tests {
             p: 0.9,
             runner_up: None,
             abstained: false,
+            letter_mass: 0.0,
         };
         let mut e = EchoEngine::new(4096);
         e.script_decisions(vec![yes]);
@@ -1771,6 +1774,7 @@ mod tests {
             p: 0.9,
             runner_up: None,
             abstained: false,
+            letter_mass: 0.0,
         };
         let mut e = EchoEngine::new(4096);
         e.script_decisions(vec![v, v]);

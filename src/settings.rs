@@ -530,6 +530,10 @@ pub struct MemorySettings {
     /// runs anyway. `0` (the default) means a rejected span is finished
     /// immediately and never reconsidered. See `ExtractState::held_span_cap`.
     pub held_span_cap: u32,
+    /// Percentage points added to `gate_percent` for each model family, to
+    /// cancel that family's prior toward the letter "yes" is shown under.
+    /// Measured offline by `/memory calibrate`; all zero until then.
+    pub gate_bias: GateBias,
     /// Per-type character budgets for the rendered memory section.
     pub budgets: crate::memory::Budgets,
 }
@@ -539,11 +543,67 @@ impl Default for MemorySettings {
         Self {
             auto_extract: true,
             extract_every_n_turns: 1,
-            min_turn_seconds: 120,
+            min_turn_seconds: 30,
             gate: false,
             gate_percent: 60,
             held_span_cap: 0,
+            gate_bias: GateBias::default(),
             budgets: crate::memory::Budgets::default(),
+        }
+    }
+}
+
+impl MemorySettings {
+    /// The gate threshold, as a percent, for a model of `family`:
+    /// `gate_percent` moved by that family's calibrated letter bias and kept
+    /// within 0..=100.
+    #[must_use]
+    pub fn gate_threshold_percent(&self, family: crate::gguf::ModelFamily) -> u32 {
+        let t = i64::from(self.gate_percent) + i64::from(self.gate_bias.for_family(family));
+        // Clamped to 0..=100 on the line above, so the conversion cannot fail.
+        u32::try_from(t.clamp(0, 100)).unwrap_or(0)
+    }
+}
+
+/// Per-family letter-bias correction for the memory gate, in percentage points
+/// (`memory.gateBias`).
+///
+/// The gate asks its yes/no question with yes as A, always, and reads P(yes).
+/// A family with a prior toward A as such inflates that number, and the
+/// correction is the mean of that inflation measured by asking the same spans
+/// with the letters swapped (`/memory calibrate`, `decide::bias_report`).
+/// Measured per family because the prior belongs to the weights: a value
+/// calibrated on one family says nothing about another. Positive raises the
+/// bar. Bounded to ±[`GateBias::MAX_ABS`], far past any measured value, so a
+/// typo cannot switch the gate fully on or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GateBias {
+    pub ds4: i32,
+    pub ds41: i32,
+    pub qwen: i32,
+}
+
+impl GateBias {
+    /// Largest correction accepted from a settings file, either direction.
+    pub const MAX_ABS: i32 = 50;
+
+    /// The settings key a family's correction is stored under.
+    #[must_use]
+    pub fn key(family: crate::gguf::ModelFamily) -> &'static str {
+        match family {
+            crate::gguf::ModelFamily::Ds4 => "ds4",
+            crate::gguf::ModelFamily::Ds41 => "ds41",
+            crate::gguf::ModelFamily::Qwen => "qwen",
+        }
+    }
+
+    /// The correction for `family`.
+    #[must_use]
+    pub fn for_family(&self, family: crate::gguf::ModelFamily) -> i32 {
+        match family {
+            crate::gguf::ModelFamily::Ds4 => self.ds4,
+            crate::gguf::ModelFamily::Ds41 => self.ds41,
+            crate::gguf::ModelFamily::Qwen => self.qwen,
         }
     }
 }
@@ -901,6 +961,21 @@ impl Settings {
 
     /// The `agents` and `worktree` half of [`overlay`](Self::overlay), split out
     /// only to keep each function under the length lint.
+    /// `memory.gateBias`: per-family, signed, clamped to ±`GateBias::MAX_ABS`.
+    fn overlay_gate_bias(&mut self, root: &Json, origin: &crate::provenance::Origin) {
+        if let Some(b) = root.get("memory").and_then(|m| m.get("gateBias")) {
+            let set = |key: &str, field: &mut i32| {
+                if let Some(v) = num::<i32>(Some(b), key) {
+                    *field = v.clamp(-GateBias::MAX_ABS, GateBias::MAX_ABS);
+                }
+            };
+            set("ds4", &mut self.memory.gate_bias.ds4);
+            set("ds41", &mut self.memory.gate_bias.ds41);
+            set("qwen", &mut self.memory.gate_bias.qwen);
+            self.note("memory.gateBias", origin);
+        }
+    }
+
     fn overlay_agents_and_worktree(&mut self, root: &Json, origin: &crate::provenance::Origin) {
         let agents = root.get("agents");
         if let Some(v) = boolean(agents, "autoRoute") {
@@ -973,6 +1048,7 @@ impl Settings {
             self.memory.held_span_cap = v;
             self.note("memory.heldSpanCap", origin);
         }
+        self.overlay_gate_bias(root, origin);
         if let Some(b) = root.get("memory").and_then(|m| m.get("budgets")) {
             let set = |key: &str, field: &mut usize| {
                 if let Some(v) = num::<usize>(Some(b), key) {
@@ -1446,6 +1522,20 @@ impl Settings {
             upsert(m, "gate", Json::Bool(self.memory.gate));
             upsert(m, "gatePercent", unum(u64::from(self.memory.gate_percent)));
             upsert(m, "heldSpanCap", unum(u64::from(self.memory.held_span_cap)));
+            // Absent until calibrated, so an uncalibrated settings file does
+            // not grow three zeros nobody chose.
+            let b = self.memory.gate_bias;
+            upsert_opt(
+                m,
+                "gateBias",
+                (b != GateBias::default()).then(|| {
+                    Json::Obj(vec![
+                        ("ds4".to_string(), inum(b.ds4)),
+                        ("ds41".to_string(), inum(b.ds41)),
+                        ("qwen".to_string(), inum(b.qwen)),
+                    ])
+                }),
+            );
         }
         {
             let s = section(&mut root, "suggestions");
@@ -2567,11 +2657,11 @@ mod tests {
     }
 
     #[test]
-    fn memory_min_turn_seconds_defaults_to_two_minutes() {
+    fn memory_min_turn_seconds_defaults_to_thirty_seconds() {
         let s = Settings::default();
         assert_eq!(
-            s.memory.min_turn_seconds, 120,
-            "a turn shorter than two minutes must not trigger the pass by default"
+            s.memory.min_turn_seconds, 30,
+            "a turn shorter than thirty seconds must not trigger the pass by default"
         );
     }
 
@@ -2595,6 +2685,71 @@ mod tests {
     }
 
     #[test]
+    fn memory_gate_bias_defaults_to_zero_and_leaves_the_threshold_alone() {
+        let s = Settings::default();
+        assert_eq!(s.memory.gate_bias, GateBias::default());
+        for f in [
+            crate::gguf::ModelFamily::Ds4,
+            crate::gguf::ModelFamily::Ds41,
+            crate::gguf::ModelFamily::Qwen,
+        ] {
+            assert_eq!(s.memory.gate_threshold_percent(f), 60);
+        }
+    }
+
+    #[test]
+    fn memory_gate_bias_overlay_is_per_family_signed_and_clamped() {
+        let mut s = Settings::default();
+        s.overlay(r#"{"memory":{"gateBias":{"ds4":7,"qwen":-4,"ds41":500}}}"#);
+        assert_eq!(s.memory.gate_bias.ds4, 7);
+        assert_eq!(s.memory.gate_bias.qwen, -4);
+        assert_eq!(s.memory.gate_bias.ds41, GateBias::MAX_ABS);
+        assert_eq!(
+            s.memory
+                .gate_threshold_percent(crate::gguf::ModelFamily::Ds4),
+            67
+        );
+        assert_eq!(
+            s.memory
+                .gate_threshold_percent(crate::gguf::ModelFamily::Qwen),
+            56
+        );
+        // 60 + 50 clamps to 100, not 110.
+        assert_eq!(
+            s.memory
+                .gate_threshold_percent(crate::gguf::ModelFamily::Ds41),
+            100
+        );
+    }
+
+    #[test]
+    fn memory_gate_bias_round_trips_through_save_to_and_is_absent_when_zero() {
+        let dir = std::env::temp_dir().join(format!(
+            "plank-gate-bias-cfg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let s = Settings::default();
+        s.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("gateBias"), "{text}");
+
+        let mut s = Settings::default();
+        s.memory.gate_bias.ds4 = 7;
+        s.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert_eq!(reloaded.memory.gate_bias.ds4, 7);
+        assert_eq!(reloaded.memory.gate_bias.qwen, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn memory_min_turn_seconds_round_trips_through_save_to() {
         let dir = std::env::temp_dir().join(format!(
             "plank-memory-floor-cfg-{}-{:?}",
@@ -2605,13 +2760,13 @@ mod tests {
         let path = dir.join("settings.json");
 
         let mut s = Settings::default();
-        s.memory.min_turn_seconds = 30; // the non-default value
+        s.memory.min_turn_seconds = 90; // the non-default value
         s.save_to(&path).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         let mut reloaded = Settings::default();
         reloaded.overlay(&text);
-        assert_eq!(reloaded.memory.min_turn_seconds, 30);
+        assert_eq!(reloaded.memory.min_turn_seconds, 90);
 
         std::fs::remove_dir_all(&dir).ok();
     }

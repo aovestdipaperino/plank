@@ -43,7 +43,7 @@ the reason a memory is lost.
 
 **Short turns no longer trigger the memory pass.** A four-second exchange is
 rarely worth a snapshot, a prefill, a generation and a restore, so
-`memory.minTurnSeconds` (120 by default) skips it. The turn's span is not
+`memory.minTurnSeconds` (30 by default) skips it. The turn's span is not
 thrown away, just deferred: the next turn that clears the floor reads the
 short ones too.
 

@@ -47,6 +47,7 @@ See [Sessions](06-sessions.md).
 | `/remember [user] <fact>` | append a dated entry to project memory (or user memory with `user`) |
 | `/memory` | open user and project memory as one buffer in the built-in editor; edits are split back to the right file on save |
 | `/memory log` | print the recent entries of the memory audit log: what the model or the extraction pass added, changed or removed, and why |
+| `/memory calibrate [N]` | ask the memory gate's question about up to N saved turns (default 20) twice, with yes and no swapped, and suggest a `memory.gateBias` value that cancels the model's lean toward one letter |
 | `/forget <pattern>` | delete every memory entry whose text contains the pattern, case-insensitively, after previewing the matches and asking |
 | `/init` | have the model read the repo and generate an `AGENTS.md` |
 

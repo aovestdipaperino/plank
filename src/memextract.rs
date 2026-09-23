@@ -406,6 +406,39 @@ fn truncate_to(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
+/// Splits a saved transcript into the turn-sized spans `/memory calibrate`
+/// asks the gate about, each rendered as the gate would see it
+/// ([`render_excerpt`]).
+///
+/// A span runs from one real user prompt up to the next one, so it holds the
+/// prompt, the answer and every tool round in between — the shape of what
+/// the live gate is handed at a turn end with `extractEveryNTurns` at 1.
+/// Tool results are user-role messages but not prompts, so they never start
+/// a span. Anything before the first prompt (a compaction summary, say) is
+/// skipped, and a span with no answer in it is dropped: the gate is never
+/// asked about a prompt alone.
+#[must_use]
+pub fn calibration_spans(transcript: &[Message]) -> Vec<String> {
+    let starts: Vec<usize> = transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::User && !crate::branch::is_tool_user(m))
+        .map(|(i, _)| i)
+        .collect();
+    starts
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &from)| {
+            let to = starts.get(k + 1).copied().unwrap_or(transcript.len());
+            let slice = &transcript[from..to];
+            slice
+                .iter()
+                .any(|m| m.role == Role::Assistant)
+                .then(|| render_excerpt(slice))
+        })
+        .collect()
+}
+
 /// Renders `slice` as the conversation excerpt, bounded by
 /// [`EXCERPT_MAX_BYTES`]: tool-result bodies become placeholders, and when
 /// the lines still exceed the cap the oldest messages are dropped first, with
@@ -510,6 +543,30 @@ pub fn current_entries(cwd: &std::path::Path) -> Vec<(Scope, Entry)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calibration_spans_split_at_real_prompts_and_skip_unanswered_ones() {
+        let t = vec![
+            Message::assistant("a summary from before the first prompt"),
+            Message::user("first prompt"),
+            Message::assistant("first answer"),
+            Message::user("<tool_result>output</tool_result>"),
+            Message::assistant("after the tool"),
+            Message::user("second prompt"),
+            Message::assistant("second answer"),
+            Message::user("third prompt, never answered"),
+        ];
+        let spans = calibration_spans(&t);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert!(spans[0].contains("first prompt"));
+        assert!(
+            spans[0].contains("after the tool"),
+            "tool rounds stay in their turn"
+        );
+        assert!(!spans[0].contains("second prompt"));
+        assert!(!spans[0].contains("summary"));
+        assert!(spans[1].contains("second answer"));
+    }
 
     /// A turn comfortably over any floor these tests set.
     const LONG: std::time::Duration = std::time::Duration::from_secs(600);

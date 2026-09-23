@@ -347,7 +347,7 @@ pub fn canonicalize(path: &[Message], off: &[OffNode]) -> Vec<OffNode> {
 
 /// Mirror of `session`'s tool-result detection (that helper is crate-private
 /// to its module's callers).
-fn is_tool_user(m: &Message) -> bool {
+pub(crate) fn is_tool_user(m: &Message) -> bool {
     let t = m.text.trim();
     m.role == Role::User
         && (t.starts_with("<tool_result>")

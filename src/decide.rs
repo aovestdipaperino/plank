@@ -55,6 +55,15 @@ impl Question {
         Self::choice(text, &["yes", "no"])
     }
 
+    /// The same yes/no question with the letters swapped: `no` is A and `yes`
+    /// is B. Only the letter-order calibration asks this (see [`OrderPair`]);
+    /// the live gate always asks [`boolean`](Self::boolean), so its `p` keeps
+    /// reading as "probability of yes".
+    #[must_use]
+    pub fn boolean_swapped(text: &str) -> Self {
+        Self::choice(text, &["no", "yes"])
+    }
+
     /// A multiple-choice question. Options beyond [`LETTERS`] are dropped
     /// rather than silently mis-lettered.
     #[must_use]
@@ -80,6 +89,12 @@ pub struct RawVerdict {
     /// True when the answer must not be acted on — either the top letter fell
     /// below the floor, or the letters together held too little mass.
     pub abstained: bool,
+    /// Share of the model's total probability that sat on the answer letters,
+    /// as passed to [`score`]; `0.0` when unknown. Carried on the verdict so a
+    /// consumer that reads the probabilities themselves (the letter-order
+    /// calibration, [`OrderPair::from_verdicts`]) can drop a ranking read off
+    /// noise without re-deriving why `abstained` was set.
+    pub letter_mass: f32,
 }
 
 /// Softmax over `logprobs` (one per option, in option order) and the
@@ -96,6 +111,7 @@ pub fn score(logprobs: &[f32], floor: f32, letter_mass: f32) -> RawVerdict {
         p: 0.0,
         runner_up: None,
         abstained: true,
+        letter_mass: 0.0,
     };
     if logprobs.is_empty() || logprobs.iter().any(|v| !v.is_finite()) {
         return abstain;
@@ -118,6 +134,7 @@ pub fn score(logprobs: &[f32], floor: f32, letter_mass: f32) -> RawVerdict {
         p,
         runner_up,
         abstained: p < floor || thin,
+        letter_mass,
     }
 }
 
@@ -211,6 +228,161 @@ pub fn render_question(q: &Question) -> String {
     out
 }
 
+/// One yes/no question asked twice, once as [`Question::boolean`] (yes = A)
+/// and once as [`Question::boolean_swapped`] (yes = B), reduced to the
+/// probability of "yes" each time.
+///
+/// `letter_mass` says whether the model answered with a letter; it cannot say
+/// why it picked the one it did. A model with a prior toward a letter as such
+/// (Zheng et al., "Large Language Models Are Not Robust Multiple Choice
+/// Selectors", ICLR 2024) can hold nearly all its mass on the letters and
+/// still lean toward A partly because it is A. Swapping the order moves that
+/// lean from "yes" to "no", so half the difference between the two asks is
+/// the letter bias and their mean is the answer with the bias averaged out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OrderPair {
+    /// P(yes) when yes was A — what the live gate reads.
+    pub p_yes_ab: f32,
+    /// P(yes) when yes was B.
+    pub p_yes_ba: f32,
+}
+
+impl OrderPair {
+    /// Builds a pair from the two verdicts, or `None` when either one carries
+    /// no usable probability for "yes": a degenerate verdict with no runner-up
+    /// (the early abstention `score` returns on bad logprobs), or letter mass
+    /// too thin for the ranking to mean anything.
+    #[must_use]
+    pub fn from_verdicts(ab: &RawVerdict, ba: &RawVerdict) -> Option<Self> {
+        Some(Self {
+            p_yes_ab: p_of(ab, 0)?,
+            p_yes_ba: p_of(ba, 1)?,
+        })
+    }
+
+    /// The letter bias on this question, in probability: positive when the
+    /// model leans toward A, whatever A means.
+    #[must_use]
+    pub fn bias(&self) -> f32 {
+        (self.p_yes_ab - self.p_yes_ba) / 2.0
+    }
+
+    /// P(yes) with the letter bias averaged out.
+    #[must_use]
+    pub fn debiased(&self) -> f32 {
+        f32::midpoint(self.p_yes_ab, self.p_yes_ba)
+    }
+}
+
+/// The normalised probability of option `i` on a verdict, when it carries one.
+fn p_of(v: &RawVerdict, i: usize) -> Option<f32> {
+    if v.letter_mass > 0.0 && v.letter_mass < MIN_LETTER_MASS {
+        return None;
+    }
+    let (ru_i, ru_p) = v.runner_up?;
+    if v.index == i {
+        Some(v.p)
+    } else if ru_i == i {
+        Some(ru_p)
+    } else {
+        None
+    }
+}
+
+/// Fewer usable pairs than this and [`bias_report`] suggests no shift at all:
+/// a mean over a handful of spans says more about those spans than about the
+/// model.
+pub const MIN_CALIBRATION_PAIRS: usize = 10;
+
+/// What a calibration run measured, and the threshold shift it supports.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BiasReport {
+    /// Usable pairs the numbers below are computed over.
+    pub pairs: usize,
+    /// Mean P(yes) as the live gate asks it (yes = A).
+    pub mean_ab: f32,
+    /// Mean P(yes) with the letters swapped (yes = B).
+    pub mean_ba: f32,
+    /// Mean letter bias ([`OrderPair::bias`]); positive leans toward A.
+    pub mean_bias: f32,
+    /// Standard error of `mean_bias`; `0.0` below two pairs.
+    pub stderr: f32,
+    /// Pairs whose gate verdict at the threshold changes once the bias is
+    /// averaged out: as-asked says one thing, debiased the other.
+    pub flips: usize,
+    /// Percentage points to add to the gate threshold for this family, so
+    /// that comparing the as-asked P(yes) against it approximates comparing
+    /// the debiased P(yes) against the unshifted threshold. `0` when the run
+    /// is too small ([`MIN_CALIBRATION_PAIRS`]) or the bias is within two
+    /// standard errors of zero.
+    pub shift_pp: i32,
+}
+
+/// Summarises a calibration run against the gate threshold `threshold`
+/// (a probability, `0.6` for the default 60 percent).
+///
+/// The shift is the mean bias itself, not something fitted to the flips:
+/// the live gate reads `p_yes_ab`, and `p_yes_ab - bias` is the debiased
+/// answer, so asking `p_yes_ab >= t + bias` is asking `debiased >= t`. The
+/// flips are reported so the size of the effect is visible in verdicts, the
+/// unit that matters, rather than only in probability.
+#[must_use]
+pub fn bias_report(pairs: &[OrderPair], threshold: f32) -> BiasReport {
+    let n = pairs.len();
+    if n == 0 {
+        return BiasReport {
+            pairs: 0,
+            mean_ab: 0.0,
+            mean_ba: 0.0,
+            mean_bias: 0.0,
+            stderr: 0.0,
+            flips: 0,
+            shift_pp: 0,
+        };
+    }
+    // Accumulated in f64: the run is small, but the variance subtracts two
+    // close quantities and f32 would lose the digits that decide the shift.
+    #[allow(clippy::cast_precision_loss)] // a run is at most a few hundred pairs
+    let nf = n as f64;
+    let mean =
+        |f: &dyn Fn(&OrderPair) -> f32| pairs.iter().map(|p| f64::from(f(p))).sum::<f64>() / nf;
+    let mean_ab = mean(&|p| p.p_yes_ab);
+    let mean_ba = mean(&|p| p.p_yes_ba);
+    let mean_bias = mean(&OrderPair::bias);
+    let stderr = if n < 2 {
+        0.0
+    } else {
+        let var = pairs
+            .iter()
+            .map(|p| (f64::from(p.bias()) - mean_bias).powi(2))
+            .sum::<f64>()
+            / (nf - 1.0);
+        (var / nf).sqrt()
+    };
+    let flips = pairs
+        .iter()
+        .filter(|p| (p.p_yes_ab >= threshold) != (p.debiased() >= threshold))
+        .count();
+    let significant = n >= MIN_CALIBRATION_PAIRS && mean_bias.abs() > 2.0 * stderr;
+    // |mean_bias| <= 0.5, so the rounded percentage fits an i32 with room.
+    #[allow(clippy::cast_possible_truncation)]
+    let shift_pp = if significant {
+        (mean_bias * 100.0).round() as i32
+    } else {
+        0
+    };
+    #[allow(clippy::cast_possible_truncation)] // probabilities, back to f32
+    BiasReport {
+        pairs: n,
+        mean_ab: mean_ab as f32,
+        mean_ba: mean_ba as f32,
+        mean_bias: mean_bias as f32,
+        stderr: stderr as f32,
+        flips,
+        shift_pp,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +448,114 @@ mod tests {
         assert!(v.abstained);
     }
 
+    fn pair(ab: f32, ba: f32) -> OrderPair {
+        OrderPair {
+            p_yes_ab: ab,
+            p_yes_ba: ba,
+        }
+    }
+
+    #[test]
+    fn boolean_swapped_puts_yes_on_b() {
+        let q = Question::boolean_swapped("worth it?");
+        assert_eq!(q.options, vec!["no".to_string(), "yes".to_string()]);
+        let text = render_question(&q);
+        assert!(text.contains("A. no\nB. yes\n"), "{text}");
+    }
+
+    #[test]
+    fn order_pair_reads_yes_from_a_then_from_b() {
+        // As asked: yes = A wins at 0.8. Swapped: yes = B, which lost at 0.4.
+        let ab = score(&[-0.2, -1.6], 0.0, 0.9);
+        let ba = score(&[-0.5, -0.9], 0.0, 0.9);
+        let p = OrderPair::from_verdicts(&ab, &ba).expect("both usable");
+        assert!((p.p_yes_ab - ab.p).abs() < 1e-6);
+        assert!((p.p_yes_ba - ba.runner_up.unwrap().1).abs() < 1e-6);
+        assert!(p.p_yes_ab > p.p_yes_ba, "{p:?}");
+    }
+
+    #[test]
+    fn order_pair_bias_is_half_the_difference_and_debiased_the_mean() {
+        let p = pair(0.8, 0.6);
+        assert!((p.bias() - 0.1).abs() < 1e-6);
+        assert!((p.debiased() - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn order_pair_drops_thin_mass_and_degenerate_verdicts() {
+        let good = score(&[-0.2, -1.6], 0.0, 0.9);
+        let thin = score(&[-3.0, -4.0], 0.0, 0.05);
+        let degenerate = score(&[], 0.0, 0.0);
+        assert!(OrderPair::from_verdicts(&good, &thin).is_none());
+        assert!(OrderPair::from_verdicts(&thin, &good).is_none());
+        assert!(OrderPair::from_verdicts(&degenerate, &good).is_none());
+    }
+
+    #[test]
+    fn order_pair_keeps_a_near_tie_the_gate_would_abstain_on() {
+        // p just above one half sits under the abstain floor, so the live gate
+        // would not act on it; the calibration still needs the number.
+        let ab = score(&[-0.68, -0.71], DEFAULT_ABSTAIN_FLOOR, 0.9);
+        assert!(ab.abstained);
+        assert!(OrderPair::from_verdicts(&ab, &ab).is_some());
+    }
+
+    #[test]
+    fn bias_report_suggests_the_mean_bias_when_it_is_significant() {
+        let pairs: Vec<OrderPair> = (0..20)
+            .map(|i| {
+                let jitter = if i % 2 == 0 { 0.01 } else { -0.01 };
+                pair(0.70 + jitter, 0.56 + jitter)
+            })
+            .collect();
+        let r = bias_report(&pairs, 0.6);
+        assert_eq!(r.pairs, 20);
+        assert!((r.mean_bias - 0.07).abs() < 1e-4, "{r:?}");
+        assert_eq!(r.shift_pp, 7);
+        // Every as-asked 0.69/0.71 clears 0.6, every debiased 0.62/0.64 too.
+        assert_eq!(r.flips, 0);
+    }
+
+    #[test]
+    fn bias_report_counts_verdicts_the_bias_flips() {
+        // 0.66 as asked clears 0.6; debiased (0.66 + 0.50) / 2 = 0.58 does not.
+        let pairs = vec![pair(0.66, 0.50); 12];
+        let r = bias_report(&pairs, 0.6);
+        assert_eq!(r.flips, 12);
+    }
+
+    #[test]
+    fn bias_report_suggests_nothing_from_a_small_run() {
+        let pairs = vec![pair(0.9, 0.5); MIN_CALIBRATION_PAIRS - 1];
+        let r = bias_report(&pairs, 0.6);
+        assert!(r.mean_bias > 0.1);
+        assert_eq!(r.shift_pp, 0, "too few pairs to act on");
+    }
+
+    #[test]
+    fn bias_report_suggests_nothing_when_the_bias_is_noise() {
+        // Symmetric scatter around zero bias.
+        let pairs: Vec<OrderPair> = (0..20)
+            .map(|i| {
+                if i % 2 == 0 {
+                    pair(0.8, 0.6)
+                } else {
+                    pair(0.6, 0.8)
+                }
+            })
+            .collect();
+        let r = bias_report(&pairs, 0.6);
+        assert!(r.mean_bias.abs() < 1e-6);
+        assert_eq!(r.shift_pp, 0);
+    }
+
+    #[test]
+    fn bias_report_of_nothing_is_all_zero() {
+        let r = bias_report(&[], 0.6);
+        assert_eq!(r.pairs, 0);
+        assert_eq!(r.shift_pp, 0);
+    }
+
     #[test]
     fn typed_maps_the_index_back_to_the_enum() {
         let raw = score(&[-0.05, -3.0], DEFAULT_ABSTAIN_FLOOR, 0.0);
@@ -291,6 +571,7 @@ mod tests {
             p: 1.0,
             runner_up: None,
             abstained: false,
+            letter_mass: 0.0,
         };
         assert!(typed::<Worthy>(&raw).is_none());
     }

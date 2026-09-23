@@ -279,7 +279,7 @@ interrupted queues nothing. <code>memory.extractEveryNTurns</code> thins
 it out, and <code>"memory": {"autoExtract": false}</code> in
 <code>settings.json</code> turns it off entirely.</p>
 <p>Two cheaper gates sit in front of it.
-<code>memory.minTurnSeconds</code> (120 by default) skips the pass after
+<code>memory.minTurnSeconds</code> (30 by default) skips the pass after
 a turn too short to be worth one, and the short turn's span is deferred
 rather than discarded, so the next turn that clears the floor reads it
 too. <code>memory.gate</code> goes further and asks the model itself, as
@@ -292,8 +292,15 @@ cannot answer typed questions at all, the span is extracted as though
 the gate were not there. A gate that is unsure is never the reason a
 memory is lost. With <code>memory.heldSpanCap</code> above zero a
 rejected span is held and re-judged as part of a larger one later,
-instead of being retired on the spot. The full design, including what
-each failure mode looks like, is in <a
+instead of being retired on the spot. The gate always shows "yes" as
+answer A, and models tend to lean toward a letter for its own sake, so
+before trusting the gate run <code>/memory calibrate</code>: it asks the
+same question about your saved turns with yes and no swapped, measures
+how far the answer follows the letter, and suggests a
+<code>memory.gateBias</code> value for the loaded model family that
+moves the threshold to cancel it. It changes nothing by itself; you copy
+the value into <code>settings.json</code>. The full design, including
+what each failure mode looks like, is in <a
 href="https://github.com/aovestdipaperino/plank/blob/main/docs/MEMORY.md"><code>docs/MEMORY.md</code></a>.</p>
 <h2 id="compaction">Compaction</h2>
 <p>When the conversation approaches the window, plank reclaims space in

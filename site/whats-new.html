@@ -174,7 +174,7 @@ cannot answer at all, the pass runs anyway. A gate that is not certain
 is never allowed to be the reason a memory is lost.</p>
 <p><strong>Short turns no longer trigger the memory pass.</strong> A
 four-second exchange is rarely worth a snapshot, a prefill, a generation
-and a restore, so <code>memory.minTurnSeconds</code> (120 by default)
+and a restore, so <code>memory.minTurnSeconds</code> (30 by default)
 skips it. The turn's span is not thrown away, just deferred: the next
 turn that clears the floor reads the short ones too.</p>
 <p><strong>The prompt stays green while plank works in the
