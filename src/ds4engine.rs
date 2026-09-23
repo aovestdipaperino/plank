@@ -3828,8 +3828,15 @@ mod tests {
         // Speculative decoding is irrelevant to a decision — nothing is
         // generated — so turn it off rather than making whoever runs this
         // test supply a draft checkpoint.
+        //
+        // `PLANK_TEST_SSD_STREAMING=1` additionally turns on SSD streaming,
+        // which a model too large for the machine needs to open at all — on a
+        // 128 GiB box V4.1 refuses with "needs 155.55 GiB before the expert
+        // cache; safe budget 107.52 GiB". Off by default because a model that
+        // fits should not pay for streaming.
         let tuning = crate::config::EngineTuning {
             mtp: false,
+            ssd_streaming: std::env::var_os("PLANK_TEST_SSD_STREAMING").is_some(),
             ..Default::default()
         };
         let model = super::Ds4Model::open_shared(
