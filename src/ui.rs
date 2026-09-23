@@ -5484,6 +5484,12 @@ impl Agent<'_> {
             compact::microcompact(&mut self.session.transcript, budget_tokens, &mut |s| {
                 engine.count_tokens(s)
             });
+        if cleared > 0 {
+            // Rewrites tool-result text in place without changing the
+            // message count, so the depth check in `current_suggestion`
+            // would not catch a suggestion made stale by this edit.
+            self.clear_suggestion();
+        }
         cleared
     }
 
@@ -5518,6 +5524,10 @@ impl Agent<'_> {
             return;
         }
         self.payload_dirty = true;
+        // Rewrites the last message's text in place without changing the
+        // transcript length, which the depth check in `current_suggestion`
+        // cannot see.
+        self.clear_suggestion();
         crate::engine::kv_debug(|| {
             format!("guard: stubbed {before}B of stopped reasoning down to {after}B")
         });
@@ -5656,6 +5666,10 @@ impl Agent<'_> {
         // — the ladder would be permanently dead from the first full compaction
         // onward, the moment it is most needed.
         self.discard_ladder();
+        // The rebuilt transcript can coincidentally land at the same length as
+        // before (summary + tail vs. the original span), which the depth
+        // check in `current_suggestion` cannot see.
+        self.clear_suggestion();
     }
 
     /// The `trigger` value compaction hooks receive: `manual` for a user-driven
@@ -6242,6 +6256,7 @@ impl Agent<'_> {
     /// the screen.
     fn reset_session_state(&mut self) {
         self.discard_ladder();
+        self.clear_suggestion();
         self.session = Session::new();
         self.extract_state.reset_to(0);
         // A new session, a new name — minted here for the same reason
@@ -7257,6 +7272,7 @@ impl Agent<'_> {
         // snapshot of the one being discarded, and the payload on disk no
         // longer matches (same as `/clear` and `/switch`).
         self.discard_ladder();
+        self.clear_suggestion();
         self.payload_dirty = true;
         crate::checkpoint::restore_transcript(&mut self.session, &cp);
         self.console_seen = self.console_seen.min(self.session.transcript.len());
@@ -14990,6 +15006,28 @@ impl Agent<'_> {
         }
     }
 
+    /// Forgets any offered suggestion.
+    fn clear_suggestion(&mut self) {
+        self.suggestion = None;
+    }
+
+    /// The suggestion to offer right now, or `None`.
+    ///
+    /// Depth-checked on every read rather than invalidated by every mutation
+    /// site: a suggestion generated against a different transcript is stale
+    /// even if no explicit clear ran, and checking here means a new
+    /// transcript-moving path cannot forget to invalidate. The explicit
+    /// `clear_suggestion` calls remain for the paths that rewrite history
+    /// *without* changing its length.
+    // Consumed by Task 7. Remove this allow there.
+    #[allow(dead_code)]
+    fn current_suggestion(&self) -> Option<&str> {
+        self.suggestion
+            .as_ref()
+            .filter(|s| s.depth == self.session.transcript.len())
+            .map(|s| s.text.as_str())
+    }
+
     /// The prompt a job's generation runs, with the engine's KV positioned
     /// for it. A retry with a snapshot restores it and re-issues the stored
     /// prompt byte for byte, so the KV is reused to its last token. A first
@@ -21849,6 +21887,44 @@ mod tests {
             !agent.suggestion_pending,
             "an interrupted turn is not a finished one"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_suggestion_is_dropped_when_the_transcript_moves() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-stale");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.suggestion = Some(crate::suggest::Suggestion {
+            text: "run the tests".to_string(),
+            depth: agent.session.transcript.len(),
+        });
+        assert_eq!(agent.current_suggestion(), Some("run the tests"));
+
+        agent.session.push(Message::user("something else"));
+        assert_eq!(
+            agent.current_suggestion(),
+            None,
+            "a guess about a conversation that has since moved is not a suggestion"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clearing_the_session_clears_the_suggestion() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-clear");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.suggestion = Some(crate::suggest::Suggestion {
+            text: "run the tests".to_string(),
+            depth: 0,
+        });
+
+        agent.clear_suggestion();
+        assert!(agent.suggestion.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
