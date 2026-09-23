@@ -24,6 +24,7 @@ pub mod context;
 pub mod ctxreport;
 pub mod cursor;
 pub mod debugmirror;
+pub mod decide;
 /// Document ingestion for the `read` tool (PDF → Markdown). Always compiled so
 /// the extension routing is CI-tested; the conversion itself needs `docparse`.
 pub mod doc;
