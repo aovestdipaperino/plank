@@ -82,7 +82,7 @@ See [Extending plank](09-extending.md).
 |---|---|
 | `/config` | open the interactive settings form |
 | `/config <section>.<key> <value>` | set one setting, e.g. `/config ui.showThinking false` |
-| `/debug [on\|off]` | override the `--debug` switch: mirror the raw model stream to a running `turbo-debug-console` (on connects and backfills at once); bare `/debug` reports the state |
+| `/debug [on\|off]` | override the `--debug` switch: mirror the raw model stream to a running `tdk` (on connects and backfills at once); bare `/debug` reports the state |
 | `/power <1..100>` | cap GPU power draw for this run; shown as `(local ⚡60%)` in the status bar |
 | `/mtp [on\|off]` | turn speculative decoding (multi-token prediction) on or off for this session; bare `/mtp` reports the state |
 | `/temp [0..100]` | set the sampling temperature; refused while `/mtp` is on, which pins it at 0 |

@@ -439,7 +439,7 @@ one gets its own window, `plank:<session>:subagent-<n>`, numbered in the order t
 start. A fan-out's slots are readable side by side instead of interleaved into a
 single stream, and each window retires when its sub-agent finishes. Both shapes are
 covered: the serial sidechain a single `agent` call runs, and the concurrent
-fan-out of a whole block. Needs turbo-debug-console 0.2.1 or newer.
+fan-out of a whole block. Needs tdk 0.2.1 or newer.
 
 🧊 **A malformed tool call no longer freezes the debug console.** One bad DSML
 stanza used to kill the window for the rest of the session: it rendered nothing

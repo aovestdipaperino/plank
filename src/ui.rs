@@ -10078,7 +10078,7 @@ the original is frozen and listed in /tree"
         if crate::debugmirror::parent_connected() {
             "debug console mirror on (connected)".to_owned()
         } else {
-            "debug console mirror on (no turbo-debug-console running; will connect when one is)"
+            "debug console mirror on (no tdk running; will connect when one is)"
                 .to_owned()
         }
     }

@@ -22,7 +22,7 @@ Other sources, by symptom:
 
 - **Model stream looks wrong** (thinking leaking, banners misplaced, tool call
   not detected): run with `--debug` and mirror the raw stream to a
-  turbo-debug-console, then compare against what `viz::StreamRenderer`
+  tdk, then compare against what `viz::StreamRenderer`
   produced. `docs/LOOP-FINDINGS.md` catalogs the known looping shapes.
 - **Turn-level behavior** (rounds, guards, compaction): `--trace`.
 - **Hooks not firing:** start with `/hooks`, which lists what actually

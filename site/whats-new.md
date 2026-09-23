@@ -496,7 +496,7 @@ told you it had handed off, and everything after that happened somewhere you
 could not see. The debug console now gives each sub-agent its own window,
 titled `plank:<session>:subagent-<n>` and numbered in the order they start.
 
-![Four turbo-debug-console windows tiled: the parent session plank:sassy-washington bottom-left summarising both results, and subagent-1 and subagent-2 on the right, each streaming its own Python and its own answer](/assets/subagent-consoles.png)
+![Four tdk windows tiled: the parent session plank:sassy-washington bottom-left summarising both results, and subagent-1 and subagent-2 on the right, each streaming its own Python and its own answer](/assets/subagent-consoles.png)
 
 When a block of `agent` calls fans out, the slots run concurrently and you can
 read them side by side — above, two sub-agents working the same question in
@@ -509,7 +509,7 @@ While fixing that, one long-standing annoyance went with it: a malformed tool
 call used to freeze a console window for the rest of the session, so it sat
 there showing nothing while plank quietly recovered and carried on. It now
 prints the error and keeps going. Both need
-[turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console)
+[tdk](https://github.com/aovestdipaperino/tdk)
 0.2.1 or newer.
 
 **The footer counts what you have changed.** The TUI's top row has always told
@@ -533,17 +533,17 @@ See [Slash commands](/guide/04-slash-commands.html).
 `showThinking` off the scrollback stays about the answer — but the reasoning is
 still worth watching while it happens, and a log file only tells you afterwards.
 plank mirrors its whole raw model stream to
-[turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console), a
+[tdk](https://github.com/aovestdipaperino/tdk), a
 text-mode viewer that renders it in its own window: thinking dimmed above the
 answer, code highlighted, tool calls as banners.
 
-![turbo-debug-console showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein](/assets/debug-console.png)
+![tdk showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein](/assets/debug-console.png)
 
 Each session gets a window titled `plank:<session-name>`, matching the name above
 your prompt, and the window and its scrollback survive plank exiting — restart and
 the new run appends below a `-- reconnected --` rule. It is entirely optional:
 with nothing listening plank connects to nothing, says nothing, and behaves
-exactly as it always has. `brew install aovestdipaperino/tap/turbo-debug-console`.
+exactly as it always has. `brew install aovestdipaperino/tap/tdk`.
 
 **plank tells you where every setting came from.** Settings arrive from five
 layers — built-in defaults, plugins, `~/.plank`, the project's `./.plank`, and

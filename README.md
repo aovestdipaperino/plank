@@ -158,20 +158,20 @@ Long turns end with a native macOS notification — your prompt as the headline 
 
 `ui.showThinking` controls whether the model's reasoning is rendered in the scrollback. It is **off by default**: the thinking is usually noise once you trust the answer, and hiding it keeps the transcript readable.
 
-Hiding it does not have to mean losing it. Start plank with `--debug` and, while `showThinking` is off, it mirrors its whole raw model stream to [turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console), a text-mode viewer that renders it in its own window, so the reasoning is one glance away instead of gone:
+Hiding it does not have to mean losing it. Start plank with `--debug` and, while `showThinking` is off, it mirrors its whole raw model stream to [tdk](https://github.com/aovestdipaperino/tdk), a text-mode viewer that renders it in its own window, so the reasoning is one glance away instead of gone:
 
 <p align="center">
-  <img src="assets/debug-console.png" alt="turbo-debug-console showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein" width="700">
+  <img src="assets/debug-console.png" alt="tdk showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein" width="700">
 </p>
 
 Install it and leave it running; a `plank --debug` finds it on its own:
 
 ```sh
-brew install aovestdipaperino/tap/turbo-debug-console
-turbo-debug-console
+brew install aovestdipaperino/tap/tdk
+tdk
 ```
 
-`cargo install turbo-debug-console` works too. It listens on port 7878, and each plank session gets its own window titled `plank:<session-name>`, matching the session name plank shows above the prompt. Sessions are reconnectable: the window and its scrollback survive plank exiting, so restarting plank appends the new run below a `-- reconnected --` rule instead of losing the old one.
+`cargo install tdk` works too. It listens on port 7878, and each plank session gets its own window titled `plank:<session-name>`, matching the session name plank shows above the prompt. Sessions are reconnectable: the window and its scrollback survive plank exiting, so restarting plank appends the new run below a `-- reconnected --` rule instead of losing the old one.
 
 The console is entirely optional and plank never depends on it. Without `--debug` plank does not even look for one: no probe, no connection, nothing sent. With it, if nothing is listening, plank connects to nothing, says nothing, and behaves exactly as it always has. If you close the console mid-turn, the mirror is dropped and the turn carries on. Turning `showThinking` back on disconnects it, since the reasoning is back in the scrollback where you can already see it.
 

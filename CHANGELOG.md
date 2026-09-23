@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`turbo-debug-console` is now `tdk`.** The external debug console plank
+  mirrors its raw model stream to was renamed upstream, so the install lines,
+  the repository link, the binary name and every mention in the docs and the
+  `--debug` help follow it: `brew install aovestdipaperino/tap/tdk`,
+  `cargo install tdk`, then `tdk`. Nothing about the protocol or the port
+  changed, and the `turbo-debug-client` crate plank links against keeps its
+  name. Entries below this one predate the rename and are left as they were.
+
 ## [5.3.0] - 2026-09-23
 
 ### Added

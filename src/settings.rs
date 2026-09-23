@@ -146,7 +146,7 @@ pub struct UiSettings {
     /// Render the model's thinking text (dimmed) in the scrollback. Off by
     /// default; when off, and plank was started with `--debug` (or `/debug
     /// on`), the raw model stream (thinking, answer, tool-call markup) is
-    /// instead mirrored to a `turbo-debug-console` listening on port 7878, if
+    /// instead mirrored to a `tdk` listening on port 7878, if
     /// one is up (see `debugmirror`), so the thinking is not simply lost. When
     /// on, plank never connects to the console at all.
     pub show_thinking: bool,

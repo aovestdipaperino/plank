@@ -1,4 +1,4 @@
-//! Mirrors the raw model stream to `turbo-debug-console`, an external Turbo
+//! Mirrors the raw model stream to `tdk`, an external Turbo
 //! Vision window, whenever `ui.showThinking` is off.
 //!
 //! The console is optional infrastructure a developer may or may not have
@@ -927,7 +927,7 @@ mod tests {
     // serialize by taking a lock (`TEST_LOCK`, in `test_support`) for the
     // duration of each test.
 
-    /// Spins up a stand-in for `turbo-debug-console`'s control port that
+    /// Spins up a stand-in for `tdk`'s control port that
     /// accepts exactly one handshake, hands back the `HELLO` line it
     /// received, and returns a connected data-port socket to the caller. Used
     /// by every test that needs to inspect what name a connection presents.
@@ -1330,7 +1330,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
 
-        // Stand in for turbo-debug-console's control port: reply with a data
+        // Stand in for tdk's control port: reply with a data
         // port and accept one connection there.
         let control = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let control_port = control.local_addr().unwrap().port();

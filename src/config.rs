@@ -63,7 +63,7 @@ pub struct AgentConfig {
     /// Front end selected by `--ui` (default [`UiMode::Tui`]).
     pub ui: UiMode,
     /// True when `--debug` was given: the only case in which plank looks for
-    /// a `turbo-debug-console` and mirrors the raw model stream to it (see
+    /// a running `tdk` and mirrors the raw model stream to it (see
     /// `debugmirror`). Off, plank never probes for a console at all.
     pub debug: bool,
     /// True when `--show-memory-stats` was given: the memory extraction
@@ -569,7 +569,7 @@ Usage: plank [options]
 Options:
   -h, --help [topic]       show this help and exit
   -V, --version            show the version and commit id, then exit
-      --debug              look for a running turbo-debug-console and mirror the
+      --debug              look for a running tdk and mirror the
                            raw model stream to it while ui.showThinking is off
       --show-memory-stats  float the memory pass's prefill/generation figures on
                            the rule below the prompt (default: the rule stays
@@ -1154,7 +1154,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/debug",
         args: "[on|off]",
-        desc: "override --debug: mirror the raw stream to turbo-debug-console",
+        desc: "override --debug: mirror the raw stream to tdk",
     },
     SlashCommand {
         name: "/remote-control",
