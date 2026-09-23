@@ -62,13 +62,32 @@ pub enum IdleWork {
 /// `None` shows nothing. There is deliberately no fallback text and no retry:
 /// a bad suggestion costs more than a missing one.
 ///
-/// A line starting with `/` is rejected outright. A suggestion is a *prompt*,
-/// and Enter over a placed suggestion submits it immediately: a model that
-/// wrote `/clear the session` would run a slash command on one keystroke.
-/// One keypress away from `/clear` is not a place to be relaxed, so the
-/// model's output never reaches the command dispatcher.
+/// A line starting with `/` or `!` is rejected outright. A suggestion is a
+/// *prompt*, and Enter over a placed suggestion submits it immediately: a
+/// model that wrote `/clear the session` would run a slash command on one
+/// keystroke, and `!cargo test --release` would run a shell command. One
+/// keypress away from either is not a place to be relaxed, so the model's
+/// output never reaches the command dispatcher or a shell.
 #[must_use]
 pub fn sanitize(reply: &str) -> Option<String> {
+    // Drop the model's reasoning first. This family generates *inside* an
+    // implicit think block and emits only the closing tag, so a reply
+    // routinely arrives as `</think>Write out the …` — the transcript
+    // carries `</think>` with no opening partner (see `debugmirror`'s
+    // `needs_think_prefix`). Taking the first line without cutting here put
+    // a literal `</think>` on the user's input line.
+    //
+    // Cut at the LAST close, not the first: reasoning that itself mentions
+    // the tag would otherwise leave a fragment behind.
+    let reply = match reply.rfind("</think>") {
+        Some(at) => &reply[at + "</think>".len()..],
+        None => reply,
+    };
+    // A think block that never closed means the whole budget went on
+    // reasoning and no suggestion was reached. There is nothing to show.
+    if reply.contains("<think>") {
+        return None;
+    }
     let line = reply.lines().map(str::trim).find(|l| !l.is_empty())?;
 
     // Strip one leading list or quote marker, then surrounding quotes.
@@ -94,7 +113,13 @@ pub fn sanitize(reply: &str) -> Option<String> {
     if line.is_empty() || line.chars().count() > MAX_LEN {
         return None;
     }
-    if line.starts_with('/') {
+    // `/` is a slash command and `!` is shell execution — `!cmd` runs it and
+    // records it, `!!cmd` runs it silently, both checked before anything else
+    // and neither asking for confirmation. Enter over a placed suggestion
+    // submits immediately, so either prefix would let the model run something
+    // the user never typed, on one keystroke. A suggestion is a *prompt*; the
+    // model's output never reaches the command dispatcher or a shell.
+    if line.starts_with('/') || line.starts_with('!') {
         return None;
     }
     let lowered = line.to_ascii_lowercase();
@@ -148,6 +173,16 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// The same hazard as the slash guard, on a different prefix: plank's
+    /// submit arm treats `!cmd` as shell execution and runs it without
+    /// confirmation, `!!cmd` silently. A suggested `!cargo test --release`
+    /// would run on one keystroke.
+    #[test]
+    fn sanitize_refuses_a_shell_command() {
+        assert_eq!(sanitize("!cargo test --release"), None);
+        assert_eq!(sanitize("!!rm -rf target"), None);
+    }
+
     #[test]
     fn sanitize_refuses_a_slash_command() {
         // Enter over a placed suggestion submits it, so a leading `/` would
@@ -160,6 +195,48 @@ mod tests {
             sanitize("check src/suggest.rs"),
             Some("check src/suggest.rs".to_string())
         );
+    }
+
+    /// Reported from a live session: the ghost showed a literal
+    /// `</think>Write out the arena-based doubly-linked list with tests.`
+    ///
+    /// This model family generates inside an implicit think block and emits
+    /// only the closing tag, so the reply arrives with `</think>` glued to
+    /// the front of the real answer — on the same line, which is why taking
+    /// the first line was not enough.
+    #[test]
+    fn sanitize_drops_the_reasoning_close_glued_to_the_answer() {
+        assert_eq!(
+            sanitize("</think>Write out the arena-based doubly-linked list with tests."),
+            Some("Write out the arena-based doubly-linked list with tests.".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_drops_a_whole_reasoning_block_before_the_answer() {
+        assert_eq!(
+            sanitize(
+                "the user just added a parser\nso tests are next</think>\nadd tests for the parser"
+            ),
+            Some("add tests for the parser".to_string())
+        );
+    }
+
+    /// Reasoning that mentions the tag must not leave a fragment: cut at the
+    /// last close, not the first.
+    #[test]
+    fn sanitize_cuts_at_the_last_reasoning_close() {
+        assert_eq!(
+            sanitize("I should not write </think> here</think>run the tests"),
+            Some("run the tests".to_string())
+        );
+    }
+
+    /// The token budget ran out mid-thought, so no suggestion was ever
+    /// reached. Showing the reasoning would be worse than showing nothing.
+    #[test]
+    fn sanitize_rejects_an_unclosed_reasoning_block() {
+        assert_eq!(sanitize("<think>the user probably wants"), None);
     }
 
     #[test]

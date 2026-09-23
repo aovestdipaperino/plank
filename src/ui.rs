@@ -8005,6 +8005,11 @@ the original is frozen and listed in /tree"
         let note = self.load_session_payload(&s);
         self.discard_ladder();
         self.session = s;
+        // A guess about the conversation we just left. The depth check would
+        // miss it whenever the adopted transcript happens to be the same
+        // length, and the ghost would then be one Enter from being sent into
+        // a different session.
+        self.clear_suggestion();
         // A restored transcript is history, not new material for the pass.
         self.extract_state.reset_to(self.session.transcript.len());
         crate::debugmirror::set_session_id(&self.session.id);
