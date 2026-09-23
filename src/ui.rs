@@ -2324,6 +2324,13 @@ struct Agent<'a> {
     /// Gating for the background memory extraction pass; sampled from
     /// `settings.memory` at the top of every `maybe_extract_memories` call.
     extract_state: crate::memextract::ExtractState,
+    /// Whether the System-1 gate runs in front of the extraction pass;
+    /// sampled from `settings.memory.gate` at the top of every
+    /// `enqueue_memory_job` call.
+    memory_gate: bool,
+    /// The gate's confidence threshold, as a whole-number percent; sampled
+    /// from `settings.memory.gate_percent` alongside `memory_gate`.
+    memory_gate_percent: u32,
     /// Spans snapshotted at turn ends and waiting for an idle moment to be
     /// read (`enqueue_memory_job` / `process_memory_job`). Front of the
     /// queue is oldest; an interrupted job goes back to the front.
@@ -14639,12 +14646,42 @@ impl Agent<'_> {
     /// call sites already hold a `turn_start`, and a parameter is what keeps
     /// a sub-agent's turn from clobbering the main turn's clock — a
     /// sidechain's own `turn_start` never reaches this call.
+    /// Asks the model whether `slice` holds anything worth remembering.
+    ///
+    /// Returns `true` to run the extraction pass. Every uncertain path
+    /// returns `true`: no capability, an engine error, or an abstention. A
+    /// gate that is unsure must never be the reason a memory is lost — its
+    /// only job is to skip passes that would plainly have found nothing.
+    fn memory_gate_says_worthy(&mut self, slice: &[crate::session::Message]) -> bool {
+        if !self.engine.supports_decide() {
+            return true;
+        }
+        let state = crate::memextract::render_excerpt(slice);
+        let verdict = crate::decide::decide_one::<crate::memextract::Worthy>(
+            self.engine.as_mut(),
+            &state,
+            crate::memextract::GATE_QUESTION,
+        );
+        let Ok(v) = verdict else {
+            return true;
+        };
+        if v.abstained {
+            return true;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let threshold = self.memory_gate_percent as f32 / 100.0;
+        v.value == crate::memextract::Worthy::Yes && v.p >= threshold
+    }
+
     fn enqueue_memory_job(&mut self, turn: std::time::Duration) -> bool {
         let settings = crate::settings::active();
         self.extract_state.enabled = settings.memory.auto_extract;
         self.extract_state.every_n = settings.memory.extract_every_n_turns;
         self.extract_state.min_turn =
             std::time::Duration::from_secs(u64::from(settings.memory.min_turn_seconds));
+        self.memory_gate = settings.memory.gate;
+        self.memory_gate_percent = settings.memory.gate_percent;
+        self.extract_state.held_span_cap = settings.memory.held_span_cap as usize;
         if self.in_sidechain() {
             return false; // a sub-agent's turn end is not a turn boundary
         }
@@ -14663,6 +14700,18 @@ impl Agent<'_> {
         }
         let entries = crate::memextract::current_entries(&self.tool_ctx.cwd);
         let slice = self.session.transcript[from.min(depth)..depth].to_vec();
+
+        // The System-1 gate. Skipped entirely when off, and skipped once the
+        // held span has outgrown its cap — past that point the pass runs
+        // regardless of what the model would have said.
+        if self.memory_gate
+            && !self.extract_state.gate_bypassed(from, depth)
+            && !self.memory_gate_says_worthy(&slice)
+        {
+            self.extract_state.reject(from, depth);
+            return false;
+        }
+
         let task = crate::memextract::build_prompt(&slice, &entries);
         self.extract_state.finish(depth);
         self.memory_jobs.push_back(crate::memextract::MemoryJob {
@@ -18644,6 +18693,8 @@ fn new_agent(
         sidechain_depth: 0,
         alt_engine_depth: 0,
         extract_state: crate::memextract::ExtractState::default(),
+        memory_gate: false,
+        memory_gate_percent: 60,
         memory_jobs: std::collections::VecDeque::new(),
         pending_memory_notice: None,
         repro_dir,
@@ -21255,6 +21306,13 @@ mod tests {
         /// falling through to the ladder) without every later `set_kv` call —
         /// including the one inside `restore_rung` itself — failing too.
         set_kv_fails_once: bool,
+        /// Verdicts `decide` hands back, oldest first. Non-empty turns
+        /// `supports_decide` on; empty leaves the engine looking like one
+        /// with no System-1 capability at all.
+        decisions: Vec<crate::decide::RawVerdict>,
+        /// Records each state `decide` was asked about, so a test can assert
+        /// that a gate which should have been skipped never ran.
+        decisions_asked: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
     }
 
     impl ScriptedEngine {
@@ -21421,6 +21479,24 @@ mod tests {
         fn model_name(&self) -> String {
             self.model.clone().unwrap_or_default()
         }
+
+        fn supports_decide(&self) -> bool {
+            !self.decisions.is_empty()
+        }
+
+        fn decide(
+            &mut self,
+            state: &str,
+            _question: &crate::decide::Question,
+        ) -> Result<crate::decide::RawVerdict, crate::engine::EngineError> {
+            if self.decisions.is_empty() {
+                return Err(crate::engine::EngineError::unsupported());
+            }
+            if let Some(log) = &self.decisions_asked {
+                log.lock().unwrap().push(state.to_string());
+            }
+            Ok(self.decisions.remove(0))
+        }
     }
 
     /// Builds an Agent over a scripted engine with the standard test fields.
@@ -21457,6 +21533,8 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -21573,6 +21651,61 @@ mod tests {
         on.memory.extract_every_n_turns = 1;
         crate::settings::install_for_test(on);
         AutoExtractGuard
+    }
+
+    /// Auto-extraction on *and* the System-1 gate on at `percent`, installed
+    /// through the same `install_for_test` path and torn down by the same
+    /// guard. Nothing here touches the settings singleton outside that guard,
+    /// which is what keeps these tests hermetic in a parallel `--lib` run.
+    fn enable_memory_gate_for_test(percent: u32) -> AutoExtractGuard {
+        let mut on = crate::settings::Settings::default();
+        on.memory.auto_extract = true;
+        on.memory.extract_every_n_turns = 1;
+        on.memory.gate = true;
+        on.memory.gate_percent = percent;
+        crate::settings::install_for_test(on);
+        AutoExtractGuard
+    }
+
+    fn enable_memory_gate_with_cap_for_test(percent: u32, cap: u32) -> AutoExtractGuard {
+        let mut on = crate::settings::Settings::default();
+        on.memory.auto_extract = true;
+        on.memory.extract_every_n_turns = 1;
+        on.memory.gate = true;
+        on.memory.gate_percent = percent;
+        on.memory.held_span_cap = cap;
+        crate::settings::install_for_test(on);
+        AutoExtractGuard
+    }
+
+    /// An agent over a `ScriptedEngine` carrying `decisions`, with the state
+    /// log wired up. `replies` is the single `[]` every memory pass expects.
+    fn gate_agent<'a>(
+        dir: &std::path::Path,
+        cfg: &'a crate::config::AgentConfig,
+        decisions: Vec<crate::decide::RawVerdict>,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Agent<'a> {
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            decisions,
+            decisions_asked: Some(asked),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(dir, engine, cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent
+    }
+
+    /// A confident verdict for option `index`.
+    fn verdict(index: usize, p: f32) -> crate::decide::RawVerdict {
+        crate::decide::RawVerdict {
+            index,
+            p,
+            runner_up: Some((1 - index.min(1), 1.0 - p)),
+            abstained: false,
+        }
     }
 
     /// An agent whose engine reports a loaded `MTP` support model, so the
@@ -26660,6 +26793,8 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -26790,6 +26925,8 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -28172,6 +28309,8 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -28447,6 +28586,8 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -28561,6 +28702,8 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -28662,6 +28805,8 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -28786,6 +28931,8 @@ mod tests {
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -31426,6 +31573,8 @@ or the user's next message aborts before its first token"
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),
@@ -31544,74 +31693,10 @@ or the user's next message aborts before its first token"
         };
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
-        let store = SessionStore::open(&dir).unwrap();
-        let mut agent = Agent {
-            engine: Box::new(engine),
-            cfg: &cfg,
-            gen_opts: cfg.generation.clone(),
-            resume_temp: crate::engine::GenerationOptions::default().temperature,
-            session: Session::new(),
-            store,
-            pending_aside: None,
-            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            isolation_seq: 0,
-            system: crate::sysprompt::build_system_prompt("", &[], true),
-            reminder: SystemPromptReminder::new(),
-            power_percent: 0,
-            payload_restored: false,
-            payload_dirty: false,
-            ladder: crate::kvladder::KvLadder::new(),
-            sensor: crate::mempressure::PressureSensor::start(),
-            hysteresis: crate::mempressure::Hysteresis::new(),
-            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
-            first_turn_done: false,
-            pressure_stop: false,
-            sidechain_depth: 0,
-            alt_engine_depth: 0,
-            extract_state: crate::memextract::ExtractState::default(),
-            memory_jobs: std::collections::VecDeque::new(),
-            pending_memory_notice: None,
-            repro_dir: test_repro_dir(),
-            quiet_tools: false,
-            guard_stopped: false,
-            pending_images: Vec::new(),
-            btw_diverged_engine: false,
-            trusted_system_len: 0,
-            think: cfg.generation.think_mode,
-            trace: Trace::open(None).unwrap(),
-            color: false,
-            show_footer: false,
-            editor_owns_footer: false,
-            last_ctx_used: 0,
-            last_spec: crate::engine::SpecStats::default(),
-            last_turn_interrupted: false,
-            goal: None,
-            loop_guard: crate::guard::LoopGuard::new(),
-            context_content: crate::context::ContextContent::new(),
-            skills: Vec::new(),
-            templates: Vec::new(),
-            agents: Vec::new(),
-            checkpoints: crate::checkpoint::CheckpointStore::new(),
-            last_edited: None,
-            remote: None,
-            remote_server: None,
-            ui_remote: None,
-            usage: SessionUsage::default(),
-            stats: SessionStats::default(),
-            passes: Vec::new(),
-            last_guard: crate::insights::GuardSnapshot::default(),
-            reply_only_next: false,
-            session_start: std::time::Instant::now(),
-            sub_sink: SubSinkTarget::default(),
-            fork_kv: Vec::new(),
-            fork_points: Vec::new(),
-            console_seen: 0,
-            unnamed_subagents: 0,
-            sidechain_dumps: std::collections::VecDeque::new(),
-            alt_engines: std::collections::HashMap::new(),
-            local_alt_warmed: false,
-            warm_note: None,
-        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        // This test predates `test_agent`'s scratch-dir cwd fix and doesn't
+        // exercise relative-path tool writes, so the process cwd is fine here.
+        agent.tool_ctx = ToolContext::new(std::env::current_dir().unwrap());
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
 
@@ -31873,6 +31958,131 @@ or the user's next message aborts before its first token"
         assert!(prompts.lock().unwrap()[0].contains("user: hello"));
         assert!(!agent.memory_jobs_pending());
         assert!(!agent.process_memory_job(), "an empty queue runs nothing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Index 1 is "no" on a boolean question: the span is judged worthless
+    /// and no pass is queued.
+    #[test]
+    fn the_gate_suppresses_a_span_the_model_calls_unworthy() {
+        let _gate = enable_memory_gate_for_test(60);
+        let dir = scratch_dir("memgate-reject");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(1, 0.95)], asked.clone());
+
+        assert!(!agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(!agent.memory_jobs_pending());
+        assert_eq!(asked.lock().unwrap().len(), 1, "the gate was consulted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_gate_lets_a_worthy_span_through() {
+        let _gate = enable_memory_gate_for_test(60);
+        let dir = scratch_dir("memgate-accept");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(0, 0.9)], asked);
+
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(agent.memory_jobs_pending());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_abstention_runs_the_pass_rather_than_suppressing_it() {
+        let _gate = enable_memory_gate_for_test(60);
+        let dir = scratch_dir("memgate-abstain");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let abstained = crate::decide::RawVerdict {
+            index: 1,
+            p: 0.52,
+            runner_up: Some((0, 0.48)),
+            abstained: true,
+        };
+        let mut agent = gate_agent(&dir, &cfg, vec![abstained], asked);
+
+        assert!(
+            agent.enqueue_memory_job(std::time::Duration::MAX),
+            "an unsure gate must never be the reason a memory is lost"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A "yes" the model is not confident enough about is a suppression: the
+    /// threshold applies to the yes probability, not just to the ranking.
+    #[test]
+    fn a_yes_below_the_threshold_suppresses() {
+        let _gate = enable_memory_gate_for_test(90);
+        let dir = scratch_dir("memgate-thresh");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(0, 0.7)], asked);
+
+        assert!(!agent.enqueue_memory_job(std::time::Duration::MAX));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_engine_without_decide_behaves_exactly_as_before() {
+        let _gate = enable_memory_gate_for_test(60);
+        let dir = scratch_dir("memgate-nocap");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // No scripted decisions: `supports_decide()` is false.
+        let mut agent = gate_agent(&dir, &cfg, Vec::new(), asked);
+
+        assert!(
+            agent.enqueue_memory_job(std::time::Duration::MAX),
+            "no capability means no gate, not no memory"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_gate_off_by_default_never_asks_the_engine() {
+        // `enable_auto_extract_for_test` leaves `memory.gate` at its default
+        // of false, which is the shipped configuration.
+        let _auto = enable_auto_extract_for_test();
+        let dir = scratch_dir("memgate-off");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(1, 0.99)], asked.clone());
+
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "an off gate must not spend a forward pass"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Past the cap the pass runs whatever the model would have said, and the
+    /// gate is not even asked.
+    #[test]
+    fn a_span_past_the_cap_bypasses_the_gate_entirely() {
+        let _gate = enable_memory_gate_with_cap_for_test(60, 5);
+        let dir = scratch_dir("memgate-cap");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(1, 0.99)], asked.clone());
+        // gate_agent pushes 2 messages; add 8 more for a span of 10, which is
+        // past the cap of 5 installed by the guard above.
+        for i in 0..4 {
+            agent.session.push(Message::user(format!("u{i}")));
+            agent.session.push(Message::assistant(format!("a{i}")));
+        }
+
+        assert!(
+            agent.enqueue_memory_job(std::time::Duration::MAX),
+            "10 messages past a cap of 5 runs unconditionally"
+        );
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "a bypassed gate is not consulted"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -32652,6 +32862,8 @@ or the user's next message aborts before its first token"
             sidechain_depth: 0,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
             memory_jobs: std::collections::VecDeque::new(),
             pending_memory_notice: None,
             repro_dir: test_repro_dir(),

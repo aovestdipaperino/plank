@@ -63,6 +63,28 @@ pub struct MemoryResume {
 /// Engine failures a queued job survives before it is dropped.
 pub const MAX_JOB_ATTEMPTS: u8 = 3;
 
+/// The System-1 gate's answer: is the span worth an extraction pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Worthy {
+    Yes,
+    No,
+}
+
+impl crate::decide::Decision for Worthy {
+    const OPTIONS: &'static [&'static str] = &["yes", "no"];
+    fn from_index(i: usize) -> Option<Self> {
+        match i {
+            0 => Some(Self::Yes),
+            1 => Some(Self::No),
+            _ => None,
+        }
+    }
+}
+
+/// The gate's question. Kept here next to [`build_prompt`] so the two pieces
+/// of extraction prompt text live together.
+pub const GATE_QUESTION: &str = "Does the conversation above contain anything worth remembering for future sessions - a stable fact about the user, a durable preference, an ongoing project, or a reference? Answer no for routine work with nothing lasting in it.";
+
 /// Gating state for the pass, owned by the `Agent`.
 ///
 /// The bools are independent switches read side by side, not a state
