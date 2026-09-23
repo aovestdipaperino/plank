@@ -21885,8 +21885,18 @@ mod tests {
         engine: ScriptedEngine,
         cfg: &'a crate::config::AgentConfig,
     ) -> Agent<'a> {
+        test_agent_boxed(dir, Box::new(engine), cfg)
+    }
+
+    /// `test_agent` over any engine, so a Metal-only test can drive the real
+    /// one. Everything else is identical.
+    fn test_agent_boxed<'a>(
+        dir: &std::path::Path,
+        engine: Box<dyn Engine>,
+        cfg: &'a crate::config::AgentConfig,
+    ) -> Agent<'a> {
         let mut agent = Agent {
-            engine: Box::new(engine),
+            engine,
             cfg,
             gen_opts: cfg.generation.clone(),
             resume_temp: crate::engine::GenerationOptions::default().temperature,
@@ -33261,6 +33271,79 @@ or the user's next message aborts before its first token"
     /// leave `sub_sink` at `Null` itself — install a live sink here and the
     /// suggestion streams into the sub-agent pane while `pass_status_ctx`
     /// paints a throbber and a "generating…" footer at an idle prompt.
+    /// The check no scripted test can make: does a REAL model, given a real
+    /// conversation, produce something a user would plausibly type — and does
+    /// the sanitizer let it through?
+    ///
+    /// `ScriptedEngine` supplies the reply, so every other suggestion test is
+    /// blind to the two failure modes that matter: the model answering as
+    /// itself, and the sanitizer rejecting everything. Either would leave the
+    /// feature fully wired, fully green and producing nothing. That exact
+    /// shape shipped once on the System-1 branch before a real-model run
+    /// caught it.
+    ///
+    /// Run with `PLANK_TEST_MODEL=<gguf> cargo test --lib a_real_model_suggests -- --nocapture`.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn a_real_model_suggests_something_a_user_would_type() {
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-realmodel");
+        let cfg = test_cfg();
+
+        let tuning = crate::config::EngineTuning {
+            mtp: false,
+            ssd_streaming: std::env::var_os("PLANK_TEST_SSD_STREAMING").is_some(),
+            ..Default::default()
+        };
+        let model = crate::ds4engine::Ds4Model::open_shared(
+            &model_path,
+            crate::ffi::Ds4Backend::Metal,
+            8192,
+            0,
+            100,
+            &tuning,
+            "you are a helpful coding assistant",
+        )
+        .expect("open the model");
+        let engine = crate::ds4engine::Ds4Session::from_model(model);
+        let mut agent = test_agent_boxed(&dir, Box::new(engine), &cfg);
+
+        // A conversation with an obvious next move, so a good suggestion is
+        // recognisable and a bad one is too.
+        agent
+            .session
+            .push(Message::user("add a parse_port function to src/net.rs"));
+        agent.session.push(Message::assistant(
+            "Added `parse_port` to src/net.rs. It takes a &str,              returns Result<u16, ParseError>, and rejects 0.",
+        ));
+        agent.suggestion_pending = true;
+
+        let stored = agent.generate_suggestion();
+        match agent.suggestion.as_ref() {
+            Some(s) => eprintln!("[suggest] ACCEPTED {:?}", s.text),
+            None => eprintln!(
+                "[suggest] REJECTED or empty (set PLANK_SUGGEST_DEBUG=1 for the raw reply)"
+            ),
+        }
+        assert!(
+            stored,
+            "a real model on a clear conversation should produce a usable \
+             suggestion; if this fails, read the raw reply under \
+             PLANK_SUGGEST_DEBUG=1 and fix the PROMPT, not the sanitizer"
+        );
+        let text = agent.suggestion.as_ref().unwrap().text.clone();
+        assert!(!text.is_empty());
+        assert!(
+            !text.starts_with('/'),
+            "a slash command must never reach the input line: {text:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn the_suggestion_pass_renders_nothing_to_the_front_end() {
         let dir = scratch_dir("suggest-quiet");
