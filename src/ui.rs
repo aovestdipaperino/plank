@@ -9881,6 +9881,13 @@ the original is frozen and listed in /tree"
             "no report".to_owned()
         };
         self.remember_sidechain(dump);
+        // Deliberately no `clear_suggestion()` here, and adding one would be
+        // a bug. This truncation restores the transcript to exactly the
+        // content and length it had before the sidechain opened, so a prompt
+        // suggestion that was depth-valid beforehand is depth-valid again
+        // afterwards — the real conversation never moved. Clearing here would
+        // drop a good suggestion every time *any* sidechain ends, including
+        // every memory-extraction pass.
         self.session.transcript.truncate(fork_at);
         self.truncate_ladder_to(fork_at);
         self.extract_state.truncate_to(fork_at);
@@ -10608,6 +10615,14 @@ the original is frozen and listed in /tree"
         // which is the worst failure this design can produce.
         let alt = std::mem::replace(&mut self.engine, parent_engine);
         self.alt_engines.insert(key, alt);
+        // No `clear_suggestion()` needed: the restore is the stashed prefix
+        // followed by whatever the run left, so everything before the stash
+        // point is byte-identical and the length only ever grows. A prompt
+        // suggestion is therefore either still valid (the run appended
+        // nothing) or correctly invalidated by `current_suggestion`'s depth
+        // check. This path stashes rather than truncating, so it is worth
+        // saying so explicitly — the reasoning that covers `fork_branch` does
+        // not obviously transfer.
         let mut restored = stashed;
         restored.append(&mut self.session.transcript);
         self.session.transcript = restored;
