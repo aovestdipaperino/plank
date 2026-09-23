@@ -21738,6 +21738,44 @@ mod tests {
         AutoExtractGuard
     }
 
+    /// `/init` is writing an AGENTS.md draft; guessing at the user's next
+    /// prompt over the top of it is noise. Pins the `!quiet_tools` conjunct,
+    /// which is otherwise present but never decisive.
+    #[test]
+    fn a_turn_while_init_is_running_queues_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-init");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.quiet_tools = true;
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(
+            !agent.suggestion_pending,
+            "/init owns the screen; do not suggest over its draft"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The user cut the model off and wants the prompt back, not a guess
+    /// about a turn they abandoned. Pins the `memory_pass_allowed()`
+    /// conjunct, which is otherwise present but never decisive.
+    #[test]
+    fn a_turn_the_user_interrupted_queues_nothing() {
+        let _s = enable_suggestions_for_test(300);
+        let dir = scratch_dir("sugg-interrupted");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.last_turn_interrupted = true;
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(
+            !agent.suggestion_pending,
+            "an interrupted turn is not a finished one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_clean_turn_end_queues_a_suggestion() {
         let _s = enable_suggestions_for_test(300);
