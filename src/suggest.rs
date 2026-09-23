@@ -61,6 +61,12 @@ pub enum IdleWork {
 ///
 /// `None` shows nothing. There is deliberately no fallback text and no retry:
 /// a bad suggestion costs more than a missing one.
+///
+/// A line starting with `/` is rejected outright. A suggestion is a *prompt*,
+/// and Enter over a placed suggestion submits it immediately: a model that
+/// wrote `/clear the session` would run a slash command on one keystroke.
+/// One keypress away from `/clear` is not a place to be relaxed, so the
+/// model's output never reaches the command dispatcher.
 #[must_use]
 pub fn sanitize(reply: &str) -> Option<String> {
     let line = reply.lines().map(str::trim).find(|l| !l.is_empty())?;
@@ -86,6 +92,9 @@ pub fn sanitize(reply: &str) -> Option<String> {
     // "rivedi le modifiche all'interfaccia" costs more bytes than chars, and
     // the cap is about how much fits on one line, not how much it weighs.
     if line.is_empty() || line.chars().count() > MAX_LEN {
+        return None;
+    }
+    if line.starts_with('/') {
         return None;
     }
     let lowered = line.to_ascii_lowercase();
@@ -138,6 +147,20 @@ pub fn idle_work(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn sanitize_refuses_a_slash_command() {
+        // Enter over a placed suggestion submits it, so a leading `/` would
+        // be one keystroke from running a command the user never typed.
+        assert_eq!(sanitize("/clear the session"), None);
+        assert_eq!(sanitize("\"/compact\""), None);
+        assert_eq!(sanitize("- /quit"), None);
+        // A slash anywhere else is ordinary prose.
+        assert_eq!(
+            sanitize("check src/suggest.rs"),
+            Some("check src/suggest.rs".to_string())
+        );
+    }
 
     #[test]
     fn sanitize_takes_the_first_non_empty_line() {

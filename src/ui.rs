@@ -12148,13 +12148,40 @@ impl Agent<'_> {
                     && !arcade.is_open()
                     && wasm_frame.is_none()
                 {
-                    match self.idle_work() {
+                    let idle_quit = match self.idle_work() {
+                        crate::suggest::IdleWork::Nothing => false,
                         crate::suggest::IdleWork::Suggestion => {
-                            self.generate_suggestion();
-                        }
-                        crate::suggest::IdleWork::Nothing => {}
-                        crate::suggest::IdleWork::MemoryPass => {
-                            let quit = self.tui_memory_pass(
+                            // Generating a suggestion is a real generation: a
+                            // KV probe, a sidechain fork and a
+                            // `generate_quiet_with`. Run inline here it would
+                            // freeze the whole TUI for its duration — no
+                            // repaint, no interrupt, no Ctrl-D — at precisely
+                            // the moment the user is idle and about to type.
+                            // So it goes on a worker behind the busy UI loop,
+                            // exactly as `tui_memory_pass` does.
+                            //
+                            // `TurnShared::memory_pass` is the busy loop's
+                            // name for "a quiet background pass", not
+                            // something the footer reads: the notes mark comes
+                            // from `extract_state`. Setting it here therefore
+                            // buys the two behaviours this pass wants — a
+                            // typed prompt interrupts it, and Ctrl-D quits out
+                            // of it — without mislabelling the footer.
+                            //
+                            // The ghost goes dark first: a suggestion painted
+                            // over a prompt that is busy looks like a prompt
+                            // taking input.
+                            input.ghost = None;
+                            let remote = self.remote.clone();
+                            let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
+                            let ui_remote = self.ui_remote.clone();
+                            let local_shared = TurnShared::default();
+                            let shared: &TurnShared = remote
+                                .as_deref()
+                                .map_or(&local_shared, |r| r.shared.as_ref());
+                            shared.memory_pass.store(true, Ordering::Relaxed);
+                            let live = LiveCommands::capture(self);
+                            let run = run_worker_ui(
                                 terminal,
                                 &mut log,
                                 &mut view,
@@ -12162,34 +12189,83 @@ impl Agent<'_> {
                                 &mut btw_panel,
                                 &mut arcade,
                                 &mut sub_pane,
-                            )?;
-                            if quit {
-                                // Ctrl-D during the pass leaves through exactly the
-                                // same door as Ctrl-D at the prompt, download warning
-                                // and all.
-                                if !confirm_quit_idle(
-                                    terminal,
-                                    &mut log,
-                                    &mut view,
-                                    &mut sub_pane,
-                                    &mut btw_panel,
-                                    &mut report,
-                                    &input,
-                                    &idle_status,
-                                    selection.current(),
-                                    &task_view,
-                                    config_form.as_ref(),
-                                    kv_pane.as_ref(),
-                                    resume_pane.as_ref(),
-                                    &arcade,
-                                    wasm_frame.as_ref(),
-                                    rem,
-                                )? {
-                                    continue;
-                                }
-                                break;
+                                shared,
+                                bus.as_deref(),
+                                ui_remote.as_deref(),
+                                None,
+                                &live,
+                                |tx| {
+                                    // As in the memory pass: `sub_sink` still
+                                    // points at the last turn's dead channel.
+                                    self.sub_sink = SubSinkTarget::Events(tx.clone());
+                                    self.generate_suggestion();
+                                },
+                            );
+                            shared.memory_pass.store(false, Ordering::Relaxed);
+                            // Read before the reset below, for the same reason
+                            // the memory pass reads it there: the Ctrl-D arm
+                            // raised the interrupt, and clearing it must not
+                            // lose why.
+                            let quit = shared.quit_requested.swap(false, Ordering::Relaxed);
+                            shared.interrupt.store(false, Ordering::Relaxed);
+                            crate::interrupt::clear();
+                            if let Err(e) = run {
+                                return Err(self.reconcile_and_fail(&mut log, shared, e));
                             }
+                            if !quit {
+                                // A prompt typed during the generation is the
+                                // next turn, now.
+                                let leftover = shared.take_queued();
+                                if !leftover.is_empty() {
+                                    self.absorb_leftover(&mut log, leftover);
+                                    self.tui_turn(
+                                        terminal,
+                                        &mut log,
+                                        &mut view,
+                                        &mut input,
+                                        &mut btw_panel,
+                                        &mut arcade,
+                                        &mut sub_pane,
+                                    )?;
+                                }
+                            }
+                            quit
                         }
+                        crate::suggest::IdleWork::MemoryPass => self.tui_memory_pass(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut input,
+                            &mut btw_panel,
+                            &mut arcade,
+                            &mut sub_pane,
+                        )?,
+                    };
+                    if idle_quit {
+                        // Ctrl-D during the pass leaves through exactly the
+                        // same door as Ctrl-D at the prompt, download warning
+                        // and all.
+                        if !confirm_quit_idle(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut sub_pane,
+                            &mut btw_panel,
+                            &mut report,
+                            &input,
+                            &idle_status,
+                            selection.current(),
+                            &task_view,
+                            config_form.as_ref(),
+                            kv_pane.as_ref(),
+                            resume_pane.as_ref(),
+                            &arcade,
+                            wasm_frame.as_ref(),
+                            rem,
+                        )? {
+                            continue;
+                        }
+                        break;
                     }
                 }
                 continue;
@@ -13550,6 +13626,11 @@ impl Agent<'_> {
         // The remote bridge's persistent `TurnShared` when there is one, so
         // a remote prompt typed during the pass lands in the same queue a
         // local one does, exactly as in `tui_turn_inner`.
+        // The busy loop below repaints with the live `input`, so a ghost left
+        // on it would stay lit for the whole pass — a prompt that looks like
+        // it is taking input while plank is busy. Clear it here rather than
+        // at each caller: every route into the pass wants it dark.
+        input.ghost = None;
         let remote = self.remote.clone();
         let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
         let ui_remote = self.ui_remote.clone();
@@ -15090,10 +15171,18 @@ impl Agent<'_> {
             && input.slash.is_none()
             && self.current_suggestion().is_some()
             && match key.code {
-                KeyCode::Tab | KeyCode::Right => !word_mod,
+                // `roster_selecting` excludes Tab for the same reason it
+                // excludes Enter: with the sub-agent roster selected, Tab
+                // toggles roster focus. Placing the suggestion there would
+                // leave Tab and Enter disagreeing about whose key it is.
+                KeyCode::Tab | KeyCode::Right => !word_mod && !roster_selecting,
                 KeyCode::Enter => {
+                    // CONTROL alongside SHIFT and ALT: Ctrl+Enter submitted
+                    // nothing over an empty prompt before this feature, and
+                    // an accept-and-send is not what it should start meaning.
                     !key.modifiers.contains(KeyModifiers::SHIFT)
                         && !key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
                         && !roster_selecting
                 }
                 _ => false,
@@ -22341,6 +22430,17 @@ mod tests {
         let empty = TuiInput::new();
         assert!(!agent.suggestion_accept_key(shift(KeyCode::Enter), &empty, false, false));
         assert!(!agent.suggestion_accept_key(key(KeyCode::Enter), &empty, false, true));
+        // Ctrl+Enter submitted nothing before suggestions existed; it must
+        // not start meaning accept-and-send.
+        assert!(!agent.suggestion_accept_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            &empty,
+            false,
+            false
+        ));
+        // And the roster owns Tab in that same state, exactly as it owns
+        // Enter: otherwise the two keys disagree about whose they are.
+        assert!(!agent.suggestion_accept_key(key(KeyCode::Tab), &empty, false, true));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -22368,8 +22468,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Named for the guard, not for arm ordering: `suggestion_accept_key`
+    /// refuses while a popup is open, which is precisely what makes the order
+    /// of the two arms immaterial. There is no seam that would let a test
+    /// observe that order without reshaping the key loop around the test, so
+    /// the guard is what is asserted and what the name promises.
     #[test]
-    fn the_completion_popup_keeps_tab_and_the_suggestion_is_untouched() {
+    fn the_suggestion_is_refused_while_the_completion_popup_is_open() {
         let _s = enable_suggestions_for_test(300);
         let dir = scratch_dir("sugg-popup");
         let cfg = test_cfg();
