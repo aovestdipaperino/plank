@@ -31926,6 +31926,47 @@ or the user's next message aborts before its first token"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A requeued job keeps the moment it FIRST started waiting.
+    ///
+    /// The starvation guard reads `queued_at` to decide when a memory job
+    /// takes the idle slot back from prompt suggestions. Re-stamping on
+    /// requeue would mean a job that keeps getting interrupted never
+    /// registers as starved — the guard would be present and permanently
+    /// inert, with nothing anywhere to say so.
+    #[test]
+    fn requeueing_a_job_does_not_reset_how_long_it_has_waited() {
+        let dir = scratch_dir("memjob-requeue-stamp");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        let stamped = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .expect("600s before now is representable");
+        let job = crate::memextract::MemoryJob {
+            task: "x".to_string(),
+            depth: 1,
+            attempts: 0,
+            resume: None,
+            queued_at: stamped,
+        };
+
+        agent.requeue_memory_job(job, true);
+        let back = agent.memory_jobs.front().expect("pushed back");
+        assert_eq!(
+            back.queued_at, stamped,
+            "an interrupted job has still been waiting since it was first queued"
+        );
+
+        // The same must hold on the error path, which bumps `attempts`.
+        let job = agent.memory_jobs.pop_front().unwrap();
+        agent.requeue_memory_job(job, false);
+        let back = agent.memory_jobs.front().expect("pushed back");
+        assert_eq!(back.attempts, 1, "precondition: the error path ran");
+        assert_eq!(back.queued_at, stamped, "still the original stamp");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A turn end snapshots the span and generates nothing; the reading is
     /// the idle loop's job, and it retires the span as it is captured.
     #[test]
