@@ -14720,6 +14720,7 @@ impl Agent<'_> {
             depth,
             attempts: 0,
             resume: None,
+            queued_at: std::time::Instant::now(),
         });
         true
     }

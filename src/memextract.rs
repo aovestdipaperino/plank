@@ -41,6 +41,11 @@ pub struct MemoryJob {
     /// The prefilled prompt of an earlier attempt, kept when that attempt
     /// was interrupted so the retry does not start from zero.
     pub resume: Option<MemoryResume>,
+    /// When this span was snapshotted. Read by the idle scheduler: a job that
+    /// has waited longer than `suggestions.memoryStarvationSeconds` takes the
+    /// idle slot back from a pending suggestion, so a fast back-and-forth
+    /// cannot keep memories from ever being written.
+    pub queued_at: std::time::Instant,
 }
 
 /// A local engine's KV after the pass prompt was prefilled and before a
@@ -1052,5 +1057,20 @@ mod tests {
         assert_eq!(s.should_run(10, LONG), Some(0));
         s.reject(0, 10);
         assert_eq!(s.should_run(10, LONG), None);
+    }
+
+    #[test]
+    fn a_queued_job_records_when_it_was_queued() {
+        let job = MemoryJob {
+            task: "x".to_string(),
+            depth: 1,
+            attempts: 0,
+            resume: None,
+            queued_at: std::time::Instant::now(),
+        };
+        assert!(
+            job.queued_at.elapsed() < std::time::Duration::from_secs(1),
+            "the stamp is the moment of queueing, not of reading"
+        );
     }
 }
