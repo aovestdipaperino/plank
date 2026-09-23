@@ -2874,6 +2874,176 @@ fn fmt_secs(secs: f64) -> String {
     fmt_duration(std::time::Duration::from_secs(whole))
 }
 
+/// One engine's block in the end-of-session stats table: its tally joined
+/// with its speed record, when it reported one.
+struct StatsSection {
+    label: String,
+    input: u64,
+    output: u64,
+    speeds: Option<crate::speeds::Record>,
+}
+
+/// What a row of the end-of-session stats table shows, which picks its color.
+#[derive(Clone, Copy)]
+enum StatsRowKind {
+    /// An engine's name (or `Total`), heading its block.
+    Heading,
+    /// Tokens ingested, drawn in red.
+    Input,
+    /// Tokens generated, drawn in green.
+    Output,
+    /// Time spent running tools, drawn in yellow.
+    Tools,
+}
+
+/// One row of the end-of-session stats table: a label and the
+/// tokens/time/rate cells, any of which may be blank.
+struct StatsRow {
+    kind: StatsRowKind,
+    label: String,
+    cells: [String; 3],
+}
+
+impl StatsRow {
+    fn heading(label: &str) -> Self {
+        Self {
+            kind: StatsRowKind::Heading,
+            label: label.to_owned(),
+            cells: Default::default(),
+        }
+    }
+
+    fn figure(kind: StatsRowKind, cells: [String; 3]) -> Self {
+        let label = match kind {
+            StatsRowKind::Heading => "",
+            StatsRowKind::Input => "  ↓ input",
+            StatsRowKind::Output => "  ↑ output",
+            StatsRowKind::Tools => "  · tools",
+        };
+        Self {
+            kind,
+            label: label.to_owned(),
+            cells,
+        }
+    }
+}
+
+/// Lays out the stats table's rows, one block per engine and a totals block
+/// when more than one engine served (with a single one it would only repeat
+/// the numbers above it).
+///
+/// Engines that never reported a rate — the echo stub and online providers,
+/// whose throughput is someone else's network — keep their token counts and
+/// leave the time and rate cells blank.
+fn run_stats_blocks(sections: &[StatsSection], totals: (u64, u64)) -> Vec<Vec<StatsRow>> {
+    let timed = |secs: f64, tps: f64| {
+        if secs > 0.0 {
+            [fmt_secs(secs), format!("{tps:.1} tok/s")]
+        } else {
+            Default::default()
+        }
+    };
+    let mut blocks: Vec<Vec<StatsRow>> = Vec::new();
+    for sec in sections {
+        let r = sec.speeds.unwrap_or_default();
+        let [pt, pr] = timed(r.prefill_secs, r.prefill_tps());
+        let [gt, gr] = timed(r.gen_secs, r.gen_tps());
+        let mut block = vec![
+            StatsRow::heading(&sec.label),
+            StatsRow::figure(StatsRowKind::Input, [fmt_u64(sec.input), pt, pr]),
+            StatsRow::figure(StatsRowKind::Output, [fmt_u64(sec.output), gt, gr]),
+        ];
+        if r.tool_secs > 0.0 {
+            block.push(StatsRow::figure(
+                StatsRowKind::Tools,
+                [String::new(), fmt_secs(r.tool_secs), String::new()],
+            ));
+        }
+        blocks.push(block);
+    }
+    if sections.len() != 1 {
+        let total = |n: u64| [fmt_u64(n), String::new(), String::new()];
+        blocks.push(vec![
+            StatsRow::heading("Total"),
+            StatsRow::figure(StatsRowKind::Input, total(totals.0)),
+            StatsRow::figure(StatsRowKind::Output, total(totals.1)),
+        ]);
+    }
+    blocks
+}
+
+/// Renders the end-of-session stats as a box-drawn table: input in red,
+/// output in green, tools in yellow, rates and borders dimmed.
+///
+/// Pure so the layout is testable; widths count chars, which is exact for the
+/// glyphs used here.
+fn render_run_stats(
+    elapsed: &str,
+    sections: &[StatsSection],
+    totals: (u64, u64),
+    color: bool,
+) -> Vec<String> {
+    use std::fmt::Write as _;
+
+    let paint = |code: &'static str| if color { code } else { "" };
+    let (bold, dim, reset) = (paint("\x1b[1m"), paint("\x1b[38;5;240m"), paint(ANSI_RESET));
+    let tint = |kind: StatsRowKind| match kind {
+        StatsRowKind::Heading => bold,
+        StatsRowKind::Input => paint("\x1b[31m"),
+        StatsRowKind::Output => paint("\x1b[32m"),
+        StatsRowKind::Tools => paint("\x1b[33m"),
+    };
+    let blocks = run_stats_blocks(sections, totals);
+
+    let headers = ["tokens", "time", "rate"];
+    let rows = blocks.iter().flatten();
+    let label_w = rows
+        .clone()
+        .map(|r| r.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut widths = headers.map(str::len);
+    for r in rows {
+        for (w, c) in widths.iter_mut().zip(&r.cells) {
+            *w = (*w).max(c.chars().count());
+        }
+    }
+    let rule = |l: &str, m: &str, r: &str| {
+        let mut s = format!("{dim}{l}{}", "─".repeat(label_w + 2));
+        for w in widths {
+            s.push_str(m);
+            s.push_str(&"─".repeat(w + 2));
+        }
+        format!("{s}{r}{reset}")
+    };
+    let bar = format!("{dim}│{reset}");
+
+    let mut out = vec![
+        format!("{bold}Session stats{reset}  {dim}·{reset}  {elapsed}"),
+        rule("╭", "┬", "╮"),
+    ];
+    let mut head = format!("{bar} {:label_w$} ", "");
+    for (h, w) in headers.iter().zip(widths) {
+        let _ = write!(head, "{bar} {dim}{h:>w$}{reset} ");
+    }
+    out.push(format!("{head}{bar}"));
+    for block in &blocks {
+        out.push(rule("├", "┼", "┤"));
+        for r in block {
+            let t = tint(r.kind);
+            let mut line = format!("{bar} {t}{:label_w$}{reset} ", r.label);
+            for (i, (c, w)) in r.cells.iter().zip(widths).enumerate() {
+                // Tokens and time are the figures; the rate is the aside.
+                let (b, t) = if i == 2 { ("", dim) } else { (bold, t) };
+                let _ = write!(line, "{bar} {b}{t}{c:>w$}{reset} ");
+            }
+            out.push(format!("{line}{bar}"));
+        }
+    }
+    out.push(rule("╰", "┴", "╯"));
+    out
+}
+
 /// Times a tool dispatch and charges the elapsed wall-clock to `model` on drop,
 /// so an early return or a panic-free `?` still books the time it cost.
 struct ToolClock {
@@ -9301,92 +9471,43 @@ the original is frozen and listed in /tree"
         println!("Resume it later with:  {bold}plank /resume {short}{reset}");
     }
 
-    /// Prints the run's stats at exit: total tokens ingested and generated
-    /// across every turn (both directions), and the wall-clock duration of the
-    /// whole run. Silent when nothing was generated, so an idle run stays
-    /// quiet. Independent of the session save, so it reports even when the
-    /// final session was empty (e.g. after `/clear`).
+    /// Prints the run's stats at exit as a table: for each engine that served
+    /// the session, tokens ingested and generated, the time each phase took
+    /// and its average rate, and the time spent running tools; then the
+    /// session totals when more than one engine contributed. Silent when
+    /// nothing was generated, so an idle run stays quiet. Independent of the
+    /// session save, so it reports even when the final session was empty
+    /// (e.g. after `/clear`).
     fn report_run_stats(&self) {
         let s = &self.stats;
         if s.input_tokens == 0 && s.output_tokens == 0 {
             return;
         }
-        let (bold, dim, reset) = if self.color {
-            ("\x1b[1m", "\x1b[38;5;238m", ANSI_RESET)
-        } else {
-            ("", "", "")
-        };
+        let rows: Vec<StatsSection> = s
+            .by_engine
+            .iter()
+            .map(|(label, input, output)| {
+                // Speed records are keyed by bare model name; the tally label
+                // carries the `(local)` mark, so strip it to join the two.
+                let model = label.strip_suffix(" (local)").unwrap_or(label);
+                let rec = crate::speeds::session_totals(model);
+                StatsSection {
+                    label: label.clone(),
+                    input: *input,
+                    output: *output,
+                    speeds: (!rec.is_empty()).then_some(rec),
+                }
+            })
+            .collect();
         let elapsed = fmt_duration(self.session_start.elapsed());
         println!();
-        println!(
-            "{bold}Session stats{reset}  ↓ {} ↑ {}  {dim}·{reset}  {elapsed}",
-            fmt_u64(s.input_tokens),
-            fmt_u64(s.output_tokens),
-        );
-        Self::report_model_speeds(bold, dim, reset);
-        // Only when more than one engine served: with a single one the rows
-        // would just repeat the totals a line lower.
-        if s.by_engine.len() < 2 {
-            return;
-        }
-        let width = s.by_engine.iter().map(|r| r.0.chars().count()).max();
-        for (label, input, output) in &s.by_engine {
-            println!(
-                "  {dim}{label:<w$}{reset}  ↓ {} ↑ {}",
-                fmt_u64(*input),
-                fmt_u64(*output),
-                w = width.unwrap_or(0),
-            );
-        }
-    }
-
-    /// Prints, for each model that ran this session, how long it spent
-    /// prefilling and generating (with the average rate for each) and how long
-    /// it spent running tools.
-    ///
-    /// Averages rather than peaks: a peak is one lucky pass, while the average
-    /// beside the phase's wall-clock says where the session actually went.
-    ///
-    /// Session-scoped: nothing is stored, so there is no cross-run figure to
-    /// compare against — yesterday's was a different engine build on a cooler
-    /// machine.
-    ///
-    /// Silent for engines that never reported a rate — the echo stub, and
-    /// online providers, whose throughput is someone else's network — so a
-    /// provider-only session's exit message is unchanged.
-    fn report_model_speeds(bold: &str, dim: &str, reset: &str) {
-        let models = crate::speeds::session_all();
-        // One model gets no label column: the row is unambiguous without it.
-        let width = (models.len() > 1)
-            .then(|| models.iter().map(|(m, _)| m.chars().count()).max())
-            .flatten();
-        for (model, r) in &models {
-            let mut parts: Vec<String> = Vec::new();
-            if r.prefill_secs > 0.0 {
-                parts.push(format!(
-                    "prefill {bold}{}{reset} {dim}({:.1} tok/s){reset}",
-                    fmt_secs(r.prefill_secs),
-                    r.prefill_tps(),
-                ));
-            }
-            if r.gen_secs > 0.0 {
-                parts.push(format!(
-                    "generation {bold}{}{reset} {dim}({:.1} tok/s){reset}",
-                    fmt_secs(r.gen_secs),
-                    r.gen_tps(),
-                ));
-            }
-            if r.tool_secs > 0.0 {
-                parts.push(format!("tools {bold}{}{reset}", fmt_secs(r.tool_secs)));
-            }
-            if parts.is_empty() {
-                continue;
-            }
-            let sep = format!("  {dim}·{reset}  ");
-            match width {
-                Some(w) => println!("  {dim}{model:<w$}{reset}  {}", parts.join(&sep)),
-                None => println!("{dim}avg{reset} {model}  {}", parts.join(&sep)),
-            }
+        for line in render_run_stats(
+            &elapsed,
+            &rows,
+            (s.input_tokens, s.output_tokens),
+            self.color,
+        ) {
+            println!("{line}");
         }
     }
 
@@ -20251,10 +20372,73 @@ fn read_batched_from(
 
 #[cfg(test)]
 mod tests {
+    fn stats_record(prefill: (i64, f64), gen_: (i64, f64), tools: f64) -> crate::speeds::Record {
+        crate::speeds::Record {
+            prefill_tokens: prefill.0,
+            prefill_secs: prefill.1,
+            gen_tokens: gen_.0,
+            gen_secs: gen_.1,
+            tool_secs: tools,
+        }
+    }
+
+    #[test]
+    fn run_stats_table_single_engine_aligns_columns() {
+        let sections = [StatsSection {
+            label: "DeepSeek V4 Flash".into(),
+            input: 19_973,
+            output: 1_526,
+            speeds: Some(stats_record((4_240, 12.0), (1_526, 49.3), 3.2)),
+        }];
+        let lines = render_run_stats("6:14", &sections, (19_973, 1_526), false);
+        let table = lines.join("\n");
+        assert_eq!(lines[0], "Session stats  ·  6:14");
+        assert!(table.contains("19,973"), "{table}");
+        assert!(table.contains("353.3 tok/s"), "{table}");
+        assert!(table.contains("31.0 tok/s"), "{table}");
+        assert!(table.contains("· tools"), "{table}");
+        // One engine: no totals block repeating the same numbers.
+        assert!(!table.contains("Total"), "{table}");
+        let width = lines[1].chars().count();
+        assert!(
+            lines[1..].iter().all(|l| l.chars().count() == width),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn run_stats_table_several_engines_adds_totals_and_blank_cells() {
+        let sections = [
+            StatsSection {
+                label: "flash (local)".into(),
+                input: 100,
+                output: 10,
+                speeds: Some(stats_record((100, 1.0), (10, 1.0), 0.0)),
+            },
+            StatsSection {
+                label: "remote".into(),
+                input: 50,
+                output: 5,
+                speeds: None,
+            },
+        ];
+        let lines = render_run_stats("0:05", &sections, (150, 15), false);
+        let table = lines.join("\n");
+        assert!(table.contains("Total"), "{table}");
+        assert!(table.contains("150"), "{table}");
+        // No tool time recorded, so no tools row.
+        assert!(!table.contains("tools"), "{table}");
+        let width = lines[1].chars().count();
+        assert!(
+            lines[1..].iter().all(|l| l.chars().count() == width),
+            "{table}"
+        );
+    }
 
     #[test]
     fn jobs_panel_closes_when_its_last_job_finishes() {
         use crate::tools::bash::NO_JOBS_TEXT;
+
         // Showing a job, then the table empties: the panel goes away.
         let mut report = Some(tui::ReportPanel::new(JOBS_REPORT_TITLE, "1 pid 10 running"));
         refresh_jobs_panel(&mut report, NO_JOBS_TEXT);
