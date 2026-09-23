@@ -2050,6 +2050,31 @@ mod tests {
         assert!(note.contains("timeoutSecs=45"), "{note}");
     }
 
+    /// A key that parses but never serialises is lost the next time anything
+    /// saves the settings, silently and permanently. Parsing tests cannot
+    /// catch that, so the three gate keys get a real write-then-read-back.
+    #[test]
+    fn the_memory_gate_keys_survive_a_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("plank-cfg-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut s = Settings::default();
+        s.memory.gate = true;
+        s.memory.gate_percent = 85;
+        s.memory.held_span_cap = 7;
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let back = from_json(&text);
+        assert!(back.memory.gate, "gate lost on save:\n{text}");
+        assert_eq!(back.memory.gate_percent, 85, "gatePercent lost:\n{text}");
+        assert_eq!(back.memory.held_span_cap, 7, "heldSpanCap lost:\n{text}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn save_to_round_trips_and_preserves_unknown_keys() {
         let dir = std::env::temp_dir().join(format!("plank-cfg-{}", std::process::id()));
