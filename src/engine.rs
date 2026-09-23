@@ -998,11 +998,15 @@ pub trait Engine: Debug + Send {
         false
     }
 
-    /// Answers `questions` against `state` without generating any tokens.
+    /// Answers one `question` against `state` without generating any tokens.
     ///
-    /// The state is prefilled once and every question branches off it, so a
-    /// caller with several questions about one state should ask them in a
-    /// single call. Returns one [`RawVerdict`] per question, in order.
+    /// One question per call, deliberately: an earlier design answered several
+    /// questions off one prefilled state by rewinding between them, which is
+    /// unsound on plank's main model family (see the annotation on
+    /// [`Ds4Session::decide`](crate::ds4engine::Ds4Session::decide) for why). A
+    /// caller with several questions about one state issues several calls; the
+    /// state's tokens are unchanged between them so a real implementation can
+    /// still reuse the common prefix.
     ///
     /// Implementations must not disturb the live turn session: the real one
     /// runs on a dedicated decision session, because branching the live
@@ -1015,8 +1019,8 @@ pub trait Engine: Debug + Send {
     fn decide(
         &mut self,
         _state: &str,
-        _questions: &[crate::decide::Question],
-    ) -> Result<Vec<crate::decide::RawVerdict>, EngineError> {
+        _question: &crate::decide::Question,
+    ) -> Result<crate::decide::RawVerdict, EngineError> {
         Err(EngineError::unsupported())
     }
 
@@ -1618,23 +1622,18 @@ impl Engine for EchoEngine {
     fn decide(
         &mut self,
         state: &str,
-        questions: &[crate::decide::Question],
-    ) -> Result<Vec<crate::decide::RawVerdict>, EngineError> {
+        _question: &crate::decide::Question,
+    ) -> Result<crate::decide::RawVerdict, EngineError> {
         if self.scripted_decisions.is_empty() {
             return Err(EngineError::unsupported());
         }
         self.decisions_asked.push(state.to_string());
-        let mut out = Vec::with_capacity(questions.len());
-        for _ in questions {
-            // An exhausted script is a test-authoring bug, so it fails
-            // loudly. Silently repeating the last verdict would let a test
-            // pass while asserting nothing.
-            let Some(v) = self.scripted_decisions.pop_front() else {
-                return Err(EngineError::new("echo decision script exhausted"));
-            };
-            out.push(v);
-        }
-        Ok(out)
+        // An exhausted script is a test-authoring bug, so it fails loudly.
+        // Silently repeating the last verdict would let a test pass while
+        // asserting nothing.
+        self.scripted_decisions
+            .pop_front()
+            .ok_or_else(|| EngineError::new("echo decision script exhausted"))
     }
 
     fn supports_decide(&self) -> bool {
@@ -1715,7 +1714,7 @@ mod tests {
         let mut e = EchoEngine::new(4096);
         assert!(!e.supports_decide(), "unscripted echo has no decisions");
         let q = crate::decide::Question::boolean("worth it?");
-        let err = e.decide("some state", &[q]).unwrap_err();
+        let err = e.decide("some state", &q).unwrap_err();
         assert!(err.is_unsupported());
     }
 
@@ -1738,12 +1737,11 @@ mod tests {
         assert!(e.supports_decide());
 
         let q = crate::decide::Question::boolean("worth it?");
-        let first = e.decide("state one", std::slice::from_ref(&q)).unwrap();
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].index, 0);
+        let first = e.decide("state one", &q).unwrap();
+        assert_eq!(first.index, 0);
 
-        let second = e.decide("state two", &[q]).unwrap();
-        assert_eq!(second[0].index, 1);
+        let second = e.decide("state two", &q).unwrap();
+        assert_eq!(second.index, 1);
 
         assert_eq!(e.decisions_asked(), vec!["state one", "state two"]);
     }
@@ -1759,15 +1757,15 @@ mod tests {
         let mut e = EchoEngine::new(4096);
         e.script_decisions(vec![yes]);
         let q = crate::decide::Question::boolean("worth it?");
-        assert!(e.decide("a", std::slice::from_ref(&q)).is_ok());
+        assert!(e.decide("a", &q).is_ok());
         assert!(
-            e.decide("b", &[q]).is_err(),
+            e.decide("b", &q).is_err(),
             "an exhausted script must fail loudly, not answer from memory"
         );
     }
 
     #[test]
-    fn a_scripted_echo_answers_every_question_in_one_call() {
+    fn a_scripted_echo_answers_two_separate_calls() {
         let v = crate::decide::RawVerdict {
             index: 0,
             p: 0.9,
@@ -1777,9 +1775,11 @@ mod tests {
         let mut e = EchoEngine::new(4096);
         e.script_decisions(vec![v, v]);
         let q = crate::decide::Question::boolean("worth it?");
-        let out = e.decide("state", &[q.clone(), q]).unwrap();
-        assert_eq!(out.len(), 2, "one verdict consumed per question");
-        assert_eq!(e.decisions_asked().len(), 1, "one prefill, two questions");
+        let first = e.decide("state", &q).unwrap();
+        let second = e.decide("state", &q).unwrap();
+        assert_eq!(first.index, 0);
+        assert_eq!(second.index, 0);
+        assert_eq!(e.decisions_asked().len(), 2, "one prefill per question");
     }
 
     /// A model name the family resolver reads as `DeepSeek` V4.1 — the one

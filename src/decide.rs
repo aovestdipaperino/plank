@@ -147,17 +147,15 @@ pub fn typed<T: Decision>(raw: &RawVerdict) -> Option<Verdict<T>> {
 
 /// Asks one typed question and maps the answer back onto `T`.
 ///
-/// This is the call site shape every consumer uses; the untyped
-/// [`Engine::decide`] slice underneath it exists for a caller with several
-/// questions about one state, which is the only case worth a manual
-/// `decide`.
+/// This is the call site shape every consumer uses, wrapping the untyped
+/// [`Engine::decide`] underneath it.
 ///
 /// An index outside what `T` covers is an engine or programming fault, not a
 /// model one, so it surfaces as an error rather than a silent abstention.
 ///
 /// # Errors
 /// Propagates the engine's error, plus an internal error if the engine
-/// returned no verdict or an index outside what `T` covers.
+/// returned an index outside what `T` covers.
 ///
 /// [`Engine::decide`]: crate::engine::Engine::decide
 pub fn decide_one<T: Decision>(
@@ -165,11 +163,8 @@ pub fn decide_one<T: Decision>(
     state: &str,
     text: &str,
 ) -> Result<Verdict<T>, crate::engine::EngineError> {
-    let raw = engine.decide(state, &[T::question(text)])?;
-    let first = raw
-        .first()
-        .ok_or_else(|| crate::engine::EngineError::new("decide returned no verdict"))?;
-    typed(first).ok_or_else(|| crate::engine::EngineError::new("verdict index outside the type"))
+    let raw = engine.decide(state, &T::question(text))?;
+    typed(&raw).ok_or_else(|| crate::engine::EngineError::new("verdict index outside the type"))
 }
 
 /// Renders the question suffix the engine evaluates after the state.
