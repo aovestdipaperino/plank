@@ -15085,7 +15085,28 @@ impl Agent<'_> {
         // text nor status leaves the pass. Restored on the way out so the
         // caller's sink is the caller's business.
         let sink = std::mem::replace(&mut self.sub_sink, SubSinkTarget::Null);
+        // And no thinking. On a reasoning family the assistant otherwise
+        // reasons first, which with a ~40-token budget means the budget is
+        // spent before any suggestion is reached: a real run produced
+        // "The user asked me to add a parse_port function. I did. Now they
+        // ask for the single next thing…", cut off mid-thought, and only the
+        // length cap kept it off the input line. Where the reasoning *did*
+        // fit, the reply arrived as "</think>Write out the …" and the tag
+        // was shown to the user.
+        //
+        // `ThinkMode::Off` makes the assistant prefix open with `</think>`
+        // itself, so the model starts at the answer and the whole budget
+        // goes to it. Free: `Off` and `Medium` share an effort preamble, so
+        // `set_think_mode` changes only the per-turn assistant prefix and
+        // leaves the cached prompt prefix — and the KV — untouched.
+        let think = self.think;
+        self.think = crate::engine::ThinkMode::Off;
+        self.engine.set_think_mode(crate::engine::ThinkMode::Off);
+
         let done = self.generate_suggestion_inner();
+
+        self.think = think;
+        self.engine.set_think_mode(think);
         self.sub_sink = sink;
         done
     }
@@ -33316,6 +33337,13 @@ or the user's next message aborts before its first token"
         .expect("open the model");
         let engine = crate::ds4engine::Ds4Session::from_model(model);
         let mut agent = test_agent_boxed(&dir, Box::new(engine), &cfg);
+        // `test_cfg` sets `ThinkMode::Off`, which makes the assistant *prefix*
+        // open with `</think>` so the model never emits one. A live session
+        // runs the default, where the model reasons first and its reply
+        // arrives with `</think>` glued to the front of the answer — which is
+        // exactly the bug this test failed to reproduce until it stopped
+        // opting out of thinking.
+        agent.think = crate::engine::ThinkMode::Medium;
 
         // A conversation with an obvious next move, so a good suggestion is
         // recognisable and a bad one is too.
@@ -33343,8 +33371,12 @@ or the user's next message aborts before its first token"
         let text = agent.suggestion.as_ref().unwrap().text.clone();
         assert!(!text.is_empty());
         assert!(
-            !text.starts_with('/'),
-            "a slash command must never reach the input line: {text:?}"
+            !text.starts_with('/') && !text.starts_with('!'),
+            "a command must never reach the input line: {text:?}"
+        );
+        assert!(
+            !text.contains("</think>") && !text.contains("<think>"),
+            "the model's reasoning must not reach the input line: {text:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
