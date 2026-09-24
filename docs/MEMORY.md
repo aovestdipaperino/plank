@@ -325,13 +325,12 @@ The **reading** happens at the next idle moment (`Agent::process_memory_job`,
 one job per call, oldest first). In the TUI that idle moment is now shared
 with prompt suggestions (`suggest.rs`, `docs/superpowers/specs/2026-09-23-prompt-suggestions-design.md`):
 `Agent::idle_work` (`crate::suggest::idle_work`) decides which of the two
-queued background jobs the slot goes to. A pending suggestion wins by
-default — a suggestion that lands after the user starts typing is wasted,
-while a deferred memory pass is explicitly tolerated
-(`memory.minTurnSeconds`) — but `suggestions.memoryStarvationSeconds`
-(default 300s) hands the slot back to the oldest queued memory job once it
-has waited that long, so a fast back-and-forth cannot lock memory extraction
-out forever. Once the slot is granted to the memory pass, reading proceeds
+queued background jobs the slot goes to. A pending suggestion always wins:
+a suggestion that lands after the user starts typing is wasted, while a
+deferred memory pass is explicitly tolerated (`memory.minTurnSeconds`). The
+memory pass cannot be locked out by this, because a suggestion is queued
+once per turn and its flag clears when it runs, so the oldest queued memory
+job takes the very next idle moment. Once the slot is granted to the memory pass, reading proceeds
 exactly as before: the idle loop's poll timeout (`tui_memory_pass`), with
 the same guards as the background-job wake — no draft in the editor, no
 modal pane — so a pass never starts under a keystroke. It runs on a worker

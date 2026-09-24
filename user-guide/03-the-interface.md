@@ -127,7 +127,8 @@ A suggestion is only ever text. A line beginning with `/` or `!` is discarded ra
 
 - `suggestions.enabled` turns it off (default `true`).
 - `suggestions.maxTokens` bounds the guess (default 160).
-- `suggestions.memoryStarvationSeconds` (default 300) is how long a queued memory pass may wait behind suggestions before it takes the idle moment back.
+
+The suggestion is always generated before a waiting memory pass, which then takes the next quiet moment.
 
 ## `!` and `!!` — run a shell command yourself
 

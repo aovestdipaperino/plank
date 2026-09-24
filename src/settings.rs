@@ -621,9 +621,6 @@ pub struct SuggestionSettings {
     /// line; anything past this is a model that misunderstood the
     /// instruction, and the sanitizer would reject it anyway.
     pub max_tokens: u32,
-    /// How long a queued memory job may wait behind suggestions before it
-    /// takes the idle slot back. `0` means suggestions never get priority.
-    pub memory_starvation_seconds: u32,
 }
 
 impl Default for SuggestionSettings {
@@ -631,7 +628,6 @@ impl Default for SuggestionSettings {
         Self {
             enabled: true,
             max_tokens: 160,
-            memory_starvation_seconds: 300,
         }
     }
 }
@@ -952,10 +948,6 @@ impl Settings {
         if let Some(v) = num::<u32>(root.get("suggestions"), "maxTokens") {
             self.suggestions.max_tokens = v.max(1);
             self.note("suggestions.maxTokens", origin);
-        }
-        if let Some(v) = num::<u32>(root.get("suggestions"), "memoryStarvationSeconds") {
-            self.suggestions.memory_starvation_seconds = v;
-            self.note("suggestions.memoryStarvationSeconds", origin);
         }
     }
 
@@ -1541,11 +1533,6 @@ impl Settings {
             let s = section(&mut root, "suggestions");
             upsert(s, "enabled", Json::Bool(self.suggestions.enabled));
             upsert(s, "maxTokens", unum(u64::from(self.suggestions.max_tokens)));
-            upsert(
-                s,
-                "memoryStarvationSeconds",
-                unum(u64::from(self.suggestions.memory_starvation_seconds)),
-            );
         }
         {
             let t = section(&mut root, "tools");
@@ -1898,7 +1885,6 @@ mod tests {
         assert_eq!(s.memory.held_span_cap, 0);
         assert!(s.suggestions.enabled);
         assert_eq!(s.suggestions.max_tokens, 160);
-        assert_eq!(s.suggestions.memory_starvation_seconds, 300);
     }
 
     #[test]
@@ -2235,9 +2221,11 @@ mod tests {
             "on by default, with the cold-KV skip carrying the cost"
         );
         assert_eq!(s.suggestions.max_tokens, 160);
-        assert_eq!(s.suggestions.memory_starvation_seconds, 300);
     }
 
+    /// `memoryStarvationSeconds` was retired when suggestions became
+    /// unconditionally first at the idle slot; a file that still carries it
+    /// must load like any other file with an unknown key.
     #[test]
     fn the_suggestion_keys_are_read_from_json() {
         let s = from_json(
@@ -2245,7 +2233,6 @@ mod tests {
         );
         assert!(!s.suggestions.enabled);
         assert_eq!(s.suggestions.max_tokens, 24);
-        assert_eq!(s.suggestions.memory_starvation_seconds, 60);
     }
 
     /// A key that parses but never serialises is lost on the next save, silently.
@@ -2259,17 +2246,12 @@ mod tests {
         let mut s = Settings::default();
         s.suggestions.enabled = false;
         s.suggestions.max_tokens = 17;
-        s.suggestions.memory_starvation_seconds = 42;
         s.save_to(&path).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         let back = from_json(&text);
         assert!(!back.suggestions.enabled, "enabled lost on save:\n{text}");
         assert_eq!(back.suggestions.max_tokens, 17, "maxTokens lost:\n{text}");
-        assert_eq!(
-            back.suggestions.memory_starvation_seconds, 42,
-            "starvation lost:\n{text}"
-        );
 
         std::fs::remove_file(&path).ok();
     }

@@ -8,8 +8,6 @@
 //!
 //! Design: `docs/superpowers/specs/2026-09-23-prompt-suggestions-design.md`.
 
-use std::time::Duration;
-
 /// Longest suggestion that is still a glanceable hint. About one editor line
 /// at a typical terminal width; past that it wraps and stops being readable
 /// at a glance, so it is rejected rather than truncated — a half-sentence
@@ -160,38 +158,25 @@ pub fn prompt() -> String {
 
 /// Which of the two background jobs the idle moment should run.
 ///
-/// A pending suggestion wins, because a suggestion that lands after the user
-/// starts typing is wasted while a memory pass is explicitly allowed to defer
-/// (`memory.minTurnSeconds`). The starvation window is what stops a fast
-/// back-and-forth from locking the memory pass out forever: once the oldest
-/// queued job has waited that long, it takes the slot back.
-///
-/// A `starvation` of zero therefore means "never give the suggestion
-/// priority", not "never starve".
+/// A pending suggestion always wins. A suggestion that lands after the user
+/// starts typing is wasted, while a memory pass is explicitly allowed to
+/// defer (`memory.minTurnSeconds`). The memory pass cannot be starved by
+/// this: a suggestion is queued once per turn and its flag is cleared when
+/// it runs, so a waiting memory job gets the very next idle moment.
 #[must_use]
-pub fn idle_work(
-    suggestion_pending: bool,
-    memory_pending: bool,
-    oldest_memory_wait: Option<Duration>,
-    starvation: Duration,
-) -> IdleWork {
-    let starved = memory_pending && oldest_memory_wait.is_some_and(|w| w >= starvation);
-    if suggestion_pending && !starved {
-        return IdleWork::Suggestion;
-    }
-    if memory_pending {
-        return IdleWork::MemoryPass;
-    }
+pub fn idle_work(suggestion_pending: bool, memory_pending: bool) -> IdleWork {
     if suggestion_pending {
-        return IdleWork::Suggestion;
+        IdleWork::Suggestion
+    } else if memory_pending {
+        IdleWork::MemoryPass
+    } else {
+        IdleWork::Nothing
     }
-    IdleWork::Nothing
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     /// The same hazard as the slash guard, on a different prefix: plank's
     /// submit arm treats `!cmd` as shell execution and runs it without
@@ -326,58 +311,21 @@ mod tests {
 
     #[test]
     fn a_pending_suggestion_takes_the_slot_ahead_of_a_memory_job() {
-        assert_eq!(
-            idle_work(
-                true,
-                true,
-                Some(Duration::from_secs(1)),
-                Duration::from_secs(300)
-            ),
-            IdleWork::Suggestion
-        );
-    }
-
-    #[test]
-    fn a_starved_memory_job_takes_the_slot_back() {
-        assert_eq!(
-            idle_work(
-                true,
-                true,
-                Some(Duration::from_secs(301)),
-                Duration::from_secs(300)
-            ),
-            IdleWork::MemoryPass,
-            "a memory must not be locked out by a fast back-and-forth"
-        );
+        assert_eq!(idle_work(true, true), IdleWork::Suggestion);
     }
 
     #[test]
     fn the_memory_pass_runs_when_no_suggestion_is_pending() {
-        assert_eq!(
-            idle_work(
-                false,
-                true,
-                Some(Duration::from_secs(1)),
-                Duration::from_secs(300)
-            ),
-            IdleWork::MemoryPass
-        );
+        assert_eq!(idle_work(false, true), IdleWork::MemoryPass);
+    }
+
+    #[test]
+    fn a_suggestion_alone_takes_the_slot() {
+        assert_eq!(idle_work(true, false), IdleWork::Suggestion);
     }
 
     #[test]
     fn nothing_pending_means_nothing_runs() {
-        assert_eq!(
-            idle_work(false, false, None, Duration::from_secs(300)),
-            IdleWork::Nothing
-        );
-    }
-
-    #[test]
-    fn a_zero_starvation_window_always_prefers_the_memory_pass() {
-        assert_eq!(
-            idle_work(true, true, Some(Duration::ZERO), Duration::ZERO),
-            IdleWork::MemoryPass,
-            "0 disables the suggestion's priority rather than meaning 'never starve'"
-        );
+        assert_eq!(idle_work(false, false), IdleWork::Nothing);
     }
 }

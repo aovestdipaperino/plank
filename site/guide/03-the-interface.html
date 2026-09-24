@@ -417,10 +417,9 @@ or <code>!</code> is discarded rather than offered, since
 <code>true</code>).</li>
 <li><code>suggestions.maxTokens</code> bounds the guess (default
 160).</li>
-<li><code>suggestions.memoryStarvationSeconds</code> (default 300) is
-how long a queued memory pass may wait behind suggestions before it
-takes the idle moment back.</li>
 </ul>
+<p>The suggestion is always generated before a waiting memory pass,
+which then takes the next quiet moment.</p>
 <h2 id="-and---run-a-shell-command-yourself"><code>!</code> and
 <code>!!</code> — run a shell command yourself</h2>
 <p>Prefix a line with <code>!</code> and it runs in your shell, in

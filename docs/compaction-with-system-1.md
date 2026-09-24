@@ -145,8 +145,7 @@ consumes is wasted generation.
 
 **Generate at idle, under the existing guard set.** `suggest::idle_work` gains a
 `CompactVerdict` variant. Order: a pending suggestion first (it is worthless once the user
-types), then a pending verdict, then a memory job, with the existing
-`suggestions.memoryStarvationSeconds` guard still letting a starved memory job jump both. The
+types), then a pending verdict, then a memory job. The
 verdict ranks above memory because it has a deadline, the next pass, and the memory pass is
 explicitly allowed to wait.
 
@@ -231,7 +230,7 @@ only if it is measurably lower.
 ### Testing
 
 Everything except the model's judgement is pure logic and testable with `ScriptedEngine`: the
-queue conditions, the idle priority (including the starvation guard), every skip condition,
+queue conditions, the idle priority, every skip condition,
 reply parsing, fingerprint invalidation, the stale-unjudged-needed order, the budget still being
 met with every candidate marked needed, and the divergence-point rule above.
 

@@ -15093,7 +15093,6 @@ impl Agent<'_> {
             depth,
             attempts: 0,
             resume: None,
-            queued_at: std::time::Instant::now(),
         });
         true
     }
@@ -15129,24 +15128,10 @@ impl Agent<'_> {
             && self.memory_pass_allowed()
     }
 
-    /// How long the oldest queued memory job has been waiting.
-    fn oldest_memory_wait(&self) -> Option<std::time::Duration> {
-        self.memory_jobs.front().map(|j| j.queued_at.elapsed())
-    }
-
-    /// What the idle moment should spend itself on.
+    /// What the idle moment should spend itself on: a pending suggestion
+    /// always first, then the oldest queued memory job.
     fn idle_work(&self) -> crate::suggest::IdleWork {
-        let starvation = std::time::Duration::from_secs(u64::from(
-            crate::settings::active()
-                .suggestions
-                .memory_starvation_seconds,
-        ));
-        crate::suggest::idle_work(
-            self.suggestion_pending,
-            self.memory_jobs_pending(),
-            self.oldest_memory_wait(),
-            starvation,
-        )
+        crate::suggest::idle_work(self.suggestion_pending, self.memory_jobs_pending())
     }
 
     /// Runs the oldest queued job: one sidechain generation against the live
@@ -22436,12 +22421,11 @@ mod tests {
         AutoExtractGuard
     }
 
-    /// Suggestions on, with an explicit starvation window. Installed through
-    /// the same `install_for_test` path and torn down by the same guard.
-    fn enable_suggestions_for_test(starvation_secs: u32) -> AutoExtractGuard {
+    /// Suggestions on. Installed through the same `install_for_test` path
+    /// and torn down by the same guard.
+    fn enable_suggestions_for_test() -> AutoExtractGuard {
         let mut on = crate::settings::Settings::default();
         on.suggestions.enabled = true;
-        on.suggestions.memory_starvation_seconds = starvation_secs;
         crate::settings::install_for_test(on);
         AutoExtractGuard
     }
@@ -22459,7 +22443,7 @@ mod tests {
     /// which is otherwise present but never decisive.
     #[test]
     fn a_turn_while_init_is_running_queues_nothing() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-init");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22478,7 +22462,7 @@ mod tests {
     /// conjunct, which is otherwise present but never decisive.
     #[test]
     fn a_turn_the_user_interrupted_queues_nothing() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-interrupted");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22494,7 +22478,7 @@ mod tests {
 
     #[test]
     fn a_suggestion_is_dropped_when_the_transcript_moves() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-stale");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22516,7 +22500,7 @@ mod tests {
 
     #[test]
     fn clearing_the_session_clears_the_suggestion() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-clear");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22532,7 +22516,7 @@ mod tests {
 
     #[test]
     fn a_clean_turn_end_queues_a_suggestion() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-queue");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22546,7 +22530,7 @@ mod tests {
 
     #[test]
     fn a_turn_that_errored_queues_nothing() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-err");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22573,7 +22557,7 @@ mod tests {
 
     #[test]
     fn a_generated_suggestion_is_sanitized_and_stored_with_its_depth() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-gen");
         let cfg = test_cfg();
         let engine = ScriptedEngine {
@@ -22595,7 +22579,7 @@ mod tests {
 
     #[test]
     fn a_reply_the_sanitizer_rejects_stores_nothing() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-reject");
         let cfg = test_cfg();
         let engine = ScriptedEngine {
@@ -22618,7 +22602,7 @@ mod tests {
     /// The generation must leave no trace in the conversation.
     #[test]
     fn generating_a_suggestion_does_not_grow_the_transcript() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-notrace");
         let cfg = test_cfg();
         let engine = ScriptedEngine {
@@ -22648,7 +22632,7 @@ mod tests {
     /// live end, which is exactly the rebuild-from-zero case.
     #[test]
     fn a_cold_kv_skips_the_generation_without_opening_a_fork() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-coldkv");
         let cfg = test_cfg();
         let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -22690,7 +22674,7 @@ mod tests {
     /// including the memory pass and this feature's own skip condition.
     #[test]
     fn a_failed_suggestion_generation_still_closes_the_fork() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-fail");
         let cfg = test_cfg();
         let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -22729,7 +22713,7 @@ mod tests {
 
     #[test]
     fn a_sidechain_turn_queues_nothing() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-side");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22745,7 +22729,7 @@ mod tests {
 
     #[test]
     fn a_pending_suggestion_wins_the_idle_slot() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-slot");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22755,10 +22739,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// However long a memory job has been queued, a pending suggestion is
+    /// generated first; the memory pass takes the next idle moment.
     #[test]
-    fn a_starved_memory_job_takes_the_idle_slot_back() {
-        let _s = enable_suggestions_for_test(0); // everything is starved at once
-        let dir = scratch_dir("sugg-starve");
+    fn a_pending_suggestion_runs_before_a_queued_memory_job() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-before-mem");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         agent.suggestion_pending = true;
@@ -22767,16 +22753,17 @@ mod tests {
             depth: 1,
             attempts: 0,
             resume: None,
-            queued_at: std::time::Instant::now(),
         });
 
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::Suggestion);
+        agent.suggestion_pending = false; // what running the suggestion does
         assert_eq!(agent.idle_work(), crate::suggest::IdleWork::MemoryPass);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn nothing_pending_means_the_idle_moment_does_nothing() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-nowork");
         let cfg = test_cfg();
         let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22796,7 +22783,7 @@ mod tests {
 
     #[test]
     fn tab_places_the_suggestion_and_leaves_it_editable() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-tab");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22824,7 +22811,7 @@ mod tests {
 
     #[test]
     fn enter_accepts_the_suggestion_on_the_way_to_the_submit_arm() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-enter");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22859,7 +22846,7 @@ mod tests {
 
     #[test]
     fn a_printable_keystroke_dismisses_the_suggestion() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-dismiss");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -22888,7 +22875,7 @@ mod tests {
     /// the guard is what is asserted and what the name promises.
     #[test]
     fn the_suggestion_is_refused_while_the_completion_popup_is_open() {
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-popup");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -33205,47 +33192,6 @@ or the user's next message aborts before its first token"
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A requeued job keeps the moment it FIRST started waiting.
-    ///
-    /// The starvation guard reads `queued_at` to decide when a memory job
-    /// takes the idle slot back from prompt suggestions. Re-stamping on
-    /// requeue would mean a job that keeps getting interrupted never
-    /// registers as starved — the guard would be present and permanently
-    /// inert, with nothing anywhere to say so.
-    #[test]
-    fn requeueing_a_job_does_not_reset_how_long_it_has_waited() {
-        let dir = scratch_dir("memjob-requeue-stamp");
-        let cfg = test_cfg();
-        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-
-        let stamped = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(600))
-            .expect("600s before now is representable");
-        let job = crate::memextract::MemoryJob {
-            task: "x".to_string(),
-            depth: 1,
-            attempts: 0,
-            resume: None,
-            queued_at: stamped,
-        };
-
-        agent.requeue_memory_job(job, true);
-        let back = agent.memory_jobs.front().expect("pushed back");
-        assert_eq!(
-            back.queued_at, stamped,
-            "an interrupted job has still been waiting since it was first queued"
-        );
-
-        // The same must hold on the error path, which bumps `attempts`.
-        let job = agent.memory_jobs.pop_front().unwrap();
-        agent.requeue_memory_job(job, false);
-        let back = agent.memory_jobs.front().expect("pushed back");
-        assert_eq!(back.attempts, 1, "precondition: the error path ran");
-        assert_eq!(back.queued_at, stamped, "still the original stamp");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     /// A turn end snapshots the span and generates nothing; the reading is
     /// the idle loop's job, and it retires the span as it is captured.
     #[test]
@@ -33784,7 +33730,7 @@ or the user's next message aborts before its first token"
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
             return;
         };
-        let _s = enable_suggestions_for_test(300);
+        let _s = enable_suggestions_for_test();
         let dir = scratch_dir("sugg-realmodel");
         let cfg = test_cfg();
 

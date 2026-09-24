@@ -27,6 +27,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A prompt suggestion always runs before a queued memory pass.** The idle
+  moment used to hand the slot to a memory job that had waited
+  `suggestions.memoryStarvationSeconds` (300s), even with a suggestion
+  pending, so the ghost text could arrive after a memory pass instead of
+  right after the answer. That window is gone, and so is the setting: a
+  suggestion is queued once per turn and clears when it runs, so the memory
+  pass takes the next quiet moment and cannot be starved. A settings file
+  that still carries the key loads unchanged.
+
 - **`memory.minTurnSeconds` now defaults to 30** (was 120). Two minutes kept
   most ordinary exchanges from ever reaching the extraction pass; thirty
   seconds still skips the quick back-and-forth while letting a real turn of
