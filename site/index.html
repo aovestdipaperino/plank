@@ -184,6 +184,13 @@
   .shot figcaption{padding:13px 16px;font-size:14.5px;color:var(--bark-soft)}
   .shot figcaption b{color:var(--bark);font-weight:800}
 
+  /* book */
+  .book{display:grid;grid-template-columns:minmax(150px,220px) 1fr;gap:28px;align-items:center}
+  .book img{width:100%;height:auto;border-radius:6px;box-shadow:0 10px 0 rgb(var(--shadow) / .12)}
+  .book p{color:var(--bark-soft);margin:0 0 14px;max-width:620px}
+  .book .actions{display:flex;gap:10px;flex-wrap:wrap}
+  @media (max-width:640px){.book{grid-template-columns:1fr}.book img{max-width:220px}}
+
   /* footer */
   footer{border-top:2px dashed var(--line);margin-top:20px;padding:26px 0 46px;color:var(--bark-soft);font-size:14px}
   .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
@@ -207,6 +214,7 @@
       <div style="display:flex;gap:10px;align-items:center">
         <a class="ghost" href="/whats-new">What's new</a>
         <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="#book">Book</a>
         <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
     </div>
@@ -399,6 +407,28 @@
       <p style="margin:16px 0 0"><a class="ghost" href="/guide/">Open the guide →</a></p>
     </section>
 
+    <section id="book">
+      <p class="kicker">Read the book</p>
+      <h2 class="rounded">How the plank got built.</h2>
+      <div class="book">
+        <img loading="lazy" decoding="async" src="/assets/book-cover.jpg" width="480" height="720"
+             alt="Cover of Writing an Agent Harness in Rust: an orange crab peeking over a terminal window beside the Rust logo">
+        <div>
+          <p><em>Writing an Agent Harness in Rust</em> is the story of plank told from the
+          workbench: why a local model makes the cache your problem, how the loop guards
+          learned to catch a model going in circles, where memory can live without breaking
+          the prompt. You build your own small harness along the way, one subsystem per
+          chapter, with a test for every claim.</p>
+          <p>Fourteen chapters and six appendices, DRM-free EPUB and PDF. It is a living
+          edition: revised as plank's answers change, and every update is included.</p>
+          <div class="actions">
+            <a class="ghost" href="https://enzolombardi.lemonsqueezy.com/checkout/buy/6b2c7f38-e83c-47e3-ad91-b1526f486a70" target="_blank" rel="noopener">Get the book, €8.99 ↗</a>
+            <a class="ghost" href="https://ebook.plank-agent.dev">Already bought it? Download →</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section>
       <p class="kicker">A day in the life</p>
       <h2 class="rounded">You talk. Plank works.</h2>
@@ -421,6 +451,7 @@
       <div>
         <a href="/whats-new">What's new</a> ·
         <a href="/guide/">User guide</a> ·
+        <a href="#book">The book</a> ·
         <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
         <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a> ·
         <a href="https://github.com/aovestdipaperino/homebrew-tap" target="_blank" rel="noopener">Homebrew tap</a>
