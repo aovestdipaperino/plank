@@ -66,11 +66,24 @@ impl ContextContent {
     /// definition it can never auto-route to.
     #[must_use]
     pub fn new_with_agents(defs: &[crate::agents::AgentDef]) -> Self {
-        let git_content = fetch_git_context();
-        let agents_md_content = discover_agents_md_files();
+        Self::collect(
+            defs,
+            crate::profile::folder_context_enabled(),
+            crate::profile::agents_md_enabled(),
+        )
+    }
+
+    /// [`Self::new_with_agents`] with the two launch-folder sources chosen
+    /// explicitly: `folder` gates the git status and project memory, and
+    /// `agents_md` the `AGENTS.md` discovery. A profile turns both off unless
+    /// its manifest opts in.
+    #[must_use]
+    pub fn collect(defs: &[crate::agents::AgentDef], folder: bool, agents_md: bool) -> Self {
+        let git_content = folder.then(fetch_git_context).flatten();
+        let agents_md_content = agents_md.then(discover_agents_md_files).flatten();
         let memory_content = std::env::current_dir()
             .ok()
-            .and_then(|cwd| crate::memory::load_default(&cwd));
+            .and_then(|cwd| crate::memory::load_scoped(&cwd, folder));
         let agents_content = agent_roster_context(defs);
         let date_content = date_context_line();
 
@@ -541,6 +554,17 @@ pub fn is_session_context(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_profile_without_folder_context_or_agents_md_gets_neither() {
+        let off = ContextContent::collect(&[], false, false);
+        assert!(off.git_content.is_none());
+        assert!(off.agents_md_content.is_none());
+        assert!(
+            !off.date_content.is_empty(),
+            "the date is not folder context"
+        );
+    }
     use super::*;
 
     /// Every block a real `ContextContent` can produce has to be recognizable,

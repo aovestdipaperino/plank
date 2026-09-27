@@ -19571,10 +19571,16 @@ pub fn run_interactive(
     // AGENTS.md is read on this very start. Interactive only: the headless
     // front end never gets here, and must neither write into a checkout nor
     // block on a question.
-    let offer_init = match std::env::current_dir()
-        .map_err(|e| e.to_string())
-        .and_then(|cwd| crate::agentsmd::prepare(&cwd))
-    {
+    // A profile that does not use AGENTS.md is not offered one, and no
+    // CLAUDE.md is linked on its behalf.
+    let agents_md = if crate::profile::agents_md_enabled() {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())
+            .and_then(|cwd| crate::agentsmd::prepare(&cwd))
+    } else {
+        Ok(crate::agentsmd::Startup::Skipped)
+    };
+    let offer_init = match agents_md {
         Ok(crate::agentsmd::Startup::Linked(path)) => {
             println!("plank: linked {} -> CLAUDE.md", path.display());
             false
@@ -23802,6 +23808,8 @@ mod tests {
             builtin_tools: Some(allowed.iter().map(|s| (*s).to_string()).collect()),
             settings_json: None,
             warnings: Vec::new(),
+            folder_context: false,
+            agents_md: false,
         }
     }
 

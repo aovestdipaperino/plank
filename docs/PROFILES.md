@@ -26,6 +26,8 @@ for the Claude Code layout), alongside the plugin's existing `name`,
 | `accent` | string | no | plank's built-in green |
 | `tools.builtin` | array of strings | no | every builtin tool is offered |
 | `settings` | object | no | no extra settings layer |
+| `folderContext` | boolean | no | `false`: no launch-folder context |
+| `agentsMd` | boolean | no | `false`: `AGENTS.md` is neither read nor offered |
 
 `systemPrompt` is the only required field, and deliberately so: a `profile`
 block without a prompt is a skin over plank's own identity, and activating a
@@ -41,6 +43,26 @@ plank's own art, also with a warning; the sample profile in this repository
 ships without a `logo` key specifically to exercise that fallback. A
 `displayName` that is not a non-empty string falls back to the plugin's name.
 A `settings` value that is not an object is dropped.
+
+### Folder context and AGENTS.md
+
+A session normally starts with context about the folder plank was launched
+from. Most profiles are not about that folder, so a profile gets none of it
+unless its manifest asks:
+
+- `folderContext: true` restores the git status block and the project memory
+  file, `<folder>/.plank/MEMORY.md`. Without it the session still gets the
+  user's own memory (`~/.plank/MEMORY.md`), the date and the sub-agent
+  roster, and tools still work in the folder; the model is just not told
+  about it up front.
+- `agentsMd: true` restores reading `AGENTS.md` and `AGENTS.local.md`, the
+  launch offer to generate an `AGENTS.md` when there is none, and linking one
+  to a lone `CLAUDE.md`.
+
+Both default to `false`, and a value that is not `true` or `false` warns and
+counts as `false`, so a typo never turns a context source on. A coding-style
+profile sets both to `true`. Without `--profile`, plank behaves as it always
+has: both are on.
 
 `tools.builtin`, if present, is expected to be an array of tool names: any
 other shape is a mistake, not a restriction the author meant, but a

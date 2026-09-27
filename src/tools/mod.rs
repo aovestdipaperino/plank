@@ -1246,6 +1246,8 @@ mod tests {
             builtin_tools: Some(vec!["bash".to_string()]),
             settings_json: None,
             warnings: Vec::new(),
+            folder_context: false,
+            agents_md: false,
         };
         assert!(spec.builtin_enabled("bash"));
         assert!(!spec.builtin_enabled("read"));
@@ -1265,6 +1267,8 @@ mod tests {
             builtin_tools: Some(allowed.iter().map(|s| (*s).to_string()).collect()),
             settings_json: None,
             warnings: Vec::new(),
+            folder_context: false,
+            agents_md: false,
         }
     }
 

@@ -14,6 +14,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/PROFILES.md` for the manifest reference and `examples/profiles/chatbgt`
   for a worked example. `/plugins` marks the plugins `--profile` accepts, and
   startup warns when a profile prompt has no `{{plank:tool-protocol}}` token.
+- **Profiles choose their launch-folder context.** Two optional `profile`
+  fields, both `false` by default: `folderContext` (the git status block and
+  `<folder>/.plank/MEMORY.md`) and `agentsMd` (reading `AGENTS.md` and
+  `AGENTS.local.md`, the launch offer to generate one, and `CLAUDE.md`
+  linking). A mail agent launched from a code checkout is no longer told
+  about the checkout or offered an `AGENTS.md`; plain plank is unchanged.
 - **`--profile` takes a path or `owner/repo:folder`.** A profile that is not
   installed yet is fetched from a local directory or one folder of a GitHub
   repository, installed after asking, and launched:

@@ -287,8 +287,18 @@ fn load_scope(scope: Scope, cwd: &Path) -> Option<String> {
 /// `None` when neither file has content.
 #[must_use]
 pub fn load_default(cwd: &Path) -> Option<String> {
+    load_scoped(cwd, true)
+}
+
+/// [`load_default`], leaving out the project file when `include_project` is
+/// false: a profile without `folderContext` still gets the user's own memory,
+/// but nothing written about the folder it happened to be launched from.
+#[must_use]
+pub fn load_scoped(cwd: &Path, include_project: bool) -> Option<String> {
     let user = load_scope(Scope::User, cwd);
-    let project = load_scope(Scope::Project, cwd);
+    let project = include_project
+        .then(|| load_scope(Scope::Project, cwd))
+        .flatten();
     if user.is_none() && project.is_none() {
         return None;
     }
@@ -1395,6 +1405,23 @@ fn forget_where_to(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn project_memory_can_be_left_out() {
+        let cwd = std::env::temp_dir().join(format!("plank-mem-scoped-{}", std::process::id()));
+        std::fs::create_dir_all(cwd.join(".plank")).expect("mkdir");
+        std::fs::write(
+            cwd.join(".plank").join("MEMORY.md"),
+            "- (2026-09-27) [project] the folder's own note\n",
+        )
+        .expect("write");
+        let with = load_scoped(&cwd, true).unwrap_or_default();
+        assert!(with.contains("the folder's own note"), "{with}");
+        let without = load_scoped(&cwd, false).unwrap_or_default();
+        assert!(!without.contains("the folder's own note"), "{without}");
+        assert!(!without.contains("## Project memory"), "{without}");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
     use super::*;
 
     fn entry(text: &str, kind: Kind) -> Entry {

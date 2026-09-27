@@ -39,6 +39,13 @@ pub struct ProfileSpec {
     pub settings_json: Option<String>,
     /// Non-fatal complaints raised while parsing.
     pub warnings: Vec<String>,
+    /// `folderContext`: whether the session starts with context about the
+    /// launch folder (its git status and `<folder>/.plank/MEMORY.md`).
+    /// `false` unless the manifest says `true`.
+    pub folder_context: bool,
+    /// `agentsMd`: whether `AGENTS.md` files are read, and offered or linked
+    /// at launch. `false` unless the manifest says `true`.
+    pub agents_md: bool,
 }
 
 impl ProfileSpec {
@@ -175,6 +182,9 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
         }
     };
 
+    let folder_context = bool_field(block, "folderContext", &mut warnings);
+    let agents_md = bool_field(block, "agentsMd", &mut warnings);
+
     Some(ProfileSpec {
         display_name,
         logo,
@@ -183,6 +193,8 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
         builtin_tools,
         settings_json,
         warnings,
+        folder_context,
+        agents_md,
     })
 }
 
@@ -230,6 +242,19 @@ fn warn_refused_engine_settings(members: &[(String, Json)], warnings: &mut Vec<S
 }
 
 /// A non-empty string member, or `None`.
+/// A boolean profile field: `false` when absent, and `false` with a warning
+/// when it is not a boolean, so a typo never turns a context source on.
+fn bool_field(obj: &Json, key: &str, warnings: &mut Vec<String>) -> bool {
+    match obj.get(key) {
+        None => false,
+        Some(Json::Bool(b)) => *b,
+        Some(_) => {
+            warnings.push(format!("profile: {key} is not true or false; using false"));
+            false
+        }
+    }
+}
+
 fn str_field(obj: &Json, key: &str) -> Option<String> {
     match obj.get(key) {
         Some(Json::Str(s)) if !s.is_empty() => Some(s.clone()),
@@ -333,6 +358,35 @@ impl Drop for TestProfileGuard {
     fn drop(&mut self) {
         TEST_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
     }
+}
+
+/// Whether the session starts with launch-folder context (git status and
+/// project memory). Always true without a profile; a profile opts in with
+/// `folderContext: true`.
+#[must_use]
+pub fn folder_context_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(on) =
+            TEST_OVERRIDE.with(|cell| cell.borrow().as_ref().map(|s| s.folder_context))
+        {
+            return on;
+        }
+    }
+    ACTIVE.get().is_none_or(|a| a.spec.folder_context)
+}
+
+/// Whether `AGENTS.md` is read, offered and linked. Always true without a
+/// profile; a profile opts in with `agentsMd: true`.
+#[must_use]
+pub fn agents_md_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(on) = TEST_OVERRIDE.with(|cell| cell.borrow().as_ref().map(|s| s.agents_md)) {
+            return on;
+        }
+    }
+    ACTIVE.get().is_none_or(|a| a.spec.agents_md)
 }
 
 /// Whether builtin tool `name` is offered under the active profile.
@@ -451,6 +505,48 @@ pub fn missing_protocol_warning(name: &str, prompt: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_context_and_agents_md_default_to_false() {
+        let root = Path::new("/p");
+        let spec = parse(r#"{"profile":{"systemPrompt":"p.md"}}"#, root).expect("parses");
+        assert!(!spec.folder_context && !spec.agents_md);
+        let spec = parse(
+            r#"{"profile":{"systemPrompt":"p.md","folderContext":true,"agentsMd":true}}"#,
+            root,
+        )
+        .expect("parses");
+        assert!(spec.folder_context && spec.agents_md);
+        assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+    }
+
+    #[test]
+    fn a_non_boolean_context_flag_warns_and_stays_off() {
+        let spec = parse(
+            r#"{"profile":{"systemPrompt":"p.md","folderContext":"yes","agentsMd":1}}"#,
+            Path::new("/p"),
+        )
+        .expect("parses");
+        assert!(!spec.folder_context && !spec.agents_md);
+        assert_eq!(spec.warnings.len(), 2, "{:?}", spec.warnings);
+        assert!(spec.warnings[0].contains("folderContext"));
+    }
+
+    #[test]
+    fn the_context_switches_follow_the_profile_and_stay_on_without_one() {
+        assert!(
+            folder_context_enabled() && agents_md_enabled(),
+            "no profile: unchanged"
+        );
+        let spec = parse(
+            r#"{"profile":{"systemPrompt":"p.md","agentsMd":true}}"#,
+            Path::new("/p"),
+        )
+        .expect("parses");
+        let _guard = TestProfileGuard::install(spec);
+        assert!(!folder_context_enabled());
+        assert!(agents_md_enabled());
+    }
 
     #[test]
     fn a_prompt_without_the_protocol_token_warns_once_by_name() {
@@ -797,6 +893,8 @@ mod tests {
             builtin_tools: tools,
             settings_json: None,
             warnings: Vec::new(),
+            folder_context: false,
+            agents_md: false,
         }
     }
 

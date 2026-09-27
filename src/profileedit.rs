@@ -133,7 +133,17 @@ fn header(plugin: &Plugin, spec: &ProfileSpec) -> String {
         Accent::Indexed(i) => i.to_string(),
         Accent::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
     });
-    let rows: [(&str, String, &str); 6] = [
+    let flag = |key: &str, on: bool| {
+        let source = if manifest_sets(plugin, key) {
+            "manifest"
+        } else {
+            "default (off for a profile)"
+        };
+        (on.to_string(), source)
+    };
+    let (folder_value, folder_source) = flag("folderContext", spec.folder_context);
+    let (agents_value, agents_source) = flag("agentsMd", spec.agents_md);
+    let rows: [(&str, String, &str); 8] = [
         match &spec.display_name {
             Some(d) => ("displayName", d.clone(), "manifest"),
             None => (
@@ -170,6 +180,8 @@ fn header(plugin: &Plugin, spec: &ProfileSpec) -> String {
             }
             _ => ("settings", "none".to_owned(), "default"),
         },
+        ("folderContext", folder_value, folder_source),
+        ("agentsMd", agents_value, agents_source),
     ];
     for (field, value, source) in rows {
         let _ = writeln!(out, "     {field:<12} {value:<28} {source}");
@@ -186,6 +198,15 @@ fn short(path: &Path, root: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+/// Whether the manifest's `profile` block names `key` at all, so the header
+/// can tell an explicit `false` from the default one.
+fn manifest_sets(plugin: &Plugin, key: &str) -> bool {
+    crate::plugins::manifest_path(&plugin.root)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| crate::tools::mcp::json_parse(&text))
+        .is_some_and(|root| root.get("profile").and_then(|b| b.get(key)).is_some())
 }
 
 /// The dotted keys a settings object sets, leaves only, in document order.
@@ -508,7 +529,8 @@ mod tests {
     "accent": "#d0021b",
     "systemPrompt": "prompt.md",
     "tools": { "builtin": ["read", "ask"] },
-    "settings": { "ui": { "showThinking": false } }
+    "settings": { "ui": { "showThinking": false } },
+    "agentsMd": true
   }
 }
 "##;
@@ -540,6 +562,8 @@ mod tests {
         assert!(row("tools").contains("read ask"));
         assert!(row("systemPrompt").contains(" prompt.md "), "{text}");
         assert!(row("settings").contains("ui.showThinking"));
+        assert!(row("folderContext").contains("false") && row("folderContext").contains("default"));
+        assert!(row("agentsMd").contains("true") && row("agentsMd").ends_with("manifest"));
         assert!(!text.contains("installed copy"));
     }
 
