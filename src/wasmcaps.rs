@@ -253,6 +253,191 @@ fn state_usage(dir: &Path, except: &Path) -> (usize, u64) {
         .fold((0, 0), |(n, bytes), m| (n + 1, bytes + m.len()))
 }
 
+// ---------------------------------------------------------------------------
+// `fs`: a private in-memory scratch disk
+// ---------------------------------------------------------------------------
+
+/// Largest single file a component may keep on its RAM disk.
+pub const FS_MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+/// Most files one component's RAM disk may hold.
+pub const FS_MAX_FILES: usize = 256;
+/// Most bytes one component's RAM disk may hold in total.
+pub const FS_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+
+/// Normalizes a RAM-disk path to `/`-rooted form.
+///
+/// `..` is refused rather than clamped at the root: a component that asks for
+/// `../x` has a bug, and quietly handing it `/x` would hide it. There is no
+/// real directory behind the disk, so this is about honest errors, not escape.
+///
+/// # Errors
+/// Returns a message for `..`, NUL or backslash.
+pub fn normalize_fs_path(path: &str) -> Result<String, String> {
+    if path.contains('\0') || path.contains('\\') {
+        return Err(format!("path {path:?} contains NUL or a backslash"));
+    }
+    let mut out = String::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => return Err(format!("path {path:?} uses '..'")),
+            s => {
+                out.push('/');
+                out.push_str(s);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    Ok(out)
+}
+
+/// One component's RAM disk: normalized path to contents. Directories are
+/// implied by the files under them.
+#[derive(Debug, Default, Clone)]
+pub struct RamFs {
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl RamFs {
+    /// A file's bytes.
+    #[must_use]
+    pub fn read(&self, path: &str) -> Option<&[u8]> {
+        self.files.get(path).map(Vec::as_slice)
+    }
+
+    /// Stores a file, refusing anything over quota before changing anything.
+    ///
+    /// # Errors
+    /// Returns a message starting with `'<id>'` naming the limit exceeded.
+    pub fn write(&mut self, id: &str, path: &str, bytes: &[u8]) -> Result<(), String> {
+        if path == "/" {
+            return Err(format!("'{id}' cannot write to the root directory"));
+        }
+        if bytes.len() > FS_MAX_FILE_BYTES {
+            return Err(format!(
+                "'{id}' file {path} is {} bytes, more than the {FS_MAX_FILE_BYTES}-byte limit",
+                bytes.len()
+            ));
+        }
+        let existing = self.files.get(path).map(Vec::len);
+        if existing.is_none() && self.files.len() >= FS_MAX_FILES {
+            return Err(format!("'{id}' already holds {FS_MAX_FILES} files, the limit; {path} was not written"));
+        }
+        let total: usize = self.files.values().map(Vec::len).sum::<usize>() - existing.unwrap_or(0);
+        if total + bytes.len() > FS_MAX_TOTAL_BYTES {
+            return Err(format!(
+                "'{id}' disk would grow to {} bytes, more than the {FS_MAX_TOTAL_BYTES}-byte limit; {path} was not written",
+                total + bytes.len()
+            ));
+        }
+        self.files.insert(path.to_string(), bytes.to_vec());
+        Ok(())
+    }
+
+    /// The immediate children of `dir`: files with their size, and
+    /// subdirectories as `name/` with size 0, sorted by name.
+    #[must_use]
+    pub fn list(&self, dir: &str) -> Vec<(String, usize)> {
+        let prefix = if dir == "/" { "/".to_string() } else { format!("{dir}/") };
+        let mut out: BTreeMap<String, usize> = BTreeMap::new();
+        for (path, bytes) in &self.files {
+            let Some(rest) = path.strip_prefix(&prefix) else { continue };
+            match rest.split_once('/') {
+                Some((sub, _)) => {
+                    out.entry(format!("{sub}/")).or_insert(0);
+                }
+                None => {
+                    out.insert(rest.to_string(), bytes.len());
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Deletes a file. Returns whether it existed.
+    pub fn remove(&mut self, path: &str) -> bool {
+        self.files.remove(path).is_some()
+    }
+}
+
+/// Every component's RAM disk for this session, keyed by component id. Shared
+/// by every loaded component's host functions; dropped when plank exits.
+pub type RamDisks = Arc<Mutex<BTreeMap<String, RamFs>>>;
+
+fn with_disk<T>(grants: &Grants, disks: &RamDisks, f: impl FnOnce(&mut RamFs) -> T) -> Result<T, String> {
+    if !grants.allows("fs") {
+        return Err(grants.refusal("fs"));
+    }
+    let mut map = disks.lock().map_err(|_| "RAM disk lock poisoned".to_string())?;
+    Ok(f(map.entry(grants.id.clone()).or_default()))
+}
+
+/// Reads a file from the component's RAM disk.
+///
+/// # Errors
+/// Without the `fs` grant, for a bad path, or when the file does not exist.
+pub fn fs_read(grants: &Grants, disks: &RamDisks, path: &str) -> Result<Vec<u8>, String> {
+    let path = normalize_fs_path(path)?;
+    with_disk(grants, disks, |d| d.read(&path).map(<[u8]>::to_vec))?
+        .ok_or_else(|| format!("no such file: {path}"))
+}
+
+/// Writes a file to the component's RAM disk.
+///
+/// # Errors
+/// Without the `fs` grant, for a bad path, or over quota.
+pub fn fs_write(grants: &Grants, disks: &RamDisks, path: &str, bytes: &[u8]) -> Result<(), String> {
+    let path = normalize_fs_path(path)?;
+    with_disk(grants, disks, |d| d.write(&grants.id, &path, bytes))?
+}
+
+/// Lists a directory of the component's RAM disk as JSON.
+///
+/// # Errors
+/// Without the `fs` grant, or for a bad path.
+pub fn fs_list(grants: &Grants, disks: &RamDisks, dir: &str) -> Result<String, String> {
+    let dir = normalize_fs_path(dir)?;
+    let entries = with_disk(grants, disks, |d| d.list(&dir))?;
+    let items: Vec<String> = entries
+        .iter()
+        .map(|(name, size)| format!("{{\"name\":{},\"size\":{size}}}", crate::wasmreg::json_str(name)))
+        .collect();
+    Ok(format!("[{}]", items.join(",")))
+}
+
+/// Removes a file from the component's RAM disk.
+///
+/// # Errors
+/// Without the `fs` grant, for a bad path, or when the file does not exist.
+pub fn fs_remove(grants: &Grants, disks: &RamDisks, path: &str) -> Result<(), String> {
+    let path = normalize_fs_path(path)?;
+    if with_disk(grants, disks, |d| d.remove(&path))? {
+        Ok(())
+    } else {
+        Err(format!("no such file: {path}"))
+    }
+}
+
+/// Frames a byte-returning host call's result for the guest: `0` then the
+/// data, or `1` then the error text. A plain empty reply could not tell "empty
+/// file" from "refused".
+#[must_use]
+pub fn fs_reply(r: Result<Vec<u8>, String>) -> Vec<u8> {
+    match r {
+        Ok(mut data) => {
+            data.insert(0, 0);
+            data
+        }
+        Err(e) => {
+            let mut out = vec![1];
+            out.extend_from_slice(e.as_bytes());
+            out
+        }
+    }
+}
+
 /// A component's private state directory: `<state_root>/<id>/state`.
 ///
 /// The id is sanitized the same way a key is — it comes from a manifest, and a
@@ -600,5 +785,93 @@ mod tests {
         state_set(&g, "c0", b"tiny").unwrap();
         state_set(&g, "spill", b"x").unwrap();
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn disks() -> RamDisks {
+        Arc::new(Mutex::new(BTreeMap::new()))
+    }
+
+    #[test]
+    fn fs_paths_normalize_and_refuse_traversal() {
+        assert_eq!(normalize_fs_path("a.csv").unwrap(), "/a.csv");
+        assert_eq!(normalize_fs_path("/x//./y.csv").unwrap(), "/x/y.csv");
+        assert_eq!(normalize_fs_path("").unwrap(), "/");
+        assert_eq!(normalize_fs_path("/").unwrap(), "/");
+        for bad in ["../a", "/x/../y", "a\\b", "a\0b"] {
+            assert!(normalize_fs_path(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn fs_needs_the_grant() {
+        let g = grants_for("dev.plank.demo", &[], None);
+        let d = disks();
+        let err = fs_write(&g, &d, "a.csv", b"x").unwrap_err();
+        assert!(err.contains("'fs'"), "{err}");
+        assert!(fs_read(&g, &d, "a.csv").is_err());
+        assert!(fs_list(&g, &d, "/").is_err());
+        assert!(fs_remove(&g, &d, "a.csv").is_err());
+    }
+
+    #[test]
+    fn fs_round_trips_lists_and_removes() {
+        let g = grants_for("dev.plank.demo", &["fs"], None);
+        let d = disks();
+        fs_write(&g, &d, "a.csv", b"1,2\n").unwrap();
+        fs_write(&g, &d, "/sub/b.csv", b"x").unwrap();
+        assert_eq!(fs_read(&g, &d, "/a.csv").unwrap(), b"1,2\n");
+        assert_eq!(
+            fs_list(&g, &d, "/").unwrap(),
+            r#"[{"name":"a.csv","size":4},{"name":"sub/","size":0}]"#
+        );
+        assert_eq!(fs_list(&g, &d, "sub").unwrap(), r#"[{"name":"b.csv","size":1}]"#);
+        let missing = fs_read(&g, &d, "nope.csv").unwrap_err();
+        assert!(missing.contains("no such file"), "{missing}");
+        fs_remove(&g, &d, "a.csv").unwrap();
+        assert!(fs_read(&g, &d, "a.csv").is_err());
+        assert!(fs_remove(&g, &d, "a.csv").is_err(), "removing a missing file is an error");
+    }
+
+    #[test]
+    fn fs_disks_are_per_component() {
+        let a = grants_for("dev.a", &["fs"], None);
+        let b = grants_for("dev.b", &["fs"], None);
+        let d = disks();
+        fs_write(&a, &d, "x", b"a").unwrap();
+        assert!(fs_read(&b, &d, "x").is_err());
+    }
+
+    #[test]
+    fn fs_quotas_refuse_without_changing_anything() {
+        let g = grants_for("dev.plank.demo", &["fs"], None);
+        let d = disks();
+        let big = vec![0u8; FS_MAX_FILE_BYTES + 1];
+        let err = fs_write(&g, &d, "big", &big).unwrap_err();
+        assert!(err.starts_with("'dev.plank.demo'"), "{err}");
+        assert!(fs_read(&g, &d, "big").is_err());
+
+        for i in 0..FS_MAX_FILES {
+            fs_write(&g, &d, &format!("f{i}"), b"").unwrap();
+        }
+        let err = fs_write(&g, &d, "one-more", b"").unwrap_err();
+        assert!(err.starts_with("'dev.plank.demo'"), "{err}");
+        // Rewriting an existing file is not a new file.
+        fs_write(&g, &d, "f0", b"ok").unwrap();
+
+        let d = disks();
+        let chunk = vec![0u8; FS_MAX_FILE_BYTES];
+        for i in 0..(FS_MAX_TOTAL_BYTES / FS_MAX_FILE_BYTES) {
+            fs_write(&g, &d, &format!("c{i}"), &chunk).unwrap();
+        }
+        let err = fs_write(&g, &d, "over", b"x").unwrap_err();
+        assert!(err.starts_with("'dev.plank.demo'"), "{err}");
+        // Replacing a file with one of the same size fits.
+        fs_write(&g, &d, "c0", &chunk).unwrap();
+    }
+
+    #[test]
+    fn fs_reply_tags_ok_and_error() {
+        assert_eq!(fs_reply(Ok(b"hi".to_vec())), b"\0hi");
+        assert_eq!(fs_reply(Err("bad".into())), b"\x01bad");
     }
 }

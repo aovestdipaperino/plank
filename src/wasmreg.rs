@@ -1245,7 +1245,8 @@ impl TrustStore {
 }
 
 /// Minimal JSON string escaping for the trust file.
-fn json_str(s: &str) -> String {
+#[must_use]
+pub fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
