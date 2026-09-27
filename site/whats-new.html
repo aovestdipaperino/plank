@@ -124,6 +124,7 @@
       <div class="navlinks">
         <a class="ghost" href="/whats-new">What's new</a>
         <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="/guide/14-profiles">Profiles</a>
         <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
     </div>
@@ -138,9 +139,36 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v5.3.0 is out</strong>, and the beta channel is on 5.3.1. The
+<p><strong>v6.0.0 is out</strong>, and the beta channel is on 6.0.1. The
 patch number is still the channel: <code>.0</code> is stable, anything
-above it is beta.</p>
+above it is beta. The major number moved for one reason: profiles.</p>
+<p><strong>Plank can be a different agent.</strong> A profile gives it
+its own system prompt, its own set of tools, its own settings, and its
+own logo, name and colour, so the same binary can start as a coding
+assistant, a mail assistant or a budget analyst. You start one by name,
+from a folder, or straight from a folder of a GitHub repository:</p>
+<pre class="sh"><code>plank --profile aovestdipaperino/plank-profiles:HAL</code></pre>
+<p>The first launch asks before installing it; after that the same
+command starts the installed copy, and when the profile's author raises
+its version, plank offers the update before it starts.
+<code>/edit-profile</code> opens the running profile's files with a note
+beside every setting saying where it comes from, and after a save it
+offers to restart into the change without losing the conversation. A
+profile also decides whether it wants to know about the folder you
+launched it from, so a mail assistant started in a code checkout is not
+told the checkout's git status or offered an <code>AGENTS.md</code>.</p>
+<p>The first published profile is <strong>HAL</strong>, a mail assistant
+over one Outlook mailbox. It reads, flags, drafts and files mail, and it
+cannot send or delete any: the permission it signs in with does not
+include sending, and its mail server has no delete tool. The <a
+href="/guide/14-profiles">Profiles chapter</a> of the guide covers
+installing, updating and writing your own.</p>
+<p>Two smaller changes came along. <code>--plugin-dir</code> is gone:
+put a plugin you are working on in <code>./.plank/plugins/</code>, and
+launch a profile folder with <code>--profile &lt;folder&gt;</code>. And
+an MCP server that stops answering is now restarted on the next call
+instead of being written off for the rest of the session.</p>
+<p>The rest of this section is what landed in 5.3.</p>
 <p><strong>Plank guesses your next prompt.</strong> After an answer, a
 short background pass works out the most likely thing you are about to
 type and offers it as grey ghost text on the empty prompt.

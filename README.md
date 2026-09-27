@@ -353,6 +353,48 @@ Only the variable's *name* lives in the file, never the key, so definitions stay
 
 **Notes** — `--provider` cannot be combined with `--remote` or the local backend selectors (`--metal`/`--cuda`/`--cpu`); it *is* the engine for that run. `/usage` reports billed token counts for the session, including Anthropic cache read/write and hit rate. The key is never written to `settings.json` — it stays on the environment or `--api-key` by design.
 
+## Profiles
+
+A profile launches plank as a different agent: its own system prompt, its own
+builtin tools, its own settings, logo, name and accent colour, and optionally
+its own MCP servers. Start one from an installed name, a local folder, or a
+folder of a GitHub repository:
+
+```sh
+plank --profile aovestdipaperino/plank-profiles:HAL
+```
+
+The first launch from a folder or a repository asks before installing it into
+`~/.plank/profiles/`; after that the same command launches the installed copy,
+and offers an update when the source's `version` goes up. `/install-profile`
+installs from inside a session, `/edit-profile` edits the running profile and
+restarts into the change, and a session resumes only under the profile that
+started it.
+
+A profile is a plugin folder whose `plugin.json` has a `profile` block:
+
+```json
+{
+  "name": "research",
+  "version": "0.1.0",
+  "profile": {
+    "displayName": "Scholar",
+    "systemPrompt": "prompt.md",
+    "tools": { "builtin": ["read", "more", "glob", "search", "google_search", "visit_page"] },
+    "folderContext": false,
+    "agentsMd": false
+  }
+}
+```
+
+HAL, a mail assistant over one Outlook mailbox that can read, flag, draft and
+file mail but cannot send or delete it, lives in
+[`aovestdipaperino/plank-profiles`](https://github.com/aovestdipaperino/plank-profiles).
+The [Profiles chapter](user-guide/14-profiles.md) of the user guide (also at
+[plank-agent.dev/guide/14-profiles](https://plank-agent.dev/guide/14-profiles))
+covers launching, installing, updating and writing one; the full manifest
+reference is in [`docs/PROFILES.md`](docs/PROFILES.md).
+
 ## The arcade
 
 Waiting on a long generation is the one moment a coding agent has nothing for you to do. So there are five games — and one thing to just watch — behind undocumented-in-`/help` slash commands, and they are meant to be used **during** a turn: type one while the model is streaming and it opens as a translucent layer over the live output, which keeps scrolling underneath.

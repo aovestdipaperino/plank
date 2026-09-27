@@ -1,4 +1,4 @@
-[← Advanced workflows](12-advanced-workflows.md) · [Index](README.md)
+[← Advanced workflows](12-advanced-workflows.md) · [Index](README.md) · Next: [Profiles →](14-profiles.md)
 
 # 13. Troubleshooting
 
@@ -201,4 +201,4 @@ Attach that to an issue at [github.com/aovestdipaperino/plank](https://github.co
 
 ---
 
-[← Back to the index](README.md)
+Next: [Profiles →](14-profiles.md)

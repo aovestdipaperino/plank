@@ -143,6 +143,7 @@ HEAD = """<!doctype html>
       <div class="navlinks">
         <a class="ghost" href="/whats-new">What's new</a>
         <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="/guide/14-profiles">Profiles</a>
         <a class="ghost" href="{repo}" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
     </div>

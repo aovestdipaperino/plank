@@ -7,8 +7,41 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.3.0 is out**, and the beta channel is on 5.3.1. The patch number
-is still the channel: `.0` is stable, anything above it is beta.
+**v6.0.0 is out**, and the beta channel is on 6.0.1. The patch number
+is still the channel: `.0` is stable, anything above it is beta. The major
+number moved for one reason: profiles.
+
+**Plank can be a different agent.** A profile gives it its own system prompt,
+its own set of tools, its own settings, and its own logo, name and colour, so
+the same binary can start as a coding assistant, a mail assistant or a budget
+analyst. You start one by name, from a folder, or straight from a folder of a
+GitHub repository:
+
+```sh
+plank --profile aovestdipaperino/plank-profiles:HAL
+```
+
+The first launch asks before installing it; after that the same command starts
+the installed copy, and when the profile's author raises its version, plank
+offers the update before it starts. `/edit-profile` opens the running
+profile's files with a note beside every setting saying where it comes from,
+and after a save it offers to restart into the change without losing the
+conversation. A profile also decides whether it wants to know about the folder
+you launched it from, so a mail assistant started in a code checkout is not
+told the checkout's git status or offered an `AGENTS.md`.
+
+The first published profile is **HAL**, a mail assistant over one Outlook
+mailbox. It reads, flags, drafts and files mail, and it cannot send or delete
+any: the permission it signs in with does not include sending, and its mail
+server has no delete tool. The [Profiles chapter](/guide/14-profiles) of the
+guide covers installing, updating and writing your own.
+
+Two smaller changes came along. `--plugin-dir` is gone: put a plugin you are
+working on in `./.plank/plugins/`, and launch a profile folder with
+`--profile <folder>`. And an MCP server that stops answering is now restarted
+on the next call instead of being written off for the rest of the session.
+
+The rest of this section is what landed in 5.3.
 
 **Plank guesses your next prompt.** After an answer, a short background pass
 works out the most likely thing you are about to type and offers it as grey

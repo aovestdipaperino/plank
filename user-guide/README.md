@@ -21,6 +21,7 @@ This guide is for people *using* plank. For how it is built, see [`docs/ARCHITEC
 11. [The arcade](11-arcade.md) — the games that run over a live turn
 12. [Advanced workflows](12-advanced-workflows.md) — branching, delegation, long sessions, repeatability
 13. [Troubleshooting](13-troubleshooting.md) — when something goes wrong
+14. [Profiles](14-profiles.md) — launching plank as a different agent, installing, updating and writing profiles
 
 ## The five-minute version
 
