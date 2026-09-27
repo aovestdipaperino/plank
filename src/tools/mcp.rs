@@ -479,6 +479,12 @@ pub struct McpServer {
     transport: Transport,
     alive: bool,
     next_id: i64,
+    /// The config a stdio server was started from, kept so a server that
+    /// stops answering can be started again ([`McpServer::revive`]). `None`
+    /// for HTTP servers and offline shadows, which have no process to restart.
+    config: Option<McpServerConfig>,
+    /// Why the last request failed, for the error a failed restart reports.
+    last_error: Option<String>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -578,6 +584,7 @@ impl McpServer {
                 agent,
             })
         };
+        let config = matches!(transport, Transport::Stdio(_)).then(|| cfg.clone());
         Ok(Self {
             name: cfg.name.clone(),
             tools: Vec::new(),
@@ -586,7 +593,39 @@ impl McpServer {
             transport,
             alive: true,
             next_id: 0,
+            config,
+            last_error: None,
         })
+    }
+
+    /// Starts a stdio server that stopped answering again, in place: a fresh
+    /// process and a fresh handshake, the old one killed by its drop.
+    ///
+    /// Without this, one slow request left a server dead for the rest of the
+    /// session while its process kept running, and every later call got the
+    /// generic "not available" with no way back.
+    ///
+    /// # Errors
+    /// A message naming the server, why it stopped, and why the restart
+    /// failed; or that it cannot be restarted (HTTP, offline shadow).
+    fn revive(&mut self) -> Result<(), String> {
+        let why = self
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "it stopped responding".to_string());
+        let Some(cfg) = self.config.clone() else {
+            return Err(format!("mcp server {} is not running ({why})", self.name));
+        };
+        match spawn_and_handshake(&cfg) {
+            Ok(fresh) => {
+                *self = fresh;
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "mcp server {} stopped responding ({why}); restarting it failed: {e}",
+                self.name
+            )),
+        }
     }
 
     /// Builds a server that renders into the prompt from a cached
@@ -606,6 +645,8 @@ impl McpServer {
             transport: Transport::Offline,
             alive: false,
             next_id: 0,
+            config: None,
+            last_error: None,
         }
     }
 
@@ -659,8 +700,9 @@ impl McpServer {
         match &mut self.transport {
             Transport::Stdio(t) => {
                 let resp = t.round_trip(&req, id);
-                if resp.is_err() {
+                if let Err(e) = &resp {
                     self.alive = false;
+                    self.last_error = Some(e.clone());
                 }
                 resp
             }
@@ -1597,6 +1639,23 @@ pub fn tool_mcp_invoke(servers: &mut [McpServer], call: &ToolCall) -> String {
     invoke_mcp_tool(servers, name, args)
 }
 
+/// The server named `name`, restarted first if it stopped answering.
+///
+/// `Ok(None)` when no server has that name. An offline shadow is returned
+/// as is, so the caller can answer that it is down.
+fn usable_server<'a>(
+    servers: &'a mut [McpServer],
+    name: &str,
+) -> Result<Option<&'a mut McpServer>, String> {
+    let Some(server) = servers.iter_mut().find(|s| s.name == name) else {
+        return Ok(None);
+    };
+    if !server.alive && !server.is_offline() {
+        server.revive()?;
+    }
+    Ok(Some(server))
+}
+
 /// Shared body of [`tool_mcp_call`] and [`tool_mcp_invoke`]: routes one
 /// `mcp__<server>__<tool>` name plus an already-encoded JSON argument object.
 fn invoke_mcp_tool(servers: &mut [McpServer], full_name: &str, arguments: &str) -> String {
@@ -1606,11 +1665,10 @@ fn invoke_mcp_tool(servers: &mut [McpServer], full_name: &str, arguments: &str) 
     // An offline shadow matches too: its tools are advertised in the prompt, so
     // a call must be answered with "the server is down" rather than the generic
     // unavailable message reserved for a name that is not configured at all.
-    let Some(server) = servers
-        .iter_mut()
-        .find(|s| s.name == server_name && (s.alive || s.is_offline()))
-    else {
-        return "Tool error: mcp server not available\n".to_string();
+    let server = match usable_server(servers, server_name) {
+        Ok(Some(server)) => server,
+        Ok(None) => return "Tool error: mcp server not available\n".to_string(),
+        Err(e) => return format!("Tool error: {e}\n"),
     };
     // Checked before the tool lookup: a shadow's tool list is only as fresh as
     // its last handshake, so "the server is down" is both the more accurate and
@@ -1748,11 +1806,10 @@ pub fn tool_mcp_read_resource(servers: &mut [McpServer], call: &ToolCall) -> Str
     // Matches an offline shadow as well, so a cached resource URI reports the
     // server as down rather than the generic unavailable message that a wholly
     // unconfigured name earns.
-    let Some(server) = servers
-        .iter_mut()
-        .find(|s| s.name == server_name && (s.alive || s.is_offline()))
-    else {
-        return format!("Tool error: mcp server not available: {server_name}\n");
+    let server = match usable_server(servers, server_name) {
+        Ok(Some(server)) => server,
+        Ok(None) => return format!("Tool error: mcp server not available: {server_name}\n"),
+        Err(e) => return format!("Tool error: {e}\n"),
     };
     if server.is_offline() {
         return offline_tool_error(&server.name);
@@ -1847,6 +1904,81 @@ mod tests {
     fn start_servers(configs: Vec<McpServerConfig>) -> Vec<McpServer> {
         let mut start = spawn_and_handshake;
         start_servers_with(configs, &[], None, &mut start)
+    }
+
+    /// A minimal stdio MCP server in `sh`. It answers the handshake and one
+    /// tool, `ping`. The first `tools/call` of the first run hangs; every run
+    /// after `marker` exists answers at once. With `die_after_first` a run
+    /// that finds the marker exits immediately instead, so a restart fails.
+    fn flaky_server(
+        name: &str,
+        marker: &std::path::Path,
+        die_after_first: bool,
+    ) -> McpServerConfig {
+        let script = r#"
+marker="$1"; die="$2"
+if [ -e "$marker" ] && [ "$die" = 1 ]; then exit 1; fi
+first=0; [ -e "$marker" ] || first=1
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"capabilities":{}}}\n' "$id" ;;
+    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping"}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      if [ "$first" = 1 ]; then : > "$marker"; sleep 30; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}]}}\n' "$id" ;;
+  esac
+done
+"#;
+        McpServerConfig {
+            name: name.to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                script.to_string(),
+                "sh".to_string(),
+                marker.to_string_lossy().into_owned(),
+                if die_after_first { "1" } else { "0" }.to_string(),
+            ],
+            env: Vec::new(),
+            url: String::new(),
+            headers: Vec::new(),
+            primary_tools: None,
+        }
+    }
+
+    fn one_second_mcp_timeout() -> crate::settings::TestSettingsGuard {
+        let mut s = crate::settings::Settings::default();
+        s.mcp.timeout_secs = 1;
+        crate::settings::install_for_test(s)
+    }
+
+    #[test]
+    fn a_server_that_timed_out_is_restarted_on_the_next_call() {
+        let _timeout = one_second_mcp_timeout();
+        let marker = advert_temp_root("flaky-restart").join("hung-once");
+        let mut servers = start_servers(vec![flaky_server("flaky", &marker, false)]);
+        assert_eq!(servers.len(), 1, "the handshake succeeds");
+        let first = invoke_mcp_tool(&mut servers, "mcp__flaky__ping", "{}");
+        assert!(first.contains("no response within 1s"), "{first}");
+        let second = invoke_mcp_tool(&mut servers, "mcp__flaky__ping", "{}");
+        assert_eq!(
+            second, "pong\n",
+            "the next call restarts the server and succeeds"
+        );
+    }
+
+    #[test]
+    fn a_failed_restart_names_the_server_and_both_reasons() {
+        let _timeout = one_second_mcp_timeout();
+        let marker = advert_temp_root("flaky-dies").join("hung-once");
+        let mut servers = start_servers(vec![flaky_server("flaky", &marker, true)]);
+        let _ = invoke_mcp_tool(&mut servers, "mcp__flaky__ping", "{}");
+        let second = invoke_mcp_tool(&mut servers, "mcp__flaky__ping", "{}");
+        assert!(second.contains("flaky"), "{second}");
+        assert!(second.contains("no response within 1s"), "{second}");
+        assert!(second.contains("restarting it failed"), "{second}");
+        assert!(!second.contains("not available"), "{second}");
     }
 
     fn cfg_named(name: &str) -> McpServerConfig {
