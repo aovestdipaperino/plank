@@ -5,4 +5,6 @@
 //! `cargo test` covers everything but the ABI glue.
 
 pub mod csv;
+pub mod disk;
 pub mod doc;
+pub mod keys;
