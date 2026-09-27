@@ -1260,9 +1260,13 @@ impl TrustStore {
     }
 }
 
-/// Minimal JSON string escaping for the trust file.
+/// A string as a JSON string literal: the trust file, and every payload
+/// plank sends a component, so it is guest-facing ABI. `"`, `\` and every
+/// character below U+0020 are escaped (`\n`, `\r`, `\t`, else `\u00XX`);
+/// everything else passes through as is.
 #[must_use]
 pub fn json_str(s: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -1270,6 +1274,11 @@ pub fn json_str(s: &str) -> String {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
             c => out.push(c),
         }
     }
@@ -2948,6 +2957,21 @@ mod tests {
             frame_key_payload("\"", Some('"')),
             r#"{"code": "\"", "text": "\""}"#
         );
+    }
+
+    #[test]
+    fn json_str_escapes_every_control_character() {
+        assert_eq!(json_str("a\tb"), r#""a\tb""#);
+        assert_eq!(json_str("a\rb"), r#""a\rb""#);
+        assert_eq!(json_str("a\u{1}b"), r#""a\u0001b""#);
+        assert_eq!(json_str("\u{1f}"), r#""\u001f""#);
+        assert_eq!(json_str("a\nb"), r#""a\nb""#);
+    }
+
+    #[test]
+    fn json_str_leaves_a_plain_string_as_it_was() {
+        assert_eq!(json_str("plain café \u{7f}"), "\"plain café \u{7f}\"");
+        assert_eq!(json_str(r#"q"b\"#), r#""q\"b\\""#);
     }
 
     fn temp_dir(tag: &str) -> PathBuf {

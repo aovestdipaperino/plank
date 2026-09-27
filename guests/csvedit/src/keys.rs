@@ -85,6 +85,9 @@ pub fn payload_text(payload: &str) -> Option<char> {
         '\\' => match chars.next()? {
             'n' => '\n',
             't' => '\t',
+            'r' => '\r',
+            'b' => '\u{8}',
+            'f' => '\u{c}',
             'u' => {
                 let hex: String = chars.by_ref().take(4).collect();
                 char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?
@@ -195,5 +198,18 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes.len(), chords.len());
+    }
+
+    #[test]
+    fn payload_text_decodes_control_escapes() {
+        assert_eq!(payload_text(r#"{"code": "tab", "text": "\t"}"#), Some('\t'));
+        assert_eq!(
+            payload_text(r#"{"code": "enter", "text": "\r"}"#),
+            Some('\r')
+        );
+        assert_eq!(
+            payload_text(r#"{"code": "a", "text": "\u0001"}"#),
+            Some('\u{1}')
+        );
     }
 }
