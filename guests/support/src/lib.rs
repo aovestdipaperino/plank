@@ -83,8 +83,7 @@ pub fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     let t = t.clamp(0.0, 1.0);
     let a = f32::from(a);
     let b = f32::from(b);
-    let v = (a + (b - a) * t).round().clamp(0.0, 255.0) as u8;
-    v
+    (a + (b - a) * t).round().clamp(0.0, 255.0) as u8
 }
 
 /// Linear interpolation between two colours.
@@ -120,6 +119,53 @@ pub fn encode(glyphs: &[Glyph], w: u16, h: u16) -> Vec<u8> {
         out.extend_from_slice(&g.y.to_le_bytes());
         out.extend_from_slice(&(g.ch as u32).to_le_bytes());
         out.extend_from_slice(&[g.color.0, g.color.1, g.color.2, 0]);
+    }
+    out
+}
+
+/// One cell with a background, for components that paint whole screens
+/// (a Turbo Vision guest's buffer) rather than sprites.
+#[derive(Debug, Clone, Copy)]
+pub struct CellGlyph {
+    pub x: u16,
+    pub y: u16,
+    pub ch: char,
+    pub fg: Rgb,
+    pub bg: Option<Rgb>,
+    pub bold: bool,
+}
+
+/// Flag bit 0: bold.
+const FLAG_BOLD: u8 = 0b01;
+/// Flag bit 1: three background bytes follow the glyph.
+const FLAG_BG: u8 = 0b10;
+
+/// Packs cells into the `PGLY` buffer, with bold and background flags — the
+/// full form of the wire format that [`encode`] leaves at its common case.
+#[must_use]
+pub fn encode_cells(cells: &[CellGlyph], w: u16, h: u16) -> Vec<u8> {
+    let count = u16::try_from(cells.len()).unwrap_or(u16::MAX);
+    let mut out = Vec::with_capacity(12 + usize::from(count) * 15);
+    out.extend_from_slice(b"PGLY");
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    for c in cells.iter().take(usize::from(count)) {
+        out.extend_from_slice(&c.x.to_le_bytes());
+        out.extend_from_slice(&c.y.to_le_bytes());
+        out.extend_from_slice(&(c.ch as u32).to_le_bytes());
+        let mut flags = 0;
+        if c.bold {
+            flags |= FLAG_BOLD;
+        }
+        if c.bg.is_some() {
+            flags |= FLAG_BG;
+        }
+        out.extend_from_slice(&[c.fg.0, c.fg.1, c.fg.2, flags]);
+        if let Some((r, g, b)) = c.bg {
+            out.extend_from_slice(&[r, g, b]);
+        }
     }
     out
 }
@@ -257,5 +303,26 @@ mod tests {
         assert_eq!(int(input, "nope"), 0);
         assert_eq!(text(input, "nope"), "");
         assert_eq!(num("not json", "w"), 0.0);
+    }
+
+    #[test]
+    fn encode_cells_writes_flags_and_trailing_background() {
+        let cells = [
+            CellGlyph { x: 1, y: 2, ch: 'A', fg: (1, 2, 3), bg: Some((4, 5, 6)), bold: true },
+            CellGlyph { x: 0, y: 0, ch: 'b', fg: (7, 8, 9), bg: None, bold: false },
+        ];
+        let out = encode_cells(&cells, 10, 5);
+        assert_eq!(&out[0..4], b"PGLY");
+        assert_eq!(u16::from_le_bytes([out[6], out[7]]), 2, "count");
+        let g0 = &out[12..27];
+        assert_eq!(&g0[0..2], &1u16.to_le_bytes());
+        assert_eq!(&g0[2..4], &2u16.to_le_bytes());
+        assert_eq!(&g0[4..8], &('A' as u32).to_le_bytes());
+        assert_eq!(&g0[8..11], &[1, 2, 3]);
+        assert_eq!(g0[11], 0b11, "bold + background");
+        assert_eq!(&g0[12..15], &[4, 5, 6]);
+        let g1 = &out[27..39];
+        assert_eq!(g1[11], 0, "no flags");
+        assert_eq!(out.len(), 39);
     }
 }
