@@ -1785,7 +1785,7 @@ mod tests {
         let staged = staged_plugin("install-loads", "demo");
         let home = tmpdir("install-loads-home");
         let out = install_staged(&staged, None, &install_dir(&home), false).expect("installs");
-        let set = crate::plugins::load_in(Some(&home), &tmpdir("install-loads-cwd"), &[]);
+        let set = crate::plugins::load_in(Some(&home), &tmpdir("install-loads-cwd"));
         let found = set
             .plugins
             .iter()
@@ -2101,7 +2101,7 @@ mod tests {
         let home = tmpdir("staging-scope-home");
         let err = install(staged.to_str().expect("utf8"), None, &home, false).expect_err("refused");
         assert!(err.contains("SubagentStop"), "{err}");
-        let set = crate::plugins::load_in(Some(&home), &tmpdir("staging-scope-cwd"), &[]);
+        let set = crate::plugins::load_in(Some(&home), &tmpdir("staging-scope-cwd"));
         assert!(
             set.plugins.iter().all(|p| p.name != "unwanted"),
             "a refused install must not be loadable: {:?}",

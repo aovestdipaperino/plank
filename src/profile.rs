@@ -892,7 +892,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".plank-plugin")).expect("mkdir");
         std::fs::write(dir.join(".plank-plugin").join("plugin.json"), manifest).expect("write");
         std::fs::write(dir.join("prompt.md"), "You are a test agent.\n").expect("write prompt");
-        let set = crate::plugins::load_in(None, &base, std::slice::from_ref(&dir));
+        let set = crate::plugins::load_in_with(None, &base, std::slice::from_ref(&dir));
         (base, set)
     }
 

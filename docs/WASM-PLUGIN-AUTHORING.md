@@ -20,18 +20,17 @@ my-plugin/
     thing.wasm.minisig # optional signature
 ```
 
-plank looks for plugins in three places:
+plank looks for plugins in two places:
 
-1. `--plugin-dir <path>` — one or more, for development. This is the flag to use
-   while writing one.
-2. `./.plank/plugins/` — project-local, checked in with a repo
-3. `~/.plank/plugins/dev/` — user-global, where `/plugins install` puts things
+1. `./.plank/plugins/` — project-local, checked in with a repo. While writing a
+   plugin, this is the place to put it (or a symlink to it).
+2. `~/.plank/plugins/dev/` — user-global, where `/plugins install` puts things
 
 Project-local plugins are **default-deny**: cloning a repo must not hand you
 executable code, so the first session in a repo that ships one asks.
 
 > The design document lists `$PLANK_PLUGIN_PATH` as the development location.
-> **It is not implemented** — nothing reads that variable. Use `--plugin-dir`.
+> **It is not implemented** — nothing reads that variable. Use `./.plank/plugins/`.
 
 `.claude-plugin/plugin.json` is accepted as an alternative spelling, for a plugin
 that wants to serve both tools.
@@ -100,7 +99,8 @@ cargo build --release --target wasm32-unknown-unknown
 mkdir -p my-plugin/.plank-plugin my-plugin/wasm
 cp plugin.json my-plugin/.plank-plugin/
 cp target/wasm32-unknown-unknown/release/hello_plank.wasm my-plugin/wasm/hello.wasm
-plank --plugin-dir my-plugin
+mkdir -p .plank/plugins && ln -s "$PWD/my-plugin" .plank/plugins/my-plugin
+plank
 ```
 
 First run asks you to approve it, listing the surfaces and capabilities. Then
@@ -364,6 +364,7 @@ lands on the same bytes.
 
 The "smallest plugin" section above was written and then **followed literally**
 from a directory outside the plank tree — a fresh crate, the manifest as printed,
-`--plugin-dir` — and the result discovered with no warnings and printed
+a symlink under `./.plank/plugins/` (the walkthrough was first run with the
+since-removed `--plugin-dir`) — and the result discovered with no warnings and printed
 `hello from wasm` when its command ran. If the walkthrough stops working, that is
 a bug in plank or in this file, not in your setup.

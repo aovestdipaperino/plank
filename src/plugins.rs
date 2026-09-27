@@ -16,8 +16,6 @@ pub enum Origin {
     UserClaude,
     /// Auto-scanned from `<cwd>/.plank/plugins/`.
     ProjectScan,
-    /// Named explicitly by `--plugin-dir`.
-    CliDir,
     /// Loaded from `~/.plank/profiles/` because `--profile` named it.
     ///
     /// Never produced by a scan: [`load_in`] does not visit the profiles root.
@@ -32,7 +30,6 @@ impl Origin {
             Origin::UserScan => "user",
             Origin::UserClaude => "claude",
             Origin::ProjectScan => "project",
-            Origin::CliDir => "--plugin-dir",
             Origin::Profile => "profile",
         }
     }
@@ -330,17 +327,31 @@ fn subdirs(root: &Path) -> Vec<PathBuf> {
 
 /// Loads every activated plugin given an explicit home directory: scans
 /// `<home>/.plank/plugins/claude/*`, then `<home>/.plank/plugins/dev/*`, then
-/// `<cwd>/.plank/plugins/*`, then each `--plugin-dir` in the order given. A later source replaces an earlier
-/// plugin of the same name. `home` is `None` when there is no home directory
-/// to scan, in which case the user-scan source contributes nothing.
+/// `<cwd>/.plank/plugins/*`. A later source replaces an earlier plugin of the
+/// same name. `home` is `None` when there is no home directory to scan, in
+/// which case the user-scan sources contribute nothing.
 #[must_use]
-pub fn load_in(home: Option<&Path>, cwd: &Path, cli_dirs: &[PathBuf]) -> PluginSet {
+pub fn load_in(home: Option<&Path>, cwd: &Path) -> PluginSet {
+    load_candidates(scan_candidates(home, cwd))
+}
+
+/// [`load_in`] with `extra` plugin directories appended as project-scan
+/// entries, so a test can load a plugin from wherever its fixture lives.
+#[cfg(test)]
+pub(crate) fn load_in_with(home: Option<&Path>, cwd: &Path, extra: &[PathBuf]) -> PluginSet {
+    let mut candidates = scan_candidates(home, cwd);
+    candidates.extend(extra.iter().map(|d| (d.clone(), Origin::ProjectScan)));
+    load_candidates(candidates)
+}
+
+/// The plugin directories [`load_in`] visits, in precedence order.
+fn scan_candidates(home: Option<&Path>, cwd: &Path) -> Vec<(PathBuf, Origin)> {
     let mut candidates: Vec<(PathBuf, Origin)> = Vec::new();
     if let Some(home) = home {
         // `claude/` first, `dev/` second: a later source replaces an earlier
         // one of the same name, so a plugin the user wrote themselves outranks
-        // one that arrived from someone else's repository. Project-local and
-        // `--plugin-dir` entries follow and outrank both.
+        // one that arrived from someone else's repository. Project-local
+        // entries follow and outrank both.
         let root = crate::claudeplugin::install_dir(home);
         candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserClaude)));
         let root = crate::home::plank_home_in(home).join("plugins").join("dev");
@@ -352,23 +363,16 @@ pub fn load_in(home: Option<&Path>, cwd: &Path, cli_dirs: &[PathBuf]) -> PluginS
             .into_iter()
             .map(|d| (d, Origin::ProjectScan)),
     );
-    candidates.extend(cli_dirs.iter().map(|d| (d.clone(), Origin::CliDir)));
+    candidates
+}
 
+/// Loads `candidates` in order, a later plugin replacing an earlier one of the
+/// same name.
+fn load_candidates(candidates: Vec<(PathBuf, Origin)>) -> PluginSet {
     let mut set = PluginSet::default();
     let mut seen_roots: Vec<PathBuf> = Vec::new();
     for (dir, origin) in candidates {
-        if origin == Origin::CliDir && !dir.is_dir() {
-            set.warnings
-                .push(format!("--plugin-dir {}: not a directory", dir.display()));
-            continue;
-        }
         let Some(plugin) = load_plugin(&dir, origin) else {
-            if origin == Origin::CliDir {
-                set.warnings.push(format!(
-                    "--plugin-dir {}: no plugin.json and no components",
-                    dir.display()
-                ));
-            }
             continue;
         };
         // The manifest `name` is gated by `valid_name` in `load_plugin`, but
@@ -407,13 +411,12 @@ pub fn load_in(home: Option<&Path>, cwd: &Path, cli_dirs: &[PathBuf]) -> PluginS
 }
 
 /// Loads every activated plugin: `~/.plank/plugins/claude/*`, then
-/// `~/.plank/plugins/dev/*`, then `<cwd>/.plank/plugins/*`, then each
-/// `--plugin-dir` in the order given.
+/// `~/.plank/plugins/dev/*`, then `<cwd>/.plank/plugins/*`.
 /// A later source replaces an earlier plugin of the same name.
 #[must_use]
-pub fn load_default(cwd: &Path, cli_dirs: &[PathBuf]) -> PluginSet {
+pub fn load_default(cwd: &Path) -> PluginSet {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    load_in(home.as_deref(), cwd, cli_dirs)
+    load_in(home.as_deref(), cwd)
 }
 
 /// A contribution addressed by name — skills, agents and templates all are.
@@ -671,7 +674,7 @@ fn render_list_with(set: &PluginSet, active: Option<&str>) -> String {
     let mut out = String::new();
     if set.plugins.is_empty() {
         out.push_str(
-            "no plugins loaded (checked ~/.plank/plugins/dev, ./.plank/plugins, and --plugin-dir)\n",
+            "no plugins loaded (checked ~/.plank/plugins/claude, ~/.plank/plugins/dev and ./.plank/plugins)\n",
         );
     }
     for plugin in &set.plugins {
@@ -743,7 +746,7 @@ pub fn user_plugin_dir(home: &Path) -> PathBuf {
 /// Returns a message when `src` is not a plugin, contains an escaping
 /// symlink, the destination exists, or the copy fails.
 pub fn install(src: &Path, home: &Path) -> Result<PathBuf, String> {
-    let plugin = load_plugin(src, Origin::CliDir)
+    let plugin = load_plugin(src, Origin::UserScan)
         .ok_or_else(|| format!("{} is not a plugin directory", src.display()))?;
     let dest = user_plugin_dir(home).join(&plugin.name);
     if dest.exists() {
@@ -1470,7 +1473,7 @@ mod tests {
             ".plank/plugins/claude/dup/.claude-plugin/plugin.json",
             r#"{"name":"dup"}"#,
         );
-        let set = load_in(Some(&home), &root.join("cwd"), &[]);
+        let set = load_in(Some(&home), &root.join("cwd"));
         let solo = set
             .plugins
             .iter()
@@ -1511,15 +1514,9 @@ mod tests {
             ".plank/plugins/dup/.plank-plugin/plugin.json",
             r#"{"name":"dup"}"#,
         );
-        let set = load_in(Some(&home), &cwd, &[]);
+        let set = load_in(Some(&home), &cwd);
         let dup = set.plugins.iter().find(|p| p.name == "dup").expect("dup");
         assert_eq!(dup.origin, Origin::ProjectScan);
-
-        let cli = root.join("cli-dup");
-        write(&cli, ".plank-plugin/plugin.json", r#"{"name":"dup"}"#);
-        let set = load_in(Some(&home), &cwd, &[cli]);
-        let dup = set.plugins.iter().find(|p| p.name == "dup").expect("dup");
-        assert_eq!(dup.origin, Origin::CliDir);
     }
 
     #[test]
@@ -1993,7 +1990,7 @@ mod tests {
             "leftover/.plank-plugin/plugin.json",
             r#"{"name":"leftover"}"#,
         );
-        let set = load_in(Some(&home), &root.join("cwd"), &[]);
+        let set = load_in(Some(&home), &root.join("cwd"));
         assert!(set.plugins.is_empty(), "{:?}", set.plugins);
     }
 
@@ -2076,7 +2073,7 @@ mod tests {
             ".plank/plugins/alpha/.plank-plugin/plugin.json",
             r#"{"name":"alpha"}"#,
         );
-        let set = load_in(Some(&home), &cwd, &[]);
+        let set = load_in(Some(&home), &cwd);
         assert_eq!(set.plugins.len(), 1);
         assert_eq!(set.plugins[0].name, "alpha");
         assert_eq!(set.plugins[0].origin, Origin::ProjectScan);
@@ -2099,10 +2096,10 @@ mod tests {
             ".plank-plugin/plugin.json",
             r#"{"name":"alpha","version":"cli"}"#,
         );
-        let set = load_in(Some(&home), &cwd, &[cli]);
+        let set = load_in_with(Some(&home), &cwd, &[cli]);
         assert_eq!(set.plugins.len(), 1);
         assert_eq!(set.plugins[0].version, "cli");
-        assert_eq!(set.plugins[0].origin, Origin::CliDir);
+        assert_eq!(set.plugins[0].origin, Origin::ProjectScan);
         assert!(set.warnings.iter().any(|w| w.contains("shadow")));
     }
 
@@ -2114,7 +2111,7 @@ mod tests {
         let cwd = base.join("proj");
         let cli = base.join("alpha");
         write(&cli, ".plank-plugin/plugin.json", r#"{"name":"alpha"}"#);
-        let set = load_in(Some(&home), &cwd, &[cli.clone(), cli]);
+        let set = load_in_with(Some(&home), &cwd, &[cli.clone(), cli]);
         assert_eq!(set.plugins.len(), 1);
     }
 
@@ -2129,21 +2126,10 @@ mod tests {
             ".plank/plugins/dev/alpha/.plank-plugin/plugin.json",
             r#"{"name":"alpha"}"#,
         );
-        let set = load_in(Some(&home), &cwd, &[]);
+        let set = load_in(Some(&home), &cwd);
         assert_eq!(set.plugins.len(), 1);
         assert_eq!(set.plugins[0].name, "alpha");
         assert_eq!(set.plugins[0].origin, Origin::UserScan);
-    }
-
-    #[test]
-    fn a_missing_cli_dir_warns_without_failing_the_set() {
-        let base = scratch("missing-cli");
-        let home = base.join("home");
-        std::fs::create_dir_all(&home).expect("mkdir");
-        let cwd = base.join("proj");
-        let set = load_in(Some(&home), &cwd, &[base.join("nope")]);
-        assert!(set.plugins.is_empty());
-        assert!(set.warnings.iter().any(|w| w.contains("nope")));
     }
 
     /// A minimal `Named` stand-in so reconciliation is tested without building
@@ -2351,7 +2337,7 @@ mod tests {
             "skills/greet/SKILL.md",
             "---\nname: greet\ndescription: says hi\n---\nHello\n",
         );
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         let (skills, _, _) = skills_in(Some(&home), &cwd, &set);
         // Plugin skills are namespaced only: one non-built-in entry, the alias.
         let contributed: Vec<&crate::skills::Skill> =
@@ -2408,7 +2394,7 @@ mod tests {
             "skills/greet/SKILL.md",
             "---\nname: greet\ndescription: says hi\n---\nHello\n",
         );
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         let (skills, warnings, _) = skills_in(Some(&home), &cwd, &set);
         // Plugin skills are namespaced only: the bare name is never registered.
         assert!(!skills.iter().any(|s| s.name == "greet"));
@@ -2434,7 +2420,7 @@ mod tests {
             "skills/greet/SKILL.md",
             "---\nname: greet\ndescription: plugin version\n---\nPlugin\n",
         );
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         let (skills, warnings, _) = skills_in(Some(&home), &cwd, &set);
         let unqualified = skills
             .iter()
@@ -2461,7 +2447,7 @@ mod tests {
             "commands/note.md",
             "---\ndescription: a note\n---\nBody\n",
         );
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         let (templates, _, _) = templates_in(Some(&home), &cwd, &set);
         assert!(templates.iter().any(|t| t.name == "note"));
         assert!(templates.iter().any(|t| t.name == "demo:note"));
@@ -2481,7 +2467,7 @@ mod tests {
             "agents/scout.md",
             "---\ndescription: scouts\n---\nBe a scout.\n",
         );
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         let (agents, _, _) = agents_in(Some(&home), &cwd, &set);
         assert!(agents.iter().any(|a| a.name == "demo:scout"));
     }
@@ -2504,7 +2490,7 @@ mod tests {
             "hooks/hooks.json",
             r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"plugin-hook"}]}]}}"#,
         );
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         let hooks = hooks_in(Some(&home), &cwd, &set);
         let commands: Vec<&str> = hooks
             .pre_tool_use
@@ -2542,7 +2528,7 @@ mod tests {
             ".mcp.json",
             r#"{"mcpServers":{"weather":{"command":"weather-server"}}}"#,
         );
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         let (servers, warnings) = mcp_servers(&set);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "weather");
@@ -2569,7 +2555,7 @@ mod tests {
                 r#"{"mcpServers":{"weather":{"command":"weather-server"}}}"#,
             );
         }
-        let set = load_in(Some(&home), &cwd, &[base.join("alpha"), base.join("beta")]);
+        let set = load_in_with(Some(&home), &cwd, &[base.join("alpha"), base.join("beta")]);
         let (servers, warnings) = mcp_servers(&set);
         let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["alpha-weather", "beta-weather"]);
@@ -2603,7 +2589,7 @@ mod tests {
             ".mcp.json",
             r#"{"mcpServers":{"alpha-weather":{"command":"x"}}}"#,
         );
-        let set = load_in(
+        let set = load_in_with(
             Some(&home),
             &cwd,
             &[base.join("alpha"), base.join("beta"), third],
@@ -2630,7 +2616,7 @@ mod tests {
         let plugin = base.join("demo");
         write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
         write(&plugin, "settings.json", r#"{"kvcache":{"maxBytes":7}}"#);
-        let set = load_in(Some(&base.join("home")), &cwd, &[plugin]);
+        let set = load_in_with(Some(&base.join("home")), &cwd, &[plugin]);
         let paths = settings_paths(&set);
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("settings.json"));
@@ -2650,7 +2636,7 @@ mod tests {
             ".mcp.json",
             r#"{"mcpServers":{"we__ather":{"command":"x"}}}"#,
         );
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         let (servers, warnings) = mcp_servers(&set);
         assert!(servers.is_empty());
         assert!(warnings.iter().any(|w| w.contains("we__ather")));
@@ -2668,12 +2654,12 @@ mod tests {
             r#"{"name":"demo","description":"A demo","version":"1.0"}"#,
         );
         write(&plugin, "skills/greet/SKILL.md", "hi\n");
-        let set = load_in(Some(&base.join("home")), &cwd, &[plugin]);
+        let set = load_in_with(Some(&base.join("home")), &cwd, &[plugin]);
         let out = render_list(&set);
         assert!(out.contains("demo"));
         assert!(out.contains("A demo"));
         assert!(out.contains("1.0"));
-        assert!(out.contains("--plugin-dir"));
+        assert!(out.contains("project"));
         assert!(out.contains("skills"));
     }
 
@@ -2689,7 +2675,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("mkdir");
         let plugin = base.join("foo:bar");
         write(&plugin, "skills/greet/SKILL.md", "hi\n");
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         assert!(set.plugins.is_empty(), "the plugin was dropped");
         assert!(
             set.warnings.iter().any(|w| w.contains("foo:bar")),
@@ -2709,7 +2695,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("mkdir");
         let plugin = base.join("a__b");
         write(&plugin, ".mcp.json", r#"{"mcpServers":{"weather":{}}}"#);
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         assert!(set.plugins.is_empty(), "the plugin was dropped");
         assert!(
             set.warnings.iter().any(|w| w.contains("a__b")),
@@ -2730,7 +2716,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("mkdir");
         let plugin = base.join("foo:bar");
         write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         assert_eq!(set.plugins.len(), 1);
         assert_eq!(set.plugins[0].name, "demo");
     }
@@ -2762,7 +2748,7 @@ mod tests {
             ".mcp.json",
             r#"{"mcpServers":{"we__ather":{"command":"true"}}}"#,
         );
-        let mut set = load_in(Some(&home), &cwd, &[plugin]);
+        let mut set = load_in_with(Some(&home), &cwd, &[plugin]);
         assert!(
             !render_list(&set).contains("demo:greet"),
             "precondition: the collision is not in the load-time warnings"
@@ -2799,7 +2785,7 @@ mod tests {
         let plugin = base.join("demo");
         write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
         write(&plugin, "settings.json", r#"{"safety":{"sandbox":false}}"#);
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         assert_eq!(set.plugins.len(), 1, "the plugin still loads");
         let out = render_list(&set);
         assert!(
@@ -2822,7 +2808,7 @@ mod tests {
             "settings.json",
             r#"{"engine":{"model":"/evil.gguf","backend":"cpu"},"worktree":{"symlinkDirectories":["x"]},"tools":{"runCode":true},"pluginConfig":{"k":"v"},"ui":{"popupRows":9}}"#,
         );
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         assert_eq!(set.plugins.len(), 1, "the plugin still loads");
         let warnings = set.all_warnings();
         for key in [
@@ -2855,7 +2841,7 @@ mod tests {
         let plugin = base.join("demo");
         write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
         write(&plugin, "settings.json", r#"{"kvcache":{"maxBytes":7}}"#);
-        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let set = load_in_with(Some(&home), &cwd, &[plugin]);
         assert!(
             !set.all_warnings().iter().any(|w| w.contains("safety")),
             "{:?}",
@@ -2868,10 +2854,10 @@ mod tests {
         let base = scratch("render-empty");
         let cwd = base.join("proj");
         std::fs::create_dir_all(&cwd).expect("mkdir");
-        let set = load_in(Some(&base.join("home")), &cwd, &[]);
+        let set = load_in(Some(&base.join("home")), &cwd);
         let out = render_list(&set);
         assert!(out.contains("no plugins"));
-        assert!(out.contains("--plugin-dir"));
+        assert!(out.contains("./.plank/plugins"));
     }
 
     #[test]
@@ -2910,7 +2896,7 @@ mod tests {
             r#"{"name":"plain"}"#,
         );
         std::fs::create_dir_all(&cwd).expect("mkdir");
-        let set = load_in(
+        let set = load_in_with(
             Some(&base.join("home")),
             &cwd,
             &[dirs.join("hal"), dirs.join("chatbgt"), dirs.join("plain")],
@@ -3050,7 +3036,7 @@ mod tests {
         seed_profile_dir(&profiles, "hal");
         let cwd = tmp.join("project");
         std::fs::create_dir_all(&cwd).expect("mkdir");
-        let set = load_in(Some(&tmp), &cwd, &[]);
+        let set = load_in(Some(&tmp), &cwd);
         assert!(!set.plugins.iter().any(|p| p.name == "hal"), "hal loaded");
     }
 

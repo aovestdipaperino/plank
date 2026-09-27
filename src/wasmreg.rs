@@ -1128,8 +1128,8 @@ impl TrustStore {
         }
         // Project-local is default-deny even when the bytes and grants are
         // known: approving a component in one repo is not approving every repo
-        // that ships the same file. A user-scanned or --plugin-dir component
-        // was named by the user directly and needs no per-project answer.
+        // that ships the same file. A user-scanned component was installed
+        // by the user directly and needs no per-project answer.
         if component.origin == Origin::ProjectScan && !entry.projects.iter().any(|p| p == project) {
             return Decision::ProjectUnapproved;
         }

@@ -198,8 +198,9 @@ or **Later**. Restarting saves the session, quits plank the normal way (which
 stops its MCP servers and background jobs), and re-executes it from the
 launch directory with the same arguments, minus `/resume`, `--worktree`,
 `--worktree-pr`, `-p` and `--chdir`, plus `--chdir <session directory>` and
-`/resume <session>`. A relative `--plugin-dir` is made absolute first, so it
-still names the same directory. The conversation carries over; the prompt
+`/resume <session>`. `--profile` is kept as typed: whatever it named is
+installed by then, so it resolves without asking. The conversation carries
+over; the prompt
 changed, so its cache is rebuilt.
 
 `/edit-profile` works only when plank was started with `--profile`, and
@@ -210,8 +211,8 @@ editing needs the TUI: the plain REPL prints the same buffer read-only.
 `examples/profiles/chatbgt` in this repository is a complete, minimal
 profile: a household-budget assistant restricted to reading files and
 running `bash`, with no logo, so it also exercises the fallback path. Its
-`README.md` shows how to run it directly with `--plugin-dir` or install it
-permanently under `~/.plank/plugins/dev/`.
+`README.md` shows how to launch it with `--profile examples/profiles/chatbgt`,
+which offers to install it on first use.
 
 `examples/profiles/hal` is a second worked example, this one installable and
 with a logo: a mail-and-calendar profile whose tools arrive over MCP from a

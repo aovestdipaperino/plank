@@ -377,9 +377,9 @@ fn main() -> ExitCode {
 
     // The plugin set has to be built before settings are read, so that a
     // plugin's `settings.json` can be layered in below the user file — but
-    // building it needs `--plugin-dir`, which only the parsed config carries.
-    // A throwaway provisional parse (base settings, no plugin layer) breaks
-    // that cycle: only its `plugin_dirs`, `chdir_path` and `debug` are used (all pure
+    // `--chdir` and `--profile`, which decide what it scans and splices, are
+    // only known once parsed. A throwaway provisional parse (base settings, no
+    // plugin layer) breaks that cycle: only its `profile`, `chdir_path` and `debug` are used (all pure
     // CLI flags, unaffected by settings layering, so they agree with the real
     // parse below), and the real parse re-derives everything else with the
     // enriched settings.
@@ -429,7 +429,7 @@ fn main() -> ExitCode {
     // worktree move would mean a second full plugin scan (and a second round of
     // warnings) purely to observe a directory that is a checkout of the same
     // repo, so the pre-worktree set is reused for the rest of startup.
-    let mut plugins = plank::plugins::load_default(&cwd, &provisional.plugin_dirs);
+    let mut plugins = plank::plugins::load_default(&cwd);
     // The profile is resolved from the provisional parse because everything
     // downstream — the settings layer, the system prompt, the tool table —
     // needs it, and the real parse at `parse_options_with` happens after the
@@ -956,8 +956,8 @@ fn run_serve(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    // See the `main` provisional-parse comment: the plugin set must be built
-    // from `--plugin-dir` before settings are read, but `--plugin-dir` is
+    // See the `main` provisional-parse comment: the plugin set and the
+    // profile must be settled before settings are read, but `--profile` is
     // only known once parsed, so a throwaway base-settings parse breaks the
     // cycle.
     let provisional =
@@ -966,7 +966,7 @@ fn run_serve(args: &[String]) -> ExitCode {
                 plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
             });
     let launch_cwd = std::env::current_dir().unwrap_or_default();
-    let mut plugins = plank::plugins::load_default(&launch_cwd, &provisional.plugin_dirs);
+    let mut plugins = plank::plugins::load_default(&launch_cwd);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     // The profile is resolved from the provisional parse because everything
     // downstream — the settings layer, the system prompt, the tool table —

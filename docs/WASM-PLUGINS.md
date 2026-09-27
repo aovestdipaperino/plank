@@ -13,7 +13,7 @@
 > Four surfaces of five are implemented (`panel` was cut), nine events of roughly
 > twenty, and five capabilities of ten. Each gap says so where it appears, so
 > "designed" and "built" stay distinguishable. The one that catches people is
-> `$PLANK_PLUGIN_PATH`: designed, never built, use `--plugin-dir`.
+> `$PLANK_PLUGIN_PATH`: designed, never built, use `./.plank/plugins/`.
 
 > Writing a plugin rather than changing plank? See
 > **[WASM-PLUGIN-AUTHORING.md](WASM-PLUGIN-AUTHORING.md)**, which documents what
@@ -659,11 +659,11 @@ have given.
 
 **Locations**, resolved in order, later overriding earlier by `id`:
 
-1. `--plugin-dir <path>`, repeatable, for development. (The original design
-   said `$PLANK_PLUGIN_PATH`; the flag is what shipped, and nothing reads that
-   variable.)
-2. `./.plank/plugins/` — project-local, checked in with the repo
-3. `~/.plank/plugins/` — user-global
+1. `./.plank/plugins/` — project-local, checked in with the repo, and the place
+   to put a plugin under development. (The original design said
+   `$PLANK_PLUGIN_PATH`, and a `--plugin-dir` flag shipped for a while; nothing
+   reads the variable and the flag is gone.)
+2. `~/.plank/plugins/` — user-global
 
 This mirrors the hierarchical `.mcp.json` resolution already in `tools/mcp.rs`,
 so users learn one precedence rule rather than two.

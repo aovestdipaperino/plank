@@ -428,22 +428,11 @@ pub fn take_restart() -> Option<Restart> {
 /// `original` is the launch argument list. One-shot or directory-moving
 /// options are dropped (`/resume`, `--worktree`, `--worktree-pr`, `-p`,
 /// `--prompt`, `--chdir`), and `--chdir <session_cwd>` plus `/resume
-/// <session>` are appended. A relative `--plugin-dir` was resolved after the
-/// original `--chdir`, so it is made absolute against that directory (or the
-/// launch directory when there was none) before the new `--chdir` could
-/// change what it means. Everything else is kept in order.
+/// <session>` are appended. Everything else is kept in order, `--profile`
+/// included: whatever it named at launch (a name, a path, or
+/// `owner/repo:folder`) is installed by now, so it resolves without asking.
 #[must_use]
-pub fn restart_args(
-    original: &[String],
-    session: &str,
-    launch_dir: &Path,
-    session_cwd: &Path,
-) -> Vec<String> {
-    let old_chdir = original
-        .iter()
-        .position(|a| a == "--chdir")
-        .and_then(|i| original.get(i + 1));
-    let base = old_chdir.map_or_else(|| launch_dir.to_path_buf(), |d| launch_dir.join(d));
+pub fn restart_args(original: &[String], session: &str, session_cwd: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < original.len() {
@@ -457,13 +446,6 @@ pub fn restart_args(
                 }
             }
             "--worktree" | "--worktree-pr" | "-p" | "--prompt" | "--chdir" => i += 1,
-            "--plugin-dir" => {
-                out.push(arg.to_owned());
-                if let Some(v) = original.get(i + 1) {
-                    out.push(base.join(v).to_string_lossy().into_owned());
-                    i += 1;
-                }
-            }
             _ => out.push(arg.to_owned()),
         }
         i += 1;
@@ -494,7 +476,7 @@ pub fn exec_restart(restart: &Restart) -> String {
     if let Err(e) = std::env::set_current_dir(&launch.dir) {
         return format!("cannot return to {}: {e}", launch.dir.display());
     }
-    let args = restart_args(&launch.args, &restart.session, &launch.dir, &restart.cwd);
+    let args = restart_args(&launch.args, &restart.session, &restart.cwd);
     std::process::Command::new(exe)
         .args(args)
         .exec()
@@ -543,7 +525,7 @@ mod tests {
 
     #[test]
     fn the_header_says_where_each_field_comes_from() {
-        let (plugin, spec) = profile("header", MANIFEST, Origin::CliDir);
+        let (plugin, spec) = profile("header", MANIFEST, Origin::ProjectScan);
         let text = render(&plugin, &spec).expect("renders");
         let row = |field: &str| {
             text.lines()
@@ -551,7 +533,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {field} row in:\n{text}"))
                 .to_owned()
         };
-        assert!(text.starts_with("<!-- plank profile \"hal\", loaded from --plugin-dir "));
+        assert!(text.starts_with("<!-- plank profile \"hal\", loaded from project "));
         assert!(row("displayName").contains("HAL") && row("displayName").ends_with("manifest"));
         assert!(row("accent").contains("#d0021b"));
         assert!(row("logo").contains("plank's logo") && row("logo").ends_with("default"));
@@ -566,7 +548,7 @@ mod tests {
         let (plugin, spec) = profile(
             "defaults",
             r#"{"name":"hal","profile":{"systemPrompt":"prompt.md"}}"#,
-            Origin::CliDir,
+            Origin::ProjectScan,
         );
         let text = render(&plugin, &spec).expect("renders");
         assert!(text.contains("default (the plugin name)"), "{text}");
@@ -586,7 +568,7 @@ mod tests {
 
     #[test]
     fn optional_sections_appear_only_when_their_files_exist() {
-        let (plugin, spec) = profile("optional", MANIFEST, Origin::CliDir);
+        let (plugin, spec) = profile("optional", MANIFEST, Origin::ProjectScan);
         let kinds = |p: &Plugin| {
             sections(p, &spec)
                 .iter()
@@ -604,7 +586,7 @@ mod tests {
 
     #[test]
     fn an_unedited_buffer_writes_nothing() {
-        let (plugin, spec) = profile("roundtrip", MANIFEST, Origin::CliDir);
+        let (plugin, spec) = profile("roundtrip", MANIFEST, Origin::ProjectScan);
         let text = render(&plugin, &spec).expect("renders");
         let applied = apply(&plugin, &spec, &text).expect("applies");
         assert!(!applied.changed, "{:?}", applied.lines);
@@ -613,7 +595,7 @@ mod tests {
 
     #[test]
     fn an_edited_prompt_writes_only_the_prompt() {
-        let (plugin, spec) = profile("prompt-edit", MANIFEST, Origin::CliDir);
+        let (plugin, spec) = profile("prompt-edit", MANIFEST, Origin::ProjectScan);
         let manifest = crate::plugins::manifest_path(&plugin.root).expect("manifest");
         let before = std::fs::metadata(&manifest).and_then(|m| m.modified()).ok();
         let text = render(&plugin, &spec)
@@ -633,7 +615,7 @@ mod tests {
 
     #[test]
     fn a_hand_edited_marker_path_cannot_redirect_a_write() {
-        let (plugin, spec) = profile("redirect", MANIFEST, Origin::CliDir);
+        let (plugin, spec) = profile("redirect", MANIFEST, Origin::ProjectScan);
         let decoy = plugin.root.join("decoy.md");
         let text = render(&plugin, &spec)
             .expect("renders")
@@ -652,7 +634,7 @@ mod tests {
 
     #[test]
     fn an_invalid_profile_writes_nothing() {
-        let (plugin, spec) = profile("invalid", MANIFEST, Origin::CliDir);
+        let (plugin, spec) = profile("invalid", MANIFEST, Origin::ProjectScan);
         let text = render(&plugin, &spec).expect("renders");
         let broken_json = text
             .replace("\"name\": \"hal\",", "\"name\": \"hal\"")
@@ -670,7 +652,7 @@ mod tests {
 
     #[test]
     fn malformed_markup_is_refused() {
-        let (plugin, spec) = profile("markup", MANIFEST, Origin::CliDir);
+        let (plugin, spec) = profile("markup", MANIFEST, Origin::ProjectScan);
         let text = render(&plugin, &spec).expect("renders");
         let prompt_start = text
             .find("\n<!-- plank-profile: begin prompt")
@@ -703,10 +685,8 @@ mod tests {
     fn restart_resumes_the_session_and_drops_one_shot_options() {
         let out = restart_args(
             &args(&[
-                "--plugin-dir",
-                "examples/profiles/hal",
                 "--profile",
-                "hal",
+                "aovestdipaperino/plank-profiles:HAL",
                 "/resume",
                 "old",
                 "--worktree",
@@ -715,20 +695,19 @@ mod tests {
                 "12",
                 "-p",
                 "hello",
+                "--chdir",
+                "proj",
                 "-c",
                 "8192",
             ]),
             "brave-curie",
-            Path::new("/launch"),
             Path::new("/launch/.claude/worktrees/feat"),
         );
         assert_eq!(
             out,
             args(&[
-                "--plugin-dir",
-                "/launch/examples/profiles/hal",
                 "--profile",
-                "hal",
+                "aovestdipaperino/plank-profiles:HAL",
                 "-c",
                 "8192",
                 "--chdir",
@@ -745,41 +724,10 @@ mod tests {
             &args(&["/resume", "--profile", "hal"]),
             "id",
             Path::new("/l"),
-            Path::new("/l"),
         );
         assert_eq!(
             out,
             args(&["--profile", "hal", "--chdir", "/l", "/resume", "id"])
         );
-    }
-
-    #[test]
-    fn a_relative_plugin_dir_resolves_against_the_original_chdir() {
-        let out = restart_args(
-            &args(&["--chdir", "proj", "--plugin-dir", "hal", "--profile", "hal"]),
-            "id",
-            Path::new("/l"),
-            Path::new("/l/proj"),
-        );
-        assert_eq!(
-            out,
-            args(&[
-                "--plugin-dir",
-                "/l/proj/hal",
-                "--profile",
-                "hal",
-                "--chdir",
-                "/l/proj",
-                "/resume",
-                "id",
-            ])
-        );
-        let absolute = restart_args(
-            &args(&["--plugin-dir", "/abs/hal"]),
-            "id",
-            Path::new("/l"),
-            Path::new("/l"),
-        );
-        assert_eq!(absolute[1], "/abs/hal");
     }
 }

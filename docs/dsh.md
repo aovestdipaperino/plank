@@ -589,7 +589,7 @@ plank has at least as many layers and no such command:
 - CLI flags in `src/config.rs`, several of which shadow settings keys (`engine.model`
   vs `-m`, `engine.threads` vs `-t`, `engine.backend`, `engine.power`, `engine.ctx`
   vs `-c` — all documented at `src/settings.rs:61`);
-- `--plugin-dir`, `~/.plank/plugins/dev/`, `./.plank/plugins/`;
+- `~/.plank/plugins/dev/`, `./.plank/plugins/`;
 - hooks from `hooks.json` at several roots (`src/hooks.rs:391`);
 - agents, skills and templates, each addressable as `<plugin>:<name>` and keeping the
   bare name only when nothing else claims it — a *resolution* rule whose outcome is

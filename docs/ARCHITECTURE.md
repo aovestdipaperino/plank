@@ -428,9 +428,9 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
 - `plugins.rs` — what a plugin *is* once it is on disk: a directory bundling
   skills, agents, templates, hooks, an `.mcp.json` and a `settings.json`,
   discovered under `~/.plank/plugins/claude/`, `~/.plank/plugins/dev/`,
-  `./.plank/plugins/`, then `--plugin-dir`, in that scan order, with a later
-  root winning a name collision: a user-authored `dev/` plugin beats a fetched
-  one, and project or `--plugin-dir` plugins outrank both. Both the plank
+  `./.plank/plugins/`, in that scan order, with a later root winning a name
+  collision: a user-authored `dev/` plugin beats a fetched one, and project
+  plugins outrank both. Both the plank
   (`.plank-plugin/plugin.json`, `templates/`, `hooks.json`) and Claude Code
   (`.claude-plugin/plugin.json`, `commands/`, `hooks/hooks.json`) spellings are
   accepted. A plugin's `settings.json` layers below the user's and cannot set
