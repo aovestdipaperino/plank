@@ -457,6 +457,12 @@ impl State {
                     self.set_message(app, "a file name is needed");
                     return;
                 }
+                // The Open dialog lists only the disk's root, so a file saved
+                // in a subfolder could never be opened again.
+                if name.contains('/') {
+                    self.set_message(app, "names cannot contain '/'");
+                    return;
+                }
                 let name = if name.to_ascii_lowercase().ends_with(".csv") {
                     name
                 } else {
@@ -1034,5 +1040,20 @@ mod tests {
         for hint in ["Ctrl-R Row", "Ctrl-S Save", "Ctrl-Q Exit", "F10 Menu"] {
             assert!(bottom.contains(hint), "{hint}: {bottom}");
         }
+    }
+
+    #[test]
+    fn save_as_refuses_a_name_with_a_slash_and_keeps_the_dialog() {
+        let mut s = new_session();
+        press(&mut s, "ctrl-r");
+        assert!(press(&mut s, "ctrl-s").is_none(), "untitled -> Save As");
+        type_str(&mut s, "sub/x.csv");
+        assert!(press(&mut s, "enter").is_none());
+        s.step(80, 24);
+        let text = screen(&s);
+        assert!(text.contains("names cannot contain '/'"), "{text}");
+        assert!(text.contains("sub/x.csv"), "the typed name stays: {text}");
+        assert!(s.doc().is_modified());
+        assert!(s.into_disk().list().unwrap().is_empty());
     }
 }
