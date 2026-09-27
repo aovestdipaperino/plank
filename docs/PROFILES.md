@@ -214,11 +214,36 @@ running `bash`, with no logo, so it also exercises the fallback path. Its
 `README.md` shows how to launch it with `--profile examples/profiles/chatbgt`,
 which offers to install it on first use.
 
-`examples/profiles/hal` is a second worked example, this one installable and
-with a logo: a mail-and-calendar profile whose tools arrive over MCP from a
-server that does not exist yet. See its own `README.md` for what that means in
-practice, the exact allow-list it ships, and the auth methods it deliberately
-does not support.
+HAL, a mail-and-calendar profile with a logo whose tools arrive over MCP from a
+server that does not exist yet, lives in its own repository,
+[`aovestdipaperino/plank-profiles`](https://github.com/aovestdipaperino/plank-profiles),
+and launches with `plank --profile aovestdipaperino/plank-profiles:HAL`. Its
+`README.md` covers the exact allow-list it ships and the auth methods it
+deliberately does not support.
+
+## Launching from a path or a repository
+
+`--profile` takes more than an installed name. Its argument is resolved in
+this order:
+
+1. **An installed name.** A plugin already loaded for this session that
+   declares a profile, or `~/.plank/profiles/<name>/`. It launches directly.
+2. **A source installed before.** Every profile install writes the source it
+   came from into `.plank-source` in the installed directory. An argument
+   matching one launches that installed copy with no fetch and no question.
+3. **A local directory**, such as `--profile examples/profiles/chatbgt`.
+4. **`owner/repo:folder`**, such as
+   `--profile aovestdipaperino/plank-profiles:HAL`: that folder of the
+   repository's default branch on GitHub. Plain `owner/repo` works for a
+   repository that is a single profile.
+
+For 3 and 4, plank asks `Install the profile <source> into ~/.plank/profiles?`
+before fetching anything, installs it exactly as `/install-profile` would, and
+launches it. Declining exits. With no terminal to ask on (piped input, or a
+headless run), nothing is installed and the error names the `/install-profile`
+command that would do it. Because the source is recorded, the same command
+line launches the installed copy from then on; to pick up a newer version,
+reinstall with `/install-profile <source> --force`.
 
 ## Installing a profile
 

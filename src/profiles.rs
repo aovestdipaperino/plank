@@ -263,7 +263,7 @@ mod tests {
             "o/r:HAL",
             "./hal",
             "~/p/hal",
-            "examples/profiles/hal",
+            "examples/profiles/chatbgt",
             "/abs",
         ] {
             assert!(is_source(source), "{source}");

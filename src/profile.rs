@@ -896,23 +896,18 @@ mod tests {
         (base, set)
     }
 
-    /// The shipped HAL profile must stay parseable and warning-free. A typo in a
-    /// builtin name or an `engine.*` key in its settings would otherwise only be
-    /// noticed by someone running it.
+    /// The shipped `chatbgt` profile must stay parseable and warning-free. A
+    /// typo in a builtin name or an `engine.*` key in its settings would
+    /// otherwise only be noticed by someone running it.
     #[test]
-    fn the_shipped_hal_profile_parses_without_warnings() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/profiles/hal");
+    fn the_shipped_chatbgt_profile_parses_without_warnings() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/profiles/chatbgt");
         let manifest = root.join(".plank-plugin").join("plugin.json");
-        let text = std::fs::read_to_string(&manifest).expect("hal manifest is readable");
-        let spec = parse(&text, &root).expect("hal declares a profile");
-        assert_eq!(spec.display_name.as_deref(), Some("HAL"));
+        let text = std::fs::read_to_string(&manifest).expect("chatbgt manifest is readable");
+        let spec = parse(&text, &root).expect("chatbgt declares a profile");
+        assert_eq!(spec.display_name.as_deref(), Some("ChatBGT"));
         assert!(spec.system_prompt.is_file(), "prompt file is missing");
-        assert!(spec.logo.is_some_and(|p| p.is_file()), "logo is missing");
+        assert!(spec.logo.is_none(), "chatbgt exercises the logo fallback");
         assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
-        // The containment that makes HAL safe to point at a mailbox.
-        let tools = spec.builtin_tools.expect("hal restricts its builtins");
-        for denied in ["bash", "edit", "write"] {
-            assert!(!tools.iter().any(|t| t == denied), "hal allows {denied}");
-        }
     }
 }

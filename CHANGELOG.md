@@ -14,6 +14,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/PROFILES.md` for the manifest reference and `examples/profiles/chatbgt`
   for a worked example. `/plugins` marks the plugins `--profile` accepts, and
   startup warns when a profile prompt has no `{{plank:tool-protocol}}` token.
+- **`--profile` takes a path or `owner/repo:folder`.** A profile that is not
+  installed yet is fetched from a local directory or one folder of a GitHub
+  repository, installed after asking, and launched:
+  `plank --profile aovestdipaperino/plank-profiles:HAL`. The install records
+  its source, so the same command launches the installed copy from then on.
 - **`/edit-profile` edits the running profile.** The manifest, prompt and any
   `settings.json` or `.mcp.json` open as one buffer in the built-in editor,
   under a header naming where each field comes from. A save is validated as a
@@ -27,9 +32,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `systemPrompt` is missing or blank, so a broken profile is caught at install
   time rather than at the launch the design makes fatal. Both manifest
   spellings are now accepted by installation, which also makes a plank-spelling
-  plugin fetchable by `/install-claude-plugin` for the first time. Ships
-  `examples/profiles/hal`, a mail and calendar profile whose MCP server is not
-  built yet. `--profile` is refused on a Qwen model, whose prompt is built
+  plugin fetchable by `/install-claude-plugin` for the first time. HAL, a mail
+  and calendar profile whose MCP server is not built yet, is published in
+  `aovestdipaperino/plank-profiles`. `--profile` is refused on a Qwen model, whose prompt is built
   separately and would ignore the profile's own.
 - **`/memory calibrate [N]` and `memory.gateBias`.** The System-1 memory gate
   always shows "yes" as answer A, and a model that leans toward a letter for
@@ -42,6 +47,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   points, which the live gate adds to `gatePercent`. It runs offline rather
   than in the gate because on DeepSeek the second ask re-prefills the span.
   Nothing is written; the suggestion is copied into `settings.json` by hand.
+
+### Removed
+
+- **`--plugin-dir`.** Plugins load from `~/.plank/plugins/claude`,
+  `~/.plank/plugins/dev` and `./.plank/plugins` only; put a plugin under
+  development in `./.plank/plugins/`. A profile that used to be launched with
+  `--plugin-dir <dir> --profile <name>` is launched with `--profile <dir>`.
 
 ### Fixed
 
