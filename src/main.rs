@@ -57,6 +57,63 @@ fn print_plugin_warnings(plugins: &plank::plugins::PluginSet) {
     }
 }
 
+/// Turns a `--profile` source (a local directory, `owner/repo:folder` or
+/// `owner/repo`) into the name of its installed copy.
+///
+/// An install that recorded this same source is used as is, with no fetch and
+/// no question, which is what lets the same command line launch it every time
+/// (and `/edit-profile`'s restart reuse it). Otherwise the user is asked
+/// before anything is fetched; with no terminal to ask on, nothing is
+/// installed and the error names the command that would do it.
+fn resolve_profile_source(
+    source: &str,
+    home: Option<&std::path::Path>,
+) -> Result<String, ExitCode> {
+    let Some(home) = home else {
+        eprintln!("plank: no HOME, so there is nowhere to install the profile {source:?}");
+        return Err(ExitCode::from(2));
+    };
+    let normalized = plank::profiles::normalize_source(source);
+    if let Some((name, _)) = plank::profiles::find_by_source(home, &normalized) {
+        return Ok(name);
+    }
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        eprintln!(
+            "plank: the profile {source:?} is not installed; install it with /install-profile {source}, or launch interactively to be asked"
+        );
+        return Err(ExitCode::from(2));
+    }
+    eprint!(
+        "Install the profile {source} into {}? [Y/n] ",
+        plank::profiles::dir(home).display()
+    );
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err()
+        || !matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "" | "y" | "yes"
+        )
+    {
+        eprintln!("plank: not installed");
+        return Err(ExitCode::SUCCESS);
+    }
+    match plank::claudeplugin::install_profile(source, None, home, false) {
+        Ok(installed) => {
+            eprintln!(
+                "plank: installed profile {} at {}",
+                installed.name,
+                installed.dest.display()
+            );
+            Ok(installed.name)
+        }
+        Err(e) => {
+            eprintln!("plank: cannot install the profile {source:?}: {e}");
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
 /// Resolves `--profile`'s argument against the loaded plugins and installs
 /// it, or reports what to do instead.
 ///
@@ -69,6 +126,16 @@ fn resolve_and_activate_profile(
     plugins: &mut plank::plugins::PluginSet,
     home: Option<&std::path::Path>,
 ) -> Option<ExitCode> {
+    // A path or `owner/repo:folder` becomes the name of the installed copy,
+    // installing it first when it is not installed yet.
+    let resolved = match requested.filter(|r| plank::profiles::is_source(r)) {
+        Some(source) => match resolve_profile_source(source, home) {
+            Ok(name) => Some(name),
+            Err(code) => return Some(code),
+        },
+        None => requested.map(str::to_owned),
+    };
+    let requested = resolved.as_deref();
     // An installed profile is loaded only now, because `--profile` named it:
     // `plugins::load_in` never scans the profiles root, so nothing there has
     // contributed anything to this session yet.

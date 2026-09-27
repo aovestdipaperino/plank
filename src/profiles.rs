@@ -80,6 +80,48 @@ pub fn names(home: &Path) -> Vec<String> {
     out
 }
 
+/// The file an install writes into the installed directory, holding the
+/// source it came from, so `--profile <that source>` finds it again.
+const SOURCE_FILE: &str = ".plank-source";
+
+/// Whether a `--profile` argument names a source to install from rather than
+/// an installed name: a path (anything with a `/`, or starting with `.` or
+/// `~`) or `owner/repo:folder`. An installed name is one segment with neither.
+#[must_use]
+pub fn is_source(arg: &str) -> bool {
+    arg.contains('/') || arg.contains(':') || arg.starts_with('.') || arg.starts_with('~')
+}
+
+/// The form a source is recorded and compared in: a directory that exists is
+/// canonicalized, so `./hal` and its absolute path match; anything else is
+/// kept as typed, trimmed.
+#[must_use]
+pub fn normalize_source(arg: &str) -> String {
+    let arg = arg.trim();
+    std::fs::canonicalize(arg)
+        .ok()
+        .filter(|p| p.is_dir())
+        .map_or_else(|| arg.to_string(), |p| p.to_string_lossy().into_owned())
+}
+
+/// Records where the profile installed at `dest` came from. Best-effort: a
+/// profile without the record still launches by name; only the by-source
+/// lookup misses, which means one more install prompt.
+pub fn record_source(dest: &Path, source: &str) {
+    let _ = std::fs::write(dest.join(SOURCE_FILE), format!("{source}\n"));
+}
+
+/// The installed profile whose recorded source is `source` (already
+/// normalized), as its name and directory.
+#[must_use]
+pub fn find_by_source(home: &Path, source: &str) -> Option<(String, PathBuf)> {
+    names(home).into_iter().find_map(|name| {
+        let dir = dir(home).join(&name);
+        let recorded = std::fs::read_to_string(dir.join(SOURCE_FILE)).ok()?;
+        (recorded.trim() == source).then_some((name, dir))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +232,44 @@ mod tests {
         .expect("write");
         assert_eq!(find(&home, "hal"), Some(root));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_recorded_source_finds_its_installed_profile() {
+        let home = tmpdir("by-source");
+        let dir = seed(&home, "hal", Some(r#"{"systemPrompt":"p.md"}"#));
+        assert_eq!(find_by_source(&home, "o/r:HAL"), None);
+        record_source(&dir, "o/r:HAL");
+        assert_eq!(
+            find_by_source(&home, "o/r:HAL"),
+            Some(("hal".to_string(), dir))
+        );
+        assert_eq!(find_by_source(&home, "o/r:OTHER"), None);
+    }
+
+    #[test]
+    fn a_local_source_is_recorded_as_its_canonical_path() {
+        let home = tmpdir("normalize");
+        let dir = seed(&home, "hal", Some(r#"{"systemPrompt":"p.md"}"#));
+        let canonical = std::fs::canonicalize(&dir).expect("canonical");
+        let dotted = format!("{}/./", dir.display());
+        assert_eq!(normalize_source(&dotted), canonical.to_string_lossy());
+        assert_eq!(normalize_source(" o/r:HAL "), "o/r:HAL");
+    }
+
+    #[test]
+    fn a_source_is_told_apart_from_an_installed_name() {
+        for source in [
+            "o/r:HAL",
+            "./hal",
+            "~/p/hal",
+            "examples/profiles/hal",
+            "/abs",
+        ] {
+            assert!(is_source(source), "{source}");
+        }
+        for name in ["hal", "chat-bgt"] {
+            assert!(!is_source(name), "{name}");
+        }
     }
 }

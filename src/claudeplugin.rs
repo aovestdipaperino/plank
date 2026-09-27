@@ -82,6 +82,15 @@ pub enum Source {
         /// necessarily the plugin root itself — see [`resolve_subpath`].
         subpath: String,
     },
+    /// `owner/repo:folder`: one folder of a GitHub repository's default
+    /// branch, the short form `--profile` takes for a repository that holds
+    /// several profiles side by side.
+    GitFolder {
+        /// The clone URL, expanded from `owner/repo`.
+        url: String,
+        /// The folder within the repository, relative, with no `..`.
+        folder: String,
+    },
 }
 
 /// Classifies `arg` into the acquisition path it names.
@@ -117,15 +126,39 @@ pub fn parse_source(arg: &str) -> Result<Source, String> {
             url: arg.to_string(),
         });
     }
-    let parts: Vec<&str> = arg.split('/').collect();
-    if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() && !parts[0].contains('.') {
-        return Ok(Source::Git {
-            url: format!("https://github.com/{}/{}", parts[0], parts[1]),
+    if let Some((repo, folder)) = arg.split_once(':') {
+        let url = github_shorthand(repo)
+            .ok_or_else(|| format!("'{repo}' is not an owner/repo shorthand"))?;
+        let folder = folder.trim_matches('/');
+        if folder.is_empty()
+            || Path::new(folder)
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "'{folder}' is not a folder inside the repository (use owner/repo:folder)"
+            ));
+        }
+        return Ok(Source::GitFolder {
+            url,
+            folder: folder.to_string(),
         });
+    }
+    if let Some(url) = github_shorthand(arg) {
+        return Ok(Source::Git { url });
     }
     Err(format!(
         "'{arg}' is neither a URL nor an owner/repo shorthand"
     ))
+}
+
+/// `owner/repo` as a GitHub clone URL: exactly two segments, no dot in the
+/// first, which is what keeps `example.com/p` from being silently rewritten
+/// into a `github.com` URL.
+fn github_shorthand(arg: &str) -> Option<String> {
+    let parts: Vec<&str> = arg.split('/').collect();
+    (parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() && !parts[0].contains('.'))
+        .then(|| format!("https://github.com/{}/{}", parts[0], parts[1]))
 }
 
 /// Recognizes a GitHub `/tree/<ref>/<path>` or `/blob/<ref>/<path>` URL,
@@ -575,6 +608,11 @@ pub fn install_profile(
     let result =
         fetch(arg, &staging).and_then(|tree| install_profile_staged(&tree, want, home, force));
     let _ = std::fs::remove_dir_all(&staging);
+    // Recorded so `--profile <this same source>` launches the installed copy
+    // instead of offering to install it again.
+    if let Ok(installed) = &result {
+        crate::profiles::record_source(&installed.dest, &crate::profiles::normalize_source(arg));
+    }
     result
 }
 
@@ -662,6 +700,17 @@ fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
         } => {
             let dest = clone(&url, Some(&refname), staging)?;
             resolve_subpath(&dest, &subpath)
+        }
+        Source::GitFolder { url, folder } => {
+            let dest = clone(&url, None, staging)?;
+            let root = dest.join(&folder);
+            if is_claude_manifest_root(&root) {
+                Ok(root)
+            } else {
+                Err(format!(
+                    "{url} has no plugin manifest in its folder '{folder}'"
+                ))
+            }
         }
         Source::Archive { url } => {
             // `download_and_extract`, not `plugins::fetch_archive`: the latter
@@ -1108,6 +1157,24 @@ mod tests {
             src,
             Source::GitSubpath { ref subpath, .. } if subpath == ".claude-plugin"
         ));
+    }
+
+    #[test]
+    fn owner_repo_colon_folder_names_one_folder_of_a_github_repo() {
+        assert_eq!(
+            parse_source("aovestdipaperino/plank-profiles:HAL").expect("parses"),
+            Source::GitFolder {
+                url: "https://github.com/aovestdipaperino/plank-profiles".to_string(),
+                folder: "HAL".to_string(),
+            }
+        );
+        assert!(matches!(
+            parse_source("o/r:nested/dir/").expect("parses"),
+            Source::GitFolder { ref folder, .. } if folder == "nested/dir"
+        ));
+        for bad in ["o/r:", "o/r:../x", "o/r:/", "example.com/r:x", "o:x"] {
+            assert!(parse_source(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
