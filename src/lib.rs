@@ -80,6 +80,7 @@ pub mod obscura_web;
 pub mod openfile;
 pub mod plugins;
 pub mod profile;
+pub mod profileedit;
 pub mod profiles;
 pub mod provenance;
 pub mod remote;

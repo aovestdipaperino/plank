@@ -74,7 +74,7 @@ fn scoped_path_for(scope: Scope, cwd: &Path, user_root: Option<&Path>) -> Option
 /// one, never a truncated one — the same idiom `session.rs` uses for
 /// transcripts. On any failure the temp file is removed and the target is
 /// left exactly as it was.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let name = path.file_name().map_or_else(
         || "memory".to_string(),
