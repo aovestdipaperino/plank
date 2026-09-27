@@ -151,7 +151,8 @@ fn is_beta(version: &str, patch: &str) -> bool {
 /// version outright.
 #[must_use]
 pub fn banner() -> String {
-    let label = banner_label(crate::profile::active().map(|_| crate::profile::display_name()));
+    let title = crate::profile::active().map(|_| crate::profile::title());
+    let label = banner_label(title.as_deref());
     format!("{}      {label}\n", active_art(DEFAULT_WIDTH))
 }
 

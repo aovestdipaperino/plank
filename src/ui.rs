@@ -11825,7 +11825,9 @@ impl Agent<'_> {
     /// screen looks exactly like a fresh start.
     fn tui_write_banner(&self, log: &mut OutputLog) {
         let version = masthead_label(
-            crate::profile::active().map(|_| crate::profile::display_name()),
+            crate::profile::active()
+                .map(|_| crate::profile::title())
+                .as_deref(),
             &crate::logo::version_label(),
             &status::format_ctx_size(self.engine.ctx_size()),
         );

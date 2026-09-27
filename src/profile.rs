@@ -288,6 +288,8 @@ pub struct ActiveProfile {
     /// mid-session cannot make composition fail or drift: the process reads
     /// it once, before there is a TUI to corrupt.
     pub prompt: String,
+    /// The plugin manifest's `version`, empty when it declares none.
+    pub version: String,
 }
 
 /// The active profile, set once at startup.
@@ -319,6 +321,28 @@ pub fn display_name() -> &'static str {
         Some(a) => a.spec.display_name.as_deref().unwrap_or(&a.name),
         None => "plank",
     }
+}
+
+/// The profile's name with its version, `HAL v0.3.1`, for the banners; the
+/// name alone when the manifest declares no version.
+#[must_use]
+pub fn title() -> String {
+    title_of(
+        display_name(),
+        ACTIVE.get().map_or("", |a| a.version.as_str()),
+    )
+}
+
+/// [`title`] for an explicit name and version, so the rendering is testable
+/// without the process-global active profile.
+#[must_use]
+pub fn title_of(name: &str, version: &str) -> String {
+    let version = version.trim();
+    if version.is_empty() {
+        return name.to_owned();
+    }
+    let v = version.strip_prefix('v').unwrap_or(version);
+    format!("{name} v{v}")
 }
 
 // Test-only override for the active profile, consulted before the process
@@ -460,6 +484,7 @@ pub fn resolve_profile(
             // has confirmed the file is readable; this function has no
             // filesystem access and stays pure.
             prompt: String::new(),
+            version: plugin.version.clone(),
         }),
         None => Resolution::NotAProfile(name.to_string()),
     }
@@ -505,6 +530,13 @@ pub fn missing_protocol_warning(name: &str, prompt: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_banner_title_carries_the_profile_version() {
+        assert_eq!(title_of("HAL", "0.3.1"), "HAL v0.3.1");
+        assert_eq!(title_of("HAL", "v1.2"), "HAL v1.2", "no doubled v");
+        assert_eq!(title_of("HAL", "  "), "HAL", "no version, name alone");
+    }
 
     #[test]
     fn folder_context_and_agents_md_default_to_false() {
