@@ -6942,6 +6942,16 @@ impl Agent<'_> {
             "/plugins" => print!("{}", self.plugins_command(arg)),
             "/install-claude-plugin" => print!("{}", self.install_claude_plugin_command(arg)),
             "/install-profile" => print!("{}", self.install_profile_command(arg)),
+            "/edit-profile" => match self.active_profile_plugin() {
+                None => println!("{NO_ACTIVE_PROFILE}"),
+                Some((plugin, spec)) => {
+                    match crate::profileedit::render(&plugin, &spec) {
+                        Ok(text) => print!("{text}"),
+                        Err(e) => println!("/edit-profile: {e}"),
+                    }
+                    println!("/edit-profile editing requires the interactive TUI");
+                }
+            },
             "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
             "/tasks" => print!(
                 "{}",
@@ -16745,6 +16755,11 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
+            "/edit-profile" => {
+                if !self.tui_edit_profile(log, terminal, view) {
+                    return false;
+                }
+            }
             "/templates" => {
                 *report = Some(tui::ReportPanel::new(
                     "templates",
@@ -17110,6 +17125,125 @@ impl Agent<'_> {
             Ok(None) => log.push_dim("[memory] unchanged".to_owned()),
             Err(e) => log.push_plain(format!("/memory failed: {e}")),
         }
+    }
+
+    /// The running profile's plugin and its spec as the manifest on disk now
+    /// describes it, or `None` when plank was started without `--profile`.
+    fn active_profile_plugin(
+        &self,
+    ) -> Option<(crate::plugins::Plugin, crate::profile::ProfileSpec)> {
+        let active = crate::profile::active()?;
+        let plugin = self
+            .tool_ctx
+            .plugins
+            .plugins
+            .iter()
+            .find(|p| p.name == active.name)?
+            .clone();
+        let spec = crate::profileedit::current_spec(&plugin, &active.spec);
+        Some((plugin, spec))
+    }
+
+    /// `/edit-profile`: the running profile's files in one buffer of the
+    /// built-in editor (`profileedit::render`), written back on accept
+    /// (`profileedit::apply`), then an offer to restart into the edit.
+    ///
+    /// Returns `false` when the user chose to restart: the session is saved
+    /// and the restart requested (`profileedit::request_restart`), and the
+    /// caller quits the loop so the normal exit path runs before `main`
+    /// re-executes plank.
+    #[cfg(feature = "builtin_editor")]
+    fn tui_edit_profile(
+        &mut self,
+        log: &mut OutputLog,
+        terminal: &mut ratatui::DefaultTerminal,
+        view: &mut tui::OutputView,
+    ) -> bool {
+        let Some((plugin, spec)) = self.active_profile_plugin() else {
+            log.push_plain(NO_ACTIVE_PROFILE.to_owned());
+            return true;
+        };
+        let initial = match crate::profileedit::render(&plugin, &spec) {
+            Ok(text) => text,
+            Err(e) => {
+                log.push_plain(format!("/edit-profile: {e}"));
+                return true;
+            }
+        };
+        let edited = with_tui_suspended(terminal, || {
+            crate::miniedit::edit_file("profile.md", &initial)
+        });
+        let text = match edited {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                log.push_dim("[profile] unchanged".to_owned());
+                return true;
+            }
+            Err(e) => {
+                log.push_plain(format!("/edit-profile failed: {e}"));
+                return true;
+            }
+        };
+        let applied = match crate::profileedit::apply(&plugin, &spec, &text) {
+            Ok(applied) => applied,
+            Err(e) => {
+                log.push_plain(format!("/edit-profile: {e}; nothing written"));
+                return true;
+            }
+        };
+        for line in &applied.lines {
+            log.push_dim(format!("[profile] {line}"));
+        }
+        if !applied.changed {
+            return true;
+        }
+        let choice = run_pick_panel(
+            terminal,
+            log,
+            view,
+            "Profile",
+            "Profile changed. Restart plank to load it?",
+            &[
+                (
+                    "Restart now",
+                    "save this session and reopen it under the edited profile",
+                ),
+                ("Later", "keep going; the changes apply at the next launch"),
+            ],
+        );
+        if choice != Some(0) {
+            log.push_dim("[profile] the changes apply at the next launch".to_owned());
+            return true;
+        }
+        match self.save_session() {
+            Ok(id) => {
+                crate::profileedit::request_restart(crate::profileedit::Restart {
+                    session: id,
+                    cwd: self.tool_ctx.cwd.clone(),
+                });
+                false
+            }
+            Err(e) => {
+                log.push_plain(format!(
+                    "/edit-profile: cannot save the session, so not restarting: {e}"
+                ));
+                true
+            }
+        }
+    }
+
+    #[cfg(not(feature = "builtin_editor"))]
+    fn tui_edit_profile(
+        &mut self,
+        log: &mut OutputLog,
+        _terminal: &mut ratatui::DefaultTerminal,
+        _view: &mut tui::OutputView,
+    ) -> bool {
+        log.push_plain(
+            "/edit-profile needs the built-in editor (build with --features builtin_editor)"
+                .to_owned(),
+        );
+        true
     }
 
     #[cfg(not(feature = "builtin_editor"))]
@@ -19432,7 +19566,7 @@ pub fn run_interactive(
     cfg: &AgentConfig,
     local_engine: Option<Box<dyn Engine>>,
     plugins: crate::plugins::PluginSet,
-) -> Result<(), String> {
+) -> Result<Option<crate::profileedit::Restart>, String> {
     // Before the agent collects its session context, so a freshly linked
     // AGENTS.md is read on this very start. Interactive only: the headless
     // front end never gets here, and must neither write into a checkout nor
@@ -19493,7 +19627,11 @@ pub fn run_interactive(
     crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
     agent.report_session_on_exit();
     agent.report_run_stats();
-    result
+    // A restart is handed out only after the agent is gone: dropping it stops
+    // the MCP servers and bash jobs, which the `exec` in `main` would not.
+    drop(agent);
+    let restart = crate::profileedit::take_restart();
+    result.map(|()| restart)
 }
 
 /// Plain-REPL [`Asker`](crate::tools::ask::Asker): prints the header, question,
@@ -20572,6 +20710,10 @@ fn read_batched_from(
     }
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
+
+/// What `/edit-profile` says when plank was started without `--profile`.
+const NO_ACTIVE_PROFILE: &str =
+    "/edit-profile: no profile is active; start plank with --profile NAME";
 
 /// The TUI masthead's text: plank's own line, or for a profile its display
 /// name first with plank's version kept beside it for bug reports.

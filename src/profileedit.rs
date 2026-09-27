@@ -149,14 +149,14 @@ fn header(plugin: &Plugin, spec: &ProfileSpec) -> String {
         match &spec.logo {
             Some(p) => (
                 "logo",
-                p.display().to_string(),
+                short(p, &plugin.root),
                 "manifest (a PNG: replace the file to change it)",
             ),
             None => ("logo", "plank's logo".to_owned(), "default"),
         },
         (
             "systemPrompt",
-            spec.system_prompt.display().to_string(),
+            short(&spec.system_prompt, &plugin.root),
             "manifest",
         ),
         match &spec.builtin_tools {
@@ -176,6 +176,16 @@ fn header(plugin: &Plugin, spec: &ProfileSpec) -> String {
     }
     out.push_str("     Edit inside the sections; save to write, quit to discard. -->\n");
     out
+}
+
+/// `path` relative to the plugin `root` when it lies inside it, else whole:
+/// the header's first line already names the root, and a full path would
+/// push the source column off the screen.
+fn short(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 /// The dotted keys a settings object sets, leaves only, in document order.
@@ -396,6 +406,23 @@ pub struct Restart {
     pub cwd: PathBuf,
 }
 
+static PENDING: std::sync::Mutex<Option<Restart>> = std::sync::Mutex::new(None);
+
+/// Records that the user chose to restart into `restart`. The TUI then quits
+/// normally; `ui::run_interactive` collects it with [`take_restart`] once the
+/// agent has been dropped.
+pub fn request_restart(restart: Restart) {
+    if let Ok(mut slot) = PENDING.lock() {
+        *slot = Some(restart);
+    }
+}
+
+/// Takes the restart [`request_restart`] recorded, if any.
+#[must_use]
+pub fn take_restart() -> Option<Restart> {
+    PENDING.lock().ok().and_then(|mut slot| slot.take())
+}
+
 /// The arguments that restart plank on `session`.
 ///
 /// `original` is the launch argument list. One-shot or directory-moving
@@ -529,6 +556,7 @@ mod tests {
         assert!(row("accent").contains("#d0021b"));
         assert!(row("logo").contains("plank's logo") && row("logo").ends_with("default"));
         assert!(row("tools").contains("read ask"));
+        assert!(row("systemPrompt").contains(" prompt.md "), "{text}");
         assert!(row("settings").contains("ui.showThinking"));
         assert!(!text.contains("installed copy"));
     }
@@ -654,6 +682,17 @@ mod tests {
         for edited in [missing, duplicated, stray, unclosed] {
             assert!(apply(&plugin, &spec, &edited).is_err(), "{edited}");
         }
+    }
+
+    #[test]
+    fn a_requested_restart_is_taken_once() {
+        let r = Restart {
+            session: "brave-curie".to_owned(),
+            cwd: PathBuf::from("/w"),
+        };
+        request_restart(r.clone());
+        assert_eq!(take_restart(), Some(r));
+        assert_eq!(take_restart(), None);
     }
 
     fn args(list: &[&str]) -> Vec<String> {

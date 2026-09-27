@@ -1051,6 +1051,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "install a profile from a repository, a tarball, or a directory",
     },
     SlashCommand {
+        name: "/edit-profile",
+        args: "",
+        desc: "edit the running profile's files, then optionally restart into them",
+    },
+    SlashCommand {
         name: "/frame",
         args: "[id]",
         desc: "open a wasm frame component, or list the openable ones",
@@ -1250,6 +1255,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/plugins"
             | "/install-claude-plugin"
             | "/install-profile"
+            | "/edit-profile"
             | "/frame"
             | "/templates"
             | "/tasks"
@@ -2933,6 +2939,7 @@ mod tests {
     #[test]
     fn plugins_is_a_known_slash_command() {
         assert!(slash_command_known("/plugins"));
+        assert!(slash_command_known("/edit-profile"));
         assert!(slash_command_known("/install-claude-plugin"));
     }
 

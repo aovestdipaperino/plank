@@ -347,6 +347,9 @@ fn post_cfg_early_exit(
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Before anything can move the process: `/edit-profile`'s restart re-runs
+    // these arguments from this directory.
+    plank::profileedit::record_launch(std::env::current_dir().unwrap_or_default(), args.clone());
 
     // `plank --model-downloader` is the detached background model downloader
     // (`src/downloader.rs`), re-execing this same binary so the helper can
@@ -1157,7 +1160,15 @@ fn run(
         }
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
-    plank::ui::run_interactive(engine, cfg, local_engine, plugins).map(|()| 0)
+    match plank::ui::run_interactive(engine, cfg, local_engine, plugins)? {
+        None => Ok(0),
+        // `/edit-profile` asked to reopen the session under the edited
+        // profile. `exec_restart` returns only when the exec failed.
+        Some(restart) => Err(format!(
+            "restart failed: {}",
+            plank::profileedit::exec_restart(&restart)
+        )),
+    }
 }
 
 #[cfg(test)]
