@@ -3563,13 +3563,22 @@ mod tests {
     /// failure this system has.
     #[test]
     fn the_shipped_guest_manifests_parse_clean() {
-        for (guest, id, module) in [
+        // screensavers and arcades import only `plank_abi`, so they ask for
+        // nothing beyond the implicit log. csvedit imports the `fs` host
+        // functions and nothing else. A grant added here without a matching
+        // host call would prompt the user to approve a capability that
+        // reaches no code.
+        let log_only = vec![Capability::Log];
+        let fs_and_log = vec![Capability::Log, Capability::Fs];
+        for (guest, id, module, caps) in [
             (
                 "screensavers",
                 "dev.plank.screensavers",
                 "screensavers.wasm",
+                &log_only,
             ),
-            ("arcades", "dev.plank.arcades", "arcades.wasm"),
+            ("arcades", "dev.plank.arcades", "arcades.wasm", &log_only),
+            ("csvedit", "dev.plank.csvedit", "csvedit.wasm", &fs_and_log),
         ] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("guests")
@@ -3588,14 +3597,9 @@ mod tests {
             assert_eq!(m.module, module, "{guest}");
             assert!(m.surfaces.contains(&Surface::Frame), "{guest}");
             assert!(m.surfaces.contains(&Surface::Command), "{guest}");
-            // Both guests import only `plank_abi`, so they ask for nothing.
-            // A grant added here without a matching host call would prompt the
-            // user to approve a capability that reaches no code.
-            assert_eq!(
-                m.capabilities,
-                vec![Capability::Log],
-                "{guest} should grant nothing beyond the implicit log"
-            );
+            let mut got = m.capabilities.clone();
+            got.sort();
+            assert_eq!(&got, caps, "{guest} grants exactly what it calls");
         }
     }
 

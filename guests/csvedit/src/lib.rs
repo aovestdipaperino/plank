@@ -11,5 +11,7 @@ mod dialogs;
 pub mod disk;
 pub mod doc;
 pub mod editor;
+#[cfg(target_arch = "wasm32")]
+pub mod frame;
 pub mod keys;
 pub mod paint;

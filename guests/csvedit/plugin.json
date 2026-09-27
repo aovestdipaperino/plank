@@ -1,0 +1,15 @@
+{
+  "name": "csvedit",
+  "version": "0.1.0",
+  "description": "A Turbo Vision CSV table editor on a private scratch disk",
+  "author": "Enzo Lombardi",
+  "wasm": [
+    {
+      "id": "dev.plank.csvedit",
+      "module": "csvedit.wasm",
+      "surfaces": ["command", "frame"],
+      "capabilities": ["fs", "log"],
+      "min_size": { "w": 60, "h": 16 }
+    }
+  ]
+}

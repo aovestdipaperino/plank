@@ -33,6 +33,7 @@ fi
 for guest in screensavers arcades; do
   (cd "$guest" && cargo clean -q --release --target wasm32-unknown-unknown 2>/dev/null || true)
 done
+(cd csvedit && cargo clean -q --release --target wasm32-wasip1 2>/dev/null || true)
 sh ./package.sh >/dev/null
 
 fail=0

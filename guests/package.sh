@@ -20,8 +20,11 @@ mkdir -p "$DIST"
 
 sh ./build.sh >/dev/null
 
-for guest in screensavers arcades; do
-  built="$ROOT/$guest/target/wasm32-unknown-unknown/release/plank_$guest.wasm"
+for guest in screensavers arcades csvedit; do
+  # csvedit is the one WASI guest (see build.sh); the others are freestanding.
+  target=wasm32-unknown-unknown
+  [ "$guest" = csvedit ] && target=wasm32-wasip1
+  built="$ROOT/$guest/target/$target/release/plank_$guest.wasm"
   if [ ! -f "$built" ]; then
     echo "missing build output: $built" >&2
     exit 1
@@ -47,7 +50,7 @@ done
 {
   echo "# plank guest modules"
   echo "# $(rustc --version)"
-  for guest in screensavers arcades; do
+  for guest in screensavers arcades csvedit; do
     (cd "$DIST/$guest/wasm" && shasum -a 256 "$guest.wasm")
   done
 } > "$DIST/SHA256SUMS"
