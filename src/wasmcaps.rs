@@ -323,13 +323,35 @@ impl RamFs {
         }
         let existing = self.files.get(path).map(Vec::len);
         if existing.is_none() && self.files.len() >= FS_MAX_FILES {
-            return Err(format!("'{id}' already holds {FS_MAX_FILES} files, the limit; {path} was not written"));
+            return Err(format!(
+                "'{id}' already holds {FS_MAX_FILES} files, the limit; {path} was not written"
+            ));
         }
         let total: usize = self.files.values().map(Vec::len).sum::<usize>() - existing.unwrap_or(0);
         if total + bytes.len() > FS_MAX_TOTAL_BYTES {
             return Err(format!(
                 "'{id}' disk would grow to {} bytes, more than the {FS_MAX_TOTAL_BYTES}-byte limit; {path} was not written",
                 total + bytes.len()
+            ));
+        }
+        // Ancestor conflict: some prefix of `path` is itself a stored file.
+        let mut ancestor = path;
+        while let Some(idx) = ancestor.rfind('/') {
+            ancestor = &ancestor[..idx];
+            if ancestor.is_empty() {
+                break;
+            }
+            if self.files.contains_key(ancestor) {
+                return Err(format!(
+                    "'{id}' cannot write {path}: '{ancestor}' already exists as a file"
+                ));
+            }
+        }
+        // Directory conflict: `path` is already an implied directory.
+        let dir_prefix = format!("{path}/");
+        if self.files.keys().any(|p| p.starts_with(&dir_prefix)) {
+            return Err(format!(
+                "'{id}' cannot write {path}: it already exists as a directory"
             ));
         }
         self.files.insert(path.to_string(), bytes.to_vec());
@@ -340,10 +362,16 @@ impl RamFs {
     /// subdirectories as `name/` with size 0, sorted by name.
     #[must_use]
     pub fn list(&self, dir: &str) -> Vec<(String, usize)> {
-        let prefix = if dir == "/" { "/".to_string() } else { format!("{dir}/") };
+        let prefix = if dir == "/" {
+            "/".to_string()
+        } else {
+            format!("{dir}/")
+        };
         let mut out: BTreeMap<String, usize> = BTreeMap::new();
         for (path, bytes) in &self.files {
-            let Some(rest) = path.strip_prefix(&prefix) else { continue };
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                continue;
+            };
             match rest.split_once('/') {
                 Some((sub, _)) => {
                     out.entry(format!("{sub}/")).or_insert(0);
@@ -366,12 +394,25 @@ impl RamFs {
 /// by every loaded component's host functions; dropped when plank exits.
 pub type RamDisks = Arc<Mutex<BTreeMap<String, RamFs>>>;
 
-fn with_disk<T>(grants: &Grants, disks: &RamDisks, f: impl FnOnce(&mut RamFs) -> T) -> Result<T, String> {
+/// Checks the `fs` grant, then normalizes `path` and hands both to `f`.
+///
+/// The grant is checked before the path is even parsed, so a component
+/// without `fs` always gets [`Grants::refusal`] regardless of what it passed
+/// — a bad path never leaks past a missing grant.
+fn with_disk<T>(
+    grants: &Grants,
+    disks: &RamDisks,
+    path: &str,
+    f: impl FnOnce(&mut RamFs, &str) -> T,
+) -> Result<T, String> {
     if !grants.allows("fs") {
         return Err(grants.refusal("fs"));
     }
-    let mut map = disks.lock().map_err(|_| "RAM disk lock poisoned".to_string())?;
-    Ok(f(map.entry(grants.id.clone()).or_default()))
+    let path = normalize_fs_path(path)?;
+    let mut map = disks
+        .lock()
+        .map_err(|_| "RAM disk lock poisoned".to_string())?;
+    Ok(f(map.entry(grants.id.clone()).or_default(), &path))
 }
 
 /// Reads a file from the component's RAM disk.
@@ -379,9 +420,15 @@ fn with_disk<T>(grants: &Grants, disks: &RamDisks, f: impl FnOnce(&mut RamFs) ->
 /// # Errors
 /// Without the `fs` grant, for a bad path, or when the file does not exist.
 pub fn fs_read(grants: &Grants, disks: &RamDisks, path: &str) -> Result<Vec<u8>, String> {
-    let path = normalize_fs_path(path)?;
-    with_disk(grants, disks, |d| d.read(&path).map(<[u8]>::to_vec))?
-        .ok_or_else(|| format!("no such file: {path}"))
+    let found = with_disk(grants, disks, path, |d, path| {
+        d.read(path).map(<[u8]>::to_vec)
+    })?;
+    found.ok_or_else(|| {
+        format!(
+            "no such file: {}",
+            normalize_fs_path(path).unwrap_or_default()
+        )
+    })
 }
 
 /// Writes a file to the component's RAM disk.
@@ -389,8 +436,9 @@ pub fn fs_read(grants: &Grants, disks: &RamDisks, path: &str) -> Result<Vec<u8>,
 /// # Errors
 /// Without the `fs` grant, for a bad path, or over quota.
 pub fn fs_write(grants: &Grants, disks: &RamDisks, path: &str, bytes: &[u8]) -> Result<(), String> {
-    let path = normalize_fs_path(path)?;
-    with_disk(grants, disks, |d| d.write(&grants.id, &path, bytes))?
+    with_disk(grants, disks, path, |d, path| {
+        d.write(&grants.id, path, bytes)
+    })?
 }
 
 /// Lists a directory of the component's RAM disk as JSON.
@@ -398,11 +446,15 @@ pub fn fs_write(grants: &Grants, disks: &RamDisks, path: &str, bytes: &[u8]) -> 
 /// # Errors
 /// Without the `fs` grant, or for a bad path.
 pub fn fs_list(grants: &Grants, disks: &RamDisks, dir: &str) -> Result<String, String> {
-    let dir = normalize_fs_path(dir)?;
-    let entries = with_disk(grants, disks, |d| d.list(&dir))?;
+    let entries = with_disk(grants, disks, dir, |d, dir| d.list(dir))?;
     let items: Vec<String> = entries
         .iter()
-        .map(|(name, size)| format!("{{\"name\":{},\"size\":{size}}}", crate::wasmreg::json_str(name)))
+        .map(|(name, size)| {
+            format!(
+                "{{\"name\":{},\"size\":{size}}}",
+                crate::wasmreg::json_str(name)
+            )
+        })
         .collect();
     Ok(format!("[{}]", items.join(",")))
 }
@@ -412,11 +464,13 @@ pub fn fs_list(grants: &Grants, disks: &RamDisks, dir: &str) -> Result<String, S
 /// # Errors
 /// Without the `fs` grant, for a bad path, or when the file does not exist.
 pub fn fs_remove(grants: &Grants, disks: &RamDisks, path: &str) -> Result<(), String> {
-    let path = normalize_fs_path(path)?;
-    if with_disk(grants, disks, |d| d.remove(&path))? {
+    if with_disk(grants, disks, path, RamFs::remove)? {
         Ok(())
     } else {
-        Err(format!("no such file: {path}"))
+        Err(format!(
+            "no such file: {}",
+            normalize_fs_path(path).unwrap_or_default()
+        ))
     }
 }
 
@@ -824,12 +878,18 @@ mod tests {
             fs_list(&g, &d, "/").unwrap(),
             r#"[{"name":"a.csv","size":4},{"name":"sub/","size":0}]"#
         );
-        assert_eq!(fs_list(&g, &d, "sub").unwrap(), r#"[{"name":"b.csv","size":1}]"#);
+        assert_eq!(
+            fs_list(&g, &d, "sub").unwrap(),
+            r#"[{"name":"b.csv","size":1}]"#
+        );
         let missing = fs_read(&g, &d, "nope.csv").unwrap_err();
         assert!(missing.contains("no such file"), "{missing}");
         fs_remove(&g, &d, "a.csv").unwrap();
         assert!(fs_read(&g, &d, "a.csv").is_err());
-        assert!(fs_remove(&g, &d, "a.csv").is_err(), "removing a missing file is an error");
+        assert!(
+            fs_remove(&g, &d, "a.csv").is_err(),
+            "removing a missing file is an error"
+        );
     }
 
     #[test]
@@ -873,5 +933,46 @@ mod tests {
     fn fs_reply_tags_ok_and_error() {
         assert_eq!(fs_reply(Ok(b"hi".to_vec())), b"\0hi");
         assert_eq!(fs_reply(Err("bad".into())), b"\x01bad");
+    }
+
+    #[test]
+    fn fs_refuses_a_file_under_a_file_and_a_file_over_a_directory() {
+        let g = grants_for("dev.plank.demo", &["fs"], None);
+        let d = disks();
+        fs_write(&g, &d, "/a", b"1").unwrap();
+        let err = fs_write(&g, &d, "/a/b", b"2").unwrap_err();
+        assert!(err.starts_with("'dev.plank.demo'"), "{err}");
+        assert!(err.contains("/a/b"), "{err}");
+        assert!(fs_read(&g, &d, "/a/b").is_err());
+
+        fs_write(&g, &d, "/d/x", b"3").unwrap();
+        let err = fs_write(&g, &d, "/d", b"4").unwrap_err();
+        assert!(err.starts_with("'dev.plank.demo'"), "{err}");
+        assert!(err.contains("/d"), "{err}");
+        assert_eq!(fs_read(&g, &d, "/d/x").unwrap(), b"3");
+
+        let list = fs_list(&g, &d, "/").unwrap();
+        assert!(
+            !(list.contains("\"a\"") && list.contains("\"a/\"")),
+            "{list}"
+        );
+        assert!(
+            !(list.contains("\"d\"") && list.contains("\"d/\"")),
+            "{list}"
+        );
+    }
+
+    #[test]
+    fn fs_refuses_without_the_grant_even_for_a_bad_path() {
+        let g = grants_for("dev.plank.demo", &[], None);
+        let d = disks();
+        let err = fs_read(&g, &d, "../x").unwrap_err();
+        assert!(err.contains("'fs'"), "{err}");
+        let err = fs_write(&g, &d, "../x", b"y").unwrap_err();
+        assert!(err.contains("'fs'"), "{err}");
+        let err = fs_list(&g, &d, "../x").unwrap_err();
+        assert!(err.contains("'fs'"), "{err}");
+        let err = fs_remove(&g, &d, "../x").unwrap_err();
+        assert!(err.contains("'fs'"), "{err}");
     }
 }
