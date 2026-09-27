@@ -11805,22 +11805,35 @@ impl Agent<'_> {
         result.map(|_| ())
     }
 
-    /// Lays the version line out to the *right* of the logo, on the logo's
-    /// middle row, so the two read as one masthead instead of stacking.
+    /// Lays the version text out to the *right* of the logo, so the two read
+    /// as one masthead instead of stacking. A multi-line text (one line per
+    /// `\n`) is centred on the logo's middle row, one line per art row, so a
+    /// long label never wraps back over the art in a narrow terminal.
     ///
-    /// Art with no rows has no middle to hang the text off, so the version
-    /// falls back to a line of its own and nothing is lost.
+    /// Art with no rows has no middle to hang the text off, so each line
+    /// falls back to a row of its own and nothing is lost; lines past the
+    /// art's last row do the same.
     fn masthead(
         mut art: Vec<ratatui::text::Line<'static>>,
-        version: String,
+        version: &str,
     ) -> Vec<ratatui::text::Line<'static>> {
+        let lines: Vec<&str> = version.split('\n').collect();
         if art.is_empty() {
-            return vec![ratatui::text::Line::from(version)];
+            return lines
+                .into_iter()
+                .map(|l| ratatui::text::Line::from(l.to_owned()))
+                .collect();
         }
         let middle = (art.len() - 1) / 2;
-        art[middle]
-            .spans
-            .push(ratatui::text::Span::raw(format!("  {version}")));
+        let start = middle.saturating_sub((lines.len() - 1) / 2);
+        for (i, line) in lines.into_iter().enumerate() {
+            match art.get_mut(start + i) {
+                Some(row) => row
+                    .spans
+                    .push(ratatui::text::Span::raw(format!("  {line}"))),
+                None => art.push(ratatui::text::Line::from(line.to_owned())),
+            }
+        }
         art
     }
 
@@ -11836,7 +11849,7 @@ impl Agent<'_> {
             &status::format_ctx_size(self.engine.ctx_size()),
         );
         let art = tui::ansi_to_lines(&crate::logo::active_art(crate::logo::DEFAULT_WIDTH));
-        for line in Self::masthead(art, version) {
+        for line in Self::masthead(art, &version) {
             log.push_spans(line.spans);
         }
         log.push_plain("Type a message, or /help for commands. Ctrl-D to quit.");
@@ -20738,11 +20751,13 @@ fn resume_command(profile: Option<&str>, short: &str) -> String {
 const NO_ACTIVE_PROFILE: &str =
     "/edit-profile: no profile is active; start plank with --profile NAME";
 
-/// The TUI masthead's text: plank's own line, or for a profile its display
-/// name first with plank's version kept beside it for bug reports.
+/// The TUI masthead's text: plank's own line, or for a profile three lines
+/// (its name and version, plank's version for bug reports, the context size)
+/// that [`Agent::masthead`] stacks beside the logo instead of letting one long
+/// line wrap over it.
 fn masthead_label(profile_name: Option<&str>, version: &str, ctx: &str) -> String {
     match profile_name {
-        Some(name) => format!("{name}  plank {version}, context {ctx} tokens"),
+        Some(name) => format!("{name}\nplank {version}\ncontext {ctx} tokens"),
         None => format!("plank {version} 🪵 Agent, context {ctx} tokens"),
     }
 }
@@ -20777,8 +20792,8 @@ mod tests {
             masthead_label(None, "v5.3.1", "1M"),
             "plank v5.3.1 🪵 Agent, context 1M tokens"
         );
-        let hal = masthead_label(Some("HAL"), "v5.3.1", "1M");
-        assert!(hal.starts_with("HAL  "), "{hal}");
+        let hal = masthead_label(Some("HAL v0.3.1"), "v5.3.1", "1M");
+        assert_eq!(hal, "HAL v0.3.1\nplank v5.3.1\ncontext 1M tokens");
         assert!(hal.contains("plank v5.3.1"), "{hal}");
         assert!(!hal.contains("🪵"), "{hal}");
     }
@@ -21280,7 +21295,7 @@ mod tests {
         let art: Vec<ratatui::text::Line<'static>> = (0..7)
             .map(|i| ratatui::text::Line::from(format!("art{i}")))
             .collect();
-        let out = Agent::masthead(art, "plank v9 🪵 Agent".to_string());
+        let out = Agent::masthead(art, "plank v9 🪵 Agent");
 
         // No extra row: the version rides an existing art line.
         assert_eq!(out.len(), 7, "the banner must not grow a row");
@@ -21297,8 +21312,26 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_line_label_is_stacked_beside_the_logo_around_its_middle() {
+        let art: Vec<ratatui::text::Line<'static>> = (0..7)
+            .map(|i| ratatui::text::Line::from(format!("a{i}")))
+            .collect();
+        let out = Agent::masthead(art, "one\ntwo\nthree");
+        let text: Vec<String> = out
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text.len(), 7, "no extra rows: {text:?}");
+        assert_eq!(text[2], "a2  one");
+        assert_eq!(text[3], "a3  two");
+        assert_eq!(text[4], "a4  three");
+        let short = Agent::masthead(vec![ratatui::text::Line::from("a0")], "one\ntwo");
+        assert_eq!(short.len(), 2, "overflow gets its own row");
+    }
+
+    #[test]
     fn masthead_without_art_still_shows_the_version() {
-        let out = Agent::masthead(Vec::new(), "plank v9".to_string());
+        let out = Agent::masthead(Vec::new(), "plank v9");
         assert_eq!(out.len(), 1);
         assert_eq!(text_of(&out[0]), "plank v9");
     }
@@ -21309,7 +21342,7 @@ mod tests {
             let art: Vec<ratatui::text::Line<'static>> = (0..rows)
                 .map(|i| ratatui::text::Line::from(format!("a{i}")))
                 .collect();
-            let out = Agent::masthead(art, "V".to_string());
+            let out = Agent::masthead(art, "V");
             assert_eq!(out.len(), rows, "{rows} rows in, {rows} rows out");
             let hits = out.iter().filter(|l| text_of(l).contains('V')).count();
             assert_eq!(
