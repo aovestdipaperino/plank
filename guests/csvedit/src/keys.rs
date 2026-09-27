@@ -64,6 +64,17 @@ pub fn translate(code: &str, text: Option<char>) -> Option<Event> {
     Some(Event::from_crossterm_key(KeyEvent::new(key, mods)))
 }
 
+/// Whether a translated event carries the Control modifier.
+///
+/// Ctrl+Ins and Ctrl+Del share key codes with plain Ins/Del in Turbo Vision
+/// (`crossterm_to_keycode` maps both to `KB_INS`/`KB_DEL` regardless of
+/// modifiers, and there is no `KB_CTRL_INS`/`KB_CTRL_DEL`), so callers that
+/// need to tell them apart must check the event's modifiers, not its code.
+#[must_use]
+pub fn is_ctrl(ev: &Event) -> bool {
+    ev.key_modifiers.contains(KeyModifiers::CONTROL)
+}
+
 /// The `text` field of a flat key payload, unescaped, when it is one char.
 #[must_use]
 pub fn payload_text(payload: &str) -> Option<char> {
@@ -122,6 +133,29 @@ mod tests {
         let expected =
             Event::from_crossterm_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
         assert_eq!(alt_x.key_code, expected.key_code);
+    }
+
+    #[test]
+    fn ctrl_insert_and_delete_keep_their_modifier() {
+        let ctrl_ins = translate("ctrl-insert", None).unwrap();
+        assert_eq!(ctrl_ins.key_code, KB_INS);
+        assert!(ctrl_ins.key_modifiers.contains(KeyModifiers::CONTROL));
+        assert!(is_ctrl(&ctrl_ins));
+
+        let ins = translate("insert", None).unwrap();
+        assert_eq!(ins.key_code, KB_INS);
+        assert!(!ins.key_modifiers.contains(KeyModifiers::CONTROL));
+        assert!(!is_ctrl(&ins));
+
+        let ctrl_del = translate("ctrl-delete", None).unwrap();
+        assert_eq!(ctrl_del.key_code, KB_DEL);
+        assert!(ctrl_del.key_modifiers.contains(KeyModifiers::CONTROL));
+        assert!(is_ctrl(&ctrl_del));
+
+        let del = translate("delete", None).unwrap();
+        assert_eq!(del.key_code, KB_DEL);
+        assert!(!del.key_modifiers.contains(KeyModifiers::CONTROL));
+        assert!(!is_ctrl(&del));
     }
 
     #[test]
