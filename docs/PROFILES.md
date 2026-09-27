@@ -217,9 +217,9 @@ which offers to install it on first use.
 HAL, a mail profile with a logo, lives in its own repository,
 [`aovestdipaperino/plank-profiles`](https://github.com/aovestdipaperino/plank-profiles),
 and launches with `plank --profile aovestdipaperino/plank-profiles:HAL`. Its
-mail tools come over MCP from
-[`plank-mail-mcp`](https://github.com/aovestdipaperino/plank-mail-mcp), a
-separate server over one Outlook mailbox that can read, flag, draft and file
+mail tools come over MCP from Softeria's
+[`ms-365-mcp-server`](https://github.com/Softeria/ms-365-mcp-server), started
+through `npx` and limited to mail tools, so it can read, flag, draft and file
 mail but cannot send or delete it. Its `README.md` covers the builtin
 allow-list it ships and how the two limits combine.
 

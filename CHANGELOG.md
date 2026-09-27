@@ -37,8 +37,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   spellings are now accepted by installation, which also makes a plank-spelling
   plugin fetchable by `/install-claude-plugin` for the first time. HAL, a mail
   profile over one Outlook mailbox, is published in
-  `aovestdipaperino/plank-profiles`; its tools come from the separate
-  `aovestdipaperino/plank-mail-mcp` server, which can read and tidy mail but
+  `aovestdipaperino/plank-profiles`; its mail tools come from Softeria's
+  `ms-365-mcp-server`, limited to mail tools so it can read and tidy mail but
   cannot send or delete it. `--profile` is refused on a Qwen model, whose prompt is built
   separately and would ignore the profile's own.
 - **`/memory calibrate [N]` and `memory.gateBias`.** The System-1 memory gate
