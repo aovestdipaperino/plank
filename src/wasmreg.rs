@@ -99,7 +99,8 @@ pub enum Capability {
     /// Per-component KV store. The only persistence most components need, and
     /// it needs no filesystem grant.
     State,
-    /// An explicit path list. Never `/`.
+    /// A private in-memory scratch disk, empty at session start and dropped
+    /// at exit. Reaches no real file.
     Fs,
     /// An explicit host list.
     Net,
@@ -157,13 +158,13 @@ impl Capability {
     /// disagree about which grants are the dangerous ones.
     #[must_use]
     pub fn undoes_the_sandbox(self) -> bool {
-        matches!(self, Self::Exec | Self::Net | Self::Fs)
+        matches!(self, Self::Exec | Self::Net)
     }
 
     /// True when a host function actually stands behind this grant.
     ///
     /// `notify`, `agent` and `session` parse, appear in the approval prompt and
-    /// reach nothing; `fs`, `net` and `exec` are the three left out on purpose.
+    /// reach nothing; `net` and `exec` are left out on purpose.
     /// Approving a capability that does not exist is worse than refusing it —
     /// the user has consented to something, and nothing tells them it was
     /// nothing — so the loader warns rather than staying silent.
@@ -171,7 +172,7 @@ impl Capability {
     pub fn is_wired(self) -> bool {
         matches!(
             self,
-            Self::Log | Self::Print | Self::State | Self::Sound | Self::Notify
+            Self::Log | Self::Print | Self::State | Self::Sound | Self::Notify | Self::Fs
         )
     }
 
@@ -3433,13 +3434,13 @@ mod tests {
             Capability::State,
             Capability::Sound,
             Capability::Notify,
+            Capability::Fs,
         ] {
             assert!(c.is_wired(), "{c:?}");
         }
         for c in [
             Capability::Agent,
             Capability::Session,
-            Capability::Fs,
             Capability::Net,
             Capability::Exec,
         ] {

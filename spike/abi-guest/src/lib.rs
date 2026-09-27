@@ -76,6 +76,8 @@ extern "ExtismHost" {
     fn plank_print(text: String) -> String;
     fn plank_state_get(key: String) -> Vec<u8>;
     fn plank_state_set(key: String, value: Vec<u8>) -> String;
+    fn plank_fs_write(path: String, bytes: Vec<u8>) -> String;
+    fn plank_fs_read(path: String) -> Vec<u8>;
 }
 
 /// Prints through the host and reports what the host said. An empty reply
@@ -102,6 +104,22 @@ pub fn cap_bump(_: ()) -> FnResult<String> {
     } else {
         Ok(err)
     }
+}
+
+/// Writes the input to `/probe.txt` on the RAM disk and returns what reads
+/// back, or the host's error text.
+#[plugin_fn]
+pub fn cap_fs(input: Vec<u8>) -> FnResult<Vec<u8>> {
+    let err = unsafe { plank_fs_write("/probe.txt".into(), input)? };
+    if !err.is_empty() {
+        return Ok(err.into_bytes());
+    }
+    let reply = unsafe { plank_fs_read("/probe.txt".into())? };
+    Ok(match reply.split_first() {
+        Some((0, data)) => data.to_vec(),
+        Some((_, msg)) => msg.to_vec(),
+        None => b"empty reply".to_vec(),
+    })
 }
 
 /// The one event handler. A guest matches on the event name rather than

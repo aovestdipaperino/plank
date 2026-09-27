@@ -489,6 +489,38 @@ fn state_without_the_grant_reads_empty_and_refuses_to_write() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// `fs` is a per-component RAM disk: a write lands there and a read sees it,
+/// with no real filesystem involved — `ram_file` is the test/inspection hook
+/// that proves that without going through the guest a second time.
+#[test]
+fn the_fs_capability_is_a_ram_disk_the_host_can_see() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load("dev.plank.demo", &wasm, &["fs"]).expect("load");
+    // cap_fs writes its input to /probe.txt, reads it back and returns it.
+    let out = h
+        .call("dev.plank.demo", "cap_fs", b"hello ram")
+        .expect("cap_fs");
+    assert_eq!(out, b"hello ram");
+    assert_eq!(
+        h.ram_file("dev.plank.demo", "/probe.txt").as_deref(),
+        Some(&b"hello ram"[..])
+    );
+}
+
+/// Without the grant, both the write and the read are refused, and nothing
+/// lands in the RAM disk to be inspected later.
+#[test]
+fn fs_without_the_grant_is_refused_by_name() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load("dev.plank.demo", &wasm, &[]).expect("load");
+    let out = h.call("dev.plank.demo", "cap_fs", b"x").expect("cap_fs");
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("'fs'"), "{text}");
+    assert_eq!(h.ram_file("dev.plank.demo", "/probe.txt"), None);
+}
+
 /// Loads a component subscribing to `events` with the given capabilities.
 fn subscribed_session(
     tag: &str,

@@ -137,6 +137,14 @@ pub trait WasmHost: std::fmt::Debug + Send {
     fn is_live(&self) -> bool {
         false
     }
+
+    /// A file on `id`'s RAM disk, for tests and inspection.
+    ///
+    /// The no-op answer for any host with no RAM disk at all — the real
+    /// implementation is [`ExtismHost::ram_file`].
+    fn ram_file(&self, _id: &str, _path: &str) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// The always-available host: refuses everything, cheerfully.
@@ -272,6 +280,7 @@ mod extism_host {
     struct CallCtx {
         grants: Grants,
         sink: SharedSink,
+        disks: crate::wasmcaps::RamDisks,
     }
 
     extism::host_fn!(plank_log(ctx: CallCtx; level: String, message: String) -> String {
@@ -328,6 +337,32 @@ mod extism_host {
         })
     });
 
+    extism::host_fn!(plank_fs_read(ctx: CallCtx; path: String) -> Vec<u8> {
+        let ctx = ctx.get()?;
+        let ctx = ctx.lock().unwrap();
+        Ok(crate::wasmcaps::fs_reply(crate::wasmcaps::fs_read(&ctx.grants, &ctx.disks, &path)))
+    });
+
+    extism::host_fn!(plank_fs_write(ctx: CallCtx; path: String, bytes: Vec<u8>) -> String {
+        let ctx = ctx.get()?;
+        let ctx = ctx.lock().unwrap();
+        Ok(crate::wasmcaps::fs_write(&ctx.grants, &ctx.disks, &path, &bytes).err().unwrap_or_default())
+    });
+
+    extism::host_fn!(plank_fs_list(ctx: CallCtx; dir: String) -> Vec<u8> {
+        let ctx = ctx.get()?;
+        let ctx = ctx.lock().unwrap();
+        Ok(crate::wasmcaps::fs_reply(
+            crate::wasmcaps::fs_list(&ctx.grants, &ctx.disks, &dir).map(String::into_bytes),
+        ))
+    });
+
+    extism::host_fn!(plank_fs_remove(ctx: CallCtx; path: String) -> String {
+        let ctx = ctx.get()?;
+        let ctx = ctx.lock().unwrap();
+        Ok(crate::wasmcaps::fs_remove(&ctx.grants, &ctx.disks, &path).err().unwrap_or_default())
+    });
+
     /// Extism-backed host holding every loaded plugin, keyed by component id.
     ///
     /// One instance per session. Extism plugins are not `Sync` and plank
@@ -339,6 +374,10 @@ mod extism_host {
         home: Option<std::path::PathBuf>,
         /// Shared by every plugin's host functions; drained at call boundaries.
         sink: SharedSink,
+        /// Every loaded component's `fs` RAM disk, keyed by component id.
+        /// Dropped when this host is dropped — nothing here reaches a real
+        /// filesystem.
+        disks: crate::wasmcaps::RamDisks,
     }
 
     impl ExtismHost {
@@ -348,6 +387,7 @@ mod extism_host {
                 plugins: std::collections::HashMap::new(),
                 home: home.map(std::path::Path::to_path_buf),
                 sink: Arc::new(Mutex::new(crate::wasmcaps::CapSink::default())),
+                disks: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             }
         }
     }
@@ -361,8 +401,88 @@ mod extism_host {
                 .field("loaded", &self.plugins.len())
                 .field("home", &self.home)
                 .field("pending_prints", &self.sink.lock().map(|s| s.is_empty()))
+                .field("disks", &self.disks.lock().map(|d| d.len()))
                 .finish()
         }
+    }
+
+    /// Every host function provided to every component, keyed to `ctx`.
+    ///
+    /// Split out of `load` purely to keep that function's line count in
+    /// check as the surface grows — this array has no logic of its own.
+    fn host_functions(ctx: extism::UserData<CallCtx>) -> [extism::Function; 10] {
+        [
+            extism::Function::new(
+                "plank_log",
+                [extism::PTR, extism::PTR],
+                [extism::PTR],
+                ctx.clone(),
+                plank_log,
+            ),
+            extism::Function::new(
+                "plank_print",
+                [extism::PTR],
+                [extism::PTR],
+                ctx.clone(),
+                plank_print,
+            ),
+            extism::Function::new(
+                "plank_sound",
+                [extism::PTR],
+                [extism::PTR],
+                ctx.clone(),
+                plank_sound,
+            ),
+            extism::Function::new(
+                "plank_notify",
+                [extism::PTR, extism::PTR],
+                [extism::PTR],
+                ctx.clone(),
+                plank_notify,
+            ),
+            extism::Function::new(
+                "plank_state_get",
+                [extism::PTR],
+                [extism::PTR],
+                ctx.clone(),
+                plank_state_get,
+            ),
+            extism::Function::new(
+                "plank_state_set",
+                [extism::PTR, extism::PTR],
+                [extism::PTR],
+                ctx.clone(),
+                plank_state_set,
+            ),
+            extism::Function::new(
+                "plank_fs_read",
+                [extism::PTR],
+                [extism::PTR],
+                ctx.clone(),
+                plank_fs_read,
+            ),
+            extism::Function::new(
+                "plank_fs_write",
+                [extism::PTR, extism::PTR],
+                [extism::PTR],
+                ctx.clone(),
+                plank_fs_write,
+            ),
+            extism::Function::new(
+                "plank_fs_list",
+                [extism::PTR],
+                [extism::PTR],
+                ctx.clone(),
+                plank_fs_list,
+            ),
+            extism::Function::new(
+                "plank_fs_remove",
+                [extism::PTR],
+                [extism::PTR],
+                ctx,
+                plank_fs_remove,
+            ),
+        ]
     }
 
     impl WasmHost for ExtismHost {
@@ -382,51 +502,9 @@ mod extism_host {
             let ctx = extism::UserData::new(CallCtx {
                 grants: grants_for(source, granted, self.home.as_deref()),
                 sink: Arc::clone(&self.sink),
+                disks: Arc::clone(&self.disks),
             });
-            let functions = [
-                extism::Function::new(
-                    "plank_log",
-                    [extism::PTR, extism::PTR],
-                    [extism::PTR],
-                    ctx.clone(),
-                    plank_log,
-                ),
-                extism::Function::new(
-                    "plank_print",
-                    [extism::PTR],
-                    [extism::PTR],
-                    ctx.clone(),
-                    plank_print,
-                ),
-                extism::Function::new(
-                    "plank_sound",
-                    [extism::PTR],
-                    [extism::PTR],
-                    ctx.clone(),
-                    plank_sound,
-                ),
-                extism::Function::new(
-                    "plank_notify",
-                    [extism::PTR, extism::PTR],
-                    [extism::PTR],
-                    ctx.clone(),
-                    plank_notify,
-                ),
-                extism::Function::new(
-                    "plank_state_get",
-                    [extism::PTR],
-                    [extism::PTR],
-                    ctx.clone(),
-                    plank_state_get,
-                ),
-                extism::Function::new(
-                    "plank_state_set",
-                    [extism::PTR, extism::PTR],
-                    [extism::PTR],
-                    ctx,
-                    plank_state_set,
-                ),
-            ];
+            let functions = host_functions(ctx);
 
             let mut plugin = extism::Plugin::new(&manifest, functions, true)
                 .map_err(|e| WasmError::Load(format!("{source}: {e}")))?;
@@ -495,6 +573,16 @@ mod extism_host {
 
         fn is_live(&self) -> bool {
             true
+        }
+
+        fn ram_file(&self, id: &str, path: &str) -> Option<Vec<u8>> {
+            let path = crate::wasmcaps::normalize_fs_path(path).ok()?;
+            self.disks
+                .lock()
+                .ok()?
+                .get(id)?
+                .read(&path)
+                .map(<[u8]>::to_vec)
         }
     }
 }
