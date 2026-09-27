@@ -57,6 +57,53 @@ fn print_plugin_warnings(plugins: &plank::plugins::PluginSet) {
     }
 }
 
+/// Offers to update the installed profile `name` when `source` now declares a
+/// higher `version`. Reads only the source's manifest, so a profile that is
+/// current costs no download; a check that fails launches what is installed.
+fn update_if_newer(source: &str, name: &str, dir: &std::path::Path, home: &std::path::Path) {
+    let installed = plank::profiles::version_of(dir);
+    let available = plank::claudeplugin::source_version(source);
+    let plank::profiles::Freshness::Newer {
+        installed,
+        available,
+    } = plank::profiles::freshness(installed.as_deref(), available.as_deref())
+    else {
+        return;
+    };
+    if !can_ask() {
+        eprintln!(
+            "plank: profile {name} {available} is available (installed: {installed}); launch interactively to update"
+        );
+        return;
+    }
+    if !ask_yes(&format!(
+        "Update profile {name} {installed} -> {available}? This replaces the installed copy, including changes made with /edit-profile."
+    )) {
+        return;
+    }
+    match plank::claudeplugin::replace_profile(source, name, home) {
+        Ok(_) => eprintln!("plank: updated profile {name} to {available}"),
+        Err(e) => eprintln!("plank: cannot update profile {name}: {e}; launching {installed}"),
+    }
+}
+
+/// Whether there is a person at a terminal to answer a startup question.
+fn can_ask() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// Asks `question` on stderr and reads one line; an empty answer is yes.
+fn ask_yes(question: &str) -> bool {
+    eprint!("{question} [Y/n] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).is_ok()
+        && matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "" | "y" | "yes"
+        )
+}
+
 /// Turns a `--profile` source (a local directory, `owner/repo:folder` or
 /// `owner/repo`) into the name of its installed copy.
 ///
@@ -74,27 +121,20 @@ fn resolve_profile_source(
         return Err(ExitCode::from(2));
     };
     let normalized = plank::profiles::normalize_source(source);
-    if let Some((name, _)) = plank::profiles::find_by_source(home, &normalized) {
+    if let Some((name, dir)) = plank::profiles::find_by_source(home, &normalized) {
+        update_if_newer(source, &name, &dir, home);
         return Ok(name);
     }
-    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+    if !can_ask() {
         eprintln!(
             "plank: the profile {source:?} is not installed; install it with /install-profile {source}, or launch interactively to be asked"
         );
         return Err(ExitCode::from(2));
     }
-    eprint!(
-        "Install the profile {source} into {}? [Y/n] ",
+    if !ask_yes(&format!(
+        "Install the profile {source} into {}?",
         plank::profiles::dir(home).display()
-    );
-    let _ = std::io::stderr().flush();
-    let mut answer = String::new();
-    if std::io::stdin().read_line(&mut answer).is_err()
-        || !matches!(
-            answer.trim().to_ascii_lowercase().as_str(),
-            "" | "y" | "yes"
-        )
-    {
+    )) {
         eprintln!("plank: not installed");
         return Err(ExitCode::SUCCESS);
     }

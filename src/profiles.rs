@@ -122,6 +122,61 @@ pub fn find_by_source(home: &Path, source: &str) -> Option<(String, PathBuf)> {
     })
 }
 
+/// The `version` a profile's manifest declares, as written.
+#[must_use]
+pub fn version_of(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(crate::plugins::manifest_path(dir)?).ok()?;
+    manifest_version(&text)
+}
+
+/// The top-level `version` of a manifest's text.
+#[must_use]
+pub fn manifest_version(text: &str) -> Option<String> {
+    match crate::tools::mcp::json_parse(text)?.get("version")? {
+        crate::tools::mcp::Json::Str(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// Whether an installed profile is behind the version its source offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Freshness {
+    /// Nothing newer, or no way to tell: launch what is installed.
+    Current,
+    /// The source declares a higher `MAJOR.MINOR.PATCH`.
+    Newer {
+        /// What is installed, or `unversioned`.
+        installed: String,
+        /// What the source offers.
+        available: String,
+    },
+}
+
+/// Compares an installed version with the one its source offers.
+///
+/// Only a source version that parses and is strictly higher counts as newer.
+/// An unreadable or unparsable source (offline, no `version`, not
+/// `MAJOR.MINOR.PATCH`) is [`Freshness::Current`], so a failed check never
+/// costs a download. An installed copy with no version is behind any source
+/// that has one.
+#[must_use]
+pub fn freshness(installed: Option<&str>, available: Option<&str>) -> Freshness {
+    let Some(available) = available else {
+        return Freshness::Current;
+    };
+    let Some(new) = crate::upgrade::parse_version(available) else {
+        return Freshness::Current;
+    };
+    let old = installed.and_then(crate::upgrade::parse_version);
+    if old.is_some_and(|old| old >= new) {
+        return Freshness::Current;
+    }
+    Freshness::Newer {
+        installed: installed.unwrap_or("unversioned").to_string(),
+        available: available.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +326,40 @@ mod tests {
         for name in ["hal", "chat-bgt"] {
             assert!(!is_source(name), "{name}");
         }
+    }
+
+    #[test]
+    fn only_a_strictly_higher_source_version_is_newer() {
+        let newer = |i, a| freshness(i, a) != Freshness::Current;
+        assert!(newer(Some("0.1.0"), Some("0.1.1")));
+        assert!(newer(Some("0.9.9"), Some("1.0.0")));
+        assert!(newer(None, Some("0.1.0")));
+        assert!(newer(Some("garbage"), Some("0.1.0")));
+        assert!(!newer(Some("0.1.1"), Some("0.1.1")));
+        assert!(!newer(Some("0.2.0"), Some("0.1.9")));
+        assert!(!newer(Some("0.1.0"), None));
+        assert!(!newer(Some("0.1.0"), Some("latest")));
+        assert_eq!(
+            freshness(Some("0.1.0"), Some("0.2.0")),
+            Freshness::Newer {
+                installed: "0.1.0".to_string(),
+                available: "0.2.0".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn the_version_is_read_from_the_manifest() {
+        let home = tmpdir("version");
+        let root = dir(&home).join("hal");
+        std::fs::create_dir_all(root.join(".plank-plugin")).expect("mkdir");
+        std::fs::write(
+            root.join(".plank-plugin/plugin.json"),
+            r#"{"name":"hal","version":" 0.3.1 ","profile":{"systemPrompt":"p.md"}}"#,
+        )
+        .expect("write");
+        assert_eq!(version_of(&root).as_deref(), Some("0.3.1"));
+        assert_eq!(manifest_version(r#"{"name":"x"}"#), None);
+        assert_eq!(manifest_version(r#"{"version":7}"#), None);
     }
 }

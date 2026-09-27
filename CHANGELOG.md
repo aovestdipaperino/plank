@@ -19,6 +19,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   repository, installed after asking, and launched:
   `plank --profile aovestdipaperino/plank-profiles:HAL`. The install records
   its source, so the same command launches the installed copy from then on.
+  If the source's manifest declares a higher `version`, read with one small
+  request instead of a download, plank offers to update the installed copy
+  first; otherwise nothing is fetched.
 - **`/edit-profile` edits the running profile.** The manifest, prompt and any
   `settings.json` or `.mcp.json` open as one buffer in the built-in editor,
   under a header naming where each field comes from. A save is validated as a

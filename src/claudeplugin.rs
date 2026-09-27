@@ -616,6 +616,120 @@ pub fn install_profile(
     result
 }
 
+/// The raw-file URLs that hold the manifest of the profile `arg` names on
+/// GitHub, plank spelling first, or `None` for a source that is not a GitHub
+/// repository (or folder of one) and so cannot be checked without a clone.
+///
+/// `HEAD` is the ref because a clone without `--branch` checks out the
+/// default branch, which is what `HEAD` names on `raw.githubusercontent.com`.
+#[must_use]
+pub fn raw_manifest_urls(arg: &str) -> Option<Vec<String>> {
+    let (url, folder) = match parse_source(arg).ok()? {
+        Source::GitFolder { url, folder } => (url, folder),
+        Source::Git { url } => (url, String::new()),
+        _ => return None,
+    };
+    let repo = url.strip_prefix("https://github.com/")?;
+    let base = if folder.is_empty() {
+        format!("https://raw.githubusercontent.com/{repo}/HEAD")
+    } else {
+        format!("https://raw.githubusercontent.com/{repo}/HEAD/{folder}")
+    };
+    Some(vec![
+        format!("{base}/.plank-plugin/plugin.json"),
+        format!("{base}/.claude-plugin/plugin.json"),
+    ])
+}
+
+/// The `version` the source `arg` currently offers, read without fetching
+/// the profile: a local directory's manifest, or one small request for a
+/// GitHub manifest, bounded by [`VERSION_CHECK_TIMEOUT_SECS`]. `None` when it
+/// cannot be told, which the caller treats as nothing newer.
+#[must_use]
+pub fn source_version(arg: &str) -> Option<String> {
+    if Path::new(arg).is_dir() {
+        return crate::profiles::version_of(Path::new(arg));
+    }
+    raw_manifest_urls(arg)?
+        .iter()
+        .find_map(|url| fetch_text(url))
+        .and_then(|text| crate::profiles::manifest_version(&text))
+}
+
+/// The bound on [`source_version`]'s request: launching must not hang on a
+/// slow network just to learn that nothing changed.
+#[cfg(not(test))]
+const VERSION_CHECK_TIMEOUT_SECS: u64 = 3;
+
+#[cfg(not(test))]
+fn fetch_text(url: &str) -> Option<String> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(
+            VERSION_CHECK_TIMEOUT_SECS,
+        )))
+        .build()
+        .new_agent();
+    let mut resp = agent
+        .get(url)
+        .header("User-Agent", concat!("plank/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.body_mut().read_to_string().ok()
+}
+
+/// Test builds never touch the network.
+#[cfg(test)]
+fn fetch_text(_url: &str) -> Option<String> {
+    None
+}
+
+/// Replaces the installed profile `name` with a fresh install from `arg`.
+///
+/// The old copy is moved aside first, into `<profiles>/.replacing/`, rather
+/// than the new one being installed elsewhere and renamed in: an install
+/// rewrites `${CLAUDE_PLUGIN_ROOT}` to its own path, so it has to happen at
+/// the final location. Any failure puts the old copy back, and a source that
+/// now declares a different name is refused the same way, since installing
+/// it would leave `name` missing while its record points somewhere else.
+///
+/// # Errors
+/// The install's own error, a changed name, or a filesystem failure moving
+/// the old copy.
+pub fn replace_profile(arg: &str, name: &str, home: &Path) -> Result<Installed, String> {
+    let dest = crate::profiles::dir(home).join(name);
+    let aside_root = crate::profiles::dir(home).join(".replacing");
+    std::fs::create_dir_all(&aside_root)
+        .map_err(|e| format!("cannot create {}: {e}", aside_root.display()))?;
+    let aside = aside_root.join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&aside);
+    std::fs::rename(&dest, &aside)
+        .map_err(|e| format!("cannot move {} aside: {e}", dest.display()))?;
+    let restore = |why: String| {
+        let _ = std::fs::remove_dir_all(&dest);
+        match std::fs::rename(&aside, &dest) {
+            Ok(()) => why,
+            Err(e) => format!("{why}; the previous copy is at {} ({e})", aside.display()),
+        }
+    };
+    match install_profile(arg, None, home, false) {
+        Ok(installed) if installed.name == name => {
+            let _ = std::fs::remove_dir_all(&aside);
+            Ok(installed)
+        }
+        Ok(installed) => {
+            let _ = std::fs::remove_dir_all(&installed.dest);
+            Err(restore(format!(
+                "{arg} now declares the profile '{}', not '{name}'",
+                installed.name
+            )))
+        }
+        Err(e) => Err(restore(e)),
+    }
+}
+
 /// Fetches the plugin `arg` names, validates it, and installs it.
 ///
 /// The one entry point the slash command calls. Everything it does happens in
@@ -1157,6 +1271,76 @@ mod tests {
             src,
             Source::GitSubpath { ref subpath, .. } if subpath == ".claude-plugin"
         ));
+    }
+
+    #[test]
+    fn a_github_source_checks_its_manifest_by_raw_url() {
+        assert_eq!(
+            raw_manifest_urls("aovestdipaperino/plank-profiles:HAL").expect("github"),
+            [
+                "https://raw.githubusercontent.com/aovestdipaperino/plank-profiles/HEAD/HAL/.plank-plugin/plugin.json",
+                "https://raw.githubusercontent.com/aovestdipaperino/plank-profiles/HEAD/HAL/.claude-plugin/plugin.json",
+            ]
+        );
+        assert_eq!(
+            raw_manifest_urls("o/r").expect("github")[0],
+            "https://raw.githubusercontent.com/o/r/HEAD/.plank-plugin/plugin.json"
+        );
+        assert_eq!(raw_manifest_urls("https://example.com/p.tar.gz"), None);
+        assert_eq!(raw_manifest_urls("https://gitlab.com/o/r"), None);
+    }
+
+    /// A profile source directory whose manifest declares `version`.
+    fn versioned_profile(tag: &str, name: &str, version: &str) -> PathBuf {
+        let src = tmpdir(tag).join(name);
+        write(
+            &src,
+            ".plank-plugin/plugin.json",
+            &format!(
+                r#"{{"name":"{name}","version":"{version}","profile":{{"systemPrompt":"prompt.md"}}}}"#
+            ),
+        );
+        write(&src, "prompt.md", "You are a test profile.\n");
+        src
+    }
+
+    #[test]
+    fn a_local_source_reports_its_version() {
+        let src = versioned_profile("source-version", "hal", "0.2.0");
+        assert_eq!(
+            source_version(src.to_str().expect("utf8")).as_deref(),
+            Some("0.2.0")
+        );
+    }
+
+    #[test]
+    fn replacing_installs_the_new_copy_and_drops_the_old_one() {
+        let home = tmpdir("replace-home");
+        let v1 = versioned_profile("replace-v1", "hal", "0.1.0");
+        install_profile(v1.to_str().expect("utf8"), None, &home, false).expect("v1");
+        let v2 = versioned_profile("replace-v2", "hal", "0.2.0");
+        let installed = replace_profile(v2.to_str().expect("utf8"), "hal", &home).expect("v2");
+        assert_eq!(
+            crate::profiles::version_of(&installed.dest).as_deref(),
+            Some("0.2.0")
+        );
+        let aside = crate::profiles::dir(&home).join(".replacing");
+        assert_eq!(std::fs::read_dir(&aside).map_or(0, Iterator::count), 0);
+    }
+
+    #[test]
+    fn a_failed_replace_puts_the_old_copy_back() {
+        let home = tmpdir("replace-fail-home");
+        let v1 = versioned_profile("replace-fail-v1", "hal", "0.1.0");
+        install_profile(v1.to_str().expect("utf8"), None, &home, false).expect("v1");
+        let renamed = versioned_profile("replace-fail-v2", "opus", "0.2.0");
+        assert!(replace_profile(renamed.to_str().expect("utf8"), "hal", &home).is_err());
+        let dest = crate::profiles::dir(&home).join("hal");
+        assert_eq!(crate::profiles::version_of(&dest).as_deref(), Some("0.1.0"));
+        assert!(!crate::profiles::dir(&home).join("opus").exists());
+        let broken = tmpdir("replace-fail-missing").join("nothing-here");
+        assert!(replace_profile(broken.to_str().expect("utf8"), "hal", &home).is_err());
+        assert_eq!(crate::profiles::version_of(&dest).as_deref(), Some("0.1.0"));
     }
 
     #[test]

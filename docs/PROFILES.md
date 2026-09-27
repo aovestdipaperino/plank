@@ -242,8 +242,31 @@ before fetching anything, installs it exactly as `/install-profile` would, and
 launches it. Declining exits. With no terminal to ask on (piped input, or a
 headless run), nothing is installed and the error names the `/install-profile`
 command that would do it. Because the source is recorded, the same command
-line launches the installed copy from then on; to pick up a newer version,
-reinstall with `/install-profile <source> --force`.
+line launches the installed copy from then on.
+
+### Versions and updates
+
+A profile's version is its manifest's top-level `version`, as
+`MAJOR.MINOR.PATCH`. When `--profile <source>` finds the installed copy by its
+recorded source, plank reads the version the source offers now without
+fetching the profile: a local directory's manifest, or one request of at most
+three seconds for the folder's `plugin.json` on `raw.githubusercontent.com`.
+
+- Not newer (the same or older version): the installed copy launches and
+  nothing is downloaded.
+- Newer: plank asks `Update profile <name> <installed> -> <available>?`. Yes
+  fetches the source and replaces the installed copy, including anything
+  changed there with `/edit-profile`; No launches the installed one. With no
+  terminal to ask on, it launches the installed copy and says a newer version
+  is available.
+- The check fails (offline, no `version`, not `MAJOR.MINOR.PATCH`): the
+  installed copy launches.
+
+The old copy is moved aside before the new one is installed, and moved back if
+the install fails or the source now declares a different profile name, so a
+failed update never leaves the profile missing. A profile author releases an
+update by raising `version`; `raw.githubusercontent.com` caches files for a
+few minutes, so a just-pushed bump can take that long to be seen.
 
 ## Installing a profile
 

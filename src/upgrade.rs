@@ -76,7 +76,7 @@ pub enum Transition {
 }
 
 /// Parses `MAJOR.MINOR.PATCH`, ignoring any `-pre`/`+build` suffix.
-fn parse_version(v: impl AsRef<str>) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_version(v: impl AsRef<str>) -> Option<(u64, u64, u64)> {
     let v = v.as_ref().trim();
     let core = v.split(['-', '+']).next()?;
     let mut it = core.split('.');
