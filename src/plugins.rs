@@ -656,6 +656,16 @@ pub fn merge_profile_names(mut names: Vec<String>, installed: &[String]) -> Vec<
 /// Renders the `/plugins` listing: one block per plugin, then every warning.
 #[must_use]
 pub fn render_list(set: &PluginSet) -> String {
+    render_list_with(set, crate::profile::active_name())
+}
+
+/// [`render_list`] with the active profile passed in, so the marker is
+/// testable without the process-global `OnceLock` that `--profile` sets.
+///
+/// A plugin with a `profile` block is marked `[profile]`, which is what tells
+/// the user `--profile` accepts its name; the one this run is operating under
+/// is marked `[profile, active]`.
+fn render_list_with(set: &PluginSet, active: Option<&str>) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -668,6 +678,13 @@ pub fn render_list(set: &PluginSet) -> String {
         let _ = write!(out, "{} ({})", plugin.name, plugin.origin.label());
         if !plugin.version.is_empty() {
             let _ = write!(out, " v{}", plugin.version);
+        }
+        if plugin.profile.is_some() {
+            out.push_str(if active == Some(plugin.name.as_str()) {
+                " [profile, active]"
+            } else {
+                " [profile]"
+            });
         }
         out.push('\n');
         if !plugin.description.is_empty() {
@@ -2870,6 +2887,45 @@ mod tests {
         let spec = p.profile.expect("has a profile");
         assert_eq!(spec.display_name.as_deref(), Some("HAL"));
         assert_eq!(spec.system_prompt, p.root.join("prompt.md"));
+    }
+
+    #[test]
+    fn the_listing_marks_the_plugins_that_profile_accepts() {
+        let base = scratch("render-profile-marker");
+        let cwd = base.join("proj");
+        let dirs = base.join("dirs");
+        write(
+            &dirs.join("hal"),
+            ".plank-plugin/plugin.json",
+            r#"{"name":"hal","profile":{"systemPrompt":"prompt.md"}}"#,
+        );
+        write(
+            &dirs.join("chatbgt"),
+            ".plank-plugin/plugin.json",
+            r#"{"name":"chatbgt","profile":{"systemPrompt":"prompt.md"}}"#,
+        );
+        write(
+            &dirs.join("plain"),
+            ".plank-plugin/plugin.json",
+            r#"{"name":"plain"}"#,
+        );
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let set = load_in(
+            Some(&base.join("home")),
+            &cwd,
+            &[dirs.join("hal"), dirs.join("chatbgt"), dirs.join("plain")],
+        );
+        let out = render_list_with(&set, Some("hal"));
+        let header = |name: &str| {
+            out.lines()
+                .find(|l| l.starts_with(&format!("{name} (")))
+                .unwrap_or_else(|| panic!("no {name} header in:\n{out}"))
+                .to_string()
+        };
+        assert!(header("hal").ends_with(" [profile, active]"), "{out}");
+        assert!(header("chatbgt").ends_with(" [profile]"), "{out}");
+        assert!(!header("plain").contains("[profile"), "{out}");
+        assert!(!render_list_with(&set, None).contains("active]"));
     }
 
     #[test]

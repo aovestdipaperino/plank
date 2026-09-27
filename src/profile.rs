@@ -431,9 +431,39 @@ pub fn refuse_under_qwen(name: &str) -> String {
     )
 }
 
+/// The load-time warning for a profile prompt that never asks for the tool
+/// protocol, or `None` when it does.
+///
+/// Without [`crate::sysprompt::TOOL_PROTOCOL_TOKEN`] the model is handed the
+/// schema block but not the DSML call syntax, so it can see its tools and
+/// has no way to call them. That can be a deliberate chat-only profile, so
+/// it warns rather than refusing.
+#[must_use]
+pub fn missing_protocol_warning(name: &str, prompt: &str) -> Option<String> {
+    (!prompt.contains(crate::sysprompt::TOOL_PROTOCOL_TOKEN)).then(|| {
+        format!(
+            "plank: profile {name:?}: the prompt has no {} token, so the model is not told how to call its tools",
+            crate::sysprompt::TOOL_PROTOCOL_TOKEN
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prompt_without_the_protocol_token_warns_once_by_name() {
+        let w = missing_protocol_warning("chatbgt", "You are ChatBGT.\n")
+            .expect("no token, so a warning");
+        assert!(w.contains("\"chatbgt\""), "{w}");
+        assert!(w.contains(crate::sysprompt::TOOL_PROTOCOL_TOKEN), "{w}");
+        let with = format!(
+            "You are ChatBGT.\n\n{}\n",
+            crate::sysprompt::TOOL_PROTOCOL_TOKEN
+        );
+        assert_eq!(missing_protocol_warning("chatbgt", &with), None);
+    }
 
     #[test]
     fn the_qwen_refusal_names_the_profile_and_the_reason() {

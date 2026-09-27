@@ -628,9 +628,28 @@ fn build_tools_prompt_parts_with_wasm(
     if syntax == ToolSyntax::Qwen {
         return build_qwen_tools_prompt_parts(mcp_servers, wasm_tools);
     }
+    let mut out = trusted_prose(profile_prompt_source(), parity, syntax);
+    let trusted_len = out.len();
+    crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
+    crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
+    crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
+    append_wasm_tool_schemas(&mut out, wasm_tools);
+    (out, trusted_len)
+}
+
+/// The trusted head of the DSML tools prompt: the active profile's composed
+/// prompt, or plank's own, respelled for V4.1 when `syntax` asks for it.
+///
+/// Split out of [`build_tools_prompt_parts_with_wasm`] so the profile path
+/// can be tested under each dialect without the process-global profile.
+fn trusted_prose(
+    profile: Option<(&str, &crate::profile::ProfileSpec)>,
+    parity: bool,
+    syntax: ToolSyntax,
+) -> String {
     // A profile replaces the whole prose prompt; the schema block is still
     // generated, from the allow-listed builtins.
-    let mut out = if let Some((text, spec)) = profile_prompt_source() {
+    let mut out = if let Some((text, spec)) = profile {
         compose_profile_prompt(text, spec, parity).0
     } else {
         let mut out = build_tools_prompt_base(parity);
@@ -648,12 +667,7 @@ fn build_tools_prompt_parts_with_wasm(
     if syntax == ToolSyntax::Dsml41 {
         out = dsml41_tools_prompt(&out);
     }
-    let trusted_len = out.len();
-    crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
-    crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
-    crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
-    append_wasm_tool_schemas(&mut out, wasm_tools);
-    (out, trusted_len)
+    out
 }
 
 /// [`TOOLS_PROMPT_QWEN`] with plank's own tools spliced into its schema list.
@@ -1516,7 +1530,7 @@ pub fn dsml41_syntax_reminder() -> &'static str {
 /// general DSML translator: applying it to model output, user input, MCP
 /// schemas or tool results would let untrusted bytes be reshaped into control
 /// text of a dialect the parser then honours. Its one call site is inside
-/// [`build_tools_prompt_parts_with_wasm`], before any third-party text has
+/// [`trusted_prose`], before any third-party text has
 /// been appended to the buffer.
 ///
 /// The rewrite walks for the `｜DSML｜` marker and, immediately after each
@@ -2908,6 +2922,37 @@ mod tests {
             trusted,
             out.len(),
             "no MCP text yet, so all of it is trusted"
+        );
+    }
+
+    /// A profile on a V4.1 model gets the same tag respelling as plank's own
+    /// prompt: its expanded protocol and schema examples would otherwise
+    /// teach the V4 tags to a model that parses the V4.1 ones.
+    #[test]
+    fn a_profile_prompt_is_respelled_for_dsml41() {
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(vec!["bash".to_string()]),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = format!("You are ChatBGT. Mind each parameter.\n\n{TOOL_PROTOCOL_TOKEN}\n");
+        let v4 = trusted_prose(Some((&text, &spec)), true, ToolSyntax::Dsml);
+        let v41 = trusted_prose(Some((&text, &spec)), true, ToolSyntax::Dsml41);
+        assert!(v4.contains("tool_calls"), "the V4 protocol names its tags");
+        assert_eq!(v41, dsml41_tools_prompt(&v4));
+        assert!(v41.contains("<｜DSML｜ calls>"), "{v41}");
+        assert!(!v41.contains("tool_calls"), "{v41}");
+        assert!(
+            v41.starts_with("You are ChatBGT. Mind each parameter."),
+            "prose outside a tag is untouched"
+        );
+        assert!(
+            v41.contains("\"name\": \"bash\""),
+            "the schema block survives"
         );
     }
 

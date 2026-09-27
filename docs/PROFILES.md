@@ -61,6 +61,14 @@ substitution: the literal text `{{plank:tool-protocol}}`, wherever it
 appears, expands to the trained DSML call-syntax text the model was actually
 trained against. A profile prompt should almost always include this token,
 because without it the model has no idea how to format a tool call at all.
+A prompt without it still loads, since a chat-only profile may want exactly
+that, but startup prints a warning naming the profile so the omission is
+never silent.
+
+On a DeepSeek V4.1 model the expanded text, like plank's own prompt, has its
+DSML tag names respelled to the V4.1 dialect before any MCP, WASM or `-sys`
+text is appended. The respelling touches only the tag names immediately after
+the DSML marker, so a profile's own prose is unaffected.
 
 The expansion is the whole prefix of the C reference prompt that precedes the
 tool-schema block, and that prefix is not generic. It includes prose that
@@ -121,7 +129,7 @@ no identity to run under.
 
 Everything else described in this document — a bad accent, a missing or
 broken logo, a malformed allow-list, an unusable settings object, a missing
-display name — warns and falls back rather than refusing to start.
+display name, a prompt without the tool-protocol token — warns and falls back rather than refusing to start.
 
 ## What actually changes on screen
 
@@ -131,7 +139,7 @@ status bar footer, despite what the introduction above might suggest — the
 footer still shows plank's own segments regardless of the active profile.
 
 `accent` only paints anything on the interactive Ratatui TUI. The
-plain-stdout path (used when output is piped, or under `--non-interactive`)
+plain-stdout path (used when output is piped, or under `--ui console`)
 keeps plank's own colors; it does not read a profile's accent at all. A
 profile's visual identity is therefore TUI-only today.
 
@@ -159,6 +167,11 @@ them.
 Running `--profile` with no name attached lists the profiles available from
 the currently loaded plugins and exits successfully; it is the way to
 discover what is installed without guessing a name.
+
+Inside a session, `/plugins` marks each plugin that `--profile` accepts with
+`[profile]` after its name, and the one the session is running under with
+`[profile, active]`. Profiles installed under `~/.plank/profiles/` are not
+scanned, so only the active one appears there.
 
 ## A worked example
 

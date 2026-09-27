@@ -121,6 +121,9 @@ fn resolve_and_activate_profile(
                 );
                 return Some(ExitCode::from(2));
             }
+            if let Some(w) = plank::profile::missing_protocol_warning(&active.name, &prompt) {
+                eprintln!("{w}");
+            }
             // The one read of the prompt file for the whole run: stored on
             // the `ActiveProfile` so composition (`sysprompt.rs`) is
             // infallible and never re-reads the file mid-session.

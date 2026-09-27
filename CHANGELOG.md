@@ -12,7 +12,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   plugin's `profile` block**, with its own system prompt, builtin-tool
   allow-list, settings layer and banner logo, display name and accent; see
   `docs/PROFILES.md` for the manifest reference and `examples/profiles/chatbgt`
-  for a worked example.
+  for a worked example. `/plugins` marks the plugins `--profile` accepts, and
+  startup warns when a profile prompt has no `{{plank:tool-protocol}}` token.
 - **`/install-profile <url|owner/repo|path> [name] [--force]` installs a
   profile** from a git repository, a marketplace repository, a `.tar.gz` or a
   local directory into `~/.plank/profiles/<name>/`, a root that only
