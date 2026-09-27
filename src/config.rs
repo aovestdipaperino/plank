@@ -71,12 +71,17 @@ pub struct AgentConfig {
     /// tells `--profile ""` apart from the listing request so it fails
     /// instead of silently succeeding as a no-op run.
     pub profile_explicit_empty: bool,
-    /// True when `--non-interactive` was given.
-    pub non_interactive: bool,
+    /// Front end selected by `--ui` (default [`UiMode::Tui`]).
+    pub ui: UiMode,
     /// True when `--debug` was given: the only case in which plank looks for
-    /// a `turbo-debug-console` and mirrors the raw model stream to it (see
+    /// a running `tdk` and mirrors the raw model stream to it (see
     /// `debugmirror`). Off, plank never probes for a console at all.
     pub debug: bool,
+    /// True when `--show-memory-stats` was given: the memory extraction
+    /// pass's prefill and generation figures float on the rule below the
+    /// prompt like a turn's do. Off, the rule stays plain while notes are
+    /// taken and the footer's `✍️` is the pass's only trace.
+    pub show_memory_stats: bool,
     /// False when `--no-session` was given: the headless run leaves no
     /// transcript under `~/.plank/kvcache`. Interactive runs always save.
     pub save_session: bool,
@@ -97,7 +102,14 @@ pub struct AgentConfig {
     /// Optional help topic following `-h`/`--help`.
     pub help_topic: Option<String>,
     /// Model file supplied with `-m`/`--model`; enables the real ds4 engine.
+    ///
+    /// A `.ggd` weight delta given here is replaced by the patched clone it
+    /// resolves to before anything reads it (`main::resolve_model_delta`),
+    /// and the delta is remembered in `model_delta`.
     pub model_path: Option<PathBuf>,
+    /// The `.ggd` weight delta `model_path` was resolved from, if any, for
+    /// the startup line.
+    pub model_delta: Option<crate::ggufdelta::Resolved>,
     /// Backend selector from `--metal`/`--cuda`/`--cpu`; `None` = platform default.
     pub backend: Option<Backend>,
     /// Worker thread count from `-t`/`--threads`; 0 = engine default.
@@ -143,7 +155,8 @@ pub struct AgentConfig {
     /// host's estimated resident KV past the budget, bounding RAM instead of
     /// OOM-ing.
     pub kv_budget_bytes: u64,
-    /// Third-party provider from `--provider openai|anthropic` (flavor b, issue
+    /// Third-party provider from `--provider openai|openai-responses|anthropic`
+    /// (flavor b, issue
     /// #26); selects [`crate::remote::provider::ProviderEngine`]. `None` unless
     /// `--provider` was given.
     pub provider: Option<ProviderSelector>,
@@ -159,19 +172,34 @@ pub struct AgentConfig {
     /// latency across multi-turn conversations by reusing the cached stable
     /// prefix (tools + system). Only consulted for `ProviderKind::Anthropic`.
     pub provider_cache: bool,
+    /// Whether skills are available this session (`--skills on|off`). On by
+    /// default. Off loads none: no built-in, user, project or plugin skill is
+    /// addressable as a slash command or resolvable by the `skill` tool, for a
+    /// session that wants only the model and the tools.
+    pub skills: bool,
     /// Whether the context size came from the user (`-c/--ctx` or the settings
     /// file) rather than [`DEFAULT_CTX_SIZE`]. Only consulted by the provider
     /// path: an untouched default is a guess sized for the local ds4 model, so
     /// it may be replaced by the provider's reported window; an explicit value
     /// is the user's decision and is never overridden.
     pub ctx_size_explicit: bool,
+    /// Whether the sampling temperature came from the user (`--temp`) rather
+    /// than from a default — plank's own 0.6, or the 0.0 [`finalize`] imposes
+    /// when speculative decoding is requested.
+    ///
+    /// Consulted when speculation turns out not to run after all (an
+    /// unsupported family, a refused `DSpark` companion): the imposed 0.0 only
+    /// existed to let the draft gate open, so with nothing to gate it is
+    /// dropped for the 0.6 default. A temperature the user typed is never
+    /// touched — see [`temperature_without_speculation`].
+    pub temp_explicit: bool,
     /// Settings keys (`section.key`) a CLI flag overrode, for `/config
     /// --resolved`. Populated by [`parse_options_with`]; empty when no flag
     /// shadowed a settings key.
     pub cli_provenance: std::collections::BTreeMap<String, crate::provenance::Origin>,
     /// True when `--dump-config` was given: print the resolved configuration
     /// (every effective key with its origin) and exit, without starting a
-    /// session. Works under `--non-interactive`.
+    /// session. Works under `--ui console`.
     pub dump_config: bool,
 }
 
@@ -180,16 +208,22 @@ pub struct AgentConfig {
 pub enum ProviderSelector {
     /// OpenAI-compatible chat completions.
     OpenAi,
+    /// `OpenAI` Responses API (`/responses`), which the newest reasoning models
+    /// require for function tools. `openai` switches to this on its own when
+    /// the endpoint says so; naming it up front skips that first failed request.
+    OpenAiResponses,
     /// Anthropic Messages.
     Anthropic,
 }
 
 impl ProviderSelector {
-    /// Short lowercase label (`openai` / `anthropic`) for reports.
+    /// Short lowercase label (`openai` / `openai-responses` / `anthropic`) for
+    /// reports.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::OpenAi => "openai",
+            Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
         }
     }
@@ -248,6 +282,15 @@ pub struct EngineTuning {
     /// it detects the family while opening, and the path has to be in the
     /// options struct before that.
     pub mtp_path: Option<PathBuf>,
+    /// Whether [`EngineTuning::mtp_path`] came from the user naming it
+    /// (`--mtp-model PATH`) rather than from plank resolving the default
+    /// `DSpark` file on disk ([`crate::download::ensure_dspark_support`]).
+    ///
+    /// The distinction is what lets a failed open retry without the companion:
+    /// a file plank chose itself may be dropped when the checkpoint refuses it,
+    /// while one the user named must fail loudly instead of being silently
+    /// ignored.
+    pub mtp_path_explicit: bool,
     /// Draft tokens per MTP step from `--mtp-draft` (C default: 1).
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
@@ -308,10 +351,41 @@ pub struct EngineTuning {
     pub dir_steering_ffn: f32,
 }
 
+impl EngineTuning {
+    /// The same tuning with a plank-chosen `DSpark` companion removed, when
+    /// there is one to remove.
+    ///
+    /// Used for the single retry after a model open that failed with a
+    /// companion attached: the C refuses to open a checkpoint at all when the
+    /// draft model does not match it (V4.1, and the Vision-Exp drafter against
+    /// the `0731` language checkpoint), so a run plank auto-paired must be able
+    /// to fall back to target-only decode instead of refusing to start.
+    ///
+    /// `None` when there is nothing to drop, and — deliberately — when the user
+    /// named the companion themselves: dropping that silently would hide a
+    /// mistyped `--mtp-model` behind a slower run.
+    #[must_use]
+    pub fn without_auto_companion(&self) -> Option<Self> {
+        if self.mtp_path.is_none() || self.mtp_path_explicit {
+            return None;
+        }
+        Some(Self {
+            mtp_path: None,
+            // Speculation needs the drafter; without it the DSpark runtime
+            // would be selected with no support model, which the C rejects
+            // outright ("--dspark requires --mtp-model FILE").
+            mtp: false,
+            mtp_strict: false,
+            ..self.clone()
+        })
+    }
+}
+
 impl Default for EngineTuning {
     fn default() -> Self {
         Self {
             mtp_path: None,
+            mtp_path_explicit: false,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
             mtp: true,
@@ -330,6 +404,32 @@ impl Default for EngineTuning {
             dir_steering_attn: 0.0,
             dir_steering_ffn: 0.0,
         }
+    }
+}
+
+/// Front end selected by `--ui`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiMode {
+    /// Full interactive front end: the Ratatui TUI on a TTY, the plain line
+    /// REPL when either end is a pipe (`main::run_interactive` decides).
+    #[default]
+    Tui,
+    /// Headless: with `-p`, one prompt and exit; without one, the stdin-driven
+    /// protocol loop. No TUI, no REPL prompt.
+    Console,
+    /// Headless one-shot that prints nothing but the `/toks` chart for the run.
+    /// Requires `-p`.
+    Chart,
+    /// Headless one-shot that prints nothing but a start and a finish note.
+    /// Requires `-p`.
+    Quiet,
+}
+
+impl UiMode {
+    /// True for the front ends that run headless (no TUI, no REPL prompt).
+    #[must_use]
+    pub fn is_headless(self) -> bool {
+        !matches!(self, Self::Tui)
     }
 }
 
@@ -369,8 +469,9 @@ impl Default for AgentConfig {
             plugin_dirs: Vec::new(),
             profile: None,
             profile_explicit_empty: false,
-            non_interactive: false,
+            ui: UiMode::Tui,
             debug: false,
+            show_memory_stats: false,
             save_session: true,
             minimal_prompt: false,
             ui_remote: None,
@@ -379,6 +480,7 @@ impl Default for AgentConfig {
             help_topic: None,
             qwen: false,
             model_path: None,
+            model_delta: None,
             backend: None,
             n_threads: 0,
             power_percent: 0,
@@ -398,7 +500,9 @@ impl Default for AgentConfig {
             provider_base_url: None,
             provider_api_key: None,
             provider_cache: true,
+            skills: true,
             ctx_size_explicit: false,
+            temp_explicit: false,
             cli_provenance: std::collections::BTreeMap::new(),
             dump_config: false,
         }
@@ -459,6 +563,15 @@ pub fn parse_backend(name: &str) -> Option<Backend> {
     }
 }
 
+/// The `--qwen` entry in the usage text.
+const QWEN_USAGE: &str = "      --qwen               run Qwen3.8-Flash-Next instead of DeepSeek V4:
+                           shorthand for -m ~/.plank/qwen.gguf, which plank
+                           downloads and upgrades from qwen.manifest like any
+                           other set. An explicit -m wins. The n-grams and MTP
+                           block live inside that GGUF, so --mtp needs no
+                           companion.
+";
+
 /// Returns the usage help text, close to the C agent's `-h` output.
 #[must_use]
 #[allow(clippy::too_many_lines)] // one long string literal
@@ -469,15 +582,21 @@ Usage: plank [options]
 Options:
   -h, --help [topic]       show this help and exit
   -V, --version            show the version and commit id, then exit
-      --debug              look for a running turbo-debug-console and mirror the
+      --debug              look for a running tdk and mirror the
                            raw model stream to it while ui.showThinking is off
-  -m, --model PATH         load a ds4 GGUF model (real inference)
-      --qwen               run Qwen3.8-Flash-Next instead of DeepSeek V4 (off by
-                           default): shorthand for -m ~/.plank/qwen.gguf
-                           --mtp-model ~/.plank/qwen.mtp.gguf, both expected to be
-                           symlinks you point at your own build. An explicit -m or
-                           --mtp-model wins.
-  -t, --threads N          worker thread count (backend default when unset)
+      --show-memory-stats  float the memory pass's prefill/generation figures on
+                           the rule below the prompt (default: the rule stays
+                           plain while notes are taken)
+  -m, --model PATH         load a ds4 GGUF model (real inference); a .ggd
+                           weight delta loads as the model it derives, by
+                           cloning its base into ~/.plank/models/patched/
+                           and patching the clone (base and delta untouched)
+                           (create deltas with the ggd tool from the
+                           gguf-delta crate: ggd create BASE TARGET OUT.ggd)
+"
+    .to_owned()
+        + QWEN_USAGE
+        + "  -t, --threads N          worker thread count (backend default when unset)
       --backend NAME       select backend by name: metal, cuda, cpu
       --metal              use the Metal backend
       --cuda               use the CUDA backend
@@ -502,6 +621,7 @@ Options:
       --quality            enable quality mode
       --warm-weights       touch all weights at load
       --ssd-streaming      stream experts from SSD instead of loading resident
+                           (automatic when the model cannot fit in RAM)
       --ssd-streaming-cold          assume a cold SSD cache
       --ssd-streaming-cache-experts N|<N>GB   bound the expert cache
       --ssd-streaming-preload-experts N       preload N experts at startup
@@ -529,9 +649,11 @@ Options:
                            reject an attach past B rather than OOM (default 0 = off,
                            count-only admission)
       --provider NAME      drive a third-party LLM API: openai (OpenAI-compatible,
-                           also vLLM/Ollama/OpenRouter) or anthropic. Use with
-                           --model NAME; key from --api-key or $OPENAI_API_KEY /
-                           $ANTHROPIC_API_KEY
+                           also vLLM/Ollama/OpenRouter), openai-responses (the
+                           /responses API, which the newest reasoning models
+                           require for tools; openai switches to it by itself)
+                           or anthropic. Use with --model NAME; key from
+                           --api-key or $OPENAI_API_KEY / $ANTHROPIC_API_KEY
       --base-url URL       base URL for --provider (OpenAI-compatible gateways)
       --api-key KEY        API key for --provider (prefer the env var)
       --provider-cache on|off  Anthropic prompt caching over the stable prefix
@@ -549,11 +671,19 @@ Options:
   /insights [fast]         report on how you have been using plank, from every
                            saved session; writes ~/.plank/usage-data/report.html
                            (\"fast\" skips the written sections)
-      --non-interactive    disable the interactive UI
-      --no-session         with --non-interactive: do not save the transcript
+      --ui MODE            front end: tui (default, the interactive UI),
+                           console (headless: one-shot with -p, else the stdin
+                           protocol), chart (headless; prints only the /toks
+                           chart for the run, live) or quiet (headless; prints
+                           only a start and a finish note). chart and quiet
+                           need a -p prompt
+      --no-session         with --ui console: do not save the transcript
                            to ~/.plank/kvcache at exit
       --dump-config        print every effective setting with the layer it came
                            from (default, plugin, ~/.plank, ./.plank, CLI) and exit
+      --skills on|off      whether skills are available (default on); off loads
+                           none, built-in or otherwise, so no /skill slash
+                           command and nothing for the `skill` tool to resolve
       --minimal-prompt     start with the smallest prompt this build can make:
                            no MCP servers, skills, templates, plugin agents,
                            WASM components or session-start context. For
@@ -572,6 +702,7 @@ Options:
       --think              ordinary thinking (default); same as /think medium
       --think-low          ask for brief reasoning (experimental; prompt-only)
       --think-max          maximum reasoning effort; needs --ctx 393216 or more
+      --think-level N      explicit reasoning effort 0..100 (DeepSeek V4.1 only)
       --nothink            disable thinking
       --chdir PATH         change working directory before starting
       --worktree NAME      start inside an isolated git worktree of this repo
@@ -609,7 +740,6 @@ Settings file:
       No secrets: keep the provider API key on --api-key or the environment,
       since ./.plank/settings.json is inside the working tree.
 "
-    .to_owned()
 }
 
 /// Parses a positive `i32`, naming `opt` in the error message.
@@ -651,6 +781,19 @@ pub fn parse_ctx_size(s: &str, opt: &str) -> Result<i32, String> {
     n.checked_mul(mult)
         .and_then(|v| i32::try_from(v).ok())
         .ok_or_else(bad)
+}
+
+/// Parses an `on|off` switch, naming `opt` in the error message. `true`/`1`
+/// and `false`/`0` are accepted alongside the documented spellings.
+///
+/// # Errors
+/// Returns an error when `s` is none of those spellings.
+fn parse_on_off(s: &str, opt: &str) -> Result<bool, String> {
+    match s {
+        "on" | "true" | "1" => Ok(true),
+        "off" | "false" | "0" => Ok(false),
+        other => Err(format!("invalid {opt} value: {other} (use on|off)")),
+    }
 }
 
 /// Parses a positive `u64`, naming `opt` in the error message.
@@ -773,6 +916,16 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "report token usage and timings for this session",
     },
     SlashCommand {
+        name: "/toks",
+        args: "",
+        desc: "chart the generation speed of every pass this session",
+    },
+    SlashCommand {
+        name: "/stats",
+        args: "[7|30|all]",
+        desc: "your plank activity: heatmap, streaks, sessions",
+    },
+    SlashCommand {
         name: "/config",
         args: "[section.key value]",
         desc: "edit settings in a form, or set one inline",
@@ -879,8 +1032,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/skills",
-        args: "",
-        desc: "list the skills loaded from SKILL.md files",
+        args: "[on|off]",
+        desc: "list the loaded skills, or turn skill expansion on/off for this session",
     },
     SlashCommand {
         name: "/plugins",
@@ -909,8 +1062,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/hooks",
-        args: "",
-        desc: "list the configured hooks and what triggers them",
+        args: "[on|off]",
+        desc: "list the configured hooks, or turn hook execution on/off for this session",
     },
     SlashCommand {
         name: "/mcp",
@@ -920,7 +1073,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/init",
         args: "",
-        desc: "write an AGENTS.md describing this repository",
+        desc: "set this repository up: survey it, then write AGENTS.md",
     },
     SlashCommand {
         name: "/remember",
@@ -928,9 +1081,14 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "append a durable note to project or user memory",
     },
     SlashCommand {
+        name: "/forget",
+        args: "<pattern>",
+        desc: "delete memory entries matching pattern, after confirming",
+    },
+    SlashCommand {
         name: "/memory",
-        args: "",
-        desc: "edit user and project memory together in the built-in editor",
+        args: "[log|calibrate [N]]",
+        desc: "edit user and project memory, show the memory change log, or calibrate the memory gate",
     },
     SlashCommand {
         name: "/think",
@@ -953,6 +1111,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "set the sampling temperature (not while mtp is on)",
     },
     SlashCommand {
+        name: "/mc",
+        args: "[on|off]",
+        desc: "toggle micro-compaction for this session, even mid-turn",
+    },
+    SlashCommand {
         name: "/loopguard",
         args: "[on|off]",
         desc: "arm or silence the loop guards, even mid-turn",
@@ -961,6 +1124,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/lg",
         args: "[on|off]",
         desc: "alias for /loopguard",
+    },
+    SlashCommand {
+        name: "/jobs",
+        args: "",
+        desc: "list running and finished background bash jobs",
     },
     SlashCommand {
         name: "/notify",
@@ -1005,7 +1173,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/debug",
         args: "[on|off]",
-        desc: "override --debug: mirror the raw stream to turbo-debug-console",
+        desc: "override --debug: mirror the raw stream to tdk",
     },
     SlashCommand {
         name: "/remote-control",
@@ -1077,17 +1245,17 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/mcp"
             | "/context"
             | "/usage"
+            | "/toks"
             | "/init"
-            | "/skills"
             | "/plugins"
             | "/install-claude-plugin"
             | "/install-profile"
             | "/frame"
             | "/templates"
             | "/tasks"
+            | "/jobs"
             | "/memory"
             | "/agent"
-            | "/hooks"
             | "/remote-control"
             | "/rc"
             | "/remote"
@@ -1121,21 +1289,29 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         // model as an ordinary prompt.
         || crate::agents::is_subagent_command(first_token(cmd))
         || slash_command_with_args(cmd, "/remember")
+        || slash_command_with_args(cmd, "/forget")
         || slash_command_with_args(cmd, "/repro")
         || slash_command_with_args(cmd, "/debug")
         || slash_command_with_args(cmd, "/mtp")
         || slash_command_with_args(cmd, "/temp")
+        || slash_command_with_args(cmd, "/mc")
         || slash_command_with_args(cmd, "/loopguard")
         || slash_command_with_args(cmd, "/lg")
         || slash_command_with_args(cmd, "/export")
         || slash_command_with_args(cmd, "/open")
         || slash_command_with_args(cmd, "/insights")
+        || slash_command_with_args(cmd, "/stats")
         || slash_command_with_args(cmd, "/resume")
         || slash_command_with_args(cmd, "/tag")
         || slash_command_with_args(cmd, "/rename")
         || slash_command_with_args(cmd, "/rate")
         || slash_command_with_args(cmd, "/power")
         || slash_command_with_args(cmd, "/think")
+        // `/hooks` takes an optional `on`/`off` runtime toggle.
+        || slash_command_with_args(cmd, "/hooks")
+        // And `/skills`, the same way: without this, `/skills off` is not a
+        // known command and the whole line is forwarded to the model.
+        || slash_command_with_args(cmd, "/skills")
         || slash_command_with_args(cmd, "/switch")
         || slash_command_with_args(cmd, "/del")
         || slash_command_with_args(cmd, "/strip")
@@ -1195,7 +1371,10 @@ fn parse_engine_option(
     steering_scale_set: &mut bool,
 ) -> Result<(), String> {
     match arg {
-        "--mtp-model" => e.mtp_path = Some(PathBuf::from(v)),
+        "--mtp-model" => {
+            e.mtp_path = Some(PathBuf::from(v));
+            e.mtp_path_explicit = true;
+        }
         "--mtp-draft" => e.mtp_draft_tokens = parse_int(v, arg)?,
         "--mtp-margin" => e.mtp_margin = parse_float_range(v, arg, 0.0, 1000.0)?,
         // The C turns DSpark on for any of its three flags, so the threshold
@@ -1349,6 +1528,7 @@ pub fn parse_options_with(
             "--provider" => {
                 c.provider = Some(match need_arg(&mut i)? {
                     "openai" => ProviderSelector::OpenAi,
+                    "openai-responses" | "responses" => ProviderSelector::OpenAiResponses,
                     "anthropic" => ProviderSelector::Anthropic,
                     other => return Err(format!("invalid provider: {other}")),
                 });
@@ -1356,18 +1536,26 @@ pub fn parse_options_with(
             "--base-url" => c.provider_base_url = Some(need_arg(&mut i)?.to_owned()),
             "--api-key" => c.provider_api_key = Some(need_arg(&mut i)?.to_owned()),
             "--provider-cache" => {
-                c.provider_cache = match need_arg(&mut i)? {
-                    "on" | "true" | "1" => true,
-                    "off" | "false" | "0" => false,
+                c.provider_cache = parse_on_off(need_arg(&mut i)?, arg)?;
+            }
+            "--skills" => {
+                c.skills = parse_on_off(need_arg(&mut i)?, arg)?;
+            }
+            "--ui" => {
+                c.ui = match need_arg(&mut i)? {
+                    "tui" => UiMode::Tui,
+                    "console" => UiMode::Console,
+                    "chart" => UiMode::Chart,
+                    "quiet" => UiMode::Quiet,
                     other => {
                         return Err(format!(
-                            "invalid --provider-cache value: {other} (use on|off)"
+                            "--ui: invalid mode {other:?} (tui|console|chart|quiet)"
                         ));
                     }
                 };
             }
-            "--non-interactive" => c.non_interactive = true,
             "--debug" => c.debug = true,
+            "--show-memory-stats" => c.show_memory_stats = true,
             "--no-session" => c.save_session = false,
             "--dump-config" => c.dump_config = true,
             "--minimal-prompt" => c.minimal_prompt = true,
@@ -1412,6 +1600,17 @@ pub fn parse_options_with(
             "--think-low" => c.generation.think_mode = ThinkMode::Low,
             "--think-max" => c.generation.think_mode = ThinkMode::Max,
             "--nothink" => c.generation.think_mode = ThinkMode::Off,
+            // The C's `--think-level`: an explicit effort only V4.1 has. The
+            // model is not loaded yet, so the family check happens once the
+            // engine is open (`engine::think_level_unsupported`).
+            "--think-level" => {
+                let v = need_arg(&mut i)?;
+                c.generation.think_mode = ThinkMode::parse(v)
+                    .filter(|m| matches!(m, ThinkMode::Off | ThinkMode::Level(_)))
+                    .ok_or_else(|| {
+                        format!("{arg} requires an integer from 0 to 100 (got `{v}`)")
+                    })?;
+            }
             "--chdir" => c.chdir_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--worktree" => c.worktree = Some(need_arg(&mut i)?.to_string()),
             "--worktree-pr" => {
@@ -1491,6 +1690,34 @@ pub fn parse_options_with(
     Ok(c)
 }
 
+/// The temperature a session should really sample at, once it is known
+/// whether speculative decoding can run.
+///
+/// [`finalize`] pins the temperature to 0 whenever `--mtp` is on, because the
+/// engine's draft gate only opens at 0 — but it runs during argument parsing,
+/// before the model family is known, and speculation can still fall away at
+/// model-open time: `DSpark` is implemented for `DeepSeek` V4 alone, and an
+/// auto-paired companion a checkpoint refuses is dropped on the retry. Left
+/// alone, such a run samples greedily as a side effect of a feature that is
+/// not running.
+///
+/// So with no speculation in force the imposed 0 is dropped for the
+/// [`GenerationOptions`] default. `temp_explicit` — a temperature the user
+/// typed — always wins, including an explicit `--temp 0`, and so does a run
+/// that never asked for speculation (`--mtp-off`), whose temperature was never
+/// imposed in the first place.
+#[must_use]
+pub fn temperature_without_speculation(
+    opts: &GenerationOptions,
+    temp_explicit: bool,
+    spec_capable: bool,
+) -> f32 {
+    if spec_capable || temp_explicit || !opts.mtp {
+        return opts.temperature;
+    }
+    GenerationOptions::default().temperature
+}
+
 /// Post-parse fixups: the steering-scale default, the `--mtp` temperature
 /// default, and `--remote` validation.
 fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Result<(), String> {
@@ -1503,14 +1730,15 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
     if c.qwen {
         c.model_path
             .get_or_insert_with(crate::download::default_qwen_path);
-        c.engine
-            .mtp_path
-            .get_or_insert_with(crate::download::default_qwen_mtp_path);
+        // No companion is filled in: upstream now ships the BF16 n-grams and
+        // the MTP block inside the main Qwen GGUF, so `--mtp` speculates with
+        // no sidecar and `--mtp-model` stays whatever the user passed.
     }
     // Speculative decoding only engages at temperature 0 (see `ds4engine`'s
     // draft gate), so DSpark defaults the temperature to 0. Done here rather
     // than at the flag because `--temp` may follow it; an explicit `--temp` in
     // either order still wins. `--mtp-off` leaves the 0.6 default in force.
+    c.temp_explicit = temp_set;
     if c.engine.mtp && !temp_set {
         c.generation.temperature = 0.0;
     }
@@ -1528,6 +1756,17 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
             crate::engine::THINK_MAX_MIN_CONTEXT,
             c.generation.ctx_size
         ));
+    }
+    // `chart` and `quiet` have nowhere to read a prompt from: they print their
+    // one thing and exit, so without `-p` they would run no turn at all.
+    // `--ui console` needs no prompt — without one it runs the stdin protocol.
+    if matches!(c.ui, UiMode::Chart | UiMode::Quiet) && c.prompt.is_none() {
+        let mode = if c.ui == UiMode::Chart {
+            "chart"
+        } else {
+            "quiet"
+        };
+        return Err(format!("--ui {mode} requires a prompt (-p TEXT)"));
     }
     // --provider (flavor b) selects a third-party API engine. Mutually
     // exclusive with the local selectors and with --remote (§4.7).
@@ -1549,7 +1788,7 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
         // given on the command line (§4.7, constraint 6).
         if c.provider_api_key.is_none() {
             let env = match provider {
-                ProviderSelector::OpenAi => "OPENAI_API_KEY",
+                ProviderSelector::OpenAi | ProviderSelector::OpenAiResponses => "OPENAI_API_KEY",
                 ProviderSelector::Anthropic => "ANTHROPIC_API_KEY",
             };
             c.provider_api_key = std::env::var(env).ok().filter(|k| !k.is_empty());
@@ -1581,6 +1820,19 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn skills_flag_toggles_skill_loading() {
+        // Skills are on unless the session turns them off.
+        assert!(parse_options(&args(&[])).unwrap().skills);
+        assert!(parse_options(&args(&["--skills", "on"])).unwrap().skills);
+        assert!(!parse_options(&args(&["--skills", "off"])).unwrap().skills);
+        // The same spellings `--provider-cache` accepts, and nothing else.
+        assert!(!parse_options(&args(&["--skills", "false"])).unwrap().skills);
+        assert!(parse_options(&args(&["--skills", "1"])).unwrap().skills);
+        let err = parse_options(&args(&["--skills", "maybe"])).unwrap_err();
+        assert!(err.contains("on|off"), "{err}");
     }
 
     /// Settings with every engine and safety key set, for override tests.
@@ -1676,7 +1928,7 @@ mod tests {
             Some(&Origin::Cli)
         );
         // A flag that shadows no settings key records nothing.
-        let c = parse_options(&args(&["--non-interactive"])).unwrap();
+        let c = parse_options(&args(&["--ui", "console"])).unwrap();
         assert!(c.cli_provenance.is_empty());
     }
 
@@ -1684,6 +1936,12 @@ mod tests {
     fn debug_flag_is_parsed_and_off_by_default() {
         assert!(!parse_options(&args(&[])).unwrap().debug);
         assert!(parse_options(&args(&["--debug"])).unwrap().debug);
+        assert!(!parse_options(&args(&[])).unwrap().show_memory_stats);
+        assert!(
+            parse_options(&args(&["--show-memory-stats"]))
+                .unwrap()
+                .show_memory_stats
+        );
     }
 
     #[test]
@@ -1785,7 +2043,7 @@ mod tests {
         assert!(c.prompt.is_none());
         // In-pass /btw suspend is on by default; --disable-btw-suspend opts out.
         assert!(c.btw.suspend);
-        assert!(!c.non_interactive);
+        assert_eq!(c.ui, UiMode::Tui);
         assert!(!c.show_help);
         // Shared engine is opt-in (issue #28); off by default.
         assert!(!c.shared_engine);
@@ -1955,7 +2213,7 @@ mod tests {
         assert!(err.contains("--ui-remote=7777"), "{err}");
         // A non-numeric follower is someone else's argument, not a port.
         assert_eq!(
-            parse_options(&args(&["--ui-remote", "--non-interactive"]))
+            parse_options(&args(&["--ui-remote", "--ui", "console"]))
                 .unwrap()
                 .ui_remote,
             Some(0)
@@ -1963,13 +2221,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_ui_modes_and_guards_chart() {
+        assert_eq!(parse_options(&args(&[])).unwrap().ui, UiMode::Tui);
+        assert_eq!(
+            parse_options(&args(&["--ui", "tui"])).unwrap().ui,
+            UiMode::Tui
+        );
+        assert_eq!(
+            parse_options(&args(&["--ui", "console"])).unwrap().ui,
+            UiMode::Console
+        );
+        let err = parse_options(&args(&["--ui", "repl"])).unwrap_err();
+        assert!(err.contains("tui|console|chart|quiet"), "{err}");
+        // `console` runs the stdin protocol without a prompt; `chart` has no
+        // such fallback, so it must be refused rather than chart nothing.
+        assert!(parse_options(&args(&["--ui", "console"])).is_ok());
+        let err = parse_options(&args(&["--ui", "chart"])).unwrap_err();
+        assert!(err.contains("-p"), "{err}");
+        let c = parse_options(&args(&["--ui", "chart", "-p", "hi"])).unwrap();
+        assert_eq!(c.ui, UiMode::Chart);
+        assert!(c.ui.is_headless() && !UiMode::Tui.is_headless());
+        // `quiet` is the same shape as `chart`: one prompt, one line of output.
+        let err = parse_options(&args(&["--ui", "quiet"])).unwrap_err();
+        assert!(err.contains("--ui quiet requires a prompt"), "{err}");
+        let c = parse_options(&args(&["--ui", "quiet", "-p", "hi"])).unwrap();
+        assert_eq!(c.ui, UiMode::Quiet);
+        assert!(c.ui.is_headless());
+    }
+
+    #[test]
     fn no_session_flag_disables_the_headless_save() {
         assert!(
-            parse_options(&args(&["--non-interactive"]))
+            parse_options(&args(&["--ui", "console"]))
                 .unwrap()
                 .save_session
         );
-        let c = parse_options(&args(&["--non-interactive", "--no-session"])).unwrap();
+        let c = parse_options(&args(&["--ui", "console", "--no-session"])).unwrap();
         assert!(!c.save_session);
     }
 
@@ -1978,7 +2265,8 @@ mod tests {
         let c = parse_options(&args(&[
             "-p",
             "hi",
-            "--non-interactive",
+            "--ui",
+            "console",
             "-sys",
             "sys",
             "--trace",
@@ -2001,7 +2289,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.prompt.as_deref(), Some("hi"));
-        assert!(c.non_interactive);
+        assert_eq!(c.ui, UiMode::Console);
         assert_eq!(c.system, "sys");
         assert_eq!(c.trace_path, Some(PathBuf::from("/tmp/t.log")));
         assert_eq!(c.generation.ctx_size, 4096);
@@ -2032,6 +2320,31 @@ mod tests {
                 .btw
                 .suspend
         );
+    }
+
+    // `--think-level` mirrors the C's flag: a plain `0..100`, with zero
+    // meaning off. The V4.1-only check needs the model, so it happens once the
+    // engine is open, not here.
+    #[test]
+    fn think_level_flag_takes_a_number() {
+        assert_eq!(
+            parse_options(&args(&["--think-level", "25"]))
+                .unwrap()
+                .generation
+                .think_mode,
+            ThinkMode::Level(25)
+        );
+        assert_eq!(
+            parse_options(&args(&["--think-level", "0"]))
+                .unwrap()
+                .generation
+                .think_mode,
+            ThinkMode::Off
+        );
+        for bad in ["101", "max", "-1", ""] {
+            let err = parse_options(&args(&["--think-level", bad])).unwrap_err();
+            assert!(err.contains("--think-level"), "{bad}: {err}");
+        }
     }
 
     #[test]
@@ -2107,14 +2420,15 @@ mod tests {
         // Composes with the flags a benchmark actually uses.
         let e = parse_options(&args(&[
             "--minimal-prompt",
-            "--non-interactive",
+            "--ui",
+            "console",
             "--provider",
             "openai",
             "--model",
             "m",
         ]))
         .unwrap();
-        assert!(e.minimal_prompt && e.non_interactive);
+        assert!(e.minimal_prompt && e.ui == UiMode::Console);
     }
 
     #[test]
@@ -2125,6 +2439,41 @@ mod tests {
             assert!(!c.show_help, "{a}");
         }
         assert!(!parse_options(&args(&[])).unwrap().show_version);
+    }
+
+    /// `usage()` is three concatenated literals, and a `\`-continued Rust
+    /// literal strips the *next* line's leading whitespace — so a chunk that
+    /// starts with one silently un-indents its first option and the column
+    /// alignment breaks at exactly the seam. Both seams are pinned here; the
+    /// bug shipped twice before this test existed.
+    #[test]
+    fn every_option_line_keeps_its_indentation_across_the_chunk_seams() {
+        let text = usage();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('-') {
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+            // A wrapped description sits in the text column and can begin with
+            // a flag name of its own; only the flag column is being checked.
+            if indent >= 10 {
+                continue;
+            }
+            assert!(
+                indent == 2 || indent == 6,
+                "option line lost its indent at a literal seam: {line:?}"
+            );
+        }
+        // The seams themselves, named so a failure says which one moved.
+        assert!(
+            text.contains("\n  -t, --threads N"),
+            "the chunk after QWEN_USAGE is un-indented"
+        );
+        assert!(
+            text.contains("\n      --qwen  "),
+            "QWEN_USAGE itself is un-indented"
+        );
     }
 
     #[test]
@@ -2157,6 +2506,46 @@ mod tests {
         assert!(err.contains("invalid value for --seed"));
         let err = parse_options(&args(&["--temp", "nan"])).unwrap_err();
         assert!(err.contains("invalid value for --temp"));
+    }
+
+    /// `--mtp-model` marks the companion as the user's own choice, which is
+    /// what stops a failed open from silently dropping it.
+    #[test]
+    fn an_explicit_mtp_model_is_marked_as_the_users_choice() {
+        let c = parse_options(&args(&["--mtp-model", "/d.gguf"])).unwrap();
+        assert_eq!(c.engine.mtp_path, Some(PathBuf::from("/d.gguf")));
+        assert!(c.engine.mtp_path_explicit);
+        assert!(
+            c.engine.without_auto_companion().is_none(),
+            "a user-named companion must never be dropped"
+        );
+        // Nothing else sets the flag.
+        let c = parse_options(&args(&["--mtp"])).unwrap();
+        assert!(!c.engine.mtp_path_explicit);
+    }
+
+    /// The retry's decision: drop a plank-chosen companion (and with it the
+    /// `DSpark` runtime, which the C rejects with no support model), keep every
+    /// other knob, and report nothing to drop when there is no companion.
+    #[test]
+    fn the_companion_fallback_drops_only_a_plank_chosen_drafter() {
+        let auto = EngineTuning {
+            mtp: true,
+            mtp_strict: true,
+            mtp_path: Some(PathBuf::from("/auto/dspark.gguf")),
+            mtp_path_explicit: false,
+            ssd_streaming: true,
+            ..EngineTuning::default()
+        };
+        let solo = auto.without_auto_companion().expect("auto is droppable");
+        assert_eq!(solo.mtp_path, None);
+        assert!(!solo.mtp);
+        assert!(!solo.mtp_strict);
+        assert!(solo.ssd_streaming, "unrelated tuning is preserved");
+        // Nothing to drop: no companion at all.
+        assert!(EngineTuning::default().without_auto_companion().is_none());
+        // And the retry is not offered twice: the fallback has no companion.
+        assert!(solo.without_auto_companion().is_none());
     }
 
     #[test]
@@ -2202,6 +2591,42 @@ mod tests {
         assert!((c.generation.temperature - 0.0).abs() < 1e-6);
         let c = parse_options(&args(&["--mtp-confidence", "0.3"])).unwrap();
         assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_temperature_falls_back_when_speculation_cannot_run() {
+        // `--mtp` (the default) pinned 0 during parsing; the model then turns
+        // out to have no DSpark drafter, so the pin has nothing left to serve.
+        let c = parse_options(&[]).unwrap();
+        assert!(c.engine.mtp && !c.temp_explicit);
+        assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+        let restored = temperature_without_speculation(&c.generation, c.temp_explicit, false);
+        let default = GenerationOptions::default().temperature;
+        assert!((restored - default).abs() < 1e-6, "{restored}");
+        // A speculating run keeps its 0.
+        let kept = temperature_without_speculation(&c.generation, c.temp_explicit, true);
+        assert!(kept.abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_explicit_temperature_survives_the_fallback() {
+        for arg in ["0", "0.9"] {
+            let c = parse_options(&["--temp".into(), arg.into()]).unwrap();
+            assert!(
+                c.temp_explicit,
+                "--temp {arg} must record the user's choice"
+            );
+            let settled = temperature_without_speculation(&c.generation, c.temp_explicit, false);
+            assert!(
+                (settled - c.generation.temperature).abs() < 1e-6,
+                "--temp {arg} was overridden: {settled}"
+            );
+        }
+        // And `--mtp-off` never had a temperature imposed, so there is nothing
+        // to restore: the 0.6 default stands either way.
+        let c = parse_options(&["--mtp-off".into()]).unwrap();
+        let settled = temperature_without_speculation(&c.generation, c.temp_explicit, false);
+        assert!((settled - 0.6).abs() < 1e-6);
     }
 
     #[test]
@@ -2271,18 +2696,16 @@ mod tests {
 
     /// One companion flag for both families. Which engine slot it lands in is
     /// decided at open time from the model's own architecture, not here — this
-    /// only pins that the flag carries a path and disturbs nothing else.
-    /// `--qwen` fills in both default paths, and nothing else: the flag is a
-    /// shorthand, so it must not touch the knobs around it.
+    /// `--qwen` fills in the model path and nothing else: the flag is a
+    /// shorthand, so it must not touch the knobs around it. In particular it
+    /// no longer fills a companion — upstream ships the n-grams and the MTP
+    /// block inside the main GGUF, so speculation needs no sidecar.
     #[test]
-    fn qwen_flag_fills_in_both_default_paths() {
+    fn qwen_flag_fills_in_the_model_path_and_no_companion() {
         let c = parse_options(&args(&["--qwen"])).unwrap();
         assert!(c.qwen);
         assert_eq!(c.model_path, Some(crate::download::default_qwen_path()));
-        assert_eq!(
-            c.engine.mtp_path,
-            Some(crate::download::default_qwen_mtp_path())
-        );
+        assert!(c.engine.mtp_path.is_none(), "no companion is invented");
         assert!(c.engine.mtp, "speculation still defaults on");
     }
 
@@ -2308,12 +2731,7 @@ mod tests {
                 Some(PathBuf::from("/custom.gguf")),
                 "{order:?}"
             );
-            // The companion still defaults, since only `-m` was overridden.
-            assert_eq!(
-                c.engine.mtp_path,
-                Some(crate::download::default_qwen_mtp_path()),
-                "{order:?}"
-            );
+            assert!(c.engine.mtp_path.is_none(), "{order:?}");
         }
     }
 
@@ -2475,6 +2893,7 @@ mod tests {
             "/mcp",
             "/context",
             "/usage",
+            "/toks",
             "/init",
             "/skills",
             "/templates",
@@ -2556,12 +2975,17 @@ mod tests {
         assert!(slash_command_known("/del 1"));
         assert!(slash_command_known("/strip"));
         assert!(slash_command_known("/kvcache"));
+        assert!(slash_command_known("/jobs"));
         assert!(slash_command_known("/kvcache gc"));
         assert!(!slash_command_known("/kvcaches"));
         assert!(slash_command_known("/history 10"));
         assert!(slash_command_known("/repro"));
         assert!(slash_command_known("/mtp off"));
         assert!(slash_command_known("/temp 0.6"));
+        assert!(slash_command_known("/mc"));
+        assert!(slash_command_known("/mc on"));
+        assert!(slash_command_known("/mc off"));
+        assert!(!slash_command_known("/mcx"));
         assert!(slash_command_known("/loopguard"));
         assert!(slash_command_known("/lg on"));
         assert!(!slash_command_known("/lgx"));
@@ -2572,6 +2996,10 @@ mod tests {
         assert!(slash_command_known("/insights"));
         assert!(slash_command_known("/insights fast"));
         assert!(!slash_command_known("/insightsx"));
+        assert!(slash_command_known("/stats"));
+        assert!(slash_command_known("/stats 7"));
+        assert!(slash_command_known("/stats 30"));
+        assert!(!slash_command_known("/statsx"));
         assert!(slash_command_known("/open"));
         assert!(slash_command_known("/open src/ui.rs"));
         assert!(!slash_command_known("/opened"));

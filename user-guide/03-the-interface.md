@@ -10,7 +10,7 @@ Type while a turn is running and your message is not lost: it is held in a **que
 
 Assistant replies render as markdown — headings, lists, tables, and fenced code blocks with tree-sitter syntax highlighting. The model's thinking appears dimmed above its answer (turn it off with `ui.showThinking`). File edits render as git-style **diff cards**: an `Update(path)` header, an added/removed summary, and red/green `@@` hunks. A brand-new file streams its contents dimmed as it is written.
 
-The status bar is two rows. The top one answers "which tree am I in" and holds still: the working directory, the git branch, and a summary of what you have changed in that tree (`📄 3 · +128 -41` — files touched, then lines added in green and lines deleted in red, staged and unstaged together, untracked files included; a clean tree shows nothing). The bottom one carries everything that churns — where inference is running, the reasoning level, a context-usage gauge, an activity throbber, what the model is doing, generation stats, the task counter, and the remote marker. When a tool is running its name sits in the notification slot and blinks; otherwise a rotating tip appears there.
+The status bar is two rows. The top one answers "which tree am I in" and holds still: the working directory, the git branch, and a summary of what you have changed in that tree (`📄 3 · +128 -41` — files touched, then lines added in green and lines deleted in red, staged and unstaged together, untracked files included; a clean tree shows nothing). The bottom one carries everything that churns — where inference is running, a brain with the reasoning level beside it (click it to hide or show thinking for the session, without writing the setting), a context-usage gauge, `⧗ N jobs` while background shell jobs are running (click it for the `/jobs` panel), a 🐞 while a debug console is actually connected to the session (not merely `--debug` on the command line), a 💾 while the loaded model is streaming its experts from SSD (blinking while a pass is in flight), `⏸ paused: memory` while plank has released the engine under memory pressure and is waiting to take it back, one `✍️` per span while the memory extraction pass takes notes, the task counter, and the remote marker. When a tool is running its name sits in the notification slot and blinks; otherwise a rotating tip appears there. There is no `idle` word: the prompt caret's colour already says the model is waiting. The figures that change many times a second — prefill and generation tokens and rates, the MTP per-step numbers — are not in the status bar at all; they float at the right end of the rule *below* the prompt, the way the session name floats on the rule above it, and the rule goes back to a plain line when the turn ends. The memory extraction pass keeps its figures to itself unless plank was started with `--show-memory-stats`: by default the rule looks idle while notes are taken and the footer's `✍️` is the only sign. The line pinned under the output while the model works carries the throbber, what the model is doing, and the clock.
 
 **Where inference runs** is named on the second row, and there can be more than one answer:
 
@@ -79,6 +79,8 @@ With an arcade game open, the first `Ctrl-C` closes the game and a second interr
 
 `Esc` at an idle prompt dismisses a `/btw` panel left open from an earlier turn, which is the only way it closes.
 
+Most slash commands wait for the turn to finish, but the read-only reports do not: `/usage`, `/mcp` and `/help` answer from a turn-start snapshot, while `/context`, `/jobs` and `/toks` read live state and redraw as the turn runs — open `/context` mid-turn and you can watch the window fill, category breakdown refreshed at each tool boundary and the total on every status tick. `/exit` asks `[y/N]` before interrupting the turn and leaving once it stops.
+
 ### In a question panel
 
 The `ask` tool's panel takes `Up`/`Down` to move, `Space` to toggle an option when the question is multi-select, `Enter` to answer, `Esc` to decline, and `Ctrl-C` to interrupt.
@@ -95,11 +97,17 @@ The moment anything is delegated — by you with `/subagent`, or by the model wi
 ○ researcher find every caller of load_config()        48s  · 9.7k
 ```
 
-A fan-out gets a row each, with its own output buffer, so concurrent agents never overwrite one another. `←` on an empty prompt steps into the roster, `←`/`→` walk the rows, `Enter` expands the selected agent's output over the transcript with its own scroll position, and `Esc` comes back.
+A fan-out gets a row each, with its own output buffer, so concurrent agents never overwrite one another. `←` on an empty prompt steps into the roster, `←`/`→` walk the rows, `Enter` expands the selected agent's output over the transcript with its own scroll position, and `Esc` comes back. A finished row leaves the roster a minute after it ends, and stepping back in does not bring it back: the roster shows what is running now, not what ran. Only the row under your cursor is kept until you move off it, so nothing vanishes while you are reading it.
+
+While a sub-agent is working, the progress line under the transcript reads
+`Waiting… (for sub-agent <name> to complete)`. The live counters — the verb, the
+clock, the tokens and the tokens per second — belong to the sub-agent's pass, so
+they are shown in that agent's own view, reached through the roster. The main
+transcript no longer looks like it is the one generating.
 
 It is a live readout: it appears with the first agent and goes away with the last, staying put only while you are reading it, and `←` brings a finished roster back so a report you delegated is still reachable. The last eight runs are kept. The transcript itself gets only a one-line signpost, which is the point of delegating in the first place — see [Extending plank](09-extending.md).
 
-The plain REPL has no roster and prints subagent output inline instead; `--non-interactive` stays silent so its stdout protocol is not corrupted.
+The plain REPL has no roster and prints subagent output inline instead; `--ui console` stays silent so its stdout protocol is not corrupted.
 
 ## `@` file completion
 
@@ -108,6 +116,19 @@ Type `@` in the prompt and a fuzzy-completion popup offers file paths from the w
 - `ui.popupRows` sets how many rows it offers (default 15).
 - `ui.respectGitignore` decides whether untracked files that `.gitignore` excludes are offered (default `true`).
 - `ui.indexRefreshSecs` is how long the file index is trusted before it is rebuilt (default 5).
+
+## Prompt suggestions
+
+After an answer, plank works out the most likely thing you are about to type and shows it as grey ghost text on the empty prompt. `Tab` or `Right` places it in the line so you can edit it before sending, `Enter` sends it as it stands, and any other keystroke dismisses it. It only ever appears on an empty prompt, so it cannot land on top of something you are writing.
+
+The guess is a short generation against the conversation already held in the KV cache, run in the background on a quiet moment rather than while you wait, so the prompt stays live and typing interrupts it. It skips itself when the cache would have to be rebuilt from scratch, which is the one case where it would be expensive.
+
+A suggestion is only ever text. A line beginning with `/` or `!` is discarded rather than offered, since `Enter` over a placed suggestion sends it straight away.
+
+- `suggestions.enabled` turns it off (default `true`).
+- `suggestions.maxTokens` bounds the guess (default 160).
+
+The suggestion is always generated before a waiting memory pass, which then takes the next quiet moment.
 
 ## `!` and `!!` — run a shell command yourself
 
@@ -160,7 +181,7 @@ See [Tools](05-tools.md).
 
 ## Notifications and the window title
 
-Long turns end with a native macOS notification: your prompt as the headline, the tail of the answer as the body (`interrupted` for an aborted turn). The terminal title tracks the current task, e.g. `🪵 plank - fix the bug…`, and names the phase when plank is busy with something that is not your turn: `🗑️ compacting...` while it reclaims context, `👀 introspecting...` during `/insights`. The title it displaced comes back afterwards, so a compaction mid-turn returns the title to your prompt.
+Long turns end with a native macOS notification: your prompt as the headline, the tail of the answer as the body (`interrupted` for an aborted turn). The terminal title tracks the current task: `🚀 fix the bug…` while a turn runs, with the rocket sparkling through a few glyphs until the turn ends (a static rocket under `ui.reducedMotion`), `🪵 Plank - READY.` at the prompt. It names the phase when plank is busy with something that is not your turn: `🗑️ compacting...` while it reclaims context, `👀 introspecting...` during `/insights`. The title it displaced comes back afterwards, so a compaction mid-turn returns the title to your prompt.
 
 - `ui.notifications` — `always`, `unfocused` (only when the terminal is not focused), or `never`.
 - `ui.notifyAfterSecs` — minimum turn length before a completion notification fires (default 10). Awaiting-input notifications ignore it.
@@ -171,6 +192,7 @@ Long turns end with a native macOS notification: your prompt as the headline, th
 - `ui.reducedMotion` collapses every animation — throbber, shimmer, pulse, flash, stall-fade — to a static fallback.
 - `ui.screensaver` sets how long the TUI must sit idle before a screensaver takes the screen: `1m`, `2m`, `5m`, or `never`. Any key or mouse event dismisses it, and it never appears mid-turn or over a dialog. `ui.screensaverFace` picks which one — see [The arcade](11-arcade.md#the-screensaver).
 - `ui.crtOff` plays a CRT power-off animation of the final frame when you exit cleanly.
+- `/exit` during a turn asks for confirmation, then interrupts the model and leaves as soon as the turn stops; the session is saved as usual.
 
 Leaving prints the session's token totals and, per model, the fastest sustained rates it reached:
 

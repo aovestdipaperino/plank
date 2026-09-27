@@ -20,7 +20,7 @@ perf = { level = "warn", priority = -1 }
 
 [package]
 name = "plank"
-version = "5.0.1"
+version = "5.3.1"
 edition = "2024"
 authors = ["Enzo Lombardi <enzinol@gmail.com>"]
 repository = "https://github.com/aovestdipaperino/plank"
@@ -72,21 +72,34 @@ docparse = ["dep:liteparse", "dep:tokio"]
 # whose no-op implementation is what the rest of plank talks to when the feature
 # is off: the same shape as `Engine`/`EchoEngine`, and for the same reason.
 plugins = ["dep:extism"]
+# Qwen3.8-Flash-Next support: the `--qwen` flag and its default model paths,
+# the model's own tools prompt and `<tool_call>` dialect, the PLE n-gram
+# sidecar wiring, and the downloader's Qwen artifacts.
+#
+# **Off by default.** The DeepSeek V4 Flash path is the product; Qwen3.8 was
+# ported for dialect parity with the C reference and its output quality does
+# not justify offering it to everyone who builds plank. A build without this
+# still *recognises* a Qwen GGUF — `gguf::family_of` is unconditional — and
+# refuses it by name rather than misparsing it as DeepSeek, and it still reads,
+# sweeps and GCs `.qwn.kv` transcripts left by a build that had the feature on.
+# On-disk compatibility is deliberately not part of the gate.
 
 [dependencies]
 trace-stream = { path = "crates/trace-stream" }
+gguf-delta = { path = "crates/gguf-delta", version = "0.1.0" }
 turbo-debug-client = "0.2"
 libc = "0.2"
 # unstable-rendered-line-info exposes Paragraph::line_count for exact
 # wrapped-line counts, so scrollback can clamp to the true bottom (word-wrap
 # produces more rows than a char-packing estimate).
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 # Paints the cursor into the frame instead of asking the terminal to recolour
 # it. OSC 12 is a request, and Warp renders its cursor as a widget in its own
 # UI where no escape can reach it — the indicator has to be drawn to be
 # reliable. Pulls ratatui's `underline-color` feature (additive, and unused
-# here: plank draws a block).
-nano-cursor = "0.1"
+# here: plank draws a block). 0.2 is the ratatui 0.30 line; 0.1 draws into a
+# 0.29 buffer and cannot share a frame with this one.
+nano-cursor = "0.2"
 unicode-width = "0.2"
 ureq = "3"
 # Plugin signature verification (minisign, docs/WASM-PLUGINS.md). `ring` is
@@ -98,28 +111,74 @@ ring = "0.17"
 # publisher passes `-l`, so without this plank would reject every signature the
 # reference tool produces by default. Same RustCrypto family as `sha2`, already
 # present.
-blake2 = "0.10"
+blake2 = "0.11"
 # Streaming SHA-256 for model-artifact verification (`src/downloader.rs`). The
 # rest of plank hashes by shelling out to `shasum` (`imagepaste`), which cannot
 # work here: an 87 GB artifact is verified *while it downloads*, so the hasher
 # has to live in-process and survive chunk by chunk. Already in the lockfile
 # behind the RustCrypto crates `blake2` pulls in, so this adds no new code.
-sha2 = "0.10"
+sha2 = "0.11"
 logo-art = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Fork of ratatui-markdown v0.3.6 (MIT OR Apache-2.0, cut at tag v0.3.6 before
 # the project relicensed to SySL-1.0) carrying one parser fix: a fenced code
 # block opening directly after a paragraph parsed *ahead* of that paragraph, so
 # an assistant message rendered its code sample above the line introducing it.
+# The fork also carries the move to ratatui 0.30, which v0.3.6 predates.
 # Pinned by rev so builds are reproducible; retire the fork if the fix is ever
 # released under the original licence. See that repo's FORK.md.
-ratatui-markdown = { git = "https://github.com/aovestdipaperino/ratatui-markdown", rev = "a819ef8dc4f902c5812e8291f403f7802254a9fd", features = ["highlight-lang-all"] }
+#
+# The grammar list is `highlight-lang-all` spelled out, minus
+# `highlight-lang-sql`. That one pulls `tree-sitter-sequel`, which has
+# required `cc = "~1.2.1"` since its 0.3.7 and so holds the *whole* build
+# — every build script in the tree — to cc 1.2.x. SQL fences render
+# unhighlighted; nothing else changes. Restore the feature (or go back to
+# `highlight-lang-all`) if that pin is ever relaxed upstream.
+ratatui-markdown = { git = "https://github.com/aovestdipaperino/ratatui-markdown", rev = "c66b7176b7617e03550c9262542789be02a488f9", features = [
+    "highlight-pest",
+    "highlight-lang-bash",
+    "highlight-lang-c",
+    "highlight-lang-cpp",
+    "highlight-lang-c-sharp",
+    "highlight-lang-css",
+    "highlight-lang-dart",
+    "highlight-lang-diff",
+    "highlight-lang-elixir",
+    "highlight-lang-go",
+    "highlight-lang-haskell",
+    "highlight-lang-html",
+    "highlight-lang-java",
+    "highlight-lang-javascript",
+    "highlight-lang-json",
+    "highlight-lang-cmake",
+    "highlight-lang-kotlin",
+    "highlight-lang-lua",
+    "highlight-lang-nix",
+    "highlight-lang-objc",
+    "highlight-lang-ocaml",
+    "highlight-lang-php",
+    "highlight-lang-powershell",
+    "highlight-lang-proto",
+    "highlight-lang-python",
+    "highlight-lang-r",
+    "highlight-lang-regex",
+    "highlight-lang-ruby",
+    "highlight-lang-rust",
+    "highlight-lang-scala",
+    "highlight-lang-solidity",
+    "highlight-lang-swift",
+    "highlight-lang-toml",
+    "highlight-lang-typescript",
+    "highlight-lang-xml",
+    "highlight-lang-yaml",
+    "highlight-lang-zig",
+] }
 # serde JSON is shared by the remote-control protocol (#25) and the
 # remote-engine wire types (#26). The remote-control server uses tungstenite;
 # the sync remote-engine client (flavor a) reuses the ureq client above.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tungstenite = "0.24"
+tungstenite = "0.30"
 nucleo-matcher = "0.3"
 git2 = { version = "0.21.0", default-features = false }
 similar = "3.1.1"
@@ -134,7 +193,9 @@ tokio = { version = "1", features = ["rt"], optional = true }
 # Document → Markdown conversion for the `read` tool (feature `docparse`).
 # Pinned exactly: the crate shipped 27 releases in three months and the
 # fixture assertions in `src/doc/mod.rs` are coupled to its markdown emitter.
-liteparse = { version = "=2.10", optional = true }
+# 2.10 → 2.14 needed no fixture change; re-run `doc::tests` before moving it
+# again, and keep the pin exact.
+liteparse = { version = "=2.14", optional = true }
 # Text buffer, immediate-mode TUI framework, and VT input parser behind the
 # built-in Ctrl-G editor (feature `builtin_editor`); the paths point into the
 # refs/edit git submodule. MIT (c) Microsoft Corporation. `stdext` carries the
@@ -150,6 +211,9 @@ stdext = { path = "refs/edit/crates/stdext", optional = true }
 extism = { version = "1.30", default-features = false, features = [
     "wasmtime-default-features",
 ], optional = true }
+
+[dev-dependencies]
+gguf-delta = { path = "crates/gguf-delta", version = "0.1.0", features = ["testing"] }
 
 [lints]
 workspace = true

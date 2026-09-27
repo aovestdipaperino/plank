@@ -5,7 +5,7 @@
 //!
 //! Holds the settings that are *stable preferences* rather than per-run
 //! choices: engine defaults, UI tuning, safety defaults, and the MCP handshake
-//! timeout. Operational flags (`--prompt`, `--non-interactive`, `--ui-remote`,
+//! timeout. Operational flags (`--prompt`, `--ui console`, `--ui-remote`,
 //! `--trace`, `--chdir`, `--seed`, and the serve/control options) describe one
 //! invocation and deliberately have no settings key.
 //!
@@ -37,7 +37,8 @@
 //!   "ask":    { "maxOptions": 7 },
 //!   "agents": { "autoRoute": true, "maxParallel": 4 },
 //!   "git":    { "signCommits": true },
-//!   "context": { "microcompact": true }
+//!   "context": { "microcompact": true, "shortReminder": true },
+//!   "memory": { "autoExtract": true, "extractEveryNTurns": 1 }
 //! }
 //! ```
 //!
@@ -60,7 +61,8 @@
 //!   tearing down and rebuilding the whole inference stack mid-session.
 //! - `safety.sandbox`, `safety.btwSuspend` — copied into `AgentConfig` once at
 //!   startup.
-//! - `tools.recall`, `tools.fanout`, `tools.runCode`, `git.signCommits` — these
+//! - `tools.recall`, `tools.fanout`, `tools.runCode`, `tools.bashNotify`,
+//!   `tools.remember`, `git.signCommits` — these
 //!   feed the system prompt text, which is built once per session and then
 //!   KV-cached (see `docs/KV-CACHE.md`); applying a change live would silently
 //!   invalidate a cache the model's prefill is relying on to be exactly what it
@@ -144,7 +146,7 @@ pub struct UiSettings {
     /// Render the model's thinking text (dimmed) in the scrollback. Off by
     /// default; when off, and plank was started with `--debug` (or `/debug
     /// on`), the raw model stream (thinking, answer, tool-call markup) is
-    /// instead mirrored to a `turbo-debug-console` listening on port 7878, if
+    /// instead mirrored to a `tdk` listening on port 7878, if
     /// one is up (see `debugmirror`), so the thinking is not simply lost. When
     /// on, plank never connects to the console at all.
     pub show_thinking: bool,
@@ -357,6 +359,22 @@ pub struct ToolsSettings {
     /// prompt and churns the `fp1` fingerprint — a deliberate, versioned
     /// deviation, documented in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
     pub run_code: bool,
+    /// Whether a bash job that finishes after the model stopped watching it
+    /// wakes the model with a notification (`docs/BACKGROUND-TASKS.md`).
+    /// Default off while the feature is in beta: on, it also appends one
+    /// sentence to the shell rules, which churns the `fp1` fingerprint.
+    pub bash_notify: bool,
+    /// Whether the no-progress budget ends a turn: a generation that emits
+    /// `NO_PROGRESS_BYTE_BUDGET` bytes without changing a file is stopped and the user told why. Default off — the byte budget is a
+    /// heuristic, and a long read-only investigation is a legitimate turn, so
+    /// this rung is opt-in even when the other loop guards are on.
+    pub no_progress_guard: bool,
+    /// Whether the `remember` tool is offered to the model. Advertising it
+    /// changes the system prompt and churns the `fp1` fingerprint once, the
+    /// same price `recall` already paid. Its writes land on disk and take
+    /// effect at the next session start, so no Tier 2 checkpoint is
+    /// invalidated mid-session.
+    pub remember: bool,
 }
 
 impl Default for ToolsSettings {
@@ -370,6 +388,9 @@ impl Default for ToolsSettings {
             recall: true,
             fanout: true,
             run_code: true,
+            bash_notify: false,
+            no_progress_guard: false,
+            remember: true,
         }
     }
 }
@@ -404,6 +425,10 @@ pub struct Settings {
     pub git: GitSettings,
     /// Tool-dispatch tuning: loop guards and call deadlines.
     pub tools: ToolsSettings,
+    /// How persistent memory maintains itself.
+    pub memory: MemorySettings,
+    /// Predictive next-prompt suggestions.
+    pub suggestions: SuggestionSettings,
     /// Values set for plugin-declared `config` options, keyed
     /// `<component-id>.<option>`.
     ///
@@ -444,11 +469,166 @@ pub struct ContextSettings {
     /// stops every in-place rewrite, at the cost of relying on full
     /// summary-based compaction alone to reclaim context under pressure.
     pub microcompact: bool,
+    /// Whether the pressure-based system-prompt reminder (re-injected once
+    /// 50K tokens have passed since the prompt was last seen) is the short
+    /// form: the tool-call syntax reminder plus the roster of tool names,
+    /// instead of the C's full tools prompt. On by default: the short form is
+    /// a few hundred tokens against several thousand, and every one of them
+    /// is prefilled once and then occupies context for the rest of the
+    /// session. Turning it off restores the C reference behaviour.
+    pub short_reminder: bool,
 }
 
 impl Default for ContextSettings {
     fn default() -> Self {
-        Self { microcompact: true }
+        Self {
+            microcompact: true,
+            short_reminder: true,
+        }
+    }
+}
+
+/// `memory` block: how persistent memory maintains itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySettings {
+    /// Whether the extraction sidechain runs at all. **On by default** since
+    /// 5.1.7, and worth knowing the price of: the pass is not a background job
+    /// in any useful sense — it runs
+    /// synchronously on the turn thread after the model's final answer, and
+    /// each run costs a whole-session KV snapshot, a prefill of the excerpt,
+    /// a generation and a KV restore, none of which shows in the turn stats.
+    /// On a local Metal model that is seconds of visible stall per answer,
+    /// so it is opt-in. Off leaves the `remember` tool and `/remember`
+    /// working — only the passive pass stops, and rendering falls back to
+    /// plain budgeted display with counters that nothing ever bumps.
+    pub auto_extract: bool,
+    /// Run the pass every N eligible turns. An eligible turn is one that
+    /// ended with no tool calls and in which the model did not itself call
+    /// `remember`. `1` means every eligible turn.
+    pub extract_every_n_turns: u32,
+    /// A turn shorter than this does not trigger the extraction pass. The
+    /// pass costs a KV snapshot, a prefill, a generation and a restore, and
+    /// a four-second exchange is rarely worth that. `0` disables the floor.
+    ///
+    /// A turn under the floor *defers* its span rather than discarding it:
+    /// `ExtractState::should_run` returns without advancing
+    /// `processed_depth`, so the next turn that clears the floor reads the
+    /// short turns too. Nothing said to the model is ever lost to this gate.
+    pub min_turn_seconds: u32,
+    /// Ask the model, before enqueuing an extraction pass, whether the span
+    /// contains anything worth remembering (`Engine::decide`). Off by
+    /// default: the threshold below has not been calibrated against real
+    /// extraction outcomes, and a gate that wrongly says no loses a memory
+    /// silently. Off leaves the pass behaving exactly as it did before the
+    /// gate existed, and an engine without `supports_decide` ignores this.
+    pub gate: bool,
+    /// Probability of "yes", as a percent, at or above which the gate lets
+    /// the pass run. An abstention — the model did not commit to a letter —
+    /// always runs the pass: an unsure gate must not suppress a memory.
+    pub gate_percent: u32,
+    /// Messages a gate-rejected span may accumulate before an extraction pass
+    /// runs anyway. `0` (the default) means a rejected span is finished
+    /// immediately and never reconsidered. See `ExtractState::held_span_cap`.
+    pub held_span_cap: u32,
+    /// Percentage points added to `gate_percent` for each model family, to
+    /// cancel that family's prior toward the letter "yes" is shown under.
+    /// Measured offline by `/memory calibrate`; all zero until then.
+    pub gate_bias: GateBias,
+    /// Per-type character budgets for the rendered memory section.
+    pub budgets: crate::memory::Budgets,
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            auto_extract: true,
+            extract_every_n_turns: 1,
+            min_turn_seconds: 30,
+            gate: false,
+            gate_percent: 60,
+            held_span_cap: 0,
+            gate_bias: GateBias::default(),
+            budgets: crate::memory::Budgets::default(),
+        }
+    }
+}
+
+impl MemorySettings {
+    /// The gate threshold, as a percent, for a model of `family`:
+    /// `gate_percent` moved by that family's calibrated letter bias and kept
+    /// within 0..=100.
+    #[must_use]
+    pub fn gate_threshold_percent(&self, family: crate::gguf::ModelFamily) -> u32 {
+        let t = i64::from(self.gate_percent) + i64::from(self.gate_bias.for_family(family));
+        // Clamped to 0..=100 on the line above, so the conversion cannot fail.
+        u32::try_from(t.clamp(0, 100)).unwrap_or(0)
+    }
+}
+
+/// Per-family letter-bias correction for the memory gate, in percentage points
+/// (`memory.gateBias`).
+///
+/// The gate asks its yes/no question with yes as A, always, and reads P(yes).
+/// A family with a prior toward A as such inflates that number, and the
+/// correction is the mean of that inflation measured by asking the same spans
+/// with the letters swapped (`/memory calibrate`, `decide::bias_report`).
+/// Measured per family because the prior belongs to the weights: a value
+/// calibrated on one family says nothing about another. Positive raises the
+/// bar. Bounded to ±[`GateBias::MAX_ABS`], far past any measured value, so a
+/// typo cannot switch the gate fully on or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GateBias {
+    pub ds4: i32,
+    pub ds41: i32,
+    pub qwen: i32,
+}
+
+impl GateBias {
+    /// Largest correction accepted from a settings file, either direction.
+    pub const MAX_ABS: i32 = 50;
+
+    /// The settings key a family's correction is stored under.
+    #[must_use]
+    pub fn key(family: crate::gguf::ModelFamily) -> &'static str {
+        match family {
+            crate::gguf::ModelFamily::Ds4 => "ds4",
+            crate::gguf::ModelFamily::Ds41 => "ds41",
+            crate::gguf::ModelFamily::Qwen => "qwen",
+        }
+    }
+
+    /// The correction for `family`.
+    #[must_use]
+    pub fn for_family(&self, family: crate::gguf::ModelFamily) -> i32 {
+        match family {
+            crate::gguf::ModelFamily::Ds4 => self.ds4,
+            crate::gguf::ModelFamily::Ds41 => self.ds41,
+            crate::gguf::ModelFamily::Qwen => self.qwen,
+        }
+    }
+}
+
+/// Predictive next-prompt suggestions in the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestionSettings {
+    /// Generate a suggestion after each turn and show it as ghost text.
+    ///
+    /// On by default. The cost argument rests on the cold-KV skip: the
+    /// expensive case — a session whose KV would rebuild from zero — is
+    /// exactly the case the generation declines.
+    pub enabled: bool,
+    /// Token budget for the suggestion generation. A suggestion is one short
+    /// line; anything past this is a model that misunderstood the
+    /// instruction, and the sanitizer would reject it anyway.
+    pub max_tokens: u32,
+}
+
+impl Default for SuggestionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_tokens: 160,
+        }
     }
 }
 
@@ -719,6 +899,10 @@ impl Settings {
             self.tools.loop_guards = v;
             self.note("tools.loopGuards", origin);
         }
+        if let Some(v) = boolean(tools, "noProgressGuard") {
+            self.tools.no_progress_guard = v;
+            self.note("tools.noProgressGuard", origin);
+        }
         if let Some(v) = num::<u64>(tools, "callTimeoutSec") {
             self.tools.call_timeout_sec = v;
             self.note("tools.callTimeoutSec", origin);
@@ -743,6 +927,14 @@ impl Settings {
             self.tools.run_code = v;
             self.note("tools.runCode", origin);
         }
+        if let Some(v) = boolean(tools, "bashNotify") {
+            self.tools.bash_notify = v;
+            self.note("tools.bashNotify", origin);
+        }
+        if let Some(v) = boolean(tools, "remember") {
+            self.tools.remember = v;
+            self.note("tools.remember", origin);
+        }
 
         self.overlay_agents_and_worktree(&root, origin);
     }
@@ -755,8 +947,36 @@ impl Settings {
             .note(origin.clone());
     }
 
+    /// The `suggestions` section of [`overlay_agents_and_worktree`], split out
+    /// to keep each function under the length lint.
+    fn overlay_suggestions(&mut self, root: &Json, origin: &crate::provenance::Origin) {
+        if let Some(v) = boolean(root.get("suggestions"), "enabled") {
+            self.suggestions.enabled = v;
+            self.note("suggestions.enabled", origin);
+        }
+        if let Some(v) = num::<u32>(root.get("suggestions"), "maxTokens") {
+            self.suggestions.max_tokens = v.max(1);
+            self.note("suggestions.maxTokens", origin);
+        }
+    }
+
     /// The `agents` and `worktree` half of [`overlay`](Self::overlay), split out
     /// only to keep each function under the length lint.
+    /// `memory.gateBias`: per-family, signed, clamped to ±`GateBias::MAX_ABS`.
+    fn overlay_gate_bias(&mut self, root: &Json, origin: &crate::provenance::Origin) {
+        if let Some(b) = root.get("memory").and_then(|m| m.get("gateBias")) {
+            let set = |key: &str, field: &mut i32| {
+                if let Some(v) = num::<i32>(Some(b), key) {
+                    *field = v.clamp(-GateBias::MAX_ABS, GateBias::MAX_ABS);
+                }
+            };
+            set("ds4", &mut self.memory.gate_bias.ds4);
+            set("ds41", &mut self.memory.gate_bias.ds41);
+            set("qwen", &mut self.memory.gate_bias.qwen);
+            self.note("memory.gateBias", origin);
+        }
+    }
+
     fn overlay_agents_and_worktree(&mut self, root: &Json, origin: &crate::provenance::Origin) {
         let agents = root.get("agents");
         if let Some(v) = boolean(agents, "autoRoute") {
@@ -800,6 +1020,50 @@ impl Settings {
             self.context.microcompact = v;
             self.note("context.microcompact", origin);
         }
+        if let Some(v) = boolean(root.get("context"), "shortReminder") {
+            self.context.short_reminder = v;
+            self.note("context.shortReminder", origin);
+        }
+
+        if let Some(v) = boolean(root.get("memory"), "autoExtract") {
+            self.memory.auto_extract = v;
+            self.note("memory.autoExtract", origin);
+        }
+        if let Some(v) = num::<u32>(root.get("memory"), "extractEveryNTurns") {
+            self.memory.extract_every_n_turns = v.max(1);
+            self.note("memory.extractEveryNTurns", origin);
+        }
+        if let Some(v) = num::<u32>(root.get("memory"), "minTurnSeconds") {
+            self.memory.min_turn_seconds = v;
+            self.note("memory.minTurnSeconds", origin);
+        }
+        if let Some(v) = boolean(root.get("memory"), "gate") {
+            self.memory.gate = v;
+            self.note("memory.gate", origin);
+        }
+        if let Some(v) = num::<u32>(root.get("memory"), "gatePercent") {
+            self.memory.gate_percent = v.min(100);
+            self.note("memory.gatePercent", origin);
+        }
+        if let Some(v) = num::<u32>(root.get("memory"), "heldSpanCap") {
+            self.memory.held_span_cap = v;
+            self.note("memory.heldSpanCap", origin);
+        }
+        self.overlay_gate_bias(root, origin);
+        if let Some(b) = root.get("memory").and_then(|m| m.get("budgets")) {
+            let set = |key: &str, field: &mut usize| {
+                if let Some(v) = num::<usize>(Some(b), key) {
+                    *field = v;
+                }
+            };
+            set("user", &mut self.memory.budgets.user);
+            set("feedback", &mut self.memory.budgets.feedback);
+            set("project", &mut self.memory.budgets.project);
+            set("reference", &mut self.memory.budgets.reference);
+            self.note("memory.budgets", origin);
+        }
+
+        self.overlay_suggestions(root, origin);
 
         if let Some(v) = boolean(root.get("git"), "signCommits") {
             self.git.sign_commits = v;
@@ -935,7 +1199,7 @@ impl Settings {
         match std::env::current_dir() {
             Ok(cwd) => Self::paths_in(home.as_deref(), &cwd),
             Err(_) => home
-                .map(|home| home.join(".plank").join("settings.json"))
+                .map(|home| crate::home::plank_home_in(home).join("settings.json"))
                 .into_iter()
                 .collect(),
         }
@@ -947,7 +1211,7 @@ impl Settings {
     pub fn paths_in(home: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Some(home) = home {
-            paths.push(home.join(".plank").join("settings.json"));
+            paths.push(crate::home::plank_home_in(home).join("settings.json"));
         }
         paths.push(cwd.join(".plank").join("settings.json"));
         paths
@@ -1202,6 +1466,7 @@ impl Settings {
     ///
     /// # Errors
     /// Returns `Err` if the parent directory cannot be created or the write fails.
+    #[allow(clippy::too_many_lines)]
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
         let mut root: Vec<(String, Json)> = match std::fs::read_to_string(path) {
             Ok(t) => match json_parse(&t) {
@@ -1295,6 +1560,69 @@ impl Settings {
             "microcompact",
             Json::Bool(self.context.microcompact),
         );
+        upsert(
+            section(&mut root, "context"),
+            "shortReminder",
+            Json::Bool(self.context.short_reminder),
+        );
+        {
+            let m = section(&mut root, "memory");
+            upsert(m, "autoExtract", Json::Bool(self.memory.auto_extract));
+            upsert(
+                m,
+                "extractEveryNTurns",
+                unum(u64::from(self.memory.extract_every_n_turns)),
+            );
+            upsert(
+                m,
+                "minTurnSeconds",
+                unum(u64::from(self.memory.min_turn_seconds)),
+            );
+            upsert(m, "gate", Json::Bool(self.memory.gate));
+            upsert(m, "gatePercent", unum(u64::from(self.memory.gate_percent)));
+            upsert(m, "heldSpanCap", unum(u64::from(self.memory.held_span_cap)));
+            // Absent until calibrated, so an uncalibrated settings file does
+            // not grow three zeros nobody chose.
+            let b = self.memory.gate_bias;
+            upsert_opt(
+                m,
+                "gateBias",
+                (b != GateBias::default()).then(|| {
+                    Json::Obj(vec![
+                        ("ds4".to_string(), inum(b.ds4)),
+                        ("ds41".to_string(), inum(b.ds41)),
+                        ("qwen".to_string(), inum(b.qwen)),
+                    ])
+                }),
+            );
+        }
+        {
+            let s = section(&mut root, "suggestions");
+            upsert(s, "enabled", Json::Bool(self.suggestions.enabled));
+            upsert(s, "maxTokens", unum(u64::from(self.suggestions.max_tokens)));
+        }
+        {
+            let t = section(&mut root, "tools");
+            upsert(t, "repeatAdvisory", Json::Bool(self.tools.repeat_advisory));
+            upsert(t, "loopGuards", Json::Bool(self.tools.loop_guards));
+            upsert(
+                t,
+                "noProgressGuard",
+                Json::Bool(self.tools.no_progress_guard),
+            );
+            upsert(t, "callTimeoutSec", unum(self.tools.call_timeout_sec));
+            upsert(t, "spillMaxBytes", unum(self.tools.spill_max_bytes as u64));
+            upsert(
+                t,
+                "spillPreviewBytes",
+                unum(self.tools.spill_preview_bytes as u64),
+            );
+            upsert(t, "recall", Json::Bool(self.tools.recall));
+            upsert(t, "fanout", Json::Bool(self.tools.fanout));
+            upsert(t, "runCode", Json::Bool(self.tools.run_code));
+            upsert(t, "bashNotify", Json::Bool(self.tools.bash_notify));
+            upsert(t, "remember", Json::Bool(self.tools.remember));
+        }
 
         let mut out = String::new();
         write_pretty(&mut out, &Json::Obj(root), 0);
@@ -1355,6 +1683,212 @@ pub fn reinstall(settings: Settings) {
     crate::debugmirror::reconcile();
 }
 
+/// Session-only override of `ui.showThinking`, set by the footer's brain
+/// click. `None` means "no override": the persisted `ui.show_thinking` stands.
+///
+/// Deliberately *not* a field on [`Settings`]: a value living there would be
+/// written out by [`Settings::save_to`] the next time anything saved the
+/// settings (a later `/config <any key>`, or a config-form save), which is
+/// exactly the accidental persistence the override exists to prevent. This
+/// layer is never serialised and never reaches disk.
+#[cfg(not(test))]
+static SHOW_THINKING_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(SHOW_THINKING_NONE);
+
+// Scoped to the calling thread in tests for the same reason as
+// `TEST_OVERRIDE` below: libtest runs tests concurrently in one process, and a
+// process-wide override would leak between them.
+#[cfg(test)]
+thread_local! {
+    static SHOW_THINKING_OVERRIDE: std::cell::Cell<i8> =
+        const { std::cell::Cell::new(SHOW_THINKING_NONE) };
+}
+
+/// The `SHOW_THINKING_OVERRIDE` encoding of `None`; `0`/`1` are `false`/`true`.
+const SHOW_THINKING_NONE: i8 = -1;
+
+/// The live session override of `ui.showThinking`, or `None` when none is set.
+#[must_use]
+pub fn show_thinking_override() -> Option<bool> {
+    #[cfg(test)]
+    let raw = SHOW_THINKING_OVERRIDE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let raw = SHOW_THINKING_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    (raw != SHOW_THINKING_NONE).then_some(raw != 0)
+}
+
+/// Session-only override of `tools.loopGuards`, set by `/loopguard`
+/// (`/lg`). `None` means "no override": the persisted `tools.loop_guards`
+/// stands.
+///
+/// Deliberately *not* a field on [`Settings`], for the same reason as
+/// [`SHOW_THINKING_OVERRIDE`]: a value living there would be written out by
+/// [`Settings::save_to`] the next time anything saved the settings (a later
+/// `/config <any key>`), which is exactly the accidental persistence this
+/// layer exists to prevent. Never serialised, never reaches disk, and — per
+/// the loop guard's own doc comment — outlives `/clear`/`/new`, since it is
+/// process state rather than session state: it defaults on as a protection,
+/// and turning it off is a diagnostic act whose whole point is to survive the
+/// investigation that prompted it.
+#[cfg(not(test))]
+static LOOP_GUARDS_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(LOOP_GUARDS_NONE);
+
+// Scoped to the calling thread in tests for the same reason as
+// `SHOW_THINKING_OVERRIDE` above: libtest runs tests concurrently in one
+// process, and a process-wide override would leak between them.
+#[cfg(test)]
+thread_local! {
+    static LOOP_GUARDS_OVERRIDE: std::cell::Cell<i8> =
+        const { std::cell::Cell::new(LOOP_GUARDS_NONE) };
+}
+
+/// The `LOOP_GUARDS_OVERRIDE` encoding of `None`; `0`/`1` are `false`/`true`.
+const LOOP_GUARDS_NONE: i8 = -1;
+
+/// The live session override of `tools.loopGuards`, or `None` when none is
+/// set.
+#[must_use]
+pub fn loop_guards_override() -> Option<bool> {
+    #[cfg(test)]
+    let raw = LOOP_GUARDS_OVERRIDE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let raw = LOOP_GUARDS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    (raw != LOOP_GUARDS_NONE).then_some(raw != 0)
+}
+
+/// Sets (or with `None` clears) the session override.
+///
+/// Unlike `set_show_thinking_override`, there is no side effect to replicate
+/// here: [`reinstall`]'s four effects (`anim::set_reduced_motion`,
+/// `notify::set_mode`, swapping the `ACTIVE` slot, `debugmirror::reconcile`)
+/// each depend on a field other than `tools.loop_guards`, and the guards
+/// themselves are read fresh from [`crate::guard::guards_enabled`] at every
+/// check rather than cached anywhere that would need reconciling.
+pub fn set_loop_guards_override(value: Option<bool>) {
+    let raw = value.map_or(LOOP_GUARDS_NONE, i8::from);
+    #[cfg(test)]
+    LOOP_GUARDS_OVERRIDE.with(|c| c.set(raw));
+    #[cfg(not(test))]
+    LOOP_GUARDS_OVERRIDE.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a scoped suspension of the loop guards is in force; see
+/// [`suspend_loop_guards`].
+#[cfg(not(test))]
+static LOOP_GUARDS_SUSPENDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Thread-scoped in tests for the same reason as `LOOP_GUARDS_OVERRIDE`.
+#[cfg(test)]
+thread_local! {
+    static LOOP_GUARDS_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[must_use]
+fn loop_guards_suspended() -> bool {
+    #[cfg(test)]
+    {
+        LOOP_GUARDS_SUSPENDED.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        LOOP_GUARDS_SUSPENDED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn set_loop_guards_suspended(value: bool) {
+    #[cfg(test)]
+    LOOP_GUARDS_SUSPENDED.with(|c| c.set(value));
+    #[cfg(not(test))]
+    LOOP_GUARDS_SUSPENDED.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Silences the loop guards until the returned value is dropped.
+///
+/// For a turn plank drives from a canned multi-phase prompt rather than from
+/// something the user typed — `/init` is the one today. Those phases repeat
+/// tool calls *by design*: the survey re-reads the tree the interview asked
+/// about, and the guards read that as the loop they exist to stop, so a turn
+/// the user asked for is refused mid-phase for doing exactly what its prompt
+/// told it to.
+///
+/// A scope rather than a flag, because the restore has to survive the early
+/// return on a failed turn: leaving the guards down after `/init` errored
+/// would disarm the protection for the rest of the session with nothing on
+/// screen saying so. Re-entrant: the previous value is restored, not `false`.
+///
+/// This is deliberately *below* the `/loopguard` session override in
+/// [`loop_guards_effective`]. A user who typed `/loopguard on` said something
+/// about this session that a canned prompt does not get to overrule, and one
+/// who typed `/loopguard off` is already where the suspension would put them.
+#[must_use = "the guards are re-armed when this value is dropped"]
+pub fn suspend_loop_guards() -> LoopGuardsSuspended {
+    let previous = loop_guards_suspended();
+    set_loop_guards_suspended(true);
+    LoopGuardsSuspended { previous }
+}
+
+/// The scope handle returned by [`suspend_loop_guards`]; re-arms the guards on
+/// drop.
+#[derive(Debug)]
+pub struct LoopGuardsSuspended {
+    previous: bool,
+}
+
+impl Drop for LoopGuardsSuspended {
+    fn drop(&mut self) {
+        set_loop_guards_suspended(self.previous);
+    }
+}
+
+/// Whether the loop guards are armed *right now*: the `/loopguard` session
+/// override if one is set, else off inside a [`suspend_loop_guards`] scope,
+/// else the persisted `tools.loopGuards`.
+///
+/// [`crate::guard::guards_enabled`] is the sole reader of this; every guard
+/// check goes through it rather than reading `tools.loop_guards` directly.
+#[must_use]
+pub fn loop_guards_effective() -> bool {
+    if let Some(explicit) = loop_guards_override() {
+        return explicit;
+    }
+    if loop_guards_suspended() {
+        return false;
+    }
+    active().tools.loop_guards
+}
+
+/// Sets (or with `None` clears) the session override, then reconciles the
+/// debug-console mirror.
+///
+/// The reconcile is the one side effect of [`reinstall`] that depends on
+/// `showThinking`: the mirror is connected only while thinking is *hidden*, so
+/// an override that changed the effective value without reconciling would
+/// leave a console attached (or detached) against what the user just asked
+/// for. `reinstall`'s other effects — `anim::set_reduced_motion`,
+/// `notify::set_mode`, and swapping the `ACTIVE` slot — read fields this layer
+/// cannot touch, so they are deliberately not replicated.
+pub fn set_show_thinking_override(value: Option<bool>) {
+    let raw = value.map_or(SHOW_THINKING_NONE, i8::from);
+    #[cfg(test)]
+    SHOW_THINKING_OVERRIDE.with(|c| c.set(raw));
+    #[cfg(not(test))]
+    SHOW_THINKING_OVERRIDE.store(raw, std::sync::atomic::Ordering::Relaxed);
+    crate::debugmirror::reconcile();
+}
+
+/// Whether thinking is displayed *right now*: the session override if one is
+/// set, else the persisted `ui.showThinking`.
+///
+/// Every display decision reads this. The persisted field is read directly
+/// only where the *configured* value is the subject: saving settings,
+/// rendering the config form, and the session file's render record.
+#[must_use]
+pub fn show_thinking_effective() -> bool {
+    show_thinking_override().unwrap_or_else(|| active().ui.show_thinking)
+}
+
 // Test-only settings override, scoped to the calling thread. The libtest
 // harness runs each test on its own thread, so this lets one test exercise a
 // non-default setting without disturbing the process-wide slot that tests
@@ -1396,6 +1930,16 @@ pub fn install_for_test(settings: Settings) -> TestSettingsGuard {
     TestSettingsGuard { previous }
 }
 
+/// Makes [`active`] return `settings` for the current thread until the next
+/// install, with no guard to restore the previous override.
+///
+/// For tests that sequence several overrides by hand, or install one from a
+/// helper that outlives the call; prefer [`install_for_test`] otherwise.
+#[cfg(test)]
+pub fn set_for_test(settings: Settings) {
+    std::mem::forget(install_for_test(settings));
+}
+
 /// The process-wide settings, or the built-in defaults before [`install`].
 #[must_use]
 pub fn active() -> &'static Settings {
@@ -1435,6 +1979,34 @@ mod tests {
         assert_eq!(s.mcp.timeout_secs, 30);
         assert_eq!(s.engine.model, None);
         assert_eq!(s.safety.sandbox, None);
+        assert!(!s.memory.gate);
+        assert_eq!(s.memory.gate_percent, 60);
+        assert_eq!(s.memory.held_span_cap, 0);
+        assert!(s.suggestions.enabled);
+        assert_eq!(s.suggestions.max_tokens, 160);
+    }
+
+    #[test]
+    fn the_memory_gate_defaults_to_off_and_holds_nothing() {
+        let s = Settings::default();
+        assert!(!s.memory.gate, "the gate ships off");
+        assert_eq!(s.memory.gate_percent, 60);
+        assert_eq!(s.memory.held_span_cap, 0, "no holding by default");
+    }
+
+    #[test]
+    fn the_memory_gate_keys_are_read_from_json() {
+        let s =
+            from_json(r#"{ "memory": { "gate": true, "gatePercent": 80, "heldSpanCap": 12 } }"#);
+        assert!(s.memory.gate);
+        assert_eq!(s.memory.gate_percent, 80);
+        assert_eq!(s.memory.held_span_cap, 12);
+    }
+
+    #[test]
+    fn an_out_of_range_gate_percent_is_clamped_rather_than_rejected() {
+        let s = from_json(r#"{ "memory": { "gatePercent": 400 } }"#);
+        assert_eq!(s.memory.gate_percent, 100);
     }
 
     #[test]
@@ -1715,6 +2287,74 @@ mod tests {
         assert!(note.contains("timeoutSecs=45"), "{note}");
     }
 
+    /// A key that parses but never serialises is lost the next time anything
+    /// saves the settings, silently and permanently. Parsing tests cannot
+    /// catch that, so the three gate keys get a real write-then-read-back.
+    #[test]
+    fn the_memory_gate_keys_survive_a_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("plank-cfg-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut s = Settings::default();
+        s.memory.gate = true;
+        s.memory.gate_percent = 85;
+        s.memory.held_span_cap = 7;
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let back = from_json(&text);
+        assert!(back.memory.gate, "gate lost on save:\n{text}");
+        assert_eq!(back.memory.gate_percent, 85, "gatePercent lost:\n{text}");
+        assert_eq!(back.memory.held_span_cap, 7, "heldSpanCap lost:\n{text}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn suggestions_are_on_by_default() {
+        let s = Settings::default();
+        assert!(
+            s.suggestions.enabled,
+            "on by default, with the cold-KV skip carrying the cost"
+        );
+        assert_eq!(s.suggestions.max_tokens, 160);
+    }
+
+    /// `memoryStarvationSeconds` was retired when suggestions became
+    /// unconditionally first at the idle slot; a file that still carries it
+    /// must load like any other file with an unknown key.
+    #[test]
+    fn the_suggestion_keys_are_read_from_json() {
+        let s = from_json(
+            r#"{ "suggestions": { "enabled": false, "maxTokens": 24, "memoryStarvationSeconds": 60 } }"#,
+        );
+        assert!(!s.suggestions.enabled);
+        assert_eq!(s.suggestions.max_tokens, 24);
+    }
+
+    /// A key that parses but never serialises is lost on the next save, silently.
+    #[test]
+    fn the_suggestion_keys_survive_a_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("plank-cfg-sugg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut s = Settings::default();
+        s.suggestions.enabled = false;
+        s.suggestions.max_tokens = 17;
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let back = from_json(&text);
+        assert!(!back.suggestions.enabled, "enabled lost on save:\n{text}");
+        assert_eq!(back.suggestions.max_tokens, 17, "maxTokens lost:\n{text}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn save_to_round_trips_and_preserves_unknown_keys() {
         let dir = std::env::temp_dir().join(format!("plank-cfg-{}", std::process::id()));
@@ -1745,6 +2385,84 @@ mod tests {
         assert_eq!(reloaded.mcp.timeout_secs, 45);
         assert_eq!(reloaded.engine.ctx, Some(8192));
         assert_eq!(reloaded.engine.backend, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_to_persists_every_tools_field() {
+        // Regression test for the bug where `save_to` wrote only
+        // `tools.loopGuards` (and, before that commit, nothing at all under
+        // `tools`) while `/config tools.<key> ...` claimed success. Every
+        // field of `ToolsSettings` must round-trip through disk.
+        let dir = std::env::temp_dir().join(format!("plank-cfg-tools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        // Flip every field away from its default.
+        s.tools.repeat_advisory = !s.tools.repeat_advisory;
+        s.tools.loop_guards = !s.tools.loop_guards;
+        s.tools.call_timeout_sec = 42;
+        s.tools.spill_max_bytes = 777;
+        s.tools.spill_preview_bytes = 123;
+        s.tools.recall = !s.tools.recall;
+        s.tools.fanout = !s.tools.fanout;
+        s.tools.run_code = !s.tools.run_code;
+        s.tools.bash_notify = !s.tools.bash_notify;
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+
+        assert_eq!(reloaded.tools.repeat_advisory, s.tools.repeat_advisory);
+        assert_eq!(reloaded.tools.loop_guards, s.tools.loop_guards);
+        assert_eq!(reloaded.tools.call_timeout_sec, s.tools.call_timeout_sec);
+        assert_eq!(reloaded.tools.spill_max_bytes, s.tools.spill_max_bytes);
+        assert_eq!(
+            reloaded.tools.spill_preview_bytes,
+            s.tools.spill_preview_bytes
+        );
+        assert_eq!(reloaded.tools.recall, s.tools.recall);
+        assert_eq!(reloaded.tools.fanout, s.tools.fanout);
+        assert_eq!(reloaded.tools.run_code, s.tools.run_code);
+        assert_eq!(reloaded.tools.bash_notify, s.tools.bash_notify);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_command_persists_tools_fields_to_disk() {
+        // Drives the same path `/config tools.<key> <value>` uses
+        // (`configform::set_from_path`) rather than calling `save_to`
+        // directly, so a regression in the command's own persistence step
+        // (not just in `save_to`) is caught too.
+        use crate::configform::set_from_path;
+
+        let dir = std::env::temp_dir().join(format!("plank-cfg-cmd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        set_from_path(&mut s, "tools.fanout", "false").unwrap();
+        set_from_path(&mut s, "tools.recall", "false").unwrap();
+        set_from_path(&mut s, "tools.repeatAdvisory", "false").unwrap();
+        set_from_path(&mut s, "tools.callTimeoutSec", "30").unwrap();
+        set_from_path(&mut s, "tools.spillMaxBytes", "2048").unwrap();
+        set_from_path(&mut s, "tools.spillPreviewBytes", "256").unwrap();
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+
+        assert!(!reloaded.tools.fanout);
+        assert!(!reloaded.tools.recall);
+        assert!(!reloaded.tools.repeat_advisory);
+        assert_eq!(reloaded.tools.call_timeout_sec, 30);
+        assert_eq!(reloaded.tools.spill_max_bytes, 2048);
+        assert_eq!(reloaded.tools.spill_preview_bytes, 256);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1960,6 +2678,201 @@ mod tests {
     }
 
     #[test]
+    fn memory_settings_default_pass_on_tools_on_and_round_trip() {
+        use crate::configform::set_from_path;
+
+        // The passive pass is on by default since 5.1.7, as are the
+        // `remember`/`forget` tools.
+        let s = Settings::default();
+        assert!(
+            s.memory.auto_extract,
+            "the extraction pass must default to on"
+        );
+        assert_eq!(s.memory.extract_every_n_turns, 1);
+        assert!(s.tools.remember);
+        assert_eq!(s.memory.budgets, crate::memory::Budgets::default());
+
+        // Every value set here is the non-default one, so a stale default
+        // cannot make the assertions vacuously true.
+        let mut s = Settings::default();
+        set_from_path(&mut s, "memory.autoExtract", "false").unwrap();
+        set_from_path(&mut s, "memory.extractEveryNTurns", "4").unwrap();
+        set_from_path(&mut s, "memory.minTurnSeconds", "45").unwrap();
+        set_from_path(&mut s, "tools.remember", "false").unwrap();
+        assert!(!s.memory.auto_extract);
+        assert_eq!(s.memory.extract_every_n_turns, 4);
+        assert_eq!(s.memory.min_turn_seconds, 45);
+        assert!(!s.tools.remember);
+    }
+
+    #[test]
+    fn memory_settings_overlay_from_json() {
+        let mut s = Settings::default();
+        s.overlay(
+            r#"{"memory":{"autoExtract":false,"extractEveryNTurns":7,"budgets":{"user":10,"feedback":20,"project":30,"reference":40}},"tools":{"remember":false}}"#,
+        );
+        assert!(
+            !s.memory.auto_extract,
+            "overlay must flip the on default off"
+        );
+        assert_eq!(s.memory.extract_every_n_turns, 7);
+        assert_eq!(s.memory.budgets.user, 10);
+        assert_eq!(s.memory.budgets.feedback, 20);
+        assert_eq!(s.memory.budgets.project, 30);
+        assert_eq!(s.memory.budgets.reference, 40);
+        assert!(!s.tools.remember);
+    }
+
+    #[test]
+    fn memory_extract_every_n_turns_overlay_clamps_zero_to_one() {
+        // The default is already 1, so overlaying anything other than 0
+        // would leave this vacuously true. Use a non-1 baseline, overlay 0,
+        // and confirm the clamp — not the default — produced the 1.
+        let mut s = Settings::default();
+        s.memory.extract_every_n_turns = 9;
+        s.overlay(r#"{"memory":{"extractEveryNTurns":0}}"#);
+        assert_eq!(
+            s.memory.extract_every_n_turns, 1,
+            "0 must clamp to 1, not pass through"
+        );
+    }
+
+    #[test]
+    fn memory_min_turn_seconds_defaults_to_thirty_seconds() {
+        let s = Settings::default();
+        assert_eq!(
+            s.memory.min_turn_seconds, 30,
+            "a turn shorter than thirty seconds must not trigger the pass by default"
+        );
+    }
+
+    #[test]
+    fn memory_min_turn_seconds_overlay_keeps_zero() {
+        // 0 means "no floor" and is a real value here, unlike
+        // extractEveryNTurns where 0 clamps to 1. Start from a non-zero,
+        // non-default baseline so neither the default nor a clamp can make
+        // this vacuously true.
+        let mut s = Settings::default();
+        s.memory.min_turn_seconds = 45;
+        s.overlay(r#"{"memory":{"minTurnSeconds":0}}"#);
+        assert_eq!(
+            s.memory.min_turn_seconds, 0,
+            "0 must pass through as 'no floor', not clamp"
+        );
+
+        let mut s = Settings::default();
+        s.overlay(r#"{"memory":{"minTurnSeconds":300}}"#);
+        assert_eq!(s.memory.min_turn_seconds, 300);
+    }
+
+    #[test]
+    fn memory_gate_bias_defaults_to_zero_and_leaves_the_threshold_alone() {
+        let s = Settings::default();
+        assert_eq!(s.memory.gate_bias, GateBias::default());
+        for f in [
+            crate::gguf::ModelFamily::Ds4,
+            crate::gguf::ModelFamily::Ds41,
+            crate::gguf::ModelFamily::Qwen,
+        ] {
+            assert_eq!(s.memory.gate_threshold_percent(f), 60);
+        }
+    }
+
+    #[test]
+    fn memory_gate_bias_overlay_is_per_family_signed_and_clamped() {
+        let mut s = Settings::default();
+        s.overlay(r#"{"memory":{"gateBias":{"ds4":7,"qwen":-4,"ds41":500}}}"#);
+        assert_eq!(s.memory.gate_bias.ds4, 7);
+        assert_eq!(s.memory.gate_bias.qwen, -4);
+        assert_eq!(s.memory.gate_bias.ds41, GateBias::MAX_ABS);
+        assert_eq!(
+            s.memory
+                .gate_threshold_percent(crate::gguf::ModelFamily::Ds4),
+            67
+        );
+        assert_eq!(
+            s.memory
+                .gate_threshold_percent(crate::gguf::ModelFamily::Qwen),
+            56
+        );
+        // 60 + 50 clamps to 100, not 110.
+        assert_eq!(
+            s.memory
+                .gate_threshold_percent(crate::gguf::ModelFamily::Ds41),
+            100
+        );
+    }
+
+    #[test]
+    fn memory_gate_bias_round_trips_through_save_to_and_is_absent_when_zero() {
+        let dir = std::env::temp_dir().join(format!(
+            "plank-gate-bias-cfg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let s = Settings::default();
+        s.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("gateBias"), "{text}");
+
+        let mut s = Settings::default();
+        s.memory.gate_bias.ds4 = 7;
+        s.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert_eq!(reloaded.memory.gate_bias.ds4, 7);
+        assert_eq!(reloaded.memory.gate_bias.qwen, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn memory_min_turn_seconds_round_trips_through_save_to() {
+        let dir = std::env::temp_dir().join(format!(
+            "plank-memory-floor-cfg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        s.memory.min_turn_seconds = 90; // the non-default value
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert_eq!(reloaded.memory.min_turn_seconds, 90);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn memory_settings_round_trip_through_save_to() {
+        let dir = std::env::temp_dir().join(format!("plank-memory-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        s.memory.auto_extract = false; // the non-default value
+        s.memory.extract_every_n_turns = 6;
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert!(!reloaded.memory.auto_extract);
+        assert_eq!(reloaded.memory.extract_every_n_turns, 6);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn microcompact_defaults_true_and_overlays_false() {
         let s = Settings::default();
         assert!(s.context.microcompact, "on by default");
@@ -1970,6 +2883,32 @@ mod tests {
         let mut s3 = Settings::default();
         s3.overlay(r#"{"context":{"microcompact":"nope"}}"#);
         assert!(s3.context.microcompact);
+    }
+
+    #[test]
+    fn short_reminder_defaults_true_overlays_false_and_round_trips() {
+        let s = Settings::default();
+        assert!(s.context.short_reminder, "on by default");
+        let mut s2 = Settings::default();
+        s2.overlay(r#"{"context":{"shortReminder":false}}"#);
+        assert!(!s2.context.short_reminder);
+        // A non-boolean value is ignored rather than flipping the default.
+        let mut s3 = Settings::default();
+        s3.overlay(r#"{"context":{"shortReminder":"nope"}}"#);
+        assert!(s3.context.short_reminder);
+
+        let dir = std::env::temp_dir().join(format!("plank-short-reminder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let mut s = Settings::default();
+        s.context.short_reminder = false;
+        s.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"shortReminder\": false"), "{text}");
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert!(!reloaded.context.short_reminder);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2011,6 +2950,19 @@ mod tests {
         let s = Settings::load_from_paths(&[low], &[high]);
         assert_eq!(s.kvcache.max_bytes, 222);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tools_bash_notify_parses_and_defaults_off() {
+        assert!(!Settings::default().tools.bash_notify);
+        let dir = std::env::temp_dir().join(format!("plank-settings-bn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"tools":{"bashNotify":true}}"#).expect("write");
+        // The user layer: a plugin layer may not set `tools.*` at all.
+        let s = Settings::load_from_paths(&[], std::slice::from_ref(&path));
+        assert!(s.tools.bash_notify);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2262,5 +3214,56 @@ mod tests {
         s.overlay(r#"{"kvcache":{"maxBytes":"soon"}}"#);
         assert!(!s.provenance.contains_key("kvcache.maxBytes"));
         assert_eq!(s.kvcache.max_bytes, 21_474_836_480);
+    }
+}
+
+#[cfg(test)]
+mod loop_guard_suspension_tests {
+    use super::*;
+
+    /// The suspension layers *under* the `/loopguard` override and *over* the
+    /// persisted setting, and — the part that matters when a turn fails — it
+    /// lifts on drop rather than on a matching call someone has to remember.
+    #[test]
+    fn suspension_is_scoped_and_loses_to_an_explicit_override() {
+        set_loop_guards_override(None);
+        assert!(loop_guards_effective(), "default is armed");
+
+        {
+            let _scope = suspend_loop_guards();
+            assert!(!loop_guards_effective(), "suspended inside the scope");
+
+            // A user who said something explicit outranks a canned prompt, in
+            // both directions.
+            set_loop_guards_override(Some(true));
+            assert!(loop_guards_effective(), "/loopguard on wins over a scope");
+            set_loop_guards_override(Some(false));
+            assert!(!loop_guards_effective());
+            set_loop_guards_override(None);
+
+            // Re-entrant: an inner scope restores the outer one, not "armed".
+            {
+                let _inner = suspend_loop_guards();
+                assert!(!loop_guards_effective());
+            }
+            assert!(!loop_guards_effective(), "inner drop kept the outer scope");
+        }
+        assert!(loop_guards_effective(), "re-armed on drop");
+    }
+
+    /// Dropping the scope on the error path is the whole reason it is a scope:
+    /// a turn that fails must not leave the protection off for the session.
+    #[test]
+    fn suspension_lifts_even_when_the_scope_body_fails() {
+        fn turn_that_fails() -> Result<(), &'static str> {
+            let _scope = suspend_loop_guards();
+            assert!(!loop_guards_effective());
+            Err("the turn failed")?;
+            unreachable!("the early return above is the point of the test")
+        }
+
+        set_loop_guards_override(None);
+        assert!(turn_that_fails().is_err());
+        assert!(loop_guards_effective(), "re-armed despite the early return");
     }
 }

@@ -343,7 +343,7 @@ pub fn load_in(home: Option<&Path>, cwd: &Path, cli_dirs: &[PathBuf]) -> PluginS
         // `--plugin-dir` entries follow and outrank both.
         let root = crate::claudeplugin::install_dir(home);
         candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserClaude)));
-        let root = home.join(".plank").join("plugins").join("dev");
+        let root = crate::home::plank_home_in(home).join("plugins").join("dev");
         candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserScan)));
     }
     let project = cwd.join(".plank").join("plugins");
@@ -701,7 +701,7 @@ pub fn render_list(set: &PluginSet) -> String {
 /// auto-scans.
 #[must_use]
 pub fn user_plugin_dir(home: &Path) -> PathBuf {
-    home.join(".plank").join("plugins").join("dev")
+    crate::home::plank_home_in(home).join("plugins").join("dev")
 }
 
 /// Installs the plugin directory at `src` for the current user.
@@ -1201,10 +1201,13 @@ pub fn skills_in(
 ) {
     let mut roots = Vec::new();
     if let Some(home) = home {
-        roots.push(home.join(".plank").join("skills"));
+        roots.push(crate::home::plank_home_in(home).join("skills"));
     }
     roots.push(cwd.join(".plank").join("skills"));
-    let local = crate::skills::load_from(&roots);
+    // The built-ins sit under the user and project directories (`load_layered`),
+    // never under a plugin's: `gather` loads each plugin root through the plain
+    // disk loader so plank's own skills are not re-attributed to a plugin.
+    let local = crate::skills::load_layered(&roots);
     let plugin = gather(set, "skills", "skills", crate::skills::load_from);
     reconcile("skills", local, plugin, false)
 }
@@ -1240,7 +1243,7 @@ pub fn agents_in(
 ) {
     let mut roots = Vec::new();
     if let Some(home) = home {
-        roots.push(home.join(".plank").join("agents"));
+        roots.push(crate::home::plank_home_in(home).join("agents"));
     }
     roots.push(cwd.join(".plank").join("agents"));
     let local = crate::agents::load_from(&roots);
@@ -1279,7 +1282,7 @@ pub fn templates_in(
 ) {
     let mut roots = Vec::new();
     if let Some(home) = home {
-        roots.push(home.join(".plank").join("templates"));
+        roots.push(crate::home::plank_home_in(home).join("templates"));
     }
     roots.push(cwd.join(".plank").join("templates"));
     let local = crate::templates::load_from(&roots);
@@ -1312,7 +1315,7 @@ pub fn templates_with_plugins(
 pub fn hooks_in(home: Option<&Path>, cwd: &Path, set: &PluginSet) -> crate::hooks::Hooks {
     let mut paths = Vec::new();
     if let Some(home) = home {
-        paths.push(home.join(".plank").join("hooks.json"));
+        paths.push(crate::home::plank_home_in(home).join("hooks.json"));
     }
     for plugin in &set.plugins {
         if let Some(path) = component_root(plugin, "hooks.json", "hooks/hooks.json") {
@@ -2333,8 +2336,11 @@ mod tests {
         );
         let set = load_in(Some(&home), &cwd, &[plugin]);
         let (skills, _, _) = skills_in(Some(&home), &cwd, &set);
-        // Plugin skills are namespaced only: one entry, the alias.
-        assert_eq!(skills.len(), 1, "only the alias: {skills:?}");
+        // Plugin skills are namespaced only: one non-built-in entry, the alias.
+        let contributed: Vec<&crate::skills::Skill> =
+            skills.iter().filter(|s| !s.is_builtin()).collect();
+        assert_eq!(contributed.len(), 1, "only the alias: {contributed:?}");
+        assert_eq!(contributed[0].name, "demo:greet");
         for out in [
             crate::skills::render_list(&skills),
             crate::skills::render_names(&skills),

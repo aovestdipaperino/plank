@@ -116,6 +116,19 @@ A successfully converted document is cached under `~/.plank/doc-cache/` by conte
 
 Pasting attaches the image and gives the model its **path**, not its contents. The local ds4 engine is text-only — there is no vision model wired in yet — so a screenshot reaches the model as a filename. Transcribe the part that matters into your prompt.
 
+## "failed to open model"
+
+The message lists what plank could establish on its own, and usually one of those lines is the answer:
+
+- **the return code**, or that the engine reported success and handed back nothing;
+- **what was asked for** — the family read from the file's own metadata, the backend, and the context size;
+- **the model file itself**: a dangling symlink names the target that is gone, which is the common one because the default model paths are symlinks by convention, and otherwise you get a directory, an unreadable file, or the size;
+- **a size mismatch** against the installed manifest, which is what a truncated or interrupted install looks like;
+- **each companion that was passed**, so a run whose drafter is missing says so. A companion plank never passed is not listed, rather than listed as absent;
+- **the Metal kernel sources**, when they are not where the engine looks.
+
+The engine writes its own diagnosis just above that message, on the line plank has been updating in place while loading, so it is easy to read past.
+
 ## The model downloads stopped, or won't start
 
 The model download streams to a `.part` file next to the destination and resumes on the next launch, so an interrupted transfer is not lost.
@@ -182,7 +195,7 @@ Nothing breaks. Malformed JSON, a wrongly-typed value, an unknown key, or an unr
 /repro
 ```
 
-Run it before you change anything. It writes `~/.plank/repro/repro-<timestamp>.md` containing the exact prompt the engine would see plus the model, backend, context size, sampling settings, think mode and engine tuning — self-contained, read-only, and enough for a maintainer to reproduce the state that triggered the problem without your session.
+Run it before you change anything. It writes `~/.plank/repro/repro-<timestamp>.md` containing the exact prompt the engine would see plus the model, backend, context size, sampling settings, think mode and engine tuning, whether the loop guards were armed, and a `## Passes` table with one row per generation pass: when it ended, tokens and rate, the reasoning bytes the guard saw, any cycle it latched, and why the pass stopped (tool calls, answer, your interrupt, or which guard rung) — self-contained, read-only, and enough for a maintainer to reproduce the state that triggered the problem without your session.
 
 Attach that to an issue at [github.com/aovestdipaperino/plank](https://github.com/aovestdipaperino/plank/issues). Strip anything proprietary first — a repro carries your actual prompt and transcript.
 

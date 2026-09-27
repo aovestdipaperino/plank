@@ -24,7 +24,9 @@
 //! A hook is a `command` (shell) or a `prompt` (static text injected to the
 //! model). Beyond exit codes, a command hook may print a JSON response envelope
 //! on stdout — `continue:false`+`stopReason` (halt the turn), `systemMessage`
-//! (warn the user), `suppressOutput`, `async:true`+`asyncTimeout` — additive
+//! (warn the user), `suppressOutput`, `additionalContext` (inject context on a
+//! context-capable event; also read from `hookSpecificOutput.additionalContext`
+//! and `additional_context`), `async:true`+`asyncTimeout` — additive
 //! over the exit-code protocol. Matchers alternate on tool name and may match
 //! arguments, e.g. `bash(git *)` or `write(*.md)`. Unknown event names load
 //! with a warning rather than failing.
@@ -85,8 +87,11 @@ pub struct HookMatcher {
 }
 
 impl HookMatcher {
-    /// True when this group applies to `target` (a tool name; Stop and
-    /// lifecycle hooks use an empty target and match everything).
+    /// True when this group applies to `target` — a tool name for tool events,
+    /// and for lifecycle events the event's own discriminator (`SessionStart`'s
+    /// `source`, `SessionEnd`'s `reason`, compaction's `trigger`), so a matcher
+    /// like `startup|clear|compact` selects among them. An empty matcher always
+    /// matches, which is what `Stop` and the unfiltered lifecycle hooks use.
     ///
     /// Each `|`-separated alternative is either a bare tool name (`bash`) or a
     /// name with an argument glob in parentheses (`bash(git *)`, `write(*.md)`).
@@ -225,13 +230,13 @@ impl Hooks {
 /// replaced rather than supplemented.
 #[must_use]
 pub fn has_worktree_create_hook(hooks: &Hooks) -> bool {
-    !hooks.worktree_create.is_empty()
+    enabled() && !hooks.worktree_create.is_empty()
 }
 
 /// True when a `WorktreeRemove` hook is configured.
 #[must_use]
 pub fn has_worktree_remove_hook(hooks: &Hooks) -> bool {
-    !hooks.worktree_remove.is_empty()
+    enabled() && !hooks.worktree_remove.is_empty()
 }
 
 /// Runs the `WorktreeCreate` hooks for `slug` and returns the worktree path the
@@ -264,6 +269,16 @@ pub fn run_worktree_create_hook(hooks: &Hooks, slug: &str, cwd: &Path) -> Result
 /// configured (the caller reached here only because creation was hook-based, so
 /// there is no git fallback to hand the worktree back to).
 pub fn run_worktree_remove_hook(hooks: &Hooks, worktree: &Path, cwd: &Path) -> Result<(), String> {
+    // Reported rather than silently skipped: this worktree exists only because
+    // a hook made it, so "hooks are off" is the whole answer to why it cannot
+    // be removed, and a quiet success would claim a removal that never ran.
+    if !enabled() {
+        return Err(
+            "hooks are disabled for this session (/hooks on to re-enable); this worktree was \
+             created by a WorktreeCreate hook and only a WorktreeRemove hook can remove it"
+                .to_string(),
+        );
+    }
     if hooks.worktree_remove.is_empty() {
         return Err(
             "this worktree was created by a WorktreeCreate hook, but no WorktreeRemove hook is \
@@ -437,7 +452,7 @@ pub fn load_from(paths: &[PathBuf]) -> Hooks {
 pub fn load_default(cwd: &Path) -> Hooks {
     let mut paths = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".plank").join("hooks.json"));
+        paths.push(crate::home::plank_home_in(home).join("hooks.json"));
     }
     paths.push(cwd.join(".plank").join("hooks.json"));
     load_from(&paths)
@@ -571,6 +586,32 @@ fn read_all<R: std::io::Read>(pipe: Option<R>) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Runtime master switch for hook execution, thrown by `/hooks on|off`.
+///
+/// Session-scoped on purpose: it is never written back to `hooks.json` or any
+/// settings file, so a restart returns to whatever the configuration says.
+/// Process-global rather than carried on the `Hooks` value for the same reason
+/// the footer's toggles are: hooks fire from a dozen call sites that each hold
+/// their own borrow of [`Hooks`], and a flag threaded through all of them would
+/// be one missed site away from a hook that still runs after `/hooks off`.
+static HOOKS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Serializes the tests that write the process-global hook master switch, so
+/// they cannot disable hooks underneath a sibling test's own hook event.
+#[cfg(test)]
+pub(crate) static TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Enables or disables hook execution for the rest of the session.
+pub fn set_enabled(on: bool) {
+    HOOKS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether hooks currently run.
+#[must_use]
+pub fn enabled() -> bool {
+    HOOKS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Runs every matching hook of one event; the first exit-2 stderr becomes
 /// `block` (remaining hooks still run), other nonzero exits accumulate
 /// user-visible warnings.
@@ -609,6 +650,36 @@ fn run_event_inner(
     cwd: &Path,
     capture_context: bool,
 ) -> HookOutcome {
+    run_event_gated(
+        enabled(),
+        groups,
+        target,
+        arg_values,
+        input,
+        cwd,
+        capture_context,
+    )
+}
+
+/// The single choke point every hook event passes through, with the master
+/// switch injected so the gate is testable without writing the process-global.
+///
+/// A disabled run is a clean skip, not a run-and-discard: nothing is spawned,
+/// no prompt text is collected, and the default [`HookOutcome`] means no block,
+/// no warnings and no injected context — exactly the shape of "no hooks
+/// configured", which every caller already handles.
+fn run_event_gated(
+    enabled: bool,
+    groups: &[HookMatcher],
+    target: &str,
+    arg_values: &[&str],
+    input: &str,
+    cwd: &Path,
+    capture_context: bool,
+) -> HookOutcome {
+    if !enabled {
+        return HookOutcome::default();
+    }
     let mut outcome = HookOutcome::default();
     let mut context = String::new();
     for group in groups.iter().filter(|g| g.matches(target, arg_values)) {
@@ -653,16 +724,21 @@ fn run_event_inner(
             }
             match code {
                 0 => {
-                    // Plain (non-envelope) stdout of a context event is injected
-                    // unless the hook asked to suppress its output.
-                    if capture_context && envelope.is_none() && !outcome.suppress_output {
-                        let stdout = stdout.trim();
-                        if !stdout.is_empty() {
-                            if !context.is_empty() {
-                                context.push('\n');
-                            }
-                            context.push_str(stdout);
+                    // A context event injects either the envelope's
+                    // `additionalContext` or, when stdout is not an envelope,
+                    // the plain stdout — unless the hook suppressed its output.
+                    let injected = match &envelope {
+                        Some(env) => env.additional_context.clone(),
+                        None => Some(stdout.trim().to_string()),
+                    };
+                    if capture_context
+                        && !outcome.suppress_output
+                        && let Some(text) = injected.filter(|t| !t.is_empty())
+                    {
+                        if !context.is_empty() {
+                            context.push('\n');
                         }
+                        context.push_str(&text);
                     }
                 }
                 2 => {
@@ -698,6 +774,9 @@ struct Envelope {
     system_message: Option<String>,
     /// `suppressOutput` flag.
     suppress_output: bool,
+    /// Context the hook asked to inject: top-level `additionalContext` /
+    /// `additional_context`, or `hookSpecificOutput.additionalContext`.
+    additional_context: Option<String>,
 }
 
 /// Parses a hook's stdout as a response envelope. Returns `None` unless the
@@ -723,10 +802,28 @@ fn parse_envelope(stdout: &str) -> Option<Envelope> {
         _ => None,
     };
     let suppress_output = matches!(root.get("suppressOutput"), Some(Json::Bool(true)));
+    // Claude Code spells it `hookSpecificOutput.additionalContext`; other hosts
+    // (and older superpowers builds) put it at the top level under either
+    // spelling. Accept all three, preferring the nested canonical one.
+    let nested = root
+        .get("hookSpecificOutput")
+        .and_then(|o| o.get("additionalContext"));
+    let additional_context = [
+        nested,
+        root.get("additionalContext"),
+        root.get("additional_context"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|v| match v {
+        Json::Str(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => None,
+    });
     Some(Envelope {
         stop_reason,
         system_message,
         suppress_output,
+        additional_context,
     })
 }
 
@@ -899,6 +996,100 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_matcher_selects_on_the_event_discriminator() {
+        // The superpowers SessionStart matcher. Firing it with the source as
+        // the target is what makes it select; an empty matcher still matches.
+        let groups = one("echo ctx", "startup|clear|compact");
+        let cwd = std::env::temp_dir();
+        assert_eq!(
+            run_event_ctx(&groups, "startup", "{}", &cwd)
+                .context
+                .as_deref(),
+            Some("ctx")
+        );
+        assert_eq!(
+            run_event_ctx(&groups, "clear", "{}", &cwd)
+                .context
+                .as_deref(),
+            Some("ctx")
+        );
+        assert!(
+            run_event_ctx(&groups, "resume", "{}", &cwd)
+                .context
+                .is_none()
+        );
+        assert_eq!(
+            run_event_ctx(&one("echo ctx", ""), "resume", "{}", &cwd)
+                .context
+                .as_deref(),
+            Some("ctx")
+        );
+    }
+
+    #[test]
+    fn envelope_additional_context_is_injected() {
+        let cwd = std::env::temp_dir();
+        // The superpowers SessionStart hook's shape: a JSON envelope whose only
+        // payload is the context to inject.
+        let out = run_event_ctx(
+            &one(
+                r#"echo '{"additionalContext": "you have superpowers"}'"#,
+                "",
+            ),
+            "",
+            "{}",
+            &cwd,
+        );
+        assert_eq!(out.context.as_deref(), Some("you have superpowers"));
+        // Claude Code's canonical nested spelling.
+        let nested = run_event_ctx(
+            &one(
+                r#"echo '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "nested ctx"}}'"#,
+                "",
+            ),
+            "",
+            "{}",
+            &cwd,
+        );
+        assert_eq!(nested.context.as_deref(), Some("nested ctx"));
+        // Cursor's snake_case spelling.
+        let snake = run_event_ctx(
+            &one(r#"echo '{"additional_context": "snake ctx"}'"#, ""),
+            "",
+            "{}",
+            &cwd,
+        );
+        assert_eq!(snake.context.as_deref(), Some("snake ctx"));
+        // Tool events never inject, envelope or not.
+        let plain = run_event(
+            &one(
+                r#"echo '{"additionalContext": "you have superpowers"}'"#,
+                "",
+            ),
+            "bash",
+            "{}",
+            &cwd,
+        );
+        assert!(plain.context.is_none());
+    }
+
+    #[test]
+    fn envelope_additional_context_honors_suppress_output() {
+        let cwd = std::env::temp_dir();
+        let out = run_event_ctx(
+            &one(
+                r#"echo '{"suppressOutput": true, "additionalContext": "hidden"}'"#,
+                "",
+            ),
+            "",
+            "{}",
+            &cwd,
+        );
+        assert!(out.suppress_output);
+        assert!(out.context.is_none());
+    }
+
+    #[test]
     fn envelope_suppress_output_blocks_context_injection() {
         let cwd = std::env::temp_dir();
         // Plain stdout would inject; suppressOutput keeps it out. The JSON here
@@ -1032,6 +1223,76 @@ mod tests {
                 prompt: None,
             }],
         }]
+    }
+
+    /// Every hook kind funnels into `run_event_gated`, so disabling it there
+    /// covers all eleven events rather than the one a caller happened to use.
+    /// Each event is exercised in the four hook shapes it can be built from,
+    /// each with a command that would be loudly visible had it run.
+    #[test]
+    fn every_hook_kind_is_skipped_when_the_gate_is_closed() {
+        let cwd = std::env::temp_dir();
+        let shapes: Vec<(&str, Vec<HookMatcher>)> = vec![
+            ("block", one("echo blocked >&2; exit 2", "")),
+            ("warn", one("echo warned >&2; exit 1", "")),
+            ("context", one("echo injected", "")),
+            (
+                "prompt",
+                vec![HookMatcher {
+                    matcher: String::new(),
+                    hooks: vec![HookDef {
+                        command: String::new(),
+                        timeout_sec: 5,
+                        is_async: false,
+                        prompt: Some("injected prompt".to_string()),
+                    }],
+                }],
+            ),
+        ];
+        for event in KNOWN_EVENTS {
+            for (shape, groups) in &shapes {
+                let off = run_event_gated(false, groups, "", &[], "{}", &cwd, true);
+                assert_eq!(
+                    off,
+                    HookOutcome::default(),
+                    "{event}/{shape} must be a clean skip when hooks are off"
+                );
+                let on = run_event_gated(true, groups, "", &[], "{}", &cwd, true);
+                assert_ne!(
+                    on,
+                    HookOutcome::default(),
+                    "{event}/{shape} must still run when hooks are on"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_toggle_is_runtime_only_and_takes_effect_immediately() {
+        let _lock = TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(enabled(), "hooks run by default");
+        set_enabled(false);
+        assert!(!enabled());
+        // The worktree backend follows the switch: with hooks off the git
+        // backend is used rather than a hook that is not going to run.
+        let hooks = Hooks {
+            worktree_create: one("echo wt", ""),
+            worktree_remove: one("true", ""),
+            ..Hooks::default()
+        };
+        assert!(!has_worktree_create_hook(&hooks));
+        assert!(!has_worktree_remove_hook(&hooks));
+        // And removing a hook-made worktree reports the reason instead of
+        // silently claiming success.
+        let dir = std::env::temp_dir();
+        let err = run_worktree_remove_hook(&hooks, &dir, &dir).unwrap_err();
+        assert!(err.contains("hooks are disabled"), "{err}");
+        set_enabled(true);
+        assert!(enabled(), "toggling back takes effect at once");
+        assert!(has_worktree_create_hook(&hooks));
+        assert!(has_worktree_remove_hook(&hooks));
     }
 
     #[test]

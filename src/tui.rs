@@ -142,20 +142,31 @@ fn line_text(line: &Line<'_>) -> String {
 /// re-render ([`OutputLog::md_render`]) and the one-shot
 /// [`OutputLog::push_markdown`], so a document pushed whole is styled exactly
 /// like one that arrived a token at a time.
+/// The one process-wide tree-sitter highlighter.
+///
+/// Building a `TreeSitterHighlighter` compiles nothing by itself, but every
+/// grammar it goes on to configure is cached inside it, so the markdown code
+/// fences ([`render_markdown_at`]) and the diff cards
+/// ([`highlight_diff_rows`]) deliberately share one instance rather than each
+/// constructing their own.
+fn highlighter() -> Arc<TreeSitterHighlighter> {
+    static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
+    HIGHLIGHTER
+        .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
+        .clone()
+}
+
 fn render_markdown_at(
     lines: &mut Vec<Line<'static>>,
     start: usize,
     src: &str,
 ) -> Vec<CodeBlockRegion> {
-    static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
     // Two columns are reserved for the output gutter added below.
     let width = ratatui::crossterm::terminal::size()
         .map_or(80, |(w, _)| w as usize)
         .saturating_sub(usize::from(OUTPUT_GUTTER_WIDTH))
         .max(20);
-    let hl = HIGHLIGHTER
-        .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
-        .clone();
+    let hl = highlighter();
     let md =
         MarkdownRenderer::new(width).with_render_hooks(Box::new(HighlightHooks::new(hl, width)));
     let blocks = md.parse(src);
@@ -564,25 +575,39 @@ impl SubPane {
     }
 
     /// Moves the roster cursor by `delta` rows (negative is up, toward `main`),
-    /// entering selection mode. Returns `false` (changing nothing) when no
-    /// sub-agent has ever run, so there is nothing to select.
+    /// entering selection mode. Returns `false` (changing nothing) when the
+    /// roster has no row to select at `now` — no sub-agent has run, or every
+    /// finished one has already left it.
     ///
-    /// The first call only reveals the cursor where it rests, whatever `delta`
-    /// says — that is how `←` enters the roster; `↑`/`↓` then walk it. Moving
-    /// off a row that was expanded collapses back to the transcript: the
-    /// cursor and what is on screen never disagree.
-    pub fn move_cursor(&mut self, delta: isize) -> bool {
-        if self.runs.is_empty() {
+    /// The cursor walks the rows the roster *draws* (see
+    /// [`Self::visible_runs`]), stepping over the runs whose row has expired,
+    /// so `↑`/`↓` never land on an agent the user cannot see. The first call
+    /// only reveals the cursor where it rests, whatever `delta` says — that is
+    /// how `←` enters the roster; `↑`/`↓` then walk it. Moving off a row that
+    /// was expanded collapses back to the transcript: the cursor and what is on
+    /// screen never disagree.
+    pub fn move_cursor(&mut self, delta: isize, now: u64) -> bool {
+        let visible = self.visible_runs(now);
+        if visible.is_empty() {
             return false;
         }
-        let last = isize::try_from(self.runs.len()).unwrap_or(isize::MAX);
-        let from = isize::try_from(self.cursor).unwrap_or(0);
+        // Row positions the cursor may take: `main`, then each drawn run.
+        let mut stops: Vec<usize> = vec![0];
+        stops.extend(visible.iter().map(|&i| i + 1));
+        let from = self.cursor;
+        let at = stops.iter().position(|&c| c == from).unwrap_or(0);
         // First `←` only reveals the cursor where it already rests; it does not
         // also jump a row, or the roster would twitch under the user's hand.
-        let to = if self.selecting { from + delta } else { from };
+        let to = if self.selecting {
+            let last = isize::try_from(stops.len() - 1).unwrap_or(isize::MAX);
+            let want = isize::try_from(at).unwrap_or(0) + delta;
+            usize::try_from(want.clamp(0, last)).unwrap_or(0)
+        } else {
+            at
+        };
         self.selecting = true;
-        self.cursor = usize::try_from(to.clamp(0, last)).unwrap_or(0);
-        if self.cursor != usize::try_from(from).unwrap_or(0) {
+        self.cursor = stops[to];
+        if self.cursor != from {
             self.active = false;
         }
         true
@@ -630,9 +655,10 @@ impl SubPane {
     /// Tab: moves focus between the prompt and the roster. Entering the roster
     /// reveals its cursor; leaving it hides the cursor but keeps an expanded
     /// pane on screen, so the user can type while watching an agent. Returns
-    /// `false` when no sub-agent has ever run, so there is nothing to focus.
-    pub fn toggle_focus(&mut self) -> bool {
-        if self.runs.is_empty() {
+    /// `false` when the roster has no row at `now`, so there is nothing to
+    /// focus.
+    pub fn toggle_focus(&mut self, now: u64) -> bool {
+        if self.visible_runs(now).is_empty() {
             return false;
         }
         self.selecting = !self.selecting;
@@ -657,18 +683,20 @@ impl SubPane {
     /// dead rows pinned under the status bar, and a pane left expanded sat over
     /// the transcript for the rest of the session.
     ///
-    /// The run itself is kept, only its row goes. Its output is the whole point
-    /// of having delegated, and the main log holds just a one-line signpost, so
-    /// a delegated report must stay reachable — which is why, while the user is
-    /// *in* the roster (`selecting`), every row is shown however long ago it
-    /// finished. That is both what the left arrow brings back and what stops a
-    /// row vanishing from under the cursor mid-read. An expanded pane with
-    /// focus back on the prompt is deliberately not exempt: the user is typing,
-    /// not reading, and that is the case the linger exists for.
+    /// Gone is gone: entering the roster does *not* bring expired rows back.
+    /// It used to — every row showed while the user was in the roster, so a
+    /// delegated report stayed reachable — but a `←` that resurrected eight
+    /// finished agents was the very pile the linger exists to clear, and a
+    /// finished run's report is not what the roster is for. The one exemption
+    /// left is the row under the cursor while the user is in the roster: a row
+    /// must not vanish from under a reader mid-read. Once the cursor moves off
+    /// it, it is gone like the rest. An expanded pane with focus back on the
+    /// prompt is deliberately not exempt: the user is typing, not reading, and
+    /// that is the case the linger exists for.
     #[must_use]
     pub fn visible_runs(&self, now: u64) -> Vec<usize> {
         (0..self.runs.len())
-            .filter(|&i| self.selecting || !self.runs[i].row_expired(now))
+            .filter(|&i| !self.runs[i].row_expired(now) || (self.selecting && self.cursor == i + 1))
             .collect()
     }
 
@@ -683,12 +711,11 @@ impl SubPane {
     /// paths, so a row goes on its own clock instead of waiting for the next
     /// keystroke.
     ///
-    /// Being *in* the roster exempts its rows from the linger — that is what
-    /// stops a row vanishing from under the cursor mid-read — but the `main`
-    /// row is not a run being read. A cursor left resting there (a click on
-    /// `main`, or a `←` never followed by `Esc`) would otherwise pin every
-    /// finished row on screen for the rest of the session, which is exactly the
-    /// pile the linger exists to clear. So once nothing is left to read — the
+    /// Being *in* the roster exempts the row under the cursor from the linger
+    /// — that is what stops a row vanishing from under a reader mid-read — but
+    /// the `main` row is not a run being read. A cursor left resting there (a
+    /// click on `main`, or a `←` never followed by `Esc`) would otherwise hold
+    /// the panel open with nothing on it. So once nothing is left to read — the
     /// cursor is on `main` and every run has outlived its linger — the roster
     /// leaves selection mode and retires as it would have with the cursor
     /// hidden.
@@ -896,6 +923,10 @@ pub struct OutputLog {
     /// not in the conversation yet, and the status line it sits under is the
     /// boundary that says so.
     pending: std::collections::VecDeque<String>,
+    /// True while a transient live preview line (a collapsed `write`'s
+    /// `… N lines` counter) is the last committed line, so the next update pops
+    /// it before pushing the replacement. See [`apply_preview_status`].
+    preview_open: bool,
 }
 
 /// Cached wrapped-row heights for [`OutputLog::lines`]; see the field.
@@ -964,6 +995,22 @@ impl OutputLog {
         }
     }
 
+    /// Re-renders a throttle-deferred segment once the gap has elapsed, on the
+    /// draw clock rather than on the arrival of the next token.
+    ///
+    /// Without this the tail of a segment is only committed when more visible
+    /// text arrives or the segment closes. A generation that stops emitting
+    /// visible text to open a tool stanza does neither: the last tokens before
+    /// the stanza stay off screen for as long as the tool runs, and the
+    /// sentence completes itself only once the tool result closes the segment.
+    /// Called once per frame by the busy UI loop, so the throttle still bounds
+    /// highlighting cost.
+    pub(crate) fn md_tick(&mut self) {
+        if self.md_dirty && self.md_start.is_some() {
+            self.md_render_throttled();
+        }
+    }
+
     /// Forces a render when the throttle has deferred appended tokens, so a
     /// segment boundary (tool/think text, end of turn, checkpoint) always
     /// commits the full buffer. No-op when nothing is pending.
@@ -995,6 +1042,7 @@ impl OutputLog {
 
     /// Appends a fully-styled standalone line (e.g. the user echo).
     pub fn push_spans(&mut self, spans: Vec<Span<'static>>) {
+        self.retire_preview();
         self.md_close();
         if !self.current.is_empty() {
             self.newline();
@@ -1009,6 +1057,7 @@ impl OutputLog {
     /// plan under `ExitPlanMode`. It is committed immediately, not left in the
     /// streaming buffer, so a later segment cannot re-render or truncate it.
     pub fn push_markdown(&mut self, src: &str) {
+        self.retire_preview();
         self.md_close();
         self.end_line();
         let start = self.lines.len();
@@ -1019,6 +1068,7 @@ impl OutputLog {
     /// Appends the echo of a submitted prompt, keeping the user's own line
     /// breaks (see [`user_echo_lines`]).
     pub fn push_user_echo(&mut self, text: &str) {
+        self.retire_preview();
         self.md_close();
         if !self.current.is_empty() {
             self.newline();
@@ -1030,6 +1080,7 @@ impl OutputLog {
     /// a green `●` bullet with `Skill(<name>)`, then an indented
     /// `└ Successfully loaded skill` under it.
     pub fn push_skill_loaded(&mut self, name: &str) {
+        self.retire_preview();
         self.md_close();
         self.end_line();
         self.lines.push(Line::from(vec![
@@ -1065,6 +1116,7 @@ impl OutputLog {
 
     /// Appends ANSI-colored text, one log line per input line.
     pub fn push_ansi(&mut self, text: &str) {
+        self.retire_preview();
         self.md_close();
         self.end_line();
         self.lines.extend(ansi_to_lines(text));
@@ -1075,6 +1127,30 @@ impl OutputLog {
         self.md_close();
         self.invalidate_rows_from(self.lines.len().saturating_sub(1));
         self.lines.pop();
+    }
+
+    /// Drops the transient live preview line if one is the last committed line.
+    /// Every out-of-stream push (a user echo, a `/context` report, a skill
+    /// notice) goes through here first: otherwise the next counter tick would
+    /// pop the pushed line instead of the counter, leaving a stale count above
+    /// a fresh one and losing the pushed line.
+    fn retire_preview(&mut self) {
+        if self.preview_open {
+            self.pop_line();
+            self.preview_open = false;
+        }
+    }
+
+    /// Sets, updates, or clears the transient live preview line — the collapsed
+    /// `write` counter (`… N lines`). `Some(text)` replaces it in place (pops
+    /// the old one, pushes the new dim line); `None` removes it, so the caller
+    /// can then append the permanent `└ N lines` summary as ordinary text.
+    pub fn apply_preview_status(&mut self, text: Option<&str>) {
+        self.retire_preview();
+        if let Some(text) = text {
+            self.push_dim(text.to_string());
+            self.preview_open = true;
+        }
     }
 
     /// Ensures the streamed output ends on a fresh line. Flushes any
@@ -1103,6 +1179,9 @@ impl OutputLog {
         self.invalidate_rows_from(len);
         self.lines.truncate(len);
         self.code_blocks.retain(|r| r.header < len);
+        // A rollback may have discarded the transient preview line; forget it
+        // so a later update does not pop an unrelated line.
+        self.preview_open = false;
     }
 
     /// Drops every line, code block, and in-flight streaming state, returning
@@ -1187,34 +1266,54 @@ impl OutputLog {
                 .sum::<usize>()
     }
 
-    /// The text to render when the first visible wrapped row is `top`, with
-    /// the residual row offset into its first logical line — the cached
-    /// counterpart of [`window_rows`], cloning only the lines at or below the
-    /// viewport instead of the whole log.
+    /// The text to render when the first visible wrapped row is `top` in a
+    /// pane `height` rows tall, with the residual row offset into its first
+    /// logical line — the cached counterpart of [`window_rows`], cloning only
+    /// the lines the pane can actually show instead of the whole log.
+    ///
+    /// Bounded at both ends on purpose. Skipping the lines above `top` is what
+    /// keeps the residual inside ratatui's `u16` scroll; stopping at the
+    /// bottom of the pane is what keeps a frame's cost independent of how much
+    /// conversation sits *below* the viewport, which is the scrolled-back case
+    /// (following the tail already clones almost nothing).
     #[must_use]
-    pub fn window(&self, width: u16, top: usize) -> (Text<'static>, u16) {
+    pub fn window(&self, width: u16, top: usize, height: u16) -> (Text<'static>, u16) {
         let width = width.max(1);
         self.ensure_rows(width);
         let tail = self.tail_lines();
         let tail_rows: Vec<usize> = tail.iter().map(|l| line_rows(l, width)).collect();
         let mut skipped = 0usize;
         let mut skip = 0usize;
+        let mut keep = 0usize;
         {
             let cache = self.row_cache.borrow();
-            for rows in cache.rows.iter().chain(tail_rows.iter()) {
-                if skipped + rows > top {
+            let rows = || cache.rows.iter().chain(tail_rows.iter());
+            for r in rows() {
+                if skipped + r > top {
                     break;
                 }
-                skipped += rows;
+                skipped += r;
                 skip += 1;
+            }
+            // The first kept line starts `residual` rows above the pane, so
+            // covering the pane takes `residual + height` rows of it.
+            let need = (top - skipped).saturating_add(usize::from(height));
+            let mut covered = 0usize;
+            for r in rows().skip(skip) {
+                if covered >= need {
+                    break;
+                }
+                covered += r;
+                keep += 1;
             }
         }
         let mut lines: Vec<Line<'static>> = Vec::new();
         if skip < self.lines.len() {
-            lines.extend_from_slice(&self.lines[skip..]);
-            lines.extend(tail);
+            let end = self.lines.len().min(skip + keep);
+            lines.extend_from_slice(&self.lines[skip..end]);
+            lines.extend(tail.into_iter().take(keep - (end - skip)));
         } else {
-            lines.extend(tail.into_iter().skip(skip - self.lines.len()));
+            lines.extend(tail.into_iter().skip(skip - self.lines.len()).take(keep));
         }
         (
             Text::from(lines),
@@ -1303,6 +1402,9 @@ impl RenderSink for OutputLog {
     fn error_text(&mut self, text: &str) {
         self.md_close();
         self.append(text, error_style());
+    }
+    fn preview_status(&mut self, text: Option<&str>) {
+        self.apply_preview_status(text);
     }
 }
 
@@ -1637,7 +1739,7 @@ pub fn selection_text_content(log: &OutputLog, width: u16, sel: ContentSelection
     let height = u16::try_from(ey - sy + 1).unwrap_or(u16::MAX);
     let rect = Rect::new(0, 0, width, height);
     let mut buf = Buffer::empty(rect);
-    let (text, scroll) = log.window(width, sy);
+    let (text, scroll) = log.window(width, sy, height);
     Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
@@ -1657,13 +1759,21 @@ pub fn selection_text_content(log: &OutputLog, width: u16, sel: ContentSelection
 /// Kept as a test-only reference: rendering itself uses the cache, and these
 /// two must never disagree (`row_cache_matches_a_full_rewrap_after_edits`).
 #[cfg(test)]
-fn window_rows(mut text: Text<'static>, width: u16, top: usize) -> (Text<'static>, u16) {
+fn window_rows(
+    mut text: Text<'static>,
+    width: u16,
+    top: usize,
+    height: u16,
+) -> (Text<'static>, u16) {
+    let measure = |line: &Line<'static>| {
+        Paragraph::new(Text::from(line.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+    };
     let mut skipped_rows = 0usize;
     let mut skip = 0usize;
     for line in &text.lines {
-        let rows = Paragraph::new(Text::from(line.clone()))
-            .wrap(Wrap { trim: false })
-            .line_count(width);
+        let rows = measure(line);
         if skipped_rows + rows > top {
             break;
         }
@@ -1671,6 +1781,17 @@ fn window_rows(mut text: Text<'static>, width: u16, top: usize) -> (Text<'static
         skip += 1;
     }
     text.lines.drain(..skip);
+    let need = (top - skipped_rows).saturating_add(usize::from(height));
+    let mut covered = 0usize;
+    let mut keep = 0usize;
+    for line in &text.lines {
+        if covered >= need {
+            break;
+        }
+        covered += measure(line);
+        keep += 1;
+    }
+    text.lines.truncate(keep);
     (text, u16::try_from(top - skipped_rows).unwrap_or(u16::MAX))
 }
 
@@ -1797,20 +1918,37 @@ pub struct TaskView {
     total: usize,
     /// `(text, is_active)` rows for the contextual strip, already capped.
     rows: Vec<(String, bool)>,
+    /// The full `/tasks` text, so a click on the footer's counter can open
+    /// the list mid-turn, when the UI thread has no session to render it from.
+    report: String,
 }
 
 impl From<&crate::tasks::TaskList> for TaskView {
     fn from(list: &crate::tasks::TaskList) -> Self {
+        Self::with_goal(list, None)
+    }
+}
+
+impl TaskView {
+    /// A view whose `/tasks` report also carries the durable goal, exactly as
+    /// the typed `/tasks` renders it.
+    #[must_use]
+    pub fn with_goal(list: &crate::tasks::TaskList, goal: Option<&crate::goal::GoalState>) -> Self {
         let (completed, total) = list.counter().unwrap_or((0, 0));
         Self {
             completed,
             total,
             rows: list.strip_rows(),
+            report: list.render_list(goal),
         }
     }
-}
 
-impl TaskView {
+    /// The `/tasks` text for the panel the footer's counter opens.
+    #[must_use]
+    pub fn report(&self) -> &str {
+        &self.report
+    }
+
     /// `(completed, total)` for the status-bar counter, or `None` when empty.
     #[must_use]
     pub fn counter(&self) -> Option<(usize, usize)> {
@@ -1853,6 +1991,14 @@ fn frame_rows(
     // three rows so it never crowds the scrollback.
     let strip = if has_prompt { tasks.strip_rows() } else { &[] };
     let strip_rows = u16::try_from(strip.len()).unwrap_or(0);
+    // Reserve a third status row for an own-line tip, but only while the agent
+    // works (no resting prompt to shift). `status_bar_lines` renders under the
+    // same predicate, so height and content agree.
+    let status_rows = if tip_on_own_line(!has_prompt, anim_tick_ms()) {
+        STATUS_ROWS + 1
+    } else {
+        STATUS_ROWS
+    };
     let FrameGeom {
         output,
         input,
@@ -1861,7 +2007,14 @@ fn frame_rows(
         rule_bottom,
         strip: strip_area,
         roster: roster_area,
-    } = frame_geom(area, has_prompt, input_rows, strip_rows, roster.height());
+    } = frame_geom(
+        area,
+        has_prompt,
+        input_rows,
+        strip_rows,
+        roster.height(),
+        status_rows,
+    );
     // Draw-site instrumentation for `--ui-remote`. This is the one place both
     // `draw` and `draw_btw_split` funnel through, so the frame is reset and
     // the structural regions published here; `render_input` and `render_popup`
@@ -1895,11 +2048,58 @@ fn frame_rows(
             rule,
         );
     }
-    // Drawn over the top rule, so it needs the rule painted first.
+    // Drawn over the rules, so they need the rules painted first: the session
+    // name on the rule above the prompt, the transient figures on the one
+    // below it.
     if let Some(rule) = rule_top {
         render_session_name(frame, rule);
     }
+    if let Some(rule) = rule_bottom {
+        render_perf_text(frame, rule);
+    }
+    set_rule_bottom_rect(rule_bottom);
     (output, input, status)
+}
+
+/// Where the last drawn frame put the rule below the prompt, for
+/// [`repaint_rule_bottom`]. `None` when the frame had no prompt.
+static RULE_BOTTOM_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+fn set_rule_bottom_rect(rect: Option<Rect>) {
+    if let Ok(mut slot) = RULE_BOTTOM_RECT.lock() {
+        *slot = rect;
+    }
+}
+
+/// Rewrites the rule below the prompt straight to the terminal, every cell,
+/// bypassing the frame diff. Called once the figures label has been cleared
+/// (`set_perf_text("")`): a glyph the terminal draws wider than ratatui
+/// measures leaves a cell the diff believes unchanged and the terminal shows
+/// blank — a notch where the label was — and a full `Terminal::clear` fixes
+/// it at the price of a whole-screen flicker. This repaints the one row the
+/// artefact can be on. The buffer already holds a plain rule for the row, so
+/// the next frame's diff agrees with what is now on screen; the cursor is
+/// repositioned by that frame as every frame does.
+pub fn repaint_rule_bottom(terminal: &mut ratatui::DefaultTerminal) {
+    use ratatui::crossterm::style::{Color as CColor, ResetColor, SetForegroundColor};
+    use ratatui::crossterm::{cursor::MoveTo, queue, style::Print};
+    use std::io::Write as _;
+    let Some(rule) = RULE_BOTTOM_RECT.lock().ok().and_then(|r| *r) else {
+        return;
+    };
+    let backend = terminal.backend_mut();
+    let _ = queue!(
+        backend,
+        MoveTo(rule.x, rule.y),
+        SetForegroundColor(match theme_accent() {
+            Color::Rgb(r, g, b) => CColor::Rgb { r, g, b },
+            Color::Indexed(i) => CColor::AnsiValue(i),
+            _ => CColor::AnsiValue(114),
+        }),
+        Print("─".repeat(rule.width as usize)),
+        ResetColor
+    );
+    let _ = backend.flush();
 }
 
 /// Columns of bare rule kept to the right of the session name, so the label
@@ -1915,20 +2115,38 @@ const SESSION_NAME_MIN_RULE: u16 = 8;
 /// instead of only being announced on exit.
 fn render_session_name(frame: &mut Frame, rule: Rect) {
     let name = session_name();
-    if name.is_empty() {
+    render_rule_label(frame, rule, &name, "session_name", "name");
+}
+
+/// Floats the transient performance figures (`status::perf_segment`) at the
+/// right end of the rule *below* the prompt: prefill and generation rates,
+/// the MTP per-step figures. They change many times a second, so they live
+/// here rather than in the footer, which is what lets the footer hold still.
+fn render_perf_text(frame: &mut Frame, rule: Rect) {
+    let text = perf_text();
+    render_rule_label(frame, rule, &text, "perf", "text");
+}
+
+/// Floats `text` at the right end of `rule`, in a gap cut into the rule, with
+/// [`SESSION_NAME_GAP`] columns of rule to its right; dropped entirely when
+/// fewer than [`SESSION_NAME_MIN_RULE`] columns of rule would be left of it,
+/// so a narrow terminal keeps its line rather than losing it to a label.
+/// `region` and `field` name the UI-tree region for remote inspection.
+fn render_rule_label(frame: &mut Frame, rule: Rect, text: &str, region: &str, field: &str) {
+    if text.is_empty() {
         return;
     }
     // Spaces on both sides: the label sits in a gap in the rule, not on top of it.
-    let label = format!(" {name} ");
-    let w = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+    let label = format!(" {text} ");
+    let w = u16::try_from(crate::status::visible_width(&label)).unwrap_or(u16::MAX);
     if rule.width < w.saturating_add(SESSION_NAME_GAP + SESSION_NAME_MIN_RULE) {
         return;
     }
     let area = Rect::new(rule.right() - SESSION_NAME_GAP - w, rule.y, w, 1);
     crate::uiremote::region(
-        "session_name",
+        region,
         area,
-        &[("name", crate::tools::mcp::Json::Str(name.clone()))],
+        &[(field, crate::tools::mcp::Json::Str(text.to_owned()))],
     );
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -1937,6 +2155,26 @@ fn render_session_name(frame: &mut Frame, rule: Rect) {
         )),
         area,
     );
+}
+
+/// The transient figures the next frame floats on the rule below the prompt.
+/// A process global for the same reason as [`SESSION_NAME`].
+static PERF_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Publishes the transient figures for later frames to draw; empty clears.
+pub fn set_perf_text(text: &str) {
+    if let Ok(mut slot) = PERF_TEXT.lock()
+        && *slot != text
+    {
+        slot.clear();
+        slot.push_str(text);
+    }
+}
+
+/// The published transient figures, empty when none.
+#[must_use]
+pub fn perf_text() -> String {
+    PERF_TEXT.lock().map(|s| s.clone()).unwrap_or_default()
 }
 
 /// The session name the next frame will float on the rule above the prompt.
@@ -2107,12 +2345,13 @@ fn frame_geom(
     input_rows: u16,
     strip_rows: u16,
     roster_rows: u16,
+    status_rows: u16,
 ) -> FrameGeom {
     // The roster sits below everything, and it never shrinks the scrollback to
     // nothing: on a short terminal it gives its rows back to the output.
     let roster_rows = roster_rows.min(
         area.height
-            .saturating_sub(STATUS_ROWS.saturating_add(input_rows).saturating_add(3)),
+            .saturating_sub(status_rows.saturating_add(input_rows).saturating_add(3)),
     );
     if has_prompt {
         let r = Layout::vertical([
@@ -2121,7 +2360,7 @@ fn frame_geom(
             Constraint::Length(1),           // top rule
             Constraint::Length(input_rows),  // input
             Constraint::Length(1),           // bottom rule
-            Constraint::Length(STATUS_ROWS), // status (two rows: see status_bar_lines)
+            Constraint::Length(status_rows), // status (2 rows, +1 for an own-line tip: see status_bar_lines)
             Constraint::Length(roster_rows), // sub-agent roster (0 until one runs)
         ])
         .split(area);
@@ -2138,7 +2377,7 @@ fn frame_geom(
         let r = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(STATUS_ROWS),
+            Constraint::Length(status_rows),
             Constraint::Length(roster_rows),
         ])
         .split(area);
@@ -2306,8 +2545,12 @@ pub fn popup_rect(output: Rect, input: Rect, rows: u16) -> Rect {
 /// scroll on its own, and disappears on Esc without leaving a trace in the log.
 #[derive(Debug)]
 pub struct ReportPanel {
-    /// Shown in the border title, before the ` · Esc closes ` hint.
+    /// Shown in the border title, before the ` · Esc closes ` hint; the
+    /// `[■]` close box sits left of it, on the frame's top-left corner.
     title: String,
+    /// The raw report text, kept so a refreshing panel can tell what it was
+    /// showing before the refresh.
+    text: String,
     /// The report text, parsed once into styled lines.
     log: OutputLog,
     view: OutputView,
@@ -2321,6 +2564,7 @@ impl ReportPanel {
         log.push_ansi(report);
         Self {
             title: title.into(),
+            text: report.to_string(),
             log,
             // Reports read top-down, so start at the top instead of following
             // the tail the way a streaming log does.
@@ -2330,6 +2574,27 @@ impl ReportPanel {
                 jump_hint_rect: None,
             },
         }
+    }
+
+    /// The panel's title, as given to [`ReportPanel::new`].
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Replaces the report text, keeping the scroll position where the new
+    /// text allows. For panels that refresh while open (`/jobs`).
+    pub fn set_text(&mut self, report: &str) {
+        let mut log = OutputLog::new();
+        log.push_ansi(report);
+        self.log = log;
+        self.text = report.to_string();
+    }
+
+    /// The raw report text currently shown.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
     }
 
     /// Scrolls the report by `delta` rows (negative scrolls up).
@@ -2371,6 +2636,7 @@ pub fn draw_report(
         input_text.map_or(1, |t| input_height(t, tw)),
         0,
         roster_rows,
+        STATUS_ROWS,
     );
     if g.output.height < 3 {
         return;
@@ -2390,7 +2656,8 @@ pub fn draw_report(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Indexed(238)))
         .title(Span::styled(
-            format!(" {} · Esc closes ", panel.title),
+            // Leading room for the `[■]` close box drawn over the corner below.
+            format!("    {} · Esc closes ", panel.title),
             Style::default()
                 .fg(theme_accent())
                 .add_modifier(Modifier::BOLD),
@@ -2398,6 +2665,51 @@ pub fn draw_report(
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     render_output(frame, inner, &panel.log, &mut panel.view, None);
+    // The Turbo Vision close box: `[■]` in the top-left corner of the frame,
+    // over the border, where a click dismisses the panel the way Esc does.
+    let close = Rect::new(rect.x + 1, rect.y, 3, 1);
+    if close.right() < rect.right() {
+        let buf = frame.buffer_mut();
+        for (x, ch) in (close.left()..close.right()).zip(REPORT_CLOSE_BOX) {
+            let cell = &mut buf[(x, close.y)];
+            cell.set_symbol(ch);
+            cell.set_style(
+                Style::default()
+                    .fg(theme_accent())
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+        set_report_close_rect(Some(close));
+    } else {
+        set_report_close_rect(None);
+    }
+}
+
+/// The glyphs of the report panel's close box, one per cell.
+const REPORT_CLOSE_BOX: [&str; 3] = ["[", "■", "]"];
+
+/// Screen rect the report panel's close box last occupied. It is never
+/// cleared when the panel goes away, because the only callers check that a
+/// panel is open first: a click on the box's old cells with no panel drawn
+/// there is just a click on the log.
+static REPORT_CLOSE_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+fn set_report_close_rect(rect: Option<Rect>) {
+    if let Ok(mut slot) = REPORT_CLOSE_RECT.lock() {
+        *slot = rect;
+    }
+}
+
+/// Whether a click at (`column`, `row`) landed on the report panel's close
+/// box. Meaningful only while a [`ReportPanel`] is open: the rect is the one
+/// from the last frame that drew a panel.
+#[must_use]
+pub fn report_close_click(column: u16, row: u16) -> bool {
+    REPORT_CLOSE_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
 }
 
 /// Draws the `@` suggestion popup over the output pane.
@@ -2503,6 +2815,7 @@ pub fn draw_popup(
         input_height(input_text, tw),
         0,
         roster_rows,
+        STATUS_ROWS,
     );
     let rows = u16::try_from(popup.rows().len()).unwrap_or(u16::MAX);
     render_popup(frame, popup_rect(g.output, g.input, rows), popup);
@@ -2631,6 +2944,7 @@ pub fn draw_slash_menu(
         input_height(input_text, tw),
         0,
         roster_rows,
+        STATUS_ROWS,
     );
     let rows = u16::try_from(menu.rows().len()).unwrap_or(u16::MAX);
     render_slash_menu(frame, popup_rect(g.output, g.input, rows), menu);
@@ -2795,6 +3109,9 @@ pub struct InputState<'a> {
     pub cursor: usize,
     /// Selected char range (half-open), when one is active.
     pub sel: Option<(usize, usize)>,
+    /// Ghost text shown dim after the cursor: the prompt suggestion, when
+    /// one is offered and the buffer is empty. Never drawn over typed text.
+    pub ghost: Option<&'a str>,
 }
 
 impl<'a> InputState<'a> {
@@ -2805,6 +3122,7 @@ impl<'a> InputState<'a> {
             text,
             cursor,
             sel: None,
+            ghost: None,
         }
     }
 }
@@ -2818,6 +3136,282 @@ impl<'a> InputState<'a> {
 /// busy with the prompt hidden), which is exactly when a click cannot land in
 /// it anyway.
 static INPUT_TEXT_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// The footer's jobs segment (`⧗ N jobs`) from the last drawn frame, for
+/// mouse hit-testing; `None` when no jobs were running on that frame.
+static JOBS_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// The footer's ctx gauge (`ctx N%`) from the last drawn frame, for mouse
+/// hit-testing; `None` when the row it was drawn on held no gauge.
+static CTX_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// The footer's task counter (`✓ Tasks: N/M`) from the last drawn frame, for
+/// mouse hit-testing; `None` when the task list was empty on that frame.
+static TASKS_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// Whether a click at (`column`, `row`) landed on the footer's task counter.
+#[must_use]
+pub fn tasks_click(column: u16, row: u16) -> bool {
+    TASKS_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// Screen rect the footer's throughput segment last occupied, so a click on
+/// the chart glyph can be mapped to it.
+static TOKS_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// Screen rect the footer's repro shutter last occupied, so a click on the
+/// camera can be mapped to it.
+static CAMERA_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// Screen rect the footer's think segment last occupied, so a click on the
+/// brain can be mapped to it.
+static THINK_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// Whether a click at (`column`, `row`) landed on the footer's jobs segment.
+#[must_use]
+pub fn jobs_click(column: u16, row: u16) -> bool {
+    JOBS_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// Whether a click at (`column`, `row`) landed on the footer's chart glyph
+/// (the throughput segment).
+#[must_use]
+pub fn toks_click(column: u16, row: u16) -> bool {
+    TOKS_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// Whether a click at (`column`, `row`) landed on the footer's repro shutter
+/// (the camera glyph in the dir prefix).
+#[must_use]
+pub fn camera_click(column: u16, row: u16) -> bool {
+    CAMERA_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// Whether a click at (`column`, `row`) landed on the footer's brain (the
+/// think segment).
+#[must_use]
+pub fn think_click(column: u16, row: u16) -> bool {
+    THINK_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// Whether a click at (`column`, `row`) landed on the footer's ctx gauge.
+#[must_use]
+pub fn ctx_click(column: u16, row: u16) -> bool {
+    CTX_RECT
+        .lock()
+        .ok()
+        .and_then(|r| *r)
+        .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+}
+
+/// The cells of row `y` of `area`, as the segment scanners read them.
+fn status_row_cells(buf: &ratatui::buffer::Buffer, area: Rect, y: u16) -> Vec<&str> {
+    (area.left()..area.right())
+        .map(|x| buf.cell((x, y)).map_or("", |c| c.symbol()))
+        .collect()
+}
+
+/// Widens `anchor` to the whole ` | `-separated run of cells it sits in,
+/// returning the inclusive `(start, end)` indices. Shared by the jobs and ctx
+/// hit boxes: scanning the drawn buffer rather than the source text means each
+/// box follows whatever elision and styling the bar applied.
+fn segment_bounds(cells: &[&str], anchor: usize) -> (usize, usize) {
+    let is_sep = |i: usize| {
+        i + 2 < cells.len() && cells[i] == " " && cells[i + 1] == "|" && cells[i + 2] == " "
+    };
+    let mut start = anchor;
+    while start > 0 && !(start >= 3 && is_sep(start - 3)) {
+        start -= 1;
+    }
+    let mut end = anchor;
+    while end + 1 < cells.len() && !is_sep(end + 1) {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// Finds the task counter in the status rows just drawn into `buf` and records
+/// its rect. The anchor is the literal `Tasks:` so a path or branch name that
+/// merely contains `tasks` cannot claim the hit box; the segment bounds are the
+/// ` | ` separators around it, as for the jobs segment. Called after every
+/// status render, so a frame drawn with an empty list forgets the rect.
+pub fn record_tasks_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    const ANCHOR: [&str; 6] = ["T", "a", "s", "k", "s", ":"];
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        let Some(anchor) =
+            (0..cells.len()).find(|&i| cells.get(i..i + ANCHOR.len()) == Some(&ANCHOR[..]))
+        else {
+            continue;
+        };
+        let (start, end) = segment_bounds(&cells, anchor);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = TASKS_RECT.lock() {
+        *g = found;
+    }
+}
+
+/// Finds the ctx gauge in the status rows just drawn into `buf` and records its
+/// rect. The anchor is the literal `ctx ` followed by digits and `%`, rather
+/// than a bare `ctx`, so a working directory or branch name containing those
+/// three letters cannot claim the hit box. Called after every status render, so
+/// a frame drawn without a gauge forgets the rect.
+pub fn record_ctx_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        // The gauge reads `ctx ` then at least one digit then `%`; scan for the
+        // first index where the whole shape matches.
+        let anchor = (0..cells.len()).find(|&i| {
+            if cells.get(i..i + 4) != Some(&["c", "t", "x", " "][..]) {
+                return false;
+            }
+            let mut j = i + 4;
+            while cells
+                .get(j)
+                .is_some_and(|c| c.chars().all(char::is_numeric) && !c.is_empty())
+            {
+                j += 1;
+            }
+            j > i + 4 && cells.get(j) == Some(&"%")
+        });
+        let Some(anchor) = anchor else { continue };
+        let (start, end) = segment_bounds(&cells, anchor);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = CTX_RECT.lock() {
+        *g = found;
+    }
+}
+
+/// Finds the jobs segment in the status rows just drawn into `buf` and records
+/// its rect. The segment is the run of cells between the ` | ` separators
+/// around [`crate::status::JOBS_MARK`]; scanning the buffer rather than the
+/// source text means the hit box follows whatever elision and styling the bar
+/// applied. Called after every status render so a frame without the mark
+/// forgets the rect.
+pub fn record_jobs_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        let Some(mark) = cells.iter().position(|c| *c == crate::status::JOBS_MARK) else {
+            continue;
+        };
+        let (start, end) = segment_bounds(&cells, mark);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = JOBS_RECT.lock() {
+        *g = found;
+    }
+}
+
+/// Finds the throughput segment in the status rows just drawn into `buf` and
+/// records its rect, exactly as [`record_jobs_rect`] does for the jobs segment:
+/// the anchor is [`crate::status::TOKS_MARK`] and the box is the run between
+/// the ` | ` separators around it. Called after every status render so a frame
+/// drawn without the glyph forgets the rect.
+pub fn record_toks_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        let Some(mark) = cells.iter().position(|c| *c == crate::status::TOKS_MARK) else {
+            continue;
+        };
+        let (start, end) = segment_bounds(&cells, mark);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = TOKS_RECT.lock() {
+        *g = found;
+    }
+}
+
+/// Finds the repro shutter in the status rows just drawn into `buf` and
+/// records its rect, exactly as [`record_toks_rect`] does for the chart glyph:
+/// the anchor is [`crate::status::CAMERA_MARK`] and the box is the run between
+/// the ` | ` separators around it. Called after every status render so a frame
+/// drawn without the glyph forgets the rect.
+pub fn record_camera_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        let Some(mark) = cells.iter().position(|c| *c == crate::status::CAMERA_MARK) else {
+            continue;
+        };
+        let (start, end) = segment_bounds(&cells, mark);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = CAMERA_RECT.lock() {
+        *g = found;
+    }
+}
+
+/// Finds the think segment in the status rows just drawn into `buf` and
+/// records its rect, exactly as [`record_camera_rect`] does for the shutter:
+/// the anchor is [`crate::status::THINK_MARK`] and the box is the run between
+/// the ` | ` separators around it, so the hit box follows whatever elision and
+/// styling the bar applied — which is the point, since the segments left of the
+/// brain (the path, the branch, the git stat) change width from frame to frame
+/// and a column computed from the source text would drift. Called after every
+/// status render so a frame drawn without the brain forgets the rect.
+///
+/// The box is the whole `🧠 med` segment, not the two columns of the glyph, for
+/// the reason every other footer control is segment-wide: the level beside the
+/// brain is the same control's label, and a two-column target in a status bar
+/// is a target users miss.
+pub fn record_think_rect(buf: &ratatui::buffer::Buffer, area: Rect) {
+    let mut found = None;
+    for y in area.top()..area.bottom() {
+        let cells = status_row_cells(buf, area, y);
+        let Some(mark) = cells.iter().position(|c| *c == crate::status::THINK_MARK) else {
+            continue;
+        };
+        let (start, end) = segment_bounds(&cells, mark);
+        let x = area.left() + u16::try_from(start).unwrap_or(0);
+        let w = u16::try_from(end - start + 1).unwrap_or(1);
+        found = Some(Rect::new(x, y, w, 1));
+        break;
+    }
+    if let Ok(mut g) = THINK_RECT.lock() {
+        *g = found;
+    }
+}
 
 /// The prompt text rect from the last drawn frame, for mouse hit-testing.
 #[must_use]
@@ -2978,6 +3572,21 @@ fn render_input(frame: &mut Frame, input_area: Rect, state: InputState<'_>) {
     };
     set_input_rect(Some(text_area));
     let (lines, cur_row, cur_col) = wrap_input(input, text_area.width, state.cursor, state.sel);
+    // The ghost is drawn only over an empty buffer, and the check lives here
+    // rather than at the call site on purpose: this is the last point before
+    // the pixels, so no earlier mistake can paint a suggestion over something
+    // the user typed.
+    let lines = match state.ghost {
+        Some(ghost) if input.is_empty() && !ghost.is_empty() => {
+            vec![Line::from(Span::styled(
+                ghost.to_owned(),
+                Style::default()
+                    .fg(Color::Indexed(245))
+                    .add_modifier(Modifier::DIM),
+            ))]
+        }
+        _ => lines,
+    };
     frame.render_widget(Paragraph::new(lines), text_area);
 
     let caret = Position::new(
@@ -3058,7 +3667,12 @@ pub fn render_diff_card(log: &mut OutputLog, p: &crate::tools::diff::EditPreview
         .bg(Color::Indexed(28))
         .fg(Color::Indexed(231))
         .add_modifier(Modifier::BOLD);
-    for row in &p.rows {
+    // Syntax colours for the code text of every row, computed once for the
+    // whole card (see `highlight_diff_rows`); empty when the file's extension
+    // names no grammar we have, which leaves the flat rendering below intact.
+    let syntax = highlight_diff_rows(p).unwrap_or_default();
+    let syntax_for = |i: usize| syntax.get(i).map_or(&[][..], Vec::as_slice);
+    for (i, row) in p.rows.iter().enumerate() {
         match row {
             DiffRow::Hunk {
                 old_start,
@@ -3069,23 +3683,41 @@ pub fn render_diff_card(log: &mut OutputLog, p: &crate::tools::diff::EditPreview
                 format!("  @@ -{old_start},{old_len} +{new_start},{new_len} @@"),
                 Style::default().fg(Color::Indexed(44)),
             )]),
-            DiffRow::Context { text, .. } => log.push_spans(vec![
-                Span::styled(format!("{}   ", gutter(row.gutter())), dim),
-                Span::raw(text.clone()),
-            ]),
+            DiffRow::Context { text, .. } => log.push_spans(diff_line_spans(
+                &format!("{}   ", gutter(row.gutter())),
+                text,
+                None,
+                syntax_for(i),
+                RowStyles {
+                    prefix: dim,
+                    base: Style::default(),
+                    emph: Style::default(),
+                    tone: Tone::Context,
+                },
+            )),
             DiffRow::Del { text, segments, .. } => log.push_spans(diff_line_spans(
                 &format!("{} - ", gutter(row.gutter())),
                 text,
                 segments.as_deref(),
-                del,
-                del_emph,
+                syntax_for(i),
+                RowStyles {
+                    prefix: del,
+                    base: del,
+                    emph: del_emph,
+                    tone: Tone::Del,
+                },
             )),
             DiffRow::Add { text, segments, .. } => log.push_spans(diff_line_spans(
                 &format!("{} + ", gutter(row.gutter())),
                 text,
                 segments.as_deref(),
-                add,
-                add_emph,
+                syntax_for(i),
+                RowStyles {
+                    prefix: add,
+                    base: add,
+                    emph: add_emph,
+                    tone: Tone::Add,
+                },
             )),
             DiffRow::Elision(n) => {
                 log.push_spans(vec![Span::styled(format!("      ⋯ {n} more lines ⋯"), dim)]);
@@ -3095,32 +3727,447 @@ pub fn render_diff_card(log: &mut OutputLog, p: &crate::tools::diff::EditPreview
     log.push_spans(vec![]);
 }
 
-/// Builds the styled spans for one Del/Add diff row. With word-level `segments`,
-/// the `prefix` (gutter + sigil) and common runs take `base` while changed runs
-/// take `emph`; without segments the whole line is one `base` span, matching the
-/// prior line-level rendering.
+/// Which side of the diff a run of code sits on, and so which background its
+/// syntax colour has to survive. See [`tone_fg`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tone {
+    /// Over the added background (green, index 22/28): lifted.
+    Add,
+    /// Over the removed background (red, index 52/88): muted.
+    Del,
+    /// No diff background at all: the colour is used as the highlighter gave it.
+    Context,
+}
+
+/// The three style layers one diff row is painted with, plus which diff
+/// background its syntax colours must survive.
+#[derive(Clone, Copy)]
+struct RowStyles {
+    /// Style for the gutter + sigil, which is never syntax-coloured.
+    prefix: Style,
+    /// The row's diff background and default foreground.
+    base: Style,
+    /// Background/modifier for a word-diff changed run.
+    emph: Style,
+    tone: Tone,
+}
+
+/// One syntax-coloured run of a row: a byte range into that row's `text` and
+/// the style the highlighter gave it.
+type SyntaxRun = (usize, usize, Style);
+
+/// The grammar name for a path, or `None` when we would be guessing.
+///
+/// Keyed off the extension only, and mapped to the names
+/// `ratatui_markdown`'s matcher accepts. An extension that is not listed
+/// returns `None` and the card renders exactly as it did before syntax
+/// highlighting existed: a wrong grammar looks worse than no grammar.
+fn diff_lang(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    let lang = match ext.as_str() {
+        "rs" => "rust",
+        "py" | "pyi" => "python",
+        "go" => "go",
+        "java" => "java",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "tsx",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "cs" => "csharp",
+        "sh" | "bash" | "zsh" => "bash",
+        "rb" => "ruby",
+        "swift" => "swift",
+        "php" => "php",
+        "scala" | "sc" => "scala",
+        "kt" | "kts" => "kotlin",
+        "lua" => "lua",
+        "hs" => "haskell",
+        "ex" | "exs" => "elixir",
+        "yaml" | "yml" => "yaml",
+        "dart" => "dart",
+        "zig" => "zig",
+        "ml" | "mli" => "ocaml",
+        "nix" => "nix",
+        "html" | "htm" => "html",
+        "css" | "scss" | "less" => "css",
+        "xml" | "svg" | "xsd" => "xml",
+        "json" => "json",
+        "toml" => "toml",
+        "sol" => "solidity",
+        "patch" | "diff" => "diff",
+        "ps1" | "psm1" => "powershell",
+        "m" | "mm" => "objc",
+        "cmake" => "cmake",
+        "proto" => "proto",
+        "r" => "r",
+        _ => return None,
+    };
+    Some(lang)
+}
+
+/// Syntax runs for every row of a diff card, indexed by row.
+///
+/// Highlighting each line on its own mis-colours anything that spans lines — a
+/// block comment, a multi-line string, a nested brace — so each *side* of each
+/// hunk is reassembled into one buffer and highlighted whole:
+///
+/// * the old-side buffer is that hunk's context + removed lines, in order;
+/// * the new-side buffer is that hunk's context + added lines, in order.
+///
+/// Each buffer is therefore a verbatim slice of one real version of the file,
+/// which is what makes multi-line constructs come out right. The byte ranges
+/// the highlighter returns are mapped back by remembering where each row
+/// started in its buffer and clipping the runs to that window.
+///
+/// Buffers are cut at every `@@` header and every elision marker, because
+/// across those the text is *not* contiguous and splicing it would invent
+/// syntax that is not in the file. Within such a buffer the leading context is
+/// still genuinely missing (a hunk can begin inside a function body, or inside
+/// a block comment); tree-sitter error-recovers, so the damage is bounded to
+/// that hunk and usually invisible — an unterminated construct at a hunk's top
+/// edge is the one case that can still colour oddly, and it cannot be fixed
+/// without reading the whole file, which the card does not have.
+///
+/// Returns `None` when the path names no grammar, so the caller keeps the
+/// previous flat rendering.
+fn highlight_diff_rows(p: &crate::tools::diff::EditPreview) -> Option<Vec<Vec<SyntaxRun>>> {
+    use crate::tools::diff::DiffRow;
+    use ratatui_markdown::highlight::CodeHighlighter;
+
+    let lang = diff_lang(&p.path)?;
+    let hl = highlighter();
+    let mut out: Vec<Vec<SyntaxRun>> = vec![Vec::new(); p.rows.len()];
+
+    // One contiguous run of code rows; flushed at each structural row.
+    let mut old_side: Vec<(usize, &str)> = Vec::new();
+    let mut new_side: Vec<(usize, &str)> = Vec::new();
+    let flush = |old: &mut Vec<(usize, &str)>,
+                 new: &mut Vec<(usize, &str)>,
+                 out: &mut Vec<Vec<SyntaxRun>>| {
+        for side in [&*old, &*new] {
+            if side.is_empty() {
+                continue;
+            }
+            let mut buf = String::new();
+            // (row index, byte offset of the row's text in `buf`).
+            let mut spots: Vec<(usize, usize)> = Vec::with_capacity(side.len());
+            for (idx, text) in side {
+                spots.push((*idx, buf.len()));
+                buf.push_str(text);
+                buf.push('\n');
+            }
+            let segs = hl.highlight(lang, &buf);
+            if segs.is_empty() {
+                continue;
+            }
+            // Both lists are sorted by start offset, so one pass over the
+            // segments per row suffices; `cursor` never walks backwards.
+            let mut cursor = 0usize;
+            for (i, (idx, off)) in spots.iter().enumerate() {
+                let len = side[i].1.len();
+                let end = off + len;
+                while cursor < segs.len() && segs[cursor].end <= *off {
+                    cursor += 1;
+                }
+                let mut runs = Vec::new();
+                let mut scan = cursor;
+                while scan < segs.len() && segs[scan].start < end {
+                    let s = segs[scan].start.max(*off) - off;
+                    let e = segs[scan].end.min(end) - off;
+                    if s < e {
+                        runs.push((s, e, segs[scan].style));
+                    }
+                    scan += 1;
+                }
+                out[*idx] = runs;
+            }
+        }
+        old.clear();
+        new.clear();
+    };
+
+    for (i, row) in p.rows.iter().enumerate() {
+        match row {
+            DiffRow::Context { text, .. } => {
+                old_side.push((i, text));
+                new_side.push((i, text));
+            }
+            DiffRow::Del { text, .. } => old_side.push((i, text)),
+            DiffRow::Add { text, .. } => new_side.push((i, text)),
+            DiffRow::Hunk { .. } | DiffRow::Elision(_) => {
+                flush(&mut old_side, &mut new_side, &mut out);
+            }
+        }
+    }
+    flush(&mut old_side, &mut new_side, &mut out);
+    Some(out)
+}
+
+/// Adapts one syntax colour to the diff background it will be painted on.
+///
+/// The fork's code palette was picked for a plain terminal background, where a
+/// dark comment grey or a green string reads fine; over the card's saturated
+/// red (index 52/88) and green (22/28) several of those colours either vanish
+/// or fight the background. Each colour is resolved to RGB and then:
+///
+/// * **Add** — blended 22% toward white and floored at 0.55 relative
+///   luminance, so every token clears the green ground;
+/// * **Del** — blended 30% toward the removal red and clamped into
+///   0.34…0.72 luminance, which keeps the tokens distinguishable but visibly
+///   *muted* next to the added side, as the reference screenshots show;
+/// * **Context** — left exactly as the highlighter gave it, since no diff
+///   background is painted there.
+///
+/// The result is quantised back to the xterm 6×6×6 cube so the card stays in
+/// the same indexed palette as its backgrounds and the gutter.
+fn tone_fg(c: Color, tone: Tone) -> Color {
+    if tone == Tone::Context {
+        return c;
+    }
+    let Some([r, g, b]) = color_rgb(c) else {
+        return c;
+    };
+    let (mut r, mut g, mut b) = (f32::from(r), f32::from(g), f32::from(b));
+    let mix = |v: &mut f32, target: f32, t: f32| *v += (target - *v) * t;
+    match tone {
+        Tone::Add => {
+            for v in [&mut r, &mut g, &mut b] {
+                mix(v, 255.0, 0.22);
+            }
+            lift(&mut r, &mut g, &mut b, 0.55);
+        }
+        Tone::Del => {
+            // 0x5f0000 is xterm index 52, the removal background.
+            mix(&mut r, 95.0, 0.30);
+            mix(&mut g, 0.0, 0.30);
+            mix(&mut b, 0.0, 0.30);
+            lift(&mut r, &mut g, &mut b, 0.34);
+            damp(&mut r, &mut g, &mut b, 0.72);
+        }
+        Tone::Context => unreachable!(),
+    }
+    Color::Indexed(cube_index(r, g, b))
+}
+
+/// Relative luminance of a 0…255 RGB triple, normalised to 0…1.
+fn luminance(r: f32, g: f32, b: f32) -> f32 {
+    (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+}
+
+/// Blends toward white until the triple reaches `min` luminance.
+fn lift(r: &mut f32, g: &mut f32, b: &mut f32, min: f32) {
+    let lum = luminance(*r, *g, *b);
+    if lum >= min || lum >= 1.0 {
+        return;
+    }
+    let t = (min - lum) / (1.0 - lum);
+    for v in [r, g, b] {
+        *v += (255.0 - *v) * t;
+    }
+}
+
+/// Scales the triple down until it is no brighter than `max` luminance.
+fn damp(r: &mut f32, g: &mut f32, b: &mut f32, max: f32) {
+    let lum = luminance(*r, *g, *b);
+    if lum <= max || lum <= 0.0 {
+        return;
+    }
+    let t = max / lum;
+    for v in [r, g, b] {
+        *v *= t;
+    }
+}
+
+/// Nearest xterm 6×6×6 colour-cube index for a 0…255 RGB triple.
+fn cube_index(red: f32, green: f32, blue: f32) -> u8 {
+    const LEVELS: [f32; 6] = [0.0, 95.0, 135.0, 175.0, 215.0, 255.0];
+    let quantise = |value: f32| -> u8 {
+        let value = value.clamp(0.0, 255.0);
+        let mut best = 0u8;
+        let mut best_dist = f32::MAX;
+        for (slot, level) in LEVELS.iter().enumerate() {
+            let dist = (value - level).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = u8::try_from(slot).unwrap_or(0);
+            }
+        }
+        best
+    };
+    16 + 36 * quantise(red) + 6 * quantise(green) + quantise(blue)
+}
+
+/// RGB for the colours the highlighter can hand back: the 16 ANSI names, the
+/// 256-colour palette, and literal RGB. `None` for `Reset`, which has no fixed
+/// value and is passed through untouched.
+fn color_rgb(c: Color) -> Option<[u8; 3]> {
+    let named = |i: u8| -> [u8; 3] {
+        // The xterm defaults for indices 0..16.
+        const ANSI: [[u8; 3]; 16] = [
+            [0, 0, 0],
+            [205, 0, 0],
+            [0, 205, 0],
+            [205, 205, 0],
+            [0, 0, 238],
+            [205, 0, 205],
+            [0, 205, 205],
+            [229, 229, 229],
+            [127, 127, 127],
+            [255, 0, 0],
+            [0, 255, 0],
+            [255, 255, 0],
+            [92, 92, 255],
+            [255, 0, 255],
+            [0, 255, 255],
+            [255, 255, 255],
+        ];
+        ANSI[i as usize & 15]
+    };
+    let idx = match c {
+        Color::Reset => return None,
+        Color::Rgb(r, g, b) => return Some([r, g, b]),
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+        Color::Indexed(i) => i,
+    };
+    if idx < 16 {
+        return Some(named(idx));
+    }
+    if idx < 232 {
+        const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        let i = idx - 16;
+        return Some([
+            LEVELS[(i / 36) as usize],
+            LEVELS[((i / 6) % 6) as usize],
+            LEVELS[(i % 6) as usize],
+        ]);
+    }
+    let v = 8 + (idx - 232) * 10;
+    Some([v, v, v])
+}
+
+/// Builds the styled spans for one diff row, composing three layers.
+///
+/// * **Background** comes from the diff: `base` (red for a removal, green for
+///   an addition, nothing for context) on every cell of the row, so the row
+///   still reads as one continuous stripe.
+/// * **Foreground** comes from `syntax` — byte ranges into `text`, toned for
+///   this row's [`Tone`] — wherever the highlighter had an opinion; elsewhere
+///   the layer's own foreground stands.
+/// * **Word-diff emphasis** *modulates* rather than overwrites: a changed run
+///   keeps its syntax colour and takes `emph`'s brighter background and bold,
+///   so all three layers are legible at once. Letting `emph` repaint the
+///   foreground white, as it used to, would erase the syntax colour exactly on
+///   the bytes the reader most wants to see.
+///
+/// The `prefix` (gutter and `+`/`-` sigil) is never syntax-coloured: it is not
+/// code, and colouring it would make the sigil column jitter between rows.
+/// Only the `syntax` argument is new; with an empty `syntax` this produces
+/// byte-for-byte the spans it produced before highlighting existed.
 fn diff_line_spans(
     prefix: &str,
     text: &str,
     segments: Option<&[crate::tools::diff::Segment]>,
-    base: Style,
-    emph: Style,
+    syntax: &[SyntaxRun],
+    st: RowStyles,
 ) -> Vec<Span<'static>> {
     use crate::tools::diff::SegKind;
-    match segments {
-        Some(segs) => {
-            let mut spans = vec![Span::styled(prefix.to_string(), base)];
-            for seg in segs {
-                let style = match seg.kind {
+    let RowStyles {
+        prefix: prefix_style,
+        base,
+        emph,
+        tone,
+    } = st;
+    if syntax.is_empty() {
+        // Unchanged flat rendering.
+        return match segments {
+            Some(segs) => {
+                let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
+                for seg in segs {
+                    let style = match seg.kind {
+                        SegKind::Removed | SegKind::Added => emph,
+                        SegKind::Common => base,
+                    };
+                    spans.push(Span::styled(seg.text.clone(), style));
+                }
+                spans
+            }
+            None => vec![
+                Span::styled(prefix.to_string(), prefix_style),
+                Span::styled(text.to_string(), base),
+            ],
+        };
+    }
+
+    // Every boundary either layer introduces, so each emitted span is covered
+    // by exactly one word-diff segment and at most one syntax run.
+    let mut cuts: Vec<usize> = vec![0, text.len()];
+    if let Some(segs) = segments {
+        let mut at = 0usize;
+        for seg in segs {
+            at += seg.text.len();
+            cuts.push(at.min(text.len()));
+        }
+    }
+    for (s, e, _) in syntax {
+        cuts.push((*s).min(text.len()));
+        cuts.push((*e).min(text.len()));
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let word_style = |at: usize| -> Style {
+        let Some(segs) = segments else { return base };
+        let mut start = 0usize;
+        for seg in segs {
+            let end = start + seg.text.len();
+            if at < end {
+                return match seg.kind {
                     SegKind::Removed | SegKind::Added => emph,
                     SegKind::Common => base,
                 };
-                spans.push(Span::styled(seg.text.clone(), style));
             }
-            spans
+            start = end;
         }
-        None => vec![Span::styled(format!("{prefix}{text}"), base)],
+        base
+    };
+
+    let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
+    for w in cuts.windows(2) {
+        let (s, e) = (w[0], w[1]);
+        if s >= e {
+            continue;
+        }
+        let mut style = word_style(s);
+        if let Some((_, _, syn)) = syntax.iter().find(|(rs, re, _)| *rs <= s && s < *re) {
+            if let Some(fg) = syn.fg {
+                style = style.fg(tone_fg(fg, tone));
+            }
+            // Only italics carry over: bold is the word-diff emphasis signal
+            // here, and letting a keyword claim it would blur the two.
+            style = style.add_modifier(syn.add_modifier & Modifier::ITALIC);
+        }
+        spans.push(Span::styled(text[s..e].to_string(), style));
     }
+    spans
 }
 
 /// Minimal pre-UI screen shown while the KV cache is (re)built at launch: a
@@ -3142,6 +4189,11 @@ pub fn draw_warm(
     let done = done.clamp(0, total);
     let pct = u16::try_from(i64::from(done) * 100 / i64::from(total)).unwrap_or(100);
     let bar = crate::status::progress_bar(done, total, tps, false);
+    // ETA sits after the percentage so the bar+t/s prefix keeps a stable width;
+    // it is absent until the rate is known, rather than showing a bogus `~0s`.
+    let eta = crate::status::prefill_eta(done, total, tps)
+        .map(|eta| format!("  ~{eta} left"))
+        .unwrap_or_default();
     let area = frame.area();
     let rows = Layout::vertical([
         Constraint::Percentage(45),
@@ -3157,7 +4209,7 @@ pub fn draw_warm(
                 .add_modifier(Modifier::BOLD),
         ))
         .centered(),
-        Line::from(format!("{bar}  {pct}%")).centered(),
+        Line::from(format!("{bar}  {pct}%{eta}")).centered(),
     ]);
     frame.render_widget(Paragraph::new(text), rows[1]);
     // Reason for the rebuild (cache missing / prompt changed + diff), below the
@@ -3999,10 +5051,17 @@ pub fn draw(
             anim_tick_ms(),
             status_style,
             tasks,
+            input.is_none(),
         ))
         .style(status_style),
         status_row,
     );
+    record_jobs_rect(frame.buffer_mut(), status_row);
+    record_ctx_rect(frame.buffer_mut(), status_row);
+    record_tasks_rect(frame.buffer_mut(), status_row);
+    record_toks_rect(frame.buffer_mut(), status_row);
+    record_camera_rect(frame.buffer_mut(), status_row);
+    record_think_rect(frame.buffer_mut(), status_row);
 }
 
 /// Draws one frame while an `ask` question (issue #34) is up: the output log
@@ -4043,10 +5102,17 @@ pub fn draw_ask(
             anim_tick_ms(),
             status_style,
             tasks,
+            false,
         ))
         .style(status_style),
         r[2],
     );
+    record_jobs_rect(frame.buffer_mut(), r[2]);
+    record_ctx_rect(frame.buffer_mut(), r[2]);
+    record_tasks_rect(frame.buffer_mut(), r[2]);
+    record_toks_rect(frame.buffer_mut(), r[2]);
+    record_camera_rect(frame.buffer_mut(), r[2]);
+    record_think_rect(frame.buffer_mut(), r[2]);
 }
 
 /// Renders the question panel: a header chip and question, then the options as a
@@ -4148,7 +5214,7 @@ fn render_output(
         view.follow = true;
     }
     // Skip whole lines above the viewport so the `u16` scroll stays small.
-    let (text, scroll) = log.window(width, view.top);
+    let (text, scroll) = log.window(width, view.top, area.height);
     let para = Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
@@ -4232,10 +5298,17 @@ pub fn draw_btw_split(
             anim_tick_ms(),
             status_style,
             tasks,
+            input.is_none(),
         ))
         .style(status_style),
         status_row,
     );
+    record_jobs_rect(frame.buffer_mut(), status_row);
+    record_ctx_rect(frame.buffer_mut(), status_row);
+    record_tasks_rect(frame.buffer_mut(), status_row);
+    record_toks_rect(frame.buffer_mut(), status_row);
+    record_camera_rect(frame.buffer_mut(), status_row);
+    record_think_rect(frame.buffer_mut(), status_row);
 }
 
 /// Overlays the sub-agent pane's identity on the output area's top row: the
@@ -4377,6 +5450,17 @@ fn push_dir_prefix(
         }
         None => (segment, String::new()),
     };
+    // The shutter is the last segment of row one, between the tree it snapshots
+    // and the origin already peeled above. Peel it so it keeps the bar's own
+    // style instead of being painted as part of the branch or the git stat.
+    let camera = crate::status::CAMERA_MARK;
+    let (segment, shutter) = match segment.trim_end().strip_suffix(camera) {
+        Some(head) => {
+            let head = head.trim_end();
+            (head.strip_suffix('|').map_or(head, str::trim_end), camera)
+        }
+        None => (segment, ""),
+    };
     if let Some(gi) = segment.find(glyph) {
         let path = segment[..gi].trim_end();
         let tail = segment[gi + glyph.len_utf8()..].trim();
@@ -4402,8 +5486,14 @@ fn push_dir_prefix(
             first.push(Span::styled(" | ".to_string(), base));
             push_git_stat(first, stat, base);
         }
-    } else {
+    } else if !segment.trim_end().is_empty() {
         first.push(Span::styled(segment.trim_end().to_string(), theme));
+    }
+    if !shutter.is_empty() {
+        if !first.is_empty() {
+            first.push(Span::styled(" | ".to_string(), base));
+        }
+        first.push(Span::styled(shutter.to_string(), base));
     }
     // The origin heads the *second* row rather than trailing the first: row one
     // answers "which tree am I in", and only that, so it stays readable at a
@@ -4534,7 +5624,27 @@ fn compact_slot_spans(frac: f64, tick_ms: u64, base: Style) -> Vec<Span<'static>
 ///
 /// The bar segment lives between `[` and `]`; `▶` cells render in the theme
 /// color (military green) and `·` cells a dim gray.
-fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> Vec<Line<'static>> {
+/// Whether the rotating tip should render on its own indented line below the
+/// status bar rather than in the tail slot. Only while the agent is working
+/// (`input_hidden`), so the extra row never pushes a resting prompt around; and
+/// only when nothing else owns the tail (no running tool, no flash) and a tip
+/// is actually within its visibility window. `frame_rows` and
+/// [`status_bar_lines`] both consult this so the reserved height and the
+/// rendered lines agree.
+fn tip_on_own_line(input_hidden: bool, tick_ms: u64) -> bool {
+    input_hidden
+        && crate::status::tool_activity().is_none()
+        && crate::status::flash_tip().is_none()
+        && !crate::status::rotating_tip(tick_ms).is_empty()
+}
+
+fn status_bar_lines(
+    text: &str,
+    tick_ms: u64,
+    base: Style,
+    tasks: &TaskView,
+    input_hidden: bool,
+) -> Vec<Line<'static>> {
     let theme = base
         .fg(Color::Indexed(crate::status::THEME_COLOR))
         .add_modifier(Modifier::BOLD);
@@ -4561,32 +5671,13 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
     };
     // The think segment is its own span: plain, like the ctx gauge and power
     // suffix it sits beside, and kept away from `push_accented`'s verb shimmer.
-    //
-    // While the *local* engine is prefilling or generating, the brain gives way
-    // to `crate::experts`' routing glyph: the one on-screen signal that says
-    // which engine is actually working, which is otherwise invisible for a
-    // `provider: local` sidechain under a remote main agent. It replaced a blink
-    // because a two-state pulse says only "something is happening", while the
-    // glyph carries the shape of the work — a few of many experts per token,
-    // changing every token. It is a stand-in, not a readout; `crate::experts`
-    // documents exactly what it does and does not claim.
-    //
-    // Braille rather than a second emoji so the segment can carry the theme
-    // color: `THINK_MARK` is a color emoji, and a terminal paints those from the
-    // glyph's own palette — an earlier version dimmed its foreground, which a
-    // terminal simply does not render. Two cells, matching the brain's two
-    // columns, so the swap never reflows the bar.
-    //
-    // Seeded off the live token (else off the pass's own elapsed time, not
-    // `tick_ms`): the status bar redraws when a prefill/generation event lands —
-    // the same event that moves the `9s` and `t/s` readouts — so the glyph steps
-    // in time with the counters beside it.
+    // The brain is static: the expert-routing glyph that used to replace it
+    // while the local engine worked now leads the window title instead, so the
+    // bar holds still and the animation lives in one place.
     if text.starts_with(think_mark)
         && let Some(i) = text.find(" | ")
     {
         let segment = &text[..i];
-        // Reduced motion holds the static brain, like every other effect.
-        let routing = crate::status::local_pass_active() && !crate::anim::reduced_motion();
         let rest = segment.strip_prefix(think_mark).unwrap_or(segment);
         // The level name is temperature-colored (`crate::status::think_color`).
         // The level is read back out of the rendered footer rather than threaded
@@ -4596,14 +5687,7 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
         let level = crate::engine::ThinkMode::parse(rest).map_or(base, |m| {
             base.fg(Color::Indexed(crate::status::think_color(m)))
         });
-        if routing {
-            spans.push(Span::styled(
-                crate::experts::glyphs(crate::status::routing_seed()),
-                theme,
-            ));
-        } else {
-            spans.push(Span::styled(think_mark.to_string(), base));
-        }
+        spans.push(Span::styled(think_mark.to_string(), base));
         spans.push(Span::styled(rest.to_string(), level));
         spans.push(Span::styled(" | ".to_string(), base));
         text = &text[i + " | ".len()..];
@@ -4672,23 +5756,257 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
             flash,
             base.fg(Color::Green).add_modifier(Modifier::BOLD),
         ));
-    } else {
-        let tip = crate::status::rotating_tip(tick_ms);
-        if !tip.is_empty() {
-            spans.push(Span::styled(" | ".to_string(), base));
-            spans.push(Span::styled(
-                format!("💡 {tip}"),
-                base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
-        }
     }
-    vec![Line::from(first), Line::from(spans)]
+    // The rotating tip: appended to the tail at rest, or returned as its own
+    // indented line while the agent works.
+    let tip_line = place_rotating_tip(&mut spans, base, tick_ms, input_hidden);
+    let mut lines = vec![Line::from(first), Line::from(spans)];
+    if let Some(tip_line) = tip_line {
+        lines.push(tip_line);
+    }
+    lines
+}
+
+/// Places the rotating tip. At rest it is pushed onto `spans` (the status
+/// tail); while the agent works (`input_hidden`) it is returned as its own
+/// indented `└` line below the progress row, matching the `└` continuations
+/// used elsewhere. Yellow-bold either way. Returns `None` when a running tool
+/// or a flash owns the tail, or no tip is within its visibility window.
+fn place_rotating_tip(
+    spans: &mut Vec<Span<'static>>,
+    base: Style,
+    tick_ms: u64,
+    input_hidden: bool,
+) -> Option<Line<'static>> {
+    if crate::status::tool_activity().is_some() || crate::status::flash_tip().is_some() {
+        return None;
+    }
+    let tip = crate::status::rotating_tip(tick_ms);
+    if tip.is_empty() {
+        return None;
+    }
+    let tip_span = Span::styled(
+        format!("💡 {tip}"),
+        base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    );
+    if input_hidden {
+        return Some(Line::from(vec![
+            Span::styled("  └ ".to_string(), base.fg(Color::Indexed(240))),
+            tip_span,
+        ]));
+    }
+    spans.push(Span::styled(" | ".to_string(), base));
+    spans.push(tip_span);
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::SubPane;
     use unicode_width::UnicodeWidthStr;
+
+    /// The click box for the footer's jobs segment is the run between the
+    /// ` | ` separators around the mark, and a frame without the mark clears it.
+    #[test]
+    fn jobs_rect_spans_the_segment_between_separators() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 40, 1);
+        let text = "ctx 12% | ⧗ 2 jobs | idle";
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, text, ratatui::style::Style::default());
+        super::record_jobs_rect(&buf, area);
+        // "ctx 12% | " is 10 cells; the segment "⧗ 2 jobs" is 8 cells.
+        assert!(super::jobs_click(10, 0));
+        assert!(super::jobs_click(17, 0));
+        assert!(!super::jobs_click(9, 0), "the separator is not the segment");
+        assert!(!super::jobs_click(18, 0));
+        assert!(!super::jobs_click(12, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_jobs_rect(&quiet, area);
+        assert!(!super::jobs_click(10, 0), "no mark, no hit box");
+    }
+
+    /// The chart glyph gets its own segment-wide click box, so a press
+    /// anywhere in the throughput segment opens `/toks`.
+    #[test]
+    fn toks_rect_spans_the_chart_segment() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 40, 1);
+        let text = format!("ctx 12% | {} | idle", crate::status::toks_segment());
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, &text, ratatui::style::Style::default());
+        super::record_toks_rect(&buf, area);
+        // "ctx 12% | " is 10 cells; the wide glyph spans the next two.
+        assert!(super::toks_click(10, 0), "the glyph itself");
+        assert!(!super::toks_click(9, 0), "the separator is not the segment");
+        assert!(!super::toks_click(12, 0), "past the segment");
+        assert!(!super::toks_click(10, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_toks_rect(&quiet, area);
+        assert!(!super::toks_click(10, 0), "no glyph, no hit box");
+    }
+
+    /// The camera gets its own segment-wide click box on the dir-prefix row,
+    /// so a press on the shutter writes a `/repro`.
+    #[test]
+    fn camera_rect_spans_the_shutter_segment() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 40, 1);
+        let text = format!("~/p \u{e0a0} main | {} | ds4", crate::status::CAMERA_MARK);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, &text, ratatui::style::Style::default());
+        super::record_camera_rect(&buf, area);
+        // "~/p \u{e0a0} main | " is 13 cells; the wide glyph spans the next two.
+        assert!(super::camera_click(13, 0), "the glyph itself");
+        assert!(
+            !super::camera_click(12, 0),
+            "the separator is not the segment"
+        );
+        assert!(!super::camera_click(15, 0), "past the segment");
+        assert!(!super::camera_click(13, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_camera_rect(&quiet, area);
+        assert!(!super::camera_click(13, 0), "no glyph, no hit box");
+    }
+
+    /// `THINK_RECT` is one process-wide slot, so the two tests that record
+    /// into it must not overlap.
+    static THINK_RECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The brain gets its own segment-wide click box, so a press anywhere in
+    /// the think segment flips `showThinking`.
+    #[test]
+    fn think_rect_spans_the_brain_segment() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let _g = THINK_RECT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let area = Rect::new(0, 0, 40, 1);
+        let text = format!("~/p | {} med | ctx 12%", crate::status::THINK_MARK);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, &text, ratatui::style::Style::default());
+        super::record_think_rect(&buf, area);
+        // "~/p | " is 6 cells; the wide glyph spans the next two, then " med".
+        assert!(super::think_click(6, 0), "the glyph itself");
+        assert!(super::think_click(10, 0), "through the level label");
+        assert!(
+            !super::think_click(5, 0),
+            "the separator is not the segment"
+        );
+        assert!(!super::think_click(12, 0), "past the segment");
+        assert!(!super::think_click(6, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_think_rect(&quiet, area);
+        assert!(!super::think_click(6, 0), "no glyph, no hit box");
+    }
+
+    /// The case a column computed from the source text gets wrong: everything
+    /// left of the brain changes width (a longer path, a git stat segment, a
+    /// different think level), and the hit box still lands on the brain
+    /// because it is read back out of the drawn buffer.
+    #[test]
+    fn think_rect_follows_the_segments_left_of_it() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let _g = THINK_RECT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let area = Rect::new(0, 0, 60, 1);
+        for (prefix, level) in [
+            ("~/p | ", "med"),
+            ("~/plank \u{e0a0} main | ", "hi"),
+            (
+                &format!(
+                    "~/plank \u{e0a0} main | {} 3 | ",
+                    crate::status::GIT_STAT_MARK
+                ),
+                "off",
+            ),
+        ] {
+            let mut buf = Buffer::empty(area);
+            let text = format!("{prefix}{} {level} | ctx 12%", crate::status::THINK_MARK);
+            buf.set_string(0, 0, &text, ratatui::style::Style::default());
+            super::record_think_rect(&buf, area);
+            // Where the brain actually landed, measured the way the bar
+            // measures: display columns, so the wide glyphs in the prefix
+            // count for two.
+            let at = u16::try_from(crate::status::visible_width(prefix)).unwrap();
+            assert!(super::think_click(at, 0), "brain at {at} for {text:?}");
+            assert!(
+                super::think_click(at + u16::try_from(level.len()).unwrap() + 2, 0),
+                "level end for {text:?}"
+            );
+            assert!(
+                !super::think_click(at.saturating_sub(1), 0),
+                "the separator before the brain for {text:?}"
+            );
+            assert!(
+                !super::think_click(at + u16::try_from(level.len()).unwrap() + 3, 0),
+                "the separator after the level for {text:?}"
+            );
+        }
+    }
+
+    /// The ctx gauge gets the same segment-wide click box, and its anchor is
+    /// the whole `ctx <digits>%` shape: a directory or branch name that merely
+    /// contains the three letters must not claim the box.
+    #[test]
+    fn ctx_rect_spans_the_gauge_and_ignores_lookalike_text() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 40, 1);
+        // The leading `ctx ` here is followed by a letter, not a digit.
+        let text = "my ctx dir | ctx 12% | idle";
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, text, ratatui::style::Style::default());
+        super::record_ctx_rect(&buf, area);
+        assert!(super::ctx_click(13, 0), "the gauge itself");
+        assert!(super::ctx_click(19, 0), "through the percent sign");
+        assert!(
+            !super::ctx_click(5, 0),
+            "the lookalike text must not be the hit box"
+        );
+        assert!(!super::ctx_click(12, 0), "the separator is not the segment");
+        assert!(!super::ctx_click(20, 0));
+        assert!(!super::ctx_click(13, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_ctx_rect(&quiet, area);
+        assert!(!super::ctx_click(13, 0), "no gauge, no hit box");
+    }
+
+    /// The task counter gets the same segment-wide click box, anchored on the
+    /// literal `Tasks:` so a directory named after tasks cannot claim it, and
+    /// forgotten on a frame whose list is empty.
+    #[test]
+    fn tasks_rect_spans_the_counter_and_ignores_lookalike_text() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 40, 1);
+        let text = "my tasks | idle | ✓ Tasks: 4/8 | tip";
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, text, ratatui::style::Style::default());
+        super::record_tasks_rect(&buf, area);
+        assert!(super::tasks_click(18, 0), "the check mark");
+        assert!(super::tasks_click(22, 0), "the label");
+        assert!(super::tasks_click(29, 0), "through the tally");
+        assert!(
+            !super::tasks_click(3, 0),
+            "the lookalike text is not the box"
+        );
+        assert!(
+            !super::tasks_click(17, 0),
+            "the separator is not the segment"
+        );
+        assert!(!super::tasks_click(30, 0));
+        assert!(!super::tasks_click(22, 1), "wrong row");
+        let quiet = Buffer::empty(area);
+        super::record_tasks_rect(&quiet, area);
+        assert!(!super::tasks_click(22, 0), "no counter, no hit box");
+    }
 
     #[test]
     fn a_skill_load_shows_a_green_bullet_and_an_indented_status() {
@@ -4796,7 +6114,7 @@ mod tests {
     fn a_run_opens_a_row_and_selection_needs_one() {
         let mut pane = SubPane::default();
         // Nothing has run yet: there is nothing to select.
-        assert!(!pane.move_cursor(-1));
+        assert!(!pane.move_cursor(-1, 0));
         assert!(!pane.active);
 
         pane.begin("research".to_string(), "", 0);
@@ -5004,8 +6322,8 @@ mod tests {
         pane.begin("research".to_string(), "", 0);
         pane.current_log_mut().unwrap().push_plain("old output");
         pane.adopt_turn = true;
-        assert!(pane.move_cursor(-1));
-        assert!(pane.move_cursor(1));
+        assert!(pane.move_cursor(-1, 0));
+        assert!(pane.move_cursor(1, 0));
         assert!(pane.expand());
         assert!(pane.active);
 
@@ -5020,7 +6338,7 @@ mod tests {
         assert!(!pane.running());
         assert!(!pane.adopt_turn);
         // Nothing to select again, exactly as at launch.
-        assert!(!pane.move_cursor(-1));
+        assert!(!pane.move_cursor(-1, 0));
         assert!(!pane.expand());
     }
 
@@ -5031,19 +6349,19 @@ mod tests {
         pane.begin("beta".to_string(), "", 0);
 
         // The first `←` only reveals the cursor where it rests, without moving.
-        assert!(pane.move_cursor(-1));
+        assert!(pane.move_cursor(-1, 0));
         assert!(pane.selecting);
         assert_eq!(pane.cursor, 0, "starts on the `main` row");
 
-        pane.move_cursor(1);
+        pane.move_cursor(1, 0);
         assert_eq!(pane.cursor, 1);
-        pane.move_cursor(1);
+        pane.move_cursor(1, 0);
         assert_eq!(pane.cursor, 2);
-        pane.move_cursor(1);
+        pane.move_cursor(1, 0);
         assert_eq!(pane.cursor, 2, "clamped at the last agent");
-        pane.move_cursor(-1);
-        pane.move_cursor(-1);
-        pane.move_cursor(-1);
+        pane.move_cursor(-1, 0);
+        pane.move_cursor(-1, 0);
+        pane.move_cursor(-1, 0);
         assert_eq!(pane.cursor, 0, "clamped at `main`");
     }
 
@@ -5053,12 +6371,12 @@ mod tests {
         // from an expanded agent puts the transcript back.
         let mut pane = SubPane::default();
         pane.begin("alpha".to_string(), "", 0);
-        pane.move_cursor(-1);
-        pane.move_cursor(1);
+        pane.move_cursor(-1, 0);
+        pane.move_cursor(1, 0);
         assert!(pane.expand());
         assert!(pane.active);
 
-        pane.move_cursor(-1);
+        pane.move_cursor(-1, 0);
         assert!(!pane.active, "collapsed by moving to another row");
 
         // `main` has nothing to expand, and Esc leaves the roster entirely.
@@ -5222,8 +6540,8 @@ mod tests {
         assert!(main.expanded, "the transcript is what is on screen");
 
         // Expanding the sub-agent hands the highlight over to it.
-        assert!(pane.move_cursor(0));
-        assert!(pane.move_cursor(1));
+        assert!(pane.move_cursor(0, 0));
+        assert!(pane.move_cursor(1, 0));
         assert!(pane.expand());
         let rows = pane.roster_view(2_000).rows;
         assert!(!rows[0].expanded);
@@ -5343,16 +6661,16 @@ mod tests {
     #[test]
     fn tab_moves_focus_in_and_out_of_the_roster_keeping_the_pane_open() {
         let mut pane = SubPane::default();
-        assert!(!pane.toggle_focus(), "nothing to focus before any run");
+        assert!(!pane.toggle_focus(0), "nothing to focus before any run");
         pane.begin("alpha".to_string(), "", 0);
-        assert!(pane.toggle_focus());
+        assert!(pane.toggle_focus(0));
         assert!(pane.selecting);
         pane.cursor = 1;
         assert!(pane.expand());
-        assert!(pane.toggle_focus());
+        assert!(pane.toggle_focus(0));
         assert!(!pane.selecting, "focus is back on the prompt");
         assert!(pane.active, "the expanded pane stays on screen");
-        assert!(pane.toggle_focus());
+        assert!(pane.toggle_focus(0));
         assert!(pane.selecting && pane.active);
     }
 
@@ -5396,9 +6714,11 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_roster_stays_on_screen_while_the_user_is_in_it() {
-        // Rows must not vanish from under the cursor: `←` brings the finished
-        // roster back, and an expanded pane keeps its row visible while read.
+    fn entering_the_roster_does_not_bring_expired_rows_back() {
+        // Gone is gone: `←` after the linger finds nothing, and Tab has nothing
+        // to focus. Completed agents used to reappear the moment the user
+        // reached into the roster, which was the pile the linger exists to
+        // clear.
         let mut pane = SubPane::default();
         pane.begin("alpha".to_string(), "", 0);
         pane.end(1_000);
@@ -5406,10 +6726,14 @@ mod tests {
         assert_eq!(pane.roster_view(2_000).rows.len(), 2, "a moment to land");
         assert!(pane.roster_view(late).rows.is_empty(), "then it expires");
 
-        assert!(pane.move_cursor(-1), "still reachable after it hid");
-        assert_eq!(pane.roster_view(late).rows.len(), 2);
+        assert!(!pane.move_cursor(-1, late), "nothing left to select");
+        assert!(!pane.selecting);
+        assert!(pane.roster_view(late).rows.is_empty());
+        assert!(!pane.toggle_focus(late), "and nothing to focus");
 
-        pane.move_cursor(1);
+        // Inside the linger it is still there to enter and expand.
+        assert!(pane.move_cursor(-1, 2_000));
+        pane.move_cursor(1, 2_000);
         assert!(pane.expand());
         pane.selecting = false;
         assert_eq!(
@@ -5417,9 +6741,33 @@ mod tests {
             2,
             "an expanded row stays on screen even with the cursor hidden"
         );
-
         pane.collapse();
         assert!(pane.roster_view(late).rows.is_empty(), "Esc puts it away");
+    }
+
+    #[test]
+    fn the_cursor_steps_over_expired_rows() {
+        // With alpha gone, `↓` from `main` lands on beta, never on the hidden
+        // run in between.
+        let mut pane = SubPane::default();
+        pane.begin("alpha".to_string(), "", 0);
+        pane.begin("beta".to_string(), "", 0);
+        pane.begin("gamma".to_string(), "", 0);
+        pane.current = 0;
+        pane.end(1_000);
+        let late = 1_000 + ROSTER_LINGER_MS;
+        assert!(pane.move_cursor(-1, late));
+        assert_eq!(pane.cursor, 0);
+        pane.move_cursor(1, late);
+        assert_eq!(pane.cursor, 2, "beta: alpha's row is not there to stop on");
+        pane.move_cursor(1, late);
+        assert_eq!(pane.cursor, 3, "gamma");
+        pane.move_cursor(1, late);
+        assert_eq!(pane.cursor, 3, "clamped at the last drawn row");
+        pane.move_cursor(-1, late);
+        pane.move_cursor(-1, late);
+        assert_eq!(pane.cursor, 0, "back on `main`, skipping alpha again");
+        assert_eq!(pane.roster_view(late).rows.len(), 3, "main, beta, gamma");
     }
 
     #[test]
@@ -5521,21 +6869,16 @@ mod tests {
             "only `main` would be left, so the whole panel goes"
         );
         assert_eq!(pane.roster_view(late).height(), 0);
-
-        // Hidden, not destroyed: the delegated report is still reachable.
-        assert!(pane.move_cursor(-1));
-        assert_eq!(
-            pane.roster_view(late).rows.len(),
-            2,
-            "`←` brings a finished roster back"
+        assert!(
+            !pane.move_cursor(-1, late),
+            "and `←` does not bring it back"
         );
     }
 
     #[test]
     fn a_row_being_read_never_expires_from_under_the_cursor() {
-        // While the user is in the roster every row shows, however long ago it
-        // finished — that is both what makes a report reachable again and what
-        // keeps rows from moving under the cursor mid-read.
+        // Only the row under the cursor is exempt from the linger: it must not
+        // vanish mid-read, but its finished siblings go on schedule.
         let mut pane = SubPane::default();
         pane.begin("alpha".to_string(), "", 0);
         pane.begin("beta".to_string(), "", 0);
@@ -5543,18 +6886,22 @@ mod tests {
         pane.end(1_000);
         pane.current = 1;
         pane.end(1_000);
-        pane.move_cursor(-1);
-        pane.move_cursor(1);
+        pane.move_cursor(-1, 2_000);
+        pane.move_cursor(1, 2_000);
         assert_eq!(pane.cursor, 1, "on alpha");
 
         let late = 1_000 + ROSTER_LINGER_MS;
         pane.expire_rows(late);
         assert_eq!(pane.cursor, 1, "still on alpha");
-        assert_eq!(pane.roster_view(late).rows.len(), 3, "and every row shows");
+        let rows = pane.roster_view(late).rows;
+        assert_eq!(rows.len(), 2, "main and alpha: beta left on schedule");
+        assert_eq!(rows[1].label, "alpha");
 
-        // Leaving the roster releases them.
-        pane.collapse();
+        // Stepping off alpha releases it too.
+        pane.move_cursor(-1, late);
+        assert_eq!(pane.cursor, 0);
         pane.expire_rows(late);
+        assert!(!pane.selecting, "nothing left to read: the roster retires");
         assert!(pane.roster_view(late).rows.is_empty());
     }
 
@@ -5761,7 +7108,7 @@ mod tests {
             pane.roster_view(0).rows.iter().all(|r| !r.cursor),
             "a quiet status readout until `←` is pressed"
         );
-        pane.move_cursor(-1);
+        pane.move_cursor(-1, 0);
         assert!(pane.roster_view(0).rows[0].cursor, "on `main` first");
     }
 
@@ -5796,8 +7143,8 @@ mod tests {
         assert_eq!(pane.active_log(&main_log).line_count(), 1);
         assert_eq!(pane.active_view(&mut main_view).top, 7);
 
-        pane.move_cursor(-1);
-        pane.move_cursor(1);
+        pane.move_cursor(-1, 0);
+        pane.move_cursor(1, 0);
         assert!(pane.expand());
         assert_eq!(pane.active_log(&main_log).line_count(), 2);
         let v = pane.active_view(&mut main_view);
@@ -6021,6 +7368,20 @@ mod tests {
         );
         // The report reads from its first line, not from its tail.
         assert!(rows[top + 1].contains("row 0"), "got {:?}", rows[top + 1]);
+        // The Turbo Vision close box sits on the top-left corner of the frame,
+        // and a click on any of its three cells is the close gesture; one cell
+        // to the right of it (the title) is not.
+        assert!(
+            rows[top].starts_with("\u{250c}[\u{25a0}]"),
+            "close box on the top border: {:?}",
+            rows[top]
+        );
+        let y = u16::try_from(top).unwrap();
+        assert!(report_close_click(1, y));
+        assert!(report_close_click(3, y));
+        assert!(!report_close_click(0, y));
+        assert!(!report_close_click(4, y));
+        assert!(!report_close_click(2, y + 1));
     }
 
     /// The colours that actually reach the screen for `input`, as
@@ -6044,6 +7405,41 @@ mod tests {
                 (cell.symbol().chars().next().unwrap_or(' '), cell.fg)
             })
             .collect()
+    }
+
+    /// Draws the input row with `ghost` offered and returns its text, so a
+    /// test can assert on what actually reached the cells rather than on the
+    /// branch that chose them.
+    fn drawn_input_with_ghost(input: &str, ghost: &str) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        term.draw(|f| {
+            let mut state = InputState::new(input, input.chars().count());
+            state.ghost = Some(ghost);
+            render_input(f, Rect::new(0, 0, 60, 1), state);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..60)
+            .map(|x| buf[(x, 0)].symbol().to_owned())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn ghost_text_is_drawn_only_over_an_empty_prompt() {
+        assert!(
+            drawn_input_with_ghost("", "run the tests").contains("run the tests"),
+            "an empty prompt shows the suggestion"
+        );
+        let typed = drawn_input_with_ghost("hello", "run the tests");
+        assert!(typed.contains("hello"));
+        assert!(
+            !typed.contains("run the tests"),
+            "typed text is never painted over"
+        );
     }
 
     /// The full styled cells of the drawn input row, as
@@ -6502,6 +7898,39 @@ mod tests {
         assert_eq!(d.release(), Release::None);
     }
 
+    /// `window` must hand back only the lines the pane can show. Cloning
+    /// every line below the viewport made a scrolled-back frame cost grow
+    /// with the length of the conversation.
+    #[test]
+    fn window_stops_at_the_bottom_of_the_viewport() {
+        use ratatui::widgets::Widget as _;
+        let mut log = OutputLog::new();
+        for i in 0..500 {
+            log.push_plain(format!("line {i:03}"));
+        }
+        let width = 20;
+        let height = 10u16;
+        let top = 100;
+        let (text, scroll) = log.window(width, top, height);
+        assert!(
+            text.lines.len() <= usize::from(height) + 1,
+            "{} lines cloned for a {height}-row pane",
+            text.lines.len()
+        );
+        // ...and the pane paints exactly what the unbounded window painted.
+        let rect = Rect::new(0, 0, width, height);
+        let paint = |text: Text<'static>, scroll: u16| {
+            let mut buf = Buffer::empty(rect);
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
+                .render(rect, &mut buf);
+            buf
+        };
+        let (full, full_scroll) = window_rows(log.to_text(), width, top, u16::MAX);
+        assert_eq!(paint(text, scroll), paint(full, full_scroll));
+    }
+
     #[test]
     fn row_cache_matches_a_full_rewrap_after_edits() {
         // The cached row heights must agree with measuring the whole text,
@@ -6527,10 +7956,15 @@ mod tests {
         let check = |log: &OutputLog| {
             assert_eq!(log.total_rows(width), full(log, width));
             for top in [0usize, 1, 5, 37, full(log, width).saturating_sub(1)] {
-                assert_eq!(
-                    log.window(width, top),
-                    window_rows(log.to_text(), width, top)
-                );
+                // Several pane heights, including one taller than the log, so
+                // the bound is exercised where it bites and where it does not.
+                for height in [0u16, 1, 7, 200] {
+                    assert_eq!(
+                        log.window(width, top, height),
+                        window_rows(log.to_text(), width, top, height),
+                        "top {top}, height {height}"
+                    );
+                }
             }
         };
         check(&log);
@@ -6597,7 +8031,7 @@ mod tests {
             .line_count(width);
         assert!(total >= 70_000, "log has {total} rows");
         let top = total - height;
-        let (text, residual) = window_rows(log.to_text(), width, top);
+        let (text, residual) = window_rows(log.to_text(), width, top, u16::MAX);
         assert!(usize::from(residual) < height, "residual {residual}");
         let last = text.lines.last().map(ToString::to_string);
         assert_eq!(last.as_deref(), Some("row 34999 second half"));
@@ -6617,7 +8051,7 @@ mod tests {
     #[test]
     fn frame_geom_survives_oversized_input_rows() {
         let area = Rect::new(0, 0, 80, 24);
-        let geom = frame_geom(area, true, u16::MAX, 0, 3);
+        let geom = frame_geom(area, true, u16::MAX, 0, 3, STATUS_ROWS);
         assert!(geom.output.height <= area.height);
     }
 
@@ -6755,6 +8189,37 @@ mod tests {
         assert!(
             view.jump_hint_rect.is_none(),
             "hint hidden while following the newest output"
+        );
+    }
+
+    #[test]
+    fn md_tick_commits_a_deferred_tail_while_the_stream_is_quiet() {
+        let mut log = OutputLog::new();
+        // A burst faster than the throttle: the tail defers.
+        for t in ["document ", "the ", "`force` ", "parameter."] {
+            log.visible_text(t);
+        }
+        let joined = |log: &OutputLog| -> String {
+            log.lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert!(log.md_dirty, "the burst must leave a deferred tail");
+        assert!(
+            !joined(&log).contains("parameter."),
+            "precondition: the tail is not committed yet"
+        );
+        // The stream goes quiet (the model opened a tool stanza) and the gap
+        // elapses. The draw clock, not the next token, must commit the tail.
+        log.last_md_render = Instant::now().checked_sub(MD_RENDER_MIN_GAP * 2);
+        log.md_tick();
+        assert!(!log.md_dirty, "md_tick clears the dirty flag when due");
+        assert!(
+            joined(&log).contains("parameter."),
+            "md_tick must commit the deferred tail: {:?}",
+            joined(&log)
         );
     }
 
@@ -6946,7 +8411,7 @@ mod tests {
     /// Both status rows flattened into one span list, for assertions about
     /// content rather than placement.
     fn status_spans(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> Vec<Span<'static>> {
-        status_bar_lines(text, tick_ms, base, tasks)
+        status_bar_lines(text, tick_ms, base, tasks, false)
             .into_iter()
             .flat_map(|l| l.spans)
             .collect()
@@ -6977,6 +8442,32 @@ mod tests {
         let line = status_spans("idle", 0, base, &tv);
         let counter = line.iter().find(|s| s.content.contains("1/1")).unwrap();
         assert_eq!(counter.style.fg, Some(Color::Indexed(240)));
+    }
+
+    /// The shutter is the last segment of row one, and stays plain: peeled off
+    /// like the origin, so neither the branch nor the git stat absorbs it.
+    #[test]
+    fn status_bar_keeps_the_shutter_out_of_the_branch() {
+        let base = Style::default();
+        let theme = Color::Indexed(crate::status::THEME_COLOR);
+        let glyph = crate::status::POWERLINE_BRANCH;
+        let camera = crate::status::CAMERA_MARK;
+        let origin = crate::status::engine_origin_label();
+        let text = format!("~/Code/plank {glyph} main | {camera} | {origin} | ctx 12% | idle");
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
+        let first: Vec<_> = rows[0].spans.iter().collect();
+
+        let branch = first
+            .iter()
+            .find(|s| s.content == "main")
+            .expect("branch span ends at the branch");
+        assert_eq!(branch.style.fg, Some(theme));
+
+        let shutter = first
+            .iter()
+            .find(|s| s.content == camera)
+            .expect("the shutter is its own span on row one");
+        assert_eq!(shutter.style.fg, None, "plain, like the separators");
     }
 
     /// With the think segment present, the branch must still end at the branch:
@@ -7090,7 +8581,7 @@ mod tests {
         let text = format!("~/x | {} med | ctx 12% | idle", crate::status::THINK_MARK);
         let tip_spans = |rotation: u64| -> Vec<(String, Option<Color>, bool)> {
             let tick = crate::status::TIP_ROTATE_MS * rotation;
-            status_bar_lines(&text, tick, base, &TaskView::default())
+            status_bar_lines(&text, tick, base, &TaskView::default(), false)
                 .into_iter()
                 .flat_map(|l| l.spans)
                 .filter(|s| s.content.contains('💡'))
@@ -7115,6 +8606,117 @@ mod tests {
             "same colour and weight as a real tip"
         );
         assert!(promo[0].0.starts_with("💡 "), "same prefix: {}", promo[0].0);
+    }
+
+    /// While the agent works (input hidden), a visible tip drops onto its own
+    /// indented `└` line below the progress row, keeping its yellow-bold
+    /// styling, and is not also shown in the tail.
+    #[test]
+    fn a_tip_drops_to_its_own_line_while_the_agent_works() {
+        crate::status::clear_flash_tip();
+        let base = Style::default();
+        let text = format!("~/x | {} med | ctx 12% | idle", crate::status::THINK_MARK);
+        // tick 0 sits inside the tip's visibility window.
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), true);
+        assert_eq!(rows.len(), 3, "a busy tip takes a third row: {rows:?}");
+        let tip_row: String = rows[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            tip_row.starts_with("  └ "),
+            "indented connector: {tip_row:?}"
+        );
+        assert!(tip_row.contains("💡 "), "keeps the tip glyph: {tip_row:?}");
+        let tail_row: String = rows[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !tail_row.contains('💡'),
+            "not duplicated in the tail: {tail_row:?}"
+        );
+        let tip_span = rows[2]
+            .spans
+            .iter()
+            .find(|s| s.content.contains('💡'))
+            .expect("tip span");
+        assert_eq!(tip_span.style.fg, Some(Color::Yellow), "coloring preserved");
+        assert!(tip_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// At rest (input shown) the tip stays in the tail slot, so the status bar
+    /// keeps its two rows and no third row shifts the prompt.
+    #[test]
+    fn a_tip_stays_in_the_tail_when_idle() {
+        crate::status::clear_flash_tip();
+        let base = Style::default();
+        let text = format!("~/x | {} med | ctx 12% | idle", crate::status::THINK_MARK);
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
+        assert_eq!(rows.len(), 2, "idle keeps two rows: {rows:?}");
+        let tail_row: String = rows[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            tail_row.contains('💡'),
+            "tip in the tail when idle: {tail_row:?}"
+        );
+    }
+
+    /// The live preview counter rewrites a single line in place, and finalizing
+    /// it drops the transient so the permanent summary lands cleanly.
+    #[test]
+    fn preview_status_rewrites_one_line_in_place() {
+        let mut log = OutputLog::new();
+        log.push_dim("● Writing x.rs");
+        log.apply_preview_status(Some("  … 5 lines"));
+        log.apply_preview_status(Some("  … 6 lines"));
+        log.apply_preview_status(Some("  … 7 lines"));
+        let rows: Vec<String> = log.to_text().lines.iter().map(Line::to_string).collect();
+        assert_eq!(
+            rows.iter().filter(|r| r.contains('…')).count(),
+            1,
+            "only one transient line at a time: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r == "  … 7 lines"),
+            "shows the latest count: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r == "● Writing x.rs"),
+            "header untouched: {rows:?}"
+        );
+        // Finalize: transient dropped, permanent summary appended in its place.
+        log.apply_preview_status(None);
+        log.think_text("  └ 7 lines\n");
+        let rows: Vec<String> = log.to_text().lines.iter().map(Line::to_string).collect();
+        assert!(
+            !rows.iter().any(|r| r.contains('…')),
+            "transient dropped: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("└ 7 lines")),
+            "permanent summary present: {rows:?}"
+        );
+    }
+
+    /// A line pushed from outside the stream (the echo of a `/usage` typed
+    /// mid-write) retires the transient counter first, so the next tick does not
+    /// pop the echo and leave a stale counter above a fresh one.
+    #[test]
+    fn preview_status_survives_an_interleaved_push() {
+        let mut log = OutputLog::new();
+        log.push_dim("● Writing x.rs");
+        log.apply_preview_status(Some("  … 85 lines"));
+        log.push_user_echo("/usage");
+        log.apply_preview_status(Some("  … 167 lines"));
+        let rows: Vec<String> = log.to_text().lines.iter().map(Line::to_string).collect();
+        assert_eq!(
+            rows.iter().filter(|r| r.contains('…')).count(),
+            1,
+            "only one transient line at a time: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("/usage")),
+            "echo kept: {rows:?}"
+        );
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some("  … 167 lines"),
+            "{rows:?}"
+        );
     }
 
     /// A fenced code block that opens on the line directly after a paragraph —
@@ -7154,104 +8756,38 @@ mod tests {
         );
     }
 
-    /// The routing glyph replaces the brain for exactly the span of a local
-    /// pass, in the glyph's own width, so the bar never reflows. This is the
-    /// only signal that says *which* engine is working, so it has to hold still
-    /// (as the brain) when nothing local is running and actually move when
-    /// something is.
-    ///
-    /// The seed comes from the pass's own elapsed time when no token has been
-    /// decoded, so the sweep here moves the pass clock rather than the animation
-    /// clock.
+    /// The think segment holds the static brain, local pass or not: the
+    /// expert-routing animation now leads the window title instead, so the bar
+    /// never swaps the glyph out from under the reader.
     #[test]
-    fn the_routing_glyph_replaces_the_brain_only_while_a_local_pass_runs() {
+    fn the_think_segment_keeps_the_static_brain() {
         let base = Style::default();
         let mark = crate::status::THINK_MARK;
         let text = format!("~/x | {mark} med | ctx 12% | generating");
         let rows = || -> Vec<String> {
-            status_bar_lines(&text, 0, base, &TaskView::default())
+            status_bar_lines(&text, 0, base, &TaskView::default(), false)
                 .into_iter()
                 .map(|l| l.spans.iter().map(|sp| sp.content.to_string()).collect())
                 .collect()
         };
         let brain_showing = || rows().iter().any(|r| r.contains(mark));
-        // Every rendering must occupy the same columns, brain or braille.
-        let widths = |r: &[String]| -> Vec<usize> { r.iter().map(|l| l.width()).collect() };
-        let reference = widths(&rows());
 
-        // Idle: the brain, whatever the clock is doing.
         assert!(!crate::status::local_pass_active());
-        assert!(brain_showing(), "no routing when nothing local is running");
+        assert!(brain_showing(), "the brain at idle");
 
         {
             let _guard = crate::status::LocalPass::begin();
             assert!(crate::status::local_pass_active());
-            assert!(!brain_showing(), "a local pass draws the routing instead");
-
-            // Frames actually advance with the pass clock, and every one of them
-            // keeps the bar's columns.
             let frames: std::collections::HashSet<Vec<String>> = (0..8u64)
                 .map(|step| {
                     crate::status::set_local_pass_ms(step * crate::status::EXPERT_FRAME_MS);
-                    let r = rows();
-                    assert_eq!(widths(&r), reference, "the bar holds its columns");
-                    r
+                    rows()
                 })
                 .collect();
-            assert!(frames.len() > 1, "the glyph never moved: {frames:?}");
-
-            // Reduced motion collapses it to the static brain like every other
-            // effect. Asserted here rather than in a test of its own — both the
-            // reduced-motion toggle and the local-pass flag are process-global,
-            // so two tests holding them would race under the default harness.
-            crate::anim::set_reduced_motion(true);
-            let brain_back = brain_showing();
-            crate::anim::set_reduced_motion(false);
-            assert!(brain_back, "reduced motion holds the brain");
-
-            // And end-to-end through a real terminal buffer, which is the only
-            // place the property that matters is visible: the braille lands in
-            // the emoji's cells and everything after it stays exactly where it
-            // was. Folded in here because the local-pass flag is process-global.
-            let rendered = |ms: u64| -> String {
-                crate::status::set_local_pass_ms(ms);
-                let mut term =
-                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 2)).unwrap();
-                term.draw(|f| {
-                    f.render_widget(
-                        ratatui::widgets::Paragraph::new(status_bar_lines(
-                            &text,
-                            0,
-                            base,
-                            &TaskView::default(),
-                        )),
-                        f.area(),
-                    );
-                })
-                .unwrap();
-                let buf = term.backend().buffer().clone();
-                (0..buf.area.height)
-                    .map(|y| {
-                        (0..buf.area.width)
-                            .map(|x| buf[(x, y)].symbol().to_string())
-                            .collect::<String>()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            let screen = rendered(0);
-            assert!(!screen.contains(mark), "the brain is gone: {screen:?}");
-            assert!(
-                screen
-                    .chars()
-                    .any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
-                "braille drawn: {screen:?}"
-            );
-            assert!(screen.contains("med | ctx 12%"), "{screen:?}");
+            assert_eq!(frames.len(), 1, "the segment must not animate: {frames:?}");
+            assert!(brain_showing(), "still the brain during a local pass");
         }
 
-        // And the guard's drop ends it, so a finished pass cannot leave the bar
-        // animating forever.
         assert!(!crate::status::local_pass_active());
         assert!(brain_showing());
     }
@@ -7271,7 +8807,7 @@ mod tests {
         let origin = crate::status::engine_origin_label();
         let text =
             format!("~/Code/plank {glyph} main | {mark} 3 · +12 -4 | {origin} | ctx 12% | idle");
-        let rows = status_bar_lines(&text, 0, base, &TaskView::default());
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
         let row: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(
             row,
@@ -7310,7 +8846,7 @@ mod tests {
         let _guard = crate::status::origin_test_guard();
         let origin = crate::status::engine_origin_label();
         let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
-        let rows = status_bar_lines(&text, 0, base, &TaskView::default());
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
         assert_eq!(rows.len(), 2, "two rows");
 
         let row =
@@ -7387,7 +8923,7 @@ mod tests {
         let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
         let mut term = Terminal::new(TestBackend::new(70, 2)).unwrap();
         term.draw(|f| {
-            let rows = status_bar_lines(&text, 0, Style::default(), &TaskView::default());
+            let rows = status_bar_lines(&text, 0, Style::default(), &TaskView::default(), false);
             f.render_widget(ratatui::widgets::Paragraph::new(rows), f.area());
         })
         .unwrap();
@@ -7418,7 +8954,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         // No strip: the top rule sits directly above the input, the bottom
         // rule directly below it (above the status bar).
-        let g0 = frame_geom(area, true, 1, 0, 0);
+        let g0 = frame_geom(area, true, 1, 0, 0, STATUS_ROWS);
         let (out0, in0, st0, rule0, rule_bot0, strip0) = (
             g0.output,
             g0.input,
@@ -7448,7 +8984,7 @@ mod tests {
         );
         // Three strip rows: reserved between the output and the rule, and the
         // output pane shrinks by exactly three rows.
-        let g3 = frame_geom(area, true, 1, 3, 0);
+        let g3 = frame_geom(area, true, 1, 3, 0, STATUS_ROWS);
         let (out3, rule3, strip3) = (g3.output, g3.rule_top, g3.strip);
         let strip3 = strip3.expect("strip present");
         let rule3 = rule3.expect("rule present");
@@ -7830,6 +9366,58 @@ mod tests {
     }
 
     #[test]
+    fn perf_text_floats_right_on_the_rule_below_the_prompt() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let log = OutputLog::new();
+        let mut view = OutputView::default();
+        let row_at = |buf: &ratatui::buffer::Buffer, y: u16| -> String {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let render = |w: u16, view: &mut OutputView| {
+            let mut term = Terminal::new(TestBackend::new(w, 8)).unwrap();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &log,
+                    Some(InputState::new("hi", 2)),
+                    "ctx 0%",
+                    view,
+                    None,
+                    &TaskView::default(),
+                    None,
+                    &RosterView::default(),
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            let y = input_row(buf).expect("prompt row present") + 1;
+            row_at(buf, y)
+        };
+
+        set_perf_text("↓ 237 tokens · 20.7 t/s");
+        let rule = render(60, &mut view);
+        assert!(
+            rule.ends_with("─ ↓ 237 tokens · 20.7 t/s ──"),
+            "figures float right with a two-column tail of rule: {rule:?}"
+        );
+        assert!(rule.starts_with("──────"), "rule still leads: {rule:?}");
+
+        let narrow = render(20, &mut view);
+        assert_eq!(narrow, "─".repeat(20), "no room for the figures");
+
+        set_perf_text("");
+        let bare = render(60, &mut view);
+        assert_eq!(bare, "─".repeat(60), "nothing published, plain rule");
+    }
+
+    #[test]
     fn green_rule_separates_output_from_the_visible_prompt() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -7980,7 +9568,14 @@ mod tests {
         // hand-made rects, for a one-row and a tall multi-row input.
         for (input_text, rows) in [("@src", 5u16), ("a\nb\nc\n@src", 15)] {
             let screen = Rect::new(0, 0, 80, 24);
-            let g = frame_geom(screen, true, input_height(input_text, 78), 0, 0);
+            let g = frame_geom(
+                screen,
+                true,
+                input_height(input_text, 78),
+                0,
+                0,
+                STATUS_ROWS,
+            );
             let (output, input, status, rule) = (g.output, g.input, g.status, g.rule_top);
             let rule = rule.expect("prompt showing means a rule row");
             let r = popup_rect(output, input, rows);
@@ -8672,5 +10267,239 @@ mod tests {
         assert!(text.contains("rename"), "{text}");
         assert!(text.contains("session-0"), "prefilled with the id: {text}");
         assert!(text.contains("Enter to rename"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod diff_highlight_tests {
+    use super::{OutputLog, Tone, diff_lang, render_diff_card, tone_fg};
+    use crate::tools::diff::edit_preview;
+    use ratatui::style::{Color, Modifier};
+    use ratatui::text::Line;
+
+    /// Every span of every row of the card, as (text, style).
+    fn card(path: &str, old: &str, new: &str) -> Vec<Line<'static>> {
+        let mut log = OutputLog::new();
+        render_diff_card(&mut log, &edit_preview(path, old, new, false));
+        log.lines.clone()
+    }
+
+    /// The row whose joined text contains `needle`.
+    fn row<'a>(lines: &'a [Line<'static>], needle: &str) -> &'a Line<'static> {
+        lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row containing {needle:?}"))
+    }
+
+    fn fg_of(line: &Line<'static>, token: &str) -> Option<Color> {
+        line.spans
+            .iter()
+            .find(|s| s.content.as_ref() == token)
+            .unwrap_or_else(|| panic!("no span exactly {token:?}"))
+            .style
+            .fg
+    }
+
+    /// A Rust diff colours keywords, strings and comments differently, and
+    /// every cell of a changed row still carries the diff background.
+    #[test]
+    fn rust_rows_are_highlighted_over_the_diff_background() {
+        let old = "fn main() {\n    let x = 1;\n}\n";
+        let new = "fn main() {\n    // note\n    let x = \"hi\";\n}\n";
+        let lines = card("src/lib.rs", old, new);
+
+        let string_row = row(&lines, "\"hi\"");
+        let comment_row = row(&lines, "// note");
+        let kw = fg_of(string_row, "let").expect("keyword coloured");
+        let st = fg_of(string_row, "\"hi\"").expect("string coloured");
+        let cm = fg_of(comment_row, "// note").expect("comment coloured");
+        assert_ne!(kw, st, "keyword and string must differ");
+        assert_ne!(kw, cm, "keyword and comment must differ");
+        assert_ne!(st, cm, "string and comment must differ");
+        // The comment keeps its italic, and the addition background survives
+        // under every span of the row including the gutter.
+        assert!(
+            comment_row
+                .spans
+                .iter()
+                .find(|s| s.content.as_ref() == "// note")
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        for span in &comment_row.spans {
+            assert_eq!(
+                span.style.bg,
+                Some(Color::Indexed(22)),
+                "added background lost under {:?}",
+                span.content
+            );
+        }
+    }
+
+    /// An extension that names no grammar falls back to the flat rendering:
+    /// one uniform foreground over the diff background, no syntax at all.
+    #[test]
+    fn unknown_extension_falls_back_to_flat_rendering() {
+        assert_eq!(diff_lang("notes.wobble"), None);
+        assert_eq!(diff_lang("Makefile"), None);
+        let lines = card("notes.wobble", "fn main() {}\n", "fn other() {}\n");
+        let added = row(&lines, "fn other");
+        for span in &added.spans {
+            assert_eq!(span.style.bg, Some(Color::Indexed(22)));
+            assert_eq!(
+                span.style.fg,
+                Some(Color::Indexed(194)),
+                "flat rows keep the single card foreground"
+            );
+        }
+    }
+
+    /// The gutter, the `+`/`-` sigils and the `@@` headers are never
+    /// syntax-coloured.
+    #[test]
+    fn gutter_and_hunk_headers_are_never_syntax_coloured() {
+        let lines = card("src/lib.rs", "fn main() {}\n", "fn other() {}\n");
+        let hunk = row(&lines, "@@");
+        assert_eq!(hunk.spans.len(), 1);
+        assert_eq!(hunk.spans[0].style.fg, Some(Color::Indexed(44)));
+        let added = row(&lines, "fn other");
+        let first = &added.spans[0];
+        assert!(
+            first.content.contains('+'),
+            "first span is the gutter + sigil, got {:?}",
+            first.content
+        );
+        assert_eq!(
+            first.style.fg,
+            Some(Color::Indexed(194)),
+            "the gutter keeps the card foreground"
+        );
+    }
+
+    /// A block comment spanning several added lines is coloured consistently
+    /// on every one of them — the case line-by-line highlighting gets wrong.
+    #[test]
+    fn multi_line_comment_is_coloured_on_every_row() {
+        let old = "fn main() {}\n";
+        let new = "/* one\n   two\n   three */\nfn main() {}\n";
+        let lines = card("src/lib.rs", old, new);
+        // The comment is one tree-sitter node, so it arrives as a single run
+        // split across rows; each row's slice must carry the same colour.
+        let a = row(&lines, "/* one");
+        let b = row(&lines, "   two");
+        let c = row(&lines, "three */");
+        let grab = |l: &Line<'static>| l.spans.last().unwrap().style.fg;
+        assert_eq!(grab(a), grab(b), "rows 1 and 2 of the comment differ");
+        assert_eq!(grab(b), grab(c), "rows 2 and 3 of the comment differ");
+        assert!(grab(a).is_some(), "the comment is coloured at all");
+        // …and it is not the row's plain foreground.
+        assert_ne!(grab(a), Some(Color::Indexed(194)));
+    }
+
+    /// Word-diff emphasis survives on a row that is also syntax-highlighted:
+    /// the changed run keeps the syntax foreground but takes the brighter
+    /// background and bold.
+    #[test]
+    fn word_diff_emphasis_survives_highlighting() {
+        let old = "let alpha = 1;\n";
+        let new = "let bravo = 1;\n";
+        let lines = card("src/lib.rs", old, new);
+        let added = row(&lines, "bravo");
+        let emph: Vec<_> = added
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Indexed(28)))
+            .collect();
+        assert!(!emph.is_empty(), "no emphasised run on the added row");
+        assert!(
+            emph.iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "emphasis lost its bold"
+        );
+        let removed = row(&lines, "alpha");
+        assert!(
+            removed
+                .spans
+                .iter()
+                .any(|s| s.style.bg == Some(Color::Indexed(88))),
+            "no emphasised run on the removed row"
+        );
+    }
+
+    /// Toning lifts colours over the added background and mutes them over the
+    /// removed one, so the two sides read differently — and context rows are
+    /// left exactly as the highlighter gave them.
+    #[test]
+    fn toning_lifts_additions_and_mutes_removals() {
+        let lum = |c: Color| {
+            let [r, g, b] = super::color_rgb(c).expect("resolvable");
+            super::luminance(f32::from(r), f32::from(g), f32::from(b))
+        };
+        for c in [Color::Magenta, Color::Cyan, Color::DarkGray, Color::Green] {
+            let a = tone_fg(c, Tone::Add);
+            let d = tone_fg(c, Tone::Del);
+            assert_ne!(a, d, "{c:?} must differ between the two sides");
+            assert!(lum(a) >= 0.5, "{c:?} too dark for the green background");
+            assert!(lum(d) <= 0.75, "{c:?} too hot for the red background");
+            assert!(lum(a) > lum(d), "{c:?}: additions must read brighter");
+            assert_eq!(tone_fg(c, Tone::Context), c, "context is untouched");
+        }
+        assert_eq!(
+            tone_fg(Color::Reset, Tone::Add),
+            Color::Reset,
+            "Reset has no fixed value to tone"
+        );
+    }
+
+    /// Extension mapping covers the common languages and never guesses.
+    #[test]
+    fn language_detection_maps_known_extensions() {
+        for (path, lang) in [
+            ("src/tui.rs", "rust"),
+            ("a/b/main.PY", "python"),
+            ("x.tsx", "tsx"),
+            ("x.hpp", "cpp"),
+            ("deploy.sh", "bash"),
+            ("Cargo.toml", "toml"),
+        ] {
+            assert_eq!(diff_lang(path), Some(lang), "{path}");
+        }
+        for path in ["README", "data.bin", "x.unknownext", ""] {
+            assert_eq!(diff_lang(path), None, "{path}");
+        }
+    }
+
+    /// Ignoring styles, a highlighted card shows exactly the same characters
+    /// as a flat one: highlighting splits spans, it never edits text.
+    #[test]
+    fn highlighting_changes_no_text() {
+        let old = "fn main() {\n    let x = 1;\n}\n";
+        let new = "fn main() {\n    let x = 2;\n}\n";
+        let flat = card("notes.wobble", old, new);
+        let lit = card("src/lib.rs", old, new);
+        let flatten = |ls: &[Line<'static>]| {
+            ls.iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let (mut a, mut b) = (flatten(&flat), flatten(&lit));
+        // Only the header names the path, which differs by construction.
+        a.remove(0);
+        b.remove(0);
+        assert_eq!(a, b);
     }
 }

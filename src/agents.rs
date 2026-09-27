@@ -246,7 +246,7 @@ pub fn load_from(roots: &[PathBuf]) -> Vec<AgentDef> {
 pub fn load_default(cwd: &Path) -> Vec<AgentDef> {
     let mut roots = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".plank").join("agents"));
+        roots.push(crate::home::plank_home_in(home).join("agents"));
     }
     roots.push(cwd.join(".plank").join("agents"));
     load_from(&roots)

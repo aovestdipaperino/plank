@@ -36,6 +36,24 @@ Bash commands are **tracked jobs**, not blocking one-shot calls: each owns a pro
 
 Every job runs in its own process group, and so do the commands you type with `!`. Stopping a job or hitting its timeout kills the whole tree, so a `sleep 600; echo ok` or a `cmd | tee` pipeline cannot outlive plank. A job that ran past its timeout is reaped by whatever tool call comes next, not only when the model polls it. Interrupting a running command (Ctrl-C in the REPL, Esc in the TUI) kills its group and reports exit status 143.
 
+#### Background jobs
+
+`refresh_sec` is how long a `bash` or `bash_status` call waits before it gives up and reports `status=running`. `bash` waits 60 seconds by default; `bash_status` returns at once unless `refresh_sec` is given. Out of the box the model then has to poll: every `bash_status` is a generation pass that reads "still running" and asks again. With `tools.bashNotify` on, the wait moves to plank. The model leaves the job running and ends its turn, you get the prompt back, and when the job exits plank appends a `[BACKGROUND JOB NOTIFICATION]` message carrying the same observation `bash_status` would have returned, then starts a turn so the model can report. Each job is announced once, and never if the model polled it to completion itself. A job that finishes while a turn is still running is announced at the next tool boundary instead.
+
+The wake is careful about your prompt: in the TUI it waits while you have unsent text in the editor or a pane open, and in the plain REPL it prints a blank line before the notice so nothing lands on your half-typed line. Headless runs print `+DWARFSTAR_JOBS_FINISHED <n>` on stderr before the turn, so a driver can tell an automatic turn from a reply to its own prompt.
+
+While any job runs the status bar shows `⧗ N jobs`. Click it, or type `/jobs`, for the job table: id, pid, elapsed time, state and output file, in a panel that keeps counting while it is open and works mid-turn. The setting is off by default because turning it on adds one sentence to the system prompt (telling the model it need not poll), which starts a fresh prompt cache; enable it in `settings.json` and start a new session.
+
+### Memory
+
+| Tool | What it does |
+|---|---|
+| `remember` | append a typed entry to user or project memory |
+| `forget` | delete a memory entry by the short id shown beside it in context |
+| `recall` | search earlier sessions of this project, and the pre-compaction part of this one |
+
+`remember` and `forget` write to the memory files on disk and take effect at the next session start; nothing rewrites the cached prompt mid-conversation. Both are gated on `tools.remember`, and every change lands in `~/.plank/memory-log.jsonl`. See [Memory](07-context.md#memory).
+
 ### Documents
 
 `read` on a `.pdf` transparently converts the file to Markdown first, so a PDF is just a readable file:

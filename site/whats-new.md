@@ -7,8 +7,286 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v5.0.0 is out**, and the beta channel has reopened on 5.0.1. The patch number
+**v5.3.0 is out**, and the beta channel is on 5.3.1. The patch number
 is still the channel: `.0` is stable, anything above it is beta.
+
+**Plank guesses your next prompt.** After an answer, a short background pass
+works out the most likely thing you are about to type and offers it as grey
+ghost text on the empty prompt. **Tab** or **Right arrow** drops it into the
+line so you can edit it, **Enter** sends it as it stands, and typing anything
+else makes it disappear. It rides the conversation already sitting in the KV
+cache, so it costs a suffix rather than a fresh read of everything, and it
+skips itself entirely on the one occasion it would be expensive: a session
+whose cache would have to be rebuilt from scratch. Turn it off with
+`"suggestions": {"enabled": false}`.
+
+A suggestion never runs anything. A line starting with `/` or `!` is thrown
+away rather than offered, because Enter over a placed suggestion sends it
+immediately, and one keystroke away from `/clear` is not a place to be
+relaxed.
+
+**Typed decisions, read straight out of the logits.** Plank can now ask the
+model a multiple-choice question and get the answer back without generating a
+single token. The question is appended to the conversation already in the
+cache, one forward pass runs, and the probabilities of the answer letters are
+read directly from the output layer. No sampling loop, no JSON to parse, and a
+real number for how sure the model was rather than a guess dressed as one.
+
+The first thing using it is a gate in front of the memory pass. Most turns
+hold nothing worth remembering, and until now plank spent a full generation
+discovering that. Now it asks one yes/no question first and only runs the
+expensive pass when the answer is a confident yes. It is off while its
+threshold is still being calibrated: `"memory": {"gate": true}` turns it on,
+`memory.gatePercent` sets the bar. If the model is unsure, or cannot answer at
+all, the pass runs anyway. A gate that is not certain is never allowed to be
+the reason a memory is lost.
+
+**Short turns no longer trigger the memory pass.** A four-second exchange is
+rarely worth a snapshot, a prefill, a generation and a restore, so
+`memory.minTurnSeconds` (30 by default) skips it. The turn's span is not
+thrown away, just deferred: the next turn that clears the floor reads the
+short ones too.
+
+**The prompt stays green while plank works in the background.** Prompt
+prediction and the memory pass are not turns you asked for, and typing during
+one stops it and starts your turn straight away, so the cursor no longer turns
+red as though you had to wait. **Ctrl-D** on an empty prompt during a memory
+pass quits, too, instead of being quietly swallowed.
+
+**`/stats`: a year of your work, in one panel.** A heatmap of the last 53
+weeks, four green tones from your quietest day to your busiest, with the
+figures that go with it underneath: favourite model, total tokens, sessions,
+longest span, days started, longest and current streak, most active day.
+
+![The /stats panel: a 53-week heatmap in four green tones with Mon, Wed, Fri and Sun down the left and month names across the top, a Less-to-More legend under it, then All time · Last 7 days · Last 30 days, and eight figures reading favorite model DeepSeek V4 Flash, total tokens 11.1m, sessions 718, longest span 14h 15m, days started 50/62, longest streak 16 days, most active day Sep 5, current streak 16 days](/assets/stats.png)
+
+It reads the same per-session cache `/insights` already fills, so it costs
+nothing after the first run and never calls the model. The heatmap always
+shows the full year; the figures under it take a range, so `/stats 7` and
+`/stats 30` narrow them and re-issuing bare `/stats` cycles the three. Esc
+closes it.
+
+Two of the figures are named for exactly what they count rather than what you
+might wish they counted. *Days started* counts days a session began, so a
+session opened on Monday and resumed through Thursday lights one square and
+not four. *Longest span* is wall-clock between a session's first and last
+message, which is not time spent working: resume something a month later and
+the span is a month.
+
+**5.1.10: a quiet rule.** The figures a turn floats on the rule under the
+prompt are cleared the moment the turn ends, and the row is repainted whole
+so no notch is left where they were. The memory pass keeps its own figures
+off that rule unless you start plank with `--show-memory-stats`.
+
+**5.1.9: notes are taken at idle, and the status bar holds still.** The
+memory extraction pass no longer holds your prompt. A turn end only snapshots
+the new part of the conversation into a queue; the reading happens at the
+next idle moment, with a `✍️` per queued span in the footer and one dim
+`memory completed in 12s` line at the end. Type while it runs and it stops,
+goes back on the queue and your turn starts at once; the retry resumes from
+the prefill it already did. The figures that used to churn in the status bar
+(prefill and generation rates, the MTP per-step numbers) now float at the
+right end of the rule under the prompt, like the session name above it, and
+the loop-guard and micro-compaction icons and the `idle` word are gone.
+
+**5.1.8: a lighter system-prompt reminder.** Every 50K tokens plank reminds
+the model of its system prompt so a long session does not drift. Until now that
+meant re-sending the whole tools prompt, thousands of tokens prefilled and then
+kept in context for the rest of the session. The reminder is now the short
+form by default: the tool-call syntax, the list of tools, and a line saying the
+original prompt still applies. `"context": {"shortReminder": false}` brings
+the full reminder back.
+
+**5.1.7: the extraction pass is on by default.** 5.1.6 shipped it off, so
+you had to opt in. Now a fresh install keeps its own memory from the first
+session. The price is the same as before: a pause after each tool-free answer
+while the pass takes a KV snapshot, prefills the new part of the conversation
+and generates its verdicts. `memory.extractEveryNTurns` makes it rarer, and
+`"memory": {"autoExtract": false}` in `settings.json` turns it back off.
+
+**5.1.6: memory that maintains itself.** Until now
+the two `MEMORY.md` files only ever changed when you typed `/remember` or opened
+`/memory`. The model now has a `remember` tool and a `forget` tool of its own,
+and an extraction pass (`memory.autoExtract`, off in 5.1.6 and on from 5.1.7;
+it costs a generation after each answer) that reads the new part of a conversation
+and proposes adds, updates and deletions, which plank applies itself. Entries
+carry a type tag, each type has its own budget for what reaches the prompt, and
+eviction goes by how often an entry has actually mattered rather than by age, so
+the oldest fact about you is no longer the first one to fall off the end. Every
+automatic change is written to `~/.plank/memory-log.jsonl`, `/memory log` reads
+it back, and `/forget <pattern>` removes entries after showing you what matched.
+Nothing rewrites the cached prompt mid-session: model writes land on disk and
+join the context at the next session start, which is what keeps the whole
+feature cheap. The design, and what took four rounds of review to get right, is
+in [`docs/MEMORY.md`](https://github.com/aovestdipaperino/plank/blob/main/docs/MEMORY.md).
+
+**5.1.5: `cargo`, `npm` and `go` work under the sandbox again.** Model-run shell
+commands are sandboxed to the project and the temp dirs, which is the right
+default right up until a build has to fetch a dependency — because every package
+manager writes a machine-wide cache outside the project by design. Until now
+that write was denied with a bare `Operation not permitted`, which reads like a
+broken filesystem rather than a sandbox saying no, and it meant `cargo build`
+worked only as long as every crate happened to be cached already. The caches are
+writable now: `~/.cargo/registry`, `~/.cargo/git`, the rustup download dirs,
+`~/.npm/_cacache`, the Go module cache, `~/.cache`, `~/Library/Caches`. What is
+still withheld is anything on your `PATH` — `~/.cargo/bin`, `~/.local/bin`,
+`/usr/local/bin` — because a binary installed there is one you later run, so
+those get the same one-question prompt `~/.plank` has always had. `cargo install`
+asks instead of failing. This is also why the grant names `~/.cargo/registry`
+rather than `~/.cargo`: the parent carries `bin` with it.
+
+**5.1.5: `/init` is not a loop.** Its phases re-read and re-survey the same tree
+on purpose — the interview, the codebase survey and the write all revisit it —
+which is precisely the pattern the loop guards exist to stop. So a setup run you
+asked for could be refused halfway through for doing exactly what its own prompt
+told it to. `/init` now runs with the guards down for that one turn and no
+longer; a `/loopguard` you typed yourself still outranks it, in either direction.
+
+**5.1.5: a headless run says how long it took.** `plank -p ...` ends with
+`total time: 8.4s`. It goes to stderr, so anything piping the reply sees exactly
+what it saw before, and `--ui chart` and `--ui quiet` keep printing their one
+deliberate thing and nothing else.
+
+**5.1.4: `--non-interactive` is now `--ui`, and two of its modes print almost
+nothing.** The flag that picked a front end only ever had two answers, on or
+off, so it becomes one flag with four: `--ui tui` is the default you already
+have, `--ui console` is exactly what `--non-interactive` was, and the two new
+ones are for runs you are not reading. `--ui chart` swallows the turn's output
+and paints the `/toks` throughput chart in its place, live, filling in as the
+model generates, which is what you want when the question is how fast the
+engine is rather than what it said. `--ui quiet` prints one line and no more:
+`Prompting.` when the turn starts, `Started working...` when the first token is
+imminent, `done.` at the end. Both need a `-p` prompt. `--non-interactive` is
+gone rather than kept as an alias, so a script that used it wants `--ui
+console`.
+
+**5.1.3: a long read-only investigation is no longer mistaken for a stall.**
+One rung of the loop guard watched a whole turn and ended it after 32 KB of
+generated output with no file changed. It was built for a real failure — a turn
+whose every individual pass looks reasonable and which has still written nothing
+fifty minutes later — but what it actually measures is output volume, and a
+perfectly ordinary turn trips it too. Ask plank why a test is flaky, or to
+explain how a subsystem fits together, and it will read, search, build and reason
+its way to a real answer without touching a file. That turn was stopped with a
+notice telling you to narrow a request that was never too wide. The rung is now
+off unless you ask for it, with `"tools": {"noProgressGuard": true}`. Every other
+guard, which watches for genuine repetition rather than for silence, is unchanged
+and still armed by default.
+
+**5.1.2: sentences no longer finish themselves when a tool returns.** The TUI
+renders streaming markdown on a bounded cadence, so highlighting a long code
+block does not cost a re-render per token. The tail that cadence deferred was
+only committed when the next token arrived — and a model that stops writing to
+open a tool call sends no next token. So the last few words of a sentence sat
+off screen for as long as the tool ran, and the sentence appeared to complete
+itself once the result came back. The deferred tail now goes out on the draw
+clock instead, in the main transcript, the `/btw` panel and every sub-agent
+view.
+
+**5.1.0: plank runs DeepSeek V4.1 Flash.** It is a family of its own rather
+than a V4 revision, with its own weights, tokenizer, tool-call spelling and
+`.ds41.kv` transcripts that never mix with V4's. Point `-m` at a V4.1 GGUF and
+the family, the dialect and the paths all follow from the GGUF's own
+architecture field; V4 stays the model plank ships and offers to download. V4.1
+also has a real reasoning dial, 0 to 100, so there `low`, `medium` and `max` are
+names for the 25, 75 and 100 the model is actually told, `/think 40` works, and
+the footer shows the number rather than the label.
+
+**Two models that needed a flag now just work.** A model too large to sit in RAM
+turns on SSD streaming by itself, printing the arithmetic it used, instead of
+refusing to open and telling you to go find `--ssd-streaming`. A draft
+checkpoint that does not match the model you loaded no longer stops the open
+either: plank retries without the drafter it chose for you and decodes
+target-only, and a companion you named with `--mtp-model` is still never
+dropped. While a streaming model is loaded the footer carries a 💾, blinking
+while a pass runs.
+
+**Qwen3.8-Flash-Next is retired.** Upstream deleted its Metal kernels, so the
+family, the `--qwen` flag, its artifact set and its dialect are gone. Existing
+`.qwn.kv` files are left strictly alone: a retired model name matches no live
+family, so nothing lists them, sweeps them or hands them to a DeepSeek engine.
+They are still on disk, and no longer loadable.
+
+**plank gets out of the way when the Mac runs out of memory.** Under memory
+pressure it releases the KV cache and the engine session at a turn boundary,
+says so, and returns to the same continuation once pressure clears, rather than
+thrashing or being killed. `⏸ paused: memory` on the footer marks the wait so it
+does not read as a hang.
+
+**`/toks` charts prefill speed as well**, beside generation speed on the same
+rows, because the question a slow pass raises is whether it is prefill-bound or
+decode-bound.
+
+![/toks panel: two side-by-side braille line charts in the theme green. Generation speed on the left reads now 29.5, avg 32.9, min 26.9, max 45.9 tok/s; prefill speed on the right reads now 232.9, avg 440.0, min 42.8, max 2112.0 tok/s](/assets/toks.png)
+
+**Smaller things.** Diff cards are syntax-highlighted rather than flat red and
+green:
+
+![An edit's diff card: added lines on green and the removed line on red, with Rust keywords, strings and function names highlighted inside both, line numbers down the left and a changed-word highlight on `&& !force`](/assets/diff-highlighting.png)
+ `!!` output opens in its own scrollable panel instead of scrolling away
+inside the model's. Sub-agents you did not name are alpha, bravo and charlie
+instead of four identical `sub-agent` labels. Clicking the footer's brain hides
+or shows thinking for the session without writing a setting. `/hooks off` and
+`/skills off` are session master switches. And an interrupted model download
+resumes where it stopped instead of starting over, which used to cost 88 GiB.
+
+**One settings bug worth naming.** `/config tools.<key>` reported "saved" and
+wrote nothing: the whole `tools` section was missing from the save path, so nine
+settings including `bashNotify` quietly reset at every launch. All nine persist
+now. The toggles that are deliberately session-only, the footer brain and
+`/loopguard`, still cannot reach `settings.json`; `/mc` still can, because that
+one is a real preference.
+
+**5.0.7 (beta) stops the parent from wearing the sub-agent's numbers.** While a
+sub-agent is working, the main transcript's progress line says
+`Waiting… (for sub-agent <name> to complete)`, and the live verb, clock, tokens
+and tokens per second move to that agent's own view — `←` then `Enter` from the
+roster. Until now the main transcript showed whatever pass the engine was
+running, which made the parent look busy generating when it was only waiting.
+
+**5.0.6 (beta) puts micro-compaction on the footer.** A wastebasket with a
+green or red light shows whether it is on, and double-clicking it flips the
+setting for the session; `/mc [on|off]` does the same by typing, and both work
+mid-turn. The loop guards learned two new shapes: reasoning that is drafting
+the answer rather than deciding what to do — a numbered list of findings, or
+the implementation as fenced code — is stopped and told to write it as the
+answer, and a cycle whose only variation is the list number is caught even
+though it is not byte-exact. A model that fails to open now says why, naming a
+dangling symlink's missing target, a truncated install caught against the
+manifest, or an absent companion sidecar. And every repro dump carries a table
+of its generation passes, which is how both guard changes were found.
+
+**5.0.5 (beta) charts the generation speed.** `/toks` draws tokens per second
+as a braille line in the theme green, one sample per second of decoding, in
+the same dismissable panel as `/usage`. Type it during a turn and it redraws on
+every status tick, so you can watch the rate move while the model types.
+
+`/exit` works mid-turn too now: it asks `[y/N]`, then interrupts the turn and
+leaves once it stops. The loop guard's reasoning budget also scales with the
+context window instead of stopping at a fixed 16 KiB, after it was caught
+cutting off a long design that was not looping.
+
+**5.0.4 (beta) moves the routing glyph into the window title**, and a `/init`
+you type mid-session keeps the conversation; only the startup AGENTS.md offer
+clears afterwards.
+
+**5.0.3 (beta) lets a shell job wake the model.** Turn on `tools.bashNotify`
+and a `bash` job the model leaves running no longer has to be polled with
+`bash_status`: the model ends its turn, you get the prompt back, and when the
+job exits plank appends a notification with the job's final output and starts
+a turn to report it. Once per job, never over a line you are still typing.
+The status bar shows `⧗ N jobs` while anything runs; click it, or type
+`/jobs`, for a live job panel that also works mid-turn. The same release fixes
+a cache regression where every tool call under speculative decoding quietly
+re-read the whole conversation.
+
+**5.0.2 (beta) gives the write tool a live preview.** A `Writing <path>`
+header, the first five lines of the file, then a `… N lines` counter that ticks
+as the file streams and settles on a `└ N lines` summary when the write lands.
+`/usage` typed during a turn now opens its dismissable panel instead of
+spilling into the scrollback, the rotating tip sits on its own line while the
+agent works, and the AGENTS.md startup offer has a "Don't ask for this folder"
+choice that remembers the answer in `~/.plank/agentsmd-skip`.
 
 **Plank runs two models now.** Qwen3.8-Flash-Next joins DeepSeek V4 Flash:
 `--qwen` reads `~/.plank/qwen.gguf` and the PLE sidecar it requires from
@@ -218,7 +496,7 @@ told you it had handed off, and everything after that happened somewhere you
 could not see. The debug console now gives each sub-agent its own window,
 titled `plank:<session>:subagent-<n>` and numbered in the order they start.
 
-![Four turbo-debug-console windows tiled: the parent session plank:sassy-washington bottom-left summarising both results, and subagent-1 and subagent-2 on the right, each streaming its own Python and its own answer](/assets/subagent-consoles.png)
+![Four tdk windows tiled: the parent session plank:sassy-washington bottom-left summarising both results, and subagent-1 and subagent-2 on the right, each streaming its own Python and its own answer](/assets/subagent-consoles.png)
 
 When a block of `agent` calls fans out, the slots run concurrently and you can
 read them side by side — above, two sub-agents working the same question in
@@ -231,7 +509,7 @@ While fixing that, one long-standing annoyance went with it: a malformed tool
 call used to freeze a console window for the rest of the session, so it sat
 there showing nothing while plank quietly recovered and carried on. It now
 prints the error and keeps going. Both need
-[turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console)
+[tdk](https://github.com/aovestdipaperino/tdk)
 0.2.1 or newer.
 
 **The footer counts what you have changed.** The TUI's top row has always told
@@ -255,17 +533,17 @@ See [Slash commands](/guide/04-slash-commands.html).
 `showThinking` off the scrollback stays about the answer — but the reasoning is
 still worth watching while it happens, and a log file only tells you afterwards.
 plank mirrors its whole raw model stream to
-[turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console), a
+[tdk](https://github.com/aovestdipaperino/tdk), a
 text-mode viewer that renders it in its own window: thinking dimmed above the
 answer, code highlighted, tool calls as banners.
 
-![turbo-debug-console showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein](/assets/debug-console.png)
+![tdk showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein](/assets/debug-console.png)
 
 Each session gets a window titled `plank:<session-name>`, matching the name above
 your prompt, and the window and its scrollback survive plank exiting — restart and
 the new run appends below a `-- reconnected --` rule. It is entirely optional:
 with nothing listening plank connects to nothing, says nothing, and behaves
-exactly as it always has. `brew install aovestdipaperino/tap/turbo-debug-console`.
+exactly as it always has. `brew install aovestdipaperino/tap/tdk`.
 
 **plank tells you where every setting came from.** Settings arrive from five
 layers — built-in defaults, plugins, `~/.plank`, the project's `./.plank`, and

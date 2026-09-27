@@ -99,21 +99,66 @@ sequenceDiagram
     end
 ```
 
+
+## Where `~/.plank` lives (`home.rs`)
+
+Everything user-scoped — models, sessions, plugins, skills, settings, the
+trust store, logs — hangs off one directory, and `home::plank_home_in` is the
+only place that decides where it is. Normally it is `$HOME/.plank`. When a
+machine has no `$HOME/.plank` but does have a shared `/Users/.plank`, plank
+uses that instead, so several accounts on one box share a single ~87 GB model
+set and one plugin install. The shared directory is never created: with
+neither present, a fresh install still lands in `$HOME/.plank`, so plank never
+writes outside the user's own home unless an administrator put the shared
+directory there first.
+
+The fallback applies only when the caller's `home` really is this process's
+`$HOME`. Every function that takes a `home` parameter as a hermetic test seam
+keeps getting `home/.plank` verbatim, so a test with a temp home can never
+pick up the machine's shared directory and pass or fail by accident.
+
+Project-scoped `./.plank` is a different thing and is unaffected.
+
 ## Module reference
 
 ### Model families (`gguf.rs`, `manifest::ModelSet`, `trace_stream::syntax`)
 plank supports two model families and tells them apart three times, from three
 different sources, because each answer is needed at a different moment.
 
+The second family is DeepSeek V4.1 Flash. It is not a revision of V4 but a
+separate model: different weights, tokenizer and vision encoder, and its own
+DSML dialect (the same markers respelled with a leading space). Nothing
+captured under one family may be replayed under the other, so the split runs
+all the way down — `ModelFamily::Ds4`/`Ds41`, `ToolSyntax::Dsml`/`Dsml41`,
+`ModelSet::Ds4`/`Ds41`, and `.ds4.kv`/`.ds41.kv` transcripts.
+
+Retiring a family is a third thing, neither supporting it nor deleting it.
+plank once served Qwen3.8-Flash-Next; upstream removed its Metal kernels, so
+the support is gone — no Cargo feature, no flag, no dialect, no manifest. What
+remains is `gguf::RETIRED_MODEL_PREFIXES`: `ModelFamily::for_model_name`
+answers `None` for a retired shape name, and because `session::blob_family`
+routes through it, `blob_family(meta) == Some(family())` can never hold for a
+blob captured under one. `.qwn.kv` transcripts and their bodies are therefore
+**inert** — never listed, never swept, never restored. That `None` is the
+data-safety guarantee, not an oversight: folding a retired name into `Ds4`
+would hand one model's KV cache to another. It is meant to stay unmatchable.
+
 `gguf::family_of` reads a model's own `general.architecture` — matching
-`qwen4exp` exactly as the C's `config_validate_model` does — and is the only
-answer available *before* `ds4_engine_open`. It has to be: the companion GGUF
-goes in a different options field per family (`mtp_path` for a DeepSeek draft
-checkpoint, `ple_path` for a Qwen sidecar), both fields must be populated
-before that call, and a `ple_path` handed to a non-Qwen model is a hard error
-in the C. Opening twice to ask the engine is not an option — the first open
-pays the whole residency cost. It also decides the vision skip, the side-artifact
-downloads, and the transcript extension.
+`deepseek41` whole, exactly as the C's `config_validate_model` does, since V4's
+`deepseek4` is not a prefix match away — and is the only answer available
+*before* `ds4_engine_open`. It has to be: the companion GGUF goes in `mtp_path`
+and must be populated before that call, while only the V4 set ships a drafter
+to put there at all. Opening twice to ask the engine is not an option — the
+first open pays the whole residency cost. It also decides the vision skip, the
+side-artifact downloads, and the transcript extension.
+
+`Ds4EngineOptions` (`ffi.rs`) mirrors the C `ds4_engine_options`
+field-for-field, and is declared through a macro that also emits the field-name
+list `tests/c_parity.rs` checks against `refs/ds4/ds4.h`. The guard is there
+because the failure it catches is silent: when a field was dropped from the
+middle of the C struct and plank's mirror kept it, every later field shifted
+eight bytes and `--ssd-streaming` stopped reaching the engine with no error
+anywhere. A field added, removed or reordered in the C now fails the build.
 
 `ToolSyntax::for_model_name` reads the shape name the engine reports *after*
 opening, and selects the tool-call dialect: the tools prompt, the parser, the
@@ -126,6 +171,51 @@ directory, install slots, artifact kinds, remote URL. The sets share nothing,
 because the invariant that makes a swap safe is per-set — the manifest moves
 last, so its presence proves that set landed, and one shared staging area would
 let a half-staged download of one family read as proof about the other.
+
+Only the V4 set is actually *managed*: `ds4.manifest` is the one manifest in
+the repo, and `default_set_for_root` answers `Ds4` for a fresh install. V4.1 is
+reached by pointing `-m` at a V4.1 GGUF — the family, dialect, transcript
+extension and install paths all follow from the file — and its manifest fetch
+simply 404s, which the startup flow already treats like being offline: nothing
+printed, nothing offered, and the 24-hour check file stamped before the fetch
+so it is not retried until tomorrow.
+
+### Weight deltas (`ggufdelta.rs`, `crates/gguf-delta`)
+A `.ggd` file is the difference between two GGUF files of identical layout —
+same metadata, same tensor table — as the changed byte spans, each stored as a
+deflate-compressed byte-wise `(target - base) mod 256` difference. Quantized
+weights nudged by a small edit (an abliteration touches 33 of 1328 tensors)
+compress far better this way than the raw target bytes do: ~440 MB for a
+1.18 GB span. The format, its reader and writer, and the small GGUF layout
+reader they need live in the `gguf-delta` workspace crate, published on its own;
+`ggufdelta.rs` is plank's side.
+
+`plank -m file.ggd` loads a delta as the model it derives. The engine cannot
+apply it in memory — `model_open` in `refs/ds4/ds4.c` maps the model read-only
+and, on Metal, `MAP_SHARED`, then wraps slices as no-copy `MTLBuffer`s — so
+`ggufdelta::resolve` APFS-clones the base into `~/.plank/models/patched/`
+(`clonefile(2)`, instant, sharing every untouched block), writes the changed
+spans into the clone, and `main::parse_config` swaps the clone's path in for
+the configured model before anything reads a header. Everything downstream
+sees an ordinary GGUF. The clone is reused across launches when its `.json`
+sidecar names the same delta hash; a base on another volume falls back to a
+full copy with a warning. Neither the base nor the delta is ever opened for
+writing.
+
+The delta records its base's filename and `general.*` metadata, never a
+path: a `.ggd` sits beside its base, so the pair moves together. Lookup tries
+`<ggd dir>/<base_name>`, then `~/.plank/models/<name>`, then the default
+model path, accepting only a file
+whose size and header hash match; every chunk additionally checks a hash of
+the base bytes it replaces, so the wrong base fails at the first chunk.
+
+KV caches are shared between base and derived weights on purpose: the engine
+reports one shape name for both and nothing here changes it, so the sysprompt
+snapshot, checkpoints and rungs are all reused. The only visible trace of the
+delta is the startup line. The crate's `ggd` binary (`ggd create`, `ggd
+info`) creates and inspects deltas; plank itself only loads them. A second
+crate, `gguf-delta-ffi`, wraps the same API as a C library with a header and a
+`ctypes` Python package, so other loaders can materialize a delta into a GGUF.
 
 ### Agent core (`ui.rs`, `worker.rs`)
 Owns the `Agent` struct (engine, session, tools, system prompt, trace) and the
@@ -221,7 +311,7 @@ screen directly: it is routed by `ui::SubSinkTarget` through a channel to
 TUI event loop applies it to the run's own buffer in `tui::SubPane` (the
 roster), the plain
 REPL prints it inline, or — for `SubSinkTarget::Null` under
-`--non-interactive` — it is discarded so the headless stdout protocol stays
+`--ui console` — it is discarded so the headless stdout protocol stays
 uncorrupted.
 
 ### Tools (`tools/`)
@@ -231,8 +321,11 @@ search), `bash.rs` (sync + async jobs), `web.rs` (`google_search`, `visit_page`)
 Output framing matches the C byte-for-byte. Every tool that writes a path
 resolves it through `ToolContext::resolve_for_write` (`tools/mod.rs`), the
 single write-containment choke point: with the sandbox enabled the target must
-sit under one of `Sandbox::write_roots` (cwd, the temp roots, configured
-`writablePaths`, `~/.plank` once granted) or the tool returns
+sit under one of `Sandbox::write_roots` (cwd, the temp roots, the toolchain
+caches such as `~/.cargo/registry` and `~/.npm/_cacache`, configured
+`writablePaths`, and the `Protected` families — `~/.plank`, and the `PATH`
+directories `~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin` — once granted) or
+the tool returns
 `Tool error: <tool> path escapes workspace: <path>`. The Seatbelt profile is
 built from the same list, so the two cannot drift; reads are deliberately not
 contained. `dispatch` also runs `BashJobs::sweep` first, so a timed-out async
@@ -306,6 +399,30 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   before a compaction pass mutates the transcript (`restore_rung_below`), so
   the engine extends forward from the rung instead of rebuilding. See
   `docs/KV-CACHE.md` for the rationale and the full mechanics.
+
+### Skills (`skills.rs`)
+- A skill is a directory holding a `SKILL.md`: optional frontmatter (`name`,
+  `description`, `argument-hint`) over a markdown body that becomes a user-turn
+  preamble, with `$ARGUMENTS` substituted (or the arguments appended as a
+  trailing paragraph when the body has no placeholder, so they are never
+  silently dropped). The name becomes a slash command, so it must be routable:
+  no whitespace, no `/`, and no `:` — the colon belongs to `<plugin>:<name>`.
+- Six skills ship compiled into the binary from `src/resources/skills/`
+  (`code-review`, `debug`, `remember`, `skillify`, `update-config`, `verify`),
+  declared in the `BUILTIN` table and parsed by the *same* loader as a user's,
+  so a built-in cannot rely on anything a user's skill could not use. They have
+  no source directory, which is what `Skill::is_builtin` keys on and what
+  `/skills` marks `[built-in]`.
+- Layering is `load_layered`: built-ins first, then `~/.plank/skills`, then
+  `./.plank/skills`, each layer replacing the last by name. A project
+  `code-review/` therefore *replaces* the built-in rather than colliding with
+  it — the built-ins are defaults, not reserved words.
+- `load_from` is deliberately disk-only. `plugins::gather` loads each plugin's
+  `skills/` directory through it, and seeding built-ins there would re-attribute
+  plank's own skills to every plugin as `<plugin>:code-review`.
+- The model reaches skills through the `skill` tool (enumerate with no name,
+  expand by name), bounded per turn by `SKILL_DEPTH_CAP` so a skill whose text
+  invokes another cannot loop.
 
 ### Plugins (`plugins.rs`, `claudeplugin.rs`)
 - `plugins.rs` — what a plugin *is* once it is on disk: a directory bundling
@@ -485,6 +602,34 @@ the transcript the moment they end, so the agent keeps the last
 captured in `end_subagent_fork` and after a fan-out) and `/repro` writes each
 beside the main file as `repro-<secs>.sub-<n>.md`, with the sub-agent's label,
 task and outcome (`report`, `no report`, or `failed: interrupted`).
+`/repro` also works mid-turn in the TUI, typed or from the footer's camera
+shutter, although the worker owns the agent for the whole turn: at every main
+pass start `worker_generate_kind` builds the full report (`Agent::repro_base`)
+and publishes it as a `repro::ReproBase` on `TurnShared`
+(`begin_repro_pass`), then streams the pass's text into `TurnShared::live_pass`;
+the UI thread's `TurnShared::write_repro` saves that base with an
+`## In-progress pass` section carrying the note and the partial output. An
+untyped note defaults to `repro::MID_TURN_NOTE` (`manually triggered mid
+turn`), stamped onto the header too. Sidechain and `/btw` passes never
+publish, the base is dropped at turn end (`end_repro`), and the written path
+is handed to `last_edited` when the turn ends so a bare `/open` finds it.
+
+### Activity report (`stats.rs`)
+`stats.rs` is `/stats`'s GitHub-style activity heatmap and headline figures
+(favorite model, total tokens, sessions, longest span, days started,
+longest streak, most active day, current streak), computed deterministically
+from the per-session metadata `insights::collect_metas` already caches under
+`~/.plank/usage-data/session-meta/` — the model is never called. Token counts
+are transcript bytes / 4, because plank keeps no real per-session token count;
+the report states the figure without the caveat, since a number nobody can act
+on is not made more useful by doubting it in the margin. The heatmap is always
+all-time; only the
+figures below it take a scope (all time, last 7 days, last 30 days). In the
+TUI it opens in the same dismissable `ReportPanel` as `/usage`, with the scope
+carried in the panel title so re-issuing `/stats` with no argument can cycle
+it and `/stats 7`/`/stats 30`/`/stats all` jump directly; the plain REPL
+prints the same report as text. Like `/insights`, it is handled only while
+plank is idle, not mid-turn.
 
 ### Settings (`settings.rs`)
 Persistent user preferences, read from `~/.plank/settings.json` then
@@ -496,7 +641,7 @@ built-in defaults < ~/.plank/settings.json < ./.plank/settings.json < env < CLI 
 ```
 
 The file holds only *stable preferences*, never per-run choices — `--prompt`,
-`--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`,
+`--ui`, `--ui-remote`, `--trace`, `--chdir`, `--seed`,
 `--worktree`, and the serve/control options deliberately have no key. Seven
 groups:
 
@@ -635,7 +780,7 @@ atomic (`interrupt.rs`) directly.
 
 `main::run` picks the path from the terminal:
 
-| stdin & stdout are a TTY | `--non-interactive` | Front-end |
+| stdin & stdout are a TTY | `--ui console` / `--ui chart` | Front-end |
 | --- | --- | --- |
 | yes | no | Ratatui TUI (`run_tui`) |
 | no | no | Plain line REPL (`run_repl_plain`) |
@@ -643,6 +788,27 @@ atomic (`interrupt.rs`) directly.
 
 The TUI uses the alternate screen, so block-based terminals (Warp) render it as
 a proper full-screen app rather than reflowing it.
+
+`--ui chart` and `--ui quiet` also show the time *while* the turn runs, each
+in the one place its mode leaves free. The chart gets a dim `elapsed 12.4s`
+footer under the panels (`ui::elapsed_footer`) — its own line, because the
+panels are the fixed grid `toks::render_report` also draws for `/toks`, where a
+wall clock printed after the fact would mean nothing. Quiet has no line to
+spare, so its clock rewrites itself in place at the end of the one line the
+mode prints (`ui::InlineClock`, backspaces rather than a carriage return, which
+would take `Prompting. Started working... ` with it), leaving its last reading
+where it stops: `Prompting. Started working... 12.4s done.`. Both clocks run
+from the turn's start, and quiet's runs only on a TTY — a redirected run keeps
+the three notes and no backspaces.
+
+A headless run given `-p` is a one-shot: it runs the single turn and exits,
+closing with `total time: <elapsed>` on **stderr** (`ui::total_time_line`),
+measured from the agent being built — so the model load and the warm are in it
+— to after the session save and `SessionEnd`. Stderr because stdout carries the
+reply a caller is piping, and under `--ui chart` and `--ui quiet` it carries
+that mode's one deliberate piece of output. The interactive paths need nothing
+here: both already close with `Agent::report_run_stats`, which prints the same
+wall clock beside the token totals.
 
 ## Build
 

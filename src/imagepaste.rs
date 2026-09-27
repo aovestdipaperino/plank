@@ -242,7 +242,7 @@ fn process_and_store(bytes: &[u8], source_path: Option<PathBuf>) -> Option<Paste
 
 /// `~/.plank/image-cache`, mirroring Claude Code's `~/.claude/image-cache`.
 fn cache_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".plank").join("image-cache"))
+    std::env::var_os("HOME").map(|h| crate::home::plank_home_in(h).join("image-cache"))
 }
 
 /// Content hash via the system `shasum` (macOS ships it; avoids a crypto dep).

@@ -590,4 +590,35 @@ mod tests {
         assert_eq!(fwd.doomed[0], 0);
         assert_eq!(rev.doomed[0], 1);
     }
+
+    /// A yielded session's restore target must survive the sweep even though
+    /// it presents no live rungs and is otherwise ordinary garbage.
+    ///
+    /// This passed on its first run: `plan_sweep` already treats `active`
+    /// unconditionally, the same as `pinned`. It is kept anyway as a
+    /// regression guard for an invariant that is easy to break later — a
+    /// yielded plank frees its session and returns with nothing "live" in the
+    /// ordinary sense, so the restore target's fingerprint reaching `active`
+    /// is the only thing standing between it and the next sweep.
+    #[test]
+    fn a_yielded_sessions_restore_target_survives_the_sweep() {
+        // Old enough and with no parent or pin, so every rule but `active`
+        // dooms it.
+        let doomed = node(KvRole::Session, "yield-target", None, 999);
+        let nodes = vec![doomed];
+
+        let without = plan_sweep(&nodes, &[], &policy(), NOW);
+        assert_eq!(
+            doomed_fps(&without, &nodes),
+            vec!["yield-target".to_owned()],
+            "precondition: this blob is otherwise swept"
+        );
+
+        let with = plan_sweep(&nodes, &["yield-target"], &policy(), NOW);
+        assert!(
+            doomed_fps(&with, &nodes).is_empty(),
+            "a yielded session has no live rungs, so the pinned restore \
+             target is the only thing keeping its blob alive"
+        );
+    }
 }

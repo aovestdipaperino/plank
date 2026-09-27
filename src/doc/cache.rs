@@ -15,7 +15,7 @@ const MAX_CACHED_DOCS: usize = 64;
 
 /// `~/.plank/doc-cache`, the sibling of `~/.plank/image-cache`.
 pub(crate) fn cache_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".plank").join("doc-cache"))
+    std::env::var_os("HOME").map(|h| crate::home::plank_home_in(h).join("doc-cache"))
 }
 
 /// Path a document with content hash `hash` converts to.

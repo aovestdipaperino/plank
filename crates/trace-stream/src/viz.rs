@@ -18,7 +18,7 @@ use crate::dsml::{
     DsmlParser, DsmlState, MARKER_NAMES, ToolCall, tag_prefix_len, tag_prefix_partial,
 };
 use crate::qwen::QwenParser;
-use crate::syntax::ToolSyntax;
+use crate::syntax::{DsmlTags, ToolSyntax};
 
 /// Told to the model when it emitted a tool call inside `<think>`.
 ///
@@ -28,12 +28,91 @@ use crate::syntax::ToolSyntax;
 pub const IN_THINK_PROHIBITION: &str =
     "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.";
 
-/// The canonical DSML tool-call opening marker.
-const DSML_START: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
-/// Canonical invoke opener, seeded when the model skips the outer wrapper.
-const CANONICAL_INVOKE: &[u8] = "<｜DSML｜invoke".as_bytes();
+/// Tree glyphs for the tool-call banner.
+///
+/// Each tool line sits two columns under the `🛠️ tool_calls` root, and its
+/// parameter branches sit two further columns in, so the banner reads as a
+/// three-level tree: stanza, tool, parameter.
+///
+/// Every parameter branch is `├─`; the last one is never `└─`. Values stream
+/// in byte by byte, and nothing tells this renderer a parameter was the final
+/// one until the invoke's close tag arrives — long after the connector was
+/// painted and flushed. A uniform connector is the only shape that stays
+/// honest without buffering the whole call, which is the one thing a
+/// streaming renderer must not do.
+const TREE_BRANCH: &str = "    ├─ ";
+/// Continuation rail under a branch, for a value spanning several lines.
+/// Same column count as [`TREE_BRANCH`], so the rail sits directly under the
+/// branch glyph it continues.
+const TREE_RAIL: &str = "    │  ";
+/// Indent of a tool line under the `🛠️ tool_calls` root.
+const TOOL_INDENT: &str = "  ";
+
+/// The emoji that heads a tool's line in the banner, so a glance at the tree
+/// tells the kind of call before the name is read. Unknown tools (WASM
+/// components, provider-specific extras) fall back to the generic wrench.
+fn tool_emoji(name: &str) -> &'static str {
+    match name {
+        "read" | "more" => "📖",
+        "write" => "📝",
+        "edit" => "✏️",
+        "search" => "🔍",
+        "glob" => "🔎",
+        "list" => "📂",
+        "bash" => "💻",
+        "bash_status" => "⏳",
+        "bash_stop" => "⏹️",
+        "run_code" => "🧪",
+        "google_search" | "visit_page" => "🌐",
+        "view_image" => "🖼️",
+        "skill" => "🎓",
+        "task" => "✅",
+        "ask" => "❓",
+        "recall" | "remember" | "forget" => "🧠",
+        "compact" => "🗜️",
+        "EnterPlanMode" | "ExitPlanMode" => "📋",
+        "EnterWorktree" | "ExitWorktree" => "🌳",
+        n if n.starts_with("mcp") => "🔌",
+        _ => "🔧",
+    }
+}
+
+/// The Qwen parameter close tag, with the newline the syntax puts before it.
+///
+/// Held as one unit so that newline is recognized as syntax and never reaches
+/// the banner as a trailing blank line.
+const QWEN_PARAM_CLOSE: &[u8] = b"\n</parameter>";
+
+/// [`parameter_close_tail`] for the Qwen dialect, which has exactly one
+/// spelling and so needs only a prefix test.
+fn qwen_param_close_tail(tail: &[u8], complete: &mut bool) -> bool {
+    if tail.len() > QWEN_PARAM_CLOSE.len() || QWEN_PARAM_CLOSE[..tail.len()] != *tail {
+        return false;
+    }
+    *complete = tail.len() == QWEN_PARAM_CLOSE.len();
+    true
+}
+
 /// The Qwen dialect's one and only stanza opener.
+///
+/// Unlike the DSML openers it carries no marker token, so it is also a string
+/// a model can plausibly write in prose. It is still matched here, because the
+/// alternative — telling the renderer which dialect to expect — is not
+/// available to every caller: `plank-console` is handed bytes off a socket
+/// with no model name attached.
 const QWEN_START: &[u8] = b"<tool_call>";
+
+/// The dialect a matched stanza opener names.
+///
+/// `ToolSyntax` cannot carry this: it is the DSML *tag table* selector, total
+/// over `dsml_tags`, and shared with plank's model-selection and system-prompt
+/// code. Qwen is not DSML-shaped and has no tag table, so it is a dialect the
+/// renderer adopts, not a `ToolSyntax` variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    Dsml(ToolSyntax),
+    Qwen,
+}
 const DSML_BAR: &[u8] = "｜".as_bytes();
 
 const THINK_OPEN: &[u8] = b"<think>";
@@ -42,6 +121,11 @@ const THINK_CLOSE: &[u8] = b"</think>";
 /// Longest status line taken from hidden thinking, in characters; a first
 /// "sentence" that runs past this is cut at a word boundary with an ellipsis.
 const THINK_STATUS_CAP: usize = 160;
+
+/// How many body lines the banners-off `write` preview shows before it
+/// collapses the rest behind a single `…` line. The `└ N lines` summary still
+/// reports the true total.
+const WRITE_PREVIEW_MAX_LINES: usize = 5;
 
 /// The first sentence of `text`: up to and including the first `.`, `!` or
 /// `?` that is followed by whitespace, or up to the first newline, whichever
@@ -137,7 +221,7 @@ fn log_tool_error(reason: &str, raw: &[u8]) {
 /// This trait is also the animation boundary. Motion is Ratatui-only: the
 /// Ratatui sink drives `plank`'s animation module effects (throbber, shimmer, pulse,
 /// flash, stall-fade) off the shared 20 Hz clock, while the plain-stdout and
-/// `--non-interactive` sinks render the static/reduced-motion form. The stream
+/// `--ui console` sinks render the static/reduced-motion form. The stream
 /// renderer feeds bytes through here without knowing which sink animates, so the
 /// plain path stays untouched.
 pub trait RenderSink {
@@ -154,6 +238,15 @@ pub trait RenderSink {
     fn error_text(&mut self, text: &str) {
         self.tool_text(text);
     }
+
+    /// Sets, updates, or clears a transient single-line status that replaces
+    /// itself in place — used for the live `… N lines` counter of a collapsed
+    /// `write` preview. `Some(text)` shows/replaces the line; `None` removes
+    /// it (the caller then emits the permanent summary through the normal text
+    /// channel). Sinks that cannot rewrite a line leave this as the default
+    /// no-op: they simply skip the live tick and still receive the final
+    /// summary as ordinary text.
+    fn preview_status(&mut self, _text: Option<&str>) {}
 }
 
 impl RenderSink for Box<dyn RenderSink> {
@@ -168,6 +261,9 @@ impl RenderSink for Box<dyn RenderSink> {
     }
     fn error_text(&mut self, text: &str) {
         (**self).error_text(text);
+    }
+    fn preview_status(&mut self, text: Option<&str>) {
+        (**self).preview_status(text);
     }
 }
 
@@ -186,6 +282,9 @@ impl RenderSink for Box<dyn RenderSink + Send> {
     }
     fn error_text(&mut self, text: &str) {
         (**self).error_text(text);
+    }
+    fn preview_status(&mut self, text: Option<&str>) {
+        (**self).preview_status(text);
     }
 }
 
@@ -252,18 +351,15 @@ fn param_kind_for(tool: &str, param: &str) -> ParamKind {
     }
 }
 
-/// Display prefix for known tools; `None` falls back to the tool name.
-fn tool_prefix(name: &str) -> Option<&'static str> {
-    match name {
-        "bash" => Some("$ "),
-        "read" => Some("read "),
-        "write" => Some("write "),
-        "edit" => Some("edit "),
-        "search" => Some("search "),
-        "google_search" => Some("google "),
-        "visit_page" => Some("visit "),
-        name if name.starts_with("mcp_") => Some("mcp "),
-        _ => None,
+/// Renders `path` relative to `base` when it sits inside it; otherwise returns
+/// `path` unchanged. Used to shorten the `write` preview header for files in
+/// the working tree while leaving out-of-tree paths absolute.
+fn repo_relative(path: &str, base: &std::path::Path) -> String {
+    let p = std::path::Path::new(path);
+    match p.strip_prefix(base) {
+        Ok(rel) if rel.as_os_str().is_empty() => path.to_string(),
+        Ok(rel) => rel.to_string_lossy().into_owned(),
+        Err(_) => path.to_string(),
     }
 }
 
@@ -300,13 +396,15 @@ fn parse_attr(tag: &str, name: &str) -> Option<String> {
 ///
 /// Returns true while `tail` could still become (or already is) a full
 /// `</｜DSML｜parameter...>` close tag; sets `complete` when the tail is a
-/// full close tag ending exactly at the last byte.
-fn parameter_close_tail(tail: &[u8], complete: &mut bool) -> bool {
+/// full close tag ending exactly at the last byte. `name` is the dialect's
+/// parameter tag name (V4.1 spells it with a leading space), so no spelling is
+/// fixed here.
+fn parameter_close_tail(tail: &[u8], name: &str, complete: &mut bool) -> bool {
     *complete = false;
-    if tag_prefix_partial(tail, true, "parameter") {
+    if tag_prefix_partial(tail, true, name) {
         return true;
     }
-    let Some(mut i) = tag_prefix_len(tail, true, "parameter") else {
+    let Some(mut i) = tag_prefix_len(tail, true, name) else {
         return false;
     };
     while i < tail.len() && tail[i].is_ascii_whitespace() {
@@ -333,24 +431,92 @@ fn parameter_close_tail(tail: &[u8], complete: &mut bool) -> bool {
 
 /// Matches a growing tail against the accepted DSML start forms.
 ///
+/// Port of `agent_stream_dsml_start_match` (`refs/ds4/ds4_agent.c`), which
+/// builds its `canonical` / `missing_bar` / `invoke` / `invoke_missing_bar`
+/// candidates from the dialect's spellings. `tags` supplies those spellings so
+/// V4 and V4.1 share one detector and neither can grow a hand-typed literal.
+///
 /// Returns true while `tail` is a prefix of any accepted opening form; sets
-/// `complete` when a form matched fully and `implicit_invoke` when the form
-/// was a direct invoke opener without the outer `tool_calls` wrapper.
-fn dsml_start_match(tail: &[u8], complete: &mut bool, implicit_invoke: &mut bool) -> bool {
+/// `complete` when a form matched fully, `implicit_invoke` when the form was a
+/// direct invoke opener without the outer wrapper, and `matched` to the
+/// dialect the form belongs to (meaningful only once `complete`).
+///
+/// Every dialect is tried, because a stream does not announce which one it
+/// speaks: the debug console renders bytes off a socket with no model name,
+/// and a replayed transcript may hold either. The dialect the opener matched
+/// is then adopted for the whole stanza, so every tag after it is read in one
+/// dialect and none of the inner matching loosens.
+fn dsml_start_match(
+    tail: &[u8],
+    complete: &mut bool,
+    implicit_invoke: &mut bool,
+    matched: &mut ToolSyntax,
+) -> bool {
+    for syntax in ToolSyntax::ALL {
+        // `ALL` is the DSML dialects; Qwen has no tag table and reaches the
+        // parser through `Dialect::Qwen`, adopted from its own opener below.
+        let Some(tags) = syntax.dsml_tags() else {
+            continue;
+        };
+        if dsml_start_match_one(tail, tags, complete, implicit_invoke) {
+            *matched = syntax;
+            return true;
+        }
+    }
+    false
+}
+
+/// [`dsml_start_match`] widened to every dialect, DSML and Qwen alike.
+///
+/// DSML is tried first and Qwen only if no DSML form is even a prefix. The two
+/// openers share no spelling, so the order is not load-bearing for
+/// correctness; DSML leads because it is the default and by far the more
+/// common stream.
+///
+/// Qwen has exactly one opener and no implicit-invoke form to stand in for it,
+/// so its arm is a plain prefix test.
+fn start_match_any(
+    tail: &[u8],
+    complete: &mut bool,
+    implicit_invoke: &mut bool,
+    matched: &mut Dialect,
+) -> bool {
+    let mut syntax = ToolSyntax::default();
+    if dsml_start_match(tail, complete, implicit_invoke, &mut syntax) {
+        *matched = Dialect::Dsml(syntax);
+        return true;
+    }
+    if tail.len() <= QWEN_START.len() && QWEN_START[..tail.len()] == *tail {
+        *implicit_invoke = false;
+        *complete = tail == QWEN_START;
+        *matched = Dialect::Qwen;
+        return true;
+    }
+    false
+}
+
+/// [`dsml_start_match`] against one dialect's spellings.
+fn dsml_start_match_one(
+    tail: &[u8],
+    tags: DsmlTags,
+    complete: &mut bool,
+    implicit_invoke: &mut bool,
+) -> bool {
     *complete = false;
     *implicit_invoke = false;
     // Each marker contributes the canonical form and the dropped-leading-bar
     // typo, for both the wrapper and the bare invoke opener. The wrapper also
     // accepts a trailing `｜` before `>` — the closing tags always tolerated it,
     // and post-update weights emit it on the opener too.
+    let (calls, invoke) = (tags.calls_name, tags.invoke_name);
     let forms = MARKER_NAMES.iter().flat_map(|m| {
         [
-            (format!("<｜{m}｜tool_calls>"), false),
-            (format!("<｜{m}｜tool_calls｜>"), false),
-            (format!("<{m}｜tool_calls>"), false),
-            (format!("<{m}｜tool_calls｜>"), false),
-            (format!("<｜{m}｜invoke"), true),
-            (format!("<{m}｜invoke"), true),
+            (format!("<｜{m}｜{calls}>"), false),
+            (format!("<｜{m}｜{calls}｜>"), false),
+            (format!("<{m}｜{calls}>"), false),
+            (format!("<{m}｜{calls}｜>"), false),
+            (format!("<｜{m}｜{invoke}"), true),
+            (format!("<{m}｜{invoke}"), true),
         ]
     });
     for (form, implicit) in forms {
@@ -503,11 +669,18 @@ impl PseudoToolDetector {
             } else {
                 text == *opener
             }
-        }) || self.tool_names.iter().any(|name| {
-            text.strip_prefix('<')
-                .and_then(|t| t.strip_suffix('>'))
-                .is_some_and(|inner| inner == name)
-        });
+        }) || text
+            .strip_prefix('<')
+            .and_then(|t| t.strip_suffix('>'))
+            .is_some_and(|inner| {
+                // Plus the prefix arm plank's `dispatch` ends with: every
+                // `mcp__server__tool` name routes to the MCP bridge, and those
+                // names are discovered per server at runtime, so no static
+                // table can list them. Without this an invented `<mcp__x__y>`
+                // block was not tool-shaped to the detector and the turn ended
+                // with no call and no error for the model to correct from.
+                inner.starts_with("mcp__") || self.tool_names.iter().any(|n| inner == n)
+            });
         if !matched {
             return None;
         }
@@ -540,6 +713,10 @@ enum DsmlScan {
 #[derive(Debug, Default)]
 struct ToolViz {
     active: bool,
+    /// Whether the `🛠️ tool_calls` root line has been painted. Emitted at the
+    /// first invoke rather than at the stanza opener, so a stanza that turns
+    /// out to be malformed reports its error without a stray header above it.
+    root_emitted: bool,
     tool_announced: bool,
     param_active: bool,
     at_line_start: bool,
@@ -547,6 +724,11 @@ struct ToolViz {
     tool_name: String,
     param_name: String,
     param_end_tail: Vec<u8>,
+    /// Qwen puts a newline between `<parameter=…>` and the value, and another
+    /// before `</parameter>`; both are syntax, not content (`QwenParser`
+    /// strips them from the parsed value). This suppresses the leading one so
+    /// the banner does not open every parameter with a blank rail line.
+    qwen_pending_lf: bool,
     read_style: bool,
     read_prefix_rendered: bool,
     read_line_rendered: bool,
@@ -558,10 +740,28 @@ struct ToolViz {
     /// Destination captured from a `write` call's path param, for the dim
     /// content-preview header.
     write_path: String,
+    /// True when the current `write` streamed its `content` before its `path`,
+    /// so the preview header could not name the file. The `└ N lines` summary
+    /// is then held back to the end of the invoke, where the path is known,
+    /// and carries it.
+    write_pathless: bool,
+    /// The held-back summary line count for a `write_pathless` preview.
+    write_pending_summary: Option<usize>,
     /// True when the current `write` targets a file that does not yet exist:
     /// only then does the content stream as a dim preview (an overwrite is left
     /// to the post-edit diff card).
     write_is_create: bool,
+    /// Content lines seen so far for the current create preview: full,
+    /// newline-terminated lines. `write_partial_line` covers a final line
+    /// with no trailing newline. Together they form the `└ N lines` summary.
+    write_content_newlines: usize,
+    /// True when the create body has emitted bytes on the current line that
+    /// are not yet newline-terminated (a trailing partial line to count).
+    write_partial_line: bool,
+    /// True once the collapsed preview has emitted its `…` line, so the
+    /// remaining body bytes are suppressed (they are still counted for the
+    /// `└ N lines` summary). Only the banners-off preview collapses.
+    write_truncated: bool,
 }
 
 impl ToolViz {
@@ -617,9 +817,9 @@ pub struct Finished<'a> {
 /// ```
 /// The active tool-call parser, one variant per dialect.
 ///
-/// An enum rather than a trait object: the renderer needs eight small
+/// An enum rather than a trait object: the renderer needs a handful of small
 /// accessors and no extensibility, and keeping it concrete means the DSML path
-/// compiles to exactly what it did before Qwen existed.
+/// compiles to what it did before Qwen existed.
 #[derive(Debug)]
 enum Parser {
     Dsml(DsmlParser),
@@ -627,11 +827,13 @@ enum Parser {
 }
 
 impl Parser {
-    fn new(syntax: ToolSyntax) -> Self {
-        match syntax {
-            ToolSyntax::Dsml => Self::Dsml(DsmlParser::new()),
-            ToolSyntax::Qwen => Self::Qwen(QwenParser::new()),
-        }
+    /// A DSML parser for `syntax`.
+    ///
+    /// One parser type, two tag tables: the dialect must be handed through, or
+    /// a V4.1 stanza reaches a parser scanning for V4 tags and every call is
+    /// silently dropped.
+    fn dsml(syntax: ToolSyntax) -> Self {
+        Self::Dsml(DsmlParser::with_syntax(syntax))
     }
 
     fn state(&self) -> DsmlState {
@@ -697,6 +899,21 @@ impl Parser {
     fn finish(&mut self) {
         if let Self::Qwen(p) = self {
             p.finish();
+        }
+    }
+
+    /// True when this parser reads the Qwen dialect.
+    fn is_qwen(&self) -> bool {
+        matches!(self, Self::Qwen(_))
+    }
+
+    /// The DSML dialect this parser is reading in, if it is a DSML parser.
+    ///
+    /// `None` for Qwen, which is not DSML-shaped and has no tag table.
+    fn dsml_syntax(&self) -> Option<ToolSyntax> {
+        match self {
+            Self::Dsml(p) => Some(p.syntax()),
+            Self::Qwen(_) => None,
         }
     }
 }
@@ -833,7 +1050,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         Self {
             sink,
             syntax,
-            parser: Parser::new(syntax),
+            parser: Parser::dsml(syntax),
             viz: ToolViz::default(),
             scan: DsmlScan::Between,
             in_think: false,
@@ -1008,13 +1225,14 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// An interrupted tool call is closed with a `[tool call interrupted]`
     /// status line; DSML seen inside thinking is reported as ignored.
     pub fn finish(&mut self) {
-        // End of generation is what completes a Qwen stanza, so the parser is
-        // told *before* the flush below, which would otherwise treat the open
-        // stanza as interrupted and report it as incomplete.
+        // A stanza still open at end of generation is settled before the
+        // flush below, which would otherwise report it as interrupted. End of
+        // generation is also what *completes* a Qwen stanza, so the parser is
+        // told first.
         //
         // Guarded on a stanza still being open: both terminal arms of
         // `settle_parser_state` clear `dsml_active`, and the Done arm
-        // *accumulates* into `self.calls`, so settling an already-settled DSML
+        // *accumulates* into `self.calls`, so settling an already-settled
         // stanza here would dispatch every one of its calls twice.
         if self.dsml_active {
             self.parser.finish();
@@ -1072,9 +1290,13 @@ impl<S: RenderSink> StreamRenderer<S> {
                     self.parser.state(),
                     DsmlState::Structural | DsmlState::ParamValue
                 )
-                .then_some(match self.syntax {
-                    ToolSyntax::Dsml => "incomplete DSML tool call",
-                    ToolSyntax::Qwen => "incomplete tool call",
+                // Named for the dialect in force: telling a Qwen model its
+                // "DSML" was incomplete, and handing it DSML to copy, is not a
+                // hypothetical — it is what a recorded session did.
+                .then_some(if self.parser.is_qwen() {
+                    "incomplete tool call"
+                } else {
+                    "incomplete DSML tool call"
                 })
             });
         Finished {
@@ -1309,10 +1531,11 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
     }
 
-    /// Starts a tool banner line: "🛠️ ".
+    /// Starts a tool line under the root: indent, then the tool's emoji.
     fn viz_line_prefix(&mut self) {
         self.viz_newline_if_open();
-        self.viz_puts("🛠️ ");
+        let emoji = tool_emoji(&self.viz.tool_name);
+        self.viz_puts(&format!("{TOOL_INDENT}{emoji} "));
         self.viz.at_line_start = false;
     }
 
@@ -1326,19 +1549,24 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.viz.tool_name = name.to_string();
         self.viz.tool_announced = true;
         self.viz.read_style = name == "read";
+        if !self.viz.root_emitted {
+            self.viz.root_emitted = true;
+            self.viz_newline_if_open();
+            self.viz_puts("🛠️ tool_calls\n");
+            self.viz.at_line_start = true;
+        }
         self.viz_line_prefix();
         if self.viz.read_style {
+            self.viz_puts("read\n");
+            self.viz_puts(TREE_BRANCH);
             self.viz_puts("Reading ");
             self.viz.read_prefix_rendered = true;
             return;
         }
-        if let Some(prefix) = tool_prefix(name) {
-            self.viz_puts(prefix);
-        } else {
-            let owned = name.to_string();
-            self.viz_puts(&owned);
-            self.viz_puts(" ");
-        }
+        let owned = name.to_string();
+        self.viz_puts(&owned);
+        self.viz_puts("\n");
+        self.viz.at_line_start = true;
     }
 
     fn viz_read_value_byte(&mut self, c: u8) {
@@ -1362,6 +1590,8 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
         if !self.viz.read_prefix_rendered {
             self.viz_line_prefix();
+            self.viz_puts("read\n");
+            self.viz_puts(TREE_BRANCH);
             self.viz_puts("Reading ");
             let path = if self.viz.read_path.is_empty() {
                 "<unknown>".to_string()
@@ -1411,6 +1641,10 @@ impl<S: RenderSink> StreamRenderer<S> {
         if !self.viz.at_line_start {
             return;
         }
+        if !self.viz_is_write_preview() {
+            self.viz_puts(TREE_RAIL);
+            self.viz.at_line_start = false;
+        }
         if let Some(prefix) = diff_prefix(self.viz.param_kind) {
             self.viz_puts(prefix);
             self.viz.at_line_start = false;
@@ -1437,7 +1671,26 @@ impl<S: RenderSink> StreamRenderer<S> {
         // dropped here (the post-edit diff card shows it).
         if self.viz_is_write_preview() {
             if self.viz.write_is_create {
-                self.emit_preview_bytes(&[c]);
+                if self.show_tool_calls {
+                    // Banners on: the 🛠️ banner is the header, so stream the
+                    // whole body flush as before.
+                    self.emit_preview_bytes(&[c]);
+                } else {
+                    // Banners off: the `● Writing …` header owns this block, so
+                    // indent the body two columns and collapse it after
+                    // `WRITE_PREVIEW_MAX_LINES` lines behind a single `…`.
+                    self.viz_write_preview_body_byte(c);
+                }
+                if c == b'\n' {
+                    self.viz.write_content_newlines += 1;
+                    self.viz.write_partial_line = false;
+                    // Past the cap, tick the live counter after each full line.
+                    if self.viz.write_truncated && !self.show_tool_calls {
+                        self.viz_write_preview_tick();
+                    }
+                } else {
+                    self.viz.write_partial_line = true;
+                }
             }
             self.viz.at_line_start = c == b'\n';
             return;
@@ -1445,6 +1698,43 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.viz_code_prefix();
         self.emit_visible_bytes(&[c]);
         self.viz.at_line_start = c == b'\n';
+    }
+
+    /// Emits one body byte of the banners-off `write` preview: the first
+    /// [`WRITE_PREVIEW_MAX_LINES`] lines are shown indented two columns; once
+    /// the body runs past that, a live `… N lines` line stands in for the rest
+    /// and further bytes are dropped (the caller still counts them, both for
+    /// the live tick and the final summary).
+    fn viz_write_preview_body_byte(&mut self, c: u8) {
+        if self.viz.write_truncated {
+            return;
+        }
+        if self.viz.write_content_newlines >= WRITE_PREVIEW_MAX_LINES {
+            // We have entered the first line past the cap: collapse the rest
+            // behind the live counter, which the caller updates per line.
+            self.viz.write_truncated = true;
+            self.viz_write_preview_tick();
+            return;
+        }
+        if self.viz.at_line_start && c != b'\n' {
+            self.viz_preview_puts("  ");
+        }
+        self.emit_preview_bytes(&[c]);
+    }
+
+    /// Updates the collapsed preview's live `… N lines` line in place, where
+    /// `N` is the number of body lines seen so far. Sinks that cannot rewrite a
+    /// line ignore it.
+    fn viz_write_preview_tick(&mut self) {
+        // Gated with the rest of the preview: `/init` turns the whole preview
+        // off, and the transient line must go with it.
+        if !self.show_write_preview {
+            return;
+        }
+        let n = self.viz.write_content_newlines;
+        let unit = if n == 1 { "line" } else { "lines" };
+        self.flush_carry();
+        self.sink.preview_status(Some(&format!("  … {n} {unit}")));
     }
 
     fn viz_param_begin(&mut self, name: &str) {
@@ -1459,6 +1749,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         match self.viz.param_kind {
             ParamKind::DiffOld | ParamKind::DiffNew => {
                 self.viz_newline_if_open();
+                self.viz_puts(&format!("{TREE_BRANCH}{name} ─\n"));
                 self.viz.at_line_start = true;
                 self.viz_code_begin();
             }
@@ -1471,37 +1762,74 @@ impl<S: RenderSink> StreamRenderer<S> {
                     // A dim header names the file for the content preview. Only
                     // when the banner is off, else the banner already shows it.
                     if self.viz.write_is_create && !self.show_tool_calls {
-                        let path = if self.viz.write_path.is_empty() {
-                            "<file>".to_string()
+                        // The path param usually precedes content. When the
+                        // model orders them the other way the destination is
+                        // simply not known yet: say "Writing" and let the
+                        // closing summary name the file, never a placeholder.
+                        if self.viz.write_path.is_empty() {
+                            self.viz.write_pathless = true;
+                            self.viz_preview_puts("● Writing\n");
                         } else {
-                            self.viz.write_path.clone()
-                        };
-                        self.viz_preview_puts(&format!("write {path}\n"));
+                            let path = if let Ok(cwd) = std::env::current_dir() {
+                                repo_relative(&self.viz.write_path, &cwd)
+                            } else {
+                                self.viz.write_path.clone()
+                            };
+                            self.viz_preview_puts(&format!("● Writing {path}\n"));
+                        }
                     }
                 } else {
-                    let label = format!("{name}:\n");
-                    self.viz_puts(&label);
+                    self.viz_puts(&format!("{TREE_BRANCH}{name} ─\n"));
                 }
                 self.viz.at_line_start = true;
                 if self.viz_param_is_code_body() {
                     self.viz_code_begin();
                 }
             }
-            ParamKind::BashCommand => {}
-            ParamKind::Normal | ParamKind::Path => {
-                if !self.viz.at_line_start {
-                    self.viz_puts(" ");
-                }
-                let label = format!("{name}=");
-                self.viz_puts(&label);
+            ParamKind::BashCommand | ParamKind::Normal | ParamKind::Path => {
+                self.viz_newline_if_open();
+                self.viz_puts(&format!("{TREE_BRANCH}{name} ─ "));
+                self.viz.at_line_start = false;
             }
         }
     }
 
     fn viz_param_end(&mut self) {
+        // A create's content just finished: append the line-count summary on
+        // the same dim preview channel, on its own line.
+        if self.viz.tool_name == "write"
+            && self.viz.param_kind == ParamKind::Content
+            && self.viz.write_is_create
+        {
+            let n = self.viz.write_content_newlines + usize::from(self.viz.write_partial_line);
+            let unit = if n == 1 { "line" } else { "lines" };
+            if self.viz.write_truncated {
+                // The collapsed body had a live `… N lines` line. Drop it and
+                // land the permanent `└ N lines` summary in its place. Gated
+                // with the preview: `/init` shows neither, so there is no
+                // transient line to clear.
+                if self.show_write_preview {
+                    self.flush_carry();
+                    self.sink.preview_status(None);
+                }
+            } else if !self.viz.at_line_start {
+                self.viz_preview_puts("\n");
+            }
+            if self.viz.write_pathless {
+                // The path is still unstreamed: hold the summary for the end
+                // of the invoke, where it can name the file.
+                self.viz.write_pending_summary = Some(n);
+            } else {
+                self.viz_preview_puts(&format!("  └ {n} {unit}\n"));
+            }
+        }
         self.viz.param_end_tail.clear();
         if self.viz.code_param_active {
             self.viz_code_end();
+        }
+        if !self.viz.read_style {
+            self.viz_newline_if_open();
+            self.viz.at_line_start = true;
         }
         self.viz.param_active = false;
         self.viz.param_name.clear();
@@ -1526,6 +1854,9 @@ impl<S: RenderSink> StreamRenderer<S> {
         if self.viz.tool_name == "write" && self.viz.param_kind == ParamKind::Path {
             self.viz.write_path.push(c as char);
         }
+        if self.viz.at_line_start && c != b'\n' {
+            self.viz_puts(TREE_RAIL);
+        }
         self.emit_visible_bytes(&[c]);
         self.viz.at_line_start = c == b'\n';
     }
@@ -1535,20 +1866,40 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// The visualizer must not wait for the whole parameter: large write/edit
     /// contents should show progress while still detecting the closing tag.
     fn viz_param_value_byte(&mut self, c: u8) {
-        if !self.viz.param_end_tail.is_empty() || c == b'<' {
+        let qwen = self.parser.is_qwen();
+        // The newline that opens a Qwen value is syntax; drop exactly one.
+        if qwen && self.viz.qwen_pending_lf {
+            self.viz.qwen_pending_lf = false;
+            if c == b'\n' {
+                return;
+            }
+        }
+        // Qwen's close tag is preceded by a newline that is syntax too, so the
+        // hold has to start one byte earlier than DSML's bare `<`.
+        let holds = if qwen { c == b'\n' } else { c == b'<' };
+        if !self.viz.param_end_tail.is_empty() || holds {
             if self.viz.param_end_tail.len() == ToolViz::END_TAIL_CAP {
                 let held = std::mem::take(&mut self.viz.param_end_tail);
                 for b in held {
                     self.viz_param_raw_byte(b);
                 }
-                if c != b'<' {
+                if !holds {
                     self.viz_param_raw_byte(c);
                     return;
                 }
             }
             self.viz.param_end_tail.push(c);
             let mut complete = false;
-            if parameter_close_tail(&self.viz.param_end_tail, &mut complete) {
+            let is_close_tail = if qwen {
+                qwen_param_close_tail(&self.viz.param_end_tail, &mut complete)
+            } else {
+                // Only the DSML branch has tag names to match; asking for them
+                // on a Qwen stanza is what used to reach `dsml_tag_names` with
+                // `ToolSyntax::Qwen` and abort the render.
+                let (_, param_name) = self.dsml_tag_names();
+                parameter_close_tail(&self.viz.param_end_tail, param_name, &mut complete)
+            };
+            if is_close_tail {
                 if complete {
                     self.viz_param_end();
                 }
@@ -1577,6 +1928,26 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.viz.read_start.clear();
         self.viz.read_max.clear();
         self.viz.read_whole.clear();
+        self.viz.write_content_newlines = 0;
+        self.viz.write_partial_line = false;
+        self.viz.write_truncated = false;
+        if let Some(n) = self.viz.write_pending_summary.take() {
+            let unit = if n == 1 { "line" } else { "lines" };
+            let path = if self.viz.write_path.is_empty() {
+                String::new()
+            } else if let Ok(cwd) = std::env::current_dir() {
+                repo_relative(&self.viz.write_path, &cwd)
+            } else {
+                self.viz.write_path.clone()
+            };
+            if path.is_empty() {
+                self.viz_preview_puts(&format!("  └ {n} {unit}\n"));
+            } else {
+                self.viz_preview_puts(&format!("  └ {n} {unit} · {path}\n"));
+            }
+        }
+        self.viz.write_pathless = false;
+        self.viz.write_path.clear();
         self.viz.tool_announced = false;
     }
 
@@ -1637,15 +2008,66 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
     }
 
+    /// The dialect's inner tag names for the display scan.
+    ///
+    /// V4 and V4.1 spell `invoke` and `parameter` differently (V4.1 carries a
+    /// leading space), and the banner scan matches them by name.
+    fn dsml_tag_names(&self) -> (&'static str, &'static str) {
+        let tags = self.dsml_tags_or_v4();
+        (tags.invoke_name, tags.param_name)
+    }
+
+    /// This renderer's DSML tag table, falling back to V4's.
+    ///
+    /// Every caller sits behind an `is_qwen` check, so the fallback is
+    /// unreachable by construction — but `ToolSyntax::Qwen` became reachable
+    /// here the moment the model family started selecting the dialect, and
+    /// these paths are driven by model bytes. A wrong banner is recoverable;
+    /// aborting the render mid-stanza is not, so this cannot be an `expect`.
+    fn dsml_tags_or_v4(&self) -> crate::syntax::DsmlTags {
+        self.syntax.dsml_tags().unwrap_or_else(|| {
+            ToolSyntax::Dsml
+                .dsml_tags()
+                .expect("Dsml is a DSML dialect")
+        })
+    }
+
+    /// The Qwen dialect's display scan.
+    ///
+    /// Its tags carry the name in the tag itself (`<function=read>`) rather
+    /// than in a `name` attribute, so none of the DSML tag matching applies.
+    fn scan_qwen_tag(&mut self, tag: &str) {
+        let Some(body) = tag.strip_prefix('<').and_then(|t| t.strip_suffix('>')) else {
+            return;
+        };
+        if body == "/function" {
+            self.viz_invoke_end();
+        } else if let Some(name) = body.strip_prefix("function=") {
+            self.viz_tool(name);
+        } else if let Some(name) = body.strip_prefix("parameter=") {
+            self.viz_param_begin(name);
+            self.viz.qwen_pending_lf = true;
+            self.scan = DsmlScan::Value;
+        }
+        // `<tool_call>` and `</tool_call>` bound the stanza and have no banner
+        // of their own; anything else is malformed, and the strict parser is
+        // what reports it.
+    }
+
     fn scan_dsml_tag(&mut self, tag: &[u8]) {
         let tag = String::from_utf8_lossy(tag).into_owned();
+        if self.parser.is_qwen() {
+            self.scan_qwen_tag(&tag);
+            return;
+        }
         let b = tag.as_bytes();
-        if tag_prefix_len(b, true, "invoke").is_some() {
+        let (invoke_name, param_name) = self.dsml_tag_names();
+        if tag_prefix_len(b, true, invoke_name).is_some() {
             self.viz_invoke_end();
-        } else if tag_prefix_len(b, false, "invoke").is_some() {
+        } else if tag_prefix_len(b, false, invoke_name).is_some() {
             let name = parse_attr(&tag, "name").unwrap_or_else(|| "tool".to_string());
             self.viz_tool(&name);
-        } else if tag_prefix_len(b, false, "parameter").is_some()
+        } else if tag_prefix_len(b, false, param_name).is_some()
             && let Some(name) = parse_attr(&tag, "name")
         {
             self.viz_param_begin(&name);
@@ -1683,13 +2105,14 @@ impl<S: RenderSink> StreamRenderer<S> {
 
     /// Acts on a terminal parser state: banner, verdict, and collected calls.
     ///
-    /// Split out of [`Self::feed_dsml_byte`] because the two dialects reach a
-    /// terminal state at different moments. DSML lands on `Done` on the byte
-    /// that closes its stanza; the Qwen dialect has no terminator that ends a
-    /// run of stanzas, so it is `finish` that settles it at end of generation
-    /// (see `QwenParser::finish`). Both routes have to do this same work, or a
-    /// Qwen call would parse cleanly and then never be collected. Idempotent,
-    /// because `finish` calls it after the byte loop already may have.
+    /// Split out of [`Self::feed_dsml_byte`] because a stanza can reach a
+    /// terminal state at two moments, and the dialects differ on which. DSML
+    /// lands on `Done` on the byte that closes its stanza; the Qwen dialect has
+    /// no terminator that ends a run of stanzas, so it is [`Self::finish`] that
+    /// settles it at end of generation (see `QwenParser::finish`). Both routes
+    /// have to do this same work, or a Qwen call would parse cleanly and then
+    /// never be collected. Idempotent, because `finish` calls it after the byte
+    /// loop already may have.
     fn settle_parser_state(&mut self) {
         match self.parser.state() {
             DsmlState::Done => {
@@ -1784,19 +2207,40 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// block it may still turn out to be the model quoting syntax, and a
     /// banner for a call that never happens is worse than a late one. Rendering
     /// starts if and when `</think>` arrives with the stanza still open.
-    /// Whether the held tail is a prefix of this dialect's stanza opener.
+    /// Whether the held tail is a prefix of *any* dialect's stanza opener.
     ///
     /// DSML accepts a spread of spellings (marker typos, a trailing bar, a
-    /// bare invoke standing in for the wrapper); Qwen has exactly one opener,
-    /// and no implicit-invoke form to stand in for it.
-    fn start_match(&self, complete: &mut bool, implicit_invoke: &mut bool) -> bool {
-        match self.syntax {
-            ToolSyntax::Dsml => dsml_start_match(&self.dsml_start_tail, complete, implicit_invoke),
-            ToolSyntax::Qwen => {
-                *implicit_invoke = false;
-                let tail = &self.dsml_start_tail[..];
-                *complete = tail == QWEN_START;
-                tail.len() <= QWEN_START.len() && QWEN_START[..tail.len()] == *tail
+    /// bare invoke standing in for the wrapper); Qwen has exactly one opener.
+    fn start_match(
+        &self,
+        complete: &mut bool,
+        implicit_invoke: &mut bool,
+        matched: &mut Dialect,
+    ) -> bool {
+        // Every DSML dialect answers `dsml_tags`, and the candidate openers
+        // are built from that table — no spelling is named here, so a new
+        // dialect cannot silently miss this site.
+        start_match_any(&self.dsml_start_tail, complete, implicit_invoke, matched)
+    }
+
+    /// Adopts the dialect a completed stanza opener named.
+    ///
+    /// Swapping the parser is only done when the dialect actually changes: the
+    /// parser accumulates nothing across stanzas that `self.calls` does not
+    /// already hold, but replacing it needlessly would throw away a `reset`
+    /// that [`Self::start_dsml`] is about to make anyway.
+    fn adopt(&mut self, dialect: Dialect) {
+        match dialect {
+            Dialect::Dsml(syntax) => {
+                self.syntax = syntax;
+                if self.parser.is_qwen() || self.parser.dsml_syntax() != Some(syntax) {
+                    self.parser = Parser::dsml(syntax);
+                }
+            }
+            Dialect::Qwen => {
+                if !self.parser.is_qwen() {
+                    self.parser = Parser::Qwen(QwenParser::new());
+                }
             }
         }
     }
@@ -1818,6 +2262,16 @@ impl<S: RenderSink> StreamRenderer<S> {
         if matches!(self.parser.state(), DsmlState::Done | DsmlState::Error) {
             self.parser.reset();
         }
+        // The opener may have named a dialect other than the one the parser
+        // was built for — a console fed off a socket starts on the V4 default
+        // and learns what it is reading from the first stanza. `adopt` has
+        // already rebuilt the parser when that happened; this guard catches
+        // the one route that does not go through it, a parser seeded by a
+        // caller. Rebuilding is only ever a no-op or a fresh `Search` parser,
+        // since this runs before any of the stanza's own bytes reach it.
+        if !self.parser.is_qwen() && self.parser.dsml_syntax() != Some(self.syntax) {
+            self.parser = Parser::dsml(self.syntax);
+        }
         self.dsml_active = true;
         self.dsml_ignored = self.rejects_in_think();
         if self.in_think {
@@ -1827,10 +2281,11 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.post_think_gap = false;
         // The parser has its own opener scan, and it is fed the *canonical*
         // spelling rather than whichever accepted variant the model wrote.
-        self.parser.feed(match self.syntax {
-            ToolSyntax::Dsml => DSML_START,
-            ToolSyntax::Qwen => QWEN_START,
-        });
+        if self.parser.is_qwen() {
+            self.parser.feed(QWEN_START);
+        } else {
+            self.parser.feed(self.dsml_tags_or_v4().start.as_bytes());
+        }
         self.scan = DsmlScan::Between;
         if !self.dsml_ignored {
             self.viz_start();
@@ -2035,7 +2490,14 @@ impl<S: RenderSink> StreamRenderer<S> {
 
         // Swallow the visual whitespace gap the model emits right after
         // `</think>`; normal rendering resumes at the first non-space byte.
-        if self.post_think_gap && matches!(c, b' ' | b'\t' | b'\r' | b'\n') {
+        // Upstream `bd66c40` added `!sr->dsml_start_len` here: whitespace is
+        // only a visual gap while no opener is half-matched. Without it a
+        // space arriving mid-opener was eaten, and the partial match then
+        // leaked as raw markup.
+        if self.post_think_gap
+            && self.dsml_start_tail.is_empty()
+            && matches!(c, b' ' | b'\t' | b'\r' | b'\n')
+        {
             return;
         }
 
@@ -2044,13 +2506,24 @@ impl<S: RenderSink> StreamRenderer<S> {
                 self.dsml_start_tail.push(c);
             }
             let (mut complete, mut implicit_invoke) = (false, false);
-            if self.start_match(&mut complete, &mut implicit_invoke) {
+            let mut matched = Dialect::Dsml(self.syntax);
+            if self.start_match(&mut complete, &mut implicit_invoke, &mut matched) {
                 if complete {
+                    // The opener names the dialect; everything downstream —
+                    // the parser's tag table, the banner scan, the wording of
+                    // a tool error — reads `self.syntax`, so adopting it here
+                    // is the whole of V4.1 support on this side. Qwen is
+                    // adopted the same way, and additionally swaps in its own
+                    // parser, since it is not DSML-shaped.
+                    self.adopt(matched);
                     // Parity mode discards an in-think stanza; otherwise it is
                     // an ordinary tool call that happens to sit inside a thought.
                     self.start_dsml();
                     if implicit_invoke {
-                        for &b in CANONICAL_INVOKE {
+                        // Same rule as the opener: replay the dialect's own
+                        // canonical invoke, not the bytes the model wrote.
+                        let invoke = self.dsml_tags_or_v4().invoke;
+                        for &b in invoke.as_bytes() {
                             self.feed_dsml_byte(b);
                         }
                     }
@@ -2206,6 +2679,9 @@ mod tests {
         visible: String,
         think: String,
         errors: String,
+        /// Each `preview_status(Some(_))` value, in order; a `None` pushes the
+        /// literal marker `"<cleared>"` so tests can see the finalize.
+        preview: Vec<String>,
     }
 
     impl RenderSink for Cap {
@@ -2218,6 +2694,10 @@ mod tests {
         }
         fn think_text(&mut self, text: &str) {
             self.think.push_str(text);
+        }
+        fn preview_status(&mut self, text: Option<&str>) {
+            self.preview
+                .push(text.map_or_else(|| "<cleared>".to_string(), str::to_string));
         }
     }
 
@@ -2232,6 +2712,21 @@ mod tests {
         let mut sr = StreamRenderer::new(Cap::default());
         sr.set_tool_names(vec!["task".to_string(), "read".to_string()]);
         sr
+    }
+
+    /// `dispatch` routes any `mcp__server__tool` name to the MCP bridge via a
+    /// prefix arm, so the detector must treat that shape as tool-shaped too —
+    /// the names are discovered per server and no static table can hold them.
+    #[test]
+    fn invented_mcp_block_is_reported() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push("<think>planning</think>");
+        sr.push("<mcp__tokensave__tokensave_search>\nquery: \"Settings\"\n");
+        sr.finish();
+        assert!(
+            sr.finished().error.is_some(),
+            "invented mcp call produced no error for the model to correct from"
+        );
     }
 
     // Issue #51: the model invents <task> XML for tools it was not trained on.
@@ -2436,7 +2931,7 @@ mod tests {
         sr.push(stanza);
         sr.finish();
         let think = &sr.sink().think;
-        assert!(think.contains("write src/foo.rs"), "header: {think:?}");
+        assert!(think.contains("Writing src/foo.rs"), "header: {think:?}");
         assert!(think.contains("fn main() {}"), "content preview: {think:?}");
         assert!(
             !sr.sink().visible.contains("fn main()"),
@@ -2446,13 +2941,232 @@ mod tests {
         assert_eq!(sr.finished().calls.len(), 1, "call still parsed");
     }
 
+    fn write_summary_for(path: &str, content: &str) -> String {
+        let stanza = format!(
+            concat!(
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"write\">",
+                "<｜DSML｜parameter name=\"path\">{}</｜DSML｜parameter>",
+                "<｜DSML｜parameter name=\"content\">{}</｜DSML｜parameter>",
+                "</｜DSML｜invoke>",
+                "</｜DSML｜tool_calls>",
+            ),
+            path, content,
+        );
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_tool_calls(false); // banners-off preview path (dim channel)
+        sr.push(&stanza);
+        sr.finish();
+        sr.sink().think.clone()
+    }
+
+    /// A `write` that streams `content` before `path` must never print the
+    /// literal `<file>`: the header says only "Writing" and the closing
+    /// summary names the file once the path has been streamed.
+    #[test]
+    fn write_preview_with_content_before_path_names_the_file_in_the_summary() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"content\">one\ntwo\n</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"path\">src/late_path.rs</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_tool_calls(false);
+        sr.push(stanza);
+        sr.finish();
+        let think = sr.sink().think.clone();
+        assert!(!think.contains("<file>"), "no placeholder: {think:?}");
+        assert!(think.contains("● Writing\n"), "bare header: {think:?}");
+        assert!(
+            think.contains("└ 2 lines · src/late_path.rs"),
+            "summary names the file: {think:?}"
+        );
+    }
+
+    #[test]
+    fn write_summary_counts_multiple_lines() {
+        // Three content lines, each newline-terminated.
+        let think = write_summary_for("src/new_a.rs", "one\ntwo\nthree\n");
+        assert!(think.contains("└ 3 lines"), "summary: {think:?}");
+    }
+
+    #[test]
+    fn write_summary_is_singular_for_one_line() {
+        let think = write_summary_for("src/new_b.rs", "only\n");
+        assert!(think.contains("└ 1 line"), "summary: {think:?}");
+        assert!(!think.contains("└ 1 lines"), "singular grammar: {think:?}");
+    }
+
+    #[test]
+    fn write_summary_counts_trailing_partial_line() {
+        // No trailing newline: the last partial line still counts.
+        let think = write_summary_for("src/new_c.rs", "a\nb");
+        assert!(think.contains("└ 2 lines"), "summary: {think:?}");
+    }
+
+    #[test]
+    fn write_summary_is_zero_for_empty_body() {
+        let think = write_summary_for("src/new_d.rs", "");
+        assert!(think.contains("└ 0 lines"), "summary: {think:?}");
+    }
+
+    #[test]
+    fn write_summary_absent_for_overwrite() {
+        // Cargo.toml exists relative to the crate dir -> treated as an overwrite.
+        let think = write_summary_for("Cargo.toml", "whatever\n");
+        assert!(!think.contains("└"), "no summary for overwrite: {think:?}");
+    }
+
+    #[test]
+    fn write_preview_has_bullet_header_and_indented_block() {
+        let think = write_summary_for("src/bullet_new.rs", "one\n");
+        assert!(
+            think.contains("● Writing src/bullet_new.rs"),
+            "bullet header: {think:?}"
+        );
+        assert!(
+            think.contains("  one"),
+            "body indented two columns: {think:?}"
+        );
+        assert!(think.contains("  └ 1 line"), "indented summary: {think:?}");
+    }
+
+    #[test]
+    fn write_preview_collapses_the_body_past_the_cap() {
+        // Seven lines, cap is five: the first five show, the rest collapse
+        // behind the live `… N lines` counter, and the final summary lands the
+        // true total. Drive it directly so the preview ticks are observable.
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"path\">src/collapse_new.rs</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"content\">l1\nl2\nl3\nl4\nl5\nl6\nl7\n</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_tool_calls(false);
+        sr.push(stanza);
+        sr.finish();
+        let think = &sr.sink().think;
+        assert!(
+            think.contains("  l1")
+                && think.contains("  l2")
+                && think.contains("  l3")
+                && think.contains("  l4")
+                && think.contains("  l5"),
+            "first five lines shown: {think:?}"
+        );
+        assert!(
+            !think.contains("l6") && !think.contains("l7"),
+            "lines past the cap are collapsed: {think:?}"
+        );
+        // The live counter ticked as lines 6 and 7 streamed, then was cleared.
+        let preview = &sr.sink().preview;
+        assert!(
+            preview.iter().any(|p| p == "  … 5 lines"),
+            "counter starts at the cap: {preview:?}"
+        );
+        assert!(
+            preview.iter().any(|p| p == "  … 7 lines"),
+            "counter ticks to the true total: {preview:?}"
+        );
+        assert_eq!(
+            preview.last().map(String::as_str),
+            Some("<cleared>"),
+            "the live line is cleared at close: {preview:?}"
+        );
+        assert!(
+            think.contains("  └ 7 lines"),
+            "permanent summary reports the true total: {think:?}"
+        );
+        assert!(
+            !think.contains("  …"),
+            "no static ellipsis in the text channel: {think:?}"
+        );
+    }
+
+    #[test]
+    fn write_preview_does_not_collapse_at_the_cap() {
+        // Exactly three lines: all shown, no ellipsis.
+        let think = write_summary_for("src/exact_new.rs", "a\nb\nc\n");
+        assert!(!think.contains('…'), "no ellipsis at the cap: {think:?}");
+        assert!(think.contains("  └ 3 lines"), "summary: {think:?}");
+    }
+
+    #[test]
+    fn write_preview_state_resets_between_invokes_in_one_stanza() {
+        // Two `write` creates in a single stanza: the second invoke's summary
+        // must not be inflated by the first invoke's line count, and its
+        // header must not be a concatenation of both paths.
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"path\">src/multi_a.rs</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"content\">a\nb\n</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"path\">src/multi_b.rs</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"content\">x\n</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_tool_calls(false);
+        sr.push(stanza);
+        sr.finish();
+        let think = &sr.sink().think;
+        assert!(think.contains("└ 2 lines"), "first summary: {think:?}");
+        assert!(think.contains("└ 1 line"), "second summary: {think:?}");
+        assert!(!think.contains("└ 3 lines"), "inflated summary: {think:?}");
+        assert!(
+            think.contains("Writing src/multi_b.rs"),
+            "second header: {think:?}"
+        );
+        assert!(
+            !think.contains("multi_asrc"),
+            "concatenated path leaked: {think:?}"
+        );
+    }
+
+    /// With banners on the tree names the tool (`  📝 write`) rather than a
+    /// verb; the `Writing <path>` phrasing survives only in the banners-off
+    /// preview header, which `write_preview_header_*` covers.
+    #[test]
+    fn write_banner_names_the_tool_when_banners_on() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"path\">src/foo.rs</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"content\">fn main() {}\n</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let mut sr = StreamRenderer::new(Cap::default());
+        // Banners on (default): the tree node names the tool.
+        sr.push(stanza);
+        sr.finish();
+        assert!(
+            sr.sink()
+                .visible
+                .contains("  📝 write\n    ├─ path ─ src/foo.rs"),
+            "banner node: {:?}",
+            sr.sink().visible
+        );
+    }
+
     #[test]
     fn show_write_preview_false_drops_the_content_preview_entirely() {
         let stanza = concat!(
             "<｜DSML｜tool_calls>",
             "<｜DSML｜invoke name=\"write\">",
             "<｜DSML｜parameter name=\"path\">src/foo.rs</｜DSML｜parameter>",
-            "<｜DSML｜parameter name=\"content\">fn main() {}\n</｜DSML｜parameter>",
+            // A long body: past the cap it would tick the live counter unless
+            // that too is gated off with the rest of the preview.
+            "<｜DSML｜parameter name=\"content\">l1\nl2\nl3\nl4\nl5\nl6\nl7\n</｜DSML｜parameter>",
             "</｜DSML｜invoke>",
             "</｜DSML｜tool_calls>",
         );
@@ -2465,9 +3179,14 @@ mod tests {
         sr.finish();
         assert!(sr.sink().think.is_empty(), "think: {:?}", sr.sink().think);
         assert!(
-            !sr.sink().visible.contains("fn main()"),
+            !sr.sink().visible.contains("l1"),
             "visible: {:?}",
             sr.sink().visible
+        );
+        assert!(
+            sr.sink().preview.is_empty(),
+            "no live counter when the preview is off: {:?}",
+            sr.sink().preview
         );
         assert_eq!(sr.finished().calls.len(), 1, "call still parsed");
     }
@@ -2670,7 +3389,10 @@ mod tests {
         );
         for sr in [run_chunked(text), run_charwise(text)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🛠️ $ cat documents.rs"), "{vis:?}");
+            assert!(
+                vis.contains("  💻 bash\n    ├─ command ─ cat documents.rs"),
+                "{vis:?}"
+            );
             assert!(!vis.contains("SSML"), "{vis:?}");
             let fin = sr.finished();
             assert_eq!(fin.calls.len(), 1);
@@ -2727,7 +3449,10 @@ mod tests {
         for sr in [run_chunked(&text), run_charwise(&text)] {
             let vis = &sr.sink().visible;
             assert!(vis.starts_with("Let me look.\n"), "{vis:?}");
-            assert!(vis.contains("🛠️ $ ls -la"), "{vis:?}");
+            assert!(
+                vis.contains("  💻 bash\n    ├─ command ─ ls -la"),
+                "{vis:?}"
+            );
             assert!(!vis.contains("DSML"), "{vis:?}");
             let fin = sr.finished();
             assert_eq!(fin.calls.len(), 1);
@@ -2748,7 +3473,10 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🛠️ Reading src/main.rs 1:500...\n"), "{vis:?}");
+            assert!(
+                vis.contains("  📖 read\n    ├─ Reading src/main.rs 1:500...\n"),
+                "{vis:?}"
+            );
             assert!(!vis.contains("DSML"), "{vis:?}");
         }
     }
@@ -2767,7 +3495,7 @@ mod tests {
         assert!(
             sr.sink()
                 .visible
-                .contains("🛠️ Reading a.c (whole file)...\n"),
+                .contains("  📖 read\n    ├─ Reading a.c (whole file)...\n"),
             "{:?}",
             sr.sink().visible
         );
@@ -2786,7 +3514,7 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🛠️ edit  path=a.rs"), "{vis:?}");
+            assert!(vis.contains("  ✏️ edit\n    ├─ path ─ a.rs"), "{vis:?}");
             assert!(vis.contains("- let a = 1;"), "{vis:?}");
             assert!(vis.contains("+ let a = 2;"), "{vis:?}");
             assert!(!vis.contains("DSML"), "{vis:?}");
@@ -3017,7 +3745,9 @@ mod tests {
         assert_eq!(fin.calls.len(), 1, "{:?}", fin.calls);
         assert_eq!(fin.calls[0].name, "bash");
         assert!(
-            sr.sink().visible.contains("🛠️ $ ls -la"),
+            sr.sink()
+                .visible
+                .contains("  💻 bash\n    ├─ command ─ ls -la"),
             "{:?}",
             sr.sink().visible
         );
@@ -3041,7 +3771,9 @@ mod tests {
         assert_eq!(fin.calls.len(), 1, "{:?}", fin.calls);
         assert_eq!(fin.calls[0].arg_value("command"), Some("ls -la"));
         assert!(
-            sr.sink().visible.contains("🛠️ $ ls -la"),
+            sr.sink()
+                .visible
+                .contains("  💻 bash\n    ├─ command ─ ls -la"),
             "{:?}",
             sr.sink().visible
         );
@@ -3094,7 +3826,9 @@ mod tests {
             // The banner renders like any other tool call, and raw DSML never
             // reaches either sink.
             assert!(
-                sr.sink().visible.contains("🛠️ $ ls -la"),
+                sr.sink()
+                    .visible
+                    .contains("  💻 bash\n    ├─ command ─ ls -la"),
                 "{:?}",
                 sr.sink().visible
             );
@@ -3134,7 +3868,10 @@ mod tests {
         sr.push("<｜DSML｜parameter name=\"command\">sleep 1");
         sr.finish();
         let vis = &sr.sink().visible;
-        assert!(vis.contains("🛠️ $ sleep 1"), "{vis:?}");
+        assert!(
+            vis.contains("  💻 bash\n    ├─ command ─ sleep 1"),
+            "{vis:?}"
+        );
         assert!(vis.contains("[tool call interrupted]\n"), "{vis:?}");
         assert!(sr.finished().calls.is_empty());
     }
@@ -3356,6 +4093,40 @@ mod tests {
         assert_eq!(fin.calls.len(), 0, "an in-think stanza is not dispatched");
     }
 
+    /// The banner renders as a tree: a stanza root, one `🔧` node per invoke,
+    /// and a `├─` branch per parameter with long values indented under a rail.
+    #[test]
+    fn tree_banner_shape() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"glob\">",
+            "<｜DSML｜parameter name=\"pattern\">src/settings.rs</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "<｜DSML｜invoke name=\"mcp__tokensave__tokensave_search\">",
+            "<｜DSML｜parameter name=\"query\">Settings</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"limit\">15</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\">cargo test\ncargo build</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let want = concat!(
+            "🛠️ tool_calls\n",
+            "  🔎 glob\n",
+            "    ├─ pattern ─ src/settings.rs\n",
+            "  🔌 mcp__tokensave__tokensave_search\n",
+            "    ├─ query ─ Settings\n",
+            "    ├─ limit ─ 15\n",
+            "  💻 bash\n",
+            "    ├─ command ─ cargo test\n",
+            "    │  cargo build\n",
+        );
+        for sr in [run_chunked(stanza), run_charwise(stanza)] {
+            assert_eq!(sr.sink().visible, want);
+        }
+    }
+
     #[test]
     fn implicit_invoke_opener_is_accepted() {
         let stanza = concat!(
@@ -3366,7 +4137,9 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             assert!(
-                sr.sink().visible.contains("🛠️ $ pwd"),
+                sr.sink()
+                    .visible
+                    .contains("  💻 bash\n    ├─ command ─ pwd"),
                 "{:?}",
                 sr.sink().visible
             );
@@ -3431,7 +4204,7 @@ mod tests {
         );
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
-            assert!(vis.contains("🛠️ write  path=x.txt"), "{vis:?}");
+            assert!(vis.contains("  📝 write\n    ├─ path ─ x.txt"), "{vis:?}");
             // The content now previews on the dim (think) channel, not visible.
             assert!(!vis.contains("line one"), "{vis:?}");
             assert!(
@@ -3509,8 +4282,10 @@ mod tests {
         assert_eq!(calls.len(), 2, "both stanzas must dispatch: {calls:?}");
         assert_eq!(calls[0].args[0].value, "A.md");
         assert_eq!(calls[1].args[0].value, "B.md");
-        // And none of the second stanza's markup leaked to the screen.
-        assert!(!vis.contains("tool_calls"), "{vis:?}");
+        // And none of the second stanza's markup leaked to the screen. The
+        // check is against the marker spelling, not the bare word: the tree
+        // banner's own root line reads "🛠️ tool_calls".
+        assert!(!vis.contains("｜tool_calls"), "{vis:?}");
         assert!(!vis.contains("parameter name="), "{vis:?}");
     }
 
@@ -3559,10 +4334,41 @@ mod tests {
             in_think.sink().visible
         );
     }
+
+    #[test]
+    fn repo_relative_strips_base_prefix() {
+        let base = std::path::Path::new("/Users/x/proj");
+        assert_eq!(
+            repo_relative("/Users/x/proj/src/foo.rs", base),
+            "src/foo.rs"
+        );
+    }
+
+    #[test]
+    fn repo_relative_leaves_outside_paths_absolute() {
+        let base = std::path::Path::new("/Users/x/proj");
+        assert_eq!(
+            repo_relative("/tmp/other/main.rs", base),
+            "/tmp/other/main.rs"
+        );
+    }
+
+    #[test]
+    fn repo_relative_passes_through_already_relative() {
+        let base = std::path::Path::new("/Users/x/proj");
+        assert_eq!(repo_relative("src/foo.rs", base), "src/foo.rs");
+    }
+
+    #[test]
+    fn repo_relative_handles_base_itself() {
+        let base = std::path::Path::new("/Users/x/proj");
+        // The base dir with a trailing slash strips to empty -> keep the path.
+        assert_eq!(repo_relative("/Users/x/proj", base), "/Users/x/proj");
+    }
 }
 
 #[cfg(test)]
-mod qwen_dialect_tests {
+mod dialect_tests {
     use super::*;
     use crate::syntax::ToolSyntax;
 
@@ -3580,13 +4386,278 @@ mod qwen_dialect_tests {
         fn think_text(&mut self, _text: &str) {}
     }
 
-    const CALL: &str = "<tool_call>\n<function=read>\n<parameter=path>\nsrc/a.rs\n</parameter>\n</function>\n</tool_call>";
+    /// Markup from the retired Qwen dialect. Kept as a sample of foreign
+    /// XML-ish tool markup that no dialect plank speaks may react to.
+    const FOREIGN_CALL: &str = "<tool_call>\n<function=read>\n<parameter=path>\nsrc/a.rs\n</parameter>\n</function>\n</tool_call>";
 
     fn run(text: &str) -> StreamRenderer<Cap> {
-        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Qwen);
+        let mut sr = StreamRenderer::new(Cap::default());
         sr.push(text);
         sr.finish();
         sr
+    }
+
+    /// Ordinary prose that merely contains a `<` must stream through
+    /// untouched — the start detector holds from `<`.
+    #[test]
+    fn prose_with_angle_brackets_is_untouched() {
+        let sr = run("use a < b and Vec<String> here.");
+        let done = sr.finished();
+        assert!(done.calls.is_empty());
+        // Checked explicitly: this test passed all the way through the loop
+        // bug, because it only ever looked at `calls`. A phantom "incomplete
+        // tool call" here is fed back to a model that did nothing wrong.
+        assert_eq!(done.error, None, "no phantom error");
+        assert!(
+            sr.sink.visible.contains("Vec<String>"),
+            "prose intact: {}",
+            sr.sink.visible
+        );
+    }
+
+    /// The same thing with no angle bracket anywhere: the plainest possible
+    /// answer, which is what every turn after a tool result looks like.
+    #[test]
+    fn a_plain_answer_reports_no_error() {
+        let sr = run("probe.txt contains one line: hello from plank.");
+        let done = sr.finished();
+        assert!(done.calls.is_empty());
+        assert_eq!(done.error, None);
+    }
+
+    /// `<tool_call>` markup is the Qwen dialect, and is adopted as such from
+    /// any starting dialect.
+    ///
+    /// This reverses what mainline asserted while Qwen was retired: the same
+    /// bytes were then the canonical *foreign* markup, and the pseudo-tool
+    /// detector told the model to use DSML instead. The two readings cannot
+    /// coexist — it is one stanza — and dispatching it is the one that serves
+    /// a caller who cannot know the model, which is the case this dialect was
+    /// restored for. The cost is that a `DeepSeek` model which mistakenly
+    /// writes Qwen markup now has its call run rather than being corrected.
+    #[test]
+    fn foreign_xml_markup_is_read_as_the_qwen_dialect() {
+        for syntax in [ToolSyntax::Dsml, ToolSyntax::Dsml41] {
+            let mut sr = StreamRenderer::with_syntax(Cap::default(), syntax);
+            sr.push(FOREIGN_CALL);
+            sr.finish();
+            let done = sr.finished();
+            assert_eq!(done.error, None, "{syntax:?}: a clean stanza");
+            assert_eq!(done.calls.len(), 1, "{syntax:?}: dispatched");
+            assert_eq!(done.calls[0].name, "read");
+        }
+    }
+
+    /// V4.1 speaks the same DSML shape with a leading space and a shorter
+    /// outer tag name. Fed one byte at a time, the detector must still find
+    /// the opener and hide every scrap of markup from the sink.
+    #[test]
+    fn v41_stream_detects_a_stanza_and_hides_its_markup() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Dsml41);
+        let text = concat!(
+            "before\n",
+            "<\u{ff5c}DSML\u{ff5c} calls>\n",
+            "<\u{ff5c}DSML\u{ff5c} invoke name=\"read\">\n",
+            "<\u{ff5c}DSML\u{ff5c} parameter name=\"path\" string=\"true\">src/a.rs",
+            "</\u{ff5c}DSML\u{ff5c} parameter>\n",
+            "</\u{ff5c}DSML\u{ff5c} invoke>\n",
+            "</\u{ff5c}DSML\u{ff5c} calls>"
+        );
+        let mut buf = [0u8; 4];
+        for ch in text.chars() {
+            sr.push(&*ch.encode_utf8(&mut buf));
+        }
+        sr.finish();
+        let calls = sr.finished().calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert!(
+            !sr.sink().visible.contains("DSML"),
+            "markup leaked to the sink: {:?}",
+            sr.sink().visible
+        );
+        // The banner is painted by the display scan, which matches the inner
+        // tags by name; with V4 names it silently paints nothing at all.
+        let visible = &sr.sink().visible;
+        assert!(visible.contains("read"), "no tool banner: {visible:?}");
+        assert!(
+            visible.contains("src/a.rs"),
+            "no parameter value: {visible:?}"
+        );
+    }
+
+    /// A renderer that was never told which model it is reading picks the
+    /// dialect up from the opener. This is the case every consumer without a
+    /// model name is in — the debug console renders bytes off a socket, and a
+    /// replayed transcript may hold either dialect — and before the opener
+    /// carried the answer, a V4.1 stanza reaching a default renderer streamed
+    /// out as raw markup with its calls dropped.
+    #[test]
+    fn a_default_renderer_adopts_the_dialect_its_opener_names() {
+        for syntax in ToolSyntax::ALL {
+            let tags = syntax
+                .dsml_tags()
+                .expect("ToolSyntax::ALL lists only DSML dialects");
+            let bar = "\u{ff5c}";
+            let mut sr = StreamRenderer::new(Cap::default());
+            sr.push(format!(
+                "{start}\n{invoke} name=\"read\">\n\
+                 <{bar}DSML{bar}{param} name=\"path\" string=\"true\">src/a.rs\
+                 </{bar}DSML{bar}{param}>\n\
+                 </{bar}DSML{bar}{inv}>\n\
+                 </{bar}DSML{bar}{calls}>",
+                start = tags.start,
+                invoke = tags.invoke,
+                param = tags.param_name,
+                inv = tags.invoke_name,
+                calls = tags.calls_name,
+            ));
+            sr.finish();
+            let calls = sr.finished().calls;
+            assert_eq!(calls.len(), 1, "{syntax:?}: {:?}", sr.sink().visible);
+            assert_eq!(calls[0].name, "read");
+            assert_eq!(calls[0].arg_value("path"), Some("src/a.rs"));
+            assert_eq!(sr.syntax(), syntax, "{syntax:?}: dialect adopted");
+            assert!(
+                !sr.sink().visible.contains("DSML"),
+                "{syntax:?}: markup leaked: {:?}",
+                sr.sink().visible
+            );
+        }
+    }
+
+    /// One renderer outlives one stanza — the debug console keeps one per
+    /// connection, and transcript replay streams a whole message through one —
+    /// so the dialect is re-read at every opener rather than latched at the
+    /// first. A V4 stanza following a V4.1 one must still parse.
+    #[test]
+    fn each_stanza_is_read_in_the_dialect_of_its_own_opener() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push(concat!(
+            "<\u{ff5c}DSML\u{ff5c} calls>\n",
+            "<\u{ff5c}DSML\u{ff5c} invoke name=\"read\">\n",
+            "<\u{ff5c}DSML\u{ff5c} parameter name=\"path\" string=\"true\">a",
+            "</\u{ff5c}DSML\u{ff5c} parameter>\n",
+            "</\u{ff5c}DSML\u{ff5c} invoke>\n",
+            "</\u{ff5c}DSML\u{ff5c} calls>"
+        ));
+        sr.push("between\n");
+        sr.push(concat!(
+            "<\u{ff5c}DSML\u{ff5c}tool_calls>\n",
+            "<\u{ff5c}DSML\u{ff5c}invoke name=\"list\">\n",
+            "<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">b",
+            "</\u{ff5c}DSML\u{ff5c}parameter>\n",
+            "</\u{ff5c}DSML\u{ff5c}invoke>\n",
+            "</\u{ff5c}DSML\u{ff5c}tool_calls>"
+        ));
+        sr.finish();
+        let calls = sr.finished().calls;
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["read", "list"], "{:?}", sr.sink().visible);
+        assert_eq!(calls[1].arg_value("path"), Some("b"));
+    }
+
+    /// The C accepts a bare invoke opener as an implicit `calls` wrapper
+    /// (`agent_stream_normal_byte`); the replayed canonical invoke must be the
+    /// dialect's, not V4's.
+    #[test]
+    fn v41_implicit_invoke_without_the_outer_wrapper_still_calls() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Dsml41);
+        sr.push(concat!(
+            "<\u{ff5c}DSML\u{ff5c} invoke name=\"read\">\n",
+            "<\u{ff5c}DSML\u{ff5c} parameter name=\"path\" string=\"true\">x",
+            "</\u{ff5c}DSML\u{ff5c} parameter>\n",
+            "</\u{ff5c}DSML\u{ff5c} invoke>\n",
+            "</\u{ff5c}DSML\u{ff5c} calls>"
+        ));
+        sr.finish();
+        assert_eq!(sr.finished().calls.len(), 1);
+    }
+
+    /// Upstream `bd66c40` added `&& !sr->dsml_start_len` to the post-thinking
+    /// whitespace suppressor, so a partially matched opener is no longer eaten.
+    /// It is a real fix and applies to the V4 path too.
+    ///
+    /// The gap suppressor exists to hide the blank lines `DeepSeek` emits after
+    /// `</think>`. While an opener is half-matched those bytes are not a gap:
+    /// swallowing one silently spliced two non-adjacent runs into a "complete"
+    /// opener, fabricating a stanza the model never wrote. With the guard the
+    /// whitespace survives, the bogus opener is abandoned, and the held bytes
+    /// are flushed verbatim instead of vanishing.
+    #[test]
+    fn post_think_gap_does_not_swallow_a_started_opener() {
+        for syntax in [ToolSyntax::Dsml, ToolSyntax::Dsml41] {
+            let tags = syntax
+                .dsml_tags()
+                .expect("ToolSyntax::ALL lists only DSML dialects");
+            let mut sr = StreamRenderer::with_syntax(Cap::default(), syntax);
+            sr.push("<think>reasoning</think>");
+            sr.push(&tags.start[..tags.start.len() - 1]);
+            sr.push(" ");
+            sr.push(&tags.start[tags.start.len() - 1..]);
+            sr.finish();
+            assert!(
+                sr.sink().visible.contains(&format!("{} ", tags.calls_name)),
+                "{syntax:?}: the gap ate a byte of a half-matched opener: {:?}",
+                sr.sink().visible
+            );
+            assert!(
+                sr.finished().calls.is_empty(),
+                "{syntax:?}: fabricated a stanza across the gap"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod qwen_dialect_tests {
+    use super::*;
+
+    /// Minimal capturing sink. Banners and errors land in `visible` too, so a
+    /// single string shows what the terminal would have seen.
+    #[derive(Debug, Default)]
+    struct Cap {
+        visible: String,
+    }
+
+    impl RenderSink for Cap {
+        fn visible_text(&mut self, text: &str) {
+            self.visible.push_str(text);
+        }
+        fn think_text(&mut self, _text: &str) {}
+    }
+
+    const CALL: &str = "<tool_call>\n<function=read>\n<parameter=path>\nsrc/a.rs\n</parameter>\n</function>\n</tool_call>";
+
+    /// A plain renderer, told nothing about the model: the stanza opener is
+    /// what names the dialect, exactly as it does for the two DSML dialects.
+    fn run(text: &str) -> StreamRenderer<Cap> {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push(text);
+        sr.finish();
+        sr
+    }
+
+    /// A renderer built from the *model family* — `ToolSyntax::Qwen`, not just
+    /// a Qwen stanza arriving at an untold renderer — must render a parameter
+    /// value to completion.
+    ///
+    /// This is where the two Qwen efforts met. The dialect layer kept Qwen in
+    /// its own `Dialect` enum, so `self.syntax` could never be `Qwen` and the
+    /// display scan reached for a DSML tag table unconditionally. Once the
+    /// model family started selecting the dialect that became reachable and
+    /// aborted the render mid-stanza. Every unit test still passed; only
+    /// loading the model caught it, which is why this one exists.
+    #[test]
+    fn a_family_selected_qwen_renderer_completes_a_parameter_value() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Qwen);
+        sr.push(CALL);
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.calls.len(), 1, "{:?}", sr.sink().visible);
+        assert_eq!(done.calls[0].name, "read");
+        assert_eq!(done.calls[0].arg_value("path"), Some("src/a.rs"));
+        assert_eq!(done.error, None);
     }
 
     /// The end-to-end shape this whole port exists for: a Qwen stanza reaches
@@ -3679,13 +4750,76 @@ mod qwen_dialect_tests {
         assert_eq!(done.error, None);
     }
 
-    /// A DSML-configured renderer must not react to Qwen markup, which is
-    /// what keeps the `DeepSeek` path exactly as it was.
+    /// The banner, not just the parsed call.
+    ///
+    /// The display scan is a separate pass from the parser, keyed on the
+    /// dialect's own tag spellings — `<function=read>` carries its name in the
+    /// tag, where DSML uses a `name` attribute. Porting the parser alone left
+    /// a Qwen stanza parsing perfectly and rendering *nothing*: swallowed as
+    /// markup, with no banner behind it. That is invisible to any test that
+    /// only looks at `calls`, and it is the whole of what a renderer-only
+    /// caller like `plank-console` sees, so it is asserted here directly.
     #[test]
-    fn the_dsml_dialect_ignores_qwen_markup() {
-        let mut sr = StreamRenderer::new(Cap::default());
-        sr.push(CALL);
-        sr.finish();
-        assert!(sr.finished().calls.is_empty(), "not a DSML call");
+    fn a_qwen_stanza_renders_a_banner() {
+        let sr = run(CALL);
+        let out = &sr.sink.visible;
+        assert!(out.contains("read"), "the banner names the tool: {out:?}");
+        assert!(out.contains("src/a.rs"), "and the value: {out:?}");
+    }
+
+    /// Qwen wraps every value in newlines that belong to the syntax, not the
+    /// value (`QwenParser` strips them). They must not reach the banner as
+    /// blank lines either.
+    #[test]
+    fn the_syntax_newlines_around_a_value_are_not_rendered() {
+        let sr = run(
+            "<tool_call>\n<function=write>\n<parameter=path>\nsrc/new.rs\n</parameter>\n</function>\n</tool_call>",
+        );
+        let out = &sr.sink.visible;
+        assert!(out.contains("src/new.rs"), "the value renders: {out:?}");
+        assert!(
+            !out.contains("\n\nsrc/new.rs") && !out.contains("src/new.rs\n\n"),
+            "no blank line from the syntax newlines: {out:?}"
+        );
+    }
+
+    /// The console is handed bytes off a socket with no model name attached,
+    /// so a renderer built with no dialect named still has to read a Qwen
+    /// stanza. `<tool_call>` is the opener that says so.
+    #[test]
+    fn a_default_renderer_adopts_the_qwen_dialect() {
+        let sr = run(CALL);
+        assert!(sr.parser.is_qwen(), "the opener named the dialect");
+        assert_eq!(sr.finished().calls.len(), 1);
+    }
+
+    /// Adoption is per stream, not per process: a DSML stanza before a Qwen
+    /// one must not leave the renderer stuck, and neither must the reverse.
+    /// One connection is one renderer, and a session outlives a stanza.
+    #[test]
+    fn the_two_dialect_families_can_follow_each_other() {
+        const DSML: &str = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"read\">\n\
+            <｜DSML｜parameter name=\"path\" string=\"true\">src/b.rs</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+        let sr = run(&format!("{DSML}\nthen\n{CALL}"));
+        let done = sr.finished();
+        assert_eq!(done.error, None, "clean stanzas in both dialects");
+        assert_eq!(done.calls.len(), 2, "both dispatched: {:?}", done.calls);
+        assert_eq!(done.calls[0].arg_value("path"), Some("src/b.rs"));
+        assert_eq!(done.calls[1].arg_value("path"), Some("src/a.rs"));
+    }
+
+    /// The cost of an opener with no marker token: a model writing about the
+    /// syntax in prose trips the detector. Worth pinning as known behaviour
+    /// rather than discovering it in a session.
+    #[test]
+    fn a_literal_tool_call_tag_in_prose_is_read_as_an_opener() {
+        let sr = run("The model emits <tool_call> to begin.");
+        assert!(
+            sr.finished().error.is_some(),
+            "a bare opener with no stanza behind it is reported, not silent"
+        );
     }
 }

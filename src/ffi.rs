@@ -20,12 +20,31 @@ pub enum Ds4Backend {
 }
 
 /// Reasoning mode, mirroring `ds4_think_mode`.
-#[repr(C)]
+///
+/// A newtype rather than an enum: `DeepSeek` V4.1 carries an explicit numeric
+/// effort as `DS4_THINK_LEVEL_BASE + level` (`refs/ds4/ds4.h`), which is not
+/// one of the named discriminants — building that value in a three-variant
+/// `#[repr(C)]` enum would be undefined behaviour. The named values keep their
+/// exact C identity, 0/1/2.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ds4ThinkMode {
-    None = 0,
-    High = 1,
-    Max = 2,
+pub struct Ds4ThinkMode(pub c_int);
+
+impl Ds4ThinkMode {
+    /// `DS4_THINK_NONE`.
+    pub const NONE: Self = Self(0);
+    /// `DS4_THINK_HIGH`.
+    pub const HIGH: Self = Self(1);
+    /// `DS4_THINK_MAX`.
+    pub const MAX: Self = Self(2);
+    /// `DS4_THINK_LEVEL_BASE`.
+    const LEVEL_BASE: c_int = 1000;
+
+    /// The mode carrying an explicit reasoning effort of `n` (`0..=100`).
+    #[must_use]
+    pub fn level(n: u8) -> Self {
+        Self(Self::LEVEL_BASE + c_int::from(n))
+    }
 }
 
 /// Growable token vector, mirroring `ds4_tokens`.
@@ -45,6 +64,18 @@ impl Default for Ds4Tokens {
             cap: 0,
         }
     }
+}
+
+/// Mirrors `ds4_token_score` (`refs/ds4/ds4.h:53`): one token's identity and
+/// its score at the session's current position. `logprob` is already
+/// normalised by the C over the full vocabulary, so scoring a handful of
+/// known tokens needs no vocabulary-wide copy.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ds4TokenScore {
+    pub id: c_int,
+    pub logit: f32,
+    pub logprob: f32,
 }
 
 /// Serialized session KV state, mirroring `ds4_session_snapshot`.
@@ -151,6 +182,41 @@ impl Default for Ds4TpOptions {
     }
 }
 
+/// Declares [`Ds4EngineOptions`] and, from the same tokens, the list of its
+/// field names in declaration order.
+///
+/// The list is *generated*, never hand-maintained: `tests/c_parity.rs` parses
+/// `ds4_engine_options` out of `refs/ds4/ds4.h` and asserts the two agree, so a
+/// field added to, removed from, or reordered in the C fails the build rather
+/// than silently shifting every later field's offset. Writing the list by hand
+/// would reintroduce exactly the failure mode that guard exists to catch.
+macro_rules! ds4_engine_options {
+    (
+        $(#[$struct_attr:meta])*
+        pub struct $name:ident {
+            $(
+                $(#[$field_attr:meta])*
+                pub $field:ident: $ty:ty,
+            )*
+        }
+    ) => {
+        $(#[$struct_attr])*
+        pub struct $name {
+            $(
+                $(#[$field_attr])*
+                pub $field: $ty,
+            )*
+        }
+
+        /// The field names of [`Ds4EngineOptions`], in declaration order.
+        ///
+        /// Mirrors `ds4_engine_options` in `refs/ds4/ds4.h`; held equal to it
+        /// by `tests/c_parity.rs`.
+        pub const DS4_ENGINE_OPTIONS_FIELDS: &[&str] = &[$(stringify!($field),)*];
+    };
+}
+
+ds4_engine_options! {
 /// Engine open options, mirroring `ds4_engine_options` field-for-field.
 #[repr(C)]
 #[derive(Debug)]
@@ -159,9 +225,6 @@ pub struct Ds4EngineOptions {
     pub mtp_path: *const c_char,
     /// Vision-encoder GGUF path; `NULL` keeps the engine text-only.
     pub vision_path: *const c_char,
-    /// Qwen3.8-Flash-Next external PLE n-gram sidecar GGUF; `NULL` for every
-    /// other model. The C engine rejects it unless the main model is Qwen3.8.
-    pub ple_path: *const c_char,
     pub backend: Ds4Backend,
     pub n_threads: c_int,
     pub context_size: c_int,
@@ -208,6 +271,7 @@ pub struct Ds4EngineOptions {
     pub load_output: bool,
     pub distributed: Ds4DistributedOptions,
     pub tp: Ds4TpOptions,
+}
 }
 
 /// Opaque handle to a loaded ds4 model.
@@ -304,6 +368,34 @@ unsafe extern "C" {
     /// `tests/c_parity.rs` holds the Rust copies equal to the C source.
     pub fn ds4_chat_append_max_effort_prefix(e: *mut Ds4Engine, tokens: *mut Ds4Tokens);
 
+    /// Appends the reasoning-effort preamble for *any* mode, in the position
+    /// and the spelling the loaded model family wants: the V4 max-effort text,
+    /// or V4.1's `Reasoning Effort: N` system line. Subsumes
+    /// `ds4_chat_append_max_effort_prefix`, which is the `DS4_THINK_MAX` case
+    /// of it, and appends nothing when the mode carries no preamble.
+    pub fn ds4_chat_append_think_prefix(
+        e: *mut Ds4Engine,
+        tokens: *mut Ds4Tokens,
+        mode: Ds4ThinkMode,
+    );
+
+    /// Whether the loaded weights are `DeepSeek` V4.1, the one family that
+    /// understands a numeric reasoning effort.
+    pub fn ds4_engine_is_deepseek41(e: *mut Ds4Engine) -> bool;
+
+    /// The V4.1 `Reasoning Effort: N` line for a mode, or NULL when the mode
+    /// carries none. Mirrored in Rust as `engine::deepseek41_effort_text` so it
+    /// is available without a model loaded.
+    pub fn ds4_deepseek41_reasoning_effort_text(mode: Ds4ThinkMode) -> *const c_char;
+
+    /// The explicit effort a mode carries (`0..=100`), or `-1` when it is one
+    /// of the named modes.
+    pub fn ds4_think_mode_level(mode: Ds4ThinkMode) -> c_int;
+
+    /// Parses a decimal `0..=100` into a mode carrying that effort. Mirrored in
+    /// Rust by `ThinkMode::parse`.
+    pub fn ds4_think_mode_parse_level(text: *const c_char, out: *mut Ds4ThinkMode) -> bool;
+
     /// Tokenizes already-rendered chat text, so control strings like
     /// `</think>` map to their special tokens rather than to literal pieces.
     pub fn ds4_tokenize_rendered_chat(e: *mut Ds4Engine, text: *const c_char, out: *mut Ds4Tokens);
@@ -366,6 +458,53 @@ unsafe extern "C" {
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;
+    /// Score of one known token at the session's current position.
+    ///
+    /// Returns **1 on success** and writes `out`; **0 on failure** — a null
+    /// session or `out`, a `token` outside the vocabulary, or logits that are
+    /// entirely non-finite (`ds4.c:76079`). Note the polarity: this is the
+    /// opposite of the `0 == ok` convention most of the other `ds4_*` entry
+    /// points in this file use, so test it as `== 1`, never as `!= 0`.
+    ///
+    /// `out.logprob` is normalised over the **full** vocabulary — the C takes
+    /// a max-shifted log-sum-exp across all `DS4_N_VOCAB` logits before
+    /// subtracting — so the exponentials of several of these scores can be
+    /// summed to learn what share of the model's probability those tokens
+    /// hold.
+    ///
+    /// This is the System-1 read path: the answer letters are known ahead of
+    /// time, so asking for exactly those beats copying a vocabulary-wide
+    /// logit slab through [`ds4_session_copy_logits`] and normalising here.
+    pub fn ds4_session_token_logprob(
+        s: *mut Ds4Session,
+        token: c_int,
+        out: *mut Ds4TokenScore,
+    ) -> c_int;
+
+    /// Writes the `k` highest-scoring tokens into `out`, best first.
+    ///
+    /// Returns **`k`** (clamped to the vocabulary size) on success and **0 on
+    /// failure** (`ds4.c:76042`). The return is therefore not a count of
+    /// meaningful entries: `out` is pre-filled with `id = -1`, and a slot
+    /// still holding `-1` was never filled. Callers must stop at the first
+    /// negative `id` rather than trusting the return.
+    ///
+    /// `logprob` is normalised over the full vocabulary, as in
+    /// [`ds4_session_token_logprob`]. `out` must have room for `k` entries.
+    pub fn ds4_session_top_logprobs(s: *mut Ds4Session, out: *mut Ds4TokenScore, k: c_int)
+    -> c_int;
+
+    /// Copies the raw logits for the current position into `out`.
+    ///
+    /// All-or-nothing: `cap` must be **at least** the full vocabulary size or
+    /// the call writes nothing and returns 0. On success it returns the
+    /// vocabulary size, which is how many floats it wrote (`ds4.c:76101`).
+    /// It is not a partial copy of the first `cap` logits.
+    ///
+    /// Diagnostics only — the decision path uses
+    /// [`ds4_session_token_logprob`], which avoids the vocabulary-wide copy.
+    pub fn ds4_session_copy_logits(s: *mut Ds4Session, out: *mut f32, cap: c_int) -> c_int;
+
     /// Draft-block size the loaded support model can propose per step, or 0
     /// when there is none. `> 1` is the C's own test for "speculation is worth
     /// attempting" — under `DSpark` it is the checkpoint's block size.
@@ -547,6 +686,15 @@ mod tests {
     /// The numbers come from `offsetof` on the checked-out submodule header.
     /// When a `refs/ds4` bump breaks this test, re-derive them rather than
     /// nudging the constants — the whole point is that they are the C's.
+    ///
+    /// These constants cannot, on their own, notice a C-side change: they
+    /// compare plank to plank. What they *do* catch is a mistake inside the
+    /// mirror that a name check cannot see — a `u32` where the C has a
+    /// `uint64_t`, a field declared in the right place with the wrong width.
+    /// The guard against the C actually moving is
+    /// `c_parity::engine_options_fields_match_the_c_header`, which reads the
+    /// field list out of `refs/ds4/ds4.h`.
+    ///
     /// Asserts a `(field name, actual offset, expected offset)` table.
     fn assert_offsets(fields: &[(&str, usize, usize)]) {
         for &(name, got, want) in fields {
@@ -556,25 +704,24 @@ mod tests {
 
     #[test]
     fn engine_options_size_matches_the_c_layout() {
-        assert_eq!(size_of::<Ds4EngineOptions>(), 288, "struct size");
+        assert_eq!(size_of::<Ds4EngineOptions>(), 280, "struct size");
     }
 
     /// The fields later bumps inserted mid-struct.
     ///
     /// Each is called out separately from the runs below because each one
-    /// *shifts* everything after it: `vision_path` and `ple_path` each slide
-    /// every later field by 8 bytes, and `dspark_exact_sampling` slides the
-    /// flag tail by one. A silent mismatch here would hand the engine garbage
-    /// rather than fail to compile, so they get their own assertions.
+    /// *shifts* everything after it: `vision_path` slides every later field by
+    /// 8 bytes, and `dspark_exact_sampling` slides the flag tail by one. A
+    /// silent mismatch here would hand the engine garbage rather than fail to
+    /// compile, so they get their own assertions.
     #[test]
     fn engine_options_inserted_fields_match_the_c_layout() {
         assert_offsets(&[
             ("vision_path", offset_of!(Ds4EngineOptions, vision_path), 16),
-            ("ple_path", offset_of!(Ds4EngineOptions, ple_path), 24),
             (
                 "dspark_exact_sampling",
                 offset_of!(Ds4EngineOptions, dspark_exact_sampling),
-                126,
+                118,
             ),
         ]);
     }
@@ -585,78 +732,78 @@ mod tests {
         assert_offsets(&[
             ("model_path", offset_of!(Ds4EngineOptions, model_path), 0),
             ("mtp_path", offset_of!(Ds4EngineOptions, mtp_path), 8),
-            ("backend", offset_of!(Ds4EngineOptions, backend), 32),
-            ("n_threads", offset_of!(Ds4EngineOptions, n_threads), 36),
+            ("backend", offset_of!(Ds4EngineOptions, backend), 24),
+            ("n_threads", offset_of!(Ds4EngineOptions, n_threads), 28),
             (
                 "context_size",
                 offset_of!(Ds4EngineOptions, context_size),
-                40,
+                32,
             ),
             (
                 "prefill_chunk",
                 offset_of!(Ds4EngineOptions, prefill_chunk),
-                44,
+                36,
             ),
             (
                 "mtp_draft_tokens",
                 offset_of!(Ds4EngineOptions, mtp_draft_tokens),
-                48,
+                40,
             ),
-            ("mtp_margin", offset_of!(Ds4EngineOptions, mtp_margin), 52),
+            ("mtp_margin", offset_of!(Ds4EngineOptions, mtp_margin), 44),
             (
                 "dspark_confidence_threshold",
                 offset_of!(Ds4EngineOptions, dspark_confidence_threshold),
-                56,
+                48,
             ),
             (
                 "directional_steering_file",
                 offset_of!(Ds4EngineOptions, directional_steering_file),
-                64,
+                56,
             ),
             (
                 "expert_profile_path",
                 offset_of!(Ds4EngineOptions, expert_profile_path),
-                72,
+                64,
             ),
             (
                 "directional_steering_attn",
                 offset_of!(Ds4EngineOptions, directional_steering_attn),
-                80,
+                72,
             ),
             (
                 "directional_steering_ffn",
                 offset_of!(Ds4EngineOptions, directional_steering_ffn),
-                84,
+                76,
             ),
             (
                 "power_percent",
                 offset_of!(Ds4EngineOptions, power_percent),
-                88,
+                80,
             ),
             (
                 "ssd_streaming_cache_experts",
                 offset_of!(Ds4EngineOptions, ssd_streaming_cache_experts),
-                92,
+                84,
             ),
             (
                 "ssd_streaming_cache_bytes",
                 offset_of!(Ds4EngineOptions, ssd_streaming_cache_bytes),
-                96,
+                88,
             ),
             (
                 "ssd_streaming_full_layers",
                 offset_of!(Ds4EngineOptions, ssd_streaming_full_layers),
-                104,
+                96,
             ),
             (
                 "ssd_streaming_preload_experts",
                 offset_of!(Ds4EngineOptions, ssd_streaming_preload_experts),
-                108,
+                100,
             ),
             (
                 "simulate_used_memory_bytes",
                 offset_of!(Ds4EngineOptions, simulate_used_memory_bytes),
-                112,
+                104,
             ),
         ]);
     }
@@ -670,98 +817,98 @@ mod tests {
             (
                 "warm_weights",
                 offset_of!(Ds4EngineOptions, warm_weights),
-                120,
+                112,
             ),
-            ("quality", offset_of!(Ds4EngineOptions, quality), 121),
-            ("glm_mtp", offset_of!(Ds4EngineOptions, glm_mtp), 122),
+            ("quality", offset_of!(Ds4EngineOptions, quality), 113),
+            ("glm_mtp", offset_of!(Ds4EngineOptions, glm_mtp), 114),
             (
                 "glm_mtp_timing",
                 offset_of!(Ds4EngineOptions, glm_mtp_timing),
-                123,
+                115,
             ),
-            ("dspark", offset_of!(Ds4EngineOptions, dspark), 124),
+            ("dspark", offset_of!(Ds4EngineOptions, dspark), 116),
             (
                 "dspark_strict",
                 offset_of!(Ds4EngineOptions, dspark_strict),
-                125,
+                117,
             ),
             (
                 "dspark_confidence_threshold_set",
                 offset_of!(Ds4EngineOptions, dspark_confidence_threshold_set),
-                127,
+                119,
             ),
             (
                 "cuda_tensor_parallel",
                 offset_of!(Ds4EngineOptions, cuda_tensor_parallel),
-                128,
+                120,
             ),
             (
                 "ssd_streaming",
                 offset_of!(Ds4EngineOptions, ssd_streaming),
-                129,
+                121,
             ),
             (
                 "ssd_streaming_cold",
                 offset_of!(Ds4EngineOptions, ssd_streaming_cold),
-                130,
+                122,
             ),
             (
                 "ssd_streaming_full_layers_set",
                 offset_of!(Ds4EngineOptions, ssd_streaming_full_layers_set),
-                131,
+                123,
             ),
             (
                 "inspect_only",
                 offset_of!(Ds4EngineOptions, inspect_only),
-                132,
+                124,
             ),
             (
                 "placement_ctx_hint",
                 offset_of!(Ds4EngineOptions, placement_ctx_hint),
-                136,
+                128,
             ),
             (
                 "placement_session_count_hint",
                 offset_of!(Ds4EngineOptions, placement_session_count_hint),
-                140,
+                132,
             ),
             (
                 "share_session_prefill_workspace",
                 offset_of!(Ds4EngineOptions, share_session_prefill_workspace),
-                144,
+                136,
             ),
             (
                 "first_token_test",
                 offset_of!(Ds4EngineOptions, first_token_test),
-                145,
+                137,
             ),
             (
                 "metal_graph_test",
                 offset_of!(Ds4EngineOptions, metal_graph_test),
-                146,
+                138,
             ),
-            ("load_slice", offset_of!(Ds4EngineOptions, load_slice), 147),
+            ("load_slice", offset_of!(Ds4EngineOptions, load_slice), 139),
             (
                 "load_layer_start",
                 offset_of!(Ds4EngineOptions, load_layer_start),
-                148,
+                140,
             ),
             (
                 "load_layer_end",
                 offset_of!(Ds4EngineOptions, load_layer_end),
-                152,
+                144,
             ),
             (
                 "load_output",
                 offset_of!(Ds4EngineOptions, load_output),
-                156,
+                148,
             ),
             (
                 "distributed",
                 offset_of!(Ds4EngineOptions, distributed),
-                160,
+                152,
             ),
-            ("tp", offset_of!(Ds4EngineOptions, tp), 224),
+            ("tp", offset_of!(Ds4EngineOptions, tp), 216),
         ]);
     }
 
@@ -811,5 +958,13 @@ mod tests {
         assert_eq!(size_of::<Ds4VisionSpan>(), 80, "struct size");
         assert_eq!(offset_of!(Ds4VisionSpan, token_start), 0);
         assert_eq!(offset_of!(Ds4VisionSpan, embedding), 8);
+    }
+
+    #[test]
+    fn token_score_matches_the_c_layout() {
+        // `ds4_token_score` in refs/ds4/ds4.h:53-57 is { int id; float logit;
+        // float logprob; } — three 4-byte fields, no padding.
+        assert_eq!(std::mem::size_of::<Ds4TokenScore>(), 12);
+        assert_eq!(std::mem::align_of::<Ds4TokenScore>(), 4);
     }
 }

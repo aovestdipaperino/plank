@@ -23,11 +23,12 @@ use ratatui::crossterm::event::{
 };
 
 use crate::compact;
-use crate::config::{AgentConfig, slash_command_known};
+use crate::config::{AgentConfig, UiMode, slash_command_known};
 use crate::context::{ContextContent, ContextTokens};
 use crate::dsml::ToolCall;
 use crate::editor::{History, LineBuffer, default_history_path};
 use crate::engine::{Engine, EngineEvent};
+use crate::home::plank_home_in;
 use crate::remote::control::RemoteState;
 use crate::render::{RenderOptions, TokenRenderer};
 use crate::session::{Message, Session, SessionEntry, SessionStore};
@@ -319,6 +320,64 @@ fn repaint_idle(
     Ok(completed.buffer.clone())
 }
 
+/// The idle loop's quit confirmation, shared by every path that leaves it.
+///
+/// A live background download is worth one line before quitting, so nobody
+/// closes the terminal wondering whether they just threw away 40 GB.
+///
+/// Returns `true` when the caller should quit and `false` when the user
+/// declined, so a call site reads `if confirm_quit_idle(..)? { break } else
+/// { continue }`. With no background download in flight there is nothing to
+/// warn about and nothing to ask, so it returns `true` without drawing.
+///
+/// The repaint is not optional: the frame is only drawn at the top of the
+/// idle loop, so without it the warning would be invisible behind a stale
+/// frame and the user's answering keystroke would be silently consumed by
+/// the confirmation they never saw.
+#[allow(clippy::too_many_arguments)]
+fn confirm_quit_idle(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &mut OutputLog,
+    view: &mut tui::OutputView,
+    sub_pane: &mut tui::SubPane,
+    btw_panel: &mut BtwPanel,
+    report: &mut Option<tui::ReportPanel>,
+    input: &TuiInput,
+    idle_status: &str,
+    selection: Option<tui::ContentSelection>,
+    task_view: &tui::TaskView,
+    config_form: Option<&crate::configform::ConfigForm>,
+    kv_pane: Option<&crate::kvpane::KvPane>,
+    resume_pane: Option<&crate::resumepane::ResumePane>,
+    arcade: &crate::arcade::Arcade,
+    wasm_frame: Option<&crate::wasmreg::OpenFrame>,
+    rem: Option<&Mutex<UiRemote>>,
+) -> Result<bool, String> {
+    let Some(warning) = crate::downloader::quit_warning() else {
+        return Ok(true);
+    };
+    log.push_dim(warning);
+    repaint_idle(
+        terminal,
+        log,
+        view,
+        sub_pane,
+        btw_panel,
+        report,
+        input,
+        idle_status,
+        selection,
+        task_view,
+        config_form,
+        kv_pane,
+        resume_pane,
+        arcade,
+        wasm_frame,
+        rem,
+    )?;
+    await_yes_default()
+}
+
 /// Answers deferred remote requests. Call right after `terminal.draw` returns.
 fn remote_service(remote: Option<&Mutex<UiRemote>>) {
     if let Some(m) = remote
@@ -550,11 +609,11 @@ impl RenderSink for NullSink {
 /// Where a headless sub-agent's rendered output goes. Sub-agents run
 /// synchronously inside a turn, so this is set by whichever front end can
 /// display the result: the TUI routes it over the worker→UI channel, the plain
-/// REPL prints it inline, and the `--non-interactive` protocol path discards it
+/// REPL prints it inline, and the `--ui console` protocol path discards it
 /// (its stdout carries a machine protocol that model text would corrupt).
 #[derive(Debug, Default)]
 pub enum SubSinkTarget {
-    /// Discard sub-agent output (the default, and the non-interactive path).
+    /// Discard sub-agent output (the default, and the headless path).
     #[default]
     Null,
     /// Forward over the worker→UI channel as [`crate::worker::UiEvent::Sub`].
@@ -600,18 +659,25 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
             ),
             sysprompt::IN_THINK_PROHIBITION
         ),
-        // Named for the dialect the model actually speaks. Telling a Qwen
-        // model its "DSML" was invalid, and handing it DSML to copy, is how a
-        // recorded session ended with the model insisting the harness was
-        // broken rather than fixing its markup.
+        // Named for the dialect the model actually speaks, with its own
+        // reminder text, each pinned against the C (`agent_dsml_syntax_reminder`
+        // / `agent_dsml41_syntax_reminder` / `agent_qwen_syntax_reminder`) as is
+        // the per-dialect error prefix. Telling a model its "DSML" was invalid,
+        // and handing it DSML to copy when it speaks something else, is how a
+        // recorded session ended with the model insisting the harness was broken
+        // rather than fixing its markup.
         PassError::Dsml => match syntax {
+            sysprompt::ToolSyntax::Qwen => format!(
+                "Tool error: invalid Qwen tool call: {err}\n{}",
+                sysprompt::qwen_syntax_reminder()
+            ),
             sysprompt::ToolSyntax::Dsml => format!(
                 "Tool error: invalid DSML tool call: {err}\n{}",
                 sysprompt::dsml_syntax_reminder()
             ),
-            sysprompt::ToolSyntax::Qwen => format!(
-                "Tool error: invalid tool call: {err}\n{}",
-                sysprompt::qwen_syntax_reminder()
+            sysprompt::ToolSyntax::Dsml41 => format!(
+                "Tool error: invalid DSML tool call: {err}\n{}",
+                sysprompt::dsml41_syntax_reminder()
             ),
         },
     }
@@ -629,10 +695,11 @@ const REPEAT_LOOP_WINDOW: usize = 8192;
 /// re-emitted the same refused tool calls three passes running.
 const LOOP_TRIPPED_NOTICE: &str = "turn stopped: the model re-issued the same refused tool calls three times in a row. Rephrase the request or give it what it is missing.";
 
-const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating the same text over and over. Do not resume that reasoning. Decide now and act: emit the tool calls for the change you already planned, or answer the user.";
+const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating the same text over and over. Do not resume that reasoning. Decide now and act: emit the tool calls for the change you already planned, or answer the user. Your next reply has no reasoning step: write the answer, or the tool calls, directly.";
 
-/// Reasoning bytes one pass may generate before it is stopped whatever its
-/// tail looks like ([`crate::insights::RepeatGuard::with_think_budget`]).
+/// Floor for the per-pass reasoning budget
+/// ([`crate::insights::RepeatGuard::with_think_budget`], see
+/// [`repeat_think_budget`]).
 ///
 /// Sized from the 32 dumps in `~/.plank/repro`: 939 passes, 16 of them
 /// looping. 923 passes are genuinely healthy and exactly one of those exceeds
@@ -647,13 +714,38 @@ const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating
 /// ratio inverts from 5:1 to 1:3.9, and a rung that fires on 3% of good
 /// reasoning is one the user turns off. The loops worth catching are enormous,
 /// so latency is the cheap axis here.
-const REPEAT_THINK_BUDGET: usize = 16384;
+const REPEAT_THINK_BUDGET_FLOOR: usize = 16384;
 
-/// Model-facing text for a [`REPEAT_THINK_BUDGET`] stop. Deliberately not
+/// Share of the context window one pass may spend on reasoning: a tenth.
+const REPEAT_THINK_BUDGET_CTX_SHARE: usize = 10;
+
+/// Reasoning bytes one pass may generate before it is stopped, sized from the
+/// engine's context window: `ctx_size / 10` bytes, never below
+/// [`REPEAT_THINK_BUDGET_FLOOR`] (~102 KB on the 1M-token window). The fixed
+/// 16 KiB was cut from a corpus of loops; the seven `repro-loop-17890*` dumps
+/// of 2026-09-10 then showed it firing on reasoning that was not looping at
+/// all — a multi-file feature drafted as code inside `<think>`, restarted
+/// from zero after every stop, so the task could never finish through
+/// reasoning. The rung is a backstop against drift, not a ration.
+fn repeat_think_budget(ctx_size: i32) -> usize {
+    (usize::try_from(ctx_size).unwrap_or(0) / REPEAT_THINK_BUDGET_CTX_SHARE)
+        .max(REPEAT_THINK_BUDGET_FLOOR)
+}
+
+/// The reasoning guard every turn pass runs: the cycle rungs over
+/// [`REPEAT_LOOP_WINDOW`], the think budget sized from the context window,
+/// the draft rung that comes with a budget, all under `tools.loopGuards`.
+fn turn_repeat_guard(ctx_size: i32) -> crate::insights::RepeatGuard {
+    crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
+        .with_think_budget(repeat_think_budget(ctx_size))
+        .gated()
+}
+
+/// Model-facing text for a [`repeat_think_budget`] stop. Deliberately not
 /// [`REPEAT_LOOP_ERROR`]: the guard has *not* proven a loop, only that the
 /// reasoning outran its budget, and telling a model that was thinking hard
 /// that it was repeating itself is a lie it then has to reconcile.
-const THINK_BUDGET_ERROR: &str = "generation stopped: the reasoning ran past its budget without reaching a decision. Do not restate the options. Pick the one you were leaning towards, say it in one sentence, and emit the tool calls for it now.";
+const THINK_BUDGET_ERROR: &str = "generation stopped: the reasoning exhausted its budget; this does not establish a loop. The previous analysis is retained as unverified working context. Do not restart it or restate the options. Close the thinking and deliver one small result now: a supported finding for a review, the next edit for an implementation, or a concise blocker or question if you cannot proceed. Do not claim that unexecuted code or unchecked findings are verified. Your next reply has no reasoning step: write the answer, or the tool calls, directly.";
 
 /// Bytes a turn may generate without a successful direct file mutation before
 /// it is ended. Bytes rather than tokens because that is the unit the corpus
@@ -661,7 +753,7 @@ const THINK_BUDGET_ERROR: &str = "generation stopped: the reasoning ran past its
 ///
 /// The rung the per-pass budget cannot be: `repro-1788796284`'s main turn ran
 /// four passes of 435, 1690, 2768 and 4328 reasoning bytes, none cyclic and
-/// every one far under [`REPEAT_THINK_BUDGET`], then spent fifty minutes and
+/// every one far under the reasoning budget, then spent fifty minutes and
 /// edited nothing. Every per-pass check passes it. What is wrong with that
 /// turn is only visible at turn scale, and only as an absence.
 ///
@@ -679,14 +771,55 @@ const NO_PROGRESS_BYTE_BUDGET: usize = 32768;
 /// Shown when [`NO_PROGRESS_BYTE_BUDGET`] ends a turn. Names the absence,
 /// because "stopped" without "and nothing was written" sends the reader
 /// looking for a crash.
-const NO_PROGRESS_NOTICE: &str = "turn stopped: the model generated 32KB of output without writing a file, editing one, or running a command. Nothing was changed. Narrow the request, or tell it which file to start with.";
+///
+/// It also has to name what does *not* count, because the stop most often
+/// lands right after a tool round and reads as a malfunction otherwise. In
+/// `repro-1789107544` the tripping pass had just run `cargo test` and
+/// `cargo clippy`, both successfully, and the notice as first written claimed
+/// the turn had gone 32 KB "without ... running a command" — contradicting
+/// both the code and the comment on the constant three lines above it.
+///
+/// Two things reset this budget, and both are observed changes rather than
+/// calls: `last_written`, which `write` and `edit` set on success, and
+/// `touched_tree`, which [`crate::treedigest`] sets when an opaque tool such
+/// as `bash` left the git working tree different than it found it. A read, a
+/// search, or a build that changes nothing still resets nothing (see
+/// `docs/LOOP-FINDINGS.md`, "An attempted mutation is not progress").
+const NO_PROGRESS_NOTICE: &str = "turn stopped: the model generated 32KB of output and changed no file. Only a file that actually changed counts here — a successful write or edit, or a shell command that left the working tree different. Reads, searches and builds, however many, do not. Narrow the request, or tell it which file to start with.";
 
 /// Whether a preflight error is one of the reasoning rungs, and so counts
 /// towards [`MAIN_REPEAT_TRIP_CAP`]. Both stops leave the prompt materially
 /// unchanged at temperature 0, so both need the cap for the same reason.
 fn is_reasoning_stop(err: Option<&str>) -> bool {
-    matches!(err, Some(REPEAT_LOOP_ERROR | THINK_BUDGET_ERROR))
+    matches!(
+        err,
+        Some(REPEAT_LOOP_ERROR | THINK_BUDGET_ERROR | DRAFT_ERROR)
+    )
 }
+
+/// The `stop` column of a repro dump's `## Passes` table: which rung, if a
+/// rung; otherwise whether the user, a tool error, tool calls or a plain
+/// answer ended the pass.
+fn pass_stop_text(interrupted: bool, error: Option<&str>, calls: usize) -> String {
+    match error {
+        Some(e) if e.contains(REPEAT_LOOP_ERROR) => "guard: cycle".to_owned(),
+        Some(e) if e.contains(DRAFT_ERROR) => "guard: draft".to_owned(),
+        Some(e) if e.contains(THINK_BUDGET_ERROR) => "guard: budget".to_owned(),
+        _ if interrupted => "interrupted by user".to_owned(),
+        Some(_) => "tool error".to_owned(),
+        _ if calls > 0 => format!("tool calls: {calls}"),
+        _ => "answer".to_owned(),
+    }
+}
+
+/// Model-facing text for a [`crate::insights::RepeatGuard::drafting`] stop:
+/// the reasoning was writing the answer — a numbered list of findings, or the
+/// code — rather than deciding what it is. Neither [`REPEAT_LOOP_ERROR`] nor
+/// [`THINK_BUDGET_ERROR`] says what actually went wrong here, and the honest
+/// instruction is the one that fixes it: write this as your answer, not in
+/// reasoning. `repro-loop-1789060243` and the seven 2026-09-10 dumps in
+/// `docs/LOOP-FINDINGS.md`.
+const DRAFT_ERROR: &str = "generation paused: lengthy structured reasoning reached a delivery checkpoint; this does not establish a loop or a finished draft. The analysis is retained as unverified working context. Do not restart the survey or compose it again. Close the thinking and deliver one supported finding now, make the next small code change with edit or write, or state what still needs verification. Do not promote rejected ideas or unexecuted code into results. Your next reply has no reasoning step: write the answer, or the tool calls, directly.";
 
 /// Consecutive repeat-guard stops a sub-agent may take before it is asked for
 /// its report instead of another attempt. At temperature 0 a pass is a pure
@@ -706,9 +839,38 @@ const SUBAGENT_REPEAT_TRIP_CAP: usize = 2;
 /// prompt back to the one party who can change it materially.
 const MAIN_REPEAT_TRIP_CAP: usize = 2;
 
+/// Consecutive *draft-rung* stops a main turn may take before it is ended.
+///
+/// Its own counter, well above [`MAIN_REPEAT_TRIP_CAP`], because a draft stop
+/// is not evidence that the pass was wasted: it says "write this out", and
+/// `repro-loop-1789108509` / `-1789108726` are a turn ended for obeying it
+/// twice. The model announced "let me stop the exhaustive analysis and deliver
+/// findings", listed fourteen of them, and was cut at the byte gate again —
+/// because the only place it had to write them was the think block it was
+/// already inside. Killing that turn at the second nudge contradicts the
+/// nudge.
+///
+/// With [`Agent::pass_opts`]'s closed-think recovery a second draft stop
+/// cannot happen at all on a local engine, since the pass after a stop has no
+/// think block to draft in. This cap is the backstop for an engine that
+/// ignores the override (every provider, for now) and for a shape nobody has
+/// seen yet.
+const MAIN_DRAFT_TRIP_CAP: usize = 3;
+
+/// Shown when [`MAIN_DRAFT_TRIP_CAP`] ends a turn. Unlike
+/// [`MAIN_REPEAT_TRIPS_NOTICE`] it points at the analysis, because there is
+/// some: a draft stop never erases what the pass reasoned.
+const MAIN_DRAFT_TRIPS_NOTICE: &str = "turn stopped: the model kept composing its answer inside its reasoning instead of writing it out. The analysis is still in the transcript — ask for the findings it already has.";
+
+/// Whether a reasoning stop is the draft rung's, which gets
+/// [`MAIN_DRAFT_TRIP_CAP`] rather than [`MAIN_REPEAT_TRIP_CAP`].
+fn is_draft_stop(payload: &str) -> bool {
+    payload.contains(DRAFT_ERROR)
+}
+
 /// Shown when [`MAIN_REPEAT_TRIP_CAP`] ends a turn. The transcript keeps the
 /// guard's tool error as its last message, so the next prompt sees why.
-const MAIN_REPEAT_TRIPS_NOTICE: &str = "turn stopped: the model's reasoning was cut short twice in a row, for looping or for running past its budget. Rephrase the request, narrow it, or give it what it is missing.";
+const MAIN_REPEAT_TRIPS_NOTICE: &str = "turn stopped: reasoning was cut short twice in a row for repetition, excessive drafting, or exhausting its budget. Narrow the request or ask for one concrete result.";
 
 /// Reported to the parent when the forced report pass looped as well.
 const REPEAT_TRIPS_NOTICE: &str =
@@ -724,16 +886,23 @@ fn guard_notice(what: &str, label: Option<&str>) -> String {
     }
 }
 
+/// The draft rung's wording. It is the one guard stop that is not news to
+/// the user — the pass is resumed, nothing is lost, and a red line about the
+/// model's reasoning shape only reads as an error. So [`report_guard_for`]
+/// keeps it off every front end and mirrors it to the debug console instead,
+/// where someone watching the raw stream does want to see it.
+const DRAFT_PAUSE_TEXT: &str = "paused lengthy structured reasoning for delivery";
+
 /// What the reasoning guard did, worded for [`guard_notice`]: the count
 /// matters once it is more than one, because that is when the cap is closing
 /// in. A budget stop is named as one, because it is a weaker claim — the
 /// pass was long, not provably circular — and reporting it as a loop would
 /// send whoever reads the dump looking for a cycle that is not there.
-fn repeat_trip_text(over_budget: bool, trips: usize) -> String {
-    let what = if over_budget {
-        "stopped an over-budget pass"
-    } else {
-        "stopped a reasoning loop"
+fn repeat_trip_text(payload: Option<&str>, trips: usize) -> String {
+    let what = match payload {
+        Some(p) if p.contains(THINK_BUDGET_ERROR) => "stopped an over-budget pass",
+        Some(p) if p.contains(DRAFT_ERROR) => DRAFT_PAUSE_TEXT,
+        _ => "stopped a reasoning loop",
     };
     if trips > 1 {
         format!("{what} ({trips} in a row)")
@@ -748,7 +917,7 @@ fn repeat_trip_text(over_budget: bool, trips: usize) -> String {
 /// the guard saw the tail cycling, or because a mid-stream preflight failed.
 ///
 /// A tripped guard records [`REPEAT_LOOP_ERROR`] — or [`THINK_BUDGET_ERROR`],
-/// when the pass outran [`REPEAT_THINK_BUDGET`] without a provable cycle — on
+/// when the pass outran [`repeat_think_budget`] without a provable cycle — on
 /// the renderer, so the ordinary preflight-error path feeds it back. Only reasoning
 /// is watched: visible output and tool arguments legitimately repeat — a
 /// `write` of a table with identical rows would trip the guard — and the
@@ -767,6 +936,10 @@ fn stream_chunk_must_stop<S: RenderSink>(
         // the model something the budget's cannot.
         if guard.feed(chunk) {
             stream.fail_preflight(REPEAT_LOOP_ERROR);
+        } else if guard.drafting() {
+            // Ahead of the budget: it names the shape of the reasoning,
+            // which the budget's byte count cannot.
+            stream.fail_preflight(DRAFT_ERROR);
         } else if guard.over_budget() {
             stream.fail_preflight(THINK_BUDGET_ERROR);
         }
@@ -777,6 +950,18 @@ fn stream_chunk_must_stop<S: RenderSink>(
     // Ordered second so a preflight failure in the same chunk still wins: it
     // has an error to feed back, and this does not.
     stream.tool_stanza_complete().then_some(PassStop::ToolCall)
+}
+
+/// Whether a pass generated under `opts` starts *inside* a `<think>` block,
+/// so the renderer — and the debug console, which only ever sees bytes — has
+/// to be told it is already there.
+///
+/// Reads the mode of the pass about to run, not the session's: a closed-think
+/// recovery pass ([`Agent::pass_opts`]) would otherwise have its answer
+/// rendered as hidden reasoning, which is the same bug in a new costume, the
+/// model delivering and the user still seeing nothing.
+fn pass_opens_in_think(opts: &crate::engine::GenerationOptions, engine: &dyn Engine) -> bool {
+    !matches!(opts.think_mode, crate::engine::ThinkMode::Off) && !engine.wants_structured()
 }
 
 /// Why a pass stopped itself before the engine ran out of tokens.
@@ -852,6 +1037,108 @@ impl Compacted {
 /// `agent_worker_compact`.
 const COMPACT_INTERRUPTED: &str =
     "Compaction interrupted; keeping the previous conversation state.";
+
+/// Footer marker shown while plank has given its KV back to the system.
+const PRESSURE_YIELDED: &str =
+    "paused: system memory pressure \u{2014} KV released, will resume when it clears";
+
+/// System line shown on resume when the rebuild is not free.
+///
+/// The disclosure rule: plank always yields, even when the resume is expensive,
+/// so it has to *say* the cost. A long re-prefill behind a silent stall is
+/// indistinguishable from a hang.
+fn pressure_disclosure(plan: &crate::yieldpolicy::RestorePlan) -> String {
+    if plan.reprefill_tokens <= 0 {
+        return String::new();
+    }
+    format!(
+        "resuming after memory pressure: re-prefilling {} tokens",
+        plan.reprefill_tokens
+    )
+}
+
+/// Whether a generation's interrupt hook should raise a pressure cancel.
+///
+/// A user interrupt outranks a pressure yield: once someone has asked the turn
+/// to stop, it must end, not pause and resume. The engine's cancel reason
+/// already gives the user priority, but raising at all once the user has asked
+/// would make the stop look resumable to whichever check runs first.
+fn should_raise_pressure_cancel(
+    level: crate::mempressure::PressureLevel,
+    user_stopped: bool,
+    gate: PressureGate,
+) -> bool {
+    level == crate::mempressure::PressureLevel::Critical && !user_stopped && gate.armed()
+}
+
+/// Everything that decides whether a mid-pass yield could actually happen,
+/// sampled once before the pass rather than per token.
+///
+/// The cancel must never be raised where the yield would then be suppressed: a
+/// raise truncates the generation at a token boundary, and if the yield is then
+/// refused nothing is freed and nothing is disclosed — a sidechain would hand a
+/// silently truncated answer back to its parent. The livelock guard belongs
+/// here for the same reason: `Hysteresis::observe` enforces it for a
+/// turn-boundary yield, but the mid-pass path never reaches `observe`, and
+/// under sustained `Critical` an unguarded raise makes every turn pay a full
+/// re-prefill (uncancellable — `warm_sync` clears the flag on entry) only to
+/// throw it away at the first token.
+///
+/// Sampling once is sound: none of the three can change during a single pass.
+#[derive(Debug, Clone, Copy)]
+struct PressureGate {
+    /// [`crate::mempressure::MIN_YIELD_INTERVAL_SECS`] has elapsed since the
+    /// last yield.
+    yield_allowed: bool,
+    first_turn_done: bool,
+    in_sidechain: bool,
+}
+
+impl PressureGate {
+    /// True when a yield raised now could actually be carried out.
+    fn armed(self) -> bool {
+        self.yield_allowed
+            && should_act(
+                crate::mempressure::Decision::Yield,
+                self.first_turn_done,
+                self.in_sidechain,
+            )
+    }
+}
+
+/// Polled from a generation's interrupt hook: raises a pressure cancel when the
+/// system is critical, the user has not already asked to stop, and the gate says
+/// the resulting yield would actually happen; then passes `stopping` through so
+/// a front end's own stop conditions stay one expression.
+fn pressure_tick(
+    sensor: &crate::mempressure::PressureSensor,
+    gate: PressureGate,
+    stopping: bool,
+) -> bool {
+    if should_raise_pressure_cancel(sensor.level(), crate::interrupt::pending(), gate) {
+        crate::ds4engine::request_pressure_cancel();
+    }
+    stopping
+}
+
+/// Whether a pressure decision should be acted on now.
+///
+/// Two suppressions. Before the first turn finishes there is no session worth
+/// saving and yielding would mean never starting. Inside a sub-agent sidechain
+/// there are no rungs (`in_sidechain()` never pushes them), so a yield costs a
+/// full sidechain rebuild \u{2014} and sidechains are short enough to wait out.
+fn should_act(
+    decision: crate::mempressure::Decision,
+    first_turn_done: bool,
+    in_sidechain: bool,
+) -> bool {
+    use crate::mempressure::Decision;
+    match decision {
+        Decision::Hold => false,
+        Decision::Yield => first_turn_done && !in_sidechain,
+        Decision::ShedCache | Decision::Resume => true,
+    }
+}
 
 /// Reported when the summary pass produced nothing usable.
 ///
@@ -1005,6 +1292,29 @@ fn stub_stopped_reasoning(text: &mut String) {
     *text = rebuilt;
 }
 
+/// Gives generation a cycle-free copy while preserving the original sidechain
+/// for repros. Match the complete harness error, not text quoted by a tool.
+/// Draft and budget stops deliberately retain their unverified working context.
+fn recovery_session(session: &Session) -> std::borrow::Cow<'_, Session> {
+    let cycle_error = format!("<tool_result>Tool error: {REPEAT_LOOP_ERROR}\n</tool_result>");
+    let mut recovery = std::borrow::Cow::Borrowed(session);
+    for i in 1..session.transcript.len() {
+        let previous = &session.transcript[i - 1];
+        let message = &session.transcript[i];
+        if previous.role == crate::session::Role::Assistant
+            && message.role == crate::session::Role::User
+            && message.text == cycle_error
+        {
+            let mut text = previous.text.clone();
+            stub_stopped_reasoning(&mut text);
+            if text != previous.text {
+                recovery.to_mut().transcript[i - 1].text = text;
+            }
+        }
+    }
+    recovery
+}
+
 /// Builds the mid-stream edit preflight hook for a [`StreamRenderer`]: it
 /// validates an `edit` call's `old` selector against the file on disk the
 /// moment that parameter closes (the C's `agent_stream_preflight_closed_param`).
@@ -1152,6 +1462,39 @@ fn arcade_command(line: &str) -> Option<&'static str> {
     crate::arcade::command_of(line)
 }
 
+/// Undoes everything `Agent::run_tui` switched on, then hands the terminal
+/// back through `ratatui::restore`.
+///
+/// `ratatui::restore` alone leaves the alternate screen and raw mode but keeps
+/// mouse reporting (DECSET 1000/1002/1003/1006), bracketed paste and focus
+/// events on, so an exit that called only it left the shell prompt filling
+/// with `ESC[<35;38;32M` motion reports at every pointer move. This is the
+/// one teardown for the clean exit, the force quit and the panic hook, so
+/// no path can forget a mode. Idempotent: every write is best-effort and a
+/// mode already off stays off.
+fn restore_terminal() {
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        PopKeyboardEnhancementFlags,
+        event::DisableFocusChange,
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
+    ratatui::restore();
+    // Drop whatever the terminal sent while the modes were still on and no
+    // event loop was reading: motion reports, a focus event, a late paste
+    // bracket. Left in the tty buffer, the shell would read them as typed
+    // input the moment it prints its prompt. Only on a real terminal — a
+    // pipe's pending bytes are someone's data, not stale reports.
+    if std::io::stdin().is_terminal() {
+        // SAFETY: `tcflush` takes a descriptor and a queue selector and touches
+        // no memory; stdin is open for the life of the process.
+        unsafe {
+            libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+        }
+    }
+}
+
 /// Turns any-motion mouse reporting (DECSET 1003) on or off.
 ///
 /// `EnableMouseCapture` asks for buttons and drags but not free hover, which is
@@ -1289,7 +1632,8 @@ pub fn render_messages_for_repro(messages: &[Message], system: Option<&str>) -> 
 }
 
 /// Formats a duration in seconds as `+Xs`, `+XmYs`, or `+XhYm`.
-fn format_elapsed(secs: u64) -> String {
+#[must_use]
+pub fn format_elapsed(secs: u64) -> String {
     if secs < 60 {
         format!("+{secs}s")
     } else if secs < 3600 {
@@ -1904,6 +2248,29 @@ pub(crate) fn render_mcp_report(servers: &[crate::tools::mcp::McpServer], color:
     out
 }
 
+/// The NATO phonetic alphabet, lowercase, in the conventional spellings
+/// (`juliett` with two t's, `x-ray` hyphenated). Source of truth for the
+/// default sub-agent names; see `nato_label`.
+const NATO_ALPHABET: [&str; 26] = [
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett",
+    "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
+    "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu",
+];
+
+/// The label for the `n`-th unnamed sub-agent of a session, counting from zero:
+/// `alpha`, `bravo`, ... `zulu`, then `alpha-2` ... `zulu-2`, `alpha-3`, and so
+/// on. It never runs out and never repeats, so a log can always tell two
+/// unnamed sub-agents apart.
+fn nato_label(n: usize) -> String {
+    let word = NATO_ALPHABET[n % NATO_ALPHABET.len()];
+    let lap = n / NATO_ALPHABET.len();
+    if lap == 0 {
+        word.to_string()
+    } else {
+        format!("{word}-{}", lap + 1)
+    }
+}
+
 /// Shared turn state for the interactive and headless front-ends.
 // The bools are independent UI/turn latches, not a disguised state machine.
 #[allow(clippy::struct_excessive_bools)]
@@ -1927,12 +2294,58 @@ struct Agent<'a> {
     payload_dirty: bool,
     /// Depth-indexed KV snapshots for this session, newest turn last.
     ladder: crate::kvladder::KvLadder,
+    /// Reads the OS memory-pressure level; cheap to clone into a generation's
+    /// interrupt closure.
+    sensor: crate::mempressure::PressureSensor,
+    /// Debounces the raw level into yield/resume decisions.
+    hysteresis: crate::mempressure::Hysteresis,
+    /// Applies those decisions to the engine and pins the restore plan.
+    yield_policy: crate::yieldpolicy::YieldPolicy,
+    /// False until the first turn completes; see [`should_act`].
+    first_turn_done: bool,
+    /// Set by a generation pass that the pressure hook cancelled, read by the
+    /// turn loop immediately afterwards. A field rather than a return value
+    /// because the flag it mirrors is thread-local and cleared by the next
+    /// engine entry, so it has to be captured the instant `generate` returns.
+    pressure_stop: bool,
     /// How many sub-agent forks are open on the live transcript (see
     /// [`Agent::begin_subagent_fork`]). While it is non-zero the transcript
     /// carries a sidechain that `end_subagent_fork` will truncate back out,
     /// so nothing captured against it — payload, rung, micro-compaction — may
     /// be written as if it were the session's own (see [`Agent::in_sidechain`]).
     sidechain_depth: usize,
+    /// Open clean-room sidechains running on an alternate engine
+    /// ([`run_sidechain_on`](Self::run_sidechain_on)). While it is non-zero
+    /// `self.engine` is not the session's own, so nothing about the
+    /// session's KV — the fork snapshots, the ladder rungs — may be fed to
+    /// it. Kept separately from `fork_kv` because a `None` there also means
+    /// a failed snapshot, which is a different situation.
+    alt_engine_depth: usize,
+    /// Gating for the background memory extraction pass; sampled from
+    /// `settings.memory` at the top of every `maybe_extract_memories` call.
+    extract_state: crate::memextract::ExtractState,
+    /// Whether the System-1 gate runs in front of the extraction pass;
+    /// sampled from `settings.memory.gate` at the top of every
+    /// `enqueue_memory_job` call.
+    memory_gate: bool,
+    /// The gate's confidence threshold, as a whole-number percent; sampled
+    /// from `settings.memory.gate_percent` alongside `memory_gate`.
+    memory_gate_percent: u32,
+    /// Spans snapshotted at turn ends and waiting for an idle moment to be
+    /// read (`enqueue_memory_job` / `process_memory_job`). Front of the
+    /// queue is oldest; an interrupted job goes back to the front.
+    memory_jobs: std::collections::VecDeque<crate::memextract::MemoryJob>,
+    /// A turn ended and a suggestion should be generated at the next quiet
+    /// moment. Set at the turn boundary and read at the idle wake: the turn
+    /// exit itself must stay a snapshot, so the prompt comes back the moment
+    /// the answer is done.
+    suggestion_pending: bool,
+    /// The suggestion currently offered as ghost text, if any. Bound to the
+    /// transcript depth it was generated at — see `suggest::Suggestion`.
+    suggestion: Option<crate::suggest::Suggestion>,
+    /// One quiet summary line queued by `report_memory_changes`, drained by
+    /// whoever ran `process_memory_job`.
+    pending_memory_notice: Option<String>,
     /// Where `/repro` and the automatic loop dumps are written. Resolved once
     /// at construction (`repro::repro_dir`, under `$HOME/.plank`), so a test
     /// agent can point it at a scratch directory instead of the real folder.
@@ -1941,6 +2354,21 @@ struct Agent<'a> {
     /// content preview and tool results are all suppressed regardless of the
     /// `ui.show*` settings, so the AGENTS.md draft never scrolls past.
     quiet_tools: bool,
+    /// Set when a main turn ended because a guard stopped it rather than
+    /// because the model finished. Every one of those stops returns
+    /// `Ok(())` — the session continues in the TUI and the plain REPL, which
+    /// is why they cannot report it as an error — so the headless `-p`
+    /// one-shot reads this instead to choose its exit code. A benchmark that
+    /// cannot tell a stopped turn from a finished one reports work that never
+    /// happened.
+    ///
+    /// Scope: the main-turn guard stops only, the ones that go through
+    /// [`Agent::stop_turn`]. A sub-agent's guard trip does not set it -- that
+    /// sidechain failing is not the outer turn failing -- and neither does a
+    /// hook halting the turn with `continue:false`, nor a memory-pressure
+    /// stop. Those are not loop guards, so a run they end still reports as
+    /// completed.
+    guard_stopped: bool,
     /// Image embeddings collected by `view_image` during the current
     /// `run_tool_calls` dispatch, drained by the caller when it pushes the
     /// tool-result message so they ride on that message into the transcript.
@@ -2047,6 +2475,15 @@ struct Agent<'a> {
     usage: SessionUsage,
     /// Engine-agnostic in/out token tally for the end-of-session stats.
     stats: SessionStats,
+    /// One note per generation pass, for the `## Passes` table of a repro
+    /// dump (`crate::repro::PassNote`); bounded by `PASS_NOTES_CAP`.
+    passes: Vec<crate::repro::PassNote>,
+    /// What the reasoning guard saw of the pass that just ended, left by the
+    /// generate paths for the turn loop that knows how the pass stopped.
+    last_guard: crate::insights::GuardSnapshot,
+    /// Set when a reasoning rung stopped the previous pass: the *next* pass
+    /// runs with reasoning closed. See [`Agent::pass_opts`].
+    reply_only_next: bool,
     /// When the current session began (process start, or the last `/clear`,
     /// `/resume`, or `/switch`), for the end-of-session duration.
     session_start: std::time::Instant,
@@ -2059,7 +2496,9 @@ struct Agent<'a> {
     /// turn — parent prefix plus the small report — diverges behind the
     /// sidechain's live end and the whole parent context re-prefills from
     /// token zero. `None` entries are engines without KV support (Echo),
-    /// where the restore no-ops.
+    /// where the restore no-ops. The innermost entry doubles as the
+    /// sidechain's rescue checkpoint (`rescue_prefix_before_rebuild`, tier 1),
+    /// peeked without popping.
     fork_kv: Vec<Option<crate::kvcache::KVCache>>,
     /// Transcript index of each open sub-agent fork, innermost last, parallel
     /// to `fork_kv`. The console backfill needs the boundary: the parent window
@@ -2072,6 +2511,13 @@ struct Agent<'a> {
     /// `showThinking` flip or a console restart never repeats what the console
     /// already showed. Reset with the session; clamped by rollback.
     console_seen: usize,
+    /// How many *unnamed* sub-agents this session has already labelled. Every
+    /// one of them used to be called `sub-agent`, which made a log holding
+    /// several of them unreadable; instead each draws the next NATO phonetic
+    /// word from `nato_label`. One counter per session covers both entry points
+    /// (the `agent` tool and `/subagent`) and any nesting, so no two unnamed
+    /// sub-agents in a session ever share a name. Reset with the session.
+    unnamed_subagents: usize,
     /// The last few finished sub-agent sidechains, newest last, for the
     /// `/repro` sidecars: a sidechain is truncated out of the transcript the
     /// moment it ends, so without this the main dump could never show what a
@@ -2428,6 +2874,176 @@ fn fmt_secs(secs: f64) -> String {
     fmt_duration(std::time::Duration::from_secs(whole))
 }
 
+/// One engine's block in the end-of-session stats table: its tally joined
+/// with its speed record, when it reported one.
+struct StatsSection {
+    label: String,
+    input: u64,
+    output: u64,
+    speeds: Option<crate::speeds::Record>,
+}
+
+/// What a row of the end-of-session stats table shows, which picks its color.
+#[derive(Clone, Copy)]
+enum StatsRowKind {
+    /// An engine's name (or `Total`), heading its block.
+    Heading,
+    /// Tokens ingested, drawn in red.
+    Input,
+    /// Tokens generated, drawn in green.
+    Output,
+    /// Time spent running tools, drawn in yellow.
+    Tools,
+}
+
+/// One row of the end-of-session stats table: a label and the
+/// tokens/time/rate cells, any of which may be blank.
+struct StatsRow {
+    kind: StatsRowKind,
+    label: String,
+    cells: [String; 3],
+}
+
+impl StatsRow {
+    fn heading(label: &str) -> Self {
+        Self {
+            kind: StatsRowKind::Heading,
+            label: label.to_owned(),
+            cells: Default::default(),
+        }
+    }
+
+    fn figure(kind: StatsRowKind, cells: [String; 3]) -> Self {
+        let label = match kind {
+            StatsRowKind::Heading => "",
+            StatsRowKind::Input => "  ↓ input",
+            StatsRowKind::Output => "  ↑ output",
+            StatsRowKind::Tools => "  · tools",
+        };
+        Self {
+            kind,
+            label: label.to_owned(),
+            cells,
+        }
+    }
+}
+
+/// Lays out the stats table's rows, one block per engine and a totals block
+/// when more than one engine served (with a single one it would only repeat
+/// the numbers above it).
+///
+/// Engines that never reported a rate — the echo stub and online providers,
+/// whose throughput is someone else's network — keep their token counts and
+/// leave the time and rate cells blank.
+fn run_stats_blocks(sections: &[StatsSection], totals: (u64, u64)) -> Vec<Vec<StatsRow>> {
+    let timed = |secs: f64, tps: f64| {
+        if secs > 0.0 {
+            [fmt_secs(secs), format!("{tps:.1} tok/s")]
+        } else {
+            Default::default()
+        }
+    };
+    let mut blocks: Vec<Vec<StatsRow>> = Vec::new();
+    for sec in sections {
+        let r = sec.speeds.unwrap_or_default();
+        let [pt, pr] = timed(r.prefill_secs, r.prefill_tps());
+        let [gt, gr] = timed(r.gen_secs, r.gen_tps());
+        let mut block = vec![
+            StatsRow::heading(&sec.label),
+            StatsRow::figure(StatsRowKind::Input, [fmt_u64(sec.input), pt, pr]),
+            StatsRow::figure(StatsRowKind::Output, [fmt_u64(sec.output), gt, gr]),
+        ];
+        if r.tool_secs > 0.0 {
+            block.push(StatsRow::figure(
+                StatsRowKind::Tools,
+                [String::new(), fmt_secs(r.tool_secs), String::new()],
+            ));
+        }
+        blocks.push(block);
+    }
+    if sections.len() != 1 {
+        let total = |n: u64| [fmt_u64(n), String::new(), String::new()];
+        blocks.push(vec![
+            StatsRow::heading("Total"),
+            StatsRow::figure(StatsRowKind::Input, total(totals.0)),
+            StatsRow::figure(StatsRowKind::Output, total(totals.1)),
+        ]);
+    }
+    blocks
+}
+
+/// Renders the end-of-session stats as a box-drawn table: input in red,
+/// output in green, tools in yellow, rates and borders dimmed.
+///
+/// Pure so the layout is testable; widths count chars, which is exact for the
+/// glyphs used here.
+fn render_run_stats(
+    elapsed: &str,
+    sections: &[StatsSection],
+    totals: (u64, u64),
+    color: bool,
+) -> Vec<String> {
+    use std::fmt::Write as _;
+
+    let paint = |code: &'static str| if color { code } else { "" };
+    let (bold, dim, reset) = (paint("\x1b[1m"), paint("\x1b[38;5;240m"), paint(ANSI_RESET));
+    let tint = |kind: StatsRowKind| match kind {
+        StatsRowKind::Heading => bold,
+        StatsRowKind::Input => paint("\x1b[31m"),
+        StatsRowKind::Output => paint("\x1b[32m"),
+        StatsRowKind::Tools => paint("\x1b[33m"),
+    };
+    let blocks = run_stats_blocks(sections, totals);
+
+    let headers = ["tokens", "time", "rate"];
+    let rows = blocks.iter().flatten();
+    let label_w = rows
+        .clone()
+        .map(|r| r.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut widths = headers.map(str::len);
+    for r in rows {
+        for (w, c) in widths.iter_mut().zip(&r.cells) {
+            *w = (*w).max(c.chars().count());
+        }
+    }
+    let rule = |l: &str, m: &str, r: &str| {
+        let mut s = format!("{dim}{l}{}", "─".repeat(label_w + 2));
+        for w in widths {
+            s.push_str(m);
+            s.push_str(&"─".repeat(w + 2));
+        }
+        format!("{s}{r}{reset}")
+    };
+    let bar = format!("{dim}│{reset}");
+
+    let mut out = vec![
+        format!("{bold}Session stats{reset}  {dim}·{reset}  {elapsed}"),
+        rule("╭", "┬", "╮"),
+    ];
+    let mut head = format!("{bar} {:label_w$} ", "");
+    for (h, w) in headers.iter().zip(widths) {
+        let _ = write!(head, "{bar} {dim}{h:>w$}{reset} ");
+    }
+    out.push(format!("{head}{bar}"));
+    for block in &blocks {
+        out.push(rule("├", "┼", "┤"));
+        for r in block {
+            let t = tint(r.kind);
+            let mut line = format!("{bar} {t}{:label_w$}{reset} ", r.label);
+            for (i, (c, w)) in r.cells.iter().zip(widths).enumerate() {
+                // Tokens and time are the figures; the rate is the aside.
+                let (b, t) = if i == 2 { ("", dim) } else { (bold, t) };
+                let _ = write!(line, "{bar} {b}{t}{c:>w$}{reset} ");
+            }
+            out.push(format!("{line}{bar}"));
+        }
+    }
+    out.push(rule("╰", "┴", "╯"));
+    out
+}
+
 /// Times a tool dispatch and charges the elapsed wall-clock to `model` on drop,
 /// so an early return or a panic-free `?` still books the time it cost.
 struct ToolClock {
@@ -2554,6 +3170,21 @@ const PRE_ROLLBACK_CHECKPOINT: &str = "pre-rollback";
 ///
 /// Held only for the duration of one `agent` call: created before the fork,
 /// unwound after it, never persisted.
+/// Who asked for `/init`, which decides whether the session is cleared after
+/// the file is written.
+///
+/// The launch offer runs before the user has said anything, and the context
+/// pushed at startup was assembled when no `AGENTS.md` existed — so clearing is
+/// what gets the new file in front of the model. A `/init` typed mid-session
+/// has a conversation behind it that clearing would throw away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitSource {
+    /// The `AGENTS.md` offer put to the user at interactive startup.
+    LaunchOffer,
+    /// The user typed `/init`.
+    UserCommand,
+}
+
 struct AgentIsolation {
     /// The live worktree session, for the removal that may follow.
     session: crate::worktree::WorktreeSession,
@@ -2624,6 +3255,14 @@ impl Agent<'_> {
     /// a fan-out slot, which is not the innermost serial sub-agent.
     fn report_guard_for(&self, label: Option<&str>, what: &str) {
         let line = guard_notice(what, label);
+        // The draft pause is debug-console-only: see [`DRAFT_PAUSE_TEXT`].
+        if what.starts_with(DRAFT_PAUSE_TEXT) {
+            if crate::debugmirror::enabled() {
+                crate::debugmirror::push(&format!("\n{line}\n"));
+                crate::debugmirror::flush();
+            }
+            return;
+        }
         match &self.sub_sink {
             SubSinkTarget::Events(tx) => {
                 let _ = tx.send(UiEvent::Error(line));
@@ -2631,6 +3270,87 @@ impl Agent<'_> {
             SubSinkTarget::Stdout => println!("{}", self.error_line(&line)),
             SubSinkTarget::Null => {}
         }
+    }
+
+    /// Ends a main turn because a guard stopped it: reports the notice and
+    /// records the stop. The `Ok(())` is deliberate and unchanged — the
+    /// interactive front ends carry on after a stop, so the turn did not
+    /// fail. [`Agent::guard_stopped`] is how the news leaves the turn.
+    // The `Result` return is deliberate, matching the call sites' `return
+    // self.stop_turn(...)` in a function that returns `Result<(), String>`;
+    // it always succeeds today because the turn does not fail here.
+    #[allow(clippy::unnecessary_wraps)]
+    fn stop_turn(&mut self, notice: &str) -> Result<(), String> {
+        self.report_guard(notice);
+        self.guard_stopped = true;
+        Ok(())
+    }
+
+    /// The generation options for the next pass, with the one-pass
+    /// closed-think override applied and consumed.
+    ///
+    /// Two things ride on the `think_mode` this returns. The engine builds the
+    /// assistant prefix from it — open `<think>` for a thinking level, the
+    /// same prefix already closed for `Off` — and records the reply span under
+    /// it, so it decides whether the pass *can* reason at all. That prefix is
+    /// the last few tokens of the prompt and is re-prefilled every pass, while
+    /// the effort preamble that keys the KV prefix comes from the engine's own
+    /// level, which this never touches. So a pass can be made reply-only for
+    /// free, with the whole cached prefix intact.
+    ///
+    /// After a reasoning-rung stop, that is exactly what happens
+    /// (`reply_only_next`, `docs/disable-thinking-guard.md`). The model does
+    /// obey the stop — `repro-loop-1789108726`'s recovery pass opens "let me
+    /// stop the exhaustive analysis and deliver findings" and lists fourteen —
+    /// but every pass begins inside a think block the chat template opened, so
+    /// "deliver now" was obeyed *there* and cut at the same byte gate again.
+    /// Taking the block away leaves the answer and the tool calls as the only
+    /// things the pass can write.
+    ///
+    /// Also the one place the live level reaches the engine's prefix:
+    /// `gen_opts.think_mode` is the startup value and `/think` only ever
+    /// updated `self.think`, so before this a mid-session `/think off` left
+    /// the assistant prefix opening `<think>` regardless.
+    fn pass_opts(&mut self) -> crate::engine::GenerationOptions {
+        let mut opts = self.gen_opts.clone();
+        opts.think_mode = if std::mem::take(&mut self.reply_only_next) {
+            crate::engine::ThinkMode::Off
+        } else {
+            self.think
+        };
+        opts
+    }
+
+    /// Arms the closed-think recovery for the next pass, which every
+    /// reasoning-rung stop does.
+    fn arm_reply_only(&mut self) {
+        self.reply_only_next = true;
+    }
+
+    /// Records how a pass ended for the repro dump's `## Passes` table. `guard`
+    /// is the snapshot the generate path left in `last_guard` (taken here so
+    /// a pass is never noted twice), or the one a quiet pass carried.
+    fn note_pass(
+        &mut self,
+        label: Option<&str>,
+        stats: &crate::engine::GenerationStats,
+        guard: crate::insights::GuardSnapshot,
+        stop: String,
+    ) {
+        if self.passes.len() >= crate::repro::PASS_NOTES_CAP {
+            self.passes.remove(0);
+        }
+        self.passes.push(crate::repro::PassNote {
+            at: now_secs(),
+            label: label
+                .or(self.tool_ctx.subagent_label.as_deref())
+                .unwrap_or_default()
+                .to_owned(),
+            generated: stats.generated,
+            tps: stats.tps,
+            guard,
+            stop,
+        });
     }
 
     /// Collects image embeddings from the transcript and hands them to the
@@ -2655,6 +3375,33 @@ impl Agent<'_> {
         self.engine.set_pending_images(images);
     }
 
+    /// The plain REPL's stream renderer: a colorized stdout sink, configured
+    /// exactly as every other pass on this path configures it.
+    fn plain_stream(&mut self) -> StreamRenderer<TerminalSink<FlushingStdout>> {
+        let sink = TerminalSink::new(TokenRenderer::new(
+            FlushingStdout,
+            RenderOptions {
+                use_color: self.color,
+                format_thinking: true,
+                format_markdown: true,
+            },
+        ));
+        let mut stream = StreamRenderer::with_syntax(sink, self.tool_syntax());
+        stream.set_freeze_on_error(true);
+        self.configure_stream(&mut stream);
+        stream
+    }
+
+    /// The reasoning level as the *footer* should show it: on a model with a
+    /// native numeric effort knob the segment carries the effort number in
+    /// force rather than plank's name for the level
+    /// ([`crate::engine::ThinkMode::for_display`]). Display only — `self.think`
+    /// stays the real state, which is what keys the KV fingerprint.
+    fn footer_think(&self, model_name: &str) -> crate::engine::ThinkMode {
+        self.think
+            .for_display(crate::engine::numeric_thinking_model(model_name))
+    }
+
     /// Streams one generation pass: paints the live status bar for prefill and
     /// generation, and routes model text through the viz + markdown pipeline.
     #[allow(clippy::type_complexity)]
@@ -2670,21 +3417,14 @@ impl Agent<'_> {
         ),
         String,
     > {
-        let sink = TerminalSink::new(TokenRenderer::new(
-            FlushingStdout,
-            RenderOptions {
-                use_color: self.color,
-                format_thinking: true,
-                format_markdown: true,
-            },
-        ));
         // See the matching guard in `worker_generate_kind`: the plain REPL has
         // no blinking brain to drive, but the flag is process-global and a
         // remote client attached to this session renders off it.
         let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
-        let mut stream = StreamRenderer::with_syntax(sink, self.tool_syntax());
-        stream.set_freeze_on_error(true);
-        self.configure_stream(&mut stream);
+        let mut stream = self.plain_stream();
+        // Bound before the closures borrow `self`: this both applies the
+        // one-pass closed-think override and consumes it.
+        let pass_opts = self.pass_opts();
         // Defensive retry point: picks up a console that started after plank
         // did, or a setting change that raced this turn's start. A settings
         // change itself already reconciles immediately (`settings::reinstall`),
@@ -2698,7 +3438,7 @@ impl Agent<'_> {
         // renders gray until `</think>`. Provider engines are excluded: their
         // translator emits explicit `<think>`/`</think>` tags, so pre-opening
         // here would mis-color any output not preceded by a reasoning delta.
-        if !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured() {
+        if pass_opens_in_think(&pass_opts, self.engine.as_ref()) {
             stream.begin_in_think();
             // The mirror gets no direct call into its own renderer, only raw
             // bytes — so under the same guard, tell it the same thing we just
@@ -2708,10 +3448,10 @@ impl Agent<'_> {
         let mut assistant_text = String::new();
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
-        let think = self.think;
         // Bound here rather than inside the event closure, which cannot borrow
         // `self` while `self.engine` is generating.
         let model_name = self.engine.model_name();
+        let think = self.footer_think(&model_name);
         let prompt_tokens = self.engine.count_tokens(prompt_text);
         let mut bar = crate::statusbar::StatusBar::new(self.show_footer && self.color, self.color);
         let verb = status::random_verb_index();
@@ -2721,9 +3461,7 @@ impl Agent<'_> {
         // Mirrors the C's worker greedy flag: argmax sampling while the
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
-        let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-            .with_think_budget(REPEAT_THINK_BUDGET)
-            .gated();
+        let mut repeat = turn_repeat_guard(self.engine.ctx_size());
         // Provider engines take a structured turn; local engines keep the flat
         // rendered transcript (byte parity, §4.4). `bufs`/`st` outlive the call.
         let bufs = self
@@ -2747,68 +3485,83 @@ impl Agent<'_> {
         // A prompt that diverges behind the live KV end would rebuild from
         // zero; restore the deepest ladder rung below the divergence first.
         self.rescue_prefix_before_rebuild(prompt_text);
-        let stats = self
-            .engine
-            .generate(
-                prompt,
-                &self.gen_opts,
-                &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
-                &|| greedy.load(Ordering::Relaxed),
-                &mut |ev| match ev {
-                    EngineEvent::Text(t) => {
-                        // Model output has started: drop the prefill bar so the
-                        // text streams cleanly from column zero.
-                        bar.clear();
-                        assistant_text.push_str(&t);
-                        stream.push(&t);
-                        // Tee the exact bytes the local renderer sees to the
-                        // debug console; a no-op unless showThinking is off
-                        // and a console is connected.
-                        crate::debugmirror::push(&t);
-                        if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy).is_some() {
-                            preflight_stop.store(true, Ordering::Relaxed);
-                        }
+        // The plain REPL has no `LiveStatus`, so it samples `/toks` itself.
+        let mut toks = crate::toks::Sampler::default();
+        let pressure = self.sensor.clone();
+        let gate = self.pressure_gate();
+        let result = self.engine.generate(
+            prompt,
+            &pass_opts,
+            &|| {
+                pressure_tick(
+                    &pressure,
+                    gate,
+                    preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
+                )
+            },
+            &|| greedy.load(Ordering::Relaxed),
+            &mut |ev| match ev {
+                EngineEvent::Text(t) => {
+                    // Model output has started: drop the prefill bar so the
+                    // text streams cleanly from column zero.
+                    bar.clear();
+                    toks.note_token();
+                    assistant_text.push_str(&t);
+                    stream.push(&t);
+                    // Tee the exact bytes the local renderer sees to the
+                    // debug console; a no-op unless showThinking is off
+                    // and a console is connected.
+                    crate::debugmirror::push(&t);
+                    if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy).is_some() {
+                        preflight_stop.store(true, Ordering::Relaxed);
                     }
-                    EngineEvent::Prefill(p) => {
-                        // Every sample, not just the last: a pass that ends
-                        // without a final event still cost the time it cost.
-                        crate::speeds::note_prefill_progress(&model_name, p.done, p.tps);
-                        bar.show(&Status {
-                            // A finished prefill means the engine is sampling,
-                            // not prefilling. Saying "prefilling" through the
-                            // whole time-to-first-token reads as a hang, and a
-                            // fully cached turn has no further event coming to
-                            // correct it (#64 follow-up).
-                            state: if p.is_complete() {
-                                WorkerState::Generating
-                            } else {
-                                WorkerState::Prefill
-                            },
-                            prefill_done: p.done,
-                            prefill_total: p.total,
-                            prefill_label: verb,
-                            thinking: stream.in_think(),
-                            prefill_tps: p.tps,
-                            elapsed_secs: turn_start.elapsed().as_secs_f64(),
-                            ctx_used: prompt_tokens,
-                            ctx_size,
-                            power_percent: power,
-                            think,
-                            ..Status::default()
-                        });
-                    }
-                    // Notices are a warm-up-only signal, never emitted mid-turn;
-                    // Spec counters reach this front-end's status line through
-                    // `stats` below, since the plain REPL has no live footer.
-                    EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
-                },
-            )
-            .map_err(|e| e.to_string())?;
+                }
+                EngineEvent::Prefill(p) => {
+                    note_prefill_event(&model_name, &p);
+                    bar.show(&Status {
+                        // A finished prefill means the engine is sampling,
+                        // not prefilling. Saying "prefilling" through the
+                        // whole time-to-first-token reads as a hang, and a
+                        // fully cached turn has no further event coming to
+                        // correct it (#64 follow-up).
+                        state: if p.is_complete() {
+                            WorkerState::Generating
+                        } else {
+                            WorkerState::Prefill
+                        },
+                        prefill_done: p.done,
+                        prefill_total: p.total,
+                        prefill_label: verb,
+                        thinking: stream.in_think(),
+                        prefill_tps: p.tps,
+                        elapsed_secs: turn_start.elapsed().as_secs_f64(),
+                        ctx_used: prompt_tokens,
+                        ctx_size,
+                        power_percent: power,
+                        think,
+                        ..Status::default()
+                    });
+                }
+                // Notices are a warm-up-only signal, never emitted mid-turn;
+                // Spec counters reach this front-end's status line through
+                // `stats` below, since the plain REPL has no live footer.
+                EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
+            },
+        );
+        self.note_pressure_stop();
+        // The latch is consumed by `finish_pressure_stop` on the success path
+        // only; an engine error ends the turn here, so clearing it is what
+        // stops the *next* pass acting on a stale reading.
+        let stats = result.map_err(|e| {
+            self.pressure_stop = false;
+            e.to_string()
+        })?;
         stream.finish();
         crate::debugmirror::flush();
         bar.clear();
         self.record_usage(&stats);
         self.last_ctx_used = stats.ctx_used;
+        self.last_guard = repeat.snapshot();
         Ok((stream, assistant_text, stats))
     }
 
@@ -2820,7 +3573,7 @@ impl Agent<'_> {
     /// evidence that work happened. Thinking on already shows the calls in
     /// context, and `/init` asks for silence outright.
     fn tool_activity_line(&self, calls: &[ToolCall]) -> Option<String> {
-        if crate::settings::active().ui.show_thinking || self.quiet_tools {
+        if crate::settings::show_thinking_effective() || self.quiet_tools {
             return None;
         }
         // Indented two columns so the line sits under the bulleted output
@@ -2884,7 +3637,14 @@ impl Agent<'_> {
         // per-call path alongside `agent`/`fanout`, which has `&mut self.engine`.
         let needs_engine =
             |c: &ToolCall| c.name == "agent" || c.name == "fanout" || c.name == "view_image";
-        self.dispatch_stanza(calls, &nudges, has_block, needs_engine)
+        let out = self.dispatch_stanza(calls, &nudges, has_block, needs_engine);
+        // The `remember`/`forget` tools set this when they run; consumed here
+        // so a turn in which the model wrote memory itself suppresses the
+        // passive extraction pass exactly once (`ExtractState::note_tool_write`).
+        if std::mem::take(&mut self.tool_ctx.wrote_memory) {
+            self.extract_state.note_tool_write();
+        }
+        out
     }
 
     /// The dispatch half of [`Self::run_tool_calls`]: routes the stanza to
@@ -3075,7 +3835,7 @@ impl Agent<'_> {
         }
         let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
         let label = if name.is_empty() {
-            "sub-agent".to_string()
+            self.next_unnamed_subagent_label()
         } else {
             name.to_string()
         };
@@ -3217,6 +3977,16 @@ impl Agent<'_> {
     /// forever. Nested `agent` calls route through [`run_tool_calls`], so the
     /// [`SUBAGENT_DEPTH_CAP`](crate::tools::SUBAGENT_DEPTH_CAP) guard applies.
     fn run_subagent_loop(&mut self) -> (SubagentDone, Result<(), String>) {
+        self.run_sidechain_quietly(Self::run_subagent_rounds)
+    }
+
+    /// The sink swap and console window shared by every quiet sidechain,
+    /// around `body` — the full agentic rounds for a sub-agent, or the single
+    /// generation of the memory pass.
+    fn run_sidechain_quietly<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> (SubagentDone, Result<T, String>) {
         // The parent turn's status sink writes bare `SystemStatus` events into
         // the MAIN log; leaving it installed would scatter the sub-agent's
         // "Searching Google for …" notices across the parent transcript while
@@ -3254,10 +4024,14 @@ impl Agent<'_> {
         // discipline as the status sink above. The guard is scoped to the
         // rounds, so nesting works for free: guards stack LIFO, matching
         // `fork_kv`.
-        let mirror = crate::debugmirror::open_subagent();
+        // Named after the roster label so the console window and the roster
+        // row agree; a sidechain with no label (the memory pass) falls back
+        // to the ordinal name.
+        let label = self.tool_ctx.subagent_label.clone().unwrap_or_default();
+        let mirror = crate::debugmirror::open_subagent(&label);
         let result = {
             let _active = mirror.activate();
-            self.run_subagent_rounds()
+            body(self)
         };
         self.tool_ctx.status_sink = parent_sink;
         self.tool_ctx.markdown_sink = parent_md;
@@ -3288,7 +4062,7 @@ impl Agent<'_> {
                 self.session
                     .push(Message::user(crate::agents::final_round_reminder()));
             }
-            let prompt_text = render_transcript(&self.session, &self.system);
+            let prompt_text = render_transcript(&recovery_session(&self.session), &self.system);
             let pass = match self.generate_quiet(&prompt_text, turn_start) {
                 Ok(pass) => pass,
                 Err(abort) => {
@@ -3302,13 +4076,20 @@ impl Agent<'_> {
                 }
             };
             self.session.push(Message::assistant(pass.assistant_text));
+            self.note_pass(
+                None,
+                &pass.stats,
+                pass.guard.clone(),
+                pass_stop_text(false, pass.tool_error.as_deref(), pass.calls.len()),
+            );
             if pass.looped {
                 trips += 1;
-                let over = pass
-                    .tool_error
-                    .as_deref()
-                    .is_some_and(|e| e.contains(THINK_BUDGET_ERROR));
-                self.report_guard(&repeat_trip_text(over, trips));
+                self.report_guard(&repeat_trip_text(pass.tool_error.as_deref(), trips));
+                // The sidechain's next quiet pass gets the same closed-think
+                // recovery the main turn does; its cap is left alone, since
+                // `SUBAGENT_REPEAT_TRIP_CAP` already asks for the report
+                // rather than ending the work.
+                self.arm_reply_only();
             } else {
                 trips = 0;
             }
@@ -3382,7 +4163,20 @@ impl Agent<'_> {
     fn generate_quiet(
         &mut self,
         prompt_text: &str,
+        turn_start: Instant,
+    ) -> Result<QuietPass, QuietAbort> {
+        let live_opts = self.pass_opts();
+        self.generate_quiet_with(prompt_text, turn_start, &live_opts)
+    }
+
+    /// [`generate_quiet`](Self::generate_quiet) with the generation options
+    /// spelled out, for the one caller that wants something other than the
+    /// live options: the memory pass's prefill-only step (`n_predict: 0`).
+    fn generate_quiet_with(
+        &mut self,
+        prompt_text: &str,
         _turn_start: Instant,
+        live_opts: &crate::engine::GenerationOptions,
     ) -> Result<QuietPass, QuietAbort> {
         // A console that appeared since the last pass: pick it up here too, so
         // a sub-agent's window is backfilled with its own slice.
@@ -3392,21 +4186,17 @@ impl Agent<'_> {
         let bufs = self
             .engine
             .wants_structured()
-            .then(|| self.build_structured(prompt_text));
-        // Cloned rather than borrowed: the live options are `self`'s now (they
-        // used to hang off the immutably-shared `cfg`), and this function goes
-        // on to touch `self` mutably.
-        let live_opts = self.gen_opts.clone();
+            .then(|| self.build_structured_for(&recovery_session(&self.session), prompt_text));
         let ctx = PassCtx {
-            opts: &live_opts,
-            think_off: matches!(self.think, crate::engine::ThinkMode::Off),
+            opts: live_opts,
+            think_off: matches!(live_opts.think_mode, crate::engine::ThinkMode::Off),
             // Read here, not inside the pass: `settings::install_for_test` is
             // thread-local, so a spawned pass would silently see defaults.
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
             display: PassDisplay {
-                show_thinking: crate::settings::active().ui.show_thinking,
+                show_thinking: crate::settings::show_thinking_effective(),
                 show_tool_calls: crate::settings::active().ui.show_tool_calls,
-                think_status: !crate::settings::active().ui.show_thinking
+                think_status: !crate::settings::show_thinking_effective()
                     && self.session.transcript.last().is_some_and(|m| {
                         m.role == crate::session::Role::User && m.text.starts_with("<tool_result>")
                     }),
@@ -3418,6 +4208,11 @@ impl Agent<'_> {
         };
         let preflight = edit_preflight(&self.tool_ctx);
         self.sync_engine_images();
+        // Same rescue as both main-turn paths: a prompt that diverges behind
+        // the live KV end would rebuild from zero. In a sub-agent that is the
+        // recovery pass after a reasoning-cycle stop, whose stubbed `<think>`
+        // block diverges from the KV the stopped pass left behind.
+        self.rescue_prefix_before_rebuild(prompt_text);
         let pass = generate_pass(
             self.engine.as_mut(),
             prompt_text,
@@ -3442,12 +4237,32 @@ impl Agent<'_> {
             tx: tx.clone(),
             power_percent: self.power_percent,
             think: self.think,
+            running_jobs: self.tool_ctx.bash.running_count(),
+            // `running` is set by the positive `should_run` that opened the
+            // pass and cleared by its `finish`/`cancel`, so it is true for
+            // exactly the generation the memory pass drives and no other.
+            memory_pass: self.extract_state.is_running(),
+            // The running job was popped from the queue, so it counts as one
+            // on top of whatever still waits.
+            memory_queue: if self.extract_state.is_running() {
+                self.memory_jobs.len() + 1
+            } else {
+                0
+            },
         })
     }
 
     /// Builds the render sink a sub-agent pass writes through, per the current
     /// [`SubSinkTarget`]. Shared by the serial loop and the parallel fan-out.
     fn sub_sink_render_sink(&self) -> Box<dyn crate::viz::RenderSink + Send> {
+        // The memory pass's reply is a verdict array for `apply_verdicts`,
+        // not something to show: on the TUI the sub-agent sink would land it
+        // in the main log as model text, on the plain REPL it would print.
+        // Its footer status still flows, through `pass_status_ctx`, which
+        // reads `sub_sink` directly rather than this sink.
+        if self.extract_state.is_running() {
+            return Box::new(NullSink);
+        }
         match &self.sub_sink {
             SubSinkTarget::Null => Box::new(NullSink),
             SubSinkTarget::Events(tx) => Box::new(crate::worker::SubAgentSink(tx.clone())),
@@ -3477,6 +4292,8 @@ struct QuietPass {
     /// Returned rather than recorded, because usage accounting lives on the
     /// `Agent` and a pass may run on a thread that cannot touch it.
     stats: crate::engine::GenerationStats,
+    /// What the reasoning guard saw, for the repro dump's pass note.
+    guard: crate::insights::GuardSnapshot,
 }
 
 /// Why a quiet pass ended with nothing to feed back: the engine failed, or the
@@ -3536,10 +4353,131 @@ struct PassDisplay {
 
 /// The footer plumbing for a quiet pass's live status: the channel and the
 /// figures a [`Status`] carries that the pass cannot read for itself.
+/// Title of the `/jobs` report panel; how the loops recognise it for the
+/// click toggle and the per-tick refresh.
+const JOBS_REPORT_TITLE: &str = "jobs";
+
+/// Replaces an open `/jobs` panel's text with `text`, or closes the panel when
+/// the table it was showing has just emptied. A panel left open past the last
+/// job would only say "no background jobs" while taking rows from the log, so
+/// the last job's exit dismisses it. A panel *opened* onto an empty table stays
+/// put: `/jobs` with nothing running still deserves its answer.
+fn refresh_jobs_panel(report: &mut Option<tui::ReportPanel>, text: &str) {
+    let Some(panel) = report.as_mut() else {
+        return;
+    };
+    let now_empty = text == crate::tools::bash::NO_JOBS_TEXT;
+    let was_empty = panel.text() == crate::tools::bash::NO_JOBS_TEXT;
+    if now_empty && !was_empty {
+        *report = None;
+    } else {
+        panel.set_text(text);
+    }
+}
+
+/// Title of the `/context` report panel; how the loops recognise it for the
+/// ctx-gauge click toggle.
+const CONTEXT_REPORT_TITLE: &str = "context";
+
+/// Title of the `/tasks` panel, which the footer's task counter also opens.
+const TASKS_REPORT_TITLE: &str = "tasks";
+
+/// Opens the `/tasks` panel over `report_text`, or closes it when it is the one
+/// showing: the footer's task counter toggles it on click, at idle and mid-turn.
+fn toggle_tasks_report(report: &mut Option<tui::ReportPanel>, report_text: &str) {
+    if report
+        .as_ref()
+        .is_some_and(|r| r.title() == TASKS_REPORT_TITLE)
+    {
+        *report = None;
+    } else {
+        *report = Some(tui::ReportPanel::new(TASKS_REPORT_TITLE, report_text));
+    }
+}
+
+/// Title of the `/mcp` report panel; the mid-turn loop names it to reopen the
+/// turn-start snapshot.
+const MCP_REPORT_TITLE: &str = "mcp";
+
+/// Opens the `/toks` panel, or closes it when it is the one showing: the
+/// footer's chart glyph toggles it on click. Free-standing like
+/// [`toks_report`], and for the same reason — the samples are process-wide, so
+/// this needs no agent.
+fn toggle_toks_report(report: &mut Option<tui::ReportPanel>) {
+    if report
+        .as_ref()
+        .is_some_and(|r| r.title() == TOKS_REPORT_TITLE)
+    {
+        *report = None;
+    } else {
+        *report = Some(tui::ReportPanel::new(TOKS_REPORT_TITLE, &toks_report(true)));
+    }
+}
+
+/// Feeds one prefill progress event to both of its readers, so the two front
+/// ends cannot drift on which events they count.
+///
+/// The session totals take every sample — a pass that ends without a final
+/// event still cost the time it cost — while `/toks` keeps only the rate the
+/// closing event reports, which is the pass's finished prefill speed.
+fn note_prefill_event(model: &str, p: &crate::engine::PrefillProgress) {
+    crate::speeds::note_prefill_progress(model, p.done, p.tps);
+    crate::toks::note_prefill_progress(p.is_complete(), p.tps);
+}
+
+/// Border title of the `/toks` report panel.
+const TOKS_REPORT_TITLE: &str = "toks";
+
+/// Braille cells across *one* of the `/toks` charts: two samples per cell, so
+/// the pair shows [`crate::toks::TokRing::SHOWN`] samples each. The report
+/// sets the two side by side, so it is a little over twice this wide.
+const TOKS_CHART_WIDTH: usize = crate::toks::TokRing::SHOWN / 2;
+
+/// Braille cells down the `/toks` chart: four levels per cell.
+const TOKS_CHART_HEIGHT: usize = 6;
+
+/// The mid-turn `/context` report: the breakdown the worker last published,
+/// drawn against the live resident count from the latest status snapshot.
+///
+/// The breakdown refines at each tool boundary, which is where context grows
+/// in bulk; `used` moves with every generated token, so the grid and the
+/// percentage fill while the model types.
+fn live_context_report(shared: &TurnShared, used: i32) -> String {
+    crate::ctxreport::render(&shared.context(), used, true)
+}
+
+/// The mid-turn `/repro`: writes the dump from the base the worker published
+/// at pass start plus the pass's output so far, copies the path to the
+/// clipboard as the idle command does, and returns the line to show. A
+/// failure (no pass started yet, or the write failed) is the line instead.
+fn live_repro_line(shared: &TurnShared, note: &str) -> String {
+    match shared.write_repro(note, "repro", now_secs()) {
+        Ok((path, sidecars)) => Agent::repro_copied_line(&path, sidecars),
+        Err(e) => format!("repro failed: {e}"),
+    }
+}
+
+/// The `/toks` report over the process-wide sample ring. Needs no agent, so
+/// the UI thread can redraw it mid-turn while the worker owns `self`.
+fn toks_report(color: bool) -> String {
+    crate::toks::render_report(
+        &crate::toks::snapshot(),
+        &crate::toks::prefill_snapshot(),
+        TOKS_CHART_WIDTH,
+        TOKS_CHART_HEIGHT,
+        color,
+    )
+}
+
 struct PassStatusCtx {
     tx: Sender<UiEvent>,
     power_percent: i32,
     think: crate::engine::ThinkMode,
+    running_jobs: usize,
+    /// The pass is the memory extraction pass; the footer mark says so.
+    memory_pass: bool,
+    /// Spans queued behind it plus itself, one footer mark each.
+    memory_queue: usize,
 }
 
 /// Builds the [`Status`] snapshots a generation pass publishes as it runs, from
@@ -3556,6 +4494,8 @@ struct LiveStatus {
     /// The first token out and the count then, so the live decode rate is
     /// measured over the decode phase alone (`crate::engine::rate_since`).
     gen_mark: Option<(Instant, i32)>,
+    /// Once-a-second decode rate samples for the `/toks` chart.
+    toks: crate::toks::Sampler,
     /// Carried across events so every snapshot keeps the running figures, not
     /// just the one built by a Spec event.
     spec: crate::engine::SpecStats,
@@ -3566,6 +4506,14 @@ struct LiveStatus {
     power_percent: i32,
     think: crate::engine::ThinkMode,
     model_name: String,
+    /// Background bash jobs running when the pass began; the footer's jobs
+    /// segment. A job started by this pass's own tool round shows from the
+    /// next snapshot that is built after dispatch.
+    running_jobs: usize,
+    /// Copied onto every snapshot; see `Status::memory_pass`.
+    memory_pass: bool,
+    /// Copied onto every snapshot; see `Status::memory_queue`.
+    memory_queue: usize,
 }
 
 impl LiveStatus {
@@ -3576,18 +4524,26 @@ impl LiveStatus {
         power_percent: i32,
         think: crate::engine::ThinkMode,
         model_name: String,
+        running_jobs: usize,
     ) -> Self {
         Self {
             prompt_tokens,
             gen_count: 0,
             gen_mark: None,
+            toks: crate::toks::Sampler::default(),
             spec: crate::engine::SpecStats::default(),
             verb: status::random_verb_index(),
             started,
             ctx_size,
             power_percent,
-            think,
+            // Footer-facing only: a numeric-thinking family shows the effort
+            // number in force instead of plank's name for it. Mapped once,
+            // here, so every snapshot this builder emits agrees.
+            think: think.for_display(crate::engine::numeric_thinking_model(&model_name)),
             model_name,
+            running_jobs,
+            memory_pass: false,
+            memory_queue: 0,
         }
     }
 
@@ -3608,6 +4564,7 @@ impl LiveStatus {
                 if self.gen_mark.is_none() {
                     self.gen_mark = Some((Instant::now(), self.gen_count));
                 }
+                self.toks.tick(self.gen_count);
                 Some(Status {
                     spec: self.spec,
                     state: WorkerState::Generating,
@@ -3622,12 +4579,15 @@ impl LiveStatus {
                     think: self.think,
                     greedy_sampling: greedy,
                     looping,
+                    running_jobs: self.running_jobs,
+                    memory_pass: self.memory_pass,
+                    memory_queue: self.memory_queue,
                     ..Status::default()
                 })
             }
             EngineEvent::Prefill(p) => {
                 // Every sample feeds the totals; see the plain path.
-                crate::speeds::note_prefill_progress(&self.model_name, p.done, p.tps);
+                note_prefill_event(&self.model_name, p);
                 Some(Status {
                     // A completed prefill is the sampling wait, not prefilling
                     // (#64 follow-up).
@@ -3646,6 +4606,9 @@ impl LiveStatus {
                     ctx_size: self.ctx_size,
                     power_percent: self.power_percent,
                     think: self.think,
+                    running_jobs: self.running_jobs,
+                    memory_pass: self.memory_pass,
+                    memory_queue: self.memory_queue,
                     ..Status::default()
                 })
             }
@@ -3704,20 +4667,22 @@ fn generate_pass(
     let mut assistant_text = String::new();
     let preflight_stop = AtomicBool::new(false);
     let greedy = AtomicBool::new(false);
-    let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-        .with_think_budget(REPEAT_THINK_BUDGET)
-        .gated();
+    let mut repeat = turn_repeat_guard(engine.ctx_size());
     // Counting the prompt only when someone is listening: it tokenizes the
     // whole rendered transcript.
     let mut live = ctx.status.as_ref().map(|sc| {
-        LiveStatus::new(
+        let mut live = LiveStatus::new(
             engine.count_tokens(prompt_text),
             Instant::now(),
             engine.ctx_size(),
             sc.power_percent,
             sc.think,
             engine.model_name(),
-        )
+            sc.running_jobs,
+        );
+        live.memory_pass = sc.memory_pass;
+        live.memory_queue = sc.memory_queue;
+        live
     });
     let st;
     let prompt = match bufs {
@@ -3772,15 +4737,32 @@ fn generate_pass(
     };
     stream.finish();
     crate::debugmirror::flush();
-    finish_quiet_pass(&stream, assistant_text, stats)
+    finish_quiet_pass(&stream, assistant_text, stats, repeat.snapshot())
 }
 
 /// Shapes a finished quiet pass into what the sub-agent loops act on: an
 /// interrupt (with the partial text), a tool error to feed back, or the calls.
+/// What the memory pass's prefill-only step left behind; see
+/// `Agent::prefill_memory_prompt`.
+enum MemoryPrefill {
+    /// The whole prompt is in the KV; the snapshot covers it exactly.
+    Done(Option<crate::kvcache::KVCache>),
+    /// Cut short by the user; the snapshot covers the prefix that landed.
+    Interrupted(Option<crate::kvcache::KVCache>),
+    /// An engine error; nothing worth keeping.
+    Failed,
+}
+
+/// The `QuietAbort::error` text of a generation the user cut short, as
+/// opposed to an engine fault. The memory pass reads it to tell "put the job
+/// back, uncounted" from "count a failed attempt".
+const QUIET_ABORT_INTERRUPTED: &str = "interrupted";
+
 fn finish_quiet_pass<S: RenderSink>(
     stream: &StreamRenderer<S>,
     mut assistant_text: String,
     stats: crate::engine::GenerationStats,
+    guard: crate::insights::GuardSnapshot,
 ) -> Result<QuietPass, QuietAbort> {
     let preflight_error = stream.preflight_error().map(str::to_owned);
     if stopped_by_user(
@@ -3791,7 +4773,7 @@ fn finish_quiet_pass<S: RenderSink>(
     {
         crate::interrupt::clear();
         return Err(QuietAbort {
-            error: "interrupted".to_string(),
+            error: QUIET_ABORT_INTERRUPTED.to_string(),
             partial: assistant_text,
         });
     }
@@ -3810,6 +4792,7 @@ fn finish_quiet_pass<S: RenderSink>(
             tool_error: Some(payload),
             looped: is_reasoning_stop(preflight_error.as_deref()),
             stats,
+            guard,
         });
     }
     let calls = finished.calls.to_vec();
@@ -3820,6 +4803,7 @@ fn finish_quiet_pass<S: RenderSink>(
         tool_error: None,
         looped: false,
         stats,
+        guard,
     })
 }
 
@@ -3841,6 +4825,17 @@ impl Agent<'_> {
         crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
+        // Turn boundary: the same place background job notifications join the
+        // transcript. The resume disclosure comes first — this turn is about to
+        // re-enter the engine, so the re-prefill it names is the one the user is
+        // about to wait through. Only then is fresh pressure observed, which may
+        // free the KV again before the turn starts.
+        if let Some(line) = self.announce_pressure_resume() {
+            println!("{}", status::system_line(&line, self.color));
+        }
+        if let Some(line) = self.poll_pressure() {
+            println!("{}", status::system_line(&line, self.color));
+        }
         // The session owns the persisted task list; load it into the live tool
         // context so the `task` tool mutates the copy that renders and saves.
         self.tool_ctx.tasks.clone_from(&self.session.tasks);
@@ -3867,6 +4862,8 @@ impl Agent<'_> {
         let mut stop_hook_ran = false;
         // Passes in a row the repeat guard stopped; see `MAIN_REPEAT_TRIP_CAP`.
         let mut repeat_trips = 0usize;
+        // The draft rung's own tally; see `MAIN_DRAFT_TRIP_CAP`.
+        let mut draft_trips = 0usize;
         // Bytes generated since the last tool call with an effect; see
         // `NO_PROGRESS_BYTE_BUDGET`.
         let mut ungrounded = 0usize;
@@ -3918,23 +4915,68 @@ impl Agent<'_> {
             );
             ungrounded += assistant_text.len();
             self.session.push(Message::assistant(assistant_text));
+            let guard = std::mem::take(&mut self.last_guard);
+            let stop = pass_stop_text(
+                real_interrupt,
+                preflight_error.as_deref().or(finished.error),
+                finished.calls.len(),
+            );
+            self.note_pass(None, &stats, guard, stop);
             // Streamed live to the parent window, so the console has seen it:
             // it must not be replayed to a window that connects later.
             self.note_pass_mirrored();
             self.payload_dirty = true;
+            // The partial output is in the transcript above, so a resume
+            // continues rather than repeats. Checked before `first_turn_done`
+            // is set, so a yield during the very first pass stays suppressed.
+            if let Some(line) = self.finish_pressure_stop() {
+                println!("{}", status::system_line(&line, self.color));
+            }
+            self.first_turn_done = true;
+            if self.is_pressure_yielded() {
+                // Not a completed answer and not a user abort: the next turn's
+                // `generate` rebuilds through `kvtier::warm` on its own.
+                self.save_payload_if_dirty();
+                // A yielded turn is still a turn that ended, and the window
+                // title is the one cue the user gets: leaving it on `Busy` for
+                // the whole yielded window says the opposite of what happened.
+                // Everything the ordinary close-out does runs here *except*
+                // the opportunistic microcompact and the end-of-turn KV flush,
+                // which would re-enter the engine and rebuild the very session
+                // the yield just freed.
+                crate::title::set(crate::title::State::Idle);
+                crate::warp::emit("stop", &self.session.id);
+                self.fire_turn_end(stats.generated, turn_start.elapsed());
+                return Ok(());
+            }
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
             if is_reasoning_stop(preflight_error.as_deref()) {
-                repeat_trips += 1;
-                let over = preflight_error.as_deref() == Some(THINK_BUDGET_ERROR);
-                self.report_guard(&repeat_trip_text(over, repeat_trips));
+                // A draft stop counts on its own tally: it is a nudge to
+                // deliver, not evidence the pass was wasted, and a cycle
+                // either side of one is still two cycles.
+                let draft = preflight_error.as_deref().is_some_and(is_draft_stop);
+                if draft {
+                    draft_trips += 1;
+                } else {
+                    repeat_trips += 1;
+                }
+                let trips = if draft { draft_trips } else { repeat_trips };
+                self.report_guard(&repeat_trip_text(preflight_error.as_deref(), trips));
                 if let Some(line) = self.loop_repro_line() {
                     println!("{}", self.debug_line(&line));
                 }
-                // Dump first, then take the cycle out of the model's copy.
-                self.stub_last_reasoning();
+                // Only proven cycles are discarded; drafts and budget-stopped
+                // analysis remain available for the bounded delivery attempt.
+                if preflight_error.as_deref() == Some(REPEAT_LOOP_ERROR) {
+                    self.stub_last_reasoning();
+                }
+                // Whatever the rung, the next pass has no think block to
+                // reason — or draft — in.
+                self.arm_reply_only();
             } else {
                 repeat_trips = 0;
+                draft_trips = 0;
             }
             let st = Status {
                 // `real_interrupt`, not `stats.interrupted`: a pass that
@@ -3955,7 +4997,9 @@ impl Agent<'_> {
                 // be useful, which is when people actually want them.
                 spec: stats.spec,
                 power_percent: self.power_percent,
-                think: self.think,
+                think: self.footer_think(&self.engine.model_name()),
+                running_jobs: self.tool_ctx.bash.running_count(),
+                pressure_yielded: self.yield_policy.plan().is_some(),
                 ..Status::default()
             };
             if real_interrupt {
@@ -3988,9 +5032,13 @@ impl Agent<'_> {
                     "<tool_result>{payload}</tool_result>"
                 )));
                 if repeat_trips >= MAIN_REPEAT_TRIP_CAP {
-                    self.report_guard(MAIN_REPEAT_TRIPS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(MAIN_REPEAT_TRIPS_NOTICE);
                 }
+                if draft_trips >= MAIN_DRAFT_TRIP_CAP {
+                    return self.stop_turn(MAIN_DRAFT_TRIPS_NOTICE);
+                }
+                let woke = self.drain_job_notifications();
+                self.print_job_wake(woke);
                 continue;
             }
             if !finished.calls.is_empty() {
@@ -4003,10 +5051,15 @@ impl Agent<'_> {
                     println!("{}", self.debug_line(&line));
                 }
                 // `last_written` is set by `write` and `edit` only after the
-                // file operation succeeds. A call-shaped check would let a
-                // failed edit, or a read-only `bash`, reset the no-progress
-                // budget forever (repro-loop-1788833715).
-                let made_progress = self.tool_ctx.last_written.is_some();
+                // file operation succeeds, and `touched_tree` only when an
+                // opaque tool (`bash`, an MCP write) left the git working tree
+                // measurably different. A call-shaped check would let a failed
+                // edit, or a read-only `bash`, reset the no-progress budget
+                // forever (repro-loop-1788833715); both of these are evidence
+                // of an actual change, not of a call having been made.
+                let made_progress =
+                    self.tool_ctx.last_written.is_some() || self.tool_ctx.touched_tree;
+                self.tool_ctx.touched_tree = false;
                 let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
                 crate::openfile::note_written(
                     &mut self.last_edited,
@@ -4044,33 +5097,25 @@ impl Agent<'_> {
                     if let Some(line) = self.loop_repro_line() {
                         println!("{}", self.debug_line(&line));
                     }
-                    self.report_guard(LOOP_TRIPPED_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(LOOP_TRIPPED_NOTICE);
                 }
                 // Checked after the results are in the transcript, so the
                 // dump and the next prompt both show what the turn did have.
                 if made_progress {
                     ungrounded = 0;
-                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET && crate::guard::guards_enabled() {
-                    self.report_guard(NO_PROGRESS_NOTICE);
-                    return Ok(());
+                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET
+                    && crate::guard::no_progress_guard_enabled()
+                {
+                    return self.stop_turn(NO_PROGRESS_NOTICE);
                 }
+                let woke = self.drain_job_notifications();
+                self.print_job_wake(woke);
                 continue;
             }
             let mut renderer = stream.into_sink().into_renderer();
             renderer.finish();
             if !renderer.last_output_newline() {
                 println!();
-            }
-            // Stop hooks: exit 2 feeds stderr to the model and the turn
-            // continues (at most once).
-            if !stop_hook_ran && let Some(feedback) = self.run_stop_hooks(&mut |w| println!("{w}"))
-            {
-                stop_hook_ran = true;
-                self.session.push(Message::user(format!(
-                    "<tool_result>Stop hook feedback:\n{feedback}</tool_result>"
-                )));
-                continue;
             }
             // Before the footer, not after: the bar is rendered from the
             // published cells, so refreshing afterwards would show every cell
@@ -4097,9 +5142,28 @@ impl Agent<'_> {
                 );
             }
             self.flush_kv_end_of_turn();
+            // Memory extraction: this is the genuine no-tool-calls turn exit,
+            // never the tool-round `continue` above — the span must not be
+            // cut mid-turn (CLAUDE.md: mirror the TUI's site in
+            // `worker_turn`). Only a snapshot: the reading happens from the
+            // REPL's idle tick (`run_repl_plain_local`), so the prompt comes
+            // back now.
+            self.enqueue_memory_job(turn_start.elapsed());
+            // Stop hooks: exit 2 feeds stderr to the model and the turn
+            // continues (at most once).
+            if !stop_hook_ran && let Some(feedback) = self.run_stop_hooks(&mut |w| println!("{w}"))
+            {
+                stop_hook_ran = true;
+                self.session.push(Message::user(format!(
+                    "<tool_result>Stop hook feedback:\n{feedback}</tool_result>"
+                )));
+                continue;
+            }
+            self.fire_turn_end(stats.generated, turn_start.elapsed());
+            // The idle title is the last thing: everything above is still
+            // part of the turn as far as a watching window is concerned.
             crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
-            self.fire_turn_end(stats.generated, turn_start.elapsed());
             return Ok(());
         }
     }
@@ -4363,7 +5427,7 @@ impl Agent<'_> {
         );
         let out = crate::hooks::run_event_ctx(
             &self.tool_ctx.hooks.session_start,
-            "",
+            source,
             &input,
             &self.tool_ctx.cwd,
         );
@@ -4482,7 +5546,7 @@ impl Agent<'_> {
         );
         let out = crate::hooks::run_event(
             &self.tool_ctx.hooks.session_end,
-            "",
+            reason,
             &input,
             &self.tool_ctx.cwd,
         );
@@ -4511,16 +5575,29 @@ impl Agent<'_> {
         self.trace.line(&format!(
             "system prompt reminder injected at transcript={pos}"
         ));
-        let mut text = sysprompt::build_system_prompt_reminder(
-            &self.tool_ctx.mcp,
-            !crate::settings::active().engine.thinking_tool_calls,
-        );
+        let text = self.system_prompt_reminder_text();
+        self.session.push(Message::user(text));
+    }
+
+    /// The reminder message both front ends inject: the short form
+    /// (`context.shortReminder`, default) or the C's full tools prompt, each
+    /// followed by the user's `-sys` text when there is one.
+    fn system_prompt_reminder_text(&self) -> String {
+        let settings = crate::settings::active();
+        let mut text = if settings.context.short_reminder {
+            sysprompt::build_short_system_prompt_reminder(&self.tool_ctx.mcp, self.tool_syntax())
+        } else {
+            sysprompt::build_system_prompt_reminder(
+                &self.tool_ctx.mcp,
+                !settings.engine.thinking_tool_calls,
+            )
+        };
         if !self.cfg.system.is_empty() {
             text.push_str("\nAdditional system instructions reminder:\n");
             text.push_str(&self.cfg.system);
             text.push_str("\n[End additional system instructions reminder.]\n\n");
         }
-        self.session.push(Message::user(text));
+        text
     }
 
     /// Compacts the transcript when the rendered context is nearly full.
@@ -4579,6 +5656,12 @@ impl Agent<'_> {
             compact::microcompact(&mut self.session.transcript, budget_tokens, &mut |s| {
                 engine.count_tokens(s)
             });
+        if cleared > 0 {
+            // Rewrites tool-result text in place without changing the
+            // message count, so the depth check in `current_suggestion`
+            // would not catch a suggestion made stale by this edit.
+            self.clear_suggestion();
+        }
         cleared
     }
 
@@ -4613,6 +5696,10 @@ impl Agent<'_> {
             return;
         }
         self.payload_dirty = true;
+        // Rewrites the last message's text in place without changing the
+        // transcript length, which the depth check in `current_suggestion`
+        // cannot see.
+        self.clear_suggestion();
         crate::engine::kv_debug(|| {
             format!("guard: stubbed {before}B of stopped reasoning down to {after}B")
         });
@@ -4641,6 +5728,13 @@ impl Agent<'_> {
         // to be truncated out, and the rung restore would touch an engine
         // that may not even be the session's.
         if !crate::settings::active().context.microcompact || self.in_sidechain() {
+            return None;
+        }
+        // Never while yielded to memory pressure: a microcompact restores a
+        // ladder rung, and `restore_rung_below` -> `set_kv` -> `ensure_session`
+        // re-acquires the very session the yield just released. Guarding here
+        // rather than at each call site closes it for both front ends at once.
+        if self.is_pressure_yielded() {
             return None;
         }
         let reclaimable = compact::microcompact_reclaimable(&self.session.transcript);
@@ -4700,6 +5794,7 @@ impl Agent<'_> {
             tail_start -= 1;
         }
         let tail: Vec<Message> = self.session.transcript[tail_start..].to_vec();
+        let old_len = self.session.transcript.len();
         self.session.transcript = Vec::new();
         // Off-path branches index into the transcript being replaced here, so
         // they cannot survive the rewrite; drop them rather than let them
@@ -4712,6 +5807,9 @@ impl Agent<'_> {
         // The transcript just shrank; `console_seen` is an index into it (see
         // the field doc), so a stale mark would silently disable the backfill.
         self.console_seen = self.console_seen.min(self.session.transcript.len());
+        // Same for the memory pass's depth: keep its unread tail unread.
+        self.extract_state
+            .rebase(old_len, self.session.transcript.len());
         let reinject = compact::build_reinjection(
             &self.tool_ctx.recent_reads,
             compact::reinject_budget(self.engine.ctx_size()),
@@ -4740,6 +5838,10 @@ impl Agent<'_> {
         // — the ladder would be permanently dead from the first full compaction
         // onward, the moment it is most needed.
         self.discard_ladder();
+        // The rebuilt transcript can coincidentally land at the same length as
+        // before (summary + tail vs. the original span), which the depth
+        // check in `current_suggestion` cannot see.
+        self.clear_suggestion();
     }
 
     /// The `trigger` value compaction hooks receive: `manual` for a user-driven
@@ -4770,7 +5872,7 @@ impl Agent<'_> {
         );
         let out = crate::hooks::run_event_ctx(
             &self.tool_ctx.hooks.pre_compact,
-            "",
+            trigger,
             &input,
             &self.tool_ctx.cwd,
         );
@@ -4806,7 +5908,7 @@ impl Agent<'_> {
         );
         let out = crate::hooks::run_event_ctx(
             &self.tool_ctx.hooks.post_compact,
-            "",
+            trigger,
             &input,
             &self.tool_ctx.cwd,
         );
@@ -4848,12 +5950,17 @@ impl Agent<'_> {
         // but the state is then correct for whoever reads it.
         let progress = status::CompactProgress::begin();
         let mut summary = String::new();
+        let pressure = self.sensor.clone();
+        let gate = self.pressure_gate();
         let stats = self
             .engine
             .generate(
                 crate::engine::Prompt::Flat(&prompt_text),
                 &self.gen_opts,
-                &|| crate::interrupt::pending(),
+                // A pressure stop during compaction abandons the pass down the
+                // existing interrupted path: a half-written summary is worse
+                // than none, and the yield is taken at the next turn boundary.
+                &|| pressure_tick(&pressure, gate, crate::interrupt::pending()),
                 &|| false,
                 &mut |ev| match ev {
                     EngineEvent::Text(t) => {
@@ -4864,16 +5971,34 @@ impl Agent<'_> {
                     EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
                 },
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string());
+        // Latched the instant `generate` returns, before anything can re-enter
+        // the engine and clear the reason (`note_pressure_stop`).
+        self.note_pressure_stop();
+        let stats = stats.inspect_err(|_| {
+            self.pressure_stop = false;
+        })?;
         drop(progress);
         if self.color {
             print!("\x1b[0m");
         }
         if stats.interrupted {
             println!("{}", status::system_line(COMPACT_INTERRUPTED, self.color));
+            // A pressure stop during compaction ends the turn here. Without
+            // this the yield would wait for the next `run_turn`'s
+            // `poll_pressure`, which on an interactive path means waiting for
+            // the user to type — the memory would stay wired exactly as long
+            // as nobody was there, which is the opposite of the point.
+            // Before `clear_cancel` (C4): free the session first, so a racing
+            // turn cannot start a generation against a session about to go.
+            if let Some(line) = self.finish_pressure_stop() {
+                println!("{}", status::system_line(&line, self.color));
+            }
             crate::interrupt::clear();
+            crate::ds4engine::clear_cancel();
             return Ok(Compacted::Interrupted);
         }
+        self.pressure_stop = false;
         let extracted = compact::extract_summary(&summary);
         if extracted.trim().is_empty() {
             println!("{}", status::system_line(COMPACT_NO_SUMMARY, self.color));
@@ -5025,9 +6150,6 @@ impl Agent<'_> {
         }
     }
 
-    /// Renders the `/usage` report: cumulative billed token usage for online
-    /// (provider) models this session. Prints a short note when no provider
-    /// turn has run (local engine, or nothing generated yet).
     /// Gathers the figures behind the local `/usage` report: the session
     /// token tally per engine joined with that engine's speed record, wall
     /// time, context fill, working-tree changes and speculation counters.
@@ -5060,6 +6182,29 @@ impl Agent<'_> {
             git: crate::status::git_stats(),
             spec: self.last_spec,
         }
+    }
+
+    /// The `/stats` report: deterministic over the cached session metadata
+    /// `/insights` keeps, so it never touches the model.
+    fn stats_report(
+        &self,
+        scope: crate::stats::Scope,
+        color: bool,
+        hint: bool,
+    ) -> Result<String, String> {
+        let root = crate::insights::usage_dir();
+        let scan = crate::insights::collect_metas(&self.store, &root, &mut |_, _| {}, &|| false)?;
+        let (metas, entries) = match scan {
+            crate::insights::Scan::Done(m, e) => (m, e),
+            crate::insights::Scan::Cancelled => (Vec::new(), Vec::new()),
+        };
+        let stats = crate::stats::Stats::build(
+            &metas,
+            &entries,
+            now_secs(),
+            crate::insights::local_utc_offset(),
+        );
+        Ok(crate::stats::render(&stats, scope, color, hint))
     }
 
     fn render_usage_report(&self, color: bool) -> String {
@@ -5118,217 +6263,163 @@ impl Agent<'_> {
         out
     }
 
-    /// Renders the `/context` usage breakdown with Claude Code's layout: a
-    /// 20-column cell grid (1k tokens per cell, coarser for large contexts
-    /// so the grid stays within half a typical screen) beside the model and
-    /// totals, then the estimated usage per category.
-    #[allow(clippy::too_many_lines)]
-    fn render_context_report(&self, color: bool) -> String {
-        use std::fmt::Write as _;
-        /// Glyph for an unused context cell in the grid.
-        const FREE_CELL: char = '⛶';
-        /// Grid width in cells.
-        const GRID_COLS: usize = 20;
-        /// Maximum grid height in rows.
-        const MAX_GRID_ROWS: usize = 16;
-        /// Category colors matching Claude Code: violet, cyan, purple, gray.
-        const COL_SYSTEM: &str = "\x1b[38;5;105m";
-        const COL_MCP: &str = "\x1b[38;5;44m";
-        const COL_MSG: &str = "\x1b[38;5;134m";
-        const COL_CONTEXT: &str = "\x1b[38;5;208m";
-        const COL_MEMORY: &str = "\x1b[38;5;114m";
-        const COL_FREE: &str = "\x1b[38;5;240m";
-        let paint = |col: &'static str| if color { col } else { "" };
-        let reset = if color { ANSI_RESET } else { "" };
-        let ctx_size = self.engine.ctx_size().max(1);
+    /// Gathers the token counts behind the `/context` report.
+    ///
+    /// Only the agent can do this — it needs the engine's tokenizer and the
+    /// live transcript — so the worker gathers it at every point the
+    /// transcript changes and publishes it for the UI thread, which renders it
+    /// with the live fill. See [`crate::ctxreport`].
+    fn context_breakdown(&self) -> crate::ctxreport::Breakdown {
         let mut schemas = String::new();
         crate::tools::mcp::append_tool_schemas(&mut schemas, &self.tool_ctx.mcp);
-        let mcp_tokens = if schemas.is_empty() {
+        let mcp = if schemas.is_empty() {
             0
         } else {
             self.engine.count_tokens(&schemas)
         };
         // MCP tool schemas are embedded in the composed system prompt; split
         // them out so the two categories don't double-count.
-        // The system prompt includes: tools prompt + user system text
-        let mut system_tokens = (self.engine.count_tokens(&self.system) - mcp_tokens).max(0);
-        let mut mcp_tokens = mcp_tokens;
-        // AGENTS.md tokens from the context collected at session start.
+        let system = (self.engine.count_tokens(&self.system) - mcp).max(0);
+        // AGENTS.md and memory tokens from the context collected at session
+        // start. Both are subsets of the first user message, so they come out
+        // of the message total rather than adding to it.
         let context_tokens =
             ContextTokens::count(&self.context_content, |s| self.engine.count_tokens(s));
-        // Message tokens: all transcript messages (user and assistant)
-        let raw_message_tokens: i32 = self
+        let raw_messages: i32 = self
             .session
             .transcript
             .iter()
             .map(|m| self.engine.count_tokens(&m.text))
             .sum();
-        // AGENTS.md gets its own category; git and date context stay grouped
-        // under Messages (they are part of the injected first user message).
-        let agents_md_tokens = context_tokens.agents_md;
-        let memory_tokens = context_tokens.memory;
-        let mut message_tokens = raw_message_tokens - agents_md_tokens - memory_tokens;
-
-        let estimated =
-            system_tokens + mcp_tokens + message_tokens + agents_md_tokens + memory_tokens;
-        if self.last_ctx_used > estimated && estimated > 0 {
-            let scale = |t: i32| {
-                i32::try_from(i64::from(t) * i64::from(self.last_ctx_used) / i64::from(estimated))
-                    .unwrap_or(t)
-            };
-            system_tokens = scale(system_tokens);
-            mcp_tokens = scale(mcp_tokens);
-            message_tokens = scale(message_tokens);
+        crate::ctxreport::Breakdown {
+            ctx_size: self.engine.ctx_size(),
+            model: self.engine.model_name(),
+            system,
+            mcp,
+            // Clamped: `AGENTS.md` and memory are counted from the context
+            // collected at session start, which is only *usually* still in
+            // the transcript. A `/clear` drops the message carrying them
+            // while `context_content` keeps them, and the subtraction then
+            // goes negative — a category with fewer than no tokens in it,
+            // which the scaling and the grid both then read as real.
+            messages: (raw_messages - context_tokens.agents_md - context_tokens.memory).max(0),
+            agents_md: context_tokens.agents_md,
+            memory: context_tokens.memory,
         }
-
-        let used = (system_tokens + mcp_tokens + message_tokens + agents_md_tokens + memory_tokens)
-            .min(ctx_size);
-        let free = ctx_size - used;
-        let pct = |n: i32| f64::from(n) * 100.0 / f64::from(ctx_size);
-
-        // Categories are told apart by color; the glyph of each cell shows
-        // how full that cell is (see `fill_glyph`).
-        let mut categories = vec![
-            ("System prompt", system_tokens, COL_SYSTEM),
-            ("MCP tools", mcp_tokens, COL_MCP),
-        ];
-
-        if agents_md_tokens > 0 {
-            categories.push(("AGENTS.md", agents_md_tokens, COL_CONTEXT));
-        }
-
-        if memory_tokens > 0 {
-            categories.push(("Memory", memory_tokens, COL_MEMORY));
-        }
-
-        categories.push(("Messages", message_tokens, COL_MSG));
-
-        // Glyph for a cell by its fill fraction: <25%, <50%, <75%, full.
-        let fill_glyph = |frac: f64| -> char {
-            if frac < 0.25 {
-                '⛀'
-            } else if frac < 0.5 {
-                '⛂'
-            } else if frac < 0.75 {
-                '⛁'
-            } else {
-                '⛃'
-            }
-        };
-
-        // Adaptive density: 1k tokens per cell, coarsened (in 1k steps) so the
-        // grid never exceeds half a typical 24-row screen. Every non-empty
-        // category shows at least one cell; free space takes what remains.
-        #[allow(clippy::cast_sign_loss)]
-        let ctx = ctx_size as usize;
-        let tokens_per_cell = ctx
-            .div_ceil(GRID_COLS * MAX_GRID_ROWS)
-            .div_ceil(1000)
-            .max(1)
-            * 1000;
-        let total_cells = ctx.div_ceil(tokens_per_cell);
-        let mut cells: Vec<(char, &'static str)> = Vec::with_capacity(total_cells);
-        for &(_, tokens, col) in &categories {
-            if tokens <= 0 || cells.len() == total_cells {
-                continue;
-            }
-            // Whole cells render full; the trailing remainder renders with a
-            // glyph matching its fill fraction.
-            #[allow(clippy::cast_sign_loss)]
-            let tokens = tokens as usize;
-            let full = (tokens / tokens_per_cell).min(total_cells - cells.len());
-            cells.extend(std::iter::repeat_n(('⛃', col), full));
-            let rem = tokens % tokens_per_cell;
-            if rem > 0 && cells.len() < total_cells {
-                #[allow(clippy::cast_precision_loss)]
-                cells.push((fill_glyph(rem as f64 / tokens_per_cell as f64), col));
-            }
-        }
-        cells.truncate(total_cells);
-        cells.resize(total_cells, (FREE_CELL, COL_FREE));
-        let grid_rows = total_cells.div_ceil(GRID_COLS);
-
-        // Right-hand column: model line, totals, then the category legend.
-        let model = self.engine.model_name();
-        let mut right: Vec<String> = Vec::new();
-        if !model.is_empty() {
-            right.push(model);
-        }
-        right.push(format!(
-            "{}/{} tokens ({:.0}%)",
-            status::format_ctx_size(used),
-            status::format_ctx_size(ctx_size),
-            pct(used)
-        ));
-        right.push(String::new());
-        right.push("Estimated usage by category".to_owned());
-        for &(label, tokens, col) in &categories {
-            right.push(format!(
-                "{}⛃{reset} {label}: {} tokens ({:.1}%)",
-                paint(col),
-                status::format_ctx_size(tokens),
-                pct(tokens)
-            ));
-        }
-        right.push(format!(
-            "{}{FREE_CELL}{reset} Free space: {} ({:.1}%)",
-            paint(COL_FREE),
-            status::format_ctx_size(free),
-            pct(free)
-        ));
-        right.push(format!(
-            "1 cell = {} tokens",
-            status::format_ctx_size(i32::try_from(tokens_per_cell).unwrap_or(i32::MAX))
-        ));
-
-        let mut out = String::from("Context Usage\n");
-        let rows = right.len().max(grid_rows);
-        for row in 0..rows {
-            out.push_str("  ");
-            if row < grid_rows {
-                let start = row * GRID_COLS;
-                let end = (start + GRID_COLS).min(total_cells);
-                for &(glyph, col) in &cells[start..end] {
-                    out.push_str(paint(col));
-                    out.push(glyph);
-                    out.push_str(reset);
-                    out.push(' ');
-                }
-                out.push_str(&" ".repeat(2 * (start + GRID_COLS - end)));
-            } else {
-                out.push_str(&" ".repeat(2 * GRID_COLS));
-            }
-            if let Some(text) = right.get(row) {
-                let _ = write!(out, "   {text}");
-            }
-            out.push('\n');
-        }
-        out
     }
 
-    /// The `/init` prompt: asks the model to analyze the codebase and write an
-    /// `AGENTS.md` for future sessions. Shared by the plain REPL and TUI paths
-    /// so the wording lives in one place.
+    /// The `/context` report as of now, against the last resident count the
+    /// engine reported. The mid-turn panel renders the same breakdown against
+    /// the live figure instead (`crate::ctxreport::render`).
+    fn render_context_report(&self, color: bool) -> String {
+        crate::ctxreport::render(&self.context_breakdown(), self.last_ctx_used, color)
+    }
+
+    /// The `/init` prompt: drives a multi-phase, interactive setup that ends
+    /// with an `AGENTS.md` (and optionally an `AGENTS.local.md`) written for
+    /// future sessions. Shared by the plain REPL and TUI paths so the wording
+    /// lives in one place.
+    ///
+    /// The phases are the model's to run, not the front end's: plank supplies
+    /// the tools (`ask` for the two interview phases, `agent` for the survey)
+    /// and the prompt supplies the order. That keeps both front ends on one
+    /// code path — whatever the model asks, the front end's installed
+    /// [`Asker`](crate::tools::ask::Asker) renders. Under `--ui console` the
+    /// `ask` tool fast-fails, and the prompt tells the model what to do then.
     const INIT_PROMPT: &'static str = concat!(
-        "Analyze this codebase and create an AGENTS.md file for future agent sessions.\n\n",
-        "Include:\n",
-        "1. Build, lint, and test commands (especially non-standard ones)\n",
-        "2. High-level architecture and structure\n",
-        "3. Required setup or environment variables\n",
-        "4. Non-obvious gotchas or workflow quirks\n\n",
+        "Set up this repository for future agent sessions. Work through the\n",
+        "phases below in order. Keep your visible narration to one short line\n",
+        "per phase; the interesting output is the files you write and the\n",
+        "summary at the end.\n\n",
+        "PHASE 1 — ask what to set up.\n",
+        "Use the `ask` tool, with multi set to true, to ask which files to\n",
+        "write. Offer exactly these options:\n",
+        "- \"Project AGENTS.md\" — shared guidance, committed to the repo\n",
+        "- \"Personal AGENTS.local.md\" — your own notes, not committed\n",
+        "If the `ask` tool reports that no user is available, skip every `ask`\n",
+        "in this prompt and write the project AGENTS.md only, using your own\n",
+        "judgement for anything you would have asked about.\n\n",
+        "PHASE 2 — survey the codebase.\n",
+        "First list the tree (`git ls-files`, or `ls -R` when there is no git).\n",
+        "If it holds fewer than about thirty files, survey it yourself in this\n",
+        "turn: read the manifests and configs directly, and skip the sub-agent.\n",
+        "For a larger tree, delegate the survey to one sub-agent with the\n",
+        "`agent` tool (leave its `name` unset) so the findings come back\n",
+        "condensed. Either way, establish:\n",
+        "- manifest files (package.json, Cargo.toml, pyproject.toml, go.mod, ...)\n",
+        "- README, Makefile, build config, CI config\n",
+        "- any existing AGENTS.md, CLAUDE.md, or .plank/rules/ files\n",
+        "- configs written for other AI coding tools: .cursor/rules, .cursorrules,\n",
+        "  .github/copilot-instructions.md, .windsurfrules, .clinerules\n",
+        "- the real build, test, lint and format commands, and the package manager\n",
+        "- languages, frameworks, and whether this is a monorepo or one project\n",
+        "- code style rules that differ from the language default\n",
+        "- required environment variables and setup steps\n",
+        "- non-obvious gotchas: things that would waste an hour if unknown\n",
+        "- whether the repo uses git worktrees, and if so whether they are nested\n",
+        "  inside the checkout or siblings of it\n\n",
+        "PHASE 3 — fill in the gaps.\n",
+        "Anything the survey could not settle, and that matters, ask the user\n",
+        "about with `ask`. Prefer a few sharp questions to many shallow ones,\n",
+        "and skip a question whose answer you already have. Good candidates:\n",
+        "commands that exist but are not the obvious ones, gotchas worth\n",
+        "recording, branch naming and PR conventions. When writing the personal\n",
+        "file, also ask about the user's role and familiarity with the codebase,\n",
+        "and any personal sandbox URLs, test accounts or local setup.\n\n",
+        "PHASE 4 — write AGENTS.md, if it was chosen.\n",
+        "Write it to the project root. Keep it minimal and specific to this\n",
+        "repository. Include:\n",
+        "- build, test, lint and format commands an agent could not guess\n",
+        "- code style rules that DIFFER from the language default\n",
+        "- testing instructions and quirks\n",
+        "- repo etiquette: branch naming, PR conventions\n",
+        "- required environment variables or setup steps\n",
+        "- non-obvious gotchas and architectural decisions\n",
+        "- whatever still matters from the other AI tools' configs found above\n",
         "Exclude:\n",
-        "- File-by-file listings the agent can discover\n",
-        "- Standard language conventions\n",
-        "- Generic advice\n",
-        "- Information from README unless essential\n\n",
-        "Preface with:\n",
+        "- file-by-file structure or component lists\n",
+        "- standard language conventions\n",
+        "- generic advice (\"write clean code\", \"handle errors\")\n",
+        "- detailed API documentation: point at the file instead\n",
+        "- anything that changes frequently\n",
+        "- long tutorials or walkthroughs\n",
+        "Preface the file with exactly:\n",
         "```",
         "# AGENTS.md\n\n",
         "This file provides guidance to the agent when working with code in this repository.",
         "```",
         "\n\n",
-        "Write the AGENTS.md file to the current directory."
+        "If an AGENTS.md already exists, read it first and update it in place\n",
+        "rather than discarding what it says. If the project has several\n",
+        "distinct concerns, say so in the summary and suggest splitting them\n",
+        "into separate focused files under .plank/rules/.\n\n",
+        "PHASE 5 — write AGENTS.local.md, if it was chosen.\n",
+        "Write it to the project root, minimal, covering only what is personal:\n",
+        "the user's role and familiarity, their sandbox URLs or test accounts,\n",
+        "and any workflow or communication preferences they gave you. Nothing\n",
+        "that belongs in the shared file goes here.\n",
+        "This file is not meant to be committed. Check .gitignore; if it does\n",
+        "not already cover AGENTS.local.md, append a line for it.\n",
+        "If phase 2 found sibling (external) worktrees, the file would be\n",
+        "invisible from them, so instead write the prose to\n",
+        "~/.plank/<project-name>-instructions.md and make AGENTS.local.md a\n",
+        "one-line pointer to that path. Nested worktrees need no such stub.\n\n",
+        "PHASE 6 — summarise.\n",
+        "Do this in the same turn as the last file you write, right after the\n",
+        "write call, not as a separate pass. In a few lines: which files you\n",
+        "wrote, and the two or three points in them most worth a second look.\n",
+        "Say plainly that these are a starting point meant to be edited, and\n",
+        "that /init can be run again later to re-scan and update them."
     );
+
+    /// Draw the next label for an unnamed sub-agent, advancing the session's
+    /// counter. A *named* sub-agent never calls this, so naming one in the
+    /// middle of a run does not skip a word.
+    fn next_unnamed_subagent_label(&mut self) -> String {
+        let label = nato_label(self.unnamed_subagents);
+        self.unnamed_subagents += 1;
+        label
+    }
 
     /// The session-state half of `/clear` (and `/new`): drops the ladder, mints
     /// a fresh session, and re-scaffolds session-start context — everything
@@ -5337,7 +6428,9 @@ impl Agent<'_> {
     /// the screen.
     fn reset_session_state(&mut self) {
         self.discard_ladder();
+        self.clear_suggestion();
         self.session = Session::new();
+        self.extract_state.reset_to(0);
         // A new session, a new name — minted here for the same reason
         // `new_agent` mints one at launch (see `SessionStore::mint_id`).
         self.session.id = self.store.mint_id();
@@ -5345,6 +6438,9 @@ impl Agent<'_> {
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
+        // ... and a new log deserves a fresh alphabet: the next unnamed
+        // sub-agent is `alpha` again.
+        self.unnamed_subagents = 0;
         self.broadcast_session_reset(None);
         self.reminder = SystemPromptReminder::new();
         // Same merged roster the launch path advertises, so /clear
@@ -5396,48 +6492,83 @@ impl Agent<'_> {
         let settings = crate::settings::active();
         stream.set_show_tool_calls(settings.ui.show_tool_calls && !self.quiet_tools);
         stream.set_show_write_preview(!self.quiet_tools);
-        stream.set_show_thinking(settings.ui.show_thinking);
+        stream.set_show_thinking(crate::settings::show_thinking_effective());
         // With thinking hidden, a pass that follows a tool result shows the
         // first sentence of its thinking as a dim status line, so a long
         // tool-calling turn reads as progress instead of a column of counts.
         let after_tool_result = self.session.transcript.last().is_some_and(|m| {
             m.role == crate::session::Role::User && m.text.starts_with("<tool_result>")
         });
-        stream.set_think_status(!settings.ui.show_thinking && after_tool_result);
+        stream.set_think_status(!crate::settings::show_thinking_effective() && after_tool_result);
         stream.set_thinking_tool_calls(settings.engine.thinking_tool_calls);
         stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
         stream.set_preflight(edit_preflight(&self.tool_ctx));
     }
 
-    /// Runs the /init command: prompts the model to create AGENTS.md, then
-    /// clears the session (the plain REPL never clears the screen) so the init
-    /// exchange does not carry into later turns.
-    fn run_init(&mut self) {
-        println!("Initializing AGENTS.md...");
-        println!("The model will now analyze the codebase and generate documentation.\n");
-
+    /// The generation turn behind `/init`, without any front end around it:
+    /// the canned prompt, quiet tools, and the loop guards suspended for its
+    /// duration. Shared by the two interactive `/init` paths and by the
+    /// headless one-shot, so all three benchmark and behave alike.
+    ///
+    /// `tui_run_init` is this method's TUI mirror (it calls `tui_turn`
+    /// instead of `run_turn`, so it cannot share this code) — a change to one
+    /// usually needs the same change in the other.
+    fn init_turn(&mut self) -> Result<(), String> {
         self.session.push(Message::user(Self::INIT_PROMPT));
         self.quiet_tools = true;
+        // The phases re-read and re-survey by design; the guards read that as
+        // a loop. Dropped at the end of the turn, error or not.
+        let guards = crate::settings::suspend_loop_guards();
         let result = self.run_turn();
+        drop(guards);
         self.quiet_tools = false;
-        if let Err(e) = result {
+        result
+    }
+
+    /// Runs the /init command: drives the multi-phase setup in
+    /// [`Agent::INIT_PROMPT`], then — for the launch offer only — clears the
+    /// session (the plain REPL never clears the screen) so the init exchange
+    /// does not carry into later turns.
+    fn run_init(&mut self, source: InitSource) {
+        println!("Setting up this repository for future sessions...");
+        println!("The model will survey the codebase and ask you a few questions.\n");
+
+        if let Err(e) = self.init_turn() {
             println!("/init failed: {e}");
         }
-        // The init prompt and the model's AGENTS.md draft are scaffolding for
-        // the file write, not part of the conversation — clear the session so
-        // the next turn starts fresh.
-        self.clear_session_plain();
+        // The init prompt and the model's survey are scaffolding for the file
+        // write, not part of the conversation — clear the session so
+        // the next turn starts fresh. The clear also rebuilds the session
+        // context (`ContextContent::new_with_agents` re-reads `AGENTS.md` from
+        // disk), which is how the file just written reaches the model at all:
+        // the context pushed at launch was assembled before it existed.
+        //
+        // A `/init` the user typed leaves the session alone: they asked to
+        // write the file, not to throw away the conversation they were having.
+        // The next `/clear` picks the new `AGENTS.md` up, same as any other.
+        if source == InitSource::LaunchOffer {
+            self.clear_session_plain();
+        }
     }
 
     /// Runs the /init command in TUI mode.
     ///
-    /// The init prompt is not echoed and the model's AGENTS.md draft is not
-    /// left in the log: the turn's output is truncated back to a checkpoint
-    /// taken before it, then the session is cleared without wiping the screen
-    /// so the exchange does not carry into later turns.
+    /// The init prompt is not echoed, but — unlike the single-turn flow this
+    /// replaced — the turn's output is *kept*: the phases interview the user
+    /// through the `ask` panel and end with a summary, and truncating the log
+    /// back to a pre-turn checkpoint would erase exactly the part worth
+    /// reading. What used to justify the truncation (the model dictating the
+    /// whole AGENTS.md into the log) is handled by `quiet_tools`, which
+    /// suppresses the write preview, plus the prompt's instruction to narrate
+    /// one line per phase.
+    ///
+    /// For the launch offer only, the session is then cleared without wiping
+    /// the screen so the exchange does not carry into later turns. See
+    /// [`Agent::run_init`] for why the source matters.
     #[allow(clippy::too_many_arguments)]
     fn tui_run_init(
         &mut self,
+        source: InitSource,
         log: &mut OutputLog,
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
@@ -5446,23 +6577,25 @@ impl Agent<'_> {
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
     ) {
-        log.push_plain("Initializing AGENTS.md...");
-        log.push_plain("The model will now analyze the codebase and generate documentation.\n");
+        log.push_plain("Setting up this repository for future sessions...");
+        log.push_plain("The model will survey the codebase and ask you a few questions.\n");
 
         self.session.push(Message::user(Self::INIT_PROMPT));
-        // Drop everything the turn renders (the AGENTS.md draft, tool banners,
-        // the turn footer) so it never stays in the TUI log. The file write
-        // itself still happens during the turn.
-        let mark = log.checkpoint();
         self.quiet_tools = true;
+        // See `run_init`: the init phases are not the loop the guards hunt.
+        let guards = crate::settings::suspend_loop_guards();
         let result = self.tui_turn(terminal, log, view, input, btw, arcade, sub);
+        drop(guards);
         self.quiet_tools = false;
-        log.truncate_to(mark);
         if let Err(e) = result {
             log.push_plain(format!("/init failed: {e}"));
         }
-        // Clear the session without wiping the screen.
-        self.tui_clear_session(log, terminal, view, sub, false);
+        // Clear the session without wiping the screen, so the fresh context
+        // carries the AGENTS.md the turn just wrote. A user-typed `/init`
+        // keeps the conversation it interrupted.
+        if source == InitSource::LaunchOffer {
+            self.tui_clear_session(log, terminal, view, sub, false);
+        }
     }
 
     /// TUI `/clear` (and `/new`): reset the session, optionally wipe the screen,
@@ -5530,7 +6663,7 @@ impl Agent<'_> {
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
             "/init" => {
-                self.run_init();
+                self.run_init(InitSource::UserCommand);
                 return Ok(true);
             }
             "/quit" | "/exit" => return Ok(false),
@@ -5678,6 +6811,8 @@ impl Agent<'_> {
             "/mtp" => println!("{}", self.mtp_command(arg)),
             "/temp" => println!("{}", self.temp_command(arg)),
             "/loopguard" | "/lg" => println!("{}", loopguard_command(arg)),
+            "/mc" => println!("{}", microcompact_command(arg)),
+            "/jobs" => println!("{}", self.jobs_command()),
             "/think" => {
                 // A level change that moves the effort preamble re-warms the KV
                 // before returning. The plain REPL has no persistent prompt to
@@ -5756,6 +6891,14 @@ impl Agent<'_> {
             "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color)),
             "/context" => print!("{}", self.render_context_report(self.color)),
             "/usage" => print!("{}", self.render_usage_report(self.color)),
+            "/toks" => print!("{}", toks_report(self.color)),
+            "/stats" => match crate::stats::Scope::parse(arg) {
+                Some(scope) => match self.stats_report(scope, self.color, false) {
+                    Ok(text) => print!("{text}"),
+                    Err(e) => println!("stats failed: {e}"),
+                },
+                None => println!("usage: /stats [7|30|all]"),
+            },
             "/goal" => {
                 let arg = arg.trim();
                 if arg.is_empty() {
@@ -5790,7 +6933,7 @@ impl Agent<'_> {
                 // pass. The interrupted case already printed its own notice.
                 self.compact("user request", arg)?;
             }
-            "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
+            "/skills" => print!("{}", self.skills_command(arg)),
             "/frame" => println!(
                 "/frame needs the full-screen TUI — a piped session has no screen to give a \
                  component\n{}",
@@ -5805,7 +6948,7 @@ impl Agent<'_> {
                 self.session.tasks.render_list(self.session.goal.as_ref())
             ),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
-            "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
+            "/hooks" => print!("{}", self.hooks_command(arg)),
             "/remote-control" | "/rc" => {
                 println!(
                     "{cmd} needs the full-screen TUI — a piped session can't mirror output or run remote prompts"
@@ -5832,14 +6975,70 @@ impl Agent<'_> {
                 ),
                 Err(e) => println!("{e}\nusage: /remember [user] <text> (default scope: project)"),
             },
+            "/forget" => {
+                let pattern = arg.trim();
+                if pattern.is_empty() {
+                    println!("usage: /forget <pattern>");
+                } else {
+                    let hits = crate::memory::forget_preview(&self.tool_ctx.cwd, pattern);
+                    if hits.is_empty() {
+                        println!("nothing matched {pattern:?}");
+                    } else {
+                        println!("this will remove:");
+                        for h in &hits {
+                            println!("  {h}");
+                        }
+                        if ask_yes_no_on_stdin(
+                            &format!(
+                                "remove {} matching {pattern:?}?",
+                                if hits.len() == 1 {
+                                    "this entry"
+                                } else {
+                                    "these entries"
+                                }
+                            ),
+                            "remove? [y/N] ",
+                        ) {
+                            match crate::memory::forget_matching(&self.tool_ctx.cwd, pattern) {
+                                Ok(removed) => {
+                                    for r in &removed {
+                                        println!("forgot {r}");
+                                    }
+                                }
+                                Err(e) => println!("{e}"),
+                            }
+                        } else {
+                            println!("forget cancelled");
+                        }
+                    }
+                }
+            }
             // Static equivalent of the TUI editor: print the combined view so
             // the sources and their bounds are at least visible here.
+            "/memory" if arg.trim() == "calibrate" || arg.trim().starts_with("calibrate ") => {
+                let rest = arg.trim().strip_prefix("calibrate").unwrap_or("");
+                let color = self.color;
+                let text = self.gate_calibrate_command(rest, &mut |line| {
+                    println!("{}", crate::status::system_line(line, color));
+                });
+                println!("{text}");
+            }
+            "/memory" if arg.trim() == "log" => {
+                let entries = crate::memory::read_log(20);
+                if entries.is_empty() {
+                    println!("no memory changes logged yet");
+                } else {
+                    for line in entries {
+                        println!("{}", render_memory_log_line(&line));
+                    }
+                }
+            }
             "/memory" => {
                 print!(
                     "{}",
                     crate::memory::combine(&crate::memory::sources_for(&self.tool_ctx.cwd))
                 );
-                println!("/memory editing requires the interactive TUI");
+                println!("/memory editing requires the interactive TUI (or /memory log)");
             }
             "/rate" => println!("{}", self.rate_command(arg)),
             "/search" => {
@@ -6091,9 +7290,14 @@ impl Agent<'_> {
         let note = self.load_session_payload(&session);
         self.discard_ladder();
         self.session = session;
+        // A restored transcript is history, not new material for the pass.
+        self.extract_state.reset_to(self.session.transcript.len());
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
+        // ... and a new log deserves a fresh alphabet: the next unnamed
+        // sub-agent is `alpha` again.
+        self.unnamed_subagents = 0;
         self.last_ctx_used = 0;
         if let Some(note) = note {
             println!("{note}");
@@ -6258,9 +7462,12 @@ impl Agent<'_> {
         // snapshot of the one being discarded, and the payload on disk no
         // longer matches (same as `/clear` and `/switch`).
         self.discard_ladder();
+        self.clear_suggestion();
         self.payload_dirty = true;
         crate::checkpoint::restore_transcript(&mut self.session, &cp);
         self.console_seen = self.console_seen.min(self.session.transcript.len());
+        self.extract_state
+            .truncate_to(self.session.transcript.len());
         self.last_ctx_used = 0;
         let note = match &cp.kv {
             Some(cache) if self.engine.set_kv(cache).is_ok() => {
@@ -6485,6 +7692,21 @@ the original is frozen and listed in /tree"
             let _ = self.store.remove_rungs(&self.session.id);
         }
         self.ladder = crate::kvladder::KvLadder::new();
+        // A pinned restore plan describes *this* chain: its `keep` stems and
+        // its re-prefill depth. Every transcript identity change — `/new`,
+        // `/clear`, `/switch`, `/resume`, rollback, fork, a full compaction —
+        // comes through here, and carrying the plan across one would disclose a
+        // wrong number and keep the footer and the micro-compaction suppression
+        // pinned to an unrelated session.
+        self.clear_pressure_plan();
+    }
+
+    /// Retires a pinned restore plan without disclosing anything, because the
+    /// transcript it described is gone.
+    fn clear_pressure_plan(&mut self) {
+        if self.yield_policy.clear_plan().is_some() {
+            self.hysteresis.note_resumed();
+        }
     }
 
     /// Forgets every rung deeper than `spans` and deletes its blobs, after the
@@ -6694,18 +7916,70 @@ the original is frozen and listed in /tree"
     /// from token zero, which on a long session is minutes of prefill (one
     /// recorded session re-prefilled 117k tokens with a rung at 112k sitting
     /// unused). Here the engine is asked how the prompt lines up first; when
-    /// it reports that shape, the deepest rung below the divergence is
-    /// restored, so the sync extends from the rung and prefills only the
-    /// tail. Returns the tokens the restored rung covers.
+    /// it reports that shape, the deepest checkpoint below the divergence is
+    /// restored so the sync extends from it and prefills only the tail.
     ///
-    /// Never inside a sidechain: the engine there may not be the session's,
-    /// and its rungs describe a transcript about to be truncated away.
+    /// Three tiers, in order:
+    ///
+    /// 1. Inside a sidechain, the innermost fork snapshot that exists
+    ///    (`fork_kv`, peeked, never popped: the fork end still owns it). A
+    ///    failed capture leaves `None` on the stack, so this is not simply
+    ///    the last entry: it is the innermost `Some`, found by walking the
+    ///    stack from the top down. An outer snapshot found this way is still
+    ///    a valid restore point — it sits at that outer fork's `fork_at`,
+    ///    which is at or below the divergence, same as the innermost one
+    ///    would be. Every divergence inside the sidechain is at or past
+    ///    `fork_at`, so only the sidechain's own transcript re-prefills. This
+    ///    is what a reasoning-cycle stop in a sub-agent used to pay in full:
+    ///    `recovery_session` stubs the stopped `<think>` block, the next
+    ///    prompt diverges behind the live end, and with no rescue the whole
+    ///    parent context re-prefilled from zero (`docs/LOOP-FINDINGS.md`).
+    /// 2. The deepest ladder rung below the divergence. Valid inside a
+    ///    sidechain too: `restore_rung` fingerprints the transcript truncated
+    ///    to the rung's depth, which is intact parent prefix.
+    /// 3. Nothing: log it, and the sync rebuilds.
+    ///
+    /// Never while a clean-room alt engine is live (`alt_engine_depth`): its
+    /// KV is not the session's, and its prompt is small enough to rebuild.
     fn rescue_prefix_before_rebuild(&mut self, prompt_text: &str) -> Option<i32> {
-        if self.session.id.is_empty() || self.in_sidechain() {
+        if self.alt_engine_depth > 0 {
             return None;
         }
         let probe = self.engine.kv_reuse_probe(prompt_text, self.think)?;
+        if probe.live > 0 && probe.common == 0 {
+            // Not a divergence but an invalidated checkpoint (the C probe
+            // returns 0 for one): no checkpoint sits below token zero, so
+            // nothing can be rescued — but say so, or the rebuild is silent.
+            crate::engine::kv_debug(|| {
+                format!(
+                    "ladder fallback: live checkpoint invalid (live={}); rebuilding from zero",
+                    probe.live
+                )
+            });
+            return None;
+        }
         if !probe.rebuilds_from_zero() {
+            return None;
+        }
+        if self.in_sidechain()
+            && let Some(kv) = self.fork_kv.iter().rev().flatten().next()
+        {
+            match self.engine.set_kv(kv) {
+                Ok(()) => {
+                    crate::engine::kv_debug(|| {
+                        format!(
+                            "fork restore: innermost snapshot for rebuild avoidance (live={} common={})",
+                            probe.live, probe.common
+                        )
+                    });
+                    return Some(0);
+                }
+                Err(e) => crate::engine::kv_debug(|| {
+                    format!("fork restore failed ({e}); trying the ladder")
+                }),
+            }
+        }
+        if self.session.id.is_empty() {
             return None;
         }
         let Some(rung) = self.ladder.select_below_tokens(probe.common).copied() else {
@@ -6923,9 +8197,19 @@ the original is frozen and listed in /tree"
         let note = self.load_session_payload(&s);
         self.discard_ladder();
         self.session = s;
+        // A guess about the conversation we just left. The depth check would
+        // miss it whenever the adopted transcript happens to be the same
+        // length, and the ghost would then be one Enter from being sent into
+        // a different session.
+        self.clear_suggestion();
+        // A restored transcript is history, not new material for the pass.
+        self.extract_state.reset_to(self.session.transcript.len());
         crate::debugmirror::set_session_id(&self.session.id);
         // A new session name is a new console window: nothing has been shown there yet.
         self.console_seen = 0;
+        // ... and a new log deserves a fresh alphabet: the next unnamed
+        // sub-agent is `alpha` again.
+        self.unnamed_subagents = 0;
         self.broadcast_session_reset(Some(
             "[session replaced — its history is on the local screen only]",
         ));
@@ -6941,6 +8225,223 @@ the original is frozen and listed in /tree"
         self.fork_points.clear();
         self.session_start = std::time::Instant::now();
         note
+    }
+
+    /// Blob stems a resume would restore through: every cacheable tier of this
+    /// launch's chain, in `kvtier::warm`'s own order.
+    ///
+    /// These are what the GC must not sweep while plank is yielded — the KV is
+    /// deliberately not snapshotted, so these blobs are the whole restore path.
+    fn tier_keep_stems(&self) -> Vec<String> {
+        self.kv_tiers()
+            .into_iter()
+            .filter(crate::kvtier::TierSpec::cacheable)
+            .map(|t| t.fingerprint)
+            .collect()
+    }
+
+    /// True while plank has given its KV back to the system.
+    ///
+    /// The pinned restore plan *is* the yielded state: it exists from the
+    /// moment the session is released until `Decision::Resume` retires it. A
+    /// yield is therefore distinguishable from a completed turn (no plan) and
+    /// from a user abort ([`Self::last_turn_interrupted`]) without either front
+    /// end needing a third turn outcome.
+    fn is_pressure_yielded(&self) -> bool {
+        self.yield_policy.plan().is_some()
+    }
+
+    /// True when the state machine committed a yield that never happened.
+    ///
+    /// `Hysteresis::observe` sets the yielded flag before the caller has tried
+    /// to act on it, so a decision that is suppressed — first turn, sidechain,
+    /// user abort — or that the engine refuses leaves the machine believing it
+    /// freed memory it never freed. It would then hold off every later
+    /// `Critical` until a full resume dwell elapsed, suppressing exactly the
+    /// retries that matter. A live restore plan is the discriminator: that
+    /// means a real yield, which still needs its matching `Resume`.
+    fn yield_is_phantom(&self) -> bool {
+        self.hysteresis.is_yielded() && !self.is_pressure_yielded()
+    }
+
+    /// Latches whether the pass that just returned was stopped by memory
+    /// pressure.
+    ///
+    /// Must be called the instant `generate` returns and before anything
+    /// re-enters the engine: `clear_cancel` runs on entry to every generate and
+    /// warm pass, so the reason is gone the moment the next one starts.
+    fn note_pressure_stop(&mut self) {
+        self.pressure_stop = crate::ds4engine::cancelled_by_pressure();
+    }
+
+    /// Samples the mid-pass yield gate for the pass about to run.
+    ///
+    /// See [`PressureGate`]: the cancel must not be raised where the yield
+    /// would be suppressed or refused by the livelock guard.
+    fn pressure_gate(&self) -> PressureGate {
+        PressureGate {
+            yield_allowed: self.hysteresis.yield_allowed_at(Self::pressure_now()),
+            first_turn_done: self.first_turn_done,
+            in_sidechain: self.in_sidechain(),
+        }
+    }
+
+    /// Ends the yielded state because this turn is about to re-enter the engine.
+    ///
+    /// The yielded state ends when the session is *rebuilt*, not when `Normal`
+    /// has dwelled for thirty seconds. Called at the turn boundary, before any
+    /// generate (compaction included) can start a re-prefill, so the disclosure
+    /// reaches the user *before* the wait it describes rather than after it —
+    /// and so nothing keeps claiming "yielded" while plank is generating: the
+    /// footer marker, the micro-compaction and end-of-turn-flush suppressions,
+    /// and `observe`'s "already yielded, nothing left to free" all key off state
+    /// this retires. The livelock guard is what stops the next `Critical`
+    /// yielding again immediately; `note_resumed` leaves it untouched.
+    fn announce_pressure_resume(&mut self) -> Option<String> {
+        let plan = self.yield_policy.clear_plan()?;
+        self.hysteresis.note_resumed();
+        let line = pressure_disclosure(&plan);
+        (!line.is_empty()).then_some(line)
+    }
+
+    /// Seconds since the epoch, for the hysteresis clock.
+    fn pressure_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    /// Releases the live session and pins the restore plan.
+    ///
+    /// Returns false when the engine declined — today, a session holding vision
+    /// state, which cannot be rebuilt from text alone. A decline is a normal
+    /// outcome: nothing was freed, so nothing is disclosed.
+    fn do_pressure_yield(&mut self) -> bool {
+        let live = self
+            .engine
+            .count_tokens(&render_transcript(&self.session, &self.system));
+        let keep = self.tier_keep_stems();
+        // `self.ladder` and `self.engine` are disjoint fields, but the borrow
+        // checker cannot see through `self`, so the ladder is lent separately.
+        let ladder = std::mem::take(&mut self.ladder);
+        let plan = self
+            .yield_policy
+            .yield_now(self.engine.as_mut(), &ladder, live, keep);
+        self.ladder = ladder;
+        plan.is_some()
+    }
+
+    /// Observes memory pressure and applies the resulting decision.
+    ///
+    /// Called at turn boundaries only — the same place background job
+    /// notifications join the transcript, never mid-pass. Mid-pass yielding
+    /// happens through the cancel callback instead, which stops at a token
+    /// boundary.
+    ///
+    /// Returns the system line the caller should surface, if any: the two front
+    /// ends print a system line by different means, so the decision is made
+    /// here and the printing is left to each path.
+    fn poll_pressure(&mut self) -> Option<String> {
+        use crate::mempressure::Decision;
+        let decision = self
+            .hysteresis
+            .observe(self.sensor.level(), Self::pressure_now());
+        if !should_act(decision, self.first_turn_done, self.in_sidechain()) {
+            // Invariant: if the machine is in the yielded state and nothing was
+            // actually freed, roll it back. `observe` commits `yielded` before
+            // returning `Yield`, so a suppressed yield — the first turn, or a
+            // sub-agent sidechain — would otherwise leave the machine believing
+            // it holds no session, holding off every later Critical until a full
+            // resume dwell elapsed. Only `Yield` commits the flag; a suppressed
+            // `ShedCache` or `Resume` has nothing to roll back.
+            if decision == Decision::Yield {
+                self.hysteresis.note_yield_declined();
+            }
+            return None;
+        }
+        match decision {
+            Decision::ShedCache => {
+                self.yield_policy.shed(&mut self.ladder);
+                None
+            }
+            Decision::Yield => {
+                if self.do_pressure_yield() {
+                    Some(PRESSURE_YIELDED.to_owned())
+                } else {
+                    // Nothing was freed, so the machine must not believe it is
+                    // yielded: it would hold off every later Critical until a
+                    // full resume dwell had passed.
+                    self.hysteresis.note_yield_declined();
+                    None
+                }
+            }
+            // Almost a no-op. The disclosure and the retirement belong to
+            // `announce_pressure_resume`, at the moment the session is actually
+            // rebuilt; a plan still pinned here means no generate has happened
+            // since the yield, so it is retired quietly. Saying "re-prefilling
+            // N tokens" here would announce a cost nobody is about to pay, and
+            // leave the real one — on whichever turn the user submits next —
+            // silent.
+            Decision::Resume => {
+                let _ = self.yield_policy.clear_plan();
+                None
+            }
+            Decision::Hold => None,
+        }
+    }
+
+    /// Handles a generation the pressure hook cancelled mid-pass.
+    ///
+    /// Returns the system line to surface, if any. The partial output the model
+    /// produced before the stop is already in the transcript by the time this
+    /// runs, so the resume continues rather than repeats.
+    fn finish_pressure_stop(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.pressure_stop) {
+            return None;
+        }
+        // The user asked to stop between the raise and here: that ends the
+        // turn, so leave the session alone and let the abort path run.
+        if crate::interrupt::pending() {
+            if self.yield_is_phantom() {
+                self.hysteresis.note_yield_declined();
+            }
+            crate::ds4engine::clear_cancel();
+            return None;
+        }
+        let mut line = None;
+        // The same gate the cancel was raised behind, re-checked here because
+        // the raise was decided before the pass and the guard window may have
+        // opened or closed since. The arithmetic lives in `Hysteresis`, never
+        // here.
+        if self.pressure_gate().armed() {
+            if self.do_pressure_yield() {
+                line = Some(PRESSURE_YIELDED.to_owned());
+                // The state machine did not make this decision, so tell it — or
+                // it will never emit the matching Resume.
+                self.hysteresis.note_external_yield(Self::pressure_now());
+            } else {
+                // The engine declined. The machine never committed this yield
+                // (it came from the cancel hook, not from `observe`), but a
+                // `Yield` it *did* decide earlier in this same turn boundary
+                // may have left it committed; roll that back so the next
+                // Critical is actionable.
+                self.hysteresis.note_yield_declined();
+            }
+        } else if self.yield_is_phantom() {
+            // Same invariant as `poll_pressure`: yielded state with nothing
+            // freed must be rolled back. This path never commits a yield of its
+            // own (the stop came from the cancel hook), but an `observe` earlier
+            // in this turn boundary may have committed one that was then
+            // suppressed here, and no session was released either way. A live
+            // restore plan means a yield really did happen, and rolling that
+            // back would cost the machine its matching Resume — so it is left
+            // alone.
+            self.hysteresis.note_yield_declined();
+        }
+        // Free first, clear second. Reversed, a racing turn can start a
+        // generation against a session about to be freed underneath it.
+        crate::ds4engine::clear_cancel();
+        line
     }
 
     /// Every fingerprint this launch is using, across every engine it holds and
@@ -6972,6 +8473,12 @@ the original is frozen and listed in /tree"
             let mut prefix = self.session.clone();
             prefix.transcript.truncate(rung.spans);
             keep.push(self.payload_fingerprint_for(&prefix));
+        }
+        // A yielded session presents no live rungs, so without this the sweep
+        // is free to delete the very blob the resume needs. The pinned plan is
+        // the only record of it while plank holds no KV at all.
+        if let Some(plan) = self.yield_policy.plan() {
+            keep.extend(plan.keep.iter().cloned());
         }
         keep
     }
@@ -7144,7 +8651,7 @@ the original is frozen and listed in /tree"
         format!("notifications {}", if new_state { "on" } else { "off" })
     }
 
-    /// Parses a `/think [off|low|medium|max]` argument and applies it; returns the
+    /// Parses a `/think [off|low|medium|max|0..100]` argument and applies it; returns the
     /// status line to report to the user. Shared by both front-ends so the two
     /// dispatchers cannot drift.
     ///
@@ -7168,6 +8675,29 @@ the original is frozen and listed in /tree"
     /// `EchoEngine`, a provider engine, `--mtp` with a missing file) is off
     /// however the flag reads, and every message and marker follows this
     /// answer rather than the flag alone.
+    /// Drops the temperature `config::finalize` pinned to 0 for speculative
+    /// decoding when this session's engine turns out not to be able to
+    /// speculate at all (`DSpark` is `DeepSeek` V4 only, and an auto-paired
+    /// companion a checkpoint refuses is dropped on the open retry). The pin
+    /// exists solely to let the draft gate open; with no gate it would leave
+    /// the session sampling greedily for no reason.
+    ///
+    /// The single choke point for that decision — the constructor calls it
+    /// once, before the first frame is drawn. A temperature the user typed is
+    /// never touched (`temp_explicit`), and `resume_temp` follows, so a later
+    /// `/mtp off` returns to the same number.
+    fn settle_speculation_temperature(&mut self, temp_explicit: bool) {
+        let settled = crate::config::temperature_without_speculation(
+            &self.gen_opts,
+            temp_explicit,
+            self.engine.spec_capable(),
+        );
+        self.gen_opts.temperature = settled;
+        if settled > 0.0 {
+            self.resume_temp = settled;
+        }
+    }
+
     fn mtp_on(&self) -> bool {
         self.gen_opts.mtp && self.engine.spec_capable()
     }
@@ -7265,17 +8795,91 @@ the original is frozen and listed in /tree"
         format!("temperature {temp:.2}")
     }
 
+    /// `/skills [on|off]`: the shared body for both front ends.
+    ///
+    /// One implementation rather than two, exactly as [`Self::hooks_command`]
+    /// is: the plain-stdout REPL prints it and the TUI puts it in a pane, and
+    /// neither can drift on what the command accepts. Bare `/skills` lists the
+    /// loaded skills *and* says whether they are currently enabled, so the
+    /// listing never implies a skill that would refuse to run. Returns the text
+    /// to print/pane, always newline-terminated.
+    fn skills_command(&self, arg: &str) -> String {
+        match arg.trim() {
+            "" => {
+                let state = if crate::skills::enabled() {
+                    "skills are enabled"
+                } else {
+                    crate::skills::DISABLED_NOTICE
+                };
+                format!("{}{state}\n", crate::skills::render_list(&self.skills))
+            }
+            "on" => {
+                crate::skills::set_enabled(true);
+                "skills enabled: /name and the skill tool expand again\n".to_string()
+            }
+            "off" => {
+                crate::skills::set_enabled(false);
+                // Runtime only: nothing is written to any SKILL.md or settings
+                // file, so the next launch is back to the configured behaviour.
+                "skills disabled for the rest of this session (nothing was written to disk)\n"
+                    .to_string()
+            }
+            other => format!("usage: /skills [on|off] (got {other:?})\n"),
+        }
+    }
+
+    /// `/hooks [on|off]`: the shared body for both front ends.
+    ///
+    /// One implementation rather than two, so the plain-stdout REPL and the
+    /// TUI pane can never drift apart on what the command accepts. Returns the
+    /// text to print/pane, always newline-terminated.
+    fn hooks_command(&self, arg: &str) -> String {
+        match arg.trim() {
+            "" => {
+                let state = if crate::hooks::enabled() {
+                    "hooks are enabled"
+                } else {
+                    "hooks are disabled for this session (/hooks on to re-enable)"
+                };
+                format!(
+                    "{}{state}\n",
+                    crate::hooks::render_list(&self.tool_ctx.hooks)
+                )
+            }
+            "on" => {
+                crate::hooks::set_enabled(true);
+                "hooks enabled: hooks will run again from the next event\n".to_string()
+            }
+            "off" => {
+                crate::hooks::set_enabled(false);
+                // Runtime only: nothing is written to hooks.json or settings,
+                // so the next launch is back to the configured behaviour.
+                "hooks disabled for the rest of this session (nothing was written to disk)\n"
+                    .to_string()
+            }
+            other => format!("usage: /hooks [on|off] (got {other:?})\n"),
+        }
+    }
+
     fn think_command(&mut self, arg: &str, on_progress: &mut dyn FnMut()) -> String {
         use crate::engine::{THINK_MAX_MIN_CONTEXT, ThinkMode};
 
         let current = self.think;
         let arg = arg.trim();
         if arg.is_empty() {
-            return format!("thinking: {} (off|low|medium|max)", current.name());
+            return format!("thinking: {} (off|low|medium|max|0..100)", current.name());
         }
         let Some(level) = ThinkMode::parse(arg) else {
-            return format!("/think: expected off|low|medium|max, got `{arg}`");
+            return format!("/think: expected off|low|medium|max|0..100, got `{arg}`");
         };
+        // A numeric effort is a V4.1 knob; on any other family the C refuses it
+        // rather than rounding it to `high`.
+        if crate::engine::think_level_unsupported(level, &self.engine.model_name()) {
+            return format!(
+                "/think {arg} requires a DeepSeek V4.1 model; still {}",
+                current.name()
+            );
+        }
         let ctx = self.engine.ctx_size();
         if level == ThinkMode::Max && ctx < THINK_MAX_MIN_CONTEXT {
             return format!(
@@ -7288,12 +8892,51 @@ the original is frozen and listed in /tree"
         if level == current {
             return format!("thinking already {}", level.name());
         }
+        // The C's context-room guard, from `worker_apply_requested_think`:
+        // `transcript.len + delta >= ctx_size` is refused outright, because the
+        // longer effort preamble would push the session past its own ceiling.
+        // plank measures the same delta in tokens between the two preambles;
+        // only a *growing* preamble can run out of room, so a shrink is always
+        // allowed. The C's message names one condition for two causes
+        // ("incompatible session or no context room"); plank splits them, since
+        // the incompatible-session half is already covered by the V4.1 and
+        // `max` refusals above and the user can act on a number.
+        let numeric = crate::engine::numeric_thinking_model(&self.engine.model_name());
+        let preamble_tokens = |mode: ThinkMode, engine: &dyn crate::engine::Engine| {
+            mode.effort_prefix(numeric)
+                .map_or(0, |text| engine.count_tokens(&text))
+        };
+        let delta = preamble_tokens(level, self.engine.as_ref())
+            - preamble_tokens(current, self.engine.as_ref());
+        if delta > 0 && self.last_ctx_used.saturating_add(delta) >= ctx {
+            return format!(
+                "/think {arg}: no context room for the longer reasoning preamble \
+                 ({} of {ctx} tokens in use, {delta} more needed); still {}",
+                self.last_ctx_used,
+                current.name()
+            );
+        }
         self.think = level;
+        // Every KV ladder rung was captured under the *old* level, and
+        // `session::payload_fingerprint` hashes `think.name()` — so from this
+        // line on no rung can be found again, at ANY level change, whether or
+        // not it moves the preamble (`off` -> `medium` share the empty preamble
+        // and still change the key). Leaving them is strictly worse than having
+        // none: `KvLadder::wants_anchor` keeps comparing against a rung that can
+        // no longer be loaded, so a fresh transcript reads as already covered
+        // and no anchor is ever captured again, while the blobs leak on disk.
+        // This is plank's half of the C's `ds4_session_invalidate`: the C
+        // invalidates the engine session (plank's `Engine::set_think_mode`
+        // does that, below), and plank must additionally drop the cache layer
+        // the C does not have. Unconditional on purpose — gating it on
+        // `prefix_changed` would leave exactly the `off`/`medium` pair silently
+        // broken, with the feature still looking fully wired up.
+        self.discard_ladder();
         // A change of effort preamble changes the prompt prefix, so the engine
         // drops its cached tokens and KV here. Re-warm from the tier
         // checkpoints under the new fingerprint rather than making the next
         // turn re-prefill the system prompt inline.
-        let prefix_changed = current.effort_prefix() != level.effort_prefix();
+        let prefix_changed = current.effort_prefix(numeric) != level.effort_prefix(numeric);
         self.engine.set_think_mode(level);
         // Cached alt engines too: `self.think` keys their Tier 1 checkpoint and
         // frames their sidechains, so an engine left at the old level would
@@ -7466,7 +9109,7 @@ the original is frozen and listed in /tree"
             },
             &|| crate::interrupt::pending(),
         )?;
-        let insights::Scan::Done(metas) = scan else {
+        let insights::Scan::Done(metas, _entries) = scan else {
             // Stopped during the scan: nothing has been computed worth
             // showing, and the half-filled cache makes the next run shorter.
             crate::interrupt::clear();
@@ -7850,92 +9493,43 @@ the original is frozen and listed in /tree"
         println!("Resume it later with:  {bold}plank /resume {short}{reset}");
     }
 
-    /// Prints the run's stats at exit: total tokens ingested and generated
-    /// across every turn (both directions), and the wall-clock duration of the
-    /// whole run. Silent when nothing was generated, so an idle run stays
-    /// quiet. Independent of the session save, so it reports even when the
-    /// final session was empty (e.g. after `/clear`).
+    /// Prints the run's stats at exit as a table: for each engine that served
+    /// the session, tokens ingested and generated, the time each phase took
+    /// and its average rate, and the time spent running tools; then the
+    /// session totals when more than one engine contributed. Silent when
+    /// nothing was generated, so an idle run stays quiet. Independent of the
+    /// session save, so it reports even when the final session was empty
+    /// (e.g. after `/clear`).
     fn report_run_stats(&self) {
         let s = &self.stats;
         if s.input_tokens == 0 && s.output_tokens == 0 {
             return;
         }
-        let (bold, dim, reset) = if self.color {
-            ("\x1b[1m", "\x1b[38;5;238m", ANSI_RESET)
-        } else {
-            ("", "", "")
-        };
+        let rows: Vec<StatsSection> = s
+            .by_engine
+            .iter()
+            .map(|(label, input, output)| {
+                // Speed records are keyed by bare model name; the tally label
+                // carries the `(local)` mark, so strip it to join the two.
+                let model = label.strip_suffix(" (local)").unwrap_or(label);
+                let rec = crate::speeds::session_totals(model);
+                StatsSection {
+                    label: label.clone(),
+                    input: *input,
+                    output: *output,
+                    speeds: (!rec.is_empty()).then_some(rec),
+                }
+            })
+            .collect();
         let elapsed = fmt_duration(self.session_start.elapsed());
         println!();
-        println!(
-            "{bold}Session stats{reset}  ↓ {} ↑ {}  {dim}·{reset}  {elapsed}",
-            fmt_u64(s.input_tokens),
-            fmt_u64(s.output_tokens),
-        );
-        Self::report_model_speeds(bold, dim, reset);
-        // Only when more than one engine served: with a single one the rows
-        // would just repeat the totals a line lower.
-        if s.by_engine.len() < 2 {
-            return;
-        }
-        let width = s.by_engine.iter().map(|r| r.0.chars().count()).max();
-        for (label, input, output) in &s.by_engine {
-            println!(
-                "  {dim}{label:<w$}{reset}  ↓ {} ↑ {}",
-                fmt_u64(*input),
-                fmt_u64(*output),
-                w = width.unwrap_or(0),
-            );
-        }
-    }
-
-    /// Prints, for each model that ran this session, how long it spent
-    /// prefilling and generating (with the average rate for each) and how long
-    /// it spent running tools.
-    ///
-    /// Averages rather than peaks: a peak is one lucky pass, while the average
-    /// beside the phase's wall-clock says where the session actually went.
-    ///
-    /// Session-scoped: nothing is stored, so there is no cross-run figure to
-    /// compare against — yesterday's was a different engine build on a cooler
-    /// machine.
-    ///
-    /// Silent for engines that never reported a rate — the echo stub, and
-    /// online providers, whose throughput is someone else's network — so a
-    /// provider-only session's exit message is unchanged.
-    fn report_model_speeds(bold: &str, dim: &str, reset: &str) {
-        let models = crate::speeds::session_all();
-        // One model gets no label column: the row is unambiguous without it.
-        let width = (models.len() > 1)
-            .then(|| models.iter().map(|(m, _)| m.chars().count()).max())
-            .flatten();
-        for (model, r) in &models {
-            let mut parts: Vec<String> = Vec::new();
-            if r.prefill_secs > 0.0 {
-                parts.push(format!(
-                    "prefill {bold}{}{reset} {dim}({:.1} tok/s){reset}",
-                    fmt_secs(r.prefill_secs),
-                    r.prefill_tps(),
-                ));
-            }
-            if r.gen_secs > 0.0 {
-                parts.push(format!(
-                    "generation {bold}{}{reset} {dim}({:.1} tok/s){reset}",
-                    fmt_secs(r.gen_secs),
-                    r.gen_tps(),
-                ));
-            }
-            if r.tool_secs > 0.0 {
-                parts.push(format!("tools {bold}{}{reset}", fmt_secs(r.tool_secs)));
-            }
-            if parts.is_empty() {
-                continue;
-            }
-            let sep = format!("  {dim}·{reset}  ");
-            match width {
-                Some(w) => println!("  {dim}{model:<w$}{reset}  {}", parts.join(&sep)),
-                None => println!("{dim}avg{reset} {model}  {}", parts.join(&sep)),
-            }
+        for line in render_run_stats(
+            &elapsed,
+            &rows,
+            (s.input_tokens, s.output_tokens),
+            self.color,
+        ) {
+            println!("{line}");
         }
     }
 
@@ -7968,7 +9562,7 @@ the original is frozen and listed in /tree"
         )
     }
 
-    /// The dump taken on the way out under `--debug` (`repro-quit-<secs>.md`),
+    /// The dump taken on the way out under `--debug` (`repro-debug-<secs>.md`),
     /// so the session that was being debugged is on disk without anyone having
     /// to remember `/repro` before quitting. Returns the line to print, or
     /// `None` when debug is off — which is every ordinary run.
@@ -7982,10 +9576,10 @@ the original is frozen and listed in /tree"
         Some(
             match self.write_repro_with(
                 "quitting under --debug; repro saved automatically",
-                "repro-quit",
+                "repro-debug",
             ) {
                 Ok((path, sidecars)) => Self::repro_written_line(&path, sidecars),
-                Err(e) => format!("[quit repro not written: {e}]"),
+                Err(e) => format!("[repro-debug not written: {e}]"),
             },
         )
     }
@@ -7996,6 +9590,20 @@ the original is frozen and listed in /tree"
         note: &str,
         prefix: &str,
     ) -> Result<(std::path::PathBuf, usize), String> {
+        let base = self.repro_base(note);
+        let out = base.save(prefix, now_secs(), &base.report)?;
+        // `self.repro_dir` is already absolute, so unlike
+        // `openfile::note_edited` there is nothing to resolve.
+        self.last_edited = Some(out.0.clone());
+        Ok(out)
+    }
+
+    /// The agent-side half of a `/repro` dump: the full report (transcript,
+    /// knobs, pass notes) plus the sidechain dumps to write beside it. Shared
+    /// by the idle `/repro`, the automatic dumps, and the worker, which
+    /// publishes one at every main pass start so the UI thread can take a
+    /// `/repro` mid-turn (`TurnShared::write_repro`).
+    fn repro_base(&mut self, note: &str) -> crate::repro::ReproBase {
         // `rendered` is the exact engine input (no timestamp markers) — used
         // for the token count so that figure stays accurate. `rendered_for_repro`
         // is the same transcript with periodic `[timestamp]` markers for the
@@ -8012,7 +9620,43 @@ the original is frozen and listed in /tree"
                 .display()
                 .to_string()
         };
+        // Asked of the live engine, not of the config: a `/model` swap or a
+        // provider sub-agent means the configured path and the loaded model
+        // are different things, and the loaded one is the one that produced
+        // the transcript.
+        let model_name = self.engine.model_name();
+        let syntax = self.tool_syntax();
+        let family = crate::manifest::ModelSet::for_family(crate::gguf::ModelFamily::from(syntax));
+        let installed = crate::manifest::read_at(&crate::manifest::installed_path(family));
+        let artifact_version = installed.as_ref().map(|m| m.version);
+        // The `main` entry is the weights themselves; its URL carries the
+        // Hugging Face repo the set came from.
+        let main_entry = installed.as_ref().and_then(|m| m.files.get("main"));
+        let weights_file = main_entry.map(|f| f.name.clone()).unwrap_or_default();
+        let hf_url = main_entry
+            .and_then(|f| crate::manifest::hf_repo_url(&f.url))
+            .unwrap_or_default();
+        let companion = self
+            .cfg
+            .engine
+            .mtp_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         let meta = crate::repro::Meta {
+            model: crate::repro::ModelMeta {
+                name: &model_name,
+                family: family.as_str(),
+                syntax: match syntax {
+                    crate::sysprompt::ToolSyntax::Dsml => "dsml",
+                    crate::sysprompt::ToolSyntax::Qwen => "qwen",
+                    crate::sysprompt::ToolSyntax::Dsml41 => "dsml41",
+                },
+                artifact_version,
+                companion: &companion,
+                weights_file: &weights_file,
+                hf_url: &hf_url,
+            },
             version: &version,
             date: &date,
             ctx_size: self.engine.ctx_size(),
@@ -8025,6 +9669,8 @@ the original is frozen and listed in /tree"
             session_tag: &self.session.tag,
             session_path: &session_path,
             note: note.trim(),
+            guards_armed: crate::guard::guards_enabled(),
+            passes: &self.passes,
         };
         // The live options, not the startup ones: `/temp` and `/mtp` change
         // how the very next pass samples, and a dump that reported the
@@ -8033,25 +9679,14 @@ the original is frozen and listed in /tree"
         let mut cfg = self.cfg.clone();
         cfg.generation = self.gen_opts.clone();
         let report = crate::repro::build_report(&meta, &cfg, &rendered_for_repro);
-        let path = crate::repro::save_in(&self.repro_dir, prefix, now_secs(), &report)?;
         // Sub-agent sidechains are gone from the transcript by now; the
         // remembered dumps go beside the main file, oldest first.
-        let main_file = path
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let mut sidecars = 0usize;
-        for (i, dump) in self.sidechain_dumps.iter().enumerate() {
-            let rendered = render_messages_for_repro(&dump.messages, None);
-            let side =
-                crate::repro::build_sidecar_report(&version, &main_file, i + 1, dump, &rendered);
-            crate::repro::save_sidecar(&path, i + 1, &side)?;
-            sidecars += 1;
+        crate::repro::ReproBase {
+            dir: self.repro_dir.clone(),
+            version,
+            report,
+            sidecars: self.sidechain_dumps.iter().cloned().collect(),
         }
-        // `self.repro_dir` is already absolute, so unlike
-        // `openfile::note_edited` there is nothing to resolve.
-        self.last_edited = Some(path.clone());
-        Ok((path, sidecars))
     }
 
     /// The explicit `/repro` variant: copies the dump's path to the system
@@ -8234,6 +9869,20 @@ the original is frozen and listed in /tree"
                             // Rendered from the settings just written, which
                             // is what `reinstall` installs next.
                             let shown = crate::configform::display(&working, field.id);
+                            // An explicit `/config ui.showThinking` wins over
+                            // a brain click: without this the user would set
+                            // the value, be told it was saved, and see nothing
+                            // change because the override still masked it.
+                            if field.id == crate::configform::FieldId::UiShowThinking {
+                                crate::settings::set_show_thinking_override(None);
+                            }
+                            // Same reasoning: an explicit `/config
+                            // tools.loopGuards` is the user stating the
+                            // value, so any `/loopguard` override steps
+                            // aside.
+                            if field.id == crate::configform::FieldId::ToolsLoopGuards {
+                                crate::settings::set_loop_guards_override(None);
+                            }
                             crate::settings::reinstall(working);
                             format!(
                                 "set {section}.{fkey} = {shown} (saved to {})",
@@ -8319,6 +9968,18 @@ the original is frozen and listed in /tree"
         task: &str,
         snapshot_kv: bool,
     ) -> usize {
+        let message = crate::agents::task_message(instructions, task, self.active_goal());
+        self.begin_sidechain(message, snapshot_kv)
+    }
+
+    /// The fork bookkeeping behind [`begin_subagent_fork`](Self::begin_subagent_fork)
+    /// with `message` pushed verbatim as the sidechain's user turn. The
+    /// memory pass uses this directly: its prompt carries its own contract
+    /// ("reply with a JSON array and nothing else"), and the generic
+    /// sub-agent framing — "complete the task using your tools, then end with
+    /// a final report" — would contradict it and steer the model toward tool
+    /// calls and prose.
+    fn begin_sidechain(&mut self, message: String, snapshot_kv: bool) -> usize {
         let fork_at = self.session.transcript.len();
         // Capture the live KV before the sidechain diverges it; the matching
         // restore is `restore_fork_kv`, called by every fork-end path. `None`
@@ -8331,11 +9992,7 @@ the original is frozen and listed in /tree"
         });
         self.sidechain_depth += 1;
         self.fork_points.push(fork_at);
-        self.session.push(Message::user(crate::agents::task_message(
-            instructions,
-            task,
-            self.active_goal(),
-        )));
+        self.session.push(Message::user(message));
         fork_at
     }
 
@@ -8370,8 +10027,16 @@ the original is frozen and listed in /tree"
             "no report".to_owned()
         };
         self.remember_sidechain(dump);
+        // Deliberately no `clear_suggestion()` here, and adding one would be
+        // a bug. This truncation restores the transcript to exactly the
+        // content and length it had before the sidechain opened, so a prompt
+        // suggestion that was depth-valid beforehand is depth-valid again
+        // afterwards — the real conversation never moved. Clearing here would
+        // drop a good suggestion every time *any* sidechain ends, including
+        // every memory-extraction pass.
         self.session.transcript.truncate(fork_at);
         self.truncate_ladder_to(fork_at);
+        self.extract_state.truncate_to(fork_at);
         self.sidechain_depth = self.sidechain_depth.saturating_sub(1);
         self.fork_points.pop();
         // The sidechain's tail is gone from the transcript, so the parent
@@ -8428,15 +10093,14 @@ the original is frozen and listed in /tree"
         if !on {
             return "debug console mirror off".to_owned();
         }
-        if crate::settings::active().ui.show_thinking {
+        if crate::settings::show_thinking_effective() {
             return "debug console mirror on (idle: ui.showThinking is on, nothing is mirrored)"
                 .to_owned();
         }
         if crate::debugmirror::parent_connected() {
             "debug console mirror on (connected)".to_owned()
         } else {
-            "debug console mirror on (no turbo-debug-console running; will connect when one is)"
-                .to_owned()
+            "debug console mirror on (no tdk running; will connect when one is)".to_owned()
         }
     }
 
@@ -8482,7 +10146,7 @@ the original is frozen and listed in /tree"
                         texts.iter().map(String::as_str),
                         reinject,
                     ) {
-                        crate::debugmirror::replay_finished_subagent(dump.ordinal, &p);
+                        crate::debugmirror::replay_finished_subagent(&dump.label, dump.ordinal, &p);
                     }
                 }
                 dump.mirrored = true;
@@ -8595,7 +10259,7 @@ the original is frozen and listed in /tree"
                         error: None,
                         trips: 0,
                         force_final: false,
-                        mirror: crate::debugmirror::open_subagent(),
+                        mirror: crate::debugmirror::open_subagent(label),
                     });
                 }
                 Ok((key, engine)) => {
@@ -8663,13 +10327,17 @@ the original is frozen and listed in /tree"
     fn run_fanout_rounds(&mut self, slots: &mut [FanoutSlot], width: usize) {
         const MAX_ROUNDS: usize = 40;
         let system = self.system.clone();
-        let opts = self.gen_opts.clone();
+        // No closed-think recovery here: one `PassCtx` is shared by every
+        // slot and every round, so a per-slot override has nowhere to live.
+        // `MAIN_DRAFT_TRIP_CAP`'s sibling still bounds a drafting slot.
+        let mut opts = self.gen_opts.clone();
+        opts.think_mode = self.think;
         let ctx = PassCtx {
             opts: &opts,
-            think_off: matches!(self.think, crate::engine::ThinkMode::Off),
+            think_off: matches!(opts.think_mode, crate::engine::ThinkMode::Off),
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
             display: PassDisplay {
-                show_thinking: crate::settings::active().ui.show_thinking,
+                show_thinking: crate::settings::show_thinking_effective(),
                 show_tool_calls: crate::settings::active().ui.show_tool_calls,
                 think_status: false,
             },
@@ -8700,11 +10368,12 @@ the original is frozen and listed in /tree"
                     if slot.done {
                         return None;
                     }
-                    let prompt = render_transcript(&slot.session, &system);
+                    let recovery = recovery_session(&slot.session);
+                    let prompt = render_transcript(&recovery, &system);
                     let bufs = slot
                         .engine
                         .wants_structured()
-                        .then(|| self.build_structured_for(&slot.session, &prompt));
+                        .then(|| self.build_structured_for(&recovery, &prompt));
                     Some((prompt, bufs))
                 })
                 .collect();
@@ -8772,13 +10441,18 @@ the original is frozen and listed in /tree"
         };
         self.fold_fanout_usage(slot, pass.stats.usage);
         slot.session.push(Message::assistant(pass.assistant_text));
+        self.note_pass(
+            Some(&slot.label),
+            &pass.stats,
+            pass.guard.clone(),
+            pass_stop_text(false, pass.tool_error.as_deref(), pass.calls.len()),
+        );
         if pass.looped {
             slot.trips += 1;
-            let over = pass
-                .tool_error
-                .as_deref()
-                .is_some_and(|e| e.contains(THINK_BUDGET_ERROR));
-            self.report_guard_for(Some(&slot.label), &repeat_trip_text(over, slot.trips));
+            self.report_guard_for(
+                Some(&slot.label),
+                &repeat_trip_text(pass.tool_error.as_deref(), slot.trips),
+            );
         } else {
             slot.trips = 0;
         }
@@ -9076,18 +10750,32 @@ the original is frozen and listed in /tree"
     ) -> T {
         let parent_engine = std::mem::replace(&mut self.engine, engine);
         // The framed task is the last message; keep it, hide everything before.
+        // `extract_state.processed_depth` is left alone across the stash: the
+        // fork opened by the caller keeps `in_sidechain()` true for the whole
+        // of `run`, so the memory pass cannot observe the short transcript,
+        // and the restore below puts every index back where it was.
         let stashed = {
             let mut prefix = std::mem::take(&mut self.session.transcript);
             let task = prefix.pop();
             self.session.transcript = task.into_iter().collect();
             prefix
         };
+        self.alt_engine_depth += 1;
         let result = run(self);
+        self.alt_engine_depth -= 1;
         // Unconditional, and with no `?` between the swap in and the swap out: a
         // leaked swap would leave the whole session pointed at the wrong engine,
         // which is the worst failure this design can produce.
         let alt = std::mem::replace(&mut self.engine, parent_engine);
         self.alt_engines.insert(key, alt);
+        // No `clear_suggestion()` needed: the restore is the stashed prefix
+        // followed by whatever the run left, so everything before the stash
+        // point is byte-identical and the length only ever grows. A prompt
+        // suggestion is therefore either still valid (the run appended
+        // nothing) or correctly invalidated by `current_suggestion`'s depth
+        // check. This path stashes rather than truncating, so it is worth
+        // saying so explicitly — the reasoning that covers `fork_branch` does
+        // not obviously transfer.
         let mut restored = stashed;
         restored.append(&mut self.session.transcript);
         self.session.transcript = restored;
@@ -9243,7 +10931,7 @@ the original is frozen and listed in /tree"
         let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
             return "no HOME, so there is no trust store\n".to_string();
         };
-        let plank_home = home.join(".plank");
+        let plank_home = plank_home_in(&home);
         if verb == "info" {
             let trust = crate::wasmreg::TrustStore::load(&plank_home);
             return match self.tool_ctx.wasm.registry.describe(id, &trust) {
@@ -9363,7 +11051,7 @@ the original is frozen and listed in /tree"
                             .rfind(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
                             .unwrap_or("")
                             .to_string();
-                        let mut trust = crate::wasmreg::TrustStore::load(&home.join(".plank"));
+                        let mut trust = crate::wasmreg::TrustStore::load(&plank_home_in(&home));
                         match trust.add_publisher(&key, &encoded) {
                             Ok(()) => format!(
                                 "trusting publisher {}\nsigned updates from it will not re-prompt; \
@@ -9380,7 +11068,7 @@ the original is frozen and listed in /tree"
                 let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
                     return "no HOME, so no publishers are recorded\n".to_string();
                 };
-                let trust = crate::wasmreg::TrustStore::load(&home.join(".plank"));
+                let trust = crate::wasmreg::TrustStore::load(&plank_home_in(&home));
                 if trust.publishers().is_empty() {
                     "no trusted publishers\nusage: /plugins publisher <key-file|base64-key>\n"
                         .to_string()
@@ -9443,6 +11131,17 @@ the original is frozen and listed in /tree"
     /// match — the caller reports an unknown command; `Some(Err)` is a
     /// matched template whose variables could not be bound.
     fn slash_message(&self, cmd: &str, arg: &str) -> Option<Result<String, String>> {
+        // The first of the two invocation routes. Reported as an error rather
+        // than passed over, so `/plan` with skills off says why instead of
+        // falling through to "unknown command" — or, worse, reaching the model
+        // as a bare prompt.
+        if !crate::skills::enabled()
+            && self
+                .skill_name(cmd)
+                .is_some_and(|name| self.skills.iter().any(|s| s.name == name))
+        {
+            return Some(Err(crate::skills::DISABLED_NOTICE.to_owned()));
+        }
         if let Some(message) = self.skill_message(cmd, arg) {
             return Some(Ok(message));
         }
@@ -9474,6 +11173,8 @@ type AltEngine = (EngineKey, Box<dyn Engine>);
 
 /// Result of one TUI generation pass.
 struct TurnOutput {
+    /// The pass's engine figures, for the repro dump's pass note.
+    stats: crate::engine::GenerationStats,
     interrupted: bool,
     /// A priority `/btw` stopped this main pass; the caller discards the
     /// partial output, answers the side question, and re-runs the pass.
@@ -9507,6 +11208,11 @@ struct TuiInput {
     /// True when the current history walk started from a `!` line, fixing it
     /// to bash mode for the rest of the walk.
     hist_bang: bool,
+    /// Set by a history recall and consumed by the [`TuiInput::sync_popup`]
+    /// that follows it in the key loop, which keeps the `/` menu shut over a
+    /// recalled command. Without it the menu opens on the recalled text and
+    /// then swallows the next Up/Down, stranding the walk after one step.
+    hist_recall: bool,
     stash: String,
     /// Open `@` suggestion popup, when one is showing.
     popup: Option<crate::complete::Popup>,
@@ -9527,6 +11233,12 @@ struct TuiInput {
     /// worker, so a server that connects mid-session starts contributing
     /// completions (issue #41).
     mcp_extra: Vec<crate::complete::Candidate>,
+    /// The suggestion to paint as ghost text on the next frame, cached here
+    /// for the same reason as `mcp_extra`: the idle repaint is a free
+    /// function, so the agent is not in scope where the frame is composed.
+    /// Refreshed from `Agent::current_suggestion` once per idle tick and
+    /// cleared when a turn starts.
+    ghost: Option<String>,
 }
 
 impl TuiInput {
@@ -9536,12 +11248,14 @@ impl TuiInput {
             history: History::live(),
             hist_idx: None,
             hist_bang: false,
+            hist_recall: false,
             stash: String::new(),
             popup: None,
             slash: None,
             slash_catalog: crate::slashmenu::catalog(&[], &[], &[]),
             worker: None,
             mcp_extra: Vec::new(),
+            ghost: None,
         }
     }
 
@@ -9563,6 +11277,7 @@ impl TuiInput {
             text: self.buf.text(),
             cursor: self.cursor_char(),
             sel: self.selection_chars(),
+            ghost: self.ghost.as_deref(),
         }
     }
 
@@ -9601,6 +11316,14 @@ impl TuiInput {
     /// Called after every key. Starts the index worker lazily on the first `@`
     /// so a session that never completes never shells out to git.
     fn sync_popup(&mut self) {
+        // A recalled line is not something the user is composing, so neither
+        // menu opens over it. The flag is consumed here, so the next real edit
+        // completes as usual.
+        if std::mem::take(&mut self.hist_recall) {
+            self.popup = None;
+            self.slash = None;
+            return;
+        }
         self.sync_slash();
         let token = crate::complete::detect_at_token(self.left_of_cursor())
             .filter(|_| self.cursor_at_token_end());
@@ -9930,6 +11653,9 @@ impl TuiInput {
     }
 
     fn history_move(&mut self, dir: i32) {
+        // Every arm below either replaces the buffer from history or restores
+        // the stash, so the whole call is a recall as far as the menus care.
+        self.hist_recall = true;
         if self.hist_idx.is_none() {
             // Mode is fixed when navigation starts. Re-deriving it per keypress
             // would flip it the moment a non-`!` entry lands in the buffer,
@@ -9995,6 +11721,17 @@ impl Agent<'_> {
             self.ui_remote = Some(Arc::new(Mutex::new(UiRemote::new(handle))));
         }
         let mut terminal = ratatui::init();
+        // `ratatui::init` installs a panic hook that only leaves the alternate
+        // screen and raw mode. Chain the full teardown in front of it, so a
+        // panic does not leave the shell reading `ESC[<35;x;yM` mouse-motion
+        // reports at every pointer move (see `restore_terminal`).
+        {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                restore_terminal();
+                previous(info);
+            }));
+        }
         // Capture the mouse so wheel events scroll the output buffer instead
         // of being translated by the terminal into arrow keys (history moves),
         // and drags select text for copying. Bracketed paste makes Cmd-V
@@ -10022,6 +11759,12 @@ impl Agent<'_> {
         // the last frame it drew (already captured pre-buffer-swap); skipped on
         // error exits (keep error text readable), non-TTY stdout, or when
         // disabled (in which case the image is `None`).
+        // Mouse reporting off *before* the animation: it runs for about a
+        // second and a half with nobody reading events, so a pointer moved
+        // during it would otherwise queue `ESC[<35;x;yM` motion reports in the
+        // tty that the shell then reads as typed text. Raw mode stays on for
+        // the effect; the two are independent modes.
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
         if let Ok(Some(img)) = &result {
             let cfg = crt_off::Config {
                 hold_secs: 0.0,
@@ -10039,14 +11782,7 @@ impl Agent<'_> {
             // drop before our own teardown runs.
             let _ = crt_off::animate(img, false, &cfg);
         }
-        let _ = ratatui::crossterm::execute!(
-            std::io::stdout(),
-            PopKeyboardEnhancementFlags,
-            event::DisableFocusChange,
-            DisableBracketedPaste,
-            DisableMouseCapture
-        );
-        ratatui::restore();
+        restore_terminal();
         // Printed after the screen is restored: inside the alternate screen it
         // would be wiped by the teardown it is meant to outlive.
         if let Some(line) = quit_repro {
@@ -10189,30 +11925,28 @@ impl Agent<'_> {
         // No AGENTS.md and no CLAUDE.md to link: offer to generate one before
         // anything else runs, through the same panel every other question
         // uses. Declining just starts the session.
-        if offer_init
-            && run_yes_no_panel(
-                terminal,
-                &log,
-                &mut view,
-                "AGENTS.md",
-                crate::agentsmd::OFFER_QUESTION,
-                ("Not now", "start the session without one"),
-                (
-                    "Generate",
-                    "run /init: the model reads the codebase and writes AGENTS.md",
-                ),
-            )
-        {
-            self.tui_run_init(
-                &mut log,
-                terminal,
-                &mut view,
-                &mut input,
-                &mut btw_panel,
-                &mut arcade,
-                &mut sub_pane,
-            );
-            last_activity = Instant::now();
+        if offer_init {
+            match run_agentsmd_offer_panel(terminal, &log, &mut view) {
+                crate::agentsmd::Offer::Generate => {
+                    self.tui_run_init(
+                        InitSource::LaunchOffer,
+                        &mut log,
+                        terminal,
+                        &mut view,
+                        &mut input,
+                        &mut btw_panel,
+                        &mut arcade,
+                        &mut sub_pane,
+                    );
+                    last_activity = Instant::now();
+                }
+                crate::agentsmd::Offer::DontAskHere => {
+                    if let Some(w) = skip_agentsmd_offer_here() {
+                        log.push_dim(format!("plank: {w}"));
+                    }
+                }
+                crate::agentsmd::Offer::NotNow => {}
+            }
         }
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             log.push_user_echo(initial);
@@ -10262,6 +11996,10 @@ impl Agent<'_> {
         let capture_crt = crate::settings::active().ui.crt_off && std::io::stdout().is_terminal();
         let mut crt_frame: Option<image::RgbaImage> = None;
         loop {
+            // A `/exit` confirmed mid-turn: the turn has stopped, leave now.
+            if quit_requested() {
+                break;
+            }
             if IMAGES_ENABLED && clip_checked.elapsed() >= Duration::from_secs(3) {
                 clip_has_image = crate::imagepaste::clipboard_has_image();
                 clip_checked = Instant::now();
@@ -10336,11 +12074,13 @@ impl Agent<'_> {
             // Width-aware so a contributed cell cannot push the built-in
             // segments off the line; see `build_status_text_within`.
             let cols = terminal.size().map_or(80, |s| s.width) as usize;
+            self.refresh_jobs_report(&mut report);
             let mut status = self.idle_status_text(cols);
             if clip_has_image {
                 status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
             }
-            let task_view = tui::TaskView::from(&self.session.tasks);
+            let task_view =
+                tui::TaskView::with_goal(&self.session.tasks, self.session.goal.as_ref());
             // Same pane selection as the busy loop, hoisted out of the draw
             // closure: a Ctrl-O pressed while idle has to be visible here too.
             // Retired first (`repaint_idle` does it too, and it is idempotent)
@@ -10360,6 +12100,10 @@ impl Agent<'_> {
                 Some(label) => format!("[sub-agent: {label}] {status}"),
                 None => status,
             };
+            // One refresh per idle frame: the ghost is a cached copy, so it
+            // is re-read here (depth check and all) rather than left to go
+            // stale behind a transcript that moved.
+            input.ghost = self.current_suggestion().map(str::to_owned);
             let completed_buffer = repaint_idle(
                 terminal,
                 &log,
@@ -10522,6 +12266,121 @@ impl Agent<'_> {
                         last_activity = Instant::now();
                     }
                 }
+                // A background job finished while the prompt sat idle: wake
+                // the model with its observation (`docs/BACKGROUND-TASKS.md`
+                // §3.4). Never over a draft the user is still typing, and
+                // never under a modal pane, where a turn would fight the
+                // dialog for the screen.
+                if input.buf.text().is_empty()
+                    && config_form.is_none()
+                    && kv_pane.is_none()
+                    && resume_pane.is_none()
+                    && !arcade.is_open()
+                    && wasm_frame.is_none()
+                    && self.has_finished_jobs()
+                {
+                    let n = self.drain_job_notifications();
+                    if n > 0 {
+                        log.push_dim(Self::job_wake_line(n));
+                        Self::notify_jobs_finished(n);
+                        self.tui_turn(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut input,
+                            &mut btw_panel,
+                            &mut arcade,
+                            &mut sub_pane,
+                        )?;
+                        last_activity = Instant::now();
+                    }
+                }
+                // A memory span snapshotted at the last turn end waits for
+                // exactly this: a quiet prompt. Same guards as the job wake,
+                // for the same reasons, plus the poll timeout above, so the
+                // pass never starts under a keystroke. Deliberately not an
+                // activity for the screensaver clock: nobody is here.
+                //
+                // The guards are shared with the prompt suggestion: an empty
+                // input buffer and no modal pane is exactly when ghost text
+                // is showable, so one condition gates both and
+                // `idle_work` decides which of them this quiet moment buys.
+                if input.buf.text().is_empty()
+                    && config_form.is_none()
+                    && kv_pane.is_none()
+                    && resume_pane.is_none()
+                    && !arcade.is_open()
+                    && wasm_frame.is_none()
+                {
+                    let idle_quit = match self.idle_work() {
+                        crate::suggest::IdleWork::Nothing => false,
+                        crate::suggest::IdleWork::Suggestion => {
+                            // Generating a suggestion is a real generation: a
+                            // KV probe, a sidechain fork and a
+                            // `generate_quiet_with`. Run inline here it would
+                            // freeze the whole TUI for its duration — no
+                            // repaint, no interrupt, no Ctrl-D — at precisely
+                            // the moment the user is idle and about to type.
+                            // So it goes on a worker behind the busy UI loop,
+                            // through the same `tui_quiet_pass` the memory
+                            // pass uses.
+                            self.tui_quiet_pass(
+                                terminal,
+                                &mut TuiHandles {
+                                    log: &mut log,
+                                    view: &mut view,
+                                    input: &mut input,
+                                    btw: &mut btw_panel,
+                                    arcade: &mut arcade,
+                                    sub: &mut sub_pane,
+                                },
+                                |agent, _tx| {
+                                    // Deliberately no `sub_sink` installed,
+                                    // unlike the memory pass: a suggestion is
+                                    // ghost text and must stay invisible.
+                                    // `generate_suggestion` silences the sink
+                                    // itself, so every route into it is quiet.
+                                    agent.generate_suggestion();
+                                },
+                            )?
+                        }
+                        crate::suggest::IdleWork::MemoryPass => self.tui_memory_pass(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut input,
+                            &mut btw_panel,
+                            &mut arcade,
+                            &mut sub_pane,
+                        )?,
+                    };
+                    if idle_quit {
+                        // Ctrl-D during the pass leaves through exactly the
+                        // same door as Ctrl-D at the prompt, download warning
+                        // and all.
+                        if !confirm_quit_idle(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut sub_pane,
+                            &mut btw_panel,
+                            &mut report,
+                            &input,
+                            &idle_status,
+                            selection.current(),
+                            &task_view,
+                            config_form.as_ref(),
+                            kv_pane.as_ref(),
+                            resume_pane.as_ref(),
+                            &arcade,
+                            wasm_frame.as_ref(),
+                            rem,
+                        )? {
+                            continue;
+                        }
+                        break;
+                    }
+                }
                 continue;
             };
             // What counts as the user being here: keys, mouse, and pastes.
@@ -10611,6 +12470,15 @@ impl Agent<'_> {
                         let v = sub_pane.active_view(&mut view);
                         v.top = v.top.saturating_add(3);
                     }
+                    // The report panel's `[■]` close box dismisses it, as Esc
+                    // does; ahead of every other surface because the panel is
+                    // drawn over them.
+                    MouseEventKind::Down(MouseButton::Left)
+                        if report.is_some() && tui::report_close_click(m.column, m.row) =>
+                    {
+                        input_drag = false;
+                        report = None;
+                    }
                     MouseEventKind::Down(MouseButton::Left) => {
                         // Every press decides afresh which surface the gesture
                         // belongs to, so a release lost off-window cannot leave
@@ -10629,6 +12497,50 @@ impl Agent<'_> {
                             r.contains(ratatui::layout::Position::new(m.column, m.row))
                         }) {
                             v.follow = true;
+                            selection.cancel();
+                        } else if tui::jobs_click(m.column, m.row) {
+                            // The footer's jobs segment toggles the `/jobs` panel.
+                            self.toggle_jobs_report(&mut report);
+                            selection.cancel();
+                        } else if tui::toks_click(m.column, m.row) {
+                            // The footer's chart glyph toggles the `/toks`
+                            // panel: the bar has no room for the chart, so the
+                            // glyph is the handle on it.
+                            toggle_toks_report(&mut report);
+                            selection.cancel();
+                        } else if tui::camera_click(m.column, m.row) {
+                            // The dir prefix's camera takes a `/repro` of the
+                            // session as it stands, and says where it landed —
+                            // the same line, and the same clipboard copy, the
+                            // typed command produces. Mid-turn the busy loop
+                            // answers the same click from the worker's
+                            // published base (`live_repro_line`).
+                            match self.write_repro("") {
+                                Ok((path, sidecars)) => {
+                                    log.push_dim(Self::repro_copied_line(&path, sidecars));
+                                }
+                                Err(e) => log.push_plain(format!("repro failed: {e}")),
+                            }
+                            view.follow = true;
+                            selection.cancel();
+                        } else if tui::think_click(m.column, m.row) {
+                            // The footer's brain flips thinking visibility for
+                            // this session. A single click: this changes only
+                            // what the next pass prints, and clicking again
+                            // undoes it.
+                            think_show_click();
+                            selection.cancel();
+                        } else if tui::ctx_click(m.column, m.row) {
+                            // The footer's ctx gauge toggles the `/context`
+                            // panel: the gauge is the one-number summary, the
+                            // panel is the breakdown behind it.
+                            self.toggle_context_report(&mut report);
+                            selection.cancel();
+                        } else if tui::tasks_click(m.column, m.row) {
+                            // The footer's task counter toggles the `/tasks`
+                            // panel: the counter is the tally, the panel the
+                            // list behind it.
+                            toggle_tasks_report(&mut report, task_view.report());
                             selection.cancel();
                         } else if let Some(run) = roster_hit {
                             sub_pane.click_run(run);
@@ -10785,6 +12697,12 @@ impl Agent<'_> {
                         match crate::settings::project_path() {
                             Some(path) => match settings.save_to(&path) {
                                 Ok(()) => {
+                                    // Same reasoning as `/config
+                                    // ui.showThinking`: an explicit save of the
+                                    // form is the user stating the value, so
+                                    // any brain-click override steps aside.
+                                    crate::settings::set_show_thinking_override(None);
+                                    crate::settings::set_loop_guards_override(None);
                                     crate::settings::reinstall(*settings);
                                     log.push_plain(format!("config saved to {}", path.display()));
                                 }
@@ -10894,7 +12812,32 @@ impl Agent<'_> {
             // Alt (Option on macOS) or Ctrl turns arrows and Backspace/Delete
             // into word-wise operations.
             let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
+            // A live suggestion is offered to exactly three keys. Everything
+            // else dismisses it, and that dismissal is done here, once,
+            // rather than in every arm: one place, so no arm can forget it.
+            let accepts_suggestion =
+                self.suggestion_accept_key(key, &input, word_mod, sub_pane.selecting);
+            if accepts_suggestion {
+                // Enter accepts *and* sends: place the text here and let the
+                // plain Enter arm below submit it, rather than duplicating
+                // everything that arm does.
+                if key.code == KeyCode::Enter {
+                    self.place_suggestion(&mut input);
+                }
+            } else {
+                self.clear_suggestion();
+                input.ghost = None;
+            }
             match key.code {
+                // Placing an offered suggestion into the prompt, leaving it
+                // editable. Guarded on an empty buffer, so it can never
+                // overwrite typed text, and placed before the plain
+                // Tab/Right arms (roster focus and cursor motion) but after
+                // the popup and slash menu, which own these keys while open.
+                KeyCode::Tab | KeyCode::Right if accepts_suggestion => {
+                    self.place_suggestion(&mut input);
+                    input.sync_popup();
+                }
                 // `←` on an empty prompt reaches into the sub-agent roster below
                 // the status bar and reveals its cursor. Once the roster is
                 // selected, `↑`/`↓` walk the rows the way they are drawn (`↑`
@@ -10905,7 +12848,7 @@ impl Agent<'_> {
                 KeyCode::Left
                     if input.buf.text().is_empty() && !word_mod && !sub_pane.selecting =>
                 {
-                    if !sub_pane.move_cursor(0) {
+                    if !sub_pane.move_cursor(0, tui::roster_clock_ms()) {
                         log.push_dim("[no sub-agent has run yet]");
                     }
                     selection.cancel();
@@ -10914,7 +12857,7 @@ impl Agent<'_> {
                     if sub_pane.selecting && input.buf.text().is_empty() && !word_mod =>
                 {
                     let delta = if key.code == KeyCode::Up { -1 } else { 1 };
-                    if !sub_pane.move_cursor(delta) {
+                    if !sub_pane.move_cursor(delta, tui::roster_clock_ms()) {
                         log.push_dim("[no sub-agent has run yet]");
                     }
                     // A selection belongs to the pane it was dragged over, so it
@@ -10935,7 +12878,7 @@ impl Agent<'_> {
                 // Tab moves focus between the prompt and the roster (the
                 // completion popup, when open, has already taken it above).
                 KeyCode::Tab if !word_mod => {
-                    if !sub_pane.toggle_focus() {
+                    if !sub_pane.toggle_focus(tui::roster_clock_ms()) {
                         log.push_dim("[no sub-agent has run yet]");
                     }
                     selection.cancel();
@@ -10958,37 +12901,25 @@ impl Agent<'_> {
                 }
                 KeyCode::Char('d') if ctrl => {
                     if input.buf.text().is_empty() {
-                        // A live background download is worth one line before
-                        // quitting, so nobody closes the terminal wondering
-                        // whether they just threw away 40 GB.
-                        if let Some(warning) = crate::downloader::quit_warning() {
-                            log.push_dim(warning);
-                            // Repaint before blocking: the frame is only drawn
-                            // at the top of this loop, so without this the
-                            // terminal would look frozen with the warning
-                            // invisible, and the user's next keystroke would
-                            // be silently consumed as the answer.
-                            repaint_idle(
-                                terminal,
-                                &log,
-                                &mut view,
-                                &mut sub_pane,
-                                &mut btw_panel,
-                                &mut report,
-                                &input,
-                                &idle_status,
-                                selection.current(),
-                                &task_view,
-                                config_form.as_ref(),
-                                kv_pane.as_ref(),
-                                resume_pane.as_ref(),
-                                &arcade,
-                                wasm_frame.as_ref(),
-                                rem,
-                            )?;
-                            if !await_yes_default()? {
-                                continue;
-                            }
+                        if !confirm_quit_idle(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut sub_pane,
+                            &mut btw_panel,
+                            &mut report,
+                            &input,
+                            &idle_status,
+                            selection.current(),
+                            &task_view,
+                            config_form.as_ref(),
+                            kv_pane.as_ref(),
+                            resume_pane.as_ref(),
+                            &arcade,
+                            wasm_frame.as_ref(),
+                            rem,
+                        )? {
+                            continue;
                         }
                         break;
                     }
@@ -11181,6 +13112,7 @@ impl Agent<'_> {
                             &mut log,
                             terminal,
                             &mut view,
+                            !feedback,
                         );
                         if feedback {
                             self.session
@@ -11188,6 +13120,18 @@ impl Agent<'_> {
                             log.push_dim(
                                 "[recorded for the model — ask about it in your next message]",
                             );
+                        } else if let Some(text) = bang_panel_report(&cmd, &result) {
+                            // `!!` output is the operator's alone, so it goes
+                            // into the same dismissable panel `/context` and
+                            // `/usage` use instead of scrolling away inside the
+                            // conversation. Nothing about it reaches the
+                            // session — that is the whole point of `!!`.
+                            report = Some(tui::ReportPanel::new(bang_panel_title(&cmd), &text));
+                            view.follow = true;
+                        } else {
+                            // Nothing to show: an empty panel would say less
+                            // than the outcome line.
+                            bang_log_outcome(&cmd, &result, &mut log);
                         }
                     } else if line.starts_with('/') {
                         if !self.tui_slash(
@@ -11278,12 +13222,19 @@ impl Agent<'_> {
     /// its output as one user message (see [`bang_transcript_entry`]) so the
     /// model has it as history on the next real prompt. For output the model
     /// should act on *now*, use a regular turn and let it call the `bash` tool.
+    ///
+    /// `quiet` is the `!!` shape: nothing is written to the scrollback — not
+    /// the streamed lines, not the closing outcome — because the caller shows
+    /// the whole thing in a [`tui::ReportPanel`] instead. The command still
+    /// runs through the same sink, so the status line keeps counting seconds
+    /// and Esc still interrupts: a slow `!!` never looks frozen.
     fn tui_bang(
         cwd: &std::path::Path,
         cmd: &str,
         log: &mut OutputLog,
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
+        quiet: bool,
     ) -> Result<crate::tools::bash::ImmediateOutput, String> {
         // Output streams into the log as it arrives (issue #22): the sink's
         // `line` appends and `tick` redraws, so a long-running command shows
@@ -11296,15 +13247,20 @@ impl Agent<'_> {
             cmd: &'b str,
             start: Instant,
             dirty: bool,
+            quiet: bool,
         }
         impl crate::tools::bash::ImmediateSink for Sink<'_, '_> {
             fn line(&mut self, _stream: crate::tools::bash::Stream, text: &str) {
+                if self.quiet {
+                    return;
+                }
                 self.log.push_dim(text.to_owned());
                 self.dirty = true;
             }
             fn tick(&mut self) -> bool {
                 let status = format!(
-                    "! {} ({}s, Esc to stop)",
+                    "{} {} ({}s, Esc to stop)",
+                    if self.quiet { "!!" } else { "!" },
                     self.cmd,
                     self.start.elapsed().as_secs()
                 );
@@ -11345,31 +13301,11 @@ impl Agent<'_> {
             cmd,
             start,
             dirty: false,
+            quiet,
         };
         let result = crate::tools::bash::run_immediate(cwd, cmd, &mut sink);
-        match &result {
-            Ok(out) => {
-                if out.interrupted {
-                    log.push_dim("[interrupted]");
-                } else if out.exit_code == 0 {
-                    // A command that prints nothing is otherwise indis-
-                    // tinguishable from one still running, so say it finished.
-                    // Only when it did: an interrupted command did not.
-                    log.push_spans(vec![ratatui::text::Span::styled(
-                        "done.",
-                        crate::tui::done_style(),
-                    )]);
-                } else {
-                    // A failing command finished too, but saying "done." in
-                    // green next to a non-zero exit reads as success. One red
-                    // line carrying the code is the whole outcome.
-                    log.push_spans(vec![ratatui::text::Span::styled(
-                        format!("failed (exit code {}).", out.exit_code),
-                        crate::tui::failed_style(),
-                    )]);
-                }
-            }
-            Err(e) => log.push_dim(format!("!{cmd}: {e}")),
+        if !quiet {
+            bang_log_outcome(cmd, &result, log);
         }
         result
     }
@@ -11415,9 +13351,23 @@ impl Agent<'_> {
         let local_names = crate::tools::mcp::local_server_names(None);
         let local_defs = crate::tools::mcp::local_tool_defs(&self.tool_ctx.mcp, &local_names);
         let local_material = crate::kvtier::tool_defs_material(&local_defs);
+        // Tier 1 is split only when the engine can hold a checkpoint at the
+        // trusted/untrusted boundary; the base is keyed on the trusted span
+        // alone so a changed tool set re-prefills the tail and nothing above it.
+        let base_fp = self.engine.splits_system_tail().then(|| {
+            let trusted =
+                &self.system[..crate::kvtier::trusted_cut(&self.system, self.trusted_system_len)];
+            crate::kvtier::system_fingerprint(model, trusted, self.think, self.trusted_system_len)
+        });
         crate::kvtier::plan(
             &fp1,
             &self.system,
+            base_fp
+                .as_deref()
+                .map(|base_fp| crate::kvtier::SystemSplit {
+                    base_fp,
+                    trusted_len: self.trusted_system_len,
+                }),
             &self.context_content.stable_context(),
             &self.context_content.volatile_context(),
             &local_material,
@@ -11447,7 +13397,7 @@ impl Agent<'_> {
             })
             .unwrap_or_default();
         crate::kvtier::TierLabels {
-            think_mode: self.think.name().to_owned(),
+            think_mode: self.think.name().into_owned(),
             trusted_len: self.trusted_system_len,
             global_mcp: crate::tools::mcp::global_eligible_names(None),
             project_path: self.tool_ctx.cwd.display().to_string(),
@@ -11728,8 +13678,10 @@ impl Agent<'_> {
             ctx_used: self.engine.count_tokens(&rendered),
             ctx_size: self.engine.ctx_size(),
             power_percent: self.power_percent,
-            think: self.think,
+            think: self.footer_think(&self.engine.model_name()),
             spec: self.last_spec,
+            running_jobs: self.tool_ctx.bash.running_count(),
+            pressure_yielded: self.yield_policy.plan().is_some(),
             ..Status::default()
         }
     }
@@ -11761,6 +13713,132 @@ impl Agent<'_> {
     /// `?` (or at the call sites that swallow the error) makes the invariant
     /// hold by construction: a future error path added inside the body cannot
     /// forget it.
+    /// Runs one queued memory job from the idle loop through
+    /// [`Self::tui_quiet_pass`], so the footer shows `taking notes…` with the
+    /// pass's own figures and the prompt stays editable. A submitted prompt
+    /// interrupts it: `process_memory_job` puts the job back at the front of
+    /// the queue and the typed line becomes the next turn.
+    ///
+    /// Returns `true` when the user pressed Ctrl-D during the pass: the
+    /// caller quits. Queued memory jobs are dropped rather than drained —
+    /// the user asked to leave.
+    #[allow(clippy::too_many_arguments)]
+    fn tui_memory_pass(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        log: &mut OutputLog,
+        view: &mut tui::OutputView,
+        input: &mut TuiInput,
+        btw: &mut BtwPanel,
+        arcade: &mut crate::arcade::Arcade,
+        sub: &mut tui::SubPane,
+    ) -> Result<bool, String> {
+        // No scrollback line: the footer mark (`status::MEMORY_MARK`) is the
+        // whole announcement. Housekeeping the user did not ask for should
+        // not write into the conversation.
+        self.tui_quiet_pass(
+            terminal,
+            &mut TuiHandles {
+                log,
+                view,
+                input,
+                btw,
+                arcade,
+                sub,
+            },
+            |agent, tx| {
+                // The memory pass publishes its footer status through
+                // `sub_sink`, which still points at the last turn's dead
+                // channel: install this one. Its model text is still held
+                // back, by `sub_sink_render_sink`'s `extract_state` check.
+                agent.sub_sink = SubSinkTarget::Events(tx.clone());
+                agent.process_memory_job();
+                if let Some(notice) = agent.pending_memory_notice.take() {
+                    let _ = tx.send(UiEvent::Dim(notice));
+                }
+            },
+        )
+    }
+
+    /// Runs `body` on a worker thread behind the same busy UI loop as a turn,
+    /// for a quiet background pass — the memory pass, or a prompt suggestion.
+    /// `TurnShared::memory_pass` tells the busy loop that a submitted prompt
+    /// is also an interrupt: the pass stops at its next token, puts its work
+    /// back where it found it, and the typed line becomes the next turn right
+    /// here — the user never waits for housekeeping.
+    ///
+    /// Returns `true` when the user pressed Ctrl-D during the pass: the
+    /// caller quits, and whatever was queued goes with the session.
+    ///
+    /// The six front-end handles travel in [`TuiHandles`] rather than as
+    /// arguments so this keeps the same arity as its callers.
+    fn tui_quiet_pass(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        h: &mut TuiHandles<'_>,
+        body: impl FnOnce(&mut Self, &Sender<UiEvent>) + Send,
+    ) -> Result<bool, String> {
+        // The busy loop below repaints with the live `input`, so a ghost left
+        // on it would stay lit for the whole pass — a prompt that looks like
+        // it is taking input while plank is busy. Clear it here rather than
+        // at each caller: every route into a quiet pass wants it dark.
+        h.input.ghost = None;
+        // The remote bridge's persistent `TurnShared` when there is one, so
+        // a remote prompt typed during the pass lands in the same queue a
+        // local one does, exactly as in `tui_turn_inner`.
+        let remote = self.remote.clone();
+        let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
+        let ui_remote = self.ui_remote.clone();
+        let local_shared = TurnShared::default();
+        let shared: &TurnShared = remote
+            .as_deref()
+            .map_or(&local_shared, |r| r.shared.as_ref());
+        shared.memory_pass.store(true, Ordering::Relaxed);
+        let live = LiveCommands::capture(self);
+        let run = run_worker_ui(
+            terminal,
+            &mut *h.log,
+            &mut *h.view,
+            &mut *h.input,
+            &mut *h.btw,
+            &mut *h.arcade,
+            &mut *h.sub,
+            shared,
+            bus.as_deref(),
+            ui_remote.as_deref(),
+            None,
+            &live,
+            |tx| body(self, &tx),
+        );
+        shared.memory_pass.store(false, Ordering::Relaxed);
+        // Read before the interrupt reset below: the Ctrl-D arm raised that
+        // interrupt to stop the pass, and clearing it must not lose the
+        // reason. Taken rather than peeked, so a persistent remote
+        // `TurnShared` does not carry the quit into the next pass.
+        let quit = shared.quit_requested.swap(false, Ordering::Relaxed);
+        // The interrupt a typed prompt raised has done its job. Both flags
+        // are cleared here, not left for the next turn to trip over: the
+        // worker clears the process flag only where it reports a cut-off
+        // generation, and this pass may have ended before it noticed.
+        shared.interrupt.store(false, Ordering::Relaxed);
+        crate::interrupt::clear();
+        if let Err(e) = run {
+            return Err(self.reconcile_and_fail(&mut *h.log, shared, e));
+        }
+        // The prompt that cut the pass short is the next turn, now — unless
+        // the thing that cut it short was Ctrl-D, in which case there is no
+        // next turn and the leftover goes with the session.
+        if quit {
+            return Ok(true);
+        }
+        let leftover = shared.take_queued();
+        if !leftover.is_empty() {
+            self.absorb_leftover(&mut *h.log, leftover);
+            self.tui_turn(terminal, h.log, h.view, h.input, h.btw, h.arcade, h.sub)?;
+        }
+        Ok(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn tui_turn(
         &mut self,
@@ -11772,6 +13850,8 @@ impl Agent<'_> {
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
     ) -> Result<(), String> {
+        // A turn is starting: whatever ghost the prompt was showing is over.
+        input.ghost = None;
         let r = self.tui_turn_inner(terminal, log, view, input, btw, arcade, sub);
         if r.is_err() {
             self.goal = None;
@@ -11823,6 +13903,9 @@ impl Agent<'_> {
             for q in carry_btw.drain(..) {
                 let _ = shared.push_btw(q);
             }
+            // So a `/context` opened during the first pass has real numbers
+            // rather than an empty breakdown.
+            shared.set_context(self.context_breakdown());
             let bus_ref = bus.as_deref();
             // UI-side handle to the `ask` rendezvous (issue #34), cloned out of
             // the tool context before the closure borrows `self`. Only the main
@@ -11869,6 +13952,13 @@ impl Agent<'_> {
                         return Err(self.reconcile_and_fail(log, shared, outer_err));
                     }
                 };
+                // A mid-turn `/repro` aims a bare `/open` at its dump, as an
+                // idle one does; the base is dropped so a shared `TurnShared`
+                // (the remote bridge's) cannot serve it to the next turn.
+                shared.end_repro();
+                if let Some(path) = shared.take_repro_written() {
+                    self.last_edited = Some(path);
+                }
                 if let Err(e) = worker_result {
                     // The turn never reached the leftover loop, so reconcile
                     // here for the same reason as the outer-error branch
@@ -11876,6 +13966,13 @@ impl Agent<'_> {
                     // `pending` and `shared.queued` empty together instead of
                     // losing the user's input.
                     return Err(self.reconcile_and_fail(log, shared, e));
+                }
+                // A confirmed mid-turn `/exit`: the interrupt has stopped the
+                // turn, so neither the queued lines nor a live goal may start
+                // another one. `tui_loop` sees the flag and leaves.
+                if quit_requested() {
+                    self.goal = None;
+                    return Ok(());
                 }
             } else {
                 let drain_result = run_worker_ui(
@@ -12046,14 +14143,19 @@ impl Agent<'_> {
                     ));
                 }
                 self.flush_kv_end_of_turn();
-                crate::title::set(crate::title::State::Idle);
-                crate::warp::emit("stop", &self.session.id);
                 // Mirrored from the plain path: a component must not observe a
                 // different number of turns depending on which front end the
                 // user happens to be running. The token count is not available
                 // here — this path reports elapsed time only — so the field is
                 // sent as -1 rather than as a plausible-looking zero.
                 self.fire_turn_end(-1, turn_started.elapsed());
+                // The idle title is the last thing: everything above is still
+                // part of the turn as far as a watching window is concerned.
+                crate::title::set(crate::title::State::Idle);
+                crate::warp::emit("stop", &self.session.id);
+                // The Stop hooks have already run inside `worker_turn`; the
+                // memory span was snapshotted there too, and is read from the
+                // idle loop (`tui_memory_pass`) once the prompt is back.
                 return Ok(());
             }
             run_main = !leftover.is_empty();
@@ -12283,6 +14385,14 @@ impl Agent<'_> {
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
         self.tool_ctx.tasks.clone_from(&self.session.tasks);
+        // Mirror of the plain path's turn-boundary poll (`run_turn`), including
+        // the resume disclosure that must precede the re-prefill it describes.
+        if let Some(line) = self.announce_pressure_resume() {
+            let _ = tx.send(UiEvent::Dim(line));
+        }
+        if let Some(line) = self.poll_pressure() {
+            let _ = tx.send(UiEvent::Dim(line));
+        }
         let mut note = |s: String| {
             let _ = tx.send(UiEvent::Dim(s));
         };
@@ -12331,6 +14441,8 @@ impl Agent<'_> {
         let mut stop_hook_ran = false;
         // Passes in a row the repeat guard stopped; see `MAIN_REPEAT_TRIP_CAP`.
         let mut repeat_trips = 0usize;
+        // The draft rung's own tally; see `MAIN_DRAFT_TRIP_CAP`.
+        let mut draft_trips = 0usize;
         // Bytes generated since the last tool call with an effect; see
         // `NO_PROGRESS_BYTE_BUDGET`.
         let mut ungrounded = 0usize;
@@ -12416,24 +14528,51 @@ impl Agent<'_> {
             close_open_think(&mut assistant_text, out.ended_in_think && turn_continues);
             ungrounded += assistant_text.len();
             self.session.push(Message::assistant(assistant_text));
+            let guard = std::mem::take(&mut self.last_guard);
+            let stop = pass_stop_text(
+                out.interrupted,
+                out.error.as_ref().map(|f| f.payload.as_str()),
+                out.calls.len(),
+            );
+            self.note_pass(None, &out.stats, guard, stop);
             // Streamed live to the parent window, so the console has seen it:
             // it must not be replayed to a window that connects later.
             self.note_pass_mirrored();
             self.payload_dirty = true;
             let _ = tx.send(UiEvent::EndLine);
+            // Mirror of the plain path: see `run_turn`.
+            if let Some(line) = self.finish_pressure_stop() {
+                let _ = tx.send(UiEvent::Dim(line));
+            }
+            self.first_turn_done = true;
+            if self.is_pressure_yielded() {
+                self.save_payload_if_dirty();
+                self.drain_btw(tx, shared);
+                return Ok(());
+            }
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
             if let Some(f) = out.error.as_ref().filter(|e| e.looped) {
-                repeat_trips += 1;
-                let over = f.payload.contains(THINK_BUDGET_ERROR);
-                self.report_guard(&repeat_trip_text(over, repeat_trips));
+                // Same split as the plain path, for the same reason.
+                let draft = is_draft_stop(&f.payload);
+                if draft {
+                    draft_trips += 1;
+                } else {
+                    repeat_trips += 1;
+                }
+                let trips = if draft { draft_trips } else { repeat_trips };
+                self.report_guard(&repeat_trip_text(Some(&f.payload), trips));
                 if let Some(line) = self.loop_repro_line() {
                     let _ = tx.send(UiEvent::Dim(line));
                 }
-                // Dump first, then take the cycle out of the model's copy.
-                self.stub_last_reasoning();
+                // Match the plain path: keep useful non-cyclic analysis.
+                if f.payload.contains(REPEAT_LOOP_ERROR) {
+                    self.stub_last_reasoning();
+                }
+                self.arm_reply_only();
             } else {
                 repeat_trips = 0;
+                draft_trips = 0;
             }
             if out.interrupted {
                 crate::interrupt::clear();
@@ -12453,10 +14592,21 @@ impl Agent<'_> {
                     "<tool_result>{payload}</tool_result>"
                 )));
                 if repeat_trips >= MAIN_REPEAT_TRIP_CAP {
-                    self.report_guard(MAIN_REPEAT_TRIPS_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(MAIN_REPEAT_TRIPS_NOTICE);
+                }
+                if draft_trips >= MAIN_DRAFT_TRIP_CAP {
+                    return self.stop_turn(MAIN_DRAFT_TRIPS_NOTICE);
                 }
                 self.drain_queued(shared, tx);
+                let woke = self.drain_job_notifications();
+                if woke > 0 {
+                    let _ = tx.send(UiEvent::Dim(Self::job_wake_line(woke)));
+                }
+                shared.set_jobs(self.tool_ctx.bash.rows());
+                // The transcript just grew by this round's results, which is
+                // where context fills in bulk; re-count so the panel's
+                // breakdown is current, not turn-start.
+                shared.set_context(self.context_breakdown());
                 continue;
             }
             if !out.calls.is_empty() {
@@ -12466,8 +14616,10 @@ impl Agent<'_> {
                     let _ = tx.send(UiEvent::Dim(line));
                 }
                 // Keep this exactly in step with the plain-stdout path: only
-                // a successful direct file mutation resets the budget.
-                let made_progress = self.tool_ctx.last_written.is_some();
+                // an observed file mutation resets the budget.
+                let made_progress =
+                    self.tool_ctx.last_written.is_some() || self.tool_ctx.touched_tree;
+                self.tool_ctx.touched_tree = false;
                 let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
                 crate::openfile::note_written(
                     &mut self.last_edited,
@@ -12479,7 +14631,10 @@ impl Agent<'_> {
                 for line in std::mem::take(&mut self.tool_ctx.task_completions) {
                     let _ = tx.send(UiEvent::Dim(format!("✓ {line}")));
                 }
-                let _ = tx.send(UiEvent::Tasks(tui::TaskView::from(&self.session.tasks)));
+                let _ = tx.send(UiEvent::Tasks(tui::TaskView::with_goal(
+                    &self.session.tasks,
+                    self.session.goal.as_ref(),
+                )));
                 for warning in self.tool_ctx.hook_warnings.drain(..) {
                     let _ = tx.send(UiEvent::Dim(warning));
                 }
@@ -12505,20 +14660,36 @@ impl Agent<'_> {
                     if let Some(line) = self.loop_repro_line() {
                         let _ = tx.send(UiEvent::Dim(line));
                     }
-                    self.report_guard(LOOP_TRIPPED_NOTICE);
-                    return Ok(());
+                    return self.stop_turn(LOOP_TRIPPED_NOTICE);
                 }
                 // Checked after the results are in the transcript, so the
                 // dump and the next prompt both show what the turn did have.
                 if made_progress {
                     ungrounded = 0;
-                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET && crate::guard::guards_enabled() {
-                    self.report_guard(NO_PROGRESS_NOTICE);
-                    return Ok(());
+                } else if ungrounded >= NO_PROGRESS_BYTE_BUDGET
+                    && crate::guard::no_progress_guard_enabled()
+                {
+                    return self.stop_turn(NO_PROGRESS_NOTICE);
                 }
                 self.drain_queued(shared, tx);
+                let woke = self.drain_job_notifications();
+                if woke > 0 {
+                    let _ = tx.send(UiEvent::Dim(Self::job_wake_line(woke)));
+                }
+                shared.set_jobs(self.tool_ctx.bash.rows());
+                // The transcript just grew by this round's results, which is
+                // where context fills in bulk; re-count so the panel's
+                // breakdown is current, not turn-start.
+                shared.set_context(self.context_breakdown());
                 continue;
             }
+            // Memory extraction: the genuine no-tool-calls exit, never a tool
+            // round — the mirror of the plain path's site in `run_turn`
+            // (CLAUDE.md). Only a snapshot: the reading happens from the
+            // idle loop (`tui_memory_pass`), on a worker with the footer
+            // live, and a prompt typed meanwhile cuts it short.
+            self.enqueue_memory_job(turn_start.elapsed());
+            self.note_turn_end_for_suggestion(false);
             // Stop hooks: exit 2 feeds stderr to the model and the turn
             // continues (at most once).
             if !stop_hook_ran {
@@ -12732,6 +14903,884 @@ impl Agent<'_> {
         err
     }
 
+    /// Appends a notification for background jobs that finished since the
+    /// model last looked, if any, returning the number of jobs announced.
+    ///
+    /// Called at every turn boundary where a user message may legally join
+    /// the transcript (after each tool round, and from `wake_for_jobs` when
+    /// idle). Off unless `tools.bashNotify` is set; sidechains never drain,
+    /// since the jobs belong to the main transcript (`docs/BACKGROUND-TASKS.md`).
+    fn drain_job_notifications(&mut self) -> usize {
+        if !crate::settings::active().tools.bash_notify || self.in_sidechain() {
+            return 0;
+        }
+        let finished = self.tool_ctx.bash.take_finished();
+        let Some(text) = crate::tools::bash::render_notification(&finished) else {
+            return 0;
+        };
+        self.session.push(Message::user(text));
+        finished.len()
+    }
+
+    /// Plain-stdout mirror of `tui_memory_pass`: runs one queued job and
+    /// prints its one-line outcome when there is one. Silent otherwise, like
+    /// the TUI, which has only its footer verb; the plain REPL has no footer
+    /// at idle, so here the pass leaves no trace unless it changed something.
+    fn plain_memory_pass(&mut self) -> bool {
+        self.process_memory_job();
+        if let Some(notice) = self.pending_memory_notice.take() {
+            println!();
+            println!("{}", crate::status::system_line(&notice, self.color));
+            return true;
+        }
+        false
+    }
+
+    /// Plain-stdout mirror of the TUI's dim wake line; silent for `0`.
+    fn print_job_wake(&self, n: usize) {
+        if n > 0 {
+            println!("{}", self.debug_line(&Self::job_wake_line(n)));
+        }
+    }
+
+    /// Asks the model whether `slice` holds anything worth remembering.
+    ///
+    /// Returns `true` to run the extraction pass. Every uncertain path
+    /// returns `true`: no capability, an engine error, or an abstention. A
+    /// gate that is unsure must never be the reason a memory is lost — its
+    /// only job is to skip passes that would plainly have found nothing.
+    fn memory_gate_says_worthy(&mut self, slice: &[crate::session::Message]) -> bool {
+        if !self.engine.supports_decide() {
+            return true;
+        }
+        let state = crate::memextract::render_excerpt(slice);
+        let verdict = crate::decide::decide_one::<crate::memextract::Worthy>(
+            self.engine.as_mut(),
+            &state,
+            crate::memextract::GATE_QUESTION,
+        );
+        let Ok(v) = verdict else {
+            return true;
+        };
+        if v.abstained {
+            return true;
+        }
+        // `u32 -> f64` and `f32 -> f64` are both lossless, so this needs no
+        // cast and no lint suppression.
+        let threshold = f64::from(self.memory_gate_percent) / 100.0;
+        v.value == crate::memextract::Worthy::Yes && f64::from(v.p) >= threshold
+    }
+
+    /// `/memory calibrate [N]`: measures the loaded family's letter bias on
+    /// the memory gate's own question, offline, and says what
+    /// `memory.gateBias` should be.
+    ///
+    /// The live gate always shows "yes" as A. A model with a prior toward A
+    /// as such reads more "yes" than the span warrants, and `letter_mass`
+    /// cannot see it. So this asks each of up to `N` saved turn spans twice,
+    /// with the letters swapped the second time, and reports the mean
+    /// difference (`decide::bias_report`). It is a command rather than part
+    /// of the gate because the second ask is not cheap everywhere: on
+    /// `DeepSeek` a decision session cannot be rewound (`decide_prefill`), so
+    /// each ask re-prefills the span. Paying that once, here, and folding the
+    /// result into the threshold keeps the live gate at one ask per span.
+    ///
+    /// Spans come from this family's saved sessions, newest first. Nothing
+    /// is written: the result is a line to put in `settings.json`, because a
+    /// calibration a user has not looked at should not move a gate that
+    /// decides what gets remembered.
+    fn gate_calibrate_command(&mut self, arg: &str, progress: &mut dyn FnMut(&str)) -> String {
+        const DEFAULT_SPANS: usize = 20;
+        const MAX_SPANS: usize = 200;
+        let want = match arg.trim() {
+            "" => DEFAULT_SPANS,
+            n => match n.parse::<usize>() {
+                Ok(n) if n > 0 => n.min(MAX_SPANS),
+                _ => return "usage: /memory calibrate [spans, default 20]".to_owned(),
+            },
+        };
+        if !self.engine.supports_decide() {
+            return "/memory calibrate: this engine cannot answer typed decisions, so the gate never runs on it".to_owned();
+        }
+        let family = crate::gguf::ModelFamily::from(self.tool_syntax());
+        let key = crate::settings::GateBias::key(family);
+
+        let mut spans: Vec<String> = Vec::new();
+        let entries = self.store.list().unwrap_or_default();
+        for e in &entries {
+            if spans.len() >= want {
+                break;
+            }
+            let Ok(saved) = self.store.load(&e.id) else {
+                continue;
+            };
+            spans.extend(crate::memextract::calibration_spans(&saved.transcript));
+        }
+        spans.truncate(want);
+        if spans.is_empty() {
+            return format!(
+                "/memory calibrate: no saved {key} sessions with an answered turn to ask about"
+            );
+        }
+
+        let settings = crate::settings::active();
+        let q_ab = crate::decide::Question::boolean(crate::memextract::GATE_QUESTION);
+        let q_ba = crate::decide::Question::boolean_swapped(crate::memextract::GATE_QUESTION);
+        let mut pairs = Vec::with_capacity(spans.len());
+        let mut unusable = 0usize;
+        let mut failed = 0usize;
+        let total = spans.len();
+        for (i, span) in spans.iter().enumerate() {
+            progress(&format!("[calibrate] span {}/{total}", i + 1));
+            let ab = self.engine.decide(span, &q_ab);
+            let ba = self.engine.decide(span, &q_ba);
+            match (ab, ba) {
+                (Ok(ab), Ok(ba)) => match crate::decide::OrderPair::from_verdicts(&ab, &ba) {
+                    Some(p) => pairs.push(p),
+                    None => unusable += 1,
+                },
+                _ => failed += 1,
+            }
+        }
+        let threshold = f64::from(settings.memory.gate_percent) / 100.0;
+        #[allow(clippy::cast_possible_truncation)] // a percent, back to f32
+        let report = crate::decide::bias_report(&pairs, threshold as f32);
+        gate_calibration_text(
+            key,
+            &report,
+            settings.memory.gate_percent,
+            settings.memory.gate_bias.for_family(family),
+            unusable,
+            failed,
+        )
+    }
+
+    /// Snapshots the span since the last pass into a [`MemoryJob`] if every
+    /// gate allows it, and returns whether one was queued. Nothing is
+    /// generated here: this is what a turn end does, so the prompt comes
+    /// back the moment the answer is done and the reading happens at the
+    /// next idle moment (`process_memory_job`).
+    ///
+    /// Called only at a turn boundary — after a generation that ended with no
+    /// tool calls — never mid-pass (`run_turn` on the plain path,
+    /// `worker_turn` in the TUI), and never for a turn the user interrupted
+    /// (`memory_pass_allowed`). The span is retired (`ExtractState::finish`)
+    /// as it is snapshotted: the job carries the whole prompt, so the live
+    /// transcript is free to move on — the next turn opens a new span from
+    /// here, and a `/clear` cannot lose what was already captured. Settings
+    /// are sampled fresh every call so a `/config` change takes effect on
+    /// the next eligible turn.
+    ///
+    /// `turn` is how long the turn that just ended took, measured by the
+    /// caller. It is passed in rather than clocked here on purpose: both
+    /// call sites already hold a `turn_start`, and a parameter is what keeps
+    /// a sub-agent's turn from clobbering the main turn's clock — a
+    /// sidechain's own `turn_start` never reaches this call.
+    fn enqueue_memory_job(&mut self, turn: std::time::Duration) -> bool {
+        let settings = crate::settings::active();
+        self.extract_state.enabled = settings.memory.auto_extract;
+        self.extract_state.every_n = settings.memory.extract_every_n_turns;
+        self.extract_state.min_turn =
+            std::time::Duration::from_secs(u64::from(settings.memory.min_turn_seconds));
+        self.memory_gate = settings.memory.gate;
+        // Moved by the family's calibrated letter bias (`memory.gateBias`,
+        // measured by `/memory calibrate`), so the as-asked P(yes) the gate
+        // reads is held to the bar the debiased one would have been.
+        self.memory_gate_percent = settings
+            .memory
+            .gate_threshold_percent(crate::gguf::ModelFamily::from(self.tool_syntax()));
+        self.extract_state.held_span_cap = settings.memory.held_span_cap as usize;
+        if self.in_sidechain() {
+            return false; // a sub-agent's turn end is not a turn boundary
+        }
+        let depth = self.session.transcript.len();
+        let Some(from) = self.extract_state.should_run(depth, turn) else {
+            return false;
+        };
+        // An interrupted turn is not a finished one: the user cut the model
+        // off and wants the prompt back. `cancel` rather than `finish`, so
+        // the span is read by the next turn that does complete. Checked after
+        // `should_run` so the model's own `remember` suppression is still
+        // consumed for this turn.
+        if !self.memory_pass_allowed() {
+            self.extract_state.cancel();
+            return false;
+        }
+        let entries = crate::memextract::current_entries(&self.tool_ctx.cwd);
+        let slice = self.session.transcript[from.min(depth)..depth].to_vec();
+
+        // The System-1 gate. Skipped entirely when off, and skipped once the
+        // held span has outgrown its cap — past that point the pass runs
+        // regardless of what the model would have said.
+        if self.memory_gate
+            && !self.extract_state.gate_bypassed(from, depth)
+            && !self.memory_gate_says_worthy(&slice)
+        {
+            self.extract_state.reject(from, depth);
+            return false;
+        }
+
+        let task = crate::memextract::build_prompt(&slice, &entries);
+        self.extract_state.finish(depth);
+        self.memory_jobs.push_back(crate::memextract::MemoryJob {
+            task,
+            depth,
+            attempts: 0,
+            resume: None,
+        });
+        true
+    }
+
+    /// Whether a queued span is waiting to be read.
+    fn memory_jobs_pending(&self) -> bool {
+        !self.memory_jobs.is_empty()
+    }
+
+    /// Records that a turn just ended, so the next quiet moment generates a
+    /// suggestion.
+    ///
+    /// Queues a flag and nothing more. The generation is deliberately not run
+    /// here: turn exit is a snapshot, and paying a generation on this path
+    /// would delay the prompt coming back after every single answer.
+    fn note_turn_end_for_suggestion(&mut self, errored: bool) {
+        if errored || !self.suggestion_allowed() {
+            return;
+        }
+        self.suggestion_pending = true;
+    }
+
+    /// Whether this session should suggest at all right now.
+    ///
+    /// The skip list, mapped from the design's table: off by setting, a
+    /// sub-agent turn, an interrupted turn, or `/init` running. The cold-KV
+    /// skip is not here — it needs the prompt text, so it is checked at
+    /// generation time.
+    fn suggestion_allowed(&self) -> bool {
+        crate::settings::active().suggestions.enabled
+            && !self.in_sidechain()
+            && !self.quiet_tools
+            && self.memory_pass_allowed()
+    }
+
+    /// What the idle moment should spend itself on: a pending suggestion
+    /// always first, then the oldest queued memory job.
+    fn idle_work(&self) -> crate::suggest::IdleWork {
+        crate::suggest::idle_work(self.suggestion_pending, self.memory_jobs_pending())
+    }
+
+    /// Runs the oldest queued job: one sidechain generation against the live
+    /// session, then the verdicts are applied. Returns whether a generation
+    /// ran. Called from each front end's idle loop, and synchronously by the
+    /// headless paths before they exit.
+    ///
+    /// The pass is a sidechain opened with `begin_sidechain` (the prompt goes
+    /// in verbatim, not through the sub-agent task framing), driven by a
+    /// single tool-free generation (`run_memory_round`, via
+    /// `run_sidechain_quietly`) and closed by `end_subagent_fork`. Running
+    /// under `in_sidechain()` is why it leaves no checkpoint debris: the KV
+    /// ladder pushes no rungs and stores no payload. Two invariants follow:
+    /// this never starts a pass while already inside a sidechain (no
+    /// nesting), and every exit path below goes through `end_subagent_fork`,
+    /// so `sidechain_depth` always returns to 0.
+    ///
+    /// How a job leaves the queue: applied (or unusable — a reply that is not
+    /// a JSON array is a property of the model on this prompt, not a
+    /// transient fault, and re-reading the same span forever would never do
+    /// better; the repro dump is the diagnostic), too big for the context
+    /// (dropped with a one-time notice), or after `MAX_JOB_ATTEMPTS` engine
+    /// errors. An interrupt — the user typed a prompt, or pressed Esc — puts
+    /// it back at the front, uncounted: the work is simply redone at the
+    /// next idle moment.
+    fn process_memory_job(&mut self) -> bool {
+        if self.in_sidechain() {
+            return false; // never nest a pass inside another sidechain
+        }
+        let Some(mut job) = self.memory_jobs.pop_front() else {
+            return false;
+        };
+        // This attempt's own wall time, for the completion line; an earlier
+        // interrupted attempt is not counted, since its prefill was kept.
+        let started = Instant::now();
+        // Preflight, before the KV snapshot the fork takes: the sidechain
+        // prompt is the whole live session plus the task, so it must fit the
+        // headroom the session leaves (`last_ctx_used`, the same figure the
+        // `/think` room guard uses) with space for the reply. A span that
+        // does not fit is a property of *this job* — the excerpt is already
+        // capped by `build_prompt`, so nothing about it shrinks on a retry.
+        let need = self
+            .engine
+            .count_tokens(&job.task)
+            .saturating_add(crate::memextract::REPLY_RESERVE_TOKENS);
+        let ctx = self.engine.ctx_size();
+        if self.last_ctx_used.saturating_add(need) > ctx {
+            if self.extract_state.note_oversized_span() {
+                self.pending_memory_notice = Some(format!(
+                    "memory: the extraction pass skipped a span that would not fit \
+                     the context ({} of {ctx} tokens in use, {need} more needed)",
+                    self.last_ctx_used
+                ));
+            }
+            return false;
+        }
+
+        // The prompt goes in verbatim — not through `task_message`, whose
+        // "use your tools, then report" framing contradicts the JSON-only
+        // contract — and the sidechain is exactly one generation with no
+        // dispatch (`run_memory_round_with`), so the pass can never touch a
+        // tool. The only visible trace is the footer verb
+        // (`Status::memory_pass`): no title change and no scrollback line,
+        // because this is housekeeping, not something the user asked for.
+        self.extract_state.begin_pass();
+        let fork_at = self.begin_sidechain(job.task.clone(), true);
+        let prompt = match self.memory_pass_prompt(&mut job) {
+            Ok(prompt) => prompt,
+            Err(interrupted) => {
+                // Cut off (or failed) during the prefill itself. The partial
+                // prefill, when there is one, is already on the job; the
+                // fork closes as always.
+                let done = self.close_quiet_sidechain();
+                self.end_subagent_fork(fork_at, "memory", &job.task, done);
+                self.extract_state.end_pass();
+                self.requeue_memory_job(job, interrupted);
+                return false;
+            }
+        };
+        let (done, result) =
+            self.run_sidechain_quietly(|agent| agent.run_memory_round_with(&prompt));
+        let report = self.end_subagent_fork(fork_at, "memory", &job.task, done);
+        self.extract_state.end_pass();
+
+        let (usable, interrupted) = match result {
+            Ok(round) => round,
+            // A cut-off generation surfaces here as an abort, not through the
+            // stats (`finish_quiet_pass`); it is not a fault.
+            Err(e) => {
+                self.requeue_memory_job(job, e == QUIET_ABORT_INTERRUPTED);
+                return false;
+            }
+        };
+        if interrupted || crate::interrupt::pending() {
+            self.requeue_memory_job(job, true);
+            return false;
+        }
+        let verdicts = if usable {
+            report
+                .as_deref()
+                .and_then(crate::memextract::extract_verdict_array)
+                .and_then(|json| crate::memory::parse_verdicts(json).ok())
+        } else {
+            None
+        };
+        match verdicts {
+            Some(verdicts) => {
+                let date = crate::context::current_local_iso_date();
+                let notes = crate::memory::apply_verdicts_to(
+                    &self.tool_ctx.cwd,
+                    &verdicts,
+                    &date,
+                    self.tool_ctx.memory_log_path.as_deref(),
+                    None,
+                );
+                // Reported on every successful pass, changes or not: the
+                // mark in the footer said notes were being taken, and this
+                // is the one line that says the taking is over.
+                self.report_memory_changes(&notes, started.elapsed());
+            }
+            None => self.note_unusable_memory_reply(),
+        }
+        true
+    }
+
+    /// Generates one suggestion as a sidechain and stores it.
+    ///
+    /// Returns whether a suggestion was stored. The pending flag is consumed
+    /// either way: a rejected suggestion is not retried, because a second
+    /// generation to rescue a failed guess costs more than the guess is
+    /// worth.
+    ///
+    /// Runs under `begin_sidechain` / `end_subagent_fork` exactly as the
+    /// memory pass does (`process_memory_job`), which is what keeps it out of
+    /// the transcript and off the KV ladder. `PLANK_SUGGEST_DEBUG` prints the
+    /// raw reply before sanitizing: without it, "the model returned nothing"
+    /// and "the sanitizer rejected everything" are indistinguishable from
+    /// outside, and those need different fixes.
+    fn generate_suggestion(&mut self) -> bool {
+        self.suggestion_pending = false;
+        if !self.suggestion_allowed() {
+            return false;
+        }
+        // A suggestion is ghost text: nothing about the generation may reach
+        // the front end. The memory pass is kept quiet by
+        // `sub_sink_render_sink`'s `extract_state.is_running()` check, which
+        // a suggestion never trips — so it silences its own sink instead.
+        // Left on the last turn's live channel, the suggestion would stream
+        // token by token into the sub-agent pane and, through
+        // `pass_status_ctx`, paint a throbber, a "generating…" verb and a
+        // throughput readout at an idle prompt, for work the user never
+        // asked for. `Null` makes `pass_status_ctx` return `None`, so neither
+        // text nor status leaves the pass. Restored on the way out so the
+        // caller's sink is the caller's business.
+        let sink = std::mem::replace(&mut self.sub_sink, SubSinkTarget::Null);
+        // NOT a think-mode switch. `ThinkMode::Off` would stop the model
+        // reasoning here, but it is not free: on a numeric-thinking family
+        // (V4.1) `Off` and `Medium` have *different* effort preambles
+        // (`engine::effort_prefix`), so `set_think_mode` drops the token
+        // transcript and calls `ds4_session_invalidate` — a full re-prefill
+        // of the whole conversation, twice per turn once the mode is
+        // restored. That is exactly the cost this feature exists to avoid.
+        // The budget and the `</think>` handling below deal with reasoning
+        // instead.
+        let done = self.generate_suggestion_inner();
+
+        self.sub_sink = sink;
+        done
+    }
+
+    /// The body of [`Self::generate_suggestion`], which owns silencing the
+    /// sub-agent sink around it.
+    fn generate_suggestion_inner(&mut self) -> bool {
+        let text = crate::suggest::prompt();
+
+        // Probe with the real prompt prefix, not the bare instruction: whether
+        // the KV rebuilds is decided by the transcript prefix, and probing
+        // with a string that shares no leading tokens makes the guard fire
+        // never. Done before the fork so the cold path costs nothing.
+        let base = render_transcript(&recovery_session(&self.session), &self.system);
+        if self
+            .engine
+            .kv_reuse_probe(&base, self.think)
+            .is_some_and(crate::engine::KvReuse::rebuilds_from_zero)
+        {
+            return false;
+        }
+
+        let depth = self.session.transcript.len();
+        // `true`, as the memory pass does: the sidechain diverges the live KV
+        // and `restore_fork_kv` puts it back. With `false` the restore no-ops
+        // and the next real turn re-prefills the whole conversation — the
+        // exact cost the probe above exists to avoid.
+        let fork_at = self.begin_sidechain(text.clone(), true);
+        // The prompt is the whole live session plus the instruction that
+        // `begin_sidechain` just pushed, exactly as `process_memory_job`
+        // builds it. Passing the bare instruction would ask the model to
+        // guess the next prompt with no conversation at all.
+        let prompt = render_transcript(&recovery_session(&self.session), &self.system);
+        let mut opts = self.pass_opts();
+        opts.n_predict =
+            i32::try_from(crate::settings::active().suggestions.max_tokens).unwrap_or(40);
+        let (done, result) = self.run_sidechain_quietly(|agent| {
+            agent
+                .generate_quiet_with(&prompt, Instant::now(), &opts)
+                .map(|pass| pass.assistant_text)
+                .map_err(|abort| abort.error)
+        });
+        // `&text`, not `&prompt`: this argument is only used to label the
+        // repro dump, and `process_memory_job` passes its bare task there
+        // too. Passing the rendered prompt would record the entire
+        // conversation as the "task" of every suggestion dump.
+        self.end_subagent_fork(fork_at, "suggest", &text, done);
+
+        let reply = result.unwrap_or_default();
+
+        if std::env::var_os("PLANK_SUGGEST_DEBUG").is_some() {
+            eprintln!("[suggest] raw={reply:?}");
+        }
+
+        // The budget ran out while the model was still reasoning, so what
+        // came back is a thought, not a suggestion.
+        if crate::suggest::reasoning_unfinished(&reply, self.think != crate::engine::ThinkMode::Off)
+        {
+            return false;
+        }
+
+        match crate::suggest::sanitize(&reply) {
+            Some(text) => {
+                self.suggestion = Some(crate::suggest::Suggestion { text, depth });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forgets any offered suggestion.
+    fn clear_suggestion(&mut self) {
+        self.suggestion = None;
+    }
+
+    /// Whether this keystroke accepts the live suggestion rather than doing
+    /// its ordinary job.
+    ///
+    /// Only over an empty buffer with neither menu open: the completion popup
+    /// and the slash menu own Tab and Enter while they are up, and both have
+    /// already had their turn by the time the key loop asks this. The
+    /// empty-buffer guard is what makes an accept unable to overwrite typed
+    /// text, and Shift/Alt+Enter (newline) and the roster's Enter keep their
+    /// meanings.
+    fn suggestion_accept_key(
+        &self,
+        key: KeyEvent,
+        input: &TuiInput,
+        word_mod: bool,
+        roster_selecting: bool,
+    ) -> bool {
+        input.buf.text().is_empty()
+            && input.popup.is_none()
+            && input.slash.is_none()
+            && self.current_suggestion().is_some()
+            && match key.code {
+                // `roster_selecting` excludes Tab for the same reason it
+                // excludes Enter: with the sub-agent roster selected, Tab
+                // toggles roster focus. Placing the suggestion there would
+                // leave Tab and Enter disagreeing about whose key it is.
+                KeyCode::Tab | KeyCode::Right => !word_mod && !roster_selecting,
+                KeyCode::Enter => {
+                    // CONTROL alongside SHIFT and ALT: Ctrl+Enter submitted
+                    // nothing over an empty prompt before this feature, and
+                    // an accept-and-send is not what it should start meaning.
+                    !key.modifiers.contains(KeyModifiers::SHIFT)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !roster_selecting
+                }
+                _ => false,
+            }
+    }
+
+    /// Puts the offered suggestion into the prompt, cursor at the end, and
+    /// consumes it. The buffer stays editable: Tab places, Enter places and
+    /// then falls through to the ordinary submit arm.
+    fn place_suggestion(&mut self, input: &mut TuiInput) {
+        if let Some(text) = self.current_suggestion().map(str::to_owned) {
+            input.hist_idx = None;
+            input.buf.set_text(&text);
+            input.buf.move_end();
+        }
+        self.clear_suggestion();
+        input.ghost = None;
+    }
+
+    /// The suggestion to offer right now, or `None`.
+    ///
+    /// Depth-checked on every read rather than invalidated by every mutation
+    /// site: a suggestion generated against a different transcript is stale
+    /// even if no explicit clear ran, and checking here means a new
+    /// transcript-moving path cannot forget to invalidate. The explicit
+    /// `clear_suggestion` calls remain for the paths that rewrite history
+    /// *without* changing its length.
+    fn current_suggestion(&self) -> Option<&str> {
+        self.suggestion
+            .as_ref()
+            .filter(|s| s.depth == self.session.transcript.len())
+            .map(|s| s.text.as_str())
+    }
+
+    /// The prompt a job's generation runs, with the engine's KV positioned
+    /// for it. A retry with a snapshot restores it and re-issues the stored
+    /// prompt byte for byte, so the KV is reused to its last token. A first
+    /// attempt (or a retry whose restore failed) renders the live session
+    /// plus the task, prefills it alone, and snapshots that into the job for
+    /// a possible retry — `MemoryResume` says why the order matters. The
+    /// generation's reply still lands on the live transcript and is folded
+    /// away by `end_subagent_fork` as before; only the prompt text differs.
+    /// `Err(interrupted)` mirrors `prefill_memory_prompt`.
+    fn memory_pass_prompt(
+        &mut self,
+        job: &mut crate::memextract::MemoryJob,
+    ) -> Result<String, bool> {
+        if let Some(resume) = job.resume.as_ref() {
+            match self.engine.set_kv(&resume.kv) {
+                Ok(()) => {
+                    crate::engine::kv_debug(|| {
+                        "memory pass: restored the interrupted attempt's prefill".to_owned()
+                    });
+                    return Ok(resume.prompt.clone());
+                }
+                Err(e) => crate::engine::kv_debug(|| {
+                    format!("memory pass: snapshot restore failed ({e}); prefilling afresh")
+                }),
+            }
+            job.resume = None;
+        }
+        let prompt = render_transcript(&recovery_session(&self.session), &self.system);
+        let keep = |kv: Option<crate::kvcache::KVCache>| {
+            kv.map(|kv| crate::memextract::MemoryResume {
+                kv,
+                prompt: prompt.clone(),
+            })
+        };
+        match self.prefill_memory_prompt(&prompt) {
+            MemoryPrefill::Done(kv) => {
+                job.resume = keep(kv);
+                Ok(prompt)
+            }
+            // The partial prefill is kept too: the retry extends it.
+            MemoryPrefill::Interrupted(kv) => {
+                job.resume = keep(kv);
+                Err(true)
+            }
+            MemoryPrefill::Failed => Err(false),
+        }
+    }
+
+    /// Puts a job that did not complete back at the front of the queue: an
+    /// interrupt is not a fault and is not counted; an engine error is, and
+    /// the job is dropped at `MAX_JOB_ATTEMPTS` so a broken engine cannot
+    /// pin the idle loop on one span.
+    fn requeue_memory_job(&mut self, mut job: crate::memextract::MemoryJob, interrupted: bool) {
+        if interrupted {
+            self.memory_jobs.push_front(job);
+            return;
+        }
+        job.attempts = job.attempts.saturating_add(1);
+        if job.attempts < crate::memextract::MAX_JOB_ATTEMPTS {
+            self.memory_jobs.push_front(job);
+        } else {
+            self.note_sidechain_outcome("dropped after repeated engine errors");
+        }
+    }
+
+    /// Runs every queued job to completion, synchronously. For the headless
+    /// paths, which have no idle loop to come back to before they exit; the
+    /// attempt cap and the drop rules in `process_memory_job` are what make
+    /// this terminate. An interrupt abandons the rest of the queue.
+    fn drain_memory_jobs(&mut self) {
+        while self.memory_jobs_pending() {
+            let before = self.memory_jobs.len();
+            self.process_memory_job();
+            if crate::interrupt::pending() {
+                return;
+            }
+            // A job put back at the front without a fault of its own (an
+            // interrupt) would spin here; the check above catches that, and
+            // the attempt cap bounds the fault case.
+            if self.memory_jobs.len() >= before && self.memory_jobs_pending() {
+                let stuck = self.memory_jobs.front().is_some_and(|j| j.attempts == 0);
+                if stuck {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Snapshot and read in one step: the synchronous behaviour, kept for the
+    /// tests, which exercise the gates and the pass together. Returns whether
+    /// a generation ran.
+    #[cfg(test)]
+    fn maybe_extract_memories(&mut self, turn: std::time::Duration) -> bool {
+        self.enqueue_memory_job(turn);
+        self.process_memory_job()
+    }
+
+    /// The memory pass's whole sidechain: one quiet generation, its text
+    /// pushed for the fork end to extract, and **no tool dispatch** — the
+    /// parsed calls are never handed to `run_tool_calls`. Returns whether the
+    /// reply is usable as a verdict list — a reply that asked for a tool, or
+    /// failed preflight, is not — and whether the generation was cut short,
+    /// which the caller reads from the stats because `generate_pass` clears
+    /// the process-wide interrupt flag as it reports it.
+    fn run_memory_round_with(&mut self, prompt_text: &str) -> Result<(bool, bool), String> {
+        let pass = match self.generate_quiet(prompt_text, Instant::now()) {
+            Ok(pass) => pass,
+            Err(abort) => {
+                if !abort.partial.is_empty() {
+                    self.session.push(Message::assistant(abort.partial));
+                }
+                return Err(abort.error);
+            }
+        };
+        let usable = pass.calls.is_empty() && pass.tool_error.is_none();
+        let interrupted = pass.stats.interrupted;
+        self.session.push(Message::assistant(pass.assistant_text));
+        self.note_pass(
+            None,
+            &pass.stats,
+            pass.guard.clone(),
+            pass_stop_text(false, pass.tool_error.as_deref(), pass.calls.len()),
+        );
+        Ok((usable, interrupted))
+    }
+
+    /// Prefills `prompt_text` without sampling a token and returns the KV
+    /// that covers it, for a retry after an interrupt. `Done(None)` on an
+    /// engine with no KV to snapshot (providers, the echo stub), where the
+    /// prefill is skipped as well — a provider call that produces nothing
+    /// would be a round trip for no gain.
+    ///
+    /// An interrupt mid-prefill still yields a snapshot: the engine stops at
+    /// a token boundary and leaves a valid *shorter* KV prefix behind
+    /// (`SYNC_INTERRUPTED`), with the token transcript already reconciled to
+    /// the whole prompt, so a retry that restores it and re-issues the same
+    /// prompt continues the prefill from where it stopped rather than from
+    /// zero. The prefill is the long phase of the pass on a local model, so
+    /// this is the case that matters most.
+    ///
+    /// Runs inside the sidechain's quiet window so its footer status and
+    /// console routing match the generation that follows.
+    fn prefill_memory_prompt(&mut self, prompt_text: &str) -> MemoryPrefill {
+        if self
+            .engine
+            .kv_reuse_probe(prompt_text, self.think)
+            .is_none()
+        {
+            return MemoryPrefill::Done(None);
+        }
+        let mut opts = self.pass_opts();
+        opts.n_predict = 0;
+        let (_done, result) = self.run_sidechain_quietly(|agent| {
+            agent
+                .generate_quiet_with(prompt_text, Instant::now(), &opts)
+                .map(|pass| pass.stats.interrupted)
+                .map_err(|abort| abort.error)
+        });
+        match result {
+            Ok(false) if !crate::interrupt::pending() => MemoryPrefill::Done(self.engine.get_kv()),
+            Ok(_) => MemoryPrefill::Interrupted(self.engine.get_kv()),
+            Err(e) if e == QUIET_ABORT_INTERRUPTED => {
+                MemoryPrefill::Interrupted(self.engine.get_kv())
+            }
+            Err(_) => MemoryPrefill::Failed,
+        }
+    }
+
+    /// The console window a sidechain that never generated still owes its
+    /// fork end, so the dump records an empty window rather than none.
+    fn close_quiet_sidechain(&mut self) -> SubagentDone {
+        let (done, _unit) = self.run_sidechain_quietly(|_agent| Ok::<(), String>(()));
+        done
+    }
+
+    /// Records a memory pass whose reply yielded no verdicts, in the
+    /// sidechain's repro dump (`/repro`) and the per-session counter only.
+    /// Nothing is printed: a pass that found nothing worth keeping is the
+    /// ordinary outcome of most turns, and a line for it was noise.
+    fn note_unusable_memory_reply(&mut self) {
+        self.note_sidechain_outcome("no usable verdicts");
+        self.extract_state.note_unusable_reply();
+    }
+
+    /// Queues one quiet summary line for the next turn boundary to print,
+    /// instead of one line per change — mirrors how `print_job_wake` and its
+    /// TUI counterpart each render their own front end's version of a shared
+    /// event. `run_turn` and `tui_turn_inner` drain
+    /// `pending_memory_notice` right after calling
+    /// [`maybe_extract_memories`](Self::maybe_extract_memories).
+    /// Whether the turn that just ended may be followed by the memory pass:
+    /// not one the user interrupted (`last_turn_interrupted`, set by both
+    /// front ends' cut-off paths), and not one with an interrupt still
+    /// pending from Esc or Ctrl-C. Shared by the pass itself and by the two
+    /// call sites' announcement, so the line and the pass always agree.
+    fn memory_pass_allowed(&self) -> bool {
+        !self.last_turn_interrupted && !crate::interrupt::pending()
+    }
+
+    fn report_memory_changes(&mut self, notes: &[String], elapsed: Duration) {
+        let took = crate::status::format_elapsed(elapsed.as_secs_f64());
+        let summary = match notes {
+            [] => format!("memory completed in {took}"),
+            [one] => format!("memory completed in {took}: {one}"),
+            many => format!("memory completed in {took}: {} update(s)", many.len()),
+        };
+        self.pending_memory_notice = Some(summary);
+    }
+
+    /// Starts a turn driven by finished background jobs rather than a user
+    /// line (plain REPL and headless). Returns `Ok(false)` without generating
+    /// when nothing has finished (`docs/BACKGROUND-TASKS.md` §3.4).
+    ///
+    /// # Errors
+    /// Propagates the turn's engine error.
+    pub fn wake_for_jobs(&mut self) -> Result<bool, String> {
+        let n = self.drain_job_notifications();
+        if n == 0 {
+            return Ok(false);
+        }
+        self.print_job_wake(n);
+        Self::notify_jobs_finished(n);
+        self.run_turn()?;
+        Ok(true)
+    }
+
+    /// Desktop notice for a job finishing while the user is away from the
+    /// prompt; `notify` itself is a no-op when notifications are off.
+    fn notify_jobs_finished(n: usize) {
+        let body = if n == 1 {
+            "A background job finished; plank is reporting on it.".to_string()
+        } else {
+            format!("{n} background jobs finished; plank is reporting on them.")
+        };
+        crate::notify::notify("plank", &body);
+    }
+
+    /// The dim log line announcing that `n` jobs woke the model.
+    fn job_wake_line(n: usize) -> String {
+        if n == 1 {
+            "background job finished; notifying the model".to_string()
+        } else {
+            format!("{n} background jobs finished; notifying the model")
+        }
+    }
+
+    /// Whether an idle wake is pending: at least one background job has
+    /// finished unseen. Cheap (one `try_wait` per job); safe on any tick.
+    pub fn has_finished_jobs(&mut self) -> bool {
+        if !crate::settings::active().tools.bash_notify {
+            return false;
+        }
+        self.tool_ctx.bash.sweep();
+        self.tool_ctx.bash.has_finished()
+    }
+
+    /// `/jobs`: the background job table as static text, shared by both
+    /// front ends so the plain path needs no pane.
+    fn jobs_command(&mut self) -> String {
+        self.tool_ctx.bash.sweep();
+        self.tool_ctx.bash.render_table()
+    }
+
+    /// Opens the `/jobs` panel, or closes it when it is the one showing:
+    /// the footer's jobs segment toggles it on click.
+    fn toggle_jobs_report(&mut self, report: &mut Option<tui::ReportPanel>) {
+        if report
+            .as_ref()
+            .is_some_and(|r| r.title() == JOBS_REPORT_TITLE)
+        {
+            *report = None;
+        } else {
+            *report = Some(tui::ReportPanel::new(
+                JOBS_REPORT_TITLE,
+                &self.jobs_command(),
+            ));
+        }
+    }
+
+    /// Opens the `/context` panel, or closes it when it is the one showing:
+    /// the footer's ctx gauge toggles it on click.
+    fn toggle_context_report(&mut self, report: &mut Option<tui::ReportPanel>) {
+        if report
+            .as_ref()
+            .is_some_and(|r| r.title() == CONTEXT_REPORT_TITLE)
+        {
+            *report = None;
+        } else {
+            *report = Some(tui::ReportPanel::new(
+                CONTEXT_REPORT_TITLE,
+                &self.render_context_report(true),
+            ));
+        }
+    }
+
+    /// Keeps an open `/jobs` panel current: elapsed times count and finished
+    /// jobs change state without the user reopening it.
+    fn refresh_jobs_report(&mut self, report: &mut Option<tui::ReportPanel>) {
+        if report
+            .as_ref()
+            .is_some_and(|r| r.title() == JOBS_REPORT_TITLE)
+        {
+            let text = self.jobs_command();
+            refresh_jobs_panel(report, &text);
+        }
+    }
+
     /// Moves user lines queued during the turn into the transcript between
     /// tool rounds, mirroring the C's `queued_user_drain`. Each line is
     /// already on screen in the log's pending region, so the UI is told to
@@ -12784,6 +15833,13 @@ impl Agent<'_> {
         if is_main {
             let _ = tx.send(UiEvent::MainCheckpoint);
         }
+        // What a mid-turn `/repro` on the UI thread writes: this pass's exact
+        // input, published before the engine takes `self`. Main passes only —
+        // a sub-agent sidechain's transcript is not the user's session, and
+        // is captured as a sidecar of the next main dump instead.
+        if is_main && !self.in_sidechain() {
+            shared.begin_repro_pass(self.repro_base(""));
+        }
         // Held for the whole pass — prefill included, which is most of the wait
         // — so the status bar's brain blinks while *this* engine works. Taken
         // here rather than only in `generate_pass`: that one covers the quiet
@@ -12801,12 +15857,14 @@ impl Agent<'_> {
         // See the matching comment in `stream_generation`: a defensive retry
         // point, cheap when already reconciled, and the backfill for whatever
         // it newly dialed.
+        // Same as the plain path: applied and consumed before the borrows.
+        let pass_opts = self.pass_opts();
         let reconciled = crate::debugmirror::reconcile();
         self.backfill_console(&reconciled);
         // Local engines open `<think>` implicitly in the prefill; provider
         // engines emit explicit tags, so only pre-open for local ones (see the
         // matching note in the plain-REPL path).
-        if !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured() {
+        if pass_opens_in_think(&pass_opts, self.engine.as_ref()) {
             stream.begin_in_think();
             // See the matching comment in `stream_generation`: the mirror
             // needs the same synthetic tag, under the same guard.
@@ -12818,9 +15876,7 @@ impl Agent<'_> {
         // Mirrors the C's worker greedy flag: argmax sampling while the
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
-        let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-            .with_think_budget(REPEAT_THINK_BUDGET)
-            .gated();
+        let mut repeat = turn_repeat_guard(self.engine.ctx_size());
         // Bound before the event closure, which cannot borrow `self` while
         // `self.engine` is generating. The elapsed clock is the turn's, so the
         // footer's seconds accumulate across the generate → tools → generate
@@ -12832,20 +15888,38 @@ impl Agent<'_> {
             self.power_percent,
             self.think,
             self.engine.model_name(),
+            self.tool_ctx.bash.running_count(),
         );
+        shared.set_jobs(self.tool_ctx.bash.rows());
+        shared.set_context(self.context_breakdown());
         let mut assistant_text = String::new();
 
+        // Polled between tokens, and relayed into prefill by the progress
+        // callback. The raise has to happen on this thread: the cancel flag is
+        // thread-local, so the sensor thread cannot set it. It deliberately
+        // does not consult `Hysteresis` — the yield dwell is zero, and the
+        // guards that matter (first turn, sidechain) are checked once after the
+        // pass rather than per token.
+        let pressure = self.sensor.clone();
+        let gate = self.pressure_gate();
         let interrupt = || {
-            shared.interrupt.load(Ordering::Relaxed)
-                || (is_main && shared.preempt.load(Ordering::Relaxed))
-                || preflight_stop.load(Ordering::Relaxed)
-                || crate::interrupt::pending()
+            pressure_tick(
+                &pressure,
+                gate,
+                shared.interrupt.load(Ordering::Relaxed)
+                    || (is_main && shared.preempt.load(Ordering::Relaxed))
+                    || preflight_stop.load(Ordering::Relaxed)
+                    || crate::interrupt::pending(),
+            )
         };
         let greedy_fn = || greedy.load(Ordering::Relaxed);
         let mut on_event = |ev: EngineEvent| {
             if let EngineEvent::Text(t) = &ev {
                 assistant_text.push_str(t);
                 stream.push(t);
+                if is_main {
+                    shared.push_live_pass(t);
+                }
                 // See `stream_generation`: same tee, TUI side.
                 crate::debugmirror::push(t);
                 if stream_chunk_must_stop(&mut repeat, &mut stream, t, &greedy).is_some() {
@@ -12896,7 +15970,7 @@ impl Agent<'_> {
             // denied for an aside, so it needs none of the dispatch machinery.
             let mut aside_renderer = StreamRenderer::new(crate::worker::BtwSink(tx.clone()));
             aside_renderer.set_freeze_on_error(true);
-            aside_renderer.set_show_thinking(crate::settings::active().ui.show_thinking);
+            aside_renderer.set_show_thinking(crate::settings::show_thinking_effective());
             if !matches!(self.think, crate::engine::ThinkMode::Off) {
                 aside_renderer.begin_in_think();
             }
@@ -12907,7 +15981,7 @@ impl Agent<'_> {
                 .generate_multiplexed(
                     prompt,
                     &aside_prompt,
-                    &self.gen_opts,
+                    &pass_opts,
                     &interrupt,
                     &mut |which, ev| match which {
                         crate::engine::AsideStream::Main => on_event(ev),
@@ -12932,16 +16006,23 @@ impl Agent<'_> {
         } else {
             self.engine.generate(
                 engine_prompt,
-                &self.gen_opts,
+                &pass_opts,
                 &interrupt,
                 &greedy_fn,
                 &mut on_event,
             )
         };
 
-        let stats = result.map_err(|e| e.to_string())?;
+        self.note_pressure_stop();
+        // Mirror of the plain path: an engine error ends the turn without a
+        // `finish_pressure_stop`, so the latch has to be cleared here.
+        let stats = result.map_err(|e| {
+            self.pressure_stop = false;
+            e.to_string()
+        })?;
         self.record_usage(&stats);
         self.last_ctx_used = stats.ctx_used;
+        self.last_guard = repeat.snapshot();
         stream.finish();
         crate::debugmirror::flush();
         let finished = stream.finished();
@@ -12980,6 +16061,7 @@ impl Agent<'_> {
         // Consume the interrupt so a queued follow-up turn starts clean.
         shared.interrupt.store(false, Ordering::Relaxed);
         Ok(TurnOutput {
+            stats,
             interrupted,
             preempted,
             assistant_text,
@@ -13088,6 +16170,10 @@ impl Agent<'_> {
         // the interrupt and engine-error paths below.
         let progress = status::CompactProgress::begin();
         let mut summary = String::new();
+        // Mirror of the plain path's compaction guard (`compact`).
+        let pressure = self.sensor.clone();
+        let gate = self.pressure_gate();
+        let interrupt = &|| pressure_tick(&pressure, gate, interrupt());
         let stats = self
             .engine
             .generate(
@@ -13107,13 +16193,25 @@ impl Agent<'_> {
                     sink.redraw();
                 },
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string());
+        // Mirror of the plain path (`compact`).
+        self.note_pressure_stop();
+        let stats = stats.inspect_err(|_| {
+            self.pressure_stop = false;
+        })?;
         drop(progress);
         if stats.interrupted {
             sink.note(COMPACT_INTERRUPTED.to_owned());
+            // Mirror of the plain path: free now rather than at the next
+            // prompt, and free before the cancel reason is cleared (C4).
+            if let Some(line) = self.finish_pressure_stop() {
+                sink.note(line);
+            }
             crate::interrupt::clear();
+            crate::ds4engine::clear_cancel();
             return Ok(Compacted::Interrupted);
         }
+        self.pressure_stop = false;
         let extracted = compact::extract_summary(&summary);
         if extracted.trim().is_empty() {
             sink.note(COMPACT_NO_SUMMARY.to_owned());
@@ -13136,15 +16234,7 @@ impl Agent<'_> {
         self.trace.line(&format!(
             "system prompt reminder injected at transcript={pos}"
         ));
-        let mut text = sysprompt::build_system_prompt_reminder(
-            &self.tool_ctx.mcp,
-            !crate::settings::active().engine.thinking_tool_calls,
-        );
-        if !self.cfg.system.is_empty() {
-            text.push_str("\nAdditional system instructions reminder:\n");
-            text.push_str(&self.cfg.system);
-            text.push_str("\n[End additional system instructions reminder.]\n\n");
-        }
+        let text = self.system_prompt_reminder_text();
         self.session.push(Message::user(text));
     }
 
@@ -13346,7 +16436,9 @@ impl Agent<'_> {
                     }
                 }
             }
-            "/tree" => log.push_ansi(&self.tree_view(true)),
+            "/tree" => {
+                *report = Some(tui::ReportPanel::new("tree", &self.tree_view(true)));
+            }
             "/fork" => match self.fork_branch(arg, true) {
                 Ok(msg) => log.push_ansi(&msg),
                 Err(e) => log.push_plain(e),
@@ -13361,8 +16453,25 @@ impl Agent<'_> {
                 }
             }
             "/version" => log.push_plain(format!("plank {}", crate::logo::version_label())),
-            "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
-            "/context" => log.push_ansi(&self.render_context_report(true)),
+            // The inventory reports below all go to the dismissable panel for
+            // the reason `/usage` does: they are snapshots of state, so in the
+            // scrollback they interleave with the model's output and scroll
+            // away for good.
+            "/mcp" => {
+                *report = Some(tui::ReportPanel::new(
+                    MCP_REPORT_TITLE,
+                    &render_mcp_report(&self.tool_ctx.mcp, true),
+                ));
+            }
+            // A report, not conversation: the same dismissable panel `/usage`
+            // uses, so the breakdown stays in one place instead of scrolling
+            // away inside the model's output.
+            "/context" => {
+                *report = Some(tui::ReportPanel::new(
+                    CONTEXT_REPORT_TITLE,
+                    &self.render_context_report(true),
+                ));
+            }
             // A report, not conversation: it goes in a dismissable panel at
             // the bottom instead of into the scrollback, where it would
             // interleave with the model's output and scroll away for good.
@@ -13372,7 +16481,39 @@ impl Agent<'_> {
                     &self.render_usage_report(true),
                 ));
             }
-            "/init" => self.tui_run_init(log, terminal, view, input, btw, arcade, sub),
+            // A snapshot like `/usage`: the chart belongs in the dismissable
+            // panel, not in the scrollback between the model's output.
+            "/toks" => {
+                *report = Some(tui::ReportPanel::new(TOKS_REPORT_TITLE, &toks_report(true)));
+            }
+            // Re-issuing `/stats` with the panel up cycles the range; an
+            // explicit argument jumps straight to it.
+            "/stats" => {
+                let showing = report
+                    .as_ref()
+                    .and_then(|r| crate::stats::Scope::from_title(r.title()));
+                let scope = match (arg.trim().is_empty(), showing) {
+                    (true, Some(s)) => Some(s.next()),
+                    _ => crate::stats::Scope::parse(arg),
+                };
+                match scope {
+                    Some(scope) => match self.stats_report(scope, true, true) {
+                        Ok(text) => *report = Some(tui::ReportPanel::new(scope.title(), &text)),
+                        Err(e) => log.push_plain(format!("stats failed: {e}")),
+                    },
+                    None => log.push_plain("usage: /stats [7|30|all]".to_string()),
+                }
+            }
+            "/init" => self.tui_run_init(
+                InitSource::UserCommand,
+                log,
+                terminal,
+                view,
+                input,
+                btw,
+                arcade,
+                sub,
+            ),
             "/compact" => {
                 let result = {
                     // A slash command runs on the UI thread, so nothing else is
@@ -13420,12 +16561,12 @@ impl Agent<'_> {
             }
             "/list" => match self.store.list() {
                 Ok(entries) => {
-                    for line in
-                        crate::session::render_session_list(&entries, now_secs(), false).lines()
-                    {
-                        log.push_plain(line.to_owned());
-                    }
+                    *report = Some(tui::ReportPanel::new(
+                        "sessions",
+                        &crate::session::render_session_list(&entries, now_secs(), false),
+                    ));
                 }
+                // A failure is a one-line acknowledgement, not a report.
                 Err(e) => log.push_plain(format!("list failed: {e}")),
             },
             "/switch" => match self
@@ -13489,6 +16630,15 @@ impl Agent<'_> {
             "/mtp" => log.push_plain(self.mtp_command(arg)),
             "/temp" => log.push_plain(self.temp_command(arg)),
             "/loopguard" | "/lg" => log.push_plain(loopguard_command(arg)),
+            "/mc" => log.push_plain(microcompact_command(arg)),
+            // A report, not conversation: the same dismissable panel as
+            // `/usage`, refreshed every tick while open (`refresh_jobs_report`).
+            "/jobs" => {
+                *report = Some(tui::ReportPanel::new(
+                    JOBS_REPORT_TITLE,
+                    &self.jobs_command(),
+                ));
+            }
             "/think" => {
                 // Moving to (or off) `max` changes the effort preamble, which
                 // re-warms the KV inline — long enough to notice. Pin a throbber
@@ -13558,18 +16708,31 @@ impl Agent<'_> {
                 log.push_dim(Self::model_text_command(arg));
             }
             "/skills" => {
-                for line in crate::skills::render_list(&self.skills).lines() {
-                    log.push_plain(line.to_owned());
-                }
+                *report = Some(tui::ReportPanel::new("skills", &self.skills_command(arg)));
             }
+            // A bare `/frame` lists the openable frames, which is a report; with
+            // an argument it opens one, which is an action and stays a line in
+            // the scrollback.
             "/frame" => {
-                for line in self.frame_command(arg).lines() {
-                    log.push_plain(line.to_owned());
+                let out = self.frame_command(arg);
+                if arg.trim().is_empty() {
+                    *report = Some(tui::ReportPanel::new("frames", &out));
+                } else {
+                    for line in out.lines() {
+                        log.push_plain(line.to_owned());
+                    }
                 }
             }
+            // As with `/frame`: bare is the inventory, an argument installs,
+            // removes or trusts and reports its outcome as a line.
             "/plugins" => {
-                for line in self.plugins_command(arg).lines() {
-                    log.push_plain(line.to_owned());
+                let out = self.plugins_command(arg);
+                if arg.trim().is_empty() {
+                    *report = Some(tui::ReportPanel::new("plugins", &out));
+                } else {
+                    for line in out.lines() {
+                        log.push_plain(line.to_owned());
+                    }
                 }
             }
             "/install-claude-plugin" => {
@@ -13583,29 +16746,25 @@ impl Agent<'_> {
                 }
             }
             "/templates" => {
-                for line in crate::templates::render_list(&self.templates).lines() {
-                    log.push_plain(line.to_owned());
-                }
+                *report = Some(tui::ReportPanel::new(
+                    "templates",
+                    &crate::templates::render_list(&self.templates),
+                ));
             }
             "/tasks" => {
-                for line in self
-                    .session
-                    .tasks
-                    .render_list(self.session.goal.as_ref())
-                    .lines()
-                {
-                    log.push_plain(line.to_owned());
-                }
+                *report = Some(tui::ReportPanel::new(
+                    TASKS_REPORT_TITLE,
+                    &self.session.tasks.render_list(self.session.goal.as_ref()),
+                ));
             }
             "/agent" => {
-                for line in crate::agents::render_list(&self.agents).lines() {
-                    log.push_plain(line.to_owned());
-                }
+                *report = Some(tui::ReportPanel::new(
+                    "agents",
+                    &crate::agents::render_list(&self.agents),
+                ));
             }
             "/hooks" => {
-                for line in crate::hooks::render_list(&self.tool_ctx.hooks).lines() {
-                    log.push_plain(line.to_owned());
-                }
+                *report = Some(tui::ReportPanel::new("hooks", &self.hooks_command(arg)));
             }
             "/remote-control" | "/rc" => {
                 for line in self.remote_toggle_lines(cmd, arg) {
@@ -13633,6 +16792,77 @@ impl Agent<'_> {
                     log.push_plain("usage: /remember [user] <text> (default scope: project)");
                 }
             },
+            "/forget" => {
+                let pattern = arg.trim();
+                if pattern.is_empty() {
+                    log.push_plain("usage: /forget <pattern>");
+                } else {
+                    let hits = crate::memory::forget_preview(&self.tool_ctx.cwd, pattern);
+                    if hits.is_empty() {
+                        log.push_plain(format!("nothing matched {pattern:?}"));
+                    } else {
+                        log.push_plain("this will remove:");
+                        for h in &hits {
+                            log.push_dim(format!("  {h}"));
+                        }
+                        let question = format!(
+                            "remove {} matching {pattern:?}?",
+                            if hits.len() == 1 {
+                                "this entry"
+                            } else {
+                                "these entries"
+                            }
+                        );
+                        let confirmed = run_yes_no_panel(
+                            terminal,
+                            &*log,
+                            view,
+                            "Forget",
+                            &question,
+                            ("Keep it", "cancel and leave memory unchanged"),
+                            ("Forget", "remove the matching entries now"),
+                        );
+                        if confirmed {
+                            match crate::memory::forget_matching(&self.tool_ctx.cwd, pattern) {
+                                Ok(removed) => {
+                                    for r in &removed {
+                                        log.push_dim(format!("forgot {r}"));
+                                    }
+                                }
+                                Err(e) => log.push_plain(e),
+                            }
+                        } else {
+                            log.push_plain("forget cancelled");
+                        }
+                    }
+                }
+            }
+            // `/memory log` is static text, on both front ends: it is the
+            // static-text equivalent the plain-stdout path relies on, so it
+            // must not gain a pane the plain path lacks.
+            // Static text like `/memory log`. The run is long (two asks per
+            // span, each a re-prefill on DeepSeek), so the screen is handed
+            // back to plain stdout for its progress lines rather than leaving
+            // a frozen frame.
+            "/memory" if arg.trim() == "calibrate" || arg.trim().starts_with("calibrate ") => {
+                let rest = arg.trim().strip_prefix("calibrate").unwrap_or("");
+                let text = with_tui_suspended(terminal, || {
+                    self.gate_calibrate_command(rest, &mut |line| println!("{line}"))
+                });
+                for line in text.lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
+            "/memory" if arg.trim() == "log" => {
+                let entries = crate::memory::read_log(20);
+                if entries.is_empty() {
+                    log.push_plain("no memory changes logged yet");
+                } else {
+                    for line in entries {
+                        log.push_plain(render_memory_log_line(&line));
+                    }
+                }
+            }
             "/memory" => self.tui_memory(log, terminal),
             "/search" => {
                 if arg.trim().is_empty() {
@@ -13758,7 +16988,7 @@ impl Agent<'_> {
                     None => (
                         None,
                         None,
-                        "sub-agent".to_string(),
+                        self.next_unnamed_subagent_label(),
                         arg.to_string(),
                         "[subagent started]".to_string(),
                     ),
@@ -13996,6 +17226,23 @@ impl Agent<'_> {
     }
 }
 
+/// Renders one `memory-log.jsonl` line (as written by
+/// [`crate::memory::log_change`]) as a single human-readable line, for
+/// `/memory log` on both front ends. Falls back to the raw line if it is not
+/// the expected JSON shape, so a hand-edited or malformed line still shows.
+fn render_memory_log_line(line: &str) -> String {
+    use crate::tools::mcp::json_parse;
+    let Some(json) = json_parse(line) else {
+        return line.to_string();
+    };
+    let action = json.str_or("action", "?");
+    let scope = json.str_or("scope", "?");
+    let id = json.str_or("id", "?");
+    let text = json.str_or("text", "");
+    let reason = json.str_or("reason", "");
+    format!("{action:<7} [{scope}] {id} — {text} ({reason})")
+}
+
 /// Asks a yes/no question at the plain-stdout prompt and returns the answer.
 /// Only an explicit yes counts; a closed or unreadable stdin declines, which is
 /// what keeps a piped run from silently agreeing to overwrite something.
@@ -14020,6 +17267,41 @@ fn ask_yes_no_on_stdin(question: &str, prompt: &str) -> bool {
         return false;
     }
     matches!(answer.trim(), "y" | "Y" | "yes")
+}
+
+/// The plain-REPL form of the startup `AGENTS.md` offer: `y` (or Enter, the
+/// same default as the TUI panel) generates, `d` stops asking for this folder,
+/// anything else starts the session without one. A piped stdin is somebody
+/// else's protocol stream, so it is never read: the offer is declined.
+fn ask_agentsmd_offer_on_stdin() -> crate::agentsmd::Offer {
+    use crate::agentsmd::{OFFER_OPTIONS, OFFER_QUESTION, Offer};
+    if !std::io::stdin().is_terminal() {
+        println!("{OFFER_QUESTION} — declined (stdin is not a terminal)");
+        return Offer::NotNow;
+    }
+    println!("{OFFER_QUESTION}");
+    for (_, label, description) in &OFFER_OPTIONS {
+        println!("  {label} — {description}");
+    }
+    print!("generate it? [Y/n/d] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return Offer::NotNow;
+    }
+    parse_agentsmd_offer(&answer)
+}
+
+/// Maps a `[Y/n/d]` line to an [`Offer`](crate::agentsmd::Offer): empty
+/// and `y`/`yes` generate, `d`/`don't`/`dont` skip the folder, anything else
+/// is "Not now".
+fn parse_agentsmd_offer(answer: &str) -> crate::agentsmd::Offer {
+    use crate::agentsmd::Offer;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Offer::Generate,
+        "d" | "dont" | "don't" => Offer::DontAskHere,
+        _ => Offer::NotNow,
+    }
 }
 
 /// Asks a yes/no question in the TUI, reusing the `ask` tool's option panel
@@ -14058,32 +17340,69 @@ fn run_yes_no_panel(
     no: (&str, &str),
     yes: (&str, &str),
 ) -> bool {
+    run_pick_panel(terminal, log, view, header, question, &[no, yes]) == Some(1)
+}
+
+/// The startup `AGENTS.md` offer as a three-way panel. Generate is listed
+/// first so Enter alone takes it; Escape and Ctrl-C answer "Not now", the
+/// answer that changes nothing on disk and asks again next time.
+fn run_agentsmd_offer_panel(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+) -> crate::agentsmd::Offer {
+    use crate::agentsmd::{OFFER_OPTIONS, OFFER_QUESTION, Offer};
+    let labels: Vec<(&str, &str)> = OFFER_OPTIONS.iter().map(|(_, l, d)| (*l, *d)).collect();
+    run_pick_panel(terminal, log, view, "AGENTS.md", OFFER_QUESTION, &labels)
+        .and_then(|i| OFFER_OPTIONS.get(i))
+        .map_or(Offer::NotNow, |(o, _, _)| *o)
+}
+
+/// Records "Don't ask for this folder" for the current directory. Returns the
+/// warning to show when the choice could not be saved, so the offer will come
+/// back next time and the user knows why.
+fn skip_agentsmd_offer_here() -> Option<String> {
+    std::env::current_dir()
+        .map_err(|e| e.to_string())
+        .and_then(|cwd| crate::agentsmd::skip(&cwd))
+        .err()
+        .map(|e| format!("could not remember the choice: {e}"))
+}
+
+/// A single-choice panel over `options` (`(label, description)` pairs),
+/// drawn with the `ask` tool's panel so every question plank asks looks the
+/// same. The cursor starts on the first option, so callers list the answer a
+/// stray Enter should pick first. Returns the chosen index, or `None` on
+/// Escape, Ctrl-C, or a terminal that can no longer be drawn.
+fn run_pick_panel(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+    header: &str,
+    question: &str,
+    options: &[(&str, &str)],
+) -> Option<usize> {
     use crate::tools::ask::{AskOption, AskRequest, AskState};
     let req = AskRequest {
         question: question.to_owned(),
         header: header.to_owned(),
-        options: vec![
-            AskOption {
-                label: no.0.to_owned(),
-                description: no.1.to_owned(),
-            },
-            AskOption {
-                label: yes.0.to_owned(),
-                description: yes.1.to_owned(),
-            },
-        ],
+        options: options
+            .iter()
+            .map(|(label, description)| AskOption {
+                label: (*label).to_owned(),
+                description: (*description).to_owned(),
+            })
+            .collect(),
         multi: false,
         allow_chat: false,
     };
-    // Cursor starts on the first option, so the safe answer is the one a stray
-    // Enter picks.
     let mut state = AskState::new(req.options.len(), false);
     loop {
         if terminal
             .draw(|f| tui::draw_ask(f, log, &req, &state, "", view, &tui::TaskView::default()))
             .is_err()
         {
-            return false;
+            return None;
         }
         let Ok(Some(Event::Key(key))) = next_event(None, Duration::from_millis(100)) else {
             continue;
@@ -14094,9 +17413,9 @@ fn run_yes_no_panel(
         match key.code {
             KeyCode::Up => state.move_up(),
             KeyCode::Down => state.move_down(),
-            KeyCode::Enter => return state.cursor == 1,
-            KeyCode::Esc => return false,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Enter => return Some(state.cursor),
+            KeyCode::Esc => return None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return None,
             _ => {}
         }
     }
@@ -14268,39 +17587,96 @@ fn await_yes_default() -> Result<bool, String> {
     }
 }
 
-/// `/loopguard [on|off]` — arm or silence every loop guard, reporting the
-/// state with no argument.
-///
-/// Written to the live settings rather than to a field on `self`, and not
-/// saved to disk: the guards are checked from several threads and from
-/// code that has no agent to ask ([`crate::guard::guards_enabled`]), and a
-/// switch thrown to watch one runaway turn is not a preference. Because
-/// every rung re-reads the setting at each check, this also takes effect
-/// on a turn that is already generating — which is the point: the moment
-/// you want the guards out of the way is while they are firing.
-#[must_use]
-pub fn loopguard_command(arg: &str) -> String {
-    let (want, reply) = loopguard_reply(arg, crate::guard::guards_enabled());
+/// `/mc [on|off]` changes only the live micro-compaction setting, not disk
+/// preferences or full summarization. All micro-compaction gates read it live.
+fn microcompact_command(arg: &str) -> String {
+    let (want, reply) = microcompact_reply(arg, crate::settings::active().context.microcompact);
     if let Some(want) = want {
         let mut settings = crate::settings::active().clone();
-        settings.tools.loop_guards = want;
+        settings.context.microcompact = want;
         crate::settings::reinstall(settings);
     }
     reply
 }
 
-/// [`loopguard_command`]'s decision: the new setting to install (`None` to
-/// leave it alone) and the line to show, given the current state.
+fn microcompact_reply(arg: &str, on: bool) -> (Option<bool>, String) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return (
+            None,
+            format!("micro-compaction: {}", if on { "on" } else { "off" }),
+        );
+    }
+    let want = match arg {
+        "on" => true,
+        "off" => false,
+        _ => return (None, format!("/mc: expected on|off, got `{arg}`")),
+    };
+    if want == on {
+        (None, format!("micro-compaction already {arg}"))
+    } else {
+        (
+            Some(want),
+            format!("micro-compaction: {arg} (this session)"),
+        )
+    }
+}
+
+/// `/loopguard [on|off]` — arm or silence every loop guard for this session,
+/// reporting the effective state with no argument.
+///
+/// A session *override* layer ([`crate::settings::set_loop_guards_override`]),
+/// never the persisted `tools.loopGuards` and never disk — the same shape as
+/// the footer brain's `show_thinking` override (`think_show_click`). The
+/// guard defaults on as a *protection*; turning it off is a diagnostic act,
+/// not a preference, and a protection left silently disabled across future
+/// sessions gives no signal until a runaway generation burns tokens with
+/// nothing pointing at the cause. An earlier implementation cloned the live
+/// settings, flipped `tools.loop_guards` and reinstalled them: it did not
+/// save either, but it left the flipped value inside the live `Settings`, so
+/// the next `/config <any key>` — which clones `active()` and writes the
+/// *whole* object — silently baked it into `settings.json`. Holding the
+/// value outside `Settings` is what closes that hole.
+///
+/// `/config tools.loopGuards` is still the way to make it stick permanently,
+/// and clears the override so the value just typed is plainly the one in
+/// force. The override survives `/clear` and `/new` — it is process state,
+/// not session state, because the investigation it supports outlives a
+/// context reset.
+///
+/// Because [`crate::guard::guards_enabled`] re-reads the effective value at
+/// every check, this also takes effect on a turn that is already
+/// generating — the point is to get the guards out of the way while they
+/// are firing.
+#[must_use]
+pub fn loopguard_command(arg: &str) -> String {
+    let (want, reply) = loopguard_reply(arg, crate::settings::loop_guards_effective());
+    if let Some(want) = want {
+        crate::settings::set_loop_guards_override(Some(want));
+    }
+    reply
+}
+
+/// [`loopguard_command`]'s decision: the new override to install (`None` to
+/// leave it alone) and the line to show, given the current effective state.
 ///
 /// Split out so the wording and the state machine are testable without
-/// reinstalling the process-wide settings — a global set mid-run leaks into
+/// touching the process-wide override — a global set mid-run leaks into
 /// every test running in parallel, exactly as `FINDINGS.md` warns.
 fn loopguard_reply(arg: &str, on: bool) -> (Option<bool>, String) {
     let arg = arg.trim();
     if arg.is_empty() {
         return (
             None,
-            format!("loop guards: {}", if on { "on" } else { "off" }),
+            format!(
+                "loop guards: {}{}",
+                if on { "on" } else { "off" },
+                if crate::settings::loop_guards_override().is_some() {
+                    " (session override; /config tools.loopGuards to persist)"
+                } else {
+                    ""
+                }
+            ),
         );
     }
     let want = match arg {
@@ -14316,9 +17692,9 @@ fn loopguard_reply(arg: &str, on: bool) -> (Option<bool>, String) {
     (
         Some(want),
         if want {
-            "loop guards on".to_owned()
+            "loop guards on (this session)".to_owned()
         } else {
-            "loop guards off — nothing will stop a repeating turn but you".to_owned()
+            "loop guards off (this session) — nothing will stop a repeating turn but you".to_owned()
         },
     )
 }
@@ -14332,7 +17708,6 @@ fn loopguard_reply(arg: &str, on: bool) -> (Option<bool>, String) {
 /// cheap next to the prefill/decoding the turn is about to do. Commands not
 /// listed here still tell the user to wait for the turn to finish.
 struct LiveCommands {
-    context: String,
     usage: String,
     mcp: String,
 }
@@ -14341,7 +17716,6 @@ impl LiveCommands {
     /// Captures the read-only reports before the worker takes the engine.
     fn capture(agent: &Agent<'_>) -> Self {
         Self {
-            context: agent.render_context_report(true),
             usage: agent.render_usage_report(true),
             mcp: render_mcp_report(&agent.tool_ctx.mcp, true),
         }
@@ -14350,12 +17724,14 @@ impl LiveCommands {
     /// ANSI output for a read-only command runnable mid-turn, or `None` when
     /// the command must wait for the turn to finish. `/help` is static, so it
     /// is rendered on demand rather than snapshotted.
-    fn output(&self, cmd: &str) -> Option<std::borrow::Cow<'_, str>> {
+    ///
+    /// `/context`, `/usage` and `/mcp` are absent on purpose: all three go to
+    /// the report panel rather than the scrollback, so the mid-turn loop reads
+    /// their snapshots (`context`, `usage`, `mcp`) directly instead of
+    /// streaming them.
+    fn output(cmd: &str) -> Option<std::borrow::Cow<'static, str>> {
         use std::borrow::Cow;
         match cmd {
-            "/context" => Some(Cow::Borrowed(self.context.as_str())),
-            "/usage" => Some(Cow::Borrowed(self.usage.as_str())),
-            "/mcp" => Some(Cow::Borrowed(self.mcp.as_str())),
             "/help" => Some(Cow::Owned(crate::config::usage())),
             "/version" => Some(Cow::Owned(format!(
                 "plank {}",
@@ -14367,6 +17743,18 @@ impl LiveCommands {
             _ => None,
         }
     }
+}
+
+/// The six front-end handles a quiet background pass hands on to
+/// [`run_worker_ui`], bundled so [`Agent::tui_quiet_pass`] can take them
+/// alongside a body closure without growing its argument list.
+struct TuiHandles<'a> {
+    log: &'a mut OutputLog,
+    view: &'a mut tui::OutputView,
+    input: &'a mut TuiInput,
+    btw: &'a mut BtwPanel,
+    arcade: &'a mut crate::arcade::Arcade,
+    sub: &'a mut tui::SubPane,
 }
 
 /// Runs `job` on a scoped worker thread while the UI thread keeps the
@@ -14424,9 +17812,61 @@ fn run_worker_ui<T: Send>(
         let out = handle
             .join()
             .map_err(|_| "worker thread panicked".to_owned());
+        // The worker is gone, so the figures it published are history: the
+        // rule below the prompt goes back to a plain line at idle. The row is
+        // then rewritten straight to the terminal (`repaint_rule_bottom`)
+        // rather than left to the frame diff: a label glyph the terminal
+        // draws wider than ratatui measures leaves a cell the diff believes
+        // unchanged and the terminal shows blank — a notch in the rule where
+        // the figures were. Only that row; a whole-screen clear flickers.
+        tui::set_perf_text("");
+        tui::repaint_rule_bottom(terminal);
         ui?;
         out
     })
+}
+
+/// The override a click on the footer's brain installs, and the flash tip it
+/// leaves behind.
+///
+/// Pure, and taking the currently effective value rather than reading it, so
+/// the whole of what the gesture decides is testable: the click always sets an
+/// explicit override (never `None`), and applying it twice returns the original
+/// value.
+fn think_show_toggled(effective: bool) -> (bool, String) {
+    let next = !effective;
+    let tip = format!(
+        "{} thinking {} (this session)",
+        crate::status::THINK_MARK,
+        if next { "shown" } else { "hidden" }
+    );
+    (next, tip)
+}
+
+/// A click on the footer's brain flips thinking display for this session only.
+///
+/// A session *override* layer, never the persisted setting and never disk. A
+/// glyph you can hit by accident must not rewrite `settings.json`, and showing
+/// thinking is a "what do I want to watch right now" decision, not a
+/// preference. The earlier implementation cloned the settings, flipped
+/// `ui.show_thinking` and reinstalled them: it did not save, but it left the
+/// clicked value inside the live `Settings`, so the next `/config <any key>` —
+/// which clones `active()` and writes the *whole* object — silently baked it
+/// into `settings.json`. Holding the value outside `Settings` is what closes
+/// that hole.
+///
+/// `/config ui.showThinking` is still the way to make it stick, and clears the
+/// override so the value the user just typed is plainly the one in force.
+///
+/// Nothing caches the value: `configure_stream` and `PassCtx` both read
+/// [`crate::settings::show_thinking_effective`] when a pass starts, so the next
+/// generation observes the flip. Feedback is a flash tip rather than a log
+/// line — the answer belongs next to the glyph that was clicked, and it must
+/// not push the output pane around mid-turn.
+fn think_show_click() {
+    let (next, tip) = think_show_toggled(crate::settings::show_thinking_effective());
+    crate::settings::set_show_thinking_override(Some(next));
+    crate::status::set_flash_tip(tip);
 }
 
 /// How long an unacknowledged interrupt waits before a second Ctrl-C is taken
@@ -14437,6 +17877,27 @@ fn run_worker_ui<T: Send>(
 /// reaching for `kill`.
 const FORCE_QUIT_GRACE: Duration = Duration::from_secs(2);
 
+/// Set when the user confirms a mid-turn `/exit`: the busy loop interrupts the
+/// worker, and once the turn has stopped the TUI leaves instead of running the
+/// queued lines or returning to the prompt. Process-wide because the request
+/// is made on the UI thread inside `busy_ui_loop` and consumed two frames up,
+/// in `tui_turn_inner` and `tui_loop`.
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// True once a mid-turn `/exit` has been confirmed.
+fn quit_requested() -> bool {
+    QUIT_REQUESTED.load(Ordering::Relaxed)
+}
+
+/// Border title of the mid-turn `/exit` confirmation panel; while it is up,
+/// the busy loop's keys answer the question instead of editing the prompt.
+const EXIT_CONFIRM_TITLE: &str = "exit";
+
+/// The mid-turn `/exit` question. No is the default: Enter, Esc and any other
+/// key keep the turn running, only `y` stops it.
+const EXIT_CONFIRM_TEXT: &str =
+    "The model is still working. Interrupt the turn and quit plank? [y/N]";
+
 /// Last resort when the worker will not stop: restore the terminal and leave.
 ///
 /// This exits the *process*, not the turn. The worker runs on a scoped thread
@@ -14446,7 +17907,7 @@ const FORCE_QUIT_GRACE: Duration = Duration::from_secs(2);
 /// and with the stream idle timeout in [`crate::remote`] it should never be
 /// reached in the network-drop case that motivated it.
 fn force_quit() -> ! {
-    ratatui::restore();
+    restore_terminal();
     // No destructor here can run (see above), so the mirror gets its farewell
     // explicitly or not at all — and this is the exit where a console left
     // hanging mid-stream most needs to be told what happened.
@@ -14512,6 +17973,11 @@ fn escalation_clock(
     }
 }
 
+/// How often the busy window-title glyph advances a frame. Slow on purpose:
+/// a title change is a whole-window repaint in most terminals, and the tab
+/// strip is read in glances, not watched.
+const TITLE_TICK: Duration = Duration::from_millis(400);
+
 /// UI-thread event loop while a worker job runs: applies streamed render
 /// events to the log, keeps the prompt editable (Enter queues the line for
 /// the worker), scrolls, and maps Esc/Ctrl-C to a worker interrupt.
@@ -14533,6 +17999,10 @@ fn busy_ui_loop(
     done: impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut status_line = String::new();
+    // A `/usage` report shown mid-turn goes in this dismissable panel — the
+    // same treatment as at idle — instead of being dumped into the scrollback
+    // where it interleaves with the model's streaming output.
+    let mut report: Option<tui::ReportPanel> = None;
     // Latest task-list snapshot (issue #35), updated on every `UiEvent::Tasks`
     // and passed to `draw` for the status-bar counter and the contextual strip.
     let mut task_view = tui::TaskView::default();
@@ -14565,6 +18035,10 @@ fn busy_ui_loop(
     // it. Rows are absolute wrapped-row indices, so the selection stays on its
     // text as new output arrives underneath it.
     let mut selection = tui::DragSelect::default();
+    // Context tokens resident as of the last status snapshot, which counts up
+    // with every generated token. What makes an open `/context` panel fill
+    // live rather than sitting on the last boundary's figure.
+    let mut live_ctx_used = 0i32;
     // True while the progress line is showing the compaction bar, so it is
     // cleared exactly once when the pass ends.
     let mut compacting_line = false;
@@ -14580,6 +18054,7 @@ fn busy_ui_loop(
     // loop: render events arrive irregularly, so the frame delta has to be
     // measured rather than inferred from the poll timeout.
     let mut arcade_last = Instant::now();
+    let mut title_last = Instant::now();
     loop {
         interrupt_at = escalation_clock(
             interrupt_at,
@@ -14590,6 +18065,13 @@ fn busy_ui_loop(
             let dt = arcade_last.elapsed();
             arcade_last = Instant::now();
             arcade.step(u64::try_from(dt.as_millis()).unwrap_or(u64::MAX));
+        }
+        // The window-title glyph steps once every `TITLE_TICK`, whatever
+        // the poll cadence below is doing (`title::tick` is a no-op unless a
+        // busy title is up).
+        if title_last.elapsed() >= TITLE_TICK {
+            title_last = Instant::now();
+            crate::title::tick();
         }
         // An `ask` question parked by the worker takes over the input region
         // until answered; the worker is blocked meanwhile, so no render events
@@ -14627,9 +18109,30 @@ fn busy_ui_loop(
                     // lives on a line pinned below the output, not in the
                     // footer — independent of showThinking.
                     status_line = status::build_status_text(&st, false, false);
-                    log.set_progress(
-                        status::progress_segment(&st, false).map(|p| tui::progress_line(&p)),
-                    );
+                    // The figures that move go to the rule below the prompt;
+                    // the pinned line keeps the throbber, the verb and the
+                    // clock. Cleared when the worker ends (`run_worker_ui`),
+                    // so an idle prompt sits over a plain rule.
+                    if let Some(perf) = status::perf_segment(&st) {
+                        tui::set_perf_text(&perf);
+                    }
+                    let progress = status::progress_brief(&st);
+                    // While a sub-agent holds the engine the live readout —
+                    // verb, elapsed, tokens, t/s — is *its* pass, so it belongs
+                    // on its own pane. The main transcript only reports that it
+                    // is waiting, or the parent looks like it is the one
+                    // generating.
+                    let waiting = (sub.running() && progress.is_some())
+                        .then(|| status::subagent_wait_segment(sub.label()));
+                    match waiting {
+                        Some(waiting) => {
+                            if let Some(sub_log) = sub.current_log_mut() {
+                                sub_log.set_progress(progress.as_deref().map(tui::progress_line));
+                            }
+                            log.set_progress(Some(tui::progress_line(&waiting)));
+                        }
+                        None => log.set_progress(progress.as_deref().map(tui::progress_line)),
+                    }
                     // The snapshot describes whichever pass the engine is
                     // running, so while a lone sub-agent holds it, it is that
                     // sub-agent's — and the only live token count its roster row
@@ -14643,8 +18146,30 @@ fn busy_ui_loop(
                     if let (true, Some(label)) = (sub.active, sub.label()) {
                         status_line = format!("[sub-agent: {label}] {status_line}");
                     }
+                    live_ctx_used = st.ctx_used;
+                    // Every status tick redraws the chart while the panel is
+                    // up, so the newest second lands as soon as it is sampled.
+                    if let Some(panel) = report.as_mut().filter(|r| r.title() == TOKS_REPORT_TITLE)
+                    {
+                        panel.set_text(&toks_report(true));
+                    }
+                    // Same for the context panel: the breakdown is whatever the
+                    // worker last published, the fill is this snapshot's.
+                    if let Some(panel) = report
+                        .as_mut()
+                        .filter(|r| r.title() == CONTEXT_REPORT_TITLE)
+                    {
+                        panel.set_text(&live_context_report(shared, live_ctx_used));
+                    }
                 }
-                UiEvent::Tasks(tv) => task_view = tv,
+                UiEvent::Tasks(tv) => {
+                    task_view = tv;
+                    // An open `/tasks` panel follows the list as tools rewrite it.
+                    if let Some(panel) = report.as_mut().filter(|r| r.title() == TASKS_REPORT_TITLE)
+                    {
+                        panel.set_text(task_view.report());
+                    }
+                }
                 UiEvent::BtwBegin => {
                     if btw.is_none() {
                         *btw = Some((OutputLog::new(), tui::OutputView::default()));
@@ -14671,7 +18196,14 @@ fn busy_ui_loop(
                 UiEvent::SubStart { label, task } => {
                     sub.on_sub_start(label, &task, tui::roster_clock_ms());
                 }
-                UiEvent::SubEnd => sub.on_sub_end(tui::roster_clock_ms()),
+                UiEvent::SubEnd => {
+                    // The run is finished: its pinned progress would otherwise
+                    // stay frozen on the last verb it was given.
+                    if let Some(sub_log) = sub.current_log_mut() {
+                        sub_log.set_progress(None);
+                    }
+                    sub.on_sub_end(tui::roster_clock_ms());
+                }
                 // Addressed to the current run. Before any run has started there
                 // is no buffer to write to, so it falls back to the transcript
                 // rather than dropping the output on the floor.
@@ -14748,6 +18280,27 @@ fn busy_ui_loop(
         // must clear while the turn is still running.
         let now = tui::roster_clock_ms();
         sub.expire_rows(now);
+        // An open `/jobs` panel follows the worker's latest snapshot, with
+        // elapsed times counted at draw time.
+        if report
+            .as_ref()
+            .is_some_and(|r| r.title() == JOBS_REPORT_TITLE)
+        {
+            refresh_jobs_panel(&mut report, &shared.jobs_report());
+        }
+        // Commit any markdown tail the render throttle deferred, on the draw
+        // clock. A generation that stops emitting visible text to open a tool
+        // stanza never calls back into `visible_text`, so without this the last
+        // tokens of the sentence stay off screen until the tool result closes
+        // the segment (the sentence appearing to complete itself when the tool
+        // returns).
+        log.md_tick();
+        if let Some((btw_log, _)) = btw.as_mut() {
+            btw_log.md_tick();
+        }
+        for run in &mut sub.runs {
+            run.log.md_tick();
+        }
         let sub_active = sub.active;
         // Owned for the same reason: the selected run's view is borrowed mutably
         // below, so nothing else may hold a borrow of the pane across the draw.
@@ -14766,7 +18319,17 @@ fn busy_ui_loop(
             };
         // The turn owns the engine: the prompt still takes keystrokes (they
         // queue), but plank is not waiting on you, so the cursor goes red.
-        crate::cursor::set(crate::cursor::State::Busy);
+        //
+        // A quiet background pass — prompt prediction, the memory pass — is
+        // the opposite case and keeps the cursor green. Nothing was asked
+        // for, plank *is* waiting on you, and a keystroke does not merely
+        // queue: it interrupts the pass and becomes the next turn. Painting
+        // it red says "wait for me" about work the user never started.
+        crate::cursor::set(if shared.memory_pass.load(Ordering::Relaxed) {
+            crate::cursor::State::Idle
+        } else {
+            crate::cursor::State::Busy
+        });
         terminal
             .draw(|f| {
                 // The `/btw` split is about the main task, so it steps aside
@@ -14801,6 +18364,11 @@ fn busy_ui_loop(
                 }
                 if let Some(p) = &input.popup {
                     tui::draw_popup(f, input.buf.text(), p, roster_rows);
+                }
+                // The `/usage` report panel, anchored above the input like the
+                // slash menu; the turn keeps streaming into the log behind it.
+                if let Some(panel) = report.as_mut() {
+                    tui::draw_report(f, Some(input.buf.text()), panel, roster_rows);
                 }
                 // Drawn last, over the live turn. Translucent by default here,
                 // so the model's output keeps streaming legibly underneath.
@@ -14908,6 +18476,37 @@ fn busy_ui_loop(
                 // Alt (Option on macOS) or Ctrl turns arrows and
                 // Backspace/Delete into word-wise operations.
                 let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
+                // The `/exit` confirmation owns the next key: `y` interrupts
+                // the worker and quits once it stops, anything else keeps the
+                // turn running. Ahead of every other binding so the answer
+                // cannot leak into the prompt or interrupt the turn by itself.
+                if report
+                    .as_ref()
+                    .is_some_and(|r| r.title() == EXIT_CONFIRM_TITLE)
+                {
+                    report = None;
+                    if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                        QUIT_REQUESTED.store(true, Ordering::Relaxed);
+                        log.push_dim("[quitting as soon as the turn stops]");
+                        raise_worker_interrupt(shared);
+                        // A worker parked on `ask` never polls the flag.
+                        if let Some(bridge) = ask
+                            && bridge.is_pending()
+                        {
+                            bridge.respond(crate::tools::ask::AskOutcome::Interrupted);
+                        }
+                        // Armed like Esc, so a wedged worker can still be
+                        // escaped with the Ctrl-C escalation.
+                        interrupt_at = escalation_clock(
+                            interrupt_at,
+                            shared.interrupt.load(Ordering::Relaxed),
+                            Instant::now(),
+                        );
+                    } else {
+                        log.push_dim("[still running]");
+                    }
+                    continue;
+                }
                 match key.code {
                     // The roster keys, mirroring the idle loop — mid-turn is
                     // exactly when reaching into a running agent matters.
@@ -14917,7 +18516,7 @@ fn busy_ui_loop(
                             && (sub.selecting || key.code == KeyCode::Left) =>
                     {
                         let delta = if key.code == KeyCode::Left { -1 } else { 1 };
-                        if !sub.move_cursor(delta) {
+                        if !sub.move_cursor(delta, tui::roster_clock_ms()) {
                             log.push_dim("[no sub-agent has run yet]");
                         }
                     }
@@ -14927,13 +18526,27 @@ fn busy_ui_loop(
                         }
                     }
                     KeyCode::Tab if !word_mod => {
-                        if !sub.toggle_focus() {
+                        if !sub.toggle_focus(tui::roster_clock_ms()) {
                             log.push_dim("[no sub-agent has run yet]");
                         }
                     }
                     // Esc leaves the roster before it interrupts the turn: the
                     // roster is what the user is looking at, and an accidental
                     // interrupt here would be expensive.
+                    // A `/usage` report panel is the most modal thing on
+                    // screen, so Esc dismisses it before it can collapse the
+                    // roster or interrupt the turn.
+                    KeyCode::Esc if report.is_some() => report = None,
+                    KeyCode::PageUp if report.is_some() => {
+                        if let Some(panel) = report.as_mut() {
+                            panel.scroll(-5);
+                        }
+                    }
+                    KeyCode::PageDown if report.is_some() => {
+                        if let Some(panel) = report.as_mut() {
+                            panel.scroll(5);
+                        }
+                    }
                     KeyCode::Esc if sub.collapse() => {}
                     KeyCode::Esc => {
                         close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
@@ -14991,7 +18604,20 @@ fn busy_ui_loop(
                         let line = input.buf.text().trim().to_owned();
                         input.buf.clear();
                         input.hist_idx = None;
+                        // Submitting anything retires an open `/usage` report.
+                        report = None;
                         if line.is_empty() {
+                        } else if shared.memory_pass.load(Ordering::Relaxed)
+                            && btw_question(&line).is_some()
+                        {
+                            // No main task to ask beside during a quiet
+                            // background pass, and nothing to preempt that
+                            // would resume: a plain prompt is the way to have
+                            // the model now.
+                            log.push_dim(
+                                "[/btw has nothing to run beside right now — \
+                                 just type your prompt; it starts at once]",
+                            );
                         } else if btw_question(&line).is_some() {
                             // A `/btw` gets priority: it preempts the running
                             // main pass so the side question is answered now,
@@ -15020,17 +18646,102 @@ fn busy_ui_loop(
                             }
                             view.follow = true;
                             sub.follow_all();
+                        } else if let Some(note) = line
+                            .strip_prefix("/repro")
+                            .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+                        {
+                            // A dump of the model's state *now*: the pass's
+                            // input the worker published at its start, plus
+                            // the output streamed since. The same line and
+                            // clipboard copy as at idle.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            log.push_dim(live_repro_line(shared, note));
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if line.split_whitespace().next() == Some("/mcp") {
+                            // Same panel as at idle, over the turn-start
+                            // snapshot the worker cannot re-render mid-turn.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report = Some(tui::ReportPanel::new(MCP_REPORT_TITLE, &live_cmds.mcp));
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if line.split_whitespace().next() == Some("/context") {
+                            // The same panel as at idle, and live: the worker
+                            // publishes the breakdown at every boundary and the
+                            // status ticks supply the fill.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report = Some(tui::ReportPanel::new(
+                                CONTEXT_REPORT_TITLE,
+                                &live_context_report(shared, live_ctx_used),
+                            ));
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if line.split_whitespace().next() == Some("/usage") {
+                            // A report, not conversation: show it in the
+                            // dismissable panel (as at idle) instead of dumping
+                            // it into the scrollback where it would interleave
+                            // with the model's streaming output.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report = Some(tui::ReportPanel::new("usage", &live_cmds.usage));
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if matches!(line.split_whitespace().next(), Some("/exit" | "/quit"))
+                        {
+                            // Quitting mid-turn throws the turn away, so it
+                            // asks first; the next key answers (see the
+                            // `EXIT_CONFIRM_TITLE` check above).
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report =
+                                Some(tui::ReportPanel::new(EXIT_CONFIRM_TITLE, EXIT_CONFIRM_TEXT));
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if line.split_whitespace().next() == Some("/toks") {
+                            // The chart is the one report worth watching
+                            // mid-turn: the sampler feeds the ring from the
+                            // worker's token stream and the panel redraws on
+                            // every status tick.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report =
+                                Some(tui::ReportPanel::new(TOKS_REPORT_TITLE, &toks_report(true)));
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if line.split_whitespace().next() == Some("/jobs") {
+                            // The worker owns the job table; the UI renders the
+                            // snapshot it publishes at every tool boundary.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            report = Some(tui::ReportPanel::new(
+                                JOBS_REPORT_TITLE,
+                                &shared.jobs_report(),
+                            ));
+                            view.follow = true;
+                            sub.follow_all();
                         } else if let Some(out) = line
                             .starts_with('/')
                             .then(|| line.split_whitespace().next().unwrap_or(&line))
-                            .and_then(|cmd| live_cmds.output(cmd))
+                            .and_then(LiveCommands::output)
                         {
-                            // Read-only reports (`/context`, `/usage`, `/mcp`,
-                            // `/help`) run against a turn-start snapshot, so they
-                            // stay available while the model streams.
+                            // The other read-only reports (`/mcp`, `/help`,
+                            // `/config`) run against a turn-start snapshot and
+                            // stream into the log, matching their idle behavior.
                             input.history.add(&line);
                             log.push_user_echo(&line);
                             log.push_ansi(&out);
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if let Some(arg) = line
+                            .strip_prefix("/mc")
+                            .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+                        {
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            log.push_plain(microcompact_command(arg));
                             view.follow = true;
                             sub.follow_all();
                         } else if let Some(arg) = line
@@ -15080,9 +18791,31 @@ fn busy_ui_loop(
                             input.history.add(&line);
                             log.push_pending(&line);
                             shared.push_queued(line);
+                            // During a quiet background pass the queued line
+                            // is also the signal to stop it: the pass goes
+                            // back on the queue and this line runs next
+                            // (`tui_quiet_pass`).
+                            if shared.memory_pass.load(Ordering::Relaxed) {
+                                raise_worker_interrupt(shared);
+                            }
                             view.follow = true;
                             sub.follow_all();
                         }
+                    }
+                    // Ctrl-D quits, but only out of a quiet background pass:
+                    // that is work the user never asked for, and at a glance
+                    // the screen looks like an idle prompt. Mid-turn Ctrl-D
+                    // stays inert, as it always has — this must never be the
+                    // reason somebody loses a generation in flight. The empty
+                    // -buffer guard matches the idle loop's Ctrl-D, where a
+                    // non-empty line is a delete, not a quit.
+                    KeyCode::Char('d')
+                        if ctrl
+                            && input.buf.text().is_empty()
+                            && shared.memory_pass.load(Ordering::Relaxed) =>
+                    {
+                        shared.quit_requested.store(true, Ordering::Relaxed);
+                        raise_worker_interrupt(shared);
                     }
                     KeyCode::Char('u') if ctrl => input.buf.kill_to_start(),
                     KeyCode::Char('k') if ctrl => input.buf.kill_to_end(),
@@ -15172,6 +18905,74 @@ fn busy_ui_loop(
                 // click-and-drag has to place and select in it here too.
                 // Every press decides afresh which surface the gesture belongs
                 // to, so a release lost off-window cannot strand the next drag.
+                // The report panel's `[■]` close box dismisses it, as at idle.
+                MouseEventKind::Down(MouseButton::Left)
+                    if report.is_some() && tui::report_close_click(m.column, m.row) =>
+                {
+                    report = None;
+                    selection.cancel();
+                }
+                // The footer's jobs segment toggles the `/jobs` panel, as at idle.
+                MouseEventKind::Down(MouseButton::Left) if tui::jobs_click(m.column, m.row) => {
+                    if report
+                        .as_ref()
+                        .is_some_and(|r| r.title() == JOBS_REPORT_TITLE)
+                    {
+                        report = None;
+                    } else {
+                        report = Some(tui::ReportPanel::new(
+                            JOBS_REPORT_TITLE,
+                            &shared.jobs_report(),
+                        ));
+                    }
+                    selection.cancel();
+                }
+                // The footer's chart glyph toggles the `/toks` panel, as at
+                // idle. The samples are process-wide, so this needs no agent.
+                MouseEventKind::Down(MouseButton::Left) if tui::toks_click(m.column, m.row) => {
+                    toggle_toks_report(&mut report);
+                    selection.cancel();
+                }
+                // The repro shutter, as at idle: the dump is what a `/repro`
+                // typed now would write, and a stall is exactly when the
+                // shutter is worth pressing.
+                MouseEventKind::Down(MouseButton::Left) if tui::camera_click(m.column, m.row) => {
+                    log.push_dim(live_repro_line(shared, ""));
+                    view.follow = true;
+                    sub.follow_all();
+                    selection.cancel();
+                }
+                // The footer's brain, as at idle. Safe mid-turn: each pass
+                // re-reads the setting when it configures its renderer, so the
+                // flip lands on the next pass of the turn already running
+                // rather than being lost.
+                MouseEventKind::Down(MouseButton::Left) if tui::think_click(m.column, m.row) => {
+                    think_show_click();
+                    selection.cancel();
+                }
+                // The footer's ctx gauge toggles the `/context` panel, as at
+                // idle, over the same turn-start snapshot the typed command
+                // gets.
+                MouseEventKind::Down(MouseButton::Left) if tui::ctx_click(m.column, m.row) => {
+                    if report
+                        .as_ref()
+                        .is_some_and(|r| r.title() == CONTEXT_REPORT_TITLE)
+                    {
+                        report = None;
+                    } else {
+                        report = Some(tui::ReportPanel::new(
+                            CONTEXT_REPORT_TITLE,
+                            &live_context_report(shared, live_ctx_used),
+                        ));
+                    }
+                    selection.cancel();
+                }
+                // The footer's task counter toggles the `/tasks` panel, as at
+                // idle, over the list the worker last published.
+                MouseEventKind::Down(MouseButton::Left) if tui::tasks_click(m.column, m.row) => {
+                    toggle_tasks_report(&mut report, task_view.report());
+                    selection.cancel();
+                }
                 // A click on a roster row selects it and opens its output.
                 MouseEventKind::Down(MouseButton::Left)
                     if let Some(run) = tui::roster_click(m.column, m.row) =>
@@ -15273,12 +19074,20 @@ fn print_footer(st: &Status, color: bool) {
 /// The set is the accumulator because it is what `/plugins` renders, and these
 /// warnings are only knowable once the contributions are merged, which is after
 /// `main()` has already printed the load-time ones.
+///
+/// `skills` is `--skills`: when off, none are read off disk and none are
+/// merged, so the slash commands and the `skill` tool have nothing to resolve.
+/// Templates are a separate contribution and load either way.
 fn load_named_contributions(
     tool_ctx: &mut ToolContext,
     mut earlier: Vec<String>,
+    skills: bool,
 ) -> (Vec<crate::skills::Skill>, Vec<crate::templates::Template>) {
-    let (skills, skill_warnings, skill_claims) =
-        crate::plugins::skills_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
+    let (skills, skill_warnings, skill_claims) = if skills {
+        crate::plugins::skills_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
     let (templates, template_warnings, template_claims) =
         crate::plugins::templates_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     earlier.extend(skill_warnings);
@@ -15383,7 +19192,7 @@ fn new_agent(
     // prompt the session does not actually use.
     {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let plank_home = home.as_ref().map(|h| h.join(".plank"));
+        let plank_home = home.as_ref().map(plank_home_in);
         let project = tool_ctx.cwd.clone();
         // Built with the home *before* activation, not after: the runtime is
         // what owns a component's `state` directory, and a host constructed
@@ -15452,8 +19261,9 @@ fn new_agent(
     }
     let wasm_tools = tool_ctx.wasm.registry.tools();
     // The dialect the loaded model speaks decides which tools prompt it gets,
-    // and later which parser reads its output back. Taken from the name the
-    // engine reports after detecting the file, not from the path.
+    // and which parser reads its output back (the DSML dialects share one
+    // prompt, with V4.1 respelling three tag names; Qwen has its own). Taken
+    // from the name the engine reports after detecting the file, not the path.
     let syntax = sysprompt::ToolSyntax::for_model_name(&engine.model_name());
     let system = sysprompt::build_system_prompt_parts_with_wasm(
         &cfg.system,
@@ -15483,8 +19293,19 @@ fn new_agent(
     // can be typed. An engine with no support model reads as off however the
     // flags were set — the footer must not promise speculation the engine
     // cannot do.
+    // Speculation may have fallen away since the flags were parsed (an
+    // unsupported family, a companion the checkpoint refused), and the 0
+    // `finalize` pinned for it has no reason to stand once it cannot run.
+    // Settled here, so the very first frame shows the temperature the session
+    // will actually sample at.
+    let settled_temperature = crate::config::temperature_without_speculation(
+        &cfg.generation,
+        cfg.temp_explicit,
+        engine.spec_capable(),
+    );
     crate::status::set_mtp(cfg.generation.mtp && engine.spec_capable());
-    crate::status::set_temperature(cfg.generation.temperature);
+    crate::status::set_show_memory_stats(cfg.show_memory_stats);
+    crate::status::set_temperature(settled_temperature);
     // The alt local engine needs both for the same reasons, and it cannot be
     // skipped as an optimization: `warm_reset` builds its system tokens from
     // these two fields, so an unconfigured engine tokenizes the *same* system
@@ -15507,13 +19328,13 @@ fn new_agent(
         // offering what this session deliberately has no access to.
         (Vec::new(), Vec::new())
     } else {
-        load_named_contributions(&mut tool_ctx, contribution_warnings)
+        load_named_contributions(&mut tool_ctx, contribution_warnings, cfg.skills)
     };
     // The `skill` tool resolves names against the same set the slash command
     // uses; hand the dispatch context its own copy.
     tool_ctx.skills.clone_from(&skills);
     let repro_dir = crate::repro::repro_dir(&tool_ctx.cwd);
-    Ok(Agent {
+    let mut agent = Agent {
         gen_opts: cfg.generation.clone(),
         resume_temp: if cfg.generation.temperature > 0.0 {
             cfg.generation.temperature
@@ -15532,9 +19353,23 @@ fn new_agent(
         payload_restored: false,
         payload_dirty: false,
         ladder: crate::kvladder::KvLadder::new(),
+        sensor: crate::mempressure::PressureSensor::start(),
+        hysteresis: crate::mempressure::Hysteresis::new(),
+        yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+        first_turn_done: false,
+        pressure_stop: false,
         sidechain_depth: 0,
+        alt_engine_depth: 0,
+        extract_state: crate::memextract::ExtractState::default(),
+        memory_gate: false,
+        memory_gate_percent: 60,
+        memory_jobs: std::collections::VecDeque::new(),
+        pending_memory_notice: None,
+        suggestion_pending: false,
+        suggestion: None,
         repro_dir,
         quiet_tools: false,
+        guard_stopped: false,
         pending_images: Vec::new(),
         btw_diverged_engine: false,
         trusted_system_len,
@@ -15560,11 +19395,15 @@ fn new_agent(
         ui_remote: None,
         usage: SessionUsage::default(),
         stats: SessionStats::default(),
+        passes: Vec::new(),
+        last_guard: crate::insights::GuardSnapshot::default(),
+        reply_only_next: false,
         session_start: std::time::Instant::now(),
         sub_sink: SubSinkTarget::default(),
         fork_kv: Vec::new(),
         fork_points: Vec::new(),
         console_seen: 0,
+        unnamed_subagents: 0,
         sidechain_dumps: std::collections::VecDeque::new(),
         // A local engine handed in alongside a provider main agent lives in the
         // same cache as any other alternate: `provider: local` definitions take
@@ -15577,7 +19416,11 @@ fn new_agent(
             .collect(),
         local_alt_warmed: false,
         warm_note: None,
-    })
+    };
+    // Speculation may have fallen away since the flags were parsed, and the 0
+    // `config::finalize` pinned for it then has nothing left to serve.
+    agent.settle_speculation_temperature(cfg.temp_explicit);
+    Ok(agent)
 }
 
 /// Runs the interactive REPL until the user exits.
@@ -15603,7 +19446,7 @@ pub fn run_interactive(
             false
         }
         Ok(crate::agentsmd::Startup::Missing) => true,
-        Ok(crate::agentsmd::Startup::Present) => false,
+        Ok(crate::agentsmd::Startup::Present | crate::agentsmd::Startup::Skipped) => false,
         Err(e) => {
             eprintln!("plank: {e}");
             false
@@ -15705,10 +19548,18 @@ fn run_plain_flow(
     if let Some(history) = agent.resumed_history() {
         print!("{history}");
     }
-    // No AGENTS.md and no CLAUDE.md to link: offer to generate one. Declining
-    // (or a non-terminal stdin) simply starts the session.
-    if offer_init && ask_yes_no_on_stdin(crate::agentsmd::OFFER_QUESTION, "generate it? [y/N] ") {
-        agent.run_init();
+    // No AGENTS.md and no CLAUDE.md to link: offer to generate one, the plain
+    // mirror of the TUI's three-way panel. A non-terminal stdin declines.
+    if offer_init {
+        match ask_agentsmd_offer_on_stdin() {
+            crate::agentsmd::Offer::Generate => agent.run_init(InitSource::LaunchOffer),
+            crate::agentsmd::Offer::DontAskHere => {
+                if let Some(w) = skip_agentsmd_offer_here() {
+                    println!("plank: {w}");
+                }
+            }
+            crate::agentsmd::Offer::NotNow => {}
+        }
     }
     if let Some(initial) = cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
         print!("{}", status::format_user_prompt_echo(initial, agent.color));
@@ -15802,6 +19653,97 @@ fn bang_head(text: &str) -> String {
     out
 }
 
+/// Writes a finished `!` command's outcome into the TUI scrollback: the
+/// interruption, or the exit status. Shared by the streaming `!` path and by
+/// the `!!` path when the command produced no output at all and so gets no
+/// panel — in both cases this line is the only proof the command finished.
+fn bang_log_outcome(
+    cmd: &str,
+    result: &Result<crate::tools::bash::ImmediateOutput, String>,
+    log: &mut OutputLog,
+) {
+    match result {
+        Ok(out) => {
+            if out.interrupted {
+                log.push_dim("[interrupted]");
+            } else if out.exit_code == 0 {
+                // A command that prints nothing is otherwise indis-
+                // tinguishable from one still running, so say it finished.
+                // Only when it did: an interrupted command did not.
+                log.push_spans(vec![ratatui::text::Span::styled(
+                    "done.",
+                    crate::tui::done_style(),
+                )]);
+            } else {
+                // A failing command finished too, but saying "done." in
+                // green next to a non-zero exit reads as success. One red
+                // line carrying the code is the whole outcome.
+                log.push_spans(vec![ratatui::text::Span::styled(
+                    format!("failed (exit code {}).", out.exit_code),
+                    crate::tui::failed_style(),
+                )]);
+            }
+        }
+        Err(e) => log.push_dim(format!("!{cmd}: {e}")),
+    }
+}
+
+/// The `!!` panel's title. The command is part of it because, unlike `/context`
+/// or `/usage`, the panel shows the output of *one specific command* and the
+/// scrollback above it may have scrolled away. Long commands are clipped so the
+/// title still fits a panel border.
+fn bang_panel_title(cmd: &str) -> String {
+    const MAX: usize = 60;
+    let one_line = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= MAX {
+        format!("!! {one_line}")
+    } else {
+        let head: String = one_line.chars().take(MAX - 1).collect();
+        format!("!! {head}…")
+    }
+}
+
+/// Renders a finished `!!` command as the body of a [`tui::ReportPanel`], or
+/// `None` when the command produced nothing to show — an empty pane explains
+/// less than the one-line outcome the caller logs instead.
+///
+/// stderr is kept, labelled and red rather than interleaved with stdout, and a
+/// non-zero exit or an interruption is stated on its own closing line: a
+/// failure must never reach the panel as silence.
+fn bang_panel_report(
+    cmd: &str,
+    result: &Result<crate::tools::bash::ImmediateOutput, String>,
+) -> Option<String> {
+    use std::fmt::Write as _;
+    let out = result.as_ref().ok()?;
+    let (stdout, stderr) = (out.stdout.trim_end(), out.stderr.trim_end());
+    if stdout.is_empty() && stderr.is_empty() {
+        return None;
+    }
+    let mut s = String::new();
+    let _ = writeln!(s, "\x1b[1m$ {cmd}{ANSI_RESET}\n");
+    if !stdout.is_empty() {
+        let _ = writeln!(s, "{stdout}");
+    }
+    if !stderr.is_empty() {
+        if !stdout.is_empty() {
+            s.push('\n');
+        }
+        let _ = writeln!(s, "\x1b[38;5;238mstderr{ANSI_RESET}");
+        let _ = writeln!(s, "\x1b[31m{stderr}{ANSI_RESET}");
+    }
+    if out.interrupted {
+        let _ = write!(s, "\n\x1b[38;5;238m[interrupted]{ANSI_RESET}");
+    } else if out.exit_code != 0 {
+        let _ = write!(
+            s,
+            "\n\x1b[31mfailed (exit code {}).{ANSI_RESET}",
+            out.exit_code
+        );
+    }
+    Some(s)
+}
+
 /// Builds the single user message a `!` command appends to the transcript:
 /// the caveat, the command as typed, and its captured output. No model turn is
 /// triggered by it — the model sees it as history on the next real prompt.
@@ -15893,56 +19835,294 @@ fn handle_plain_line(agent: &mut Agent<'_>, line: &str) -> Result<bool, String> 
 /// The classic blocking plain REPL (no remote bridge): read a line, handle it,
 /// repeat until EOF.
 fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
-    let stdin = std::io::stdin();
+    // stdin is read on a helper thread so the loop can wake for a finished
+    // background job while nobody is typing (`docs/BACKGROUND-TASKS.md`
+    // §3.4). Lines arrive whole; `Ok(None)` is EOF. The thread is detached:
+    // it dies with the process, and a `read_line` blocked on a TTY cannot be
+    // interrupted from here anyway.
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<Option<String>>>();
+    std::thread::Builder::new()
+        .name("plank-stdin".into())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            loop {
+                let mut line = String::new();
+                let msg = match stdin.lock().read_line(&mut line) {
+                    Ok(0) => Ok(None),
+                    Ok(_) => Ok(Some(line)),
+                    Err(e) => Err(e),
+                };
+                let stop = !matches!(msg, Ok(Some(_)));
+                if tx.send(msg).is_err() || stop {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
     loop {
         print!("{}", status::prompt_text());
         std::io::stdout().flush().map_err(|e| e.to_string())?;
-        let mut line = String::new();
-        let n = stdin
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Ok(()); // EOF
-        }
+        let line = loop {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(Ok(Some(line))) => break line,
+                Ok(Ok(None)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(()); // EOF
+                }
+                Ok(Err(e)) => return Err(e.to_string()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if agent.has_finished_jobs() {
+                        println!();
+                        agent.wake_for_jobs()?;
+                        print!("{}", status::prompt_text());
+                        std::io::stdout().flush().map_err(|e| e.to_string())?;
+                    } else if agent.memory_jobs_pending() {
+                        // The quiet prompt is the moment to read the span the
+                        // last turn snapshotted. One job per tick, so a line
+                        // typed meanwhile is picked up between jobs; the
+                        // plain REPL cannot cut a generation short on
+                        // keystrokes, so a typed line waits out this one.
+                        // The prompt is reprinted only when the pass left a
+                        // line, so a silent pass leaves the screen untouched.
+                        let notice = agent.plain_memory_pass();
+                        if notice {
+                            print!("{}", status::prompt_text());
+                            std::io::stdout().flush().map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+            }
+        };
         if !handle_plain_line(agent, &line)? {
             return Ok(());
         }
     }
 }
 
+/// Exit code for a headless one-shot whose turn a guard stopped. Distinct
+/// from 1 so a caller can tell a stopped turn from plank failing outright,
+/// and from 124, which `timeout(1)` uses for a run it killed.
+pub const GUARD_STOP_EXIT: u8 = 3;
+
+/// The exit code a finished headless one-shot reports.
+/// The static text `/memory calibrate` prints, on both front ends.
+///
+/// Kept apart from the run so the wording, the sign convention and the
+/// no-suggestion cases are tested without a model.
+fn gate_calibration_text(
+    key: &str,
+    r: &crate::decide::BiasReport,
+    gate_percent: u32,
+    current: i32,
+    unusable: usize,
+    failed: usize,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "gate calibration on {key}: {} span(s) asked both ways",
+        r.pairs
+    );
+    if unusable + failed > 0 {
+        let _ = write!(
+            out,
+            " ({unusable} dropped for thin letter mass, {failed} failed)"
+        );
+    }
+    out.push('\n');
+    if r.pairs == 0 {
+        out.push_str("  nothing usable to measure; memory.gateBias left as it is");
+        return out;
+    }
+    let lean = if r.mean_bias >= 0.0 { "A" } else { "B" };
+    let _ = writeln!(
+        out,
+        "  P(yes) with yes as A: {:.3}   with yes as B: {:.3}",
+        r.mean_ab, r.mean_ba
+    );
+    let _ = writeln!(
+        out,
+        "  letter bias: {:+.3} \u{b1} {:.3} (leans toward {lean})",
+        r.mean_bias, r.stderr
+    );
+    let _ = writeln!(
+        out,
+        "  at {gate_percent}%: {} of {} verdict(s) change once the order is averaged out",
+        r.flips, r.pairs
+    );
+    if r.shift_pp == 0 {
+        let why = if r.pairs < crate::decide::MIN_CALIBRATION_PAIRS {
+            format!("fewer than {} spans", crate::decide::MIN_CALIBRATION_PAIRS)
+        } else {
+            "within two standard errors of zero".to_owned()
+        };
+        let _ = write!(
+            out,
+            "  no correction supported ({why}); current memory.gateBias.{key} is {current}"
+        );
+    } else {
+        let _ = write!(
+            out,
+            "  suggested memory.gateBias.{key}: {} (current {current}); in ~/.plank/settings.json:\n    \"memory\": {{ \"gateBias\": {{ \"{key}\": {} }} }}",
+            r.shift_pp, r.shift_pp
+        );
+    }
+    out
+}
+
+fn headless_exit_code(guard_stopped: bool) -> u8 {
+    if guard_stopped { GUARD_STOP_EXIT } else { 0 }
+}
+
+/// Whether a headless `-p` prompt is the `/init` command rather than text for
+/// the model. Exactly `/init`, surrounding whitespace aside: a general slash
+/// dispatcher on this path is not wanted, and `/initialise` is a word.
+///
+/// There is deliberately no escape: `-p "/init"` cannot send those five
+/// characters to the model as text. Someone who wants to talk *about* the
+/// command can write it into a sentence, which is the ordinary case anyway.
+fn headless_prompt_is_init(prompt: &str) -> bool {
+    prompt.trim() == "/init"
+}
+
 /// Runs headless mode: one-shot with `-p`, else a stdin-driven protocol.
 ///
+/// Under `--ui chart` the run is a one-shot whose stdout is swallowed for the
+/// duration of the turn (see [`SilencedStdout`]) so the only thing the process
+/// prints is the `/toks` chart for what it just generated.
+///
 /// # Errors
-/// Returns an error string on unrecoverable I/O or engine failure.
-pub fn run_non_interactive(
+/// Returns an error string on unrecoverable I/O or engine failure. On
+/// success, the `Ok` value is the process exit code.
+#[allow(clippy::too_many_lines)]
+pub fn run_headless(
     engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     local_engine: Option<Box<dyn Engine>>,
     plugins: crate::plugins::PluginSet,
-) -> Result<(), String> {
+) -> Result<u8, String> {
     let mut agent = new_agent(engine, cfg, false, local_engine, plugins)?;
     // The notification mode is seeded (and kept live) by
     // `settings::install`/`reinstall`, not here — see their doc comments.
     agent.warm_plain()?;
     agent.fire_session_start("startup", &mut |w| eprintln!("{w}"));
     if let Some(prompt) = cfg.prompt.as_deref() {
-        agent.session.push(Message::user(prompt));
-        let r = agent.run_turn();
+        // `/init` is the one command this path understands. It is not text
+        // for the model: it runs the canned phases with the loop guards
+        // suspended, which is the only way to measure or use it headlessly.
+        // There is no Asker here, so the interview phase fast-fails and the
+        // prompt tells the model to proceed on its own judgement.
+        let is_init = headless_prompt_is_init(prompt);
+        if !is_init {
+            agent.session.push(Message::user(prompt));
+        }
+        let color = agent.color;
+        let r = match cfg.ui {
+            // Both of these swallow the turn's own stdout and put one thing of
+            // their own on the descriptor underneath it.
+            mode @ (UiMode::Chart | UiMode::Quiet) => {
+                let silenced = SilencedStdout::open();
+                // With no descriptor to silence there is nothing to paint on,
+                // so the turn prints as `--ui console` would and the mode's
+                // own output simply follows it.
+                let say = |text: &str| {
+                    if let Some(s) = &silenced {
+                        s.write_real(text);
+                    } else {
+                        print!("{text}");
+                        let _ = std::io::stdout().flush();
+                    }
+                };
+                let live = (mode == UiMode::Chart)
+                    .then(|| silenced.as_ref().map(|s| ChartLive::start(s.saved, color)))
+                    .flatten();
+                let quiet_note = if mode == UiMode::Quiet {
+                    say(QUIET_PROMPTING);
+                    if let Some(s) = silenced.as_ref() {
+                        Some(QuietLive::start(s.saved))
+                    } else {
+                        // Nothing silenced, so nothing to wait for a quiet
+                        // moment to say: the note goes out now and the turn
+                        // prints over it as `--ui console` would.
+                        say(QUIET_START);
+                        None
+                    }
+                } else {
+                    None
+                };
+                let r = if is_init {
+                    agent.init_turn()
+                } else {
+                    agent.run_turn()
+                };
+                // Both of these write the last of what their mode puts on
+                // screen, so they have to land before anything follows.
+                drop(live);
+                drop(quiet_note);
+                match mode {
+                    UiMode::Quiet => say(QUIET_DONE),
+                    // The painter already drew it, unless there was none.
+                    _ if silenced.is_none() => say(&toks_report(color)),
+                    _ => {}
+                }
+                r
+            }
+            _ => {
+                if is_init {
+                    agent.init_turn()
+                } else {
+                    agent.run_turn()
+                }
+            }
+        };
+        // No idle loop to come back to: read the snapshotted span now, so a
+        // one-shot run still leaves its notes.
+        agent.drain_memory_jobs();
         agent.save_headless_session(cfg.save_session);
+        headless_quit_repro(&mut agent);
         agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
         crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
-        return r;
+        // What the `-p` user actually waited, measured from the agent being
+        // built (so the model load and the warm are in it) to here. On stderr,
+        // like every other headless diagnostic: stdout carries the reply a
+        // caller is piping, and under `--ui chart` and `--ui quiet` it carries
+        // that mode's one deliberate piece of output, neither of which wants a
+        // line appended to it.
+        eprintln!("{}", total_time_line(agent.session_start.elapsed()));
+        r?;
+        return Ok(headless_exit_code(agent.guard_stopped));
     }
     // Stdin protocol, like the C: announce readiness on stderr, collect bytes
     // until stdin has been quiet for 200 ms, submit that buffer as one prompt,
     // repeat until EOF. (The C also queues input arriving mid-generation; the
     // synchronous port reads between turns instead.)
+    // With `tools.bashNotify` on, the idle wait ticks every 250 ms so a
+    // finished background job can be announced (`docs/BACKGROUND-TASKS.md`
+    // §3.4). The driver owns the loop: plank appends the notification, marks
+    // it on stderr, and runs the turn, then goes back to waiting.
     let mut eof = false;
     while !eof {
         eprintln!("+DWARFSTAR_WAITING");
-        let Some(prompt) = read_quiet_batched(&mut eof).map_err(|e| e.to_string())? else {
-            break;
+        let idle_ms = if crate::settings::active().tools.bash_notify {
+            250
+        } else {
+            -1
+        };
+        let Some(prompt) = read_quiet_batched(&mut eof, idle_ms).map_err(|e| e.to_string())? else {
+            if eof {
+                break;
+            }
+            if agent.has_finished_jobs() {
+                let n = agent.drain_job_notifications();
+                if n > 0 {
+                    eprintln!("+DWARFSTAR_JOBS_FINISHED {n}");
+                    agent.run_turn()?;
+                }
+            } else if agent.memory_jobs_pending() {
+                agent.process_memory_job();
+                agent.pending_memory_notice = None;
+            }
+            continue;
         };
         if prompt.trim().is_empty() {
             continue;
@@ -15950,28 +20130,408 @@ pub fn run_non_interactive(
         agent.session.push(Message::user(prompt.trim_end()));
         agent.run_turn()?;
     }
+    agent.drain_memory_jobs();
     agent.save_headless_session(cfg.save_session);
+    headless_quit_repro(&mut agent);
     agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
     crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
-    Ok(())
+    Ok(0)
+}
+
+/// The closing line of a headless `-p` run: how long the whole thing took.
+///
+/// Reuses [`fmt_secs`], so a run under a minute keeps a decimal (`8.4s`) —
+/// a one-shot is often seconds long and rounding those to `0:08` throws away
+/// the part worth reading — and a longer one reads as `M:SS`.
+fn total_time_line(d: std::time::Duration) -> String {
+    format!("total time: {}", fmt_secs(d.as_secs_f64()))
+}
+
+/// Redirects the process's stdout to `/dev/null` for as long as it lives, and
+/// restores the real one on drop.
+///
+/// `--ui chart` prints one thing and one thing only. The turn it runs first
+/// streams model text, tool banners and status lines to stdout from several
+/// layers (the stream renderer, the status sink, tool output), so silencing it
+/// at the file descriptor is both the complete answer and the small one — and
+/// it leaves stderr, where headless diagnostics belong, untouched.
+///
+/// `open` returning `None` (no `/dev/null`, no spare descriptor) means the run
+/// simply prints its turn as `--ui console` would; it is not worth failing over.
+struct SilencedStdout {
+    saved: std::os::fd::RawFd,
+}
+
+impl SilencedStdout {
+    fn open() -> Option<Self> {
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .ok()?;
+        // SAFETY: plain descriptor duplication on stdout; `saved` is restored
+        // and closed in `drop`, and `devnull` closes at the end of this scope.
+        unsafe {
+            let saved = libc::dup(libc::STDOUT_FILENO);
+            if saved < 0 {
+                return None;
+            }
+            if libc::dup2(
+                std::os::fd::AsRawFd::as_raw_fd(&devnull),
+                libc::STDOUT_FILENO,
+            ) < 0
+            {
+                libc::close(saved);
+                return None;
+            }
+            Some(Self { saved })
+        }
+    }
+
+    /// Writes to the saved (real) stdout, past the silencing.
+    fn write_real(&self, text: &str) {
+        write_fd(self.saved, text);
+    }
+}
+
+impl Drop for SilencedStdout {
+    fn drop(&mut self) {
+        // Anything the turn buffered belongs to the silenced stdout, not to the
+        // chart that is about to be written.
+        let _ = std::io::stdout().flush();
+        // SAFETY: `self.saved` is the descriptor `open` duplicated and nobody
+        // else holds it.
+        unsafe {
+            libc::dup2(self.saved, libc::STDOUT_FILENO);
+            libc::close(self.saved);
+        }
+    }
+}
+
+/// The three things `--ui quiet` prints, in order, on one line: the turn has
+/// begun and is prefilling, the model has started generating, the turn is over.
+/// The mode exists for a script or a person who wants to know a run is alive
+/// and then that it is finished, and nothing else.
+const QUIET_PROMPTING: &str = "Prompting. ";
+/// See [`QUIET_PROMPTING`].
+const QUIET_START: &str = "Started working... ";
+/// See [`QUIET_PROMPTING`].
+const QUIET_DONE: &str = "done.\n";
+
+/// Watches for the start of generation during a `--ui quiet` turn, writes
+/// [`QUIET_START`] when it arrives, and then ticks a running time in place
+/// until the turn ends.
+///
+/// "Generation has started" is read off the first prefill sample: prefill is
+/// what precedes the first token and `toks` records its rate at the moment the
+/// pass completes, so that sample is the handover. A turn that finishes before
+/// either ring sees anything still gets the note on drop, so the line always
+/// has the same three parts.
+///
+/// The clock runs only on a terminal ([`InlineClock`] repaints with
+/// backspaces, which belong on a screen and not in a captured file), and it
+/// counts from the turn's start rather than from the handover — what the user
+/// is timing is the wait, not the generation. The last reading is left on the
+/// line, so a finished run reads
+/// `Prompting. Started working... 12.4s done.`
+struct QuietLive {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl QuietLive {
+    /// Poll interval. Short: this note is the only sign of life the mode gives
+    /// between a long prefill and the first token.
+    const TICK: std::time::Duration = std::time::Duration::from_millis(50);
+
+    fn start(fd: std::os::fd::RawFd) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A redirected stdout has nothing to backspace over: it gets the three
+        // notes and no clock, so a captured run stays one clean line.
+        // SAFETY: `isatty` only inspects the descriptor.
+        let tty = unsafe { libc::isatty(fd) } == 1;
+        let handle = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !crate::toks::prefill_snapshot().is_empty()
+                        || !crate::toks::snapshot().is_empty()
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Self::TICK);
+                }
+                write_fd(fd, QUIET_START);
+                if !tty {
+                    return;
+                }
+                let mut clock = InlineClock::default();
+                loop {
+                    if let Some(bytes) = clock.update(&fmt_secs(started.elapsed().as_secs_f64())) {
+                        write_fd(fd, &bytes);
+                    }
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Self::TICK);
+                }
+                // The line continues with `done.`, which needs the gap the
+                // clock has been occupying.
+                write_fd(fd, " ");
+            })
+        };
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for QuietLive {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Paints the `/toks` report onto the real stdout while a `--ui chart` turn
+/// runs, redrawing it in place a few times a second so the charts fill as the
+/// model generates rather than appearing only once the turn is over.
+///
+/// The painter is a thread because the turn it reports on owns the calling
+/// one. It writes to the descriptor [`SilencedStdout`] saved — the process's
+/// stdout is pointed at `/dev/null` for the duration, which is what keeps the
+/// screen to the chart alone — with raw `write`, since that fd is deliberately
+/// not owned by anything that would close it.
+///
+/// Before the first throughput sample lands there is no chart to draw, so the
+/// frame is a one-line "prefilling" note: an engine loading and prefilling a
+/// long prompt is the slowest part of a short run, and a blank screen there
+/// reads as a hang.
+struct ChartLive {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ChartLive {
+    /// How often the painter redraws. Fast enough that the line grows visibly,
+    /// slow enough that it costs nothing beside a generation pass.
+    const TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// Spinner frames for the pre-sample note, as elsewhere in plank.
+    const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+
+    fn start(fd: std::os::fd::RawFd, color: bool) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A piped stdout has no cursor to move: it gets the final frame only,
+        // so a redirected run captures one report rather than a flipbook.
+        // SAFETY: `isatty` only inspects the descriptor.
+        let tty = unsafe { libc::isatty(fd) } == 1;
+        let handle = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let mut painter = ChartPainter { fd, tty, lines: 0 };
+                if tty {
+                    painter.write("\x1b[?25l");
+                }
+                let mut tick = 0_usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if tty {
+                        painter.paint(&Self::frame(color, started, tick));
+                    }
+                    tick += 1;
+                    std::thread::sleep(Self::TICK);
+                }
+                painter.paint(&Self::frame(color, started, tick));
+                if tty {
+                    painter.write("\x1b[?25h");
+                }
+            })
+        };
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// One frame: the report once there is anything to chart, else the note.
+    ///
+    /// Both carry the running time. The pre-sample note always did — a blank
+    /// screen during a long prefill reads as a hang — and the chart needs it
+    /// for the same reason once the note goes away: throughput says how fast
+    /// the model is going, never how long you have been waiting.
+    fn frame(color: bool, started: std::time::Instant, tick: usize) -> String {
+        if crate::toks::snapshot().is_empty() && crate::toks::prefill_snapshot().is_empty() {
+            let spin = Self::SPINNER[tick % Self::SPINNER.len()];
+            return format!(
+                "{spin} prefilling... {}\n",
+                fmt_secs(started.elapsed().as_secs_f64())
+            );
+        }
+        let mut out = toks_report(color);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&elapsed_footer(started.elapsed(), color));
+        out
+    }
+}
+
+impl Drop for ChartLive {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// The chart's running-time footer, dim when the descriptor takes colour.
+///
+/// Its own line under the panels rather than a cell inside them: the panels are
+/// a fixed-width grid built by [`crate::toks::render_report`], which `/toks`
+/// renders too, and a wall clock means nothing in a report printed after the
+/// fact.
+fn elapsed_footer(d: std::time::Duration, color: bool) -> String {
+    let (dim, reset) = if color {
+        ("\x1b[38;5;238m", ANSI_RESET)
+    } else {
+        ("", "")
+    };
+    format!("{dim}elapsed{reset} {}\n", fmt_secs(d.as_secs_f64()))
+}
+
+/// A clock that rewrites itself in place at the end of a line already written.
+///
+/// `--ui quiet` puts its whole run on one line, so the running time cannot have
+/// a line of its own and cannot be repainted with a carriage return either —
+/// that would take `Prompting. Started working... ` with it. Backspaces erase
+/// exactly what this wrote and nothing before it.
+///
+/// Emits nothing while the rendered text is unchanged, so a 50 ms poll costs
+/// one write every tenth of a second rather than twenty.
+#[derive(Debug, Default)]
+struct InlineClock {
+    shown: String,
+}
+
+impl InlineClock {
+    /// The bytes that turn what is on screen into `next`, or `None` when it is
+    /// already there. The erase is backspace-space-backspace per character, so
+    /// a shorter reading (`59.9s` → `1:00`) leaves nothing of the longer one
+    /// behind.
+    fn update(&mut self, next: &str) -> Option<String> {
+        if next == self.shown {
+            return None;
+        }
+        let mut out = String::new();
+        let n = self.shown.chars().count();
+        for _ in 0..n {
+            out.push('\u{8}');
+        }
+        for _ in 0..n {
+            out.push(' ');
+        }
+        for _ in 0..n {
+            out.push('\u{8}');
+        }
+        out.push_str(next);
+        self.shown = next.to_string();
+        Some(out)
+    }
+}
+
+/// Writes frames to a raw descriptor, erasing the previous one first.
+///
+/// The frame's height is read off the frame itself rather than assumed from
+/// [`TOKS_CHART_HEIGHT`], because the painter switches between the one-line
+/// prefill note and the full report mid-run.
+struct ChartPainter {
+    fd: std::os::fd::RawFd,
+    tty: bool,
+    /// Lines the previous frame occupied, 0 before the first one.
+    lines: usize,
+}
+
+impl ChartPainter {
+    fn paint(&mut self, frame: &str) {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        if self.tty && self.lines > 0 {
+            // Back to the top of the last frame, then clear to end of screen:
+            // frames differ in height, so erasing line by line would leave the
+            // tail of a taller predecessor behind.
+            let _ = write!(out, "\x1b[{}A\x1b[0J", self.lines);
+        }
+        out.push_str(frame);
+        if !frame.ends_with('\n') {
+            out.push('\n');
+        }
+        self.lines = frame.trim_end_matches('\n').split('\n').count();
+        self.write(&out);
+    }
+
+    fn write(&self, text: &str) {
+        write_fd(self.fd, text);
+    }
+}
+
+/// Writes `text` to a raw descriptor, retrying short writes and giving up on
+/// error. Used for the descriptor [`SilencedStdout`] saved, which is
+/// deliberately owned by nothing that would close or buffer it.
+fn write_fd(fd: std::os::fd::RawFd, text: &str) {
+    let mut buf = text.as_bytes();
+    while !buf.is_empty() {
+        // SAFETY: writing `buf.len()` bytes from a live slice to a descriptor
+        // the caller keeps open for the duration of the call.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            return;
+        }
+        buf = &buf[usize::try_from(n).unwrap_or(buf.len())..];
+    }
+}
+
+/// The headless mirror of the TUI and plain-REPL quit dump (CLAUDE.md: a
+/// change to one front end needs the same change in the others): under
+/// `--debug`, the finished session lands in `~/.plank/repro` without anyone
+/// having to remember `/repro`, which headless has no way to type anyway.
+///
+/// The line goes to stderr, not stdout: a script consuming a headless run
+/// reads the model's output there and must not find a diagnostics line in it.
+fn headless_quit_repro(agent: &mut Agent<'_>) {
+    if let Some(line) = agent.quit_repro_line() {
+        eprintln!("{line}");
+    }
 }
 
 /// Reads one stdin batch: bytes accumulated until a 200 ms quiet window.
 ///
-/// Returns `None` at EOF with nothing buffered; sets `eof` once stdin closes.
-fn read_quiet_batched(eof: &mut bool) -> std::io::Result<Option<String>> {
-    read_batched_from(libc::STDIN_FILENO, eof)
+/// Returns `None` at EOF with nothing buffered, or when `idle_ms` (>= 0)
+/// elapsed with nothing buffered and `eof` still clear; sets `eof` once stdin
+/// closes. `-1` waits for input indefinitely.
+fn read_quiet_batched(eof: &mut bool, idle_ms: i32) -> std::io::Result<Option<String>> {
+    read_batched_from(libc::STDIN_FILENO, eof, idle_ms)
 }
 
 /// Reads one batch from `fd`: bytes accumulated until a 200 ms quiet window.
 ///
 /// Factored from [`read_quiet_batched`] so the pipe-split fix is testable
-/// without spawning a subprocess.
-fn read_batched_from(fd: std::os::fd::RawFd, eof: &mut bool) -> std::io::Result<Option<String>> {
+/// without spawning a subprocess. `idle_ms` bounds the wait for the first
+/// byte (`-1` = forever); a bounded wait that expires returns `Ok(None)`
+/// without setting `eof`.
+fn read_batched_from(
+    fd: std::os::fd::RawFd,
+    eof: &mut bool,
+    idle_ms: i32,
+) -> std::io::Result<Option<String>> {
     const QUIET_MS: i32 = 200;
     let mut buf = Vec::new();
     loop {
-        let timeout = if buf.is_empty() { -1 } else { QUIET_MS };
+        let timeout = if buf.is_empty() { idle_ms } else { QUIET_MS };
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -16015,8 +20575,281 @@ fn read_batched_from(fd: std::os::fd::RawFd, eof: &mut bool) -> std::io::Result<
 
 #[cfg(test)]
 mod tests {
+    fn stats_record(prefill: (i64, f64), gen_: (i64, f64), tools: f64) -> crate::speeds::Record {
+        crate::speeds::Record {
+            prefill_tokens: prefill.0,
+            prefill_secs: prefill.1,
+            gen_tokens: gen_.0,
+            gen_secs: gen_.1,
+            tool_secs: tools,
+        }
+    }
+
+    #[test]
+    fn run_stats_table_single_engine_aligns_columns() {
+        let sections = [StatsSection {
+            label: "DeepSeek V4 Flash".into(),
+            input: 19_973,
+            output: 1_526,
+            speeds: Some(stats_record((4_240, 12.0), (1_526, 49.3), 3.2)),
+        }];
+        let lines = render_run_stats("6:14", &sections, (19_973, 1_526), false);
+        let table = lines.join("\n");
+        assert_eq!(lines[0], "Session stats  ·  6:14");
+        assert!(table.contains("19,973"), "{table}");
+        assert!(table.contains("353.3 tok/s"), "{table}");
+        assert!(table.contains("31.0 tok/s"), "{table}");
+        assert!(table.contains("· tools"), "{table}");
+        // One engine: no totals block repeating the same numbers.
+        assert!(!table.contains("Total"), "{table}");
+        let width = lines[1].chars().count();
+        assert!(
+            lines[1..].iter().all(|l| l.chars().count() == width),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn run_stats_table_several_engines_adds_totals_and_blank_cells() {
+        let sections = [
+            StatsSection {
+                label: "flash (local)".into(),
+                input: 100,
+                output: 10,
+                speeds: Some(stats_record((100, 1.0), (10, 1.0), 0.0)),
+            },
+            StatsSection {
+                label: "remote".into(),
+                input: 50,
+                output: 5,
+                speeds: None,
+            },
+        ];
+        let lines = render_run_stats("0:05", &sections, (150, 15), false);
+        let table = lines.join("\n");
+        assert!(table.contains("Total"), "{table}");
+        assert!(table.contains("150"), "{table}");
+        // No tool time recorded, so no tools row.
+        assert!(!table.contains("tools"), "{table}");
+        let width = lines[1].chars().count();
+        assert!(
+            lines[1..].iter().all(|l| l.chars().count() == width),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn jobs_panel_closes_when_its_last_job_finishes() {
+        use crate::tools::bash::NO_JOBS_TEXT;
+
+        // Showing a job, then the table empties: the panel goes away.
+        let mut report = Some(tui::ReportPanel::new(JOBS_REPORT_TITLE, "1 pid 10 running"));
+        refresh_jobs_panel(&mut report, NO_JOBS_TEXT);
+        assert!(report.is_none(), "last job done should close the panel");
+        // Opened onto an empty table: it stays and keeps answering.
+        let mut report = Some(tui::ReportPanel::new(JOBS_REPORT_TITLE, NO_JOBS_TEXT));
+        refresh_jobs_panel(&mut report, NO_JOBS_TEXT);
+        assert!(report.is_some(), "an empty panel the user opened must stay");
+        // A table that is still populated is refreshed in place.
+        let mut report = Some(tui::ReportPanel::new(JOBS_REPORT_TITLE, "1 pid 10 running"));
+        refresh_jobs_panel(&mut report, "1 pid 10 done, exit 0");
+        assert_eq!(
+            report.as_ref().map(tui::ReportPanel::text),
+            Some("1 pid 10 done, exit 0")
+        );
+    }
+    /// `--skills off` leaves the session with no skills at all — not even the
+    /// compiled-in ones, which is what makes the flag different from an empty
+    /// skills directory.
+    #[test]
+    fn skills_off_loads_no_skills() {
+        // A per-run directory: a fixed name is how the other temp-dir tests
+        // here learned to flake against a concurrent run.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let cwd = std::env::temp_dir().join(format!("plank-skills-off-{stamp}"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut on = crate::tools::ToolContext::new(cwd.clone());
+        let (skills, templates_on) = super::load_named_contributions(&mut on, Vec::new(), true);
+        assert!(!skills.is_empty(), "the built-ins should load by default");
+        let mut off = crate::tools::ToolContext::new(cwd);
+        let (skills, templates_off) = super::load_named_contributions(&mut off, Vec::new(), false);
+        assert!(skills.is_empty(), "{} skills survived", skills.len());
+        // Templates are a separate contribution and are untouched by the flag.
+        assert_eq!(templates_on.len(), templates_off.len());
+    }
+
+    #[test]
+    fn agentsmd_offer_line_parses_like_the_panel_order() {
+        use crate::agentsmd::Offer;
+        assert_eq!(super::parse_agentsmd_offer(""), Offer::Generate);
+        assert_eq!(super::parse_agentsmd_offer("\n"), Offer::Generate);
+        assert_eq!(super::parse_agentsmd_offer("Y"), Offer::Generate);
+        assert_eq!(super::parse_agentsmd_offer("yes"), Offer::Generate);
+        assert_eq!(super::parse_agentsmd_offer("n"), Offer::NotNow);
+        assert_eq!(super::parse_agentsmd_offer("whatever"), Offer::NotNow);
+        assert_eq!(super::parse_agentsmd_offer("d"), Offer::DontAskHere);
+        assert_eq!(super::parse_agentsmd_offer("Don't"), Offer::DontAskHere);
+    }
+
     use super::*;
     use crate::engine::{EngineError, EngineEvent, GenerationStats, ThinkMode};
+
+    #[test]
+    fn the_disclosure_names_the_reprefill_cost() {
+        let plan = crate::yieldpolicy::RestorePlan {
+            reprefill_tokens: 11_808,
+            keep: vec!["tier2".to_owned()],
+        };
+        let line = pressure_disclosure(&plan);
+        assert!(
+            line.contains("11808") || line.contains("11,808"),
+            "a silent multi-minute re-prefill reads as a hang: {line}"
+        );
+    }
+
+    #[test]
+    fn the_yield_marker_names_the_cause() {
+        assert!(
+            PRESSURE_YIELDED.contains("memory pressure"),
+            "the footer marker has to say why plank stopped: {PRESSURE_YIELDED}"
+        );
+    }
+
+    #[test]
+    fn a_pressure_stop_is_not_a_user_abort() {
+        use crate::mempressure::PressureLevel;
+        assert!(should_raise_pressure_cancel(
+            PressureLevel::Critical,
+            false,
+            open_gate()
+        ));
+        assert!(
+            !should_raise_pressure_cancel(PressureLevel::Critical, true, open_gate()),
+            "once the user has asked to stop, pressure must not make the turn \
+             resumable again"
+        );
+        assert!(!should_raise_pressure_cancel(
+            PressureLevel::Warn,
+            false,
+            open_gate()
+        ));
+        // And the engine agrees at its own level: the reason a pressure stop
+        // records is not the reason a user stop records.
+        crate::ds4engine::clear_cancel();
+        crate::ds4engine::request_pressure_cancel();
+        assert!(crate::ds4engine::cancelled_by_pressure());
+        crate::ds4engine::clear_cancel();
+        assert!(!crate::ds4engine::cancelled_by_pressure());
+    }
+
+    /// A gate with nothing suppressing the yield: past the guard window, past
+    /// the first turn, not in a sidechain.
+    fn open_gate() -> PressureGate {
+        PressureGate {
+            yield_allowed: true,
+            first_turn_done: true,
+            in_sidechain: false,
+        }
+    }
+
+    #[test]
+    fn the_livelock_guard_covers_the_mid_pass_path() {
+        use crate::mempressure::PressureLevel;
+        // F1: `MIN_YIELD_INTERVAL_SECS` used to be enforced only inside
+        // `Hysteresis::observe`, which the mid-pass path never calls. A second
+        // yield inside the guard window must be refused *before* the cancel is
+        // raised — a raise there truncates a generation and buys a re-prefill
+        // that `warm_sync` will not even let pressure cancel.
+        let mut h = crate::mempressure::Hysteresis::new();
+        assert_eq!(
+            h.observe(PressureLevel::Critical, 0),
+            crate::mempressure::Decision::Yield
+        );
+        // The session is rebuilt at the next generate, so the machine is no
+        // longer yielded — exactly the F3/F4 state where only the guard stands
+        // between plank and a yield-per-turn loop.
+        h.note_resumed();
+        let inside = PressureGate {
+            yield_allowed: h.yield_allowed_at(1),
+            ..open_gate()
+        };
+        assert!(
+            !should_raise_pressure_cancel(PressureLevel::Critical, false, inside),
+            "a second mid-pass yield inside the guard window would re-prefill \
+             gigabytes once per turn, forever"
+        );
+        let outside = PressureGate {
+            yield_allowed: h.yield_allowed_at(1 + crate::mempressure::MIN_YIELD_INTERVAL_SECS),
+            ..open_gate()
+        };
+        assert!(
+            should_raise_pressure_cancel(PressureLevel::Critical, false, outside),
+            "past the window, sustained pressure is actionable again"
+        );
+    }
+
+    #[test]
+    fn a_sidechain_under_critical_is_not_cancelled() {
+        use crate::mempressure::PressureLevel;
+        // F2: `should_act` suppresses a sidechain's yield, so raising the
+        // cancel there truncates the sub-agent's answer, frees nothing and
+        // discloses nothing — the parent gets a silently short answer.
+        let sidechain = PressureGate {
+            in_sidechain: true,
+            ..open_gate()
+        };
+        assert!(
+            !should_raise_pressure_cancel(PressureLevel::Critical, false, sidechain),
+            "a sidechain's yield is suppressed, so its cancel must never be raised"
+        );
+        let first_turn = PressureGate {
+            first_turn_done: false,
+            ..open_gate()
+        };
+        assert!(
+            !should_raise_pressure_cancel(PressureLevel::Critical, false, first_turn),
+            "the first turn's yield is suppressed for the same reason"
+        );
+    }
+
+    #[test]
+    fn a_free_resume_says_nothing() {
+        let plan = crate::yieldpolicy::RestorePlan {
+            reprefill_tokens: 0,
+            keep: vec![],
+        };
+        assert!(
+            pressure_disclosure(&plan).is_empty(),
+            "nothing to disclose when nothing must be rebuilt"
+        );
+    }
+
+    #[test]
+    fn pressure_is_ignored_until_the_first_turn_completes() {
+        use crate::mempressure::{Decision, Hysteresis, PressureLevel};
+        let mut h = Hysteresis::new();
+        let first_turn_done = false;
+        let decision = h.observe(PressureLevel::Critical, 0);
+        assert_eq!(decision, Decision::Yield);
+        assert!(
+            !should_act(decision, first_turn_done, false),
+            "yielding during the initial sysprompt prefill means never starting"
+        );
+    }
+
+    #[test]
+    fn a_sidechain_defers_the_yield() {
+        use crate::mempressure::Decision;
+        assert!(
+            !should_act(Decision::Yield, true, true),
+            "a sidechain has no rungs to fall back to, so waiting out a short \
+             one beats rebuilding it"
+        );
+        assert!(should_act(Decision::Yield, true, false));
+    }
+
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -16182,6 +21015,30 @@ mod tests {
                 .any(|n| matches!(n, crate::guard::Nudge::Block(_))),
             "6th identical call should be blocked"
         );
+    }
+
+    #[test]
+    fn a_suppressed_yield_does_not_wedge_the_hysteresis() {
+        use crate::mempressure::PressureLevel;
+        let dir = scratch_dir("pressure-suppressed");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.sensor.set_for_test(PressureLevel::Critical);
+
+        // Suppressed because the first turn has not completed.
+        agent.first_turn_done = false;
+        assert!(agent.poll_pressure().is_none(), "the yield is suppressed");
+        assert!(
+            !agent.hysteresis.is_yielded(),
+            "nothing was freed, so the machine must not believe it yielded"
+        );
+
+        // Suppressed because the agent is inside a sub-agent sidechain.
+        agent.hysteresis = crate::mempressure::Hysteresis::new();
+        agent.first_turn_done = true;
+        agent.sidechain_depth = 1;
+        assert!(agent.poll_pressure().is_none(), "the yield is suppressed");
+        assert!(!agent.hysteresis.is_yielded());
     }
 
     #[test]
@@ -16362,11 +21219,11 @@ mod tests {
     }
 
     /// Regression: `run_turn` must not force `sub_sink` to `Stdout`. It is
-    /// called by both the plain REPL and `run_non_interactive` (the `-p`
+    /// called by both the plain REPL and `run_headless` (the `-p`
     /// one-shot path and the stdin-protocol loop), and the headless path's
     /// stdout carries the `+DWARFSTAR_WAITING` / one-shot machine protocol
     /// that interleaved sub-agent model text would corrupt. An `Agent` built
-    /// the way `run_non_interactive` builds it (default `sub_sink`, i.e.
+    /// the way `run_headless` builds it (default `sub_sink`, i.e.
     /// `Null`) must still have `sub_sink == Null` after a turn runs, and any
     /// sub-agent output emitted through that sink must be silently dropped
     /// rather than printed.
@@ -16380,7 +21237,7 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, engine, &cfg);
 
-        // Sanity: this is the same default `new_agent`/`run_non_interactive`
+        // Sanity: this is the same default `new_agent`/`run_headless`
         // leave in place (no assignment on the non-interactive path).
         assert!(matches!(agent.sub_sink, SubSinkTarget::Null));
 
@@ -17125,6 +21982,39 @@ mod tests {
         assert_eq!(input.buf.text(), "@src");
     }
 
+    /// Walking history onto a slash command must not open the `/` menu: the
+    /// menu takes Up and Down for its own selection, so an opened menu strands
+    /// the walk on that entry.
+    #[test]
+    fn a_recalled_slash_command_does_not_open_the_menu() {
+        let mut input = TuiInput::new();
+        input.history.add("/context");
+        input.history.add("/usage");
+        // The key loop syncs after every key, which is what used to open the
+        // menu over the recalled text.
+        input.history_move(-1);
+        input.sync_popup();
+        assert_eq!(input.buf.text(), "/usage");
+        assert!(
+            input.slash.is_none(),
+            "the menu must stay shut over a recalled command"
+        );
+        // With no menu holding the key, a second Up keeps walking back.
+        assert!(!input.popup_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        input.history_move(-1);
+        input.sync_popup();
+        assert_eq!(input.buf.text(), "/context");
+        assert!(input.slash.is_none());
+        // Typing again is composing, not recalling, so completion resumes.
+        input.buf.set_text("/con");
+        input.buf.move_end();
+        input.sync_popup();
+        assert!(
+            input.slash.is_some(),
+            "an edited line completes as usual again"
+        );
+    }
+
     #[test]
     fn popup_survives_while_the_cursor_stays_at_the_token_end() {
         let mut input = input_with_popup("@src", 0);
@@ -17185,9 +22075,18 @@ mod tests {
         /// `generate`, so a test can assert the pass marked itself while it was
         /// actually generating rather than merely before or after.
         saw_local_pass: Option<std::sync::Arc<AtomicBool>>,
+        /// Records `guard::guards_enabled()` as observed from *inside*
+        /// `generate`, so a test can assert a scoped suspension was in force
+        /// while the turn ran rather than merely set and cleared around it.
+        saw_loop_guards: Option<std::sync::Arc<std::sync::Mutex<Vec<bool>>>>,
         /// Records every `set_think_mode` call, so a test can assert the level
         /// change reached the engine (where it drops cached tokens and KV).
         think_modes: Option<std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>>>,
+        /// Records the `think_mode` on each `generate`'s options — the mode
+        /// that decides whether the pass opens inside `<think>` at all, and so
+        /// the one the closed-think recovery works through
+        /// (`Agent::pass_opts`).
+        pass_modes: Option<std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>>>,
         /// Records every `set_trusted_system_prefix` call, the other half of
         /// the configuration an engine needs before it tokenizes anything.
         trusted_lens: Option<std::sync::Arc<std::sync::Mutex<Vec<usize>>>>,
@@ -17201,6 +22100,19 @@ mod tests {
         /// tests can exercise the error paths (e.g. that a swapped-in sub-agent
         /// engine is still returned to its cache when the sidechain dies).
         fail_with: Option<String>,
+        /// When true, the *next* `set_kv` call still logs `restore:<tag>` but
+        /// then returns an error and clears this flag, so a test can exercise
+        /// exactly one failed restore (e.g. the fork-tier restore failing and
+        /// falling through to the ladder) without every later `set_kv` call —
+        /// including the one inside `restore_rung` itself — failing too.
+        set_kv_fails_once: bool,
+        /// Verdicts `decide` hands back, oldest first. Non-empty turns
+        /// `supports_decide` on; empty leaves the engine looking like one
+        /// with no System-1 capability at all.
+        decisions: Vec<crate::decide::RawVerdict>,
+        /// Records each state `decide` was asked about, so a test can assert
+        /// that a gate which should have been skipped never ran.
+        decisions_asked: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
     }
 
     impl ScriptedEngine {
@@ -17242,6 +22154,13 @@ mod tests {
     }
 
     impl Engine for ScriptedEngine {
+        /// Reports a real release, so a test can tell a *suppressed* yield
+        /// apart from a *declined* one. With the trait default (`false`) every
+        /// yield reads as declined and rolls the hysteresis back on its own,
+        /// which would make any suppression assertion pass vacuously.
+        fn release_session(&mut self) -> bool {
+            true
+        }
         fn is_local(&self) -> bool {
             self.local
         }
@@ -17251,13 +22170,19 @@ mod tests {
         fn generate(
             &mut self,
             prompt: crate::engine::Prompt<'_>,
-            _opts: &crate::engine::GenerationOptions,
+            opts: &crate::engine::GenerationOptions,
             _interrupt: &dyn Fn() -> bool,
             _greedy: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> Result<GenerationStats, EngineError> {
+            if let Some(seen) = &self.pass_modes {
+                seen.lock().unwrap().push(opts.think_mode);
+            }
             if let Some(seen) = &self.saw_local_pass {
                 seen.store(crate::status::local_pass_active(), Ordering::Relaxed);
+            }
+            if let Some(seen) = &self.saw_loop_guards {
+                seen.lock().unwrap().push(crate::guard::guards_enabled());
             }
             if let Some(msg) = &self.fail_with {
                 return Err(EngineError::new(msg.clone()));
@@ -17313,6 +22238,9 @@ mod tests {
                 let tag = cache.kv().first().copied().unwrap_or(0);
                 events.lock().unwrap().push(format!("restore:{tag}"));
             }
+            if std::mem::take(&mut self.set_kv_fails_once) {
+                return Err(EngineError::new("scripted set_kv failure".to_string()));
+            }
             Ok(())
         }
         fn kv_reuse_probe(
@@ -17351,6 +22279,24 @@ mod tests {
         fn model_name(&self) -> String {
             self.model.clone().unwrap_or_default()
         }
+
+        fn supports_decide(&self) -> bool {
+            !self.decisions.is_empty()
+        }
+
+        fn decide(
+            &mut self,
+            state: &str,
+            _question: &crate::decide::Question,
+        ) -> Result<crate::decide::RawVerdict, crate::engine::EngineError> {
+            if self.decisions.is_empty() {
+                return Err(crate::engine::EngineError::unsupported());
+            }
+            if let Some(log) = &self.decisions_asked {
+                log.lock().unwrap().push(state.to_string());
+            }
+            Ok(self.decisions.remove(0))
+        }
     }
 
     /// Builds an Agent over a scripted engine with the standard test fields.
@@ -17359,15 +22305,29 @@ mod tests {
         engine: ScriptedEngine,
         cfg: &'a crate::config::AgentConfig,
     ) -> Agent<'a> {
-        Agent {
-            engine: Box::new(engine),
+        test_agent_boxed(dir, Box::new(engine), cfg)
+    }
+
+    /// `test_agent` over any engine, so a Metal-only test can drive the real
+    /// one. Everything else is identical.
+    fn test_agent_boxed<'a>(
+        dir: &std::path::Path,
+        engine: Box<dyn Engine>,
+        cfg: &'a crate::config::AgentConfig,
+    ) -> Agent<'a> {
+        let mut agent = Agent {
+            engine,
             cfg,
             gen_opts: cfg.generation.clone(),
             resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
             store: SessionStore::open(dir).unwrap(),
             pending_aside: None,
-            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            // The scratch dir, not the process cwd: a test agent whose tools
+            // write relative paths would otherwise drop them in the repo root
+            // — `a_turn_that_keeps_writing_is_never_stopped_for_lack_of_progress`
+            // left five `out<N>.txt` behind on every `cargo test --lib`.
+            tool_ctx: ToolContext::new(dir.to_path_buf()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
@@ -17375,9 +22335,23 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
+            memory_jobs: std::collections::VecDeque::new(),
+            pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -17402,16 +22376,25 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
-        }
+        };
+        // The same settling the real constructor does, so a test agent over an
+        // engine that cannot speculate has the temperature production would
+        // give it.
+        agent.settle_speculation_temperature(cfg.temp_explicit);
+        agent
     }
 
     impl Agent<'_> {
@@ -17432,6 +22415,593 @@ mod tests {
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
         cfg
+    }
+
+    /// RAII guard restoring the process-wide (thread-local, in tests)
+    /// settings to the default on drop, so a test that returns early or
+    /// panics mid-body cannot leak its override onto whatever test libtest
+    /// schedules next on the same OS thread.
+    #[must_use = "dropping this immediately restores the default auto_extract"]
+    struct AutoExtractGuard;
+
+    impl Drop for AutoExtractGuard {
+        fn drop(&mut self) {
+            crate::settings::set_for_test(crate::settings::Settings::default());
+        }
+    }
+
+    /// Turns off the background memory extraction pass for the current
+    /// thread (`settings::install_for_test` is thread-local) and returns a
+    /// guard that restores the default settings when it drops — including
+    /// on an early return or a panic in the caller's test body.
+    ///
+    /// `memory.auto_extract` now defaults to `false`, so this is redundant
+    /// with the default — it is kept because a test driving a
+    /// `ScriptedEngine` through a tool-free turn boundary (a fixed reply
+    /// script indexed by call order) depends on the pass *not* stealing a
+    /// reply meant for its own next turn, and saying so at the call site
+    /// keeps that intent explicit and correct if the default ever flips
+    /// back. Tests that exercise the pass itself (see `the_pass_*` below)
+    /// opt in through [`enable_auto_extract_for_test`].
+    fn disable_auto_extract_for_test() -> AutoExtractGuard {
+        let mut off = crate::settings::Settings::default();
+        off.memory.auto_extract = false;
+        crate::settings::set_for_test(off);
+        AutoExtractGuard
+    }
+
+    /// Turns the extraction pass *on* for the current thread, with the same
+    /// restore-on-drop guard. `maybe_extract_memories` samples
+    /// `settings::active()` on every call and overwrites
+    /// `extract_state.enabled` with it, so poking the field directly does
+    /// nothing: a pass test that forgets this guard silently tests a pass
+    /// that never runs (its positive `assert!(agent.maybe_extract_memories(std::time::Duration::MAX))`
+    /// is what catches the omission).
+    fn enable_auto_extract_for_test() -> AutoExtractGuard {
+        let mut on = crate::settings::Settings::default();
+        on.memory.auto_extract = true;
+        on.memory.extract_every_n_turns = 1;
+        crate::settings::set_for_test(on);
+        AutoExtractGuard
+    }
+
+    /// Suggestions on. Installed through the same `install_for_test` path
+    /// and torn down by the same guard.
+    fn enable_suggestions_for_test() -> AutoExtractGuard {
+        let mut on = crate::settings::Settings::default();
+        on.suggestions.enabled = true;
+        crate::settings::set_for_test(on);
+        AutoExtractGuard
+    }
+
+    /// Suggestions explicitly off, everything else default.
+    fn disable_suggestions_for_test() -> AutoExtractGuard {
+        let mut off = crate::settings::Settings::default();
+        off.suggestions.enabled = false;
+        crate::settings::set_for_test(off);
+        AutoExtractGuard
+    }
+
+    /// `/init` is writing an AGENTS.md draft; guessing at the user's next
+    /// prompt over the top of it is noise. Pins the `!quiet_tools` conjunct,
+    /// which is otherwise present but never decisive.
+    #[test]
+    fn a_turn_while_init_is_running_queues_nothing() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-init");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.quiet_tools = true;
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(
+            !agent.suggestion_pending,
+            "/init owns the screen; do not suggest over its draft"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The user cut the model off and wants the prompt back, not a guess
+    /// about a turn they abandoned. Pins the `memory_pass_allowed()`
+    /// conjunct, which is otherwise present but never decisive.
+    #[test]
+    fn a_turn_the_user_interrupted_queues_nothing() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-interrupted");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.last_turn_interrupted = true;
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(
+            !agent.suggestion_pending,
+            "an interrupted turn is not a finished one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_suggestion_is_dropped_when_the_transcript_moves() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-stale");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.suggestion = Some(crate::suggest::Suggestion {
+            text: "run the tests".to_string(),
+            depth: agent.session.transcript.len(),
+        });
+        assert_eq!(agent.current_suggestion(), Some("run the tests"));
+
+        agent.session.push(Message::user("something else"));
+        assert_eq!(
+            agent.current_suggestion(),
+            None,
+            "a guess about a conversation that has since moved is not a suggestion"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clearing_the_session_clears_the_suggestion() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-clear");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.suggestion = Some(crate::suggest::Suggestion {
+            text: "run the tests".to_string(),
+            depth: 0,
+        });
+
+        agent.clear_suggestion();
+        assert!(agent.suggestion.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_clean_turn_end_queues_a_suggestion() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-queue");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(agent.suggestion_pending);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_turn_that_errored_queues_nothing() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-err");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        agent.note_turn_end_for_suggestion(true);
+        assert!(
+            !agent.suggestion_pending,
+            "an errored turn suggests nothing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn suggestions_off_queue_nothing() {
+        let _s = disable_suggestions_for_test();
+        let dir = scratch_dir("sugg-off");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(!agent.suggestion_pending);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_generated_suggestion_is_sanitized_and_stored_with_its_depth() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-gen");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["add tests for the parser".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+
+        assert!(agent.generate_suggestion());
+        let s = agent.suggestion.as_ref().expect("stored");
+        assert_eq!(s.text, "add tests for the parser");
+        assert_eq!(s.depth, agent.session.transcript.len());
+        assert!(!agent.suggestion_pending, "the flag is consumed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_reply_the_sanitizer_rejects_stores_nothing() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-reject");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["I've added the tests you asked for.".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.suggestion_pending = true;
+
+        assert!(!agent.generate_suggestion(), "the model answered as itself");
+        assert!(agent.suggestion.is_none());
+        assert!(
+            !agent.suggestion_pending,
+            "consumed even on rejection: no retry"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The generation must leave no trace in the conversation.
+    #[test]
+    fn generating_a_suggestion_does_not_grow_the_transcript() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-notrace");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["run the tests".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        let before = agent.session.transcript.len();
+        agent.suggestion_pending = true;
+
+        agent.generate_suggestion();
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "a suggestion is housekeeping, not conversation"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed generation must still close the fork: a leaked sidechain
+    /// The cold-KV skip is what makes this feature affordable on by default,
+    /// and nothing exercised it: `ScriptedEngine` returns `None` from
+    /// `kv_reuse_probe` unless a test stages one, so the guard had never been
+    /// seen to fire. `live: 10, common: 5` is a prompt diverging behind the
+    /// live end, which is exactly the rebuild-from-zero case.
+    #[test]
+    fn a_cold_kv_skips_the_generation_without_opening_a_fork() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-coldkv");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["run the tests".to_string()],
+            kv_events: Some(kv_events.clone()),
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 10,
+                common: 5,
+            }),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+
+        assert!(
+            !agent.generate_suggestion(),
+            "a cold KV is the one case this feature cannot afford"
+        );
+        assert!(agent.suggestion.is_none());
+        // The probe itself logs `probe`, so the list is not empty — the claim
+        // is that no FORK was opened, i.e. no `capture`. Asserting emptiness
+        // here would be asserting something untrue about the double.
+        let events = kv_events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e == "capture"),
+            "skipped before the fork, so nothing was captured: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e == "probe"),
+            "the guard did consult the probe: {events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// silently disables every feature that checks `in_sidechain()`,
+    /// including the memory pass and this feature's own skip condition.
+    #[test]
+    fn a_failed_suggestion_generation_still_closes_the_fork() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-fail");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            fail_with: Some("scripted generation failure".to_string()),
+            kv_events: Some(kv_events.clone()),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        let before = agent.session.transcript.len();
+        agent.suggestion_pending = true;
+
+        assert!(
+            !agent.generate_suggestion(),
+            "a failed generation stores nothing"
+        );
+        // Without this the three assertions below would also pass if the
+        // function had returned before ever opening a fork — which a future
+        // change to the skip conditions could easily cause. `capture` proves
+        // `begin_sidechain` ran with snapshot_kv true.
+        let events = kv_events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e == "capture"),
+            "a fork was actually opened: {events:?}"
+        );
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "the fork leaves no trace even on failure"
+        );
+        assert_eq!(agent.sidechain_depth, 0, "the fork is closed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sidechain_turn_queues_nothing() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-side");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.begin_sidechain("sub".to_string(), false);
+
+        agent.note_turn_end_for_suggestion(false);
+        assert!(
+            !agent.suggestion_pending,
+            "a sub-agent turn suggests nothing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pending_suggestion_wins_the_idle_slot() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-slot");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.suggestion_pending = true;
+
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::Suggestion);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// However long a memory job has been queued, a pending suggestion is
+    /// generated first; the memory pass takes the next idle moment.
+    #[test]
+    fn a_pending_suggestion_runs_before_a_queued_memory_job() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-before-mem");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.suggestion_pending = true;
+        agent.memory_jobs.push_back(crate::memextract::MemoryJob {
+            task: "x".to_string(),
+            depth: 1,
+            attempts: 0,
+            resume: None,
+        });
+
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::Suggestion);
+        agent.suggestion_pending = false; // what running the suggestion does
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::MemoryPass);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nothing_pending_means_the_idle_moment_does_nothing() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-nowork");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::Nothing);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Arms a live suggestion at the agent's current transcript depth, which
+    /// is what `current_suggestion`'s staleness check compares against.
+    fn offer_suggestion(agent: &mut Agent<'_>, text: &str) {
+        agent.suggestion = Some(crate::suggest::Suggestion {
+            text: text.to_string(),
+            depth: agent.session.transcript.len(),
+        });
+    }
+
+    #[test]
+    fn tab_places_the_suggestion_and_leaves_it_editable() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-tab");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "run the tests");
+        let mut input = TuiInput::new();
+
+        assert!(agent.suggestion_accept_key(key(KeyCode::Tab), &input, false, false));
+        agent.place_suggestion(&mut input);
+
+        assert_eq!(input.buf.text(), "run the tests");
+        assert_eq!(
+            input.buf.cursor(),
+            "run the tests".len(),
+            "cursor at the end"
+        );
+        assert!(
+            agent.current_suggestion().is_none(),
+            "the offer is consumed"
+        );
+        assert!(input.ghost.is_none(), "and the ghost with it");
+        // Nothing was submitted: the text is sitting in the prompt.
+        assert!(agent.session.transcript.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enter_accepts_the_suggestion_on_the_way_to_the_submit_arm() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-enter");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "explain the parser");
+        let mut input = TuiInput::new();
+
+        assert!(agent.suggestion_accept_key(key(KeyCode::Enter), &input, false, false));
+        agent.place_suggestion(&mut input);
+        // The plain `KeyCode::Enter` arm then reads the buffer, which is the
+        // whole point of placing rather than duplicating the submit path.
+        assert_eq!(input.buf.text().trim(), "explain the parser");
+        assert!(agent.current_suggestion().is_none());
+
+        // Shift+Enter still means newline, and the roster still owns Enter.
+        offer_suggestion(&mut agent, "x");
+        let empty = TuiInput::new();
+        assert!(!agent.suggestion_accept_key(shift(KeyCode::Enter), &empty, false, false));
+        assert!(!agent.suggestion_accept_key(key(KeyCode::Enter), &empty, false, true));
+        // Ctrl+Enter submitted nothing before suggestions existed; it must
+        // not start meaning accept-and-send.
+        assert!(!agent.suggestion_accept_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            &empty,
+            false,
+            false
+        ));
+        // And the roster owns Tab in that same state, exactly as it owns
+        // Enter: otherwise the two keys disagree about whose they are.
+        assert!(!agent.suggestion_accept_key(key(KeyCode::Tab), &empty, false, true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_printable_keystroke_dismisses_the_suggestion() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-dismiss");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "run the tests");
+        let mut input = TuiInput::new();
+
+        let k = key(KeyCode::Char('h'));
+        assert!(
+            !agent.suggestion_accept_key(k, &input, false, false),
+            "a printable key is not an accept key"
+        );
+        // What the key loop does for every non-accept key, in one place.
+        agent.clear_suggestion();
+        input.ghost = None;
+        input.buf.insert("h");
+
+        assert!(agent.current_suggestion().is_none());
+        assert_eq!(input.buf.text(), "h", "and the key still did its own job");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Named for the guard, not for arm ordering: `suggestion_accept_key`
+    /// refuses while a popup is open, which is precisely what makes the order
+    /// of the two arms immaterial. There is no seam that would let a test
+    /// observe that order without reshaping the key loop around the test, so
+    /// the guard is what is asserted and what the name promises.
+    #[test]
+    fn the_suggestion_is_refused_while_the_completion_popup_is_open() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-popup");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offer_suggestion(&mut agent, "run the tests");
+
+        // The key loop's real order: `popup_key` runs before the suggestion
+        // check, and takes the Tab while the popup is open.
+        let mut input = input_with_popup("@src", 0);
+        assert!(input.popup.is_some(), "the `@` popup is open");
+        assert!(
+            input.popup_key(key(KeyCode::Tab)),
+            "the popup takes the Tab"
+        );
+        assert_eq!(
+            agent.current_suggestion(),
+            Some("run the tests"),
+            "the offer survives a key it never saw"
+        );
+
+        // And the guard is the popup itself, not merely the typed text:
+        // an empty buffer with a popup still is not an accept.
+        let popup = input.popup.take();
+        input.buf.clear();
+        input.popup = popup;
+        assert!(!agent.suggestion_accept_key(key(KeyCode::Tab), &input, false, false));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Auto-extraction on *and* the System-1 gate on at `percent`, installed
+    /// through the same `install_for_test` path and torn down by the same
+    /// guard. Nothing here touches the settings singleton outside that guard,
+    /// which is what keeps these tests hermetic in a parallel `--lib` run.
+    fn enable_memory_gate_for_test(percent: u32) -> AutoExtractGuard {
+        let mut on = crate::settings::Settings::default();
+        on.memory.auto_extract = true;
+        on.memory.extract_every_n_turns = 1;
+        on.memory.gate = true;
+        on.memory.gate_percent = percent;
+        crate::settings::set_for_test(on);
+        AutoExtractGuard
+    }
+
+    fn enable_memory_gate_with_cap_for_test(percent: u32, cap: u32) -> AutoExtractGuard {
+        let mut on = crate::settings::Settings::default();
+        on.memory.auto_extract = true;
+        on.memory.extract_every_n_turns = 1;
+        on.memory.gate = true;
+        on.memory.gate_percent = percent;
+        on.memory.held_span_cap = cap;
+        crate::settings::set_for_test(on);
+        AutoExtractGuard
+    }
+
+    /// An agent over a `ScriptedEngine` carrying `decisions`, with the state
+    /// log wired up. `replies` is the single `[]` every memory pass expects.
+    fn gate_agent<'a>(
+        dir: &std::path::Path,
+        cfg: &'a crate::config::AgentConfig,
+        decisions: Vec<crate::decide::RawVerdict>,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Agent<'a> {
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            decisions,
+            decisions_asked: Some(asked),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(dir, engine, cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent
+    }
+
+    /// A confident verdict for option `index`.
+    fn verdict(index: usize, p: f32) -> crate::decide::RawVerdict {
+        crate::decide::RawVerdict {
+            index,
+            p,
+            runner_up: Some((1 - index.min(1), 1.0 - p)),
+            abstained: false,
+            letter_mass: 0.0,
+        }
     }
 
     /// An agent whose engine reports a loaded `MTP` support model, so the
@@ -17527,6 +23097,144 @@ mod tests {
         assert_eq!(agent.temp_command("0.5"), "temperature 0.50");
     }
 
+    /// A run started under the default `--mtp` had its temperature pinned to
+    /// 0 during argument parsing, before the family was known. When the engine
+    /// turns out to have no drafter (`DSpark` is V4-only, or the companion was
+    /// refused), the pin is serving nothing and the session would sample
+    /// greedily for no reason: the 0.6 default comes back.
+    #[test]
+    fn stats_report_renders_for_an_empty_store_and_a_bad_arg_is_refused() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("stats-report-empty-store");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let text = agent
+            .stats_report(crate::stats::Scope::AllTime, false, false)
+            .unwrap();
+        assert!(text.contains("Sessions: 0"));
+        assert!(!text.contains('\x1b'));
+        assert_eq!(crate::stats::Scope::parse("yesterday"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_run_that_cannot_speculate_gets_its_default_temperature_back() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("mtp-unsupported-temp");
+        let mut cfg = test_cfg();
+        cfg.generation.mtp = true;
+        cfg.generation.temperature = 0.0;
+        cfg.temp_explicit = false;
+        // `ScriptedEngine::default()` has no support model (`spec: false`).
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let default = crate::engine::GenerationOptions::default().temperature;
+        assert!(!agent.engine.spec_capable());
+        assert!(
+            (agent.gen_opts.temperature - default).abs() < 1e-6,
+            "{}",
+            agent.gen_opts.temperature
+        );
+        // The footer and `/mtp` already read off `spec_capable`, so they stay
+        // truthful through the fallback.
+        assert!(!agent.mtp_on());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same run, with the user having typed `--temp 0`: their choice is
+    /// never second-guessed, speculating or not.
+    #[test]
+    fn an_explicit_zero_temperature_survives_a_run_that_cannot_speculate() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("mtp-unsupported-temp-explicit");
+        let mut cfg = test_cfg();
+        cfg.generation.mtp = true;
+        cfg.generation.temperature = 0.0;
+        cfg.temp_explicit = true;
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert!(agent.gen_opts.temperature.abs() < 1e-6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// And a session that really can speculate keeps its pinned 0.
+    #[test]
+    fn a_speculating_run_keeps_the_pinned_zero_temperature() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("mtp-supported-temp");
+        let mut cfg = test_cfg();
+        cfg.generation.mtp = true;
+        cfg.generation.temperature = 0.0;
+        let agent = spark_agent(&dir, &cfg);
+        assert!(agent.mtp_on());
+        assert!(agent.gen_opts.temperature.abs() < 1e-6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/skills` lists and reports state; `on`/`off` flip the session switch
+    /// and anything else is a usage line. One body serves both front ends.
+    #[test]
+    fn skills_command_lists_toggles_and_rejects_junk() {
+        let _lock = crate::skills::TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch_dir("skills-toggle");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.skills.push(crate::skills::Skill {
+            name: "plan".into(),
+            description: "plans".into(),
+            argument_hint: String::new(),
+            body: "plan body $ARGUMENTS".into(),
+            dir: std::path::PathBuf::new(),
+        });
+        crate::skills::set_enabled(true);
+
+        // Bare: the listing AND the state.
+        let out = agent.skills_command("");
+        assert!(out.contains("/plan"), "{out}");
+        assert!(out.contains("skills are enabled"), "{out}");
+
+        let out = agent.skills_command("off");
+        assert!(out.contains("disabled"), "{out}");
+        assert!(!crate::skills::enabled());
+        assert!(
+            agent
+                .skills_command("")
+                .contains(crate::skills::DISABLED_NOTICE),
+            "the listing must report the switch"
+        );
+        // The slash route is gated too: `/plan` says why instead of expanding,
+        // and never reaches the model as a bare prompt.
+        let refused = agent.slash_message("/plan", "x");
+        assert_eq!(
+            refused,
+            Some(Err(crate::skills::DISABLED_NOTICE.to_owned()))
+        );
+
+        let out = agent.skills_command("on");
+        assert!(out.contains("enabled"), "{out}");
+        assert_eq!(
+            agent.slash_message("/plan", "x").unwrap().unwrap(),
+            "plan body x"
+        );
+
+        let out = agent.skills_command("sideways");
+        assert!(out.contains("usage: /skills [on|off]"), "{out}");
+        crate::skills::set_enabled(true);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The trap the `/hooks` work hit: without the with-args recognizer,
+    /// `/skills off` is not a known command and the line goes to the model.
+    #[test]
+    fn skills_with_an_argument_is_a_known_command() {
+        for line in ["/skills", "/skills on", "/skills off", "/skills sideways"] {
+            assert!(
+                crate::config::slash_command_known(line),
+                "{line} would be forwarded to the model"
+            );
+        }
+    }
+
     #[test]
     fn mtp_rejects_anything_but_on_and_off() {
         // `/mtp` and `/temp` publish to the footer's process-global slots,
@@ -17544,6 +23252,80 @@ mod tests {
 
     /// Under `--debug`, quitting leaves the dump on disk without anyone having
     /// to remember `/repro` first; with debug off it writes nothing.
+    /// The call site, not the formatter: `build_report` is unit-tested against
+    /// a hand-built `ModelMeta`, which cannot catch a field wired to the wrong
+    /// source. This drives the real `write_repro_with` and reads the file back.
+    #[test]
+    fn a_written_repro_names_the_model_the_engine_reports() {
+        let dir = scratch_dir("repro-model-meta");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            model: Some("DeepSeek V4 Flash Vision Experimental".to_owned()),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+
+        let (path, _) = agent
+            .write_repro_with("", "repro-modelmeta")
+            .expect("written");
+        let text = std::fs::read_to_string(&path).expect("readable");
+        let section = text
+            .split_once("## Model\n")
+            .expect("a Model section")
+            .1
+            .split_once("## Generation")
+            .expect("followed by Generation")
+            .0;
+        // The engine's own answer, not the configured path — a `/model` swap
+        // makes those two different things.
+        assert!(
+            section.contains("- name: DeepSeek V4 Flash Vision Experimental"),
+            "{section}"
+        );
+        // Dialect follows from the name, and the family follows from the
+        // dialect; a DSML model must never be labelled qwen.
+        assert!(section.contains("- tool dialect: dsml"), "{section}");
+        assert!(section.contains("- family: ds4"), "{section}");
+        // The artifact set line is always present, in one of its two shapes,
+        // because "no manifest installed" is itself the answer.
+        assert!(section.contains("- artifact set: "), "{section}");
+        assert!(!section.contains("/resolve/"), "no download URL: {section}");
+        let _ = std::fs::remove_file(&path);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The headless front end has no `/repro` to type, so the `--debug` dump
+    /// at the end of the run is the only way its session reaches disk.
+    #[test]
+    fn a_headless_run_under_debug_saves_a_repro_at_the_end() {
+        let _console = crate::debugmirror::test_support::lock();
+        let dir = scratch_dir("headless-quit-repro");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+
+        let before = headless_debug_dumps();
+        crate::debugmirror::set_enabled(false);
+        headless_quit_repro(&mut agent);
+        assert_eq!(headless_debug_dumps(), before, "debug off writes nothing");
+
+        crate::debugmirror::set_enabled(true);
+        headless_quit_repro(&mut agent);
+        assert!(
+            headless_debug_dumps() > before,
+            "debug on writes a repro-debug dump"
+        );
+    }
+
+    fn headless_debug_dumps() -> usize {
+        std::fs::read_dir(test_repro_dir()).map_or(0, |d| {
+            d.filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("repro-debug-"))
+                .count()
+        })
+    }
+
     #[test]
     fn quitting_under_debug_writes_a_repro_and_otherwise_writes_nothing() {
         // `set_enabled` is process-wide (it defaults to on under `cfg(test)`),
@@ -17560,9 +23342,9 @@ mod tests {
         let written = std::fs::read_dir(test_repro_dir())
             .expect("repro dir")
             .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with("repro-quit-"))
+            .filter(|e| e.file_name().to_string_lossy().starts_with("repro-debug-"))
             .count();
-        assert!(written >= 1, "a repro-quit dump should exist");
+        assert!(written >= 1, "a repro-debug dump should exist");
 
         crate::debugmirror::set_enabled(false);
         assert!(
@@ -17570,6 +23352,96 @@ mod tests {
             "debug off writes nothing"
         );
         crate::debugmirror::set_enabled(true);
+    }
+
+    /// A mid-turn `/repro` pairs the base the worker published at pass start
+    /// with the output streamed since, carries the note the user typed, and
+    /// leaves the path for `/open` to pick up when the turn ends.
+    #[test]
+    fn a_mid_turn_repro_pairs_the_published_base_with_the_live_pass() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("repro-mid-turn");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("why is the sky blue"));
+
+        let shared = TurnShared::default();
+        assert!(
+            shared
+                .write_repro("", "repro", 1)
+                .is_err_and(|e| e.contains("not started")),
+            "before the first pass there is nothing to dump"
+        );
+        shared.begin_repro_pass(agent.repro_base(""));
+        shared.push_live_pass("Rayleigh ");
+        shared.push_live_pass("scattering, because");
+        let (path, sidecars) = shared
+            .write_repro("stalls here", "repro", 1)
+            .expect("dump written");
+        assert_eq!(sidecars, 0);
+        assert_eq!(shared.take_repro_written().as_deref(), Some(path.as_path()));
+        assert!(shared.take_repro_written().is_none(), "taken once");
+
+        let text = std::fs::read_to_string(&path).expect("dump readable");
+        assert!(text.contains("why is the sky blue"), "{text}");
+        assert!(text.contains("## In-progress pass"), "{text}");
+        assert_eq!(text.matches("- note: stalls here").count(), 2, "{text}");
+        assert!(!text.contains("- note: (none)"), "{text}");
+        assert!(
+            text.contains("----- BEGIN PARTIAL OUTPUT -----\nRayleigh scattering, because\n"),
+            "{text}"
+        );
+
+        // The next pass starts a fresh buffer: its dump carries only its own
+        // output, and the base is gone once the turn ends.
+        shared.begin_repro_pass(agent.repro_base(""));
+        let (path, _) = shared.write_repro("", "repro", 2).expect("dump written");
+        let text = std::fs::read_to_string(&path).expect("dump readable");
+        assert!(!text.contains("Rayleigh"), "{text}");
+        assert!(text.contains("- generated so far: 0 bytes"), "{text}");
+        assert!(
+            text.starts_with(&format!(
+                "# plank repro {}\n\n- date: ",
+                crate::logo::version_label()
+            )) && text.contains(&format!("- note: {}\n", crate::repro::MID_TURN_NOTE)),
+            "an untyped note defaults to the mid-turn marker: {text}"
+        );
+        shared.end_repro();
+        assert!(shared.write_repro("", "repro", 3).is_err());
+    }
+
+    /// The worker publishes the base before each main pass and streams that
+    /// pass's text into the live buffer, so the UI thread's `/repro` is never
+    /// behind by more than a token.
+    #[test]
+    fn the_worker_publishes_the_repro_base_and_streams_the_live_pass() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("repro-worker-publish");
+        let engine = ScriptedEngine {
+            replies: vec!["The answer is 7.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("what is 3+4?"));
+
+        let shared = TurnShared::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+
+        let base = shared
+            .repro
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("base published");
+        assert!(base.report.contains("what is 3+4?"), "{}", base.report);
+        assert_eq!(base.dir, agent.repro_dir);
+        assert_eq!(
+            shared.live_pass.lock().unwrap().as_str(),
+            "The answer is 7.\n"
+        );
     }
 
     /// The dump reports the temperature the *next pass* would use, not the one
@@ -17606,6 +23478,115 @@ mod tests {
                 .1
                 .contains("expected on|off")
         );
+    }
+
+    /// `/loopguard off` silences the guards for this session without
+    /// touching the persisted `tools.loopGuards`.
+    #[test]
+    fn loopguard_off_disables_for_session_without_persisting() {
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = true;
+        crate::settings::set_for_test(settings);
+        crate::settings::set_loop_guards_override(None);
+
+        assert!(crate::guard::guards_enabled());
+        let out = super::loopguard_command("off");
+        assert!(out.contains("off"), "{out:?}");
+        assert!(!crate::guard::guards_enabled(), "override took effect");
+        assert!(
+            crate::settings::active().tools.loop_guards,
+            "persisted value must be untouched"
+        );
+        crate::settings::set_loop_guards_override(None);
+    }
+
+    /// The bug this layer exists to close: `/loopguard off` followed by a
+    /// `/config` of some *unrelated* key must not smuggle the toggled value
+    /// into the file that `/config` writes in full.
+    #[test]
+    fn loopguard_off_then_config_of_another_key_does_not_persist_it() {
+        let _g = crate::debugmirror::test_support::lock();
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = true;
+        crate::settings::set_for_test(settings);
+        crate::settings::set_loop_guards_override(None);
+
+        let dir = scratch_dir("loopguard-then-config");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let dest = dir.join("settings.json");
+
+        let out = super::loopguard_command("off");
+        assert!(out.contains("off"), "{out:?}");
+        assert!(!crate::guard::guards_enabled());
+
+        // An unrelated key, and deliberately a non-guard, non-display one.
+        let out = agent.config_set_command_at("engine.threads 7", Some(dest.clone()));
+        assert!(out.contains("threads"), "{out:?}");
+        let written = std::fs::read_to_string(&dest).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            json["tools"]["loopGuards"],
+            serde_json::Value::Bool(true),
+            "the toggled value must not reach disk: {written}"
+        );
+        // And the toggle still stands for enforcement: an unrelated
+        // `/config` does not silently cancel it.
+        assert!(!crate::guard::guards_enabled());
+        crate::settings::set_loop_guards_override(None);
+    }
+
+    /// An explicit `/config tools.loopGuards` wins: it persists the value
+    /// and clears `/loopguard`'s override, so what the user typed is what's
+    /// in force.
+    #[test]
+    fn config_loop_guards_persists_and_clears_the_override() {
+        let _g = crate::debugmirror::test_support::lock();
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = true;
+        crate::settings::set_for_test(settings);
+        crate::settings::set_loop_guards_override(None);
+
+        let dir = scratch_dir("config-loop-guards");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let dest = dir.join("settings.json");
+
+        let out = super::loopguard_command("off");
+        assert!(out.contains("off"), "{out:?}");
+        assert!(!crate::guard::guards_enabled());
+
+        let out = agent.config_set_command_at("tools.loopGuards true", Some(dest.clone()));
+        assert!(out.contains("loopGuards"), "{out:?}");
+        assert_eq!(
+            crate::settings::loop_guards_override(),
+            None,
+            "an explicit /config clears the /loopguard toggle"
+        );
+        assert!(crate::guard::guards_enabled());
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(json["tools"]["loopGuards"], serde_json::Value::Bool(true));
+    }
+
+    /// The override is process state, not conversation state: `/clear`/`/new`
+    /// leave it alone, because the investigation it supports outlives a
+    /// context reset.
+    #[test]
+    fn the_loop_guards_override_survives_a_session_clear() {
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.loop_guards = true;
+        crate::settings::set_for_test(settings);
+        crate::settings::set_loop_guards_override(None);
+
+        let dir = scratch_dir("loopguard-survives-clear");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let _ = super::loopguard_command("off");
+        agent.reset_session_state();
+        assert_eq!(crate::settings::loop_guards_override(), Some(false));
+        assert!(!crate::guard::guards_enabled());
+        crate::settings::set_loop_guards_override(None);
     }
 
     /// Regression: the screensaver's idle clock must not be reset by focus or
@@ -17701,6 +23682,56 @@ mod tests {
                 "expected {name} to reach its real handler under a permissive profile, got: {out}"
             );
         }
+    }
+
+    #[test]
+    fn init_turn_pushes_the_init_prompt_and_suspends_the_guards() {
+        // `/init`'s phases re-read and re-survey the same tree on purpose,
+        // which is the shape LoopGuard refuses. A headless `/init` that ran
+        // with the guards armed would be stopped for obeying its own prompt.
+        let dir = scratch_dir("init-turn");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.init_turn().unwrap();
+        assert!(
+            agent
+                .session
+                .transcript
+                .iter()
+                .any(|m| m.text == Agent::INIT_PROMPT),
+            "the canned prompt, not the four characters the user typed"
+        );
+        assert!(
+            !agent.quiet_tools,
+            "quiet_tools is restored when the turn ends"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_the_exact_init_prompt_is_a_command() {
+        // The narrow rule this change is allowed to have: `/init` and nothing
+        // else. `-p "/initialise"` is a prompt about a word that starts with
+        // a slash, and must still reach the model verbatim.
+        assert!(headless_prompt_is_init("/init"));
+        assert!(headless_prompt_is_init("  /init  "));
+        assert!(!headless_prompt_is_init("/initialise"));
+        assert!(!headless_prompt_is_init("/init the repo"));
+        assert!(!headless_prompt_is_init("hello"));
+        assert!(!headless_prompt_is_init("/clear"));
+    }
+
+    #[test]
+    fn a_guard_stopped_one_shot_exits_three() {
+        // 3, not 1: a benchmark needs to tell "plank errored" from "the
+        // guards stopped the turn", and both from a clean run.
+        assert_eq!(headless_exit_code(false), 0);
+        assert_eq!(headless_exit_code(true), GUARD_STOP_EXIT);
+        assert_eq!(GUARD_STOP_EXIT, 3);
     }
 
     /// `ScriptedEngine::default()` leaves `kv_events` unset, so `get_kv`
@@ -17967,6 +23998,76 @@ mod tests {
     /// synthetic context pressure is high. The measured trade (~1.2 bytes per
     /// token) is below the strict floor, so before the pressure term this pass
     /// was refused at every pressure and the restore never ran.
+    #[test]
+    fn the_plan_does_not_survive_the_session_being_rebuilt() {
+        // F3/F4: the yielded state used to end at `Decision::Resume`, thirty
+        // seconds into a sustained Normal — long after the first post-yield
+        // generate had already re-acquired the session, and possibly long
+        // before it, so the user paid a silent multi-gigabyte re-prefill and
+        // read about it later.
+        let dir = scratch_dir("pressure-rebuild-retires-plan");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.first_turn_done = true;
+        agent.session.push(Message::user("do a thing"));
+
+        assert!(agent.do_pressure_yield(), "the scripted engine releases");
+        agent.hysteresis.note_external_yield(Agent::pressure_now());
+        assert!(
+            agent.is_pressure_yielded(),
+            "precondition: a plan is pinned"
+        );
+
+        // The turn boundary: this is where the session is about to be rebuilt.
+        let line = agent.announce_pressure_resume();
+        assert!(
+            line.is_some_and(|l| l.contains("re-prefilling")),
+            "the disclosure must reach the user before the wait it describes"
+        );
+        assert!(
+            !agent.is_pressure_yielded(),
+            "no state may claim 'yielded' once the session is live again"
+        );
+        assert!(
+            !agent.hysteresis.is_yielded(),
+            "the hysteresis must be able to act on the next episode"
+        );
+        assert!(
+            agent.announce_pressure_resume().is_none(),
+            "the plan is retired exactly once"
+        );
+
+        // ...and F1 is what stops the next Critical yielding straight back:
+        // un-yielding at the rebuild is only safe behind the guard window.
+        assert!(
+            !agent.pressure_gate().armed(),
+            "a fresh yield inside the guard window would be the livelock"
+        );
+    }
+
+    #[test]
+    fn a_new_session_does_not_inherit_a_restore_plan() {
+        // F5: `plan.keep` names the old chain's tier stems and
+        // `reprefill_tokens` the old depth; carried across a `/new` or a
+        // `/switch` it would disclose a wrong number and keep micro-compaction
+        // and the footer marker suppressed on an unrelated session.
+        let dir = scratch_dir("pressure-plan-not-inherited");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.first_turn_done = true;
+        agent.session.push(Message::user("do a thing"));
+        assert!(agent.do_pressure_yield());
+        agent.hysteresis.note_external_yield(Agent::pressure_now());
+
+        // Every transcript-identity change funnels through here.
+        agent.discard_ladder();
+        assert!(
+            !agent.is_pressure_yielded(),
+            "a plan from a transcript that no longer exists must not stand"
+        );
+        assert!(!agent.hysteresis.is_yielded());
+    }
+
     #[test]
     fn under_pressure_the_opportunistic_pass_fires_and_restores_a_rung() {
         let dir = scratch_dir("ladder-pressure-e2e");
@@ -18371,6 +24472,139 @@ mod tests {
             crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
+    /// The init prompt drives its phases entirely through tools plank
+    /// actually ships: the two interview phases through `ask`, the survey
+    /// through `agent`. Renaming or dropping one of those tools without
+    /// touching the prompt would leave `/init` instructing the model to call
+    /// something that does not exist, and the failure would be a silently
+    /// degraded setup rather than an error — so the prompt's tool names are
+    /// checked against the live registry here.
+    #[test]
+    fn the_init_prompt_only_names_tools_that_exist() {
+        let names = sysprompt::tool_names(&[]);
+        for tool in ["ask", "agent"] {
+            assert!(
+                names.iter().any(|n| n == tool),
+                "/init tells the model to use `{tool}`, which is not a tool: {names:?}"
+            );
+            assert!(
+                Agent::INIT_PROMPT.contains(&format!("`{tool}`")),
+                "the prompt no longer names `{tool}`"
+            );
+        }
+        // The todo tool is also called `task`. The prompt used to say "a
+        // `task` sub-agent", and every model in the first bench-matrix run
+        // dispatched the survey to the todo tool, got "task requires 'op'"
+        // back, and only then found `agent`: one wasted round per /init.
+        assert!(
+            !Agent::INIT_PROMPT.contains("`task`"),
+            "the prompt names `task`, which is the todo tool, not the sub-agent"
+        );
+        // Every phase has to survive an edit to the prompt: dropping one
+        // silently shortens the flow rather than breaking it.
+        for phase in [
+            "PHASE 1", "PHASE 2", "PHASE 3", "PHASE 4", "PHASE 5", "PHASE 6",
+        ] {
+            assert!(Agent::INIT_PROMPT.contains(phase), "{phase} went missing");
+        }
+        // The two files the flow can write, and the header AGENTS.md must
+        // carry — the same one `context::discover_agents_md_files` looks for.
+        assert!(Agent::INIT_PROMPT.contains("AGENTS.local.md"));
+        assert!(Agent::INIT_PROMPT.contains("# AGENTS.md\n"));
+        // Headless has no user to interview; the prompt must say so itself,
+        // because `ask` under `--ui console` returns a refusal, not an error.
+        assert!(
+            Agent::INIT_PROMPT.contains("no user is available"),
+            "the prompt must tell the model what to do when `ask` fast-fails"
+        );
+    }
+
+    /// `/init` clears the session only when the launch offer ran it.
+    ///
+    /// The offer fires before the user has said anything, and the context
+    /// pushed at startup predates the file the turn just wrote — so the clear
+    /// is the thing that puts the new `AGENTS.md` in front of the model, which
+    /// is why the fresh transcript is checked for it here. A `/init` the user
+    /// typed has a conversation behind it and must keep it.
+    /// `/init` drives a canned multi-phase prompt whose phases re-read and
+    /// re-survey by design, which is exactly the shape the loop guards refuse.
+    /// The suspension has to be observable from *inside* the turn — a flag set
+    /// and cleared around one would pass a before/after check while doing
+    /// nothing — and it has to lift again afterwards.
+    #[test]
+    fn init_runs_with_the_loop_guards_suspended_and_re_arms_after() {
+        let dir = scratch_dir("init-loopguards");
+        let cfg = test_cfg();
+        crate::settings::set_loop_guards_override(None);
+        assert!(
+            crate::guard::guards_enabled(),
+            "precondition: the guards are armed by default"
+        );
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            saw_loop_guards: Some(std::sync::Arc::clone(&seen)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.run_init(InitSource::UserCommand);
+
+        let observed = seen.lock().unwrap().clone();
+        assert!(!observed.is_empty(), "the init turn never reached generate");
+        assert!(
+            observed.iter().all(|armed| !armed),
+            "the guards were armed during /init: {observed:?}"
+        );
+        assert!(
+            crate::guard::guards_enabled(),
+            "the guards must be armed again once /init returns"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn init_clears_the_session_only_for_the_launch_offer() {
+        let dir = scratch_dir("init-clear-source");
+        let cfg = test_cfg();
+        let earlier = "what does this crate do?";
+
+        let mut typed = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        typed.session.push(Message::user(earlier));
+        typed.run_init(InitSource::UserCommand);
+        let text = |a: &Agent<'_>| -> String {
+            a.session
+                .transcript
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            text(&typed).contains(earlier),
+            "a typed /init must not throw the conversation away"
+        );
+
+        let mut offered = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        offered.session.push(Message::user(earlier));
+        offered.run_init(InitSource::LaunchOffer);
+        let fresh = text(&offered);
+        assert!(!fresh.contains(earlier), "the offer path clears: {fresh:?}");
+        assert!(
+            !fresh.contains(Agent::INIT_PROMPT),
+            "the init scaffolding must not survive: {fresh:?}"
+        );
+        // The clear re-reads AGENTS.md from disk, so a file written during the
+        // init turn reaches the model. (The repo this runs in has one; when it
+        // does not, there is nothing to assert.)
+        if let Some(md) = crate::context::ContextContent::new().agents_md_content {
+            let head: String = md.lines().take(4).collect::<Vec<_>>().join("\n");
+            assert!(
+                fresh.contains(&head),
+                "the fresh context must carry AGENTS.md: {fresh:?}"
+            );
+        }
+    }
+
     /// Replacing the session must clear the ladder and take its blobs with it.
     ///
     /// `/new`, `/clear`, `/switch`, both `/resume` paths and `resume_by_id`
@@ -18526,6 +24760,7 @@ mod tests {
     /// is why `store.save` runs first below).
     #[test]
     fn drive_goal_loop_saves_the_payload_on_a_settled_verdict() {
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = scratch_dir("goal-loop-saves-on-verdict");
         let cfg = test_cfg();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -18976,7 +25211,7 @@ mod tests {
             ClientMsg::RequestControl,
             ClientMsg::Prompt { text: "hi".into() },
         ] {
-            ws.send(Message::Text(ClientFrame::new(m).to_json().unwrap()))
+            ws.send(Message::Text(ClientFrame::new(m).to_json().unwrap().into()))
                 .unwrap();
         }
 
@@ -19192,6 +25427,7 @@ mod tests {
         let shared = TurnShared::default();
         shared.push_btw("what is 3+4?".to_owned());
         let (tx, _rx) = std::sync::mpsc::channel();
+        let _no_extract = disable_auto_extract_for_test();
         agent.worker_turn(&tx, &shared).unwrap();
         drop(tx);
 
@@ -19240,6 +25476,7 @@ mod tests {
         shared.push_btw("what language?".to_owned());
         shared.preempt.store(true, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
+        let _no_extract = disable_auto_extract_for_test();
         agent.worker_turn(&tx, &shared).unwrap();
         drop(tx);
 
@@ -19307,6 +25544,7 @@ mod tests {
         shared.push_btw("what language?".to_owned());
         shared.preempt.store(true, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
+        let _no_extract = disable_auto_extract_for_test();
         agent.worker_turn(&tx, &shared).unwrap();
         drop(tx);
 
@@ -19598,6 +25836,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // `/hooks` shares one body between the plain REPL and the TUI pane, so this
+    // covers both call sites. The toggle is runtime-only: nothing is written.
+    #[test]
+    fn hooks_command_lists_toggles_and_rejects_junk() {
+        let _lock = crate::hooks::TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch_dir("hooks-cmd");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        // Bare form still lists, and now says which way the switch is thrown.
+        let out = agent.hooks_command("");
+        assert!(out.contains("hooks are enabled"), "got: {out}");
+
+        let out = agent.hooks_command("off");
+        assert!(out.contains("disabled"), "got: {out}");
+        assert!(!crate::hooks::enabled());
+        let listed = agent.hooks_command("");
+        assert!(listed.contains("hooks are disabled"), "got: {listed}");
+
+        let out = agent.hooks_command("on");
+        assert!(out.contains("enabled"), "got: {out}");
+        assert!(crate::hooks::enabled());
+
+        let out = agent.hooks_command("sideways");
+        assert!(out.contains("usage: /hooks [on|off]"), "got: {out}");
+        // A bad argument changes nothing.
+        assert!(crate::hooks::enabled());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // `/think` with no argument reports rather than changes, and names the
     // levels so the user learns the vocabulary from the answer.
     #[test]
@@ -19634,6 +25904,188 @@ mod tests {
         let out = agent.think_command("medium", &mut || {});
         assert!(out.contains("already"), "got: {out}");
         assert_eq!(seen.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scripted engine the numeric `/think` levels are accepted on.
+    fn v41_engine() -> ScriptedEngine {
+        ScriptedEngine {
+            model: Some("DeepSeek V4.1 Flash".to_owned()),
+            ..ScriptedEngine::default()
+        }
+    }
+
+    /// Seeds `agent` with a named session, a short transcript and `rungs` KV
+    /// ladder rungs, so a test can watch what a `/think` does to them. The rung
+    /// depths and token counts only have to be increasing — nothing here reads
+    /// a blob, and `discard_ladder`'s deletes are best-effort over a scratch
+    /// dir that has none.
+    fn seed_ladder(agent: &mut Agent<'_>, rungs: usize) {
+        agent.session.id = "brave-curie".to_owned();
+        for i in 0..4u32 {
+            agent
+                .session
+                .transcript
+                .push(Message::user(format!("m{i}")));
+        }
+        for i in 0..rungs {
+            agent
+                .ladder
+                .push(i + 1, i32::try_from(i + 1).unwrap() * 100);
+        }
+        assert_eq!(agent.ladder.rungs().len(), rungs, "seeding failed");
+    }
+
+    /// The silent one. Every rung was captured under the old reasoning level,
+    /// and `session::payload_fingerprint` hashes `think.name()`, so after a
+    /// `/think` no rung can ever be loaded again. A surviving rung is not a
+    /// wrong-KV hazard here — `restore_rung` only hands the engine a blob it
+    /// actually loaded — but it is a permanently dead ladder: `wants_anchor`
+    /// measures against a rung that can no longer be found, so the ladder reads
+    /// as covered and never captures again, with nothing in the logs to say so.
+    #[test]
+    fn changing_effort_discards_every_kv_rung() {
+        let dir = scratch_dir("think-ladder-discard");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, v41_engine(), &cfg);
+        seed_ladder(&mut agent, 3);
+
+        let out = agent.think_command("25", &mut || {});
+        assert!(out.contains("25"), "got: {out}");
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "a rung survived a reasoning-level change: {:?}",
+            agent.ladder.rungs()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `off` and `medium` share the empty effort preamble, so nothing about the
+    /// *prompt* moves — but `payload_fingerprint` keys on the level's name, not
+    /// on its preamble, so the rungs die just the same. This is the pair a
+    /// `prefix_changed` gate would silently leave broken.
+    #[test]
+    fn a_level_change_that_keeps_the_preamble_still_discards_the_ladder() {
+        let dir = scratch_dir("think-ladder-free-pair");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert_eq!(agent.think, ThinkMode::Off);
+        assert_eq!(
+            ThinkMode::Off.effort_prefix(false),
+            ThinkMode::Medium.effort_prefix(false),
+            "this test is about the pair that shares a preamble",
+        );
+        seed_ladder(&mut agent, 2);
+
+        agent.think_command("medium", &mut || {});
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "the ladder outlived a level change that kept the preamble",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The C splices the new prefix in front of the transcript tail and leaves
+    /// every token behind it untouched. plank never materializes that prefix
+    /// into the transcript at all — it is re-rendered from `self.think` on each
+    /// prompt build — so the tail must come through a `/think` byte-identical,
+    /// and a `/think` that rewrote conversation content would be a bug the C
+    /// does not have either.
+    #[test]
+    fn changing_effort_preserves_the_transcript_tail() {
+        let dir = scratch_dir("think-ladder-tail");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, v41_engine(), &cfg);
+        seed_ladder(&mut agent, 1);
+        let before = render_transcript(&agent.session, &agent.system);
+
+        agent.think_command("25", &mut || {});
+        assert_eq!(
+            render_transcript(&agent.session, &agent.system),
+            before,
+            "the transcript tail must survive a think-prefix change verbatim",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The C scans levels 0..100 to find the prefix a *restored* session really
+    /// carries, because its transcript holds spliced tokens that may predate the
+    /// current CLI setting. plank has no such disagreement to resolve — the
+    /// prefix is rebuilt from `self.think` every time — but the hazard the scan
+    /// guards against is real here in the cache layer: rungs signed at one
+    /// effort must be dropped when the effort changes, whatever level the
+    /// session is sitting at and whether the change moves the preamble or not.
+    ///
+    /// This covers only the in-memory ladder: it seeds rungs with the agent at
+    /// `Max` and switches to a numeric level. Nothing is written to or read
+    /// back from disk, so it proves the drop-on-change rule, not restoration.
+    #[test]
+    fn switching_effort_drops_rungs_seeded_at_the_previous_level() {
+        let dir = scratch_dir("think-ladder-restored");
+        let mut cfg = crate::config::AgentConfig::default();
+        // The session came back at `max`; the rungs on disk were signed by
+        // whatever level wrote them.
+        cfg.generation.think_mode = ThinkMode::Max;
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                ctx_override: Some(crate::engine::THINK_MAX_MIN_CONTEXT),
+                ..v41_engine()
+            },
+            &cfg,
+        );
+        assert_eq!(agent.think, ThinkMode::Max);
+        seed_ladder(&mut agent, 3);
+
+        let out = agent.think_command("7", &mut || {});
+        assert!(out.contains('7'), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Level(7));
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "rungs seeded at a different effort survived the switch",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The C refuses when `transcript.len + delta >= ctx_size`: a longer effort
+    /// preamble that does not fit is not worth a session that no longer fits its
+    /// own context. Only a growth can run out of room, so the shrink back is
+    /// always allowed — and a refusal changes nothing, not the level, not the
+    /// engine, not the ladder.
+    #[test]
+    fn think_refuses_a_longer_preamble_with_no_context_room() {
+        let dir = scratch_dir("think-no-room");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cfg = test_cfg();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                ctx_override: Some(512),
+                think_modes: Some(std::sync::Arc::clone(&seen)),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        seed_ladder(&mut agent, 2);
+        // Full to the brim: any preamble growth at all overruns.
+        agent.last_ctx_used = 512;
+
+        let out = agent.think_command("low", &mut || {});
+        assert!(out.contains("no context room"), "got: {out}");
+        assert_eq!(
+            agent.think,
+            ThinkMode::Off,
+            "a refusal must not take effect"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the engine must not be told"
+        );
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            2,
+            "a refused change must leave the ladder alone",
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -19826,6 +26278,68 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // `/think N` on V4.1: the level is set, reported, and pushed to the engine,
+    // which is where it becomes `DS4_THINK_LEVEL_BASE + N`.
+    #[test]
+    fn think_command_accepts_a_numeric_level_on_v41() {
+        let dir = scratch_dir("think-level-v41");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            model: Some("DeepSeek V4.1 Flash".to_owned()),
+            think_modes: Some(std::sync::Arc::clone(&seen)),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        let out = agent.think_command("25", &mut || {});
+        assert!(out.contains("25"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Level(25));
+        assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Level(25)]);
+
+        // Zero is `off`, not a level, exactly as the C parses it.
+        let out = agent.think_command("0", &mut || {});
+        assert!(out.contains("off"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Off);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // On anything but V4.1 a numeric effort is refused rather than rounded to
+    // ordinary thinking, and the level is left alone.
+    #[test]
+    fn think_command_rejects_a_numeric_level_off_v41() {
+        let dir = scratch_dir("think-level-v4");
+        let engine = ScriptedEngine {
+            model: Some("DeepSeek V4 Flash".to_owned()),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let out = agent.think_command("25", &mut || {});
+        assert!(out.contains("V4.1"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Off, "level unchanged");
+        // The named levels are unaffected.
+        let out = agent.think_command("max", &mut || {});
+        assert!(!out.contains("V4.1"), "got: {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Out of range is not a level at all, on any model.
+    #[test]
+    fn think_command_rejects_an_out_of_range_level() {
+        let dir = scratch_dir("think-level-range");
+        let engine = ScriptedEngine {
+            model: Some("DeepSeek V4.1 Flash".to_owned()),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let out = agent.think_command("101", &mut || {});
+        assert!(out.contains("expected"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Off, "level unchanged");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn think_command_rejects_an_unknown_level() {
         let dir = scratch_dir("think-bad");
@@ -19904,20 +26418,170 @@ mod tests {
     #[test]
     fn live_commands_allow_read_only_reports_and_reject_the_rest() {
         let live = LiveCommands {
-            context: "CTX".to_owned(),
             usage: "USE".to_owned(),
             mcp: "MCP".to_owned(),
         };
-        assert_eq!(live.output("/context").as_deref(), Some("CTX"));
-        assert_eq!(live.output("/usage").as_deref(), Some("USE"));
-        assert_eq!(live.output("/mcp").as_deref(), Some("MCP"));
+        // `/context`, `/usage` and `/mcp` are snapshotted for the report
+        // panel, which reads the fields directly, so they are deliberately not
+        // streamable.
+        assert_eq!(live.usage, "USE");
+        assert_eq!(live.mcp, "MCP");
+        assert!(LiveCommands::output("/context").is_none());
+        assert!(LiveCommands::output("/usage").is_none());
+        assert!(LiveCommands::output("/mcp").is_none());
         // /help is static, rendered on demand — just present.
-        assert!(live.output("/help").is_some());
+        assert!(LiveCommands::output("/help").is_some());
         // Mutating / stateful commands must not run mid-turn.
-        assert!(live.output("/compact").is_none());
-        assert!(live.output("/save").is_none());
-        assert!(live.output("/resume").is_none());
-        assert!(live.output("/context-ish").is_none());
+        assert!(LiveCommands::output("/compact").is_none());
+        assert!(LiveCommands::output("/save").is_none());
+        assert!(LiveCommands::output("/resume").is_none());
+        assert!(LiveCommands::output("/context-ish").is_none());
+    }
+
+    /// A brain click flips the effective value and names it in the tip.
+    #[test]
+    fn a_brain_click_flips_only_show_thinking() {
+        let (next, tip) = super::think_show_toggled(false);
+        assert!(next, "the click turns thinking on");
+        assert!(tip.contains("shown"), "{tip:?}");
+        assert!(tip.contains("this session"), "{tip:?}");
+    }
+
+    /// Clicking twice puts it back exactly as it was, from either start.
+    #[test]
+    fn two_brain_clicks_round_trip() {
+        for start in [true, false] {
+            let (once, _) = super::think_show_toggled(start);
+            assert_ne!(once, start);
+            let (twice, tip) = super::think_show_toggled(once);
+            assert_eq!(twice, start, "back to the original value");
+            assert!(
+                tip.contains(if start { "shown" } else { "hidden" }),
+                "{tip:?}"
+            );
+        }
+    }
+
+    /// The click sets the session override and leaves the *persisted* setting
+    /// — and therefore the settings file — exactly as it was.
+    #[test]
+    fn a_brain_click_does_not_touch_the_settings_file() {
+        // Setting the override reconciles the debug-console mirror off
+        // `showThinking`: take the same lock the mirror's own tests take so
+        // the two cannot interleave.
+        let _g = crate::debugmirror::test_support::lock();
+        let before = crate::settings::project_path().map(|p| std::fs::read(&p).ok());
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::set_for_test(settings);
+        crate::settings::set_show_thinking_override(None);
+
+        super::think_show_click();
+        assert!(
+            crate::settings::show_thinking_effective(),
+            "the effective value flipped"
+        );
+        assert!(
+            !crate::settings::active().ui.show_thinking,
+            "the persisted value did not move"
+        );
+        super::think_show_click();
+        assert!(
+            !crate::settings::show_thinking_effective(),
+            "and flipped back"
+        );
+        assert!(!crate::settings::active().ui.show_thinking);
+        crate::settings::set_show_thinking_override(None);
+        let after = crate::settings::project_path().map(|p| std::fs::read(&p).ok());
+        assert_eq!(before, after, "settings.json must be untouched");
+    }
+
+    /// The bug this layer exists to close: a click followed by a `/config` of
+    /// some *unrelated* key must not smuggle the clicked value into the file
+    /// that `/config` writes in full.
+    #[test]
+    fn a_click_then_config_of_another_key_does_not_persist_the_click() {
+        let _g = crate::debugmirror::test_support::lock();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::set_for_test(settings);
+        crate::settings::set_show_thinking_override(None);
+
+        let dir = scratch_dir("click-then-config");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let dest = dir.join("settings.json");
+
+        super::think_show_click();
+        assert!(crate::settings::show_thinking_effective(), "click took");
+
+        // An unrelated key, and deliberately a non-display one: this test
+        // reinstalls settings process-wide, and a display key would reach
+        // tests running concurrently.
+        let out = agent.config_set_command_at("engine.threads 7", Some(dest.clone()));
+        assert!(out.contains("threads"), "{out:?}");
+        let written = std::fs::read_to_string(&dest).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            json["ui"]["showThinking"],
+            serde_json::Value::Bool(false),
+            "the clicked value must not reach disk: {written}"
+        );
+        // And the click still stands for display: an unrelated `/config` does
+        // not silently cancel it either.
+        assert!(crate::settings::show_thinking_effective());
+        crate::settings::set_show_thinking_override(None);
+    }
+
+    /// An explicit `/config ui.showThinking` wins: it persists the value and
+    /// clears the click's override, so what the user typed is what shows.
+    #[test]
+    fn config_show_thinking_persists_and_clears_the_override() {
+        let _g = crate::debugmirror::test_support::lock();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::set_for_test(settings);
+        crate::settings::set_show_thinking_override(None);
+
+        let dir = scratch_dir("config-show-thinking");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let dest = dir.join("settings.json");
+
+        super::think_show_click();
+        assert!(crate::settings::show_thinking_effective(), "click took");
+
+        let out = agent.config_set_command_at("ui.showThinking false", Some(dest.clone()));
+        assert!(out.contains("showThinking"), "{out:?}");
+        assert_eq!(
+            crate::settings::show_thinking_override(),
+            None,
+            "an explicit /config clears the click"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(json["ui"]["showThinking"], serde_json::Value::Bool(false));
+    }
+
+    /// The override is a property of the terminal session, not of the
+    /// conversation: clearing the conversation leaves it alone, so the footer
+    /// glyph and the display stay in step across `/new`.
+    #[test]
+    fn the_override_survives_a_session_clear() {
+        let _g = crate::debugmirror::test_support::lock();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::set_for_test(settings);
+        crate::settings::set_show_thinking_override(None);
+
+        let dir = scratch_dir("override-survives-clear");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        super::think_show_click();
+        agent.reset_session_state();
+        assert_eq!(crate::settings::show_thinking_override(), Some(true));
+        assert!(crate::settings::show_thinking_effective());
+        crate::settings::set_show_thinking_override(None);
     }
 
     /// A console that connects after two turns receives exactly those two
@@ -20050,10 +26714,9 @@ mod tests {
 
         let (_parent_hello, _parent) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         let (hello, mut sub) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-        assert!(
-            hello.contains("plank:bouncy-phelps:subagent-2"),
-            "{hello:?}"
-        );
+        // Replayed under its roster label, the same name the live window
+        // would have carried, not a bare ordinal.
+        assert!(hello.contains("plank:bouncy-phelps:reviewer"), "{hello:?}");
         let got = dm::read_available(&mut sub);
         assert!(got.contains("sub answer\n"), "{got:?}");
         assert!(
@@ -20083,7 +26746,7 @@ mod tests {
         let fork_at = agent.begin_subagent_fork(None, "delegated", false);
         assert_eq!(agent.fork_points, vec![fork_at]);
         agent.session.push(Message::assistant("child answer"));
-        let mirror = crate::debugmirror::open_subagent();
+        let mirror = crate::debugmirror::open_subagent("");
         let _active = mirror.activate();
 
         let (port, rx) = dm::fake_console_keeping_sockets();
@@ -20126,7 +26789,7 @@ mod tests {
         agent.session.push(Message::assistant("parent answer"));
         let fork_at = agent.begin_subagent_fork(None, "delegated", false);
         assert_eq!(agent.fork_points, vec![fork_at]);
-        let mirror = crate::debugmirror::open_subagent();
+        let mirror = crate::debugmirror::open_subagent("");
         let _active = mirror.activate();
         // The stash: the parent transcript is gone, only the framed task
         // remains, so `fork_points[0]` is past the end.
@@ -20914,6 +27577,67 @@ mod tests {
         assert_eq!(bang_head("ok\n"), "ok\n");
     }
 
+    /// A `!!` command's output becomes the body of the scrollable panel, with
+    /// the command itself as a header, and the panel title names the command
+    /// so it is identifiable once the echo has scrolled away.
+    #[test]
+    fn bang_panel_shows_the_command_and_its_output() {
+        let out = crate::tools::bash::ImmediateOutput {
+            stdout: "hello\nworld\n".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            interrupted: false,
+        };
+        let text = bang_panel_report("echo hello", &Ok(out)).expect("panel for non-empty output");
+        assert!(text.contains("$ echo hello"), "{text}");
+        assert!(text.contains("hello\nworld"), "{text}");
+        assert_eq!(bang_panel_title("echo hello"), "!! echo hello");
+        // A long command is clipped, not wrapped, so the border still fits.
+        let long = bang_panel_title(&"x".repeat(200));
+        assert!(long.chars().count() <= 63, "{long}");
+        assert!(long.ends_with('…'), "{long}");
+    }
+
+    /// A failing command's exit status and its stderr both reach the panel:
+    /// neither may be dropped just because the output moved out of the log.
+    #[test]
+    fn bang_panel_keeps_stderr_and_the_exit_status() {
+        let out = crate::tools::bash::ImmediateOutput {
+            stdout: String::new(),
+            stderr: "boom: not found\n".to_string(),
+            exit_code: 127,
+            interrupted: false,
+        };
+        let text = bang_panel_report("nope", &Ok(out)).expect("stderr alone still opens a panel");
+        assert!(text.contains("stderr"), "{text}");
+        assert!(text.contains("boom: not found"), "{text}");
+        assert!(text.contains("failed (exit code 127)."), "{text}");
+
+        let stopped = crate::tools::bash::ImmediateOutput {
+            stdout: "partial\n".to_string(),
+            stderr: String::new(),
+            exit_code: 130,
+            interrupted: true,
+        };
+        let text = bang_panel_report("sleep 99", &Ok(stopped)).expect("partial output");
+        assert!(text.contains("[interrupted]"), "{text}");
+    }
+
+    /// Nothing to show means no panel at all — the caller logs the one-line
+    /// outcome instead of opening an empty pane. A spawn failure is the same:
+    /// there is no output, and the error belongs on the `!<cmd>: …` log line.
+    #[test]
+    fn bang_panel_is_skipped_when_there_is_no_output() {
+        let quiet = crate::tools::bash::ImmediateOutput {
+            stdout: "\n".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            interrupted: false,
+        };
+        assert!(bang_panel_report("true", &Ok(quiet)).is_none());
+        assert!(bang_panel_report("nope", &Err("no such binary".into())).is_none());
+    }
+
     #[test]
     fn esc_cancels_a_streaming_answer_and_defers_the_panel_close() {
         let shared = TurnShared::default();
@@ -21414,9 +28138,23 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
+            memory_jobs: std::collections::VecDeque::new(),
+            pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -21441,11 +28179,15 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -21504,6 +28246,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn usage_report_tallies_provider_turns() {
         let dir = std::env::temp_dir().join(format!("plank-usage-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -21529,9 +28272,23 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
+            memory_jobs: std::collections::VecDeque::new(),
+            pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -21556,11 +28313,15 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -22275,6 +29036,192 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Inside a sub-agent the fork snapshot is a checkpoint at exactly
+    /// `fork_at`, and every divergence in the sidechain sits at or past it.
+    /// The rescue restores it — peeked, not popped, so the fork end still
+    /// finds it — instead of letting the sync rebuild from token zero.
+    #[test]
+    fn a_sidechain_prompt_diverging_behind_the_live_end_restores_the_fork_snapshot() {
+        let dir = scratch_dir("fork-rescue");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(9_000, 8_500);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        let fork_at = agent.begin_subagent_fork(None, "task", true);
+        assert_eq!(agent.fork_kv.len(), 1);
+
+        let restored = agent.rescue_prefix_before_rebuild("prompt");
+        assert_eq!(restored, Some(0), "the fork snapshot is restored");
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["capture", "probe", "restore:1"],
+            "the snapshot the fork captured reached the engine"
+        );
+        assert_eq!(agent.fork_kv.len(), 1, "peeked, not popped");
+        assert!(!agent.finish_subagent_fork(fork_at, "task"));
+        assert_eq!(
+            events.lock().unwrap().last().map(String::as_str),
+            Some("restore:1"),
+            "the fork end still restores the parent"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Nested forks: the innermost snapshot is the one at the innermost
+    /// `fork_at`, which is the shallowest checkpoint that still covers the
+    /// divergence.
+    #[test]
+    fn a_nested_sidechain_rescue_restores_the_innermost_fork_snapshot() {
+        let dir = scratch_dir("fork-rescue-nested");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(9_000, 8_500);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let outer = agent.begin_subagent_fork(None, "outer", true);
+        let inner = agent.begin_subagent_fork(None, "inner", true);
+        assert_eq!(agent.rescue_prefix_before_rebuild("prompt"), Some(0));
+        assert_eq!(
+            events.lock().unwrap().last().map(String::as_str),
+            Some("restore:2")
+        );
+        assert_eq!(agent.fork_kv.len(), 2);
+        assert!(!agent.finish_subagent_fork(inner, "inner"));
+        assert!(!agent.finish_subagent_fork(outer, "outer"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Nested forks where the innermost capture failed: the outer snapshot
+    /// still sits at or below the divergence, so it beats any rung and must
+    /// be the one restored, not skipped in favor of falling through.
+    #[test]
+    fn a_nested_sidechain_rescue_restores_the_outer_fork_snapshot_when_the_inner_one_failed() {
+        let dir = scratch_dir("fork-rescue-nested-inner-failed");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(9_000, 8_500);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let outer = agent.begin_subagent_fork(None, "outer", true);
+        let inner = agent.begin_subagent_fork(None, "inner", false);
+        assert_eq!(agent.rescue_prefix_before_rebuild("prompt"), Some(0));
+        assert_eq!(
+            events.lock().unwrap().last().map(String::as_str),
+            Some("restore:1"),
+            "the outer capture is restored, not skipped"
+        );
+        assert_eq!(agent.fork_kv.len(), 2);
+        assert!(!agent.finish_subagent_fork(inner, "inner"));
+        assert!(!agent.finish_subagent_fork(outer, "outer"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no snapshot on the fork stack (a failed `get_kv` at fork start)
+    /// the sidechain falls back to the parent's ladder: the rungs describe
+    /// intact parent prefix, so the deepest one below the divergence is
+    /// still a valid restore point.
+    #[test]
+    fn a_sidechain_without_a_fork_snapshot_falls_back_to_the_ladder() {
+        let dir = scratch_dir("fork-rescue-ladder");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(117_369, 117_368);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        let rung = agent.capture_first_rung();
+        // `snapshot_kv = false` stands in for a failed capture: a `None` on
+        // the stack at alt depth zero.
+        let fork_at = agent.begin_subagent_fork(None, "task", false);
+        assert_eq!(
+            agent.rescue_prefix_before_rebuild("prompt"),
+            Some(rung.tokens)
+        );
+        assert_eq!(
+            events.lock().unwrap().last().map(String::as_str),
+            Some("restore:1"),
+            "the rung blob reached the engine"
+        );
+        assert!(!agent.finish_subagent_fork(fork_at, "task"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The fork tier can fail its restore (`set_kv` errors) even with a
+    /// snapshot on the stack; the rescue must fall through to the ladder
+    /// instead of giving up.
+    #[test]
+    fn a_failed_fork_restore_falls_through_to_the_ladder() {
+        let dir = scratch_dir("fork-rescue-restore-failed");
+        let cfg = test_cfg();
+        let (mut engine, events) = rebuild_probe_engine(117_369, 117_368);
+        engine.set_kv_fails_once = true;
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        let rung = agent.capture_first_rung();
+        let fork_at = agent.begin_subagent_fork(None, "task", true);
+        assert_eq!(
+            agent.rescue_prefix_before_rebuild("prompt"),
+            Some(rung.tokens),
+            "the ladder rescues the turn after the fork restore fails"
+        );
+        let events = events.lock().unwrap().clone();
+        // The rung was captured first (tag 1, saved to the store) and the
+        // fork snapshot second (tag 2, kept only in `fork_kv`), so the failed
+        // fork restore logs `restore:2` before the rung's `restore:1`
+        // succeeds — not two identical tags in a row, since the two
+        // snapshots are genuinely different captures here.
+        assert_eq!(
+            events[events.len() - 2..],
+            ["restore:2".to_string(), "restore:1".to_string()],
+            "the failed fork restore (tag 2), then the rung restore (tag 1): {events:?}"
+        );
+        assert!(!agent.finish_subagent_fork(fork_at, "task"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A clean-room sidechain runs on an engine that is not the session's:
+    /// neither the fork snapshot nor a rung may be fed to it.
+    #[test]
+    fn a_clean_room_sidechain_is_never_rescued_with_the_sessions_kv() {
+        let dir = scratch_dir("fork-rescue-alt");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(9_000, 8_500);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        agent.capture_first_rung();
+        let fork_at = agent.begin_subagent_fork(None, "task", true);
+        agent.alt_engine_depth = 1;
+        assert_eq!(agent.rescue_prefix_before_rebuild("prompt"), None);
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore")),
+            "nothing restored onto the alt engine: {:?}",
+            events.lock().unwrap()
+        );
+        agent.alt_engine_depth = 0;
+        assert!(!agent.finish_subagent_fork(fork_at, "task"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An extending prompt inside a sidechain is left alone, exactly as on
+    /// the main path.
+    #[test]
+    fn a_sidechain_prompt_that_extends_the_live_end_is_not_rescued() {
+        let dir = scratch_dir("fork-rescue-extend");
+        let cfg = test_cfg();
+        let (engine, events) = rebuild_probe_engine(500, 500);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let fork_at = agent.begin_subagent_fork(None, "task", true);
+        assert_eq!(agent.rescue_prefix_before_rebuild("prompt"), None);
+        assert_eq!(events.lock().unwrap().as_slice(), ["capture", "probe"]);
+        assert!(!agent.finish_subagent_fork(fork_at, "task"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `/kvcache gc` under a tight budget must not take the running session's
     /// own accelerators. Their fingerprints are over the transcript truncated
     /// to each rung's depth, exactly as `restore_rung_below` looks them up.
@@ -22607,6 +29554,70 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The `--ui quiet` clock shares one line with the notes around it, so it
+    /// may only ever erase what it wrote itself — and it must erase all of it,
+    /// including when a reading gets *shorter* crossing the minute.
+    #[test]
+    fn the_inline_clock_erases_exactly_what_it_wrote() {
+        let mut clock = InlineClock::default();
+        // First reading: nothing to erase yet.
+        assert_eq!(clock.update("1.2s").as_deref(), Some("1.2s"));
+        // Unchanged: no write at all, so a 50 ms poll is not 20 writes a second.
+        assert_eq!(clock.update("1.2s"), None);
+        // Same width: four characters back, blanked, back again.
+        assert_eq!(
+            clock.update("1.3s").as_deref(),
+            Some("\u{8}\u{8}\u{8}\u{8}    \u{8}\u{8}\u{8}\u{8}1.3s")
+        );
+        // Shorter reading: the erase is sized to what is on screen (5), not to
+        // what replaces it (4), or the tail of `59.9s` would survive.
+        assert_eq!(
+            clock.update("59.9s").as_deref(),
+            Some("\u{8}\u{8}\u{8}\u{8}    \u{8}\u{8}\u{8}\u{8}59.9s")
+        );
+        let shrink = clock.update("1:00").expect("a changed reading writes");
+        assert_eq!(shrink.chars().filter(|c| *c == '\u{8}').count(), 10);
+        assert!(shrink.ends_with("1:00"));
+    }
+
+    /// The chart's footer, which is the only thing in `--ui chart` that says
+    /// how long the run has been going once the prefill note is gone.
+    #[test]
+    fn the_chart_elapsed_footer_is_one_dim_line() {
+        let plain = elapsed_footer(std::time::Duration::from_millis(8_412), false);
+        assert_eq!(plain, "elapsed 8.4s\n");
+        let colored = elapsed_footer(std::time::Duration::from_secs(90), true);
+        assert!(colored.contains("1:30"), "{colored:?}");
+        assert!(colored.starts_with("\x1b[38;5;238melapsed"), "{colored:?}");
+        assert!(colored.ends_with('\n'));
+        assert_eq!(
+            colored.lines().count(),
+            1,
+            "the painter sizes its erase off the frame's line count"
+        );
+    }
+
+    /// The headless `-p` closing line: seconds keep a decimal because a
+    /// one-shot is usually seconds long, and anything past a minute reads as
+    /// `M:SS` like the rest of the stats.
+    #[test]
+    fn the_headless_total_time_line_keeps_sub_minute_precision() {
+        use std::time::Duration;
+        assert_eq!(
+            total_time_line(Duration::from_millis(8_412)),
+            "total time: 8.4s"
+        );
+        assert_eq!(
+            total_time_line(Duration::from_millis(0)),
+            "total time: 0.0s"
+        );
+        assert_eq!(total_time_line(Duration::from_secs(90)), "total time: 1:30");
+        assert_eq!(
+            total_time_line(Duration::from_secs(3729)),
+            "total time: 1:02:09"
+        );
+    }
+
     #[test]
     fn duration_formats_with_and_without_hours() {
         use std::time::Duration;
@@ -22647,9 +29658,23 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
+            memory_jobs: std::collections::VecDeque::new(),
+            pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -22674,11 +29699,15 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -22704,6 +29733,17 @@ mod tests {
     /// worker's `stop_block` at `AGENT_DSML_DONE`. Without it the model keeps
     /// sampling past a call it already finished: pure waste, and in the
     /// recorded sessions it sometimes spent those tokens on a second stanza.
+    /// The per-pass reasoning budget is a tenth of the context window, in
+    /// bytes, and never below the 16 KiB the corpus was cut at.
+    #[test]
+    fn the_think_budget_is_a_tenth_of_the_context() {
+        assert_eq!(repeat_think_budget(1_048_576), 104_857);
+        assert_eq!(repeat_think_budget(262_144), 26_214);
+        assert_eq!(repeat_think_budget(131_072), REPEAT_THINK_BUDGET_FLOOR);
+        assert_eq!(repeat_think_budget(0), REPEAT_THINK_BUDGET_FLOOR);
+        assert_eq!(repeat_think_budget(-1), REPEAT_THINK_BUDGET_FLOOR);
+    }
+
     #[test]
     fn a_completed_stanza_stops_the_pass() {
         const STANZA: &str = concat!(
@@ -22715,7 +29755,7 @@ mod tests {
         );
         let mut stream = StreamRenderer::new(NullSink);
         let mut guard = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW)
-            .with_think_budget(REPEAT_THINK_BUDGET)
+            .with_think_budget(REPEAT_THINK_BUDGET_FLOOR)
             .gated();
         let greedy = AtomicBool::new(false);
         let mut feed = |stream: &mut StreamRenderer<NullSink>, chunk: &str| {
@@ -22854,6 +29894,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn tool_call_inside_think_is_dispatched_and_the_block_is_closed() {
         // Opt this thread into in-think dispatch; the shipped default is off.
         let mut settings = crate::settings::Settings::default();
@@ -22896,9 +29937,23 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
+            memory_jobs: std::collections::VecDeque::new(),
+            pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -22923,11 +29978,15 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -22996,9 +30055,23 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
+            memory_jobs: std::collections::VecDeque::new(),
+            pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -23023,11 +30096,15 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -23083,9 +30160,23 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
+            memory_jobs: std::collections::VecDeque::new(),
+            pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -23110,11 +30201,15 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -23193,9 +30288,23 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
+            memory_jobs: std::collections::VecDeque::new(),
+            pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -23220,11 +30329,15 @@ mod tests {
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -23291,6 +30404,18 @@ mod tests {
     /// repeat guard's four cycles, never closing its `<think>`.
     fn looping_reasoning() -> String {
         "Now, `WindowLike::window(self).frame`? Yes.\n\n".repeat(400)
+    }
+
+    /// [`looping_reasoning`] that opens its own `<think>`.
+    ///
+    /// A pass generated after a reasoning stop runs under the closed-think
+    /// recovery (`Agent::pass_opts`), so the chat template's implicit open is
+    /// gone and only an explicit tag puts the model back inside a reasoning
+    /// block. That is the case the trip caps still have to bound: a model that
+    /// reopens thinking anyway, which is the only way a *second* consecutive
+    /// reasoning stop can still happen.
+    fn reopened_looping_reasoning() -> String {
+        format!("<think>{}", looping_reasoning())
     }
 
     /// Runs `agent_call(task, None)` with the given sub-agent replies on a TUI
@@ -23429,7 +30554,7 @@ mod tests {
         let engine = ScriptedEngine {
             replies: vec![
                 looping_reasoning(),
-                looping_reasoning(),
+                reopened_looping_reasoning(),
                 "</think>What I found before looping.\n".to_string(),
             ],
             prompts: prompts.clone(),
@@ -23463,9 +30588,9 @@ mod tests {
         assert_eq!(
             errors,
             vec![
-                "guard: stopped a reasoning loop in sub-agent 'sub-agent'",
-                "guard: stopped a reasoning loop (2 in a row) in sub-agent 'sub-agent'",
-                "guard: asked for the report after 2 loops in a row in sub-agent 'sub-agent'",
+                "guard: stopped a reasoning loop in sub-agent 'alpha'",
+                "guard: stopped a reasoning loop (2 in a row) in sub-agent 'alpha'",
+                "guard: asked for the report after 2 loops in a row in sub-agent 'alpha'",
             ],
             "{events:?}"
         );
@@ -23481,8 +30606,8 @@ mod tests {
         let engine = ScriptedEngine {
             replies: vec![
                 looping_reasoning(),
-                looping_reasoning(),
-                looping_reasoning(),
+                reopened_looping_reasoning(),
+                reopened_looping_reasoning(),
             ],
             prompts: prompts.clone(),
             ..ScriptedEngine::default()
@@ -23553,7 +30678,7 @@ mod tests {
     }
 
     /// Reasoning that never repeats a thing and runs well past
-    /// `REPEAT_THINK_BUDGET`, as `repro-1788796284`'s sub-agent did.
+    /// the reasoning budget, as `repro-1788796284`'s sub-agent did.
     fn unbounded_reasoning() -> String {
         use std::fmt::Write as _;
         (0..600).fold(String::new(), |mut acc, i| {
@@ -23599,12 +30724,22 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Turns on `tools.noProgressGuard`, which is off by default, for the
+    /// no-progress budget tests. `install_for_test` is thread-local, so this
+    /// affects only the calling test.
+    fn enable_no_progress_guard() {
+        let mut on = crate::settings::Settings::default();
+        on.tools.no_progress_guard = true;
+        crate::settings::set_for_test(on);
+    }
+
     #[test]
     fn a_turn_that_changes_nothing_is_stopped() {
         // `repro-1788796284`'s main turn: four passes, none cyclic, every one
         // far under the per-pass budget, fifty minutes, nothing edited. Only
         // a turn-scale rung sees it, and only as an absence.
         let dir = scratch_dir("no-progress");
+        enable_no_progress_guard();
         let cfg = test_cfg();
         let read_call = concat!(
             "<｜DSML｜tool_calls>",
@@ -23636,10 +30771,62 @@ mod tests {
     }
 
     #[test]
+    fn a_guard_hard_stop_is_recorded_on_the_agent() {
+        // The same turn as `a_turn_that_changes_nothing_is_stopped`: three
+        // passes that read, change nothing and generate 12 KB each, so the
+        // third crosses the 32 KiB no-progress budget. That turn returns
+        // `Ok(())`, which is why the flag has to carry the news instead.
+        let dir = scratch_dir("guard-stop-flag");
+        enable_no_progress_guard();
+        let cfg = test_cfg();
+        let read_call = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"list\">",
+            "<｜DSML｜parameter name=\"path\">.</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let pass = format!("{}{read_call}", "x".repeat(12 * 1024));
+        let engine = ScriptedEngine {
+            replies: vec![pass.clone(), pass.clone(), pass, "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        assert!(!agent.guard_stopped, "a fresh agent has not been stopped");
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        assert!(
+            agent.guard_stopped,
+            "the no-progress stop must be recorded, not just printed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_clean_turn_records_no_guard_stop() {
+        // The control: without it, a flag wired to `true` unconditionally
+        // would pass the test above.
+        let dir = scratch_dir("guard-stop-clean");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        agent.run_turn().unwrap();
+        assert!(!agent.guard_stopped, "nothing stopped this turn");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn failed_edits_do_not_reset_the_no_progress_budget() {
         // A failed edit used to count by its name alone, so it could reset the
         // budget forever. `last_written` stays empty on failure.
         let dir = scratch_dir("no-progress-failed-edit");
+        enable_no_progress_guard();
         let cfg = test_cfg();
         std::fs::write(dir.join("target.rs"), "present\n").unwrap();
         let edit_call = concat!(
@@ -23673,8 +30860,15 @@ mod tests {
     fn read_only_bash_does_not_reset_the_no_progress_budget() {
         // Exit status says only that a command ran. It does not establish that
         // the task advanced; in particular it must not excuse repeated builds
-        // and searches such as repro-loop-1788833715.
+        // and searches such as repro-loop-1788833715. The directory is a
+        // repository so the `treedigest` witness is genuinely captured and
+        // genuinely unmoved, rather than absent.
         let dir = scratch_dir("no-progress-bash");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        git2::Repository::init(&dir).unwrap();
+        enable_no_progress_guard();
         let cfg = test_cfg();
         let bash_call = concat!(
             "<｜DSML｜tool_calls>",
@@ -23700,6 +30894,49 @@ mod tests {
             vec![format!("guard: {NO_PROGRESS_NOTICE}")],
             "{events:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_bash_command_that_writes_resets_the_no_progress_budget() {
+        // The other half of `read_only_bash_does_not_reset_the_no_progress_budget`:
+        // a shell command whose exit status proves nothing, but whose effect on
+        // the working tree does. `sed -i`, `cargo fmt` and codegen scripts all
+        // land here, and before the `treedigest` witness every one of them
+        // counted as zero progress.
+        let dir = scratch_dir("no-progress-bash-writes");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        git2::Repository::init(&dir).unwrap();
+        enable_no_progress_guard();
+        let cfg = test_cfg();
+        // Appends, so each round grows the file: the digest moves on every
+        // pass without depending on filesystem timestamp resolution.
+        let bash_call = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">printf x >> grew.txt</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let pass = format!("{}{bash_call}", "x".repeat(12 * 1024));
+        let engine = ScriptedEngine {
+            replies: vec![pass.clone(), pass.clone(), pass, "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            error_lines(&events).is_empty(),
+            "36 KB of output, but every round changed the tree: {events:?}"
+        );
+        assert!(dir.join("grew.txt").exists(), "the command never ran");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -23804,6 +31041,7 @@ mod tests {
         agent.session.push(Message::user("do the task"));
         let shared = TurnShared::default();
         let (tx, _rx) = std::sync::mpsc::channel();
+        let _no_extract = disable_auto_extract_for_test();
         agent.worker_turn(&tx, &shared).unwrap();
 
         let seen = prompts.lock().unwrap().clone();
@@ -23815,6 +31053,122 @@ mod tests {
         );
         assert!(recovery.contains(STOPPED_REASONING_STUB), "{recovery}");
         assert!(recovery.contains(REPEAT_LOOP_ERROR), "{recovery}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `repro-loop-1789108509` / `-1789108726`: the draft rung stopped the
+    /// synthesis pass, the model announced "let me stop the exhaustive
+    /// analysis and deliver findings", listed fourteen of them — inside the
+    /// think block it was still in — and was cut at the same byte gate. The
+    /// recovery takes the block away: the pass after any reasoning stop is
+    /// generated with `ThinkMode::Off`, so the answer is the only thing it can
+    /// write, and the pass after that is back to the session's level.
+    #[test]
+    fn the_pass_after_a_reasoning_stop_has_no_reasoning() {
+        let dir = scratch_dir("reply-only-recovery");
+        let mut cfg = test_cfg();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Low;
+        let modes: std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec![
+                looping_reasoning(),
+                // Delivered, not drafted: no think block to draft in.
+                "Here is the finding I had.\n".to_string(),
+            ],
+            pass_modes: Some(std::sync::Arc::clone(&modes)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a code review"));
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _no_extract = disable_auto_extract_for_test();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert_eq!(
+            *modes.lock().unwrap(),
+            vec![ThinkMode::Low, ThinkMode::Off],
+            "the stopped pass thinks, the one after it does not: {events:?}"
+        );
+        // One stop, and then an answer: the turn is not ended by the cap.
+        assert_eq!(
+            error_lines(&events),
+            vec!["guard: stopped a reasoning loop".to_string()],
+            "{events:?}"
+        );
+        // The override is one pass. A third pass would think again.
+        assert!(!agent.reply_only_next, "the override was consumed");
+        assert_eq!(agent.pass_opts().think_mode, ThinkMode::Low);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A draft stop is a nudge to deliver, not evidence the pass was wasted,
+    /// so it counts on its own tally: two of them no longer end the turn the
+    /// way two cycles do (`MAIN_DRAFT_TRIP_CAP`), and a cycle either side of
+    /// one is still two cycles.
+    #[test]
+    fn draft_stops_and_cycles_count_separately() {
+        assert!(is_draft_stop(DRAFT_ERROR));
+        assert!(!is_draft_stop(REPEAT_LOOP_ERROR));
+        assert!(!is_draft_stop(THINK_BUDGET_ERROR));
+        // The framed payload the turn loop actually inspects, not the bare
+        // string: `tool_error_payload` wraps it.
+        let framed = format!("<tool_result>Tool error: {DRAFT_ERROR}</tool_result>");
+        assert!(is_draft_stop(&framed));
+        // The draft rung gets the looser cap.
+        assert_eq!((MAIN_REPEAT_TRIP_CAP, MAIN_DRAFT_TRIP_CAP), (2, 3));
+    }
+
+    /// The `/context` panel stays current during a turn: the worker publishes
+    /// the breakdown into the shared turn state wherever the transcript grows,
+    /// and the UI thread draws it against the live resident count without ever
+    /// touching the agent.
+    #[test]
+    fn the_context_breakdown_is_published_as_the_turn_runs() {
+        let dir = scratch_dir("live-context");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["All done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let shared = TurnShared::default();
+        // Nothing published yet: an empty breakdown renders rather than
+        // dividing by a zero window.
+        assert_eq!(shared.context(), crate::ctxreport::Breakdown::default());
+        assert!(live_context_report(&shared, 0).starts_with("Context Usage"));
+
+        agent.session.push(Message::user("count the context"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+
+        let published = shared.context();
+        assert_eq!(published.ctx_size, agent.engine.ctx_size());
+        assert!(published.system > 0, "{published:?}");
+        assert!(published.estimated() > 0, "{published:?}");
+        // No category is ever negative, whatever the session-start context
+        // and the transcript disagree about.
+        assert!(published.messages >= 0, "{published:?}");
+        // The same numbers the agent would report at idle.
+        assert_eq!(published, agent.context_breakdown());
+
+        // The fill is the UI thread's, not the breakdown's: the same published
+        // numbers drawn against a larger live count report a fuller window.
+        let idle = live_context_report(&shared, 0);
+        let mid_pass = live_context_report(&shared, published.ctx_size / 2);
+        assert_ne!(idle, mid_pass);
+        // The reported total is the sum of the categories, not the live figure
+        // itself — the legend has to agree with the grid drawn from those same
+        // numbers — so what a bigger live count buys is a fuller report, which
+        // is the thing the panel is watched for.
+        let free_cells = |r: &str| r.matches('⛶').count();
+        assert!(
+            free_cells(&mid_pass) < free_cells(&idle),
+            "idle {} vs mid-pass {}",
+            free_cells(&idle),
+            free_cells(&mid_pass)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -23830,7 +31184,7 @@ mod tests {
         let engine = ScriptedEngine {
             replies: vec![
                 looping_reasoning(),
-                looping_reasoning(),
+                reopened_looping_reasoning(),
                 "</think>Done.\n".to_string(),
             ],
             prompts: prompts.clone(),
@@ -24329,9 +31683,9 @@ mod tests {
     /// whichever thread happens to start first.
     #[test]
     fn fanout_slots_take_distinct_ordinals_in_block_order() {
-        let a = crate::debugmirror::open_subagent();
-        let b = crate::debugmirror::open_subagent();
-        let c = crate::debugmirror::open_subagent();
+        let a = crate::debugmirror::open_subagent("");
+        let b = crate::debugmirror::open_subagent("");
+        let c = crate::debugmirror::open_subagent("");
         let mut ids = vec![a.id(), b.id(), c.id()];
         ids.dedup();
         assert_eq!(ids.len(), 3, "every slot needs its own window");
@@ -24342,7 +31696,7 @@ mod tests {
     /// streams on this same thread.
     #[test]
     fn a_serial_sidechain_restores_the_parent_mirror_target() {
-        let sub = crate::debugmirror::open_subagent();
+        let sub = crate::debugmirror::open_subagent("");
         assert_ne!(sub.id(), crate::debugmirror::MirrorId::PARENT);
         {
             let _active = sub.activate();
@@ -24725,6 +32079,7 @@ mod tests {
             "alt engine returned to the cache"
         );
         unsafe { std::env::remove_var(KEY) };
+        crate::settings::set_for_test(crate::settings::Settings::default());
     }
 
     /// Regression: `/subagent` used to resolve only the definition's *persona*
@@ -24734,6 +32089,7 @@ mod tests {
     #[test]
     fn slash_subagent_honours_the_definitions_engine() {
         const KEY: &str = "PLANK_TEST_SLASH_ALT_KEY";
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -24803,6 +32159,7 @@ mod tests {
 
     #[test]
     fn goal_stops_on_the_first_attained_verdict() {
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = scratch_dir("goal-attained");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -24844,6 +32201,7 @@ mod tests {
 
     #[test]
     fn goal_stops_at_the_iteration_cap() {
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = scratch_dir("goal-cap");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -24878,6 +32236,7 @@ mod tests {
     /// another full iteration (and not be reported as a cap).
     #[test]
     fn goal_stops_on_an_interrupt_during_the_adjudication() {
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = scratch_dir("goal-interrupt-adjudication");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -25032,6 +32391,7 @@ or the user's next message aborts before its first token"
     /// report as a tool result.
     #[test]
     fn slash_subagent_runs_a_turn_on_the_report() {
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = scratch_dir("slash-subagent-followup");
         let cfg = test_cfg();
         let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -25401,7 +32761,7 @@ or the user's next message aborts before its first token"
             matches!(
                 got.first(),
                 Some(crate::worker::UiEvent::Dim(d))
-                    if d == &crate::tui::subagent_signpost("sub-agent")
+                    if d == &crate::tui::subagent_signpost("alpha")
             ),
             "first event should be the Dim signpost: {got:?}"
         );
@@ -25421,9 +32781,112 @@ or the user's next message aborts before its first token"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The generated names are the NATO alphabet, lowercase, and they wrap with
+    /// a lap suffix rather than running out or repeating.
+    #[test]
+    fn nato_labels_run_alpha_bravo_charlie_and_wrap_past_zulu() {
+        assert_eq!(nato_label(0), "alpha");
+        assert_eq!(nato_label(1), "bravo");
+        assert_eq!(nato_label(2), "charlie");
+        assert_eq!(nato_label(3), "delta");
+        // The conventional spellings, not the naive ones.
+        assert_eq!(nato_label(9), "juliett");
+        assert_eq!(nato_label(23), "x-ray");
+        assert_eq!(nato_label(25), "zulu");
+        // Past zulu the alphabet starts again with a lap suffix.
+        assert_eq!(nato_label(26), "alpha-2");
+        assert_eq!(nato_label(27), "bravo-2");
+        assert_eq!(nato_label(51), "zulu-2");
+        assert_eq!(nato_label(52), "alpha-3");
+        // ... and never repeats: 1000 draws, 1000 distinct labels.
+        let all: std::collections::HashSet<String> = (0..1000).map(nato_label).collect();
+        assert_eq!(all.len(), 1000);
+    }
+
+    /// One counter per session, shared by every unnamed sub-agent, and a `/new`
+    /// or `/clear` puts it back to `alpha` so a post-reset log reads the same.
+    #[test]
+    fn the_unnamed_sub_agent_counter_is_per_session_and_resets_with_it() {
+        let dir = scratch_dir("nato-counter");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert_eq!(agent.next_unnamed_subagent_label(), "alpha");
+        assert_eq!(agent.next_unnamed_subagent_label(), "bravo");
+        assert_eq!(agent.next_unnamed_subagent_label(), "charlie");
+        agent.reset_session_state();
+        assert_eq!(
+            agent.next_unnamed_subagent_label(),
+            "alpha",
+            "a session reset restarts the alphabet"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `agent` tool's unnamed sub-agents draw successive NATO names, and a
+    /// *named* one keeps its name without consuming a slot — so naming one in
+    /// the middle does not skip a word.
+    #[test]
+    fn unnamed_agent_tool_calls_are_labelled_alpha_then_bravo() {
+        let dir = scratch_dir("nato-agent-tool");
+        let engine = ScriptedEngine {
+            replies: vec![
+                "one\n".to_string(),
+                "two\n".to_string(),
+                "three\n".to_string(),
+            ],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.agents = vec![named_def("reviewer", true)];
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        for c in [
+            agent_call("say hi", None),
+            agent_call("review it", Some("reviewer")),
+            agent_call("say hi again", None),
+        ] {
+            let out = agent.run_agent_tool(&c);
+            assert!(!out.starts_with("Tool error"), "{out}");
+        }
+        let labels: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                crate::worker::UiEvent::SubStart { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "alpha".to_string(),
+                "reviewer".to_string(),
+                "bravo".to_string()
+            ],
+            "the named run keeps its name and consumes no NATO slot"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other entry point — `/subagent` with no `:<name>` — draws from the
+    /// same per-session sequence, so the two never collide in one log.
+    #[test]
+    fn the_subagent_command_shares_the_nato_sequence() {
+        let dir = scratch_dir("nato-slash");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        // Both sites call the same draw, so the sequence is shared: standing in
+        // for one of them here still proves the other cannot repeat it.
+        assert_eq!(agent.next_unnamed_subagent_label(), "alpha");
+        assert_eq!(agent.next_unnamed_subagent_label(), "bravo");
+        assert_eq!(agent.unnamed_subagents, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn agent_tool_delegates_and_returns_only_the_report() {
+        let _auto_extract_guard = disable_auto_extract_for_test();
         let dir = std::env::temp_dir().join(format!("plank-ui-agenttool-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Main turn delegates via the `agent` tool.
@@ -25472,9 +32935,23 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
+            memory_jobs: std::collections::VecDeque::new(),
+            pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -25499,11 +32976,15 @@ or the user's next message aborts before its first token"
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25543,7 +33024,7 @@ or the user's next message aborts before its first token"
             "one finished sidechain kept"
         );
         let dump = agent.sidechain_dumps.back().unwrap();
-        assert_eq!(dump.label, "sub-agent");
+        assert_eq!(dump.label, "alpha");
         assert_eq!(dump.outcome, "report");
         assert!(
             dump.messages.iter().any(|m| m.text.contains("echo 42")),
@@ -25584,60 +33065,10 @@ or the user's next message aborts before its first token"
         };
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
-        let store = SessionStore::open(&dir).unwrap();
-        let mut agent = Agent {
-            engine: Box::new(engine),
-            cfg: &cfg,
-            gen_opts: cfg.generation.clone(),
-            resume_temp: crate::engine::GenerationOptions::default().temperature,
-            session: Session::new(),
-            store,
-            pending_aside: None,
-            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            isolation_seq: 0,
-            system: crate::sysprompt::build_system_prompt("", &[], true),
-            reminder: SystemPromptReminder::new(),
-            power_percent: 0,
-            payload_restored: false,
-            payload_dirty: false,
-            ladder: crate::kvladder::KvLadder::new(),
-            sidechain_depth: 0,
-            repro_dir: test_repro_dir(),
-            quiet_tools: false,
-            pending_images: Vec::new(),
-            btw_diverged_engine: false,
-            trusted_system_len: 0,
-            think: cfg.generation.think_mode,
-            trace: Trace::open(None).unwrap(),
-            color: false,
-            show_footer: false,
-            editor_owns_footer: false,
-            last_ctx_used: 0,
-            last_spec: crate::engine::SpecStats::default(),
-            last_turn_interrupted: false,
-            goal: None,
-            loop_guard: crate::guard::LoopGuard::new(),
-            context_content: crate::context::ContextContent::new(),
-            skills: Vec::new(),
-            templates: Vec::new(),
-            agents: Vec::new(),
-            checkpoints: crate::checkpoint::CheckpointStore::new(),
-            last_edited: None,
-            remote: None,
-            remote_server: None,
-            ui_remote: None,
-            usage: SessionUsage::default(),
-            stats: SessionStats::default(),
-            session_start: std::time::Instant::now(),
-            sub_sink: SubSinkTarget::default(),
-            fork_kv: Vec::new(),
-            fork_points: Vec::new(),
-            console_seen: 0,
-            sidechain_dumps: std::collections::VecDeque::new(),
-            alt_engines: std::collections::HashMap::new(),
-            local_alt_warmed: false,
-            warm_note: None,
-        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        // This test predates `test_agent`'s scratch-dir cwd fix and doesn't
+        // exercise relative-path tool writes, so the process cwd is fine here.
+        agent.tool_ctx = ToolContext::new(std::env::current_dir().unwrap());
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
 
@@ -25659,6 +33090,1237 @@ or the user's next message aborts before its first token"
         let fork_at = agent.begin_subagent_fork(None, "noop", true);
         assert!(!agent.finish_subagent_fork(fork_at, "noop"));
         assert_eq!(agent.session.transcript.len(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_pass_is_suppressed_by_a_remember_call_in_the_same_turn() {
+        let dir = scratch_dir("memextract-suppress");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let _auto_extract_on = enable_auto_extract_for_test();
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        // Route the audit log to a scratch file instead of the real
+        // `~/.plank`, the same way `dispatch`'s own `remember` test does.
+        agent.tool_ctx.memory_log_path = Some(dir.join("memory-log.jsonl"));
+
+        // Drive the real `remember` dispatch through `run_tool_calls` — the
+        // production path — rather than poking `tool_ctx.wrote_memory` and
+        // `extract_state.note_tool_write()` by hand. This is the integration
+        // under test: that `run_tool_calls` itself takes `wrote_memory` and
+        // forwards it. If that forwarding were deleted, this test would now
+        // fail, where the old inlined version would not have noticed.
+        let out = agent.run_tool_calls(&[crate::tools::test_call(
+            "remember",
+            &[
+                ("text", "prefers tabs"),
+                ("type", "user"),
+                ("scope", "project"),
+            ],
+        )]);
+        assert!(out.contains("remembered"), "{out}");
+
+        assert!(
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the model already wrote memory this turn"
+        );
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the next turn is eligible again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_pass_never_pushes_a_ladder_rung() {
+        let dir = scratch_dir("memextract-no-rung");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let _auto_extract_on = enable_auto_extract_for_test();
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        let before = agent.ladder.rungs().len();
+        // A no-op `maybe_extract_memories` (returns `false`, touches nothing)
+        // would pass the rung/depth assertions below trivially, proving
+        // nothing about the property this test is named for. Pin that the
+        // pass actually ran, and that it had an observable effect: `true`
+        // is the direct signal, and an immediate rerun at the same
+        // transcript depth being ineligible (`ExtractState::should_run`
+        // rejects `depth <= processed_depth`) is indirect proof that
+        // `processed_depth` genuinely advanced, since `ExtractState`'s
+        // fields are private to this test's module.
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the pass must actually run"
+        );
+        assert!(
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
+            "processed_depth must have advanced past the current transcript \
+             depth, so an immediate rerun with no new messages is not \
+             eligible"
+        );
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            before,
+            "sidechains push no rungs"
+        );
+        assert_eq!(agent.sidechain_depth, 0, "the fork is closed on every path");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bash stanza that, if dispatched, leaves a file behind — the one
+    /// observation that distinguishes "the tool ran" from "the model asked".
+    fn bash_marker_stanza(marker: &std::path::Path) -> String {
+        format!(
+            concat!(
+                "Updating memory.\n",
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"bash\">",
+                "<｜DSML｜parameter name=\"command\" string=\"true\">echo ran > {}</｜DSML｜parameter｜>",
+                "</｜DSML｜invoke｜>",
+                "</｜DSML｜tool_calls｜>",
+            ),
+            marker.display()
+        )
+    }
+
+    #[test]
+    fn the_pass_cannot_dispatch_a_tool_call() {
+        let dir = scratch_dir("memextract-no-tools");
+        let cfg = test_cfg();
+        let marker = dir.join("tool-ran");
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            // Every reply asks for the tool: an agentic loop would dispatch
+            // it on round one and generate again on the observation.
+            replies: vec![bash_marker_stanza(&marker); 3],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let _auto_extract_on = enable_auto_extract_for_test();
+        agent.tool_ctx.memory_log_path = Some(dir.join("memory-log.jsonl"));
+        agent.session.push(Message::user("run something for me"));
+        agent.session.push(Message::assistant("done"));
+
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the pass ran"
+        );
+        assert!(
+            !marker.exists(),
+            "the memory pass dispatched a tool call: {}",
+            marker.display()
+        );
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "exactly one generation — no tool round, no report round"
+        );
+        assert_eq!(agent.sidechain_depth, 0);
+        assert_eq!(agent.session.transcript.len(), 2, "sidechain folded out");
+        assert!(
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
+            "an unusable reply still advances the span (no retry loop)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_pass_prompt_is_the_verdict_contract_not_the_task_framing() {
+        let dir = scratch_dir("memextract-framing");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let _auto_extract_on = enable_auto_extract_for_test();
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.maybe_extract_memories(std::time::Duration::MAX));
+        let prompts = prompts.lock().unwrap();
+        let prompt = prompts.last().expect("one generation");
+        assert!(
+            prompt.contains("Reply with a JSON array and nothing else"),
+            "the model must see build_prompt's contract"
+        );
+        assert!(
+            !prompt.contains("acting as a subagent"),
+            "the generic task framing contradicts the JSON-only contract"
+        );
+        let notice = agent.pending_memory_notice.take().expect("reported");
+        assert!(
+            notice.starts_with("memory completed in ") && !notice.contains(':'),
+            "an empty array is a valid outcome, reported without a change summary: {notice}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_fenced_reply_with_a_lead_in_still_applies_its_verdicts() {
+        let dir = scratch_dir("memextract-fenced");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec![
+                concat!(
+                    "Here is what I would save:\n```json\n",
+                    "[{\"verdict\": \"ADD\", \"text\": \"prefers tabs\", ",
+                    "\"type\": \"user\", \"scope\": \"project\"}]\n```\n"
+                )
+                .to_string(),
+            ],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let _auto_extract_on = enable_auto_extract_for_test();
+        agent.tool_ctx.memory_log_path = Some(dir.join("memory-log.jsonl"));
+        agent.session.push(Message::user("I prefer tabs"));
+        agent.session.push(Message::assistant("noted"));
+        assert!(agent.maybe_extract_memories(std::time::Duration::MAX));
+        let saved = std::fs::read_to_string(dir.join(".plank").join("MEMORY.md"))
+            .expect("project memory written");
+        assert!(saved.contains("prefers tabs"), "{saved}");
+        let notice = agent
+            .pending_memory_notice
+            .take()
+            .expect("a change summary");
+        assert!(notice.starts_with("memory completed in "), "{notice}");
+        assert!(
+            notice.contains(": "),
+            "carries the change summary: {notice}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A turn end snapshots the span and generates nothing; the reading is
+    /// the idle loop's job, and it retires the span as it is captured.
+    #[test]
+    fn a_turn_end_only_queues_the_span() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        // Duration::MAX clears any floor: these tests exercise the other
+        // gates, not the turn-length one, and have no turn clock in scope.
+        assert!(
+            agent.enqueue_memory_job(std::time::Duration::MAX),
+            "the span is queued"
+        );
+        assert!(prompts.lock().unwrap().is_empty(), "nothing generated yet");
+        assert_eq!(agent.memory_jobs.len(), 1);
+        assert!(
+            !agent.enqueue_memory_job(std::time::Duration::MAX),
+            "the span is retired as it is snapshotted, so nothing new to queue"
+        );
+        assert!(agent.memory_jobs_pending());
+        assert!(agent.process_memory_job(), "the idle moment reads it");
+        assert_eq!(prompts.lock().unwrap().len(), 1);
+        assert!(prompts.lock().unwrap()[0].contains("user: hello"));
+        assert!(!agent.memory_jobs_pending());
+        assert!(!agent.process_memory_job(), "an empty queue runs nothing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Index 1 is "no" on a boolean question: the span is judged worthless
+    /// and no pass is queued.
+    #[test]
+    fn the_gate_suppresses_a_span_the_model_calls_unworthy() {
+        let _gate = enable_memory_gate_for_test(60);
+        let dir = scratch_dir("memgate-reject");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(1, 0.95)], asked.clone());
+
+        assert!(!agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(!agent.memory_jobs_pending());
+        assert_eq!(asked.lock().unwrap().len(), 1, "the gate was consulted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The shipped default's consequence, pinned where it is actually
+    /// decided. `heldSpanCap` is 0 out of the box, so a gate "no" calls
+    /// `finish` and the span is retired permanently — the messages are never
+    /// offered to a later pass. `ExtractState` unit-tests that branch, but
+    /// nothing at this level proved `enqueue_memory_job` takes it, and the
+    /// difference between "discarded" and "deferred" is the whole risk of
+    /// turning the gate on.
+    #[test]
+    fn under_the_default_cap_a_rejected_span_is_discarded_not_deferred() {
+        let _gate = enable_memory_gate_for_test(60);
+        let dir = scratch_dir("memgate-discard");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Two verdicts: a "no" for the first span, and a "yes" that must never
+        // be reached for those same messages if the first one retired them.
+        let mut agent = gate_agent(
+            &dir,
+            &cfg,
+            vec![verdict(1, 0.95), verdict(0, 0.95)],
+            asked.clone(),
+        );
+
+        assert!(!agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(
+            !agent.memory_jobs_pending(),
+            "nothing queued for a rejection"
+        );
+
+        // No new messages: the span is empty now, so there is nothing to ask
+        // about and the gate is not consulted a second time.
+        assert!(!agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            1,
+            "the rejected span was retired, not held for a re-judgement"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_gate_holds_a_yes_to_the_family_corrected_threshold() {
+        // 0.8 clears the raw 60%, but a calibrated +30 on ds4 moves the bar to
+        // 90%, and the same verdict is now a rejection.
+        let mut on = crate::settings::Settings::default();
+        on.memory.auto_extract = true;
+        on.memory.extract_every_n_turns = 1;
+        on.memory.gate = true;
+        on.memory.gate_percent = 60;
+        on.memory.gate_bias.ds4 = 30;
+        crate::settings::set_for_test(on);
+        let _restore = AutoExtractGuard;
+        let dir = scratch_dir("memgate-bias");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(0, 0.8)], asked);
+
+        assert!(!agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert_eq!(agent.memory_gate_percent, 90);
+        assert!(!agent.memory_jobs_pending());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A saved session of `turns` answered prompts, so `/memory calibrate`
+    /// has spans to ask about.
+    fn save_calibration_session(agent: &mut Agent<'_>, turns: usize) {
+        agent.session = Session::new();
+        for i in 0..turns {
+            agent.session.push(Message::user(format!("prompt {i}")));
+            agent
+                .session
+                .push(Message::assistant(format!("answer {i}")));
+        }
+        agent.store.save(&mut agent.session).unwrap();
+    }
+
+    #[test]
+    fn calibrate_asks_each_span_both_ways_and_suggests_the_bias() {
+        let _settings = disable_auto_extract_for_test();
+        let dir = scratch_dir("memgate-calibrate");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Per span: yes-as-A wins at 0.8, then no-as-A wins at 0.6, so
+        // P(yes) is 0.8 one way and 0.4 the other: a bias of +0.2 toward A.
+        let script: Vec<_> = (0..12)
+            .flat_map(|_| [verdict(0, 0.8), verdict(0, 0.6)])
+            .collect();
+        let mut agent = gate_agent(&dir, &cfg, script, asked.clone());
+        save_calibration_session(&mut agent, 12);
+
+        let mut lines = Vec::new();
+        let text = agent.gate_calibrate_command("12", &mut |l| lines.push(l.to_owned()));
+        assert_eq!(asked.lock().unwrap().len(), 24, "two asks per span");
+        assert_eq!(lines.len(), 12, "one progress line per span");
+        assert!(text.contains("12 span(s) asked both ways"), "{text}");
+        assert!(text.contains("letter bias: +0.200"), "{text}");
+        assert!(text.contains("suggested memory.gateBias.ds4: 20"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn calibrate_refuses_a_bad_count_and_an_empty_store() {
+        let _settings = disable_auto_extract_for_test();
+        let dir = scratch_dir("memgate-calibrate-empty");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(0, 0.8)], asked.clone());
+
+        let text = agent.gate_calibrate_command("zero", &mut |_| {});
+        assert!(text.starts_with("usage:"), "{text}");
+        let text = agent.gate_calibrate_command("", &mut |_| {});
+        assert!(text.contains("no saved ds4 sessions"), "{text}");
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "nothing asked without spans"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn calibration_text_explains_why_it_suggests_nothing() {
+        let few = crate::decide::bias_report(
+            &[crate::decide::OrderPair {
+                p_yes_ab: 0.9,
+                p_yes_ba: 0.5,
+            }],
+            0.6,
+        );
+        let text = gate_calibration_text("ds4", &few, 60, 3, 1, 0);
+        assert!(text.contains("1 dropped for thin letter mass"), "{text}");
+        assert!(
+            text.contains("no correction supported (fewer than 10 spans)"),
+            "{text}"
+        );
+        assert!(text.contains("memory.gateBias.ds4 is 3"), "{text}");
+
+        let none = crate::decide::bias_report(&[], 0.6);
+        let text = gate_calibration_text("qwen", &none, 60, 0, 0, 4);
+        assert!(text.contains("nothing usable to measure"), "{text}");
+    }
+
+    #[test]
+    fn the_gate_lets_a_worthy_span_through() {
+        let _gate = enable_memory_gate_for_test(60);
+        let dir = scratch_dir("memgate-accept");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(0, 0.9)], asked);
+
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(agent.memory_jobs_pending());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_abstention_runs_the_pass_rather_than_suppressing_it() {
+        let _gate = enable_memory_gate_for_test(60);
+        let dir = scratch_dir("memgate-abstain");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let abstained = crate::decide::RawVerdict {
+            index: 1,
+            p: 0.52,
+            runner_up: Some((0, 0.48)),
+            abstained: true,
+            letter_mass: 0.0,
+        };
+        let mut agent = gate_agent(&dir, &cfg, vec![abstained], asked);
+
+        assert!(
+            agent.enqueue_memory_job(std::time::Duration::MAX),
+            "an unsure gate must never be the reason a memory is lost"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A "yes" the model is not confident enough about is a suppression: the
+    /// threshold applies to the yes probability, not just to the ranking.
+    #[test]
+    fn a_yes_below_the_threshold_suppresses() {
+        let _gate = enable_memory_gate_for_test(90);
+        let dir = scratch_dir("memgate-thresh");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(0, 0.7)], asked);
+
+        assert!(!agent.enqueue_memory_job(std::time::Duration::MAX));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_engine_without_decide_behaves_exactly_as_before() {
+        let _gate = enable_memory_gate_for_test(60);
+        let dir = scratch_dir("memgate-nocap");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // No scripted decisions: `supports_decide()` is false.
+        let mut agent = gate_agent(&dir, &cfg, Vec::new(), asked);
+
+        assert!(
+            agent.enqueue_memory_job(std::time::Duration::MAX),
+            "no capability means no gate, not no memory"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_gate_off_by_default_never_asks_the_engine() {
+        // `enable_auto_extract_for_test` leaves `memory.gate` at its default
+        // of false, which is the shipped configuration.
+        let _auto = enable_auto_extract_for_test();
+        let dir = scratch_dir("memgate-off");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(1, 0.99)], asked.clone());
+
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "an off gate must not spend a forward pass"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Past the cap the pass runs whatever the model would have said, and the
+    /// gate is not even asked.
+    #[test]
+    fn a_span_past_the_cap_bypasses_the_gate_entirely() {
+        let _gate = enable_memory_gate_with_cap_for_test(60, 5);
+        let dir = scratch_dir("memgate-cap");
+        let cfg = test_cfg();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = gate_agent(&dir, &cfg, vec![verdict(1, 0.99)], asked.clone());
+        // gate_agent pushes 2 messages; add 8 more for a span of 10, which is
+        // past the cap of 5 installed by the guard above.
+        for i in 0..4 {
+            agent.session.push(Message::user(format!("u{i}")));
+            agent.session.push(Message::assistant(format!("a{i}")));
+        }
+
+        assert!(
+            agent.enqueue_memory_job(std::time::Duration::MAX),
+            "10 messages past a cap of 5 runs unconditionally"
+        );
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "a bypassed gate is not consulted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A prompt typed while a job runs interrupts it; the job goes back to
+    /// the front, uncounted, and runs at the next idle moment.
+    #[test]
+    fn an_interrupted_job_goes_back_to_the_front_of_the_queue() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-interrupt");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string(), "[]".to_string()],
+            // The engine reports the first generation cut short, the way a
+            // real one does when the busy loop raises the interrupt; the
+            // process-wide flag is deliberately not touched here, because
+            // it is shared with every other test on the run.
+            interrupt_at: Some(0),
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        let task = agent.memory_jobs.front().unwrap().task.clone();
+        assert!(!agent.process_memory_job(), "cut short: not applied");
+        assert_eq!(agent.memory_jobs.len(), 1, "back on the queue");
+        let job = agent.memory_jobs.front().unwrap();
+        assert_eq!(job.task, task, "the same job, not a new span");
+        assert_eq!(job.attempts, 0, "an interrupt is not a fault");
+        assert_eq!(agent.sidechain_depth, 0, "the fork is closed");
+        assert!(agent.process_memory_job(), "runs at the next idle moment");
+        assert!(!agent.memory_jobs_pending());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A job whose engine keeps failing is dropped after the attempt cap, so
+    /// a broken engine cannot pin the idle loop on the same span forever.
+    #[test]
+    fn a_job_is_dropped_after_repeated_engine_errors() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-drop");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            fail_with: Some("provider exploded".to_string()),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        for attempt in 1..crate::memextract::MAX_JOB_ATTEMPTS {
+            assert!(!agent.process_memory_job());
+            assert_eq!(agent.memory_jobs.len(), 1, "attempt {attempt} keeps it");
+            assert_eq!(agent.memory_jobs.front().unwrap().attempts, attempt);
+        }
+        assert!(!agent.process_memory_job());
+        assert!(!agent.memory_jobs_pending(), "dropped at the cap");
+        assert_eq!(
+            agent.sidechain_dumps.back().map(|d| d.outcome.as_str()),
+            Some("dropped after repeated engine errors")
+        );
+        // The headless drain terminates on the same rule.
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX) || !agent.memory_jobs_pending());
+        agent.drain_memory_jobs();
+        assert!(!agent.memory_jobs_pending());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The job carries the whole prompt, so what the session does between
+    /// the turn end and the idle moment cannot lose the captured span.
+    #[test]
+    fn a_clear_between_turn_end_and_idle_does_not_lose_the_span() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-clear");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent
+            .session
+            .push(Message::user("remember the port is 8080"));
+        agent.session.push(Message::assistant("noted"));
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        agent.session.transcript.clear();
+        assert!(agent.process_memory_job());
+        let prompt = prompts.lock().unwrap()[0].clone();
+        assert!(prompt.contains("the port is 8080"), "{prompt}");
+        assert!(
+            agent.session.transcript.is_empty(),
+            "the sidechain folded away"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On a KV-capable engine the pass prefills the prompt alone, snapshots
+    /// that KV into the job, then generates; an interrupted attempt keeps
+    /// the snapshot and the retry restores it instead of prefilling again.
+    #[test]
+    fn an_interrupted_attempt_resumes_from_its_prefill_snapshot() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-resume");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            // Call 0 is the prefill-only pass, call 1 the generation the
+            // user cuts short (`interrupt_at`), call 2 the retry's generation.
+            replies: vec![String::new(), "[]".to_string(), "[]".to_string()],
+            interrupt_at: Some(1),
+            prompts: prompts.clone(),
+            kv_events: Some(kv_events.clone()),
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 10,
+                common: 10,
+            }),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(agent.memory_jobs.front().unwrap().resume.is_none());
+
+        // First attempt: the generation after the prefill snapshot is cut
+        // short by the engine reporting an interrupt.
+        assert!(!agent.process_memory_job());
+        let job = agent.memory_jobs.front().expect("back on the queue");
+        assert_eq!(job.attempts, 0, "an interrupt is not a fault");
+        let resume = job.resume.as_ref().expect("the prefill was kept");
+        assert!(resume.prompt.contains("user: hello"));
+        let stored_prompt = resume.prompt.clone();
+        {
+            let ev = kv_events.lock().unwrap();
+            // One capture for the fork, one for the resume, in that order;
+            // the fork's (tag 1) is what the fork end restores.
+            let captures = ev.iter().filter(|e| *e == "capture").count();
+            assert_eq!(captures, 2, "{ev:?}");
+            assert_eq!(ev.last().map(String::as_str), Some("restore:1"), "{ev:?}");
+        }
+        let generated_before = prompts.lock().unwrap().len();
+        assert_eq!(
+            generated_before, 2,
+            "prefill-only pass, then the cut-off generation"
+        );
+
+        // Retry: the snapshot is restored, no prefill-only pass runs, and
+        // the prompt is the stored one byte for byte.
+        kv_events.lock().unwrap().clear();
+        assert!(agent.process_memory_job());
+        assert!(!agent.memory_jobs_pending());
+        let ev = kv_events.lock().unwrap().clone();
+        assert!(
+            ev.iter().any(|e| e == "restore:2"),
+            "the resume snapshot (second capture) is restored: {ev:?}"
+        );
+        assert_eq!(
+            ev.iter().filter(|e| *e == "capture").count(),
+            1,
+            "only the fork snapshot; no new prefill snapshot: {ev:?}"
+        );
+        let seen = prompts.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            generated_before + 1,
+            "one generation, no prefill pass"
+        );
+        assert_eq!(
+            seen[seen.len() - 1],
+            stored_prompt,
+            "the stored prompt is re-issued"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The pass's JSON reply never reaches a front end: the render sink is
+    /// null while it runs, whatever `sub_sink` says, so the TUI log and the
+    /// plain REPL show only the completion line.
+    #[test]
+    fn the_memory_pass_renders_nothing_to_the_front_end() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-quiet");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(agent.process_memory_job());
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            !events.iter().any(|e| matches!(e, UiEvent::Sub(_))),
+            "no model text or banners for the pass: {events:?}"
+        );
+        assert!(
+            agent
+                .pending_memory_notice
+                .take()
+                .is_some_and(|n| n.starts_with("memory completed in ")),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A prompt suggestion is ghost text, not a turn: nothing about it may
+    /// reach the front end. It has no `extract_state` flag to make
+    /// `sub_sink_render_sink` fall back to a `NullSink`, so the pass must
+    /// leave `sub_sink` at `Null` itself — install a live sink here and the
+    /// suggestion streams into the sub-agent pane while `pass_status_ctx`
+    /// paints a throbber and a "generating…" footer at an idle prompt.
+    /// The check no scripted test can make: does a REAL model, given a real
+    /// conversation, produce something a user would plausibly type — and does
+    /// the sanitizer let it through?
+    ///
+    /// `ScriptedEngine` supplies the reply, so every other suggestion test is
+    /// blind to the two failure modes that matter: the model answering as
+    /// itself, and the sanitizer rejecting everything. Either would leave the
+    /// feature fully wired, fully green and producing nothing. That exact
+    /// shape shipped once on the System-1 branch before a real-model run
+    /// caught it.
+    ///
+    /// Run with `PLANK_TEST_MODEL=<gguf> cargo test --lib a_real_model_suggests -- --nocapture`.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn a_real_model_suggests_something_a_user_would_type() {
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-realmodel");
+        let cfg = test_cfg();
+
+        let tuning = crate::config::EngineTuning {
+            mtp: false,
+            ssd_streaming: std::env::var_os("PLANK_TEST_SSD_STREAMING").is_some(),
+            ..Default::default()
+        };
+        let model = crate::ds4engine::Ds4Model::open_shared(
+            &model_path,
+            crate::ffi::Ds4Backend::Metal,
+            8192,
+            0,
+            100,
+            &tuning,
+            "you are a helpful coding assistant",
+        )
+        .expect("open the model");
+        let engine = crate::ds4engine::Ds4Session::from_model(model);
+        let mut agent = test_agent_boxed(&dir, Box::new(engine), &cfg);
+        // `test_cfg` sets `ThinkMode::Off`, which makes the assistant *prefix*
+        // open with `</think>` so the model never emits one. A live session
+        // runs the default, where the model reasons first and its reply
+        // arrives with `</think>` glued to the front of the answer — which is
+        // exactly the bug this test failed to reproduce until it stopped
+        // opting out of thinking.
+        agent.think = crate::engine::ThinkMode::Medium;
+
+        // A conversation with an obvious next move, so a good suggestion is
+        // recognisable and a bad one is too.
+        agent
+            .session
+            .push(Message::user("add a parse_port function to src/net.rs"));
+        agent.session.push(Message::assistant(
+            "Added `parse_port` to src/net.rs. It takes a &str,              returns Result<u16, ParseError>, and rejects 0.",
+        ));
+        agent.suggestion_pending = true;
+
+        let stored = agent.generate_suggestion();
+        match agent.suggestion.as_ref() {
+            Some(s) => eprintln!("[suggest] ACCEPTED {:?}", s.text),
+            None => eprintln!(
+                "[suggest] REJECTED or empty (set PLANK_SUGGEST_DEBUG=1 for the raw reply)"
+            ),
+        }
+        assert!(
+            stored,
+            "a real model on a clear conversation should produce a usable \
+             suggestion; if this fails, read the raw reply under \
+             PLANK_SUGGEST_DEBUG=1 and fix the PROMPT, not the sanitizer"
+        );
+        let text = agent.suggestion.as_ref().unwrap().text.clone();
+        assert!(!text.is_empty());
+        assert!(
+            !text.starts_with('/') && !text.starts_with('!'),
+            "a command must never reach the input line: {text:?}"
+        );
+        assert!(
+            !text.contains("</think>") && !text.contains("<think>"),
+            "the model's reasoning must not reach the input line: {text:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_suggestion_pass_renders_nothing_to_the_front_end() {
+        let dir = scratch_dir("suggest-quiet");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["write the tests".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Exactly what the idle worker leaves behind: the previous turn's
+        // live channel. The pass must not publish through it.
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+        agent.generate_suggestion();
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            !events.iter().any(|e| matches!(e, UiEvent::Sub(_))),
+            "no suggestion text or banners reach the front end: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                UiEvent::Status(s) if s.state == crate::status::WorkerState::Generating
+            )),
+            "no throbber or generating footer at an idle prompt: {events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An interrupt that lands during the prefill itself — the long phase on
+    /// a local model — still leaves a snapshot: the engine keeps the prefix
+    /// it prefilled, and the retry restores it and continues from there.
+    #[test]
+    fn an_interrupt_during_the_prefill_keeps_the_partial_snapshot() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-prefill-interrupt");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            // Call 0 is the prefill-only pass, cut short; call 1 the retry's
+            // generation straight on the restored prefix.
+            replies: vec![String::new(), "[]".to_string()],
+            interrupt_at: Some(0),
+            prompts: prompts.clone(),
+            kv_events: Some(kv_events.clone()),
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 10,
+                common: 10,
+            }),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(!agent.process_memory_job(), "cut short during the prefill");
+        let job = agent.memory_jobs.front().expect("back on the queue");
+        assert_eq!(job.attempts, 0, "an interrupt is not a fault");
+        let resume = job.resume.as_ref().expect("the partial prefill was kept");
+        let stored_prompt = resume.prompt.clone();
+        assert_eq!(prompts.lock().unwrap().len(), 1, "no generation ran");
+
+        kv_events.lock().unwrap().clear();
+        assert!(agent.process_memory_job());
+        assert!(!agent.memory_jobs_pending());
+        let ev = kv_events.lock().unwrap().clone();
+        assert!(
+            ev.iter().any(|e| e == "restore:2"),
+            "the partial snapshot is restored: {ev:?}"
+        );
+        assert_eq!(
+            ev.iter().filter(|e| *e == "capture").count(),
+            1,
+            "only the fork snapshot; no new prefill-only pass: {ev:?}"
+        );
+        let seen = prompts.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one generation, straight on the prefix");
+        assert_eq!(seen[1], stored_prompt, "the stored prompt is re-issued");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An engine with no KV to snapshot pays no prefill-only pass either.
+    #[test]
+    fn an_engine_without_kv_skips_the_prefill_snapshot() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-queue-nokv");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(agent.process_memory_job());
+        assert_eq!(prompts.lock().unwrap().len(), 1, "the generation alone");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An interrupted turn runs no pass, and the span is not retired: the
+    /// next completed turn reads it.
+    #[test]
+    fn an_interrupted_turn_skips_the_memory_pass() {
+        let dir = scratch_dir("memextract-interrupted");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let _auto_extract_on = enable_auto_extract_for_test();
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.last_turn_interrupted = true;
+        assert!(
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the user cut the turn off: no extra generation"
+        );
+        assert!(!agent.extract_state.is_running());
+        agent.last_turn_interrupted = false;
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the span was cancelled, not retired, so the next turn reads it"
+        );
+    }
+
+    #[test]
+    fn a_prose_reply_is_noted_once_and_never_as_an_error() {
+        let dir = scratch_dir("memextract-prose");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec![
+                "Nothing here is worth remembering.".to_string(),
+                "Still nothing.".to_string(),
+            ],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let _auto_extract_on = enable_auto_extract_for_test();
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.maybe_extract_memories(std::time::Duration::MAX));
+        assert!(
+            agent.pending_memory_notice.is_none(),
+            "an empty pass is silent: the dump is the diagnostic"
+        );
+        assert_eq!(
+            agent.sidechain_dumps.back().map(|d| d.outcome.as_str()),
+            Some("no usable verdicts")
+        );
+        agent.session.push(Message::user("more"));
+        agent.session.push(Message::assistant("ok"));
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the span advanced, so it runs again"
+        );
+        assert!(
+            agent.pending_memory_notice.is_none(),
+            "the second unusable reply is not announced again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_shrinking_the_transcript_neither_disables_nor_skips_the_pass() {
+        let dir = scratch_dir("memextract-compact");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string(), "[]".to_string()],
+            prompts: prompts.clone(),
+            // `tail_budget(8000)` is 1000 tokens at ~4 bytes each: the two
+            // short new messages fit the verbatim tail, the long processed
+            // ones (3 KiB each) mostly do not and are folded into the
+            // summary. Large enough that the size preflight in
+            // `maybe_extract_memories` lets the first pass (six 3 KiB
+            // messages, ~4.8k tokens plus the reply reserve) run.
+            ctx_override: Some(8000),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let _auto_extract_on = enable_auto_extract_for_test();
+        for i in 0..3 {
+            agent.session.push(Message::user(format!(
+                "old-question-{i} {}",
+                "x".repeat(3000)
+            )));
+            agent.session.push(Message::assistant(format!(
+                "old-answer-{i} {}",
+                "y".repeat(3000)
+            )));
+        }
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "covers depth 0..6"
+        );
+        agent.session.push(Message::user("new-q"));
+        agent.session.push(Message::assistant("new-a"));
+        agent.rebuild_after_compact("<summary>did things</summary>");
+        let depth = agent.session.transcript.len();
+        assert!(
+            depth < 6,
+            "the transcript must have shrunk beneath the processed depth (got {depth})"
+        );
+        assert!(
+            agent.session.transcript.iter().any(|m| m.text == "new-q"),
+            "the unread pair survives in the verbatim tail"
+        );
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the shrink must not silently stop the pass"
+        );
+        let prompts = prompts.lock().unwrap();
+        let prompt = prompts.last().expect("second generation");
+        assert!(
+            prompt.contains("user: new-q"),
+            "the unread message was skipped"
+        );
+        assert!(
+            prompt.contains("assistant: new-a"),
+            "the unread message was skipped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_pass_runs_under_default_settings() {
+        // No guard installed: `settings::active()` is the built-in default,
+        // and since 5.1.7 `memory.autoExtract` defaults to on. The field on
+        // `extract_state` is re-sampled from the setting on every call, so
+        // poking it off is deliberately shown to be inert: the setting, not
+        // the field, decides.
+        let dir = scratch_dir("memextract-default-on");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        assert!(
+            crate::settings::active().memory.auto_extract,
+            "the pass must be on by default"
+        );
+        agent.extract_state.enabled = false;
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "on by default: the pass runs"
+        );
+        assert!(
+            agent.extract_state.enabled,
+            "the setting, not the field, decides"
+        );
+        assert_eq!(prompts.lock().unwrap().len(), 1, "exactly one generation");
+        assert_eq!(agent.sidechain_depth, 0, "the fork is closed again");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Swaps in a fresh engine that has room for anything, sharing the
+    /// prompt log, so a follow-up call can tell "retired" (nothing runs even
+    /// with room) from "cancelled" (runs as soon as it can).
+    fn give_agent_room(
+        agent: &mut Agent<'_>,
+        prompts: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        agent.engine = Box::new(ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        });
+    }
+
+    #[test]
+    fn a_span_that_cannot_fit_the_context_is_retired_not_retried() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-oversized");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["[]".to_string()],
+            prompts: prompts.clone(),
+            kv_events: Some(kv_events.clone()),
+            // Smaller than the verdict contract alone: no span fits.
+            ctx_override: Some(200),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent
+            .session
+            .push(Message::user(format!("notes {}", "n".repeat(4000))));
+        agent.session.push(Message::assistant("ok"));
+
+        assert!(
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the span does not fit"
+        );
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "the engine was never asked to generate"
+        );
+        assert!(
+            kv_events.lock().unwrap().is_empty(),
+            "the preflight runs before the fork takes its KV snapshot"
+        );
+        let notice = agent.pending_memory_notice.take().expect("noted once");
+        assert!(notice.contains("would not fit"), "{notice}");
+        assert_eq!(agent.sidechain_depth, 0);
+
+        // Same depth, now with room: a cancelled span would run here, a
+        // retired one is done.
+        give_agent_room(&mut agent, &prompts);
+        assert!(
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the oversized span was retired, not left for a retry"
+        );
+        assert!(prompts.lock().unwrap().is_empty());
+
+        // New material above the retired depth is still read.
+        agent.session.push(Message::user("more"));
+        agent.session.push(Message::assistant("ok"));
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "later spans still run"
+        );
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        // The sidechain prompt is the whole live transcript plus the task,
+        // so the retired message is present as history; what must not
+        // happen is its reappearance in the *excerpt* the pass reads.
+        let excerpt = prompts[0]
+            .rsplit("Conversation excerpt:\n")
+            .next()
+            .expect("the task ends with the excerpt");
+        assert!(
+            !excerpt.contains("nnnn"),
+            "the retired span is not re-read: {excerpt}"
+        );
+        assert!(excerpt.contains("user: more"), "{excerpt}");
+        let notice = agent.pending_memory_notice.take().expect("reported");
+        assert!(
+            notice.starts_with("memory completed in "),
+            "the oversized notice is not repeated; only the pass's own report: {notice}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_transient_engine_error_cancels_and_the_span_is_retried() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-transient");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            fail_with: Some("provider exploded".to_string()),
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+
+        assert!(
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
+            "the engine failed"
+        );
+        assert_eq!(
+            agent.sidechain_depth, 0,
+            "the fork is closed on the error path"
+        );
+        assert!(agent.pending_memory_notice.is_none());
+
+        // Same depth, engine healthy again: the span was only cancelled.
+        give_agent_room(&mut agent, &prompts);
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "a transient fault leaves the span to be redone"
+        );
+        assert!(
+            prompts
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .contains("user: hello"),
+            "the retried span is the same one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_resumed_transcript_is_not_shipped_wholesale_on_the_first_idle_turn() {
+        let dir = scratch_dir("memextract-resume");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let mut restored = Session::new();
+        for i in 0..6 {
+            restored.push(Message::user(format!("old-{i}")));
+            restored.push(Message::assistant("ok"));
+        }
+        agent.reset_for_adopted_session(restored);
+        assert!(
+            !agent.maybe_extract_memories(std::time::Duration::MAX),
+            "a restored transcript is history, not new material"
+        );
+        agent.session.push(Message::user("new"));
+        agent.session.push(Message::assistant("ok"));
+        assert!(
+            agent.maybe_extract_memories(std::time::Duration::MAX),
+            "new turns are still read"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -25687,10 +34349,73 @@ or the user's next message aborts before its first token"
         agent.run_turn().unwrap();
         assert!(agent.finish_subagent_fork(fork_at, "count the tests"));
 
+        // The probe is the sidechain rescue looking for a checkpoint; this
+        // engine reports none, so nothing is restored before the generation.
         assert_eq!(
             events.lock().unwrap().as_slice(),
-            ["capture", "generate", "restore:1"]
+            ["capture", "probe", "generate", "restore:1"]
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The sub-agent's quiet pass runs the same pre-generation rescue as the
+    /// main turn: with the divergence shape staged, the fork snapshot is
+    /// restored *before* the generate, and the fork end restores it again.
+    #[test]
+    fn a_quiet_sub_agent_pass_rescues_the_prefix_before_generating() {
+        let dir =
+            std::env::temp_dir().join(format!("plank-ui-quiet-rescue-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["Report: done.\n".to_string()],
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 9_000,
+                common: 8_500,
+            }),
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hi"));
+        agent.session.push(Message::assistant("hello"));
+
+        let fork_at = agent.begin_subagent_fork(None, "count the tests", true);
+        let (done, result) = agent.run_subagent_loop();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            agent
+                .end_subagent_fork(fork_at, "sub", "count the tests", done)
+                .is_some()
+        );
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["capture", "probe", "restore:1", "generate", "restore:1"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `run_sidechain_on` marks the alt engine live for exactly the span of
+    /// `run`, on the same unconditional path as the engine swap, so the KV
+    /// rescue can tell a clean-room sidechain from a failed snapshot.
+    #[test]
+    fn a_clean_room_sidechain_marks_the_alt_engine_live_only_while_it_runs() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-alt-depth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("task"));
+        assert_eq!(agent.alt_engine_depth, 0);
+        let seen =
+            agent.run_sidechain_on(EngineKey::Local, Box::new(ScriptedEngine::default()), |a| {
+                a.alt_engine_depth
+            });
+        assert_eq!(seen, 1, "depth is one inside the sidechain");
+        assert_eq!(agent.alt_engine_depth, 0, "and back to zero after it");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -25764,9 +34489,23 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
             sidechain_depth: 0,
+            alt_engine_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
+            memory_jobs: std::collections::VecDeque::new(),
+            pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
             repro_dir: test_repro_dir(),
             quiet_tools: false,
+            guard_stopped: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -25791,11 +34530,15 @@ or the user's next message aborts before its first token"
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             fork_points: Vec::new(),
             console_seen: 0,
+            unnamed_subagents: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -25884,6 +34627,113 @@ or the user's next message aborts before its first token"
             "the old prose notice must be gone"
         );
         assert!(events.iter().any(|e| matches!(e, UiEvent::Status(_))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A background job that finished before a tool round is announced to
+    /// the model at that round, once, as a user message after the tool result
+    /// and any queued lines (`docs/BACKGROUND-TASKS.md` §3.4 point 1).
+    #[test]
+    fn worker_turn_announces_finished_background_jobs_between_tool_rounds() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-jobs-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.bash_notify = true;
+        crate::settings::set_for_test(settings);
+        let stanza = concat!(
+            "Checking.\n",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo hi</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let engine = ScriptedEngine {
+            replies: vec![stanza.to_string(), "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("run echo"));
+
+        // A job "left running" by an earlier turn that exits before this one
+        // reaches its first tool boundary.
+        let id = agent
+            .tool_ctx
+            .bash
+            .start(&dir, "echo background-done", 30, None)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+
+        // user, assistant(tool call), user(tool result), user(notification),
+        // assistant(final)
+        let texts: Vec<&str> = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(texts.len(), 5, "got: {texts:#?}");
+        assert!(texts[2].starts_with("<tool_result>"));
+        let note = texts[3];
+        assert!(note.starts_with("<system-reminder>\n"), "got: {note}");
+        assert!(note.contains(crate::tools::bash::NOTIFICATION_HEADER));
+        assert!(note.contains(&format!("bash job={id} pid=")));
+        assert!(note.contains("exit_status=0\n"));
+        assert!(note.contains("background-done\n"));
+        assert!(texts[4].contains("Done."));
+        // Announced once: the table forgot the job.
+        assert!(agent.tool_ctx.bash.take_finished().is_empty());
+
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UiEvent::Dim(t) if t.contains("background job finished"))),
+            "the UI is told why the transcript grew"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With the feature off nothing is announced, even with a finished job
+    /// in the table, so parity sessions never see the new message.
+    #[test]
+    fn worker_turn_leaves_finished_jobs_alone_when_notify_is_off() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-jobs-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::settings::set_for_test(crate::settings::Settings::default());
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo hi</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let engine = ScriptedEngine {
+            replies: vec![stanza.to_string(), "Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("run echo"));
+        agent
+            .tool_ctx
+            .bash
+            .start(&dir, "echo background-done", 30, None)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let shared = TurnShared::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        assert_eq!(agent.session.transcript.len(), 4);
+        assert!(!agent.has_finished_jobs(), "off means the tick never wakes");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -26276,7 +35126,7 @@ or the user's next message aborts before its first token"
             drop(tx);
         });
         let mut eof = false;
-        let prompt = read_batched_from(rx, &mut eof).expect("read");
+        let prompt = read_batched_from(rx, &mut eof, -1).expect("read");
         writer.join().expect("writer joined");
         // The full prompt was collected — not truncated at 4096.
         assert_eq!(prompt.as_deref(), Some(payload.as_str()));

@@ -63,6 +63,15 @@ test` and review the diff before committing.
   re-injected only once the token-estimate distance since it was last seen
   exceeds 50,000 (`AGENT_SYSTEM_PROMPT_REMINDER_TOKENS` in the C,
   `SYSTEM_PROMPT_REMINDER_TOKENS` in `src/sysprompt.rs`).
+- **The reminder's cost is prefill, not tokenization, and it cannot be
+  cached.** Tokenizing the reminder text is milliseconds; running its tokens
+  through the model is the seconds, and those KV rows are only valid at the
+  position and after the transcript they were computed for, so unlike the
+  position-zero `sysprompt.kv` snapshot there is nothing to save. The lever is
+  the size of the text: `context.shortReminder` (default `true`) injects the
+  dialect's syntax reminder plus the tool-name roster
+  (`build_short_system_prompt_reminder`) instead of the C's full tools prompt,
+  which remains available as `"shortReminder": false`.
 - **The datetime context line falls back to raw Unix seconds.** Local time is
   formatted with `strftime("%Y-%m-%d %H:%M:%S %Z")`; if that fails, the raw
   seconds are printed instead — the surrounding sentence is fixed either way
@@ -456,13 +465,32 @@ test` and review the diff before committing.
   one discarded for sitting inside `<think>`, which the model still has to
   retry), `stream_chunk_must_stop` turns it into `PassStop::ToolCall`, and
   `Ds4Engine::generate` polls `interrupt()` *per token inside* the accepted
-  speculative run rather than once per block, so the rest of the run is rewound
-  out of the KV instead of generated. The trap: that stop rides the same
+  speculative run rather than once per block, so the rest of the run is never
+  rendered. The trap: that stop rides the same
   `interrupt` closure a preflight failure does — the only stop channel
   `Engine::generate` has — so it comes back as `stats.interrupted`, and every
   site that asks "did the user stop this?" has to go through `stopped_by_user`
   or the turn is abandoned with a parsed, complete tool call that never runs. A
   genuine Ctrl-C still wins there, deliberately.
+
+- **Never `ds4_session_rewind` a DeepSeek session; record the committed tail
+  instead.** The C agent rewinds the accepted speculative run to the token it
+  kept when a stanza closes or EOS lands mid-block, and plank copied that
+  (commit `19b4796`). On DeepSeek the rewind cannot roll the compressor
+  frontiers back, so `ds4.c` marks the checkpoint invalid; the next pass's
+  `ds4_session_common_prefix` then returns 0 and `ds4_session_sync` re-prefills
+  the whole conversation. A `PLANK_KV_DEBUG` log showed it on every tool round
+  of an 18k-token session: `reconcile ... kept 6` followed by `generate:
+  cached=0 prefill=17885 (0.0% reused)`, with no `full rebuild` note because
+  `common` itself was 0. The ladder rescue never fired either:
+  `KvReuse::rebuilds_from_zero` needs `common > 0`, so an invalid checkpoint
+  returned silently (it now logs `ladder fallback: live checkpoint invalid`).
+  The fix keeps the committed-but-unrendered tail as *shadow tokens* in the
+  recorded assistant span (`assistant_span_tokens`): the token buffer mirrors
+  the live KV exactly and the next prompt extends it. The model sees at most
+  one draft block of stray tokens between the stanza close and EOS; with the
+  default one-token draft that is a single token. Without MTP nothing changes,
+  since the serial path never overshoots.
 
 - **Post-update weights also write the parameter name as the element name.**
   `<｜DSML｜command string="true">ls</｜DSML｜invoke>` in place of
@@ -2062,6 +2090,50 @@ Related: `sha2` is a direct dependency solely because artifacts are verified
 time. A resumed `.part` re-reads itself from disk to rebuild the hasher, since
 `sha2` exposes no serializable state — do not add a hasher-state sidecar.
 
+Related: the artifacts must be fetched in **bounded** ranges. Hugging Face's
+xet CDN answers `Range: bytes={offset}-` with `400 Bad Request` for the **V4.1**
+objects while answering `Range: bytes={offset}-{end}` with `206`, verified live
+against the 341 GiB V4.1 main artifact (`bytes=100-199` → 206,
+`bytes=100-` → 400, `bytes=1000000000-1268435455` → 206 with
+`Content-Length: 268435456`), and reproduced independently.
+
+The scoping matters: the **V4** artifacts are served by a backend that still
+*accepts* `bytes={offset}-`, so this is not a property of Hugging Face in
+general, nor something to infer from a V4 probe. Two reviews initially
+contradicted each other for exactly that reason — one had probed the V4 object
+from `ds4.manifest` and concluded open-ended ranges were fine. Always probe the
+artifact you actually ship. Naming an end offset is correct against both
+backends, so `downloader::http_fetch` does it unconditionally rather than
+per-set, and `one_artifact` loops over 256 MiB chunks: end-of-stream means
+end-of-*chunk*, not end-of-file. Before this, any interruption of a multi-hour
+download restarted from zero and the whole `.part` rehash machinery was dead
+weight — one real interruption cost 88 GiB.
+
+## A `</think>` splice has to be decided before the truncate, or the branch is dead
+
+`Ds4Session`'s prompt reconciliation truncates the token buffer to the common
+prefix and re-tokenizes the rest. One divergence is deliberately not a rewrite:
+the UI closes a `<think>` the model left open before a tool continuation
+(`close_open_think`), so the incoming assistant text is the recorded reply plus
+exactly `</think>`. Re-tokenizing that from text yields ids unrelated to the
+sampled ones and rebuilds the KV from that span on — a recorded session lost a
+56k-token prefix to it (`turbo-vision-debug-2.log`, 18008 bytes against 18000).
+The splice path exists to keep the sampled ids and insert the close ahead of the
+recorded EOS instead.
+
+It was also unreachable. `truncate_spans(keep)` leaves exactly `keep` spans, and
+the span the splice recognizes is `spans()[keep]` — the *first one dropped*. With
+the truncate running first the lookup found nothing, every time, for every input:
+no error, no log line, just every guard-stopped pass paying a full re-prefill to
+append eight bytes. The decision now happens before the truncate, and the hold is
+widened by one span when there is a close, so the span survives to be spliced.
+
+The lesson generalizes past this call site: a lookup positioned *at* a truncation
+boundary is silently dead on the wrong side of it. The decision is FFI-free, so it
+moved to `TokenTranscript::think_close` in `ds4tokens.rs` where CI compiles and
+tests it (`the_think_close_must_be_read_before_the_truncate_not_after` asserts
+both orders — the wrong one answers `None`, the right one splices).
+
 ## Hand-rolled test tempdirs need an atomic counter, not just pid + nanos
 
 Model-manifest tests that build their own scratch directory (rather than using
@@ -2116,6 +2188,23 @@ the anchor line changed by line ending alone. `tools::edit::adapt_line_endings`
 now converts LF to CRLF in both `old` and `new` when the whole file is CRLF
 and the text carries no `\r` of its own; mixed-ending files are left alone,
 because guessing there would corrupt the other kind of line.
+
+## `search` must clip, or one minified asset prefills for seven minutes
+
+A literal `search` for `566` over a repo hit two single-line minified SVGs of
+238 KB each under a Claude Code agent worktree. The tool printed both lines in
+full: a 480 KB tool result, roughly 300k tokens, which then prefilled for seven
+minutes at local speeds and is baked into that session's transcript for good.
+The C never gets there: `agent_search_read_line` skips a file whose line
+reaches `AGENT_TOOL_MAX_BYTES` (128 KiB, reported as "line exceeds 128 KiB"),
+and every tool writes through an `agent_buf` whose `.limit` clips the whole
+result at the same size with "[Output truncated at the tool byte limit. Narrow
+the request.]". plank had neither for `search`. It now has both, scoped to
+`search` (`SEARCH_MAX_BYTES`): `read` deliberately bounds by context instead of
+128 KiB (see "`AGENT_TOOL_CONTRACTS` is not adopted"), so the C's global limit
+is not adopted wholesale. A skipped file is reported with the C's "Search
+incomplete" footer even when nothing else matched, so the model learns the
+coverage hole instead of reading "No matches".
 
 ## `search` must skip `target/`, or Cargo's package copy drowns the real matches
 
@@ -2276,6 +2365,21 @@ Anything else that addresses rows by position — the cursor, `move_cursor`,
 `current` — is only ever exercised while `selecting` is set, which is exactly
 when every row is shown, so those stay index-for-index with `runs`.
 
+## The live write counter owns the last log line, so every other push must retire it
+
+The collapsed `write` preview's `… N lines` counter is a single `OutputLog`
+line rewritten in place: `preview_open` means "the last committed line is the
+counter, pop it before pushing the next count". That contract breaks the
+moment anything else appends to the log while a write is streaming — a
+`/usage` echo typed mid-turn, a `/context` report, a skill-loaded notice. The
+next tick popped the *pushed* line instead of the counter, so the echo
+vanished and a stale `… 85 lines` sat above a fresh `… 167 lines`. Every
+out-of-stream push (`push_spans`, `push_user_echo`, `push_ansi`,
+`push_markdown`, `push_skill_loaded`) therefore goes through
+`retire_preview` first: drop the transient counter, clear the flag, and let
+the next tick re-push it below whatever landed. The alternative — leaving the
+counter and just clearing the flag — freezes a wrong count in the scrollback.
+
 ## C parity stops at the wire format: tool error text is ours
 
 `view_image`'s refusal used to be the C's string byte-for-byte —
@@ -2414,9 +2518,57 @@ This is a test bug, not a product bug: re-stamping `used` on every save is the
 correct product behavior. The test is not being fixed as part of this change;
 this entry exists so the next person who hits the flake recognizes it instead
 of chasing a phantom regression in session serialization.
+
+## Weight deltas cannot be applied in memory, and the engine cannot tell two weight sets apart
+
+Two things shaped `.ggd` weight deltas (`ggufdelta.rs`, `crates/gguf-delta`).
+
+`model_open` in `refs/ds4/ds4.c` maps the model `PROT_READ` and, on Metal,
+`MAP_SHARED`, then wraps slices of that mapping as no-copy `MTLBuffer`s. There
+is no hook to substitute bytes, and the comment above the `mmap` says the
+shared/private choice was made around a Darwin VM bug. So a delta is applied
+to a *file* — an APFS `clonefile(2)` of the base, patched in place — and the
+engine loads that. The clone costs only the diverged blocks; on the abliterated
+Vision-Exp checkpoint that is ~1.2 GB against an 87 GB base.
+
+`ds4_engine_model_name` returns `DS4_MODEL_SHAPE_NAME`, a compile-time shape
+name, so base and derived weights report the *same* model name. plank keys the
+sysprompt KV snapshot as `sha(model ‖ system)` and stamps that name into every
+KV sidecar, so the two weight sets share every KV cache. This is accepted on
+purpose: a rank-1 edit on 33 tensors is within the noise the model already
+tolerates from quantization, and re-prefilling per variant would cost more
+than it buys. Do not "fix" it by suffixing the model name without also
+deciding that the cache split is worth it.
+
+A last measurement worth keeping: raw target bytes of an edited Q8_0 tensor
+deflate to 92%, but the byte-wise `(target - base) mod 256` deflates to 37%,
+because most int8 weights moved by 0 or ±1. Diff, then compress.
+
 ## Qwen3.8-Flash-Next — the traps that cost the most
 
+**Qwen is back, and official.** Upstream `bd66c40` (the V4.1 bump) had deleted
+the Qwen Metal support, so plank removed the family, its CLI flag, its tool
+dialect and its KV namespace with it. Upstream then merged Qwen3.8 Flash Next
+properly (PR #991, in `9139e2a`) and publishes the weights itself, so all of
+that is restored and the off-by-default `qwen` cargo feature — a compromise for
+a model that only existed in our fork — is gone. Read the notes below as live,
+not historical.
+
 Every one of these was found by running the model, not by reading the C.
+
+**SSD streaming is refused for Qwen, and the heuristic that turns it on is
+measuring the wrong thing.** `ds4_engine_open` rejects a Qwen3.8 checkpoint
+outright when streaming is set ("requires single-host Metal ... SSD streaming
+... not supported"), so a run that auto-enables it never loads at all. Worse,
+the auto-enable fires *every* time: it weighs the GGUF on disk against the
+resident budget, and a Qwen GGUF is mostly BF16 n-grams the engine never makes
+resident. For the Q4 build the engine's own accounting is 95.37 GiB of n-grams
+read from disk against 69.73 GiB resident, out of 165.11 GiB on disk — so the
+file size says it cannot fit a 128 GB Mac while the resident set fits with
+50 GiB to spare. `ensure_side_artifacts` therefore returns for Qwen *before*
+`auto_enable_ssd_streaming`, not after. Nothing in the unit tests or the parity
+suite can see this; it takes a real load, which is the whole lesson of this
+section.
 
 **The engine compiles one combined Metal source for every model.**
 `ds4_gpu_full_source` treats each entry of its `required_sources` array as
@@ -2478,3 +2630,508 @@ hard-linked files", which plank never checks. Its other claims do hold, so the
 block is adoptable sentence by sentence once those two are settled. The parity
 tests subtract exactly that span, with markers that fail loudly if upstream
 reshapes it.
+
+## A vision encoder is refused unless the checkpoint is Vision-Exp
+
+`ds4_engine_open` does not load the encoder best-effort when the main model
+cannot use it: with a `vision_path` set and a `DeepSeek` GGUF that lacks
+`deepseek4.checkpoint_variant = "vision-exp"`, it prints "--vision requires
+GLM-5.3, Qwen3.8-Flash-Next or the pinned DeepSeek V4 Flash Vision-Exp model"
+and fails the whole open. plank used to pass the encoder for every `DeepSeek`
+run, so a language-only or re-quantized checkpoint (an abliterated Q2, say)
+could not be opened at all, and the only message was the generic "failed to
+open model". `gguf::supports_vision` now reads that key before the open;
+`Ds4Model::open` passes a null `vision_path` and `ensure_side_artifacts` skips
+the encoder download when it is absent, and a note at open time says the run
+is text-only. `view_image` then refuses at call time, the same path a missing
+encoder file already took.
+
+## Cancel is polled during prefill, and chunked prefill keeps its partial checkpoint
+
+`ds4_session_set_cancel`'s callback is polled per token during prefill, not
+only during generation (`refs/ds4/ds4.c:33264`, `33289`, `37888`, `37933`).
+More usefully, `ds4_session_note_prefill_progress` (`70570`) rewrites the live
+checkpoint on every `prefill_chunk` event, and on cancel `ds4_session_sync`
+sets `checkpoint_valid = s->checkpoint.len > 0` (`71795`) — so an interrupted
+chunked prefill leaves a valid *shorter* KV prefix rather than nothing.
+
+Not every path chunks: decode-style streaming prefill reports "one cacheable
+chunk at the end" (`33256`), and `metal_graph_prefill_raw_swa` returns
+INTERRUPTED without advancing the checkpoint. Yield depth is therefore
+path-dependent, and anything reporting a re-prefill cost must read the
+checkpoint that actually survived rather than assume one.
+
+## A decided yield that does not free has to be rolled back by hand
+
+`Hysteresis::observe` commits the yielded flag *before* the caller acts on its
+verdict, so the state machine already believes a yield happened by the time the
+caller discovers it cannot free — a session holding vision state, a turn that
+is not in a yieldable phase, an engine that declines. Every such path must call
+`note_yield_declined()`. Miss one and the machine stays latched in "yielded"
+with nothing freed: later pressure is swallowed as already-handled for a full
+resume dwell, which reads as plank ignoring memory pressure entirely and shows
+up nowhere in a test that only drives the happy path.
+
+## Micro-compaction must not run while yielded
+
+`restore_rung_below` → `set_kv` → `ensure_session` lazily *re-acquires* the very
+session the yield just freed, which is a multi-gigabyte allocation made at the
+one moment the machine has no memory to spare — the opposite of what the yield
+was for. Micro-compaction is therefore suppressed for the duration of a yield
+rather than allowed to race the resume; the rewrite it wanted to do is still
+waiting when the session comes back.
+
+## A livelock guard inside the state machine does not protect the path that bypasses it
+
+`MIN_YIELD_INTERVAL_SECS` was enforced in exactly one place: `Hysteresis::observe`.
+But the mid-pass yield never calls `observe` — it goes `pressure_tick` (inside the
+generation's interrupt hook) → `finish_pressure_stop` → `do_pressure_yield` →
+`note_external_yield`, which *sets* `last_yield` and never *reads* it. The guard
+looked fully wired up while covering only the turn-boundary half of the paths
+that can yield.
+
+What made the gap expensive rather than merely untidy is that `warm_sync` is
+uncancellable by pressure: it passes `interrupt: &|| false` and calls
+`cancel_clear()` on entry, so the whole multi-gigabyte re-prefill is paid, the
+memory is re-wired, and only then can the first sampled token see the cancel.
+Under sustained `Critical` that is one full rebuild-and-free per turn, forever —
+precisely the loop the constant exists to forbid.
+
+The fix is a query on the state machine (`Hysteresis::yield_allowed_at`) that both
+paths consult, with the arithmetic staying in `mempressure.rs`; the mid-pass path
+samples it *before* the pass, so a suppressed yield costs no truncated generation.
+The general lesson: a guard that lives inside a state machine protects only the
+callers that go through it. Any out-of-band path that reports its outcome back to
+the machine (`note_external_yield`, and the `note_yield_declined` rollback above)
+has to ask the machine for permission on the way in, not just tell it on the way
+out.
+
+## A stream that fails after its 200 says so in the body, and swallowing it looks like an answer
+
+`repro-1789068998` (session `zesty-chaplin`, `openai-responses:gpt-6-astra`) has
+four passes — 59, 72, 79 and 81 — that ran 1 to 13 seconds, generated **0 tokens
+at 0.0 tok/s**, and ended with the stop reason `answer`. Pass 81 is the last one
+in the session: the user typed `finish`, the assistant block came back empty, and
+the turn ended. No loop guard tripped, and `~/.plank/errors.log` has nothing at
+all between 20:01 and 21:52, so the whole episode left no trace anywhere.
+
+The cause was three lines in the Responses translator: `"response.failed" |
+"error"` set `done` and returned `false`, with no notice, no log line and no
+error. `ProviderEngine::generate` then took its ordinary success path —
+`translator.usage()` is `None` for a stream that never reached
+`response.completed`, so the `unwrap_or` fallback reports `output_tokens: 0` —
+and returned `Ok(GenerationStats)`. The turn loop sees an answer with no tool
+calls and ends the turn. A failed request and a model that chose to say nothing
+are, from the user's seat, the same event.
+
+The tell that the pass really got no terminal frame is in the dump's header:
+`last ctx used: 160942` against `transcript tokens: 160945`. Both are plank's own
+count. A server-reported `input_tokens` would not track the local tokenizer that
+closely; the fallback does, because it *is* the local count.
+
+Two rules come out of it. An HTTP status cannot diagnose a streamed provider:
+the 200 is committed before the model runs, so the body's terminal frame is the
+only place a mid-generation failure is reported, and a translator that drops it
+is the last place it could have been caught. And a terminal frame that is not a
+success must not share an arm with one that is: `response.incomplete` was handled
+identically to `response.completed`, which presented a truncation (an exhausted
+`max_output_tokens` — plank sends `n_predict`, 50 000 there — or a content
+filter) as a finished answer. Failures now carry the provider's message out
+through `SseTranslator::stream_error` into an `EngineError` and the error log,
+and a truncation keeps its usage and its text but announces the reason as a
+`Notice`. Neither event had a test before; both do now.
+
+## The V4.1 DSML dialect is a respelling, so every tag must come from one table
+
+V4.1 does not invent a tool syntax; it respells the existing one. Where V4 writes
+`<｜DSML｜tool_calls>`, `<｜DSML｜invoke` and `</｜DSML｜parameter>`, V4.1 writes
+`<｜DSML｜ calls>`, `<｜DSML｜ invoke` and `</｜DSML｜ parameter>` — the word
+`tool_calls` becomes ` calls`, and the leading **space** after the second bar is
+part of the tag, not formatting. It survives no trimming and no normalization.
+
+The trap is that the difference is small enough to invite hand-typed constants at
+each of the half-dozen sites that name a tag. They must all come from
+`ToolSyntax::dsml_tags` (`crates/trace-stream/src/syntax.rs`) instead, because the
+tolerance plank already grants the V4 spelling has to compose with the respelling:
+`start_markers` accepts every marker name (`DSML`, `SSML`) in both the canonical
+and dropped-leading-bar forms, and it builds them by substituting the marker word
+into the table's `start`, replacing only `DSML` and never the space that follows.
+Hand-type `"<｜DSML｜ calls>"` at one site and the SSML or dropped-bar variant of it
+silently stops being recognized on V4.1 only — which surfaces as the generic
+"DSML markup outside a valid tool_calls block" on every turn.
+
+`ToolSyntax::for_model_name` keys on the C's shape name (`DS4_MODEL_SHAPE_NAME`),
+not the GGUF path, so a renamed or relocated checkpoint still resolves; anything
+not starting with `DeepSeek V4.1` falls through to the V4 dialect.
+
+## The V4 think prefix is unchanged by the V4.1 effort plumbing — dumped, not argued
+
+Adding V4.1's numeric reasoning effort replaced plank's direct
+`ds4_chat_append_max_effort_prefix` call with `ds4_chat_append_think_prefix(mode)`
+for *every* mode. That is only safe if the new call is a no-op on V4 wherever the
+old one did nothing, and the argument for it was pure source-reading for a while.
+
+It holds, and the C makes it nearly trivial: both public symbols are one-line
+wrappers around the same static `chat_push_think_prefix(&e->vocab, mode, tokens)`
+(`refs/ds4/ds4.c:42097`), whose family switch tests `DS4_MODEL_FAMILY` — a
+**runtime** global (`g_ds4_shape.family`), not a compile-time constant. On
+anything that is neither GLM nor DeepSeek41 the only arm that appends is
+`think_mode == DS4_THINK_MAX`, so `NONE`, `HIGH` and any numeric level append
+nothing at all.
+
+The useful part is how to *test* that without the 87 GB of weights:
+`ds4_dump_chat_tokenization` (exposed as `ds4 --dump-tokens`) does
+`model_open` + `vocab_load` + `encode_chat_prompt` and no weight load, so a full
+token dump against a real V4 checkpoint returns in about 0.4 s. Reach for it
+whenever a claim is about prompt bytes; there is no reason to load a model.
+
+Two traps when doing so:
+
+- **`--think-max` silently downgrades to `HIGH` below a 393216-token context**
+  (`ds4_think_mode_for_context`, V4 only). At the default context the MAX prefix
+  simply does not appear, which reads exactly like "the prefix was dropped". Pass
+  `--ctx 524288` or the test proves nothing.
+- **The dump path refuses a numeric level on non-V4.1** before it encodes
+  anything, so `--think-level N` cannot be observed on V4 as shipped. That guard
+  lives in `ds4_dump_chat_tokenization`, *not* in `chat_push_think_prefix` — it
+  therefore does not protect plank, which calls the wrapper directly. This matters
+  because plank's own `Low` passes `Level(25)` on **every** family, V4 included.
+  Temporarily stubbing that one guard and re-dumping confirms the real behaviour:
+  on V4, levels 25/50/100 are byte-identical to plain `--think` and level 0 to
+  `--nothink`. No effort prefix on any of them.
+
+## A close tag bearing attributes is a fused close-and-open, not value text
+
+The model sometimes writes the *next* parameter's opening tag with a leading
+`/`, fusing two parameters into one tag pair:
+
+```
+<｜DSML｜parameter name="query" string="true">impl Rng</｜DSML｜parameter name="path" string="true">src/words.rs</｜DSML｜parameter｜>
+```
+
+`close_tag_at` accepts only the bare close tag (whitespace and an optional
+trailing `｜` before the `>`), so the attribute-bearing one is not a terminator
+and the value ran on to the final close. The dispatched call then had `query`
+equal to `impl Rng</｜DSML｜parameter name="path" …>src/words.rs` and **no
+`path` argument at all** — the parameter did not merely arrive wrong, it
+disappeared.
+
+That is the expensive failure shape, because nothing looks broken from the
+model's side: `search` answered "No matches", which was correct for that query,
+and the model concluded the search tool was ignoring the root folder it had
+been given. It spent two turns on that phantom bug before falling back to
+`bash grep` (`~/.plank/repro/repro-loop-1789365915.md:5084`). A parse error
+costs one re-emit; a plausible wrong answer costs the turn and can end up
+recorded as a bug in the wrong component.
+
+So this is now `DsmlState::Error` with a message naming both tags to write.
+Two details worth keeping:
+
+- **An attribute means an `=` before the `>`.** A bare word in that position
+  (`</｜DSML｜parameter x>`) is one of the adversarial payload values
+  `incremental_scan_matches_whole_value_rescan` requires to stay value text.
+  Keying on "any non-`>` byte after whitespace" is the obvious rule and it
+  breaks that test.
+- **The candidate has to be *held*, not ruled out, until the `=` or `>`
+  arrives.** The scan advances `param_scan_from` past a ruled-out candidate and
+  never revisits it, so deciding before the deciding byte has streamed in means
+  never deciding. Holding needs a bound (`ATTR_CLOSE_LOOKAHEAD`) or a value that
+  opens a close tag and never closes it pins the cursor and makes the scan
+  quadratic — the thing `param_scan_from` exists to prevent.
+
+## `set_var("HOME")` in a test re-enables the shared-home fallback it was avoiding
+
+Two tests (`consent`, `errlog`) scoped themselves by pointing `$HOME` at a
+scratch directory, restoring it at the end. Both wrote to the user's real
+`~/.plank` anyway, and took four unrelated `tools::` sandbox tests down with
+them.
+
+The race is the obvious half: `HOME` is process-global and `cargo test` runs
+threads in parallel, so for as long as one test held the scratch value every
+other test resolving a plank path got it too. That is why the failures moved
+around and why each test passed when run alone.
+
+The other half is specific to `home::plank_home_in`, and it inverts the
+intent of the test:
+
+```rust
+fn resolve(home: &Path, shared: &Path, allow_shared: bool) -> PathBuf { … }
+fn is_real_home(home: &Path) -> bool {
+    std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == home)
+}
+```
+
+The shared `/Users/.plank` fallback is gated on *the root being this process's
+own `$HOME`* — precisely so an injected root (a test, a worktree copy) can
+never reach the machine's state. Setting `HOME` to the scratch directory makes
+`is_real_home` true again, so the guard opens: the scratch `.plank` does not
+exist yet, `/Users/.plank` does, and the fallback wins. The test resolves to
+the shared directory, which on a developer box is typically a symlink to the
+user's own `~/.plank`.
+
+So the two tests were not merely unhermetic, they were operating on live user
+state: the errlog test appended to the real `errors.log` (it asserted two
+timestamped lines and counted 6657), and the consent test called `remove_file`
+on the real `web-consent` marker, revoking standing web consent.
+
+The rule this leaves behind, already the one `spill` arrived at independently:
+**a function that resolves a path from `$HOME` gets an explicit-root `_in`
+variant for tests, and the environment is never touched.** Where the write
+itself needs testing, split the body so the resolved path is a parameter
+(`append_entry`, `write_marker`) and let the public function stay the
+one-line `$HOME` wrapper. A red run in any `$HOME`-touching module is worth a
+`grep -rn 'set_var("HOME"' src/` before it is blamed on the diff.
+
+## The bash sandbox's write roots have to model the toolchain, not just the project
+
+A `cargo install --path .` inside a sandboxed plank fails with
+
+```
+error: failed to open: /Users/enzo/.cargo/.crates.toml
+Caused by: Operation not permitted (os error 1)
+```
+
+and the failure is easy to misread as a filesystem problem: the file is owned
+by the user, mode `0644`, with no `uchg` flag, on a writable volume. The tell
+is the errno. Seatbelt denies with **EPERM** (`Operation not permitted`,
+errno 1); an ordinary permission problem is **EACCES** (`Permission denied`,
+errno 13). A writable, owner-owned directory denied with EPERM for both an
+existing file and a new one is a sandbox profile, every time.
+
+The narrow reading — "`cargo install` is blocked" — is the wrong lesson. The
+same denial covers `~/.cargo/registry`, so `cargo build` worked only as long as
+every dependency happened to be cached already; the first `cargo add` of an
+uncached crate failed identically, as would `npm install` and `go build`. A
+sandbox whose write roots are cwd plus temp does not describe how build tools
+actually work: they write a machine-wide cache outside the project by design.
+
+The split the fix settled on is **cache versus `PATH`**, not "inside versus
+outside the project":
+
+- Caches are granted by default. A write there costs disk and nothing else.
+- Directories on the user's `PATH` (`~/.cargo/bin`, `~/.local/bin`,
+  `/usr/local/bin`) are withheld and granted on request, because a binary
+  installed there is one the user later runs.
+
+That distinction is why the cache grant names `~/.cargo/registry` and
+`~/.cargo/git` rather than `~/.cargo` — the parent carries `bin` with it, and
+granting it would hand the model the user's `PATH` while looking like a build
+fix. `~/.cargo/config.toml` stays denied for the same reason: it can redirect
+the registry or inject a linker flag.
+
+One detection wrinkle: the profile is built *before* the command runs, so the
+prompt reads the command text, and `cargo install` with no `--root` writes
+`$CARGO_HOME/bin` without ever spelling the path. The mention check therefore
+recognises the command shape, not just the path — and `--root /tmp/...`, which
+redirects the install somewhere already writable, is excluded so it does not
+prompt for nothing.
+
+Finally, the `[sandbox blocked: …]` hint had been telling the model to add the
+path to `writablePaths` in `.plank/sandbox.json` — but a *project*-scoped
+sandbox file may only tighten the policy (a cloned checkout must not be able to
+widen it), so `writablePaths` there is dropped silently. Following the hint did
+nothing at all. Only `~/.plank/sandbox.json` can widen the sandbox.
+
+## Memory's three separate non-hermetic-test holes, and the rule they confirm
+
+Automatic memory management (`src/memory.rs`, `src/memextract.rs`) touched
+`~/.plank` from three different call sites during development — `remember`'s
+writer, the audit log, and the verdict-application loop that both writes
+`MEMORY.md` and deletes lines from it — and each one needed its own hermetic
+test hole plugged before `cargo test` stopped mutating the developer's real
+files. The worst of the three: a test exercising `forget_matching` against a
+pattern common enough to appear in a real memory file would have deleted real
+user entries the moment it ran without an explicit root.
+
+This confirms the rule `spill` already left behind (see "A function that
+resolves a path from `$HOME`…" above), but memory's shape made it easy to miss
+twice more even after fixing it once: `remember` writes, `apply_verdicts`
+writes *and* logs *and* touches the sidecar, and `forget_matching` writes and
+logs and touches the sidecar from a different function. Each needed its own
+`_to`/`_from` variant (`apply_verdicts_to`, `forget_matching_to`,
+`forget_preview_to`, `log_change_to`, `read_log_from`) taking an explicit
+`log_dest` and, for the user scope specifically, a `user_root` override —
+`Scope::Project` already redirects safely through `cwd`, so only the user
+scope's `$HOME`-resolved path needed the second override. The lesson: when a
+module has several functions that each independently resolve `~/.plank`,
+budget for one hermetic hole per function, not one for the module.
+
+## Nothing durable is recorded until the memory file write actually lands
+
+`apply_verdicts_to` stages every audit-log line and every `MetaStore` mutation
+in memory while it walks a batch of verdicts, and flushes both only after the
+scope's file write (if there was one) has succeeded — see `ScopeState` and the
+`write_ok` check in `apply_verdicts_to`. The first version wrote the audit log
+and bumped usage counters as verdicts were applied, before the file write at
+the end of the scope loop. A failed write (permissions, disk full, a
+directory that vanished) then left three sources of truth disagreeing: the
+audit log said an entry was added or deleted, the sidecar had usage counters
+for an id that was never written, and `MEMORY.md` itself had neither. Nothing
+downstream can reconcile that after the fact, because the audit log's whole
+purpose is to be the log of what actually happened.
+
+The fix is the general shape, not specific to memory: when a batch of
+mutations spans an audit trail, a cache, and the actual write, order the
+flush so the audit trail and cache are only ever behind the write, never
+ahead of it. Staging in memory and flushing on success is cheap; a scope
+whose write failed is left exactly as it was, and the loop moves on to the
+next scope rather than aborting the whole batch.
+
+## An entry's identity is a hash of its text alone, so `carry` is what saves its usage across an edit
+
+`Entry::id` hashes only `self.text` — not the date, not the `[kind]` tag —
+deliberately, so re-tagging or re-dating a line does not orphan its sidecar
+row. But that also means a `Verdict::Update`, which rewrites an entry's text
+in place, produces a *new* id: the old row in `MetaStore` and the new line in
+`MEMORY.md` no longer agree. `apply_one_verdict`'s `Update` arm calls
+`state.meta.carry(id, &new.id())` immediately after computing the new entry,
+moving the accumulated `uses`/`last_used`/`pinned` row across to the new key
+before anything is saved. Skip that call — or get the order wrong relative to
+the file rewrite — and every `UPDATE` verdict silently resets the entry's
+usage history to zero, which looks like nothing broke (the text is still
+there, still renders) until someone asks why a fact reworded six times over a
+month keeps evicting as if it were brand new.
+
+## `bash_status` never waited: the port passed `stop` for `wait`
+
+`agent_bash_job_tool_result` in the C takes `wait`, `refresh_sec` and `stop`
+as three separate arguments, and its `bash_status`/`bash_stop` caller derives
+`wait = stop || refresh > 0` with `refresh_sec` defaulting to `0` (and forced to
+`1` for `bash_stop`). The port collapsed that to `job_tool_result(idx, stop,
+refresh, stop, true)` and gave `refresh_sec` the `bash` tool's default of 60
+with a floor of 1. Net effect: `bash_status` did a single non-blocking poll no
+matter what `refresh_sec` said, and the model looped `bash_status refresh_sec=300`
+once per generation while a long test ran. The C prompt line "bash_status
+returns immediately unless refresh_sec is given" was accurate to the C and false
+for plank. When mirroring a C function that takes flags derived from each other,
+port the derivation at the call site too, not just the callee's signature.
+
+
+## Benchmarking plank against itself (`bench/bench-matrix.sh`)
+
+A harness that runs plank in a scratch directory has to keep its own files out
+of that directory. Writing the phase log and the per-run JSON record into the
+model's working directory looks harmless and is not: a `/init` phase then
+surveys the harness's bookkeeping and writes an `AGENTS.md` about "a transient
+benchmark scratch directory" instead of about the code, and the `files` count
+has to be filtered by filename to mean anything. The model's tree and the
+harness's metadata belong in sibling directories, and then "every file here is
+model output" is true rather than approximately true.
+
+Two consequences of that split are worth stating separately, because each one
+produced a plausible-looking report that was wrong:
+
+- A snapshot taken by copying the run directory copies the run records too, and
+  a summariser that finds records by recursive glob then counts every one twice.
+  One iteration reported as four runs, with every second and every tool call
+  doubled. Nothing in the numbers looked anomalous.
+- `timeout(1)` does not exist on macOS, and neither does `gtimeout` without
+  coreutils. A harness that wraps runs in it does not fail loudly: the wrapper
+  exits 127, every run records as a failure, and no timeout is ever enforced.
+  Resolve the binary up front, and only demand it when a definition actually
+  asks for a timeout.
+
+On prompts: "Generate a quick sort algorithm in Rust" gets an answer in the
+chat, not a file, and a benchmark that means to snapshot generated code gets
+`files: 0`. Naming the target file in the prompt is what makes the work
+observable on disk. Measured on DS4 Flash at temp 0, that one change took the
+work phase from 100s and 1 tool call to 318s and 9.
+
+`-p` never consulted the slash dispatcher, so `-p "/init"` sent four literal
+characters to the model. Pasting `INIT_PROMPT` in as text is not a substitute:
+`/init` is the only caller of `settings::suspend_loop_guards()`, and its phases
+re-read the same tree by design, which is the shape `LoopGuard` refuses.
+
+## What the second bench-matrix session showed (`local/bench-coding-baseline-20260917-131726`)
+
+Three findings, none of them about the models.
+
+**The bench measured this machine's `~/.plank`, not the prompt.** plank reads
+skills, plugin hooks, memory, the MCP config and settings from its home, and
+every one of them reached the model. All three models opened the LRU task with
+two `skill` calls (a probe, then the user's `superpowers:brainstorming` or
+`test-driven-development`) and DS4 spent passes classifying the task as
+"bounded or architectural" before writing a line. Every DS4 LRU run first wrote
+to `/Users/enzo/Code/CC-Lab-1/lru.rs` and was refused for escaping the
+workspace: that path was lifted from the cached tokensave MCP server
+instructions, which list the user's other projects. The harness now runs plank
+under a scratch `HOME` whose `.plank` holds the model artifacts (symlinked) and
+the manifests (copied) and nothing else. The symptom that led there is worth
+keeping: a refused write to a path the prompt never mentioned means the path
+came from context, and the repro shows exactly which line.
+
+**A run killed by `timeout(1)` left nothing behind.** SIGTERM ends plank
+without saving, so every timed-out run recorded `toolCalls: 0`, no transcript
+and no repro, and the report's median of 0 tools looked like a model that never
+started. Two of the five were in fact finished: `quicksort.rs` was on disk six
+seconds before the kill. plank treats SIGINT as "interrupt the generation" and
+then saves and writes the repro like any other exit, so the harness now sends
+`-s INT -k 30`; `timeout` still exits 124 on expiry. A missing transcript is
+recorded as `toolCalls: null`, and the summariser leaves unknowns out of the
+medians and says how many there were, because a floor printed as a total is a
+number nobody questions. The other three timeouts were DS4.1 at 11 tok/s never
+reaching its first tool call inside 300 s; a limit has to be set for the
+slowest model in the matrix, not the fastest.
+
+**`/init` told the model to use a `task` sub-agent, and `task` is the todo
+tool.** All nine init runs, all three models, dispatched the survey to `task`,
+got `task requires 'op' set to add, update, or list` back, and only then found
+`agent`. One wasted round per `/init`, identical everywhere, invisible in a
+"completed" status. The prompt now names `agent`, and the parity test that
+checks the prompt's tool names against the registry also asserts it never names
+`task` again. The general lesson: when two tools share a word, a prompt that
+uses the word informally will be read as the tool name.
+
+## A leftover plank fails a whole benchmark session, and Ctrl-C used to make one
+
+Three bench-matrix sessions died in a row today, and only the first died of
+what the report said. A bad `plankArgs` entry killed the first; the second
+recorded 45 runs "failed" with a reason visible only inside a per-phase log:
+
+```
+plank: another plank (ds4) instance is already running (PID 22850).
+```
+
+`singleton.rs` flocks a model lock file because only one process can map the
+~82 GB of weights, so a single orphan fails every run behind it. The orphan
+came from the harness itself. A terminal SIGINT reaches the whole foreground
+process group, so plank took Ctrl-C as "interrupt the generation", saved and
+exited, and the loop started the next of 45 runs as if nothing had happened;
+killing the script instead left plank alive with the weights mapped, working
+in a directory that had already been deleted. Either way the next session
+found the lock held.
+
+So the harness now traps the signal and stops the child deliberately — SIGINT
+first, since that is what makes plank save its transcript and write its repro,
+then SIGKILL after a grace period — and refuses to start at all while another
+plank is running. Two things made that trap work that are easy to get wrong:
+bash defers a trap until the foreground command returns, so the run has to be
+backgrounded and `wait`ed on; and `timeout(1)` relays signals only while it is
+alive, so a KILL has to be delivered to the whole child tree rather than
+through the middleman.
+
+One consequence is worth knowing rather than fixing: a plank that exits after
+an interrupt exits 0, so a run killed from outside the harness records as
+`completed` with whatever partial work it had done. Under `timeout(1)` this
+never shows, because 124 overrides it, and the trap exits before writing a
+record. But a `kill -INT` aimed at plank by hand produces a record that says
+completed and means interrupted — the repro is the place that says so, under
+`outcome`.
+
+## DeepSeek V4 Flash leans toward answer A on the memory gate, by about 9 points
+
+Measured with `/memory calibrate 30` on 2026-09-23, over 30 turn spans from
+saved `.ds4.kv` sessions, each asked the gate question with `yes` as A and
+again with `yes` as B. Mean P(yes) was 0.240 as the live gate asks it and 0.062
+swapped, a letter bias of +0.089 ± 0.012 toward A: far outside two standard
+errors, so the prior is real, not noise. `letter_mass` never saw it; across all
+60 asks it ranged 0.60 to 0.98 (median 0.78), healthy every time. That is the
+blind spot the calibration exists for: mass on the letters says the model
+answered with a letter, not why it chose that one.
+
+At the default 60% the bias changed 1 of 30 verdicts, because almost every
+span sat far below the bar either way. The bigger finding is that the gate,
+bias or not, says "not worth remembering" to nearly every turn: a debiased mean
+P(yes) of about 0.15. Whether that is right is not something this run can tell:
+there is no ground truth here for which spans actually held a memory.
+Suggested correction: `memory.gateBias.ds4 = 9`. V4.1 and Qwen are unmeasured.

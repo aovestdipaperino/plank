@@ -155,11 +155,29 @@ what you have changed in that tree (<code>📄 3 · +128 -41</code> — files
 touched, then lines added in green and lines deleted in red, staged and
 unstaged together, untracked files included; a clean tree shows
 nothing). The bottom one carries everything that churns — where
-inference is running, the reasoning level, a context-usage gauge, an
-activity throbber, what the model is doing, generation stats, the task
-counter, and the remote marker. When a tool is running its name sits in
-the notification slot and blinks; otherwise a rotating tip appears
-there.</p>
+inference is running, a brain with the reasoning level beside it (click
+it to hide or show thinking for the session, without writing the
+setting), a context-usage gauge, <code>⧗ N jobs</code> while background
+shell jobs are running (click it for the <code>/jobs</code> panel), a 🐞
+while a debug console is actually connected to the session (not merely
+<code>--debug</code> on the command line), a 💾 while the loaded model
+is streaming its experts from SSD (blinking while a pass is in flight),
+<code>⏸ paused: memory</code> while plank has released the engine under
+memory pressure and is waiting to take it back, one <code>✍️</code> per
+span while the memory extraction pass takes notes, the task counter, and
+the remote marker. When a tool is running its name sits in the
+notification slot and blinks; otherwise a rotating tip appears there.
+There is no <code>idle</code> word: the prompt caret's colour already
+says the model is waiting. The figures that change many times a second —
+prefill and generation tokens and rates, the MTP per-step numbers — are
+not in the status bar at all; they float at the right end of the rule
+<em>below</em> the prompt, the way the session name floats on the rule
+above it, and the rule goes back to a plain line when the turn ends. The
+memory extraction pass keeps its figures to itself unless plank was
+started with <code>--show-memory-stats</code>: by default the rule looks
+idle while notes are taken and the footer's <code>✍️</code> is the only
+sign. The line pinned under the output while the model works carries the
+throbber, what the model is doing, and the clock.</p>
 <p><strong>Where inference runs</strong> is named on the second row, and
 there can be more than one answer:</p>
 <pre><code>api.regolo.ai, (local ⚡100%)</code></pre>
@@ -308,6 +326,15 @@ stopping a turn.</p>
 <p><code>Esc</code> at an idle prompt dismisses a <code>/btw</code>
 panel left open from an earlier turn, which is the only way it
 closes.</p>
+<p>Most slash commands wait for the turn to finish, but the read-only
+reports do not: <code>/usage</code>, <code>/mcp</code> and
+<code>/help</code> answer from a turn-start snapshot, while
+<code>/context</code>, <code>/jobs</code> and <code>/toks</code> read
+live state and redraw as the turn runs — open <code>/context</code>
+mid-turn and you can watch the window fill, category breakdown refreshed
+at each tool boundary and the total on every status tick.
+<code>/exit</code> asks <code>[y/N]</code> before interrupting the turn
+and leaving once it stops.</p>
 <h3 id="in-a-question-panel">In a question panel</h3>
 <p>The <code>ask</code> tool's panel takes
 <code>Up</code>/<code>Down</code> to move, <code>Space</code> to toggle
@@ -338,7 +365,16 @@ agents never overwrite one another. <code>←</code> on an empty prompt
 steps into the roster, <code>←</code>/<code>→</code> walk the rows,
 <code>Enter</code> expands the selected agent's output over the
 transcript with its own scroll position, and <code>Esc</code> comes
-back.</p>
+back. A finished row leaves the roster a minute after it ends, and
+stepping back in does not bring it back: the roster shows what is
+running now, not what ran. Only the row under your cursor is kept until
+you move off it, so nothing vanishes while you are reading it.</p>
+<p>While a sub-agent is working, the progress line under the transcript
+reads <code>Waiting… (for sub-agent &lt;name&gt; to complete)</code>.
+The live counters — the verb, the clock, the tokens and the tokens per
+second — belong to the sub-agent's pass, so they are shown in that
+agent's own view, reached through the roster. The main transcript no
+longer looks like it is the one generating.</p>
 <p>It is a live readout: it appears with the first agent and goes away
 with the last, staying put only while you are reading it, and
 <code>←</code> brings a finished roster back so a report you delegated
@@ -346,8 +382,8 @@ is still reachable. The last eight runs are kept. The transcript itself
 gets only a one-line signpost, which is the point of delegating in the
 first place — see <a href="09-extending.html">Extending plank</a>.</p>
 <p>The plain REPL has no roster and prints subagent output inline
-instead; <code>--non-interactive</code> stays silent so its stdout
-protocol is not corrupted.</p>
+instead; <code>--ui console</code> stays silent so its stdout protocol
+is not corrupted.</p>
 <h2 id="-file-completion"><code>@</code> file completion</h2>
 <p>Type <code>@</code> in the prompt and a fuzzy-completion popup offers
 file paths from the working tree; pick one and the path is spliced into
@@ -361,6 +397,29 @@ that <code>.gitignore</code> excludes are offered (default
 <li><code>ui.indexRefreshSecs</code> is how long the file index is
 trusted before it is rebuilt (default 5).</li>
 </ul>
+<h2 id="prompt-suggestions">Prompt suggestions</h2>
+<p>After an answer, plank works out the most likely thing you are about
+to type and shows it as grey ghost text on the empty prompt.
+<code>Tab</code> or <code>Right</code> places it in the line so you can
+edit it before sending, <code>Enter</code> sends it as it stands, and
+any other keystroke dismisses it. It only ever appears on an empty
+prompt, so it cannot land on top of something you are writing.</p>
+<p>The guess is a short generation against the conversation already held
+in the KV cache, run in the background on a quiet moment rather than
+while you wait, so the prompt stays live and typing interrupts it. It
+skips itself when the cache would have to be rebuilt from scratch, which
+is the one case where it would be expensive.</p>
+<p>A suggestion is only ever text. A line beginning with <code>/</code>
+or <code>!</code> is discarded rather than offered, since
+<code>Enter</code> over a placed suggestion sends it straight away.</p>
+<ul>
+<li><code>suggestions.enabled</code> turns it off (default
+<code>true</code>).</li>
+<li><code>suggestions.maxTokens</code> bounds the guess (default
+160).</li>
+</ul>
+<p>The suggestion is always generated before a waiting memory pass,
+which then takes the next quiet moment.</p>
 <h2 id="-and---run-a-shell-command-yourself"><code>!</code> and
 <code>!!</code> — run a shell command yourself</h2>
 <p>Prefix a line with <code>!</code> and it runs in your shell, in
@@ -460,12 +519,15 @@ just point at one:</p>
 title</h2>
 <p>Long turns end with a native macOS notification: your prompt as the
 headline, the tail of the answer as the body (<code>interrupted</code>
-for an aborted turn). The terminal title tracks the current task, e.g.
-<code>🪵 plank - fix the bug…</code>, and names the phase when plank is
-busy with something that is not your turn: <code>🗑️ compacting...</code>
-while it reclaims context, <code>👀 introspecting...</code> during
-<code>/insights</code>. The title it displaced comes back afterwards, so
-a compaction mid-turn returns the title to your prompt.</p>
+for an aborted turn). The terminal title tracks the current task:
+<code>🚀 fix the bug…</code> while a turn runs, with the rocket
+sparkling through a few glyphs until the turn ends (a static rocket
+under <code>ui.reducedMotion</code>), <code>🪵 Plank - READY.</code> at
+the prompt. It names the phase when plank is busy with something that is
+not your turn: <code>🗑️ compacting...</code> while it reclaims context,
+<code>👀 introspecting...</code> during <code>/insights</code>. The
+title it displaced comes back afterwards, so a compaction mid-turn
+returns the title to your prompt.</p>
 <ul>
 <li><code>ui.notifications</code> — <code>always</code>,
 <code>unfocused</code> (only when the terminal is not focused), or
@@ -487,6 +549,9 @@ it, and it never appears mid-turn or over a dialog.
 href="11-arcade.html#the-screensaver">The arcade</a>.</li>
 <li><code>ui.crtOff</code> plays a CRT power-off animation of the final
 frame when you exit cleanly.</li>
+<li><code>/exit</code> during a turn asks for confirmation, then
+interrupts the model and leaves as soon as the turn stops; the session
+is saved as usual.</li>
 </ul>
 <p>Leaving prints the session's token totals and, per model, the fastest
 sustained rates it reached:</p>

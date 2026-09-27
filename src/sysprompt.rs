@@ -245,7 +245,7 @@ module for Y), call the agent tool with a fully specified task and continue from
 for several independent parts use fanout. Your context then holds conclusions, not file dumps.\n",
     );
     out.push_str("\n## Shell\n\n");
-    out.push_str(SHELL_RULES);
+    out.push_str(&shell_rules());
     out.push_str("\n## Git\n\n");
     out.push_str(GIT_RULES);
     if crate::settings::active().git.sign_commits {
@@ -619,25 +619,36 @@ fn build_tools_prompt_parts_with_wasm(
     parity: bool,
     syntax: ToolSyntax,
 ) -> (String, usize) {
-    // Qwen's prompt is a different document with a different schema fence, so
-    // it is built whole by its own builder. A profile's replacement prose is
-    // composed for the DSML prompt only and does not reach this path yet.
+    // Unreachable without the feature: `Ds4Model::open` refuses a Qwen model
+    // before any prompt is built, so the dialect can never be selected. The
+    // arm is gated rather than left to fall through to DSML so that, if that
+    // refusal is ever bypassed, the build fails to compile instead of quietly
+    // handing a Qwen model the wrong prompt. `--profile` is refused on a Qwen
+    // model for the same reason: a profile's prose never reaches this builder.
     if syntax == ToolSyntax::Qwen {
         return build_qwen_tools_prompt_parts(mcp_servers, wasm_tools);
     }
     // A profile replaces the whole prose prompt; the schema block is still
     // generated, from the allow-listed builtins.
-    let (mut out, trusted_len) = if let Some((text, spec)) = profile_prompt_source() {
-        compose_profile_prompt(text, spec, parity)
+    let mut out = if let Some((text, spec)) = profile_prompt_source() {
+        compose_profile_prompt(text, spec, parity).0
     } else {
         let mut out = build_tools_prompt_base(parity);
         insert_marker_spelling_note(&mut out);
         insert_document_read_note(&mut out);
         append_native_extra_schemas(&mut out);
         append_working_style(&mut out);
-        let trusted_len = out.len();
-        (out, trusted_len)
+        out
     };
+    // The V4.1 tag respelling happens here and nowhere else: at this point
+    // `out` is entirely trusted prompt text (plank's own, or the installed
+    // profile's), and not one byte of MCP, WASM or `-sys` text has been
+    // appended yet. See [`dsml41_tools_prompt`] for why that ordering is
+    // load-bearing.
+    if syntax == ToolSyntax::Dsml41 {
+        out = dsml41_tools_prompt(&out);
+    }
+    let trusted_len = out.len();
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
@@ -705,6 +716,7 @@ const WORKING_STYLE: &str = "# Working style
 - Decide, do not deliberate. When two designs are both plausible, pick the smaller one that covers every call site, say so in one line, and proceed. The user can redirect you after seeing a result; they cannot use a decision you never made.
 - Keep reasoning short and forward-moving. Each thought must add a fact or a decision. If you notice yourself restating an earlier thought, stop thinking and emit the tool calls you have already planned.
 - Narrate progress outside your thinking. After </think> and before every <｜DSML｜tool_calls> stanza, write one or two plain sentences for the user: what the last results told you and what you are about to do. Your thinking is hidden from the user by default, so this line is the only status they see between tool rounds; without it a long thinking block looks like a stall.
+- Write findings as you find them. When the answer is a list — a review, an audit, a survey of options — emit each item to the user as soon as you have it, after </think>, and move to the next. Do not accumulate the list in your thinking and write it out at the end: the user sees nothing until then, and a stop loses all of it. Your thinking is for deciding what the next item is, not for drafting it.
 - Edit from search output. Call search with context=5 to see the exact lines around a match, then edit directly from them; do not follow a search with a read of the same lines.
 - Edit files with the edit tool, not with a script. Do not pipe a change through sed, awk, perl or a throwaway Python script to touch several files at once: a regex that matches in one file matches somewhere you did not read in another, and the damage is silent and spread out. Make the edits one call at a time, batching independent ones into a single stanza. The exception is a change that is genuinely a simple, uniform replacement of one exact string across files you have already inspected — then say what you are running and check the result.
 - Do not compact unless the user asks you to. The compact tool replaces the conversation with a summary, and only the user knows whether the detail it drops still matters. Asking for it outright is an instruction, and so is saying the context is too full and to carry on from a summary; merely running low on room is not. plank compacts on its own when it has to.
@@ -738,6 +750,22 @@ Do not sleep between commands that can run immediately. To wait on a job, poll i
 A refused tool call means the user declined it. Do not re-issue the same call; change approach or ask. Treat hook output as feedback from the user.
 ";
 
+/// Appended to [`SHELL_RULES`] when `tools.bashNotify` is on: the model may
+/// leave a job running and end its turn, because plank wakes it with the
+/// job's final observation (`docs/BACKGROUND-TASKS.md` §3.6). Without this
+/// line the model keeps polling and the feature is invisible. Changes `fp1`.
+pub const BASH_NOTIFY_RULE: &str = "When a bash job is still running you may end your turn: plank notifies you automatically when it finishes, so do not poll or sleep to wait for it.
+";
+
+/// The shell rules plus [`BASH_NOTIFY_RULE`] when the setting is on.
+fn shell_rules() -> String {
+    let mut out = SHELL_RULES.to_string();
+    if crate::settings::active().tools.bash_notify {
+        out.push_str(BASH_NOTIFY_RULE);
+    }
+    out
+}
+
 /// Git conduct the model is not otherwise told. Body only, see
 /// [`SHELL_RULES`] for why. Adapted from the Bash git safety protocol in the
 /// Claude Code system prompts; the model runs git in roughly a tenth of the
@@ -755,7 +783,7 @@ fn append_working_style(out: &mut String) {
     out.push('\n');
     out.push_str(WORKING_STYLE);
     out.push_str("\n# Shell\n\n");
-    out.push_str(SHELL_RULES);
+    out.push_str(&shell_rules());
     out.push_str("\n# Git\n\n");
     out.push_str(GIT_RULES);
 }
@@ -1110,10 +1138,14 @@ fn append_native_extra_schemas(out: &mut String) {
     if crate::settings::active().tools.run_code {
         append_run_code_schema(out);
     }
+    if crate::settings::active().tools.remember {
+        append_remember_schema(out);
+    }
 }
 
 /// The always-advertised native extras: [`append_native_extra_schemas`]
-/// minus the `recall`/`fanout`/`run_code` tail, which is settings-gated.
+/// minus the `recall`/`fanout`/`run_code`/`remember` tail, which is
+/// settings-gated.
 /// Split out so [`native_extra_specs`] can build the same text with or
 /// without those gates without duplicating the schema bodies.
 fn append_native_extra_schemas_ungated_core(out: &mut String) {
@@ -1201,6 +1233,9 @@ fn native_extra_specs(respect_settings_gates: bool) -> Vec<crate::engine::ToolSp
     if !respect_settings_gates || gates.run_code {
         append_run_code_schema(&mut text);
     }
+    if !respect_settings_gates || gates.remember {
+        append_remember_schema(&mut text);
+    }
     parse_tool_schema_stream(&text)
 }
 
@@ -1216,6 +1251,45 @@ pub fn known_builtin_names() -> std::collections::HashSet<String> {
         .chain(native_extra_specs(false))
         .map(|spec| spec.name)
         .collect()
+}
+
+/// Appends the `remember` and `forget` tool schemas. Writes land on disk and
+/// take effect at the *next* session start, which is what keeps them free
+/// against the KV cache: the Tier 2 prefix holding memory is never rewritten
+/// mid-session.
+fn append_remember_schema(out: &mut String) {
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"remember\",\n\
+         \x20   \"description\": \"Save a durable fact to persistent memory. Use it for things you could not re-derive by reading the repository: who the user is, corrections they have given you, project constraints, and pointers to external systems. Do not save code patterns, architecture, git history, or anything already in AGENTS.md. The fact is written immediately and appears in context from the next session on.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"text\": {\"type\": \"string\", \"description\": \"the fact, one sentence\"},\n\
+         \x20       \"type\": {\"type\": \"string\", \"description\": \"one of: user, feedback, project, reference\"},\n\
+         \x20       \"scope\": {\"type\": \"string\", \"description\": \"'user' to follow the user across projects, 'project' for this checkout; defaults to project\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"text\", \"type\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         {\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"forget\",\n\
+         \x20   \"description\": \"Remove a memory entry that has turned out to be wrong. Give the id shown beside the entry in context. The entry is deleted from the memory file immediately; the removal, with the entry text, is recorded in the memory log.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"id\": {\"type\": \"string\", \"description\": \"the entry id\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"id\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
 }
 
 /// Appends the `recall` tool schema (M8): search prior sessions and the
@@ -1412,6 +1486,82 @@ pub fn dsml_syntax_reminder() -> &'static str {
 </｜DSML｜tool_calls>\n"
 }
 
+/// Returns the short DSML syntax reminder in the V4.1 dialect (verbatim from
+/// the C's `agent_dsml41_syntax_reminder`).
+///
+/// Written as plain lines rather than a `\`-continued literal, so no leading
+/// whitespace can be stripped: the V4.1 tag names *begin* with a space.
+#[must_use]
+pub fn dsml41_syntax_reminder() -> &'static str {
+    concat!(
+        "DSML syntax reminder:\n",
+        "<｜DSML｜ calls>\n",
+        "<｜DSML｜ invoke name=\"$TOOL_NAME\">\n",
+        "<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n",
+        "</｜DSML｜ calls>\n",
+    )
+}
+
+/// Rewrites the three DSML tag names in **plank's own tools prompt** to their
+/// V4.1 spellings.
+///
+/// Ports `agent_dsml41_tools_prompt` from `refs/ds4/ds4_agent.c`, whose comment
+/// states the rule this function inherits:
+///
+/// > Adapt only our trusted examples, including their escaped closing tags.
+/// > Never translate sampled text or user/tool payloads between model formats.
+///
+/// So this must only ever be called on text plank authored. It is not a
+/// general DSML translator: applying it to model output, user input, MCP
+/// schemas or tool results would let untrusted bytes be reshaped into control
+/// text of a dialect the parser then honours. Its one call site is inside
+/// [`build_tools_prompt_parts_with_wasm`], before any third-party text has
+/// been appended to the buffer.
+///
+/// The rewrite walks for the `｜DSML｜` marker and, immediately after each
+/// occurrence, replaces `tool_calls`, `invoke` or `parameter` with the V4.1
+/// name — but only when the word is followed by `>` or a space, so it is
+/// really a tag and not prose. A bare "parameter" in a sentence is untouched.
+/// # Panics
+/// Never in practice: both dialects named here are DSML ones, so both answer
+/// [`ToolSyntax::dsml_tags`] with a tag table. Only Qwen answers `None`, and it
+/// is not one of the two.
+#[must_use]
+pub fn dsml41_tools_prompt(source: &str) -> String {
+    const MARKER: &str = "｜DSML｜";
+    let tags = ToolSyntax::Dsml41
+        .dsml_tags()
+        .expect("Dsml41 is a DSML dialect");
+    let v4 = ToolSyntax::Dsml
+        .dsml_tags()
+        .expect("Dsml is a DSML dialect");
+    let names = [
+        (v4.calls_name, tags.calls_name),
+        (v4.invoke_name, tags.invoke_name),
+        (v4.param_name, tags.param_name),
+    ];
+
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(at) = rest.find(MARKER) {
+        let after = at + MARKER.len();
+        out.push_str(&rest[..after]);
+        rest = &rest[after..];
+        for (from, to) in names {
+            if let Some(tail) = rest.strip_prefix(from)
+                && (tail.starts_with('>') || tail.starts_with(' '))
+            {
+                out.push_str(to);
+                rest = tail;
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Builds the full system prompt reminder block, framed like the C version.
 ///
 /// Mirrors `agent_build_system_prompt_reminder`: the tools prompt wrapped in
@@ -1423,6 +1573,38 @@ pub fn build_system_prompt_reminder(
 ) -> String {
     let mut out = String::from("\n\n[System prompt reminder follows.]\n");
     out.push_str(&build_tools_prompt_parts(mcp_servers, parity).0);
+    out.push_str("[End system prompt reminder.]\n\n");
+    out
+}
+
+/// Builds the short system prompt reminder (`context.shortReminder`, the
+/// default).
+///
+/// Same framing markers as [`build_system_prompt_reminder`], but the body is
+/// cut to what a reminder is for: the tool-call syntax in the dialect the
+/// model speaks, the roster of tool names it may call, and a pointer back to
+/// the rules already in context. Nothing here is re-taught; the full prompt
+/// is still at the head of the transcript, this only pulls its shape back
+/// into the model's attention at a fraction of the prefill and context cost.
+/// Deliberately not a C-parity text: the C has no short form.
+#[must_use]
+pub fn build_short_system_prompt_reminder(
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    syntax: ToolSyntax,
+) -> String {
+    let mut out = String::from("\n\n[System prompt reminder follows.]\n");
+    out.push_str(match syntax {
+        ToolSyntax::Qwen => qwen_syntax_reminder(),
+        ToolSyntax::Dsml => dsml_syntax_reminder(),
+        ToolSyntax::Dsml41 => dsml41_syntax_reminder(),
+    });
+    out.push_str("Available tools: ");
+    out.push_str(&tool_names(mcp_servers).join(", "));
+    out.push_str(".\n");
+    out.push_str(
+        "The system prompt at the start of this conversation still applies in full: \
+its tool schemas, editing rules, shell and git rules, and working style.\n",
+    );
     out.push_str("[End system prompt reminder.]\n\n");
     out
 }
@@ -1525,6 +1707,9 @@ pub fn build_system_prompt_parts_with_wasm(
     parity: bool,
     syntax: ToolSyntax,
 ) -> SplitSystemPrompt {
+    // The DSML dialects share one tools prompt, V4.1 differing only by the
+    // three tag names the builder respells inside the trusted span; Qwen is not
+    // DSML at all and takes its own.
     let (mut text, trusted_len) =
         build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity, syntax);
     if crate::settings::active().git.sign_commits {
@@ -1659,6 +1844,36 @@ mod tests {
     /// fingerprint for every session. What parity still guarantees is that the
     /// C-*derived* text is byte-identical, which `tools_prompt_matches_c_source`
     /// checks independently of this schema list.
+    /// The short reminder keeps the C's framing markers, carries the dialect's
+    /// own syntax reminder and every advertised tool name, and stays a small
+    /// fraction of the full reminder it replaces by default.
+    #[test]
+    fn short_reminder_is_framed_dialect_aware_and_small() {
+        let short = build_short_system_prompt_reminder(&[], ToolSyntax::Dsml);
+        assert!(short.starts_with("\n\n[System prompt reminder follows.]\n"));
+        assert!(short.ends_with("[End system prompt reminder.]\n\n"));
+        assert!(short.contains(dsml_syntax_reminder()));
+        for name in ["read", "edit", "bash", "task", "agent", "glob"] {
+            assert!(
+                short.contains(name),
+                "short reminder omits tool {name}: {short}"
+            );
+        }
+        let full = build_system_prompt_reminder(&[], true);
+        assert!(
+            short.len() * 4 < full.len(),
+            "short={} full={}",
+            short.len(),
+            full.len()
+        );
+
+        let v41 = build_short_system_prompt_reminder(&[], ToolSyntax::Dsml41);
+        assert!(v41.contains(dsml41_syntax_reminder()));
+        assert!(!v41.contains("<｜DSML｜tool_calls>"));
+        let qwen = build_short_system_prompt_reminder(&[], ToolSyntax::Qwen);
+        assert!(qwen.contains(qwen_syntax_reminder()));
+    }
+
     #[test]
     fn recall_schema_is_advertised_by_default_and_can_be_disabled() {
         let mut text = String::new();
@@ -1676,6 +1891,34 @@ mod tests {
             !text.contains("\"recall\""),
             "tools.recall = false removes the schema"
         );
+    }
+
+    /// The `remember`/`forget` tools (Task 7) go through the same extra-
+    /// schemas mechanism as `recall`, so appending them can never touch the
+    /// frozen prompt region that `tests/c_parity.rs` pins byte-for-byte.
+    #[test]
+    fn remember_schema_is_advertised_by_default_and_can_be_disabled() {
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(text.contains("\"name\": \"remember\""));
+        assert!(text.contains("\"name\": \"forget\""));
+    }
+
+    #[test]
+    fn bash_notify_rule_rides_on_the_setting() {
+        crate::settings::set_for_test(crate::settings::Settings::default());
+        assert!(!shell_rules().contains(BASH_NOTIFY_RULE), "off by default");
+        assert_eq!(
+            shell_rules(),
+            SHELL_RULES,
+            "off leaves the C-adjacent bytes alone"
+        );
+        let mut s = crate::settings::Settings::default();
+        s.tools.bash_notify = true;
+        crate::settings::set_for_test(s);
+        let rules = shell_rules();
+        assert!(rules.starts_with(SHELL_RULES));
+        assert!(rules.ends_with(BASH_NOTIFY_RULE));
     }
 
     #[test]
@@ -2083,6 +2326,106 @@ mod tests {
         assert_eq!(read.parameters["type"], "object");
         assert!(read.parameters["properties"].get("path").is_some());
         assert!(!read.description.is_empty());
+    }
+
+    #[test]
+    fn dsml41_reminder_shape() {
+        let r = dsml41_syntax_reminder();
+        assert!(r.starts_with("DSML syntax reminder:\n"));
+        assert!(r.contains("<｜DSML｜ invoke name=\"$TOOL_NAME\">"));
+        assert!(r.contains("</｜DSML｜ parameter>"));
+        assert!(r.ends_with("</｜DSML｜ calls>\n"));
+        assert!(!r.contains("tool_calls"));
+    }
+
+    /// The V4 reminder rewritten by [`dsml41_tools_prompt`] is exactly the
+    /// V4.1 reminder — the two constants cannot drift apart silently.
+    #[test]
+    fn dsml41_reminder_is_the_v4_reminder_rewritten() {
+        assert_eq!(
+            dsml41_tools_prompt(dsml_syntax_reminder()),
+            dsml41_syntax_reminder()
+        );
+    }
+
+    #[test]
+    fn dsml41_rewrite_touches_only_the_three_tag_names() {
+        let src = concat!(
+            "call it with <｜DSML｜tool_calls> then <｜DSML｜invoke name=\"read\"> and ",
+            "<｜DSML｜parameter name=\"path\">v</｜DSML｜parameter></｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>. The word parameter alone is untouched."
+        );
+        let out = dsml41_tools_prompt(src);
+        assert!(out.contains("<｜DSML｜ calls>"));
+        assert!(out.contains("<｜DSML｜ invoke name=\"read\">"));
+        assert!(out.contains("</｜DSML｜ parameter>"));
+        assert!(!out.contains("tool_calls"));
+        assert!(out.ends_with("The word parameter alone is untouched."));
+    }
+
+    /// A tag name that is not followed by `>` or a space is prose, not a tag:
+    /// the C's predicate leaves it alone, and so must this port. A marker at
+    /// the very end of the input must not index past the string either.
+    #[test]
+    fn dsml41_rewrite_leaves_non_tag_text_alone() {
+        assert_eq!(
+            dsml41_tools_prompt("<｜DSML｜parameters> and ｜DSML｜invoked"),
+            "<｜DSML｜parameters> and ｜DSML｜invoked"
+        );
+        assert_eq!(
+            dsml41_tools_prompt("trailing ｜DSML｜"),
+            "trailing ｜DSML｜"
+        );
+        assert_eq!(dsml41_tools_prompt(""), "");
+    }
+
+    /// The V4.1 prompt is the V4 prompt with exactly those three tag names
+    /// rewritten, and nothing else: every byte of difference is accounted for
+    /// by `tool_calls` (10 bytes) becoming ` calls` (6, so -4 each) and
+    /// `invoke`/`parameter` each gaining one leading space (+1 each).
+    #[test]
+    fn dsml41_prompt_is_the_v4_prompt_with_tags_rewritten() {
+        let v4 = build_tools_prompt(&[], true);
+        let v41 = dsml41_tools_prompt(&v4);
+
+        // Count only real tags: the marker, the name, then `>` or a space.
+        let tags = |name: &str| -> usize {
+            let needle = format!("｜DSML｜{name}");
+            v4.match_indices(&needle)
+                .filter(|(at, _)| {
+                    let tail = &v4[at + needle.len()..];
+                    tail.starts_with('>') || tail.starts_with(' ')
+                })
+                .count()
+        };
+        let (calls, invokes, params) = (tags("tool_calls"), tags("invoke"), tags("parameter"));
+        assert!(calls > 0 && invokes > 0 && params > 0);
+
+        // Stated as an addition so no subtraction can underflow: the V4 bytes
+        // plus the spaces V4.1 gains equal the V4.1 bytes plus the 4 bytes
+        // each `tool_calls` loses.
+        assert_eq!(v4.len() + invokes + params, v41.len() + calls * 4);
+        assert!(!v41.contains("tool_calls"));
+        assert!(!v41.contains("｜DSML｜invoke"));
+        assert!(!v41.contains("｜DSML｜parameter"));
+        // Rewriting back must reproduce the V4 prompt exactly.
+        assert_eq!(
+            v41.replace("｜DSML｜ calls", "｜DSML｜tool_calls")
+                .replace("｜DSML｜ invoke", "｜DSML｜invoke")
+                .replace("｜DSML｜ parameter", "｜DSML｜parameter"),
+            v4
+        );
+    }
+
+    /// The dialect reaches the built prompt through the public entry point,
+    /// and MCP text appended after the trusted span is never rewritten.
+    #[test]
+    fn dsml41_syntax_selects_the_rewritten_tools_prompt() {
+        let v4 = build_system_prompt_parts_with_wasm("", &[], &[], true, ToolSyntax::Dsml);
+        let v41 = build_system_prompt_parts_with_wasm("", &[], &[], true, ToolSyntax::Dsml41);
+        assert_eq!(dsml41_tools_prompt(&v4.text), v41.text);
+        assert!(v41.text.contains("<｜DSML｜ calls>"));
+        assert!(!v41.text.contains("tool_calls"));
     }
 
     #[test]

@@ -167,8 +167,8 @@ finds it and injects it at session start. It is the only instructions
 file plank reads: a project root that has a <code>CLAUDE.md</code> but
 no <code>AGENTS.md</code> gets an <code>AGENTS.md</code> symlink to it
 the first time you start plank there, and a project with neither is
-asked whether to generate one. Headless runs
-(<code>--non-interactive</code>) do neither.</p>
+asked whether to generate one. Headless runs (<code>--ui console</code>)
+do neither.</p>
 <pre><code>/init</code></pre>
 <p>has the model read your repository and write one. Review what it
 produces — it is a starting point, not a finished document.</p>
@@ -185,11 +185,15 @@ goals and constraints of this checkout.</li>
 <pre><code>/remember prefers small commits with imperative subject lines
 /remember user I work in Rust and TypeScript, mostly on macOS</code></pre>
 <p>Without <code>user</code>, the entry goes to project memory. Entries
-are dated bullets.</p>
+are dated bullets, each carrying a type tag:</p>
+<pre><code>- (2026-09-15) [feedback] don&#39;t force-add generated docs</code></pre>
 <p>To edit them rather than append, <code>/memory</code> opens both
 files as one buffer in the built-in editor, each between markers naming
 its scope and path; on save the buffer is split back along those markers
-and only the files whose text changed are written.</p>
+and only the files whose text changed are written.
+<code>/forget &lt;pattern&gt;</code> removes every entry whose text
+contains the pattern, case-insensitively, after showing you exactly what
+will go.</p>
 <p>Four kinds of entry are worth keeping, and they share one test:
 <strong>facts the model cannot re-derive from the
 repository.</strong></p>
@@ -221,7 +225,83 @@ repository.</strong></p>
 </table>
 <p>Do not record what the code, the git history, or
 <code>AGENTS.md</code> already says. That is context you are paying for
-twice.</p>
+twice. A bullet without a tag still works and reads as
+<code>project</code>, so a memory file from an older plank needs no
+migration.</p>
+<h3 id="the-model-can-write-memory-too">The model can write memory
+too</h3>
+<p>The model has a <code>remember</code> tool and a <code>forget</code>
+tool (gated on <code>tools.remember</code>, on by default).
+<code>remember</code> appends an entry exactly as <code>/remember</code>
+would; <code>forget</code> deletes one by the short id shown beside it
+in context. Both write to the file on disk and <strong>take effect at
+the next session start</strong>, not mid-conversation. That is
+deliberate: memory sits in the cached, project-stable part of the
+prompt, and rewriting it mid-session would force a full re-prefill of
+everything after it, which on a local model is the most expensive thing
+plank can do. The tool's own reply says so, so a model that just saved
+something and sees no change in its context knows that is expected.</p>
+<h3 id="budgets-not-truncation">Budgets, not truncation</h3>
+<p>Each type has its own byte budget for what renders into context (4096
+for <code>user</code> and <code>feedback</code>, 6144 for
+<code>project</code>, 2048 for <code>reference</code>, set under
+<code>memory.budgets</code>). When a type is over budget, entries are
+dropped least-valuable first: pinned entries never go, then the
+least-used, then the least recently used, and among entries the counters
+cannot separate the newest wins. The usage counters live in a
+<code>MEMORY.md.meta.json</code> sidecar beside each file. It is
+advisory: delete it and memory loads exactly as before, with every
+counter at zero.</p>
+<h3 id="the-extraction-pass">The extraction pass</h3>
+<p>With <code>memory.autoExtract</code> on (it is <strong>on by
+default</strong> since 5.1.7), plank runs a pass at the end of any turn
+that produced no tool calls. It hands the model the new part of the
+conversation and the current entries, and asks for a JSON list of
+verdicts: add an entry, update one, delete one, or mark one as having
+been useful. plank applies the verdicts itself; the pass cannot run
+tools, cannot touch anything but memory, and reads only the part of the
+transcript it has not already seen. Every change it makes is appended to
+<code>~/.plank/memory-log.jsonl</code>, which <code>/memory log</code>
+prints.</p>
+<p>The pass is not free, and it is worth knowing what you are paying
+for. It costs one extra generation plus a KV snapshot each time, but
+since 5.1.9 it no longer holds your prompt: the turn end only snapshots
+the new part of the conversation into a queue, and the reading happens
+at the next idle moment. While it runs the footer shows one
+<code>✍️</code> per queued span in place of the state word, with its
+prefill and generation figures floated on the rule below the prompt, and
+one dim <code>memory completed in 12s</code> line reports the outcome,
+carrying the change summary when it wrote something. Type a prompt while
+notes are being taken and the pass stops at its next token, goes back to
+the front of the queue and your turn starts at once; the retry resumes
+from the prefill it had already done rather than from zero. A turn you
+interrupted queues nothing. <code>memory.extractEveryNTurns</code> thins
+it out, and <code>"memory": {"autoExtract": false}</code> in
+<code>settings.json</code> turns it off entirely.</p>
+<p>Two cheaper gates sit in front of it.
+<code>memory.minTurnSeconds</code> (30 by default) skips the pass after
+a turn too short to be worth one, and the short turn's span is deferred
+rather than discarded, so the next turn that clears the floor reads it
+too. <code>memory.gate</code> goes further and asks the model itself, as
+a single typed yes/no question answered without generating any tokens,
+whether the span holds anything worth remembering at all; below
+<code>memory.gatePercent</code> (60) no pass is queued. It is off by
+default while that threshold is still being calibrated. Every uncertain
+answer runs the pass: if the model abstains, errors, or the engine
+cannot answer typed questions at all, the span is extracted as though
+the gate were not there. A gate that is unsure is never the reason a
+memory is lost. With <code>memory.heldSpanCap</code> above zero a
+rejected span is held and re-judged as part of a larger one later,
+instead of being retired on the spot. The gate always shows "yes" as
+answer A, and models tend to lean toward a letter for its own sake, so
+before trusting the gate run <code>/memory calibrate</code>: it asks the
+same question about your saved turns with yes and no swapped, measures
+how far the answer follows the letter, and suggests a
+<code>memory.gateBias</code> value for the loaded model family that
+moves the threshold to cancel it. It changes nothing by itself; you copy
+the value into <code>settings.json</code>. The full design, including
+what each failure mode looks like, is in <a
+href="https://github.com/aovestdipaperino/plank/blob/main/docs/MEMORY.md"><code>docs/MEMORY.md</code></a>.</p>
 <h2 id="compaction">Compaction</h2>
 <p>When the conversation approaches the window, plank reclaims space in
 escalating steps, cheapest first.</p>
@@ -264,6 +344,24 @@ list</strong> (that is what the <code>task</code> tool is for) and
 taken before it stores the whole transcript, so <code>/rollback</code>
 reconstructs the pre-compaction conversation exactly. See <a
 href="06-sessions.html">Sessions</a>.</p>
+<h2 id="the-system-prompt-reminder">The system-prompt reminder</h2>
+<p>The system prompt sits at the very start of the transcript, and after
+tens of thousands of tokens the model attends to it less than it should:
+tool calls get sloppier, a house rule slips. Once 50K tokens have passed
+since the prompt was last seen, plank appends a short reminder as a user
+turn, bracketed by <code>[System prompt reminder follows.]</code> and
+<code>[End system prompt reminder.]</code>: the tool-call syntax in the
+model's dialect, the list of tools it may call, one line saying the
+original prompt still applies, and your <code>-sys</code> text if you
+gave one. It is pressure-based, not periodic, so a short session never
+sees one, and <code>/new</code> resets the count.</p>
+<p>The reminder cannot be cached the way the system prompt itself is,
+because its KV entries depend on where it lands and on everything before
+it; each one is a real prefill and then permanent context. That is why
+the default is the short form.
+<code>"context": {"shortReminder": false}</code> in
+<code>settings.json</code> re-injects the entire tools prompt instead,
+exactly as the C reference agent does.</p>
 <h2 id="context-size">Context size</h2>
 <p>The window defaults to 1048576 tokens. Set it with <code>-c N</code>
 or <code>engine.ctx</code>. Bigger costs memory; smaller compacts
@@ -277,9 +375,16 @@ is in force:</p>
 <p>The model reasons before it answers. <code>--think-low</code> (the
 default), <code>--think</code>, <code>--think-max</code>, and
 <code>--nothink</code> set the effort; <code>ui.showThinking</code>
-controls whether you see it. Low is the default because on the same
-coding task it finished a third faster than medium with the same result,
-and its reasoning reads as a plan rather than a list of second thoughts.
+controls whether you see it, and clicking the footer's brain toggles
+that for the session without writing the setting. On DeepSeek V4.1
+Flash, which has a native reasoning-effort dial of 0 to 100, those names
+are labels for the numbers the model is actually told (low is 25, medium
+is 75, max is 100), <code>/think &lt;n&gt;</code> sets a number
+directly, and the footer shows the number in force. <code>off</code>
+stays <code>off</code>, because thinking-disabled is a distinct state
+rather than effort zero. Low is the default because on the same coding
+task it finished a third faster than medium with the same result, and
+its reasoning reads as a plan rather than a list of second thoughts.
 Hiding thinking does not stop it — the model still produces it, and it
 still occupies context.</p>
 <h2 id="token-usage-on-hosted-providers">Token usage on hosted
@@ -288,6 +393,20 @@ providers</h2>
 <p>reports billed input and output tokens for the session, including
 Anthropic cache reads, cache writes, and the hit rate. Local engines
 have nothing to bill, so it is a provider-only report.</p>
+<h2 id="generation-and-prefill-speed">Generation and prefill speed</h2>
+<pre><code>/toks</code></pre>
+<p>draws two braille line charts side by side in the theme green,
+generation speed on the left and prefill speed on the right: tokens per
+second, sampled once a second while the model works, newest at the
+right, each with its own current, average, minimum and maximum rates
+underneath. Two panels rather than one because the question a slow pass
+raises is comparative, whether it is prefill-bound or decode-bound, and
+that reading is only immediate when both lines sit on the same rows. The
+x axis is time spent in the engine, so tool rounds and turns leave no
+mark on it. It opens in the same dismissable panel as
+<code>/usage</code>, and typed during a turn it redraws on every status
+tick, so you can watch the rate settle as a long answer streams. On the
+piped REPL it prints as plain text.</p>
 <hr />
 <p>Next: <a href="08-configuration.html">Configuration →</a></p>
 

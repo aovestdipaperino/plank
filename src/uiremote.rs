@@ -844,7 +844,7 @@ mod tests {
     fn cell_with_skip_flag_and_real_content_is_not_dropped() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
         buf.set_string(0, 0, "abc", Style::default());
-        buf[(1, 0)].set_skip(true);
+        buf[(1, 0)].set_diff_option(ratatui::buffer::CellDiffOption::Skip);
         // `skip` is an overlay/redraw hint, not the wide-char continuation
         // marker; content marked skip=true must still be emitted.
         assert_eq!(buffer_to_ansi(&buf), "abc");

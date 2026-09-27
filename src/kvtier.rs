@@ -50,7 +50,20 @@ const SYSPROMPT_SNIPPET_LINES: usize = 6;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TierKind {
     /// Tier 1: model + system prompt. Cached globally, shared across projects.
+    ///
+    /// Holds the whole prompt unless the engine splits the tail off (see
+    /// [`SystemSplit`]), in which case this is the trusted control-text span
+    /// alone and [`Self::SystemTail`] carries the rest.
     System,
+    /// Tier 1b: the system prompt's untrusted remainder — MCP tool schemas,
+    /// server instructions, and `-sys` text — cached globally beside Tier 1.
+    ///
+    /// Split out because it is the volatile half. The built-in prompt above it
+    /// changes only when plank is rebuilt, while this changes whenever a tool
+    /// set does, and an undivided Tier 1 makes the cheap change pay for the
+    /// expensive one: the whole prompt re-prefills to absorb a few hundred
+    /// tokens of schema at its very end.
+    SystemTail,
     /// Tier 2: project-stable context, shared by every session of a project.
     ProjectStable,
     /// Tier 3: session-volatile context. Prefill-only, never checkpointed.
@@ -66,6 +79,7 @@ impl TierKind {
     pub fn warm_label(self) -> &'static str {
         match self {
             Self::System => "Updating system prompt cache",
+            Self::SystemTail => "Updating tool definitions cache",
             Self::ProjectStable => "Updating project context cache",
             Self::SessionVolatile => "Updating session context",
         }
@@ -100,6 +114,43 @@ impl TierSpec {
     pub fn cacheable(&self) -> bool {
         self.key.is_some()
     }
+}
+
+/// Where to cut the system prompt into a stable base and a volatile tail, and
+/// what to key the base on.
+///
+/// Passed to [`plan`] only when the engine reports
+/// [`Engine::splits_system_tail`](crate::engine::Engine::splits_system_tail).
+#[derive(Debug, Clone, Copy)]
+pub struct SystemSplit<'a> {
+    /// Tier 1's key: the fingerprint of the trusted span *alone*, computed with
+    /// [`system_fingerprint`] over that span.
+    pub base_fp: &'a str,
+    /// Byte offset ending the trusted control-text span
+    /// (`sysprompt::SplitSystemPrompt::trusted_len`).
+    pub trusted_len: usize,
+}
+
+/// Public wrapper on [`split_on_char_boundary`] so a caller computing the base
+/// fingerprint cuts the trusted span at exactly the offset [`plan`] will.
+///
+/// The two must agree: fingerprinting one span and caching another would key a
+/// checkpoint on text it does not hold.
+#[must_use]
+pub fn trusted_cut(text: &str, at: usize) -> usize {
+    split_on_char_boundary(text, at)
+}
+
+/// The largest char boundary at or below `at`, so slicing `text` never panics.
+///
+/// Snapping *down* matches `Ds4Model::append_system_text`, which clamps the
+/// same way: a wrong offset may only ever shrink the trusted span, never let
+/// untrusted bytes into it.
+fn split_on_char_boundary(text: &str, at: usize) -> usize {
+    (0..=at.min(text.len()))
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0)
 }
 
 /// Tier 1's fingerprint: `sha1(model ‖ NUL ‖ think ‖ NUL ‖ trusted_len ‖ NUL ‖ system)`.
@@ -205,9 +256,22 @@ pub struct TierLabels {
 /// appearing on a system label would mean the segregation this module enforces
 /// had broken.
 #[must_use]
-fn tier_label(kind: TierKind, labels: &TierLabels) -> crate::kvmeta::KvLabel {
+/// `split` says whether a [`TierKind::SystemTail`] tier exists. When one does,
+/// the global MCP tool definitions live in *it*, not in the base tier above —
+/// and a base label listing servers whose schemas its checkpoint does not
+/// contain would misdescribe the very thing `/kvcache` is consulted to check.
+fn tier_label(kind: TierKind, labels: &TierLabels, split: bool) -> crate::kvmeta::KvLabel {
     match kind {
         TierKind::System => crate::kvmeta::KvLabel::System {
+            think_mode: labels.think_mode.clone(),
+            trusted_len: labels.trusted_len,
+            global_mcp: if split {
+                Vec::new()
+            } else {
+                labels.global_mcp.clone()
+            },
+        },
+        TierKind::SystemTail => crate::kvmeta::KvLabel::System {
             think_mode: labels.think_mode.clone(),
             trusted_len: labels.trusted_len,
             global_mcp: labels.global_mcp.clone(),
@@ -235,6 +299,7 @@ fn tier_label(kind: TierKind, labels: &TierLabels) -> crate::kvmeta::KvLabel {
 pub fn plan(
     fp1: &str,
     system: &str,
+    split: Option<SystemSplit<'_>>,
     stable: &str,
     volatile: &str,
     local_tool_defs: &str,
@@ -246,13 +311,42 @@ pub fn plan(
     // `build_system_tokens`, not by the user-message path that `parse_sections`
     // trims, so trimming here would change `fp1` and invalidate every existing
     // system checkpoint for no reason.
-    let mut tiers = vec![TierSpec {
-        kind: TierKind::System,
-        fingerprint: fp1.to_owned(),
-        parent: None,
-        text: system.to_owned(),
-        key: Some(KvKey::System { fp: fp1.to_owned() }),
-    }];
+    // The tail split, when the engine supports one and there is a tail to
+    // split off. `fp1` keeps meaning "the whole system prompt" in both shapes,
+    // so the tail tier lands on the same key an undivided Tier 1 would have
+    // used and every checkpoint already on disk stays valid — the split adds a
+    // cheaper rung above, it does not renumber the ladder.
+    let cut = split
+        .filter(|s| s.trusted_len > 0 && s.trusted_len < system.len())
+        .map(|s| (s, split_on_char_boundary(system, s.trusted_len)))
+        .filter(|&(_, at)| at > 0 && at < system.len());
+    let mut tiers = match cut {
+        Some((split, at)) => vec![
+            TierSpec {
+                kind: TierKind::System,
+                fingerprint: split.base_fp.to_owned(),
+                parent: None,
+                text: system[..at].to_owned(),
+                key: Some(KvKey::System {
+                    fp: split.base_fp.to_owned(),
+                }),
+            },
+            TierSpec {
+                kind: TierKind::SystemTail,
+                fingerprint: fp1.to_owned(),
+                parent: Some(split.base_fp.to_owned()),
+                text: system[at..].to_owned(),
+                key: Some(KvKey::System { fp: fp1.to_owned() }),
+            },
+        ],
+        None => vec![TierSpec {
+            kind: TierKind::System,
+            fingerprint: fp1.to_owned(),
+            parent: None,
+            text: system.to_owned(),
+            key: Some(KvKey::System { fp: fp1.to_owned() }),
+        }],
+    };
     // Canonicalize each tier to the exact text the turn will tokenize. A tier
     // becomes one user message, and the turn rebuilds its tokens from the
     // rendered transcript, where `parse_sections` trims every message's
@@ -465,6 +559,16 @@ pub fn warm(
         return Ok(false);
     };
     engine.warm_reset(&system.text)?;
+    // The prompt as a whole, for the miss explanation and its sidecar: with a
+    // tail split `system.text` is only the trusted half, and a note holding
+    // half a prompt would diff against the next launch's whole one and report
+    // the tail as deleted every time.
+    let whole_system: String = tiers
+        .iter()
+        .take_while(|t| matches!(t.kind, TierKind::System | TierKind::SystemTail))
+        .map(|t| t.text.as_str())
+        .collect();
+    let split = tiers.iter().any(|t| t.kind == TierKind::SystemTail);
 
     // Restore: deepest tier whose checkpoint loads clean.
     let mut resume = 0;
@@ -500,7 +604,7 @@ pub fn warm(
     if resume == 0
         && let Some(old) = store.and_then(SessionStore::system_prompt_note)
         && let Some(snip) =
-            crate::tools::diff::first_change_snippet(&old, &system.text, SYSPROMPT_SNIPPET_LINES)
+            crate::tools::diff::first_change_snippet(&old, &whole_system, SYSPROMPT_SNIPPET_LINES)
     {
         on_event(EngineEvent::Notice(format!(
             "system prompt changed; rebuilding cache\n{snip}"
@@ -525,8 +629,14 @@ pub fn warm(
         //
         // The system tier's tokens are already in the warm buffer from
         // `warm_reset`; every other tier appends its text as a user message.
-        let text = (i > 0).then_some(t.text.as_str());
-        engine.warm_append(text)?;
+        // Role matters here: the tail is the system prompt's own remainder and
+        // must go back as a `system` message, or the rebuilt buffer would not
+        // be the one the turn tokenizes and the whole prefix would miss.
+        if t.kind == TierKind::SystemTail {
+            engine.warm_append_system(&t.text)?;
+        } else {
+            engine.warm_append((i > 0).then_some(t.text.as_str()))?;
+        }
         if i < resume {
             // Already in KV via the restore above; extend the buffer, do not
             // sync — and do not re-persist a checkpoint we just read.
@@ -571,7 +681,7 @@ pub fn warm(
                 &cache,
                 t.parent.as_deref(),
                 &model,
-                &tier_label(t.kind, labels),
+                &tier_label(t.kind, labels, split),
             );
         }
     }
@@ -581,7 +691,7 @@ pub fn warm(
     if resume == 0
         && let Some(store) = store
     {
-        let _ = store.store_system_prompt_note(&system.text);
+        let _ = store.store_system_prompt_note(&whole_system);
     }
     Ok(prefilled)
 }
@@ -597,6 +707,7 @@ mod tests {
         let tiers = plan(
             &fp1,
             "SYSTEM",
+            None,
             "agents\n",
             "git status\n",
             "",
@@ -627,7 +738,7 @@ mod tests {
     #[test]
     fn plan_without_a_project_dir_still_caches_the_system_tier() {
         let fp1 = system_fingerprint("m", "SYSTEM", crate::engine::ThinkMode::default(), 0);
-        let tiers = plan(&fp1, "SYSTEM", "agents\n", "", "", None);
+        let tiers = plan(&fp1, "SYSTEM", None, "agents\n", "", "", None);
         assert_eq!(tiers[0].key, Some(KvKey::System { fp: fp1 }));
         assert_eq!(tiers[1].key, None, "no store, no project checkpoint");
     }
@@ -659,6 +770,7 @@ mod tests {
         let tiers = plan(
             "fp1",
             "SYSTEM",
+            None,
             &content.stable_context(),
             &content.volatile_context(),
             "",
@@ -680,6 +792,7 @@ mod tests {
         let tiers = plan(
             "fp1",
             "SYSTEM",
+            None,
             "agents\n",
             "git + date\n",
             "",
@@ -712,16 +825,32 @@ mod tests {
 
     #[test]
     fn plan_omits_empty_tiers() {
-        let tiers = plan("fp1", "SYSTEM", "", "git\n", "", Some(Path::new("/p")));
+        let tiers = plan(
+            "fp1",
+            "SYSTEM",
+            None,
+            "",
+            "git\n",
+            "",
+            Some(Path::new("/p")),
+        );
         assert_eq!(tiers.len(), 2);
         assert_eq!(tiers[1].kind, TierKind::SessionVolatile);
 
-        let tiers = plan("fp1", "SYSTEM", "agents\n", "", "", Some(Path::new("/p")));
+        let tiers = plan(
+            "fp1",
+            "SYSTEM",
+            None,
+            "agents\n",
+            "",
+            "",
+            Some(Path::new("/p")),
+        );
         assert_eq!(tiers.len(), 2);
         assert_eq!(tiers[1].kind, TierKind::ProjectStable);
 
         assert_eq!(
-            plan("fp1", "SYSTEM", "", "", "", Some(Path::new("/p"))).len(),
+            plan("fp1", "SYSTEM", None, "", "", "", Some(Path::new("/p"))).len(),
             1,
             "only the system tier remains"
         );
@@ -729,19 +858,37 @@ mod tests {
 
     #[test]
     fn tier2_key_chains_off_tier1_and_folds_in_local_tool_defs() {
-        let base = plan("fp1", "SYSTEM", "agents\n", "v", "", Some(Path::new("/p")));
-        let other_parent = plan(
-            "fp1-changed",
+        let base = plan(
+            "fp1",
             "SYSTEM",
+            None,
             "agents\n",
             "v",
             "",
             Some(Path::new("/p")),
         );
-        let other_stable = plan("fp1", "SYSTEM", "agents2\n", "v", "", Some(Path::new("/p")));
+        let other_parent = plan(
+            "fp1-changed",
+            "SYSTEM",
+            None,
+            "agents\n",
+            "v",
+            "",
+            Some(Path::new("/p")),
+        );
+        let other_stable = plan(
+            "fp1",
+            "SYSTEM",
+            None,
+            "agents2\n",
+            "v",
+            "",
+            Some(Path::new("/p")),
+        );
         let other_tools = plan(
             "fp1",
             "SYSTEM",
+            None,
             "agents\n",
             "v",
             "srv/tool\u{1}{}\n",
@@ -757,7 +904,16 @@ mod tests {
         // Deterministic.
         assert_eq!(
             base[1].fingerprint,
-            plan("fp1", "SYSTEM", "agents\n", "v", "", Some(Path::new("/p")))[1].fingerprint
+            plan(
+                "fp1",
+                "SYSTEM",
+                None,
+                "agents\n",
+                "v",
+                "",
+                Some(Path::new("/p"))
+            )[1]
+            .fingerprint
         );
         // And the checkpoint key follows the fingerprint.
         assert_eq!(
@@ -771,7 +927,7 @@ mod tests {
 
     #[test]
     fn volatile_tier_never_gets_a_checkpoint_even_with_a_path_fn() {
-        let tiers = plan("fp1", "SYSTEM", "s", "v", "", Some(Path::new("/p")));
+        let tiers = plan("fp1", "SYSTEM", None, "s", "v", "", Some(Path::new("/p")));
         assert!(
             tiers.iter().all(|t| t.cacheable()
                 == (t.kind == TierKind::System || t.kind == TierKind::ProjectStable))
@@ -780,7 +936,7 @@ mod tests {
 
     #[test]
     fn tier2_is_uncached_without_a_checkpoint_path() {
-        let tiers = plan("fp1", "SYSTEM", "agents\n", "v", "", None);
+        let tiers = plan("fp1", "SYSTEM", None, "agents\n", "v", "", None);
         assert_eq!(tiers[1].kind, TierKind::ProjectStable);
         assert!(!tiers[1].cacheable());
         // Still keyed, so a caller that later gains a store can reuse the fp.
@@ -862,6 +1018,7 @@ mod tests {
         let tiers = plan(
             "fp1-system",
             "system text",
+            None,
             "stable context",
             "volatile context",
             "local defs",
@@ -893,7 +1050,7 @@ mod tests {
         // `plan` collapses fp2 to fp1 when `stable` is empty and emits no Tier 2,
         // so Tier 3's recorded parent must follow that collapse rather than naming
         // a tier that does not exist.
-        let tiers = plan("fp1-system", "system text", "", "volatile", "", None);
+        let tiers = plan("fp1-system", "system text", None, "", "volatile", "", None);
         assert!(
             !tiers.iter().any(|t| t.kind == TierKind::ProjectStable),
             "no stable text means no Tier 2"
@@ -918,7 +1075,7 @@ mod tests {
             agents_files: vec!["AGENTS.md".into()],
             local_mcp: vec!["local-srv".into()],
         };
-        match tier_label(TierKind::System, &labels) {
+        match tier_label(TierKind::System, &labels, false) {
             crate::kvmeta::KvLabel::System {
                 think_mode,
                 trusted_len,
@@ -934,7 +1091,7 @@ mod tests {
             }
             other => panic!("expected a System label, got {other:?}"),
         }
-        match tier_label(TierKind::ProjectStable, &labels) {
+        match tier_label(TierKind::ProjectStable, &labels, false) {
             crate::kvmeta::KvLabel::Project {
                 project_path,
                 agents_files,
@@ -951,7 +1108,7 @@ mod tests {
             other => panic!("expected a Project label, got {other:?}"),
         }
         assert!(matches!(
-            tier_label(TierKind::SessionVolatile, &labels),
+            tier_label(TierKind::SessionVolatile, &labels, false),
             crate::kvmeta::KvLabel::Unknown
         ));
     }
@@ -973,6 +1130,13 @@ struct SpyEngine {
     /// When true `set_kv` fails, standing in for a checkpoint this build cannot
     /// load — keyed correctly, but not restorable.
     refuse_kv: bool,
+    /// Whether this engine claims it can hold a checkpoint at the system
+    /// prompt's trusted/untrusted boundary.
+    splits_tail: bool,
+    /// Text handed to `warm_append_system`, in order. Separate from `appended`
+    /// so a test can tell the role apart: the tail going back as a user message
+    /// would build a buffer the turn never tokenizes.
+    system_appended: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1026,6 +1190,15 @@ impl crate::engine::Engine for SpyEngine {
         self.appended.push(text.map(str::to_owned));
         Ok(())
     }
+    fn splits_system_tail(&self) -> bool {
+        self.splits_tail
+    }
+    fn warm_append_system(&mut self, text: &str) -> Result<(), crate::engine::EngineError> {
+        self.system_appended.push(text.to_owned());
+        // Also the cumulative buffer, which is what `warm_sync` flushes.
+        self.appended.push(Some(text.to_owned()));
+        Ok(())
+    }
     fn warm_sync(
         &mut self,
         _e: &mut dyn FnMut(crate::engine::EngineEvent),
@@ -1055,7 +1228,166 @@ mod warm_tests {
 
     fn tiers_for(system: &str, stable: &str, volatile: &str) -> Vec<TierSpec> {
         let fp1 = system_fingerprint("m", system, crate::engine::ThinkMode::default(), 0);
-        plan(&fp1, system, stable, volatile, "", Some(Path::new("/p")))
+        plan(
+            &fp1,
+            system,
+            None,
+            stable,
+            volatile,
+            "",
+            Some(Path::new("/p")),
+        )
+    }
+
+    /// Tiers with the system prompt split at `trusted_len`, the shape a
+    /// tail-splitting engine gets.
+    fn split_tiers_for(system: &str, trusted_len: usize, stable: &str) -> Vec<TierSpec> {
+        let think = crate::engine::ThinkMode::default();
+        let fp1 = system_fingerprint("m", system, think, trusted_len);
+        let cut = super::trusted_cut(system, trusted_len);
+        let base_fp = system_fingerprint("m", &system[..cut], think, trusted_len);
+        plan(
+            &fp1,
+            system,
+            Some(super::SystemSplit {
+                base_fp: &base_fp,
+                trusted_len,
+            }),
+            stable,
+            "",
+            "",
+            Some(Path::new("/p")),
+        )
+    }
+
+    /// The split's shape: two globally-cached system tiers, the tail chained
+    /// off the base, and — the compatibility point — the tail keyed on exactly
+    /// the `fp1` an undivided Tier 1 would have used, so every checkpoint
+    /// already on disk keeps being found.
+    #[test]
+    fn the_tail_split_adds_a_rung_above_tier_1_without_renumbering_it() {
+        let system = "TRUSTED-BUILTIN-PROMPT<<<TAIL: mcp schemas>>>";
+        let trusted_len = system.find("<<<").unwrap();
+        let tiers = split_tiers_for(system, trusted_len, "agents\n");
+
+        assert_eq!(tiers[0].kind, TierKind::System);
+        assert_eq!(tiers[1].kind, TierKind::SystemTail);
+        assert_eq!(tiers[0].text, "TRUSTED-BUILTIN-PROMPT");
+        assert_eq!(tiers[1].text, "<<<TAIL: mcp schemas>>>");
+        assert_eq!(
+            format!("{}{}", tiers[0].text, tiers[1].text),
+            system,
+            "the two halves must reassemble the prompt exactly, byte for byte"
+        );
+        assert_eq!(
+            tiers[1].parent.as_deref(),
+            Some(tiers[0].fingerprint.as_str())
+        );
+        assert_eq!(
+            tiers[1].fingerprint,
+            system_fingerprint(
+                "m",
+                system,
+                crate::engine::ThinkMode::default(),
+                trusted_len
+            ),
+            "the tail keeps fp1, so pre-split checkpoints still resolve"
+        );
+        // Tier 2 chains off the tail, i.e. off the whole prompt, exactly as it
+        // chained off an undivided Tier 1.
+        let proj = tiers
+            .iter()
+            .find(|t| t.kind == TierKind::ProjectStable)
+            .expect("Tier 2 present");
+        assert_eq!(proj.parent.as_deref(), Some(tiers[1].fingerprint.as_str()));
+    }
+
+    /// A degenerate cut is no cut: an engine that splits must still get one
+    /// undivided tier when there is nothing on one side of the boundary, rather
+    /// than an empty tier whose checkpoint would describe no tokens.
+    #[test]
+    fn a_split_with_an_empty_half_stays_one_tier() {
+        for trusted_len in [0, 6] {
+            let tiers = split_tiers_for("SYSTEM", trusted_len, "");
+            assert_eq!(
+                tiers
+                    .iter()
+                    .filter(|t| t.kind == TierKind::SystemTail)
+                    .count(),
+                0,
+                "trusted_len {trusted_len} leaves an empty half, so there is no tail tier"
+            );
+        }
+    }
+
+    /// The payoff. A changed tool set moves only the tail, so the base tier's
+    /// checkpoint still hits and only the tail re-prefills — where before, the
+    /// whole system prompt did.
+    #[test]
+    fn a_changed_tail_reprefills_the_tail_and_not_the_builtin_prompt() {
+        let (store, dir) = spy_store("tail-split");
+        let head = "TRUSTED-BUILTIN-PROMPT";
+        let first = format!("{head}<<<TAIL: one server>>>");
+        let trusted_len = head.len();
+
+        let mut e = SpyEngine {
+            supports_kv: true,
+            splits_tail: true,
+            ..Default::default()
+        };
+        warm(
+            &mut e,
+            Some(&store),
+            &split_tiers_for(&first, trusted_len, ""),
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            e.synced.len(),
+            2,
+            "a cold start prefills both halves: {:?}",
+            e.synced
+        );
+        assert_eq!(
+            e.system_appended,
+            vec!["<<<TAIL: one server>>>".to_owned()],
+            "the tail goes back as a system message, never as a user one"
+        );
+
+        // Second launch: a server appeared, so only the tail's bytes moved.
+        let second = format!("{head}<<<TAIL: one server, two servers>>>");
+        let mut e = SpyEngine {
+            supports_kv: true,
+            splits_tail: true,
+            ..Default::default()
+        };
+        warm(
+            &mut e,
+            Some(&store),
+            &split_tiers_for(&second, trusted_len, ""),
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            e.restored.len(),
+            1,
+            "the base tier's checkpoint is found and restored"
+        );
+        assert_eq!(
+            e.synced,
+            vec![Some("<<<TAIL: one server, two servers>>>".to_owned())],
+            "only the tail is prefilled; the built-in prompt above it is not"
+        );
+        assert_eq!(
+            e.reset_to.as_deref(),
+            Some(head),
+            "the engine is reset to the trusted span alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `restore` is the restore leg alone. On a miss it must leave the engine

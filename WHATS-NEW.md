@@ -10,10 +10,171 @@ it.
 
 ## In the betas
 
-Riding ahead of stable 5.0.0 in the 5.0.1 beta. Install with `brew install
+Riding ahead of stable 5.1.0 in the 5.1.5 beta. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
 
-Nothing new here yet — 5.0.1 opens where 5.0.0 landed.
+### 5.1.5
+
+**`cargo`, `npm` and `go` work under the sandbox again.** A build that had to
+fetch a dependency was denied with a bare `Operation not permitted`, because
+the sandbox let a model-chosen command write the project and temp dirs and
+nothing else — while every package manager writes a machine-wide cache outside
+the project by design. Those caches are writable now. Directories on your
+`PATH` are not: `~/.cargo/bin`, `~/.local/bin` and `/usr/local/bin` are
+withheld and granted on request, the same prompt `~/.plank` has always used,
+because a binary installed there is one you later run. So `cargo install` asks
+instead of failing, and `cargo build` no longer depends on every crate
+happening to be cached already.
+
+**`/init` is not a loop.** Its phases re-read and re-survey the same tree by
+design — the interview, the survey and the write all revisit it — which is
+exactly the pattern the loop guards refuse, so a setup run the user asked for
+could be blocked mid-phase for following its own prompt. `/init` now runs with
+the guards suspended for the duration of that turn, and only that turn; a
+`/loopguard` you typed yourself still wins.
+
+**A headless `-p` run says how long it took.** `plank -p ...` closes with
+`total time: 8.4s` on stderr. Stdout is untouched, so anything piping the reply
+sees exactly what it saw before, and `--ui chart`'s chart and `--ui quiet`'s
+single line of notes stay as they are.
+
+### 5.1.2
+
+**Sentences no longer finish themselves when a tool returns.** The TUI renders
+streaming markdown on a bounded cadence, so highlighting a long code block does
+not cost a re-render per token. The tail that cadence deferred was only
+committed when the next token arrived — and a model that stops writing to open
+a tool call sends no next token. So the last few words of a sentence sat off
+screen for as long as the tool ran, and the sentence appeared to complete
+itself once the result came back. The deferred tail now goes out on the draw
+clock instead, in the main transcript, the `/btw` panel and every sub-agent
+view.
+
+### 5.1.0
+
+**plank runs DeepSeek V4.1 Flash.** It is a model family of its own rather than
+a V4 revision: its own weights and tokenizer, its own tool-call spelling, and
+its own `.ds41.kv` transcripts, which never mix with V4's. You reach it by
+pointing `-m` at a V4.1 GGUF; the family, the dialect and the paths all come out
+of the GGUF's own architecture field, so there is nothing to declare. V4 stays
+the model plank ships and offers to download. V4.1 also has a real reasoning
+dial, 0 to 100, so on that family `low`, `medium` and `max` are just names for
+the 25, 75 and 100 the model is told, `/think 40` works, and the footer shows
+the number instead of the label.
+
+**Two models that needed a flag now just work.** A model too big to sit in RAM
+turns on SSD streaming by itself, printing the arithmetic it used, instead of
+failing to open and telling you to go find `--ssd-streaming`. And a draft
+checkpoint that does not match the model you loaded no longer stops the open:
+plank retries without the drafter it chose for you and decodes target-only. A
+companion you named with `--mtp-model` is still never dropped. While a
+streaming model is loaded the footer carries a 💾, blinking while a pass runs.
+
+**Qwen3.8-Flash-Next is back, and no longer optional.** It was retired when
+upstream deleted its Metal kernels. Upstream has since merged Qwen3.8 Flash
+Next properly and publishes the weights itself, so the family, the `--qwen`
+flag, its dialect and its artifact set all return — and the old off-by-default
+`qwen` cargo feature is gone with the reason for it. Every build serves it.
+
+Two things changed while it was away. The BF16 n-grams and the MTP block now
+live inside the main GGUF, so the `~/.plank/qwen.mtp.gguf` sidecar is gone and
+`--mtp` speculates with no companion file. And Qwen is downloadable now:
+`qwen.manifest` tracks it like any other set, so `--qwen` on a machine without
+the weights offers the download instead of pointing you at a symlink you had to
+make yourself. Your old `.qwn.kv` transcripts load again.
+
+One limit worth stating plainly: Qwen runs text-only in plank. The vision
+encoder exists upstream, but plank does not pass one, so `view_image` is
+refused.
+
+**plank gets out of the way when the Mac runs out of memory.** Under memory
+pressure it releases the KV cache and the engine session at a turn boundary,
+says so, and comes back to the same continuation when pressure clears, instead
+of thrashing or being killed. The footer shows `⏸ paused: memory` while it
+waits, so the pause does not read as a hang.
+
+**`/toks` now charts prefill speed too**, beside generation speed on the same
+rows, because the question a slow pass raises is whether it is prefill-bound or
+decode-bound.
+
+![/toks panel: two side-by-side braille line charts in the theme green. Generation speed on the left reads now 29.5, avg 32.9, min 26.9, max 45.9 tok/s; prefill speed on the right reads now 232.9, avg 440.0, min 42.8, max 2112.0 tok/s](assets/toks.png)
+
+**Smaller things.** Diff cards are syntax-highlighted now rather than flat red
+and green:
+
+![An edit's diff card: added lines on green and the removed line on red, with Rust keywords, strings and function names highlighted inside both, line numbers down the left and a changed-word highlight on `&& !force`](assets/diff-highlighting.png) `!!` output opens in its own scrollable panel instead of scrolling
+away inside the model's. Sub-agents you did not name are called alpha, bravo,
+charlie instead of four identical `sub-agent` labels. Clicking the footer's
+brain hides or shows thinking for the session without writing a setting.
+`/hooks off` and `/skills off` are session master switches for hooks and
+skills. And an interrupted model download resumes where it stopped rather than
+starting over, which used to cost 88 GiB.
+
+**One settings bug worth naming.** `/config tools.<key>` reported "saved" and
+wrote nothing: the whole `tools` section was missing from the save path, so
+nine settings including `bashNotify` quietly reset at every launch. All nine
+persist now. The toggles that are deliberately session-only, the footer brain
+and `/loopguard`, still cannot reach `settings.json`; `/mc` still can, because
+that one is a real preference.
+
+### 5.0.7
+
+A sub-agent's progress belongs to the sub-agent. While one is working, the main
+transcript's progress line now reads `Waiting… (for sub-agent <name> to
+complete)`, and the live verb, clock, token count and tokens per second are
+shown in that agent's own view, reached from the roster with `←` and `Enter`.
+Before, the main transcript carried the sub-agent's counters and looked as
+though it were the one generating.
+
+### 5.0.6
+
+Micro-compaction is on the footer now, as a wastebasket with a green or red
+light, and double-clicking it turns the feature on or off for the session.
+`/mc` does the same by typing, and both work mid-turn. The loop guards learned
+two new shapes: reasoning that is drafting the answer — a numbered list of
+findings, or the code — is stopped and told to write it as the answer instead,
+and a cycle whose only variation is the list number is no longer invisible just
+because it is not byte-exact. When a model fails to open, the error now says
+why: a dangling symlink names the target that is gone, a truncated install is
+caught by comparing against the manifest, and a missing companion sidecar is
+named. Repro dumps gained a table of every generation pass, which is how the
+two guard changes above were found.
+
+### 5.0.5
+
+`/toks` charts the generation speed: a braille line in the theme green, one
+sample per second of decoding, in the same dismissable panel as `/usage`. Type
+it during a turn and it redraws on every status tick, so you can watch the
+rate move while the model types.
+
+`/exit` works mid-turn too now: it asks
+`[y/N]`, then interrupts the turn and leaves once it stops. Under the hood the
+loop guard's reasoning budget scales with the context window instead of
+stopping at a fixed 16 KiB, after it was caught cutting off a long design that
+was not looping.
+
+### 5.0.4
+
+The expert-routing glyph moved from the status bar to the window title, and a
+`/init` you type mid-session no longer clears the conversation; only the
+startup AGENTS.md offer does.
+
+### 5.0.3
+
+Turn on `tools.bashNotify` and a `bash` job the model leaves running wakes it
+when the job exits, once per job, never over a line you are still typing.
+`/jobs` and the `⧗ N jobs` footer segment show the live job table, also
+mid-turn. The same release fixed a cache regression where every tool call
+under speculative decoding re-read the whole conversation.
+
+### 5.0.2
+
+The write tool got a proper preview: a `Writing <path>` header, five lines of
+the file, then a live `… N lines` counter that ticks as the file streams and
+settles on a `└ N lines` summary. `/usage` typed during a turn opens its panel
+instead of spilling into the scrollback, and the rotating tip moves onto its
+own line while the agent works. If you never want the AGENTS.md offer in a
+folder, "Don't ask for this folder" now records that.
 
 ## Stable releases
 
@@ -278,7 +439,7 @@ one gets its own window, `plank:<session>:subagent-<n>`, numbered in the order t
 start. A fan-out's slots are readable side by side instead of interleaved into a
 single stream, and each window retires when its sub-agent finishes. Both shapes are
 covered: the serial sidechain a single `agent` call runs, and the concurrent
-fan-out of a whole block. Needs turbo-debug-console 0.2.1 or newer.
+fan-out of a whole block. Needs tdk 0.2.1 or newer.
 
 🧊 **A malformed tool call no longer freezes the debug console.** One bad DSML
 stanza used to kill the window for the rest of the session: it rendered nothing

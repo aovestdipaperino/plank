@@ -46,6 +46,7 @@ cargo build --release
 
 - **With `refs/ds4` present:** `build.rs` builds `libds4core.a` from the Metal-backend objects and links the required frameworks, enabling the `ds4_engine` cfg.
 - **Missing submodule:** plank still builds, but without the native engine it uses the echo engine only (useful for development/CI).
+- **Three model families, one build.** DeepSeek V4 Flash, V4.1 Flash and Qwen3.8-Flash-Next are all compiled in and told apart from the GGUF's own `general.architecture`; each has its own tool-call dialect, artifact set and transcript extension (`.ds4.kv` / `.ds41.kv` / `.qwn.kv`). Qwen was retired once, when upstream deleted its Metal kernels; upstream has since merged it properly and publishes the weights, so it is back unconditionally — no cargo feature to enable, and `--qwen` is always there.
 
 You will also need a GGUF model file (e.g. `ds4flash.gguf`) for real inference; see the `download_model.sh` script in `refs/ds4`.
 
@@ -79,9 +80,9 @@ Without a model (or on non-macOS platforms) plank still runs against a built-in 
 
 ### Speculative decoding (MTP)
 
-Speculative decoding — multi-token prediction, `--mtp` — is **on by default**, with a different mechanism per model family. DeepSeek uses its auxiliary DSpark draft checkpoint for V4 Flash: it reads hidden states from the main model, proposes up to five tokens ahead, and the main model verifies them and commits only the prefix it agrees with, so one verification pass can advance the stream by several tokens. Qwen3.8-Flash-Next instead speculates from the MTP block inside its own main GGUF, so it needs no draft checkpoint at all. `--mtp-off` turns it off for target-only decode.
+Speculative decoding — multi-token prediction, `--mtp` — is **on by default**, with a different mechanism per model family. DeepSeek uses its auxiliary DSpark draft checkpoint for V4 Flash: it reads hidden states from the main model, proposes up to five tokens ahead, and the main model verifies them and commits only the prefix it agrees with, so one verification pass can advance the stream by several tokens. V4.1 Flash ships no drafter, so it decodes target-only. `--mtp-off` turns it off for target-only decode.
 
-On DeepSeek the support model (~5.6 GB) does not need a flag of its own. It resolves to `~/.plank/ds4flash.dspark.gguf` and, when missing, is offered for download through the same resumable, playable path as the main model. `--mtp-model <path>` overrides it, and is the same flag that carries Qwen's required PLE sidecar — one companion flag, routed to whichever slot the loaded model's family wants.
+On DeepSeek the support model (~5.6 GB) does not need a flag of its own. It resolves to `~/.plank/ds4flash.dspark.gguf` and, when missing, is offered for download through the same resumable, playable path as the main model. `--mtp-model <path>` overrides it.
 
 ```sh
 plank --temp 0
@@ -100,6 +101,8 @@ plank tracks `ds4_agent` for the core agent loop but moves faster on the user-fa
 
 - **Full-screen Ratatui TUI** — markdown rendering with syntax-highlighted code, mouse-wheel scrollback, and a two-row animated status bar: the working directory, git branch and a working-tree change counter (`📄 3 · +128 -41` — files touched, then lines added in green and deleted in red) on the first row, so the location holds still, and everything volatile on the second — engine origin, reasoning level (colored by how hard the model is thinking, with a braille stand-in for the expert routing that re-rolls every token), context gauge, and the name of the tool currently running. The C reference is a plain line REPL. Resumed sessions replay through the same renderer, so history comes back as markdown with thinking dimmed, not flat text.
 - **Type while it thinks** — each turn runs on a worker thread, so the prompt stays live during generation and you can queue the next message.
+- **`/toks` live speed chart** — two braille line charts side by side, generation speed and prefill speed, each a time series sampled once a second, drawn in the theme green. Open it mid-turn and it redraws on every status tick, so the line grows while the model types. `/exit` also works mid-turn now: it asks `[y/N]` first, then interrupts the turn and leaves once it stops.
+- **A footer you can click** — the ctx gauge opens the `/context` breakdown, `⧗ N jobs` opens the live job table, the chart glyph opens `/toks`, and the brain flips thinking display for the session. All of them work while the model is generating.
 - **`/btw` side questions** — ask something mid-task; the answer runs on a fork of the session, interleaved with the main generation, so it streams into a split panel while the main task keeps going. Nothing is written to the conversation, and neither side re-prefills.
 - **Checkpoints, resume, and instant KV restore** — `/checkpoint`/`/rollback` and `/resume` snapshot the live engine KV alongside the transcript, so returning to a conversation skips re-prefilling it.
 - **Git-style diff cards** — an `edit` (or an overwriting `write`) renders as a change card with an `Update(path)` header, an added/removed summary, and red/green `@@` hunks; a brand-new file streams its content dimmed as it is written.
@@ -131,6 +134,12 @@ The `/context` command visualizes context-window usage by category:
   <img src="assets/context-usage.png" alt="/context report showing token usage by category" width="700">
 </p>
 
+`/toks` charts the generation speed and the prefill speed side by side as they happen, one sample per second of decoding; typed during a turn, the panel redraws as the model types:
+
+<p align="center">
+  <img src="assets/toks.png" alt="/toks panel: two side-by-side braille line charts in the theme green. Generation speed on the left reads now 29.5, avg 32.9, min 26.9, max 45.9 tok/s; prefill speed on the right reads now 232.9, avg 440.0, min 42.8, max 2112.0 tok/s" width="700">
+</p>
+
 `/btw` answers a side question *beside* the running task rather than pausing it. The aside runs on a fork of the session, interleaved with the main generation, so both advance at once — here the model keeps counting on the left while `/btw what is the capital of Italy` is answered on the right, with nothing written to the conversation:
 
 <p align="center">
@@ -149,20 +158,20 @@ Long turns end with a native macOS notification — your prompt as the headline 
 
 `ui.showThinking` controls whether the model's reasoning is rendered in the scrollback. It is **off by default**: the thinking is usually noise once you trust the answer, and hiding it keeps the transcript readable.
 
-Hiding it does not have to mean losing it. Start plank with `--debug` and, while `showThinking` is off, it mirrors its whole raw model stream to [turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console), a text-mode viewer that renders it in its own window, so the reasoning is one glance away instead of gone:
+Hiding it does not have to mean losing it. Start plank with `--debug` and, while `showThinking` is off, it mirrors its whole raw model stream to [tdk](https://github.com/aovestdipaperino/tdk), a text-mode viewer that renders it in its own window, so the reasoning is one glance away instead of gone:
 
 <p align="center">
-  <img src="assets/debug-console.png" alt="turbo-debug-console showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein" width="700">
+  <img src="assets/debug-console.png" alt="tdk showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein" width="700">
 </p>
 
 Install it and leave it running; a `plank --debug` finds it on its own:
 
 ```sh
-brew install aovestdipaperino/tap/turbo-debug-console
-turbo-debug-console
+brew install aovestdipaperino/tap/tdk
+tdk
 ```
 
-`cargo install turbo-debug-console` works too. It listens on port 7878, and each plank session gets its own window titled `plank:<session-name>`, matching the session name plank shows above the prompt. Sessions are reconnectable: the window and its scrollback survive plank exiting, so restarting plank appends the new run below a `-- reconnected --` rule instead of losing the old one.
+`cargo install tdk` works too. It listens on port 7878, and each plank session gets its own window titled `plank:<session-name>`, matching the session name plank shows above the prompt. Sessions are reconnectable: the window and its scrollback survive plank exiting, so restarting plank appends the new run below a `-- reconnected --` rule instead of losing the old one.
 
 The console is entirely optional and plank never depends on it. Without `--debug` plank does not even look for one: no probe, no connection, nothing sent. With it, if nothing is listening, plank connects to nothing, says nothing, and behaves exactly as it always has. If you close the console mid-turn, the mirror is dropped and the turn carries on. Turning `showThinking` back on disconnects it, since the reasoning is back in the scrollback where you can already see it.
 
@@ -246,7 +255,7 @@ It lists only settings actually in effect: a value a command-line flag overrode 
 Two things the file deliberately does **not** do:
 
 - **It holds no secrets.** `./.plank/settings.json` sits inside your working tree and is easy to commit by accident, so there is no API-key setting — keep it on `--api-key` or the provider's environment variable.
-- **It holds no per-run choices.** `--prompt`, `--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, `--worktree`, and `serve` describe one invocation rather than a preference, so they have no settings key.
+- **It holds no per-run choices.** `--prompt`, `--ui`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, `--worktree`, and `serve` describe one invocation rather than a preference, so they have no settings key.
 
 A broken settings file never stops plank from starting: malformed JSON, a wrongly-typed value, an unknown key, or an unrecognised backend name each fall back to that key's default. (The same unrecognised name passed to `--backend` is still an error — a flag is an explicit instruction, a config file is a preference.) One limitation: settings are read from the directory plank launches in, so project-scoped settings do not follow `--chdir`.
 
@@ -432,6 +441,43 @@ Each module in `src/` maps to one functional section of the original `ds4_agent.
 - `ui.rs`, `render.rs`, `statusbar.rs`, `editor.rs`, `viz.rs` — terminal UI
 - `arcade.rs`, `arcade/` — the easter-egg games, the matrix rain, the starfield and the minions (see above)
 - `config.rs`, `settings.rs`, `trace.rs`, `interrupt.rs`, `status.rs` — configuration, persistent settings, tracing, signal handling
+
+## Known warnings
+
+`cargo update` reports one dependency as behind the latest release, and it
+stays that way on purpose:
+
+```
+generic-array v0.14.7 (available: v0.14.9)
+```
+
+It is not ours to move. `crypto-common 0.1` requires `generic-array` at
+exactly `=0.14.7`, and that pin is deliberate: `generic-array` types appear
+in `crypto-common`'s public API, so the exact version is part of the contract
+between every crate compiled against it. In this tree that means `digest`,
+`cipher`, `aead` and `universal-hash`, and under those `aes`, `aes-gcm`,
+`cbc`, `ctr`, `ecb`, `hmac`, `sha1`, `md-5`, `pbkdf2` and `polyval` — the
+whole RustCrypto 0.10-era stack.
+
+So there is no local fix worth having. Patching it would mean forking the
+trait crate that all of those compile against and carrying that fork
+indefinitely, to gain a patch release. What actually resolves it is those
+crates reaching `digest 0.11`, which drops the 0.10 stack out of the graph;
+plank's own `sha2` and `blake2` are already on `0.11`.
+
+Two neighbouring pins are worth knowing about for the same reason, though
+neither produces a warning any more:
+
+- **`liteparse` is held at `=2.14`** rather than tracking its latest. The
+  crate shipped 27 releases in three months, and the fixtures in
+  `src/doc/mod.rs` are coupled to its markdown emitter. Bump it deliberately
+  and re-run `cargo test --lib doc::` before trusting the result.
+- **SQL code fences are not syntax-highlighted.** The grammar for them,
+  `tree-sitter-sequel`, requires `cc = "~1.2.1"`, and because cargo unifies
+  `cc` across the whole graph that one optional grammar held every build
+  script in the tree to `cc` 1.2.x. Plank lists ratatui-markdown's grammar
+  features explicitly, minus `highlight-lang-sql`, so the crate leaves the
+  graph entirely. Restore the feature if that pin is ever relaxed upstream.
 
 ## Star History
 

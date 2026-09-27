@@ -193,7 +193,8 @@ survives and a later resume re-prefills it</td>
 </tr>
 <tr>
 <td><code>/quit</code>, <code>/exit</code></td>
-<td>leave (the session is saved)</td>
+<td>leave (the session is saved). Mid-turn it asks <code>[y/N]</code>
+first, then interrupts the turn and leaves once it stops</td>
 </tr>
 </tbody>
 </table>
@@ -242,7 +243,8 @@ argument shows the tree</td>
 <tbody>
 <tr>
 <td><code>/context</code></td>
-<td>report context-window usage by category</td>
+<td>report context-window usage by category (or click the
+<code>ctx N%</code> gauge)</td>
 </tr>
 <tr>
 <td><code>/compact [instructions]</code></td>
@@ -253,6 +255,18 @@ pass; an argument steers what this one summary keeps</td>
 <td><code>/usage</code></td>
 <td>billed token counts for the session (hosted providers, including
 cache hit rate)</td>
+</tr>
+<tr>
+<td><code>/toks</code></td>
+<td>two braille line charts side by side, generation speed and prefill
+speed, one sample per second of decoding. Works mid-turn and redraws as
+the model types</td>
+</tr>
+<tr>
+<td><code>/jobs</code></td>
+<td>the background bash job table: id, pid, elapsed, state and output
+file. A live panel in the TUI, also mid-turn; clicking
+<code>⧗ N jobs</code> in the status bar toggles it</td>
 </tr>
 <tr>
 <td><code>/rate [+|-] [note]</code></td>
@@ -268,6 +282,23 @@ works in the TUI and the plain REPL alike</td>
 <td><code>/memory</code></td>
 <td>open user and project memory as one buffer in the built-in editor;
 edits are split back to the right file on save</td>
+</tr>
+<tr>
+<td><code>/memory log</code></td>
+<td>print the recent entries of the memory audit log: what the model or
+the extraction pass added, changed or removed, and why</td>
+</tr>
+<tr>
+<td><code>/memory calibrate [N]</code></td>
+<td>ask the memory gate's question about up to N saved turns (default
+20) twice, with yes and no swapped, and suggest a
+<code>memory.gateBias</code> value that cancels the model's lean toward
+one letter</td>
+</tr>
+<tr>
+<td><code>/forget &lt;pattern&gt;</code></td>
+<td>delete every memory entry whose text contains the pattern,
+case-insensitively, after previewing the matches and asking</td>
 </tr>
 <tr>
 <td><code>/init</code></td>
@@ -291,8 +322,10 @@ edits are split back to the right file on save</td>
 <td>connected MCP servers and the tools they expose</td>
 </tr>
 <tr>
-<td><code>/skills</code></td>
-<td>skills available to the model</td>
+<td><code>/skills [on|off]</code></td>
+<td>skills available to the model; <code>on</code>/<code>off</code>
+enable or disable skill expansion for this session, on both the slash
+route and the <code>skill</code> tool</td>
 </tr>
 <tr>
 <td><code>/templates</code></td>
@@ -304,8 +337,10 @@ edits are split back to the right file on save</td>
 on</td>
 </tr>
 <tr>
-<td><code>/hooks</code></td>
-<td>which hooks are configured and on what events</td>
+<td><code>/hooks [on|off]</code></td>
+<td>which hooks are configured and on what events;
+<code>on</code>/<code>off</code> enable or disable hook execution for
+this session</td>
 </tr>
 <tr>
 <td><code>/plugins</code></td>
@@ -371,8 +406,8 @@ instead.</p>
 <tr>
 <td><code>/debug [on|off]</code></td>
 <td>override the <code>--debug</code> switch: mirror the raw model
-stream to a running <code>turbo-debug-console</code> (on connects and
-backfills at once); bare <code>/debug</code> reports the state</td>
+stream to a running <code>tdk</code> (on connects and backfills at
+once); bare <code>/debug</code> reports the state</td>
 </tr>
 <tr>
 <td><code>/power &lt;1..100&gt;</code></td>
@@ -391,8 +426,12 @@ which pins it at 0</td>
 </tr>
 <tr>
 <td><code>/loopguard [on|off]</code>, <code>/lg</code></td>
-<td>arm or silence the loop guards. The one mutating command that also
-works mid-turn</td>
+<td>arm or silence the loop guards. Works mid-turn</td>
+</tr>
+<tr>
+<td><code>/mc [on|off]</code></td>
+<td>turn micro-compaction on or off for this session; bare
+<code>/mc</code> reports the state. Works mid-turn</td>
 </tr>
 <tr>
 <td><code>/notify &lt;mode&gt;</code></td>
@@ -422,14 +461,48 @@ cannot be loaded into a running engine. The status bar shows
 <code>✨</code> while speculation is on, with its per-step figures
 beside it, and <code>🌡 0.60</code> while it is off.</p>
 <p><code>/loopguard off</code> silences every rung of every guard: the
-repetition guard and its think budget, the repeated-tool-call guard and
-its no-progress budget, and the repeat advisory. Unlike other settings
-commands it takes effect on a turn that is already generating, because
-the moment you want the guards out of the way is usually while they are
-firing. <code>🔁</code> in the status bar means they are armed;
-<code>♻ looping</code> means one has actually seen a cycle. The switch
-is session-only and is never written to disk (the underlying setting is
-<code>tools.loopGuards</code>).</p>
+repetition guard with its draft rung and think budget, the
+repeated-tool-call guard and its no-progress budget, and the repeat
+advisory. Unlike other settings commands it takes effect on a turn that
+is already generating, because the moment you want the guards out of the
+way is usually while they are firing. <code>🔁</code> in the status bar
+means they are armed; <code>♻ looping</code> means one has actually seen
+a cycle. The switch is session-only and is never written to disk (the
+underlying setting is <code>tools.loopGuards</code>).</p>
+<h3 id="the-no-progress-budget">The no-progress budget</h3>
+<p>One rung of the loop guard is off unless you ask for it. The
+no-progress budget watches a whole turn rather than a single pass: it
+counts the bytes the model generates and resets that count only when a
+file actually changes on disk. Cross 32 KB without a change and the turn
+ends with
+<code>guard: turn stopped: the model generated 32KB of output and changed no file.</code></p>
+<p>What counts as a change is narrow on purpose. A successful
+<code>write</code> or <code>edit</code> counts. So does a shell command
+that left the git working tree different than it found it, which is how
+<code>sed -i</code>, <code>cargo fmt</code>, a codegen script and
+<code>git apply</code> get credit for work they do without plank ever
+seeing the edit. Reads, searches, builds and test runs do not count,
+however many of them succeed, and neither does an <code>edit</code> that
+failed to apply. That asymmetry is the whole point: the pattern this
+rung was built for is a turn whose every individual pass looks
+reasonable and which still, fifty minutes later, has written
+nothing.</p>
+<p>It is off by default because the count is a measure of output volume,
+not of looping, and there is a perfectly ordinary turn that trips it: a
+long read-only investigation. Ask plank why a test is flaky, or to
+explain how a subsystem fits together, and it will read, search, build
+and reason its way to a real answer without touching a file. The budget
+stops that turn too, and the notice tells you to narrow a request that
+was never too wide. Every other rung of the guard, which watches for
+genuine repetition instead, stays armed by default.</p>
+<p>Turn it on when you are handing plank a long autonomous task and you
+would rather it gave up than spent an afternoon:</p>
+<pre class="json"><code>{ &quot;tools&quot;: { &quot;noProgressGuard&quot;: true } }</code></pre>
+<p>It is ANDed with <code>tools.loopGuards</code>, so
+<code>/loopguard off</code> silences it along with everything else, and
+arming it while the guards are off does nothing. There is no slash
+command of its own; <code>/config tools.noProgressGuard true</code> sets
+it for the project.</p>
 <p><code>/config</code> changes write to
 <code>./.plank/settings.json</code> and apply immediately. In the TUI, a
 bare <code>/config</code> opens the form and
@@ -468,6 +541,11 @@ the model-written prose, <code>fresh</code> forces it to be written
 again)</td>
 </tr>
 <tr>
+<td><code>/stats [7|30|all]</code></td>
+<td>a year of activity as a heatmap, with streaks and totals under it;
+re-issue bare <code>/stats</code> to cycle the range</td>
+</tr>
+<tr>
 <td><code>/repro [note]</code></td>
 <td>dump the exact engine input and runtime knobs to
 <code>~/.plank/repro/</code> for a bug report; the file's path is copied
@@ -481,7 +559,7 @@ model, backend, context size, sampling settings and think mode, in a
 single self-contained file. It never touches the live session.</p>
 <p>Under <code>--debug</code> (or after <code>/debug on</code>) plank
 dumps on its own as well: quitting writes
-<code>repro-quit-&lt;timestamp&gt;.md</code>, and a panic writes
+<code>repro-debug-&lt;timestamp&gt;.md</code>, and a panic writes
 <code>repro-panic-&lt;timestamp&gt;.md</code> with whatever transcript
 the session had last rendered. Neither needs you to remember
 <code>/repro</code> before the session ends.</p>
@@ -505,6 +583,27 @@ lines, files, commits, and any tool or friction category that was not
 there last time. It is subtraction of two deterministic aggregates, so
 it costs nothing and cannot be wrong the way a written summary
 could.</p>
+<p><code>/stats</code> is the quick look <code>/insights</code> is not:
+a year of weeks as a heatmap, four green tones from your quietest day to
+your busiest, and eight figures under it — favourite model, total
+tokens, sessions, longest span, days started, longest and current
+streak, most active day. It reads the same per-session cache
+<code>/insights</code> fills, so it costs nothing after the first run
+and never calls the model.</p>
+<p>Two of those figures are named for exactly what they count.
+<strong>Days started</strong> counts days a session began, so a session
+opened on Monday and resumed through Thursday lights one square, not
+four. <strong>Longest span</strong> is wall-clock between a session's
+first and last message, which is not time spent working — resume
+something a month later and the span is a month. Token totals are
+transcript bytes divided by four, since plank keeps no true per-session
+count.</p>
+<p>The heatmap always shows the full year. The figures under it take a
+range: <code>/stats 7</code> and <code>/stats 30</code> jump straight to
+the last week or month, <code>/stats all</code> goes back, and
+re-issuing bare <code>/stats</code> while the panel is open cycles the
+three. Esc closes it. Like <code>/insights</code>, it is answered only
+while plank is idle.</p>
 <p>Suggestions are made to be used, not read: every snippet, prompt and
 instruction in the report has a <strong>Copy</strong> button, and the
 <strong>Worth putting in AGENTS.md</strong> list arrives as a checklist

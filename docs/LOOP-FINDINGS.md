@@ -18,19 +18,49 @@ The guards, for orientation:
   *latched* at the warn rung and then tracked forward copy by copy
   (`RepeatGuard::extend_latched`), so the period a stop can see is not capped
   by the window — see "The stop rung saw a quarter of the window", below.
+  A second, byte-independent cycle rung rides on the draft scanner
+  (`NumberedCycle`): numbered lines are hashed with their leading ordinal
+  stripped, so a cycle whose only variation is its list number is still a
+  cycle — see "A cycle that renumbers itself is not byte-exact", below.
 - **Tool-call loop guard** — `guard::LoopGuard`: advisory on the 3rd identical
   call, refusal from the 6th, turn ended after three stanzas in a row refused
   in full (`tripped`). Also detects a repeated *sequence* of calls
   (`repeated_period`).
-- **Think budget** — `REPEAT_THINK_BUDGET` = 16 KiB of reasoning per pass,
-  whatever the tail looks like. Recognises nothing, so unlike the cycle rungs
+- **Think budget** — `repeat_think_budget(ctx_size)`: `ctx_size / 10` bytes,
+  floored at 16 KiB (`REPEAT_THINK_BUDGET_FLOOR`; ~102 KB on the 1M-token
+  window) of reasoning
+  per pass, whatever the tail looks like. Recognises nothing, so unlike the cycle rungs
   it has no `2p` latency floor and no period ceiling, and it is the only rung
   that catches a drifting loop. Stops through the same preflight channel with
   `THINK_BUDGET_ERROR`, and counts towards `MAIN_REPEAT_TRIP_CAP`.
+- **Draft rung** — `RepeatGuard::drafting`: past `draft_min_bytes` (an eighth
+  of the pass's think budget, so ~12.8 KiB on the 1M-token window, never below
+  the 8 KiB `DRAFT_MIN_BYTES_FLOOR`) of
+  reasoning, `DRAFT_HEADINGS` (10) numbered deliverable headings
+  (`**Bug 3:**`, `1. **Title**`, `### 4.`) or `DRAFT_FENCED_BYTES` (4 KiB)
+  inside code fences means the reasoning is writing the answer, not deciding
+  it. Checked after the cycle rungs and before the budget, stops through the
+  same preflight channel with `DRAFT_ERROR` ("write this as your answer, not
+  in reasoning"), counts towards `MAIN_REPEAT_TRIP_CAP`, and runs only on
+  guards that have a budget, i.e. the turn guards — see "The review that was
+  written in the wrong place", below.
 - **No-progress budget** — `NO_PROGRESS_BYTE_BUDGET` = 32 KiB generated in one
-  turn with no `PROGRESS_TOOLS` call (`write`, `edit`, `bash`, `bash_stop`).
+  turn with no observed file change: neither a successful `write`/`edit`
+  (`ToolContext::last_written`) nor a working-tree difference across an opaque
+  tool such as `bash` (`ToolContext::touched_tree`, from `treedigest`).
   Turn-scale, so it is the only rung that sees a turn whose every pass is
-  individually reasonable and which still changes nothing.
+  individually reasonable and which still changes nothing. Off by default
+  behind `tools.noProgressGuard` (`guard::no_progress_guard_enabled`), which
+  is ANDed with `tools.loopGuards`: the budget measures output volume, and a
+  long read-only investigation is a legitimate turn it stops anyway.
+- **Scoped suspension** — `settings::suspend_loop_guards()`: an RAII scope that
+  silences every rung above for as long as it is held, used by `/init` (both
+  front-end paths) and nothing else. It is a scope rather than a flag so the
+  restore survives a failed turn — leaving the guards down after `/init` errored
+  would disarm the protection for the rest of the session with nothing on screen
+  saying so — and it loses to an explicit `/loopguard` either way, since a user
+  who typed one said something about this session that a canned prompt does not
+  get to overrule.
 - **Sub-agent trip cap** — `SUBAGENT_REPEAT_TRIP_CAP = 2`: a sidechain stopped
   twice running is pushed to its report; a third loop fails it.
 
@@ -55,6 +85,19 @@ argument for the design.
 | 2026-09-07 | *(this change)* | `REPEAT_THINK_BUDGET = 16 KiB` per-pass reasoning cap (`RepeatGuard::with_think_budget`, `THINK_BUDGET_ERROR`, counted towards `MAIN_REPEAT_TRIP_CAP`); `NO_PROGRESS_BYTE_BUDGET = 32 KiB` per-turn cap on output with no `PROGRESS_TOOLS` call | `repro-1788796284`: a 9042-byte cycle 20 times over in a sub-agent, longer than the whole window so no rung could see it, and a parent turn that looped no text at all yet edited nothing in fifty minutes |
 | 2026-09-07 | `aaf0f3d` | `MAIN_REPEAT_TRIP_CAP = 2` on both main-turn paths (`MAIN_REPEAT_TRIPS_NOTICE`); `Agent::repro_dir` so test dumps stay out of `~/.plank/repro`; this document | `repro-loop-1788708943`/`-1788709421`: the main turn looped, stopped, looped again, and the user quit |
 | 2026-09-08 | *(this change)* | no-progress budget resets only after a successful direct `write` or `edit`, not an attempted `edit` or arbitrary `bash` call | `repro-loop-1788833715`: 5h7m of failed edits, builds, and repeated reads kept resetting the budget |
+| 2026-09-10 | *(this change)* | think budget sized from the context window: `repeat_think_budget` = `ctx_size / 10` bytes, floored at the old 16 KiB (`REPEAT_THINK_BUDGET_FLOOR`) | `repro-loop-1789051332` … `-1789053127`: seven budget stops in three sessions on one feature request, none a cycle — see "The think budget fired on reasoning that was not looping", below |
+| 2026-09-11 | *(this change)* | closed-think recovery (`Agent::pass_opts`): the pass after any reasoning stop is generated with `ThinkMode::Off`, so it can only deliver; and a draft stop counts on its own tally (`MAIN_DRAFT_TRIP_CAP` = 3) instead of against `MAIN_REPEAT_TRIP_CAP` | `repro-loop-1789108509` / `-1789108726`: a turn ended for obeying the draft rung twice — see "The recovery had nowhere to write", below |
+| 2026-09-11 | *(this change)* | `NO_PROGRESS_NOTICE` reworded: it no longer claims a shell command would have reset the budget, and it names what does | `repro-1789107544`: the tripping pass had just run `cargo test` and `cargo clippy` successfully — see "The no-progress notice named the wrong evidence", below |
+| 2026-09-13 | *(this change)* | `treedigest`: a git working-tree fingerprint taken before and after every opaque tool (`bash` family, `run_code`, MCP, WASM), whose difference sets `ToolContext::touched_tree` and resets the no-progress budget; `NO_PROGRESS_NOTICE` reworded again to name it | shell-driven work (`sed -i`, `cargo fmt`, codegen, `git apply`) scored zero progress and could trip the budget for doing the job — see "An attempted mutation is not progress", below |
+| 2026-09-16 | *(this change)* | `rescue_prefix_before_rebuild` gains a fork-snapshot tier and runs before every quiet sub-agent pass | a cycle stop inside a sub-agent re-prefilled the whole parent context from token zero — see "The KV cost", below |
+| 2026-09-10 | *(this change)* | draft rung (`RepeatGuard::drafting`, `DRAFT_ERROR`): numbered deliverable headings or fenced code accumulating inside `<think>` past 8 KiB stop the pass with "write this as your answer, not in reasoning"; and a `WORKING_STYLE` rule, "Write findings as you find them", so list-shaped answers are emitted item by item after `</think>` | `repro-loop-1789060243` and the seven 2026-09-10 dumps: deliverables drafted in reasoning, never emitted |
+| 2026-09-10 | *(no code change)* | counter-case to the raised budget recorded: a 30 KB review drafted inside `<think>` under the ~102 KB budget, interrupted by the user at 12m42s; the `resume` pass redrafted and fell into a 5-line cycle the exact-cycle rung caught | `repro-loop-1789060243`: `do a code review`, 18 minutes, no visible output — see "The review that was written in the wrong place", below |
+| 2026-09-10 | `1a09915` | `NumberedCycle` inside `DraftScan`: numbered reasoning lines hashed with the leading ordinal stripped, a bounded 256-item history independent of the byte window, reported as a cycle through `RepeatGuard::feed` at `REPEAT_CYCLES` copies; a cycle must carry three distinct substantial bodies and 256 bytes | `repro-1789068543`: a 26-item cycle, over 7 KiB per copy, that no byte rung could match — see "A cycle that renumbers itself is not byte-exact", below |
+| 2026-09-16 | — | `/repro` and the shutter work mid-turn: the worker publishes the pass's report at each main pass start (`TurnShared::begin_repro_pass`) and streams the pass into `live_pass`; the UI thread writes both under an `## In-progress pass` section (`TurnShared::write_repro`) | typing `/repro` during a stall queued the text as a prompt for the model, and the shutter did nothing until the turn ended, so a loop no rung fired on could only be dumped after it had already run its course |
+| 2026-09-11 | `4dde15d` | a repro shutter (camera glyph) at the end of the footer's dir prefix, writing the same `/repro` dump and clipboard copy the typed command produces | hand-saved dumps were the only record of a loop no rung fired on, and typing `/repro` mid-stall is the thing a user does last |
+| 2026-09-11 | `13b75cc` | `DRAFT_PAUSE_TEXT`: a draft stop is worded as a pause and mirrored to the debug console instead of printed as a red `guard:` line on the front ends; `DRAFT_ERROR` reworded around delivery rather than accusation | the draft rung is the one stop that loses nothing — see "A draft stop is a pause, not news", below |
+| 2026-09-15 | *(this change)* | `settings::suspend_loop_guards()`, a scope that silences every rung for the duration of a turn plank drives from a canned multi-phase prompt; `/init` is the only caller. Layered *below* the `/loopguard` session override and *above* the persisted `tools.loopGuards`, so a user who said something explicit still outranks a canned prompt | the `/init` phases re-read and re-survey by design — the interview, the `task` survey and the write all revisit the same tree — which is precisely the shape `LoopGuard::observe` refuses; a turn the user asked for was being blocked mid-phase for following its own prompt |
+| 2026-09-14 | *(this change)* | the no-progress budget moved behind its own `tools.noProgressGuard`, default **off**, ANDed with `tools.loopGuards` in `guard::no_progress_guard_enabled` | the byte budget is a volume heuristic, and read-only investigation turns are legitimate; opting in keeps the other rungs on by default |
 | 2026-09-08 | *(this change)* | `tools.loopGuards` and `/loopguard` (alias `/lg`): one switch over every rung — `LoopGuard::observe`/`tripped`, the gated `RepeatGuard` (cycles and think budget), the no-progress budget. Read through `guard::guards_enabled()` at each check, never captured at turn start, so the switch lands on a generation already streaming; `🔁` in the footer while armed, and the tripped marker moved to `♻ looping` | diagnosing the guards themselves, where every rung fires before the behaviour under study can be observed |
 
 Two patterns run through the table. First, every detector started advisory
@@ -222,13 +265,16 @@ what has the floor. Cycle detection needs two copies before it can name a
 cycle, so its latency floor is `2p` — 18 KB here, and unreachable anyway when
 `2p` exceeds the window. A budget has no floor: it just stops counting.
 
-- **`REPEAT_THINK_BUDGET` = 16 KiB**, a per-pass cap on reasoning bytes
+- **`REPEAT_THINK_BUDGET` = 16 KiB** (since 2026-09-10 `repeat_think_budget`,
+  a tenth of the context window with 16 KiB as the floor), a per-pass cap on reasoning bytes
   (`RepeatGuard::with_think_budget`), fed back as `THINK_BUDGET_ERROR` and
   counted towards `MAIN_REPEAT_TRIP_CAP` alongside a real loop, since both
   leave the prompt materially unchanged at temperature 0.
 - **`NO_PROGRESS_BYTE_BUDGET` = 32 KiB**, a per-*turn* cap on output generated
-  without a `PROGRESS_TOOLS` call (`write`, `edit`, `bash`, `bash_stop` — the
-  same set plan mode blocks). This is the rung the per-pass budget cannot be:
+  without an observed file change, opt-in behind `tools.noProgressGuard`. (As first written this counted a
+  `PROGRESS_TOOLS` *call* — `write`, `edit`, `bash`, `bash_stop`, the same set
+  plan mode blocks — which is the mistake "An attempted mutation is not
+  progress" below is about.) This is the rung the per-pass budget cannot be:
   the parent turn above passes every per-pass check ever written.
 
 Both were sized against the 32 dumps in `~/.plank/repro`, 939 passes, and the
@@ -285,6 +331,22 @@ not assumed to have made progress: detecting arbitrary shell mutations
 reliably would require a separate workspace-mutation witness, rather than an
 exit-status heuristic. Regression tests cover a failed `edit`, a successful
 read-only `bash`, and repeated successful writes.
+
+**2026-09-13: the witness now exists.** Leaving shell calls out was right
+about the evidence and wrong about the cost. A turn doing real work through
+`sed -i`, `cargo fmt`, a codegen script or `git apply` scored zero progress
+and could trip the budget for doing exactly what it was asked. `treedigest`
+supplies the missing witness without reintroducing the exit-status heuristic:
+`dispatch` fingerprints the git working tree before and after every *opaque*
+tool (the `bash` family, `run_code`, MCP and WASM tools — never `write` or
+`edit`, which report themselves precisely), and a **difference** sets
+`ToolContext::touched_tree`. A command that runs successfully and changes
+nothing still resets nothing, which is the property the original finding was
+protecting. Outside a git repository the digest is `None` on both sides and
+the guard falls back to `last_written` alone, exactly as before. See
+`docs/FILE-SYSTEM-HOOK.md` for why this is observation rather than a real
+write hook, and for the FSEvents design that would widen it to ignored and
+non-repo paths.
 
 ## A stopped pass is regenerated verbatim: the main turn has no trip cap
 
@@ -494,16 +556,25 @@ cap stays as the backstop, unchanged. Anything the pass emitted *after* leaving
 `<think>` is visible output the user has already been shown and is kept, so a
 partial answer is not silently withdrawn from the model's own context.
 
-The KV cost is the part that turned out to be free, and it is worth recording
-why, because the obvious reading is that this is microcompact's mid-transcript
-rewrite and has to pay microcompact's rung restore. It is not: the rewritten
-message is the transcript's *last*, so every earlier section still matches
-byte for byte, `ds4_session_common_prefix` reuses the whole prefix, and the
-recovery pass prefills the stub plus the guard's tool result and nothing else.
-No rung is invalidated either — every rung sits at a shallower depth and still
-describes an intact prefix — so neither `discard_ladder` nor
-`truncate_ladder_to` is called. A tail rewrite is cheap by construction; the
-expensive rewrites are the ones with transcript behind them.
+The KV cost is cheap, but not for the reason first recorded here. The obvious
+reading was that the rewritten message is the transcript's *last*, so
+`ds4_session_common_prefix` reuses everything before it. That is only half the
+story: the live KV ran *past* the stopped message by the tokens the pass
+generated, so the stubbed prompt diverges *behind* the live end, and
+`ds4_session_sync` is extend-only — that shape rebuilds from token zero
+(`engine::reusable_prefix`). What makes it cheap on the main paths is
+`rescue_prefix_before_rebuild`, which sees the shape and restores the deepest
+ladder rung below the divergence first; the sync then extends from the rung.
+No rung is invalidated by the rewrite, so neither `discard_ladder` nor
+`truncate_ladder_to` is called.
+
+Sub-agents did not have that rescue (2026-09-16): `generate_quiet` never
+called it and it refused under `in_sidechain()`, so the recovery pass after a
+cycle stop inside a sub-agent re-prefilled the whole parent context plus the
+sidechain from zero, up to `SUBAGENT_REPEAT_TRIP_CAP` times. Fixed by making
+the rescue three-tiered — innermost fork snapshot, then ladder rung, then
+rebuild — and calling it from the quiet pass; `docs/KV-CACHE.md` Layer 6 has
+the mechanics.
 
 What it trades is the property that the recovery prompt can see what looped.
 The guard's tool result still says *that* the reasoning was stopped and why, so
@@ -547,3 +618,467 @@ Two secondary observations from the same pair:
   at 12:08:55 having read three doc chunks and listed two directories, with no
   edit and no answer. The cap is the floor on the damage, not a fix; the cost
   of a loop is still the whole turn.
+
+## The think budget fired on reasoning that was not looping
+
+`repro-loop-1789051332` through `repro-loop-1789053127` (2026-09-10, sessions
+`dapper-jagger`, `grumpy-churchill` at temperature 0 and `witty-jagger` at
+0.6) are one request — "add the ability to expand a folder to select single
+items with the '+' key" against the tommaso disk sweeper — retried three times
+for about forty minutes, with zero edits. All seven stops are
+`THINK_BUDGET_ERROR`; no dump has a byte cycle.
+
+What filled the 16 KiB, pass by pass:
+
+| dump | fenced code lines | "Actually / Wait / Hmm" | option-weighing lines |
+|---|---|---|---|
+| `1789051332` | 135 | 15 | 3 |
+| `1789051554` (recovery) | 122 | 17 | 0 |
+| `1789051976` | 39 | 0 | 2 |
+| `1789052266` (recovery) | 101 | 0 | 3 |
+| `1789052500` (2nd recovery) | 146 | 0 | 0 |
+| `1789052875` | 53 | 16 | 4 |
+| `1789053127` (recovery) | 82 | 23 | 4 |
+
+Two distinct things happen. The **first** pass of each session stalls on
+genuine design forks — sync or async child measurement, one-level or recursive
+expansion, how parent and child ticks interact on delete — questions the user
+could answer in seconds and which the `ask` tool exists for. Across the 78
+dumps in the repro directory the model has called `ask` in exactly one session
+(`repro-quit-1788876504`), both times about process, never about design.
+
+The **recovery** passes show the larger problem. After the budget error the
+model does decide in one sentence, as the error asks, then drafts the entire
+implementation inside `<think>` as fenced Rust — struct fields, `expand()`,
+`ticked_paths()`, the poll loop — until the budget cuts it again mid-function.
+`stub_last_reasoning` then erases the draft, so the next pass restarts the
+code from zero, and the third trip ends the turn. A 16 KiB budget is smaller
+than a multi-file feature drafted as code, so a task this shape could never
+finish through reasoning.
+
+Fixed 2026-09-10 in the cheap direction first: the budget is now
+`repeat_think_budget(ctx_size)`, `ctx_size / 10` bytes with the old 16 KiB as
+the floor — ~102 KB on the 1M-token window, about six times the reasoning any
+of these passes managed before the stop. The rung goes back to
+being a backstop against drift rather than a ration; the exact-cycle rungs
+and the no-progress budget still stop the shorter loops first. Raising it does
+not teach the model to leave code for the edit tool; that, a prompt rule to
+`ask` on user-visible design forks (reconciled with "Decide, do not
+deliberate": decide on internal choices, ask on user-visible ones), and a
+budget error that demands the first *edit* in the same pass rather than a
+one-sentence decision, are the follow-ups.
+
+## The review that was written in the wrong place
+
+`repro-loop-1789060243` (2026-09-10, session `jazzy-koch`, DeepSeek V4 Flash
+Vision, think low, `showThinking` off, temperature 0) is the counter-case to
+the budget raise above, and it arrived the same evening. The binary was a
+local build of the working tree, so it already carried the ~102 KB budget
+despite reporting v5.0.4.
+
+The request was `do a code review` on the tommaso repository. The first
+twelve minutes were healthy: eight tool rounds reading every source file,
+`Cargo.toml` and the docs, then `cargo test` and `cargo clippy`, each round
+narrated with the one-line status the working-style rule asks for. The
+synthesis pass then wrote the whole review inside `<think>` — thirty-one
+numbered `**Bug N:**` entries, 30 KB — and never closed the block. Under the
+old 16 KiB budget it would have been stopped near the seven-minute mark; under
+the new one nothing stopped it, and with thinking hidden the user saw a token
+counter and nothing else for 12m42s, then pressed Esc. The partial pass stayed
+in the transcript.
+
+The user typed `resume`. With its own 30 KB of analysis in context, the model
+did not read it back: it restarted the synthesis inside `<think>`, produced
+17 KB, and degenerated into a five-line cycle — the same "`draw`
+`f.render_widget(Block::default()…)` for the X block. Good." sentence for the
+header, categories, items, path and modal blocks, five times round. The
+exact-cycle rung caught it after about 3 KB of repetition, as designed, and
+the turn ended at 19:10:43: eighteen minutes, zero visible output, no review.
+
+Three things follow.
+
+**The budget size is not the lever.** The morning dumps were the fixed budget
+cutting off a design that was not looping; this is the raised budget letting a
+deliverable be drafted in reasoning until the user gave up. Both are the same
+failure — a long, structured deliverable composed inside `<think>` and
+restarted from scratch after every stop — seen from either side of a number.
+Pulling the budget back down in reaction to this dump would only trade one
+for the other.
+
+**The narration rule does not reach the synthesis.** "Narrate progress
+outside your thinking" is written around tool rounds — one line after
+`</think>` before each stanza — and the model obeyed it there. The final pass
+has no stanza to hang a line on, so the rule is silent exactly where the
+output was. A review, an audit, a plan: anything whose deliverable is prose
+rather than an edit ends in a pass this rule never touches.
+
+**The `resume` restarted rather than resumed.** As in the morning's recovery
+passes, prior reasoning in context was not used as a draft to finish but as
+evidence to re-derive. Whatever the model is asked after a stop, it starts the
+composition over.
+
+**Second occurrence, same evening.** `repro-loop-1789062437` (session
+`peppery-jenner`, 19:33-19:47, still the v5.0.4 build: the draft rung and the
+prompt rule below were installed at 19:33 but this process predates them) is
+the same `do a code review` on the same repository, replayed. The reading
+rounds went exactly as before. This time the synthesis pass did not wait for
+Esc: it cycled inside `<think>` and the exact-cycle rung stopped it at
+19:45:22. The recovery pass opened with "I have enough to write a code review.
+Let me synthesize findings" — the instruction `REPEAT_LOOP_ERROR` gives — and
+then synthesized inside `<think>` again: four numbered bold findings, 6.7 KB,
+before it fell into a ~600-byte cycle enumerating the app-cache dedup list
+("`Library/Caches/org.swift.swiftpm` excluded. `Library/Caches/Yarn`
+excluded. … missing. Also") ten times over. Second trip, cap reached, turn
+ended at 19:47:17: 13m38s, no output. Two sessions, one task, same failure
+from a different trigger, which is what makes the task a fair test of the two
+changes below: the next run of it on the new build is the measurement.
+
+### A prompt rule for intermediate findings
+
+The candidate fix is in `WORKING_STYLE` (`src/sysprompt.rs`), plank's own
+prompt text, not the C-parity section — so it costs a fixture regeneration
+(`PLANK_REGEN_FIXTURES=1 cargo test`) and, like any system-prompt byte, a
+fresh `fp1` and a sysprompt KV rebuild, but no parity concern. Something of
+the shape:
+
+> Write findings as you find them. When the answer is a list — a review, an
+> audit, a survey of options — emit each item to the user as soon as you have
+> it, after `</think>`, and move to the next. Do not accumulate the list in
+> your thinking and write it out at the end: the user sees nothing until then,
+> and a stop loses all of it. Your thinking is for deciding what the next item
+> is, not for drafting it.
+
+Why this shape rather than a generic "think less": the model already narrates
+between tool rounds when told where the line goes, so the rule names the
+place (`after </think>`) and the unit (one item), the same way the existing
+rule does. It also gives the exact-cycle and budget rungs something to work
+with: a pass that emits an item every few KB of reasoning has short think
+blocks, which is where the guards have latency to spare, and a stop after
+item 20 leaves twenty items on screen instead of none.
+
+What it will not do on its own is stop the restart-after-stop pattern, and it
+adds prompt bytes the model may weigh against "keep reasoning short". The
+check is the one this document always uses: count, in the dumps that follow,
+how many list-shaped answers reach the user before the pass ends, against
+the four sessions this evening and this morning in which none did.
+
+### The draft rung
+
+Shipped alongside the rule rather than held back as its fallback, because the
+rule only reaches a model that reads it and the dumps show what happens when
+one does not. `RepeatGuard::drafting` scans the reasoning line by line: a line
+that reads as a numbered deliverable heading — `**Bug 22:**`, `1. **Scan
+worker panic**`, `### 3.`, `Finding 7:` — counts once, and every byte of a
+line inside a ``` fence counts towards a second tally. Plain numbered
+thoughts (`1. read the file`) do not count: a plan numbers its steps too, and
+the difference between a plan and a written-out list is the bold title on
+each item. Past `draft_min_bytes` of reasoning, `DRAFT_HEADINGS` = 10
+headings or `DRAFT_FENCED_BYTES` = 4 KiB of fenced code trips it.
+
+The byte gate is a share of the pass's think budget — a
+`DRAFT_MIN_BUDGET_SHARE` of it, an eighth, never below the 8 KiB
+`DRAFT_MIN_BYTES_FLOOR` — rather than an absolute, because "long enough to be
+a draft rather than an outline" is relative to how much room the pass has:
+8 KiB is nothing on the 1M-token window and a large fraction of everything a
+small one can hold. Since the budget is already `ctx_size / 10`, measuring
+against it scales the rung with the window without plumbing the window into
+the guard, and it fixes the relationship that matters — the draft rung starts
+looking at an eighth of where the budget would stop the pass anyway, which is
+what makes it the early rung. Every window at or under 640k tokens sits on the
+floor and behaves exactly as the fixed 8 KiB did. The heading count and the
+fence threshold stay absolute: those are evidence about the *shape* of the
+reasoning, and neither claim gets truer because the window is bigger.
+
+The thresholds against the corpus: the review pass had thirty-one headings in
+30 KB, so it would have stopped around the tenth, at roughly 9-10 KB and three
+minutes rather than thirteen; the seven morning dumps carried 39-146 fenced
+lines each, all past 4 KiB well before the 16 KiB budget that actually cut
+them. The two-option design fork with a quoted snippet that opens most honest
+passes stays under both counts, and the byte floor keeps a short outline from
+tripping regardless of how it is numbered.
+
+It sits between the cycle rungs and the budget in `stream_chunk_must_stop`:
+a proven cycle still wins because it has evidence, and the draft rung goes
+ahead of the budget because it can name the shape of the reasoning where the
+budget can only name its size. Its message, `DRAFT_ERROR`, is the instruction
+the symptom calls for — close the thinking, emit the items you already have
+one at a time, make code changes with the edit tool — rather than the cycle
+text's "you were repeating yourself", which would be a lie, or the budget's
+"pick the option you were leaning towards", which addresses a deliberation
+this pass was not having. It counts towards `MAIN_REPEAT_TRIP_CAP` like the
+others, and `stub_last_reasoning` still erases the stopped reasoning, so the
+restart-from-zero pattern is untouched by it; the rule is what is meant to
+change where the next attempt writes.
+
+### What the dump now records
+
+Reading this dump meant reconstructing by hand what plank knew at the time:
+whether the 30 KB pass was ended by Esc or a rung (the transcript shows an
+unclosed `<think>` either way), how many reasoning bytes each pass had, and
+what the guards were set to. Every repro now carries a `## Passes` table —
+one row per generation pass with its end time and the gap since the previous
+one, the agent that ran it, tokens and rate, the reasoning bytes the guard
+saw, a latched cycle as period × copies, the draft rung's heading and
+fenced-code counts, and the stop reason (`tool calls: N`, `answer`,
+`interrupted by user`, `guard: cycle|draft|budget`, `tool error`) — and the
+`## Generation` section states whether `tools.loopGuards` was armed and the
+think budget in effect. The pass notes live on the agent
+(`Agent::passes`, capped at `PASS_NOTES_CAP`), recorded at the four points a
+pass's message is pushed: the plain and TUI turn loops, the serial
+sub-agent loop and the fan-out fold. Future entries in this file should quote
+the table rather than re-derive it.
+
+## The no-progress notice named the wrong evidence
+
+`repro-1789107544` (plucky-goodall, 2026-09-11, a `do a code review` on
+tommaso) ended with the no-progress budget, and the notice said the turn had
+generated 32 KB "without writing a file, editing one, or running a command".
+The pass that tripped it had just run `cargo test` and `cargo clippy`, both
+successfully.
+
+The stop was correct. Across the whole session the model called `read` eleven
+times, `bash` five and `more` twice, and never wrote or edited anything, so
+`last_written` was never set and the budget correctly ran to its cap. The
+third clause of the notice was simply false: a shell command has not reset
+this budget since 2026-09-08, for the reason the section above gives, and the
+comment on `NO_PROGRESS_BYTE_BUDGET` says as much three lines from the string
+that contradicted it. Reworded to name what actually counts, since the stop
+almost always lands right after a tool round and a notice that miscounts the
+evidence reads as a malfunction.
+
+Two things in the same dump are worth keeping, both from the `## Passes`
+table this file asked for:
+
+- **The draft rung's first live catch.** Pass 11 stopped at 27,542 bytes of
+  reasoning with 10 numbered headings and no cycle — the shape the rung was
+  cut for, and invisible to every other rung. Pass 14 then answered with 15
+  headings in 6,717 bytes, under the byte gate, which is the rung correctly
+  staying quiet on an outline.
+- **The alternation, demonstrated.** Pass 11's stop was the first consecutive
+  reasoning stop; pass 12 was a real tool round, which reset that counter to
+  zero. Had those two `cargo` commands also reset the no-progress budget, as
+  they would have before 2026-09-08, nothing would have been left bounding the
+  turn and it would have continued exactly as `repro-loop-1788833715` did.
+  This budget is the only rung that was still holding.
+
+## The recovery had nowhere to write
+
+`repro-loop-1789108509` and `-1789108726` are one session (`sparkly-boltzmann`,
+2026-09-11, `do a code review`, 217 seconds apart) and the first evidence that
+the draft rung made a turn *worse*. From the pass table:
+
+| # | reasoning | headings | stop |
+|---|---|---|---|
+| 1-7 | ≤380 B | 0 | tool calls |
+| 8 | 13,109 | 12 | guard: draft |
+| 9 | 13,113 | 14 | guard: draft |
+
+Two consecutive draft stops, cap reached, turn over, nothing delivered. The
+day before, the same request on the same repository reached an answer on its
+fourteenth pass; the only structural difference is that a tool round happened
+to land between its two stops and reset the counter.
+
+Three things are visible here and only here.
+
+**The byte gate is the binding condition, not the shape.** Both stops landed
+two and six bytes past the 13,107 gate. In a numbered review the tenth heading
+arrives long before 13 KB, so the heading condition is satisfied early and the
+rung fires the instant the byte floor is crossed. For this shape of task the
+rung is a reasoning cap, not a shape detector. (Scaling the gate with the
+window softened this — at the old fixed 8 KiB it would have fired sooner — but
+did not change its character.)
+
+**The model obeyed and still lost.** Pass 9 opens "Let me stop the exhaustive
+analysis and deliver findings. I have enough to write a review." and then lists
+fourteen findings. That is precisely what `DRAFT_ERROR` asks for. It had
+nowhere to write them but the think block it was already inside, because every
+pass begins inside one the chat template opened, so it was cut at the same byte
+count and the second stop ended the turn. The reasoning was *not* stubbed — a
+draft stop keeps it, as the error promises — so the analysis was in the
+transcript the whole time. It simply never reached the user.
+
+**Counting a draft stop as a loop was the design error.** `is_reasoning_stop`
+lumped `DRAFT_ERROR` with the cycle and budget errors, so a draft stop
+consumed one of `MAIN_REPEAT_TRIP_CAP`'s two lives. A draft stop carries no
+evidence of a loop; it is an instruction to deliver. Ending the turn because
+the model followed it twice is the opposite of what it asks.
+
+Fixed the same day, in both directions at once:
+
+- the pass after *any* reasoning stop is generated with `ThinkMode::Off`
+  (`Agent::pass_opts`), so it physically cannot draft — the answer and the tool
+  calls are the only things it can write. Full rationale and the three
+  deviations from the original plan in `disable-thinking-guard.md`;
+- a draft stop counts on its own tally, `MAIN_DRAFT_TRIP_CAP` = 3, which with
+  the recovery in place is unreachable on a local engine and exists for the
+  provider paths that ignore the override.
+
+Had both been in place, pass 9's fourteen findings would have been the answer.
+
+## A cycle that renumbers itself is not byte-exact
+
+`repro-1789068543` (sneezy-hahn, 2026-09-10, saved by hand — the `repro-`
+rather than `repro-loop-` prefix is again the tell that no rung ended it). The
+pass table is the whole diagnosis:
+
+| # | reasoning | cycle | headings | stop |
+|---|---|---|---|---|
+| 1-3 | ≤380 B | - | 0 | tool calls |
+| 4 | 18 228 | - | 10 | guard: draft |
+| 5 | **58 317** | **-** | 0 | interrupted by user |
+
+Pass 5 ran 16m9s and cycled a numbered list of 26 items, over 7 KiB per copy,
+and every rung read `-`. Two independent reasons, and closing either alone
+would not have been enough: the copies are not byte-equal, because each line
+carries its own ordinal and the ordinals keep climbing, so `cycle_period` and
+`extend_latched` have nothing to match; and at 7 KiB a copy the period is
+larger than the 8 KiB byte window anyway, which is the `p > window/2` gap from
+"A cycle can be longer than the whole window" all over again. The draft rung
+did not cover it either — pass 5 registered zero headings, because these are
+plain numbered items, exactly the shape the heading test deliberately excludes
+so that a numbered *plan* does not trip it.
+
+Fixed 2026-09-10 by hashing, not by widening. `NumberedCycle` keeps one SHA-256
+per numbered line with the leading `N. ` or `N) ` stripped, in a 256-entry
+deque that is bounded by *items* rather than bytes, so the detectable period no
+longer has anything to do with the byte window. A repeat of `REPEAT_CYCLES`
+copies is reported to `RepeatGuard::feed` as a cycle, with the normalized bytes
+as the period, so it reaches the same stop, the same footer marker and the same
+`cycle` column as a byte-exact loop.
+
+What keeps it from firing on honest enumeration is the shape requirement, and
+it is the part to preserve if this rung is ever touched: a repeated block must
+contain at least three *distinct* substantial bodies and total 256 bytes, so a
+sentence repeated verbatim, or two lines alternating, is not a cycle; bodies
+under 12 bytes or over 16 KiB are ignored; and any non-list prose or a code
+fence clears the history, so a list that is genuinely being written once, with
+commentary between the items, never accumulates a period. Blank lines are the
+single allowed separator.
+
+The generalization is the same one the 9 KB sub-agent cycle taught, one level
+up: a loop repeats *structure*, and byte equality is only the cheapest proxy
+for it. Every time the model found a new way to vary the surface — an ordinal
+here, drifting wording in the stutter section — the byte rungs went quiet while
+the behaviour was unchanged. A rung that normalizes the varying part and keeps
+its own bounded history costs nothing against the window and is the shape the
+next such finding will want too.
+
+## A draft stop is a pause, not news
+
+The draft rung differs from every other rung in what it costs. A cycle stop, a
+budget stop and a no-progress stop all end something: the reasoning is stubbed,
+or the turn is over. A draft stop keeps the reasoning, counts on its own tally
+(`MAIN_DRAFT_TRIP_CAP`), and since the closed-think recovery the following pass
+simply delivers. Nothing is lost, and the turn continues.
+
+It was nonetheless reported the way the others are — a red `guard:` line on the
+main window — which reads as an error about the model's reasoning *shape*, for
+an event the user has no action to take on and which is followed immediately by
+the answer. Fixed 2026-09-11: `report_guard_for` recognises `DRAFT_PAUSE_TEXT`
+and mirrors it to the debug console rather than printing it, where someone
+watching the raw stream still sees it; the other guard stops are unchanged.
+
+`DRAFT_ERROR` itself was reworded in the same direction: it opens "generation
+paused", says outright that this establishes neither a loop nor a finished
+draft, states that the analysis is retained as unverified working context, and
+asks for one supported finding or the next small edit — plus a warning not to
+promote rejected ideas or unexecuted code into results, and notice that the next
+reply has no reasoning step. The old text ("generation stopped: the reasoning
+was drafting the answer") made a claim the dumps had already shown to be wrong
+half the time: the pass that trips this rung is frequently doing real analysis
+that merely reached the byte gate, as "The recovery had nowhere to write"
+records. `repeat_trip_text` follows the same wording, so the pass table and the
+dump call it a pause too.
+
+The rule this keeps arriving at: a guard's message and its presentation are
+part of its design, not decoration. A stop that removes work should be loud and
+should say what it removed; a stop that only redirects where the next bytes go
+should be quiet and should not accuse.
+
+## The progress witness was blind to the whole source tree
+
+`repro-1789367979` — session `turbo-euler`, working in a scratch project at
+`~/Code/parola-4.1` — is the first dump taken because the *no-progress* budget
+kept ending turns that were plainly getting somewhere. The model wrote four
+source files in that stretch and the guard counted none of them.
+
+The reason is one line of `StatusOptions`. `treedigest::capture` hashes, for
+each dirty entry, the path, the status bits and a `symlink_metadata` of the
+file. With `recurse_untracked_dirs(false)` git collapses an untracked directory
+to a single entry, so for `?? src/` the stat that enters the hash is the
+directory's, not any file's — and a directory's size and mtime do not move when
+a file inside it is rewritten in place. Measured on the live repository, before
+and after both a redirect and a `sed -i ''`:
+
+```
+before                          ??|src/|96:1789368342
+after rewriting src/words.rs    ??|src/|96:1789368342
+after sed -i '' on src/words.rs ??|src/|96:1789368342
+```
+
+The digest is constant. `touched_tree` is never set, and since `write` and
+`edit` were failing on this session's `&`-bearing parameters and the model had
+fallen back to `sed` and a codegen script, `last_written` was never set either.
+Both halves of `made_progress` were blind at once, `ungrounded` climbed through
+round after round of real work, and the turn died at 32 KiB.
+
+What makes this worse than a rare miss is where it bites. A repository with
+nothing committed yet has *every* directory collapsed to one entry, so the blind
+spot is the entire project — and "nothing committed yet" is precisely the state
+a "build me an app" session starts in and stays in for its first hour. The
+guard was at its most wrong exactly where a turn legitimately generates a lot of
+text before its first visible change.
+
+Fixed 2026-09-14: `recurse_untracked_dirs(true)`. `include_ignored` stays off,
+so the walk still skips `target/`, and on this repository `git status -uall` and
+`-unormal` time the same to two decimal places. The regression test builds a
+repository with no commits and nothing tracked, rewrites a file inside `src/`,
+and asserts the digest moves.
+
+The module's own doc had named the old setting as a deliberate limit costing "at
+most a missed budget reset", with the reasoning that creating `src/new/mod.rs`
+shows up as a new `src/new/` entry and that is difference enough. That reasoning
+is sound for *adding* a file and silently wrong for *changing* one, which is
+most of what an agent does. A limit that has been argued for in prose is not a
+limit that has been measured.
+
+## A list enumeration collapses to one item
+
+`repro-loop-1789554852` — session `groovy-oppenheimer`, asked to analyze three
+tokensave issues and propose fixes — is a different loop shape from the
+paragraph cycles above. In pass 30 the model began listing the tables inside a
+tree-sitter `parser.c` (`ts_lex_table`, `ts_lex_actions`, …) and, at
+temperature 0, greedy decoding collapsed the list into the same 20-byte bullet
+eleven times over. The byte rung saw four copies at once inside its 8 KiB
+window and stopped the pass after 2568 bytes of reasoning. Detection is fine
+here; nothing to tune.
+
+Two things about the dump were not fine.
+
+First, the guarded row read `cycle: -` next to `stop: guard: cycle`.
+`RepeatGuard::snapshot` reports only the latched block, and until 2026-09-16 a
+latch was created only on the warn-then-extend path. A period short enough to
+show `REPEAT_CYCLES` copies in one check returned true from `cycle_period`
+without ever latching, so exactly the loops that are cheapest to catch were the
+ones the table could not describe. The direct hit now latches the block it
+matched, with `REPEAT_CYCLES` as the copy count (a floor: the guard does not
+count further copies once it has stopped), and the regression test feeds the
+dump's bullet and asserts the snapshot carries its period.
+
+Second, the loop was the least expensive part of the turn. Thirty passes and
+18m47s went by with nothing written to the user: passes 6–9 on one issue,
+10–24 on the second, 25–30 on the third, and passes 22 through 30 each
+re-derived the same four facts about the binary size — no `[profile.release]`,
+a stale README claim, a 178 MB local build, a 136 MB `__const` section — at 4
+to 8 KB of reasoning per pass under `--think-low`. That is the semantic circle
+of "An hour-long turn was one thinking loop" again, and the byte rungs are not
+the instrument for it. The prompt rule for intermediate findings (above, under
+"The review that was written in the wrong place") would have produced a partial
+deliverable by pass 10; that this session did not shows it needs to trigger per
+sub-task, not only per turn.
+
+Throughput also fell from about 37 to about 21 tokens per second between passes
+8 and 9, when three large `tokensave_context` results landed. The transcript
+was at 87k tokens by the end. That is the context penalty measured in
+`FINDINGS.md`, not a loop symptom, but it doubles the wall-clock cost of every
+re-derivation that follows.

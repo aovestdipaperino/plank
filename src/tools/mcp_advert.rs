@@ -70,7 +70,7 @@ impl PartialEq for AdvertRecord {
 #[must_use]
 pub fn default_root() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".plank").join("mcp-advert"))
+    Some(crate::home::plank_home_in(home).join("mcp-advert"))
 }
 
 /// File name for one server's record: the name with every character outside

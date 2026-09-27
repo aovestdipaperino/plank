@@ -57,9 +57,17 @@ impl StatusBar {
         // the right edge, which is the power suffix — the bar's own anchor.
         let mut line = status::build_status_text_within(st, self.color, true, cols);
         // Keep the status within one screen row so it never wraps, for the case
-        // where the built-in segments alone exceed the width.
-        if line.chars().count() > cols {
-            line = line.chars().take(cols).collect();
+        // where the built-in segments alone exceed the width. Measured the
+        // same way `build_status_text_within` fits its own candidates:
+        // display columns via `unicode_width`, with ANSI escapes stripped
+        // before measuring and always copied through whole when truncating.
+        // A plain `chars().count()`/`take()` here would both undercount wide
+        // emoji (so it would fail to catch an overflow) and, once `color` is
+        // on, overcount by treating every byte of an escape sequence as a
+        // visible column — which could truncate mid-escape and leave a
+        // dangling, unterminated sequence bleeding into whatever prints next.
+        if status::visible_width(&line) > cols {
+            line = status::truncate_visible(&line, cols);
         }
         let mut out = std::io::stdout();
         // Carriage-return to column 0, paint, clear to end of line. No newline.
@@ -106,5 +114,41 @@ mod tests {
         bar.show(&Status::default());
         assert!(!bar.line_open);
         bar.clear();
+    }
+
+    /// Regression test for the truncation bug in `show`: a coloured line
+    /// carrying a wide emoji, sitting right at the boundary of the terminal
+    /// width, must be cut by display column (never mid-escape-sequence and
+    /// never off by the emoji's extra column). This exercises the exact
+    /// `visible_width`/`truncate_visible` pair `show` calls, since `show`
+    /// itself writes straight to stdout and can't be captured here.
+    #[test]
+    fn boundary_width_truncation_handles_ansi_and_wide_emoji() {
+        // 8 ASCII cols of red text, a 2-col emoji, then more red text and a
+        // reset — 8 + 2 + 8 = 18 true columns, but naive `chars().count()`
+        // would see every escape byte as a column and wildly overcount, or
+        // (without colour) undercount the emoji and miss the overflow.
+        let line = format!("\x1b[31m{}🧠{}\x1b[0m", "x".repeat(8), "y".repeat(8));
+        assert_eq!(status::visible_width(&line), 18);
+
+        // Exactly at the boundary: fits untouched.
+        assert_eq!(status::truncate_visible(&line, 18), line);
+        assert_eq!(
+            status::visible_width(&status::truncate_visible(&line, 18)),
+            18
+        );
+
+        // One column short: must drop exactly the trailing "y", keeping the
+        // colour escapes intact (never truncated mid-sequence) and the emoji
+        // whole.
+        let cut = status::truncate_visible(&line, 17);
+        assert_eq!(status::visible_width(&cut), 17);
+        assert_eq!(cut, format!("\x1b[31m{}🧠{}", "x".repeat(8), "y".repeat(7)));
+
+        // Cutting right after the emoji: the emoji itself must not be sliced
+        // (it is atomic — either the whole 2-column glyph or none of it).
+        let cut10 = status::truncate_visible(&line, 10);
+        assert_eq!(status::visible_width(&cut10), 10);
+        assert_eq!(cut10, format!("\x1b[31m{}🧠", "x".repeat(8)));
     }
 }

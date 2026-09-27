@@ -15,7 +15,9 @@ plank picks its front end from your terminal, not from a flag:
 |---|---|
 | stdin and stdout are both a TTY | the full-screen **Ratatui TUI** |
 | either end is piped | the plain **line REPL** |
-| `--non-interactive` | **headless** stdin protocol |
+| `--ui console` | **headless** stdin protocol |
+| `--ui chart` | **headless** one-shot that prints only the `/toks` chart |
+| `--ui quiet` | **headless** one-shot that prints only `Prompting. Started working... done.` |
 | `-p "…"` / `--prompt "…"` | run one prompt, print the reply, exit |
 
 The TUI and the REPL support the same slash commands and the same tools. The TUI adds markdown rendering, syntax highlighting, mouse scrollback, the status bar, panels for `/btw` and questions, and the arcade.
@@ -74,7 +76,7 @@ plank --provider anthropic --model claude-sonnet-4-5 -p "review src/parser.rs"
 
 ## Headless mode
 
-`--non-interactive` disables the interactive UI and reads a line protocol from stdin — the mode to drive plank from a script or another program. For driving the *TUI* from a test harness, see `--ui-remote` in [Remote and hosted engines](10-remote-and-providers.md).
+`--ui` picks the front end. `--ui tui` is the default (the full interactive UI, or the plain REPL when either end is piped). `--ui console` disables the interactive UI: with `-p` it runs the one prompt and exits, and without one it reads a line protocol from stdin — the mode to drive plank from a script or another program. `--ui chart` runs a single `-p` prompt with its output swallowed and prints nothing but the `/toks` throughput chart for the run, painted live — it fills in place as the model generates, and shows `prefilling...` until the first sample lands, which is what you want when you are measuring the engine rather than reading the reply; `--ui quiet` is the smallest front end there is: it prints `Prompting. ` as the turn starts, `Started working... ` when the model begins generating, and `done.` when the turn ends, all on one line and nothing else — for a script, or for watching a long run from the corner of your eye. Both `chart` and `quiet` need a `-p` prompt and refuse to start without one. For driving the *TUI* from a test harness, see `--ui-remote` in [Remote and hosted engines](10-remote-and-providers.md).
 
 ## Leaving and coming back
 

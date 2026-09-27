@@ -9,6 +9,7 @@
 //! head-biased so headers and early errors are visible; later observations
 //! are tail-biased.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::os::unix::process::CommandExt as _;
@@ -18,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::dsml::ToolCall;
+use crate::sandbox::Protected;
 
 use super::{ToolContext, parse_int_default, parse_timeout};
 
@@ -396,7 +398,8 @@ impl BashJob {
                 "[sandbox blocked: this command ran under plank's write sandbox \
                  (writes allowed only under the working directory and temp dirs). \
                  If the failure is a legitimate write elsewhere, ask the user to add \
-                 the path to writablePaths in .plank/sandbox.json.]"
+                 the path to writablePaths in ~/.plank/sandbox.json — the project's \
+                 own .plank/sandbox.json cannot widen the sandbox.]"
             );
         }
         if self.running {
@@ -533,6 +536,70 @@ impl BashJobs {
         }
     }
 
+    /// Number of jobs still running: the footer's job count.
+    #[must_use]
+    pub fn running_count(&self) -> usize {
+        self.jobs.iter().filter(|j| j.running).count()
+    }
+
+    /// A snapshot of every tracked job, for `/jobs` and the UI thread's
+    /// panel (which cannot reach the table while the worker owns it).
+    #[must_use]
+    pub fn rows(&self) -> Vec<JobRow> {
+        self.jobs
+            .iter()
+            .map(|job| JobRow {
+                id: job.id,
+                pid: job.pid,
+                started: job.start,
+                state: if job.running {
+                    JobState::Running
+                } else if job.timed_out {
+                    JobState::TimedOut(job.exit_status)
+                } else {
+                    JobState::Done(job.exit_status)
+                },
+                path: job.path.clone(),
+            })
+            .collect()
+    }
+
+    /// One line per tracked job for `/jobs`; a fixed sentence when empty.
+    #[must_use]
+    pub fn render_table(&self) -> String {
+        render_rows(&self.rows())
+    }
+
+    /// Whether any job in the table has finished (after a `sweep`).
+    #[must_use]
+    pub fn has_finished(&self) -> bool {
+        self.jobs.iter().any(|j| !j.running)
+    }
+
+    /// Polls every job and removes those that finished without the model
+    /// seeing the exit, returning each one's final observation.
+    ///
+    /// The table is the sole source of truth for "unannounced": a job the
+    /// model observed as `status=done` through `bash`, `bash_status` or
+    /// `bash_stop` is removed at that observation (`job_tool_result`), so
+    /// anything still present and not running finished on its own. Each job
+    /// therefore produces at most one notification, and none if the model
+    /// polled it to completion itself (see `docs/BACKGROUND-TASKS.md`).
+    pub fn take_finished(&mut self) -> Vec<String> {
+        self.sweep();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.jobs.len() {
+            if self.jobs[i].running {
+                i += 1;
+                continue;
+            }
+            let mut job = self.jobs.remove(i);
+            out.push(job.observation(true));
+        }
+        out
+    }
+
     fn find(&self, id: i64, pid: u32) -> Option<usize> {
         self.jobs
             .iter()
@@ -567,10 +634,110 @@ impl BashJobs {
     }
 }
 
-/// How far a user's answer to the `~/.plank` write prompt reaches.
+/// Lifecycle of a tracked job as the `/jobs` panel reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlankHomeGrant {
-    /// "Allow": this command only; the session flag stays clear.
+pub enum JobState {
+    /// Still running.
+    Running,
+    /// Exited on its own with this status.
+    Done(i64),
+    /// Killed by its own timeout; the status is what the kill produced.
+    TimedOut(i64),
+}
+
+/// One job as the `/jobs` panel sees it: a copy, so the UI thread can render
+/// it while the worker thread owns the live table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRow {
+    /// The `job=` id the model uses.
+    pub id: i64,
+    /// The shell's pid.
+    pub pid: u32,
+    /// When the job started; elapsed time is computed at render time so an
+    /// open panel keeps counting.
+    pub started: Instant,
+    /// Running, done or timed out.
+    pub state: JobState,
+    /// The output file the model was shown as `output_path`.
+    pub path: PathBuf,
+}
+
+/// What `render_rows` says for an empty table.
+pub const NO_JOBS_TEXT: &str = "no background jobs";
+
+/// Renders job rows as the `/jobs` text: one line per job, a fixed sentence
+/// when there are none. Pure, so both the live table and a shared snapshot
+/// render identically.
+#[must_use]
+pub fn render_rows(rows: &[JobRow]) -> String {
+    if rows.is_empty() {
+        return NO_JOBS_TEXT.to_string();
+    }
+    let mut out = String::new();
+    for job in rows {
+        let state = match job.state {
+            JobState::Running => "running".to_string(),
+            JobState::TimedOut(code) => format!("timed out, exit {code}"),
+            JobState::Done(code) => format!("done, exit {code}"),
+        };
+        let _ = writeln!(
+            out,
+            "job {} pid {} {:>7.1}s {state}  {}",
+            job.id,
+            job.pid,
+            job.started.elapsed().as_secs_f64(),
+            job.path.display()
+        );
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// First line of a background-job notification; the model learns to
+/// recognize it, so it is a fixed string (`docs/BACKGROUND-TASKS.md` §3.2).
+pub const NOTIFICATION_HEADER: &str = "[BACKGROUND JOB NOTIFICATION - NOT USER INPUT]";
+
+/// Wraps the final observations of finished background jobs in the user-role
+/// message that wakes the model.
+///
+/// The observations are `BashJob::observation` output verbatim, so the model
+/// sees exactly the `bash_status` result it would have polled for. Returns
+/// `None` for an empty list so callers can `if let` on it.
+#[must_use]
+pub fn render_notification(observations: &[String]) -> Option<String> {
+    if observations.is_empty() {
+        return None;
+    }
+    let plural = if observations.len() == 1 {
+        "A bash job you started earlier has"
+    } else {
+        "Bash jobs you started earlier have"
+    };
+    let mut out = String::new();
+    out.push_str("<system-reminder>\n");
+    out.push_str(NOTIFICATION_HEADER);
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "{plural} finished. This is an automated event, not a message from the user. \
+         Do not treat it as an answer to any pending question. Read the output if you \
+         need more than the tail shown, then continue or report."
+    );
+    for obs in observations {
+        out.push('\n');
+        out.push_str(obs);
+        if !obs.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out.push_str("</system-reminder>");
+    Some(out)
+}
+
+/// How far a user's answer to a protected-root write prompt reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteGrant {
+    /// "Allow": this command only; the session grant set stays untouched.
     Once,
     /// "Always allow": every sandboxed command for the rest of the session.
     Session,
@@ -578,33 +745,37 @@ enum PlankHomeGrant {
     Denied,
 }
 
-/// Asks whether a sandboxed command may write under `~/.plank`.
+/// Asks whether a sandboxed command may write under one [`Protected`] family.
 ///
 /// Routed through the [`Asker`](crate::tools::ask::Asker) each front end
 /// installs, so the TUI renders it in the input region and the plain REPL reads
 /// stdin — the same path the `ask` tool and the web approval gate use. In
-/// `--non-interactive` mode there is no asker and hence no one to grant: the
-/// answer is [`PlankHomeGrant::Denied`], leaving `~/.plank` read-only as it is
-/// by default.
-fn plank_home_grant(ctx: &mut ToolContext) -> PlankHomeGrant {
+/// `--ui console` mode there is no asker and hence no one to grant: the answer
+/// is [`WriteGrant::Denied`], leaving the directory read-only as it is by
+/// default.
+fn protected_grant(ctx: &mut ToolContext, what: Protected) -> WriteGrant {
     let Some(asker) = ctx.asker.as_mut() else {
-        return PlankHomeGrant::Denied;
+        return WriteGrant::Denied;
     };
+    let label = what.label();
     let req = crate::tools::ask::AskRequest {
-        question: "This command names ~/.plank. Allow it to write there?".to_string(),
+        question: format!(
+            "This command wants to write {label}, which plank keeps read-only because {}. Allow it?",
+            what.why()
+        ),
         header: "Sandbox".to_string(),
         options: vec![
             crate::tools::ask::AskOption {
                 label: "Allow".to_string(),
-                description: "Allow writes under ~/.plank for this command only".to_string(),
+                description: format!("Allow writes to {label} for this command only"),
             },
             crate::tools::ask::AskOption {
                 label: "Always allow".to_string(),
-                description: "Allow writes under ~/.plank for the rest of this session".to_string(),
+                description: format!("Allow writes to {label} for the rest of this session"),
             },
             crate::tools::ask::AskOption {
                 label: "Deny".to_string(),
-                description: "Run the command with ~/.plank read-only".to_string(),
+                description: format!("Run the command with {label} read-only"),
             },
         ],
         multi: false,
@@ -614,12 +785,12 @@ fn plank_home_grant(ctx: &mut ToolContext) -> PlankHomeGrant {
         crate::tools::ask::AskOutcome::Answered(labels)
             if labels.iter().any(|l| l == "Always allow") =>
         {
-            PlankHomeGrant::Session
+            WriteGrant::Session
         }
         crate::tools::ask::AskOutcome::Answered(labels) if labels.iter().any(|l| l == "Allow") => {
-            PlankHomeGrant::Once
+            WriteGrant::Once
         }
-        _ => PlankHomeGrant::Denied,
+        _ => WriteGrant::Denied,
     }
 }
 
@@ -637,28 +808,33 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
         3600,
     ))
     .unwrap_or(60);
-    // `~/.plank` is read-only under the sandbox unless the user says otherwise.
-    // Ask only when the command actually names it and is not provably
-    // read-only, so ordinary commands and `cat ~/.plank/...` never see a
-    // prompt, and only while the session grant is still unset.
-    let mut grant_once = false;
-    if ctx.sandbox.should_sandbox(cmd)
-        && !ctx.sandbox.plank_home_writable
-        && crate::sandbox::mentions_plank_home(cmd)
-        && !crate::sandbox::is_read_only_command(cmd)
-    {
-        match plank_home_grant(ctx) {
-            PlankHomeGrant::Session => ctx.sandbox.plank_home_writable = true,
-            PlankHomeGrant::Once => grant_once = true,
-            PlankHomeGrant::Denied => {
-                ctx.publish_status("~/.plank stays read-only for this command");
+    // The protected roots are read-only under the sandbox unless the user says
+    // otherwise. Ask only about the families the command actually names, and
+    // only when it is not provably read-only, so ordinary commands and
+    // `cat ~/.plank/...` never see a prompt.
+    let mut once: BTreeSet<Protected> = BTreeSet::new();
+    if ctx.sandbox.should_sandbox(cmd) && !crate::sandbox::is_read_only_command(cmd) {
+        for what in crate::sandbox::protected_mentions(cmd, &ctx.sandbox.granted) {
+            match protected_grant(ctx, what) {
+                WriteGrant::Session => {
+                    ctx.sandbox.granted.insert(what);
+                }
+                WriteGrant::Once => {
+                    once.insert(what);
+                }
+                WriteGrant::Denied => {
+                    ctx.publish_status(&format!(
+                        "{} stays read-only for this command",
+                        what.label()
+                    ));
+                }
             }
         }
     }
     // A one-command grant rides on a throwaway copy of the policy, leaving the
-    // session's own `plank_home_writable` clear.
-    let once_policy = grant_once.then(|| crate::sandbox::Sandbox {
-        plank_home_writable: true,
+    // session's own grant set clear.
+    let once_policy = (!once.is_empty()).then(|| crate::sandbox::Sandbox {
+        granted: ctx.sandbox.granted.union(&once).copied().collect(),
         ..ctx.sandbox.clone()
     });
     let sandbox = ctx
@@ -687,14 +863,16 @@ pub fn tool_bash_status_or_stop(ctx: &mut ToolContext, call: &ToolCall, stop: bo
     let Some(idx) = ctx.bash.find(job_id, pid) else {
         return format!("Tool error: bash job not found: job={job_id} pid={pid}\n");
     };
-    let refresh = u64::try_from(parse_int_default(
-        call.arg_value("refresh_sec"),
-        60,
-        1,
-        3600,
-    ))
-    .unwrap_or(60);
-    ctx.bash.job_tool_result(idx, stop, refresh, stop, true)
+    // Mirrors the C: `bash_status` returns immediately unless a positive
+    // refresh_sec asks it to wait; `bash_stop` always waits at least 1 s so
+    // the observation reflects the termination.
+    let mut refresh =
+        u64::try_from(parse_int_default(call.arg_value("refresh_sec"), 0, 0, 3600)).unwrap_or(0);
+    let wait = stop || refresh > 0;
+    if stop && refresh == 0 {
+        refresh = 1;
+    }
+    ctx.bash.job_tool_result(idx, wait, refresh, stop, true)
 }
 
 /// Outcome of an immediate (`!`-prefixed) shell command.
@@ -915,6 +1093,116 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// A job that exits after the model last saw it running is returned once
+    /// by `take_finished`, with its final observation, and then forgotten.
+    #[test]
+    fn take_finished_announces_a_background_exit_once() {
+        let (mut ctx, dir) = test_ctx();
+        // `refresh_sec` is clamped to >= 1 s, so start the job directly to
+        // leave it running when the table is first inspected.
+        let id = ctx
+            .bash
+            .start(&ctx.cwd.clone(), "sleep 0.3; echo late", 30, None)
+            .unwrap();
+        assert!(ctx.bash.take_finished().is_empty(), "still running");
+        assert_eq!(ctx.bash.running_count(), 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = Vec::new();
+        while got.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            got = ctx.bash.take_finished();
+        }
+        assert_eq!(got.len(), 1, "exactly one announcement");
+        let obs = &got[0];
+        assert!(
+            obs.starts_with(&format!("bash job={id} pid=")),
+            "got: {obs}"
+        );
+        assert!(obs.contains(" status=done "));
+        assert!(obs.contains("exit_status=0\n"));
+        assert!(obs.contains("late\n"));
+        assert!(ctx.bash.take_finished().is_empty(), "never announced twice");
+        assert!(ctx.bash.jobs.is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A job the model polled to completion itself is removed by that poll,
+    /// so it is never announced.
+    #[test]
+    fn take_finished_skips_jobs_the_model_observed_done() {
+        let (mut ctx, dir) = test_ctx();
+        let out = tool_bash(&mut ctx, &test_call("bash", &[("command", "echo now")]));
+        assert!(out.contains(" status=done "));
+        assert!(ctx.bash.take_finished().is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A job killed by its own timeout is announced with `timed_out=1`.
+    #[test]
+    fn take_finished_announces_timeouts() {
+        let (mut ctx, dir) = test_ctx();
+        let id = ctx
+            .bash
+            .start(&ctx.cwd.clone(), "sleep 30", 1, None)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        let got = ctx.bash.take_finished();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].starts_with(&format!("bash job={id} pid=")));
+        assert!(got[0].contains("timed_out=1\n"), "got: {}", got[0]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn render_rows_lists_each_job_state() {
+        assert_eq!(render_rows(&[]), "no background jobs");
+        let now = Instant::now();
+        let rows = vec![
+            JobRow {
+                id: 1,
+                pid: 10,
+                started: now,
+                state: JobState::Running,
+                path: PathBuf::from("/tmp/a"),
+            },
+            JobRow {
+                id: 2,
+                pid: 11,
+                started: now,
+                state: JobState::Done(0),
+                path: PathBuf::from("/tmp/b"),
+            },
+            JobRow {
+                id: 3,
+                pid: 12,
+                started: now,
+                state: JobState::TimedOut(143),
+                path: PathBuf::from("/tmp/c"),
+            },
+        ];
+        let text = render_rows(&rows);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("job 1 pid 10 ") && lines[0].contains("running  /tmp/a"));
+        assert!(lines[1].contains("done, exit 0  /tmp/b"));
+        assert!(lines[2].contains("timed out, exit 143  /tmp/c"));
+    }
+
+    #[test]
+    fn render_notification_wraps_observations() {
+        assert!(render_notification(&[]).is_none());
+        let one = render_notification(&["bash job=3 pid=1 status=done\n".to_string()]).unwrap();
+        assert!(
+            one.starts_with("<system-reminder>\n[BACKGROUND JOB NOTIFICATION - NOT USER INPUT]\n")
+        );
+        assert!(one.contains("A bash job you started earlier has finished."));
+        assert!(one.contains("\nbash job=3 pid=1 status=done\n"));
+        assert!(one.ends_with("</system-reminder>"));
+        let two = render_notification(&["a".to_string(), "b".to_string()]).unwrap();
+        assert!(two.contains("Bash jobs you started earlier have finished."));
+        assert!(two.contains("\na\n\nb\n"));
+    }
+
     #[test]
     fn bash_nonzero_exit_and_stderr_capture() {
         let (mut ctx, dir) = test_ctx();
@@ -967,6 +1255,35 @@ mod tests {
             "missing violation hint: {blocked}"
         );
         assert!(!outside.join("escape.txt").exists());
+
+        // A toolchain cache under the same $HOME is writable without any
+        // grant: this is the `cargo build fetches a crate` path, and the one
+        // the escape check above must not have closed off.
+        let cache = std::path::Path::new(&home).join(".cache/plank-sandbox-test");
+        std::fs::create_dir_all(&cache).unwrap();
+        let cmd_cache = format!("echo cached > '{}/probe.txt'", cache.display());
+        let cached = tool_bash(&mut ctx, &test_call("bash", &[("command", &cmd_cache)]));
+        assert!(
+            cached.contains("exit_status=0\n"),
+            "toolchain cache write should be allowed: {cached}"
+        );
+        std::fs::remove_dir_all(&cache).ok();
+
+        // ...while a PATH directory under the same $HOME stays denied, since
+        // no asker is installed in this test to grant it.
+        let bin = std::path::Path::new(&home).join(".cargo/bin");
+        if bin.is_dir() {
+            let cmd_bin = format!(
+                "echo nope > '{}/plank-sandbox-test-{}'",
+                bin.display(),
+                std::process::id()
+            );
+            let denied = tool_bash(&mut ctx, &test_call("bash", &[("command", &cmd_bin)]));
+            assert!(
+                !denied.contains("exit_status=0\n"),
+                "PATH bin write should be denied without a grant: {denied}"
+            );
+        }
 
         // Excluded commands bypass the sandbox entirely.
         ctx.sandbox.excluded_commands.push("echo *".to_string());
@@ -1021,6 +1338,48 @@ mod tests {
         let out =
             tool_bash_status_or_stop(&mut ctx, &test_call("bash_status", &[("job", "1")]), false);
         assert_eq!(out, "Tool error: bash job not found: job=1 pid=0\n");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn bash_status_waits_for_refresh_sec() {
+        let (mut ctx, dir) = test_ctx();
+        let out = tool_bash(
+            &mut ctx,
+            &test_call(
+                "bash",
+                &[("command", "sleep 2; echo finished"), ("refresh_sec", "1")],
+            ),
+        );
+        assert!(out.contains("status=running"), "got: {out}");
+
+        // A positive refresh_sec waits, so the job finishes within the poll.
+        let started = std::time::Instant::now();
+        let out = tool_bash_status_or_stop(
+            &mut ctx,
+            &test_call("bash_status", &[("job", "1"), ("refresh_sec", "5")]),
+            false,
+        );
+        assert!(out.contains("status=done"), "got: {out}");
+        assert!(out.contains("finished"), "got: {out}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn bash_status_without_refresh_returns_immediately() {
+        let (mut ctx, dir) = test_ctx();
+        tool_bash(
+            &mut ctx,
+            &test_call("bash", &[("command", "sleep 30"), ("refresh_sec", "1")]),
+        );
+        let started = std::time::Instant::now();
+        let out =
+            tool_bash_status_or_stop(&mut ctx, &test_call("bash_status", &[("job", "1")]), false);
+        assert!(out.contains("status=running"), "got: {out}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        tool_bash_status_or_stop(&mut ctx, &test_call("bash_stop", &[("job", "1")]), true);
+        assert!(ctx.bash.jobs.is_empty());
         std::fs::remove_dir_all(dir).ok();
     }
 

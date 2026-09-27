@@ -210,6 +210,36 @@ impl TokenTranscript {
         last.ntokens += tokens.len();
     }
 
+    /// The `</think>` the UI appended to the recorded assistant reply held at
+    /// span `keep`, when the incoming section at that index is exactly that
+    /// reply (compared trailing-trimmed, as
+    /// [`TokenTranscript::common_prefix`] compares) followed by the close and
+    /// nothing else. `None` for any other difference, which is a genuine
+    /// rewrite.
+    ///
+    /// Ask *before* truncating. `truncate_spans(keep)` leaves exactly `keep`
+    /// spans, so the span this reads is the first one it drops — reconcile in
+    /// the other order and the answer is always `None`, silently, while the
+    /// splice path looks fully wired up.
+    #[must_use]
+    pub fn think_close<'k>(&self, keys: &'k [SectionKey], keep: usize) -> Option<&'k str> {
+        const CLOSE: &str = "</think>";
+        let (held, sec) = self.spans.get(keep).zip(keys.get(keep))?;
+        if held.role != SpanRole::Assistant {
+            return None;
+        }
+        let rest = sec.text.strip_prefix(held.text.trim_end())?;
+        (rest == CLOSE).then_some(rest)
+    }
+
+    /// Tokens held by the first `n` spans — what stays resident when the
+    /// buffer is truncated to `n`, and so the offset any span-indexed sidecar
+    /// (vision spans) is freed from.
+    #[must_use]
+    pub fn tokens_upto_span(&self, n: usize) -> usize {
+        self.spans.iter().take(n).map(|s| s.ntokens).sum()
+    }
+
     /// Drops all spans (and their tokens) from index `keep` onward, so the
     /// buffer holds exactly the reconciled common prefix. The caller then
     /// re-appends the divergent sections via [`TokenTranscript::push_span`].
@@ -342,6 +372,87 @@ mod tests {
             role,
             text: text.to_string(),
         }
+    }
+
+    /// Regression for the 56k-token rebuild in `turbo-vision-debug-2.log`: the
+    /// incoming assistant section was the held reply plus exactly `</think>`
+    /// (18008 bytes against 18000). Only that shape is a splice — every other
+    /// difference is a rewrite, and a non-assistant span is never one.
+    #[test]
+    fn only_an_appended_think_close_counts_as_a_splice() {
+        let close = |held: &str, incoming: &str| {
+            let mut t = TokenTranscript::new();
+            t.push_span(SpanRole::User, 0, "q".into(), &[1]);
+            t.push_span(SpanRole::Assistant, 1, held.into(), &[2, 3]);
+            let keys = [key(SpanRole::User, "q"), key(SpanRole::Assistant, incoming)];
+            t.think_close(&keys, 1).map(str::to_owned)
+        };
+        assert_eq!(
+            close("We have enough.", "We have enough.</think>").as_deref(),
+            Some("</think>")
+        );
+        // Held text is stored raw and compared trimmed, like `common_prefix`.
+        assert_eq!(
+            close("reply\n\n", "reply</think>").as_deref(),
+            Some("</think>")
+        );
+        assert_eq!(close("reply", "reply"), None);
+        assert_eq!(close("reply", "reply</think>\n\n"), None);
+        assert_eq!(close("reply", "other</think>"), None);
+        assert_eq!(close("reply", "reply more</think>"), None);
+        // Past the end of either side there is nothing to compare.
+        let mut t = TokenTranscript::new();
+        t.push_span(SpanRole::Assistant, 1, "reply".into(), &[2]);
+        assert_eq!(
+            t.think_close(&[key(SpanRole::Assistant, "reply</think>")], 9),
+            None
+        );
+        assert_eq!(t.think_close(&[], 0), None);
+        // A user span carrying the same shape is a rewrite, not a splice.
+        let mut u = TokenTranscript::new();
+        u.push_span(SpanRole::User, 0, "reply".into(), &[2]);
+        assert_eq!(
+            u.think_close(&[key(SpanRole::User, "reply</think>")], 0),
+            None
+        );
+    }
+
+    /// The order the reconcile must run in, and the one it must not.
+    ///
+    /// `truncate_spans(keep)` drops the span the splice reads, so asking after
+    /// the truncate answers `None` for every input — which is exactly how the
+    /// splice path once went dead while still looking wired up, and every
+    /// guard-stopped pass re-prefilled its whole prefix to append eight bytes.
+    #[test]
+    fn the_think_close_must_be_read_before_the_truncate_not_after() {
+        let build = || {
+            let mut t = TokenTranscript::new();
+            t.push_span(SpanRole::User, 0, "q".into(), &[1, 2]);
+            t.push_span(SpanRole::Assistant, 1, "thinking".into(), &[10, 11, 99]);
+            t
+        };
+        let keys = [
+            key(SpanRole::User, "q"),
+            key(SpanRole::Assistant, "thinking</think>"),
+        ];
+        let keep = 1; // The user span matched; the assistant span is the divergence.
+
+        // Wrong order: nothing is left at index `keep` to recognise.
+        let mut wrong = build();
+        wrong.truncate_spans(keep);
+        assert_eq!(wrong.think_close(&keys, keep), None);
+
+        // Right order: the close is found, the span is held rather than
+        // dropped, and the sampled ids survive with the close ahead of the EOS.
+        let mut t = build();
+        let close = t.think_close(&keys, keep).map(str::to_owned);
+        assert_eq!(close.as_deref(), Some("</think>"));
+        let hold = keep + usize::from(close.is_some());
+        assert_eq!(t.tokens_upto_span(hold), 5);
+        t.truncate_spans(hold);
+        t.splice_last_span(close.as_deref().unwrap(), &[42], 1);
+        assert_eq!(t.tokens(), &[1, 2, 10, 11, 42, 99]);
+        assert_eq!(t.spans().last().unwrap().text, "thinking</think>");
     }
 
     /// A think close spliced ahead of the recorded EOS leaves the ids the live

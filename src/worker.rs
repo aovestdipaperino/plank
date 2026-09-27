@@ -37,6 +37,11 @@ pub enum UiEvent {
     Error(String),
     /// A dim log line (tool observations, notices, hook warnings).
     Dim(String),
+    /// The transient live `… N lines` line of a collapsed `write` preview.
+    /// `Some` sets/replaces it in place; `None` removes it (the permanent
+    /// summary then arrives as ordinary [`Self::Think`] text). See
+    /// [`crate::viz::RenderSink::preview_status`].
+    PreviewStatus(Option<String>),
     /// An agent system status line (`agent_publish_system_status`): carries the
     /// bare message, styled by the UI with [`crate::status::system_line`].
     SystemStatus(String),
@@ -198,6 +203,9 @@ impl RenderSink for ChannelSink {
     }
     fn error_text(&mut self, text: &str) {
         let _ = self.0.send(UiEvent::Error(text.to_owned()));
+    }
+    fn preview_status(&mut self, text: Option<&str>) {
+        let _ = self.0.send(UiEvent::PreviewStatus(text.map(str::to_owned)));
     }
 }
 
@@ -390,6 +398,27 @@ pub struct TurnShared {
     /// Set by the UI (Esc / Ctrl-C / SIGINT) to stop the worker at the next
     /// sampling or prefill checkpoint.
     pub interrupt: AtomicBool,
+    /// Set by the front end while the worker is running a *quiet background
+    /// pass* rather than a turn — the memory pass, or a prompt suggestion.
+    /// (The name predates the second one; the flag has never meant that a
+    /// memory job exists, and nothing that reads it assumes one does. The
+    /// footer's notes mark comes from `extract_state`, not from here.) The
+    /// busy loop then treats a submitted prompt as an interrupt as well as a
+    /// queued line: the user wants the model, and the pass goes back where it
+    /// came from for the next idle moment.
+    pub memory_pass: AtomicBool,
+    /// Set by the busy loop's Ctrl-D arm while a quiet background pass is
+    /// running: the user wants out, and work they never asked for must not
+    /// hold the door shut. `tui_quiet_pass` reads it once the worker has
+    /// stopped and hands the quit to the idle loop, which takes its normal
+    /// exit path.
+    /// Never set during a real turn — see the arm's `memory_pass` guard.
+    ///
+    /// Distinct from the file-scope `QUIT_REQUESTED` static in `ui.rs` and
+    /// its same-named reader `quit_requested()`, which belong to the
+    /// mid-turn `/exit` confirmation pane. The two quit channels are
+    /// disjoint; only the name is shared.
+    pub quit_requested: AtomicBool,
     /// Set by the UI when a `/btw` is submitted mid-turn: the current main
     /// generation pass stops immediately so the side question is answered
     /// with priority, then the interrupted pass is re-run (nothing is
@@ -402,6 +431,27 @@ pub struct TurnShared {
     /// `/btw` side questions queued while the worker is busy, answered FIFO
     /// at generation boundaries (modeled on `OpenClaw`'s side-question queue).
     pub btw: Mutex<Vec<String>>,
+    /// Snapshot of the background bash job table, refreshed by the worker at
+    /// each pass start and tool boundary, so the UI thread can show `/jobs`
+    /// and the footer's jobs panel while the worker owns the live table.
+    pub jobs: Mutex<Vec<crate::tools::bash::JobRow>>,
+    /// Token counts behind the `/context` report, refreshed by the worker
+    /// wherever the transcript changes, so the UI thread can draw the panel
+    /// mid-turn against the live fill while the worker owns the agent.
+    pub context: Mutex<crate::ctxreport::Breakdown>,
+    /// The `/repro` dump's agent-side half, published by the worker at the
+    /// start of every main pass, so the UI thread can write a dump mid-turn
+    /// while the worker owns the agent. `None` before the first pass.
+    pub repro: Mutex<Option<crate::repro::ReproBase>>,
+    /// The text the running main pass has generated so far, appended token by
+    /// token by the worker and reset at each pass start; a mid-turn `/repro`
+    /// writes it below the transcript, which is what makes the dump the
+    /// model's state *now* rather than at the last boundary.
+    pub live_pass: Mutex<String>,
+    /// The path of the last mid-turn `/repro`, handed to the agent when the
+    /// turn ends so a bare `/open` aims at it, exactly as an idle `/repro`
+    /// sets `last_edited` directly.
+    pub repro_written: Mutex<Option<std::path::PathBuf>>,
 }
 
 /// Cap on queued `/btw` questions; a push beyond it drops the oldest entry
@@ -418,6 +468,116 @@ pub const BTW_SUSPEND_MARKER: &str = "[btw — main task paused]";
 pub const BTW_RESUME_MARKER: &str = "[btw — resuming]";
 
 impl TurnShared {
+    /// Replaces the shared job snapshot.
+    pub fn set_jobs(&self, rows: Vec<crate::tools::bash::JobRow>) {
+        if let Ok(mut g) = self.jobs.lock() {
+            *g = rows;
+        }
+    }
+
+    /// Replaces the shared `/context` breakdown.
+    pub fn set_context(&self, breakdown: crate::ctxreport::Breakdown) {
+        if let Ok(mut g) = self.context.lock() {
+            *g = breakdown;
+        }
+    }
+
+    /// Publishes the `/repro` base for the pass about to run and empties the
+    /// live-pass buffer, so a dump taken during it pairs this base with only
+    /// this pass's output.
+    pub fn begin_repro_pass(&self, base: crate::repro::ReproBase) {
+        if let Ok(mut g) = self.repro.lock() {
+            *g = Some(base);
+        }
+        if let Ok(mut g) = self.live_pass.lock() {
+            g.clear();
+        }
+    }
+
+    /// Appends a generated chunk to the live-pass buffer.
+    pub fn push_live_pass(&self, text: &str) {
+        if let Ok(mut g) = self.live_pass.lock() {
+            g.push_str(text);
+        }
+    }
+
+    /// Drops the published `/repro` base at turn end, so a `TurnShared` that
+    /// outlives the turn (the remote bridge's) cannot serve a stale one.
+    pub fn end_repro(&self) {
+        if let Ok(mut g) = self.repro.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.live_pass.lock() {
+            g.clear();
+        }
+    }
+
+    /// Writes a `/repro` dump from the UI thread, mid-turn: the base the
+    /// worker published at pass start plus the pass's output so far, under
+    /// `prefix`. `Err` names the reason, including the no-base-yet case
+    /// (the turn has not reached its first main pass).
+    ///
+    /// # Errors
+    /// Returns a message when no base has been published or a file cannot be
+    /// written.
+    pub fn write_repro(
+        &self,
+        note: &str,
+        prefix: &str,
+        secs: u64,
+    ) -> Result<(std::path::PathBuf, usize), String> {
+        let base = self
+            .repro
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .ok_or_else(|| {
+                "the turn has not started generating yet; try again in a moment".to_owned()
+            })?;
+        let partial = self
+            .live_pass
+            .lock()
+            .map_or_else(|_| String::new(), |g| g.clone());
+        let note = match note.trim() {
+            "" => crate::repro::MID_TURN_NOTE,
+            n => n,
+        };
+        // The base was rendered with an empty note; stamp the real one onto
+        // the header's line (the first `note:` in the file) so the dump reads
+        // as what it is from the top, not only from the in-progress section.
+        let report = base
+            .report
+            .replacen("- note: (none)\n", &format!("- note: {note}\n"), 1);
+        let mut report = report;
+        crate::repro::append_live_pass(&mut report, note, &partial);
+        let out = base.save(prefix, secs, &report)?;
+        if let Ok(mut g) = self.repro_written.lock() {
+            *g = Some(out.0.clone());
+        }
+        Ok(out)
+    }
+
+    /// Takes the path of the last mid-turn `/repro`, if one was written.
+    pub fn take_repro_written(&self) -> Option<std::path::PathBuf> {
+        self.repro_written.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// The `/context` breakdown the worker last published.
+    #[must_use]
+    pub fn context(&self) -> crate::ctxreport::Breakdown {
+        self.context
+            .lock()
+            .map_or_else(|_| crate::ctxreport::Breakdown::default(), |g| g.clone())
+    }
+
+    /// The `/jobs` text for the shared snapshot, elapsed times as of now.
+    #[must_use]
+    pub fn jobs_report(&self) -> String {
+        self.jobs
+            .lock()
+            .map_or_else(|_| String::new(), |g| crate::tools::bash::render_rows(&g))
+    }
+
     /// Takes all queued user lines.
     pub fn take_queued(&self) -> Vec<String> {
         self.queued.lock().map_or_else(
@@ -491,6 +651,7 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         UiEvent::Tool(t) => log.tool_text(&t),
         UiEvent::Error(t) => log.error_text(&t),
         UiEvent::Dim(t) => log.push_dim(t),
+        UiEvent::PreviewStatus(t) => log.apply_preview_status(t.as_deref()),
         UiEvent::SystemStatus(t) => log.push_ansi(&crate::status::system_line(&t, true)),
         UiEvent::EditCard(p) => crate::tui::render_diff_card(log, &p),
         UiEvent::Markdown(t) => log.push_markdown(&t),

@@ -327,6 +327,113 @@ see.</p>
 </tr>
 </tbody>
 </table>
+<h3 id="tools"><code>tools</code></h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tools.bashNotify</code></td>
+<td><code>false</code></td>
+<td>wake the model when a bash job it left running finishes, instead of
+having it poll with <code>bash_status</code>. Adds one sentence to the
+system prompt, so it takes effect in a new session. See <a
+href="05-tools.html#background-jobs">Background jobs</a>.</td>
+</tr>
+<tr>
+<td><code>tools.loopGuards</code></td>
+<td><code>true</code></td>
+<td>arm the loop guards (<code>/loopguard</code> flips it for the
+session)</td>
+</tr>
+<tr>
+<td><code>tools.noProgressGuard</code></td>
+<td><code>false</code></td>
+<td>also stop a turn that generates 32 KB of output without changing a
+file. Requires <code>tools.loopGuards</code>; see <a
+href="04-slash-commands.html#the-no-progress-budget">The no-progress
+budget</a>.</td>
+</tr>
+<tr>
+<td><code>tools.recall</code>, <code>tools.fanout</code>,
+<code>tools.runCode</code></td>
+<td><code>true</code></td>
+<td>offer the <code>recall</code>, <code>fanout</code> and
+<code>run_code</code> tools to the model</td>
+</tr>
+<tr>
+<td><code>tools.remember</code></td>
+<td><code>true</code></td>
+<td>offer the <code>remember</code> and <code>forget</code> tools, which
+write memory to disk for the next session. See <a
+href="07-context.html#memory">Memory</a>.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="context"><code>context</code></h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>context.microcompact</code></td>
+<td><code>true</code></td>
+<td>let micro-compaction clear old tool-result bodies in place to
+reclaim context. <code>/mc off</code> is the session equivalent.</td>
+</tr>
+<tr>
+<td><code>context.shortReminder</code></td>
+<td><code>true</code></td>
+<td>make the system-prompt reminder plank re-injects every 50K tokens
+the short form: tool-call syntax, tool names, and a pointer to the
+original prompt. <code>false</code> re-injects the whole tools prompt as
+the C reference does.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="memory"><code>memory</code></h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>memory.autoExtract</code></td>
+<td><code>true</code></td>
+<td>queue the extraction pass at the end of turns with no tool calls; it
+runs at the next idle moment and a typed prompt interrupts it. It costs
+a generation and a KV snapshot each time, at idle.</td>
+</tr>
+<tr>
+<td><code>memory.extractEveryNTurns</code></td>
+<td><code>1</code></td>
+<td>run the pass only every N eligible turns; <code>0</code> is treated
+as <code>1</code></td>
+</tr>
+<tr>
+<td><code>memory.budgets</code></td>
+<td><code>4096</code> / <code>4096</code> / <code>6144</code> /
+<code>2048</code></td>
+<td>bytes of <code>user</code>, <code>feedback</code>,
+<code>project</code> and <code>reference</code> entries rendered into
+context. Hand-edit only; not exposed in <code>/config</code>.</td>
+</tr>
+</tbody>
+</table>
 <h3 id="mcp-ask-update-agents"><code>mcp</code>, <code>ask</code>,
 <code>update</code>, <code>agents</code></h3>
 <table>
@@ -472,10 +579,10 @@ sits inside your working tree and is easy to commit by accident, so
 there is no API-key setting. Keep keys on <code>--api-key</code> or the
 provider's environment variable.</li>
 <li><strong>No per-run choices.</strong> <code>--prompt</code>,
-<code>--non-interactive</code>, <code>--ui-remote</code>,
-<code>--trace</code>, <code>--chdir</code>, <code>--seed</code>,
-<code>--worktree</code>, and the serve/control options describe one
-invocation, not a preference, so they have no settings key.</li>
+<code>--ui</code>, <code>--ui-remote</code>, <code>--trace</code>,
+<code>--chdir</code>, <code>--seed</code>, <code>--worktree</code>, and
+the serve/control options describe one invocation, not a preference, so
+they have no settings key.</li>
 </ul>
 <h3 id="when-it-goes-wrong">When it goes wrong</h3>
 <p>A broken settings file never stops plank from starting. Malformed
@@ -587,8 +694,12 @@ suffix: <code>-c 128k</code>, <code>-c 1m</code></td>
 <td>run one prompt and exit</td>
 </tr>
 <tr>
-<td><code>--non-interactive</code></td>
-<td>disable the interactive UI</td>
+<td><code>--ui MODE</code></td>
+<td>front end: <code>tui</code> (default), <code>console</code>
+(headless), <code>chart</code> (headless, prints only the live
+<code>/toks</code> chart) or <code>quiet</code> (headless, prints only a
+start and a finish note); <code>chart</code> and <code>quiet</code> need
+<code>-p</code></td>
 </tr>
 <tr>
 <td><code>-sys, --system TEXT</code></td>
@@ -660,8 +771,8 @@ suspending</td>
 </tr>
 <tr>
 <td><code>--mtp-model PATH</code></td>
-<td>the loaded model's companion GGUF: the DSpark drafter for DeepSeek,
-the required PLE sidecar for Qwen3.8</td>
+<td>the loaded model's companion GGUF: the DSpark drafter for DeepSeek
+V4</td>
 </tr>
 <tr>
 <td><code>--mtp-confidence F</code></td>
@@ -672,28 +783,29 @@ five-token blocks)</td>
 <td><code>--mtp-strict</code></td>
 <td>load the drafter but keep target-only decode, for comparisons</td>
 </tr>
-<tr>
-<td><code>--qwen</code></td>
-<td>run Qwen3.8-Flash-Next: shorthand for
-<code>-m ~/.plank/qwen.gguf --mtp-model ~/.plank/qwen.mtp.gguf</code></td>
-</tr>
 </tbody>
 </table>
 <p>Speculative decoding is <strong>on by default</strong> under one
-name, <code>--mtp</code>, with a different mechanism per model family.
-DeepSeek uses its auxiliary DSpark draft checkpoint for V4 Flash: it
-proposes up to five tokens ahead and the main model verifies them,
-committing only the prefix it agrees with, so one verification pass can
-advance the stream by several tokens. Qwen3.8-Flash-Next speculates from
-the MTP block inside its own main GGUF and needs no drafter.
-<code>--mtp-off</code> turns it off for target-only decode.</p>
-<p>On DeepSeek the support model (~5.6 GB) needs no flag of its own — it
+name, <code>--mtp</code>. DeepSeek V4 Flash uses its auxiliary DSpark
+draft checkpoint: it proposes up to five tokens ahead and the main model
+verifies them, committing only the prefix it agrees with, so one
+verification pass can advance the stream by several tokens. DeepSeek
+V4.1 Flash has no drafter upstream, so plank never pairs one with it and
+decodes target-only there. <code>--mtp-off</code> turns speculation off
+explicitly.</p>
+<p>On V4 the support model (~5.6 GB) needs no flag of its own: it
 resolves to <code>~/.plank/ds4flash.dspark.gguf</code> and is offered
 for download through the same resumable path as the main model, unless
-<code>--mtp-model</code> names one. On Qwen the same
-<code>--mtp-model</code> flag carries the PLE sidecar, which is required
-rather than optional; <code>--qwen</code> fills in both default paths
-for you.</p>
+<code>--mtp-model</code> names one.</p>
+<p>A drafter plank paired for you is no longer able to stop a model from
+loading. The engine refuses to open a model at all when the draft
+checkpoint does not match it, so a checkpoint the default drafter does
+not fit used to fail until you found <code>--mtp-off</code>; plank now
+retries the open once without the companion it chose and reports the
+original error only if that fails too. A companion you named with
+<code>--mtp-model</code> is never dropped. When speculation turns out
+not to run, the temperature you would have been sampling at is restored
+rather than left pinned at 0.</p>
 <p>Verification is argmax, so proposals are only used at
 <code>--temp 0</code>; sampled decoding ignores them. Whether it pays
 depends on the engine build, the quant and the machine: on an M5 Max it
@@ -708,10 +820,15 @@ draft model. <code>--ssd-streaming</code> and its companions
 <code>--ssd-streaming-cache-experts</code>,
 <code>--ssd-streaming-preload-experts</code>) stream experts from SSD
 instead of loading them resident, which is how you run a model that does
-not fit. <code>--simulate-used-memory &lt;N&gt;GB</code> pretends memory
-is already used, for testing those paths.
-<code>--dir-steering-file</code>, <code>--dir-steering-ffn</code>,
-<code>--dir-steering-attn</code> apply directional steering vectors.</p>
+not fit. You rarely need to reach for <code>--ssd-streaming</code>
+yourself any more: plank measures the model file at startup and turns
+streaming on when it exceeds 80% of installed RAM less the engine's
+context buffers, printing the calculation it used. Passing the flag
+yourself skips that decision.
+<code>--simulate-used-memory &lt;N&gt;GB</code> pretends memory is
+already used, for testing those paths. <code>--dir-steering-file</code>,
+<code>--dir-steering-ffn</code>, <code>--dir-steering-attn</code> apply
+directional steering vectors.</p>
 <p>Remote, shared-engine, control, and provider flags are covered in <a
 href="10-remote-and-providers.html">Remote and hosted engines</a>.</p>
 <h2 id="environment-variables">Environment variables</h2>

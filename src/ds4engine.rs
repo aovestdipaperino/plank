@@ -20,7 +20,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
 use crate::ds4tokens::{self, SectionKey, SpanRole, TokenTranscript};
 use crate::engine::{
@@ -36,30 +36,30 @@ use crate::snapshot::{RestoreOnDrop, SessionSnapshot};
 /// is the ceiling the entry point itself is written against.
 const SPEC_ACCEPT_CAP: usize = 17;
 
-/// Where the live KV must be rewound to after a speculative block, or `None`
-/// when the block was consumed whole.
+/// The token span recorded for an assistant reply: the assistant prefix, the
+/// rendered reply, then any `shadow` tokens the engine committed but the pass
+/// never rendered, and finally EOS unless the shadow already ended on one.
 ///
-/// The engine commits all `committed` accepted tokens starting at
-/// `block_start`; the generate loop keeps only the `kept` tokens before a stop
-/// token or the token budget. Any committed token it did not keep is not in the
-/// transcript, so leaving it in the KV makes the next prompt diverge *behind*
-/// the live end and `ds4_session_sync` rebuilds from zero. Mirrors the C agent's
-/// `ds4_session_rewind(w->session, block_start + ti)`.
-/// The `</think>` the UI appended to a recorded assistant reply, when
-/// `incoming` is exactly `held` (compared trailing-trimmed, as
-/// [`TokenTranscript::common_prefix`] compares) followed by that close and
-/// nothing else. Any other difference is a genuine rewrite and returns `None`.
-fn think_close_suffix<'a>(held: &str, incoming: &'a str) -> Option<&'a str> {
-    const CLOSE: &str = "</think>";
-    let rest = incoming.strip_prefix(held.trim_end())?;
-    (rest == CLOSE).then_some(rest)
-}
-
-fn spec_block_rewind_target(block_start: i32, committed: i32, kept: i32) -> Option<i32> {
-    if committed <= 0 || kept < 0 || kept >= committed {
-        return None;
+/// Shadow tokens exist because a speculative block is committed to the KV
+/// whole while the generate loop may stop part-way through it (a tool stanza
+/// closed, EOS, the token budget, a user interrupt). The C agent rewinds the
+/// KV to the kept token; on `DeepSeek` `ds4_session_rewind` cannot roll the
+/// compressor frontiers back and so marks the checkpoint invalid, which makes
+/// the *next* pass re-prefill the whole conversation (a recorded 18k-token
+/// session paid that on every tool round). Recording the committed tail here
+/// instead keeps the token buffer an exact mirror of the live KV, so the next
+/// prompt extends it and prefills only the new message. The cost is at most a
+/// draft block of unrendered tokens that the model sees between the stanza
+/// close and EOS; with the default one-token draft that is a single token.
+fn assistant_span_tokens(prefix: &[i32], reply: &[i32], shadow: &[i32], eos: i32) -> Vec<i32> {
+    let mut span = Vec::with_capacity(prefix.len() + reply.len() + shadow.len() + 1);
+    span.extend_from_slice(prefix);
+    span.extend_from_slice(reply);
+    span.extend_from_slice(shadow);
+    if span.last() != Some(&eos) {
+        span.push(eos);
     }
-    Some(block_start.saturating_add(kept))
+    span
 }
 
 /// The immutable, shareable half of the ds4 engine: weights, tokenizer, and the
@@ -87,12 +87,94 @@ pub struct Ds4Model {
 unsafe impl Send for Ds4Model {}
 unsafe impl Sync for Ds4Model {}
 
+/// Why the engine was asked to stop.
+///
+/// One flag could say *that* somebody wants the pass to stop, but not *who* —
+/// and the consequences differ completely. A user's Esc ends the turn; a
+/// memory-pressure yield frees the session and comes back. Ordered by
+/// precedence: a raise never lowers the reason, so an Esc during a yield wins
+/// and the resume is abandoned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelReason {
+    None,
+    Pressure,
+    User,
+}
+
+impl CancelReason {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Pressure => 1,
+            Self::User => 2,
+        }
+    }
+
+    /// Inverse of [`Self::as_u8`], the only thing that ever writes the flag.
+    /// Explicitly exhaustive with a loud catch-all: a fourth variant that
+    /// forgot this arm must be an obvious panic, never a silent "nobody asked
+    /// to stop" that turns a cancel into a truncated answer.
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::None,
+            1 => Self::Pressure,
+            2 => Self::User,
+            other => unreachable!("CancelReason::from_u8 fed a byte no as_u8 emits: {other}"),
+        }
+    }
+}
+
 thread_local! {
-    static INTERRUPT: AtomicBool = const { AtomicBool::new(false) };
+    static CANCEL: AtomicU8 = const { AtomicU8::new(0) };
+}
+
+/// Raises the cancel flag, keeping whichever reason outranks the other.
+fn cancel_request(reason: CancelReason) {
+    CANCEL.with(|f| {
+        let _ = f.fetch_max(reason.as_u8(), Ordering::SeqCst);
+    });
+}
+
+/// The current reason, or [`CancelReason::None`].
+fn cancel_reason() -> CancelReason {
+    CancelReason::from_u8(CANCEL.with(|f| f.load(Ordering::SeqCst)))
+}
+
+/// Clears the flag. Every path that reads the reason clears it on entry — the
+/// stale-flag bug this fixes is documented at `warm_sync` below.
+fn cancel_clear() {
+    CANCEL.with(|f| f.store(0, Ordering::SeqCst));
+}
+
+/// Raises a memory-pressure cancel on the calling thread.
+///
+/// The mid-pass yield path. It must be called from the thread running
+/// `generate`, because the flag `cancel_cb` reads is thread-local — the sensor
+/// thread cannot raise it directly, which is why the front end polls the
+/// sensor from inside the interrupt closure instead.
+pub fn request_pressure_cancel() {
+    cancel_request(CancelReason::Pressure);
+}
+
+/// True when the last stop was a memory-pressure yield rather than a user
+/// interrupt. The caller uses it to decide whether to end the turn or to free
+/// the session and come back.
+#[must_use]
+pub fn cancelled_by_pressure() -> bool {
+    cancel_reason() == CancelReason::Pressure
+}
+
+/// Clears the cancel flag from outside the module.
+///
+/// **Ordering:** callers must free the session *before* calling this.
+/// Reversed, a racing turn can start a generation against a session that is
+/// about to be freed underneath it.
+pub fn clear_cancel() {
+    cancel_clear();
 }
 
 unsafe extern "C" fn cancel_cb(_ud: *mut std::os::raw::c_void) -> bool {
-    INTERRUPT.with(|f| f.load(Ordering::SeqCst))
+    cancel_reason() != CancelReason::None
 }
 
 /// `DS4_SESSION_SYNC_INTERRUPTED` (ds4.h): `ds4_session_sync` stopped because
@@ -159,7 +241,7 @@ unsafe extern "C" fn progress_cb(
     // callback's flag; relay the caller's interrupt here so Esc/Ctrl-C can
     // abort prefill, not just token generation.
     if (ctx.interrupt)() {
-        INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
+        cancel_request(CancelReason::User);
     }
     let secs = ctx.start.elapsed().as_secs_f64();
     let progress = PrefillProgress::from_absolute(ctx.base, cur, &mut ctx.total, secs);
@@ -183,6 +265,82 @@ fn steady_rate(mark: Option<(std::time::Instant, i32)>, generated: i32) -> f64 {
 /// Tokens a pass must produce *after* the warmup before its steady rate is
 /// reported. A couple of tokens divided by a sliver of a second is noise.
 const STEADY_MIN_TOKENS: i32 = 8;
+
+/// Whether the engine is handed the vision encoder for this model.
+///
+/// The encoder GGUF sits beside the main model at
+/// `~/.plank/ds4flash.vision.gguf` and is downloaded at startup when the model
+/// can use it. It is passed only when the C would accept it: `ds4_engine_open`
+/// fails outright when `vision_path` is set and the main GGUF is not the pinned
+/// Vision-Exp checkpoint ("--vision requires ... the pinned `DeepSeek` V4 Flash
+/// Vision-Exp model"), so a language-only or re-quantized `DeepSeek`
+/// checkpoint must open with a null path and run text-only. Likewise for a
+/// Qwen3.8-Flash-Next model: the DS4 encoder is not a Qwen encoder, and a Qwen
+/// run is text-only until a Qwen encoder is wired up (the C branch ships a
+/// separate `qwen38-vision` target). Either way the `view_image` tool refuses
+/// at call time instead of the open failing.
+fn model_supports_vision(family: crate::gguf::ModelFamily, path: &Path) -> bool {
+    family != crate::gguf::ModelFamily::Qwen && crate::gguf::supports_vision(path)
+}
+
+/// Says at open time why the run is text-only, instead of letting the first
+/// `view_image` call be the only symptom several turns into a session.
+///
+/// The engine loads the vision encoder best-effort: a missing or unreadable
+/// GGUF leaves it text-only without failing the open, so this is the one place
+/// that knows. Each cause gets its own line, because naming the encoder path
+/// for a model plank deliberately never passed it to would report a failure to
+/// read a file that was never opened.
+fn report_text_only(
+    family: crate::gguf::ModelFamily,
+    model_supports_vision: bool,
+    vision_path: &Path,
+) {
+    if family == crate::gguf::ModelFamily::Qwen {
+        eprintln!("note: Qwen3.8 runs text-only in plank; view_image will be refused");
+    } else if !model_supports_vision {
+        eprintln!(
+            "note: this checkpoint is not the DeepSeek V4 Flash Vision-Exp model, \
+             so it runs text-only; view_image will be refused"
+        );
+    } else {
+        eprintln!(
+            "warning: vision encoder not loaded from {}; view_image will be refused",
+            vision_path.display()
+        );
+    }
+}
+
+/// Whether the Metal kernel sources are absent from where the engine looks.
+///
+/// `set_metal_source_env` points `DS4_METAL_FLASH_ATTN_SOURCE` at them when it
+/// can find them; if the variable is unset or names a path that is gone, the
+/// engine cannot build its kernels and the open fails with nothing on the
+/// file's own account.
+fn metal_kernels_missing() -> bool {
+    std::env::var_os("DS4_METAL_FLASH_ATTN_SOURCE").is_none_or(|p| !Path::new(&p).exists())
+}
+
+/// The companion files an open passed, labelled for a failure message. Each is
+/// `None` when plank deliberately did not pass it, which
+/// [`crate::gguf::file_detail`] reports as nothing rather than as absent.
+fn companion_notes<'a>(
+    mtp: Option<&'a Path>,
+    vision: Option<&'a Path>,
+) -> [(&'static str, Option<&'a Path>); 2] {
+    [("mtp draft model", mtp), ("vision encoder", vision)]
+}
+
+/// Decides whether V4.1 expects an empty `system` message ahead of the tools
+/// prompt, exactly as `agent_append_system_prompt` pushes one before the
+/// rendered-chat tokenization. Gated on a non-empty `trusted` span so the
+/// split path (`warm_append_system`, which passes `trusted_len` 0 for the
+/// untrusted remainder) cannot emit a second one.
+fn wants_empty_system(model_name: &str, trusted: &str) -> bool {
+    !trusted.is_empty()
+        && crate::sysprompt::ToolSyntax::for_model_name(model_name)
+            == crate::sysprompt::ToolSyntax::Dsml41
+}
 
 impl Ds4Model {
     /// Opens a model file with the given backend, context size, and tuning
@@ -209,31 +367,24 @@ impl Ds4Model {
             })
             .transpose()
         };
+        // Every family the probe can now report is one this build serves; the
+        // refusal that used to sit here existed only for Qwen.
         let family = crate::gguf::family_of(path);
-        let (mtp_path, ple_path) = companion_slots(family, tuning.mtp_path.as_deref());
+        let mtp_path = mtp_companion(family, tuning.mtp_path.as_deref());
         let c_mtp = c_opt_path(mtp_path, "mtp model")?;
-        let c_ple = c_opt_path(ple_path, "ple sidecar")?;
         let c_steering = c_opt_path(tuning.dir_steering_file.as_deref(), "dir-steering file")?;
-        // Vision is always on: the encoder GGUF sits beside the main model at
-        // `~/.plank/ds4flash.vision.gguf` and is downloaded at startup when
-        // absent. A null path would keep the engine text-only, but plank never
-        // passes one — the `view_image` tool is served unconditionally.
-        // ...except for a Qwen3.8-Flash-Next model. The DS4 encoder is not a
-        // Qwen encoder, and handing it over fails the load outright, so a Qwen
-        // run is text-only until a Qwen encoder is wired up (the C branch
-        // ships a separate `qwen38-vision` target).
         let vision_path = crate::download::default_vision_path();
-        let c_vision = if family == crate::gguf::ModelFamily::Qwen {
-            None
-        } else {
+        let model_supports_vision = model_supports_vision(family, path);
+        let c_vision = if model_supports_vision {
             c_opt_path(Some(&vision_path), "vision encoder")?
+        } else {
+            None
         };
         let as_ptr = |c: &Option<CString>| c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let opts = ffi::Ds4EngineOptions {
             model_path: c_path.as_ptr(),
             mtp_path: as_ptr(&c_mtp),
             vision_path: as_ptr(&c_vision),
-            ple_path: as_ptr(&c_ple),
             backend,
             n_threads,
             context_size: ctx_size,
@@ -296,34 +447,26 @@ impl Ds4Model {
         // SAFETY: opts and its CStrings outlive the call; engine is a valid out-ptr.
         let rc = unsafe { ffi::ds4_engine_open(&raw mut engine, &raw const opts) };
         if rc != 0 || engine.is_null() {
-            let mut msg = format!("failed to open model {}", path.display());
-            let kernels_missing = std::env::var_os("DS4_METAL_FLASH_ATTN_SOURCE")
-                .is_none_or(|p| !Path::new(&p).exists());
-            if kernels_missing {
-                msg.push_str(
-                    " (Metal kernel sources not found; set DS4_METAL_DIR to a \
-                     directory containing the .metal files)",
-                );
-            }
-            return Err(EngineError::new(msg));
+            // Everything the message can establish without the engine lives in
+            // `gguf`, which is always compiled and so CI-tested; this side
+            // supplies only what is FFI-shaped.
+            let vision = model_supports_vision.then_some(vision_path.as_path());
+            return Err(EngineError::new(crate::gguf::open_failure_detail(
+                &crate::gguf::OpenAttempt {
+                    path,
+                    rc,
+                    engine_null: engine.is_null(),
+                    family,
+                    backend: &format!("{backend:?}"),
+                    ctx_size,
+                    companions: &companion_notes(mtp_path, vision),
+                    metal_kernels_missing: metal_kernels_missing(),
+                },
+            )));
         }
-        // The engine loads the vision encoder best-effort: a missing or
-        // unreadable GGUF leaves it text-only without failing the open. Say so
-        // now, at the one place that knows, instead of letting the first
-        // `view_image` call be the only symptom several turns into a session.
         // SAFETY: `engine` is non-null and valid, checked just above.
-        // A Qwen run is the one case where no encoder was offered at all, so
-        // it gets its own line: naming the DeepSeek path there would report a
-        // failure to read a file plank deliberately never passed.
         if !unsafe { ffi::ds4_engine_has_vision(engine) } {
-            if family == crate::gguf::ModelFamily::Qwen {
-                eprintln!("note: Qwen3.8 runs text-only in plank; view_image will be refused");
-            } else {
-                eprintln!(
-                    "warning: vision encoder not loaded from {}; view_image will be refused",
-                    vision_path.display()
-                );
-            }
+            report_text_only(family, model_supports_vision, &vision_path);
         }
         Ok(Self {
             engine,
@@ -459,6 +602,19 @@ impl Ds4Model {
             .find(|&i| system.is_char_boundary(i))
             .unwrap_or(0);
         let (trusted, plain) = system.split_at(split);
+        if wants_empty_system(&self.model_name(), trusted)
+            && let (Ok(role), Ok(empty)) = (CString::new("system"), CString::new(""))
+        {
+            // SAFETY: engine and tokens valid; strings outlive the call.
+            unsafe {
+                ffi::ds4_chat_append_message(
+                    self.engine,
+                    tokens.as_mut_ptr(),
+                    role.as_ptr(),
+                    empty.as_ptr(),
+                );
+            }
+        }
         if !trusted.is_empty()
             && let Ok(text) = CString::new(trusted)
         {
@@ -504,20 +660,52 @@ impl Ds4Model {
     /// past the BOS). Folding it into the system *string* instead would place
     /// it after the system role marker and diverge.
     ///
-    /// `Max` goes through the C's own `ds4_chat_append_max_effort_prefix` so its
-    /// tokens stay byte-identical to the reference; `Low`, which the C does not
-    /// have, is tokenized here from [`crate::engine::THINK_LOW_PREFIX`] through
-    /// the same rendered-chat tokenizer the C symbol uses internally.
+    /// Every level but `Low` goes through the C's own
+    /// `ds4_chat_append_think_prefix` — the same call
+    /// `agent_worker_build_system_tokens` makes — so the tokens stay
+    /// byte-identical to the reference and the family decides the spelling: the
+    /// V4 max-effort text, or V4.1's `Reasoning Effort: N` system line. It
+    /// appends nothing for the modes that carry no preamble, which is why it is
+    /// safe to call unconditionally. `Low`, which the C does not have, is
+    /// tokenized here from [`crate::engine::THINK_LOW_PREFIX`] through the same
+    /// rendered-chat tokenizer the C symbol uses internally — but only on a
+    /// family without a native effort knob
+    /// ([`crate::engine::injects_low_preamble`]); on one with a knob the C's
+    /// own `Reasoning Effort: 25` line is the whole of what `Low` emits.
     fn append_effort_prefix(&self, tokens: &mut Ds4TokensGuard, think: ThinkMode) {
-        match think {
-            ThinkMode::Max => {
-                // SAFETY: engine and tokens are valid for the call.
-                unsafe { ffi::ds4_chat_append_max_effort_prefix(self.engine, tokens.as_mut_ptr()) };
-            }
-            ThinkMode::Low => {
+        if think == ThinkMode::Low {
+            // Plank's invented brief-reasoning prose, but only on a family with
+            // no effort dial of its own: where the model has one, the
+            // `Reasoning Effort: 25` line below says the same thing in the
+            // model's own trained vocabulary, and stacking plank prose on top
+            // of it is exactly the prompt-mangling this avoids
+            // (`engine::injects_low_preamble`).
+            if crate::engine::injects_low_preamble(think, &self.model_name()) {
                 tokens.push_all(&self.tokenize_rendered(crate::engine::THINK_LOW_PREFIX));
             }
-            ThinkMode::Off | ThinkMode::Medium => {}
+            // `Low` has no dedicated C think mode, so it is `HIGH` at the FFI
+            // boundary (`ds4_think`) — and the C's own DeepSeek V4.1 effort
+            // text defaults `HIGH` to 75, indistinguishable from `Medium`. Ask
+            // for the explicit low effort level instead: on V4.1 this appends
+            // `Reasoning Effort: 25 ...` right after plank's own preamble
+            // above, restoring `low < medium < max`; on every other family
+            // `chat_push_think_prefix`'s family switch has no branch for a
+            // plain numeric level (the GLM/DeepSeek41 arms return NULL for it,
+            // and the non-effort-text `else` arm only fires for `MAX`), so the
+            // call is a byte-for-byte no-op there.
+            // SAFETY: engine and tokens are valid for the call.
+            unsafe {
+                ffi::ds4_chat_append_think_prefix(
+                    self.engine,
+                    tokens.as_mut_ptr(),
+                    ds4_think(ThinkMode::Level(crate::engine::THINK_LOW_EFFORT_LEVEL)),
+                );
+            }
+            return;
+        }
+        // SAFETY: engine and tokens are valid for the call.
+        unsafe {
+            ffi::ds4_chat_append_think_prefix(self.engine, tokens.as_mut_ptr(), ds4_think(think));
         }
     }
 
@@ -754,7 +942,7 @@ impl ModelHandle for Ds4Model {
             unsafe { ffi::ds4_session_free(session) };
             return Err(e);
         }
-        let inner = Ds4Session {
+        let mut inner = Ds4Session {
             model: Arc::clone(&self),
             session,
             transcript: TokenTranscript::new(),
@@ -763,7 +951,15 @@ impl ModelHandle for Ds4Model {
             trusted_system_len: 0,
             pending_images: Vec::new(),
             vision_spans: Vec::new(),
+            #[cfg(ds4_engine)]
+            decide_session: None,
+            #[cfg(ds4_engine)]
+            decide_letters: Vec::new(),
+            #[cfg(ds4_engine)]
+            decide_letters_tried: false,
         };
+        #[cfg(ds4_engine)]
+        inner.init_decide_letters();
         Ok(Box::new(Ds4HostSession {
             inner,
             pending: None,
@@ -822,6 +1018,26 @@ pub struct Ds4Session {
     /// by `reconcile` and consumed by `generate` to call
     /// `ds4_session_sync_multimodal`.
     vision_spans: Vec<ffi::Ds4VisionSpan>,
+    /// Lazily created session used only for System-1 decisions
+    /// (`Engine::decide`). Separate from `session` on purpose: a decision
+    /// evaluates a question suffix, and doing that on the live session would
+    /// disturb state guarded by the prefix fingerprints and the KV ladder.
+    /// `None` until the first decision.
+    #[cfg(ds4_engine)]
+    decide_session: Option<*mut ffi::Ds4Session>,
+    /// The single token each answer letter tokenizes to, in
+    /// [`crate::decide::LETTERS`] order. Empty when the family does not give
+    /// every letter exactly one token, which switches the whole capability
+    /// off. Populated eagerly at construction (`spawn`/`from_model`), not
+    /// lazily from inside `decide`, so `supports_decide` — which only reads
+    /// this — is accurate before `decide` is ever called (see
+    /// `init_decide_letters`).
+    #[cfg(ds4_engine)]
+    decide_letters: Vec<i32>,
+    /// Whether [`Ds4Session::init_decide_letters`] has already probed the
+    /// letters, so an unsupported family is not re-tokenized on every call.
+    #[cfg(ds4_engine)]
+    decide_letters_tried: bool,
 }
 
 /// Back-compatible alias: the single-owner engine callers used before the split
@@ -862,7 +1078,7 @@ impl Ds4Session {
     /// Wraps a shared model in a session whose FFI session is created lazily.
     #[must_use]
     pub fn from_model(model: Arc<Ds4Model>) -> Self {
-        Self {
+        let mut session = Self {
             model,
             session: std::ptr::null_mut(),
             transcript: TokenTranscript::new(),
@@ -871,7 +1087,16 @@ impl Ds4Session {
             trusted_system_len: 0,
             pending_images: Vec::new(),
             vision_spans: Vec::new(),
-        }
+            #[cfg(ds4_engine)]
+            decide_session: None,
+            #[cfg(ds4_engine)]
+            decide_letters: Vec::new(),
+            #[cfg(ds4_engine)]
+            decide_letters_tried: false,
+        };
+        #[cfg(ds4_engine)]
+        session.init_decide_letters();
+        session
     }
 
     /// Forks this session: a sibling over the *same* weights, pre-loaded with
@@ -1068,15 +1293,7 @@ impl Ds4Session {
         // real buffer is the span itself. A kept span's tokens are reused
         // verbatim and do not move, so its offsets stay valid; everything from
         // the divergence on is retokenized and its spans are freed.
-        let kept_tokens = self
-            .transcript
-            .spans()
-            .iter()
-            .take(keep)
-            .map(|s| s.ntokens)
-            .sum::<usize>();
-        self.free_vision_spans_from(u32::try_from(kept_tokens).unwrap_or(0));
-        self.transcript.truncate_spans(keep);
+        //
         // The one divergence that is not a rewrite: the UI closed a `<think>`
         // the model left open before a tool continuation (`close_open_think`),
         // so the incoming assistant text is the recorded reply plus `</think>`.
@@ -1085,17 +1302,26 @@ impl Ds4Session {
         // lost a 56k-token prefix to exactly this). Keep the sampled ids and
         // splice the close in ahead of the recorded EOS instead; the buffer
         // stays a strict extension of the live KV.
+        //
+        // Decided here, *before* the truncate: `truncate_spans(keep)` leaves
+        // exactly `keep` spans, so the held span at index `keep` is gone by the
+        // time the splice would look for it — which is how this whole branch
+        // once became unreachable, and every guard-stopped pass paid a full
+        // re-prefill for one appended `</think>`.
+        let close: Option<String> = self.transcript.think_close(&keys, keep).map(str::to_owned);
+        // The spliced span is kept, so its tokens (and any vision spans behind
+        // them) stay: they do not move and their offsets stay valid.
+        let hold = keep + usize::from(close.is_some());
+        let kept_tokens = self.transcript.tokens_upto_span(hold);
+        self.free_vision_spans_from(u32::try_from(kept_tokens).unwrap_or(0));
+        self.transcript.truncate_spans(hold);
         let mut keep = keep;
-        if let (Some(held), Some(sec)) = (self.transcript.spans().get(keep), keys.get(keep))
-            && held.role == SpanRole::Assistant
-            && let Some(close) = think_close_suffix(&held.text, &sec.text)
-        {
-            self.transcript.truncate_spans(keep + 1);
-            let tokens = self.model.tokenize_rendered(close);
+        if let Some(close) = close {
+            let tokens = self.model.tokenize_rendered(&close);
             // SAFETY: engine valid.
             let eos = unsafe { ffi::ds4_token_eos(self.model.engine) };
             let tail = usize::from(self.transcript.tokens().last() == Some(&eos));
-            self.transcript.splice_last_span(close, &tokens, tail);
+            self.transcript.splice_last_span(&close, &tokens, tail);
             kv_debug(|| {
                 format!("reconcile: spliced {close:?} into the held assistant span {keep}")
             });
@@ -1274,15 +1500,24 @@ impl Ds4Session {
     /// (sampled but never evaluated) — exactly the token sequence the next
     /// turn's KV common-prefix probe expects. `text` is the trimmed reply text
     /// used as the span's reconciliation key.
-    fn record_reply(&mut self, text: String, reply_tokens: &[i32], think: ThinkMode) {
-        if reply_tokens.is_empty() {
+    fn record_reply(
+        &mut self,
+        text: String,
+        reply_tokens: &[i32],
+        shadow_tokens: &[i32],
+        think: ThinkMode,
+    ) {
+        if reply_tokens.is_empty() && shadow_tokens.is_empty() {
             return;
         }
-        let mut span = self.model.assistant_prefix_tokens(think);
-        span.extend_from_slice(reply_tokens);
         // SAFETY: engine valid.
         let eos = unsafe { ffi::ds4_token_eos(self.model.engine) };
-        span.push(eos);
+        let span = assistant_span_tokens(
+            &self.model.assistant_prefix_tokens(think),
+            reply_tokens,
+            shadow_tokens,
+            eos,
+        );
         // A reply that follows another assistant span *continues* it: the pass
         // was suspended for an in-pass `/btw` and resumed, and the UI splices
         // both halves into one assistant message. Extend rather than append, so
@@ -1294,8 +1529,130 @@ impl Ds4Session {
             self.transcript.extend_last_span(&text, &span);
         } else {
             self.transcript
-                .push_span(SpanRole::Assistant, ds4_think(think) as u8, text, &span);
+                .push_span(SpanRole::Assistant, think_span_tag(think), text, &span);
         }
+    }
+}
+
+#[cfg(ds4_engine)]
+impl Ds4Session {
+    /// Context window for the decision session. The largest state a caller
+    /// passes is the memory gate's excerpt, bounded by
+    /// `memextract::EXCERPT_MAX_BYTES` (32 KiB), plus a short question
+    /// suffix. 16k tokens covers that with room to spare and costs a
+    /// fraction of the live session's KV.
+    const DECIDE_CTX: i32 = 16_384;
+
+    /// Tokenizes each answer letter and keeps it only if it is exactly one
+    /// token. A family that splits any letter turns the capability off
+    /// wholesale rather than answering from a partial letter set.
+    ///
+    /// Called once, from construction (`ModelHandle::spawn` and
+    /// `Ds4Session::from_model`), so `supports_decide` is accurate before
+    /// `decide` is ever called. Idempotent via `tried` rather than by
+    /// re-probing on an empty `decide_letters`: an unsupported family would
+    /// otherwise leave `decide_letters` empty forever and re-tokenize all four
+    /// letters on every call.
+    fn init_decide_letters(&mut self) {
+        if self.decide_letters_tried {
+            return;
+        }
+        self.decide_letters_tried = true;
+        let mut ids = Vec::with_capacity(crate::decide::LETTERS.len());
+        for i in 0..crate::decide::LETTERS.len() {
+            let Some(text) = crate::decide::letter_token_text(i) else {
+                return;
+            };
+            let toks = self.model.tokenize_rendered(&text);
+            if toks.len() != 1 {
+                return; // leaves decide_letters empty: unsupported
+            }
+            ids.push(toks[0]);
+        }
+        self.decide_letters = ids;
+    }
+
+    /// The decision session, created on first use.
+    fn decide_session(&mut self) -> Result<*mut ffi::Ds4Session, EngineError> {
+        if let Some(s) = self.decide_session {
+            return Ok(s);
+        }
+        let s = self.model.create_session(Self::DECIDE_CTX)?;
+        self.decide_session = Some(s);
+        Ok(s)
+    }
+
+    /// Frees the decision session and forgets it, so the next decision builds
+    /// a fresh one.
+    ///
+    /// Called when a prefill or eval fails part-way. The C may have cleared
+    /// `checkpoint_valid` on that session, and a session kept in that state
+    /// would poison every later decision on this engine — the failure would
+    /// stop being per-call and become permanent, silently, since nothing
+    /// upstream distinguishes "this engine cannot decide" from "this one call
+    /// went wrong". Throwing the session away keeps the blast radius at one
+    /// call.
+    fn discard_decide_session(&mut self) {
+        if let Some(s) = self.decide_session.take() {
+            // SAFETY: created by `decide_session` and not yet freed; taking it
+            // out of the option is what guarantees it is freed only once.
+            unsafe { ffi::ds4_session_free(s) };
+        }
+    }
+
+    /// Prefills `state` plus one question's suffix onto the decision session
+    /// in a single `ds4_session_sync`, so the letters are read at the final
+    /// position.
+    ///
+    /// # Multi-question batching, if ever wanted
+    ///
+    /// Do **not** reintroduce `ds4_session_rewind` between questions. The C's
+    /// `ds4_session_rewind` (`refs/ds4/ds4.c:83658`) only sets `state_ok` on
+    /// the Qwen4 and GLM paths; every other family — including plank's main
+    /// `DeepSeek` target — falls through to `if (!state_ok) s->checkpoint_valid
+    /// = false;` (the comment there: "`DeepSeek` compressors cannot be rolled
+    /// back by truncating their row counts"). The next `ds4_session_eval` or
+    /// `ds4_session_sync` then refuses with "decode requires a synchronized
+    /// checkpoint" — so a first question answers correctly and every
+    /// subsequent one on the same rewound session fails.
+    ///
+    /// The sound way to answer several questions about one state is: keep the
+    /// state's token vector on the Rust side, and for each question call
+    /// `ds4_session_sync` with `state_tokens ++ question_suffix_tokens` (one
+    /// sync per question, not a rewind). `sync` reuses the longest common
+    /// prefix against whatever the session currently holds, so on a family
+    /// where `checkpoint_valid` survives (Qwen4, GLM) each subsequent question
+    /// costs only its own suffix tokens, and on `DeepSeek` it costs a full
+    /// re-prefill of the state — slower, but always a *correct* answer rather
+    /// than a silently wrong one from a corrupted checkpoint.
+    fn decide_prefill(
+        &mut self,
+        s: *mut ffi::Ds4Session,
+        state: &str,
+        question: &crate::decide::Question,
+    ) -> Result<(), EngineError> {
+        let mut tokens = Ds4TokensGuard::new();
+        tokens.push_all(&self.model.tokenize_rendered(state));
+        tokens.push_all(
+            &self
+                .model
+                .tokenize_rendered(&crate::decide::render_question(question)),
+        );
+        let mut err = [0_i8; 256];
+        // SAFETY: session and tokens are valid for the call; err is sized.
+        let rc = unsafe { ffi::ds4_session_sync(s, tokens.as_ptr(), err.as_mut_ptr(), err.len()) };
+        if rc != 0 {
+            return Err(EngineError::new(cstr_message(
+                &err,
+                "decision state prefill failed",
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn raw_session(&self) -> *mut ffi::Ds4Session {
+        self.session
     }
 }
 
@@ -1346,7 +1703,7 @@ impl Engine for Ds4Session {
         // recomputed. Create it lazily on the first turn.
         let session = self.ensure_session()?;
 
-        INTERRUPT.with(|f| f.store(false, Ordering::SeqCst));
+        cancel_clear();
         // SAFETY: session valid; cancel_cb reads a thread-local flag.
         unsafe { ffi::ds4_session_set_cancel(session, Some(cancel_cb), std::ptr::null_mut()) };
 
@@ -1420,7 +1777,7 @@ impl Engine for Ds4Session {
         unsafe { ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut()) };
         let on_event = progress.on_event;
         if sync_rc != 0 {
-            if interrupt() || INTERRUPT.with(|f| f.load(Ordering::SeqCst)) {
+            if interrupt() || cancel_reason() != CancelReason::None {
                 return Ok(GenerationStats {
                     interrupted: true,
                     ctx_used: prompt_len,
@@ -1450,6 +1807,10 @@ impl Engine for Ds4Session {
         };
         let mut generated = 0;
         let mut reply_tokens: Vec<i32> = Vec::new();
+        // Tokens the engine committed in a speculative block after the point
+        // the walk stopped: in the KV, never rendered. Recorded with the reply
+        // so the token buffer mirrors the live KV (see `assistant_span_tokens`).
+        let mut shadow_tokens: Vec<i32> = Vec::new();
         let mut reply_text = String::new();
         let mut utf8 = crate::engine::Utf8Stream::default();
         // The local chat template opens `<think>` in the prefill prefix unless
@@ -1490,7 +1851,7 @@ impl Engine for Ds4Session {
                 steady_mark = Some((std::time::Instant::now(), generated));
             }
             if interrupt() {
-                INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
+                cancel_request(CancelReason::User);
                 break;
             }
             // A burst covers the whole remaining budget: the callback stops it
@@ -1518,13 +1879,11 @@ impl Engine for Ds4Session {
             if speculative {
                 let mut accepted = [0_i32; SPEC_ACCEPT_CAP];
                 let cap = i32::try_from(accepted.len()).unwrap_or(i32::MAX);
-                // Where this block starts in the live KV. The C commits every
-                // accepted token, EOS included, so whatever the walk below
-                // drops must be rewound, or the KV ends one token past the
-                // transcript and the next turn rebuilds from zero (a recorded
-                // session re-prefilled 117k tokens this way).
-                // SAFETY: session valid.
-                let block_start = unsafe { ffi::ds4_session_pos(session) };
+                // The C commits every accepted token, EOS included; whatever
+                // the walk below drops stays in the KV and is recorded as
+                // shadow tokens, or the KV ends past the transcript and the
+                // next turn rebuilds from zero (a recorded session
+                // re-prefilled 117k tokens this way).
                 // SAFETY: session valid; `accepted` is a valid out-buffer of
                 // `cap` ints; err buffer valid.
                 let n = unsafe {
@@ -1595,11 +1954,14 @@ impl Engine for Ds4Session {
                         break;
                     }
                 }
-                if let Some(pos) = spec_block_rewind_target(block_start, n, kept) {
-                    // SAFETY: session valid; `pos` lies inside the block the
-                    // engine just committed, so the dropped tokens are still
-                    // in the raw window — the same call the C agent makes.
-                    unsafe { ffi::ds4_session_rewind(session, pos) };
+                // The engine committed the whole run; the walk stopped at
+                // `kept`. Not rewound: on DeepSeek a rewind invalidates the
+                // checkpoint and the next pass re-prefills from token zero.
+                // The tail is kept as shadow tokens instead.
+                if let Ok(kept) = usize::try_from(kept)
+                    && kept < run.len()
+                {
+                    shadow_tokens.extend_from_slice(&run[kept..]);
                 }
                 if hit_eos || stopped {
                     break;
@@ -1678,9 +2040,9 @@ impl Engine for Ds4Session {
         // and the two halves have to concatenate into exactly what the UI
         // renders (`docs/DOUBLE-BTW.md` §4.1). `common_prefix` trims when it
         // compares, so a completed reply still matches its rendered section.
-        self.record_reply(reply_text, &reply_tokens, opts.think_mode);
+        self.record_reply(reply_text, &reply_tokens, &shadow_tokens, opts.think_mode);
 
-        let interrupted = interrupt() || INTERRUPT.with(|f| f.load(Ordering::SeqCst));
+        let interrupted = interrupt() || cancel_reason() != CancelReason::None;
         let secs = start.elapsed().as_secs_f64();
         // SAFETY: session valid.
         let ctx_used = unsafe { ffi::ds4_session_pos(session) };
@@ -1887,7 +2249,8 @@ impl Engine for Ds4Session {
         // `Medium` lives entirely in the per-turn assistant prefix, which is
         // re-derived every turn and never cached. So a level change that keeps
         // the preamble where it is costs nothing.
-        let prefix_changed = self.think.effort_prefix() != mode.effort_prefix();
+        let numeric = crate::engine::numeric_thinking_model(&self.model_name());
+        let prefix_changed = self.think.effort_prefix(numeric) != mode.effort_prefix(numeric);
         self.think = mode;
         if prefix_changed {
             // The whole token buffer now starts with the wrong prefix. Drop it
@@ -1910,12 +2273,33 @@ impl Engine for Ds4Session {
         Ok(())
     }
 
+    // The two halves of the system prompt already reach the tokenizer as
+    // separate calls — `append_system_text` sends the trusted span through
+    // `ds4_tokenize_rendered_chat` and the remainder through
+    // `ds4_chat_append_message` — so the boundary between them is a hard token
+    // boundary no BPE merge can straddle. That is what makes it a legal place
+    // to keep a checkpoint.
+    fn splits_system_tail(&self) -> bool {
+        true
+    }
+
+    fn warm_append_system(&mut self, text: &str) -> Result<(), EngineError> {
+        // `trusted_len` 0 sends the whole text down the plain path, which is
+        // byte-for-byte the branch `append_system_text` would take for this
+        // same remainder. So `warm_reset(trusted)` followed by this call builds
+        // exactly the buffer `build_system_tokens(whole, trusted_len)` builds,
+        // and the split costs no token movement at all.
+        let msg = self.model.system_message_tokens(text, 0);
+        self.warm_tokens.push_all(&msg);
+        Ok(())
+    }
+
     fn warm_sync(&mut self, on_event: &mut dyn FnMut(EngineEvent)) -> Result<bool, EngineError> {
         // An interrupted generation leaves the thread-local cancel flag raised
         // and `cancel_cb` still registered on the session; `generate`/`prefill`
         // reset it on entry but this path never did, so the sync below would
         // stop at once with `SYNC_INTERRUPTED` and report a failed prefill.
-        INTERRUPT.with(|f| f.store(false, Ordering::SeqCst));
+        cancel_clear();
         let total = self.warm_tokens.len();
         let session = self.ensure_session()?;
         // SAFETY: session and tokens are valid.
@@ -2032,6 +2416,39 @@ impl Engine for Ds4Session {
         Ok(())
     }
 
+    fn release_session(&mut self) -> bool {
+        if self.session.is_null() {
+            return false;
+        }
+        // Mirror get_kv's two vision gates exactly: `vision_spans` is plank's
+        // own record, the FFI check is the engine's internal one, and either
+        // being non-empty means a rebuilt session would re-prefill image
+        // token positions with no embeddings behind them — silently
+        // ungrounded. Refuse the yield the same way `get_kv` refuses to
+        // capture such a session.
+        if !self.vision_spans.is_empty() {
+            kv_debug(|| "release_session: declined, session holds vision state".to_owned());
+            return false;
+        }
+        // SAFETY: session is non-null (checked above).
+        if unsafe { ffi::ds4_session_has_vision_state(self.session) } {
+            kv_debug(|| "release_session: declined, engine holds vision state".to_owned());
+            return false;
+        }
+        // SAFETY: session is non-null and owned by this engine; ds4_session_free
+        // is the matching destructor for ds4_session_new.
+        unsafe { ffi::ds4_session_free(self.session) };
+        self.session = std::ptr::null_mut();
+        // `warm_tokens` and `vision_spans` describe the live prompt, not the
+        // freed native session: they are what the next `warm_sync` resends into
+        // whatever session `ensure_session` recreates lazily. Clearing them
+        // here would throw away the very transcript this design means to
+        // rebuild from, and would leave `warm_sync`'s common-prefix probe
+        // comparing against nothing. Only the session handle is destroyed.
+        kv_debug(|| "release_session: live KV freed for memory pressure".to_owned());
+        true
+    }
+
     // ── Vision ───────────────────────────────────────────────────────────
 
     fn has_vision(&self) -> bool {
@@ -2120,6 +2537,81 @@ impl Engine for Ds4Session {
     fn set_pending_images(&mut self, images: Vec<(String, crate::engine::VisionImage)>) {
         self.pending_images = images;
     }
+
+    #[cfg(ds4_engine)]
+    fn supports_decide(&self) -> bool {
+        !self.decide_letters.is_empty()
+    }
+
+    #[cfg(ds4_engine)]
+    fn decide(
+        &mut self,
+        state: &str,
+        question: &crate::decide::Question,
+    ) -> Result<crate::decide::RawVerdict, EngineError> {
+        if self.decide_letters.is_empty() {
+            return Err(EngineError::unsupported());
+        }
+        // An option list longer than the answer-letter set is a caller/type
+        // mismatch, not a model failure — reject it before touching the
+        // session so the error names the real problem instead of surfacing
+        // as a bogus "logprob read failed" once the loop below runs dry on
+        // `decide_letters`.
+        if question.options.len() > self.decide_letters.len() {
+            return Err(EngineError::new(format!(
+                "question has {} options but only {} answer letters are available",
+                question.options.len(),
+                self.decide_letters.len()
+            )));
+        }
+        let s = self.decide_session()?;
+        // Both failure paths below drop the decision session rather than
+        // leaving it cached: a part-way prefill or a refused logprob read can
+        // leave the C's `checkpoint_valid` clear, and reusing that session
+        // would turn one bad call into a permanently broken capability.
+        if let Err(e) = self.decide_prefill(s, state, question) {
+            self.discard_decide_session();
+            return Err(e);
+        }
+
+        let mut logprobs = Vec::with_capacity(question.options.len());
+        for i in 0..question.options.len() {
+            // `decide_letters.len() >= options.len()` was checked above, so
+            // this is always `Some`.
+            let tok = self.decide_letters[i];
+            let mut sc = ffi::Ds4TokenScore::default();
+            // SAFETY: session is valid; sc is a valid out-ptr.
+            if unsafe { ffi::ds4_session_token_logprob(s, tok, &raw mut sc) } != 1 {
+                self.discard_decide_session();
+                return Err(EngineError::new("decision logprob read failed"));
+            }
+            logprobs.push(sc.logprob);
+        }
+
+        // How much of the model's probability sat on the letters at all.
+        // A question it wanted to answer in prose leaves this near zero,
+        // and `score` abstains rather than reading a ranking off noise.
+        let letter_mass: f32 = logprobs.iter().map(|lp| lp.exp()).sum();
+
+        // `letter_mass` decides whether the answer is trusted at all, and it
+        // is the one quantity no test without a real model can observe: if it
+        // routinely lands under `MIN_LETTER_MASS` the gate abstains on
+        // everything and is a silent no-op — working exactly as written and
+        // achieving nothing. Set `PLANK_DECIDE_DEBUG` to watch it on a real
+        // model before trusting a threshold.
+        if std::env::var_os("PLANK_DECIDE_DEBUG").is_some() {
+            eprintln!(
+                "[decide] letter_mass={letter_mass:.4} logprobs={logprobs:?} q={:?}",
+                question.text
+            );
+        }
+
+        Ok(crate::decide::score(
+            &logprobs,
+            crate::decide::DEFAULT_ABSTAIN_FLOOR,
+            letter_mass,
+        ))
+    }
 }
 
 impl Drop for Ds4Session {
@@ -2129,6 +2621,11 @@ impl Drop for Ds4Session {
             // model (weights + Metal context) is dropped separately when its
             // Arc refcount reaches zero (design §4).
             unsafe { ffi::ds4_session_free(self.session) };
+        }
+        #[cfg(ds4_engine)]
+        if let Some(d) = self.decide_session.take() {
+            // SAFETY: created by `decide_session()` and not yet freed.
+            unsafe { ffi::ds4_session_free(d) };
         }
         // Free any vision span embedding buffers still owned by this session.
         self.free_vision_spans();
@@ -2201,7 +2698,7 @@ impl Ds4HostSession {
         let prompt_len = tokens.len();
         let session = self.inner.ensure_session()?;
 
-        INTERRUPT.with(|f| f.store(false, Ordering::SeqCst));
+        cancel_clear();
         // SAFETY: session valid; cancel_cb reads a thread-local flag.
         unsafe { ffi::ds4_session_set_cancel(session, Some(cancel_cb), std::ptr::null_mut()) };
 
@@ -2233,7 +2730,7 @@ impl Ds4HostSession {
         // SAFETY: session valid; clearing before ProgressCtx drops.
         unsafe { ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut()) };
         if sync_rc != 0 {
-            if interrupt.load(Ordering::SeqCst) || INTERRUPT.with(|f| f.load(Ordering::SeqCst)) {
+            if interrupt.load(Ordering::SeqCst) || cancel_reason() != CancelReason::None {
                 return Ok(Err(GenerationStats {
                     interrupted: true,
                     ctx_used: prompt_len,
@@ -2285,7 +2782,7 @@ impl Ds4HostSession {
         // mid-stream characters were already reassembled by the carry.
         reply_text.push_str(&st.utf8.flush());
         self.inner
-            .record_reply(reply_text, &st.reply_tokens, st.opts.think_mode);
+            .record_reply(reply_text, &st.reply_tokens, &[], st.opts.think_mode);
         let secs = st.start.elapsed().as_secs_f64();
         // SAFETY: session valid (created during prefill).
         let ctx_used = unsafe { ffi::ds4_session_pos(self.inner.session) };
@@ -2336,7 +2833,7 @@ impl HostSession for Ds4HostSession {
         loop {
             let st = self.active.as_mut().expect("gen present after prefill");
             if interrupt.load(Ordering::SeqCst) {
-                INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
+                cancel_request(CancelReason::User);
                 return Ok(Some(self.finalize(true)));
             }
             if st.generated >= st.max_tokens {
@@ -2489,6 +2986,10 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     // kernels landed in the antirez/main sync and must be pointed at
     // explicitly, since the C engine's fallback search paths (relative
     // `metal/...` and `./metal/...`) only work from the submodule root.
+    // `DS4_METAL_DSV41_SOURCE` (`dsv41.metal`) arrived with the V4.1 bump
+    // for the same reason: the combined Metal source is compiled once for
+    // every model, so a missing V4.1 kernel would abort startup even for a
+    // plain V4 run.
     ("DS4_METAL_FLASH_ATTN_SOURCE", "flash_attn.metal"),
     ("DS4_METAL_DENSE_SOURCE", "dense.metal"),
     ("DS4_METAL_GLM53_BF16_SOURCE", "glm53_bf16.metal"),
@@ -2502,6 +3003,7 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     ("DS4_METAL_DSV4_HC_SOURCE", "dsv4_hc.metal"),
     ("DS4_METAL_UNARY_SOURCE", "unary.metal"),
     ("DS4_METAL_DSV4_KV_SOURCE", "dsv4_kv.metal"),
+    ("DS4_METAL_DSV41_SOURCE", "dsv41.metal"),
     ("DS4_METAL_DSV4_ROPE_SOURCE", "dsv4_rope.metal"),
     ("DS4_METAL_DSV4_MISC_SOURCE", "dsv4_misc.metal"),
     ("DS4_METAL_ARGSORT_SOURCE", "argsort.metal"),
@@ -2523,23 +3025,22 @@ pub const METAL_KERNEL_SOURCES: &[(&str, &str)] = &[
     ("DS4_METAL_QWEN4_VISION_SOURCE", "qwen4_vision.metal"),
 ];
 
-/// Which of the engine's two companion slots `--mtp-model` fills.
+/// The `--mtp-model` companion, checked against the family of the *main* model.
 ///
-/// Decided by the family of the *main* model, read from its own GGUF metadata.
-/// The engine cannot be asked: it detects the family while opening, and both
-/// paths have to be in the options struct before that call — and a `ple_path`
-/// handed to a non-Qwen model is a hard error there, not a warning.
-fn companion_slots(
-    family: crate::gguf::ModelFamily,
-    companion: Option<&Path>,
-) -> (Option<&Path>, Option<&Path>) {
+/// The engine cannot be asked which companion it wants: it detects the family
+/// while opening, and the path has to be in the options struct before that
+/// call. So the family is read from the main model's own GGUF metadata and the
+/// companion is warned about here, ahead of `ds4_engine_open`.
+///
+/// There used to be a second slot, `ple_path`, for the Qwen3.8 n-gram sidecar.
+/// Upstream now ships those n-grams inside the Qwen GGUF itself and deleted the
+/// field from `ds4_engine_options`, so every family Qwen included fills the one
+/// drafter slot or none.
+fn mtp_companion(family: crate::gguf::ModelFamily, companion: Option<&Path>) -> Option<&Path> {
     if let Some(c) = companion {
         warn_on_companion_mismatch(family, c);
     }
-    match family {
-        crate::gguf::ModelFamily::Qwen => (None, companion),
-        crate::gguf::ModelFamily::Ds4 => (companion, None),
-    }
+    companion
 }
 
 /// Warns when the `--mtp-model` companion is not the kind this family wants.
@@ -2556,9 +3057,19 @@ fn warn_on_companion_mismatch(family: crate::gguf::ModelFamily, companion: &Path
     let Some(arch) = crate::gguf::architecture(companion) else {
         return;
     };
+    // DSpark, pipeline execution and non-Metal backends are not implemented
+    // for V4.1 (`refs/ds4/docs/MODELS.md`, as of commit bd66c40) — there is no
+    // V4.1 drafter architecture to name, real or invented.
+    if family == crate::gguf::ModelFamily::Ds41 {
+        eprintln!(
+            "warning: --mtp {} was given, but DSpark speculative decoding is not implemented for DeepSeek V4.1 Flash",
+            companion.display()
+        );
+        return;
+    }
     let expected = match family {
         crate::gguf::ModelFamily::Qwen => "qwen4-exp-ple",
-        crate::gguf::ModelFamily::Ds4 => "deepseek4-dspark",
+        crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41 => "deepseek4-dspark",
     };
     if arch != expected {
         eprintln!(
@@ -2613,14 +3124,25 @@ fn cstr_message(buf: &[i8], fallback: &str) -> String {
     s.to_string_lossy().into_owned()
 }
 
+/// The reasoning discriminant recorded on an assistant span.
+///
+/// Saturating, because the span field is one byte while a V4.1 effort rides at
+/// `1000 + n`: every explicit effort therefore tags as 255, distinct from the
+/// three named modes, which keep the C's 0/1/2 as they always had.
+fn think_span_tag(think: ThinkMode) -> u8 {
+    u8::try_from(ds4_think(think).0).unwrap_or(u8::MAX)
+}
+
 /// Maps the engine-agnostic think mode to ds4's.
 fn ds4_think(think: ThinkMode) -> ffi::Ds4ThinkMode {
     match think {
-        ThinkMode::Off => ffi::Ds4ThinkMode::None,
+        ThinkMode::Off => ffi::Ds4ThinkMode::NONE,
         // `Low` is `HIGH` to the engine — the brevity request lives entirely in
         // the prompt preamble, since the engine has no level below `HIGH`.
-        ThinkMode::Low | ThinkMode::Medium => ffi::Ds4ThinkMode::High,
-        ThinkMode::Max => ffi::Ds4ThinkMode::Max,
+        ThinkMode::Low | ThinkMode::Medium => ffi::Ds4ThinkMode::HIGH,
+        ThinkMode::Max => ffi::Ds4ThinkMode::MAX,
+        // The explicit V4.1 effort, `DS4_THINK_LEVEL_BASE + n`.
+        ThinkMode::Level(n) => ffi::Ds4ThinkMode::level(n),
     }
 }
 
@@ -2700,6 +3222,108 @@ fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        CancelReason, cancel_cb, cancel_clear, cancel_reason, cancel_request,
+        cancelled_by_pressure, request_pressure_cancel, wants_empty_system,
+    };
+
+    #[test]
+    fn wants_empty_system_for_v41_with_trusted_text() {
+        assert!(wants_empty_system("DeepSeek V4.1 Flash", "system text"));
+    }
+
+    #[test]
+    fn wants_empty_system_false_for_v4() {
+        assert!(!wants_empty_system("DeepSeek V4 Flash", "system text"));
+    }
+
+    #[test]
+    fn wants_empty_system_false_when_trusted_is_empty() {
+        assert!(!wants_empty_system("DeepSeek V4.1 Flash", ""));
+    }
+
+    #[test]
+    fn wants_empty_system_false_for_empty_model_name() {
+        assert!(!wants_empty_system("", "system text"));
+    }
+
+    #[test]
+    fn a_user_interrupt_outranks_a_pressure_yield() {
+        cancel_clear();
+        cancel_request(CancelReason::Pressure);
+        assert_eq!(cancel_reason(), CancelReason::Pressure);
+        cancel_request(CancelReason::User);
+        assert_eq!(
+            cancel_reason(),
+            CancelReason::User,
+            "Esc during a yield must end the turn, not resume it"
+        );
+    }
+
+    #[test]
+    fn a_pressure_yield_never_downgrades_a_user_interrupt() {
+        cancel_clear();
+        cancel_request(CancelReason::User);
+        cancel_request(CancelReason::Pressure);
+        assert_eq!(
+            cancel_reason(),
+            CancelReason::User,
+            "pressure must not turn a killed generation into a resumable one"
+        );
+    }
+
+    #[test]
+    fn clear_resets_to_none() {
+        cancel_clear();
+        cancel_request(CancelReason::Pressure);
+        cancel_clear();
+        assert_eq!(cancel_reason(), CancelReason::None);
+    }
+
+    #[test]
+    fn the_cancel_callback_fires_for_either_reason() {
+        for reason in [CancelReason::User, CancelReason::Pressure] {
+            cancel_clear();
+            cancel_request(reason);
+            // SAFETY: cancel_cb only reads a thread-local; the pointer is unused.
+            assert!(
+                unsafe { cancel_cb(std::ptr::null_mut()) },
+                "{reason:?} must stop the engine"
+            );
+        }
+        cancel_clear();
+        // SAFETY: as above.
+        assert!(!unsafe { cancel_cb(std::ptr::null_mut()) });
+    }
+
+    #[test]
+    fn pressure_is_reported_only_for_a_pressure_stop() {
+        cancel_clear();
+        assert!(!cancelled_by_pressure());
+        request_pressure_cancel();
+        assert!(cancelled_by_pressure());
+        cancel_request(CancelReason::User);
+        assert!(
+            !cancelled_by_pressure(),
+            "an Esc during a yield ends the turn; it must not look resumable"
+        );
+    }
+    /// The `--mtp` companion reaches the drafter slot unchanged for every
+    /// family plank serves: the warning is advisory, never a filter, so a
+    /// companion the heuristic dislikes must still be handed to the engine.
+    #[test]
+    fn the_companion_always_fills_the_drafter_slot() {
+        let c = std::path::Path::new("/models/dspark.gguf");
+        for family in [
+            crate::gguf::ModelFamily::Ds4,
+            crate::gguf::ModelFamily::Ds41,
+            crate::gguf::ModelFamily::Qwen,
+        ] {
+            assert_eq!(super::mtp_companion(family, None), None);
+            assert_eq!(super::mtp_companion(family, Some(c)), Some(c));
+        }
+    }
+
     /// The filter that keeps a position-based callback honest. Both hooks are
     /// installed, so both names must pass; anything else must not be read as a
     /// prompt position.
@@ -2718,54 +3342,31 @@ mod tests {
         }
     }
 
-    use super::{
-        is_prefill_event, parse_sections, spec_block_rewind_target, strip_legacy,
-        think_close_suffix,
-    };
+    use super::{assistant_span_tokens, is_prefill_event, parse_sections, strip_legacy};
 
-    /// Regression for the 56k-token rebuild in `turbo-vision-debug-2.log`: the
-    /// incoming assistant section was the held reply plus exactly `</think>`
-    /// (18008 vs 18000 bytes). Only that shape is a splice; anything else is a
-    /// rewrite.
+    /// The recorded span mirrors the live KV exactly: prefix, rendered reply,
+    /// the committed-but-unrendered tail of a cut speculative block, then one
+    /// EOS — never two.
     #[test]
-    fn only_an_appended_think_close_counts_as_a_splice() {
+    fn assistant_span_keeps_the_committed_tail_and_ends_on_one_eos() {
+        let eos = 1;
+        // Whole block kept: prefix + reply + EOS, as before.
         assert_eq!(
-            think_close_suffix("We have enough.", "We have enough.</think>"),
-            Some("</think>")
+            assistant_span_tokens(&[9], &[5, 6], &[], eos),
+            vec![9, 5, 6, 1]
         );
-        // The held text is stored raw and compared trimmed, like common_prefix.
+        // A tool stanza closed mid-block: the extra committed token rides along.
         assert_eq!(
-            think_close_suffix("reply\n\n", "reply</think>"),
-            Some("</think>")
+            assistant_span_tokens(&[9], &[5, 6], &[7], eos),
+            vec![9, 5, 6, 7, 1]
         );
-        assert_eq!(think_close_suffix("reply", "reply"), None);
-        assert_eq!(think_close_suffix("reply", "reply</think>\n\n"), None);
-        assert_eq!(think_close_suffix("reply", "other</think>"), None);
-        assert_eq!(think_close_suffix("reply", "reply more</think>"), None);
-    }
-
-    /// Regression for the recorded 117k-token rebuild: a speculative block
-    /// whose accepted run ends in EOS leaves the KV one token past the
-    /// transcript unless the loop rewinds to the tokens it actually kept.
-    #[test]
-    fn spec_block_rewind_drops_only_the_tokens_the_loop_did_not_keep() {
-        // Block of 4 committed at 117365; EOS was the 4th, so 3 were kept:
-        // the KV must end at 117368, not 117369.
-        assert_eq!(spec_block_rewind_target(117_365, 4, 3), Some(117_368));
-        // EOS as the very first accepted token: rewind to the block start.
-        assert_eq!(spec_block_rewind_target(100, 1, 0), Some(100));
-        // Token budget cut the walk short mid-block: same rule.
-        assert_eq!(spec_block_rewind_target(100, 5, 2), Some(102));
-    }
-
-    #[test]
-    fn spec_block_rewind_is_a_no_op_when_the_whole_block_was_kept() {
-        assert_eq!(spec_block_rewind_target(100, 5, 5), None);
-        assert_eq!(spec_block_rewind_target(100, 1, 1), None);
-        // Nothing committed (the caller breaks before reaching here anyway).
-        assert_eq!(spec_block_rewind_target(100, 0, 0), None);
-        // Defensive: a kept count past the block never rewinds forward.
-        assert_eq!(spec_block_rewind_target(100, 3, 7), None);
+        // The engine stopped the block on EOS: it is already the last token.
+        assert_eq!(
+            assistant_span_tokens(&[9], &[5, 6], &[1], eos),
+            vec![9, 5, 6, 1]
+        );
+        // EOS as the very first accepted token of the reply.
+        assert_eq!(assistant_span_tokens(&[9], &[], &[1], eos), vec![9, 1]);
     }
 
     #[test]
@@ -3215,6 +3816,148 @@ mod tests {
         assert!(stats.generated > 0);
     }
 
+    /// Opens a bare `Ds4Session` (not host-wrapped) over `PLANK_TEST_MODEL`,
+    /// for tests that call `Engine` methods directly on it.
+    #[cfg(ds4_engine)]
+    fn open_test_session(model_path: &std::ffi::OsStr) -> super::Ds4Session {
+        use crate::ffi::Ds4Backend;
+
+        // `mtp` defaults to true, and on a DeepSeek model with no companion
+        // the C refuses to open at all ("--dspark requires --mtp-model
+        // FILE"), so the default tuning cannot load a plain ds4 GGUF.
+        // Speculative decoding is irrelevant to a decision — nothing is
+        // generated — so turn it off rather than making whoever runs this
+        // test supply a draft checkpoint.
+        //
+        // `PLANK_TEST_SSD_STREAMING=1` additionally turns on SSD streaming,
+        // which a model too large for the machine needs to open at all — on a
+        // 128 GiB box V4.1 refuses with "needs 155.55 GiB before the expert
+        // cache; safe budget 107.52 GiB". Off by default because a model that
+        // fits should not pay for streaming.
+        let tuning = crate::config::EngineTuning {
+            mtp: false,
+            ssd_streaming: std::env::var_os("PLANK_TEST_SSD_STREAMING").is_some(),
+            ..Default::default()
+        };
+        let model = super::Ds4Model::open_shared(
+            model_path,
+            Ds4Backend::Metal,
+            4096,
+            0,
+            100,
+            &tuning,
+            "you are a helpful assistant",
+        )
+        .unwrap();
+        super::Ds4Session::from_model(model)
+    }
+
+    #[cfg(ds4_engine)]
+    #[test]
+    fn decide_answers_a_boolean_and_leaves_the_live_session_untouched() {
+        use crate::engine::Engine;
+
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let mut e = open_test_session(&model_path);
+        if !e.supports_decide() {
+            eprintln!("skipping: answer letters are not single tokens on this family");
+            return;
+        }
+        // Take the live session to a non-trivial position first, so a rewind
+        // bug would show up as a changed position rather than a no-op.
+        e.warm_reset("You are a helpful assistant.").unwrap();
+        e.warm_append(Some("Hello there.")).unwrap();
+        e.warm_sync(&mut |_| {}).unwrap();
+        // SAFETY: session was just synced above.
+        let before_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };
+
+        let q = crate::decide::Question::boolean(
+            "Does the text above state a person's name? Answer yes or no.",
+        );
+        let out = e
+            .decide("The user's name is Enzo and he lives in Milan.", &q)
+            .expect("decide must succeed once supported");
+        assert!(out.p.is_finite());
+        assert!((0.0..=1.0).contains(&out.p));
+        // `Question::boolean` puts "yes" at index 0, and the state plainly
+        // does state a name. Asserting the answer — not merely that the call
+        // returned — is what makes this catch a logprob read taken at the
+        // wrong position, which would otherwise look like a healthy but
+        // meaningless probability.
+        assert!(
+            !out.abstained,
+            "a plain question about an explicit fact should not abstain"
+        );
+        assert_eq!(out.index, 0, "expected yes; p was {}", out.p);
+
+        // SAFETY: session is still valid.
+        let after_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };
+        assert_eq!(
+            before_pos, after_pos,
+            "a decision must not move the live session"
+        );
+    }
+
+    #[cfg(ds4_engine)]
+    #[test]
+    fn two_separate_decide_calls_both_succeed_and_leave_position_unchanged() {
+        use crate::engine::Engine;
+
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let mut e = open_test_session(&model_path);
+        if !e.supports_decide() {
+            eprintln!("skipping: answer letters are not single tokens on this family");
+            return;
+        }
+        e.warm_reset("You are a helpful assistant.").unwrap();
+        e.warm_append(Some("Hello there.")).unwrap();
+        e.warm_sync(&mut |_| {}).unwrap();
+        // SAFETY: session was just synced above.
+        let before_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };
+
+        // Two separate `decide` calls on the same session — the single-question
+        // API's replacement for the old rewind-between-questions batching,
+        // which was unsound on DeepSeek (see the annotation on
+        // `Ds4Session::decide_prefill`).
+        let travel = e
+            .decide(
+                "I flew to Rome last week.",
+                &crate::decide::Question::boolean("Is the text about travel?"),
+            )
+            .unwrap();
+        let food = e
+            .decide(
+                "I flew to Rome last week.",
+                &crate::decide::Question::boolean("Is the text about food?"),
+            )
+            .unwrap();
+        assert!(travel.p.is_finite());
+        assert!(food.p.is_finite());
+        // The two questions must produce DIFFERENT answers about the same
+        // state. Asserting only that both calls returned would pass even if
+        // the second call read a stale distribution left by the first — which
+        // is exactly the failure mode the old rewind design had, and the one
+        // thing these two calls exist to rule out.
+        assert_ne!(
+            (travel.index, travel.abstained),
+            (food.index, food.abstained),
+            "travel={travel:?} food={food:?}: the second call looks stale"
+        );
+
+        // SAFETY: session is still valid.
+        let after_pos = unsafe { crate::ffi::ds4_session_pos(e.raw_session()) };
+        assert_eq!(
+            before_pos, after_pos,
+            "two decide calls in a row must not move the live session"
+        );
+    }
+
     #[cfg(ds4_engine)]
     #[test]
     fn two_sessions_no_cross_contamination() {
@@ -3557,6 +4300,98 @@ mod tests {
             resumed_remaining < restored_len,
             "resume reused the payload prefix rather than rebuilding its \
              {restored_len} tokens (remaining={resumed_remaining})"
+        );
+    }
+
+    // The one behaviour no spy engine can prove: a generation interrupted by a
+    // memory-pressure yield and resumed produces the *same* continuation as an
+    // uninterrupted one. The yield deliberately captures no KV payload — it
+    // frees the live session outright — so the resumed turn rebuilds its prefix
+    // from the transcript alone. If that rebuild ever serves a wrong prefix
+    // (an off-by-one retokenization, a stale `warm_tokens`, a checkpoint kept
+    // past the free), the continuation diverges and this test catches it; a
+    // reuse-count assertion would not, because a wrong prefix can still be
+    // "reused" cheaply.
+    //
+    // Harness copied from `switch_payload_resume_suffix_only`: same
+    // `Ds4Session::open` construction, the same seeded `GenerationOptions`,
+    // the same scoped one-live-engine-per-process discipline, and
+    // `gen_capture_reply` to drive a generation and collect its text.
+    //
+    // Requires a loaded model; skips unless PLANK_TEST_MODEL points at a GGUF.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn a_pressure_yield_resumes_to_the_same_continuation() {
+        use crate::engine::{Engine, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let opts = GenerationOptions {
+            seed: 42,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+        let transcript = "[user]\nName a fruit.\n";
+
+        // Only ONE live engine per process: each engine lives in its own scope
+        // so its Metal model is fully dropped before the next one opens.
+
+        // Baseline: two turns, uninterrupted.
+        let (baseline, resumed_transcript) = {
+            let mut a =
+                super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            let (_, reply1) = gen_capture_reply(&mut a, transcript, &opts);
+            let second = format!(
+                "{transcript}[assistant]\n{}\n[user]\nName a planet.\n",
+                reply1.trim()
+            );
+            let (_, reply2) = gen_capture_reply(&mut a, &second, &opts);
+            (reply2, second)
+        };
+
+        // Same two turns, but the session is freed between them exactly as the
+        // pressure path frees it: raise the reason, free, *then* clear. The
+        // order matters — `clear_cancel` before the free lets a racing turn
+        // start against a session about to vanish — and `generate` clears the
+        // flag on entry anyway, so a reason raised between passes would be
+        // dropped if the free did not already consume it.
+        let resumed = {
+            let mut b =
+                super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            let (_, reply1) = gen_capture_reply(&mut b, transcript, &opts);
+            assert_eq!(
+                resumed_transcript,
+                format!(
+                    "{transcript}[assistant]\n{}\n[user]\nName a planet.\n",
+                    reply1.trim()
+                ),
+                "the two runs must reach the same second-turn prompt, or the \
+                 continuation comparison below proves nothing"
+            );
+
+            request_pressure_cancel();
+            assert!(cancelled_by_pressure());
+            assert!(
+                b.release_session(),
+                "a text-only session must actually be freed by the yield; a \
+                 declined release means there is no yield to resume from"
+            );
+            super::clear_cancel();
+            assert!(!cancelled_by_pressure());
+
+            // No `set_kv` here on purpose: the resume rebuilds from the
+            // transcript, which is the whole point of not snapshotting.
+            gen_capture_reply(&mut b, &resumed_transcript, &opts).1
+        };
+
+        assert_eq!(
+            baseline, resumed,
+            "a yield must be invisible in the output; a differing continuation \
+             means the restore served a wrong prefix"
         );
     }
 

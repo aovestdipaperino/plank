@@ -305,6 +305,20 @@ pub fn tool_write(ctx: &mut ToolContext, call: &ToolCall) -> String {
     };
     // Prior content (for the diff card); absent means this write creates it.
     let prior = std::fs::read(&full).ok();
+    // A missing parent directory is created rather than refused: the target
+    // already passed write containment, so the hierarchy lands inside the
+    // workspace, and making the model re-issue the write behind a `bash mkdir`
+    // costs a whole round trip of the file it just generated. The user still
+    // gets told, because directories appearing is a side effect they did not
+    // ask for by name.
+    if let Some(parent) = full.parent()
+        && !parent.exists()
+    {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return format!("Tool error: create parent directory failed: {e}\n");
+        }
+        ctx.publish_status(&format!("Created directory {}", parent.display()));
+    }
     let mut file = match std::fs::File::create(&full) {
         Ok(f) => f,
         Err(e) => return format!("Tool error: open for write failed: {e}\n"),
@@ -904,6 +918,44 @@ mod tests {
             tool_write(&mut ctx, &test_call("write", &[("path", "p")])),
             "Tool error: write requires content\n"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Writing into a directory that does not exist yet creates the hierarchy
+    /// instead of failing, so the model does not have to regenerate the file
+    /// after a `mkdir` round trip — but the user is told a directory appeared.
+    #[test]
+    fn write_creates_missing_parent_directories_and_warns() {
+        let (mut ctx, dir) = test_ctx();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        ctx.status_sink = Some({
+            let seen = seen.clone();
+            Box::new(move |m: &str| seen.lock().unwrap().push(m.to_owned()))
+        });
+        let out = tool_write(
+            &mut ctx,
+            &test_call("write", &[("path", "a/b/c/deep.txt"), ("content", "hi\n")]),
+        );
+        assert_eq!(out, "Wrote 3 bytes to a/b/c/deep.txt\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a/b/c/deep.txt")).unwrap(),
+            "hi\n"
+        );
+        let warnings = seen.lock().unwrap().clone();
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(
+            warnings[0].starts_with("Created directory ")
+                && warnings[0].ends_with(&dir.join("a/b/c").display().to_string()),
+            "warning names the directory: {}",
+            warnings[0]
+        );
+
+        // A second write into the now-existing directory warns about nothing.
+        tool_write(
+            &mut ctx,
+            &test_call("write", &[("path", "a/b/c/next.txt"), ("content", "x")]),
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1, "no repeat warning");
         std::fs::remove_dir_all(dir).ok();
     }
 

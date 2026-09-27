@@ -1,4 +1,5 @@
-//! Just enough GGUF reading to learn which model family a file is.
+//! Just enough GGUF reading to learn which model family a file is, and
+//! whether it is the checkpoint the engine will pair with a vision encoder.
 //!
 //! plank has to know this *before* `ds4_engine_open`, and the engine cannot
 //! tell it: the C detects the family while opening, but the companion-GGUF
@@ -25,6 +26,11 @@ pub enum ModelFamily {
     Ds4,
     /// Qwen3.8-Flash-Next (`qwen4exp`).
     Qwen,
+    /// `DeepSeek` V4.1 Flash (`deepseek41`). A distinct family, not a revision
+    /// of V4: its weights, vision encoder and tokenizer are not interchangeable,
+    /// and it speaks its own DSML dialect, so nothing captured under one family
+    /// may be replayed under the other.
+    Ds41,
 }
 
 impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
@@ -36,6 +42,7 @@ impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
     fn from(syntax: trace_stream::syntax::ToolSyntax) -> Self {
         match syntax {
             trace_stream::syntax::ToolSyntax::Qwen => Self::Qwen,
+            trace_stream::syntax::ToolSyntax::Dsml41 => Self::Ds41,
             trace_stream::syntax::ToolSyntax::Dsml => Self::Ds4,
         }
     }
@@ -43,6 +50,12 @@ impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
 
 /// The `general.architecture` value the C matches for Qwen3.8-Flash-Next.
 const QWEN_ARCH: &str = "qwen4exp";
+
+/// The `general.architecture` value the C matches for `DeepSeek` V4.1 Flash.
+///
+/// V4's is `deepseek4`, which is *not* a prefix match away: the C compares the
+/// whole string, so `deepseek41` must be listed on its own.
+const DS41_ARCH: &str = "deepseek41";
 
 /// Refuses to allocate for a declared length beyond this. The file may be
 /// truncated or not a GGUF at all, and a bogus 64-bit length would otherwise
@@ -63,6 +76,7 @@ const MAX_KV_PAIRS: u64 = 1 << 20;
 pub fn family_of(path: &Path) -> ModelFamily {
     match architecture(path).as_deref() {
         Some(QWEN_ARCH) => ModelFamily::Qwen,
+        Some(DS41_ARCH) => ModelFamily::Ds41,
         _ => ModelFamily::Ds4,
     }
 }
@@ -72,6 +86,36 @@ pub fn family_of(path: &Path) -> ModelFamily {
 /// `None` when the file is not GGUF, is truncated, or has no such key.
 #[must_use]
 pub fn architecture(path: &Path) -> Option<String> {
+    string_value(path, "general.architecture")
+}
+
+/// The `deepseek4.checkpoint_variant` value the C requires before it will
+/// bind the `DeepSeek` vision encoder (`g_ds4_flash_vision_exp`).
+const VISION_EXP_VARIANT: &str = "vision-exp";
+
+/// Whether the engine will accept a vision encoder alongside the model at
+/// `path`.
+///
+/// The C refuses `ds4_engine_open` outright — "--vision requires ... the
+/// pinned `DeepSeek` V4 Flash Vision-Exp model" — when a `vision_path` is set
+/// and the main GGUF is not that checkpoint, so plank has to know before the
+/// open whether to pass one at all. Any other `DeepSeek` V4 checkpoint (a
+/// language-only quant, an abliterated re-quant) is text-only; the
+/// `view_image` tool then refuses at call time exactly as it does when the
+/// encoder file is missing. Qwen is answered elsewhere: the C would accept a
+/// Qwen encoder, but plank does not ship one, so this stays a `DeepSeek`
+/// question.
+#[must_use]
+pub fn supports_vision(path: &Path) -> bool {
+    string_value(path, "deepseek4.checkpoint_variant").as_deref() == Some(VISION_EXP_VARIANT)
+}
+
+/// Reads one string-typed metadata value out of a GGUF file.
+///
+/// `None` when the file is not GGUF, is truncated, has no such key, or the
+/// key holds a non-string value.
+#[must_use]
+pub fn string_value(path: &Path, wanted: &str) -> Option<String> {
     let mut r = BufReader::new(File::open(path).ok()?);
     if &read_exact::<4>(&mut r)? != b"GGUF" {
         return None;
@@ -85,7 +129,7 @@ pub fn architecture(path: &Path) -> Option<String> {
     for _ in 0..kv_count {
         let key = read_string(&mut r)?;
         let ty = u32::from_le_bytes(read_exact::<4>(&mut r)?);
-        if key == "general.architecture" {
+        if key == wanted {
             // Type 8 is STRING. A different type here means the file is not
             // shaped the way the engine expects, so say nothing rather than
             // coerce it.
@@ -160,6 +204,212 @@ fn skip_value<R: Read + Seek>(r: &mut BufReader<R>, ty: u32) -> Option<()> {
         }
         _ => None,
     }
+}
+
+/// One detail line about a file the engine open depended on: whether it is
+/// there, what a symlink points at, how big it is, and whether this process
+/// can actually read it.
+///
+/// `None` when `path` is `None`, so a companion plank deliberately never
+/// passed is not reported as a file that is missing — the same distinction
+/// `report_text_only` makes for the vision encoder.
+#[must_use]
+pub fn file_detail(label: &str, path: Option<&Path>) -> Option<String> {
+    use std::fmt::Write as _;
+    let path = path?;
+    let mut line = format!("- {label}: {}", path.display());
+    // `symlink_metadata` first: plank's own default model paths are symlinks
+    // by convention (`~/.plank/qwen.gguf` and its sidecar are expected to
+    // point at whichever build you keep), so a dangling one is the single most
+    // likely cause of an open that fails with the path looking perfectly fine.
+    match std::fs::symlink_metadata(path) {
+        Err(e) => {
+            let _ = write!(line, " — not found ({e})");
+            return Some(line);
+        }
+        Ok(md) if md.file_type().is_symlink() => {
+            match std::fs::read_link(path) {
+                Ok(target) => {
+                    let _ = write!(line, " → {}", target.display());
+                }
+                Err(e) => {
+                    let _ = write!(line, " — symlink unreadable ({e})");
+                    return Some(line);
+                }
+            }
+            if !path.exists() {
+                line.push_str(" — DANGLING: the symlink target does not exist");
+                return Some(line);
+            }
+        }
+        Ok(_) => {}
+    }
+    match std::fs::metadata(path) {
+        Ok(md) if md.is_dir() => line.push_str(" — is a directory, not a file"),
+        Ok(md) => {
+            let _ = write!(line, ", {}", crate::kvpane::human_bytes(md.len()));
+            // Size says nothing about permissions, and an artifact copied in
+            // as root is a real way to get here.
+            if let Err(e) = File::open(path) {
+                let _ = write!(line, " — cannot read it ({e})");
+            }
+        }
+        Err(e) => {
+            let _ = write!(line, " — cannot stat ({e})");
+        }
+    }
+    Some(line)
+}
+
+/// The line comparing an artifact against the length the installed manifest
+/// records for it, when `path` is one of the managed artifacts and the two
+/// disagree.
+///
+/// The decisive check for the failure mode a plain "failed to open" hides
+/// worst: a truncated weights file. An interrupted install, a full disk, or a
+/// half-copied file opens as a perfectly ordinary path of the right name, and
+/// the engine's own complaint about it is a parse error deep in a tensor
+/// table. plank already knows the expected byte count, so it can say so.
+#[must_use]
+pub fn artifact_size_mismatch(path: &Path, family: ModelFamily) -> Option<String> {
+    let on_disk = std::fs::metadata(path).ok()?.len();
+    let set = crate::manifest::ModelSet::for_family(family);
+    let manifest = crate::manifest::read_at(&crate::manifest::installed_path(set))?;
+    let same = |a: &Path, b: &Path| {
+        a == b
+            || match (a.canonicalize(), b.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+    };
+    let (_, entry) = manifest.files.iter().find(|(kind, _)| {
+        crate::manifest::local_path_for(set, kind).is_some_and(|p| same(&p, path))
+    })?;
+    (entry.bytes != on_disk).then(|| {
+        format!(
+            "- SIZE MISMATCH: the installed {} manifest records {} for this artifact, but the file is {} — an interrupted or truncated install",
+            set.as_str(),
+            crate::kvpane::human_bytes(entry.bytes),
+            crate::kvpane::human_bytes(on_disk)
+        )
+    })
+}
+
+/// What plank knew when it asked the engine to open a model, for
+/// [`open_failure_detail`]. A struct because the answer draws on eight
+/// unrelated facts and a positional call of that width is a bug waiting for a
+/// refactor to swap two of them.
+#[derive(Debug)]
+pub struct OpenAttempt<'a> {
+    /// The model file handed to the engine.
+    pub path: &'a Path,
+    /// What `ds4_engine_open` returned.
+    pub rc: i32,
+    /// Whether it left the out-pointer null.
+    pub engine_null: bool,
+    /// Family plank detected from the file's own metadata before opening.
+    pub family: ModelFamily,
+    /// Backend label, already formatted by the caller so this module needs no
+    /// FFI type.
+    pub backend: &'a str,
+    /// Context window requested, in tokens.
+    pub ctx_size: i32,
+    /// Companion files actually passed, label first. `None` for one plank
+    /// deliberately did not pass.
+    pub companions: &'a [(&'a str, Option<&'a Path>)],
+    /// Whether the Metal kernel sources were absent where the engine looks.
+    pub metal_kernels_missing: bool,
+}
+
+/// The multi-line body of a "failed to open model" error: every fact plank can
+/// establish about why, on its own, without the engine.
+///
+/// A bare "failed to open model &lt;path&gt;" is the least useful form of a
+/// failure that has a handful of cheap and decisive causes: a dangling symlink,
+/// a truncated artifact from an interrupted install, a companion sidecar that
+/// is absent (a Qwen run cannot open without its PLE file, and `--mtp` on a
+/// `DeepSeek` run cannot without the draft checkpoint), a context size the
+/// machine cannot hold, or the Metal kernel sources not being where the engine
+/// looks. Each gets its own line, and only when it is true, so the message
+/// never pads itself out with reassurance that everything is fine.
+///
+/// Lives here rather than beside the open it describes because everything in
+/// it is FFI-free and so stays CI-tested, the same split `ds4tokens` makes:
+/// the gated engine wrapper passes its backend as a label and its return code
+/// as a number.
+#[must_use]
+pub fn open_failure_detail(attempt: &OpenAttempt) -> String {
+    use std::fmt::Write as _;
+    let OpenAttempt {
+        path,
+        rc,
+        engine_null,
+        family,
+        backend,
+        ctx_size,
+        companions,
+        metal_kernels_missing,
+    } = *attempt;
+    let mut msg = format!("failed to open model {}", path.display());
+    // The two ways the C reports a refusal are worth telling apart: a code is
+    // something it decided, a null engine with a zero code is a bug in the
+    // glue or an allocation that failed without saying so.
+    if rc != 0 {
+        let _ = write!(
+            msg,
+            "
+- ds4_engine_open returned {rc}"
+        );
+    } else if engine_null {
+        msg.push_str(
+            "
+- ds4_engine_open reported success but returned no engine",
+        );
+    }
+    let _ = write!(
+        msg,
+        "
+- opened as: {} family, {backend} backend, context {ctx_size} tokens",
+        crate::manifest::ModelSet::for_family(family).as_str()
+    );
+    if let Some(line) = file_detail("model file", Some(path)) {
+        let _ = write!(
+            msg,
+            "
+{line}"
+        );
+    }
+    if let Some(line) = artifact_size_mismatch(path, family) {
+        let _ = write!(
+            msg,
+            "
+{line}"
+        );
+    }
+    for (label, companion) in companions {
+        if let Some(line) = file_detail(label, *companion) {
+            let _ = write!(
+                msg,
+                "
+{line}"
+            );
+        }
+    }
+    if metal_kernels_missing {
+        msg.push_str(
+            "
+- Metal kernel sources not found; set DS4_METAL_DIR to a directory \
+             containing the .metal files",
+        );
+    }
+    // The C logs its own diagnosis on the way out, and plank renders that log
+    // in place on a single row, so the line that actually names the cause is
+    // usually the last thing above this message — and easy to read past.
+    msg.push_str(
+        "
+- the engine's own log is on the lines above this one",
+    );
+    msg
 }
 
 #[cfg(test)]
@@ -296,6 +546,59 @@ mod tests {
         }
     }
 
+    /// `deepseek41` is not a prefix match away from `deepseek4` and must not
+    /// fall through to it: it is its own family, with its own weights,
+    /// vision encoder, tokenizer and DSML dialect.
+    #[test]
+    fn deepseek41_arch_is_its_own_family() {
+        let p = Gguf::default()
+            .str_val("general.architecture", "deepseek41")
+            .write("ds41");
+        assert_eq!(family_of(&p), ModelFamily::Ds41);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// The probe and the dialect selector must agree for V4.1 too, the same
+    /// way `the_dialect_and_the_family_agree` checks it for V4 and Qwen.
+    #[test]
+    fn v41_dialect_maps_to_the_v41_family() {
+        use trace_stream::syntax::ToolSyntax;
+        assert_eq!(ModelFamily::from(ToolSyntax::Dsml41), ModelFamily::Ds41);
+        assert_eq!(
+            ModelFamily::from(ToolSyntax::for_model_name("DeepSeek V4.1 Flash")),
+            ModelFamily::Ds41
+        );
+    }
+
+    /// Only the pinned Vision-Exp checkpoint may be opened with a vision
+    /// encoder; the C refuses the open for any other `DeepSeek` GGUF. A
+    /// language-only or re-quantized checkpoint has no
+    /// `deepseek4.checkpoint_variant` key at all.
+    #[test]
+    fn only_the_vision_exp_checkpoint_supports_vision() {
+        let vision = Gguf::default()
+            .str_val("general.architecture", "deepseek4")
+            .str_val("deepseek4.checkpoint_variant", "vision-exp")
+            .write("vision-exp");
+        assert!(supports_vision(&vision));
+        let _ = std::fs::remove_file(vision);
+
+        let plain = Gguf::default()
+            .str_val("general.architecture", "deepseek4")
+            .u32_val("deepseek4.block_count", 47)
+            .write("plain-ds4");
+        assert!(!supports_vision(&plain));
+        let _ = std::fs::remove_file(plain);
+
+        let other = Gguf::default()
+            .str_val("deepseek4.checkpoint_variant", "something-else")
+            .write("other-variant");
+        assert!(!supports_vision(&other));
+        let _ = std::fs::remove_file(other);
+
+        assert!(!supports_vision(Path::new("/nonexistent/x.gguf")));
+    }
+
     /// A probe is run on whatever path the user passed, so it has to survive
     /// files that are not models at all rather than panic or hang.
     #[test]
@@ -332,5 +635,114 @@ mod tests {
         std::fs::write(&p, &bytes).unwrap();
         assert_eq!(architecture(&p), None);
         let _ = std::fs::remove_file(p);
+    }
+
+    /// A path for one test's fixtures, in the shape the tests above already
+    /// use: process-scoped so parallel runs cannot collide.
+    fn detail_tmp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("plank-detail-{}-{name}", std::process::id()))
+    }
+
+    /// The file line reports what is wrong: absent, a dangling symlink, a
+    /// directory, or present with its size.
+    #[test]
+    fn the_file_detail_line_names_what_is_wrong() {
+        // Never passed is not the same as missing, and says nothing.
+        assert_eq!(file_detail("vision encoder", None), None);
+
+        let missing = detail_tmp("missing.gguf");
+        let _ = std::fs::remove_file(&missing);
+        let line = file_detail("model file", Some(&missing)).expect("a path was given");
+        assert!(line.starts_with("- model file: "), "{line}");
+        assert!(line.contains("not found"), "{line}");
+
+        // A real file reports its size.
+        let real = detail_tmp("real.gguf");
+        std::fs::write(&real, vec![7u8; 2048]).expect("write");
+        let line = file_detail("model file", Some(&real)).expect("a path was given");
+        assert!(line.contains("2.0 KB"), "{line}");
+        assert!(!line.contains("not found"), "{line}");
+
+        // The case plank's own symlinked default paths make likely.
+        let dangling = detail_tmp("dangling.gguf");
+        let _ = std::fs::remove_file(&dangling);
+        std::os::unix::fs::symlink(detail_tmp("nowhere.gguf"), &dangling).expect("symlink");
+        let line = file_detail("model file", Some(&dangling)).expect("a path was given");
+        assert!(line.contains("DANGLING"), "{line}");
+        assert!(line.contains("nowhere.gguf"), "the target is named: {line}");
+
+        // A symlink that resolves names its target and still sizes it.
+        let good_link = detail_tmp("good.gguf");
+        let _ = std::fs::remove_file(&good_link);
+        std::os::unix::fs::symlink(&real, &good_link).expect("symlink");
+        let line = file_detail("model file", Some(&good_link)).expect("a path was given");
+        assert!(line.contains("real.gguf"), "{line}");
+        assert!(line.contains("2.0 KB"), "{line}");
+        assert!(!line.contains("DANGLING"), "{line}");
+
+        let dir = detail_tmp("dir.gguf");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let line = file_detail("model file", Some(&dir)).expect("a path was given");
+        assert!(line.contains("is a directory"), "{line}");
+
+        let _ = std::fs::remove_file(&real);
+        let _ = std::fs::remove_file(&dangling);
+        let _ = std::fs::remove_file(&good_link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The assembled message: the return code, what was opened, the file
+    /// itself, only the companions that were passed, and the hints — and no
+    /// line for anything that is fine.
+    #[test]
+    fn the_open_failure_message_names_every_fact_it_has() {
+        let model = detail_tmp("attempt.gguf");
+        std::fs::write(&model, vec![0u8; 4096]).expect("write");
+        let drafter = detail_tmp("attempt.dspark.gguf");
+        let _ = std::fs::remove_file(&drafter);
+        let msg = open_failure_detail(&OpenAttempt {
+            path: &model,
+            rc: -3,
+            engine_null: true,
+            family: ModelFamily::Qwen,
+            backend: "Metal",
+            ctx_size: 1_048_576,
+            companions: &[
+                ("mtp draft model", Some(&drafter)),
+                ("vision encoder", None),
+            ],
+            metal_kernels_missing: true,
+        });
+        assert!(msg.starts_with("failed to open model "), "{msg}");
+        assert!(msg.contains("returned -3"), "{msg}");
+        assert!(
+            msg.contains("qwen family, Metal backend, context 1048576 tokens"),
+            "{msg}"
+        );
+        assert!(msg.contains("- model file: "), "{msg}");
+        assert!(msg.contains("4.0 KB"), "{msg}");
+        // The companion that was passed and is absent gets a line; the one
+        // plank never passed gets none.
+        assert!(msg.contains("- mtp draft model: "), "{msg}");
+        assert!(!msg.contains("vision encoder"), "{msg}");
+        assert!(msg.contains("DS4_METAL_DIR"), "{msg}");
+        assert!(msg.contains("engine's own log"), "{msg}");
+
+        // A non-zero code and a null engine are different news, and only one
+        // of them is reported per failure.
+        let msg = open_failure_detail(&OpenAttempt {
+            path: &model,
+            rc: 0,
+            engine_null: true,
+            family: ModelFamily::Ds4,
+            backend: "Cpu",
+            ctx_size: 8192,
+            companions: &[],
+            metal_kernels_missing: false,
+        });
+        assert!(msg.contains("success but returned no engine"), "{msg}");
+        assert!(!msg.contains("returned 0"), "{msg}");
+        assert!(!msg.contains("DS4_METAL_DIR"), "{msg}");
+        let _ = std::fs::remove_file(&model);
     }
 }

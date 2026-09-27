@@ -42,7 +42,7 @@ one guarantee that makes it work.
   hosted multi-user product; plank is a local single-user macOS binary with its own
   `src/sandbox.rs` and `src/remote/`;
 - the web UI on `:3080`. plank already keeps three front-ends in sync (Ratatui TUI,
-  plain REPL, `--non-interactive`, plus `src/serve.rs`/`src/ds4web.rs`); a fourth
+  plain REPL, `--ui console`, plus `src/serve.rs`/`src/ds4web.rs`); a fourth
   is a maintenance tax, not a feature.
 
 The ten items below are ordered by value-per-unit-of-work, not by size.
@@ -811,7 +811,7 @@ time a later milestone adds a settings key that mysteriously does not take effec
 - The `<plugin>:<name>` claiming rule is the highest-value output: when a bare name is
   claimed, record the loser and the qualified name it is still reachable under.
 - Surfaces: `/config --resolved` in both loop paths, and a `--dump-config` CLI flag that
-  works under `--non-interactive`. Rendered as key, value, winning origin, then indented
+  works under `--ui console`. Rendered as key, value, winning origin, then indented
   shadowed candidates.
 
 **Tests.** A fixture tree with a user settings file, a project settings file and two

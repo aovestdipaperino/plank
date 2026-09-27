@@ -83,6 +83,31 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 | `sandbox` | on (macOS) | default for the bash write sandbox. Same as `--sandbox` / `--no-sandbox`. |
 | `btwSuspend` | `true` | default for `/btw` mid-generation suspend |
 
+### `tools`
+
+| Key | Default | What |
+|---|---|---|
+| `tools.bashNotify` | `false` | wake the model when a bash job it left running finishes, instead of having it poll with `bash_status`. Adds one sentence to the system prompt, so it takes effect in a new session. See [Background jobs](05-tools.md#background-jobs). |
+| `tools.loopGuards` | `true` | arm the loop guards (`/loopguard` flips it for the session) |
+| `tools.noProgressGuard` | `false` | also stop a turn that generates 32 KB of output without changing a file. Requires `tools.loopGuards`; see [The no-progress budget](04-slash-commands.md#the-no-progress-budget). |
+| `tools.recall`, `tools.fanout`, `tools.runCode` | `true` | offer the `recall`, `fanout` and `run_code` tools to the model |
+| `tools.remember` | `true` | offer the `remember` and `forget` tools, which write memory to disk for the next session. See [Memory](07-context.md#memory). |
+
+### `context`
+
+| Key | Default | What |
+|---|---|---|
+| `context.microcompact` | `true` | let micro-compaction clear old tool-result bodies in place to reclaim context. `/mc off` is the session equivalent. |
+| `context.shortReminder` | `true` | make the system-prompt reminder plank re-injects every 50K tokens the short form: tool-call syntax, tool names, and a pointer to the original prompt. `false` re-injects the whole tools prompt as the C reference does. |
+
+### `memory`
+
+| Key | Default | What |
+|---|---|---|
+| `memory.autoExtract` | `true` | queue the extraction pass at the end of turns with no tool calls; it runs at the next idle moment and a typed prompt interrupts it. It costs a generation and a KV snapshot each time, at idle. |
+| `memory.extractEveryNTurns` | `1` | run the pass only every N eligible turns; `0` is treated as `1` |
+| `memory.budgets` | `4096` / `4096` / `6144` / `2048` | bytes of `user`, `feedback`, `project` and `reference` entries rendered into context. Hand-edit only; not exposed in `/config`. |
+
 ### `mcp`, `ask`, `update`, `agents`
 
 | Key | Default | What |
@@ -122,7 +147,7 @@ Three things always survive both passes: anything you have pinned in `/kvcache`,
 ### Two things the file deliberately will not do
 
 - **No secrets.** `./.plank/settings.json` sits inside your working tree and is easy to commit by accident, so there is no API-key setting. Keep keys on `--api-key` or the provider's environment variable.
-- **No per-run choices.** `--prompt`, `--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, `--worktree`, and the serve/control options describe one invocation, not a preference, so they have no settings key.
+- **No per-run choices.** `--prompt`, `--ui`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, `--worktree`, and the serve/control options describe one invocation, not a preference, so they have no settings key.
 
 ### When it goes wrong
 
@@ -165,7 +190,7 @@ One limitation: settings come from the directory plank launches in, so project s
 | Flag | What |
 |---|---|
 | `-p, --prompt TEXT` | run one prompt and exit |
-| `--non-interactive` | disable the interactive UI |
+| `--ui MODE` | front end: `tui` (default), `console` (headless), `chart` (headless, prints only the live `/toks` chart) or `quiet` (headless, prints only a start and a finish note); `chart` and `quiet` need `-p` |
 | `-sys, --system TEXT` | override the system prompt |
 | `--chdir PATH` | change working directory before starting |
 | `--worktree NAME` | start inside an isolated git worktree of this repository |
@@ -187,20 +212,21 @@ One limitation: settings come from the directory plank launches in, so project s
 |---|---|
 | `--mtp` | speculative decoding (multi-token prediction), on by default |
 | `--mtp-off` | disable speculative decoding (target-only decode) |
-| `--mtp-model PATH` | the loaded model's companion GGUF: the DSpark drafter for DeepSeek, the required PLE sidecar for Qwen3.8 |
+| `--mtp-model PATH` | the loaded model's companion GGUF: the DSpark drafter for DeepSeek V4 |
 | `--mtp-confidence F` | pruning threshold, `0..1` (`0` forces fixed five-token blocks) |
 | `--mtp-strict` | load the drafter but keep target-only decode, for comparisons |
-| `--qwen` | run Qwen3.8-Flash-Next: shorthand for `-m ~/.plank/qwen.gguf --mtp-model ~/.plank/qwen.mtp.gguf` |
 
-Speculative decoding is **on by default** under one name, `--mtp`, with a different mechanism per model family. DeepSeek uses its auxiliary DSpark draft checkpoint for V4 Flash: it proposes up to five tokens ahead and the main model verifies them, committing only the prefix it agrees with, so one verification pass can advance the stream by several tokens. Qwen3.8-Flash-Next speculates from the MTP block inside its own main GGUF and needs no drafter. `--mtp-off` turns it off for target-only decode.
+Speculative decoding is **on by default** under one name, `--mtp`. DeepSeek V4 Flash uses its auxiliary DSpark draft checkpoint: it proposes up to five tokens ahead and the main model verifies them, committing only the prefix it agrees with, so one verification pass can advance the stream by several tokens. DeepSeek V4.1 Flash has no drafter upstream, so plank never pairs one with it and decodes target-only there. `--mtp-off` turns speculation off explicitly.
 
-On DeepSeek the support model (~5.6 GB) needs no flag of its own — it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download through the same resumable path as the main model, unless `--mtp-model` names one. On Qwen the same `--mtp-model` flag carries the PLE sidecar, which is required rather than optional; `--qwen` fills in both default paths for you.
+On V4 the support model (~5.6 GB) needs no flag of its own: it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download through the same resumable path as the main model, unless `--mtp-model` names one.
+
+A drafter plank paired for you is no longer able to stop a model from loading. The engine refuses to open a model at all when the draft checkpoint does not match it, so a checkpoint the default drafter does not fit used to fail until you found `--mtp-off`; plank now retries the open once without the companion it chose and reports the original error only if that fails too. A companion you named with `--mtp-model` is never dropped. When speculation turns out not to run, the temperature you would have been sampling at is restored rather than left pinned at 0.
 
 Verification is argmax, so proposals are only used at `--temp 0`; sampled decoding ignores them. Whether it pays depends on the engine build, the quant and the machine: on an M5 Max it was a 0.71× *slowdown* until the Metal verifier was pipelined upstream, after which the same measurement read 1.19×. The peak rates in the exit message are the way to check on your own hardware.
 
 ### Advanced engine tuning
 
-`--mtp PATH`, `--mtp-draft N`, `--mtp-margin F` configure multi-token prediction with a draft model. `--ssd-streaming` and its companions (`--ssd-streaming-cold`, `--ssd-streaming-cache-experts`, `--ssd-streaming-preload-experts`) stream experts from SSD instead of loading them resident, which is how you run a model that does not fit. `--simulate-used-memory <N>GB` pretends memory is already used, for testing those paths. `--dir-steering-file`, `--dir-steering-ffn`, `--dir-steering-attn` apply directional steering vectors.
+`--mtp PATH`, `--mtp-draft N`, `--mtp-margin F` configure multi-token prediction with a draft model. `--ssd-streaming` and its companions (`--ssd-streaming-cold`, `--ssd-streaming-cache-experts`, `--ssd-streaming-preload-experts`) stream experts from SSD instead of loading them resident, which is how you run a model that does not fit. You rarely need to reach for `--ssd-streaming` yourself any more: plank measures the model file at startup and turns streaming on when it exceeds 80% of installed RAM less the engine's context buffers, printing the calculation it used. Passing the flag yourself skips that decision. `--simulate-used-memory <N>GB` pretends memory is already used, for testing those paths. `--dir-steering-file`, `--dir-steering-ffn`, `--dir-steering-attn` apply directional steering vectors.
 
 Remote, shared-engine, control, and provider flags are covered in [Remote and hosted engines](10-remote-and-providers.md).
 

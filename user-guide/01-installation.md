@@ -51,7 +51,9 @@ cargo build --release
 
 ## Getting the model
 
-Real inference needs the DeepSeek V4 Flash GGUF. On first run, with no `-m` flag and nothing at the default path (`~/.plank/ds4flash.gguf`), plank offers to fetch the quantized model (~87 GB) from Hugging Face. One keypress and it downloads in place with live progress.
+Real inference needs the DeepSeek V4 Flash GGUF. On first run, with no `-m` flag and nothing at the default path (`~/.plank/ds4flash.gguf`), plank offers to fetch the quantized model (~87 GB) from Hugging Face. One keypress and it downloads in place with live progress, and an interruption resumes where it stopped rather than starting over.
+
+DeepSeek V4.1 Flash is supported too, as a family of its own with its own tool-call dialect and its own `.ds41.kv` transcripts. plank ships no manifest for it, so it is not offered for download: point `-m` at a V4.1 GGUF and the family, the dialect and the companion paths all follow from the file's own architecture field. It is large enough that plank will usually turn on SSD streaming for you.
 
 Things worth knowing before you start an 87 GB transfer:
 
@@ -88,8 +90,8 @@ Without a model file plank runs against a built-in echo engine. Every command, t
 |---|---|
 | `~/.plank/ds4flash.gguf` | default model location |
 | `~/.plank/ds4flash.dspark.gguf` | DSpark draft model, for DeepSeek speculation (`--mtp`) |
-| `~/.plank/qwen.gguf` | Qwen3.8-Flash-Next main model, when `--qwen` is used (expected to be a symlink) |
-| `~/.plank/qwen.mtp.gguf` | Qwen3.8-Flash-Next PLE sidecar, required by that model |
+| `~/.plank/qwen.gguf` | Qwen3.8-Flash-Next main model, when `--qwen` is used |
+| `~/.plank/qwen.vision.gguf` | Qwen3.8-Flash-Next vision encoder (installed by the manifest; plank does not load one yet) |
 | `~/.plank/kvcache/` | saved sessions (`<name>.kv`) plus the KV snapshots (`*.kv_raw`) and their metadata (`*.json`). Browse it with `/kvcache`. |
 | `~/.plank/settings.json` | global preferences |
 | `~/.plank/.mcp.json` | global MCP server config |

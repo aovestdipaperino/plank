@@ -25,6 +25,802 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `examples/profiles/hal`, a mail and calendar profile whose MCP server is not
   built yet. `--profile` is refused on a Qwen model, whose prompt is built
   separately and would ignore the profile's own.
+- **`/memory calibrate [N]` and `memory.gateBias`.** The System-1 memory gate
+  always shows "yes" as answer A, and a model that leans toward a letter for
+  its own sake reads more "yes" than a span deserves, while its letter mass
+  still looks healthy. `/memory calibrate` asks the gate's question about up
+  to N saved turns (default 20) of the loaded family twice, the second time
+  with yes and no swapped, and reports the mean letter bias, its standard
+  error, how many verdicts it flips at the current `gatePercent`, and a
+  suggested `memory.gateBias.<family>` (`ds4`, `ds41`, `qwen`) in percentage
+  points, which the live gate adds to `gatePercent`. It runs offline rather
+  than in the gate because on DeepSeek the second ask re-prefills the span.
+  Nothing is written; the suggestion is copied into `settings.json` by hand.
+
+### Fixed
+
+- **`docs/MEMORY.md` had `memory.gatePercent` backwards.** It said a "yes"
+  above the threshold rejects the span; it is what lets the pass run.
+
+### Changed
+
+- **A prompt suggestion always runs before a queued memory pass.** The idle
+  moment used to hand the slot to a memory job that had waited
+  `suggestions.memoryStarvationSeconds` (300s), even with a suggestion
+  pending, so the ghost text could arrive after a memory pass instead of
+  right after the answer. That window is gone, and so is the setting: a
+  suggestion is queued once per turn and clears when it runs, so the memory
+  pass takes the next quiet moment and cannot be starved. A settings file
+  that still carries the key loads unchanged.
+
+- **`memory.minTurnSeconds` now defaults to 30** (was 120). Two minutes kept
+  most ordinary exchanges from ever reaching the extraction pass; thirty
+  seconds still skips the quick back-and-forth while letting a real turn of
+  work be read. A short turn still defers its span rather than discarding it.
+
+- **`turbo-debug-console` is now `tdk`.** The external debug console plank
+  mirrors its raw model stream to was renamed upstream, so the install lines,
+  the repository link, the binary name and every mention in the docs and the
+  `--debug` help follow it: `brew install aovestdipaperino/tap/tdk`,
+  `cargo install tdk`, then `tdk`. Nothing about the protocol or the port
+  changed, and the `turbo-debug-client` crate plank links against keeps its
+  name. Entries below this one predate the rename and are left as they were.
+
+## [5.3.0] - 2026-09-23
+
+### Added
+
+- **System-1 typed decisions (`Engine::decide`).** A typed, probabilistic
+  answer out of the model with **zero generated tokens**: the state and a short
+  question suffix are prefilled, and the logprobs of pre-tokenized answer
+  letters are read directly. No sampling loop at all, and roughly the cost
+  of the suffix alone, because the live session's KV already holds the
+  conversation. `decide.rs` is the pure layer (max-shifted softmax over the
+  letters, an abstention floor, a letter-mass floor, and the mapping from the
+  winning index back onto a caller's enum); `ds4engine` implements it on a
+  **dedicated decision session**, never the live turn session, so it sits
+  outside the KV-cache discipline entirely. One question per call: branching
+  several questions off one prefill by rewinding is unsound on DeepSeek, where
+  `ds4_session_rewind` clears `checkpoint_valid` and the next eval refuses.
+  The code carries the correct way to batch if it is ever wanted.
+- **A content gate in front of the memory extraction pass** (`memory.gate`,
+  default **off**). The pass costs a KV snapshot, a prefill, a generation and a
+  restore, and most turns hold nothing durable, so most of that is spent to be
+  told there was nothing to write down. The gate asks one boolean first and
+  skips the pass on a confident no. Every uncertain outcome runs the pass: no
+  capability, an engine error, or an abstention all mean "extract anyway", so
+  the gate can never be the reason a memory is lost. `memory.gatePercent`
+  (default 60) is the threshold; `memory.heldSpanCap` (default 0) decides
+  whether a rejected span is retired at once or held to be re-judged as part of
+  a larger one.
+- **Predictive prompt suggestions in the TUI** (`suggestions.enabled`, default
+  **on**). After a turn, a short sidechain generation guesses the next thing
+  you are likely to type and shows it as dim ghost text: **Tab** or **Right**
+  places it in the buffer to edit, **Enter** sends it, any other key dismisses
+  it. It rides the warm KV the way the memory pass does, runs on a worker
+  thread through a shared quiet-pass path, and is **skipped when the KV would
+  rebuild from zero**, which is what makes it affordable on by default. A
+  suggestion never reaches the command dispatcher or a shell: a leading `/` or
+  `!` is rejected outright, because Enter over a placed suggestion submits
+  immediately. `suggestions.maxTokens` (160) bounds the generation and
+  `suggestions.memoryStarvationSeconds` (300) stops a fast back-and-forth from
+  locking the memory pass out of the idle slot.
+- **`memory.minTurnSeconds`** (default 120). A turn shorter than this does not
+  trigger the extraction pass. The short turn's span is **deferred, not
+  discarded**, so nothing said to the model is lost to the gate.
+- **`PLANK_SUGGEST_DEBUG` and `PLANK_DECIDE_DEBUG`.** The first prints a
+  suggestion's raw reply before sanitizing, the second prints a decision's
+  letter mass and logprobs. Both exist because these features fail silently by
+  construction: without them, "the model returned nothing" and "the sanitizer
+  rejected everything" look identical from outside.
+
+### Changed
+
+- **The idle moment is now shared.** A pending prompt suggestion takes it ahead
+  of a queued memory job, because a suggestion is worthless once you start
+  typing while a memory pass is explicitly allowed to defer. The starvation
+  window above bounds that.
+- **The cursor stays green during a quiet background pass.** Prompt prediction
+  and the memory pass are not turns you asked for, and a keystroke during one
+  interrupts it rather than queueing behind it, so painting the prompt red said
+  "wait for me" about work you never started.
+
+### Fixed
+
+- **Ctrl-D on an empty prompt during the memory pass quits.** It was being
+  dropped by the busy UI loop. Mid-turn Ctrl-D stays inert.
+
+## [5.2.1] - 2026-09-18
+
+Beta channel opened on the 5.2 series. No functional change against 5.2.0.
+
+## [5.2.0] - 2026-09-18
+
+### Added
+
+- **`/stats`, an activity report.** A GitHub-style heatmap in theme-green
+  shades plus eight headline figures, computed from the per-session metadata
+  cache `/insights` already maintains and shown in the existing dismissable
+  panel. Re-issuing the command cycles the range. Token counts are approximate,
+  transcript bytes over four, and say so; two figures are named for exactly
+  what they count, days started and longest span.
+- **A benchmarking harness.** `bench/bench-matrix.sh` and its report script,
+  plus the agent-side support they needed: a guard hard stop recorded on the
+  agent, `-p "/init"` running the real `/init`, and a guard-stopped headless
+  run exiting 3.
+
+## [5.1.10] - 2026-09-16
+
+### Added
+
+- **`--show-memory-stats`.** Off by default: the rule below the prompt stays
+  plain while the memory pass takes notes, and the footer's `✍️` is its only
+  trace. On, the pass's prefill and generation figures float on the rule like
+  a turn's do.
+
+### Fixed
+
+- **The rule below the prompt is plain again at idle.** The figures a turn
+  floated there are cleared when the worker ends, and the row is rewritten
+  whole rather than left to the frame diff: a label glyph the terminal draws
+  wider than the renderer measures used to leave a blank notch in the rule
+  where the figures had been. Only that row is repainted, so nothing flickers.
+
+## [5.1.9] - 2026-09-16
+
+### Changed
+
+- **The memory extraction pass no longer holds the prompt.** A turn end now
+  only snapshots the new part of the conversation into a queue; the reading
+  happens at the next idle moment, on a worker with the screen live. Typing a
+  prompt while notes are being taken interrupts the pass, puts the job back on
+  the queue and starts your turn at once. In the TUI the pass used to run on
+  the UI thread after the worker was joined, so nothing repainted and no key
+  was read until it finished. An interrupted turn queues nothing, and the
+  Stop hooks now fire after the snapshot, right before the prompt comes back.
+- **An interrupted pass resumes where it stopped.** The pass prefills its
+  prompt first, snapshots that KV into the job, then generates; an interrupt,
+  including one mid-prefill, keeps the snapshot and the retry continues from
+  it instead of prefilling from zero.
+- **What a pass shows.** One `✍️` per queued span in the footer, in place of
+  the state word, and one dim `memory completed in <elapsed>` line on success
+  with the change summary when it wrote something. No window title change, no
+  progress line, no `no usable verdicts` notice, and the pass's own JSON reply
+  is never rendered into the log.
+- **Transient figures move to the rule below the prompt.** Prefill and
+  generation tokens and rates, the MTP per-step figures and the memory pass's
+  numbers now float at the right end of the rule under the prompt, the way the
+  session name floats on the rule above it, so the status bar holds still. The
+  line pinned under the output keeps only the throbber, the verb and the
+  clock; the footer's MTP slot shows the mark alone.
+
+### Removed
+
+- **The loop-guard and micro-compaction footer icons**, with the wastebasket
+  double-click. `/loopguard` and `/mc` remain the way to read and flip both.
+- **The footer's `idle` state word.** The prompt caret already says so.
+
+## [5.1.8] - 2026-09-16
+
+### Added
+
+- **A short system-prompt reminder, on by default.** Every 50K tokens plank
+  re-injects a reminder of the system prompt so a long session does not drift.
+  It used to be the whole tools prompt, several thousand tokens prefilled once
+  and then held in context for good. The new `context.shortReminder` (default
+  `true`) sends only the tool-call syntax in the model's dialect, the roster
+  of tool names, and one line saying the original prompt still applies, a few
+  hundred tokens. `"context": {"shortReminder": false}` restores the full
+  reminder, byte-identical to the C reference, so the two can be compared
+  with one setting.
+
+### Fixed
+
+- **`bash_status` honours `refresh_sec`.** The port passed the tool's *stop*
+  flag where the C passes its *wait* flag, so every `bash_status` returned at
+  once and a model asking for `refresh_sec=300` polled in a tight loop, one
+  generation per poll. It now mirrors the C: `refresh_sec` defaults to `0` and
+  the call returns immediately without it, a positive value waits up to that
+  long for the job to finish, and `bash_stop` always waits at least a second
+  so its observation reflects the kill.
+- **Sub-agent debug windows are named after the roster.** A sidechain's
+  console window is `plank:<session>:<label>` (`alpha`, `reviewer`), the same
+  name its roster row shows, instead of `subagent-<n>`; the ordinal remains
+  only as the fallback for a sidechain with no label, and a late console's
+  `/repro` replay reopens the labelled window.
+
+### Changed
+
+- **Finished agents stay off the roster.** A completed run's row still leaves
+  the roster a minute after it ends, but stepping back in with `←` or Tab no
+  longer brings every expired row back, and `↑`/`↓` step over hidden runs.
+  Only the row under the cursor is exempt, so nothing vanishes mid-read. The
+  roster shows what is running; a finished agent's full stream is the debug
+  console's job.
+- **A 🐞 in the status line while a debug console is connected.** Keyed on the
+  live connection, not on `--debug`: the switch alone shows nothing, a console
+  that answered the dial does.
+
+## [5.1.7] - 2026-09-16
+
+### Changed
+
+- **The extraction pass is on by default.** `memory.autoExtract` now defaults
+  to `true`, so a fresh install gets self-maintaining memory without touching
+  `settings.json`. The cost is unchanged and worth knowing: the pass runs
+  synchronously after each tool-free answer and buys a KV snapshot, a prefill
+  and a generation. `memory.extractEveryNTurns` thins it, and
+  `"memory": {"autoExtract": false}` restores the 5.1.6 behaviour.
+- **TUI report panels close cleanly, `/jobs` auto-dismisses, and the task
+  counter is clickable.** Landed alongside this beta in `e90a17e`.
+
+## [5.1.6] - 2026-09-16
+
+### Added
+
+- **Memory maintains itself.** The model gains `remember` and `forget` tools,
+  gated on `tools.remember`, whose writes land in the memory files on disk and
+  join the context at the next session start, so nothing rewrites the cached
+  prompt mid-session. Entries carry a `[type]` tag (`user`, `feedback`,
+  `project`, `reference`; untagged legacy lines read as `project`), an advisory
+  `MEMORY.md.meta.json` sidecar tracks per-entry usage and pin state, and each
+  type has its own byte budget for what renders, evicting pinned last, then
+  least used, then least recent, with the newest entry winning a full tie. An
+  optional extraction pass (`memory.autoExtract`, off by default because it
+  costs a generation and a KV snapshot after each answer;
+  `memory.extractEveryNTurns` thins it) reads only the part of the transcript
+  it has not seen, asks for ADD/UPDATE/DELETE/USED verdicts as a single
+  tool-free generation, and applies them through one audited, atomic write
+  path. `/forget <pattern>` previews and confirms before deleting, `/memory log`
+  reads the audit log at `~/.plank/memory-log.jsonl`, and every memory file is
+  written atomically. Design and failure modes in `docs/MEMORY.md`.
+- **`--ui chart` and `--ui quiet` show a live running time.** The chart gains a
+  dim `elapsed 12.4s` footer under the panels, updated with every repaint:
+  throughput says how fast the model is going, never how long you have been
+  waiting, and the pre-sample "prefilling" note was the only thing that ever
+  answered that. Quiet's clock ticks in place at the end of its single line and
+  leaves its last reading there, so a finished run reads `Prompting. Started
+  working... 12.4s done.` It repaints with backspaces and so runs only on a
+  terminal; a redirected run captures the same clean line it always did.
+
+## [5.1.5] - 2026-09-15
+
+### Added
+
+- **A headless `-p` run says how long it took.** `plank -p ...` under `--ui
+  console`, `chart` or `quiet` now closes with `total time: 8.4s` on stderr,
+  measured from the agent being built (model load and warm included) to after
+  the session is saved. Stderr keeps stdout exactly as it was for anything
+  piping the reply, and leaves `--ui chart`'s chart and `--ui quiet`'s single
+  line of notes alone. The interactive front ends already reported the same
+  wall clock through their end-of-session stats; only the one-shot had nothing.
+
+### Fixed
+
+- **The bash sandbox no longer breaks cargo, npm and go.** Package-manager and
+  compiler caches (`~/.cargo/registry`, `~/.cargo/git`, the rustup download
+  dirs, `~/.npm/_cacache`, the Go module cache, `~/.cache`,
+  `~/Library/Caches`) are writable by default: building the project the model
+  was pointed at is part of what it was told to do, and a build that has to
+  fetch a dependency writes there rather than into the project. Previously any
+  such write failed with a bare `Operation not permitted`, which looked like a
+  filesystem problem rather than a sandbox denial — `cargo build` worked only
+  as long as every dependency was already cached.
+- The `[sandbox blocked: ...]` hint pointed at `.plank/sandbox.json` for adding
+  a `writablePaths` entry, but a project-scoped sandbox file may only *tighten*
+  the policy, so following the hint did nothing. It now names
+  `~/.plank/sandbox.json` and says why.
+
+### Changed
+
+- **`/init` runs with the loop guards suspended.** Its phases re-read and
+  re-survey the same tree by design — the interview, the `task` survey and the
+  write all revisit it — which is exactly the shape the tool-call guard refuses,
+  so a turn the user asked for was being blocked mid-phase for following its own
+  prompt. The suspension is a scope (`settings::suspend_loop_guards`), so the
+  guards come back even when the turn fails, and it loses to an explicit
+  `/loopguard`: a user who typed one said something about this session that a
+  canned prompt does not get to overrule. No other command suspends them.
+- **The `~/.plank` write prompt generalised to protected roots.** Directories on
+  the user's `PATH` — `~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin` — join
+  `~/.plank` as withheld-by-default and granted per command or per session
+  through the same prompt, because a binary installed there is one the user
+  later runs. This is why the cache grant above names `~/.cargo/registry` and
+  `~/.cargo/git` rather than `~/.cargo`, which would carry `bin` with it. So
+  `cargo install --path .` now asks instead of failing, and is recognised as
+  naming `~/.cargo/bin` even though the command never spells the path (unless
+  `--root` redirects it somewhere already writable).
+
+## [5.1.4] - 2026-09-15
+
+### Changed
+
+- **`--non-interactive` is now `--ui MODE`.** The front end is chosen by one
+  flag with three values: `tui` (the default — the full interactive UI, or the
+  plain REPL when either end is piped), `console` (exactly what
+  `--non-interactive` did: one prompt and exit with `-p`, the stdin protocol
+  without one) and `chart`, a headless one-shot that swallows the turn's stdout
+  and prints nothing but the `/toks` throughput chart for what it just
+  generated — for measuring the engine rather than reading the reply. The chart is
+  live: it is repainted in place a few times a second while the turn runs, so
+  the lines grow as the model generates instead of appearing only at the end,
+  and before the first sample lands the frame is a `prefilling...` note rather
+  than a blank screen. Piped, it prints the final report once. `quiet` is
+  the smallest of them: it prints `Prompting. ` when the turn begins,
+  `Started working... ` when generation starts (read off the first prefill
+  sample, the handover into decoding) and `done.` at the end — one line, for a
+  script or a person who only wants to see that the run is alive and then that
+  it finished. `chart` and `quiet`
+  need a `-p` prompt and refuse to start without one. `--non-interactive` is
+  gone rather than kept as an alias; scripts need `--ui console`.
+
+### Added
+
+- **Qwen3.8-Flash-Next is served again, by every build.** Upstream merged
+  Qwen3.8 Flash Next and now publishes the weights itself, so the family, the
+  `--qwen` flag, the `<tool_call>` dialect, the `.qwn.kv` transcript extension
+  and the `qwen` artifact set all return. The off-by-default `qwen` cargo
+  feature is removed rather than defaulted on: it existed to keep a model this
+  build could not honestly serve out of the default build, and nothing is left
+  to gate. Its two C-parity tests consequently run on every build.
+- **Qwen is downloadable.** `qwen.manifest` tracks the Q4 build from the
+  official release repository and an `mmproj` vision encoder, so `--qwen`
+  without the weights offers a download like any other set instead of
+  requiring a hand-made symlink.
+
+### Changed
+
+- **Qwen's PLE sidecar is gone.** Upstream now ships the BF16 n-grams and the
+  MTP block inside the main GGUF, so `~/.plank/qwen.mtp.gguf`, the `mtp`
+  artifact kind and the companion `--qwen` used to fill in are all removed.
+  `--mtp` speculates off the embedded block with no companion file.
+
+### Fixed
+
+- **`--qwen` could never load.** SSD streaming was auto-enabled for Qwen, and
+  the engine refuses to open a Qwen checkpoint with it on. The heuristic also
+  weighs the GGUF on disk against the resident budget, and a Qwen GGUF is
+  mostly n-grams the engine leaves on disk — 165 GiB on disk against 69.7 GiB
+  resident — so it fired on every machine. It is now skipped for Qwen.
+
+### Known limitations
+
+- Qwen runs text-only in plank: the vision encoder is installed but never
+  passed to the engine, so `view_image` is refused.
+
+## [5.1.3] - 2026-09-14
+
+### Changed
+
+- **The no-progress budget is opt-in.** The turn-scale rung that stops a
+  generation after 32 KiB of output with no observed file change now sits
+  behind its own setting, `tools.noProgressGuard`, which defaults to off and
+  is ANDed with `tools.loopGuards`. The budget measures output volume, so a
+  long read-only investigation — a turn that reads, searches and builds its
+  way to an answer without writing anything — was a legitimate turn it
+  stopped anyway. Every other loop guard is unchanged and still on by
+  default; set `"tools": {"noProgressGuard": true}` to get the old
+  behaviour back.
+
+### Fixed
+
+- **Two parameters fused into one tag pair are rejected instead of silently
+  merged.** When the model closes a parameter with a tag that carries the next
+  parameter's attributes — `</｜DSML｜parameter name="path" string="true">`, the
+  `/` being all that separates it from an opener — that is not a close tag, so
+  the value used to run on to the next one: the first parameter came out
+  carrying the markup, the second vanished, and the tool was dispatched with a
+  corrupted argument and a missing one. In `repro-loop-1789365915.md` a
+  `search` got a garbage `query` and no `path` at all, and the model read the
+  empty result as search ignoring the root folder. It is now a retryable tool
+  error naming both tags to write instead. A bare word where an attribute
+  would go (`</｜DSML｜parameter x>`) is unaffected and stays value text.
+
+- **A V4.1 stanza is recognized without being told the model first.** The
+  dialect was fixed at renderer construction from the model name, so every
+  consumer that has no model name — `turbo-debug-console`, which renders bytes
+  off a socket, and transcript replay, which may hold either dialect — read a
+  V4.1 stanza with V4's tag table: the opener never matched, the markup
+  streamed to the screen as prose and the calls were dropped. Both stanza
+  openers are now matched at once and the dialect the opener was spelled in is
+  adopted for the whole stanza, so the inner tags stay exactly as strict as
+  before. The same fix makes a *second* V4.1 stanza work in a renderer that
+  outlives the first: `DsmlParser::reset` used to drop back to V4 and go deaf.
+  `trace-stream` 0.1.4.
+
+## [5.1.2] - 2026-09-13
+
+### Fixed
+
+- **The tail of a streaming sentence no longer waits for the tool to finish.**
+  `OutputLog` re-renders a live markdown segment at most once per 100 ms
+  (`MD_RENDER_MIN_GAP`), because highlighting a code block recompiles a
+  tree-sitter query and rendering per token is quadratic in the block's length.
+  Tokens arriving inside that gap were deferred behind `md_dirty` and committed
+  only by the *next* `visible_text` call or by the segment closing — and a
+  generation that stops emitting visible text to open a DSML tool stanza does
+  neither, so the last tokens before the stanza stayed off screen for the whole
+  duration of the tool and the sentence appeared to complete itself when the
+  result landed. `OutputLog::md_tick` now commits a due deferred render on the
+  draw clock, called once per frame by `busy_ui_loop` for the main log, the
+  `/btw` panel and each sub-agent run. The throttle still bounds highlighting
+  cost: a frame re-renders only once the gap has elapsed.
+
+## [5.1.0] - 2026-09-13
+
+### Added
+
+- **DeepSeek V4.1 Flash is a model family of its own.** Not a V4 revision:
+  different weights, a different tokenizer and a third DSML dialect whose tags
+  carry a leading space (`<｜DSML｜ calls>` where V4 writes
+  `<｜DSML｜tool_calls>`), so `deepseek41` gets its own `ModelFamily`, its own
+  `.ds41.kv` transcripts beside V4's in the same cache directory, and the V4.1
+  tools prompt and syntax reminder ported byte-for-byte from the C reference.
+  The family is resolved from the GGUF's own `general.architecture`, so nothing
+  has to be declared: V4 stays the default artifact set and the only manifest
+  plank publishes, and V4.1 is reached by pointing `-m` at a V4.1 GGUF. Metal
+  only.
+- **V4.1's native reasoning effort is a number, and plank uses it.** The family
+  takes an explicit effort of 0..100, so `low`, `medium` and `max` are labels
+  for the 25, 75 and 100 the model is actually told, `/think <n>` sets the
+  number directly, and the footer shows the number in force rather than the
+  label. `off` stays `off`, because thinking-disabled is a distinct state and
+  not effort zero. plank's own brief-reasoning prose preamble, which exists
+  only because other families have no such knob, is no longer injected on top
+  of a line the model understands: 97 tokens of plank text gone on V4.1 `low`,
+  the C's own 24-token effort line kept. Every other family is byte-identical.
+- **plank yields the model under memory pressure and picks the turn back up.**
+  When macOS reports memory pressure at a turn boundary, plank releases the KV
+  cache and the engine session rather than being killed or thrashing, announces
+  what it did, and restores to the same continuation when pressure clears. A
+  hysteresis keeps it from flapping between release and rebuild, a refused
+  yield is retried instead of wedging the machine until a full dwell has
+  passed, and the yielded state is visible as a `⏸ paused: memory` segment on
+  the footer so a wait does not read as a hang. A yielded session's restore
+  target is held out of the KV sweep, so the thing it is waiting to come back
+  to cannot be collected while it waits.
+- **`/toks` charts prefill speed beside generation speed.** Two panels on the
+  same rows rather than one, because the question a slow pass raises is
+  comparative: prefill-bound or decode-bound. Each keeps its own braille line
+  and its own now, average, minimum and maximum.
+- **`/hooks on|off` and `/skills on|off`.** Both were list-only; each is now
+  also a session master switch. `/hooks off` closes the gate every one of the
+  eleven hook kinds funnels through, `/skills off` stops skill expansion on
+  both routes it has, the slash command and the `skill` tool. Neither writes
+  anything to disk, so a restart returns to the configured behaviour.
+- **Unnamed sub-agents get a name.** Every sub-agent without one was labelled
+  `sub-agent`, so a log holding several could not tell them apart. Each now
+  draws the next NATO phonetic word in lowercase: alpha, bravo, charlie, delta.
+  Past zulu it laps with a suffix, so it never runs out and never repeats. A
+  named sub-agent draws nothing.
+- **Diff cards are syntax-highlighted.** The red and green rows are painted by
+  the same tree-sitter highlighter the markdown code fences already used, with
+  each side of each hunk highlighted whole so a block comment or a multi-line
+  string is coloured consistently across rows. The language comes from the
+  path's extension; an unlisted extension falls back to exactly the old flat
+  rendering, because a wrong grammar looks worse than none.
+- **`!!` output opens in a scrollable panel.** `!!` is shell you ran, not part
+  of the conversation, so it now gets the same dismissable panel `/context` and
+  `/usage` use, titled with the command that produced it. `!` still prints
+  inline.
+- **Clicking the footer's brain toggles thinking visibility.** The hit box
+  spans the whole `🧠 med` segment and flips `ui.showThinking` for the session
+  only, never touching `settings.json`: a glyph you can hit by accident must
+  not rewrite a preference. `/config ui.showThinking` still persists.
+- **A 💾 marker on the footer while the model streams experts from SSD.**
+  Steady whenever streaming is on for the loaded model, blinking while a pass
+  is in flight, absent otherwise. It is a proxy for "this model streams", not a
+  disk-I/O reading.
+- **An interrupted model download resumes where it stopped.** Hugging Face's
+  CDN rejects an open-ended range for these artifacts, so every interruption
+  used to restart from zero: one real interruption cost 88 GiB. Artifacts are
+  now fetched in bounded 256 MiB chunks, and a chunk that fails is retried up
+  to four times with doubling backoff rather than killing the whole job.
+  Cancellation still answers within about a tenth of a second, and the staged
+  manifest still moves last.
+
+### Changed
+
+- **A model too large to be resident turns on SSD streaming by itself.** V4.1
+  Flash Q2 is 340.60 GiB and the engine refuses to open it on a 128 GiB Mac, so
+  the user had to discover `--ssd-streaming` from an error message. plank now
+  measures the model file and enables streaming when it exceeds 80% of
+  installed RAM less the engine's context buffers, printing the whole
+  calculation. An explicit `--ssd-streaming` skips the decision, the streaming
+  tuning flags are never touched, and an unreadable model or an unknown RAM
+  figure means no auto-enable rather than a guess.
+- **A mismatched DSpark drafter no longer stops the model opening.** plank
+  auto-paired `~/.plank/ds4flash.dspark.gguf` with any checkpoint and the C
+  refuses to open a model at all when the draft model does not match, so V4.1
+  and the V4 0731 chat-v2 checkpoint both failed to load until the user found
+  `--mtp-off`. V4.1 never auto-pairs a drafter now (upstream implements none),
+  and any other failed open is retried once without a plank-chosen companion,
+  reporting the original error if that fails too. A companion named with
+  `--mtp-model` is never dropped.
+
+### Removed
+
+- **Qwen3.8-Flash-Next support is gone.** Upstream deleted its Metal kernels,
+  so the family, the `--qwen` flag, the `qwen` cargo feature, the Qwen artifact
+  set, its tool-call dialect and every engine path that selected its PLE
+  sidecar or its speculation mechanism are removed. Existing `.qwn.kv`
+  transcripts and KV blobs are left strictly alone rather than migrated or
+  deleted: a retired model name matches no live family, so those files are
+  never listed, swept, restored, or handed to a DeepSeek engine. They are inert
+  and no longer loadable, and they are still on disk if you want them.
+
+### Fixed
+
+- **A guard-stopped pass no longer re-prefills its whole prefix to append
+  `</think>`.** When the UI closes a `<think>` the model left open before a
+  tool continuation, the recorded ids are meant to be kept and the close
+  spliced in ahead of the EOS. The code that recognized that shape read the
+  span the truncation had already dropped, so it never matched and the
+  reconcile fell back to re-tokenizing from text — rebuilding the KV from that
+  span on (a recorded session lost a 56k-token prefix to exactly this). The
+  decision now runs before the truncate, and the held span is kept. The logic
+  moved to `TokenTranscript::think_close`, which is FFI-free and so covered by
+  CI rather than only by an engine build.
+
+- **`/config tools.<key>` said "saved" while writing nothing.** `save_to` wrote
+  only `tools.loopGuards`; the other eight fields of the section
+  (`repeatAdvisory`, `callTimeoutSec`, `spillMaxBytes`, `spillPreviewBytes`,
+  `recall`, `fanout`, `runCode`, `bashNotify`) applied to the live session,
+  reported success, and were gone at the next launch. All nine are written now,
+  keyed exactly as the `/config` form spells them, with a per-field round trip
+  through the same path `/config` uses.
+- **The session-only toggles provably stay out of `settings.json`.** Clicking
+  the footer's brain and `/loopguard` flip the live settings and reinstall them
+  without ever reaching disk, which is the bargain a one-keystroke or one-click
+  control has to make. `/mc` still persists, because which way you want
+  micro-compaction is a preference rather than a thing you want right now.
+- **A run whose speculation never started no longer samples greedily.** The
+  temperature is pinned to 0 while `--mtp` is on, because the engine's draft
+  gate only opens there, but `--mtp` is the default and the decision was made
+  during argument parsing, before the model family was known. Speculation can
+  still fall away at model-open time, and such a run paid the cost of a feature
+  that was not running. The temperature is now settled once the engine can say
+  whether it is speculation-capable. An explicit `--temp`, including
+  `--temp 0`, always wins.
+- **A Responses stream that fails after its 200 now fails the pass.** A
+  `response.failed` or `error` frame set `done` and returned, so the turn loop
+  took the success path with a zero-token usage fallback and read the silence
+  as the model's answer. The provider's message is kept and surfaced as an
+  engine error. `response.incomplete` keeps its usage and text and announces
+  the truncation reason instead of being treated as a clean completion.
+- **The KV ladder is discarded when the reasoning level changes.** Every rung
+  was captured under the old level, and the fingerprint hashes the level, so
+  after a change no rung could ever be loaded again. Left in place they were
+  worse than absent: the ladder read as covered, no new anchor was captured,
+  and the blobs leaked on disk.
+- **The footer is measured in display columns, not characters.** Every emoji in
+  the status bar counted as one column instead of the two it draws, so on a
+  narrow terminal plank could pick a footer that then overflowed. Widths are
+  measured with the unicode width tables now, the text-default marks carry the
+  variation selector they need to measure as they render, and the status bar's
+  fallback truncation is ANSI-aware so it can no longer cut mid-escape and
+  bleed a colour into whatever prints next.
+
+## [5.0.7] - 2026-09-11
+
+### Changed
+
+- **The parent transcript says it is waiting while a sub-agent works.** The
+  pinned progress line under the main transcript showed the verb, the clock,
+  the tokens and the t/s of whatever pass the engine was running — which,
+  while a sub-agent holds it, is the sub-agent's, not the main agent's. The
+  live readout now goes to the sub-agent's own pane, where the roster can
+  reach it, and the main transcript reads `Waiting… (for sub-agent <name> to
+  complete)`. A finished run's progress line is cleared instead of freezing on
+  its last verb.
+
+- **`/context` is live during a turn, not a turn-start snapshot.** The report
+  split into the numbers (which only the agent can count, so the worker
+  gathers them wherever the transcript grows — at turn start and every tool
+  boundary) and the drawing (which needs no agent, so the UI thread redraws on
+  every status tick against the tokens resident right then). Open the panel
+  mid-turn, or click the `ctx` gauge, and the grid fills as the model
+  generates. The rendering moved to its own module and is tested without an
+  engine.
+
+### Fixed
+
+- **The `/context` report could show a negative Messages category.**
+  `AGENTS.md` and memory tokens are counted from the context collected at
+  session start and subtracted from the transcript total, but a `/clear` drops
+  the message carrying them while that count stays — and the scaling and the
+  grid both then read the negative as real. Clamped at zero.
+
+- **A guard stop no longer leaves the model drafting in the same place.** The
+  pass after any reasoning-rung stop is generated with reasoning closed, so
+  the answer and the tool calls are the only things it can write. From
+  `repro-loop-1789108509` / `-1789108726`: the draft rung stopped a code
+  review's synthesis pass, the model said "let me stop the exhaustive analysis
+  and deliver findings", listed fourteen of them inside the think block it was
+  still in, and was cut at the same byte gate again — two stops, and the turn
+  ended with nothing delivered. The three stop messages now also say the next
+  reply has no reasoning step. As a side effect a mid-session `/think off`
+  reaches the engine's prompt prefix, which it never did before.
+- **A draft stop no longer counts against the loop cap.** It gets its own,
+  looser tally: a draft stop is an instruction to deliver, not evidence the
+  pass was wasted, and ending a turn because the model obeyed it twice is the
+  opposite of what it asks. A cycle either side of a draft stop is still two
+  cycles.
+
+## [5.0.6] - 2026-09-11
+
+### Changed
+
+- **"failed to open model" now says why.** The message carried the path and,
+  on macOS, a Metal-kernels hint; it now adds what `ds4_engine_open` returned
+  (or that it returned success with no engine), the family, backend and
+  context size plank asked for, the model file's own state — a dangling
+  symlink names its target, a directory, an unreadable file, otherwise the
+  size — a size mismatch against the installed manifest, which is what a
+  truncated or interrupted install looks like, and the same state for each
+  companion actually passed, so a Qwen run missing its PLE sidecar says so.
+  Companions plank never passed stay unmentioned rather than being reported
+  as missing. The assembly is FFI-free and lives in `gguf`, so it is tested
+  without the engine submodule.
+
+### Fixed
+
+- **The no-progress notice claimed running a command would have satisfied
+  it.** Only a successful `write` or `edit` resets that budget — reads and
+  shell commands deliberately do not, since a turn of failed edits and builds
+  is what the rule was written for — so the old wording contradicted both the
+  code and the comment above the constant, and the stop read as a malfunction
+  because it usually lands right after a tool round. It now says what counts.
+
+### Added
+
+- **`/mc [on|off]` and a wastebasket on the footer.** Micro-compaction's live
+  state is now on the status bar as `🗑 🟢` (on) or `🗑 🔴` (off), beside the
+  loop-guard segment, and **double-clicking it** flips the setting for the
+  session. A single click reports the state and names the gesture instead of
+  toggling: micro-compaction rewrites old tool results in place and costs a
+  rung restore when it does, so a stray press in the status bar must not
+  rewrite the transcript. `/mc` is the typed equivalent, and like
+  `/loopguard` both work mid-turn, because every micro-compaction check reads
+  the setting afresh.
+- **The reasoning guard catches numbered-list cycles.** A cycle whose only
+  variation is the list ordinal is not byte-exact, so the existing rungs were
+  blind to it; numbered lines are now hashed with the ordinal stripped and a
+  repeat of at least three distinct items is reported as a cycle. From a
+  26-item, 7 KiB cycle that the byte-window rungs could not see.
+
+- **A draft rung on the reasoning guard.** Past an eighth of the pass's think
+  budget in reasoning (~12.8 KiB on the 1M-token window, never below 8 KiB), ten
+  numbered deliverable headings (`**Bug 3:**`, `1. **Title**`) or 4 KiB of
+  fenced code inside `<think>` stop the pass with "write this as your answer,
+  not in reasoning": the reasoning was drafting the answer, not deciding what
+  to do. Checked after the cycle rungs and before the think budget, counted
+  towards the same trip cap, silenced by `/loopguard off` like the rest. From
+  `repro-loop-1789060243`, a thirty-one-item code review written inside
+  `<think>` for thirteen minutes and never emitted.
+- **"Write findings as you find them" in the working-style prompt.** When
+  the answer is a list — a review, an audit, a survey of options — the model
+  is told to emit each item after `</think>` as soon as it has it rather than
+  accumulate the list in reasoning. A system-prompt change, so the first
+  launch rebuilds the prompt cache.
+- **Repro dumps carry a `## Passes` table.** One row per generation pass:
+  when it ended and how long after the previous one, which agent ran it,
+  tokens and rate, the reasoning bytes the guard saw, any latched cycle as
+  period × copies, the draft rung's heading and fenced-code counts, and why
+  the pass stopped (`tool calls: N`, `answer`, `interrupted by user`,
+  `guard: cycle|draft|budget`, `tool error`). The `## Generation` section
+  also says whether the loop guards were armed and the think budget in
+  effect. `repro-loop-1789060243` left it ambiguous whether its 30 KB
+  reasoning pass was stopped by the user or a guard; now the dump says.
+
+## [5.0.5] - 2026-09-10
+
+### Added
+
+- **`/toks`: a live chart of generation speed.** A braille line chart of
+  tokens per second as a time series: while the model decodes, the rate is
+  sampled once a second into a 256-entry process-wide ring, so the x axis is
+  decode time and the chart knows nothing about passes or turns. It opens in
+  the same dismissable panel as `/usage` (plain text on the piped REPL) and
+  also runs mid-turn, redrawing on every status tick so the line grows while
+  the model types. The dots are drawn in the theme green.
+- **`/exit` and `/quit` work mid-turn, behind a confirmation.** Typing either
+  while the model is working opens a `[y/N]` panel; `y` interrupts the turn
+  on both routes a generation polls, unblocks a worker parked on `ask`, and
+  leaves as soon as the turn stops without running the queued lines or a
+  live goal. Any other key keeps the turn running.
+
+### Changed
+
+- **The per-pass reasoning budget scales with the context window.** The loop
+  guard's think budget is now a tenth of the context window in bytes
+  (`repeat_think_budget`), never below the old 16 KiB, so on the 1M-token
+  window it is ~102 KB. Seven dumps from 2026-09-10 showed the fixed budget
+  stopping reasoning that was not looping at all: a multi-file feature drafted
+  as code inside `<think>`, restarted from zero after every stop. Details in
+  `docs/LOOP-FINDINGS.md`.
+
+## [5.0.4] - 2026-09-10
+
+### Changed
+
+- **The expert-routing glyph moved from the status bar to the window title.**
+  The busy title now leads with the two-cell braille routing stand-in
+  (`crate::experts`) instead of the sparkling rocket, seeded off the live
+  decoded token while the local engine works and off the frame counter
+  otherwise. The status bar's think segment holds the static 🧠 again, so the
+  footer no longer animates under the reader; the rocket survives only in the
+  `🚀 Plank loading...` state.
+- **A `/init` you type no longer clears the session.** Only the AGENTS.md
+  offer at startup clears afterwards, because that clear is what rebuilds the
+  session context around the file the turn just wrote. A `/init` run
+  mid-session writes `AGENTS.md` and leaves the conversation intact; the next
+  `/clear` picks the new file up like any other.
+
+## [5.0.3] - 2026-09-10
+
+### Added
+
+- **Background bash jobs wake the model (`tools.bashNotify`, default off).**
+  A job the model leaves running with a short `refresh_sec` no longer has to
+  be polled: when it exits, plank appends a `[BACKGROUND JOB NOTIFICATION]`
+  user message carrying the same observation `bash_status` would return and
+  starts a turn. Each job is announced once, never if the model saw the exit
+  itself, and only at a turn boundary: the next tool round, or the idle loop
+  of each front end (the TUI tick, a stdin thread in the plain REPL, a bounded
+  poll in headless mode that prints `+DWARFSTAR_JOBS_FINISHED <n>` first).
+  The TUI does not wake while you have unsent text or a pane open. Turning
+  the setting on appends one sentence to the shell rules, so it takes effect
+  in a fresh session. Design and verification notes in
+  `docs/BACKGROUND-TASKS.md`.
+- **`/jobs` and a `⧗ N jobs` footer segment.** The job table (id, pid,
+  elapsed, state, output file) opens in the same dismissable panel as
+  `/usage`, refreshes while open, and works mid-turn from a snapshot the
+  worker publishes at every tool boundary. Clicking the footer segment
+  toggles it; the plain REPL prints the table as text.
+
+### Fixed
+
+- **Every tool round under speculative decoding re-prefilled the whole
+  conversation.** When a tool stanza closed inside an accepted MTP block the
+  loop rewound the KV to the kept token, mirroring the C agent; on DeepSeek
+  that rewind cannot roll the compressor frontiers back and marks the
+  checkpoint invalid, so the next pass rebuilt from token zero (an 18k-token
+  session paid it on every `bash` call, `cached=0` in the KV log). The
+  committed tail is now recorded in the assistant span as unrendered shadow
+  tokens, so the token buffer mirrors the live KV and the next prompt extends
+  it. The ladder rescue also logs an invalidated checkpoint instead of
+  returning silently.
+
+## [5.0.2] - 2026-09-09
+
+### Added
+
+- **The AGENTS.md startup offer can be silenced per folder.** When neither
+  `AGENTS.md` nor `CLAUDE.md` exists, the offer now has three choices:
+  Generate (the default), Not now, and "Don't ask for this folder", which
+  records the project path in `~/.plank/agentsmd-skip` so that folder is never
+  asked again. The plain-stdin path takes `[Y/n/d]`.
+- **The write preview shows a live line counter.** Past the preview cap (now 5
+  lines, up from 3) the collapsed body shows a `… N lines` line that ticks as
+  the file streams and settles on the permanent `└ N lines` summary. The
+  preview header is `Writing <repo-relative-path>` in a bulleted, indented
+  block.
+
+### Changed
+
+- **`/usage` typed during a turn opens its panel** instead of dumping the
+  report into the scrollback between the model's streaming output. Esc
+  dismisses it, PageUp/PageDown scroll it, and the next submit retires it.
+- **The rotating tip sits on its own line while the agent works**, below the
+  progress row, instead of in the status tail; at rest it stays in the tail.
+
+### Fixed
+
+- **A `/usage` typed mid-write no longer duplicates the line counter.** The
+  echo landed after the live counter and the next tick popped the echo instead,
+  leaving a stale count above a fresh one. Out-of-stream pushes now retire the
+  counter first.
 
 ## [5.0.0] - 2026-09-08
 

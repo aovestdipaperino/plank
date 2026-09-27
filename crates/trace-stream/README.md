@@ -34,7 +34,7 @@ stream.finish();
 
 Give `TokenRenderer` a `std::io::Stdout` to write to a terminal, or a `Vec<u8>`
 to capture the ANSI and convert it to something else — which is what
-[turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console)
+[tdk](https://github.com/aovestdipaperino/tdk)
 does to render a stream into a text-mode UI.
 
 Zero dependencies beyond `std`.

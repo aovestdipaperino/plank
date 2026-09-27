@@ -13,7 +13,9 @@
 //! named `repro-<unix-seconds>[-<n>].md`. When the repetition guard stops a
 //! looping pass the agent writes one automatically as
 //! `repro-loop-<unix-seconds>[-<n>].md`, so a stall is captured without
-//! anyone having to notice it. Nothing here touches the live session — it is
+//! anyone having to notice it. Every front end — TUI, plain REPL and the
+//! headless protocol — writes one the same way on the way out under `--debug`
+//! (`repro-debug-<unix-seconds>[-<n>].md`). Nothing here touches the live session — it is
 //! a read-only snapshot.
 //!
 //! Sub-agent sidechains are folded out of the transcript the moment they end,
@@ -26,10 +28,50 @@ use std::path::{Path, PathBuf};
 
 use crate::config::AgentConfig;
 
+/// Which model produced the transcript, as far as anything can say.
+///
+/// Four different answers, because no one of them identifies a model on its
+/// own. The configured *path* is often a symlink the reporter repointed; the
+/// engine-reported *name* is the shape the C matched and is what selects the
+/// dialect; the *family* decides the companion slot and the transcript
+/// extension; and the artifact set *version* names the weights, which is the
+/// one thing a maintainer cannot recover from the other three. A report that
+/// carried only the path has repeatedly not been enough to tell which build of
+/// which model was actually loaded.
+#[derive(Debug, Default)]
+pub struct ModelMeta<'a> {
+    /// Shape name the engine reports after opening, e.g. `DeepSeek V4 Flash
+    /// Vision Experimental`. Empty when no engine is loaded (the echo stub).
+    pub name: &'a str,
+    /// Family the loaded model belongs to, spelled as the CLI spells it
+    /// (`ds4` / `qwen`).
+    pub family: &'a str,
+    /// Tool-call dialect in force. Derived from `name`, recorded separately
+    /// because a mismatch between the two is itself a bug worth seeing.
+    pub syntax: &'a str,
+    /// `version` of the installed `ds4.manifest`, i.e. which artifact set is
+    /// on disk. `None` when no manifest is installed.
+    pub artifact_version: Option<u32>,
+    /// The companion GGUF in effect: the `DSpark` draft checkpoint for
+    /// `DeepSeek`, the PLE n-gram sidecar for Qwen. Empty when none is configured.
+    pub companion: &'a str,
+    /// File name of the main artifact the installed manifest declares — the
+    /// weights' real name, which a symlinked `path` hides. Empty when no
+    /// manifest is installed.
+    pub weights_file: &'a str,
+    /// Hugging Face *repository* page for the weights (see
+    /// [`crate::manifest::hf_repo_url`]), so a report links somewhere a human
+    /// can read rather than somewhere a click starts an 87 GB download. Empty
+    /// when no manifest is installed or its URL is not a Hugging Face link.
+    pub hf_url: &'a str,
+}
+
 /// Runtime facts worth recording alongside the transcript, gathered from the
 /// live `Agent` by the caller (which owns the engine and config).
 #[derive(Debug)]
 pub struct Meta<'a> {
+    /// Which model produced this transcript. See [`ModelMeta`].
+    pub model: ModelMeta<'a>,
     /// plank version string.
     pub version: &'a str,
     /// Local ISO date/time the repro was taken.
@@ -59,7 +101,38 @@ pub struct Meta<'a> {
     pub session_path: &'a str,
     /// Optional user note describing the bug.
     pub note: &'a str,
+    /// Whether `tools.loopGuards` was armed when the dump was taken.
+    pub guards_armed: bool,
+    /// One entry per generation pass this session, oldest first; see
+    /// [`PassNote`]. Empty for dumps taken before any pass ran.
+    pub passes: &'a [PassNote],
 }
+
+/// One generation pass as the agent saw it end, for the `## Passes` table.
+///
+/// The transcript alone cannot answer the questions a loop dump raises —
+/// `repro-loop-1789060243` left it ambiguous whether a 30 KB reasoning pass
+/// with no `</think>` was stopped by the user or a guard, and how much of it
+/// the guard had counted. This records the answer at the moment it is known.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PassNote {
+    /// Wall-clock second the pass ended.
+    pub at: u64,
+    /// Which agent ran it: empty for the main turn, the sub-agent's label
+    /// otherwise.
+    pub label: String,
+    /// Tokens the pass generated, and its rate.
+    pub generated: i32,
+    pub tps: f64,
+    /// What the reasoning guard counted.
+    pub guard: crate::insights::GuardSnapshot,
+    /// Why the pass ended: `tool calls: N`, `answer`, `interrupted by user`,
+    /// `guard: cycle` / `guard: draft` / `guard: budget`, `tool error`.
+    pub stop: String,
+}
+
+/// Passes remembered for the table; older ones fall off the front.
+pub const PASS_NOTES_CAP: usize = 256;
 
 /// How many finished sub-agent sidechains the agent remembers for `/repro`.
 /// Oldest are dropped first; a fan-out of N slots contributes N entries.
@@ -81,8 +154,9 @@ pub struct SidechainDump {
     pub fork_at: usize,
     /// The sidechain's messages, framed task first, in order.
     pub messages: Vec<crate::session::Message>,
-    /// The `subagent-<ordinal>` of the console window this sidechain streamed
-    /// to, so a console attaching later can reopen the same window.
+    /// The ordinal of the console window this sidechain streamed to (its name
+    /// is `label`, or `subagent-<ordinal>` when the label was empty), so a
+    /// console attaching later can reopen the same window.
     pub ordinal: usize,
     /// Whether that window was connected when the sidechain ended. A dump
     /// that was never mirrored is what a late console gets backfilled with;
@@ -164,6 +238,87 @@ pub fn build_sidecar_report(
     out
 }
 
+/// The note a mid-turn `/repro` carries when the user typed none: the dump
+/// was asked for by hand while the model was generating, which is worth
+/// telling apart from the automatic `repro-loop` dumps and from an idle one.
+pub const MID_TURN_NOTE: &str = "manually triggered mid turn";
+
+/// Everything a `/repro` dump needs that only the agent can supply, captured
+/// on the worker thread at the start of a main generation pass so the UI
+/// thread can write a dump *during* the pass, while the worker owns the agent.
+///
+/// The report is built in full at capture time (with `note` empty); a
+/// mid-turn dump appends a `## In-progress pass` section carrying the user's
+/// note and the text the pass has produced so far ([`append_live_pass`]).
+/// Sidecars are kept as dumps rather than rendered reports because a sidecar
+/// names the main file it belongs to, which is only known once the main file
+/// is saved.
+#[derive(Debug, Clone, Default)]
+pub struct ReproBase {
+    /// Where the dump goes (`Agent::repro_dir`).
+    pub dir: PathBuf,
+    /// The version label the sidecar headers carry.
+    pub version: String,
+    /// The complete main report, transcript included, with an empty note.
+    pub report: String,
+    /// The finished sidechains to write beside the main file, oldest first.
+    pub sidecars: Vec<SidechainDump>,
+}
+
+impl ReproBase {
+    /// Saves the main report as `<prefix>-<secs>.md` in `dir` with every
+    /// sidecar beside it; returns the main path and the number of sidecars.
+    ///
+    /// # Errors
+    /// Returns the OS error message when a file cannot be written.
+    pub fn save(&self, prefix: &str, secs: u64, report: &str) -> Result<(PathBuf, usize), String> {
+        let path = save_in(&self.dir, prefix, secs, report)?;
+        let main_file = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for (i, dump) in self.sidecars.iter().enumerate() {
+            let rendered = crate::ui::render_messages_for_repro(&dump.messages, None);
+            let side = build_sidecar_report(&self.version, &main_file, i + 1, dump, &rendered);
+            save_sidecar(&path, i + 1, &side)?;
+        }
+        Ok((path, self.sidecars.len()))
+    }
+}
+
+/// Appends the section a mid-turn dump adds to a [`ReproBase`] report: the
+/// user's note (the header's `note:` line says `(none)`, having been rendered
+/// before the note existed) and the text the running pass had generated when
+/// the dump was taken, between the same fences the transcript uses. The
+/// rendered transcript above it is exactly that pass's engine input, so the
+/// two together are the state of the model at the moment of the `/repro`.
+pub fn append_live_pass(report: &mut String, note: &str, partial: &str) {
+    let _ = writeln!(report);
+    let _ = writeln!(report, "## In-progress pass");
+    let _ = writeln!(report);
+    let _ = writeln!(
+        report,
+        "Taken mid-turn: the transcript above is the engine input of the pass \
+         that was generating when `/repro` ran, and below is what that pass had \
+         produced so far. The `## Passes` table stops at the previous pass."
+    );
+    let _ = writeln!(report);
+    let note = note.trim();
+    let _ = writeln!(
+        report,
+        "- note: {}",
+        if note.is_empty() { "(none)" } else { note }
+    );
+    let _ = writeln!(report, "- generated so far: {} bytes", partial.len());
+    let _ = writeln!(report);
+    let _ = writeln!(report, "----- BEGIN PARTIAL OUTPUT -----");
+    report.push_str(partial);
+    if !partial.is_empty() && !partial.ends_with('\n') {
+        report.push('\n');
+    }
+    let _ = writeln!(report, "----- END PARTIAL OUTPUT -----");
+}
+
 /// The path of sidecar `ordinal` for the main dump at `main`: the main file's
 /// stem plus `.sub-<ordinal>.md`, in the same directory.
 #[must_use]
@@ -190,7 +345,7 @@ pub fn save_sidecar(main: &Path, ordinal: usize, report: &str) -> Result<PathBuf
 pub fn repro_dir(cwd: &Path) -> PathBuf {
     std::env::var_os("HOME").map_or_else(
         || cwd.join(".plank").join("repro"),
-        |h| PathBuf::from(h).join(".plank").join("repro"),
+        |h| crate::home::plank_home_in(h).join("repro"),
     )
 }
 
@@ -200,6 +355,54 @@ pub fn repro_dir(cwd: &Path) -> PathBuf {
 /// The transcript is emitted between explicit `BEGIN`/`END` fences rather than
 /// a markdown code block, because it can itself contain triple-backtick code
 /// and must survive round-tripping byte-for-byte.
+/// The `## Passes` table: one row per generation pass, oldest first; nothing
+/// when no pass has run.
+fn write_passes(out: &mut String, passes: &[PassNote]) {
+    if !passes.is_empty() {
+        let _ = writeln!(out, "## Passes");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "One row per generation pass, oldest first. `reasoning` is the bytes the guard saw inside `<think>`; `cycle` is a latched period × copies; `headings`/`fenced` are the draft rung's counts."
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "| # | ended | Δ | agent | tokens | tok/s | reasoning | cycle | headings | fenced | stop |"
+        );
+        let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|");
+        let mut prev: Option<u64> = None;
+        for (i, p) in passes.iter().enumerate() {
+            let delta = prev.map_or_else(String::new, |q| {
+                crate::ui::format_elapsed(p.at.saturating_sub(q))
+            });
+            prev = Some(p.at);
+            let cycle = p.guard.cycle.map_or_else(
+                || "-".to_owned(),
+                |(period, copies)| format!("{period} B × {copies}"),
+            );
+            let label = if p.label.is_empty() {
+                "main"
+            } else {
+                p.label.as_str()
+            };
+            let _ = writeln!(
+                out,
+                "| {} | {} | {delta} | {label} | {} | {:.1} | {} | {cycle} | {} | {} | {} |",
+                i + 1,
+                crate::context::format_local_time(p.at),
+                p.generated,
+                p.tps,
+                p.guard.fed,
+                p.guard.headings,
+                p.guard.fenced_bytes,
+                p.stop
+            );
+        }
+        let _ = writeln!(out);
+    }
+}
+
 #[must_use]
 pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -> String {
     let g = &cfg.generation;
@@ -228,6 +431,51 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     let _ = writeln!(out, "- power: {}%", meta.power_percent);
     let _ = writeln!(out);
 
+    // Its own section rather than more lines on the header list: this is the
+    // block a maintainer reads first, and burying the weights' identity under
+    // sampling knobs is what made "which model was this?" a question worth
+    // asking of a report that already answered it.
+    let m = &meta.model;
+    let _ = writeln!(out, "## Model");
+    let _ = writeln!(out);
+    if m.name.is_empty() {
+        // The echo stub, or a dump taken before the engine opened. Said out
+        // loud, because a blank line reads as "the field was not filled in".
+        let _ = writeln!(out, "- name: (no engine loaded)");
+    } else {
+        let _ = writeln!(out, "- name: {}", m.name);
+    }
+    if !m.family.is_empty() {
+        let _ = writeln!(out, "- family: {}", m.family);
+    }
+    if !m.syntax.is_empty() {
+        let _ = writeln!(out, "- tool dialect: {}", m.syntax);
+    }
+    if let Some(model) = &cfg.model_path {
+        let _ = writeln!(out, "- path: {}", model.display());
+    }
+    if !m.companion.is_empty() {
+        let _ = writeln!(out, "- companion: {}", m.companion);
+    }
+    match m.artifact_version {
+        Some(v) => {
+            let _ = writeln!(out, "- artifact set: version {v}");
+        }
+        None => {
+            let _ = writeln!(out, "- artifact set: (no manifest installed)");
+        }
+    }
+    if !m.weights_file.is_empty() {
+        let _ = writeln!(out, "- weights file: {}", m.weights_file);
+    }
+    if !m.hf_url.is_empty() {
+        let _ = writeln!(out, "- hugging face: {}", m.hf_url);
+    }
+    if let Some(backend) = &cfg.backend {
+        let _ = writeln!(out, "- backend: {backend:?}");
+    }
+    let _ = writeln!(out);
+
     let _ = writeln!(out, "## Generation");
     let _ = writeln!(out);
     let _ = writeln!(out, "- think mode: {}", meta.think.name());
@@ -238,16 +486,25 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     let _ = writeln!(out, "- top_p: {}", g.top_p);
     let _ = writeln!(out, "- min_p: {}", g.min_p);
     let _ = writeln!(out, "- seed: {}", g.seed);
-    if let Some(model) = &cfg.model_path {
-        let _ = writeln!(out, "- model: {}", model.display());
-    }
-    if let Some(backend) = &cfg.backend {
-        let _ = writeln!(out, "- backend: {backend:?}");
-    }
+    // Model path and backend used to be listed here; they moved to `## Model`.
     if cfg.engine != crate::config::EngineTuning::default() {
         let _ = writeln!(out, "- engine tuning: {:?}", cfg.engine);
     }
+    let _ = writeln!(
+        out,
+        "- loop guards: {}",
+        if meta.guards_armed {
+            "armed"
+        } else {
+            "off (/loopguard off)"
+        }
+    );
+    if let Some(budget) = meta.passes.iter().rev().find_map(|p| p.guard.budget) {
+        let _ = writeln!(out, "- think budget: {budget} bytes of reasoning per pass");
+    }
     let _ = writeln!(out);
+
+    write_passes(&mut out, meta.passes);
 
     let _ = writeln!(out, "## Rendered transcript (exact engine input)");
     let _ = writeln!(out);
@@ -398,6 +655,15 @@ mod tests {
 
     fn meta() -> Meta<'static> {
         Meta {
+            model: ModelMeta {
+                name: "DeepSeek V4 Flash Vision Experimental",
+                family: "ds4",
+                syntax: "dsml",
+                artifact_version: Some(7),
+                companion: "/home/u/.plank/ds4flash.dspark.gguf",
+                weights_file: "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS.gguf",
+                hf_url: "https://huggingface.co/antirez/deepseek-v4-gguf",
+            },
             version: "9.9.9",
             date: "2026-07-19T10:00:00",
             ctx_size: 1_000_000,
@@ -409,6 +675,8 @@ mod tests {
                 show_thinking: true,
                 show_tool_calls: false,
             },
+            guards_armed: true,
+            passes: &[],
             session_id: "abc123",
             session_tag: "",
             session_path: "/home/u/.plank/kvcache/abc123.kv",
@@ -439,6 +707,68 @@ mod tests {
     fn a_panic_report_with_no_transcript_says_so() {
         let text = build_panic_report("9.9.9", "d", "boom", None);
         assert!(text.contains("(no transcript was captured before the panic)"));
+    }
+
+    /// The weights' identity is the thing a maintainer cannot reconstruct from
+    /// anything else in the file, so all four answers are pinned: the engine's
+    /// own name, the family, the dialect, and the installed artifact version.
+    #[test]
+    fn the_model_section_records_which_model_produced_the_transcript() {
+        let cfg = AgentConfig::default();
+        let report = build_report(&meta(), &cfg, "[user]\nhi\n");
+        let section = report
+            .split_once("## Model\n")
+            .expect("a Model section")
+            .1
+            .split_once("## Generation")
+            .expect("followed by Generation")
+            .0;
+        assert!(
+            section.contains("- name: DeepSeek V4 Flash Vision Experimental"),
+            "{section}"
+        );
+        assert!(section.contains("- family: ds4"), "{section}");
+        assert!(section.contains("- tool dialect: dsml"), "{section}");
+        assert!(section.contains("- artifact set: version 7"), "{section}");
+        assert!(
+            section.contains("- weights file: DeepSeek-V4-Flash-Vision-Exp-IQ2XXS.gguf"),
+            "{section}"
+        );
+        // The repo page, never the `/resolve/` download URL.
+        assert!(
+            section.contains("- hugging face: https://huggingface.co/antirez/deepseek-v4-gguf"),
+            "{section}"
+        );
+        assert!(!section.contains("/resolve/"), "no download URL: {section}");
+        assert!(
+            section.contains("- companion: /home/u/.plank/ds4flash.dspark.gguf"),
+            "{section}"
+        );
+        // It moved out of `## Generation`, so it must not be in both places.
+        let generation = report.split_once("## Generation").unwrap().1;
+        assert!(
+            !generation.contains("- name:") && !generation.contains("- model:"),
+            "the model is recorded once, in its own section: {generation}"
+        );
+    }
+
+    /// An absent engine and an absent manifest are stated, not left blank: a
+    /// missing line reads as a field nobody filled in, which is a different
+    /// bug report from "there was no engine".
+    #[test]
+    fn an_unknown_model_says_so_rather_than_leaving_the_field_empty() {
+        let cfg = AgentConfig::default();
+        let mut m = meta();
+        m.model = ModelMeta::default();
+        let report = build_report(&m, &cfg, "[user]\nhi\n");
+        assert!(report.contains("- name: (no engine loaded)"), "{report}");
+        assert!(
+            report.contains("- artifact set: (no manifest installed)"),
+            "{report}"
+        );
+        // The optional lines are simply absent rather than printed empty.
+        assert!(!report.contains("- family: \n"), "{report}");
+        assert!(!report.contains("- companion: \n"), "{report}");
     }
 
     #[test]
@@ -564,5 +894,59 @@ mod tests {
         let c = save_in(&dir, "repro", 1000, "manual").unwrap();
         assert_eq!(c.file_name().unwrap().to_str().unwrap(), "repro-1000.md");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_passes_table_names_each_stop() {
+        let passes = vec![
+            PassNote {
+                at: 1_700_000_000,
+                label: String::new(),
+                generated: 900,
+                tps: 16.7,
+                guard: crate::insights::GuardSnapshot {
+                    fed: 30_467,
+                    budget: Some(104_857),
+                    cycle: None,
+                    headings: 31,
+                    fenced_bytes: 0,
+                },
+                stop: "interrupted by user".to_owned(),
+            },
+            PassNote {
+                at: 1_700_000_311,
+                label: "reviewer".to_owned(),
+                generated: 500,
+                tps: 15.0,
+                guard: crate::insights::GuardSnapshot {
+                    fed: 17_038,
+                    budget: Some(104_857),
+                    cycle: Some((631, 5)),
+                    headings: 6,
+                    fenced_bytes: 0,
+                },
+                stop: "guard: cycle".to_owned(),
+            },
+        ];
+        let mut m = meta();
+        m.passes = &passes;
+        let report = build_report(&m, &AgentConfig::default(), "");
+        assert!(report.contains("## Passes"), "{report}");
+        assert!(
+            report.contains("| main | 900 | 16.7 | 30467 | - | 31 | 0 | interrupted by user |"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "| +5m11s | reviewer | 500 | 15.0 | 17038 | 631 B × 5 | 6 | 0 | guard: cycle |"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("- loop guards: armed"), "{report}");
+        assert!(report.contains("- think budget: 104857 bytes"), "{report}");
+        // No passes: no table, and no budget line to invent one from.
+        let report = build_report(&meta(), &AgentConfig::default(), "");
+        assert!(!report.contains("## Passes"));
+        assert!(!report.contains("think budget"));
     }
 }

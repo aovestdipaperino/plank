@@ -20,7 +20,7 @@ Every command below works identically in the TUI and the plain REPL.
 | `/rename <name>` | change the name later saves use; what is already on disk keeps its old name |
 | `/strip <id>` | drop a saved session's KV payload to reclaim disk; the transcript survives and a later resume re-prefills it |
 | `/history` | reprint recent turns |
-| `/quit`, `/exit` | leave (the session is saved) |
+| `/quit`, `/exit` | leave (the session is saved). Mid-turn it asks `[y/N]` first, then interrupts the turn and leaves once it stops |
 
 See [Sessions](06-sessions.md).
 
@@ -38,12 +38,17 @@ See [Sessions](06-sessions.md).
 
 | Command | What it does |
 |---|---|
-| `/context` | report context-window usage by category |
+| `/context` | report context-window usage by category (or click the `ctx N%` gauge) |
 | `/compact [instructions]` | compact the conversation now, rather than waiting for the automatic pass; an argument steers what this one summary keeps |
 | `/usage` | billed token counts for the session (hosted providers, including cache hit rate) |
+| `/toks` | two braille line charts side by side, generation speed and prefill speed, one sample per second of decoding. Works mid-turn and redraws as the model types |
+| `/jobs` | the background bash job table: id, pid, elapsed, state and output file. A live panel in the TUI, also mid-turn; clicking `⧗ N jobs` in the status bar toggles it |
 | `/rate [+\|-] [note]` | rate the last turn (thumbs up by default) with an optional note; works in the TUI and the plain REPL alike |
 | `/remember [user] <fact>` | append a dated entry to project memory (or user memory with `user`) |
 | `/memory` | open user and project memory as one buffer in the built-in editor; edits are split back to the right file on save |
+| `/memory log` | print the recent entries of the memory audit log: what the model or the extraction pass added, changed or removed, and why |
+| `/memory calibrate [N]` | ask the memory gate's question about up to N saved turns (default 20) twice, with yes and no swapped, and suggest a `memory.gateBias` value that cancels the model's lean toward one letter |
+| `/forget <pattern>` | delete every memory entry whose text contains the pattern, case-insensitively, after previewing the matches and asking |
 | `/init` | have the model read the repo and generate an `AGENTS.md` |
 
 See [Context](07-context.md).
@@ -53,10 +58,10 @@ See [Context](07-context.md).
 | Command | What it does |
 |---|---|
 | `/mcp` | connected MCP servers and the tools they expose |
-| `/skills` | skills available to the model |
+| `/skills [on\|off]` | skills available to the model; `on`/`off` enable or disable skill expansion for this session, on both the slash route and the `skill` tool |
 | `/templates` | your `{{var}}` prompt templates |
 | `/agent` | named subagents you can delegate to, and which engine each runs on |
-| `/hooks` | which hooks are configured and on what events |
+| `/hooks [on\|off]` | which hooks are configured and on what events; `on`/`off` enable or disable hook execution for this session |
 | `/plugins` | loaded plugins, where each came from, what it contributes, and any warnings |
 | `/tasks` | the model's task list |
 
@@ -78,11 +83,12 @@ See [Extending plank](09-extending.md).
 |---|---|
 | `/config` | open the interactive settings form |
 | `/config <section>.<key> <value>` | set one setting, e.g. `/config ui.showThinking false` |
-| `/debug [on\|off]` | override the `--debug` switch: mirror the raw model stream to a running `turbo-debug-console` (on connects and backfills at once); bare `/debug` reports the state |
+| `/debug [on\|off]` | override the `--debug` switch: mirror the raw model stream to a running `tdk` (on connects and backfills at once); bare `/debug` reports the state |
 | `/power <1..100>` | cap GPU power draw for this run; shown as `(local ⚡60%)` in the status bar |
 | `/mtp [on\|off]` | turn speculative decoding (multi-token prediction) on or off for this session; bare `/mtp` reports the state |
 | `/temp [0..100]` | set the sampling temperature; refused while `/mtp` is on, which pins it at 0 |
-| `/loopguard [on\|off]`, `/lg` | arm or silence the loop guards. The one mutating command that also works mid-turn |
+| `/loopguard [on\|off]`, `/lg` | arm or silence the loop guards. Works mid-turn |
+| `/mc [on\|off]` | turn micro-compaction on or off for this session; bare `/mc` reports the state. Works mid-turn |
 | `/notify <mode>` | change notification mode for this session |
 | `/version` | the running version |
 | `/help` | full command and flag reference |
@@ -91,7 +97,23 @@ The model can also ask for a compaction itself, with the `compact` tool, and car
 
 Speculative decoding verifies its drafts by argmax, so it only runs at temperature 0: `/mtp on` pins the temperature there and `/mtp off` gives you back the one you were sampling at. `/mtp on` is refused without loaded draft support — that is chosen at startup (`--mtp`, `--mtp-model`) and cannot be loaded into a running engine. The status bar shows `✨` while speculation is on, with its per-step figures beside it, and `🌡 0.60` while it is off.
 
-`/loopguard off` silences every rung of every guard: the repetition guard and its think budget, the repeated-tool-call guard and its no-progress budget, and the repeat advisory. Unlike other settings commands it takes effect on a turn that is already generating, because the moment you want the guards out of the way is usually while they are firing. `🔁` in the status bar means they are armed; `♻ looping` means one has actually seen a cycle. The switch is session-only and is never written to disk (the underlying setting is `tools.loopGuards`).
+`/loopguard off` silences every rung of every guard: the repetition guard with its draft rung and think budget, the repeated-tool-call guard and its no-progress budget, and the repeat advisory. Unlike other settings commands it takes effect on a turn that is already generating, because the moment you want the guards out of the way is usually while they are firing. `🔁` in the status bar means they are armed; `♻ looping` means one has actually seen a cycle. The switch is session-only and is never written to disk (the underlying setting is `tools.loopGuards`).
+
+### The no-progress budget
+
+One rung of the loop guard is off unless you ask for it. The no-progress budget watches a whole turn rather than a single pass: it counts the bytes the model generates and resets that count only when a file actually changes on disk. Cross 32 KB without a change and the turn ends with `guard: turn stopped: the model generated 32KB of output and changed no file.`
+
+What counts as a change is narrow on purpose. A successful `write` or `edit` counts. So does a shell command that left the git working tree different than it found it, which is how `sed -i`, `cargo fmt`, a codegen script and `git apply` get credit for work they do without plank ever seeing the edit. Reads, searches, builds and test runs do not count, however many of them succeed, and neither does an `edit` that failed to apply. That asymmetry is the whole point: the pattern this rung was built for is a turn whose every individual pass looks reasonable and which still, fifty minutes later, has written nothing.
+
+It is off by default because the count is a measure of output volume, not of looping, and there is a perfectly ordinary turn that trips it: a long read-only investigation. Ask plank why a test is flaky, or to explain how a subsystem fits together, and it will read, search, build and reason its way to a real answer without touching a file. The budget stops that turn too, and the notice tells you to narrow a request that was never too wide. Every other rung of the guard, which watches for genuine repetition instead, stays armed by default.
+
+Turn it on when you are handing plank a long autonomous task and you would rather it gave up than spent an afternoon:
+
+```json
+{ "tools": { "noProgressGuard": true } }
+```
+
+It is ANDed with `tools.loopGuards`, so `/loopguard off` silences it along with everything else, and arming it while the guards are off does nothing. There is no slash command of its own; `/config tools.noProgressGuard true` sets it for the project.
 
 `/config` changes write to `./.plank/settings.json` and apply immediately. In the TUI, a bare `/config` opens the form and `/config <key> <value>` sets and persists the value directly, the same as on the plain REPL. See [Configuration](08-configuration.md).
 
@@ -103,17 +125,24 @@ Speculative decoding verifies its drafts by argmax, so it only runs at temperatu
 | `/kvcache` | browse the KV cache as a tree: what each snapshot is, what it was built on, its size, how often it has been used, and when it expires |
 | `/kvcache gc\|pin\|unpin\|rm` | sweep expired entries now, or pin, unpin or delete one by fingerprint prefix |
 | `/insights [fast\|fresh]` | a usage report computed from every saved session, written to `~/.plank/usage-data/report.html` (`fast` skips the model-written prose, `fresh` forces it to be written again) |
+| `/stats [7\|30\|all]` | a year of activity as a heatmap, with streaks and totals under it; re-issue bare `/stats` to cycle the range |
 | `/repro [note]` | dump the exact engine input and runtime knobs to `~/.plank/repro/` for a bug report; the file's path is copied to the clipboard |
 
 `/repro` is the one to reach for when you want to report a problem: it captures the rendered prompt the engine would see plus the model, backend, context size, sampling settings and think mode, in a single self-contained file. It never touches the live session.
 
-Under `--debug` (or after `/debug on`) plank dumps on its own as well: quitting writes `repro-quit-<timestamp>.md`, and a panic writes `repro-panic-<timestamp>.md` with whatever transcript the session had last rendered. Neither needs you to remember `/repro` before the session ends.
+Under `--debug` (or after `/debug on`) plank dumps on its own as well: quitting writes `repro-debug-<timestamp>.md`, and a panic writes `repro-panic-<timestamp>.md` with whatever transcript the session had last rendered. Neither needs you to remember `/repro` before the session ends.
 
 `/insights` computes **every number in code** and uses the model only for prose it cannot replace — a failed or skipped model call costs the report its narrative, never its statistics.
 
 The report is **differential**. Per-session statistics have always been cached and recomputed only for sessions that changed; the written sections now work the same way. plank remembers the last report in `~/.plank/usage-data/last-report.json` and reuses its prose until ten sessions — or a tenth of your history, whichever is smaller — are new or have been written to since. A section the previous run failed to produce is not reused, so it gets written on the next run rather than staying missing. `/insights fresh` writes everything again regardless, for when the last answer was wrong rather than stale.
 
 When there is a previous report to compare against, the new one opens with a **Since** strip: sessions new or updated, prompts, lines, files, commits, and any tool or friction category that was not there last time. It is subtraction of two deterministic aggregates, so it costs nothing and cannot be wrong the way a written summary could.
+
+`/stats` is the quick look `/insights` is not: a year of weeks as a heatmap, four green tones from your quietest day to your busiest, and eight figures under it — favourite model, total tokens, sessions, longest span, days started, longest and current streak, most active day. It reads the same per-session cache `/insights` fills, so it costs nothing after the first run and never calls the model.
+
+Two of those figures are named for exactly what they count. **Days started** counts days a session began, so a session opened on Monday and resumed through Thursday lights one square, not four. **Longest span** is wall-clock between a session's first and last message, which is not time spent working — resume something a month later and the span is a month. Token totals are transcript bytes divided by four, since plank keeps no true per-session count.
+
+The heatmap always shows the full year. The figures under it take a range: `/stats 7` and `/stats 30` jump straight to the last week or month, `/stats all` goes back, and re-issuing bare `/stats` while the panel is open cycles the three. Esc closes it. Like `/insights`, it is answered only while plank is idle.
 
 Suggestions are made to be used, not read: every snippet, prompt and instruction in the report has a **Copy** button, and the **Worth putting in AGENTS.md** list arrives as a checklist — untick what you disagree with, press **Copy all checked**, and paste the rest into plank. The report stays a single self-contained local file: the clipboard handler is inlined next to the stylesheet, with a fallback for `file://`, where the browser clipboard API is unavailable.
 

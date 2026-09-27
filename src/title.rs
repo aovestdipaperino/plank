@@ -5,7 +5,9 @@
 //!
 //! A handful of states, so the window (and tab) names plank's phase at a
 //! glance: `🚀 Plank loading...` before a front end is up, `🪵 Plank - READY.`
-//! while idle at the prompt, `🚀 <prompt>` while a turn runs,
+//! while idle at the prompt, `⠿⠇ <prompt>` while a turn runs (the
+//! expert-routing glyph of [`crate::experts`], restepped once per [`tick`],
+//! unless reduced motion is on),
 //! `❓ waiting for you...` while the `ask` tool holds the turn open for an
 //! answer, and
 //! `👀 introspecting...` while `/insights` reads back the user's own history. Set via the OSC 0
@@ -13,7 +15,7 @@
 //! stderr reaches the same tty as stdout but bypasses the Ratatui frame
 //! buffer, so a title change can never tear a frame even when emitted from the
 //! worker thread. No-op when stderr is not a terminal (piped runs, tests,
-//! `--non-interactive` under a harness).
+//! `--ui console` under a harness).
 
 use std::io::{IsTerminal, Write};
 
@@ -35,7 +37,7 @@ pub enum State<'a> {
     /// reason as [`State::Compacting`]: it interrupts a running turn, and it is
     /// the one phase where a backgrounded window should say the turn is not
     /// stalled but waiting on *you*. Always set through [`Scoped`], so whatever
-    /// the turn was showing — normally the [`State::Busy`] rocket — comes back
+    /// the turn was showing — normally the [`State::Busy`] glyph — comes back
     /// however the question ends, including a declined or interrupted one.
     Asking,
     /// Summarizing the transcript to reclaim context. Like
@@ -67,26 +69,80 @@ const ASKING: &str = "❓ waiting for you...";
 /// whitespace-only prompt degrades to the plain loading form.
 #[must_use]
 pub fn window_title(state: State<'_>) -> String {
-    let prompt = match state {
-        State::Loading => return LOADING.to_string(),
-        State::Idle => {
-            return match crate::profile::active() {
-                Some(_) => format!("🪵 {} - READY.", crate::profile::display_name()),
-                None => "🪵 Plank - READY.".to_string(),
-            };
-        }
-        State::Introspecting => return INTROSPECTING.to_string(),
-        State::Compacting => return COMPACTING.to_string(),
-        State::Asking => return ASKING.to_string(),
-        State::Busy(p) => p.split_whitespace().collect::<Vec<_>>().join(" "),
+    match state {
+        State::Loading => LOADING.to_string(),
+        State::Idle => match crate::profile::active() {
+            Some(_) => format!("🪵 {} - READY.", crate::profile::display_name()),
+            None => "🪵 Plank - READY.".to_string(),
+        },
+        State::Introspecting => INTROSPECTING.to_string(),
+        State::Compacting => COMPACTING.to_string(),
+        State::Asking => ASKING.to_string(),
+        State::Busy(p) => match collapse_prompt(p) {
+            Some(prompt) => busy_title(&prompt, 0),
+            None => LOADING.to_string(),
+        },
+    }
+}
+
+/// Collapses a busy prompt to one whitespace-normalized line; `None` when
+/// nothing is left, so the caller can fall back to the loading title.
+fn collapse_prompt(prompt: &str) -> Option<String> {
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then_some(collapsed)
+}
+
+/// The glyph leading a [`State::Busy`] title at animation frame `frame`: the
+/// expert-routing braille of [`crate::experts`], which the status bar used to
+/// carry. Two cells wide whatever the routing is, so the prompt beside it never
+/// shifts, and the same seed the bar used: the live token while the local
+/// engine is working, else the frame counter, so a remote turn still animates.
+fn busy_glyph(frame: usize) -> String {
+    let seed = if crate::status::local_pass_active() {
+        crate::status::routing_seed()
+    } else {
+        frame as u64
     };
-    if prompt.is_empty() {
-        return LOADING.to_string();
-    }
+    crate::experts::glyphs(seed)
+}
+
+/// Formats the [`State::Busy`] title for animation frame `frame`: that frame's
+/// routing glyph, then the already-collapsed `prompt`, truncated past
+/// [`TITLE_PROMPT_MAX`] characters.
+fn busy_title(prompt: &str, frame: usize) -> String {
+    let glyph = busy_glyph(frame);
     match prompt.char_indices().nth(TITLE_PROMPT_MAX) {
-        Some((i, _)) => format!("🚀 {}…", prompt[..i].trim_end()),
-        None => format!("🚀 {prompt}"),
+        Some((i, _)) => format!("{glyph} {}…", prompt[..i].trim_end()),
+        None => format!("{glyph} {prompt}"),
     }
+}
+
+/// The running busy animation: the collapsed prompt and the frame last shown.
+/// `Some` only while the title is a [`State::Busy`] one; any other state
+/// clears it, and [`Scoped`] parks and restores it with the title it displaces.
+static BUSY: std::sync::Mutex<Option<(String, usize)>> = std::sync::Mutex::new(None);
+
+fn busy_lock() -> std::sync::MutexGuard<'static, Option<(String, usize)>> {
+    BUSY.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Advances the busy routing glyph one frame, if a [`State::Busy`] title is
+/// showing. Called from the TUI's redraw loop; a no-op at any other title, and
+/// under reduced motion (`ui.reducedMotion`), where the glyph stays at frame 0.
+pub fn tick() {
+    if crate::anim::reduced_motion() {
+        return;
+    }
+    let next = {
+        let mut busy = busy_lock();
+        let Some((prompt, frame)) = busy.as_mut() else {
+            return;
+        };
+        *frame = frame.wrapping_add(1);
+        busy_title(prompt, *frame)
+    };
+    set_text(&next);
 }
 
 /// The title last written, so a transient state ([`Scoped`]) can put back what
@@ -96,6 +152,12 @@ static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// Sets the terminal window title to [`window_title`]`(state)`. Best-effort:
 /// errors are ignored, and nothing is written when stderr is not a tty.
 pub fn set(state: State<'_>) {
+    // Record the prompt for `tick` only when the title is actually a busy one —
+    // a blank prompt degrades to the loading form and must not animate.
+    *busy_lock() = match state {
+        State::Busy(p) => collapse_prompt(p).map(|prompt| (prompt, 0)),
+        _ => None,
+    };
     set_text(&window_title(state));
 }
 
@@ -124,24 +186,31 @@ fn set_text(title: &str) {
 /// [`State::Idle`]), so the phase itself cannot know what to restore — and
 /// restoring on drop covers the interrupted and failed passes too.
 #[derive(Debug)]
-pub struct Scoped(Option<String>);
+pub struct Scoped {
+    title: Option<String>,
+    /// The busy animation that was running, parked while the guard lives so
+    /// `tick` does not step the glyph over the displaced title.
+    busy: Option<(String, usize)>,
+}
 
 impl Scoped {
     /// Displaces the current title with `state`'s.
     #[must_use]
     pub fn set(state: State<'_>) -> Self {
-        let previous = LAST
+        let title = LAST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let busy = busy_lock().take();
         crate::title::set(state);
-        Self(previous)
+        Self { title, busy }
     }
 }
 
 impl Drop for Scoped {
     fn drop(&mut self) {
-        if let Some(previous) = self.0.take() {
+        *busy_lock() = self.busy.take();
+        if let Some(previous) = self.title.take() {
             set_text(&previous);
         }
     }
@@ -170,10 +239,10 @@ mod tests {
     }
 
     /// The `ask` tool's contract with the window title: the question mark is up
-    /// only while the user is being asked, and the rocket the turn was flying
-    /// comes back afterwards — whichever way the question ended.
+    /// only while the user is being asked, and the busy title the turn was
+    /// showing comes back afterwards — whichever way the question ended.
     #[test]
-    fn asking_displaces_the_busy_rocket_and_gives_it_back() {
+    fn asking_displaces_the_busy_title_and_gives_it_back() {
         let _serial = TITLE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -205,7 +274,7 @@ mod tests {
         set_text("sentinel-title");
         let guard = Scoped::set(State::Compacting);
         assert_eq!(
-            guard.0.as_deref(),
+            guard.title.as_deref(),
             Some("sentinel-title"),
             "the guard must capture the title it displaced"
         );
@@ -233,14 +302,92 @@ mod tests {
 
     #[test]
     fn busy_prompt_is_collapsed_and_truncated() {
-        assert_eq!(window_title(State::Busy("fix  the\nbug")), "🚀 fix the bug");
+        let glyph = busy_glyph(0);
+        assert_eq!(
+            window_title(State::Busy("fix  the\nbug")),
+            format!("{glyph} fix the bug")
+        );
         let long = "a".repeat(60);
         let t = window_title(State::Busy(&long));
-        assert!(t.starts_with("🚀 "));
+        assert!(t.starts_with(&format!("{glyph} ")));
         assert!(t.ends_with('…'));
         assert_eq!(
             t.chars().count(),
-            "🚀 ".chars().count() + TITLE_PROMPT_MAX + 1
+            glyph.chars().count() + 1 + TITLE_PROMPT_MAX + 1
         );
+    }
+
+    /// The glyph moves from frame to frame and always in the same two columns,
+    /// so the prompt beside it never shifts; a truncated prompt is cut the same
+    /// way on every frame.
+    #[test]
+    fn routing_glyph_steps_in_place() {
+        use unicode_width::UnicodeWidthStr;
+        let frames: Vec<String> = (0..8).map(|f| busy_title("go", f)).collect();
+        assert!(
+            frames
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1,
+            "the glyph never moved: {frames:?}"
+        );
+        for f in 0..8 {
+            assert_eq!(busy_glyph(f).width(), busy_glyph(0).width());
+        }
+        let long = "b".repeat(40);
+        let tail = |f: usize| busy_title(&long, f)[busy_glyph(f).len()..].to_owned();
+        assert_eq!(tail(3), tail(0));
+    }
+
+    /// `tick` advances only a busy title, is parked by a `Scoped` displacement
+    /// and resumes where it left off, and stops once the title leaves Busy.
+    #[test]
+    fn tick_steps_the_glyph_only_while_busy() {
+        let _serial = TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_reduced = crate::anim::reduced_motion();
+        crate::anim::set_reduced_motion(false);
+        let last = || {
+            LAST.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        let frame = |f: usize| format!("{} go", busy_glyph(f));
+        set(State::Busy("go"));
+        tick();
+        assert_eq!(last().as_deref(), Some(frame(1).as_str()));
+        let guard = Scoped::set(State::Compacting);
+        tick();
+        assert_eq!(
+            last().as_deref(),
+            Some(COMPACTING),
+            "parked while displaced"
+        );
+        drop(guard);
+        assert_eq!(
+            last().as_deref(),
+            Some(frame(1).as_str()),
+            "displaced frame restored"
+        );
+        tick();
+        assert_eq!(
+            last().as_deref(),
+            Some(frame(2).as_str()),
+            "resumes from where it was"
+        );
+        set(State::Idle);
+        tick();
+        assert_eq!(last().as_deref(), Some("🪵 Plank - READY."));
+        crate::anim::set_reduced_motion(true);
+        set(State::Busy("go"));
+        tick();
+        assert_eq!(
+            last().as_deref(),
+            Some(frame(0).as_str()),
+            "still under reduced motion"
+        );
+        crate::anim::set_reduced_motion(was_reduced);
     }
 }

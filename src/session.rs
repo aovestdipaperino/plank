@@ -88,6 +88,12 @@ const MAGIC: &str = "plank-session 1";
 const DS4_FILE_EXT: &str = ".ds4.kv";
 /// Transcript extension for a Qwen session.
 const QWEN_FILE_EXT: &str = ".qwn.kv";
+/// Transcript extension for a `DeepSeek` V4.1 session.
+///
+/// Note it is not a suffix of, nor suffixed by, [`DS4_FILE_EXT`]: `.ds4.kv`
+/// and `.ds41.kv` differ before the final `.kv`, so the plain `ends_with`
+/// matching everything here does keeps the two families apart.
+const DS41_FILE_EXT: &str = ".ds41.kv";
 /// The untagged extension every transcript used before the families split.
 ///
 /// Migrated to [`DS4_FILE_EXT`] on first launch; nothing writes it any more.
@@ -99,25 +105,37 @@ const LEGACY_FILE_EXT: &str = ".kv";
 /// reason: a `SessionStore` is opened from places that hold no engine handle
 /// (the `/kvcache` browser, the insights reader), and threading a family
 /// through every one of them to name a file extension is not worth it.
-static FAMILY_IS_QWEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A tag rather than a flag: this was a `FAMILY_IS_QWEN` bool until V4.1
+/// arrived, and a third family no longer fits in a yes/no. `0` is the unset
+/// value an untouched static holds, so it has to stay `Ds4` — every transcript
+/// written before the families split was a `DeepSeek` one.
+static FAMILY_TAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(FAMILY_TAG_DS4);
+
+const FAMILY_TAG_DS4: u8 = 0;
+const FAMILY_TAG_QWEN: u8 = 1;
+const FAMILY_TAG_DS41: u8 = 2;
 
 /// Records the live model family. Called once at startup, before any store is
 /// opened; unset means `Ds4`, which is what every transcript written before
 /// the families split was.
 pub fn set_family(family: crate::gguf::ModelFamily) {
-    FAMILY_IS_QWEN.store(
-        family == crate::gguf::ModelFamily::Qwen,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let tag = match family {
+        crate::gguf::ModelFamily::Ds4 => FAMILY_TAG_DS4,
+        crate::gguf::ModelFamily::Qwen => FAMILY_TAG_QWEN,
+        crate::gguf::ModelFamily::Ds41 => FAMILY_TAG_DS41,
+    };
+    FAMILY_TAG.store(tag, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The live model family.
 #[must_use]
 pub fn family() -> crate::gguf::ModelFamily {
-    if FAMILY_IS_QWEN.load(std::sync::atomic::Ordering::Relaxed) {
-        crate::gguf::ModelFamily::Qwen
-    } else {
-        crate::gguf::ModelFamily::Ds4
+    match FAMILY_TAG.load(std::sync::atomic::Ordering::Relaxed) {
+        FAMILY_TAG_QWEN => crate::gguf::ModelFamily::Qwen,
+        FAMILY_TAG_DS41 => crate::gguf::ModelFamily::Ds41,
+        // Including any value never stored: unset and unknown both read as the
+        // pre-split family, never as a wrong one.
+        _ => crate::gguf::ModelFamily::Ds4,
     }
 }
 
@@ -138,6 +156,7 @@ pub fn family_ext(family: crate::gguf::ModelFamily) -> &'static str {
     match family {
         crate::gguf::ModelFamily::Ds4 => DS4_FILE_EXT,
         crate::gguf::ModelFamily::Qwen => QWEN_FILE_EXT,
+        crate::gguf::ModelFamily::Ds41 => DS41_FILE_EXT,
     }
 }
 /// Extension of the engine KV payload written beside a transcript.
@@ -524,7 +543,7 @@ impl Default for Session {
 }
 
 /// Lightweight listing record for one saved session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionEntry {
     /// Session id (memorable name, or a legacy 40-hex id).
     pub id: String,
@@ -630,7 +649,7 @@ impl SessionStore {
         let home = std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
             .map_or_else(|| PathBuf::from("."), PathBuf::from);
-        home.join(".plank").join("kvcache")
+        crate::home::plank_home_in(home).join("kvcache")
     }
 
     /// Directory this store persists sessions in.
@@ -960,22 +979,27 @@ impl SessionStore {
         freed
     }
 
-    /// The system-prompt text the last Tier 1 checkpoint was built from, or
-    /// `None` when no sidecar has been written yet (first run, or a cleared
-    /// cache). Used only to explain a Tier 1 miss — never to validate a cache.
+    /// The system-prompt text the live family's last Tier 1 checkpoint was
+    /// built from, or `None` when that family has written no sidecar yet
+    /// (first run, a cleared cache, or a family whose note predates the
+    /// per-family split). Used only to explain a Tier 1 miss — never to
+    /// validate a cache.
+    ///
+    /// Reading only the live family's note is the point: see
+    /// [`sysprompt_note_name`].
     #[must_use]
     pub fn system_prompt_note(&self) -> Option<String> {
-        fs::read_to_string(self.dir.join(SYSPROMPT_NOTE_NAME)).ok()
+        fs::read_to_string(self.dir.join(sysprompt_note_name(family()))).ok()
     }
 
-    /// Records `system` as the prompt text behind the current Tier 1
-    /// checkpoint.
+    /// Records `system` as the prompt text behind the live family's current
+    /// Tier 1 checkpoint.
     ///
     /// # Errors
     /// Returns the underlying [`io::Error`] when the write fails. Best-effort:
     /// losing the sidecar costs only the explanation on the next miss.
     pub fn store_system_prompt_note(&self, system: &str) -> io::Result<()> {
-        fs::write(self.dir.join(SYSPROMPT_NOTE_NAME), system)
+        fs::write(self.dir.join(sysprompt_note_name(family())), system)
     }
 
     /// Filesystem location backing a [`KvKey`].
@@ -1105,7 +1129,7 @@ impl SessionStore {
                 if !entry.file_type().is_ok_and(|t| t.is_file()) {
                     continue;
                 }
-                if name == SYSPROMPT_NOTE_NAME {
+                if is_sysprompt_note(name) {
                     // Deleted but deliberately not counted: it's a tiny
                     // diagnostic sidecar, not cache, and the tally means
                     // cache bytes reclaimed.
@@ -1166,7 +1190,7 @@ impl SessionStore {
             let Some(stem) = name.strip_suffix(LEGACY_FILE_EXT) else {
                 continue;
             };
-            // `.ds4.kv` and `.qwn.kv` both end in `.kv`, so the tagged files
+            // `.ds4.kv`, `.qwn.kv` and `.ds41.kv` all end in `.kv`, so the tagged files
             // reach here too; their "stem" still carries the tag, and a stem
             // containing a dot is never a valid id.
             if !is_valid_id_prefix(stem) {
@@ -1798,12 +1822,41 @@ const SYSPROMPT_STEM: &str = "sysprompt";
 /// `sysprompt-<fp1>.kv_raw`.
 const SYSPROMPT_PREFIX: &str = "sysprompt-";
 
-/// Sidecar holding the system-prompt text that the most recent Tier 1
-/// checkpoint was built from. Deliberately *not* keyed by `fp1` — a changed
-/// prompt yields a different key, so the point of this file is to be findable
-/// after the fingerprint has already moved. Its name ends in `.prompt`, not
-/// `.kv_raw`, so [`SessionStore::sweep`] never sees it as a blob.
-const SYSPROMPT_NOTE_NAME: &str = "sysprompt-last.prompt";
+/// Shared prefix of the sidecars holding the system-prompt text behind the
+/// most recent Tier 1 checkpoint, one per model family.
+///
+/// Deliberately *not* keyed by `fp1` — a changed prompt yields a different
+/// key, so the point of these files is to be findable after the fingerprint
+/// has already moved. The name ends in `.prompt`, not `.kv_raw`, so
+/// [`SessionStore::sweep`] never sees one as a blob.
+const SYSPROMPT_NOTE_PREFIX: &str = "sysprompt-last";
+
+/// Suffix of a system-prompt note, after the family tag.
+const SYSPROMPT_NOTE_SUFFIX: &str = ".prompt";
+
+/// The pre-family note name, written by builds before the note was split per
+/// family. Swept like the tagged ones and never read: it cannot be attributed
+/// to a family, which is the whole reason the split exists.
+const LEGACY_SYSPROMPT_NOTE_NAME: &str = "sysprompt-last.prompt";
+
+/// Whether `name` is a system-prompt note sidecar of any family, including the
+/// untagged legacy one.
+fn is_sysprompt_note(name: &str) -> bool {
+    name == LEGACY_SYSPROMPT_NOTE_NAME
+        || (name.starts_with(SYSPROMPT_NOTE_PREFIX) && name.ends_with(SYSPROMPT_NOTE_SUFFIX))
+}
+
+/// Note filename for one model family: `sysprompt-last.<family>.prompt`.
+///
+/// The families share one cache directory, so an untagged note is whichever
+/// family launched last. Diffing a `DeepSeek` prompt against a note left by a
+/// Qwen run explains a Tier 1 miss with a Qwen-to-DSML diff that has nothing
+/// to do with why the checkpoint missed — a confidently wrong diagnosis
+/// exactly when families are being alternated.
+fn sysprompt_note_name(family: crate::gguf::ModelFamily) -> String {
+    let tag = family_ext(family).trim_end_matches(LEGACY_FILE_EXT);
+    format!("{SYSPROMPT_NOTE_PREFIX}{tag}{SYSPROMPT_NOTE_SUFFIX}")
+}
 
 /// File-stem prefix of the Tier 2 project-stable KV checkpoints (issue #60):
 /// `project-<fp2>.kv_raw`, living under the per-project subdirectory.
@@ -2129,8 +2182,13 @@ pub fn session_identity_sha(title: &str, created_at: u64) -> String {
 ///
 /// `think` and `trusted_len` are here for the reason the text fields cannot
 /// cover: both change the *tokens* the prompt prefills to while leaving every
-/// byte of `system` and `transcript_render` identical. `ThinkMode::Max`
-/// prepends the reasoning-effort preamble, and `trusted_len` decides how much
+/// byte of `system` and `transcript_render` identical. Every non-default
+/// `think` puts something ahead of the system prompt, and *what* it puts there
+/// depends on the model family as well as the mode: on `DeepSeek` V4 both
+/// `Max` and `Low` prepend a prose reasoning-effort preamble, while on V4.1 the
+/// preamble is suppressed in favour of the C's numeric `Reasoning Effort: N`
+/// line, which every level including `Low` and `Max` maps onto. `trusted_len`
+/// decides how much
 /// of the prompt is tokenized as rendered chat (native `｜DSML｜` versus
 /// spelled-out BPE pieces). Without them a payload written before either
 /// changed — including one written by a build with a different tokenization
@@ -3091,6 +3149,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The two families share one cache directory, so their notes must not
+    /// share one filename: an untagged note is whichever family launched last,
+    /// and diffing against it explains a DS4-family miss with a Qwen diff.
+    #[test]
+    fn the_system_prompt_note_is_named_per_family() {
+        let ds4 = sysprompt_note_name(crate::gguf::ModelFamily::Ds4);
+        let qwen = sysprompt_note_name(crate::gguf::ModelFamily::Qwen);
+        assert_eq!(ds4, "sysprompt-last.ds4.prompt");
+        assert_eq!(qwen, "sysprompt-last.qwn.prompt");
+        assert_ne!(ds4, qwen, "one family's note must never shadow the other's");
+
+        // Every spelling is swept, so switching families cannot leave the
+        // other's note behind as cache the tally never accounts for — and the
+        // untagged legacy name is swept too, since it can never be attributed.
+        assert!(is_sysprompt_note(&ds4));
+        assert!(is_sysprompt_note(&qwen));
+        assert!(is_sysprompt_note(LEGACY_SYSPROMPT_NOTE_NAME));
+        // A checkpoint blob is not a note: `.kv_raw` must keep reaching the
+        // byte-budget tally rather than being deleted as a diagnostic.
+        assert!(!is_sysprompt_note("sysprompt-a19f.kv_raw"));
+        assert!(!is_sysprompt_note("cheeky-bell.ds4.kv"));
+    }
+
+    /// A note written under one family is invisible to the other, so the miss
+    /// explanation either diffs against that family's own last prompt or says
+    /// nothing at all. Saying nothing beats saying something false.
+    #[test]
+    fn a_note_from_one_family_is_not_read_by_the_other() {
+        let dir = std::env::temp_dir().join(format!("plank-spnote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        std::fs::write(
+            dir.join(sysprompt_note_name(crate::gguf::ModelFamily::Qwen)),
+            "the qwen prompt",
+        )
+        .unwrap();
+        // The live family is DeepSeek by default, so the Qwen note is not it.
+        assert_eq!(family(), crate::gguf::ModelFamily::Ds4);
+        assert_eq!(store.system_prompt_note(), None);
+
+        store.store_system_prompt_note("the ds4 prompt").unwrap();
+        assert_eq!(
+            store.system_prompt_note().as_deref(),
+            Some("the ds4 prompt")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(sysprompt_note_name(crate::gguf::ModelFamily::Qwen)))
+                .unwrap(),
+            "the qwen prompt",
+            "writing one family's note must not clobber the other's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn migration_wipes_old_blobs_and_keeps_every_transcript() {
         let dir = std::env::temp_dir().join(format!("plank-migrate-{}", std::process::id()));
@@ -3626,9 +3738,25 @@ hello\n";
         assert_eq!(family_ext(ModelFamily::Qwen), ".qwn.kv");
         assert_ne!(family_ext(ModelFamily::Ds4), family_ext(ModelFamily::Qwen));
         // Both still end in `.kv`, so anything matching on that keeps working.
-        for f in [ModelFamily::Ds4, ModelFamily::Qwen] {
+        for f in [ModelFamily::Ds4, ModelFamily::Qwen, ModelFamily::Ds41] {
             assert!(family_ext(f).ends_with(LEGACY_FILE_EXT));
         }
+    }
+
+    /// V4.1 shares the cache directory with V4, and `.ds41.kv` also ends in
+    /// `.kv` — the one arrangement where a sloppy suffix match would let one
+    /// family read the other's transcripts.
+    #[test]
+    fn ds41_has_its_own_transcript_extension() {
+        use crate::gguf::ModelFamily;
+        assert_eq!(family_ext(ModelFamily::Ds41), ".ds41.kv");
+        // `.ds4.kv` must not match a `.ds41.kv` name by suffix.
+        assert!(!"wily-curie.ds41.kv".ends_with(family_ext(ModelFamily::Ds4)));
+        assert!(!"wily-curie.ds4.kv".ends_with(family_ext(ModelFamily::Ds41)));
+        assert_eq!(
+            sysprompt_note_name(ModelFamily::Ds41),
+            "sysprompt-last.ds41.prompt"
+        );
     }
 
     /// Untagged transcripts are renamed once, at the top level only.
@@ -3640,6 +3768,10 @@ hello\n";
         fs::write(dir.join("zippy-kennedy.kv"), b"plank-session 1\n").unwrap();
         // Already tagged: must be left exactly as it is.
         fs::write(dir.join("wily-curie.qwn.kv"), b"plank-session 1\n").unwrap();
+        // Also already tagged, and the family whose transcripts the
+        // untagged-rename path must never mistake for the legacy `.kv`
+        // extension it targets.
+        fs::write(dir.join("plucky-turing.ds41.kv"), b"plank-session 1\n").unwrap();
         // A per-project checkpoint tree. Transcripts never live here, and
         // walking it at every launch would be scanning for nothing.
         let proj = dir.join("abcdef123456");
@@ -3656,6 +3788,10 @@ hello\n";
         assert!(
             dir.join("wily-curie.qwn.kv").exists(),
             "tagged file untouched"
+        );
+        assert!(
+            dir.join("plucky-turing.ds41.kv").exists(),
+            "ds41-tagged file untouched"
         );
         assert!(
             proj.join("project-7c02.kv").exists(),

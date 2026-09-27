@@ -1059,7 +1059,7 @@ pub fn config_load(path: &Path) -> Vec<McpServerConfig> {
 #[must_use]
 pub fn global_config_path() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".plank").join(".mcp.json"))
+    Some(crate::home::plank_home_in(&home).join(".mcp.json"))
 }
 
 /// Every server name declared in the global `~/.plank/.mcp.json`.

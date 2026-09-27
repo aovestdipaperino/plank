@@ -20,7 +20,7 @@ The three that matter, up front:
   server is started only by `/remote-control` (alias `/rc`) from inside a running
   session, on an ephemeral loopback port, with a token minted per activation.
 - **TUI only.** The design's primary target was headless server mode
-  (`--remote --non-interactive`). That does not exist: `/rc` can only be typed in
+  (`--remote --ui console`). That does not exist: `/rc` can only be typed in
   the full-screen TUI, and the headless and piped-REPL remote-drive paths were
   written, found unreachable once the flags went, and removed. `/rc` in those
   front-ends declines rather than starting a server nothing can drive.

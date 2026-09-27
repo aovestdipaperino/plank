@@ -152,8 +152,18 @@ plank --help       # every flag</code></pre>
 <td>the plain <strong>line REPL</strong></td>
 </tr>
 <tr>
-<td><code>--non-interactive</code></td>
+<td><code>--ui console</code></td>
 <td><strong>headless</strong> stdin protocol</td>
+</tr>
+<tr>
+<td><code>--ui chart</code></td>
+<td><strong>headless</strong> one-shot that prints only the
+<code>/toks</code> chart</td>
+</tr>
+<tr>
+<td><code>--ui quiet</code></td>
+<td><strong>headless</strong> one-shot that prints only
+<code>Prompting. Started working... done.</code></td>
 </tr>
 <tr>
 <td><code>-p "…"</code> / <code>--prompt "…"</code></td>
@@ -224,11 +234,26 @@ settings are read from the launch directory, so
 exits. Works with hosted providers too:</p>
 <pre class="sh"><code>plank --provider anthropic --model claude-sonnet-4-5 -p &quot;review src/parser.rs&quot;</code></pre>
 <h2 id="headless-mode">Headless mode</h2>
-<p><code>--non-interactive</code> disables the interactive UI and reads
-a line protocol from stdin — the mode to drive plank from a script or
-another program. For driving the <em>TUI</em> from a test harness, see
-<code>--ui-remote</code> in <a href="10-remote-and-providers.html">Remote
-and hosted engines</a>.</p>
+<p><code>--ui</code> picks the front end. <code>--ui tui</code> is the
+default (the full interactive UI, or the plain REPL when either end is
+piped). <code>--ui console</code> disables the interactive UI: with
+<code>-p</code> it runs the one prompt and exits, and without one it
+reads a line protocol from stdin — the mode to drive plank from a script
+or another program. <code>--ui chart</code> runs a single
+<code>-p</code> prompt with its output swallowed and prints nothing but
+the <code>/toks</code> throughput chart for the run, painted live — it
+fills in place as the model generates, and shows
+<code>prefilling...</code> until the first sample lands, which is what
+you want when you are measuring the engine rather than reading the
+reply; <code>--ui quiet</code> is the smallest front end there is: it
+prints <code>Prompting. </code> as the turn starts,
+<code>Started working... </code> when the model begins generating, and
+<code>done.</code> when the turn ends, all on one line and nothing else
+— for a script, or for watching a long run from the corner of your eye.
+Both <code>chart</code> and <code>quiet</code> need a <code>-p</code>
+prompt and refuse to start without one. For driving the <em>TUI</em>
+from a test harness, see <code>--ui-remote</code> in <a
+href="10-remote-and-providers.html">Remote and hosted engines</a>.</p>
 <h2 id="leaving-and-coming-back">Leaving and coming back</h2>
 <p>Type <code>/quit</code> (or <code>/exit</code>, or Ctrl-D at an empty
 prompt). Your session is saved automatically.</p>

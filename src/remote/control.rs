@@ -168,7 +168,7 @@ impl From<&Status> for StatusWire {
             cwd: crate::status::cwd_label(),
             branch: crate::status::git_branch_label().unwrap_or_default(),
             origin: crate::status::engine_origin_label(),
-            think: s.think.short_name().to_owned(),
+            think: s.think.short_name().into_owned(),
         }
     }
 }
@@ -352,6 +352,10 @@ impl ServerMsg {
             | UiEvent::SubTokens { .. }
             | UiEvent::Sub(_)
             | UiEvent::Btw(_)
+            // The live preview counter rewrites a line in place, which the wire
+            // cannot express; remote clients skip the tick and still receive the
+            // permanent `└ N lines` summary as ordinary `Think` text.
+            | UiEvent::PreviewStatus(_)
             | UiEvent::QueuedJoined => {
                 return None;
             }
@@ -928,11 +932,9 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<RemoteState>) -> Result<
     // Replay the consumed head bytes so tungstenite can parse the handshake
     // itself, and cap the outbound buffer for per-client backpressure.
     let prefixed = PrefixStream::new(head, stream);
-    let config = tungstenite::protocol::WebSocketConfig {
-        write_buffer_size: 0,
-        max_write_buffer_size: state.queue_max.max(1),
-        ..Default::default()
-    };
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .write_buffer_size(0)
+        .max_write_buffer_size(state.queue_max.max(1));
     let mut ws =
         tungstenite::accept_with_config(prefixed, Some(config)).map_err(|e| e.to_string())?;
 
@@ -1470,7 +1472,7 @@ fn send<S: std::io::Read + std::io::Write>(
     frame: &ServerFrame,
 ) -> Result<(), String> {
     let json = frame.to_json().map_err(|e| e.to_string())?;
-    match ws.write(Message::Text(json)) {
+    match ws.write(Message::Text(json.into())) {
         Ok(()) => {}
         Err(tungstenite::Error::WriteBufferFull(_)) => return Err(EVICT_SLOW.to_owned()),
         Err(e) if is_would_block(&e) => return Ok(()), // buffered; flush later
@@ -1864,8 +1866,10 @@ mod tests {
     }
 
     fn send_client(ws: &mut tungstenite::WebSocket<std::net::TcpStream>, msg: ClientMsg) {
-        ws.send(Message::Text(ClientFrame::new(msg).to_json().unwrap()))
-            .unwrap();
+        ws.send(Message::Text(
+            ClientFrame::new(msg).to_json().unwrap().into(),
+        ))
+        .unwrap();
         ws.flush().unwrap();
     }
 

@@ -6,6 +6,7 @@
 //! Provides context content and token-counting by category for the /context report.
 
 use std::fmt::Write as _;
+use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -351,20 +352,38 @@ fn git_recent_commits() -> Option<String> {
         })
 }
 
+/// The project-note filenames read at each level, in the order they are
+/// appended. `AGENTS.local.md` comes second on purpose: it is the personal
+/// file `/init` offers to write, so when the two disagree the one the user
+/// wrote for themselves is the later word.
+const AGENTS_MD_NAMES: [&str; 2] = ["AGENTS.md", "AGENTS.local.md"];
+
 /// Discovers AGENTS.md files from the current directory upward.
 ///
-/// Only `AGENTS.md` is read. `CLAUDE.md` is no longer a fallback: an
+/// Only [`AGENTS_MD_NAMES`] are read. `CLAUDE.md` is no longer a fallback: an
 /// interactive start links `AGENTS.md` to a lone `CLAUDE.md` in the project
 /// root instead (`agentsmd::prepare`), so the file the model sees is always
 /// the one named for it, and a `CLAUDE.md` elsewhere up the tree is left to
 /// the tool it was written for.
 fn discover_agents_md_files() -> Option<String> {
+    discover_agents_md_files_from(&std::env::current_dir().ok()?)
+}
+
+/// [`discover_agents_md_files`] from an explicit starting directory.
+///
+/// The public entry point walks up from the process working directory, which
+/// a test cannot change without racing every other test in the binary — so
+/// the walk itself takes its root as an argument and the tests call this.
+fn discover_agents_md_files_from(start: &Path) -> Option<String> {
     let mut contents = Vec::new();
-    let mut current_dir = std::env::current_dir().ok()?;
+    let mut current_dir = start.to_path_buf();
 
     loop {
-        let path = current_dir.join("AGENTS.md");
-        if let Ok(content) = std::fs::read_to_string(&path) {
+        for name in AGENTS_MD_NAMES {
+            let path = current_dir.join(name);
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let header = format!("\n---\n# From: {}\n---\n", path.display());
             contents.push(header);
             contents.push(content);
@@ -558,6 +577,57 @@ mod tests {
         assert!(!is_session_context(
             "what does 'Agent instructions:' mean here?"
         ));
+    }
+
+    /// A unique directory for one test, named after it so a parallel run of
+    /// the whole `--lib` suite cannot have two tests share a tree.
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("plank-ctx-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `/init` can write a personal `AGENTS.local.md` beside the shared file;
+    /// both must reach the model, with the personal one last so it has the
+    /// final word when the two disagree.
+    #[test]
+    fn discovery_reads_the_personal_file_after_the_shared_one() {
+        let dir = scratch_dir("agents-local");
+        std::fs::write(dir.join("AGENTS.md"), "shared: run cargo test").unwrap();
+        std::fs::write(dir.join("AGENTS.local.md"), "personal: I am new here").unwrap();
+
+        let found = discover_agents_md_files_from(&dir).expect("both files exist");
+        let shared = found.find("shared: run cargo test").expect("shared file");
+        let personal = found
+            .find("personal: I am new here")
+            .expect("personal file");
+        assert!(
+            shared < personal,
+            "the personal file must come last: {found:?}"
+        );
+        assert!(
+            found.contains("AGENTS.local.md"),
+            "headed by path: {found:?}"
+        );
+    }
+
+    /// The personal file is optional on both sides: neither name is required
+    /// for the other to be picked up, and a directory with neither yields
+    /// nothing rather than an empty block.
+    #[test]
+    fn discovery_tolerates_either_file_alone() {
+        let dir = scratch_dir("agents-alone");
+        assert_eq!(discover_agents_md_files_from(&dir), None);
+
+        std::fs::write(dir.join("AGENTS.local.md"), "only personal").unwrap();
+        let only_personal = discover_agents_md_files_from(&dir).expect("personal alone counts");
+        assert!(only_personal.contains("only personal"));
+
+        std::fs::remove_file(dir.join("AGENTS.local.md")).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "only shared").unwrap();
+        let only_shared = discover_agents_md_files_from(&dir).expect("shared alone counts");
+        assert!(only_shared.contains("only shared"));
     }
 
     #[test]

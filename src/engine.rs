@@ -7,6 +7,7 @@
 //! behind a narrow trait so the UX layer works against any backend; a stub
 //! echo engine makes the agent runnable end-to-end without a model.
 
+use std::borrow::Cow;
 use std::fmt::Debug;
 
 /// Reasoning level requested for a generation, mirroring `ds4_think_mode`.
@@ -30,7 +31,11 @@ pub enum ThinkMode {
     /// Suppress thinking: the assistant prefix opens with `</think>`.
     Off,
     /// Ordinary thinking plus the brief-reasoning preamble in
-    /// [`THINK_LOW_PREFIX`]. A plank extension, not a C level.
+    /// [`THINK_LOW_PREFIX`]. A plank extension, not a C level. On `DeepSeek`
+    /// V4.1 this is followed by a `Reasoning Effort: 25` system line
+    /// ([`THINK_LOW_EFFORT_LEVEL`]), so `low` stays strictly below `medium`'s
+    /// (V4.1-only, implicit) effort of 75 instead of leaving the model's
+    /// numeric effort unspecified; every other family sees only the preamble.
     Low,
     /// Ordinary thinking (the C's `DS4_THINK_HIGH`). The default.
     #[default]
@@ -38,6 +43,12 @@ pub enum ThinkMode {
     /// Ordinary thinking plus the reasoning-effort preamble, prepended ahead of
     /// the system prompt. Needs a context of at least [`THINK_MAX_MIN_CONTEXT`].
     Max,
+    /// An explicit numeric reasoning effort, `1..=100`, which only `DeepSeek`
+    /// V4.1 understands (the C's `DS4_THINK_LEVEL_BASE + level`). The engine
+    /// turns it into the `Reasoning Effort: N` system line
+    /// [`deepseek41_effort_text`] mirrors; on any other model family a level is
+    /// rejected rather than silently ignored.
+    Level(u8),
 }
 
 impl ThinkMode {
@@ -51,17 +62,25 @@ impl ThinkMode {
     ///
     /// [`parse`]: ThinkMode::parse
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub fn name(self) -> Cow<'static, str> {
         match self {
-            Self::Off => "off",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::Max => "max",
+            Self::Off => Cow::Borrowed("off"),
+            Self::Low => Cow::Borrowed("low"),
+            Self::Medium => Cow::Borrowed("medium"),
+            Self::Max => Cow::Borrowed("max"),
+            // Owned, and distinct per level: this is KV-fingerprint key
+            // material, so two efforts that named themselves alike would share
+            // a cache built at the other's prompt.
+            Self::Level(n) => {
+                debug_assert!(n > 0, "Level(0) is incoherent — it means Off, not a level");
+                Cow::Owned(n.to_string())
+            }
         }
     }
 
     /// The level's name abbreviated to a fixed three columns: `off`, `low`,
-    /// `med`, `max`.
+    /// `med`, `max`, or a right-aligned number (`  7`, ` 25`, `100`) for an
+    /// explicit numeric level.
     ///
     /// For the status footer, where every level must occupy the same width — a
     /// segment that grows and shrinks as the level changes shifts everything to
@@ -70,12 +89,19 @@ impl ThinkMode {
     ///
     /// [`name`]: ThinkMode::name
     #[must_use]
-    pub fn short_name(self) -> &'static str {
+    pub fn short_name(self) -> Cow<'static, str> {
         match self {
-            Self::Off => "off",
-            Self::Low => "low",
-            Self::Medium => "med",
-            Self::Max => "max",
+            Self::Off => Cow::Borrowed("off"),
+            Self::Low => Cow::Borrowed("low"),
+            Self::Medium => Cow::Borrowed("med"),
+            Self::Max => Cow::Borrowed("max"),
+            // Right-aligned so the segment stays exactly three columns wide at
+            // every level (`  7`, ` 25`, `100`); `parse` trims, so what the
+            // footer shows still parses back.
+            Self::Level(n) => {
+                debug_assert!(n > 0, "Level(0) is incoherent — it means Off, not a level");
+                Cow::Owned(format!("{n:>3}"))
+            }
         }
     }
 
@@ -89,6 +115,19 @@ impl ThinkMode {
             "low" | "brief" => Some(Self::Low),
             "medium" | "med" | "high" | "on" => Some(Self::Medium),
             "max" | "maximum" => Some(Self::Max),
+            // A numeric effort, mirroring the C's `ds4_think_mode_parse_level`:
+            // digits only, `0..=100`. Zero is not a level — the C's effort text
+            // is empty there — so it means `Off`, and a sign or any other
+            // character is not a number at all.
+            s if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => match s.parse::<u16>() {
+                Ok(0) => Some(Self::Off),
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "guarded to 1..=100 by the arm"
+                )]
+                Ok(n) if n <= 100 => Some(Self::Level(n as u8)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -108,15 +147,159 @@ impl ThinkMode {
     /// token transcript and KV. `Off` and `Medium` differ only in the per-turn
     /// assistant prefix, which is re-derived every turn and never cached, so
     /// both return `None` and moving between them is free.
+    ///
+    /// Family-aware, exactly as [`for_display`] is, because what is emitted
+    /// depends on the family: on a numeric-thinking model the *only* thing any
+    /// level puts ahead of the system prompt is the C's `Reasoning Effort: N`
+    /// line ([`effort_level`]), so plank's own `low` prose and the V4 `max`
+    /// text are never emitted there ([`injects_low_preamble`]). Reporting them
+    /// anyway would claim a prefix change between `low` and `/think 25` (which
+    /// emit identical bytes) and make the `/think` context-room guard charge
+    /// for prose it will not send. `numeric_family` is
+    /// [`numeric_thinking_model`] of the live model name.
+    ///
+    /// [`for_display`]: ThinkMode::for_display
+    /// [`effort_level`]: ThinkMode::effort_level
     #[must_use]
-    pub fn effort_prefix(self) -> Option<&'static str> {
+    pub fn effort_prefix(self, numeric_family: bool) -> Option<Cow<'static, str>> {
+        if numeric_family {
+            // The whole preamble on this family is the numeric line, for every
+            // level; `Off` is thinking-disabled and carries none.
+            return self
+                .effort_level()
+                .map(|n| Cow::Owned(deepseek41_effort_text(n)));
+        }
         match self {
             Self::Off | Self::Medium => None,
-            Self::Low => Some(THINK_LOW_PREFIX),
-            Self::Max => Some(THINK_MAX_PREFIX),
+            Self::Low => Some(Cow::Borrowed(THINK_LOW_PREFIX)),
+            Self::Max => Some(Cow::Borrowed(THINK_MAX_PREFIX)),
+            // Distinct per level, because moving between two efforts moves the
+            // prompt prefix exactly as moving between two named levels does.
+            // The tokens themselves come from the C on a V4.1 engine; this is
+            // the change-detection key.
+            Self::Level(n) => {
+                debug_assert!(
+                    n > 0,
+                    "Level(0) is incoherent — the C returns NULL (no prefix) for it, not a level"
+                );
+                Some(Cow::Owned(deepseek41_effort_text(n)))
+            }
+        }
+    }
+
+    /// The numeric reasoning effort this level actually puts in force on a
+    /// numeric-thinking family, or `None` for [`Off`], which disables thinking
+    /// rather than asking for zero effort — a distinct state, not effort 0.
+    ///
+    /// [`Off`]: ThinkMode::Off
+    #[must_use]
+    pub fn effort_level(self) -> Option<u8> {
+        match self {
+            Self::Off => None,
+            Self::Low => Some(THINK_LOW_EFFORT_LEVEL),
+            Self::Medium => Some(V41_MEDIUM_EFFORT),
+            Self::Max => Some(V41_MAX_EFFORT),
+            Self::Level(n) => Some(n),
+        }
+    }
+
+    /// The level as the status footer should *show* it: unchanged on an
+    /// ordinary family, and the numeric effort in force ([`effort_level`]) on
+    /// one with a native effort knob, where `low`/`med`/`max` are only plank's
+    /// names for 25/75/100 and the number is what the model is actually told.
+    ///
+    /// Display only. [`name`] is KV-fingerprint key material and must keep one
+    /// distinct name per state, so this deliberately does not touch it — the
+    /// mapped value is handed to [`short_name`], which keeps its fixed three
+    /// columns for a number just as for a word.
+    ///
+    /// [`effort_level`]: ThinkMode::effort_level
+    /// [`name`]: ThinkMode::name
+    /// [`short_name`]: ThinkMode::short_name
+    #[must_use]
+    pub fn for_display(self, numeric_family: bool) -> Self {
+        if !numeric_family {
+            return self;
+        }
+        match self.effort_level() {
+            Some(n) => Self::Level(n),
+            // `Off` is thinking-disabled, not effort zero: it stays `off`.
+            None => self,
         }
     }
 }
+
+/// The `Reasoning Effort: N` system line a numeric level carries on `DeepSeek`
+/// V4.1, byte-for-byte the C's `ds4_deepseek41_reasoning_effort_text`
+/// (`refs/ds4/ds4.c`).
+///
+/// On a real V4.1 engine the tokens come from the C itself
+/// (`ds4_chat_append_think_prefix`); this copy exists so a level has a prefix
+/// to compare and a text to show without a model loaded.
+/// The numeric reasoning effort `ThinkMode::Low` asks for on `DeepSeek` V4.1,
+/// via the same `Reasoning Effort: N` system line a `/think 25` session would
+/// get. Upstream's own example of an explicit low setting
+/// (`--think-level 25`, `refs/ds4/docs/MODELS.md`), used here so `low` sits
+/// strictly below `medium`'s 75 instead of being unspecified (V4.1 defaults
+/// its `HIGH` mode, which `Low` maps to at the FFI boundary, to the same 75 as
+/// `Medium`). On every other model family this number is inert: those
+/// families' `chat_push_think_prefix` branches ignore a plain numeric level.
+pub const THINK_LOW_EFFORT_LEVEL: u8 = 25;
+
+#[must_use]
+pub fn deepseek41_effort_text(level: u8) -> String {
+    format!(
+        "Reasoning Effort: {level} (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+    )
+}
+
+/// The C's rejection of a numeric reasoning effort on a model that has no such
+/// knob: `ds4_agent.c`'s message word for word, minus its `ds4-agent: ` prefix,
+/// because plank's error path prefixes `plank: ` itself.
+pub const THINK_LEVEL_REQUIRES_V41: &str = "--think-level requires a DeepSeek V4.1 model";
+
+/// The single answer to "does this model have a native numeric reasoning-effort
+/// knob?" — today that is `DeepSeek` V4.1 and nothing else.
+///
+/// Every decision that turns on the numeric-effort family goes through here,
+/// rather than each site re-deriving it from [`crate::sysprompt::ToolSyntax`]:
+/// refusing `/think <n>` elsewhere ([`think_level_unsupported`]), showing the
+/// effort number in the footer ([`ThinkMode::for_display`]), and suppressing
+/// plank's own reasoning prose ([`injects_low_preamble`]). One predicate, so a
+/// future family that gains the knob is added in exactly one place.
+#[must_use]
+pub fn numeric_thinking_model(model_name: &str) -> bool {
+    crate::sysprompt::ToolSyntax::for_model_name(model_name) == crate::sysprompt::ToolSyntax::Dsml41
+}
+
+/// Whether `mode` is a numeric level the named model cannot honour, in which
+/// case the caller must refuse rather than silently fall back to `HIGH`.
+#[must_use]
+pub fn think_level_unsupported(mode: ThinkMode, model_name: &str) -> bool {
+    matches!(mode, ThinkMode::Level(_)) && !numeric_thinking_model(model_name)
+}
+
+/// Whether plank's own [`THINK_LOW_PREFIX`] prose should be injected ahead of
+/// the system prompt for `mode` on the named model.
+///
+/// On a numeric-thinking family the model has a real effort dial, and the C
+/// already emits `Reasoning Effort: 25` for `Low` ([`THINK_LOW_EFFORT_LEVEL`])
+/// — so plank injecting *additional* invented prose on top would mangle a
+/// prompt the model was trained on to say something it already says better.
+/// Only families with no such dial get the preamble.
+#[must_use]
+pub fn injects_low_preamble(mode: ThinkMode, model_name: &str) -> bool {
+    mode == ThinkMode::Low && !numeric_thinking_model(model_name)
+}
+
+/// The numeric effort `DeepSeek` V4.1 applies for the C's `HIGH` mode, which
+/// [`ThinkMode::Medium`] maps to (`ds4_deepseek41_reasoning_effort_text`,
+/// `refs/ds4/ds4.c`).
+pub const V41_MEDIUM_EFFORT: u8 = 75;
+
+/// The numeric effort `DeepSeek` V4.1 applies for the C's `MAX` mode, which
+/// [`ThinkMode::Max`] maps to.
+pub const V41_MAX_EFFORT: u8 = 100;
 
 /// The reasoning-effort preamble `Max` prepends ahead of the system prompt,
 /// byte-for-byte the C's `DS4_REASONING_EFFORT_MAX_PREFIX` (`refs/ds4/ds4.c`).
@@ -815,6 +998,40 @@ pub trait Engine: Debug + Send {
         false
     }
 
+    /// Answers one `question` against `state` without generating any tokens.
+    ///
+    /// One question per call, deliberately: an earlier design answered several
+    /// questions off one prefilled state by rewinding between them, which is
+    /// unsound on plank's main model family (see the annotation on
+    /// [`Ds4Session::decide`](crate::ds4engine::Ds4Session::decide) for why). A
+    /// caller with several questions about one state issues several calls; the
+    /// state's tokens are unchanged between them so a real implementation can
+    /// still reuse the common prefix.
+    ///
+    /// Implementations must not disturb the live turn session: the real one
+    /// runs on a dedicated decision session, because branching the live
+    /// session would rewind state guarded by the prefix fingerprints and the
+    /// KV ladder (`docs/KV-CACHE.md`).
+    ///
+    /// # Errors
+    /// The default implementation always returns [`EngineError::unsupported`].
+    /// A real implementation returns [`EngineError`] on a backend failure.
+    fn decide(
+        &mut self,
+        _state: &str,
+        _question: &crate::decide::Question,
+    ) -> Result<crate::decide::RawVerdict, EngineError> {
+        Err(EngineError::unsupported())
+    }
+
+    /// Whether [`decide`](Self::decide) can answer on this engine. False when
+    /// there is no model, or when the answer letters do not tokenize to a
+    /// single token on the loaded family. Callers must fall back to their
+    /// pre-existing behaviour rather than treating false as a "no" answer.
+    fn supports_decide(&self) -> bool {
+        false
+    }
+
     /// Answers a one-shot, tool-free prompt on a *forked* session, leaving this
     /// one completely untouched (`docs/SESSION-CLONE-DESIGN.md` §6.1).
     ///
@@ -915,6 +1132,27 @@ pub trait Engine: Debug + Send {
         Err(EngineError::new("engine does not support KV snapshots"))
     }
 
+    /// Frees the live KV session, keeping the model open.
+    ///
+    /// The yield path for memory pressure: the session is anonymous and partly
+    /// wired, so the kernel cannot reclaim it, while the GGUF weights are
+    /// file-backed and reclaimed for free. Closing the engine would therefore
+    /// trade a large certain cost for almost no gain.
+    ///
+    /// Must not allocate — it is called precisely when the system has no
+    /// memory — and must leave the engine usable: the next `warm_sync` or
+    /// `generate` recreates the session lazily.
+    ///
+    /// An engine may decline: it returns `true` only when the session was
+    /// actually released, and `false` when it refused (for instance because
+    /// the session holds state that cannot be rebuilt from text alone). A
+    /// caller must not assume memory was returned.
+    ///
+    /// Engines holding no local KV do nothing and release nothing.
+    fn release_session(&mut self) -> bool {
+        false
+    }
+
     /// Begins a warm walk: resets the cumulative warm token buffer to the
     /// system prompt's tokens. No prefill happens yet.
     ///
@@ -947,6 +1185,37 @@ pub trait Engine: Debug + Send {
     /// Returns [`EngineError`] when the backend cannot tokenize the text.
     fn warm_append(&mut self, _text: Option<&str>) -> Result<(), EngineError> {
         Ok(())
+    }
+
+    /// Whether this engine can hold a checkpoint boundary *inside* the system
+    /// prompt, between its trusted control-text span and the untrusted
+    /// remainder (`sysprompt::SplitSystemPrompt::trusted_len`).
+    ///
+    /// Off by default, and the tier planner emits no system-tail tier unless an
+    /// engine says yes, so every other backend keeps the single undivided
+    /// system tier it has always had.
+    ///
+    /// The boundary is only safe where the two halves already reach the
+    /// tokenizer as separate calls — otherwise it would be a mid-message split
+    /// whose tokenization could shift under BPE merges, which
+    /// [`Engine::warm_append`] forbids for exactly that reason.
+    fn splits_system_tail(&self) -> bool {
+        false
+    }
+
+    /// Appends the system prompt's untrusted remainder to the warm buffer as a
+    /// `system`-role message — the tail half of the split
+    /// [`splits_system_tail`](Engine::splits_system_tail) describes.
+    ///
+    /// The default is the user-role append, which is wrong for a role-aware
+    /// backend and harmless for the rest: no engine reaches it without first
+    /// declaring the split, and the ones that never declare it are handed no
+    /// tail tier to append.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the backend fails to tokenize.
+    fn warm_append_system(&mut self, text: &str) -> Result<(), EngineError> {
+        self.warm_append(Some(text))
     }
 
     /// Prefills the session up to the cumulative warm buffer's end. Returns
@@ -1252,13 +1521,34 @@ impl Utf8Stream {
 #[derive(Debug, Default)]
 pub struct EchoEngine {
     ctx_size: i32,
+    /// Verdicts `decide` hands back, oldest first. Empty means the capability
+    /// is off, which is the default: a test that wants decisions scripts them.
+    scripted_decisions: std::collections::VecDeque<crate::decide::RawVerdict>,
+    /// Every state `decide` was asked about, in order, for assertions.
+    decisions_asked: Vec<String>,
 }
 
 impl EchoEngine {
     /// Creates an echo engine with the given context size.
     #[must_use]
     pub fn new(ctx_size: i32) -> Self {
-        Self { ctx_size }
+        Self {
+            ctx_size,
+            scripted_decisions: std::collections::VecDeque::default(),
+            decisions_asked: Vec::default(),
+        }
+    }
+
+    /// Queues the verdicts `decide` will return, one per question asked.
+    /// Scripting any verdict turns [`Engine::supports_decide`] on.
+    pub fn script_decisions(&mut self, verdicts: Vec<crate::decide::RawVerdict>) {
+        self.scripted_decisions = verdicts.into();
+    }
+
+    /// The states `decide` was asked about, in call order.
+    #[must_use]
+    pub fn decisions_asked(&self) -> Vec<String> {
+        self.decisions_asked.clone()
     }
 }
 
@@ -1328,6 +1618,27 @@ impl Engine for EchoEngine {
     fn ctx_size(&self) -> i32 {
         self.ctx_size
     }
+
+    fn decide(
+        &mut self,
+        state: &str,
+        _question: &crate::decide::Question,
+    ) -> Result<crate::decide::RawVerdict, EngineError> {
+        if self.scripted_decisions.is_empty() {
+            return Err(EngineError::unsupported());
+        }
+        self.decisions_asked.push(state.to_string());
+        // An exhausted script is a test-authoring bug, so it fails loudly.
+        // Silently repeating the last verdict would let a test pass while
+        // asserting nothing.
+        self.scripted_decisions
+            .pop_front()
+            .ok_or_else(|| EngineError::new("echo decision script exhausted"))
+    }
+
+    fn supports_decide(&self) -> bool {
+        !self.scripted_decisions.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -1393,9 +1704,93 @@ mod spec_stats_tests {
 mod tests {
     use super::{
         EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, PrefillProgress,
-        THINK_LOW_PREFIX, THINK_MAX_PREFIX, ThinkMode, ThinkToolRecovery, Utf8Stream,
-        reusable_prefix,
+        THINK_LOW_EFFORT_LEVEL, THINK_LOW_PREFIX, THINK_MAX_PREFIX, ThinkMode, ThinkToolRecovery,
+        Utf8Stream, V41_MAX_EFFORT, V41_MEDIUM_EFFORT, deepseek41_effort_text,
+        injects_low_preamble, numeric_thinking_model, reusable_prefix, think_level_unsupported,
     };
+
+    #[test]
+    fn an_engine_without_the_capability_reports_it_and_errors() {
+        let mut e = EchoEngine::new(4096);
+        assert!(!e.supports_decide(), "unscripted echo has no decisions");
+        let q = crate::decide::Question::boolean("worth it?");
+        let err = e.decide("some state", &q).unwrap_err();
+        assert!(err.is_unsupported());
+    }
+
+    #[test]
+    fn a_scripted_echo_returns_its_verdicts_in_order_and_records_the_state() {
+        let yes = crate::decide::RawVerdict {
+            index: 0,
+            p: 0.9,
+            runner_up: Some((1, 0.1)),
+            abstained: false,
+            letter_mass: 0.0,
+        };
+        let no = crate::decide::RawVerdict {
+            index: 1,
+            p: 0.8,
+            runner_up: Some((0, 0.2)),
+            abstained: false,
+            letter_mass: 0.0,
+        };
+        let mut e = EchoEngine::new(4096);
+        e.script_decisions(vec![yes, no]);
+        assert!(e.supports_decide());
+
+        let q = crate::decide::Question::boolean("worth it?");
+        let first = e.decide("state one", &q).unwrap();
+        assert_eq!(first.index, 0);
+
+        let second = e.decide("state two", &q).unwrap();
+        assert_eq!(second.index, 1);
+
+        assert_eq!(e.decisions_asked(), vec!["state one", "state two"]);
+    }
+
+    #[test]
+    fn a_scripted_echo_runs_dry_rather_than_repeating_its_last_answer() {
+        let yes = crate::decide::RawVerdict {
+            index: 0,
+            p: 0.9,
+            runner_up: None,
+            abstained: false,
+            letter_mass: 0.0,
+        };
+        let mut e = EchoEngine::new(4096);
+        e.script_decisions(vec![yes]);
+        let q = crate::decide::Question::boolean("worth it?");
+        assert!(e.decide("a", &q).is_ok());
+        assert!(
+            e.decide("b", &q).is_err(),
+            "an exhausted script must fail loudly, not answer from memory"
+        );
+    }
+
+    #[test]
+    fn a_scripted_echo_answers_two_separate_calls() {
+        let v = crate::decide::RawVerdict {
+            index: 0,
+            p: 0.9,
+            runner_up: None,
+            abstained: false,
+            letter_mass: 0.0,
+        };
+        let mut e = EchoEngine::new(4096);
+        e.script_decisions(vec![v, v]);
+        let q = crate::decide::Question::boolean("worth it?");
+        let first = e.decide("state", &q).unwrap();
+        let second = e.decide("state", &q).unwrap();
+        assert_eq!(first.index, 0);
+        assert_eq!(second.index, 0);
+        assert_eq!(e.decisions_asked().len(), 2, "one prefill per question");
+    }
+
+    /// A model name the family resolver reads as `DeepSeek` V4.1 — the one
+    /// family with a native numeric reasoning-effort knob.
+    const V41: &str = "DeepSeek V4.1 Flash";
+    /// A model name from a family with no such knob.
+    const V4: &str = "DeepSeek V4 Flash";
 
     // A KV-backed engine holds one live session, so concurrent sidechains on it
     // would interleave and corrupt the shared prefix. 1 is the honest default.
@@ -1431,21 +1826,292 @@ mod tests {
     // The footer's segment must not change width with the level.
     #[test]
     fn think_mode_short_names_are_a_fixed_width() {
-        let names: Vec<&str> = ThinkMode::ALL.iter().map(|l| l.short_name()).collect();
+        let names: Vec<String> = ThinkMode::ALL
+            .iter()
+            .map(|l| l.short_name().into_owned())
+            .collect();
         assert!(
             names.iter().all(|n| n.chars().count() == 3),
             "{names:?} must all be three columns wide"
         );
         // And each still parses back, since it is what the user sees and copies.
         for level in ThinkMode::ALL {
-            assert_eq!(ThinkMode::parse(level.short_name()), Some(level));
+            assert_eq!(ThinkMode::parse(&level.short_name()), Some(level));
         }
     }
 
     #[test]
     fn think_mode_round_trips_through_its_name() {
         for level in ThinkMode::ALL {
-            assert_eq!(ThinkMode::parse(level.name()), Some(level), "{level:?}");
+            assert_eq!(ThinkMode::parse(&level.name()), Some(level), "{level:?}");
+        }
+    }
+
+    // The numeric effort V4.1 adds, with the C's own bounds: digits only,
+    // `0..=100`, and zero is `off` rather than a level (the C's effort text is
+    // empty at zero).
+    #[test]
+    fn numeric_levels_parse_and_bound() {
+        assert_eq!(ThinkMode::parse("25"), Some(ThinkMode::Level(25)));
+        assert_eq!(ThinkMode::parse("0"), Some(ThinkMode::Off));
+        assert_eq!(ThinkMode::parse("1"), Some(ThinkMode::Level(1)));
+        assert_eq!(ThinkMode::parse("100"), Some(ThinkMode::Level(100)));
+        assert_eq!(ThinkMode::parse(" 42 "), Some(ThinkMode::Level(42)));
+        assert_eq!(ThinkMode::parse("101"), None);
+        assert_eq!(ThinkMode::parse("-1"), None);
+        assert_eq!(ThinkMode::parse("+5"), None);
+        assert_eq!(ThinkMode::parse("1e2"), None);
+        assert_eq!(ThinkMode::parse("99999999999999999999"), None);
+        // The named levels keep working.
+        assert_eq!(ThinkMode::parse("max"), Some(ThinkMode::Max));
+    }
+
+    // `name` is KV-fingerprint key material (`kvtier::system_fingerprint`,
+    // `session`), so two efforts that named themselves alike would let a cache
+    // built at one be reused at the other: the wrong prompt, silently.
+    #[test]
+    fn each_level_names_itself_distinctly_for_the_fingerprint() {
+        let mut seen = std::collections::HashSet::new();
+        for n in 1..=100u8 {
+            assert!(seen.insert(ThinkMode::Level(n).name().to_string()), "{n}");
+        }
+        for m in ThinkMode::ALL {
+            assert!(seen.insert(m.name().to_string()), "{m:?} collides");
+        }
+    }
+
+    // And the same for the prefix, which is what decides whether a level change
+    // costs a re-prefill.
+    #[test]
+    fn each_level_carries_a_distinct_effort_prefix() {
+        let mut seen = std::collections::HashSet::new();
+        for n in 1..=100u8 {
+            let prefix = ThinkMode::Level(n)
+                .effort_prefix(false)
+                .expect("a numeric level always carries one");
+            assert!(seen.insert(prefix.into_owned()), "{n}");
+        }
+        assert!(seen.insert(THINK_LOW_PREFIX.to_owned()));
+        assert!(seen.insert(THINK_MAX_PREFIX.to_owned()));
+    }
+
+    // Right-aligned, so the footer's segment is three columns at every effort,
+    // and still parses back because `parse` trims.
+    #[test]
+    fn numeric_short_names_stay_three_columns() {
+        for n in 1..=100u8 {
+            let short = ThinkMode::Level(n).short_name();
+            assert_eq!(short.chars().count(), 3, "{n}: {short:?}");
+            assert_eq!(ThinkMode::parse(&short), Some(ThinkMode::Level(n)));
+        }
+    }
+
+    // A level thinks, like every mode but `off`.
+    #[test]
+    fn numeric_levels_think() {
+        assert!(ThinkMode::Level(1).thinks());
+        assert!(ThinkMode::Level(100).thinks());
+    }
+
+    // The C's `DS4_THINK_LEVEL_BASE` is 1000, and the named modes keep the
+    // exact discriminants the FFI boundary has always carried.
+    #[test]
+    fn ffi_level_repr_matches_the_c_base() {
+        assert_eq!(crate::ffi::Ds4ThinkMode::level(25).0, 1025);
+        assert_eq!(crate::ffi::Ds4ThinkMode::level(0).0, 1000);
+        assert_eq!(crate::ffi::Ds4ThinkMode::level(100).0, 1100);
+        assert_eq!(crate::ffi::Ds4ThinkMode::NONE.0, 0);
+        assert_eq!(crate::ffi::Ds4ThinkMode::HIGH.0, 1);
+        assert_eq!(crate::ffi::Ds4ThinkMode::MAX.0, 2);
+    }
+
+    // On DeepSeek V4.1 the C maps `Medium` (its `HIGH`) to 75 and `Max` to 100
+    // (`ds4_deepseek41_reasoning_effort_text`, `refs/ds4/ds4.c:41934-41935`);
+    // `append_effort_prefix` (`src/ds4engine.rs`) asks for
+    // `THINK_LOW_EFFORT_LEVEL` on `Low` for the same reason. Effort must
+    // strictly increase off < low < medium < max, never leaving `low`
+    // unspecified (which would make it indistinguishable from — or worse,
+    // higher than — `medium`).
+    #[test]
+    fn v41_effort_ordering_is_strictly_increasing() {
+        const {
+            assert!(THINK_LOW_EFFORT_LEVEL > 0, "0 means Off, not a low effort");
+            assert!(
+                THINK_LOW_EFFORT_LEVEL < V41_MEDIUM_EFFORT,
+                "low must sit below medium"
+            );
+            assert!(
+                V41_MEDIUM_EFFORT < V41_MAX_EFFORT,
+                "medium must sit below max"
+            );
+        }
+    }
+
+    // The effort line mirrors `ds4_deepseek41_reasoning_effort_text`.
+    #[test]
+    fn the_effort_text_matches_the_c_format() {
+        assert_eq!(
+            deepseek41_effort_text(25),
+            "Reasoning Effort: 25 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+        );
+    }
+
+    // On a numeric-thinking family `low` IS `/think 25`: plank injects no prose
+    // of its own there, so the two emit the same bytes and moving between them
+    // must not be reported as a prefix change (which would cost a re-prefill).
+    #[test]
+    fn low_and_level_25_share_a_prefix_on_a_numeric_family() {
+        let numeric = numeric_thinking_model(V41);
+        assert!(numeric);
+        assert_eq!(
+            ThinkMode::Low.effort_prefix(numeric),
+            ThinkMode::Level(THINK_LOW_EFFORT_LEVEL).effort_prefix(numeric),
+        );
+        // And on a family without the knob they genuinely differ: there `low`
+        // really does emit plank's prose.
+        assert_ne!(
+            ThinkMode::Low.effort_prefix(false),
+            ThinkMode::Level(THINK_LOW_EFFORT_LEVEL).effort_prefix(false),
+        );
+    }
+
+    // The `/think` context-room guard sizes the preamble it is about to emit.
+    // On a numeric family that is the one `Reasoning Effort:` line, not plank's
+    // ~97-token prose — charging for the prose can wrongly refuse a level
+    // change that would have fit.
+    #[test]
+    fn a_numeric_family_reports_no_phantom_prose_tokens() {
+        let reported = ThinkMode::Low
+            .effort_prefix(true)
+            .expect("low carries the numeric line");
+        assert_eq!(reported, deepseek41_effort_text(THINK_LOW_EFFORT_LEVEL));
+        assert!(
+            !reported.contains(THINK_LOW_PREFIX),
+            "plank's prose must not be counted on a numeric family"
+        );
+        // Same for `max`, whose V4 prose is likewise never emitted there.
+        assert_eq!(
+            ThinkMode::Max.effort_prefix(true).as_deref(),
+            Some(deepseek41_effort_text(V41_MAX_EFFORT).as_str())
+        );
+        // `Off` disables thinking outright, so it carries no line at all.
+        assert_eq!(ThinkMode::Off.effort_prefix(true), None);
+    }
+
+    // A numeric effort is a V4.1 knob; the named levels are everyone's.
+    #[test]
+    fn only_a_numeric_level_is_refused_off_v41() {
+        assert!(think_level_unsupported(
+            ThinkMode::Level(50),
+            "DeepSeek V4 Flash"
+        ));
+        assert!(!think_level_unsupported(
+            ThinkMode::Level(50),
+            "DeepSeek V4.1 Flash"
+        ));
+        for m in ThinkMode::ALL {
+            assert!(!think_level_unsupported(m, "DeepSeek V4 Flash"), "{m:?}");
+        }
+    }
+
+    // One predicate answers "does this family have a native effort knob", and
+    // every feature that turns on it goes through that one predicate.
+    #[test]
+    fn one_predicate_identifies_the_numeric_thinking_family() {
+        assert!(numeric_thinking_model(V41));
+        assert!(!numeric_thinking_model(V4));
+        assert!(!numeric_thinking_model("Qwen3 Coder"));
+        // `think_level_unsupported` is now a thin wrapper over it, so the two
+        // can never disagree about which family is which.
+        for n in [1u8, 25, 75, 100] {
+            assert!(!think_level_unsupported(ThinkMode::Level(n), V41));
+            assert!(think_level_unsupported(ThinkMode::Level(n), V4));
+        }
+    }
+
+    // CHANGE 1: on a numeric-thinking family the footer shows the effort
+    // number actually in force; elsewhere it shows plank's name unchanged.
+    #[test]
+    fn the_footer_shows_the_effort_number_on_a_numeric_family() {
+        let short = |m: ThinkMode, model: &str| {
+            m.for_display(numeric_thinking_model(model))
+                .short_name()
+                .into_owned()
+        };
+        // V4.1: the numbers the model is actually told.
+        assert_eq!(short(ThinkMode::Low, V41), " 25");
+        assert_eq!(short(ThinkMode::Medium, V41), " 75");
+        assert_eq!(short(ThinkMode::Max, V41), "100");
+        assert_eq!(short(ThinkMode::Level(7), V41), "  7");
+        // Thinking-disabled is a distinct state, not effort zero.
+        assert_eq!(short(ThinkMode::Off, V41), "off");
+        // Every other family is untouched.
+        assert_eq!(short(ThinkMode::Off, V4), "off");
+        assert_eq!(short(ThinkMode::Low, V4), "low");
+        assert_eq!(short(ThinkMode::Medium, V4), "med");
+        assert_eq!(short(ThinkMode::Max, V4), "max");
+    }
+
+    // The footer segment must not change width as the level changes, on
+    // EITHER family — a segment that grows shifts everything to its right.
+    #[test]
+    fn the_think_segment_is_three_columns_on_both_families() {
+        let mut modes: Vec<ThinkMode> = ThinkMode::ALL.to_vec();
+        modes.extend((1..=100u8).map(ThinkMode::Level));
+        for m in modes {
+            for numeric in [false, true] {
+                let short = m.for_display(numeric).short_name();
+                assert_eq!(
+                    short.chars().count(),
+                    3,
+                    "{m:?} numeric={numeric}: {short:?}"
+                );
+            }
+        }
+    }
+
+    // Display only: mapping for the footer must never reach `name()`, which
+    // keys the KV fingerprint and must stay distinct per state.
+    #[test]
+    fn for_display_does_not_disturb_the_fingerprint_names() {
+        for m in ThinkMode::ALL {
+            assert_eq!(m.name(), m.name(), "name is pure");
+        }
+        // `low` and `Level(25)` render alike on V4.1 but remain distinct
+        // states with distinct cache keys.
+        assert_ne!(ThinkMode::Low.name(), ThinkMode::Level(25).name());
+        assert_eq!(
+            ThinkMode::Low.for_display(true).short_name(),
+            ThinkMode::Level(25).short_name()
+        );
+    }
+
+    // The efforts the display maps to are the efforts the engine puts in
+    // force, in strictly increasing order.
+    #[test]
+    fn effort_level_reports_what_is_in_force() {
+        assert_eq!(ThinkMode::Off.effort_level(), None);
+        assert_eq!(ThinkMode::Low.effort_level(), Some(THINK_LOW_EFFORT_LEVEL));
+        assert_eq!(ThinkMode::Medium.effort_level(), Some(V41_MEDIUM_EFFORT));
+        assert_eq!(ThinkMode::Max.effort_level(), Some(V41_MAX_EFFORT));
+        assert_eq!(ThinkMode::Level(42).effort_level(), Some(42));
+    }
+
+    // CHANGE 2: plank's invented brief-reasoning prose is injected only where
+    // the model has no effort dial of its own. On V4.1 the C's
+    // `Reasoning Effort: 25` line is the whole of what `low` emits.
+    #[test]
+    fn the_low_preamble_is_suppressed_on_a_numeric_family() {
+        assert!(!injects_low_preamble(ThinkMode::Low, V41));
+        assert!(injects_low_preamble(ThinkMode::Low, V4));
+        assert!(injects_low_preamble(ThinkMode::Low, "Qwen3 Coder"));
+        // No other level ever carried it, on any family.
+        for m in [ThinkMode::Off, ThinkMode::Medium, ThinkMode::Max] {
+            assert!(!injects_low_preamble(m, V4), "{m:?}");
+            assert!(!injects_low_preamble(m, V41), "{m:?}");
+        }
+        for n in [1u8, 25, 100] {
+            assert!(!injects_low_preamble(ThinkMode::Level(n), V41));
         }
     }
 
@@ -1485,10 +2151,16 @@ mod tests {
     // levels must report one, and the two preambles must differ.
     #[test]
     fn only_low_and_max_carry_an_effort_prefix() {
-        assert_eq!(ThinkMode::Off.effort_prefix(), None);
-        assert_eq!(ThinkMode::Medium.effort_prefix(), None);
-        assert_eq!(ThinkMode::Low.effort_prefix(), Some(THINK_LOW_PREFIX));
-        assert_eq!(ThinkMode::Max.effort_prefix(), Some(THINK_MAX_PREFIX));
+        assert_eq!(ThinkMode::Off.effort_prefix(false), None);
+        assert_eq!(ThinkMode::Medium.effort_prefix(false), None);
+        assert_eq!(
+            ThinkMode::Low.effort_prefix(false).as_deref(),
+            Some(THINK_LOW_PREFIX)
+        );
+        assert_eq!(
+            ThinkMode::Max.effort_prefix(false).as_deref(),
+            Some(THINK_MAX_PREFIX)
+        );
         assert_ne!(THINK_LOW_PREFIX, THINK_MAX_PREFIX);
     }
 
@@ -1496,7 +2168,7 @@ mod tests {
     // This is the property `set_think_mode` and `/think` both key on.
     #[test]
     fn effort_prefix_identifies_the_free_level_changes() {
-        let changed = |a: ThinkMode, b: ThinkMode| a.effort_prefix() != b.effort_prefix();
+        let changed = |a: ThinkMode, b: ThinkMode| a.effort_prefix(false) != b.effort_prefix(false);
         assert!(!changed(ThinkMode::Off, ThinkMode::Medium));
         assert!(changed(ThinkMode::Medium, ThinkMode::Low));
         assert!(changed(ThinkMode::Low, ThinkMode::Max));

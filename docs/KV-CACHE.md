@@ -728,7 +728,8 @@ extension checkpoint of the one above it. `kvtier::plan` builds the list;
 
 | Tier | Content | Key | Storage |
 |---|---|---|---|
-| 1 | system prompt, global MCP tool defs, sub-agent roster | `fp1 = sha1(model ‖ think ‖ trusted_len ‖ system)` | `sysprompt-<fp1>.kv_raw`, model-global |
+| 1 | the trusted built-in system prompt | `fp1a = sha1(model ‖ think ‖ trusted_len ‖ trusted span)` | `sysprompt-<fp1a>.kv_raw`, model-global |
+| 1b | the prompt's untrusted tail: global MCP tool defs and instructions, `-sys` text, sub-agent roster | `fp1 = sha1(model ‖ think ‖ trusted_len ‖ system)` | `sysprompt-<fp1>.kv_raw`, model-global |
 | 2 | project-stable context: `AGENTS.md`/`CLAUDE.md`, memory, local MCP tool defs | `fp2 = tier(fp1, stable ‖ local defs)` | `<project-key>/project-<fp2>.kv_raw` |
 | 3 | session-volatile: git status, date, hook output | — | never cached |
 | 4 | conversation turns | `tier(fp2, transcript)` | `<session>.kv_raw` |
@@ -736,6 +737,32 @@ extension checkpoint of the one above it. `kvtier::plan` builds the list;
 Each fingerprint **chains its parent's**, which is what makes the walk sound:
 a deep tier matching proves every ancestor matches, so the walk can restore the
 deepest hit without independently revalidating what sits above it.
+
+#### Why Tier 1 is split at `trusted_len`
+
+The two halves change at completely different rates. The built-in prompt above
+the cut moves only when plank is rebuilt; the tail below it moves whenever a
+tool set does — an MCP server added, a project entered for the first time, a
+`-sys` string edited. Undivided, the cheap change paid for the expensive one:
+the whole ~14.5k-token prompt re-prefilled to absorb a few hundred tokens of
+schema appended at its very end, about a minute of wall clock on a Metal build.
+
+The cut is legal for one specific reason, and only there. "A cache boundary has
+to fall on a message boundary" (Part 2) forbids mid-message splits because BPE
+merges straddle a seam — but `Ds4Model::append_system_text` already sends the
+two halves through **two separate tokenizer calls**: the trusted span through
+`ds4_tokenize_rendered_chat`, so its literal `｜DSML｜` markers become real
+vocabulary tokens, and the remainder through `ds4_chat_append_message` as a
+`system`-role message. No merge can cross that join, so the boundary is already
+a hard token boundary and a checkpoint may sit on it. Do not generalise this to
+any other offset in the prompt.
+
+`fp1` keeps meaning *the whole system prompt*, so Tier 1b lands on the key an
+undivided Tier 1 used and every checkpoint already on disk stays valid; the
+split adds a cheaper rung above rather than renumbering the ladder. The split
+is engine-gated on `Engine::splits_system_tail`, which only the ds4 backend
+answers yes to — a backend whose tokenizer does not already break at
+`trusted_len` gets the single undivided tier and is none the wiser.
 
 #### What is allowed in Tier 1
 
@@ -823,7 +850,7 @@ extension means **session transcript** and nothing else:
   <project-key>/
     project-<fp2>.kv_raw     tier 2 for one project
     project-<fp2>.json
-  cheeky-bell.kv             a session TRANSCRIPT (user data)
+  cheeky-bell.ds4.kv         a session TRANSCRIPT (user data)
   cheeky-bell.kv_raw         that session's KV payload
   cheeky-bell.json           its metadata
   cheeky-bell.rung-0.kv_raw  a ladder rung (Layer 7)
@@ -850,6 +877,37 @@ migration that introduced this layout (see Garbage collection below) deleted
 every old-format body and did not touch a single transcript, and every scan that
 feeds the sweep filters on `.kv_raw` precisely so that a transcript is not merely
 unlikely to be deleted but unreachable by the code that deletes things.
+
+#### Two families in one directory
+
+Both model families share `~/.plank/kvcache/`, and are told apart by a tag in
+the transcript name: `<id>.ds4.kv` for DeepSeek V4, `<id>.ds41.kv` for V4.1
+(`session::family_ext`). The tag sits *before* the `.kv` so a transcript still
+ends in `.kv` and the id is still everything before the first dot. Untagged
+`.kv` files predate the split and are renamed to `.ds4.kv` once at first
+launch, top level only — everything written before the split was a V4 blob.
+
+The families never see each other's bodies. Every blob carries the model it was
+captured under in its sidecar, and `session::blob_family` resolves that name
+through `gguf::ModelFamily::for_model_name`; the listing and the GC keep only
+blobs whose family equals the live one. So launching V4.1 cannot evict V4's
+checkpoints, and neither can restore the other's KV — which would be silent
+corruption rather than a miss, since the two tokenize differently.
+
+That same routing is how a *retired* model's blobs are made unreachable:
+`for_model_name` answers `None` for a name in `gguf::RETIRED_MODEL_PREFIXES`
+(today, Qwen3.8), and `None` equals no live family, so the `.qwn.kv` era is
+never listed, never swept and never restored. The `None` is deliberate; folding
+a retired name into `Ds4` would hand one model's cache to another.
+
+**Known hazard, pre-existing and unfixed here.** `SessionStore::kv_node_at`
+(`session.rs:753`) synthesises a `KvMeta` from the file name, size and mtime
+when the sidecar is missing or unreadable, and that synthetic metadata has an
+empty `model`. `for_model_name("")` matches no retired prefix and so resolves
+to a live family — meaning a retired-family body whose sidecar was lost *is*
+sweepable, the one path around the guarantee above. It predates the family
+split and nothing in the V4.1 work changed it; it is recorded here so the next
+person to touch either side knows the two interact.
 
 #### The body
 
@@ -969,6 +1027,24 @@ behind the sidechain's live end, and the extend-only sync re-prefills the whole
 parent context from token zero rather than just the report. The stack is LIFO
 and pushes `None` rather than skipping, so a nested fork cannot pop the parent's
 snapshot.
+
+**The fork snapshot doubles as the sidechain's rescue checkpoint.** A quiet
+sub-agent pass runs the same pre-generation probe as the main turn
+(`rescue_prefix_before_rebuild`, called from `generate_quiet`). When the prompt
+diverges behind the live end — the recovery pass after a reasoning-cycle stop,
+whose `recovery_session` stub rewrites the tail of the message the KV ran past —
+the rescue restores, in order: the innermost `fork_kv` entry (peeked, never
+popped; it sits at exactly `fork_at`, so only the sidechain's own transcript
+re-prefills), then the deepest ladder rung below the divergence (valid in a
+sidechain because rungs are fingerprinted over intact parent prefix), then
+nothing. `alt_engine_depth`, maintained by `run_sidechain_on`, disables both
+tiers while a clean-room alt engine is live: its KV is not the session's, and
+its prompt is small enough to rebuild. Before this, a cycle stop inside a
+sub-agent re-prefilled the whole parent context from token zero, once per trip
+up to `SUBAGENT_REPEAT_TRIP_CAP`. One consequence worth noting: every sidechain
+generation now makes one `kv_reuse_probe` call it did not before, on top of the
+generate that follows — one prompt tokenization, which the following generate
+reconciles idempotently.
 
 **Sidechains never write the live session's cache.** A `sidechain_depth`
 counter, raised by `/subagent` and the `agent` tool and read through
@@ -1172,6 +1248,80 @@ A rung restore is a performance mechanism only: on a miss (stale fingerprint,
 missing blob, or no rung shallow enough) the code path is identical to having
 no ladder at all — the transcript rewrite proceeds and the next turn simply
 re-prefills, exactly as it always did.
+
+### Layer 8: the memory-pressure yield
+
+Every other layer in this document exists to *keep* KV around. This one throws
+it away on purpose.
+
+When macOS reports memory pressure caused by other applications, plank's live
+session is the largest thing it holds that the kernel cannot reclaim by itself:
+the KV is wired, so the system will page everything else out and still be under
+pressure. plank therefore stops at a token boundary, frees the session outright,
+and comes back once the pressure clears.
+
+The deliberate omission is the snapshot. Nothing on the yield path calls
+`get_kv`. Capturing the session would serialise gigabytes — allocating a second
+copy of the very thing that is too large — at exactly the moment memory is
+scarce, which is the failure the yield exists to avoid. The yield frees; it does
+not save.
+
+What makes that affordable is that the resume has a floor already on disk. It is
+never a rebuild from token zero:
+
+- if a ladder rung (Layer 7) survives at a depth at or below the current
+  transcript, the deepest such rung is the restore point;
+- otherwise the tier blobs (Layer 2, walked by Layer 3) are, and the system
+  prompt's tier-1 checkpoint alone spares the largest single span.
+
+So the cost of a yield is bounded by the distance from the deepest surviving
+blob to the live cursor, not by the length of the conversation. The resume is a
+`kvtier::warm` walk like any cold start, and takes the same path — which is why
+it needs no new trust machinery: the signature checks of Part 2 already decide
+what may be restored.
+
+Three things about the ordering are load-bearing.
+
+**The restore plan is pinned at yield time, not at resume time.** Deciding which
+blob the resume will use *after* the pressure clears leaves a window in which the
+retention sweep (below) can delete it — it is, by every measure the sweep uses,
+a cold file nobody is holding open. Resolving the plan when the session is freed
+and pinning it into the GC keep set closes that window, at the cost of one blob's
+worth of disk held through the yield.
+
+**The session is freed before the cancel reason is cleared.** Reversed, a turn
+racing the resume can enter `generate` — which clears the flag on entry — and
+start a pass against a session that is about to disappear underneath it.
+
+**A session holding vision state is never yielded.** `release_session` mirrors
+`get_kv`'s two vision gates exactly and returns `false` for either, because a
+rebuild goes through `warm_sync`'s plain `ds4_session_sync`: it would re-prefill
+the image token positions with no embeddings behind them, leaving a session that
+looks whole and is silently ungrounded. Refusing the yield and staying large is
+the correct trade. A caller whose yield is declined this way must roll back the
+hysteresis state it already committed (see `FINDINGS.md`).
+
+Micro-compaction is suppressed while yielded for the same reason the yield skips
+`get_kv`: `restore_rung_below` → `set_kv` → `ensure_session` would re-acquire the
+session the yield just freed.
+
+**The yielded state ends when the session is rebuilt, not when the pressure
+clears.** The restore plan is retired — and its disclosure printed — at the turn
+boundary that is about to re-enter the engine, so the "re-prefilling N tokens"
+line precedes the wait it describes instead of arriving thirty seconds of quiet
+later, when nothing is pending. Everything that keys off "yielded" (the footer
+marker, the micro-compaction and end-of-turn-flush suppressions, and the
+hysteresis' "already yielded, nothing left to free") therefore stops the moment
+the KV is live again. What prevents that from becoming a yield-per-turn loop is
+the minimum-interval guard, which `Hysteresis` now answers for *both* the
+turn-boundary and the mid-pass paths.
+
+**Exiting while yielded loses the GC keep protection until the next launch.**
+The plan's `keep` set lives in memory, so a plank that exits mid-yield leaves
+the blobs it named unpinned: a sweep at the next launch judges them on age and
+budget like any other cold file, and one may be gone before the session is
+reloaded. Benign — the blobs are on disk and a missing one only deepens the
+re-prefill — but it means a yield is not a durable reservation.
 
 ### Garbage collection
 
@@ -1456,6 +1606,16 @@ never hits.
 justifies it.** A `set_kv` restore is only valid to perform once the caller
 already knows it will use the result; performing it speculatively and then
 declining leaves the engine worse off than doing nothing.
+
+**The memory-pressure yield never calls `get_kv`.** Snapshotting to save a
+session being freed for memory pressure allocates gigabytes at the one moment
+there are none. The resume rebuilds from the blobs already on disk.
+
+**The session is freed before the cancel reason is cleared**, never after.
+
+**A yield's restore plan is pinned into the GC keep set when the session is
+freed**, not looked up when the resume runs, so the sweep cannot delete the blob
+the resume depends on.
 
 **A sidechain never writes the live session's cache.** A payload or rung
 captured over messages that are about to be truncated back out describes a

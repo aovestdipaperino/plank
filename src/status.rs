@@ -46,6 +46,11 @@ pub const POWERLINE_BRANCH: char = '\u{e0a0}';
 /// Also the anchor the TUI splits the footer on: it sits between the dir prefix
 /// and the body, so [`crate::tui`] peels it as its own span rather than letting
 /// `push_dir_prefix` mistake it for part of the branch name.
+///
+/// The bare codepoint, without the U+FE0F variation selector: `unicode_width`
+/// and the terminal agree on two columns for it, and the measurement is also
+/// the click box, since [`crate::tui::record_think_rect`] locates the segment by finding
+/// this symbol in the drawn buffer.
 pub const THINK_MARK: &str = "🧠";
 
 /// Leading glyph of the **git stat segment** (`📄 3 · +12 -4`), shown just
@@ -201,8 +206,12 @@ pub fn think_color(mode: crate::engine::ThinkMode) -> u8 {
     match mode {
         ThinkMode::Max => 196,
         ThinkMode::Medium => 231,
-        ThinkMode::Low => 39,
         ThinkMode::Off => 245,
+        // A numeric effort borrows the color of the named level it sits
+        // nearest, so the footer reads at a glance at any effort.
+        ThinkMode::Level(n) if n >= 90 => 196,
+        ThinkMode::Level(n) if n >= 34 => 231,
+        ThinkMode::Low | ThinkMode::Level(_) => 39,
     }
 }
 
@@ -229,6 +238,11 @@ pub enum WorkerState {
 }
 
 /// Snapshot of worker progress shown in the footer, mirroring `agent_status`.
+///
+/// The bools are independent readings the footer draws side by side, not a
+/// state that should have been an enum — each names its own segment, and any
+/// combination of them is a real footer.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct Status {
     /// Current worker state.
@@ -269,6 +283,24 @@ pub struct Status {
     /// conditional now: with [`mtp`](Self::mtp) on the segment is drawn
     /// whether or not a pass has speculated yet.
     pub spec: crate::engine::SpecStats,
+    /// Background bash jobs still running (`BashJobs::running_count`); the
+    /// jobs segment is drawn only when this is non-zero.
+    pub running_jobs: usize,
+    /// True while plank has handed its KV session back to the system under
+    /// memory pressure. Drives [`pressure_segment`], the one marker that says
+    /// a wait of up to `RESUME_DWELL_SECS` is a pause and not a hang.
+    pub pressure_yielded: bool,
+    /// The pass generating is the passive memory extraction pass, read from
+    /// the idle queue after the reply the user asked for is complete. It
+    /// draws no progress line ([`progress_brief`] is `None`); the footer
+    /// shows [`MEMORY_MARK`] in place of the state word and the phase's
+    /// figures ride on the rule ([`perf_segment`]): housekeeping the user
+    /// did not ask for gets a glyph, not a verb.
+    pub memory_pass: bool,
+    /// Spans waiting to be read, the running one included, while
+    /// `memory_pass` is set: the footer draws one [`MEMORY_MARK`] per job,
+    /// so a backlog is visible at a glance.
+    pub memory_queue: usize,
 }
 
 /// Marks the speculative-decoding segment, mirroring how `THINK_MARK` labels
@@ -283,22 +315,81 @@ const MTP_MARK: &str = "✨";
 /// while `/mtp` is off — the two are mutually exclusive by construction,
 /// since speculation only runs at temperature 0.
 ///
-/// The bare codepoint, deliberately without the U+FE0F variation selector:
-/// the footer is width-sensitive and the emoji-presentation form measures
-/// differently across terminals.
-const TEMP_MARK: &str = "🌡";
+/// U+1F321 followed by U+FE0F (VS16): the bare codepoint is a *text-default*
+/// emoji, so `unicode_width` reports 1 column for it unless the emoji
+/// presentation is requested explicitly — but terminals render it in colour
+/// at 2 columns regardless. VS16 makes the requested presentation match what
+/// actually gets drawn, so the width measurement agrees with the terminal.
+const TEMP_MARK: &str = "🌡\u{fe0f}";
 
-/// Marks the footer's loop-guard segment: the guards are armed and watching.
-/// Distinct from [`LOOP_MARK`], which says a guard has actually seen a cycle.
-const GUARD_MARK: &str = "🔁";
+/// Marks the footer's jobs segment: background bash jobs still running.
+/// Public so the TUI can find the segment for mouse hit-testing.
+pub const JOBS_MARK: &str = "⧗";
+
+/// The SSD-streaming marker. `unicode_width::UnicodeWidthStr::width` (the
+/// same measure [`crate::experts`] uses to pin the brain emoji's width) puts
+/// this at exactly two columns, matching [`HD_MARK_OFF`] below — see
+/// `hd_segment_at` for why the blink alternates the glyph rather than its
+/// style.
+const HD_MARK: &str = "💾";
+
+/// The off phase of the SSD-streaming blink: two spaces, chosen because they
+/// measure the same two columns as [`HD_MARK`] (again by
+/// `unicode_width::UnicodeWidthStr::width`), so swapping between the two never
+/// shifts anything to the segment's right.
+const HD_MARK_OFF: &str = "  ";
+
+/// Marks the footer's memory-pressure segment: plank is paused with its KV
+/// released, waiting for the system to calm down.
+///
+/// U+23F8 followed by U+FE0F (VS16), for the same reason as [`TEMP_MARK`]:
+/// text-default emoji need the selector to measure the two columns
+/// terminals actually render them in.
+const PRESSURE_MARK: &str = "⏸\u{fe0f}";
+
+/// Marks the footer while the memory extraction pass is running
+/// (`Status::memory_pass`): the whole of what the pass shows.
+///
+/// U+270D followed by U+FE0F (VS16), for the same reason as [`TEMP_MARK`]:
+/// text-default emoji need the selector to measure the two columns
+/// terminals actually render them in.
+pub const MEMORY_MARK: &str = "✍\u{fe0f}";
+
+/// Marks the footer's debugger segment: the raw model stream is being mirrored
+/// to a live debug console right now. Connection, not capability: `--debug`
+/// alone earns nothing, only a console that actually answered the dial.
+const DEBUG_MARK: &str = "🐞";
+
+/// Marks the footer's throughput segment, which toggles the `/toks` panel on
+/// click. Public so the TUI can find the segment for mouse hit-testing, the
+/// same reason [`JOBS_MARK`] is.
+///
+/// The bare codepoint, without the U+FE0F variation selector: `unicode_width`
+/// and the terminal agree on two columns for it, and the measurement is also
+/// the click box, since [`crate::tui::record_toks_rect`] locates the segment by finding
+/// this symbol in the drawn buffer.
+pub const TOKS_MARK: &str = "📈";
+
+/// Marks the footer's repro shutter, which writes a `/repro` dump on click.
+/// Public so the TUI can find the segment for mouse hit-testing, the same
+/// reason [`JOBS_MARK`] is.
+///
+/// It rides in the dir prefix, on the row that answers "which tree am I in",
+/// because a repro is a snapshot of *this* session in *this* tree.
+///
+/// The bare codepoint, without the U+FE0F variation selector: `unicode_width`
+/// and the terminal agree on two columns for it, and the measurement is also
+/// the click box, since [`crate::tui::record_camera_rect`] locates the segment by
+/// finding this symbol in the drawn buffer.
+pub const CAMERA_MARK: &str = "\u{1f4f7}";
 
 /// Marks the footer's loop segment, shown while the repetition guard sees the
 /// reasoning cycling (`♻ looping`).
 ///
-/// Deliberately not [`GUARD_MARK`]: that one means the guards are armed, which
-/// is the resting state of every session, and one glyph for "watching" and
-/// "caught something" would be read as the same news twice.
-const LOOP_MARK: &str = "♻";
+/// Deliberately not the `🔁` the armed guards used to show: that was the
+/// resting state of every session, and one glyph for "watching" and "caught
+/// something" would be read as the same news twice.
+const LOOP_MARK: &str = "♻\u{fe0f}";
 
 /// The loop segment: ` | 🔁 looping` while `st.looping`, empty otherwise. Rides
 /// after the ctx gauge in the generating footer, whether or not the progress
@@ -533,6 +624,22 @@ static DSPARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// The sampling temperature, as `f32` bits — `AtomicF32` does not exist.
 static TEMPERATURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f19_999a); // 0.6
 
+/// Whether the memory pass's figures ride on the rule (`--show-memory-stats`).
+/// Off by default: the pass is housekeeping, and the rule looks idle while it
+/// runs. Process-global for the same reason as the speculation marker.
+static SHOW_MEMORY_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records `--show-memory-stats` from startup config.
+pub fn set_show_memory_stats(on: bool) {
+    SHOW_MEMORY_STATS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`perf_segment`] reports the memory pass's figures.
+#[must_use]
+pub fn show_memory_stats() -> bool {
+    SHOW_MEMORY_STATS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Records whether speculative decoding is on, from startup config or
 /// `/mtp`.
 pub fn set_mtp(on: bool) {
@@ -543,6 +650,24 @@ pub fn set_mtp(on: bool) {
 #[must_use]
 pub fn mtp() -> bool {
     DSPARK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the loaded model streams its experts from SSD rather than holding
+/// them resident. Process-global beside the speculation marker and for the same
+/// reason: [`build_status_text`] is a pure function called from a dozen
+/// snapshot sites, and a field would have to be copied forward by every one.
+/// Startup publishes here once the streaming decision is final; the bar reads.
+static SSD_STREAMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether the local engine streams experts from SSD.
+pub fn set_ssd_streaming(on: bool) {
+    SSD_STREAMING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the footer should show the `💾` marker.
+#[must_use]
+pub fn ssd_streaming() -> bool {
+    SSD_STREAMING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Records the sampling temperature, from startup config or `/temp`.
@@ -1670,7 +1795,7 @@ pub fn progress_bar(done: i32, total: i32, tps: f64, color: bool) -> String {
 /// Time left for a prefill pass at the current throughput, as a
 /// [`format_elapsed`] string. `None` while the rate is unknown or nothing is
 /// left, so the readout never shows a bogus `~0s left` or a division by zero.
-fn prefill_eta(done: i32, total: i32, tps: f64) -> Option<String> {
+pub(crate) fn prefill_eta(done: i32, total: i32, tps: f64) -> Option<String> {
     let remaining = total.saturating_sub(done);
     if remaining <= 0 || !tps.is_finite() || tps <= 0.0 {
         return None;
@@ -1678,12 +1803,89 @@ fn prefill_eta(done: i32, total: i32, tps: f64) -> Option<String> {
     Some(format_elapsed(f64::from(remaining) / tps))
 }
 
+/// The transient performance readout — the figures that change many times a
+/// second while the engine works — for the TUI to float at the right end of
+/// the rule *below* the prompt, the way the session name floats on the rule
+/// above it. Keeping them off the footer is what lets the footer stay still.
+///
+/// Prefill: `↑ done/total tokens · t/s · ~eta left`; generation: `↓ n tokens
+/// · t/s`; with MTP on and a pass that has speculated, `✨ 1.2t/step 4%` is
+/// appended. The memory pass's figures ride here too, under the same arrows.
+/// `None` when there is nothing to show, and for the memory pass unless
+/// `--show-memory-stats` was given. The TUI clears the rule when the worker
+/// ends, so at idle the line is plain.
+#[must_use]
+pub fn perf_segment(st: &Status) -> Option<String> {
+    // The memory pass reports its figures only on request
+    // (`--show-memory-stats`); by default the rule looks idle while it runs.
+    if st.memory_pass && !show_memory_stats() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    match st.state {
+        WorkerState::Prefill => {
+            let total = st.prefill_total.max(1);
+            let done = st.prefill_done.min(total);
+            parts.push(format!(
+                "↑ {}/{} tokens · {:.1} t/s{}",
+                format_ctx_size(done),
+                format_ctx_size(total),
+                st.prefill_tps,
+                prefill_eta(done, total, st.prefill_tps)
+                    .map(|eta| format!(" · ~{eta} left"))
+                    .unwrap_or_default()
+            ));
+        }
+        WorkerState::Generating => parts.push(format!(
+            "↓ {} tokens{} · {:.1} t/s",
+            format_ctx_size(st.generated),
+            if st.greedy_sampling { " ❄️" } else { "" },
+            st.gen_tps
+        )),
+        _ => {}
+    }
+    if mtp() && st.spec.active() {
+        parts.push(format!(
+            "{MTP_MARK} {:.1}t/step {:.0}%",
+            st.spec.tokens_per_step(),
+            100.0 * st.spec.block_fill()
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The progress line the TUI pins below the output: throbber, spinner verb
+/// and elapsed time only — the figures live on the rule (`perf_segment`).
+/// `None` outside prefill and generation, and for the memory pass, whose only
+/// trace is the footer mark.
+#[must_use]
+pub fn progress_brief(st: &Status) -> Option<String> {
+    if st.memory_pass {
+        return None;
+    }
+    match st.state {
+        WorkerState::Prefill | WorkerState::Generating => Some(format!(
+            "{} {}… ({})",
+            throbber(),
+            prefill_label(st),
+            format_elapsed(st.elapsed_secs)
+        )),
+        _ => None,
+    }
+}
+
 /// The animated progress segment — throbber, spinner verb, and the
 /// elapsed/tokens/throughput readout — for the prefill and generating states.
-/// `None` in every other state. Split out so the TUI can render it on a line
-/// below the output instead of in the footer.
+/// `None` in every other state. The plain REPL's footer, which has no rule to
+/// float figures on, shows it whole; the TUI splits it into `progress_brief`
+/// (pinned below the output) and `perf_segment` (on the rule).
 #[must_use]
 pub fn progress_segment(st: &Status, color: bool) -> Option<String> {
+    // The memory pass has no progress line at all: the footer's
+    // `MEMORY_MARK` is its only trace.
+    if st.memory_pass {
+        return None;
+    }
     let theme = |text: &str| {
         if color {
             format!("\x1b[38;5;{THEME_COLOR};1m{text}{STATUS_STYLE_START}")
@@ -1722,6 +1924,21 @@ pub fn progress_segment(st: &Status, color: bool) -> Option<String> {
             st.gen_tps
         )),
         _ => None,
+    }
+}
+
+/// The progress line the *main* transcript shows while a sub-agent holds the
+/// engine: the turn is not idle, but none of the live counters are the main
+/// agent's, so they stay in the sub-agent's own pane and this says what the
+/// parent is actually doing.
+#[must_use]
+pub fn subagent_wait_segment(label: Option<&str>) -> String {
+    match label {
+        Some(label) => format!(
+            "{} Waiting… (for sub-agent {label} to complete)",
+            throbber()
+        ),
+        None => format!("{} Waiting… (for the sub-agent to complete)", throbber()),
     }
 }
 
@@ -1766,7 +1983,7 @@ fn build_status_text_with_cells(
             st.think.short_name()
         )
     } else {
-        st.think.short_name().to_owned()
+        st.think.short_name().into_owned()
     };
     let think = format!("{THINK_MARK} {level} | ");
     let power = power_suffix(st);
@@ -1784,19 +2001,19 @@ fn build_status_text_with_cells(
     // but as its own bar-separated segment, like the think and ctx segments.
     let origin = format!("{} | ", engine_origin_label());
     let dir = if cwd.is_empty() {
-        origin
+        format!("{CAMERA_MARK} | {origin}")
     } else if let Some(branch) = git_branch_label() {
         // The git stat segment rides with the branch, inside the dir prefix:
         // it answers "what have I changed in this tree", which is the same
         // question the path and branch answer, one level down.
         let stat = git_stat_segment(color).map_or(String::new(), |s| format!(" | {s}"));
         format!(
-            "{} {POWERLINE_BRANCH} {}{stat} | {origin}",
+            "{} {POWERLINE_BRANCH} {}{stat} | {CAMERA_MARK} | {origin}",
             theme(&cwd),
             theme(&branch)
         )
     } else {
-        format!("{} | {origin}", theme(&cwd))
+        format!("{} | {CAMERA_MARK} | {origin}", theme(&cwd))
     };
     let ctx = format!("{think}{ctx}");
     // The MTP segment sits with the ctx gauge rather than in the state word:
@@ -1806,7 +2023,32 @@ fn build_status_text_with_cells(
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
     };
-    let ctx = match guard_segment() {
+    // Beside the speculation segment: both are facts about the loaded engine
+    // that hold for every turn, not readings from this one.
+    let ctx = match hd_segment(st, color) {
+        Some(seg) => format!("{ctx} | {seg}"),
+        None => ctx,
+    };
+    // A connected console is a session-wide fact about how the run is being
+    // watched, not a reading from this pass, so it rides with the ctx gauge.
+    // The loop-guard and micro-compaction switches used to sit here too;
+    // both are now `/loopguard` and `/mc` only, and their state is answered
+    // by those commands rather than by a permanent glyph.
+    let ctx = match debug_segment(crate::debugmirror::parent_connected()) {
+        Some(seg) => format!("{ctx} | {}", theme(&seg)),
+        None => ctx,
+    };
+    // A footer glyph whose whole purpose is to be clicked; it does not
+    // belong to the running turn.
+    let ctx = format!("{ctx} | {}", theme(&toks_segment()));
+    let ctx = match jobs_segment(st) {
+        Some(seg) => format!("{ctx} | {}", theme(&seg)),
+        None => ctx,
+    };
+    // Beside the jobs segment: both are session-scoped states that outlive the
+    // pass, and both matter most at idle — which is exactly where a yielded
+    // plank sits.
+    let ctx = match pressure_segment(st) {
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
     };
@@ -1819,6 +2061,9 @@ fn build_status_text_with_cells(
     // suffix is the line's right anchor and must stay last.
     let power = format!("{}{power}", wasm_segment_text_keeping(cells, color));
     let body = match st.state {
+        WorkerState::Prefill | WorkerState::Generating if st.memory_pass => {
+            format!("{ctx} | {}{power}", memory_segment(st))
+        }
         WorkerState::Prefill | WorkerState::Generating => {
             let looping = loop_segment(st);
             match progress_segment(st, color).filter(|_| progress_in_bar) {
@@ -1841,48 +2086,166 @@ fn build_status_text_with_cells(
             }
         ),
         WorkerState::Stopped => format!("{ctx} | interrupted{power}"),
-        WorkerState::Idle => format!("{ctx} | idle{power}"),
+        // No state word at idle: the prompt caret's colour already says the
+        // model is waiting, and a word repeating it costs a footer slot.
+        WorkerState::Idle => format!("{ctx}{power}"),
     };
     format!("{dir}{body}")
 }
 
-/// The `--mtp` segment: mean tokens committed per speculative step, then the
-/// share of the offered draft capacity that survived verification.
-///
-/// `None` when the pass never speculated, so a plain run's footer is unchanged.
-///
-/// Rendered `1.5t/step`, never `1.5x`: it is a per-step token count, not a
-/// wall-clock speedup, and the two diverge badly. See
-/// [`SpecStats::tokens_per_step`](crate::engine::SpecStats::tokens_per_step).
+/// The `--mtp` slot: the MTP mark while speculation is on, the temperature
+/// while it is off (the two states are exclusive, so they share the slot).
+/// The per-step figures — mean tokens committed per speculative step, then
+/// the share of the offered draft capacity that survived verification,
+/// rendered `1.5t/step` and never `1.5x` because it is a per-step token
+/// count, not a wall-clock speedup — belong to [`perf_segment`].
 #[must_use]
-pub fn spec_segment(st: &Status) -> Option<String> {
+pub fn spec_segment(_st: &Status) -> Option<String> {
     if !mtp() {
         // Speculation off: the temperature is back in play, so show it. It is
         // the same slot because the two states are exclusive — under MTP
         // the temperature is pinned at 0 and says nothing.
         return Some(format!("{TEMP_MARK} {:.2}", temperature()));
     }
-    if !st.spec.active() {
-        // On, but nothing to count yet (idle, or a pass that has not reached
-        // its first block): the mark alone still answers "is MTP on?".
-        return Some(MTP_MARK.to_owned());
+    // The mark alone: it answers "is MTP on?", which is all a footer that
+    // holds still can say. The per-step figures are transient and ride on the
+    // rule below the prompt (`perf_segment`).
+    Some(MTP_MARK.to_owned())
+}
+
+/// The memory pass's footer segment: one [`MEMORY_MARK`] per queued span —
+/// no throbber, no verb, no figures, so it reads as the background chore it
+/// is rather than as the model answering.
+fn memory_segment(st: &Status) -> String {
+    // One mark per queued span, the running one included; never fewer than
+    // one, since a pass is running. The figures ride on the rule
+    // (`perf_segment`), so this slot holds still.
+    MEMORY_MARK.repeat(st.memory_queue.max(1))
+}
+
+/// The debugger segment: [`DEBUG_MARK`] while the session's window on the
+/// debug console is connected, `None` otherwise so an ordinary footer is
+/// unchanged.
+///
+/// Keyed on the live connection, not on `--debug`: the switch only permits
+/// the dial, and a developer who started plank with it but no console open
+/// has nothing watching. Takes the state as a parameter because the
+/// registry behind it is process-global, and a test must be able to ask for
+/// both states under parallel threads.
+#[must_use]
+pub fn debug_segment(connected: bool) -> Option<String> {
+    connected.then(|| DEBUG_MARK.to_owned())
+}
+
+/// The throughput segment: [`TOKS_MARK`] alone, a click target that toggles
+/// the `/toks` panel.
+///
+/// Always drawn: the glyph *is* the affordance, so it has to be there to be
+/// clicked. It carries
+/// no reading of its own — the chart behind it needs more room than the footer
+/// has, and a bare icon keeps the bar's width unchanged whatever the rate.
+#[must_use]
+pub fn toks_segment() -> String {
+    TOKS_MARK.to_owned()
+}
+
+/// The jobs segment: `⧗ 2 jobs` while background bash jobs are still running
+/// (`docs/BACKGROUND-TASKS.md` §3.7), `None` otherwise so an ordinary footer is
+/// unchanged. Rides with the ctx gauge like the guard segment: a job belongs
+/// to the session, not to the pass, and is most useful to see at idle.
+#[must_use]
+pub fn jobs_segment(st: &Status) -> Option<String> {
+    match st.running_jobs {
+        0 => None,
+        1 => Some(format!("{JOBS_MARK} 1 job")),
+        n => Some(format!("{JOBS_MARK} {n} jobs")),
     }
+}
+
+/// The SSD-streaming segment: `💾`, shown whenever the loaded model streams its
+/// experts from disk instead of holding them resident, and blinking while the
+/// engine is prefilling or decoding.
+///
+/// **The blink is a proxy for streaming activity, not a measurement of disk
+/// I/O.** The engine reports no such thing: its only progress event is
+/// `prefill_chunk` (`ds4_session_progress_fn`), and there is no expert-cache
+/// hit/miss counter and no SSD-read callback to hang a real reading on. So the
+/// marker blinks on the one fact plank does know — that a pass is in flight —
+/// which is when a streaming model must be reading experts, without claiming to
+/// count the reads. Steady `💾` therefore means "this model streams", not "the
+/// disk is idle".
+///
+/// Rides with the ctx gauge next to the speculation segment: both describe how
+/// the engine executes every turn rather than anything about this one, and both
+/// have to stay left of the power suffix, which is the line's right anchor.
+///
+/// Most terminals render an emoji glyph with its own colour and ignore SGR
+/// foreground/weight changes, so a style-only blink (as this used to be, back
+/// when the marker was the plain letters `HD`) would be invisible on an emoji.
+/// The blink is therefore a *substitution*: [`HD_MARK`] alternates with
+/// [`HD_MARK_OFF`], two spaces that measure the same two columns (by
+/// `unicode_width::UnicodeWidthStr::width`, the same measure
+/// [`crate::experts`] uses for the brain emoji), so nothing to its right
+/// shifts even though the glyph itself changes. Under reduced motion the
+/// shared clock goes dark and the marker is steady, like the throbber.
+#[must_use]
+pub fn hd_segment(st: &Status, color: bool) -> Option<String> {
+    let active = matches!(st.state, WorkerState::Prefill | WorkerState::Generating);
+    hd_segment_at(ssd_streaming(), active, color, crate::anim::clock_ms())
+}
+
+/// [`hd_segment`] with every input injected, so both phases are testable at a
+/// chosen timestamp without a running clock or a process-global write.
+///
+/// `tick_ms` is [`crate::anim::clock_ms`]: `None` is reduced motion, and the
+/// marker then renders lit whatever the engine is doing.
+#[must_use]
+pub fn hd_segment_at(
+    streaming: bool,
+    active: bool,
+    color: bool,
+    tick_ms: Option<u64>,
+) -> Option<String> {
+    if !streaming {
+        return None;
+    }
+    let lit = match tick_ms {
+        // Reduced motion: no blink, and the marker stays in its lit form.
+        None => true,
+        Some(ms) => !active || tool_blink_on(ms),
+    };
+    if !color {
+        // A monochrome footer has no second appearance to blink into, and
+        // blanking the slot would shift the segments to its right. One form.
+        return Some(HD_MARK.to_owned());
+    }
+    // A style-only blink (bold vs faint) is invisible on an emoji glyph in
+    // most terminals, which render emoji in their own colour and ignore SGR
+    // foreground/weight. So the blink swaps the glyph itself instead:
+    // `HD_MARK` for lit, `HD_MARK_OFF` (two spaces) for the off phase — both
+    // measure the same two columns, so the swap never shifts anything to the
+    // segment's right.
+    let mark = if lit { HD_MARK } else { HD_MARK_OFF };
     Some(format!(
-        "{MTP_MARK} {:.1}t/step {:.0}%",
-        st.spec.tokens_per_step(),
-        100.0 * st.spec.block_fill()
+        "\x1b[38;5;{THEME_COLOR}m{mark}{STATUS_STYLE_START}"
     ))
 }
 
-/// The loop-guard segment: [`GUARD_MARK`] while the guards are armed, empty
-/// when `/loopguard off` has silenced them.
+/// The memory-pressure segment: `⏸ paused: memory` while plank has given its
+/// KV session back to the system, `None` otherwise so an ordinary footer is
+/// unchanged.
 ///
-/// Rides with the ctx gauge rather than in the state word, so it is visible in
-/// every worker state — the switch is a property of the session, not of the
-/// turn, and `/loopguard` can be typed at idle.
+/// Rides with the ctx gauge beside the jobs segment, and for the same reason:
+/// it is a property of the session rather than of a running pass, and the
+/// whole point is that it is readable at idle — the yielded window can last
+/// `RESUME_DWELL_SECS`, which without a persistent marker reads as a hang.
+/// The wording is deliberately terser than the one-shot system line: that line
+/// marks the transition and can afford a sentence, this marks the state and
+/// has to fit beside everything else.
 #[must_use]
-pub fn guard_segment() -> Option<String> {
-    crate::guard::guards_enabled().then(|| GUARD_MARK.to_owned())
+pub fn pressure_segment(st: &Status) -> Option<String> {
+    st.pressure_yielded
+        .then(|| format!("{PRESSURE_MARK} paused: memory"))
 }
 
 /// Appends `seg` (already themed) to `ctx`, or returns `ctx` unchanged.
@@ -1941,8 +2304,15 @@ pub fn build_status_text_within(
 
 /// Visible width, ignoring ANSI escapes so a coloured line is not judged by
 /// the length of its escape sequences.
-fn visible_width(text: &str) -> usize {
-    let mut width = 0;
+///
+/// `pub(crate)` so [`crate::statusbar`] can share this exact measure for its
+/// own safety-net truncation rather than duplicating (an earlier, buggy copy
+/// used `chars().count()`, which both undercounts wide emoji and overcounts
+/// coloured text by counting escape bytes as visible columns).
+pub(crate) fn visible_width(text: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+
+    let mut stripped = String::with_capacity(text.len());
     let mut in_escape = false;
     for c in text.chars() {
         if in_escape {
@@ -1953,10 +2323,54 @@ fn visible_width(text: &str) -> usize {
         } else if c == '\u{1b}' {
             in_escape = true;
         } else {
-            width += 1;
+            stripped.push(c);
         }
     }
-    width
+    // Measured once over the whole stripped string (not per-char) so a
+    // multi-codepoint grapheme is judged by `unicode_width`'s own notion of
+    // combined width rather than summed as independent characters. This is
+    // still not grapheme-cluster aware: a ZWJ sequence (e.g. a family emoji
+    // built from several emoji joined by U+200D) is measured as the sum of
+    // its constituent codepoints' widths, which overcounts relative to how
+    // most terminals render the joined cluster in a single cell. Plain
+    // emoji, flags (regional indicator pairs) and emoji+variation-selector
+    // pairs are measured correctly; true ZWJ sequences are the known gap.
+    stripped.width()
+}
+
+/// Truncates `text` to at most `cols` visible columns, the same measure
+/// [`visible_width`] uses: ANSI escape sequences are zero-width and are
+/// always copied through whole (never sliced mid-sequence, which would leave
+/// a dangling escape that corrupts the terminal's state), and each remaining
+/// character counts by `unicode_width`'s display width rather than by 1.
+///
+/// `pub(crate)` for the same reason as [`visible_width`]: shared with
+/// [`crate::statusbar`]'s safety-net truncation.
+pub(crate) fn truncate_visible(text: &str, cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut out = String::with_capacity(text.len());
+    let mut width = 0usize;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            out.push(c);
+            for c2 in chars.by_ref() {
+                out.push(c2);
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let w = c.width().unwrap_or(0);
+        if width + w > cols {
+            break;
+        }
+        width += w;
+        out.push(c);
+    }
+    out
 }
 
 /// Formats the echoed user prompt line (`* <text>` with bold styling on TTYs).
@@ -2054,6 +2468,23 @@ mod tests {
     /// builds exact-match text under default (parallel) test threads, and a
     /// global set mid-run would leak into them (this repo's `FINDINGS.md` has
     /// a prior instance of exactly this flake).
+    /// The parent's line while a sub-agent works names the sub-agent and
+    /// carries none of the live counters: those are the sub-agent's pass, and
+    /// showing them on the main transcript is what made the parent look busy.
+    #[test]
+    fn the_waiting_line_names_the_sub_agent_and_counts_nothing() {
+        let line = super::subagent_wait_segment(Some("scout"));
+        assert!(
+            line.contains("Waiting… (for sub-agent scout to complete)"),
+            "{line}"
+        );
+        assert!(!line.contains("t/s"), "{line}");
+        assert!(
+            super::subagent_wait_segment(None).contains("the sub-agent"),
+            "an unlabelled run still reads as a sentence"
+        );
+    }
+
     #[test]
     fn the_download_segment_rides_with_the_ctx_gauge() {
         let ctx = splice_download_segment(
@@ -2212,7 +2643,151 @@ mod tests {
         assert_eq!(visible_width("\x1b[1;31mred\x1b[0m"), 3);
         assert_eq!(visible_width("\x1b[38;5;120mgreen\x1b[0m!"), 6);
     }
+
+    /// Emoji occupy (at least) two terminal columns each in real terminals,
+    /// but `unicode_width` measures per the Unicode East Asian Width tables:
+    /// `🌡` (U+1F321) and `🗑` (U+1F5D1) are text-default emoji, so the bare
+    /// codepoint is categorized "Ambiguous"/narrow at this Unicode version
+    /// and measures 1 — not 2, as terminals actually draw it. Appending
+    /// U+FE0F (VS16) requests the emoji presentation explicitly, which
+    /// brings `unicode_width` to 2, matching every other mark. Either way
+    /// this is a strict improvement over `chars()` (which gave 1 for all
+    /// six), and it is the same measurement `src/experts.rs` already relies
+    /// on for the brain glyph, so the two stay consistent.
+    #[test]
+    fn visible_width_counts_wide_emoji_as_two_columns() {
+        assert_eq!(visible_width("🌡\u{fe0f}"), 2);
+        assert_eq!(visible_width("🗑\u{fe0f}"), 2);
+        assert_eq!(visible_width("🟢"), 2);
+        assert_eq!(visible_width("📈"), 2);
+        assert_eq!(visible_width("🧠"), 2);
+        assert_eq!(visible_width("💾"), 2);
+        assert_eq!(visible_width("🗑\u{fe0f} 🟢"), 5); // 2 + space + 2
+    }
+
+    /// Pins the display width of every footer mark by name, so a future
+    /// change to any of these constants (adding/dropping VS16, swapping the
+    /// glyph) cannot silently reintroduce an undercount. See
+    /// `visible_width_counts_wide_emoji_as_two_columns` for why `TEMP_MARK`,
+    /// `PRESSURE_MARK`, `MEMORY_MARK` and `LOOP_MARK` carry an explicit
+    /// VS16 while the others don't need one.
+    ///
+    /// Exhaustive over every footer mark constant: each is listed once, with
+    /// its expected column count, so a newly added mark that is never added
+    /// to this list is a compile-clean gap rather than a silent one — the
+    /// list below is the enumeration to extend. `JOBS_MARK` is the one
+    /// legitimate 1-column entry (a mathematical symbol, not an emoji; VS16
+    /// would be meaningless), so it is listed deliberately with its own
+    /// value instead of being covered by the "everything is 2" assumption.
+    #[test]
+    fn footer_marks_all_measure_two_columns() {
+        let marks: &[(&str, &str, usize)] = &[
+            ("THINK_MARK", THINK_MARK, 2),
+            ("GIT_STAT_MARK", GIT_STAT_MARK, 2),
+            ("MTP_MARK", MTP_MARK, 2),
+            ("TEMP_MARK", TEMP_MARK, 2),
+            ("JOBS_MARK", JOBS_MARK, 1), // deliberate exception: math symbol, not emoji
+            ("HD_MARK", HD_MARK, 2),
+            ("PRESSURE_MARK", PRESSURE_MARK, 2),
+            ("MEMORY_MARK", MEMORY_MARK, 2),
+            ("TOKS_MARK", TOKS_MARK, 2),
+            ("CAMERA_MARK", CAMERA_MARK, 2),
+            ("LOOP_MARK", LOOP_MARK, 2),
+            ("SPILL_MARK", SPILL_MARK, 2),
+        ];
+        for (name, mark, expected) in marks {
+            assert_eq!(visible_width(mark), *expected, "{name} = {mark:?}");
+        }
+    }
+
+    #[test]
+    fn visible_width_emoji_mixed_with_ansi() {
+        assert_eq!(visible_width("\x1b[1;31m🧠\x1b[0m"), 2);
+        assert_eq!(visible_width("\x1b[38;5;120m🧠 💾\x1b[0m!"), 6); // 2+1+2+1
+    }
+
+    #[test]
+    fn visible_width_realistic_footer_with_several_emoji() {
+        // A representative footer fragment: thermometer, brain, chart, disk,
+        // wastebasket+dot. Thermometer and wastebasket carry VS16, as the
+        // real constants do, so all six marks measure 2 columns each.
+        let footer = "🌡\u{fe0f} 72% 🧠 4.2k 📈 1.1x 💾 🗑\u{fe0f} 🟢";
+        let ascii_len = footer.chars().filter(char::is_ascii).count();
+        // Six marks (thermometer, brain, chart, disk, wastebasket, dot), each
+        // measuring 2 columns.
+        assert_eq!(visible_width(footer), ascii_len + 6 * 2);
+    }
+
+    /// Pins the real bug: a footer whose emoji make it wider than `cols`
+    /// must be treated as not fitting, so the elider picks a shorter
+    /// candidate instead of overflowing/wrapping the line.
+    #[test]
+    fn visible_width_boundary_emoji_footer_does_not_falsely_fit() {
+        // 40 ASCII chars + one emoji (2 cols) = 42 true columns, but the old
+        // chars()-based counter would have reported 41 and wrongly believed
+        // it fit in a 41-column terminal.
+        let ascii_prefix = "x".repeat(40);
+        let footer = format!("{ascii_prefix}💾");
+        assert_eq!(footer.chars().count(), 41);
+        assert_eq!(visible_width(&footer), 42);
+        assert!(
+            visible_width(&footer) > 41,
+            "must not appear to fit in 41 cols"
+        );
+    }
     use super::*;
+
+    #[test]
+    fn the_debug_segment_shows_only_while_a_console_is_connected() {
+        assert_eq!(
+            debug_segment(false),
+            None,
+            "an ordinary footer is unchanged"
+        );
+        assert_eq!(debug_segment(true).as_deref(), Some("🐞"));
+        // No test thread owns a console here, so the built line has no bug.
+        let line = build_status_text(&Status::default(), false, true);
+        assert!(!line.contains(DEBUG_MARK), "{line}");
+    }
+
+    #[test]
+    fn the_pressure_segment_marks_the_yielded_state_persistently() {
+        let mut st = Status::default();
+        assert_eq!(
+            pressure_segment(&st),
+            None,
+            "an ordinary footer must be unchanged"
+        );
+        st.pressure_yielded = true;
+        assert_eq!(
+            pressure_segment(&st).as_deref(),
+            Some("⏸\u{fe0f} paused: memory")
+        );
+        // Idle is the state the marker exists for: the yielded window is a
+        // wait, and without this it reads as a hang.
+        st.state = WorkerState::Idle;
+        let text = build_status_text(&st, false, true);
+        // With no idle word after it, the marker closes the line.
+        // `contains`, not `ends_with`: other tests toggle process-global footer
+        // state (contributed cells, the power suffix) that may trail the
+        // segment in a parallel run.
+        assert!(text.contains(" | ⏸\u{fe0f} paused: memory"), "got: {text}");
+    }
+
+    #[test]
+    fn jobs_segment_shows_only_while_jobs_run() {
+        let mut st = Status::default();
+        assert_eq!(jobs_segment(&st), None);
+        st.running_jobs = 1;
+        assert_eq!(jobs_segment(&st).as_deref(), Some("⧗ 1 job"));
+        st.running_jobs = 3;
+        assert_eq!(jobs_segment(&st).as_deref(), Some("⧗ 3 jobs"));
+        let text = build_status_text(&st, false, true);
+        // `contains`, not `ends_with`, for the same reason as the pressure test.
+        assert!(text.contains(" | ⧗ 3 jobs"), "got: {text}");
+        let quiet = build_status_text(&Status::default(), false, true);
+        assert!(!quiet.contains('⧗'), "got: {quiet}");
+    }
 
     #[test]
     fn system_line_is_theme_green_with_white_urls() {
@@ -2264,9 +2839,68 @@ mod tests {
             ..Status::default()
         };
         assert!(
-            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡 0.00 | idle"),
+            build_status_text(&st, false, true).ends_with("ctx 12% | 🌡\u{fe0f} 0.00 | 📈"),
             "{}",
             build_status_text(&st, false, true)
+        );
+    }
+
+    /// The actual user-visible bug: with `chars().count()` measuring width,
+    /// a footer whose true column width exceeds `cols` (because of its
+    /// emoji) was judged to fit, so `build_status_text_within` returned the
+    /// full, overflowing line instead of eliding down to a shorter one.
+    ///
+    /// Built-in segments are never elided (only contributed plugin cells
+    /// are), so this needs at least one plugin cell to give the elider
+    /// something to drop; it is restored to empty before the guard is
+    /// released.
+    #[test]
+    fn build_status_text_within_elides_when_emoji_push_past_cols() {
+        // Resets the process-global wasm-segments slot on scope exit, panic
+        // or not, so a failing assertion here can never leak a segment into
+        // an unrelated test running under the same `quiet_footer` lock.
+        struct ResetWasmSegments;
+        impl Drop for ResetWasmSegments {
+            fn drop(&mut self) {
+                set_wasm_segments(Vec::new());
+            }
+        }
+
+        let _lock = quiet_footer();
+        let _reset = ResetWasmSegments;
+        set_wasm_segments(vec![Cell {
+            text: "💾 spill".to_string(),
+            priority: 1,
+            fg: None,
+            bg: None,
+        }]);
+        let st = Status {
+            ctx_used: 1000,
+            ctx_size: 8000,
+            ..Status::default()
+        };
+        let full = build_status_text(&st, false, true);
+        let true_width = visible_width(&full);
+        let naive_width = full.chars().count();
+        // The footer's 💾 plugin cell measures 2 columns under
+        // unicode_width, but only 1 char, so the naive count undercounts
+        // relative to the true column width.
+        assert!(naive_width < true_width, "{full}");
+
+        // Pick cols right at the boundary: the full line fits under the
+        // old, wrong measurement but must NOT fit under the true one, so it
+        // must be elided down (dropping the plugin cell) to something that
+        // actually fits.
+        let cols = naive_width;
+        let candidate = build_status_text_within(&st, false, true, cols);
+        assert!(
+            visible_width(&candidate) <= cols,
+            "candidate must actually fit: {candidate:?} (width {}, cols {cols})",
+            visible_width(&candidate)
+        );
+        assert_ne!(
+            candidate, full,
+            "the full line does not truly fit and must have been elided"
         );
     }
 
@@ -2286,24 +2920,6 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_marks_the_loop_guards_while_they_are_armed() {
-        let (_lock, _settings_guard) = quiet_footer();
-        let st = Status {
-            ctx_used: 1000,
-            ctx_size: 8000,
-            ..Status::default()
-        };
-        assert!(!build_status_text(&st, false, true).contains(GUARD_MARK));
-        let _settings_guard =
-            crate::settings::install_for_test(crate::settings::Settings::default());
-        let line = build_status_text(&st, false, true);
-        assert!(line.contains(GUARD_MARK), "{line}");
-        // Armed is not the same news as caught: the tripped marker is its own
-        // glyph and appears only while a guard has actually seen a cycle.
-        assert!(!line.contains(LOOP_MARK), "{line}");
-    }
-
-    #[test]
     fn mtp_shows_its_mark_before_a_pass_has_speculated() {
         let (_lock, _settings_guard) = quiet_footer();
         set_mtp(true);
@@ -2316,7 +2932,7 @@ mod tests {
         // question the slot exists to answer.
         let line = build_status_text(&plain, false, true);
         assert!(
-            line.ends_with(&format!("ctx 12% | {MTP_MARK} | idle")),
+            line.ends_with(&format!("ctx 12% | {MTP_MARK} | {TOKS_MARK}")),
             "{line}"
         );
         assert!(!line.contains(TEMP_MARK), "{line}");
@@ -2332,9 +2948,50 @@ mod tests {
         };
         let line = build_status_text(&spark, false, true);
         assert!(
-            line.ends_with(&format!("ctx 12% | {MTP_MARK} 3.0t/step 50% | idle")),
-            "{line}"
+            line.ends_with(&format!("ctx 12% | {MTP_MARK} | {TOKS_MARK}")),
+            "the footer holds still; the figures ride on the rule: {line}"
         );
+        assert_eq!(
+            perf_segment(&spark).as_deref(),
+            Some(format!("{MTP_MARK} 3.0t/step 50%").as_str())
+        );
+    }
+
+    #[test]
+    fn perf_segment_carries_the_transient_figures() {
+        let _lock = quiet_footer();
+        set_mtp(false);
+        assert_eq!(
+            perf_segment(&Status::default()),
+            None,
+            "idle, nothing to say"
+        );
+        let prefill = Status {
+            state: WorkerState::Prefill,
+            prefill_done: 500,
+            prefill_total: 2000,
+            prefill_tps: 100.0,
+            ..Status::default()
+        };
+        assert_eq!(
+            perf_segment(&prefill).as_deref(),
+            Some("↑ 500/2k tokens · 100.0 t/s · ~15s left")
+        );
+        let sampling = Status {
+            state: WorkerState::Generating,
+            generated: 237,
+            gen_tps: 20.7,
+            greedy_sampling: true,
+            ..Status::default()
+        };
+        assert_eq!(
+            perf_segment(&sampling).as_deref(),
+            Some("↓ 237 tokens ❄️ · 20.7 t/s")
+        );
+        // The pinned line keeps only the throbber, the verb and the clock.
+        let brief = progress_brief(&sampling).expect("a pass is running");
+        assert!(brief.ends_with("… (0s)"), "{brief}");
+        assert!(!brief.contains("tokens"), "{brief}");
     }
 
     #[test]
@@ -2355,9 +3012,14 @@ mod tests {
             ..Status::default()
         };
         let line = build_status_text(&st, false, true);
-        // Every draft rejected: 1.0 per step and 0%, still shown — "speculation is on
-        // and buying nothing" is exactly what a user needs to see.
-        assert!(line.contains(&format!("{MTP_MARK} 1.0t/step 0%")), "{line}");
+        assert!(line.contains(MTP_MARK), "{line}");
+        // Every draft rejected: 1.0 per step and 0%, still shown — on the
+        // rule, at idle — "speculation is on and buying nothing" is exactly
+        // what a user needs to see.
+        assert_eq!(
+            perf_segment(&st).as_deref(),
+            Some(format!("{MTP_MARK} 1.0t/step 0%").as_str())
+        );
     }
 
     #[test]
@@ -2566,6 +3228,66 @@ mod tests {
         VerbPhase::Prefill,
         VerbPhase::Fun,
     ];
+
+    #[test]
+    fn memory_pass_shows_the_mark_and_no_progress_line() {
+        let _lock = quiet_footer();
+        for state in [WorkerState::Prefill, WorkerState::Generating] {
+            let st = Status {
+                state,
+                ctx_used: 1000,
+                ctx_size: 8000,
+                prefill_total: 4000,
+                prefill_done: 3300,
+                generated: 12,
+                memory_pass: true,
+                ..Status::default()
+            };
+            assert_eq!(
+                progress_segment(&st, false),
+                None,
+                "no readout under the output"
+            );
+            assert_eq!(progress_brief(&st), None, "no pinned line either");
+            let line = build_status_text(&st, false, true);
+            assert!(line.ends_with(&format!("| {MEMORY_MARK}")), "{line}");
+            assert!(!line.contains("tokens"), "figures ride on the rule: {line}");
+            // Off by default: the rule looks idle while notes are taken.
+            set_show_memory_stats(false);
+            assert_eq!(perf_segment(&st), None, "no figures without the flag");
+            set_show_memory_stats(true);
+            let perf = perf_segment(&st).expect("figures on the rule, on request");
+            let expect = match state {
+                WorkerState::Prefill => "↑ 3.3k/4k tokens · 0.0 t/s",
+                _ => "↓ 12 tokens · 0.0 t/s",
+            };
+            assert_eq!(perf, expect);
+            set_show_memory_stats(false);
+        }
+        // A backlog: one mark per queued span, the running one included.
+        let backlog = Status {
+            state: WorkerState::Generating,
+            generated: 12,
+            memory_pass: true,
+            memory_queue: 3,
+            ..Status::default()
+        };
+        let line = build_status_text(&backlog, false, true);
+        assert!(
+            line.ends_with(&format!("| {MEMORY_MARK}{MEMORY_MARK}{MEMORY_MARK}")),
+            "{line}"
+        );
+        let plain = Status {
+            state: WorkerState::Generating,
+            generated: 12,
+            ..Status::default()
+        };
+        assert!(
+            progress_segment(&plain, false).is_some(),
+            "an ordinary pass keeps its readout"
+        );
+        assert!(!build_status_text(&plain, false, true).contains(MEMORY_MARK));
+    }
 
     #[test]
     fn spinner_verbs_are_200_and_unique_across_pools() {
@@ -2918,7 +3640,7 @@ mod tests {
             assert!(colored.contains(&want), "{level:?}: {colored:?}");
             let plain = build_status_text(&st, false, true);
             assert!(!plain.contains("\x1b["), "{level:?}: {plain:?}");
-            assert!(plain.contains(level.short_name()), "{level:?}: {plain:?}");
+            assert!(plain.contains(&*level.short_name()), "{level:?}: {plain:?}");
         }
     }
 
@@ -3016,6 +3738,56 @@ mod tests {
         assert!(seg.ends_with(STATUS_STYLE_START), "{seg}");
     }
 
+    /// On a model with a native numeric effort knob the think segment shows
+    /// the effort number in force instead of plank's name for the level — and
+    /// must still hold exactly the same width, so nothing to its right shifts
+    /// when the level changes.
+    #[test]
+    fn the_think_segment_keeps_its_width_with_a_numeric_effort() {
+        use crate::engine::ThinkMode;
+
+        let seg_and_rest = |think: ThinkMode| {
+            let st = Status {
+                think,
+                ctx_size: 1000,
+                ctx_used: 30,
+                ..Status::default()
+            };
+            let line = build_status_text(&st, false, true);
+            let at = line.find(THINK_MARK).expect("think segment present");
+            // The segment alone, mark to bar: measuring the whole tail would
+            // also pick up neighbours that carry process-global state.
+            let rest = &line[at..];
+            let end = rest.find('|').expect("think segment ends at a bar");
+            rest[..=end].chars().count()
+        };
+        // Every level the footer can be in on a numeric family, as the UI
+        // layer maps it for display (`ThinkMode::for_display`).
+        let mut widths = std::collections::HashSet::new();
+        for m in ThinkMode::ALL {
+            widths.insert(seg_and_rest(m.for_display(true)));
+            widths.insert(seg_and_rest(m.for_display(false)));
+        }
+        for n in 1..=100u8 {
+            widths.insert(seg_and_rest(ThinkMode::Level(n)));
+        }
+        assert_eq!(
+            widths.len(),
+            1,
+            "the think segment changed width: {widths:?}"
+        );
+        // And the number is what is shown: `low` reads as 25 on V4.1.
+        let st = Status {
+            think: ThinkMode::Low.for_display(true),
+            ctx_size: 1000,
+            ctx_used: 30,
+            ..Status::default()
+        };
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("25"), "{line}");
+        assert!(!line.contains("low"), "{line}");
+    }
+
     /// A clean tree says nothing: the segment exists to report change, and a
     /// permanent `0 · +0 -0` would be three columns of noise.
     #[test]
@@ -3061,6 +3833,111 @@ mod tests {
         // never reach the bar, or the tag would be silently missing.
         assert!(!line.contains("(local )"), "{line}");
         assert!(!line.contains("(local ⚡"), "{line}");
+    }
+
+    // The two blink glyphs themselves, independent of any segment plumbing:
+    // this is the exact method src/experts.rs uses to pin the brain emoji's
+    // width, applied to the SSD-streaming marker's two phases.
+    #[test]
+    fn hd_mark_and_off_form_are_the_same_display_width() {
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(HD_MARK),
+            unicode_width::UnicodeWidthStr::width(HD_MARK_OFF),
+        );
+        assert_eq!(unicode_width::UnicodeWidthStr::width(HD_MARK), 2);
+    }
+
+    // `💾` appears only for a streaming model, and its two blink phases are
+    // the same two columns, so nothing to its right moves.
+    #[test]
+    fn hd_segment_is_absent_off_and_width_stable_on() {
+        // Visible columns, with the SGR escapes taken back out.
+        fn plain(s: &str) -> String {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '\u{1b}' {
+                    for e in chars.by_ref() {
+                        if e == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        assert_eq!(hd_segment_at(false, false, true, Some(0)), None);
+        assert_eq!(hd_segment_at(false, true, true, Some(0)), None);
+
+        // Idle streaming model: steady, never blinking.
+        let idle = hd_segment_at(true, false, true, Some(0)).unwrap();
+        let idle_late = hd_segment_at(true, false, true, Some(TOOL_BLINK_MS / 2)).unwrap();
+        assert_eq!(
+            idle, idle_late,
+            "a steady marker does not depend on the tick"
+        );
+
+        // Working: the two phases differ in glyph, not style.
+        let lit = hd_segment_at(true, true, true, Some(0)).unwrap();
+        let dim = hd_segment_at(true, true, true, Some(TOOL_BLINK_MS / 2)).unwrap();
+        assert_ne!(lit, dim, "the marker has to actually blink");
+        assert_eq!(lit, idle, "the lit phase is the steady form");
+        // Same measure src/experts.rs uses to pin the brain emoji's width.
+        let visible = |s: &str| unicode_width::UnicodeWidthStr::width(plain(s).as_str());
+        assert_eq!(visible(&lit), 2);
+        assert_eq!(visible(&dim), 2, "the blink must not change the width");
+        assert!(plain(&lit).contains(HD_MARK));
+        assert!(plain(&dim).contains(HD_MARK_OFF));
+        // Both phases hand the footer's own style back, so the bar background
+        // survives past the segment.
+        assert!(lit.ends_with(STATUS_STYLE_START));
+        assert!(dim.ends_with(STATUS_STYLE_START));
+    }
+
+    // Reduced motion freezes the marker the way it freezes the throbber: the
+    // shared clock returns `None` and the lit form is what is drawn.
+    #[test]
+    fn hd_segment_is_steady_under_reduced_motion() {
+        let lit = hd_segment_at(true, true, true, Some(0)).unwrap();
+        assert_eq!(
+            hd_segment_at(true, true, true, None).as_deref(),
+            Some(&*lit)
+        );
+        assert_eq!(
+            hd_segment_at(true, false, true, None).as_deref(),
+            Some(&*lit)
+        );
+        // A monochrome footer has no second appearance to blink into.
+        assert_eq!(
+            hd_segment_at(true, true, false, Some(0)).as_deref(),
+            Some(HD_MARK)
+        );
+        assert_eq!(
+            hd_segment_at(true, true, false, Some(TOOL_BLINK_MS / 2)).as_deref(),
+            Some(HD_MARK)
+        );
+    }
+
+    // The whole footer, not just the segment: `💾` shows up beside the ctx
+    // gauge for a streaming model and is nowhere to be seen otherwise.
+    #[test]
+    fn hd_rides_in_the_footer_beside_the_ctx_gauge() {
+        let _lock = quiet_footer();
+        let st = Status {
+            ctx_size: 1000,
+            ctx_used: 100,
+            ..Status::default()
+        };
+        set_ssd_streaming(false);
+        let off = build_status_text(&st, false, true);
+        assert!(!off.contains(HD_MARK), "{off}");
+        set_ssd_streaming(true);
+        let on = build_status_text(&st, false, true);
+        assert!(on.contains(&format!("| {HD_MARK} |")), "{on}");
+        set_ssd_streaming(false);
     }
 
     /// The power cap rides with the local origin, not the bar's tail: it caps

@@ -140,6 +140,10 @@ pub enum WireThinkMode {
     #[serde(alias = "auto", alias = "medium", alias = "high")]
     On,
     Max,
+    /// An explicit V4.1 reasoning effort, `1..=100`. Newest of all, and a peer
+    /// that does not know it rejects the frame rather than thinking at some
+    /// other effort — the same bargain `"low"` struck.
+    Level(u8),
 }
 
 impl From<ThinkMode> for WireThinkMode {
@@ -149,6 +153,7 @@ impl From<ThinkMode> for WireThinkMode {
             ThinkMode::Low => Self::Low,
             ThinkMode::Medium => Self::On,
             ThinkMode::Max => Self::Max,
+            ThinkMode::Level(n) => Self::Level(n),
         }
     }
 }
@@ -156,10 +161,15 @@ impl From<ThinkMode> for WireThinkMode {
 impl From<WireThinkMode> for ThinkMode {
     fn from(m: WireThinkMode) -> Self {
         match m {
-            WireThinkMode::Off => Self::Off,
+            // `Level(0)` shares this arm: a peer is not trusted to be us, and
+            // zero is off rather than an effort, exactly as `parse` reads it.
+            WireThinkMode::Off | WireThinkMode::Level(0) => Self::Off,
             WireThinkMode::Low => Self::Low,
             WireThinkMode::On => Self::Medium,
             WireThinkMode::Max => Self::Max,
+            // Out-of-range efforts cannot come from our own `ThinkMode`:
+            // clamp rather than build a level the engine would reject.
+            WireThinkMode::Level(n) => Self::Level(n.min(100)),
         }
     }
 }

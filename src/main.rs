@@ -8,7 +8,7 @@
 //! 1. **Interactive agent** (default, TUI or plain stdout): the main agent loop
 //!    that drives inference, tool dispatch, and user interaction. Uses Ratatui
 //!    when both stdin and stdout are real terminals, otherwise a plain line REPL.
-//! 2. **Non-interactive / headless** (`--non-interactive`): reads commands from
+//! 2. **Non-interactive / headless** (`--ui console`, `--ui chart`): reads commands from
 //!    stdin and prints structured output, for scripting and CI integration.
 //! 3. **Remote server** (`plank serve`): hosts the engine over a WebSocket
 //!    control interface. Supports single-tenant and shared-engine modes.
@@ -201,13 +201,57 @@ fn report_kvcache_migration() {
 /// parse). Shared by every consumer that needs to know which model family is
 /// loading, so none of them can resolve it a different way and disagree.
 ///
-/// A path that does not exist yet — a first run, before the download — is
-/// left for the caller's `family_of` to probe; that resolves to `Ds4`, which
-/// is the right default.
+/// The fallback follows the set this machine manages rather than always
+/// naming the V4 path. A path that does not exist yet — a first run, before
+/// the download — is probed by name, so it still tags the family of the model
+/// that is about to land.
 fn resolve_model_path(cfg: &plank::config::AgentConfig) -> std::path::PathBuf {
     cfg.model_path
         .clone()
-        .unwrap_or_else(plank::download::default_model_path)
+        .unwrap_or_else(plank::download::default_managed_model_path)
+}
+
+/// The real config parse, with a `.ggd` model swapped for its patched clone.
+/// Errors are already printed under `prog`; the caller just returns the code.
+fn parse_config(
+    settings: &plank::settings::Settings,
+    args: &[String],
+    prog: &str,
+) -> Result<plank::config::AgentConfig, ExitCode> {
+    plank::config::parse_options_with(settings, args)
+        .and_then(|mut cfg| resolve_model_delta(&mut cfg).map(|()| cfg))
+        .map_err(|msg| {
+            eprintln!("{prog}: {msg}");
+            ExitCode::from(2)
+        })
+}
+
+/// Swaps a `.ggd` weight delta given as the model for the patched clone it
+/// resolves to, so everything downstream — family probe, manifest check,
+/// companion lookup, the engine open — sees an ordinary GGUF.
+///
+/// Runs right after the config is parsed and before anything reads a model
+/// header. The clone is materialized on first use and reused afterwards
+/// (`ggufdelta::resolve`). Prints one line naming the delta and its base.
+fn resolve_model_delta(cfg: &mut plank::config::AgentConfig) -> Result<(), String> {
+    let Some(delta) = cfg
+        .model_path
+        .as_deref()
+        .filter(|p| plank::ggufdelta::is_delta_path(p))
+        .map(std::path::Path::to_path_buf)
+    else {
+        return Ok(());
+    };
+    let resolved = plank::ggufdelta::resolve(&delta)?;
+    eprintln!(
+        "plank: {} ({}): {}",
+        delta.display(),
+        resolved.describe(),
+        resolved.path.display()
+    );
+    cfg.model_path = Some(resolved.path.clone());
+    cfg.model_delta = Some(resolved);
+    Ok(())
 }
 
 /// Records the live model family for the session store.
@@ -290,7 +334,7 @@ fn post_cfg_early_exit(
     }
     // `--dump-config` prints the resolved configuration (every effective key
     // with the layer it came from) and exits, without starting a session. It
-    // works under `--non-interactive` because it needs no UI.
+    // works under `--ui console` because it needs no UI.
     if cfg.dump_config {
         print!("{}", plank::provenance::render_resolved(settings, cfg));
         return Some(ExitCode::SUCCESS);
@@ -401,12 +445,9 @@ fn main() -> ExitCode {
     // chance to dial the console.
     plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
-    let cfg = match plank::config::parse_options_with(&settings, &args) {
+    let cfg = match parse_config(&settings, &args, "plank") {
         Ok(cfg) => cfg,
-        Err(msg) => {
-            eprintln!("plank: {msg}");
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
     if let Some(code) = post_cfg_early_exit(&cfg, &settings) {
         return code;
@@ -418,7 +459,7 @@ fn main() -> ExitCode {
     }
     // One-shot wipe of pre-`.kv_raw` KV blobs, before any terminal setup so
     // the note prints as a plain line on every front end (TUI, plain REPL,
-    // and `--non-interactive` all funnel through here). Best-effort: a store
+    // and `--ui console` all funnel through here). Best-effort: a store
     // that fails to open is skipped silently, and the next launch retries.
     //
     // Gated on the cache directory already existing, and deliberately not
@@ -444,7 +485,7 @@ fn main() -> ExitCode {
     // First launch after an upgrade: the KV caches self-validate and survive,
     // but a major version change drops the image cache (see upgrade.rs).
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-        let plank_dir = std::path::PathBuf::from(home).join(".plank");
+        let plank_dir = plank::home::plank_home_in(home);
         let t = plank::upgrade::run_startup_maintenance(&plank_dir, env!("CARGO_PKG_VERSION"));
         if t == plank::upgrade::Transition::Major {
             eprintln!("plank: major version change detected; cleared the image cache");
@@ -468,7 +509,7 @@ fn main() -> ExitCode {
         }
     };
     match run(engine.main, engine.local, &cfg, plugins) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("plank: {e}");
             ExitCode::FAILURE
@@ -528,25 +569,6 @@ fn enter_startup_worktree(
 #[cfg(ds4_engine)]
 const MIN_RAM_BYTES: u64 = 96 * 1024 * 1024 * 1024;
 
-/// Total physical RAM in bytes, via `sysctl hw.memsize`.
-#[cfg(ds4_engine)]
-fn total_ram_bytes() -> Option<u64> {
-    let mut mem: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    // SAFETY: hw.memsize returns a u64; `mem`/`len` are valid out-params and
-    // the name is a NUL-terminated C string.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&raw mut mem).cast(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (rc == 0).then_some(mem)
-}
-
 /// Fails fast when another plank/ds4 instance is already running, with a clear
 /// message — instead of the engine's own guard, which calls `exit(2)` deep in
 /// `ds4_engine_open` (`ds4_acquire_instance_lock` in `ds4.c`) and kills the
@@ -586,7 +608,7 @@ fn acquire_model_lock() -> Result<(), String> {
 /// Returns an explanatory message when physical RAM is below the minimum.
 #[cfg(ds4_engine)]
 fn require_min_ram() -> Result<(), String> {
-    if let Some(bytes) = total_ram_bytes()
+    if let Some(bytes) = plank::download::total_ram_bytes()
         && bytes < MIN_RAM_BYTES
     {
         #[allow(clippy::cast_precision_loss)]
@@ -647,6 +669,7 @@ fn make_engine(cfg: &AgentConfig, plugins: &plank::plugins::PluginSet) -> Result
         use plank::remote::provider::{ProviderEngine, ProviderKind};
         let kind = match provider {
             ProviderSelector::OpenAi => ProviderKind::OpenAi,
+            ProviderSelector::OpenAiResponses => ProviderKind::OpenAiResponses,
             ProviderSelector::Anthropic => ProviderKind::Anthropic,
         };
         let model = cfg
@@ -743,7 +766,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         let model = cfg
             .model_path
             .clone()
-            .unwrap_or_else(plank::download::default_model_path);
+            .unwrap_or_else(plank::download::default_managed_model_path);
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
@@ -753,15 +776,16 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // and idempotent: it does nothing at all when no download is running.
         plank::downloader::spawn_watcher();
         plank::download::ensure_model(&model)?;
-        // Vision is always on: the encoder GGUF sits beside the main model and
-        // is fetched on demand when missing, the same as the main model.
+        // The vision encoder sits beside the main model and is fetched on
+        // demand when the model can use it (the pinned Vision-Exp checkpoint);
+        // any other DeepSeek checkpoint runs text-only.
         // Speculation is on by default; without `--mtp-model` a DeepSeek run
         // resolves the default support GGUF and fetches it on demand
         // (`--mtp-off` skips that). Kept local rather than written back into
         // `cfg`: only the engine open needs it. A Qwen model skips both side
         // artifacts, since it opens neither.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&model, &mut tuning)?;
+        plank::download::ensure_side_artifacts(&model, cfg.generation.ctx_size, &mut tuning)?;
 
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
@@ -772,17 +796,55 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         eprintln!("plank: loading model {}...", model.display());
         // Render the C engine's noisy startup log in place on one row.
         let replacer = plank::stderrline::StderrLineReplacer::start();
-        let engine = Ds4Engine::open(
-            &model,
-            backend,
-            cfg.generation.ctx_size,
-            cfg.n_threads,
-            cfg.power_percent,
-            &tuning,
-        )
-        .map_err(|e| e.to_string())?;
+        let opened = (|| {
+            let first = match Ds4Engine::open(
+                &model,
+                backend,
+                cfg.generation.ctx_size,
+                cfg.n_threads,
+                cfg.power_percent,
+                &tuning,
+            ) {
+                Ok(engine) => return Ok(engine),
+                Err(e) => e.to_string(),
+            };
+            // The C refuses to open a checkpoint at all when the DSpark draft
+            // model does not match it. When plank picked that companion itself,
+            // retry once (never in a loop) rather than making the user discover
+            // `--mtp-off`; a companion the user named is never dropped (see
+            // `EngineTuning::without_auto_companion`).
+            let Some(solo) = tuning.without_auto_companion() else {
+                return Err(first);
+            };
+            eprintln!(
+                "note: speculative decoding disabled (the DSpark draft model is not compatible with this checkpoint)"
+            );
+            Ds4Engine::open(
+                &model,
+                backend,
+                cfg.generation.ctx_size,
+                cfg.n_threads,
+                cfg.power_percent,
+                &solo,
+            )
+            // Report the original failure, with the retry's as context: the
+            // retry only rules the companion out, it does not diagnose a
+            // corrupt model.
+            .map_err(|second| {
+                format!(
+                    "{first}\n(retried without the DSpark draft model, which also failed: {second})"
+                )
+            })
+        })();
         drop(replacer);
-        eprintln!("plank: model ready: {}", engine.model_name());
+        let engine = opened?;
+        eprintln!(
+            "plank: model ready: {}{}",
+            engine.model_name(),
+            cfg.model_delta
+                .as_ref()
+                .map_or_else(String::new, |d| format!(" ({})", d.describe()))
+        );
         Ok(Box::new(engine))
     }
     #[cfg(not(ds4_engine))]
@@ -921,12 +983,9 @@ fn run_serve(args: &[String]) -> ExitCode {
     // chance to dial the console.
     plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
-    let cfg = match plank::config::parse_options_with(&settings, &passthrough) {
+    let cfg = match parse_config(&settings, &passthrough, "plank serve") {
         Ok(cfg) => cfg,
-        Err(msg) => {
-            eprintln!("plank serve: {msg}");
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
     // See `main`'s matching call; the function doc has the full reasoning.
     if let Some(code) = refuse_if_profile_conflicts_with_qwen(&cfg) {
@@ -1001,7 +1060,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         let model_path = cfg
             .model_path
             .clone()
-            .unwrap_or_else(plank::download::default_model_path);
+            .unwrap_or_else(plank::download::default_managed_model_path);
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
@@ -1011,11 +1070,12 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         // and idempotent: it does nothing at all when no download is running.
         plank::downloader::spawn_watcher();
         plank::download::ensure_model(&model_path)?;
-        // Vision is always on: the encoder GGUF sits beside the main model and
-        // is fetched on demand when missing, the same as the main model.
+        // The vision encoder sits beside the main model and is fetched on
+        // demand when the model can use it (the pinned Vision-Exp checkpoint);
+        // any other DeepSeek checkpoint runs text-only.
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&model_path, &mut tuning)?;
+        plank::download::ensure_side_artifacts(&model_path, cfg.generation.ctx_size, &mut tuning)?;
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,
@@ -1034,7 +1094,13 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         )
         .map_err(|e| e.to_string())?;
         drop(replacer);
-        eprintln!("plank: shared model ready: {}", model.model_name());
+        eprintln!(
+            "plank: shared model ready: {}{}",
+            model.model_name(),
+            cfg.model_delta
+                .as_ref()
+                .map_or_else(String::new, |d| format!(" ({})", d.describe()))
+        );
         Ok(EngineHost::new(model, host_cfg))
     }
     #[cfg(not(ds4_engine))]
@@ -1056,10 +1122,16 @@ fn run(
     local_engine: Option<Box<dyn Engine>>,
     cfg: &AgentConfig,
     plugins: plank::plugins::PluginSet,
-) -> Result<(), String> {
+) -> Result<u8, String> {
+    // The family check the C makes right after opening the engine: a numeric
+    // effort is meaningless to anything but V4.1, and falling back to `high`
+    // silently would be worse than refusing.
+    if plank::engine::think_level_unsupported(cfg.generation.think_mode, &engine.model_name()) {
+        return Err(plank::engine::THINK_LEVEL_REQUIRES_V41.to_string());
+    }
     let color = std::io::stdout().is_terminal();
-    if cfg.non_interactive {
-        return plank::ui::run_non_interactive(engine, cfg, local_engine, plugins);
+    if cfg.ui.is_headless() {
+        return plank::ui::run_headless(engine, cfg, local_engine, plugins);
     }
     plank::title::set(plank::title::State::Loading);
     // The full-screen TUI (a real terminal on both ends) draws its own header,
@@ -1082,7 +1154,7 @@ fn run(
         }
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
-    plank::ui::run_interactive(engine, cfg, local_engine, plugins)
+    plank::ui::run_interactive(engine, cfg, local_engine, plugins).map(|()| 0)
 }
 
 #[cfg(test)]
@@ -1169,7 +1241,7 @@ mod tests {
         cfg.model_path = None;
         assert_eq!(
             resolve_model_path(&cfg),
-            plank::download::default_model_path()
+            plank::download::default_managed_model_path()
         );
 
         let configured = std::path::PathBuf::from("/from/settings.gguf");
