@@ -173,6 +173,38 @@ Inside a session, `/plugins` marks each plugin that `--profile` accepts with
 `[profile, active]`. Profiles installed under `~/.plank/profiles/` are not
 scanned, so only the active one appears there.
 
+## Editing the running profile
+
+`/edit-profile` opens the active profile in the built-in editor as one
+buffer, the way `/memory` shows every memory file at once. A header comment
+comes first: where the profile was loaded from (the plugin origin and root,
+with a note when it is the installed copy under `~/.plank/profiles/` rather
+than its source), then one row per field with its value and where it comes
+from, either `manifest` or the `default` it falls back to. Below it, each
+file sits between `<!-- plank-profile: begin ... -->` and `end` markers: the
+manifest and the prompt always, the plugin's `settings.json` and `.mcp.json`
+only when they exist. The logo is a picture, so it is a header row, not a
+section.
+
+Saving checks the whole buffer before writing anything. The manifest must
+still parse into a `profile` block with a `systemPrompt`, and the prompt must
+not be empty, which is the same gate `/install-profile` applies; a failure
+writes nothing and says why. Only the files that changed are written, and
+the path in a begin marker is ignored, so editing it cannot redirect a
+write.
+
+A profile is set once at startup, so a saved change offers **Restart now**
+or **Later**. Restarting saves the session, quits plank the normal way (which
+stops its MCP servers and background jobs), and re-executes it from the
+launch directory with the same arguments, minus `/resume`, `--worktree`,
+`--worktree-pr`, `-p` and `--chdir`, plus `--chdir <session directory>` and
+`/resume <session>`. A relative `--plugin-dir` is made absolute first, so it
+still names the same directory. The conversation carries over; the prompt
+changed, so its cache is rebuilt.
+
+`/edit-profile` works only when plank was started with `--profile`, and
+editing needs the TUI: the plain REPL prints the same buffer read-only.
+
 ## A worked example
 
 `examples/profiles/chatbgt` in this repository is a complete, minimal

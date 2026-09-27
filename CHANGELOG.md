@@ -14,6 +14,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/PROFILES.md` for the manifest reference and `examples/profiles/chatbgt`
   for a worked example. `/plugins` marks the plugins `--profile` accepts, and
   startup warns when a profile prompt has no `{{plank:tool-protocol}}` token.
+- **`/edit-profile` edits the running profile.** The manifest, prompt and any
+  `settings.json` or `.mcp.json` open as one buffer in the built-in editor,
+  under a header naming where each field comes from. A save is validated as a
+  whole before anything is written, then offers to restart plank on the same
+  session so the edit takes effect.
 - **`/install-profile <url|owner/repo|path> [name] [--force]` installs a
   profile** from a git repository, a marketplace repository, a `.tar.gz` or a
   local directory into `~/.plank/profiles/<name>/`, a root that only
