@@ -177,7 +177,10 @@ expect to be elided — plank's own segments are never dropped on your behalf.
 
 - `frame_open(json) -> {veiled?}` — `OpenParams` carries `{w, h, seed, arg, config}`.
 - `frame_step(json) -> bytes` **or** `frame_step_text(json) -> {lines: [...]}`.
-- `frame_key(json) -> {stay}|{close: "line"}`
+- `frame_key(json) -> {stay}|{close: "line"}`. The payload is
+  `{"code": "ctrl-s"}` for a key that types nothing, and gains a `text` field
+  holding the one character the key typed when it typed one:
+  `{"code": "a", "text": "a"}`, `{"code": "A", "text": "A"}`.
 - `frame_mouse(json) -> Outcome` — **optional**. Without it your frame is
   keyboard-only; plank does not strike you for declining an optional export.
 - `frame_close() -> {scrollback?}`
@@ -213,8 +216,8 @@ Declared in the manifest, shown to the user at approval, and **never widened
 silently**: an update that asks for more re-prompts even with a valid signature.
 
 Wired today: `log`, `print`, `state` (a per-component KV store — the only
-persistence most components need, and it needs no filesystem grant), `sound`,
-and `notify`.
+persistence most components need, and it needs no filesystem grant), `fs` (a
+private RAM disk, below), `sound`, and `notify`.
 
 `state` has quotas, checked before anything touches the disk: 1 MiB per value,
 255-byte keys, 256 keys, 16 MiB in total per component. An over-quota
@@ -229,13 +232,51 @@ strings are clipped to 200 characters. It respects the user's own notification
 setting rather than routing around it: a plugin is not more entitled to
 interrupt than plank is.
 
+`fs` gives each component a private in-memory scratch disk. It is empty when
+the session starts, it is dropped when plank exits, and it reaches no real file:
+no path you pass can name anything on the user's machine, and no other
+component can see your disk or you theirs. `/plugins` and `/plugins info`
+describe the grant to the user as "a private in-memory scratch disk, cleared
+when plank exits", so that is the promise you are making when you ask for it.
+Use it for a document the user edits and saves within one sitting; use `state`
+for anything that must survive a restart.
+
+Four host functions reach it. `plank_fs_read(path) -> bytes` and
+`plank_fs_list(dir) -> bytes` answer with a tagged reply: a leading `0` byte
+followed by the data on success, or a leading `1` byte followed by a UTF-8 error
+message. The listing is JSON, `[{"name": "a.csv", "size": 12}, {"name":
+"sub/", "size": 0}]`, holding the immediate children of `dir` sorted by name,
+with subdirectories marked by a trailing `/`. `plank_fs_write(path, bytes) ->
+string` and `plank_fs_remove(path) -> string` answer with an empty string on
+success and the error message otherwise. Reading or removing a file that does
+not exist is an error (`no such file: /x.csv`), not an empty reply.
+
+Paths are `/`-separated, and a relative path is taken relative to `/`, so
+`t.csv`, `/t.csv` and `./t.csv` are the same file. Empty segments and `.`
+collapse. `..` is refused rather than clamped at the root, because a component
+that asks for `../x` has a bug that quietly handing it `/x` would hide; NUL and
+backslash are refused too. Directories exist only as the files under them.
+Writing to `/` is refused, and so is any write that would make a path both a
+file and a directory: a file under a path that is already a file, or a file over
+a path that already holds files beneath it.
+
+The quotas are 4 MiB per file, 256 files and 16 MiB in total per component, and
+they are checked before anything changes, so a refused write leaves the disk
+exactly as it was. The grant is checked before the path is even parsed, so a
+component without `fs` always gets the same refusal whatever it passed. That
+refusal, every quota refusal and every overlap refusal starts with your
+component id (`'<id>' was not granted the 'fs' capability`, `'<id>' file /t.csv
+is N bytes, more than the ...-byte limit`); a malformed path or a missing file
+is reported without it.
+
 Declared but reaching nothing yet: `agent`, `session`. plank warns at load if
 you ask for one, because approving a capability that does not exist is worse
 than refusing it.
 
-Deliberately unimplemented: `fs`, `net`, `exec`. These are the three that undo
-the sandbox, and each needs its own decision about what the grant means before
-it gets code.
+Deliberately unimplemented: `net` and `exec`. These undo the sandbox, and each
+needs its own decision about what the grant means before it gets code. `fs`
+was the third, and the decision it got is the RAM disk above: a disk that
+reaches no real file undoes nothing.
 
 ## User-settable options
 
@@ -345,8 +386,9 @@ buffers sized to the `w`/`h` you were handed rather than to a worst case.
   optional ones being absent. plank holds itself to the same rule. This is how
   a plugin you cannot recompile keeps working.
 - **One call at a time.** plank serialises calls per instance; no re-entrancy.
-- **Do not expect a filesystem.** Use `state`. A component asking for `fs` today
-  is asking for something that does not exist.
+- **Do not expect a real filesystem.** `fs` is a private RAM disk that is
+  cleared when plank exits and reaches no file on the user's machine; use
+  `state` for anything that must outlive the session.
 - **A frame is a screen, not a stream.** Declaring more glyphs than the area can
   hold is refused rather than allocated on your say-so.
 
@@ -354,6 +396,12 @@ buffers sized to the `w`/`h` you were handed rather than to a worst case.
 
 - `guests/screensavers` and `guests/arcades` — real `frame` + `command`
   components, sharing `guests/support` for the RNG and glyph packing.
+- `guests/csvedit`: a full-screen Turbo Vision CSV editor (`/csvedit:new`,
+  `/csvedit:open <name.csv>`) that saves to the `fs` RAM disk. It is the one
+  guest built for `wasm32-wasip1` rather than `wasm32-unknown-unknown`, because
+  Turbo Vision reads the clock; it gets WASI with no preopened directories, so
+  the RAM disk is still the only storage it can reach. Its Extism glue is one
+  file, `src/frame.rs`, and everything behind it is tested natively.
 - `spike/text-guest` — the smallest `frame_step_text` component.
 - `spike/abi-guest` — one component exercising every surface, used by plank's
   own integration tests.

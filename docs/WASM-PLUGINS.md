@@ -11,7 +11,8 @@
 > the reasoning, including for the parts that were deliberately cut.
 >
 > Four surfaces of five are implemented (`panel` was cut), nine events of roughly
-> twenty, and five capabilities of ten. Each gap says so where it appears, so
+> twenty, and six capabilities of ten, with `fs` built as a private RAM disk
+> rather than as access to real paths. Each gap says so where it appears, so
 > "designed" and "built" stay distinguishable. The one that catches people is
 > `$PLANK_PLUGIN_PATH`: designed, never built, use `./.plank/plugins/`.
 
@@ -45,8 +46,12 @@ refusal says are pure functions over a directory, and the Extism glue in
 `wasmhost` is a thin shell over them. Every host function is provided to every
 component and checks its own grant when called, so a missing grant reads as
 "this component was not granted `print`" rather than as a wasm import error.
-`fs`, `net` and `exec` — the three that undo the sandbox — are deliberately not
-wired.
+`net` and `exec`, which undo the sandbox, are deliberately not wired. `fs` is
+wired, but not as the design below first sketched it: rather than Extism's
+`allowed_paths` onto real directories, each component gets a private in-memory
+scratch disk (`RamFs` in `src/wasmcaps.rs`), empty at session start and dropped
+at exit, that reaches no real file. Granting it therefore undoes nothing, which
+is what let it ship without the separate decision the other two still need.
 
 **The `observer` surface and the event bus.** `src/wasmevents.rs`. Five events
 are dispatched — `session_start`, `user_prompt_submit`, `pre_tool_use`,
@@ -289,6 +294,11 @@ exports:
   frame_close()                -> json: { scrollback: string? }
 ```
 
+`KeyEvent` is `{ code }`, plus a `text` field holding the one character the key
+typed when it typed one (`{"code": "a", "text": "a"}`); the field is omitted
+rather than null for a key that types nothing, so a guest written before it
+existed sees exactly the payload it always did.
+
 `StepParams` carries `{ dt_ms, w, h, now_ms }`; `dt_ms` is clamped host-side
 the way `arcade::MAX_STEP_MS` clamps today, so a suspended terminal cannot
 teleport a plugin's simulation. `Outcome` is `{"stay"}` or
@@ -499,7 +509,7 @@ granted per-plugin in the manifest. Nothing is granted by default.
 | `print` | `plank_print(text)`, `plank_print_md(text)` | Writes scrollback lines |
 | `notify` | `plank_notify(title, body)` | Desktop/terminal notification |
 | `state` | `plank_state_get(key)`, `plank_state_set(key, val)` | A per-plugin KV store under `~/.plank/plugins/<id>/state`. The *only* persistence most plugins need, and it needs no filesystem grant. Quotas: 1 MiB per value, 255-byte keys, 256 keys and 16 MiB in total per component (`STATE_MAX_*` in `src/wasmcaps.rs`); an over-quota `state_set` is refused with a `'<id>' ...` error before anything is written |
-| `fs` | Extism `allowed_paths` | Explicit path list, never `/` |
+| `fs` | `plank_fs_read(path)`, `plank_fs_write(path, bytes)`, `plank_fs_list(dir)`, `plank_fs_remove(path)` | A private in-memory scratch disk per component, empty at session start and cleared when plank exits; it reaches no real file. Paths are `/`-rooted, `..`, NUL and backslash are refused, and a write that would make one path both a file and a directory is refused. Quotas: 4 MiB per file, 256 files and 16 MiB in total per component (`FS_MAX_*` in `src/wasmcaps.rs`). The grant is checked before the path, and grant, quota and overlap refusals start with `'<id>'` and change nothing |
 | `net` | Extism `allowed_hosts` | Explicit host list |
 | `exec` | `plank_exec(cmd) -> {out, code}` | **Escape hatch.** Grants shell. Requires explicit user confirmation at install and is flagged in `/plugins` |
 | `agent` | `plank_prompt(text)` | Submits a prompt to the model as if typed. Rate-limited to prevent loops |
