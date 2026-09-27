@@ -250,7 +250,9 @@ A profile's version is its manifest's top-level `version`, as
 `MAJOR.MINOR.PATCH`. When `--profile <source>` finds the installed copy by its
 recorded source, plank reads the version the source offers now without
 fetching the profile: a local directory's manifest, or one request of at most
-three seconds for the folder's `plugin.json` on `raw.githubusercontent.com`.
+three seconds for the folder's `plugin.json` through GitHub's contents API
+(falling back to `raw.githubusercontent.com` when the API's unauthenticated
+hourly limit is spent).
 
 - Not newer (the same or older version): the installed copy launches and
   nothing is downloaded.
@@ -265,8 +267,9 @@ three seconds for the folder's `plugin.json` on `raw.githubusercontent.com`.
 The old copy is moved aside before the new one is installed, and moved back if
 the install fails or the source now declares a different profile name, so a
 failed update never leaves the profile missing. A profile author releases an
-update by raising `version`; `raw.githubusercontent.com` caches files for a
-few minutes, so a just-pushed bump can take that long to be seen.
+update by raising `version`. The API is asked first because
+`raw.githubusercontent.com` is a CDN that can serve an old copy for minutes
+after a push, and not the same old copy to every client.
 
 ## Installing a profile
 

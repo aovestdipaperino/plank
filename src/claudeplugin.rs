@@ -616,12 +616,17 @@ pub fn install_profile(
     result
 }
 
-/// The raw-file URLs that hold the manifest of the profile `arg` names on
-/// GitHub, plank spelling first, or `None` for a source that is not a GitHub
+/// The URLs that serve the manifest of the profile `arg` names on GitHub, in
+/// the order to try them, or `None` for a source that is not a GitHub
 /// repository (or folder of one) and so cannot be checked without a clone.
 ///
-/// `HEAD` is the ref because a clone without `--branch` checks out the
-/// default branch, which is what `HEAD` names on `raw.githubusercontent.com`.
+/// The contents API comes first because `raw.githubusercontent.com` is a CDN
+/// that can keep serving an old copy for minutes after a push, and not the
+/// same old copy to every client: a version bump just released would read as
+/// nothing new. The raw URLs follow as the fallback for when the API's
+/// unauthenticated hourly limit is spent. Both name the default branch, as a
+/// clone without `--branch` does (`HEAD` on the raw host, no `ref` on the
+/// API), and both spellings of the manifest are tried, plank's first.
 #[must_use]
 pub fn raw_manifest_urls(arg: &str) -> Option<Vec<String>> {
     let (url, folder) = match parse_source(arg).ok()? {
@@ -630,15 +635,23 @@ pub fn raw_manifest_urls(arg: &str) -> Option<Vec<String>> {
         _ => return None,
     };
     let repo = url.strip_prefix("https://github.com/")?;
-    let base = if folder.is_empty() {
-        format!("https://raw.githubusercontent.com/{repo}/HEAD")
+    let prefix = if folder.is_empty() {
+        String::new()
     } else {
-        format!("https://raw.githubusercontent.com/{repo}/HEAD/{folder}")
+        format!("{folder}/")
     };
-    Some(vec![
-        format!("{base}/.plank-plugin/plugin.json"),
-        format!("{base}/.claude-plugin/plugin.json"),
-    ])
+    let mut out = Vec::new();
+    for manifest in [".plank-plugin/plugin.json", ".claude-plugin/plugin.json"] {
+        out.push(format!(
+            "https://api.github.com/repos/{repo}/contents/{prefix}{manifest}"
+        ));
+    }
+    for manifest in [".plank-plugin/plugin.json", ".claude-plugin/plugin.json"] {
+        out.push(format!(
+            "https://raw.githubusercontent.com/{repo}/HEAD/{prefix}{manifest}"
+        ));
+    }
+    Some(out)
 }
 
 /// The `version` the source `arg` currently offers, read without fetching
@@ -672,6 +685,7 @@ fn fetch_text(url: &str) -> Option<String> {
     let mut resp = agent
         .get(url)
         .header("User-Agent", concat!("plank/", env!("CARGO_PKG_VERSION")))
+        .header("Accept", "application/vnd.github.raw+json")
         .call()
         .ok()?;
     if !resp.status().is_success() {
@@ -1274,17 +1288,19 @@ mod tests {
     }
 
     #[test]
-    fn a_github_source_checks_its_manifest_by_raw_url() {
+    fn a_github_source_checks_its_manifest_through_the_api_then_the_cdn() {
         assert_eq!(
             raw_manifest_urls("aovestdipaperino/plank-profiles:HAL").expect("github"),
             [
+                "https://api.github.com/repos/aovestdipaperino/plank-profiles/contents/HAL/.plank-plugin/plugin.json",
+                "https://api.github.com/repos/aovestdipaperino/plank-profiles/contents/HAL/.claude-plugin/plugin.json",
                 "https://raw.githubusercontent.com/aovestdipaperino/plank-profiles/HEAD/HAL/.plank-plugin/plugin.json",
                 "https://raw.githubusercontent.com/aovestdipaperino/plank-profiles/HEAD/HAL/.claude-plugin/plugin.json",
             ]
         );
         assert_eq!(
             raw_manifest_urls("o/r").expect("github")[0],
-            "https://raw.githubusercontent.com/o/r/HEAD/.plank-plugin/plugin.json"
+            "https://api.github.com/repos/o/r/contents/.plank-plugin/plugin.json"
         );
         assert_eq!(raw_manifest_urls("https://example.com/p.tar.gz"), None);
         assert_eq!(raw_manifest_urls("https://gitlab.com/o/r"), None);
