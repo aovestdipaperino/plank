@@ -446,8 +446,11 @@ impl State {
                 } else {
                     format!("{name}.csv")
                 };
-                self.close_overlay(app);
+                // Keep the dialog open (with the name still in it) on a
+                // refused write, so the typed name is not lost; only a
+                // successful save closes it.
                 if self.save_to(app, &name) {
+                    self.close_overlay(app);
                     self.run(app, then);
                 }
             }
@@ -739,6 +742,66 @@ mod tests {
         let mut s = Session::open(80, 24, "bad.csv", Box::new(disk));
         s.step(80, 24);
         assert!(screen(&s).contains("line 2"), "{}", screen(&s));
+    }
+
+    /// A disk whose writes are always refused, like a plank quota error.
+    /// Reads and listing behave like the `MemDisk` it wraps.
+    struct FailDisk(MemDisk);
+
+    impl Disk for FailDisk {
+        fn read(&self, path: &str) -> Result<String, String> {
+            self.0.read(path)
+        }
+        fn write(&mut self, _path: &str, _text: &str) -> Result<(), String> {
+            Err("'dev.plank.csvedit' disk would grow to ... limit".into())
+        }
+        fn list(&self) -> Result<Vec<String>, String> {
+            self.0.list()
+        }
+    }
+
+    #[test]
+    fn a_refused_save_keeps_the_doc_modified_and_shows_the_error() {
+        let mut s = Session::open(80, 24, "", Box::new(FailDisk(MemDisk::default())));
+        s.step(80, 24);
+        press(&mut s, "enter");
+        type_str(&mut s, "x");
+        press(&mut s, "enter");
+        assert!(press(&mut s, "ctrl-s").is_none(), "untitled -> Save As");
+        type_str(&mut s, "x.csv");
+        assert!(
+            press(&mut s, "enter").is_none(),
+            "refused save must not close"
+        );
+        s.step(80, 24);
+        assert!(s.doc().is_modified());
+        let text = screen(&s);
+        assert!(text.contains("limit"), "{text}");
+        // Save As fix: the dialog stays open with the typed name preserved,
+        // instead of losing it when the write fails.
+        assert!(text.contains("x.csv"), "{text}");
+    }
+
+    #[test]
+    fn exit_with_a_refused_save_does_not_close() {
+        let mut s = Session::open(80, 24, "", Box::new(FailDisk(MemDisk::default())));
+        s.step(80, 24);
+        press(&mut s, "enter");
+        type_str(&mut s, "x");
+        press(&mut s, "enter");
+        assert!(press(&mut s, "alt-x").is_none(), "asks first");
+        assert!(
+            press(&mut s, "enter").is_none(),
+            "Save on untitled asks for a name"
+        );
+        type_str(&mut s, "out");
+        assert!(
+            press(&mut s, "enter").is_none(),
+            "a refused save must not close the editor"
+        );
+        s.step(80, 24);
+        assert!(s.doc().is_modified());
+        assert!(screen(&s).contains("limit"), "{}", screen(&s));
     }
 
     fn disk_with(files: &[(&str, &str)]) -> Box<dyn Disk> {
