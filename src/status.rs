@@ -402,10 +402,18 @@ fn loop_segment(st: &Status) -> String {
     }
 }
 
-/// Returns the input prompt text.
+/// Returns the input prompt text: plank's log glyph, or a bare `> ` while a
+/// profile runs, since the log is plank's own mark rather than the agent's.
+///
+/// Every caller measures the prompt through this function, so the input
+/// indent follows whichever glyph is shown.
 #[must_use]
 pub fn prompt_text() -> &'static str {
-    "🪵> "
+    prompt_text_for(crate::profile::active().is_some())
+}
+
+fn prompt_text_for(profile: bool) -> &'static str {
+    if profile { "> " } else { "🪵> " }
 }
 
 /// Collapses `home` at the front of `path` to `~` (e.g. `/Users/x/Code` with
@@ -2462,6 +2470,12 @@ pub fn no_model_lines() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_profile_prompt_drops_the_log_glyph() {
+        assert_eq!(super::prompt_text_for(false), "🪵> ");
+        assert_eq!(super::prompt_text_for(true), "> ");
+    }
 
     /// Exercises the composition directly, rather than through the
     /// process-global [`DOWNLOAD_SEGMENT`] slot: every other status-bar test
