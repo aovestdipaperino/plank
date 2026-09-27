@@ -1,0 +1,23 @@
+# A Turbo Vision CSV editor as a plank frame component. Not a workspace
+# member of plank: it targets wasm32-wasip1 (WASI makes Instant::now() work,
+# which Turbo Vision needs). Native `cargo test` runs the pure modules.
+[workspace]
+
+[package]
+name = "plank-csvedit"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+extism-pdk = "1"
+plank-guest-support = { path = "../support" }
+turbo-vision = { path = "../../../turbo-vision-wasm", default-features = false }
+
+[profile.release]
+opt-level = "s"
+strip = true
