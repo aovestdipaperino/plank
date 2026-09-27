@@ -138,6 +138,13 @@ own logo, name and accent colour, and it can bring MCP servers, skills
 and hooks with it. The same binary becomes a coding assistant, a mail
 assistant or a budget analyst depending on what you start it with:</p>
 <pre class="sh"><code>plank --profile aovestdipaperino/plank-profiles:HAL</code></pre>
+<p>The theming is what you notice first. HAL's manifest names a logo, a
+display name and a <code>#d0021b</code> accent, so the banner shows
+HAL's art and version above plank's, and the rules around the prompt
+turn red where plank's are green:</p>
+<p><img
+src="https://raw.githubusercontent.com/aovestdipaperino/plank/main/assets/profile-hal.png"
+alt="plank launched with --profile hal: HAL&#39;s pixel-art logo as the banner art beside HAL v0.3.1, plank v6.0.1 BETA and context 1.0M tokens, with the prompt framed by red rules instead of plank&#39;s green" /></p>
 <p>Under the hood a profile is an ordinary plugin whose
 <code>plugin.json</code> carries a <code>profile</code> block. Without
 <code>--profile</code> nothing about it is active, so installing one
