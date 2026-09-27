@@ -9478,9 +9478,12 @@ the original is frozen and listed in /tree"
         }
         if let Some((id, path)) = self.save_for_exit() {
             eprintln!(
-                "plank: session saved to {} (resume with: plank /resume {})",
+                "plank: session saved to {} (resume with: {})",
                 path.display(),
-                crate::session::display_id(&id)
+                resume_command(
+                    crate::profile::active_name(),
+                    crate::session::display_id(&id)
+                )
             );
         }
     }
@@ -9500,7 +9503,8 @@ the original is frozen and listed in /tree"
         };
         println!();
         println!("{bold}Session saved{reset} {dim}{}{reset}", path.display());
-        println!("Resume it later with:  {bold}plank /resume {short}{reset}");
+        let command = resume_command(crate::profile::active_name(), short);
+        println!("Resume it later with:  {bold}{command}{reset}");
     }
 
     /// Prints the run's stats at exit as a table: for each engine that served
@@ -20719,6 +20723,17 @@ fn read_batched_from(
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
+/// The command that resumes session `short`: with `--profile <name>` when a
+/// profile wrote it, since a session is bound to its profile and a plain
+/// `plank /resume` would refuse it. The installed name is used rather than the
+/// launch argument, because it resolves from any folder.
+fn resume_command(profile: Option<&str>, short: &str) -> String {
+    match profile {
+        Some(name) => format!("plank --profile {name} /resume {short}"),
+        None => format!("plank /resume {short}"),
+    }
+}
+
 /// What `/edit-profile` says when plank was started without `--profile`.
 const NO_ACTIVE_PROFILE: &str =
     "/edit-profile: no profile is active; start plank with --profile NAME";
@@ -20742,6 +20757,18 @@ mod tests {
             gen_secs: gen_.1,
             tool_secs: tools,
         }
+    }
+
+    #[test]
+    fn a_profile_session_resumes_under_its_profile() {
+        assert_eq!(
+            resume_command(None, "sneezy-hahn"),
+            "plank /resume sneezy-hahn"
+        );
+        assert_eq!(
+            resume_command(Some("hal"), "sneezy-hahn"),
+            "plank --profile hal /resume sneezy-hahn"
+        );
     }
 
     #[test]
