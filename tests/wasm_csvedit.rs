@@ -109,6 +109,26 @@ fn csvedit_edits_a_cell_and_saves_to_the_ram_disk() {
     );
 }
 
+/// The Mac chord for Exit: a stock Mac terminal types Option+X as a
+/// character, so Ctrl+Q is the exit a Mac keyboard can reach.
+#[test]
+fn csvedit_ctrl_q_closes_a_clean_frame() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load(ID, &wasm, &["fs", "log"]).expect("load");
+    h.call(
+        ID,
+        "frame_open",
+        br#"{"w": 80, "h": 24, "seed": 1, "arg": "", "config": {}}"#,
+    )
+    .expect("frame_open");
+    let out = key(h.as_mut(), "ctrl-q", None);
+    assert!(
+        out.starts_with(r#"{"close": "csvedit:"#),
+        "expected a close reply naming the editor: {out}"
+    );
+}
+
 #[test]
 fn csvedit_command_specs_name_both_commands() {
     let wasm = guest_or_skip!();

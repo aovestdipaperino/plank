@@ -9,7 +9,8 @@
 use turbo_vision::app::{AppHandler, Application};
 use turbo_vision::core::command::{CM_CLOSE, CM_QUIT, CommandId};
 use turbo_vision::core::event::{
-    Event, EventType, KB_ALT_X, KB_CTRL_S, KB_DEL, KB_ENTER, KB_ESC, KB_INS,
+    Event, EventType, KB_ALT_X, KB_CTRL_K, KB_CTRL_L, KB_CTRL_O, KB_CTRL_Q, KB_CTRL_R, KB_CTRL_S,
+    KB_CTRL_Y, KB_DEL, KB_ENTER, KB_ESC, KB_INS,
 };
 use turbo_vision::core::geometry::Rect;
 use turbo_vision::core::menu_data::{Menu, MenuItem, MenuItemBuilder};
@@ -99,6 +100,10 @@ fn interior_bounds(window: Rect) -> (Rect, Rect) {
     (Rect::new(0, 0, iw, ih - 1), Rect::new(0, ih - 1, iw, ih))
 }
 
+/// The key hints the menus show. plank is macOS-only, and a stock Mac
+/// terminal types Option as a character (no Alt+X), has no Insert key, and
+/// keeps F10 behind fn, so each hint names the Control chord a Mac keyboard
+/// can type. The PC keys (Alt+X, Ins, Del, Ctrl+Ins, Ctrl+Del) still work.
 fn menu_bar(width: i16) -> MenuBar {
     let item = |text: &str, command: CommandId, shortcut: Option<&str>| {
         let b = MenuItemBuilder::new().text(text).command(command);
@@ -111,11 +116,11 @@ fn menu_bar(width: i16) -> MenuBar {
         "~F~ile",
         Menu::from_items(vec![
             item("~N~ew", CMD_NEW, None),
-            item("~O~pen...", CMD_OPEN, None),
+            item("~O~pen...", CMD_OPEN, Some("Ctrl+O")),
             item("~S~ave", CMD_SAVE, Some("Ctrl+S")),
             item("Save ~a~s...", CMD_SAVE_AS, None),
             MenuItem::separator(),
-            item("E~x~it", CMD_EXIT, Some("Alt+X")),
+            item("E~x~it", CMD_EXIT, Some("Ctrl+Q")),
         ]),
     );
     let edit = SubMenu::new(
@@ -128,15 +133,15 @@ fn menu_bar(width: i16) -> MenuBar {
     let row = SubMenu::new(
         "~R~ow",
         Menu::from_items(vec![
-            item("~I~nsert", CMD_ROW_INS, Some("Ins")),
-            item("~D~elete", CMD_ROW_DEL, Some("Del")),
+            item("~I~nsert", CMD_ROW_INS, Some("Ctrl+R")),
+            item("~D~elete", CMD_ROW_DEL, Some("Ctrl+Y")),
         ]),
     );
     let col = SubMenu::new(
         "~C~olumn",
         Menu::from_items(vec![
-            item("~I~nsert", CMD_COL_INS, Some("Ctrl+Ins")),
-            item("~D~elete", CMD_COL_DEL, Some("Ctrl+Del")),
+            item("~I~nsert", CMD_COL_INS, Some("Ctrl+L")),
+            item("~D~elete", CMD_COL_DEL, Some("Ctrl+K")),
         ]),
     );
     let mut bar = MenuBar::new(Rect::new(0, 0, width, 1));
@@ -148,17 +153,20 @@ fn menu_bar(width: i16) -> MenuBar {
 
 fn status_line(width: i16, height: i16) -> StatusLine {
     // Hint text only: every key here is claimed in `pre_event`, so the items
-    // carry the commands for mouse clicks and bind no key of their own.
+    // carry the commands for mouse clicks and bind no key of their own. Each
+    // item takes its text plus four columns, so all five would need 70; at
+    // the 60-column minimum Enter (the obvious key) gives way to F10, the one
+    // way into the menus. F10 Menu has no command: the menu bar owns F10.
     let item = |text: &str, command: CommandId| {
         StatusItemBuilder::new().text(text).command(command).build()
     };
     StatusLine::new(
         Rect::new(0, height - 1, width, height),
         vec![
-            item("~Enter~ Edit", CMD_EDIT_CELL),
-            item("~Ins~ Row", CMD_ROW_INS),
+            item("~Ctrl-R~ Row", CMD_ROW_INS),
             item("~Ctrl-S~ Save", CMD_SAVE),
-            item("~Alt-X~ Exit", CMD_EXIT),
+            item("~Ctrl-Q~ Exit", CMD_EXIT),
+            item("~F10~ Menu", 0),
         ],
     )
 }
@@ -552,6 +560,13 @@ impl AppHandler for State {
             KB_INS => CMD_ROW_INS,
             KB_DEL => CMD_ROW_DEL,
             KB_CTRL_S => CMD_SAVE,
+            // The same commands on chords a Mac keyboard can type.
+            KB_CTRL_Q => CMD_EXIT,
+            KB_CTRL_O => CMD_OPEN,
+            KB_CTRL_R => CMD_ROW_INS,
+            KB_CTRL_Y => CMD_ROW_DEL,
+            KB_CTRL_L => CMD_COL_INS,
+            KB_CTRL_K => CMD_COL_DEL,
             _ => return,
         };
         *event = Event::command(command);
@@ -952,5 +967,72 @@ mod tests {
             Some('\u{2557}'),
             "the frame's corner is at the new edge: {row1}"
         );
+    }
+
+    #[test]
+    fn mac_chords_insert_and_delete_rows_and_columns() {
+        let mut s = new_session();
+        assert!(press(&mut s, "ctrl-r").is_none());
+        assert_eq!(s.doc().height(), 4);
+        assert!(press(&mut s, "ctrl-y").is_none());
+        assert_eq!(s.doc().height(), 3);
+        assert!(press(&mut s, "ctrl-l").is_none());
+        assert_eq!(s.doc().width(), 4);
+        assert!(press(&mut s, "ctrl-k").is_none());
+        assert_eq!(s.doc().width(), 3);
+    }
+
+    #[test]
+    fn ctrl_o_shows_the_open_dialog() {
+        let mut s = Session::open(80, 24, "", disk_with(&[("a.csv", "h\n1\n")]));
+        s.step(80, 24);
+        assert!(press(&mut s, "ctrl-o").is_none());
+        s.step(80, 24);
+        assert!(screen(&s).contains("a.csv"), "{}", screen(&s));
+        press(&mut s, "enter");
+        assert_eq!(s.doc().header()[0], "h");
+    }
+
+    #[test]
+    fn ctrl_q_with_unsaved_changes_asks_first() {
+        let mut s = new_session();
+        press(&mut s, "ctrl-r");
+        assert!(press(&mut s, "ctrl-q").is_none(), "asks first");
+        s.step(80, 24);
+        assert!(screen(&s).contains("Discard"), "{}", screen(&s));
+        press(&mut s, "tab");
+        let line = press(&mut s, "enter").expect("closes");
+        assert!(line.contains("closed without saving"), "{line}");
+    }
+
+    #[test]
+    fn ctrl_q_when_clean_closes_at_once() {
+        let mut s = new_session();
+        let line = press(&mut s, "ctrl-q").expect("closes");
+        assert!(line.contains("csvedit"), "{line}");
+    }
+
+    #[test]
+    fn ctrl_q_inside_a_dialog_does_not_exit() {
+        let mut s = new_session();
+        press(&mut s, "enter");
+        assert!(press(&mut s, "ctrl-q").is_none());
+        s.step(80, 24);
+        assert!(screen(&s).contains("Edit cell"), "{}", screen(&s));
+    }
+
+    #[test]
+    fn the_status_line_shows_the_mac_chords_at_the_minimum_width() {
+        let mut s = new_session();
+        s.step(60, 16);
+        let bottom: String = s
+            .cells()
+            .iter()
+            .filter(|c| c.y == 15)
+            .map(|c| c.ch)
+            .collect();
+        for hint in ["Ctrl-R Row", "Ctrl-S Save", "Ctrl-Q Exit", "F10 Menu"] {
+            assert!(bottom.contains(hint), "{hint}: {bottom}");
+        }
     }
 }

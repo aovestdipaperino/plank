@@ -172,4 +172,28 @@ mod tests {
         assert_eq!(payload_text(r#"{"code": "\"", "text": "\""}"#), Some('"'));
         assert_eq!(payload_text(r#"{"code": "enter"}"#), None);
     }
+
+    #[test]
+    fn the_mac_chords_are_distinct_control_codes() {
+        use turbo_vision::core::event::{
+            KB_CTRL_K, KB_CTRL_L, KB_CTRL_O, KB_CTRL_Q, KB_CTRL_R, KB_CTRL_Y, KB_TAB,
+        };
+        let chords = [
+            ("ctrl-q", KB_CTRL_Q),
+            ("ctrl-o", KB_CTRL_O),
+            ("ctrl-r", KB_CTRL_R),
+            ("ctrl-y", KB_CTRL_Y),
+            ("ctrl-l", KB_CTRL_L),
+            ("ctrl-k", KB_CTRL_K),
+        ];
+        for (code, expected) in chords {
+            let got = code_of(code, None);
+            assert_eq!(got, expected, "{code}");
+            assert!(![KB_TAB, KB_ENTER, KB_ESC].contains(&got), "{code}");
+        }
+        let mut codes: Vec<u16> = chords.iter().map(|(c, _)| code_of(c, None)).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), chords.len());
+    }
 }
