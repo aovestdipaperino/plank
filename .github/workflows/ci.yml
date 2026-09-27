@@ -24,7 +24,9 @@ jobs:
           # The default build includes `plugins` now, so this job compiles the
           # WASM host and the guest-backed tests. Without the cross target the
           # guests below cannot be built and those tests would silently skip.
-          targets: wasm32-unknown-unknown
+          # csvedit is the one guest on wasm32-wasip1 (Turbo Vision reads the
+          # clock, which needs WASI).
+          targets: wasm32-unknown-unknown, wasm32-wasip1
 
       - uses: Swatinem/rust-cache@v2
 
@@ -79,6 +81,9 @@ jobs:
 
       - name: Test the shared guest crate
         run: cargo test --manifest-path guests/support/Cargo.toml
+
+      - name: Test the CSV editor guest natively
+        run: cargo test --manifest-path guests/csvedit/Cargo.toml --lib
 
       - name: Package plugin archives
         run: sh guests/package.sh

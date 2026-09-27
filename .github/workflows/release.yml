@@ -102,7 +102,7 @@ jobs:
       # single matrix entry means they are produced exactly once. `--clobber`
       # keeps a re-run idempotent.
       - name: Add wasm32 target for the guests
-        run: rustup target add wasm32-unknown-unknown
+        run: rustup target add wasm32-unknown-unknown wasm32-wasip1
 
       - name: Package plugin archives
         run: sh guests/package.sh
