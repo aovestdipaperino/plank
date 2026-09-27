@@ -12686,7 +12686,11 @@ impl Agent<'_> {
             // arcade below it.
             if let Some(open) = &wasm_frame {
                 let code = tui::key_code_name(key);
-                match self.tool_ctx.wasm.frame_key(open, &code) {
+                match self
+                    .tool_ctx
+                    .wasm
+                    .frame_key(open, &code, tui::key_text(key))
+                {
                     Ok(crate::wasmreg::FrameOutcome::Stay) => {}
                     Ok(crate::wasmreg::FrameOutcome::Close(line)) => {
                         if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {

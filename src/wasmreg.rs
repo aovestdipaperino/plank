@@ -1277,6 +1277,19 @@ pub fn json_str(s: &str) -> String {
     out
 }
 
+/// The `frame_key` payload. `text` is omitted rather than null when the key
+/// types nothing, so a guest that predates it sees exactly the old payload.
+fn frame_key_payload(code: &str, text: Option<char>) -> String {
+    match text {
+        Some(c) => format!(
+            "{{\"code\": {}, \"text\": {}}}",
+            json_str(code),
+            json_str(&c.to_string())
+        ),
+        None => format!("{{\"code\": {}}}", json_str(code)),
+    }
+}
+
 /// One slash command a `command` component contributes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -1832,12 +1845,18 @@ impl Session {
         }
     }
 
-    /// Delivers a key. `code` is the key's name (`"left"`, `"q"`, `"space"`).
+    /// Delivers a key. `code` is the key's name (`"left"`, `"q"`, `"space"`),
+    /// `text` the typed character with its case, when the key types one.
     ///
     /// # Errors
     /// Returns the message to show when the call traps; the caller closes.
-    pub fn frame_key(&mut self, frame: &OpenFrame, code: &str) -> Result<FrameOutcome, String> {
-        let payload = format!("{{\"code\": {}}}", json_str(code));
+    pub fn frame_key(
+        &mut self,
+        frame: &OpenFrame,
+        code: &str,
+        text: Option<char>,
+    ) -> Result<FrameOutcome, String> {
+        let payload = frame_key_payload(code, text);
         let bytes = self
             .host
             .call(&frame.id, "frame_key", payload.as_bytes())
@@ -2917,6 +2936,19 @@ pub fn module_sha256(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_key_payload_adds_text_only_when_present() {
+        assert_eq!(
+            frame_key_payload("a", Some('A')),
+            r#"{"code": "a", "text": "A"}"#
+        );
+        assert_eq!(frame_key_payload("enter", None), r#"{"code": "enter"}"#);
+        assert_eq!(
+            frame_key_payload("\"", Some('"')),
+            r#"{"code": "\"", "text": "\""}"#
+        );
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("plank-wasmreg-{tag}-{}", std::process::id()));

@@ -1126,11 +1126,11 @@ fn a_frame_component_opens_steps_and_closes() {
 
     // An ordinary key is absorbed; `q` closes with a line for the scrollback.
     assert_eq!(
-        session.frame_key(&frame, "left").expect("key"),
+        session.frame_key(&frame, "left", None).expect("key"),
         FrameOutcome::Stay
     );
     assert_eq!(
-        session.frame_key(&frame, "q").expect("key"),
+        session.frame_key(&frame, "q", None).expect("key"),
         FrameOutcome::Close(Some("the bouncer says goodbye".to_string()))
     );
     assert_eq!(

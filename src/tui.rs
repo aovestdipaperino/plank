@@ -4866,6 +4866,25 @@ pub fn key_code_name(key: ratatui::crossterm::event::KeyEvent) -> String {
     out
 }
 
+/// The character a key types, case kept, for the `text` field of a frame's
+/// key payload. `None` for named keys and for Ctrl/Alt chords, which type
+/// nothing. `code` lowercases on purpose (games match on it); an editor needs
+/// this instead.
+#[must_use]
+pub fn key_text(key: ratatui::crossterm::event::KeyEvent) -> Option<char> {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    match key.code {
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
 /// Draws an open WASM `frame` component, on the same terms as the built-in
 /// faces: veiled over the live UI, or on a real black ground.
 ///
@@ -5804,6 +5823,33 @@ fn place_rotating_tip(
 mod tests {
     use super::SubPane;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn key_text_keeps_case_and_skips_chords_and_named_keys() {
+        use super::{key_code_name, key_text};
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = |code, m| KeyEvent::new(code, m);
+        assert_eq!(
+            key_text(k(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            Some('A')
+        );
+        assert_eq!(
+            key_text(k(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some('a')
+        );
+        assert_eq!(
+            key_text(k(KeyCode::Char(' '), KeyModifiers::NONE)),
+            Some(' ')
+        );
+        assert_eq!(key_text(k(KeyCode::Char('s'), KeyModifiers::CONTROL)), None);
+        assert_eq!(key_text(k(KeyCode::Char('x'), KeyModifiers::ALT)), None);
+        assert_eq!(key_text(k(KeyCode::Enter, KeyModifiers::NONE)), None);
+        // The code stays exactly as before: games match on it.
+        assert_eq!(
+            key_code_name(k(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            "a"
+        );
+    }
 
     /// The click box for the footer's jobs segment is the run between the
     /// ` | ` separators around the mark, and a frame without the mark clears it.
