@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [6.0.0] - 2026-09-27
+
 ### Added
 
 - **`--profile <name>` launches plank as a named agent declared in a
