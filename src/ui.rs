@@ -11814,12 +11814,12 @@ impl Agent<'_> {
     /// `log`. Used both at launch and after `/clear` and `/new`, so a cleared
     /// screen looks exactly like a fresh start.
     fn tui_write_banner(&self, log: &mut OutputLog) {
-        let version = format!(
-            "plank {} 🪵 Agent, context {} tokens",
-            crate::logo::version_label(),
-            status::format_ctx_size(self.engine.ctx_size())
+        let version = masthead_label(
+            crate::profile::active().map(|_| crate::profile::display_name()),
+            &crate::logo::version_label(),
+            &status::format_ctx_size(self.engine.ctx_size()),
         );
-        let art = tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH));
+        let art = tui::ansi_to_lines(&crate::logo::active_art(crate::logo::DEFAULT_WIDTH));
         for line in Self::masthead(art, version) {
             log.push_spans(line.spans);
         }
@@ -20573,6 +20573,15 @@ fn read_batched_from(
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
+/// The TUI masthead's text: plank's own line, or for a profile its display
+/// name first with plank's version kept beside it for bug reports.
+fn masthead_label(profile_name: Option<&str>, version: &str, ctx: &str) -> String {
+    match profile_name {
+        Some(name) => format!("{name}  plank {version}, context {ctx} tokens"),
+        None => format!("plank {version} 🪵 Agent, context {ctx} tokens"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn stats_record(prefill: (i64, f64), gen_: (i64, f64), tools: f64) -> crate::speeds::Record {
@@ -20583,6 +20592,18 @@ mod tests {
             gen_secs: gen_.1,
             tool_secs: tools,
         }
+    }
+
+    #[test]
+    fn the_masthead_names_the_profile_and_keeps_the_plank_version() {
+        assert_eq!(
+            masthead_label(None, "v5.3.1", "1M"),
+            "plank v5.3.1 🪵 Agent, context 1M tokens"
+        );
+        let hal = masthead_label(Some("HAL"), "v5.3.1", "1M");
+        assert!(hal.starts_with("HAL  "), "{hal}");
+        assert!(hal.contains("plank v5.3.1"), "{hal}");
+        assert!(!hal.contains("🪵"), "{hal}");
     }
 
     #[test]

@@ -151,14 +151,21 @@ fn is_beta(version: &str, patch: &str) -> bool {
 /// version outright.
 #[must_use]
 pub fn banner() -> String {
-    let (logo, label) = match crate::profile::active() {
-        Some(a) => (
-            art_from_path(a.spec.logo.as_deref(), DEFAULT_WIDTH),
-            banner_label(Some(crate::profile::display_name())),
-        ),
-        None => (art(DEFAULT_WIDTH), banner_label(None)),
-    };
-    format!("{logo}      {label}\n")
+    let label = banner_label(crate::profile::active().map(|_| crate::profile::display_name()));
+    format!("{}      {label}\n", active_art(DEFAULT_WIDTH))
+}
+
+/// The logo for this run, `width` columns wide: the active profile's `logo`
+/// when a profile is running, else plank's own art.
+///
+/// The one place both banners, plain and TUI, choose their art, so a profile
+/// cannot show its logo on one front end and plank's on the other.
+#[must_use]
+pub fn active_art(width: u32) -> String {
+    match crate::profile::active() {
+        Some(a) => art_from_path(a.spec.logo.as_deref(), width),
+        None => art(width),
+    }
 }
 
 /// The banner's text label: the version alone for plain plank, or the
