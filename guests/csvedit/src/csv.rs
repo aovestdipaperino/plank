@@ -51,10 +51,8 @@ pub fn parse(text: &str) -> Parsed {
             '\r' if chars.peek() == Some(&'\n') => {}
             '\n' => {
                 line += 1;
-                if any || !field.is_empty() {
-                    row.push(std::mem::take(&mut field));
-                    rows.push(std::mem::take(&mut row));
-                }
+                row.push(std::mem::take(&mut field));
+                rows.push(std::mem::take(&mut row));
                 any = false;
             }
             c => {
@@ -127,6 +125,15 @@ mod tests {
         let p = parse("a,b\nc,\"open\nstill open");
         assert_eq!(p.rows, rows(&[&["a", "b"]]));
         assert_eq!(p.error, Some(2));
+    }
+
+    #[test]
+    fn a_blank_line_is_an_empty_record() {
+        assert!(parse("").rows.is_empty());
+        assert_eq!(parse("a\n").rows, rows(&[&["a"]]));
+        assert_eq!(parse("a\n\n").rows, rows(&[&["a"], &[""]]));
+        assert_eq!(parse("a,b\n\nc,d\n").rows, rows(&[&["a", "b"], &[""], &["c", "d"]]));
+        assert_eq!(parse("a,b\r\n\r\nc,d").rows, rows(&[&["a", "b"], &[""], &["c", "d"]]));
     }
 
     #[test]

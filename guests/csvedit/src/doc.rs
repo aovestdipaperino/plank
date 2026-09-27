@@ -185,6 +185,23 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_row_survives_a_round_trip() {
+        let (d, err) = CsvDoc::from_text("h1,h2\n\nx,y\n");
+        assert_eq!(err, None);
+        assert_eq!(d.height(), 2);
+        assert_eq!(d.cell(0, 0), "");
+        assert_eq!(d.cell(0, 1), "");
+
+        let mut one_col = CsvDoc::new_blank(1, 1);
+        let text = one_col.to_text();
+        let (round_tripped, err2) = CsvDoc::from_text(&text);
+        assert_eq!(err2, None);
+        assert_eq!(round_tripped.header(), one_col.header());
+        assert_eq!(round_tripped.height(), one_col.height());
+        one_col.mark_saved();
+    }
+
+    #[test]
     fn edits_mark_modified_and_save_clears_it() {
         let mut d = CsvDoc::new_blank(2, 1);
         d.set_cell(0, 1, "v".into());
