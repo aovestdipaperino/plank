@@ -185,6 +185,21 @@ impl Capability {
             "declared but not implemented yet: the grant reaches no host function"
         }
     }
+
+    /// The plain-language reach of this grant, shown wherever a user decides
+    /// whether to approve it or audits what a component already holds.
+    ///
+    /// Most capabilities are self-explanatory from their label; `fs` is not —
+    /// it is private and in-memory, not the real filesystem the name suggests
+    /// — so it gets a note. Add one here, not a separate comment elsewhere, so
+    /// the approval prompt and `/plugins info` cannot drift apart.
+    #[must_use]
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Self::Fs => Some("a private in-memory scratch disk, cleared when plank exits"),
+            _ => None,
+        }
+    }
 }
 
 /// One mouse event for [`Session::frame_mouse`].
@@ -2013,7 +2028,10 @@ impl Registry {
             .iter()
             .map(|c| {
                 if c.is_wired() {
-                    c.label().to_string()
+                    match c.note() {
+                        Some(note) => format!("{} ({note})", c.label()),
+                        None => c.label().to_string(),
+                    }
                 } else {
                     format!("{} (not wired)", c.label())
                 }
@@ -2598,11 +2616,14 @@ pub fn render_held(registry: &Registry) -> String {
             component.origin.label(),
             decision.reason()
         );
-        let caps: Vec<&str> = component
+        let caps: Vec<String> = component
             .manifest
             .capabilities
             .iter()
-            .map(|c| c.label())
+            .map(|c| match c.note() {
+                Some(note) => format!("{} ({note})", c.label()),
+                None => c.label().to_string(),
+            })
             .collect();
         let _ = write!(out, "    wants: {}", caps.join(", "));
         if component.is_privileged() {
@@ -2661,7 +2682,15 @@ pub fn render_components(set: &WasmSet) -> String {
             out.push_str(" ⚠ not sandboxed");
         }
         out.push('\n');
-        let caps: Vec<&str> = c.manifest.capabilities.iter().map(|c| c.label()).collect();
+        let caps: Vec<String> = c
+            .manifest
+            .capabilities
+            .iter()
+            .map(|c| match c.note() {
+                Some(note) => format!("{} ({note})", c.label()),
+                None => c.label().to_string(),
+            })
+            .collect();
         let _ = writeln!(out, "    capabilities: {}", caps.join(", "));
     }
     for w in &set.warnings {
@@ -3421,6 +3450,51 @@ mod tests {
         // `state` is wired, so it must not be warned about — a warning on every
         // grant would be noise nobody reads.
         assert!(!joined.contains("'state'"), "{joined}");
+    }
+
+    /// The spec requires the approval prompt and `/plugins info` to describe
+    /// `fs` as a private in-memory scratch disk rather than just the bare word
+    /// `fs` — otherwise a user approving it, now that it is no longer flagged
+    /// as sandbox-breaking, sees strictly less than before.
+    #[test]
+    fn describe_explains_what_an_fs_grant_reaches() {
+        let c = component(Origin::UserScan, vec![Capability::Fs]);
+        let mut trust = TrustStore::ephemeral();
+        trust
+            .approve(&c, "hash-a", Path::new("/repo"), &SigStatus::Absent)
+            .unwrap();
+        let registry = Registry {
+            loaded: vec![Loaded {
+                component: c,
+                strikes: 0,
+                tools: Vec::new(),
+                commands: Vec::new(),
+            }],
+            ..Registry::default()
+        };
+        let text = registry.describe("dev.plank.demo", &trust).unwrap();
+        assert!(
+            text.contains("fs (a private in-memory scratch disk, cleared when plank exits)"),
+            "{text}"
+        );
+    }
+
+    /// Same note, this time on the held-component listing that backs the
+    /// approval surface in `/plugins`. It must not carry the "not sandboxed"
+    /// warning — `fs` no longer undoes the sandbox.
+    #[test]
+    fn held_component_listing_explains_an_fs_grant() {
+        let c = component(Origin::UserScan, vec![Capability::Fs]);
+        let registry = Registry {
+            held: vec![(c, Decision::Unknown)],
+            ..Registry::default()
+        };
+        let text = render_held(&registry);
+        assert!(
+            text.contains("fs (a private in-memory scratch disk, cleared when plank exits)"),
+            "{text}"
+        );
+        assert!(!text.contains("not sandboxed"), "{text}");
     }
 
     /// Every capability is either wired or has a reason. A new variant added
