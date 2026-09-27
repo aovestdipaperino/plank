@@ -214,12 +214,14 @@ running `bash`, with no logo, so it also exercises the fallback path. Its
 `README.md` shows how to launch it with `--profile examples/profiles/chatbgt`,
 which offers to install it on first use.
 
-HAL, a mail-and-calendar profile with a logo whose tools arrive over MCP from a
-server that does not exist yet, lives in its own repository,
+HAL, a mail profile with a logo, lives in its own repository,
 [`aovestdipaperino/plank-profiles`](https://github.com/aovestdipaperino/plank-profiles),
 and launches with `plank --profile aovestdipaperino/plank-profiles:HAL`. Its
-`README.md` covers the exact allow-list it ships and the auth methods it
-deliberately does not support.
+mail tools come over MCP from
+[`plank-mail-mcp`](https://github.com/aovestdipaperino/plank-mail-mcp), a
+separate server over one Outlook mailbox that can read, flag, draft and file
+mail but cannot send or delete it. Its `README.md` covers the builtin
+allow-list it ships and how the two limits combine.
 
 ## Launching from a path or a repository
 

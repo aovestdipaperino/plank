@@ -36,8 +36,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   time rather than at the launch the design makes fatal. Both manifest
   spellings are now accepted by installation, which also makes a plank-spelling
   plugin fetchable by `/install-claude-plugin` for the first time. HAL, a mail
-  and calendar profile whose MCP server is not built yet, is published in
-  `aovestdipaperino/plank-profiles`. `--profile` is refused on a Qwen model, whose prompt is built
+  profile over one Outlook mailbox, is published in
+  `aovestdipaperino/plank-profiles`; its tools come from the separate
+  `aovestdipaperino/plank-mail-mcp` server, which can read and tidy mail but
+  cannot send or delete it. `--profile` is refused on a Qwen model, whose prompt is built
   separately and would ignore the profile's own.
 - **`/memory calibrate [N]` and `memory.gateBias`.** The System-1 memory gate
   always shows "yes" as answer A, and a model that leans toward a letter for
