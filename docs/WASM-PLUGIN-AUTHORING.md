@@ -180,7 +180,8 @@ expect to be elided — plank's own segments are never dropped on your behalf.
 - `frame_key(json) -> {stay}|{close: "line"}`. The payload is
   `{"code": "ctrl-s"}` for a key that types nothing, and gains a `text` field
   holding the one character the key typed when it typed one:
-  `{"code": "a", "text": "a"}`, `{"code": "A", "text": "A"}`.
+  `{"code": "a", "text": "a"}`, and Shift+A gives `{"code": "a", "text": "A"}`:
+  `code` is always lowercase, so read the case from `text`.
 - `frame_mouse(json) -> Outcome` — **optional**. Without it your frame is
   keyboard-only; plank does not strike you for declining an optional export.
 - `frame_close() -> {scrollback?}`
@@ -401,7 +402,14 @@ buffers sized to the `w`/`h` you were handed rather than to a worst case.
   guest built for `wasm32-wasip1` rather than `wasm32-unknown-unknown`, because
   Turbo Vision reads the clock; it gets WASI with no preopened directories, so
   the RAM disk is still the only storage it can reach. Its Extism glue is one
-  file, `src/frame.rs`, and everything behind it is tested natively.
+  file, `src/frame.rs`, and everything behind it is tested natively. Its keys
+  are chosen so a stock Mac keyboard can type every one, since a Mac terminal
+  types Option as a character (no Alt+X), has no Insert key and hides F10
+  behind fn: Enter edits a cell, Ctrl+S saves, Ctrl+O opens, Ctrl+Q exits
+  (asking first about unsaved changes), Ctrl+R and Ctrl+Y insert and delete a
+  row, Ctrl+L and Ctrl+K insert and delete a column, and F10 opens the menus.
+  The PC keys still work alongside them: Alt+X, Ins, Del, Ctrl+Ins and
+  Ctrl+Del.
 - `spike/text-guest` — the smallest `frame_step_text` component.
 - `spike/abi-guest` — one component exercising every surface, used by plank's
   own integration tests.
