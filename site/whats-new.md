@@ -36,6 +36,8 @@ any: the permission it signs in with does not include sending, and its mail
 server has no delete tool. The [Profiles chapter](/guide/14-profiles) of the
 guide covers installing, updating and writing your own.
 
+![plank launched with --profile hal: HAL's pixel-art logo as the banner art beside HAL v0.3.1, plank v6.0.1 BETA and context 1.0M tokens, with the prompt framed by red rules instead of plank's green](/assets/profile-hal.png)
+
 Two smaller changes came along. `--plugin-dir` is gone: put a plugin you are
 working on in `./.plank/plugins/`, and launch a profile folder with
 `--profile <folder>`. And an MCP server that stops answering is now restarted
