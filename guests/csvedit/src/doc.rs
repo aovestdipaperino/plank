@@ -44,7 +44,12 @@ impl CsvDoc {
         let mut rows = parsed.rows.into_iter();
         let mut header = rows.next().unwrap_or_default();
         let mut body: Vec<Vec<String>> = rows.collect();
-        let width = body.iter().map(Vec::len).chain([header.len(), 1]).max().unwrap_or(1);
+        let width = body
+            .iter()
+            .map(Vec::len)
+            .chain([header.len(), 1])
+            .max()
+            .unwrap_or(1);
         for i in header.len()..width {
             header.push(column_name(i));
         }
@@ -54,7 +59,14 @@ impl CsvDoc {
         if body.is_empty() {
             body.push(vec![String::new(); width]);
         }
-        (Self { header, body, modified: parsed.error.is_some() }, parsed.error)
+        (
+            Self {
+                header,
+                body,
+                modified: parsed.error.is_some(),
+            },
+            parsed.error,
+        )
     }
 
     /// The document as CSV text, header first.
@@ -84,7 +96,10 @@ impl CsvDoc {
     }
     #[must_use]
     pub fn cell(&self, row: usize, col: usize) -> &str {
-        self.body.get(row).and_then(|r| r.get(col)).map_or("", String::as_str)
+        self.body
+            .get(row)
+            .and_then(|r| r.get(col))
+            .map_or("", String::as_str)
     }
 
     pub fn set_cell(&mut self, row: usize, col: usize, value: String) {

@@ -62,7 +62,10 @@ pub fn parse(text: &str) -> Parsed {
         }
     }
     if in_quotes {
-        return Parsed { rows, error: Some(quote_line) };
+        return Parsed {
+            rows,
+            error: Some(quote_line),
+        };
     }
     if any || !field.is_empty() {
         row.push(field);
@@ -98,7 +101,9 @@ mod tests {
     use super::*;
 
     fn rows(v: &[&[&str]]) -> Vec<Vec<String>> {
-        v.iter().map(|r| r.iter().map(|s| (*s).to_string()).collect()).collect()
+        v.iter()
+            .map(|r| r.iter().map(|s| (*s).to_string()).collect())
+            .collect()
     }
 
     #[test]
@@ -132,8 +137,14 @@ mod tests {
         assert!(parse("").rows.is_empty());
         assert_eq!(parse("a\n").rows, rows(&[&["a"]]));
         assert_eq!(parse("a\n\n").rows, rows(&[&["a"], &[""]]));
-        assert_eq!(parse("a,b\n\nc,d\n").rows, rows(&[&["a", "b"], &[""], &["c", "d"]]));
-        assert_eq!(parse("a,b\r\n\r\nc,d").rows, rows(&[&["a", "b"], &[""], &["c", "d"]]));
+        assert_eq!(
+            parse("a,b\n\nc,d\n").rows,
+            rows(&[&["a", "b"], &[""], &["c", "d"]])
+        );
+        assert_eq!(
+            parse("a,b\r\n\r\nc,d").rows,
+            rows(&[&["a", "b"], &[""], &["c", "d"]])
+        );
     }
 
     #[test]

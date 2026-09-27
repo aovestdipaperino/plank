@@ -308,8 +308,22 @@ mod tests {
     #[test]
     fn encode_cells_writes_flags_and_trailing_background() {
         let cells = [
-            CellGlyph { x: 1, y: 2, ch: 'A', fg: (1, 2, 3), bg: Some((4, 5, 6)), bold: true },
-            CellGlyph { x: 0, y: 0, ch: 'b', fg: (7, 8, 9), bg: None, bold: false },
+            CellGlyph {
+                x: 1,
+                y: 2,
+                ch: 'A',
+                fg: (1, 2, 3),
+                bg: Some((4, 5, 6)),
+                bold: true,
+            },
+            CellGlyph {
+                x: 0,
+                y: 0,
+                ch: 'b',
+                fg: (7, 8, 9),
+                bg: None,
+                bold: false,
+            },
         ];
         let out = encode_cells(&cells, 10, 5);
         assert_eq!(&out[0..4], b"PGLY");

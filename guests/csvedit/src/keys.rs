@@ -99,7 +99,9 @@ pub fn payload_text(payload: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turbo_vision::core::event::{KB_DEL, KB_ENTER, KB_ESC, KB_F10, KB_INS, KB_LEFT, KB_SHIFT_TAB};
+    use turbo_vision::core::event::{
+        KB_DEL, KB_ENTER, KB_ESC, KB_F10, KB_INS, KB_LEFT, KB_SHIFT_TAB,
+    };
 
     fn code_of(code: &str, text: Option<char>) -> u16 {
         translate(code, text).expect("translates").key_code

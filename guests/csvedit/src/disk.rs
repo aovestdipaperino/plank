@@ -38,7 +38,12 @@ impl Disk for MemDisk {
         Ok(())
     }
     fn list(&self) -> Result<Vec<String>, String> {
-        Ok(self.0.keys().filter(|k| k.ends_with(".csv")).cloned().collect())
+        Ok(self
+            .0
+            .keys()
+            .filter(|k| k.ends_with(".csv"))
+            .cloned()
+            .collect())
     }
 }
 
@@ -106,22 +111,16 @@ fn untag(reply: Vec<u8>) -> Result<Vec<u8>, String> {
 #[cfg(target_arch = "wasm32")]
 impl Disk for PlankDisk {
     fn read(&self, path: &str) -> Result<String, String> {
-        let reply =
-            unsafe { host::plank_fs_read(path.to_string()) }.map_err(|e| e.to_string())?;
+        let reply = unsafe { host::plank_fs_read(path.to_string()) }.map_err(|e| e.to_string())?;
         String::from_utf8(untag(reply)?).map_err(|_| format!("{path} is not UTF-8"))
     }
     fn write(&mut self, path: &str, text: &str) -> Result<(), String> {
         let err = unsafe { host::plank_fs_write(path.to_string(), text.as_bytes().to_vec()) }
             .map_err(|e| e.to_string())?;
-        if err.is_empty() {
-            Ok(())
-        } else {
-            Err(err)
-        }
+        if err.is_empty() { Ok(()) } else { Err(err) }
     }
     fn list(&self) -> Result<Vec<String>, String> {
-        let reply =
-            unsafe { host::plank_fs_list("/".to_string()) }.map_err(|e| e.to_string())?;
+        let reply = unsafe { host::plank_fs_list("/".to_string()) }.map_err(|e| e.to_string())?;
         let json = String::from_utf8_lossy(&untag(reply)?).into_owned();
         Ok(csv_names(&json))
     }
@@ -162,7 +161,8 @@ mod tests {
 
     #[test]
     fn csv_names_excludes_dirs_and_non_csv() {
-        let json = r#"[{"name":"sub/","size":0},{"name":"notes.txt","size":1},{"name":"a.csv","size":1}]"#;
+        let json =
+            r#"[{"name":"sub/","size":0},{"name":"notes.txt","size":1},{"name":"a.csv","size":1}]"#;
         assert_eq!(csv_names(json), vec!["a.csv"]);
     }
 
