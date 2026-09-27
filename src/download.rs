@@ -463,7 +463,7 @@ pub fn ensure_dspark(path: &Path) -> Result<(), String> {
     }
     if !std::io::stdin().is_terminal() {
         return Err(format!(
-            "no DSpark support model at {}; pass --mtp <path> or download it first",
+            "no DSpark support model at {}; pass --mtp-model <path>, turn speculation off with --mtp-off, or run plank in a terminal to download it",
             path.display()
         ));
     }
@@ -490,7 +490,7 @@ pub fn ensure_dspark(path: &Path) -> Result<(), String> {
     // Default to yes: Enter (empty) accepts, like the main model prompt.
     if matches!(answer.trim(), "n" | "N" | "no") {
         return Err(
-            "no DSpark support model available; re-run without --dspark or pass --mtp <path>"
+            "no DSpark support model available; re-run with --mtp-off or pass --mtp-model <path>"
                 .to_string(),
         );
     }
@@ -785,7 +785,7 @@ pub fn ensure_vision_encoder() -> Result<(), String> {
     }
     if !std::io::stdin().is_terminal() {
         return Err(format!(
-            "no vision encoder at {}; pass --vision <path> or download it first",
+            "no vision encoder at {}; run plank in a terminal to download it (~0.9 GB), or put the file at that path",
             path.display()
         ));
     }
@@ -3030,5 +3030,25 @@ mod tests {
         ))
         .expect("installed manifest recorded");
         assert_eq!(recorded.version, 3);
+    }
+
+    /// The startup hints for a missing companion file name options a user can
+    /// actually pass; `--vision`, `--mtp <path>` and `--dspark` were once
+    /// suggested here and none of them is an option.
+    #[test]
+    fn the_missing_file_hints_name_real_options() {
+        let parse = |args: &[&str]| {
+            crate::config::parse_options(&args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>())
+        };
+        assert!(parse(&["--mtp-off"]).is_ok());
+        assert!(parse(&["--mtp-model", "/x/dspark.gguf"]).is_ok());
+        assert!(
+            parse(&["--vision", "/x"]).is_err(),
+            "the hint must not suggest it"
+        );
+        assert!(
+            parse(&["--dspark"]).is_err(),
+            "the hint must not suggest it"
+        );
     }
 }
