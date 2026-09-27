@@ -210,14 +210,68 @@ pub fn int(input: &str, key: &str) -> u64 {
 }
 
 /// Reads a string field out of a flat JSON payload.
+///
+/// Scans the value honoring JSON's backslash escapes rather than splitting on
+/// the next `"`, so a value containing an escaped quote or backslash is read
+/// whole instead of truncated or left with stray backslashes: a name that
+/// crosses the `command_run` -> `frame_open` hop must survive intact.
 #[must_use]
 pub fn text(input: &str, key: &str) -> String {
-    input
-        .split_once(&format!("\"{key}\":"))
-        .and_then(|(_, rest)| rest.trim_start().strip_prefix('"'))
-        .and_then(|rest| rest.split('"').next())
-        .unwrap_or("")
-        .to_string()
+    let Some((_, rest)) = input.split_once(&format!("\"{key}\":")) else {
+        return String::new();
+    };
+    let Some(rest) = rest.trim_start().strip_prefix('"') else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    loop {
+        match chars.next() {
+            None | Some('"') => break,
+            Some('\\') => match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('b') => out.push('\u{8}'),
+                Some('f') => out.push('\u{c}'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                        // A high surrogate needs its low partner, next as
+                        // `\uXXXX`, to form one scalar value; anything else
+                        // (a lone or unpaired surrogate) is dropped rather
+                        // than passed through as an invalid `char`.
+                        if (0xD800..=0xDBFF).contains(&code) {
+                            let mut lookahead = chars.clone();
+                            let low = lookahead
+                                .next()
+                                .filter(|c| *c == '\\')
+                                .and_then(|_| lookahead.next().filter(|c| *c == 'u'))
+                                .map(|_| lookahead.by_ref().take(4).collect::<String>())
+                                .and_then(|hex| u32::from_str_radix(&hex, 16).ok())
+                                .filter(|low| (0xDC00..=0xDFFF).contains(low));
+                            if let Some(low) = low {
+                                let scalar = 0x10000 + (code - 0xD800) * 0x400 + (low - 0xDC00);
+                                if let Some(c) = char::from_u32(scalar) {
+                                    out.push(c);
+                                }
+                                chars = lookahead;
+                            }
+                        } else if let Some(c) = char::from_u32(code) {
+                            out.push(c);
+                        }
+                    }
+                }
+                Some(other) => out.push(other),
+                None => break,
+            },
+            Some(c) => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -338,5 +392,41 @@ mod tests {
         let g1 = &out[27..39];
         assert_eq!(g1[11], 0, "no flags");
         assert_eq!(out.len(), 39);
+    }
+
+    #[test]
+    fn text_reads_a_plain_value() {
+        let input = r#"{"name": "plain"}"#;
+        assert_eq!(text(input, "name"), "plain");
+    }
+
+    #[test]
+    fn text_decodes_an_escaped_quote() {
+        let input = r#"{"name": "we\"ird.csv"}"#;
+        assert_eq!(text(input, "name"), "we\"ird.csv");
+    }
+
+    #[test]
+    fn text_decodes_an_escaped_backslash() {
+        let input = r#"{"name": "a\\b.csv"}"#;
+        assert_eq!(text(input, "name"), "a\\b.csv");
+    }
+
+    #[test]
+    fn text_decodes_escaped_newline_tab_and_other_controls() {
+        let input = r#"{"name": "a\nb\tc\r\b\f"}"#;
+        assert_eq!(text(input, "name"), "a\nb\tc\r\u{8}\u{c}");
+    }
+
+    #[test]
+    fn text_decodes_a_unicode_escape() {
+        let input = r#"{"name": "café"}"#;
+        assert_eq!(text(input, "name"), "café");
+    }
+
+    #[test]
+    fn text_passes_through_an_invalid_escape() {
+        let input = r#"{"name": "a\qb"}"#;
+        assert_eq!(text(input, "name"), "aqb");
     }
 }
