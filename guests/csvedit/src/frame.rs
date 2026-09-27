@@ -31,18 +31,30 @@ pub fn command_specs() -> FnResult<String> {
         .to_string())
 }
 
-/// `new` opens the frame with an empty arg, `open NAME` with arg `NAME`. The
-/// host only ever opens the calling component's own frame, so `open` names an
-/// arg, never a component.
+/// `new` opens the frame with an empty arg, `open NAME` with arg `NAME`, and a
+/// bare `open` (no name) with the [`crate::editor::OPEN_DIALOG_ARG`] sentinel
+/// so the frame comes up showing the Open dialog. The host only ever opens
+/// the calling component's own frame, so `open` names an arg, never a
+/// component. An unknown command name is reported rather than silently
+/// treated as `new`.
 #[plugin_fn]
 pub fn command_run(input: String) -> FnResult<String> {
     let name = text(&input, "name");
     let args = text(&input, "args");
     let arg = args.trim();
     Ok(match name.as_str() {
-        "open" if arg.is_empty() => r#"{"print": ["usage: /csvedit:open <name.csv>"]}"#.to_string(),
+        "new" => r#"{"open": ""}"#.to_string(),
+        "open" if arg.is_empty() => {
+            format!(
+                "{{\"open\": {}}}",
+                json_string(crate::editor::OPEN_DIALOG_ARG)
+            )
+        }
         "open" => format!("{{\"open\": {}}}", json_string(arg)),
-        _ => r#"{"open": ""}"#.to_string(),
+        other => format!(
+            "{{\"print\": [{}]}}",
+            json_string(&format!("csvedit: unknown command \"{other}\""))
+        ),
     })
 }
 

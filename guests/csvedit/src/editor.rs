@@ -163,9 +163,14 @@ fn status_line(width: i16, height: i16) -> StatusLine {
     )
 }
 
+/// The sentinel `command_run` sends for a bare `/csvedit:open` (no name): the
+/// RAM disk refuses `/` as a file name, so it can never collide with a real
+/// one, and `Session::open` reads it as "start blank, show the Open dialog".
+pub const OPEN_DIALOG_ARG: &str = "/";
+
 /// The document an argument names, its name, and a message to show.
 fn load(arg: &str, disk: &dyn Disk) -> (CsvDoc, Option<String>, String) {
-    if arg.is_empty() {
+    if arg.is_empty() || arg == OPEN_DIALOG_ARG {
         return (CsvDoc::new_blank(3, 3), None, String::new());
     }
     match disk.read(arg) {
@@ -217,6 +222,9 @@ impl Session {
             last_saved: None,
         };
         state.refresh(&mut app);
+        if arg == OPEN_DIALOG_ARG {
+            state.open_picker(&mut app);
+        }
         Self { app, input, state }
     }
 
@@ -896,6 +904,27 @@ mod tests {
         s.key(Event::command(CMD_OPEN));
         s.step(80, 24);
         assert!(screen(&s).contains("no saved files yet"), "{}", screen(&s));
+    }
+
+    #[test]
+    fn opening_with_the_slash_sentinel_shows_a_blank_doc_and_the_open_dialog() {
+        let mut s = Session::open(80, 24, "/", disk_with(&[("a.csv", "h\n1\n")]));
+        s.step(80, 24);
+        let text = screen(&s);
+        assert!(text.contains("untitled.csv"), "{text}");
+        assert!(text.contains("a.csv"), "{text}");
+        assert_eq!(s.doc().width(), 3);
+        press(&mut s, "enter");
+        s.step(80, 24);
+        assert_eq!(s.doc().header()[0], "h");
+    }
+
+    #[test]
+    fn opening_with_the_slash_sentinel_and_no_saved_files_says_so() {
+        let mut s = Session::open(80, 24, "/", Box::new(MemDisk::default()));
+        s.step(80, 24);
+        assert!(screen(&s).contains("no saved files yet"), "{}", screen(&s));
+        assert_eq!(s.doc().width(), 3);
     }
 
     #[test]

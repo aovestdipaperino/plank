@@ -96,7 +96,10 @@ fn csvedit_edits_a_cell_and_saves_to_the_ram_disk() {
         Some(&b"A,B,C\n42,,\n,,\n,,\n"[..])
     );
     let out = key(h, "alt-x", None);
-    assert!(out.contains("close"), "{out}");
+    assert!(
+        out.starts_with(r#"{"close": "csvedit:"#),
+        "expected a close reply naming the editor: {out}"
+    );
 
     // The host calls frame_close after a closing key and prefers its line.
     let closed = String::from_utf8(h.call(ID, "frame_close", b"").expect("frame_close")).unwrap();
@@ -134,4 +137,30 @@ fn csvedit_commands_open_the_frame_with_the_file_name() {
         run(&mut h, r#"{"name": "open", "args": "  t.csv "}"#),
         r#"{"open": "t.csv"}"#
     );
+    // A bare "open" (no name) opens the frame with the "/" sentinel, which
+    // Session::open reads as "blank doc, show the Open dialog".
+    assert_eq!(
+        run(&mut h, r#"{"name": "open", "args": ""}"#),
+        r#"{"open": "/"}"#
+    );
+    assert_eq!(
+        run(&mut h, r#"{"name": "open", "args": "   "}"#),
+        r#"{"open": "/"}"#
+    );
+    // An unknown command is reported rather than silently opening a document.
+    let unknown = run(&mut h, r#"{"name": "bogus", "args": ""}"#);
+    assert!(unknown.contains("\"print\""), "{unknown}");
+    assert!(unknown.contains("bogus"), "{unknown}");
+}
+
+#[test]
+fn csvedit_command_run_round_trips_a_quoted_and_backslashed_name() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load(ID, &wasm, &["fs", "log"]).expect("load");
+    // The name contains a JSON-escaped quote and backslash, exercising the
+    // command_run -> frame_open hop's text() decoding.
+    let payload = "{\"name\": \"open\", \"args\": \"a\\\"b\\\\c.csv\"}";
+    let out = String::from_utf8(h.call(ID, "command_run", payload.as_bytes()).unwrap()).unwrap();
+    assert_eq!(out, "{\"open\": \"a\\\"b\\\\c.csv\"}");
 }

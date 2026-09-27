@@ -291,7 +291,7 @@ exports:
   frame_step(json: StepParams) -> bin: GlyphBuffer
   frame_key(json: KeyEvent)    -> json: Outcome
   frame_mouse(json: MouseEvent)-> json: Outcome
-  frame_close()                -> json: { scrollback: string? }
+  frame_close()                -> json: { scrollback: string }
 ```
 
 `KeyEvent` is `{ code }`, plus a `text` field holding the one character the key
@@ -301,8 +301,13 @@ existed sees exactly the payload it always did.
 
 `StepParams` carries `{ dt_ms, w, h, now_ms }`; `dt_ms` is clamped host-side
 the way `arcade::MAX_STEP_MS` clamps today, so a suspended terminal cannot
-teleport a plugin's simulation. `Outcome` is `{"stay"}` or
-`{"close": {"scrollback": "..."}}`, mirroring `arcade::Outcome`.
+teleport a plugin's simulation. `Outcome` is `{"stay": true}` to keep the
+frame open, or `{"close": ...}` to close it: a string closes with that line
+in the scrollback (`{"close": "csvedit: saved t.csv"}`), while `true`, an
+object or `null` closes with nothing. `frame_close()`'s own reply is read
+separately and takes priority when it names a non-empty `scrollback` string:
+`{"scrollback": "csvedit: saved t.csv"}`, never the nested object the design
+originally sketched.
 
 A `frame` plugin additionally declares `activation`:
 
