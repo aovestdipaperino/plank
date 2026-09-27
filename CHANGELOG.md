@@ -8,6 +8,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--profile <name>` launches plank as a named agent declared in a
+  plugin's `profile` block**, with its own system prompt, builtin-tool
+  allow-list, settings layer and banner logo, display name and accent; see
+  `docs/PROFILES.md` for the manifest reference and `examples/profiles/chatbgt`
+  for a worked example. `/plugins` marks the plugins `--profile` accepts, and
+  startup warns when a profile prompt has no `{{plank:tool-protocol}}` token.
+- **`/install-profile <url|owner/repo|path> [name] [--force]` installs a
+  profile** from a git repository, a marketplace repository, a `.tar.gz` or a
+  local directory into `~/.plank/profiles/<name>/`, a root that only
+  `--profile` reads — installing a profile adds nothing to an ordinary
+  session. Refused when the manifest declares no `profile` block or its
+  `systemPrompt` is missing or blank, so a broken profile is caught at install
+  time rather than at the launch the design makes fatal. Both manifest
+  spellings are now accepted by installation, which also makes a plank-spelling
+  plugin fetchable by `/install-claude-plugin` for the first time. Ships
+  `examples/profiles/hal`, a mail and calendar profile whose MCP server is not
+  built yet. `--profile` is refused on a Qwen model, whose prompt is built
+  separately and would ignore the profile's own.
 - **`/memory calibrate [N]` and `memory.gateBias`.** The System-1 memory gate
   always shows "yes" as answer A, and a model that leans toward a letter for
   its own sake reads more "yes" than a span deserves, while its letter mass

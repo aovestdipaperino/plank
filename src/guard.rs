@@ -235,10 +235,10 @@ mod tests {
 
     /// Settings with the loop guards off, thread-local so this cannot leak
     /// into a parallel test (`settings::install_for_test`).
-    fn guards_off() {
+    fn guards_off() -> crate::settings::TestSettingsGuard {
         let mut s = crate::settings::Settings::default();
         s.tools.loop_guards = false;
-        crate::settings::install_for_test(s);
+        crate::settings::install_for_test(s)
     }
 
     #[test]
@@ -255,14 +255,15 @@ mod tests {
         }
         assert!(g.tripped());
 
-        guards_off();
+        let _settings_guard = guards_off();
         // Nothing to say and nothing to end: the same guard, mid-loop.
         assert_eq!(g.observe("read", digest("a")), Nudge::None);
         assert!(!g.tripped());
 
         // Back on: the history the guard kept while it was quiet still counts,
         // so re-arming does not hand the model a fresh allowance.
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         assert!(g.tripped());
         assert!(g.observe("read", digest("a")).as_block().is_some());
     }

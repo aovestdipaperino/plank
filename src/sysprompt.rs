@@ -542,6 +542,18 @@ fn parse_builtin_tool_schemas() -> Vec<crate::engine::ToolSpec> {
     let region = rest.split("# Rules").next().unwrap_or(rest);
     // Skip the header line itself.
     let region = region.split_once('\n').map_or(region, |(_, body)| body);
+    parse_tool_schema_stream(region)
+}
+
+/// Parses a run of blank-line-separated `{"type": "function", "function":
+/// {...}}` JSON objects (the shape every hand-written schema block in this
+/// file uses) into structured [`crate::engine::ToolSpec`]s.
+///
+/// Shared by [`parse_builtin_tool_schemas`] (the C-derived text) and
+/// [`native_extra_specs`] (plank's own native-only tools), so both the
+/// C-parsed and native schema text can be filtered by a profile's allow-list
+/// as data instead of pre-rendered text.
+fn parse_tool_schema_stream(region: &str) -> Vec<crate::engine::ToolSpec> {
     let mut specs = Vec::new();
     // Consecutive JSON objects, blank-line separated; a streaming deserializer
     // tolerates the interspersed whitespace and stops cleanly at the tail.
@@ -611,28 +623,51 @@ fn build_tools_prompt_parts_with_wasm(
     // before any prompt is built, so the dialect can never be selected. The
     // arm is gated rather than left to fall through to DSML so that, if that
     // refusal is ever bypassed, the build fails to compile instead of quietly
-    // handing a Qwen model the wrong prompt.
+    // handing a Qwen model the wrong prompt. `--profile` is refused on a Qwen
+    // model for the same reason: a profile's prose never reaches this builder.
     if syntax == ToolSyntax::Qwen {
         return build_qwen_tools_prompt_parts(mcp_servers, wasm_tools);
     }
-    let mut out = build_tools_prompt_base(parity);
-    insert_marker_spelling_note(&mut out);
-    insert_document_read_note(&mut out);
-    append_native_extra_schemas(&mut out);
-    append_working_style(&mut out);
-    // The V4.1 tag respelling happens here and nowhere else: at this point
-    // `out` is entirely plank's own trusted prompt text, and not one byte of
-    // MCP, WASM or `-sys` text has been appended yet. See
-    // [`dsml41_tools_prompt`] for why that ordering is load-bearing.
-    if syntax == ToolSyntax::Dsml41 {
-        out = dsml41_tools_prompt(&out);
-    }
+    let mut out = trusted_prose(profile_prompt_source(), parity, syntax);
     let trusted_len = out.len();
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     append_wasm_tool_schemas(&mut out, wasm_tools);
     (out, trusted_len)
+}
+
+/// The trusted head of the DSML tools prompt: the active profile's composed
+/// prompt, or plank's own, respelled for V4.1 when `syntax` asks for it.
+///
+/// Split out of [`build_tools_prompt_parts_with_wasm`] so the profile path
+/// can be tested under each dialect without the process-global profile.
+fn trusted_prose(
+    profile: Option<(&str, &crate::profile::ProfileSpec)>,
+    parity: bool,
+    syntax: ToolSyntax,
+) -> String {
+    // A profile replaces the whole prose prompt; the schema block is still
+    // generated, from the allow-listed builtins.
+    let mut out = if let Some((text, spec)) = profile {
+        compose_profile_prompt(text, spec, parity).0
+    } else {
+        let mut out = build_tools_prompt_base(parity);
+        insert_marker_spelling_note(&mut out);
+        insert_document_read_note(&mut out);
+        append_native_extra_schemas(&mut out);
+        append_working_style(&mut out);
+        out
+    };
+    // The V4.1 tag respelling happens here and nowhere else: at this point
+    // `out` is entirely trusted prompt text (plank's own, or the installed
+    // profile's), and not one byte of MCP, WASM or `-sys` text has been
+    // appended yet. See [`dsml41_tools_prompt`] for why that ordering is
+    // load-bearing.
+    if syntax == ToolSyntax::Dsml41 {
+        out = dsml41_tools_prompt(&out);
+    }
+    out
 }
 
 /// [`TOOLS_PROMPT_QWEN`] with plank's own tools spliced into its schema list.
@@ -786,6 +821,210 @@ fn append_wasm_tool_schemas(out: &mut String, tools: &[&crate::wasmreg::WasmTool
     }
 }
 
+/// The token a profile prompt may use to pull in the trained DSML call-syntax
+/// text instead of retyping it.
+///
+/// Expands to everything the base prompt says before `### Available Tool
+/// Schemas` — not just the call-shape grammar, but also its surrounding
+/// prose about specific builtins (`bash_status`, `bash_stop`, `google_search`,
+/// `visit_page`, the read/edit guidance). A profile that allow-lists only
+/// some builtins still receives all of this prose, including sentences about
+/// tools it does not have; there is no per-tool filtering of it.
+pub const TOOL_PROTOCOL_TOKEN: &str = "{{plank:tool-protocol}}";
+
+/// The DSML call-syntax section of the C prompt: everything from the top of
+/// the base prompt down to (not including) the schema block.
+///
+/// A profile that replaces the whole prompt still needs this text verbatim —
+/// the model was trained on it, and paraphrasing it degrades tool calling in
+/// ways that read as model bugs. Computed from the parity base rather than
+/// duplicated, so it can never drift from it.
+///
+/// Like [`TOOL_PROTOCOL_TOKEN`], the returned text is the *whole* prefix
+/// before the schema block, prose about specific builtins included, not only
+/// the call-syntax grammar; there is no per-tool filtering.
+///
+/// `parity` selects which base to draw from ([`build_tools_prompt_base`]):
+/// with `parity` false the [`IN_THINK_PROHIBITION`] line is stripped, same as
+/// for a plain run, so a profile under a permissive engine is not told to
+/// avoid something plank will in fact dispatch.
+#[must_use]
+pub fn tool_protocol_fragment(parity: bool) -> &'static str {
+    static PARITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static PERMISSIVE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let cell = if parity { &PARITY } else { &PERMISSIVE };
+    cell.get_or_init(|| {
+        let base = build_tools_prompt_base(parity);
+        match base.find("### Available Tool Schemas") {
+            Some(at) => base[..at].to_string(),
+            None => base,
+        }
+    })
+}
+
+/// Renders `specs` as the `### Available Tool Schemas` block, in the same
+/// `OpenAI` function shape the C prompt uses.
+///
+/// Hand-formatted rather than run through `serde_json::to_string_pretty` (or
+/// `serde_json::Value`'s own key order) so the emitted shape does not depend
+/// on how `serde_json` happens to order object keys at all: this crate does
+/// not itself request the `preserve_order` feature, but it ends up enabled
+/// anyway through feature unification with transitive dependencies (notably
+/// `extism` and `deno_core`, see `cargo tree -e features -i serde_json`) —
+/// pinning byte-for-byte shape to that incidental, transitively-controlled
+/// setting would be fragile, and is exactly why this function writes the
+/// fields itself in the fixed order the C prompt uses (`type`, then
+/// `function` with `name`, `description`, `parameters` in that order),
+/// two-space indented, matching [`append_wasm_tool_schemas`]'s approach. This
+/// is the exact byte shape of the C examples, not merely valid JSON in some
+/// order — and `name` and `description` are both escaped through
+/// [`crate::tools::mcp::json_escape`], not interpolated raw.
+#[must_use]
+pub fn render_schema_block(specs: &[crate::engine::ToolSpec]) -> String {
+    let mut out = String::from("### Available Tool Schemas\n\n");
+    for spec in specs {
+        out.push_str("{\n  \"type\": \"function\",\n  \"function\": {\n    \"name\": ");
+        crate::tools::mcp::json_escape(&mut out, &spec.name);
+        out.push_str(",\n    \"description\": ");
+        crate::tools::mcp::json_escape(&mut out, &spec.description);
+        out.push_str(",\n    \"parameters\": ");
+        render_parameters(&mut out, &spec.parameters);
+        out.push_str("\n  }\n}\n\n");
+    }
+    out
+}
+
+/// Renders a `parameters` value in the C shape: `type`, then `properties`
+/// (each property compact on one line), then `required` when present — in
+/// that fixed order, rather than the alphabetical order a `BTreeMap`-backed
+/// `serde_json::Value` would otherwise serialize in.
+///
+/// Falls back to `serde_json`'s compact formatter for anything that is not
+/// shaped like the builtins' `{"type": "object", "properties": {...},
+/// "required": [...]}` — still valid JSON, just not guaranteed to match the
+/// C byte order, which only matters for the schemas the model trained on.
+fn render_parameters(out: &mut String, params: &serde_json::Value) {
+    use std::fmt::Write as _;
+
+    let Some(obj) = params.as_object() else {
+        let _ = write!(out, "{}", compact(params));
+        return;
+    };
+    let (Some(ty), Some(props)) = (
+        obj.get("type"),
+        obj.get("properties").and_then(|p| p.as_object()),
+    ) else {
+        let _ = write!(out, "{}", compact(params));
+        return;
+    };
+    out.push_str("{\n      \"type\": ");
+    out.push_str(&compact(ty));
+    out.push_str(",\n      \"properties\": {");
+    let mut first = true;
+    for (key, value) in props {
+        out.push_str(if first { "\n        " } else { ",\n        " });
+        first = false;
+        crate::tools::mcp::json_escape(out, key);
+        let _ = write!(out, ": {}", compact(value));
+    }
+    out.push_str(if first { "}" } else { "\n      }" });
+    if let Some(required) = obj.get("required") {
+        out.push_str(",\n      \"required\": ");
+        out.push_str(&compact(required));
+    }
+    out.push_str("\n    }");
+}
+
+/// Single-line rendering of `value` in the C prompt's compact-leaf style:
+/// like `serde_json`'s compact formatter, but with a space after every `:`
+/// and `,`, matching `{"type": "string"}` and `["path", "content"]` in
+/// `resources/tools_prompt_after_edit.txt` rather than `serde_json`'s
+/// `{"type":"string"}`/`["path","content"]`. Recurses so a nested object or
+/// array (an `enum` list, say) gets the same spacing throughout.
+fn compact(value: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = String::from("{");
+            for (i, (key, v)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                crate::tools::mcp::json_escape(&mut out, key);
+                let _ = write!(out, ": {}", compact(v));
+            }
+            out.push('}');
+            out
+        }
+        serde_json::Value::Array(items) => {
+            let mut out = String::from("[");
+            for (i, v) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&compact(v));
+            }
+            out.push(']');
+            out
+        }
+        other => serde_json::to_string(other).unwrap_or_else(|_| "null".to_string()),
+    }
+}
+
+/// Composes a profile's prompt: the profile text with
+/// [`TOOL_PROTOCOL_TOKEN`] expanded, followed by the schema block for the
+/// builtins the profile allows.
+///
+/// `parity` is threaded to [`tool_protocol_fragment`] so a profile under a
+/// permissive engine gets the matching in-think guidance instead of always
+/// the strict-parity text.
+///
+/// Note the omission: [`MARKER_SPELLING_NOTE`] is inserted into this same
+/// region of the default prompt (see [`insert_marker_spelling_note`]) but is
+/// deliberately not added here — a profile replaces the prompt wholesale, and
+/// `dsml.rs` already recovers the `SSML` misspelling via an alias, so the
+/// note would be advisory twice over. Not an oversight.
+///
+/// Returns the text and its trusted length, matching
+/// [`SplitSystemPrompt::trusted_len`]: all of it is plank-side text the user
+/// installed, so the whole span is trusted. MCP and WASM schemas are appended
+/// after it by the caller and stay outside.
+fn compose_profile_prompt(
+    profile_text: &str,
+    spec: &crate::profile::ProfileSpec,
+    parity: bool,
+) -> (String, usize) {
+    let mut out = profile_text.replace(TOOL_PROTOCOL_TOKEN, tool_protocol_fragment(parity));
+    if !out.ends_with("\n\n") {
+        out.push_str(if out.ends_with('\n') { "\n" } else { "\n\n" });
+    }
+    // Every dispatchable builtin, not just the C-trained twelve: a profile's
+    // allow-list governs the whole table (see the controller decision in the
+    // finding-1/2 fix), so the schema block must offer everything dispatch
+    // would actually run under this profile.
+    let specs: Vec<crate::engine::ToolSpec> = parse_builtin_tool_schemas()
+        .into_iter()
+        .chain(native_extra_specs(true))
+        .filter(|s| spec.builtin_enabled(&s.name))
+        .collect();
+    out.push_str(&render_schema_block(&specs));
+    let trusted = out.len();
+    (out, trusted)
+}
+
+/// The active profile's prompt text and spec, or `None` for a plain run.
+///
+/// The text is a borrow of what `main.rs` read once at activation
+/// (`ActiveProfile::prompt`); composition never touches the filesystem, so
+/// this is infallible and safe to call mid-session (MCP reload, compaction,
+/// sub-agent spawn) — unlike a re-read, which could fail or race a mid-run
+/// edit of the file after a TUI already exists to corrupt.
+fn profile_prompt_source() -> Option<(&'static str, &'static crate::profile::ProfileSpec)> {
+    let active = crate::profile::active()?;
+    Some((active.prompt.as_str(), &active.spec))
+}
+
 /// The C-derived tools prompt with nothing appended.
 ///
 /// This is what the parity suite locks byte-for-byte against `refs/ds4`: it is
@@ -895,6 +1134,35 @@ const TASK_SCHEMA: &str = "{\n\
      }\n";
 
 fn append_native_extra_schemas(out: &mut String) {
+    append_native_extra_schemas_ungated_core(out);
+    // The `recall` (M8), `fanout` (M9) and `run_code` (M10) tools are
+    // deliberate deviations from the C reference: the C agent has none of them.
+    // They are advertised by default and can be switched off individually
+    // (`tools.recall` / `tools.fanout` / `tools.runCode`). Because they are in
+    // the prompt, `fp1` differs from the C agent's fingerprint — the versioned
+    // deviation documented in docs/SYSTEM-PROMPT-OVERRIDES.md. What parity
+    // still holds byte-for-byte is the C-*derived* text, which
+    // `tools_prompt_matches_c_source` checks independently of this list.
+    if crate::settings::active().tools.recall {
+        append_recall_schema(out);
+    }
+    if crate::settings::active().tools.fanout {
+        append_fanout_schema(out);
+    }
+    if crate::settings::active().tools.run_code {
+        append_run_code_schema(out);
+    }
+    if crate::settings::active().tools.remember {
+        append_remember_schema(out);
+    }
+}
+
+/// The always-advertised native extras: [`append_native_extra_schemas`]
+/// minus the `recall`/`fanout`/`run_code`/`remember` tail, which is
+/// settings-gated.
+/// Split out so [`native_extra_specs`] can build the same text with or
+/// without those gates without duplicating the schema bodies.
+fn append_native_extra_schemas_ungated_core(out: &mut String) {
     out.push_str(
         "\n{\n\
          \x20 \"type\": \"function\",\n\
@@ -947,26 +1215,56 @@ fn append_native_extra_schemas(out: &mut String) {
          }\n",
     );
     append_agent_and_plan_schemas(out);
-    // The `recall` (M8), `fanout` (M9) and `run_code` (M10) tools are
-    // deliberate deviations from the C reference: the C agent has none of them.
-    // They are advertised by default and can be switched off individually
-    // (`tools.recall` / `tools.fanout` / `tools.runCode`). Because they are in
-    // the prompt, `fp1` differs from the C agent's fingerprint — the versioned
-    // deviation documented in docs/SYSTEM-PROMPT-OVERRIDES.md. What parity
-    // still holds byte-for-byte is the C-*derived* text, which
-    // `tools_prompt_matches_c_source` checks independently of this list.
-    if crate::settings::active().tools.recall {
-        append_recall_schema(out);
+}
+
+/// Every native tool beyond the C-trained table, as filterable
+/// [`crate::engine::ToolSpec`]s rather than the pre-rendered text
+/// [`append_native_extra_schemas`] produces.
+///
+/// `respect_settings_gates` selects whether `recall`, `fanout` and
+/// `run_code` are included only when their `tools.*` setting is on (the
+/// same gating `append_native_extra_schemas` applies to the default prompt)
+/// or unconditionally. A profile's schema block wants the gated view — a
+/// tool a setting disabled must stay absent regardless of the allow-list.
+/// Enumerating every known builtin name (finding 3's warning check) wants
+/// the ungated view, since a name is "known" independent of whether this
+/// run's settings currently expose it.
+///
+/// Parses the same hand-written schema text `append_native_extra_schemas`
+/// emits, through [`parse_tool_schema_stream`], so there is exactly one
+/// place that spells out each native tool's schema; this only reads it back
+/// as data.
+fn native_extra_specs(respect_settings_gates: bool) -> Vec<crate::engine::ToolSpec> {
+    let mut text = String::new();
+    append_native_extra_schemas_ungated_core(&mut text);
+    let gates = &crate::settings::active().tools;
+    if !respect_settings_gates || gates.recall {
+        append_recall_schema(&mut text);
     }
-    if crate::settings::active().tools.fanout {
-        append_fanout_schema(out);
+    if !respect_settings_gates || gates.fanout {
+        append_fanout_schema(&mut text);
     }
-    if crate::settings::active().tools.run_code {
-        append_run_code_schema(out);
+    if !respect_settings_gates || gates.run_code {
+        append_run_code_schema(&mut text);
     }
-    if crate::settings::active().tools.remember {
-        append_remember_schema(out);
+    if !respect_settings_gates || gates.remember {
+        append_remember_schema(&mut text);
     }
+    parse_tool_schema_stream(&text)
+}
+
+/// The full set of builtin tool names plank knows how to dispatch: the
+/// C-trained table plus every native extra, independent of the current
+/// run's `tools.*` settings gates. Feeds finding 3's allow-list-name
+/// warning, so a gate being off in this run does not make a profile that
+/// names the gated tool look like it typo'd a nonexistent one.
+#[must_use]
+pub fn known_builtin_names() -> std::collections::HashSet<String> {
+    parse_builtin_tool_schemas()
+        .into_iter()
+        .chain(native_extra_specs(false))
+        .map(|spec| spec.name)
+        .collect()
 }
 
 /// Appends the `remember` and `forget` tool schemas. Writes land on disk and
@@ -1232,7 +1530,7 @@ pub fn dsml41_syntax_reminder() -> &'static str {
 /// general DSML translator: applying it to model output, user input, MCP
 /// schemas or tool results would let untrusted bytes be reshaped into control
 /// text of a dialect the parser then honours. Its one call site is inside
-/// [`build_tools_prompt_parts_with_wasm`], before any third-party text has
+/// [`trusted_prose`], before any third-party text has
 /// been appended to the buffer.
 ///
 /// The rewrite walks for the `｜DSML｜` marker and, immediately after each
@@ -1600,7 +1898,7 @@ mod tests {
         );
         let mut s = crate::settings::Settings::default();
         s.tools.recall = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         let mut text = String::new();
         append_native_extra_schemas(&mut text);
         assert!(
@@ -1622,7 +1920,7 @@ mod tests {
 
     #[test]
     fn bash_notify_rule_rides_on_the_setting() {
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        crate::settings::set_for_test(crate::settings::Settings::default());
         assert!(!shell_rules().contains(BASH_NOTIFY_RULE), "off by default");
         assert_eq!(
             shell_rules(),
@@ -1631,7 +1929,7 @@ mod tests {
         );
         let mut s = crate::settings::Settings::default();
         s.tools.bash_notify = true;
-        crate::settings::install_for_test(s);
+        crate::settings::set_for_test(s);
         let rules = shell_rules();
         assert!(rules.starts_with(SHELL_RULES));
         assert!(rules.ends_with(BASH_NOTIFY_RULE));
@@ -1650,7 +1948,7 @@ mod tests {
         assert!(text.contains("deterministic"), "{text}");
         let mut s = crate::settings::Settings::default();
         s.tools.fanout = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         let mut text = String::new();
         append_native_extra_schemas(&mut text);
         assert!(
@@ -1669,7 +1967,7 @@ mod tests {
         );
         let mut s = crate::settings::Settings::default();
         s.tools.run_code = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         let mut text = String::new();
         append_native_extra_schemas(&mut text);
         assert!(
@@ -2329,5 +2627,369 @@ mod tests {
         assert_eq!(&bytes[10..11], b" ");
         assert_eq!(&bytes[13..14], b":");
         assert_eq!(&bytes[16..17], b":");
+    }
+
+    #[test]
+    fn the_tool_protocol_fragment_is_the_base_prompt_up_to_the_schemas() {
+        let base = build_tools_prompt_base(true);
+        let frag = tool_protocol_fragment(true);
+        assert!(
+            base.starts_with(frag),
+            "the fragment must be a prefix of the C base"
+        );
+        assert!(
+            frag.contains("｜DSML｜"),
+            "the fragment teaches the call syntax"
+        );
+        assert!(
+            !frag.contains("### Available Tool Schemas"),
+            "schemas are generated, not part of the protocol fragment"
+        );
+    }
+
+    #[test]
+    fn the_tool_protocol_fragment_respects_parity() {
+        let strict = tool_protocol_fragment(true);
+        let permissive = tool_protocol_fragment(false);
+        assert!(
+            strict.contains(IN_THINK_PROHIBITION),
+            "parity text keeps the in-think prohibition"
+        );
+        assert!(
+            !permissive.contains(IN_THINK_PROHIBITION),
+            "permissive text drops it, matching engine.thinkingToolCalls"
+        );
+        assert_ne!(strict, permissive);
+    }
+
+    #[test]
+    fn the_schema_block_filters_out_disallowed_tools() {
+        let specs = vec![
+            crate::engine::ToolSpec {
+                name: "bash".to_string(),
+                description: "Run a shell command.".to_string(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            },
+            crate::engine::ToolSpec {
+                name: "read".to_string(),
+                description: "Read a text file.".to_string(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            },
+            crate::engine::ToolSpec {
+                name: "write".to_string(),
+                description: "Create or overwrite a text file.".to_string(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            },
+        ];
+        let named_only: Vec<_> = specs.into_iter().filter(|s| s.name == "bash").collect();
+        let block = render_schema_block(&named_only);
+        assert!(block.starts_with("### Available Tool Schemas\n"));
+        assert!(block.contains("\"name\": \"bash\""));
+        assert!(
+            !block.contains("\"name\": \"read\""),
+            "read was filtered out before rendering, not merely never emitted"
+        );
+        assert!(
+            !block.contains("\"name\": \"write\""),
+            "write was filtered out before rendering, not merely never emitted"
+        );
+    }
+
+    #[test]
+    fn an_empty_allow_list_renders_zero_builtin_schemas() {
+        // The fail-closed property: `builtin_tools: Some(vec![])` must starve
+        // the schema block completely, not silently fall back to "all of
+        // them" the way `None` does.
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(Vec::new()),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let specs: Vec<crate::engine::ToolSpec> = parse_builtin_tool_schemas()
+            .into_iter()
+            .filter(|s| spec.builtin_enabled(&s.name))
+            .collect();
+        assert!(
+            specs.is_empty(),
+            "an empty allow-list must admit no builtins"
+        );
+        let block = render_schema_block(&specs);
+        assert_eq!(
+            block, "### Available Tool Schemas\n\n",
+            "the block is header-only with nothing after it"
+        );
+    }
+
+    #[test]
+    fn an_empty_allow_list_starves_the_composed_profile_prompt_too() {
+        // Same fail-closed property as
+        // `an_empty_allow_list_renders_zero_builtin_schemas`, but exercised
+        // through `compose_profile_prompt` itself — the actual security-shaped
+        // path a profile's prompt is built on — rather than through the
+        // filter expression re-typed inline. A regression that dropped the
+        // filter from the composer would slip past the sibling test but not
+        // this one.
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(Vec::new()),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = "You are ChatBGT.\n".to_string();
+        let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
+        assert!(
+            out.contains("### Available Tool Schemas\n\n"),
+            "the header is still emitted"
+        );
+        assert!(
+            !out.contains("\"type\": \"function\""),
+            "an empty allow-list must admit no builtin schema through the composer"
+        );
+    }
+
+    #[test]
+    fn a_profile_allow_listing_native_extras_gets_exactly_those_in_its_schema_block() {
+        // Finding 2: "builtin" means every dispatchable builtin, not just the
+        // twelve the C reference parses out of the resource file. `glob` and
+        // `ask` are native extras (`append_native_extra_schemas`), never in
+        // `parse_builtin_tool_schemas`'s output, so this fails unless the
+        // composer folds native extras into the filtered set too.
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(vec!["glob".to_string(), "ask".to_string()]),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = "You are ChatBGT.\n".to_string();
+        let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
+        assert!(
+            out.contains("\"name\": \"glob\""),
+            "glob must be advertised"
+        );
+        assert!(out.contains("\"name\": \"ask\""), "ask must be advertised");
+        let names: Vec<&str> = out
+            .match_indices("\"name\": \"")
+            .map(|(i, _)| {
+                let rest = &out[i + "\"name\": \"".len()..];
+                rest.split('"').next().unwrap_or("")
+            })
+            .collect();
+        for name in &names {
+            assert!(
+                *name == "glob" || *name == "ask",
+                "only the allow-listed tools may appear in the schema block, found {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_gated_native_extra_stays_absent_even_when_allow_listed() {
+        // recall/fanout/run_code are additionally gated by `tools.*`
+        // settings; a profile allow-listing one must not resurrect it once
+        // the setting has turned it off.
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.recall = false;
+        let _settings_guard = crate::settings::install_for_test(settings);
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(vec!["recall".to_string()]),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = "You are ChatBGT.\n".to_string();
+        let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
+        assert!(
+            !out.contains("\"name\": \"recall\""),
+            "tools.recall = false must withhold recall even though the profile allow-lists it"
+        );
+    }
+
+    // Regression test for the settings test-seam guard's `Drop`: libtest
+    // spawns a fresh OS thread per test even under `--test-threads=1` (that
+    // flag bounds concurrency, not thread reuse), so relying on scheduling
+    // order across two `#[test]` functions to land on the same thread is not
+    // reliable. Instead this drives both halves — install, then an explicit
+    // drop — on the one thread running this test, which is exactly the
+    // scenario `TestSettingsGuard` exists for.
+    #[test]
+    fn a_settings_guard_clears_the_override_on_drop() {
+        assert!(
+            crate::settings::active().tools.recall,
+            "recall must be at its default before the override is installed"
+        );
+        let mut settings = crate::settings::Settings::default();
+        settings.tools.recall = false;
+        let guard = crate::settings::install_for_test(settings);
+        assert!(
+            !crate::settings::active().tools.recall,
+            "the override must be visible while the guard is alive"
+        );
+        drop(guard);
+        assert!(
+            crate::settings::active().tools.recall,
+            "dropping the guard must restore the previous (default) settings on this thread"
+        );
+    }
+
+    #[test]
+    fn the_schema_block_round_trips_through_the_builtin_parser() {
+        let specs = parse_builtin_tool_schemas();
+        assert!(!specs.is_empty(), "the C prompt carries schemas");
+        let block = render_schema_block(&specs);
+        let body = block.split_once('\n').expect("has a header line").1;
+        let count = serde_json::Deserializer::from_str(body)
+            .into_iter::<serde_json::Value>()
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(
+            count,
+            specs.len(),
+            "every spec round-trips as one JSON object"
+        );
+    }
+
+    #[test]
+    fn the_schema_block_matches_the_c_key_order_and_leaf_shape() {
+        // Pins the hand-formatted shape byte-for-byte against the literal C
+        // text in `resources/tools_prompt_after_edit.txt`: the
+        // `### Available Tool Schemas` header through the closing brace and
+        // blank line of the `google_search` example. The expected string is
+        // sliced straight out of that file (not retyped) so this test pins
+        // the real C bytes, including the space after every `:` and `,` in
+        // the compact leaves (`{"type": "string"}`, `["query"]`), rather
+        // than the emitter's own output. No deliberate difference remains:
+        // this is a full byte match.
+        let c_prompt = include_str!("resources/tools_prompt_after_edit.txt");
+        let start = c_prompt
+            .find("### Available Tool Schemas")
+            .expect("C prompt has the schema header");
+        let after_header = &c_prompt[start..];
+        let end = after_header
+            .find("\n}\n\n")
+            .expect("google_search example closes with a blank line")
+            + "\n}\n\n".len();
+        let expected = &after_header[..end];
+
+        let specs = vec![crate::engine::ToolSpec {
+            name: "google_search".to_string(),
+            description: "Search Google in a visible browser and return compact Markdown links."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+        }];
+        let block = render_schema_block(&specs);
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn a_profile_prompt_replaces_the_base_and_keeps_generated_schemas() {
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(vec!["bash".to_string()]),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = format!("You are ChatBGT.\n\n{TOOL_PROTOCOL_TOKEN}\n");
+        let (out, trusted) = compose_profile_prompt(&text, &spec, true);
+        assert!(out.starts_with("You are ChatBGT."));
+        assert!(!out.contains(TOOL_PROTOCOL_TOKEN), "the token is expanded");
+        assert!(out.contains("｜DSML｜"), "the protocol fragment landed");
+        assert!(out.contains("\"name\": \"bash\""));
+        assert!(
+            !out.contains("\"name\": \"read\""),
+            "read is not allowed here"
+        );
+        assert_eq!(
+            trusted,
+            out.len(),
+            "no MCP text yet, so all of it is trusted"
+        );
+    }
+
+    /// A profile on a V4.1 model gets the same tag respelling as plank's own
+    /// prompt: its expanded protocol and schema examples would otherwise
+    /// teach the V4 tags to a model that parses the V4.1 ones.
+    #[test]
+    fn a_profile_prompt_is_respelled_for_dsml41() {
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(vec!["bash".to_string()]),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = format!("You are ChatBGT. Mind each parameter.\n\n{TOOL_PROTOCOL_TOKEN}\n");
+        let v4 = trusted_prose(Some((&text, &spec)), true, ToolSyntax::Dsml);
+        let v41 = trusted_prose(Some((&text, &spec)), true, ToolSyntax::Dsml41);
+        assert!(v4.contains("tool_calls"), "the V4 protocol names its tags");
+        assert_eq!(v41, dsml41_tools_prompt(&v4));
+        assert!(v41.contains("<｜DSML｜ calls>"), "{v41}");
+        assert!(!v41.contains("tool_calls"), "{v41}");
+        assert!(
+            v41.starts_with("You are ChatBGT. Mind each parameter."),
+            "prose outside a tag is untouched"
+        );
+        assert!(
+            v41.contains("\"name\": \"bash\""),
+            "the schema block survives"
+        );
+    }
+
+    #[test]
+    fn a_profile_prompt_respects_parity_too() {
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: None,
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let text = TOOL_PROTOCOL_TOKEN.to_string();
+        let (strict, _) = compose_profile_prompt(&text, &spec, true);
+        let (permissive, _) = compose_profile_prompt(&text, &spec, false);
+        assert!(strict.contains(IN_THINK_PROHIBITION));
+        assert!(!permissive.contains(IN_THINK_PROHIBITION));
+    }
+
+    #[test]
+    fn a_profile_prompt_without_the_token_gets_no_protocol_text() {
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: None,
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        let (out, _) = compose_profile_prompt("Just prose.\n", &spec, true);
+        assert!(out.starts_with("Just prose."));
+        assert!(
+            out.contains("### Available Tool Schemas"),
+            "schemas are never optional"
+        );
     }
 }

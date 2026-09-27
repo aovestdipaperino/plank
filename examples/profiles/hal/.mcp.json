@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "plank-mail": {
+      "command": "plank-mail-mcp",
+      "args": ["--config", "~/.plank/hal/mail.toml"]
+    }
+  }
+}

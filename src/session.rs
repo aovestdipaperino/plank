@@ -378,6 +378,10 @@ pub struct Session {
     pub render: Option<RenderState>,
     /// True when the transcript has unsaved changes.
     pub dirty: bool,
+    /// The profile this session was written under, from the `profile` record.
+    /// `None` for a plain plank session and for every file written before
+    /// profiles existed.
+    pub profile: Option<String>,
 }
 
 /// The rendering switches that decide what a user sees of a pass: whether the
@@ -473,6 +477,7 @@ impl Session {
             goal: None,
             render: None,
             dirty: false,
+            profile: None,
         }
     }
 
@@ -1420,6 +1425,15 @@ impl SessionStore {
             body.extend_from_slice(record.as_bytes());
             body.push(b'\n');
         }
+        // Which profile wrote this transcript (absent for a plain run, and in
+        // every file written before profiles existed). Written before `cwd`,
+        // not after, so `cwd` stays the record directly above `meta` —
+        // `parse_cwd_before_meta`'s fast listing path depends on that.
+        if let Some(profile) = &session.profile {
+            let _ = writeln!(body, "profile {}", profile.len());
+            body.extend_from_slice(profile.as_bytes());
+            body.push(b'\n');
+        }
         // Project directory (issue: `/insights`): omitted when unset so a
         // session saved by an older build round-trips byte-identically.
         if !session.cwd.is_empty() {
@@ -1510,6 +1524,32 @@ impl SessionStore {
         // The filename is the identity; the memorable name (or a legacy sha)
         // is authoritative, with no separate content cross-check.
         session.id = id;
+        Ok(session)
+    }
+
+    /// [`load`](Self::load), refusing a session that belongs to a different
+    /// profile.
+    ///
+    /// The transcript was written against a different system prompt and a
+    /// different tool set; continuing it under another identity would leave
+    /// the model unaware of what it can do, in a way no error would surface.
+    ///
+    /// # Errors
+    /// The same errors as [`load`](Self::load), plus a mismatch between the
+    /// session's profile and `profile`.
+    pub fn load_for_profile(
+        &self,
+        prefix: impl AsRef<str>,
+        profile: Option<&str>,
+    ) -> Result<Session> {
+        let session = self.load(prefix)?;
+        if session.profile.as_deref() != profile {
+            let owner = session.profile.as_deref().unwrap_or("plank");
+            let now = profile.unwrap_or("plank");
+            return Err(SessionError::new(format!(
+                "session belongs to profile {owner}; this run is {now}"
+            )));
+        }
         Ok(session)
     }
 
@@ -2579,6 +2619,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
     let mut branches: Vec<crate::branch::OffNode> = Vec::new();
     let mut goal: Option<crate::goal::GoalState> = None;
     let mut render: Option<RenderState> = None;
+    let mut profile: Option<String> = None;
     while pos < data.len() {
         let header = line(&data, &mut pos).ok_or_else(corrupt)?;
         // Session-tree off-path nodes (issue #65); absent in linear sessions
@@ -2613,6 +2654,13 @@ fn read_session_file(path: &Path) -> Result<Session> {
                     Some(active)
                 },
             });
+            continue;
+        }
+        // The profile the session was written under; absent in plain sessions
+        // and in every pre-profile file.
+        if let Some(rest) = header.strip_prefix("profile ") {
+            let len: usize = rest.trim().parse().map_err(|_| corrupt())?;
+            profile = Some(take(&data, &mut pos, len)?);
             continue;
         }
         // Project directory the session ran in; absent in pre-`/insights`
@@ -2690,6 +2738,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
         goal,
         render,
         dirty: false,
+        profile,
     })
 }
 
@@ -2929,6 +2978,17 @@ mod tests {
             std::env::temp_dir().join(format!("plank-session-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// A fresh on-disk store for one test, tagged by a counter so parallel
+    /// tests never collide. Returns the directory alongside the store so
+    /// callers can inspect files directly if needed.
+    fn temp_store() -> (PathBuf, SessionStore) {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = temp_dir(&format!("profile-{n}"));
+        let store = SessionStore::open(&dir).unwrap();
+        (dir, store)
     }
 
     /// The repair pass for sessions titled before the context blocks were
@@ -5350,5 +5410,65 @@ hello\n";
             "wrong error: {err}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_profile_round_trips_through_the_transcript_file() {
+        let (tmp, store) = temp_store();
+        let _ = &tmp;
+        let mut s = Session::new();
+        s.push(Message::user("hi"));
+        s.profile = Some("hal".to_string());
+        let id = store.save(&mut s).expect("saves");
+        let back = store.load(&id).expect("loads");
+        assert_eq!(back.profile.as_deref(), Some("hal"));
+    }
+
+    #[test]
+    fn a_session_saved_without_a_profile_loads_with_none() {
+        let (tmp, store) = temp_store();
+        let _ = &tmp;
+        let mut s = Session::new();
+        s.push(Message::user("hi"));
+        let id = store.save(&mut s).expect("saves");
+        assert_eq!(store.load(&id).expect("loads").profile, None);
+    }
+
+    #[test]
+    fn resuming_under_a_different_profile_is_refused() {
+        let (tmp, store) = temp_store();
+        let _ = &tmp;
+        let mut s = Session::new();
+        s.push(Message::user("hi"));
+        s.profile = Some("hal".to_string());
+        let id = store.save(&mut s).expect("saves");
+
+        let err = store
+            .load_for_profile(&id, Some("chatbgt"))
+            .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("hal"),
+            "the message names the owner"
+        );
+
+        let err = store.load_for_profile(&id, None).expect_err("must refuse");
+        assert!(err.to_string().contains("hal"));
+
+        store
+            .load_for_profile(&id, Some("hal"))
+            .expect("the right profile loads it");
+    }
+
+    #[test]
+    fn a_plain_session_is_refused_under_a_profile() {
+        let (tmp, store) = temp_store();
+        let _ = &tmp;
+        let mut s = Session::new();
+        s.push(Message::user("hi"));
+        let id = store.save(&mut s).expect("saves");
+        assert!(store.load_for_profile(&id, Some("hal")).is_err());
+        store
+            .load_for_profile(&id, None)
+            .expect("plain loads plain");
     }
 }

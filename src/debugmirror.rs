@@ -973,7 +973,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         reconcile();
         assert!(
@@ -1004,7 +1004,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         reconcile();
         let sub = open_subagent("");
@@ -1042,7 +1042,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         reconcile();
         disconnect(REASON_EXIT);
@@ -1071,7 +1071,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         set_session_id("bouncy-phelps");
         // Drain the parent's handshake so the two below are the sub-agents'.
         let _parent = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
@@ -1106,7 +1106,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         set_session_id("bouncy-phelps");
         let (_h, mut parent_sock) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
 
@@ -1174,7 +1174,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         set_session_id("bouncy-phelps");
         let _parent = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
 
@@ -1204,7 +1204,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         set_session_id("first-session");
         let _p1 = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
@@ -1239,7 +1239,7 @@ mod tests {
         reset();
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = true;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         reconcile();
 
@@ -1278,7 +1278,7 @@ mod tests {
         // Persisted: thinking shown, so no mirror is wanted.
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = true;
-        crate::settings::install_for_test(s);
+        crate::settings::set_for_test(s);
         crate::settings::set_show_thinking_override(None);
         assert!(MIRRORS.lock().unwrap().is_empty());
 
@@ -1313,7 +1313,7 @@ mod tests {
         reset();
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         reconcile(); // port 0: nothing is listening, must not panic/hang.
 
@@ -1351,7 +1351,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         reconcile();
         assert!(
@@ -1371,7 +1371,7 @@ mod tests {
         // reconcile: the mirror must be dropped, not left dangling.
         let mut on = crate::settings::Settings::default();
         on.ui.show_thinking = true;
-        crate::settings::install_for_test(on);
+        let _settings_guard = crate::settings::install_for_test(on);
         reconcile();
         assert!(
             MIRRORS.lock().unwrap().is_empty(),
@@ -1394,7 +1394,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         set_session_id("spunky-oppenheimer");
         let line = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
@@ -1423,7 +1423,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         reconcile();
         let line = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
@@ -1448,7 +1448,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         set_session_id("parser-hunt");
         let first = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
@@ -1486,7 +1486,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         // Sanitizing strips whitespace rather than refusing outright — a name
         // that is nothing *but* whitespace is the case that must fall back.
@@ -1527,7 +1527,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         reconcile();
         assert!(MIRRORS.lock().unwrap().contains_key(&MirrorId::PARENT));
 
@@ -1554,7 +1554,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         let first = reconcile();
         assert!(first.parent_new, "the first dial is new");
@@ -1576,7 +1576,7 @@ mod tests {
         *CURRENT_SESSION_NAME.lock().unwrap() = Some("bouncy-phelps".to_owned());
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         // No console yet: the window opens unconnected.
         let sub = open_subagent("");
@@ -1620,7 +1620,7 @@ mod tests {
         CONTROL_PORT.store(control_port, Ordering::Relaxed);
         let mut s = crate::settings::Settings::default();
         s.ui.show_thinking = false;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
 
         reconcile();
         let (_hello, mut parent) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();

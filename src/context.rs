@@ -789,7 +789,8 @@ mod tests {
             auto: true,
             isolate: false,
         };
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
 
         let one = ContextContent {
             agents_content: agent_roster_context(&[def("reviewer", "reviews diffs")]),
@@ -837,7 +838,8 @@ mod tests {
             auto: false,
             isolate: false,
         };
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         assert!(
             agent_roster_context(std::slice::from_ref(&manual)).is_none(),
             "auto: false is withheld"
@@ -847,12 +849,13 @@ mod tests {
 
         let mut settings = crate::settings::Settings::default();
         settings.agents.auto_route = false;
-        crate::settings::install_for_test(settings);
+        let _settings_guard = crate::settings::install_for_test(settings);
         assert!(
             agent_roster_context(std::slice::from_ref(&manual)).is_none(),
             "autoRoute off withholds everything"
         );
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
     /// The roster the model sees is built from the definitions it is handed,
@@ -861,7 +864,8 @@ mod tests {
     #[test]
     fn the_roster_advertises_the_definitions_it_is_handed() {
         use crate::agents::AgentDef;
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         let from_plugin = AgentDef {
             name: "demo:scout".to_string(),
             description: "scouts ahead".to_string(),

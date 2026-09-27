@@ -341,14 +341,10 @@ pub fn resolve_in_tree(staged: &Path, want: Option<&str>) -> Result<PathBuf, Str
     if market.is_file() {
         return resolve_marketplace(staged, &market, want);
     }
-    if staged.join(".claude-plugin").join("plugin.json").is_file() {
+    if crate::plugins::manifest_path(staged).is_some() {
         return Ok(staged.to_path_buf());
     }
-    Err(
-        "this is not a Claude Code plugin: no .claude-plugin/plugin.json and no \
-         .claude-plugin/marketplace.json at its root"
-            .to_string(),
-    )
+    Err("this is not a plank or Claude Code plugin: no .plank-plugin/plugin.json, no .claude-plugin/plugin.json and no .claude-plugin/marketplace.json at its root".to_string())
 }
 
 /// Picks `want` out of a marketplace manifest. Split out to keep
@@ -416,13 +412,9 @@ fn resolve_marketplace(
             "marketplace entry '{want}' points outside the repository, at {source}"
         ));
     }
-    if !canon_dir
-        .join(".claude-plugin")
-        .join("plugin.json")
-        .is_file()
-    {
+    if crate::plugins::manifest_path(&canon_dir).is_none() {
         return Err(format!(
-            "marketplace entry '{want}' has no .claude-plugin/plugin.json at {source}"
+            "marketplace entry '{want}' has no .plank-plugin/plugin.json or .claude-plugin/plugin.json at {source}"
         ));
     }
     Ok(canon_dir)
@@ -442,10 +434,15 @@ pub struct Installed {
     pub skipped_hook_events: Vec<String>,
 }
 
-/// Validates the staged tree and copies it into `~/.plank/plugins/claude/`.
+/// Validates a staged tree and copies it into `dest_root`.
+///
+/// `dest_root` is the install root, not the plugin directory: the plugin's own
+/// name is appended here, from its manifest. `/install-claude-plugin` passes
+/// [`install_dir`]; `/install-profile` passes [`crate::profiles::dir`].
 ///
 /// The order matters: everything that can refuse happens before anything is
-/// written under `home`, so a refusal never leaves a partial install behind.
+/// written under `dest_root`, so a refusal never leaves a partial install
+/// behind.
 ///
 /// `force` waives only the unimplemented-hook refusal, in which case those
 /// hooks are installed and simply never fire. The structural refusals — no
@@ -453,13 +450,13 @@ pub struct Installed {
 /// of them describes a plugin the user could still want as it is.
 ///
 /// # Errors
-/// Returns a message when the tree is not a Claude Code plugin, contains a
-/// symlink, names a hook event plank does not implement (without `force`), is
-/// already installed, or cannot be copied.
+/// Returns a message when the tree holds an escaping symlink, hooks an event
+/// plank does not implement (unless `force`), has no usable name, or names
+/// something already installed.
 pub fn install_staged(
     staged: &Path,
     want: Option<&str>,
-    home: &Path,
+    dest_root: &Path,
     force: bool,
 ) -> Result<Installed, String> {
     let root = resolve_in_tree(staged, want)?;
@@ -479,10 +476,10 @@ pub fn install_staged(
         ));
     }
     let name = plugin_name(&root)?;
-    let dest = install_dir(home).join(&name);
+    let dest = dest_root.join(&name);
     if dest.exists() {
         return Err(format!(
-            "'{name}' is already installed at {}; remove it first with /plugins remove {name}",
+            "'{name}' is already installed at {}; remove it first",
             dest.display()
         ));
     }
@@ -495,6 +492,90 @@ pub fn install_staged(
         rewrote_plugin_root: rewrote,
         skipped_hook_events: skipped,
     })
+}
+
+/// Refuses a staged tree that is not an installable profile, then installs it
+/// into the profiles root.
+///
+/// Split from [`install_profile`] so the gate is testable without fetching:
+/// every refusal below is reachable from a directory on disk.
+///
+/// The prompt is validated *here*, at install time, rather than left to
+/// startup. `main.rs` treats an unreadable or blank profile prompt as fatal —
+/// deliberately, because silently running as plain plank when the user asked
+/// for HAL is worse than not running — and a fatal launch is a bad place to
+/// discover a bad download.
+///
+/// # Errors
+/// Returns a message when the tree has no manifest, its manifest declares no
+/// `profile` block, its `systemPrompt` is missing, unreadable or blank, or
+/// [`install_staged`]'s own checks refuse it.
+pub fn install_profile_staged(
+    staged: &Path,
+    want: Option<&str>,
+    home: &Path,
+    force: bool,
+) -> Result<Installed, String> {
+    let root = resolve_in_tree(staged, want)?;
+    let name = plugin_name(&root)?;
+    // `plugin_name`'s grammar is looser than `--profile` will later demand:
+    // once installed, this same name (the directory `install_staged` creates
+    // under `crate::profiles::dir`) becomes the plugin's namespace prefix in
+    // `plugins::splice_profile`, which gates it with `plugins::valid_name`.
+    // Refusing here, rather than letting `plugin_name` wave it through, is
+    // what keeps `/install-profile` from reporting success for a name that
+    // `--profile` would then refuse to load — the refusal belongs where the
+    // user can still pick a different name.
+    if !crate::plugins::valid_name(&name) {
+        return Err(format!(
+            "'{name}' is not usable as a profile name: it would make an ambiguous or unroutable \
+             namespace prefix (no ':', '/', '\\', or '__' allowed); rename it in plugin.json"
+        ));
+    }
+    let manifest = crate::plugins::manifest_path(&root)
+        .ok_or_else(|| format!("no plugin.json in {}", root.display()))?;
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
+    let spec = crate::profile::parse(&text, &root).ok_or_else(|| {
+        format!(
+            "plugin '{name}' declares no profile block; install it with /install-claude-plugin instead"
+        )
+    })?;
+    let prompt = std::fs::read_to_string(&spec.system_prompt).map_err(|e| {
+        format!(
+            "profile '{name}': cannot read {}: {e}",
+            spec.system_prompt.display()
+        )
+    })?;
+    if prompt.trim().is_empty() {
+        return Err(format!(
+            "profile '{name}': {} is empty",
+            spec.system_prompt.display()
+        ));
+    }
+    install_staged(staged, want, &crate::profiles::dir(home), force)
+}
+
+/// Fetches the profile `arg` names, validates it, and installs it.
+///
+/// The `/install-profile` counterpart of [`install`], sharing its staging
+/// discipline: everything happens in a directory outside every scan root, and
+/// that directory is removed on every exit path.
+///
+/// # Errors
+/// Returns a message when the argument names nothing fetchable, the fetch
+/// fails, or the tree does not pass [`install_profile_staged`]'s checks.
+pub fn install_profile(
+    arg: &str,
+    want: Option<&str>,
+    home: &Path,
+    force: bool,
+) -> Result<Installed, String> {
+    let staging = staging_dir(home)?;
+    let result =
+        fetch(arg, &staging).and_then(|tree| install_profile_staged(&tree, want, home, force));
+    let _ = std::fs::remove_dir_all(&staging);
+    result
 }
 
 /// Fetches the plugin `arg` names, validates it, and installs it.
@@ -516,7 +597,8 @@ pub fn install(
     force: bool,
 ) -> Result<Installed, String> {
     let staging = staging_dir(home)?;
-    let result = fetch(arg, &staging).and_then(|tree| install_staged(&tree, want, home, force));
+    let result = fetch(arg, &staging)
+        .and_then(|tree| install_staged(&tree, want, &install_dir(home), force));
     let _ = std::fs::remove_dir_all(&staging);
     result
 }
@@ -600,18 +682,21 @@ fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
             // would make a git clone of a directory-of-directories resolve
             // somewhere it never has before.
             find_claude_root(staging).ok_or_else(|| {
-                "this is not a Claude Code plugin: no .claude-plugin/plugin.json and no \
-                 .claude-plugin/marketplace.json at its root or one level in"
-                    .to_string()
+                "this is not a plank or Claude Code plugin: no .plank-plugin/plugin.json, no .claude-plugin/plugin.json and no .claude-plugin/marketplace.json at its root or one level in".to_string()
             })
         }
     }
 }
 
-/// Whether `dir` itself carries a Claude Code manifest — either spelling,
-/// since a tarball of a marketplace repository must resolve here too.
+/// Whether `dir` is the root of an installable tree: a plugin manifest in
+/// either spelling, or a marketplace manifest.
+///
+/// Both spellings, because `/install-profile` fetches profiles authored in
+/// plank's own `.plank-plugin/` layout and `/install-claude-plugin` had no
+/// reason to refuse them either — a plank-spelling plugin was previously
+/// unfetchable by any command.
 fn is_claude_manifest_root(dir: &Path) -> bool {
-    dir.join(".claude-plugin").join("plugin.json").is_file()
+    crate::plugins::manifest_path(dir).is_some()
         || dir
             .join(".claude-plugin")
             .join("marketplace.json")
@@ -716,7 +801,8 @@ fn resolve_subpath(dest: &Path, subpath: &str) -> Result<PathBuf, String> {
 /// parent), and whitespace-only strings. A plugin calling itself `../x` or `.`
 /// is not a naming style to accommodate.
 fn plugin_name(root: &Path) -> Result<String, String> {
-    let manifest = root.join(".claude-plugin").join("plugin.json");
+    let manifest = crate::plugins::manifest_path(root)
+        .ok_or_else(|| format!("no plugin.json in {}", root.display()))?;
     let text = std::fs::read_to_string(&manifest)
         .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
     let from_manifest = match json_parse(&text).as_ref().and_then(|j| j.get("name")) {
@@ -738,6 +824,26 @@ fn plugin_name(root: &Path) -> Result<String, String> {
     Ok(name)
 }
 
+/// Splits an install command's argument line into the `--force` flag and the
+/// positional words, in order.
+///
+/// Shared by [`render_install`] and [`render_install_profile`]: the two render
+/// different text but take the same argument shape, and a flag one of them
+/// learned to accept and the other did not would be a silent divergence
+/// between two commands users expect to behave alike.
+fn split_force_flag(arg: &str) -> (bool, Vec<&str>) {
+    let mut force = false;
+    let mut words: Vec<&str> = Vec::new();
+    for word in arg.split_whitespace() {
+        if word == "--force" {
+            force = true;
+        } else {
+            words.push(word);
+        }
+    }
+    (force, words)
+}
+
 /// The whole `/install-claude-plugin` command: parses its argument line, runs
 /// the install, and renders the outcome — success or refusal — as the text
 /// both front ends print.
@@ -757,15 +863,7 @@ pub fn render_install(arg: &str, home: Option<&Path>) -> String {
         "usage: /install-claude-plugin <url|owner/repo> [plugin-name] [--force]\n",
         "a url may be a git repository, a marketplace repository, or a .tar.gz\n"
     );
-    let mut force = false;
-    let mut words: Vec<&str> = Vec::new();
-    for word in arg.split_whitespace() {
-        if word == "--force" {
-            force = true;
-        } else {
-            words.push(word);
-        }
-    }
+    let (force, words) = split_force_flag(arg);
     let Some(target) = words.first() else {
         return USAGE.to_string();
     };
@@ -775,6 +873,40 @@ pub fn render_install(arg: &str, home: Option<&Path>) -> String {
     match install(target, words.get(1).copied(), home, force) {
         Ok(out) => render_installed(&out),
         Err(e) => format!("{e}\n"),
+    }
+}
+
+/// The whole `/install-profile` command: parses its argument line, runs the
+/// install, and renders the outcome as the text both front ends print.
+///
+/// Mirrors [`render_install`] rather than sharing its body: the two differ in
+/// their usage line, in the closing hint (a profile is launched with
+/// `--profile`, not merely loaded), and in how they are removed. Sharing would
+/// mean threading three flags through one function to save a dozen lines.
+#[must_use]
+pub fn render_install_profile(arg: &str, home: Option<&Path>) -> String {
+    // `concat!`, not a `\`-continued literal: continuation strips the next
+    // line's leading whitespace.
+    const USAGE: &str = concat!(
+        "usage: /install-profile <url|owner/repo|path> [name] [--force]\n",
+        "a url may be a git repository, a marketplace repository, or a .tar.gz\n"
+    );
+    let (force, words) = split_force_flag(arg);
+    let Some(source) = words.first() else {
+        return USAGE.to_string();
+    };
+    let Some(home) = home else {
+        return "plank: no home directory; nowhere to install a profile\n".to_string();
+    };
+    match install_profile(source, words.get(1).copied(), home, force) {
+        Ok(installed) => format!(
+            "installed profile '{}' into {}\nrun it with: plank --profile {}\nremove it with: rm -rf {}\n",
+            installed.name,
+            installed.dest.display(),
+            installed.name,
+            installed.dest.display()
+        ),
+        Err(e) => format!("plank: {e}\n"),
     }
 }
 
@@ -856,6 +988,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
+    }
+
+    #[test]
+    fn a_plank_spelling_tree_is_found_and_named() {
+        let dir = tmpdir("plank-spelling");
+        let root = dir.join("thing");
+        std::fs::create_dir_all(root.join(".plank-plugin")).expect("mkdir");
+        std::fs::write(
+            root.join(".plank-plugin").join("plugin.json"),
+            r#"{"name":"thing"}"#,
+        )
+        .expect("write");
+        // Found one level in, exactly as the Claude spelling is.
+        assert_eq!(find_claude_root(&dir), Some(root.clone()));
+        // And named from the plank manifest rather than falling back to the
+        // directory name, which would silently differ when the two disagree.
+        assert_eq!(plugin_name(&root).as_deref(), Ok("thing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_plank_manifest_wins_when_a_tree_carries_both() {
+        let dir = tmpdir("both-spellings");
+        std::fs::create_dir_all(dir.join(".plank-plugin")).expect("mkdir");
+        std::fs::create_dir_all(dir.join(".claude-plugin")).expect("mkdir");
+        std::fs::write(
+            dir.join(".plank-plugin").join("plugin.json"),
+            r#"{"name":"plank-name"}"#,
+        )
+        .expect("write");
+        std::fs::write(
+            dir.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"claude-name"}"#,
+        )
+        .expect("write");
+        // Same precedence `plugins::manifest_path` already uses everywhere else,
+        // so a tree with both spellings loads under one name, not two.
+        assert_eq!(plugin_name(&dir).as_deref(), Ok("plank-name"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1353,11 +1524,28 @@ mod tests {
     }
 
     #[test]
+    fn install_staged_copies_into_the_destination_it_is_given() {
+        let tmp = tmpdir("dest-root");
+        let staged = tmp.join("staged");
+        std::fs::create_dir_all(staged.join(".claude-plugin")).expect("mkdir");
+        std::fs::write(
+            staged.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"thing"}"#,
+        )
+        .expect("write");
+        let dest_root = tmp.join("somewhere-else");
+        let installed = install_staged(&staged, None, &dest_root, false).expect("installs");
+        assert_eq!(installed.dest, dest_root.join("thing"));
+        assert!(dest_root.join("thing").join(".claude-plugin").is_dir());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn a_valid_tree_installs_under_the_claude_root() {
         let staged = staged_plugin("install-ok", "demo");
         write(&staged, "commands/note.md", "hi\n");
         let home = tmpdir("install-ok-home");
-        let out = install_staged(&staged, None, &home, false).expect("installs");
+        let out = install_staged(&staged, None, &install_dir(&home), false).expect("installs");
         assert_eq!(out.name, "demo");
         assert_eq!(out.dest, install_dir(&home).join("demo"));
         assert!(out.dest.join(".claude-plugin/plugin.json").is_file());
@@ -1371,7 +1559,7 @@ mod tests {
         let staged = staged_plugin("install-hook", "demo");
         write(&staged, "hooks/hooks.json", r#"{"SubagentStop":[]}"#);
         let home = tmpdir("install-hook-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("SubagentStop"), "{err}");
         assert!(err.contains("--force"), "{err}");
         assert!(
@@ -1385,7 +1573,7 @@ mod tests {
         let staged = staged_plugin("install-force", "demo");
         write(&staged, "hooks/hooks.json", r#"{"SubagentStop":[]}"#);
         let home = tmpdir("install-force-home");
-        let out = install_staged(&staged, None, &home, true).expect("installs");
+        let out = install_staged(&staged, None, &install_dir(&home), true).expect("installs");
         assert_eq!(out.skipped_hook_events, vec!["SubagentStop".to_string()]);
         assert!(out.dest.join("hooks/hooks.json").is_file());
     }
@@ -1395,7 +1583,7 @@ mod tests {
         let staged = staged_plugin("install-symlink", "demo");
         std::os::unix::fs::symlink("/etc/hosts", staged.join("link")).expect("symlink");
         let home = tmpdir("install-symlink-home");
-        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), true).expect_err("refused");
         assert!(err.contains("symlink"), "{err}");
         assert!(
             !install_dir(&home).join("demo").exists(),
@@ -1412,7 +1600,7 @@ mod tests {
         write(&staged, "CLAUDE.md", "the real content\n");
         std::os::unix::fs::symlink("CLAUDE.md", staged.join("AGENTS.md")).expect("symlink");
         let home = tmpdir("install-contained-symlink-home");
-        let out = install_staged(&staged, None, &home, false).expect("installs");
+        let out = install_staged(&staged, None, &install_dir(&home), false).expect("installs");
         let installed = std::fs::read_to_string(out.dest.join("AGENTS.md")).expect("read");
         assert_eq!(installed, "the real content\n");
     }
@@ -1422,7 +1610,7 @@ mod tests {
         let staged = staged_plugin("install-escape-absolute", "demo");
         std::os::unix::fs::symlink("/etc/hosts", staged.join("link")).expect("symlink");
         let home = tmpdir("install-escape-absolute-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("symlink"), "{err}");
         assert!(!install_dir(&home).join("demo").exists());
     }
@@ -1447,7 +1635,7 @@ mod tests {
             .join("secret.txt");
         std::os::unix::fs::symlink(&rel, staged.join("link")).expect("symlink");
         let home = tmpdir("install-escape-relative-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("symlink"), "{err}");
         assert!(!install_dir(&home).join("demo").exists());
         assert!(
@@ -1478,7 +1666,7 @@ mod tests {
         std::fs::write(staged.join("real_dir/f.txt"), "hi\n").expect("write");
         std::os::unix::fs::symlink("real_dir", staged.join("link_dir")).expect("symlink");
         let home = tmpdir("install-dir-symlink-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("symlink"), "{err}");
         assert!(err.contains("directory"), "{err}");
         assert!(!install_dir(&home).join("demo").exists());
@@ -1543,7 +1731,7 @@ mod tests {
             "demo/.claude-plugin/plugin.json",
             r#"{"name":"demo","description":"the one already there"}"#,
         );
-        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), true).expect_err("refused");
         assert!(err.contains("already installed"), "{err}");
         let kept =
             std::fs::read_to_string(install_dir(&home).join("demo/.claude-plugin/plugin.json"))
@@ -1552,12 +1740,29 @@ mod tests {
     }
 
     #[test]
-    fn a_tree_with_no_claude_manifest_refuses() {
-        let staged = tmpdir("install-nomanifest");
+    fn a_plank_spelling_only_tree_installs() {
+        let staged = tmpdir("install-plankspelling");
         write(&staged, ".plank-plugin/plugin.json", r#"{"name":"native"}"#);
+        let home = tmpdir("install-plankspelling-home");
+        let installed = install_staged(&staged, None, &install_dir(&home), true).expect("installs");
+        assert!(
+            installed
+                .dest
+                .join(".plank-plugin")
+                .join("plugin.json")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn a_tree_with_no_manifest_at_all_refuses() {
+        let staged = tmpdir("install-nomanifest");
+        write(&staged, "README.md", "nothing here\n");
         let home = tmpdir("install-nomanifest-home");
-        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), true).expect_err("refused");
+        assert!(err.contains(".plank-plugin/plugin.json"), "{err}");
         assert!(err.contains(".claude-plugin/plugin.json"), "{err}");
+        assert!(err.contains(".claude-plugin/marketplace.json"), "{err}");
     }
 
     #[test]
@@ -1569,7 +1774,7 @@ mod tests {
             r#"{"mcpServers":{"s":{"command":"${CLAUDE_PLUGIN_ROOT}/bin/s"}}}"#,
         );
         let home = tmpdir("install-rewrite-home");
-        let out = install_staged(&staged, None, &home, false).expect("installs");
+        let out = install_staged(&staged, None, &install_dir(&home), false).expect("installs");
         assert!(out.rewrote_plugin_root);
         let mcp = std::fs::read_to_string(out.dest.join(".mcp.json")).expect("read");
         assert!(mcp.contains(&out.dest.display().to_string()), "{mcp}");
@@ -1579,7 +1784,7 @@ mod tests {
     fn an_installed_plugin_is_found_by_the_loader() {
         let staged = staged_plugin("install-loads", "demo");
         let home = tmpdir("install-loads-home");
-        let out = install_staged(&staged, None, &home, false).expect("installs");
+        let out = install_staged(&staged, None, &install_dir(&home), false).expect("installs");
         let set = crate::plugins::load_in(Some(&home), &tmpdir("install-loads-cwd"), &[]);
         let found = set
             .plugins
@@ -1594,7 +1799,7 @@ mod tests {
     fn plugin_named_dot_is_refused() {
         let staged = staged_plugin("install-dot-name", ".");
         let home = tmpdir("install-dot-name-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("not a usable plugin name"), "{err}");
         assert!(
             !install_dir(&home).exists(),
@@ -1606,7 +1811,7 @@ mod tests {
     fn plugin_named_dot_is_refused_with_force() {
         let staged = staged_plugin("install-dot-force", ".");
         let home = tmpdir("install-dot-force-home");
-        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), true).expect_err("refused");
         assert!(err.contains("not a usable plugin name"), "{err}");
     }
 
@@ -1614,7 +1819,7 @@ mod tests {
     fn plugin_with_whitespace_only_name_is_refused() {
         let staged = staged_plugin("install-whitespace", "   ");
         let home = tmpdir("install-whitespace-home");
-        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        let err = install_staged(&staged, None, &install_dir(&home), false).expect_err("refused");
         assert!(err.contains("not a usable plugin name"), "{err}");
     }
 
@@ -1963,5 +2168,106 @@ mod tests {
     fn render_without_a_home_says_so() {
         let out = render_install("owner/repo", None);
         assert!(out.contains("HOME"), "{out}");
+    }
+
+    /// Builds a staged tree at `<tmp>/staged` and returns it. `block` is the
+    /// `profile` member's JSON text, or `None` for no profile block. `prompt` is
+    /// the prompt file's contents, or `None` to write no prompt file at all.
+    fn staged_profile(tmp: &Path, block: Option<&str>, prompt: Option<&str>) -> PathBuf {
+        let staged = tmp.join("staged");
+        std::fs::create_dir_all(staged.join(".plank-plugin")).expect("mkdir");
+        if let Some(p) = prompt {
+            std::fs::write(staged.join("prompt.md"), p).expect("write");
+        }
+        let manifest = match block {
+            Some(b) => format!("{{\"name\":\"hal\",\"profile\":{b}}}"),
+            None => "{\"name\":\"hal\"}".to_string(),
+        };
+        std::fs::write(staged.join(".plank-plugin").join("plugin.json"), manifest).expect("write");
+        staged
+    }
+
+    const GOOD_BLOCK: &str = r#"{"systemPrompt":"prompt.md"}"#;
+
+    #[test]
+    fn a_tree_with_no_profile_block_is_refused() {
+        let tmp = tmpdir("gate-no-block");
+        let staged = staged_profile(&tmp, None, Some("hi\n"));
+        let err = install_profile_staged(&staged, None, &tmp, false).expect_err("refused");
+        assert!(err.contains("declares no profile block"), "{err}");
+        assert!(err.contains("/install-claude-plugin"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_profile_whose_prompt_file_is_missing_is_refused() {
+        let tmp = tmpdir("gate-no-prompt");
+        let staged = staged_profile(&tmp, Some(GOOD_BLOCK), None);
+        let err = install_profile_staged(&staged, None, &tmp, false).expect_err("refused");
+        assert!(err.contains("cannot read"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_profile_whose_prompt_file_is_blank_is_refused() {
+        let tmp = tmpdir("gate-blank-prompt");
+        let staged = staged_profile(&tmp, Some(GOOD_BLOCK), Some("   \n\n"));
+        let err = install_profile_staged(&staged, None, &tmp, false).expect_err("refused");
+        assert!(err.contains("is empty"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// N1: a name `plugin_name` admits but `plugins::valid_name` refuses
+    /// (double underscore, which mints an unroutable MCP server namespace)
+    /// must be caught here, at install time, rather than installed
+    /// successfully only to be refused later by `--profile`.
+    #[test]
+    fn a_profile_whose_name_fails_the_namespace_grammar_is_refused() {
+        let tmp = tmpdir("gate-bad-namespace-name");
+        let staged = tmp.join("staged");
+        std::fs::create_dir_all(staged.join(".plank-plugin")).expect("mkdir");
+        std::fs::write(staged.join("prompt.md"), "You are HAL.\n").expect("write");
+        std::fs::write(
+            staged.join(".plank-plugin").join("plugin.json"),
+            r#"{"name":"a__b","profile":{"systemPrompt":"prompt.md"}}"#,
+        )
+        .expect("write");
+        let home = tmp.join("home");
+        let err = install_profile_staged(&staged, None, &home, false).expect_err("refused");
+        assert!(err.contains("a__b"), "{err}");
+        assert!(
+            !crate::profiles::dir(&home).join("a__b").exists(),
+            "a refused name must leave nothing installed"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_good_profile_lands_in_the_profiles_root() {
+        let tmp = tmpdir("gate-good");
+        let home = tmp.join("home");
+        let staged = staged_profile(&tmp, Some(GOOD_BLOCK), Some("You are HAL.\n"));
+        let installed = install_profile_staged(&staged, None, &home, false).expect("installs");
+        assert_eq!(installed.dest, crate::profiles::dir(&home).join("hal"));
+        assert!(installed.dest.join("prompt.md").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The gate runs before the copy: a refused profile leaves nothing behind for
+    /// the next `--profile` listing to find.
+    #[test]
+    fn a_refused_profile_is_not_partially_installed() {
+        let tmp = tmpdir("gate-atomic");
+        let home = tmp.join("home");
+        let staged = staged_profile(&tmp, None, Some("hi\n"));
+        let _ = install_profile_staged(&staged, None, &home, false);
+        assert!(!crate::profiles::dir(&home).join("hal").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_profile_usage_line_names_its_own_command() {
+        let out = render_install_profile("", Some(Path::new("/tmp/h")));
+        assert!(out.contains("usage: /install-profile"), "{out}");
     }
 }

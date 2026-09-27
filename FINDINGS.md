@@ -2459,6 +2459,66 @@ disagree again. The old Enter-time echo had the same exposure (it also sat
 inside the rolled-back range), so this is not a regression and rollback
 behaviour is intentionally left alone here.
 
+## `serde_json`'s `preserve_order` is on, and plank never asked for it
+
+plank declares plain `serde_json = "1"` in `Cargo.toml`, with no
+`preserve_order` feature named anywhere in this crate. `cargo tree -p plank -e
+features -i serde_json` shows it enabled anyway, through feature unification
+with two transitive dependencies:
+
+```
+serde_json v1.0.150
+├── serde_json feature "default"
+│   ├── cbindgen v0.29.4
+│   │   [build-dependencies]
+│   │   └── extism v1.30.0
+│   │       └── extism feature "wasmtime-default-features"
+│   │           └── plank v4.5.1 (...)
+│   ├── deno_core v0.350.0
+...
+├── serde_json feature "indexmap"
+│   └── serde_json feature "preserve_order"
+│       └── deno_core v0.350.0 (*)
+├── serde_json feature "preserve_order" (*)
+└── serde_json feature "std"
+    ├── serde_json feature "default" (*)
+    └── serde_json feature "preserve_order" (*)
+```
+
+Cargo unifies features across the whole dependency graph, so once anything —
+here `deno_core`, pulled in via the `obscura` plugin runtime — asks
+`serde_json` for `preserve_order`, every crate in the build gets it, plank's
+own code included. That means `serde_json::Map` preserves insertion order
+instead of sorting by key, for every `Map` this crate builds, whether or not
+plank meant to depend on that behavior.
+
+This is exactly why `sysprompt::render_schema_block` (`src/sysprompt.rs`)
+hand-formats the tool-schema block field by field in the fixed order the C
+prompt uses, rather than going through `serde_json::to_string_pretty` or
+relying on `Value`'s own key order: pinning byte-for-byte prompt shape to a
+feature this crate does not itself request, and that a dependency could stop
+requesting, would be fragile in a way that would not show up until something
+upstream changed. Anything else in this codebase that leans on `serde_json`
+map ordering — sorted or insertion — is leaning on the same incidental,
+transitively-controlled setting and should be treated with the same
+suspicion.
+
+## A byte-identity session test has a one-second race
+
+`session::tests::a_pre_goal_file_loads_with_goal_none_and_resaves_byte_identically`
+saves the same session twice and asserts the two files come out byte-for-byte
+identical. `SessionStore::save` re-stamps the sidecar's `used <timestamp>`
+field from `unix_now()` on every save (`src/session.rs:1164` and `:1179`), so
+when the two saves in the test straddle a one-second boundary the two
+timestamps legitimately differ by one second and the byte-identity assertion
+fails. It reproduces about 1 run in 15, exactly the rate you'd expect from a
+save pair racing a one-second clock tick under normal test scheduling jitter.
+
+This is a test bug, not a product bug: re-stamping `used` on every save is the
+correct product behavior. The test is not being fixed as part of this change;
+this entry exists so the next person who hits the flake recognizes it instead
+of chasing a phantom regression in session serialization.
+
 ## Weight deltas cannot be applied in memory, and the engine cannot tell two weight sets apart
 
 Two things shaped `.ggd` weight deltas (`ggufdelta.rs`, `crates/gguf-delta`).

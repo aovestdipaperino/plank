@@ -380,6 +380,44 @@ impl ToolContext {
 ///
 /// Mirrors `agent_execute_tool_call`: the same tool names the C agent
 /// registers, minus the browser web tools.
+/// What the model is told when it calls a builtin the active profile withheld.
+///
+/// Byte-identical to the unknown-tool arm of `dispatch`: the profile's prompt
+/// never advertised the tool, so "unknown" is both the honest answer and the
+/// one the model already knows how to recover from.
+fn disabled_tool_error(name: &str) -> String {
+    format!("Tool error: unknown tool: {name}\n")
+}
+
+/// True when `name` is dispatched by a profile's own components (an MCP
+/// server or a WASM component) rather than the builtin table, and so is
+/// exempt from the profile's builtin allow-list.
+fn is_component_tool(wasm: &crate::wasmreg::Session, name: &str) -> bool {
+    name.starts_with("mcp__") || wasm.registry.tools().iter().any(|t| t.exposed == name)
+}
+
+/// The response to send back, if any, when the active profile withholds
+/// `call`'s builtin. `None` means dispatch should proceed as normal.
+fn withheld_tool_response(ctx: &ToolContext, call: &ToolCall) -> Option<ToolResult> {
+    withheld_before_dispatch(&ctx.wasm, &call.name).map(ToolResult::from_output)
+}
+
+/// The model-visible refusal text, if any, when the active profile withholds
+/// builtin `name`. `None` means the call may proceed.
+///
+/// This is the single predicate both `dispatch` (via `withheld_tool_response`)
+/// and `src/ui.rs`'s per-call executors for `agent`, `fanout` and
+/// `view_image` consult. Those three tools need `&mut self.engine` and so are
+/// routed around `dispatch` entirely; without this shared check called ahead
+/// of that routing, a restrictive profile's allow-list could be bypassed by
+/// asking the model for one of them. Keeping the check as one function used
+/// from both call sites is what keeps them from drifting apart.
+#[must_use]
+pub fn withheld_before_dispatch(wasm: &crate::wasmreg::Session, name: &str) -> Option<String> {
+    (!is_component_tool(wasm, name) && !crate::profile::builtin_enabled(name))
+        .then(|| disabled_tool_error(name))
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     if call.name.is_empty() {
@@ -455,6 +493,22 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     // around the tool body only, so hooks still see the full output.
     let deadline = crate::settings::active().tools.call_timeout_sec;
     let start = std::time::Instant::now();
+    // Deliberately NOT the first statement of `dispatch`: it sits after
+    // `ctx.bash.sweep()`, the PreToolUse shell hooks, the WASM
+    // `pre_tool_use` event and the plan-mode gate specifically so a withheld
+    // builtin runs through the exact same pre-dispatch machinery a genuinely
+    // unknown tool name would. Those hooks/events fire on every call
+    // regardless of whether the name resolves, so a call for a withheld tool
+    // and a call for a tool that never existed are observationally identical
+    // right up to the final "unknown tool" line — which is the whole point:
+    // a withheld tool must not be distinguishable from one that was never
+    // offered. Hoisting this check above those stages would make a withheld
+    // tool visibly skip hooks/WASM events that an unknown tool still runs,
+    // leaking the allow-list's existence to anything watching PreToolUse.
+    // Do not "simplify" this by moving it to the top of the function.
+    if let Some(res) = withheld_tool_response(ctx, call) {
+        return res;
+    }
     // Workspace-mutation witness for the tools that cannot report their own
     // writes (see [`is_opaque_mutator`]). Captured only for those, so a `read`
     // never pays for a `git status` walk.
@@ -1181,6 +1235,143 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_builtin_is_reported_as_unknown() {
+        // The model was never told the tool exists, so "unknown" is the honest
+        // answer and matches what the prompt claimed.
+        let spec = crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(vec!["bash".to_string()]),
+            settings_json: None,
+            warnings: Vec::new(),
+        };
+        assert!(spec.builtin_enabled("bash"));
+        assert!(!spec.builtin_enabled("read"));
+        assert_eq!(
+            disabled_tool_error("read"),
+            "Tool error: unknown tool: read\n"
+        );
+    }
+
+    /// Builds a `ProfileSpec` whose builtin allow-list is exactly `allowed`.
+    fn allow_list_spec(allowed: &[&str]) -> crate::profile::ProfileSpec {
+        crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(allowed.iter().map(|s| (*s).to_string()).collect()),
+            settings_json: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dispatch_refuses_a_withheld_builtin_as_unknown() {
+        // Real end-to-end wiring: install a profile that excludes `read`,
+        // call the real `dispatch`, and confirm the guard actually fires —
+        // not just the standalone helpers `a_disabled_builtin_is_reported_as_unknown`
+        // exercises. Deleting the guard from `dispatch`, or wiring it to the
+        // wrong field, must fail this test.
+        let _guard = crate::profile::TestProfileGuard::install(allow_list_spec(&["bash"]));
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(&test_call("read", &[("path", "/tmp/x")]), &mut ctx);
+        assert_eq!(res.output, "Tool error: unknown tool: read\n");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dispatch_still_runs_an_allowed_builtin_under_a_restrictive_profile() {
+        // Companion to the refusal test above: proves the guard discriminates
+        // rather than blanket-refusing every call once a profile is active.
+        let _guard = crate::profile::TestProfileGuard::install(allow_list_spec(&["view_image"]));
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(
+            &test_call("view_image", &[("path", "/tmp/x.png")]),
+            &mut ctx,
+        );
+        // Routed to the real view_image handler, not the unknown-tool arm.
+        assert_ne!(res.output, "Tool error: unknown tool: view_image\n");
+        assert_eq!(res.output, VIEW_IMAGE_NO_ENCODER);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dispatch_exempts_an_mcp_prefixed_name_from_the_allow_list() {
+        // `mcp__`-prefixed names come from the profile's own MCP servers, not
+        // the builtin table, so they must stay callable even under a
+        // maximally restrictive (empty) allow-list. No server is configured
+        // in this fixture, so the call still errors — but through
+        // `mcp::tool_mcp_call`'s own "no such server" message, not through
+        // the withheld-builtin refusal. If the guard's component exemption
+        // regressed, this would instead come back as the byte-identical
+        // unknown-tool line.
+        let _guard = crate::profile::TestProfileGuard::install(allow_list_spec(&[]));
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(&test_call("mcp__nope__thing", &[]), &mut ctx);
+        assert_ne!(
+            res.output, "Tool error: unknown tool: mcp__nope__thing\n",
+            "mcp__-prefixed name must not be refused as a withheld builtin, got: {}",
+            res.output
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dispatch_exempts_a_registered_wasm_component_tool_from_the_allow_list() {
+        // A WASM component's tool is exempt from the builtin allow-list the
+        // same way an MCP tool is: it comes from the profile's own manifest.
+        // Registering a real (if inert) component and calling its exposed
+        // name proves the exemption is live in `dispatch`, not just in
+        // `is_component_tool` unit-tested in isolation. `NoWasmHost::call`
+        // always errors "unsupported", so a byte-identical unknown-tool
+        // response can only mean the guard, not the missing runtime, refused
+        // the call.
+        let _guard = crate::profile::TestProfileGuard::install(allow_list_spec(&[]));
+        let (mut ctx, dir) = test_ctx();
+        let component = crate::wasmreg::WasmComponent {
+            plugin: "demo".to_string(),
+            origin: crate::plugins::Origin::UserScan,
+            path: std::path::PathBuf::from("/nowhere/demo.wasm"),
+            manifest: crate::wasmreg::WasmManifest {
+                id: "dev.plank.demo".to_string(),
+                abi: 1,
+                module: "demo.wasm".to_string(),
+                surfaces: Vec::new(),
+                capabilities: Vec::new(),
+                kind: crate::wasmreg::FrameKind::default(),
+                veiled: false,
+                min_size: (0, 0),
+                frames: Vec::new(),
+                config: Vec::new(),
+                events: Vec::new(),
+            },
+        };
+        ctx.wasm.registry = crate::wasmreg::Registry::with_loaded(vec![crate::wasmreg::Loaded {
+            component,
+            strikes: 0,
+            tools: vec![crate::wasmreg::WasmTool {
+                component: "dev.plank.demo".to_string(),
+                name: "thing".to_string(),
+                exposed: "wasm__demo__thing".to_string(),
+                description: String::new(),
+                schema: "{\"type\":\"object\",\"properties\":{}}".to_string(),
+            }],
+            commands: Vec::new(),
+        }]);
+        let res = dispatch(&test_call("wasm__demo__thing", &[]), &mut ctx);
+        assert_ne!(
+            res.output, "Tool error: unknown tool: wasm__demo__thing\n",
+            "a registered wasm__-prefixed component tool must not be refused as \
+             a withheld builtin, got: {}",
+            res.output
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn dispatch_unknown_tool_errors() {
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(&test_call("frobnicate", &[]), &mut ctx);
@@ -1335,7 +1526,7 @@ mod tests {
         // dispatch as unknown, matching the prompt where it is unadvertised.
         let mut off = crate::settings::Settings::default();
         off.tools.run_code = false;
-        crate::settings::install_for_test(off);
+        let _settings_guard = crate::settings::install_for_test(off);
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(
             &test_call("run_code", &[("script", "read x.txt")]),
@@ -1346,7 +1537,8 @@ mod tests {
         // At the default, a script of named operations executes through the
         // existing dispatch path (so consent/sandbox checks apply) and collects
         // outputs.
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         let (mut ctx, dir2) = test_ctx();
         let f = dir2.join("x.txt");
         std::fs::write(&f, "hello").expect("write");
@@ -1400,7 +1592,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_bash_step_inside_run_code_is_sandboxed_like_a_bare_call() {
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
 
         // The escape target lives under `$HOME` (outside cwd and temp), and
         // `sandbox-exec` can't apply a profile from inside a nested sandbox —
@@ -1459,13 +1652,14 @@ mod tests {
         // call dispatch as unknown, matching the prompt where it is unadvertised.
         let mut off = crate::settings::Settings::default();
         off.tools.recall = false;
-        crate::settings::install_for_test(off);
+        let _settings_guard = crate::settings::install_for_test(off);
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(&test_call("recall", &[("query", "needle")]), &mut ctx);
         assert!(res.is_error);
         assert!(res.output.contains("unknown tool: recall"));
         // Back at the default, it dispatches.
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         let (mut ctx, dir2) = test_ctx();
         ctx.current_transcript = vec![crate::session::Message::user("a needle here")];
         let res = dispatch(&test_call("recall", &[("query", "needle")]), &mut ctx);
@@ -1483,7 +1677,8 @@ mod tests {
     fn recall_snippet_window_snaps_to_char_boundaries() {
         // An em dash and an emoji sit inside the 40-byte context window on
         // both sides of the match; the snippet must not slice mid-character.
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
         let (mut ctx, dir) = test_ctx();
         let text = format!(
             "{}\u{2014}\u{1F600}{}needle{}\u{2014}\u{1F600}{}",
@@ -1505,7 +1700,8 @@ mod tests {
         // the model: the request itself quotes the query, so the current
         // transcript always self-matches and `No sessions match` never fires
         // in a live session.
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
 
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(&test_call("recall", &[("query", "   ")]), &mut ctx);
@@ -1533,7 +1729,7 @@ mod tests {
 
     #[test]
     fn remember_writes_to_disk_and_forget_deletes_through_the_audited_path() {
-        crate::settings::install_for_test(crate::settings::Settings::default());
+        crate::settings::set_for_test(crate::settings::Settings::default());
         let (mut ctx, dir) = test_ctx();
         // Route the audit log to a scratch file instead of the real
         // `~/.plank`, the same way `apply_verdicts_to`'s `log_dest` does.
@@ -1607,7 +1803,7 @@ mod tests {
         let mut s = crate::settings::Settings::default();
         s.tools.spill_max_bytes = 100;
         s.tools.spill_preview_bytes = 50;
-        crate::settings::install_for_test(s);
+        let _settings_guard = crate::settings::install_for_test(s);
         let (mut ctx, dir) = test_ctx();
         // Dispatch spills through the real `~/.plank/spill`, so use a session
         // id unique to this test run: a fixed one collides with other tests and

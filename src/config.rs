@@ -60,6 +60,17 @@ pub struct AgentConfig {
     pub mcp_config_path: Option<PathBuf>,
     /// Directories named by `--plugin-dir`, loaded as session-only plugins.
     pub plugin_dirs: Vec<PathBuf>,
+    /// The profile named by `--profile`. `Some("")` means either a bare
+    /// `--profile` (lists the available profiles and exits) or an explicit
+    /// `--profile ""` (a fatal error) — `profile_explicit_empty`
+    /// disambiguates the two, since both parse to the same empty string.
+    pub profile: Option<String>,
+    /// True when `--profile` was given an explicit empty-string argument
+    /// (`--profile ""`), as opposed to a bare `--profile` with no argument
+    /// at all. Both leave `profile` as `Some(String::new())`; this is what
+    /// tells `--profile ""` apart from the listing request so it fails
+    /// instead of silently succeeding as a no-op run.
+    pub profile_explicit_empty: bool,
     /// Front end selected by `--ui` (default [`UiMode::Tui`]).
     pub ui: UiMode,
     /// True when `--debug` was given: the only case in which plank looks for
@@ -456,6 +467,8 @@ impl Default for AgentConfig {
             worktree_pr: None,
             mcp_config_path: None,
             plugin_dirs: Vec::new(),
+            profile: None,
+            profile_explicit_empty: false,
             ui: UiMode::Tui,
             debug: false,
             show_memory_stats: false,
@@ -697,6 +710,7 @@ Options:
       --mcp-config FILE    local MCP server config (default: ./.mcp.json);
                            overlays the global ~/.plank/.mcp.json by name
       --plugin-dir PATH    load a plugin directory for this session (repeatable)
+      --profile NAME       run as the profile declared by plugin NAME (bare: list them)
       --sandbox            run model bash commands under sandbox-exec
                            (writes limited to cwd/temp; see sandbox.json).
                            On by default on macOS
@@ -1032,6 +1046,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "install a Claude Code plugin from a repository or a tarball",
     },
     SlashCommand {
+        name: "/install-profile",
+        args: "<url|owner/repo|path> [name] [--force]",
+        desc: "install a profile from a repository, a tarball, or a directory",
+    },
+    SlashCommand {
         name: "/frame",
         args: "[id]",
         desc: "open a wasm frame component, or list the openable ones",
@@ -1230,6 +1249,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/init"
             | "/plugins"
             | "/install-claude-plugin"
+            | "/install-profile"
             | "/frame"
             | "/templates"
             | "/tasks"
@@ -1601,6 +1621,23 @@ pub fn parse_options_with(
             }
             "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--plugin-dir" => c.plugin_dirs.push(PathBuf::from(need_arg(&mut i)?)),
+            "--profile" => {
+                // A bare `--profile`, or one followed by another flag, is the
+                // listing request rather than an error: the name is what the
+                // user is trying to look up. An explicit empty argument
+                // (`--profile ""`) is different: the user supplied a name,
+                // it happened to be empty, and that must fail loudly rather
+                // than collide with the listing sentinel (finding 4).
+                let next = args.get(i + 1).filter(|a| !a.starts_with('-'));
+                if let Some(name) = next {
+                    i += 1;
+                    c.profile_explicit_empty = name.is_empty();
+                    c.profile = Some(name.clone());
+                } else {
+                    c.profile_explicit_empty = false;
+                    c.profile = Some(String::new());
+                }
+            }
             "--sandbox" => {
                 c.sandbox_override = Some(true);
                 c.cli_set("safety.sandbox");
@@ -1936,6 +1973,41 @@ mod tests {
             c.plugin_dirs,
             vec![PathBuf::from("/a"), PathBuf::from("/b")]
         );
+    }
+
+    #[test]
+    fn profile_takes_a_name() {
+        let c = parse_options(&args(&["--profile", "hal"])).expect("parses");
+        assert_eq!(c.profile.as_deref(), Some("hal"));
+    }
+
+    #[test]
+    fn a_bare_profile_flag_is_the_listing_request() {
+        let c = parse_options(&args(&["--profile"])).expect("parses");
+        assert_eq!(c.profile.as_deref(), Some(""));
+        assert!(!c.profile_explicit_empty);
+    }
+
+    #[test]
+    fn an_explicit_empty_profile_argument_is_distinguished_from_the_bare_flag() {
+        // Finding 4: `--profile ""` must be told apart from a bare
+        // `--profile`, even though both leave `c.profile` at `Some("")`.
+        let c = parse_options(&args(&["--profile", ""])).expect("parses");
+        assert_eq!(c.profile.as_deref(), Some(""));
+        assert!(c.profile_explicit_empty);
+    }
+
+    #[test]
+    fn no_profile_flag_leaves_it_unset() {
+        let c = parse_options(&args(&[])).expect("parses");
+        assert!(c.profile.is_none());
+    }
+
+    #[test]
+    fn a_flag_after_profile_is_not_swallowed_as_its_name() {
+        let c = parse_options(&args(&["--profile", "--debug"])).expect("parses");
+        assert_eq!(c.profile.as_deref(), Some(""));
+        assert!(c.debug);
     }
 
     #[test]
@@ -2862,6 +2934,11 @@ mod tests {
     fn plugins_is_a_known_slash_command() {
         assert!(slash_command_known("/plugins"));
         assert!(slash_command_known("/install-claude-plugin"));
+    }
+
+    #[test]
+    fn install_profile_is_a_known_command() {
+        assert!(slash_command_known("/install-profile"));
     }
 
     #[test]

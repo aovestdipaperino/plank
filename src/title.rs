@@ -71,7 +71,10 @@ const ASKING: &str = "❓ waiting for you...";
 pub fn window_title(state: State<'_>) -> String {
     match state {
         State::Loading => LOADING.to_string(),
-        State::Idle => "🪵 Plank - READY.".to_string(),
+        State::Idle => match crate::profile::active() {
+            Some(_) => format!("🪵 {} - READY.", crate::profile::display_name()),
+            None => "🪵 Plank - READY.".to_string(),
+        },
         State::Introspecting => INTROSPECTING.to_string(),
         State::Compacting => COMPACTING.to_string(),
         State::Asking => ASKING.to_string(),
@@ -287,6 +290,14 @@ mod tests {
     fn blank_busy_prompt_falls_back_to_loading() {
         assert_eq!(window_title(State::Busy("   ")), "🚀 Plank loading...");
         assert_eq!(window_title(State::Busy("")), "🚀 Plank loading...");
+    }
+
+    #[test]
+    fn the_idle_title_uses_the_agent_name() {
+        // No profile is installed in the test process, so this is the plank
+        // wording — the assertion exists so a profile-aware rewrite that
+        // breaks the default is caught.
+        assert_eq!(window_title(State::Idle), "🪵 Plank - READY.");
     }
 
     #[test]
