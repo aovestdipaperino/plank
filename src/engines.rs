@@ -440,14 +440,10 @@ pub fn resolve_with_note_in(
                     catalog.names()
                 ));
             }
-            // A path that is exactly a managed engine's main selects the engine.
-            for (name, entry) in &catalog.engines {
-                if let Some(id) = EngineId::new(name) {
-                    let sel = select(root, entry, id);
-                    if sel.managed_main && sel.main == path {
-                        return Ok((sel, None));
-                    }
-                }
+            // A path that is a managed engine's main file, under any name,
+            // selects the engine.
+            if let Some(sel) = managed_engine_at(root, catalog, &path) {
+                return Ok((sel, None));
             }
             Ok((
                 Selection {
@@ -460,6 +456,66 @@ pub fn resolve_with_note_in(
                 None,
             ))
         }
+    }
+}
+
+/// Whether `a` and `b` name the same file: equal as written, equal once
+/// canonicalized (each side falling back to itself when it cannot be, e.g.
+/// because it does not exist yet), or the same inode, which also catches a
+/// hard link.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canon(a) == canon(b) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if let (Ok(x), Ok(y)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return x.dev() == y.dev() && x.ino() == y.ino();
+        }
+    }
+    false
+}
+
+/// The full selection of the managed engine whose `main` is the file at
+/// `path`, if any. The one rule both a bare `--model PATH` and a delta's
+/// base go through.
+fn managed_engine_at(root: &Path, catalog: &Catalog, path: &Path) -> Option<Selection> {
+    catalog.engines.iter().find_map(|(name, entry)| {
+        let sel = select(root, entry, EngineId::new(name)?);
+        (sel.managed_main && same_file(&sel.main, path)).then_some(sel)
+    })
+}
+
+/// `sel` with the companions of the managed engine whose `main` is `base`,
+/// for a `.ggd` delta patched onto that base.
+///
+/// The result keeps `sel.main` (the patched clone) and takes the engine's
+/// `id`, `mtp` and `vision`, but never `managed_main`: the clone is the
+/// user's file, so plank must neither upgrade nor re-download it. The
+/// companions are still the engine's, so a missing one is offered for
+/// download as for the engine itself. A base that is no managed engine's
+/// main leaves `sel` unchanged.
+#[must_use]
+pub fn inherit_companions_in(
+    root: &Path,
+    catalog: &Catalog,
+    base: &Path,
+    sel: Selection,
+) -> Selection {
+    match managed_engine_at(root, catalog, base) {
+        Some(engine) => Selection {
+            id: engine.id,
+            main: sel.main,
+            mtp: engine.mtp,
+            vision: engine.vision,
+            managed_main: false,
+        },
+        None => sel,
     }
 }
 
@@ -787,6 +843,83 @@ mod tests {
         let s = resolve_in(&r, &c, Choice::Spec(p.to_str().unwrap())).unwrap();
         assert_eq!(s.id, Some(crate::manifest::EngineId::QWEN));
         assert!(s.managed_main);
+    }
+
+    #[test]
+    fn a_symlink_to_a_managed_main_selects_that_engine() {
+        let r = root("sel-symlink");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        std::fs::write(r.join("ds4vision.gguf"), "m").unwrap();
+        let link = r.join("elsewhere").join("my-v4.gguf");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(r.join("ds4vision.gguf"), &link).unwrap();
+        let s = resolve_in(&r, &c, Choice::Spec(link.to_str().unwrap())).unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS4VISION));
+        assert_eq!(s.main, r.join("ds4vision.gguf"));
+        assert_eq!(s.vision, Some(r.join("ds4vision.vision.gguf")));
+        assert!(s.managed_main);
+    }
+
+    #[test]
+    fn a_path_to_an_unrelated_existing_file_gets_no_companions() {
+        let r = root("sel-unrelated");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        std::fs::write(r.join("ds4vision.gguf"), "m").unwrap();
+        let other = r.join("other.gguf");
+        std::fs::write(&other, "o").unwrap();
+        let s = resolve_in(&r, &c, Choice::Spec(other.to_str().unwrap())).unwrap();
+        assert_eq!(s.id, None);
+        assert_eq!(s.main, other);
+        assert!(s.mtp.is_none() && s.vision.is_none() && !s.managed_main);
+    }
+
+    fn clone_selection(main: PathBuf) -> Selection {
+        Selection {
+            id: None,
+            main,
+            mtp: None,
+            vision: None,
+            managed_main: false,
+        }
+    }
+
+    #[test]
+    fn a_delta_on_a_managed_main_inherits_its_companions_but_not_management() {
+        let r = root("inherit-managed");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let base = r.join("ds4vision.gguf");
+        std::fs::write(&base, "m").unwrap();
+        let clone = r.join("models/patched/x.gguf");
+        let s = inherit_companions_in(&r, &c, &base, clone_selection(clone.clone()));
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS4VISION));
+        assert_eq!(s.main, clone, "the patched clone stays the main");
+        assert_eq!(s.mtp, Some(r.join("ds4vision.mtp.gguf")));
+        assert_eq!(s.vision, Some(r.join("ds4vision.vision.gguf")));
+        assert!(!s.managed_main, "the clone is never upgraded or downloaded");
+    }
+
+    #[test]
+    fn a_delta_on_a_symlinked_base_still_inherits() {
+        let r = root("inherit-symlink");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        std::fs::write(r.join("ds4vision.gguf"), "m").unwrap();
+        std::fs::create_dir_all(r.join("models")).unwrap();
+        let base = r.join("models/ds4vision.gguf");
+        std::os::unix::fs::symlink(r.join("ds4vision.gguf"), &base).unwrap();
+        let s = inherit_companions_in(&r, &c, &base, clone_selection(r.join("clone.gguf")));
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS4VISION));
+        assert!(!s.managed_main);
+    }
+
+    #[test]
+    fn a_delta_on_an_unmanaged_base_is_unchanged() {
+        let r = root("inherit-unmanaged");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        std::fs::write(r.join("ds4vision.gguf"), "m").unwrap();
+        let base = r.join("somebody-elses.gguf");
+        std::fs::write(&base, "b").unwrap();
+        let sel = clone_selection(r.join("clone.gguf"));
+        assert_eq!(inherit_companions_in(&r, &c, &base, sel.clone()), sel);
     }
 
     #[test]

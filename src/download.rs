@@ -350,8 +350,9 @@ pub fn ensure_role(sel: &crate::engines::Selection, role: &str, path: &Path) -> 
 /// a Qwen3.8-Flash-Next one.
 ///
 /// The companions come from the selection ([`apply_companions`]): an engine
-/// that declares no `mtp` or `vision` role, and a bare `--model PATH`, get
-/// none. An explicit `--mtp-model` is kept and never fetched.
+/// that declares no `mtp` or `vision` role, and a bare `--model PATH` that is
+/// not a managed engine's main, get none; a `.ggd` delta on a managed main
+/// has inherited that engine's. An explicit `--mtp-model` is kept and never fetched.
 ///
 /// A Qwen run opens neither: the engine is not handed a vision encoder, and
 /// Qwen speculates from the MTP block embedded in its own main GGUF rather
@@ -2673,6 +2674,66 @@ mod tests {
             !root.join("staging").exists(),
             "a bare path must never touch staging"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A selection a `.ggd` delta inherited from its managed base: the
+    /// engine's `id` and companions, but an unmanaged patched clone as main.
+    fn inheriting_selection(root: &Path) -> crate::engines::Selection {
+        let base = root.join("ds4vision.gguf");
+        std::fs::create_dir_all(root).expect("root");
+        std::fs::write(&base, b"m").expect("base");
+        let clone = crate::engines::Selection {
+            id: None,
+            main: root.join("models/patched/missing-clone.gguf"),
+            mtp: None,
+            vision: None,
+            managed_main: false,
+        };
+        let sel = crate::engines::inherit_companions_in(root, &catalog(), &base, clone);
+        assert_eq!(
+            sel.id,
+            Some(EngineId::DS4VISION),
+            "inherits the base engine"
+        );
+        assert!(!sel.managed_main);
+        sel
+    }
+
+    /// An inheriting selection names the base engine but must never run its
+    /// upgrade check: the patched clone is not the engine's file.
+    #[test]
+    fn check_manifest_at_startup_with_skips_an_inheriting_selection() {
+        let root = crate::downloader::tests::tempdir();
+        let sel = inheriting_selection(&root);
+        assert_eq!(managed_id(&sel), None);
+        check_manifest_at_startup_with(
+            &sel,
+            &root,
+            &|| panic!("an inheriting clone must never fetch the catalog"),
+            &|_, _| panic!("an inheriting clone must never spawn a download"),
+            &|_, _| panic!("an inheriting clone must never be asked anything"),
+        );
+        assert!(!root.join("staging").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A missing patched clone is an error, never an offer of the base
+    /// engine's main; its companions are still offered, as for the engine.
+    #[test]
+    fn an_inheriting_selection_offers_its_companions_but_never_its_main() {
+        let root = crate::downloader::tests::tempdir();
+        let sel = inheriting_selection(&root);
+        assert!(!sel.main.exists());
+        assert_eq!(
+            main_offer_with(&sel, || panic!("the clone's main is never looked up")),
+            None
+        );
+        let err = ensure_model_in(&catalog(), &sel, true)
+            .expect_err("even on a terminal the clone is never downloaded");
+        assert!(err.contains("no model at"), "{err}");
+        assert!(role_offer_in(&catalog(), &sel, "mtp").is_some());
+        assert!(role_offer_in(&catalog(), &sel, "vision").is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 

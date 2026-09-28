@@ -183,7 +183,9 @@ fresh install resolves to with no `--model` given. V4.1 (`ds41`) is a named
 engine like any other, reached with `--model ds41` or by pointing `-m` at a
 V4.1 GGUF path directly. Loaded by path, the family, dialect and transcript
 extension still follow from the file, but a bare path has no install paths:
-plank neither downloads nor upgrades it, and looks up no companions beside it. An engine whose
+plank neither downloads nor upgrades it, and looks up no companions beside it.
+The exception is a path to a managed engine's main file under another name
+(compared canonicalized, or by inode), which selects that engine outright. An engine whose
 remote fetch 404s or times out is treated like being offline: nothing
 printed, nothing offered, and the 24-hour check file stamped before the fetch
 so it is not retried until tomorrow.
@@ -216,6 +218,13 @@ path: a `.ggd` sits beside its base, so the pair moves together. Lookup tries
 model path, accepting only a file
 whose size and header hash match; every chunk additionally checks a hash of
 the base bytes it replaces, so the wrong base fails at the first chunk.
+
+When the base found is a managed engine's main, `main::finish_selection`
+passes the selection through `engines::inherit_companions_in`: it takes that
+engine's `id`, `mtp` and `vision` but keeps `managed_main` false, so the
+companions are fetched on demand as for the engine itself while the patched
+clone is never offered for download or upgraded. A delta on any other base
+gets no companions, like a bare path.
 
 KV caches are shared between base and derived weights on purpose: the engine
 reports one shape name for both and nothing here changes it, so the sysprompt

@@ -338,11 +338,12 @@ fn model_choice(cfg: &plank::config::AgentConfig) -> plank::engines::Choice<'_> 
 /// delta-adjusted selection once both steps have run.
 ///
 /// The catalog and managed paths come from `root`, which is `~/.plank` in
-/// every real run and a scratch directory in tests.
+/// every real run and a scratch directory in tests. The loaded catalog is
+/// returned so [`finish_selection`] can reuse it rather than load it twice.
 fn resolve_selection(
     cfg: &mut plank::config::AgentConfig,
     root: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<plank::engines::Catalog, String> {
     let mut warn = Vec::new();
     let catalog = plank::engines::load_in(root, &mut warn);
     for w in warn {
@@ -354,7 +355,33 @@ fn resolve_selection(
     }
     cfg.model_path = Some(sel.main.clone());
     cfg.selection = Some(sel);
-    Ok(())
+    Ok(catalog)
+}
+
+/// Points the selection at the final `model_path`, and gives a `.ggd`
+/// delta patched onto a managed engine's `main` that engine's companions
+/// (`engines::inherit_companions_in`), so an abliterated V4 delta still gets
+/// the vision encoder and the `DSpark` drafter. The clone itself stays
+/// unmanaged: it is never upgraded or re-downloaded.
+///
+/// Runs after `resolve_model_delta` and before `set_active`, keeping the
+/// invariant `selection.main == model_path`.
+fn finish_selection(
+    cfg: &mut plank::config::AgentConfig,
+    root: &std::path::Path,
+    catalog: &plank::engines::Catalog,
+) {
+    let Some(path) = cfg.model_path.clone() else {
+        return;
+    };
+    let Some(mut sel) = cfg.selection.take() else {
+        return;
+    };
+    sel.main = path;
+    if let Some(delta) = &cfg.model_delta {
+        sel = plank::engines::inherit_companions_in(root, catalog, &delta.base, sel);
+    }
+    cfg.selection = Some(sel);
 }
 
 /// Whether a `resolve_selection`/`resolve_model_delta` error must abort
@@ -390,17 +417,17 @@ fn parse_config_in(
 ) -> Result<plank::config::AgentConfig, ExitCode> {
     plank::config::parse_options_with(settings, args)
         .and_then(|mut cfg| {
-            if let Err(e) =
-                resolve_selection(&mut cfg, root).and_then(|()| resolve_model_delta(&mut cfg))
+            match resolve_selection(&mut cfg, root)
+                .and_then(|catalog| resolve_model_delta(&mut cfg).map(|()| catalog))
             {
-                if resolution_is_fatal(&cfg) {
-                    return Err(e);
+                Ok(catalog) => finish_selection(&mut cfg, root, &catalog),
+                Err(e) => {
+                    if resolution_is_fatal(&cfg) {
+                        return Err(e);
+                    }
+                    eprintln!("plank: {e}");
+                    cfg.selection = None;
                 }
-                eprintln!("plank: {e}");
-                cfg.selection = None;
-            } else if let (Some(sel), Some(path)) = (cfg.selection.as_mut(), cfg.model_path.clone())
-            {
-                sel.main = path;
             }
             if let Some(sel) = cfg.selection.clone() {
                 plank::engines::set_active(sel);
@@ -961,10 +988,10 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // Speculation is on by default; without `--mtp-model` a DeepSeek run
         // takes its companion from the selected engine's `mtp` role and
         // fetches it on demand (`--mtp-off` skips that). A run with no such
-        // companion — a bare `--model PATH`, or an engine that declares
-        // none — has speculation turned off instead of failing to open. Kept
-        // local rather than written back into `cfg`: only the engine open
-        // needs it. A Qwen model skips both side artifacts, since it opens
+        // companion — a bare `--model PATH` or a `.ggd` on no managed base,
+        // or an engine that declares none — has speculation turned off
+        // instead of failing to open. Kept local rather than written back
+        // into `cfg`: only the engine open needs it. A Qwen model skips both side artifacts, since it opens
         // neither.
         let mut tuning = cfg.engine.clone();
         plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;
@@ -1377,6 +1404,62 @@ mod tests {
             .expect("parses");
             assert!(!should_migrate(&cfg), "{flag} must not migrate");
         }
+    }
+
+    fn scratch_root(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("plank-main-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("scratch root");
+        p
+    }
+
+    /// A resolved delta, as `resolve_model_delta` leaves it, without a real
+    /// `.ggd`: the selection must follow the clone and inherit the base
+    /// engine's companions without becoming managed.
+    #[test]
+    fn a_delta_on_the_managed_v4_base_inherits_its_companions() {
+        let root = scratch_root("delta-inherit");
+        let base = root.join("ds4vision.gguf");
+        std::fs::write(&base, "m").expect("base");
+        let clone = root.join("models/patched/abl.gguf");
+        let mut cfg =
+            plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
+        cfg.model_spec = Some(root.join("models/abl.ggd").display().to_string());
+        let catalog = resolve_selection(&mut cfg, &root).expect("a .ggd spec is a bare path");
+        assert!(cfg.selection.as_ref().unwrap().mtp.is_none());
+        cfg.model_path = Some(clone.clone());
+        cfg.model_delta = Some(plank::ggufdelta::Resolved {
+            path: clone.clone(),
+            base,
+            label: "abl".into(),
+            id: "0123456789ab".into(),
+        });
+        finish_selection(&mut cfg, &root, &catalog);
+        let sel = cfg.selection.as_ref().expect("selection");
+        assert_eq!(sel.main, clone);
+        assert_eq!(cfg.model_path.as_ref(), Some(&sel.main));
+        assert_eq!(sel.id, Some(plank::manifest::EngineId::DS4VISION));
+        assert_eq!(sel.mtp, Some(root.join("ds4vision.mtp.gguf")));
+        assert_eq!(sel.vision, Some(root.join("ds4vision.vision.gguf")));
+        assert!(!sel.managed_main);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No delta: `finish_selection` only aligns `main` with `model_path`.
+    #[test]
+    fn without_a_delta_the_selection_is_untouched_but_for_main() {
+        let root = scratch_root("delta-none");
+        let other = root.join("mine.gguf");
+        std::fs::write(&other, "o").expect("file");
+        let mut cfg =
+            plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
+        cfg.model_spec = Some(other.display().to_string());
+        let catalog = resolve_selection(&mut cfg, &root).expect("resolves");
+        finish_selection(&mut cfg, &root, &catalog);
+        let sel = cfg.selection.as_ref().expect("selection");
+        assert_eq!(sel.main, other);
+        assert!(sel.id.is_none() && sel.mtp.is_none() && sel.vision.is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
