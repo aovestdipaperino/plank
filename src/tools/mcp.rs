@@ -28,6 +28,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::dsml::ToolCall;
+use crate::grid::{GridStaging, WriteBack};
 
 /// Timeout for one MCP request round trip, in seconds.
 ///
@@ -1565,12 +1566,52 @@ pub fn args_to_json(call: &ToolCall) -> String {
     out
 }
 
-/// Flattens a `tools/call` result's `content[]` into plain text.
-fn append_content(out: &mut String, result: &Json) {
+/// What one MCP tool call produced: the text the model sees, and the grids
+/// it asked plank to open, which the model never sees.
+#[derive(Debug, Default)]
+pub struct McpOutput {
+    /// The flattened tool result, in tool-result framing.
+    pub text: String,
+    /// `plank-frame://` resources removed from the result, in content order.
+    pub stagings: Vec<GridStaging>,
+}
+
+impl McpOutput {
+    /// A text-only result: an error, or anything else with no stagings.
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            stagings: Vec::new(),
+        }
+    }
+}
+
+/// The note that replaces a `plank-frame://` resource plank cannot use.
+const MALFORMED_FRAME_NOTE: &str = "grid not opened: malformed plank-frame resource\n";
+
+/// Flattens a `tools/call` result's `content[]` into plain text, removing
+/// `plank-frame://` resources and returning them as stagings.
+///
+/// An item is a staging when its `type` is `resource`, its `resource.uri`
+/// starts with [`crate::grid::FRAME_SCHEME`] and its `resource.text` is a
+/// string. The write-back target is read from the resource's `_meta`, else
+/// from the result's. A staging whose URI does not parse or which names no
+/// complete write-back is dropped and leaves a note in the text instead, so
+/// the model can tell the user. Every other item is handled as before: its
+/// top-level `text`, if any, is appended.
+fn append_content_staged(out: &mut String, server: &str, result: &Json) -> Vec<GridStaging> {
+    let mut stagings = Vec::new();
     let Some(Json::Arr(content)) = result.get("content") else {
-        return;
+        return stagings;
     };
     for item in content {
+        if let Some((uri, csv, meta)) = frame_resource(item) {
+            match staging_from(server, uri, csv, meta.or_else(|| result.get("_meta"))) {
+                Some(staging) => stagings.push(staging),
+                None => out.push_str(MALFORMED_FRAME_NOTE),
+            }
+            continue;
+        }
         let Some(Json::Str(text)) = item.get("text") else {
             continue;
         };
@@ -1579,6 +1620,48 @@ fn append_content(out: &mut String, result: &Json) {
             out.push('\n');
         }
     }
+    stagings
+}
+
+/// The URI, CSV text and `_meta` of a qualifying `plank-frame://` resource
+/// item, or `None` for any other item.
+fn frame_resource(item: &Json) -> Option<(&str, &str, Option<&Json>)> {
+    if !matches!(item.get("type"), Some(Json::Str(t)) if t == "resource") {
+        return None;
+    }
+    let resource = item.get("resource")?;
+    let Some(Json::Str(uri)) = resource.get("uri") else {
+        return None;
+    };
+    if !uri.starts_with(crate::grid::FRAME_SCHEME) {
+        return None;
+    }
+    let Some(Json::Str(csv)) = resource.get("text") else {
+        return None;
+    };
+    Some((uri, csv, resource.get("_meta")))
+}
+
+/// Builds a staging from a qualifying resource, `None` when its URI or its
+/// write-back (`meta.writeBack.{tool,table,grid}`, all strings) is malformed.
+fn staging_from(server: &str, uri: &str, csv: &str, meta: Option<&Json>) -> Option<GridStaging> {
+    let (component, file) = crate::grid::parse_frame_uri(uri)?;
+    let write_back = meta?.get("writeBack")?;
+    let field = |key: &str| match write_back.get(key) {
+        Some(Json::Str(v)) => Some(v.clone()),
+        _ => None,
+    };
+    Some(GridStaging {
+        server: server.to_string(),
+        component: component.to_string(),
+        file: file.to_string(),
+        csv: csv.to_string(),
+        write_back: WriteBack {
+            tool: field("tool")?,
+            table: field("table")?,
+            grid: field("grid")?,
+        },
+    })
 }
 
 fn split_name(full_name: &str) -> Option<(&str, &str)> {
@@ -1609,7 +1692,10 @@ fn offline_tool_error(server: &str) -> String {
 }
 
 /// Executes one `mcp__<server>__<tool>` call, mirroring `agent_tool_mcp_call`.
-pub fn tool_mcp_call(servers: &mut [McpServer], call: &ToolCall) -> String {
+///
+/// Any grid stagings in the result come back beside the text; the caller
+/// keeps them for the frame side ([`crate::grid`]).
+pub fn tool_mcp_call(servers: &mut [McpServer], call: &ToolCall) -> McpOutput {
     invoke_mcp_tool(servers, &call.name, &args_to_json(call))
 }
 
@@ -1623,9 +1709,9 @@ pub fn tool_mcp_call(servers: &mut [McpServer], call: &ToolCall) -> String {
 /// The text path needs no equivalent: there the model writes DSML, which is
 /// free text and can name any tool.
 #[must_use]
-pub fn tool_mcp_invoke(servers: &mut [McpServer], call: &ToolCall) -> String {
+pub fn tool_mcp_invoke(servers: &mut [McpServer], call: &ToolCall) -> McpOutput {
     let Some(name) = call.arg_value("name").filter(|n| !n.is_empty()) else {
-        return "Tool error: mcp_call requires name\n".to_string();
+        return McpOutput::error("Tool error: mcp_call requires name\n");
     };
     // Absent arguments is a legitimate no-parameter call, not an error.
     let args = call.arg_value("arguments").unwrap_or("").trim().to_string();
@@ -1634,7 +1720,7 @@ pub fn tool_mcp_invoke(servers: &mut [McpServer], call: &ToolCall) -> String {
     // produce a `tools/call` the server rejects with a schema error that reads
     // as the tool's fault rather than the caller's.
     if !json_parse(args).is_some_and(|v| matches!(v, Json::Obj(_))) {
-        return "Tool error: mcp_call arguments must be a JSON object\n".to_string();
+        return McpOutput::error("Tool error: mcp_call arguments must be a JSON object\n");
     }
     invoke_mcp_tool(servers, name, args)
 }
@@ -1658,26 +1744,28 @@ fn usable_server<'a>(
 
 /// Shared body of [`tool_mcp_call`] and [`tool_mcp_invoke`]: routes one
 /// `mcp__<server>__<tool>` name plus an already-encoded JSON argument object.
-fn invoke_mcp_tool(servers: &mut [McpServer], full_name: &str, arguments: &str) -> String {
+fn invoke_mcp_tool(servers: &mut [McpServer], full_name: &str, arguments: &str) -> McpOutput {
     let Some((server_name, tool_name)) = split_name(full_name) else {
-        return "Tool error: malformed mcp tool name, expected mcp__server__tool\n".to_string();
+        return McpOutput::error(
+            "Tool error: malformed mcp tool name, expected mcp__server__tool\n",
+        );
     };
     // An offline shadow matches too: its tools are advertised in the prompt, so
     // a call must be answered with "the server is down" rather than the generic
     // unavailable message reserved for a name that is not configured at all.
     let server = match usable_server(servers, server_name) {
         Ok(Some(server)) => server,
-        Ok(None) => return "Tool error: mcp server not available\n".to_string(),
-        Err(e) => return format!("Tool error: {e}\n"),
+        Ok(None) => return McpOutput::error("Tool error: mcp server not available\n"),
+        Err(e) => return McpOutput::error(format!("Tool error: {e}\n")),
     };
     // Checked before the tool lookup: a shadow's tool list is only as fresh as
     // its last handshake, so "the server is down" is both the more accurate and
     // the more actionable fact.
     if server.is_offline() {
-        return offline_tool_error(&server.name);
+        return McpOutput::error(offline_tool_error(&server.name));
     }
     if server.find_tool(tool_name).is_none() {
-        return format!("Tool error: unknown mcp tool: {full_name}\n");
+        return McpOutput::error(format!("Tool error: unknown mcp tool: {full_name}\n"));
     }
 
     let mut params = String::from("{\"name\":");
@@ -1688,18 +1776,21 @@ fn invoke_mcp_tool(servers: &mut [McpServer], full_name: &str, arguments: &str) 
 
     let result = match server.request("tools/call", &params) {
         Ok(result) => result,
-        Err(err) => return format!("Tool error: mcp call failed: {err}\n"),
+        Err(err) => return McpOutput::error(format!("Tool error: mcp call failed: {err}\n")),
     };
 
     let mut out = String::new();
     if matches!(result.get("isError"), Some(Json::Bool(true))) {
         out.push_str("Tool error: ");
     }
-    append_content(&mut out, &result);
+    let stagings = append_content_staged(&mut out, &server.name, &result);
     if out.is_empty() {
         out.push_str("(no output)\n");
     }
-    out
+    McpOutput {
+        text: out,
+        stagings,
+    }
 }
 
 /// `mcp_describe`: returns the full schema of directory (secondary) tools.
@@ -1959,9 +2050,9 @@ done
         let marker = advert_temp_root("flaky-restart").join("hung-once");
         let mut servers = start_servers(vec![flaky_server("flaky", &marker, false)]);
         assert_eq!(servers.len(), 1, "the handshake succeeds");
-        let first = invoke_mcp_tool(&mut servers, "mcp__flaky__ping", "{}");
+        let first = invoke_mcp_tool(&mut servers, "mcp__flaky__ping", "{}").text;
         assert!(first.contains("no response within 1s"), "{first}");
-        let second = invoke_mcp_tool(&mut servers, "mcp__flaky__ping", "{}");
+        let second = invoke_mcp_tool(&mut servers, "mcp__flaky__ping", "{}").text;
         assert_eq!(
             second, "pong\n",
             "the next call restarts the server and succeeds"
@@ -1974,7 +2065,7 @@ done
         let marker = advert_temp_root("flaky-dies").join("hung-once");
         let mut servers = start_servers(vec![flaky_server("flaky", &marker, true)]);
         let _ = invoke_mcp_tool(&mut servers, "mcp__flaky__ping", "{}");
-        let second = invoke_mcp_tool(&mut servers, "mcp__flaky__ping", "{}");
+        let second = invoke_mcp_tool(&mut servers, "mcp__flaky__ping", "{}").text;
         assert!(second.contains("flaky"), "{second}");
         assert!(second.contains("no response within 1s"), "{second}");
         assert!(second.contains("restarting it failed"), "{second}");
@@ -2557,7 +2648,7 @@ done
                 is_string: true,
             }],
         };
-        let out = tool_mcp_call(&mut servers, &call);
+        let out = tool_mcp_call(&mut servers, &call).text;
         assert_eq!(out, "echoed: hi\n");
 
         let sessions = handle.join().expect("server thread");
@@ -2620,7 +2711,7 @@ done
             name: "mcp__demo__alpha".to_string(),
             args: Vec::new(),
         };
-        let out = tool_mcp_call(&mut servers, &call);
+        let out = tool_mcp_call(&mut servers, &call).text;
         assert!(out.contains("is not running"), "{out}");
         assert!(out.contains("demo"), "must name the server: {out}");
         assert!(
@@ -2635,7 +2726,11 @@ done
             name: "mcp__demo__nope".to_string(),
             args: Vec::new(),
         };
-        assert!(tool_mcp_call(&mut servers, &bogus).contains("is not running"));
+        assert!(
+            tool_mcp_call(&mut servers, &bogus)
+                .text
+                .contains("is not running")
+        );
 
         // A server that is not present at all keeps the old generic message.
         let missing = ToolCall {
@@ -2643,7 +2738,9 @@ done
             args: Vec::new(),
         };
         assert!(
-            tool_mcp_call(&mut servers, &missing).contains("mcp server not available"),
+            tool_mcp_call(&mut servers, &missing)
+                .text
+                .contains("mcp server not available"),
             "an absent server is a different situation"
         );
     }
@@ -2716,9 +2813,147 @@ done
             ],
         };
         assert_eq!(
-            tool_mcp_invoke(&mut servers, &call),
+            tool_mcp_invoke(&mut servers, &call).text,
             "buried ran with depth=2\n"
         );
+    }
+
+    /// A `tools/call` result with `content` items given as raw JSON text.
+    fn call_result(items: &str, extra: &str) -> Json {
+        json_parse(&format!("{{\"content\":[{items}]{extra}}}")).expect("valid test json")
+    }
+
+    const FRAME_ITEM: &str = r##"{"type":"resource","resource":{"uri":"plank-frame://csvedit/accounts.csv","mimeType":"text/csv","text":"#,name\n1,Checking\n","_meta":{"writeBack":{"tool":"apply_grid","table":"accounts","grid":"0a1b2c3d"}}}}"##;
+
+    fn expected_staging() -> crate::grid::GridStaging {
+        crate::grid::GridStaging {
+            server: "fin".to_string(),
+            component: "csvedit".to_string(),
+            file: "accounts.csv".to_string(),
+            csv: "#,name\n1,Checking\n".to_string(),
+            write_back: crate::grid::WriteBack {
+                tool: "apply_grid".to_string(),
+                table: "accounts".to_string(),
+                grid: "0a1b2c3d".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_plank_frame_resource_is_removed_and_the_text_kept() {
+        let result = call_result(
+            &format!(r#"{{"type":"text","text":"Opened accounts."}},{FRAME_ITEM}"#),
+            "",
+        );
+        let mut out = String::new();
+        let stagings = append_content_staged(&mut out, "fin", &result);
+        assert_eq!(out, "Opened accounts.\n");
+        assert_eq!(stagings, vec![expected_staging()]);
+    }
+
+    #[test]
+    fn a_write_back_on_the_result_is_accepted() {
+        let item = r##"{"type":"resource","resource":{"uri":"plank-frame://csvedit/accounts.csv","mimeType":"text/csv","text":"#,name\n1,Checking\n"}}"##;
+        let result = call_result(
+            item,
+            r#","_meta":{"writeBack":{"tool":"apply_grid","table":"accounts","grid":"0a1b2c3d"}}"#,
+        );
+        let mut out = String::new();
+        let stagings = append_content_staged(&mut out, "fin", &result);
+        assert_eq!(out, "");
+        assert_eq!(stagings, vec![expected_staging()]);
+    }
+
+    #[test]
+    fn a_malformed_plank_frame_resource_is_dropped_with_a_note() {
+        let note = "grid not opened: malformed plank-frame resource\n";
+        for uri in [
+            "plank-frame://csvedit/sub/accounts.csv",
+            "plank-frame://csvedit",
+            "plank-frame:///accounts.csv",
+            "plank-frame://csvedit/..",
+        ] {
+            let item = FRAME_ITEM.replace("plank-frame://csvedit/accounts.csv", uri);
+            let mut out = String::new();
+            let stagings = append_content_staged(&mut out, "fin", &call_result(&item, ""));
+            assert!(stagings.is_empty(), "{uri}");
+            assert_eq!(out, note, "{uri}");
+        }
+        // A missing writeBack, on both the resource and the result.
+        let item =
+            r#"{"type":"resource","resource":{"uri":"plank-frame://csvedit/a.csv","text":"x\n"}}"#;
+        let mut out = String::new();
+        let stagings = append_content_staged(&mut out, "fin", &call_result(item, ""));
+        assert!(stagings.is_empty());
+        assert_eq!(out, note);
+        // An incomplete writeBack is as malformed as a missing one.
+        let item = FRAME_ITEM.replace(r#","grid":"0a1b2c3d""#, "");
+        let mut out = String::new();
+        let stagings = append_content_staged(&mut out, "fin", &call_result(&item, ""));
+        assert!(stagings.is_empty());
+        assert_eq!(out, note);
+    }
+
+    #[test]
+    fn a_resource_with_another_uri_is_left_alone() {
+        let item = r#"{"type":"resource","resource":{"uri":"file:///tmp/a.csv","mimeType":"text/csv","text":"a,b\n","_meta":{"writeBack":{"tool":"apply_grid","table":"t","grid":"0a1b2c3d"}}}}"#;
+        let result = call_result(&format!(r#"{{"type":"text","text":"done"}},{item}"#), "");
+        let mut out = String::new();
+        let stagings = append_content_staged(&mut out, "fin", &result);
+        assert!(stagings.is_empty());
+        // Today's behaviour: an item with no top-level `text` is skipped.
+        assert_eq!(out, "done\n");
+    }
+
+    #[test]
+    fn without_resources_the_output_is_what_append_content_gives() {
+        let result = call_result(
+            r#"{"type":"text","text":"one"},{"type":"image","data":"AAAA"},{"type":"text","text":"two\n"}"#,
+            "",
+        );
+        let mut out = String::new();
+        let stagings = append_content_staged(&mut out, "fin", &result);
+        assert!(stagings.is_empty());
+        assert_eq!(out, "one\ntwo\n");
+    }
+
+    #[test]
+    fn a_tools_call_answer_with_a_grid_gives_text_only_and_one_staging() {
+        // End to end over stdio: the resource never reaches the output text.
+        let script = r##"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"protocolVersion\":\"2024-11-05\"}}" ;;
+    *'"tools/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"tools\":[{\"name\":\"open_grid\",\"description\":\"g\",\"inputSchema\":{\"type\":\"object\"}}]}}" ;;
+    *'"tools/call"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Opened accounts.\"},{\"type\":\"resource\",\"resource\":{\"uri\":\"plank-frame://csvedit/accounts.csv\",\"mimeType\":\"text/csv\",\"text\":\"#,name\\n1,Checking\\n\",\"_meta\":{\"writeBack\":{\"tool\":\"apply_grid\",\"table\":\"accounts\",\"grid\":\"0a1b2c3d\"}}}}]}}" ;;
+    *)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"error\":{\"message\":\"method not found\"}}" ;;
+  esac
+done
+"##;
+        let path = write_temp_config(&format!(
+            "{{\"mcpServers\":{{\"fin\":{{\"command\":\"sh\",\"args\":[\"-c\",{}]}}}}}}",
+            {
+                let mut esc = String::new();
+                json_escape(&mut esc, script);
+                esc
+            }
+        ));
+        let mut servers = start_servers(config_load(&path));
+        std::fs::remove_file(&path).ok();
+        assert_eq!(servers.len(), 1);
+
+        let call = ToolCall {
+            name: "mcp__fin__open_grid".to_string(),
+            args: Vec::new(),
+        };
+        let out = tool_mcp_call(&mut servers, &call);
+        assert_eq!(out.text, "Opened accounts.\n");
+        assert_eq!(out.stagings, vec![expected_staging()]);
     }
 
     #[test]
@@ -2734,21 +2969,27 @@ done
             args,
         };
         assert!(
-            tool_mcp_invoke(&mut servers, &call(vec![])).contains("requires name"),
+            tool_mcp_invoke(&mut servers, &call(vec![]))
+                .text
+                .contains("requires name"),
             "a missing name must not reach the wire"
         );
         // A scalar or array would produce a `tools/call` the server rejects with
         // a schema error that reads as the tool's fault, not the caller's.
         let bad = call(vec![arg("name", "mcp__d__t"), arg("arguments", "[1,2]")]);
         assert!(
-            tool_mcp_invoke(&mut servers, &bad).contains("must be a JSON object"),
+            tool_mcp_invoke(&mut servers, &bad)
+                .text
+                .contains("must be a JSON object"),
             "non-object arguments must be caught locally"
         );
         // No arguments at all is a legitimate zero-parameter call: it must get
         // past validation and fail only on the (absent) server.
         let none = call(vec![arg("name", "mcp__d__t")]);
         assert!(
-            tool_mcp_invoke(&mut servers, &none).contains("server not available"),
+            tool_mcp_invoke(&mut servers, &none)
+                .text
+                .contains("server not available"),
             "omitted arguments must be treated as {{}}"
         );
     }
@@ -2804,7 +3045,7 @@ done
                 is_string: true,
             }],
         };
-        let out = tool_mcp_call(&mut servers, &call);
+        let out = tool_mcp_call(&mut servers, &call).text;
         assert_eq!(out, "echoed: hi\n");
     }
 

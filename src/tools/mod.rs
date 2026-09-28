@@ -199,6 +199,10 @@ pub struct ToolContext {
     /// `memory::apply_verdicts_to`'s `log_dest`, and for the same reason: it
     /// lets a test redirect the audit log without ever setting `HOME`.
     pub memory_log_path: Option<PathBuf>,
+    /// Grids MCP tool results asked to open in a frame component
+    /// (`plank-frame://` resources), removed from the text the model saw.
+    /// Filled by dispatch, oldest first, for the frame side to drain.
+    pub grid_stagings: Vec<crate::grid::GridStaging>,
 }
 
 /// Most `skill` invocations allowed within one turn before the tool refuses,
@@ -306,6 +310,7 @@ impl ToolContext {
             web_browser: None,
             wrote_memory: false,
             memory_log_path: None,
+            grid_stagings: Vec::new(),
         }
     }
 
@@ -555,7 +560,11 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "google_search" => web::tool_google_search(ctx, call),
         "visit_page" => web::tool_visit_page(ctx, call),
         "mcp_describe" => mcp::tool_mcp_describe(&ctx.mcp, call),
-        "mcp_call" => mcp::tool_mcp_invoke(&mut ctx.mcp, call),
+        "mcp_call" => {
+            let out = mcp::tool_mcp_invoke(&mut ctx.mcp, call);
+            ctx.grid_stagings.extend(out.stagings);
+            out.text
+        }
         "mcp_list_resources" => mcp::tool_mcp_list_resources(&ctx.mcp, call),
         "mcp_read_resource" => mcp::tool_mcp_read_resource(&mut ctx.mcp, call),
         "skill" => crate::skills::tool_skill(
@@ -570,7 +579,11 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "remember" => tool_remember(ctx, call),
         "forget" => tool_forget(ctx, call),
         "run_code" => tool_run_code(ctx, call),
-        name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
+        name if name.starts_with("mcp__") => {
+            let out = mcp::tool_mcp_call(&mut ctx.mcp, call);
+            ctx.grid_stagings.extend(out.stagings);
+            out.text
+        }
         // A WASM component's tool. Checked before the unknown-tool fallthrough
         // and after every built-in, so a component can extend the table and
         // never shadow it.
