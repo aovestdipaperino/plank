@@ -779,6 +779,7 @@ fn main() -> ExitCode {
     }
 
     plank::interrupt::install();
+    plank::gpuyield::sweep_stray_signals();
     arm_panic_dump();
     let engine = match make_engine(&cfg, &plugins) {
         Ok(engine) => engine,
@@ -1315,6 +1316,7 @@ fn run_serve(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
     plank::interrupt::install();
+    plank::gpuyield::sweep_stray_signals();
 
     select_session_family(&cfg);
 

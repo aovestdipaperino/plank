@@ -4043,6 +4043,26 @@ impl Agent<'_> {
             // The tool's own error; nothing to unload for.
             return self.dispatch_tool_reactive(call);
         }
+        // A pending interrupt (Esc/Ctrl-C already requested before this call
+        // was even dispatched) must never start a suspend-model cycle: run
+        // it normally instead, mirroring the `!o.interrupted` guard in
+        // `run_bang`.
+        if crate::interrupt::pending() {
+            return self.dispatch_tool_reactive(call);
+        }
+        // The PreToolUse hook is evaluated before the model is ever
+        // unloaded: a `suspend_model` call has no earlier real run to have
+        // already paid that cost against (unlike the reactive cycle, whose
+        // first attempt already went through `dispatch` and its hooks), so
+        // without this check a hook that blocks the command would still
+        // cost a full unload/reload for nothing. A block short-circuits
+        // here and never reaches `dispatch` at all, so the hook runs once.
+        let arg_values: Vec<&str> = call.args.iter().map(|a| a.value.as_str()).collect();
+        if let Some(blocked) =
+            crate::tools::precheck_pre_tool_use(&mut self.tool_ctx, call, &arg_values)
+        {
+            return blocked;
+        }
         let slot = match self.gpu_slot() {
             None => Err(SUSPEND_IGNORED_NO_MODEL.to_owned()),
             Some(_) if crate::tools::bash::backgrounds_itself(command) => {
@@ -4081,7 +4101,10 @@ impl Agent<'_> {
         let Some(exit) = self.tool_ctx.bash.last_foreground.take() else {
             return first;
         };
-        if call.name != "bash" || !exit.needs_gpu {
+        // An Esc/Ctrl-C that arrived during the run must never start a
+        // cycle: the user asked to stop, not to unload-and-retry. Mirrors
+        // the `!o.interrupted` guard in `run_bang`.
+        if call.name != "bash" || !exit.needs_gpu || crate::interrupt::pending() {
             return first;
         }
         let Some(slot) = self.gpu_slot() else {
@@ -36370,6 +36393,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_gpu_request_saves_releases_reruns_reopens_and_restores_in_order() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("order");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36427,6 +36451,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_second_gpu_refusal_is_returned_as_is_and_not_run_again() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("twice");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36492,6 +36517,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_signal_file_through_a_pipe_cycles_and_the_rerun_gets_a_fresh_path() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("signal-file");
         let (counter, paths) = (dir.join("runs"), dir.join("paths"));
         let log = std::sync::Arc::default();
@@ -36530,6 +36556,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_signal_file_on_every_run_gets_one_rerun_and_the_second_result() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("signal-twice");
         let (counter, paths) = (dir.join("runs"), dir.join("paths"));
         let log = std::sync::Arc::default();
@@ -36549,6 +36576,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_signal_file_is_deleted_even_when_no_cycle_can_run() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("signal-nocycle");
         let (counter, paths) = (dir.join("runs"), dir.join("paths"));
         let cfg = test_cfg();
@@ -36573,6 +36601,7 @@ or the user's next message aborts before its first token"
     /// finished, and the model must not reopen while it runs.
     #[test]
     fn the_rerun_waits_for_the_command_to_exit_before_the_reopen() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("long-rerun");
         let counter = dir.join("runs");
         let done = dir.join("done");
@@ -36616,6 +36645,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_refused_restore_falls_back_to_the_rebuild_path() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("refused");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36652,6 +36682,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn an_engine_that_cannot_release_the_gpu_never_cycles() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("echo");
         let counter = dir.join("runs");
         let log: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
@@ -36710,6 +36741,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_background_bash_job_never_cycles() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("background");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36744,6 +36776,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn the_alternate_local_engine_is_cycled_under_a_provider_main_agent() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("alt");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36781,6 +36814,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_failed_reopen_leaves_a_placeholder_and_the_next_turn_retries() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("reopen-fails");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36850,6 +36884,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_local_parent_parked_under_a_provider_sidechain_is_cycled() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("parked");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36922,6 +36957,7 @@ or the user's next message aborts before its first token"
     /// provider's slot.
     #[test]
     fn a_retry_after_a_sidechain_reloads_into_the_slot_the_placeholder_moved_to() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("retry-sidechain");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36960,6 +36996,7 @@ or the user's next message aborts before its first token"
     /// the placeholder unwinds back into the main slot and is reloaded there.
     #[test]
     fn a_retry_after_a_parked_parent_failed_reloads_the_main_slot() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("retry-parked");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36990,6 +37027,7 @@ or the user's next message aborts before its first token"
     /// retried into that same alternate slot.
     #[test]
     fn a_retry_after_the_alt_slot_failed_reloads_the_alt_slot() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("retry-alt");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37018,6 +37056,7 @@ or the user's next message aborts before its first token"
     /// dropped (its snapshot file with it) and the factory is never called.
     #[test]
     fn a_retry_with_no_placeholder_left_drops_the_reload() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("retry-gone");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37047,6 +37086,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_third_gpu_request_in_one_turn_gets_the_first_result_and_a_note() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("cap");
         let log = std::sync::Arc::default();
         let cfg = test_cfg();
@@ -37090,6 +37130,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn idle_passes_wait_while_a_gpu_reload_is_owed() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let _s = enable_suggestions_for_test();
         let dir = gpu_dir("idle");
         let cfg = test_cfg();
@@ -37278,6 +37319,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn suspend_model_saves_releases_runs_reopens_and_restores_in_order() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("suspend-order");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37313,8 +37355,90 @@ or the user's next message aborts before its first token"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Clears the process-wide interrupt flag on drop, panic included, so a
+    /// failing assertion between [`crate::interrupt::request`] and the
+    /// matching `clear` can never leave the flag set for every other test
+    /// that shares the process.
+    struct ClearInterruptOnDrop;
+    impl Drop for ClearInterruptOnDrop {
+        fn drop(&mut self) {
+            crate::interrupt::clear();
+        }
+    }
+
+    #[test]
+    fn a_pending_interrupt_skips_the_suspend_model_cycle_entirely() {
+        let _guard = crate::interrupt::test_guard();
+        crate::interrupt::clear();
+        let _clear_on_drop = ClearInterruptOnDrop;
+        let dir = gpu_dir("suspend-interrupted");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        // Esc/Ctrl-C already arrived before this call was even dispatched;
+        // `suspend_model` must not still unload the model for it. The
+        // interrupt also kills the plain (non-suspended) run the call falls
+        // back to, same as any other bash job — that part is not new
+        // behavior, only the absence of a GPU-yield cycle is what this test
+        // is about.
+        crate::interrupt::request();
+
+        agent.run_tool_calls(&[suspend_call(&counted(&counter))]);
+
+        assert!(
+            logged(&log).is_empty(),
+            "no save/release/reopen when interrupted: {:?}",
+            logged(&log)
+        );
+        assert_eq!(
+            agent.gpu_yield.cycles_this_turn, 0,
+            "a skipped cycle does not count against the cap"
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `PreToolUse` hook group whose single hook always blocks (exit 2).
+    fn blocking_hook() -> Vec<crate::hooks::HookMatcher> {
+        vec![crate::hooks::HookMatcher {
+            matcher: String::new(),
+            hooks: vec![crate::hooks::HookDef {
+                command: "echo blocked >&2; exit 2".to_string(),
+                timeout_sec: 5,
+                is_async: false,
+                prompt: None,
+            }],
+        }]
+    }
+
+    #[test]
+    fn a_blocking_pretooluse_hook_skips_the_unload_entirely() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let dir = gpu_dir("suspend-hook-block");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        agent.tool_ctx.hooks.pre_tool_use = blocking_hook();
+
+        let out = agent.run_tool_calls(&[suspend_call(&counted(&counter))]);
+
+        assert_eq!(runs(&counter), 0, "the command never ran");
+        assert!(
+            logged(&log).is_empty(),
+            "no save/release/reopen for a blocked command: {:?}",
+            logged(&log)
+        );
+        assert!(out.contains("blocked by PreToolUse hook"), "{out}");
+        assert_eq!(agent.gpu_yield.cycles_this_turn, 0);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_gpu_signal_from_a_suspended_run_is_returned_not_cycled_again() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("suspend-signal");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37338,6 +37462,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn suspend_model_past_the_cap_runs_without_suspending_and_says_so() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("suspend-cap");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37360,6 +37485,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn suspend_model_on_a_self_backgrounding_command_is_ignored() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("suspend-background");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37377,6 +37503,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn suspend_model_without_a_releasable_model_is_ignored() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         // Echo-like: a scripted engine and no reopen factory.
         let dir = gpu_dir("suspend-echo");
         let counter = dir.join("runs");
@@ -37410,6 +37537,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_bang_that_asks_for_the_gpu_cycles_and_records_the_second_run() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-feedback");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37454,6 +37582,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_quiet_bang_cycles_into_a_panel_of_the_second_run_and_no_transcript() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-quiet");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37483,6 +37612,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn plain_repl_bangs_cycle_and_only_the_single_bang_is_recorded() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-plain");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37517,6 +37647,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn single_and_double_bangs_honour_the_signal_file_once_per_escape() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-signal");
         let (counter, paths) = (dir.join("runs"), dir.join("paths"));
         let log = std::sync::Arc::default();
@@ -37546,6 +37677,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_bang_without_the_marker_or_a_releasable_model_never_cycles() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-none");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37598,6 +37730,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_bang_refused_twice_reports_the_second_refusal_without_a_loop() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-twice");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37623,6 +37756,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_bang_inside_a_sidechain_skips_the_cycle_with_a_note() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-sidechain");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();

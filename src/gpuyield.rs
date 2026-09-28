@@ -86,10 +86,18 @@ fn signal_dir(base: &Path) -> Option<PathBuf> {
 #[must_use]
 pub fn take_signal(path: &Path) -> Option<String> {
     use std::io::Read as _;
+    // A FIFO (or anything else a hostile or confused tool leaves at this
+    // path) must never be opened for a blocking read here: nothing on the
+    // other end may ever write or close it, and plank would hang. Check the
+    // file type first with symlink_metadata (which does not open the file)
+    // and only read when it is a regular file. Whatever is found, the path
+    // is removed afterward so a stale entry never lingers.
+    let is_file = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
     let mut bytes = Vec::new();
-    let read = std::fs::File::open(path)
-        .and_then(|f| f.take(SIGNAL_READ_MAX).read_to_end(&mut bytes))
-        .is_ok();
+    let read = is_file
+        && std::fs::File::open(path)
+            .and_then(|f| f.take(SIGNAL_READ_MAX).read_to_end(&mut bytes))
+            .is_ok();
     let _ = std::fs::remove_file(path);
     if !read || bytes.is_empty() {
         return None;
@@ -106,6 +114,57 @@ pub fn take_signal(path: &Path) -> Option<String> {
         .map(|l| l.trim().to_owned())
         .find(|l| !l.is_empty());
     Some(line.unwrap_or_else(|| MARKER.to_owned()))
+}
+
+/// Age past which an untouched `signal-*` file in the signal directory is
+/// swept as stray: one hour, generously longer than any real command's run.
+const STALE_SIGNAL_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Removes every `signal-*` file under `dir` last modified more than `max_age`
+/// before `now`, ignoring anything else in the directory (including a
+/// subdirectory, or a name `take_signal` would never have produced) and any
+/// error reading a single entry, since this is a best-effort tidy-up, not a
+/// correctness requirement.
+///
+/// A file can be left behind when its command wrote it but plank never
+/// called [`take_signal`] on it (a crash between write and read, or a job
+/// dropped without going through the foreground path). Pure and taking an
+/// injected directory and clock so it is testable without touching a real
+/// `~/.plank`; see [`sweep_stray_signals`] for the real wiring.
+fn sweep_stale_signals_in(dir: &Path, now: std::time::SystemTime, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("signal-") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age > max_age {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Sweeps stray `signal-*` files older than [`STALE_SIGNAL_AGE`] out of the
+/// real per-user signal directory. Best-effort: a directory that cannot be
+/// created or read (see [`signal_dir`]) simply means nothing is swept.
+///
+/// Meant to run once, at startup or at first use of the GPU-yield machinery,
+/// so a command that wrote a signal file and then crashed before plank read
+/// it does not leave that file behind forever.
+pub fn sweep_stray_signals() {
+    if let Some(dir) = signal_dir(&std::env::temp_dir()) {
+        sweep_stale_signals_in(&dir, std::time::SystemTime::now(), STALE_SIGNAL_AGE);
+    }
 }
 
 /// Reopens the local engine with the parameters it was first opened with.
@@ -567,6 +626,51 @@ mod tests {
         assert_eq!(take_signal(&path).as_deref(), Some(MARKER));
         std::fs::write(&path, "x".repeat(10_000)).unwrap();
         assert_eq!(take_signal(&path).map(|l| l.len()), Some(SIGNAL_LINE_MAX));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stray_signal_sweep_removes_only_old_matching_files() {
+        let dir = std::env::temp_dir().join(format!("plank-gpuyield-stale-{}", nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("signal-old");
+        let young = dir.join("signal-young");
+        let other = dir.join("not-a-signal");
+        std::fs::write(&old, "x").unwrap();
+        std::fs::write(&young, "x").unwrap();
+        std::fs::write(&other, "x").unwrap();
+        let now = std::time::SystemTime::now();
+        let hour = std::time::Duration::from_secs(3600);
+        // Backdate the "old" file's mtime by two hours; leave the others alone.
+        let times = std::fs::FileTimes::new().set_modified(now - hour * 2);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        sweep_stale_signals_in(&dir, now, hour);
+        assert!(!old.exists(), "old signal file is removed");
+        assert!(young.exists(), "young signal file is kept");
+        assert!(other.exists(), "a non-matching name is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fifo_at_the_signal_path_is_not_read_and_is_removed() {
+        let dir = std::env::temp_dir().join(format!("plank-gpuyield-fifo-{}", nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("signal");
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: c_path is a valid, NUL-terminated string for a path in a
+        // directory we just created; mkfifo has no other preconditions.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+        // If take_signal opened this for a blocking read, this call would
+        // hang forever (nothing ever opens the FIFO for writing). Returning
+        // at all is the test.
+        assert_eq!(take_signal(&path), None);
+        assert!(!path.exists(), "the FIFO is removed either way");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -48,6 +48,18 @@ pub fn clear() -> bool {
     SIGINT_PENDING.swap(false, Ordering::SeqCst)
 }
 
+/// Serializes tests that raise [`request`] to simulate an interrupt: the flag
+/// is one process-wide atomic, so two such tests running concurrently (the
+/// default under `cargo test`) could otherwise see each other's flag. Callers
+/// hold the guard for the whole time the flag may be set, and should still
+/// [`clear`] it before dropping the guard so the next test starts clean.
+#[cfg(test)]
+pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

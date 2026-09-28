@@ -709,12 +709,20 @@ impl BashJobs {
             self.jobs[idx].refresh_for(refresh_sec);
         }
         let job = &self.jobs[idx];
+        // A pending interrupt means refresh_for/wait_for_exit killed the job
+        // itself: the signal file or exit code may still say "needs the
+        // GPU" (the kill can race a write, or land right after exit 75), but
+        // trusting that would unload and reload the model for a run the user
+        // asked to stop, not one that wants to try again. Esc/Ctrl-C must
+        // never lead to a cycle.
+        let interrupted = crate::interrupt::pending();
         self.last_foreground = (!job.running).then(|| {
             let signal = job.signal.as_deref().and_then(crate::gpuyield::take_signal);
             crate::gpuyield::ForegroundExit {
                 exit_status: job.exit_status,
-                needs_gpu: signal.is_some()
-                    || crate::gpuyield::output_file_needs_gpu(job.exit_status, &job.path),
+                needs_gpu: !interrupted
+                    && (signal.is_some()
+                        || crate::gpuyield::output_file_needs_gpu(job.exit_status, &job.path)),
                 signal,
                 sandbox,
             }
@@ -907,8 +915,47 @@ pub fn suspend_model_requested(call: &ToolCall) -> bool {
 /// unloading the model around it would buy nothing.
 #[must_use]
 pub fn backgrounds_itself(cmd: &str) -> bool {
-    let cmd = cmd.trim_end();
-    cmd.ends_with('&') && !cmd.ends_with("&&")
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        match c {
+            '\\' if !in_single => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '&' if !in_single && !in_double => {
+                if bare_ampersand_backgrounds(&chars, i) {
+                    return true;
+                }
+                // `&&`, `>&` or `&>` consume the second character too, so the
+                // loop below never re-examines it as its own operator.
+                if chars.get(i + 1) == Some(&'&') || chars.get(i + 1) == Some(&'>') {
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether the `&` at `chars[i]` is a bare backgrounding operator rather than
+/// half of `&&`, `>&`, `&>` or `|&` (none of which end a foreground
+/// subcommand). Quoting and escaping are resolved by the caller; this only
+/// looks at the immediate neighbors.
+fn bare_ampersand_backgrounds(chars: &[char], i: usize) -> bool {
+    let prev = i.checked_sub(1).and_then(|j| chars.get(j));
+    let next = chars.get(i + 1);
+    !matches!(next, Some('&' | '>')) && !matches!(prev, Some('>' | '|'))
 }
 
 /// Implements the `bash` tool: start a job and wait up to `refresh_sec`.
@@ -1216,6 +1263,7 @@ mod tests {
 
     #[test]
     fn bash_echo_round_trip() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(&mut ctx, &test_call("bash", &[("command", "echo hello")]));
         assert!(out.starts_with("bash job=1 pid="), "got: {out}");
@@ -1289,7 +1337,27 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_ampersand_anywhere_in_the_command_backgrounds_a_subcommand() {
+        assert!(backgrounds_itself("(mex x &)"));
+        assert!(backgrounds_itself("mex x & disown"));
+        assert!(backgrounds_itself("mex x & echo started"));
+        assert!(backgrounds_itself("mex x & sleep 1"));
+    }
+
+    #[test]
+    fn two_char_operators_and_quoted_ampersands_are_not_backgrounding() {
+        assert!(!backgrounds_itself("a && b"));
+        assert!(!backgrounds_itself("x >&2"));
+        assert!(!backgrounds_itself("x &> f"));
+        assert!(!backgrounds_itself(r#"echo "a & b""#));
+        assert!(!backgrounds_itself("echo 'a & b'"));
+        assert!(!backgrounds_itself("x |& tail"));
+        assert!(!backgrounds_itself(r"echo a \& b"));
+    }
+
+    #[test]
     fn a_bash_job_sees_plank_gpu_yield() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -1301,6 +1369,7 @@ mod tests {
 
     #[test]
     fn a_foreground_call_records_how_its_command_ended() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let cmd = "echo 'GPU not available: held by plank (PID 1)' >&2; exit 75";
         tool_bash(&mut ctx, &test_call("bash", &[("command", cmd)]));
@@ -1335,6 +1404,7 @@ mod tests {
 
     #[test]
     fn each_bash_command_gets_its_own_signal_path_and_none_is_left_behind() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let a = foreground_with_path(&mut ctx, &dir, "true");
         let b = foreground_with_path(&mut ctx, &dir, "true");
@@ -1347,6 +1417,7 @@ mod tests {
 
     #[test]
     fn a_signal_file_asks_for_the_gpu_whatever_the_exit_status() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let cmd = "echo 'GPU not available: held by plank' > \"$PLANK_GPU_YIELD_FILE\"; exit 0";
         let path = foreground_with_path(&mut ctx, &dir, cmd);
@@ -1363,6 +1434,7 @@ mod tests {
 
     #[test]
     fn a_signal_file_survives_a_pipe_that_replaces_the_exit_status() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let cmd = "sh -c 'echo \"GPU not available: x\" > \"$PLANK_GPU_YIELD_FILE\"; exit 3' 2>&1 | tail -20";
         let path = foreground_with_path(&mut ctx, &dir, cmd);
@@ -1374,8 +1446,52 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Clears the process-wide interrupt flag on drop (panic included), so a
+    /// failing assertion between raising it and clearing it cannot leave it
+    /// set for every other test sharing the process.
+    struct ClearInterruptOnDrop;
+    impl Drop for ClearInterruptOnDrop {
+        fn drop(&mut self) {
+            crate::interrupt::clear();
+        }
+    }
+
+    #[test]
+    fn an_interrupt_during_the_run_is_never_recorded_as_needing_the_gpu() {
+        // Held for the whole body, not just the run: the flag is live from
+        // just before `request()` to the final `clear()`, and every other
+        // bash-spawning test in this module takes the same guard, so none of
+        // them can observe this test's interrupt (or vice versa).
+        let _interrupt_guard = crate::interrupt::test_guard();
+        crate::interrupt::clear();
+        let _clear_on_drop = ClearInterruptOnDrop;
+        let (mut ctx, dir) = test_ctx();
+        // Writes the signal file immediately, then keeps running: without the
+        // interrupt this would be an unmistakable GPU request.
+        let cmd = "echo 'GPU not available: held' > \"$PLANK_GPU_YIELD_FILE\"; sleep 5; exit 75";
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            crate::interrupt::request();
+        });
+        let start = Instant::now();
+        foreground_with_path(&mut ctx, &dir, cmd);
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "the interrupt should have killed the job long before its own sleep finished"
+        );
+        let exit = ctx.bash.last_foreground.take().expect("recorded");
+        assert!(
+            !exit.needs_gpu,
+            "an interrupted run must never start the GPU-yield cycle, \
+             even though it wrote a signal file"
+        );
+        crate::interrupt::clear();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn no_signal_file_and_exit_0_is_no_gpu_request() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         // The marker without the file or exit 75 is still not a request.
         foreground_with_path(&mut ctx, &dir, "echo 'GPU not available: x'");
@@ -1387,6 +1503,7 @@ mod tests {
 
     #[test]
     fn a_background_jobs_signal_file_goes_when_the_job_is_reaped() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let cmd = "sleep 2; echo 'GPU not available: x' > \"$PLANK_GPU_YIELD_FILE\"";
         let rec = dir.join("path");
@@ -1420,6 +1537,7 @@ mod tests {
 
     #[test]
     fn the_gpu_marker_is_found_past_the_observations_head() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         // Far more lines than the head shows, marker last.
         let cmd = "seq 1 5000; echo 'GPU not available: busy'; exit 75";
@@ -1434,6 +1552,7 @@ mod tests {
 
     #[test]
     fn wait_to_exit_outlasts_the_refresh_and_is_consumed() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         ctx.bash.wait_to_exit = true;
         let call = test_call(
@@ -1453,6 +1572,7 @@ mod tests {
 
     #[test]
     fn a_background_job_records_nothing_even_when_it_later_asks_for_the_gpu() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let cmd = "sleep 2; echo 'GPU not available: busy'; exit 75";
         let out = tool_bash(
@@ -1509,6 +1629,7 @@ mod tests {
     /// so it is never announced.
     #[test]
     fn take_finished_skips_jobs_the_model_observed_done() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(&mut ctx, &test_call("bash", &[("command", "echo now")]));
         assert!(out.contains(" status=done "));
@@ -1584,6 +1705,7 @@ mod tests {
 
     #[test]
     fn bash_nonzero_exit_and_stderr_capture() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -1601,6 +1723,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_sandbox_blocks_writes_outside_cwd() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         // The escape target lives under `$HOME` (outside cwd and temp), and
         // `sandbox-exec` itself can't apply a profile from inside a nested
         // sandbox — so skip both when `$HOME` isn't writable.
@@ -1677,6 +1800,7 @@ mod tests {
 
     #[test]
     fn bash_missing_command_errors() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         assert_eq!(
             tool_bash(&mut ctx, &test_call("bash", &[])),
@@ -1687,6 +1811,7 @@ mod tests {
 
     #[test]
     fn async_job_spawn_poll_and_stop() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         // refresh_sec=1 returns while the job is still running.
         let out = tool_bash(
@@ -1722,6 +1847,7 @@ mod tests {
 
     #[test]
     fn bash_status_waits_for_refresh_sec() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -1747,6 +1873,7 @@ mod tests {
 
     #[test]
     fn bash_status_without_refresh_returns_immediately() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         tool_bash(
             &mut ctx,
@@ -1949,6 +2076,7 @@ mod tests {
 
     #[test]
     fn stopping_a_job_kills_its_grandchildren() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -1979,6 +2107,7 @@ mod tests {
 
     #[test]
     fn an_unpolled_timed_out_job_is_swept_by_the_next_bash_call() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -2031,6 +2160,7 @@ mod tests {
 
     #[test]
     fn bash_timeout_kills_job() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -2049,6 +2179,7 @@ mod tests {
 
     #[test]
     fn bash_runs_in_context_cwd() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         std::fs::write(dir.join("marker.txt"), "x").unwrap();
         let out = tool_bash(
