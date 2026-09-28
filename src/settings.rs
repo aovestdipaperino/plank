@@ -1243,8 +1243,10 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
 
     // Engine and safety keys: reported only when the parsed config still
     // carries the file's value, i.e. no flag overrode it.
+    // Compared against the user's spec, not the resolved path: `engine.model`
+    // may name a catalog engine (`qwen`) that resolves to a file elsewhere.
     if let Some(m) = &s.engine.model
-        && cfg.model_path.as_ref() == Some(m)
+        && cfg.model_spec.as_deref() == Some(&*m.to_string_lossy())
     {
         parts.push(format!("model={}", m.display()));
     }

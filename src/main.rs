@@ -306,30 +306,59 @@ fn report_kvcache_migration() {
     }
 }
 
-/// Resolves the model path that will actually load, from the real `cfg`
-/// (parsed against the fully-loaded settings, not the CLI-only provisional
-/// parse). Shared by every consumer that needs to know which model family is
-/// loading, so none of them can resolve it a different way and disagree.
+/// The model path that will actually load, from the real `cfg` (parsed
+/// against the fully-loaded settings, not the CLI-only provisional parse).
+/// Shared by every consumer that needs to know which model family is loading,
+/// so none of them can resolve it a different way and disagree.
 ///
-/// The fallback follows the set this machine manages rather than always
-/// naming the V4 path. A path that does not exist yet — a first run, before
-/// the download — is probed by name, so it still tags the family of the model
-/// that is about to land.
+/// `parse_config` has already resolved the catalog choice into a path. A path
+/// that does not exist yet — a first run, before the download — is probed by
+/// name, so it still tags the family of the model that is about to land.
 fn resolve_model_path(cfg: &plank::config::AgentConfig) -> std::path::PathBuf {
     cfg.model_path
         .clone()
-        .unwrap_or_else(plank::download::default_managed_model_path)
+        .expect("parse_config resolves the model before anything reads it")
 }
 
-/// The real config parse, with a `.ggd` model swapped for its patched clone.
-/// Errors are already printed under `prog`; the caller just returns the code.
+/// The user's model choice, as the catalog resolver takes it.
+fn model_choice(cfg: &plank::config::AgentConfig) -> plank::engines::Choice<'_> {
+    match (cfg.model_spec.as_deref(), cfg.model_named) {
+        (None, _) => plank::engines::Choice::Default,
+        (Some(s), true) => plank::engines::Choice::Named(s),
+        (Some(s), false) => plank::engines::Choice::Spec(s),
+    }
+}
+
+/// Resolves the model choice against the catalog and records it as the
+/// process's active selection. Must precede `resolve_model_delta`, which
+/// reads the resolved `model_path`.
+fn resolve_selection(cfg: &mut plank::config::AgentConfig) -> Result<(), String> {
+    let mut warn = Vec::new();
+    let catalog = plank::engines::load(&mut warn);
+    for w in warn {
+        eprintln!("plank: {w}");
+    }
+    let sel =
+        plank::engines::resolve_in(&plank::manifest::plank_dir(), &catalog, model_choice(cfg))?;
+    cfg.model_path = Some(sel.main.clone());
+    plank::engines::set_active(sel.clone());
+    cfg.selection = Some(sel);
+    Ok(())
+}
+
+/// The real config parse, with the model choice resolved against the engine
+/// catalog and a `.ggd` model swapped for its patched clone. Errors are
+/// already printed under `prog`; the caller just returns the code.
 fn parse_config(
     settings: &plank::settings::Settings,
     args: &[String],
     prog: &str,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
     plank::config::parse_options_with(settings, args)
-        .and_then(|mut cfg| resolve_model_delta(&mut cfg).map(|()| cfg))
+        .and_then(|mut cfg| {
+            resolve_selection(&mut cfg)?;
+            resolve_model_delta(&mut cfg).map(|()| cfg)
+        })
         .map_err(|msg| {
             eprintln!("{prog}: {msg}");
             ExitCode::from(2)
@@ -846,12 +875,9 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // fast here with a clear message instead.
         acquire_model_lock()?;
 
-        // With no explicit model, fall back to the default location and offer
-        // to download it when it is not present.
-        let model = cfg
-            .model_path
-            .clone()
-            .unwrap_or_else(plank::download::default_managed_model_path);
+        // `parse_config` resolved the catalog choice; offer to download the
+        // model when it is not present.
+        let model = cfg.model_path.clone().expect("resolved by parse_config");
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
@@ -934,10 +960,9 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
     }
     #[cfg(not(ds4_engine))]
     {
-        if let Some(model) = &cfg.model_path {
+        if let Some(model) = &cfg.model_spec {
             return Err(format!(
-                "-m {} requires the ds4 engine, which is not built on this platform",
-                model.display()
+                "-m {model} requires the ds4 engine, which is not built on this platform"
             ));
         }
         Ok(Box::new(EchoEngine::new(cfg.generation.ctx_size)))
@@ -1143,10 +1168,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
 
         require_min_ram()?;
         acquire_model_lock()?;
-        let model_path = cfg
-            .model_path
-            .clone()
-            .unwrap_or_else(plank::download::default_managed_model_path);
+        let model_path = cfg.model_path.clone().expect("resolved by parse_config");
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
@@ -1192,10 +1214,9 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
     #[cfg(not(ds4_engine))]
     {
         use std::sync::Arc;
-        if let Some(model) = &cfg.model_path {
+        if let Some(model) = &cfg.model_spec {
             return Err(format!(
-                "-m {} requires the ds4 engine, which is not built on this platform",
-                model.display()
+                "-m {model} requires the ds4 engine, which is not built on this platform"
             ));
         }
         let model = Arc::new(plank::host::EchoSharedModel::new(cfg.generation.ctx_size));
@@ -1255,25 +1276,15 @@ fn run(
 mod tests {
     use super::*;
 
-    /// `resolve_model_path` falls back to the default `DeepSeek` path when
-    /// `cfg.model_path` is unset, exactly like `select_session_family` did
-    /// before this refactor, and returns the configured path unchanged when
-    /// one is set — including one that only ever came from a settings file
-    /// (`AgentConfig::from_settings`/`parse_options_with` do not distinguish
-    /// CLI from settings-file origin once parsed, which is the point: the
-    /// session family reads the same resolved value the engine will).
     #[test]
-    fn resolve_model_path_matches_configured_or_falls_back_to_default() {
+    fn choice_is_named_default_or_spec() {
         let mut cfg =
             plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
-        cfg.model_path = None;
-        assert_eq!(
-            resolve_model_path(&cfg),
-            plank::download::default_managed_model_path()
-        );
-
-        let configured = std::path::PathBuf::from("/from/settings.gguf");
-        cfg.model_path = Some(configured.clone());
-        assert_eq!(resolve_model_path(&cfg), configured);
+        cfg.model_spec = None;
+        assert_eq!(model_choice(&cfg), plank::engines::Choice::Default);
+        cfg.model_spec = Some("qwen".into());
+        assert_eq!(model_choice(&cfg), plank::engines::Choice::Spec("qwen"));
+        cfg.model_named = true;
+        assert_eq!(model_choice(&cfg), plank::engines::Choice::Named("qwen"));
     }
 }
