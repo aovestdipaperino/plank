@@ -707,45 +707,55 @@ fn qwen_syntax_reminder_matches_c_source() {
     );
 }
 
-/// Both committed manifests must parse with plank's own parser.
+/// The compiled-in engine catalog must only name roles this build can
+/// actually install.
 ///
-/// They are data files, so nothing else compiles them: a typo in a URL, a
-/// truncated hash, or a kind this build cannot install would otherwise only
-/// surface as a failed download on a user's machine.
+/// `engines.json` is a data file, so nothing else compiles it: a role key
+/// this build cannot resolve to an install path would otherwise only surface
+/// as a failed install on a user's machine.
 #[test]
-fn the_committed_manifests_parse_and_name_installable_kinds() {
+fn the_engines_catalog_names_only_installable_roles() {
+    use plank::engines::{COMPILED_IN, Catalog, Layer, ROLES};
     use plank::manifest::EngineId;
-    // The legacy per-set files predate the engine catalog, and still spell
-    // the drafter `dspark`; it installs as the `mtp` role.
-    let kinds_ds4: &[&str] = &["main", "vision", "dspark"];
-    let kinds_qwen: &[&str] = &["main", "vision"];
-    for (id, name, kinds) in [
-        (EngineId::DS4VISION, "ds4.manifest", kinds_ds4),
-        (EngineId::QWEN, "qwen.manifest", kinds_qwen),
-    ] {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let m = plank::manifest::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
 
-        // Every kind this build installs for the set must be present, or a
-        // swap would never find the set complete and would silently install
-        // nothing at all.
-        for kind in kinds {
-            let entry = m
-                .files
-                .get(*kind)
-                .unwrap_or_else(|| panic!("{name} omits the {kind} artifact"));
-            assert!(entry.bytes > 0, "{name}: {kind} has no size");
+    let mut warnings = Vec::new();
+    let catalog: Catalog = plank::engines::parse(COMPILED_IN, Layer::Published, &mut warnings)
+        .expect("compiled-in engines catalog must parse");
+    assert!(
+        warnings.is_empty(),
+        "compiled-in engines catalog produced warnings: {warnings:?}"
+    );
+
+    for (name, engine) in &catalog.engines {
+        assert!(
+            engine.files.contains_key("main"),
+            "{name} has no main engine"
+        );
+        for role in engine.files.keys() {
             assert!(
-                entry.url.starts_with("https://"),
-                "{name}: {kind} url is not https"
+                ROLES.contains(&role.as_str()),
+                "{name}: {role} is not an installable role"
             );
-            let role = if *kind == "dspark" { "mtp" } else { kind };
+            let id = EngineId::new(name).unwrap_or_else(|| panic!("{name} is not a valid id"));
             assert!(
                 plank::manifest::local_path_for(id, role).is_some(),
-                "{name}: {kind} has nowhere to install"
+                "{name}: {role} has nowhere to install"
             );
         }
+    }
+}
+
+/// The frozen legacy manifests must still parse with plank's own parser.
+///
+/// `ds4.manifest` and `qwen.manifest` stay in the repo only so older plank
+/// releases keep upgrading against them; new plank no longer installs from
+/// them, so this checks parsing only, not installable kinds.
+#[test]
+fn the_frozen_manifests_still_parse() {
+    for name in ["ds4.manifest", "qwen.manifest"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        plank::manifest::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
     }
 }
 

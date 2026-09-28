@@ -2603,7 +2603,6 @@ mod tests {
         assert!((gb(1_500_000_000) - 1.5).abs() < 1e-9);
     }
 
-    /// A well-formed manifest naming only `main`, at `version` and `bytes`.
     /// The installed record's path for `id` under `root`, with its directory
     /// created so a test can write it.
     fn installed_at(root: &Path, id: crate::manifest::EngineId) -> PathBuf {
@@ -2612,6 +2611,7 @@ mod tests {
         path
     }
 
+    /// A well-formed manifest naming only `main`, at `version` and `bytes`.
     fn manifest_text(version: u32, bytes: u64) -> String {
         format!(
             r#"{{"version":{version},"released":"t","notes":"","files":{{
