@@ -355,7 +355,15 @@ no memory or suggestion pass. A turn runs at most two cycles
 note. The re-run is an ordinary dispatch, so tool hooks fire for both runs.
 The local engine can be `Agent::engine`, the `EngineKey::Local` alternate under
 a provider main agent, or a parent parked in `Agent::parked_engines` while a
-provider sidechain runs. Background jobs, `!` commands, a local engine inside a
+provider sidechain runs. The user's `!` and `!!` escapes get the same cycle
+through `Agent::run_bang`: `run_immediate` exports the variable too, and the
+cycle's re-run step is a `CycleRerun` the agent's host is generic over, the
+tool call's re-dispatch (`ToolRerun`) or the escape's second `run_immediate`
+through the front end's `BangIo` (`BangRerun`; console lines, or the TUI log
+redrawn on the UI thread, which stays blocked through the reload), so save,
+release, reopen, restore and the retry are one code path. An escape runs
+between turns: one cycle each, outside the per-turn cap, skipped with a note
+if ever reached inside a sidechain. Background jobs, a local engine inside a
 fan-out slot and `plank serve` are not covered.
 
 ### Remote, hosted, and shared engines (`serve.rs`, `host.rs`, `remote/`)

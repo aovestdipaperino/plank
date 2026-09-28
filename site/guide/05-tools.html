@@ -233,9 +233,10 @@ REPL, Esc in the TUI) kills its group and reports exit status 143.</p>
 <p>A local model holds the Mac's GPU for as long as plank runs, so a
 command that wants the GPU for itself, such as <code>mex</code>
 generating an image with a diffusion model, would have to fail or wait.
-plank sets <code>PLANK_GPU_YIELD=1</code> in every <code>bash</code> job
-to say it can step aside. A command that cannot get the GPU exits with
-status 75 and prints a line that starts with
+plank sets <code>PLANK_GPU_YIELD=1</code> in every <code>bash</code>
+job, and in the commands you run with <code>!</code> and
+<code>!!</code>, to say it can step aside. A command that cannot get the
+GPU exits with status 75 and prints a line that starts with
 <code>GPU not available</code> (on stdout or stderr), for example
 <code>GPU not available: held by plank (PID 1234)</code>.</p>
 <p>When a <code>bash</code> call ends that way, plank prints one notice,
@@ -252,6 +253,15 @@ plank does not try a third time, and reloads the model regardless. A
 turn gets at most two of these cycles; a third GPU request in the same
 turn returns its first result with the line
 <code>GPU yield skipped: limit of 2 per turn reached</code>.</p>
+<p>A command you run yourself with <code>!</code> or <code>!!</code>
+gets the same treatment: the notice, the second run streaming where the
+first did, then
+<code>plank: reloading the model, this takes a moment</code> while the
+screen waits for the model to come back. Only the second run counts
+afterwards, for the exit line, for what <code>!</code> records for the
+model and for the <code>!!</code> panel. Each such command gets one
+cycle of its own, whatever the turn limit says, and a second refusal is
+shown as it is.</p>
 <p>Hooks see both runs, because both really happened:
 <code>PreToolUse</code> and <code>PostToolUse</code> fire for the first
 run and again for the second, and any <code>PostToolUse</code> warning
