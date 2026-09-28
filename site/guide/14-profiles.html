@@ -300,7 +300,7 @@ withheld</td>
 <tr>
 <td><code>recommendedModel</code></td>
 <td>an engine to run, such as <code>"qwen"</code>, used only when its
-model file is already on disk</td>
+model file and every companion it declares are already on disk</td>
 <td>the usual model choice</td>
 </tr>
 </tbody>
@@ -318,11 +318,12 @@ should not be told the checkout's git status or offered an
 loaded either way.</p>
 <p><code>recommendedModel</code> lets a profile suggest the engine it
 works best with, and plank takes the suggestion only if that engine is
-locally available. It outranks <code>engine.model</code> in your
-settings but never a <code>--model</code> you typed, and it never starts
-a download: when the engine is not installed, or is not an engine at
-all, plank prints one line saying so and picks the model the usual
-way.</p>
+locally available: its main model file and every companion it declares
+must already exist on disk. It outranks <code>engine.model</code> in
+your settings but never a <code>--model</code> you typed, and it never
+starts a download: when the engine is not installed (main or a companion
+missing), or is not an engine at all, plank prints one line saying so
+and picks the model the usual way.</p>
 <h3 id="the-prompt">The prompt</h3>
 <p>The prompt file replaces plank's system prompt entirely. To keep tool
 calls working, include the token <code>{{plank:tool-protocol}}</code>

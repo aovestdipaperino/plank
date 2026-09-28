@@ -69,9 +69,11 @@ has: both are on.
 
 `recommendedModel` names an engine from the catalog (`engines.json`, layered
 with `~/.plank/engines.local.json`) that suits the profile, and plank uses it
-only if it is locally available: the engine's main model file must already
-exist on disk, at its derived managed path under `~/.plank` or at a local
-engine's `path`. A recommendation is never downloaded and never asked about.
+only if it is locally available: the engine's main model file, and every
+companion it declares (`mtp`, `vision`), must already exist on disk, at their
+derived managed paths under `~/.plank` or at a local engine's `path`. A
+recommendation is never downloaded and never asked about, so a missing
+companion falls through exactly as a missing main would.
 The model is chosen in this order: `--model`, `-m` or `--model:` on the
 command line; the recommendation, when its file is on disk; `engine.model`
 from settings; the `engines.local.json` default; the catalog default. A used

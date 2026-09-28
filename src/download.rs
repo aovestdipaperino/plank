@@ -303,6 +303,27 @@ fn size_text(bytes: Option<u64>, decimals: usize) -> String {
 /// # Errors
 /// Declined prompt, no terminal, unmanaged role, or a failed download.
 pub fn ensure_role(sel: &crate::engines::Selection, role: &str, path: &Path) -> Result<(), String> {
+    ensure_role_with(
+        sel,
+        role,
+        path,
+        std::io::stdin().is_terminal(),
+        content_length,
+    )
+}
+
+/// [`ensure_role`] against an injected TTY-ness and size probe, so a test
+/// never blocks on stdin or makes a real network call.
+///
+/// # Errors
+/// Same as [`ensure_role`].
+fn ensure_role_with(
+    sel: &crate::engines::Selection,
+    role: &str,
+    path: &Path,
+    is_tty: bool,
+    probe: impl FnOnce(&str) -> Option<u64>,
+) -> Result<(), String> {
     if path.exists() {
         return Ok(());
     }
@@ -314,7 +335,7 @@ pub fn ensure_role(sel: &crate::engines::Selection, role: &str, path: &Path) -> 
     let Some((url, bytes)) = role_offer(sel, role) else {
         return Err(format!("no {label} at {}", path.display()));
     };
-    if !std::io::stdin().is_terminal() {
+    if !is_tty {
         let hatch = if role == "mtp" {
             "; pass --mtp-model <path> or turn speculation off with --mtp-off"
         } else {
@@ -326,7 +347,14 @@ pub fn ensure_role(sel: &crate::engines::Selection, role: &str, path: &Path) -> 
             size_text(bytes, 1)
         ));
     }
-    let bytes = bytes.or_else(|| content_length(&url));
+    let bytes = bytes.or_else(|| probe(&url));
+    let Some(bytes) = bytes else {
+        return Err(format!(
+            "cannot download {url}: the server does not report a size; download it to {} yourself",
+            path.display()
+        ));
+    };
+    let bytes = Some(bytes);
     let resuming = partial_bytes(path) > 0;
     eprintln!("No {label} found at {}.", path.display());
     if resuming {
@@ -689,6 +717,20 @@ pub fn ensure_model_in(
     sel: &crate::engines::Selection,
     is_tty: bool,
 ) -> Result<(), String> {
+    ensure_model_in_with(catalog, sel, is_tty, content_length)
+}
+
+/// [`ensure_model_in`] against an injected size probe, so a test never makes
+/// a real network call.
+///
+/// # Errors
+/// Same as [`ensure_model_in`].
+fn ensure_model_in_with(
+    catalog: &crate::engines::Catalog,
+    sel: &crate::engines::Selection,
+    is_tty: bool,
+    probe: impl FnOnce(&str) -> Option<u64>,
+) -> Result<(), String> {
     let path = sel.main.as_path();
     if path.exists() {
         return Ok(());
@@ -713,7 +755,14 @@ pub fn ensure_model_in(
             )
         });
     }
-    let bytes = bytes.or_else(|| content_length(&url));
+    let bytes = bytes.or_else(|| probe(&url));
+    let Some(bytes) = bytes else {
+        return Err(format!(
+            "cannot download {url}: the server does not report a size; download it to {} yourself",
+            path.display()
+        ));
+    };
+    let bytes = Some(bytes);
     let label = sel.id.map_or("the model", |id| id.as_str());
     // A leftover .part file means a previous download can be resumed.
     let resuming = partial_bytes(path) > 0;
@@ -2627,6 +2676,42 @@ mod tests {
         );
         assert_eq!(size_text(None, 1), "size unknown");
         assert_eq!(size_text(Some(1_500_000_000), 1), "~1.5 GB");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding 1: a local-engine url with no catalog size and a server that
+    /// also refuses to report one (a probe returning `None`) must error
+    /// before any download starts, instead of streaming the whole file and
+    /// failing at the end with "server reported no content length".
+    #[test]
+    fn ensure_model_in_with_an_unknown_size_url_errors_before_downloading() {
+        let root = crate::downloader::tests::tempdir();
+        let (cat, sel) = local_url_selection(&root);
+        let err =
+            ensure_model_in_with(&cat, &sel, true, |_| None).expect_err("no size, so no download");
+        assert!(err.contains("cannot download"), "{err}");
+        assert!(
+            err.contains("https://huggingface.co/o/r/resolve/main/mine.gguf"),
+            "{err}"
+        );
+        assert!(err.contains(&sel.main.display().to_string()), "{err}");
+        assert!(!sel.main.with_extension("part").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Same as above for `ensure_role`: a companion role with no known size
+    /// and a probe that also comes back empty must refuse before the prompt.
+    #[test]
+    fn ensure_role_with_an_unknown_size_url_errors_before_downloading() {
+        let root = crate::downloader::tests::tempdir();
+        let (_, sel) = local_url_selection(&root);
+        let path = sel.vision.clone().expect("vision role has a path");
+        let err = ensure_role_with(&sel, "vision", &path, true, |_| None)
+            .expect_err("no size, so no download");
+        assert!(err.contains("cannot download"), "{err}");
+        assert!(err.contains("https://example.com/v.gguf"), "{err}");
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(!path.with_extension("part").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

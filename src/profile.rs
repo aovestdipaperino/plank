@@ -249,7 +249,6 @@ fn warn_refused_engine_settings(members: &[(String, Json)], warnings: &mut Vec<S
     }
 }
 
-/// A non-empty string member, or `None`.
 /// `recommendedModel`: an engine name, or `None` with a warning when it is
 /// present but not a valid one (`crate::engines::valid_name`).
 fn recommended_model_field(obj: &Json, warnings: &mut Vec<String>) -> Option<String> {
@@ -284,6 +283,7 @@ fn bool_field(obj: &Json, key: &str, warnings: &mut Vec<String>) -> bool {
     }
 }
 
+/// A non-empty string member, or `None`.
 fn str_field(obj: &Json, key: &str) -> Option<String> {
     match obj.get(key) {
         Some(Json::Str(s)) if !s.is_empty() => Some(s.clone()),

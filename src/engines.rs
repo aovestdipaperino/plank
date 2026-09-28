@@ -241,8 +241,11 @@ fn parse_entry(name: &str, value: &serde_json::Value, layer: Layer) -> Result<En
 
 /// The download URL for a local role's `url`: a Hugging Face file page
 /// (`https://huggingface.co/<owner>/<repo>/blob/<rev>/<path>`) becomes its
-/// `/resolve/` link, and any other `https://` URL is kept as written. `None`
-/// for anything that is not `https://`.
+/// `/resolve/` link, and any other `https://` URL is kept as written. A
+/// dataset (`.../datasets/<owner>/<repo>/blob/...`) or space
+/// (`.../spaces/<owner>/<repo>/blob/...`) repo is rewritten the same way,
+/// with the owner/repo shifted one segment later. `None` for anything that
+/// is not `https://`.
 #[must_use]
 pub fn download_url(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://")?;
@@ -250,6 +253,19 @@ pub fn download_url(url: &str) -> Option<String> {
         return None;
     }
     if let Some(tail) = rest.strip_prefix("huggingface.co/") {
+        for (prefix, kind) in [("datasets/", "datasets"), ("spaces/", "spaces")] {
+            if let Some(repo_tail) = tail.strip_prefix(prefix) {
+                let mut parts = repo_tail.splitn(4, '/');
+                if let (Some(owner), Some(repo), Some("blob"), Some(file)) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
+                {
+                    return Some(format!(
+                        "https://huggingface.co/{kind}/{owner}/{repo}/resolve/{file}"
+                    ));
+                }
+                return Some(url.to_string());
+            }
+        }
         let mut parts = tail.splitn(4, '/');
         if let (Some(owner), Some(repo), Some("blob"), Some(file)) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -564,13 +580,15 @@ pub fn choose_with_recommendation_in(
         return Ok((sel, notes));
     }
     let wanted = resolve_in(root, catalog, Choice::Named(engine))?;
-    if wanted.main.exists() {
+    if wanted.main.exists() && companions_available(&wanted) {
         return Ok((
             wanted,
             vec![format!("using {engine}, recommended by profile {profile}")],
         ));
     }
-    let (sel, mut notes) = with_note(settings)?;
+    let skip_note =
+        format!("profile {profile} recommends {engine}, which is not installed; skipping it");
+    let (sel, mut notes) = with_note(settings).map_err(|e| format!("{skip_note}: {e}"))?;
     let using = sel
         .id
         .map_or_else(|| sel.main.display().to_string(), |id| id.to_string());
@@ -578,6 +596,16 @@ pub fn choose_with_recommendation_in(
         "profile {profile} recommends {engine}, which is not installed; using {using}"
     ));
     Ok((sel, notes))
+}
+
+/// Whether `sel`'s `main` and every companion it declares (`mtp`, `vision`)
+/// already exist on disk. A recommendation only counts as "locally available"
+/// when this holds for it, so acting on it never leads to a download prompt.
+fn companions_available(sel: &Selection) -> bool {
+    [sel.mtp.as_deref(), sel.vision.as_deref()]
+        .into_iter()
+        .flatten()
+        .all(Path::exists)
 }
 
 /// Whether `a` and `b` name the same file: equal as written, equal once
@@ -785,6 +813,22 @@ mod tests {
         assert_eq!(
             download_url("https://huggingface.co/o/r/blob/main/m.gguf?download=true").as_deref(),
             Some("https://huggingface.co/o/r/resolve/main/m.gguf?download=true")
+        );
+    }
+
+    #[test]
+    fn download_url_handles_dataset_and_space_repos() {
+        assert_eq!(
+            download_url("https://huggingface.co/datasets/o/r/blob/main/x").as_deref(),
+            Some("https://huggingface.co/datasets/o/r/resolve/main/x")
+        );
+        assert_eq!(
+            download_url("https://huggingface.co/spaces/o/r/blob/main/x").as_deref(),
+            Some("https://huggingface.co/spaces/o/r/resolve/main/x")
+        );
+        assert_eq!(
+            download_url("https://huggingface.co/datasets/o/blob/blob/main/x").as_deref(),
+            Some("https://huggingface.co/datasets/o/blob/resolve/main/x")
         );
     }
 
@@ -1251,12 +1295,30 @@ mod tests {
     fn an_installed_recommendation_beats_the_settings_model() {
         let r = root("rec-used");
         std::fs::write(r.join("qwen.gguf"), "q").unwrap();
+        std::fs::write(r.join("qwen.vision.gguf"), "v").unwrap();
         let (s, notes) =
             choose_with_recommendation_in(&r, &compiled(), None, HAL, Choice::Spec("ds41"))
                 .unwrap();
         assert_eq!(s.id, Some(crate::manifest::EngineId::QWEN));
         assert_eq!(s.main, r.join("qwen.gguf"));
         assert_eq!(notes, ["using qwen, recommended by profile HAL"]);
+    }
+
+    #[test]
+    fn a_recommendation_with_a_missing_companion_falls_to_the_settings_model() {
+        let r = root("rec-missing-companion");
+        // Main is on disk, but the declared vision companion is not: the
+        // recommendation must not count as locally available, or picking it
+        // would lead straight into a download prompt.
+        std::fs::write(r.join("qwen.gguf"), "q").unwrap();
+        let (s, notes) =
+            choose_with_recommendation_in(&r, &compiled(), None, HAL, Choice::Spec("ds41"))
+                .unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS41));
+        assert_eq!(
+            notes,
+            ["profile HAL recommends qwen, which is not installed; using ds41"]
+        );
     }
 
     #[test]
@@ -1325,6 +1387,17 @@ mod tests {
         let (s, notes) = choose_with_recommendation_in(&r, &c, None, rec, Choice::Default).unwrap();
         assert_eq!(s.main, main);
         assert_eq!(notes, ["using mine, recommended by profile EAP"]);
+    }
+
+    #[test]
+    fn a_skipped_recommendation_note_survives_an_invalid_settings_model() {
+        let r = root("rec-missing-and-invalid-settings");
+        let err = choose_with_recommendation_in(&r, &compiled(), None, HAL, Choice::Named("nope"))
+            .unwrap_err();
+        assert!(
+            err.contains("profile HAL recommends qwen, which is not installed"),
+            "{err}"
+        );
     }
 
     #[test]
