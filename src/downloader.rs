@@ -1137,6 +1137,33 @@ pub fn running() -> bool {
     running_in(&crate::manifest::plank_dir())
 }
 
+/// Takes the same machine-wide `flock` [`running_in`] probes and holds it
+/// until the returned guard drops, for tests that need to simulate a live
+/// helper. `None` if the lock is already held or could not be opened.
+#[cfg(all(unix, test))]
+#[must_use]
+pub fn try_lock_in(root: &Path) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+
+    let path = lock_path_in(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    // SAFETY: `file` owns a valid fd; LOCK_NB makes this non-blocking.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return None;
+    }
+    Some(file)
+}
+
 /// Spawns the detached helper for `manifest`, unless one is already running.
 ///
 /// Detached deliberately: the download outlives the plank that started it, and

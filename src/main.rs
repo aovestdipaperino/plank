@@ -462,6 +462,11 @@ fn main() -> ExitCode {
             .unwrap_or_else(|_| {
                 plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
             });
+    // Renames any old `ModelSet` layout into the engine layout, before
+    // anything below reads a model path or checks/installs an artifact set.
+    for w in plank::enginemigrate::migrate() {
+        eprintln!("{w}");
+    }
     // `--help` is answered from the provisional parse, before `--chdir` and
     // before the plugin scan. Both of those can fail or print warnings, and
     // `plank --chdir /nonexistent --help` printing a chdir error instead of the
@@ -1039,6 +1044,11 @@ fn run_serve(args: &[String]) -> ExitCode {
             .unwrap_or_else(|_| {
                 plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
             });
+    // Renames any old `ModelSet` layout into the engine layout, before
+    // anything below reads a model path or checks/installs an artifact set.
+    for w in plank::enginemigrate::migrate() {
+        eprintln!("{w}");
+    }
     let launch_cwd = std::env::current_dir().unwrap_or_default();
     let mut plugins = plank::plugins::load_default(&launch_cwd);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
