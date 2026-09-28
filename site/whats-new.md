@@ -7,8 +7,8 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v6.1.0 is out**, and the beta channel is on 6.1.1. This one is about how
-plank finds its models.
+**Coming in the next release.** These changes are on `main` and not in a
+published build yet. They are about how plank finds its models.
 
 **Models are named engines now.** Plank used to know its three model sets by
 hard-coded file names. It now reads an `engines.json` catalog, where each
