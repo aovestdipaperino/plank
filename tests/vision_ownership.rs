@@ -52,6 +52,7 @@ fn two_turns_over_an_image_message_do_not_double_free_the_embedding() {
     // is about ownership, not decode speed, so keep the plain target path.
     let tuning = plank::config::EngineTuning {
         mtp: false,
+        vision_path: Some(vision.clone()),
         ..plank::config::EngineTuning::default()
     };
     let mut session = plank::ds4engine::Ds4Session::open(
@@ -161,6 +162,7 @@ fn a_view_image_tool_result_grounds_its_image() {
 
     let tuning = plank::config::EngineTuning {
         mtp: false,
+        vision_path: Some(vision.clone()),
         ..plank::config::EngineTuning::default()
     };
     let mut session = plank::ds4engine::Ds4Session::open(

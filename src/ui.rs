@@ -3728,7 +3728,12 @@ impl Agent<'_> {
             return format!(
                 "{}Expected the encoder at {}.\n",
                 crate::tools::VIEW_IMAGE_NO_ENCODER,
-                crate::download::default_vision_path().display()
+                crate::engines::active()
+                    .and_then(|s| s.vision.as_deref())
+                    .map_or_else(
+                        || "(this engine has no vision encoder)".to_string(),
+                        |p| p.display().to_string()
+                    )
             );
         }
         match self.engine.vision_encode_file(path) {

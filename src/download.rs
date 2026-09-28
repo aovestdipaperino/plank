@@ -58,22 +58,6 @@ const QWEN_FILE: &str = "Qwen3.8-Flash-Next-Q4.gguf";
 /// model.
 const FILE: &str = "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf";
 
-/// The `DSpark` speculative-decoding support GGUF (~5.6 GB) for the
-/// Vision-Experimental checkpoint.
-///
-/// Not a standalone model: it is the auxiliary drafter, and it is
-/// checkpoint-specific — pairing it with the older 0731 language checkpoint is
-/// a load error, not a quality question, which is why it is fetched from the
-/// same repository as [`FILE`].
-const DSPARK_FILE: &str = "DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf";
-
-/// The vision-encoder GGUF that pairs with the Vision-Experimental checkpoint.
-///
-/// A standalone encoder (~0.9 GB) loaded alongside the main model so the
-/// `view_image` tool can decode images. It is fetched at startup when absent
-/// for any Vision-Exp run, the same as the main model.
-const VISION_ENCODER_FILE: &str = "DeepSeek-V4-Flash-Vision-Encoder.gguf";
-
 /// Rotating status lines shown while the model downloads.
 const MESSAGES: [&str; 200] = [
     "Summoning alien intelligence from the void...",
@@ -300,16 +284,6 @@ fn repo_file_url(repo: &str, file: &str) -> String {
     format!("https://huggingface.co/{repo}/resolve/main/{file}")
 }
 
-/// Default `DSpark` support-model location, used when `--dspark` is given
-/// without an explicit `--mtp`.
-///
-/// Sits beside the main model and mirrors its name so the pairing is legible
-/// on disk: `ds4vision.gguf` and `ds4vision.mtp.gguf`.
-#[must_use]
-pub fn default_dspark_path() -> PathBuf {
-    managed_path(crate::manifest::EngineId::DS4VISION, "mtp")
-}
-
 /// Default Qwen3.8-Flash-Next model location, selected by `--qwen`.
 ///
 /// Deliberately outside the `ds4vision.*` family, which the `DeepSeek` manifest
@@ -322,25 +296,6 @@ pub fn default_qwen_path() -> PathBuf {
     managed_path(crate::manifest::EngineId::QWEN, "main")
 }
 
-/// Default Qwen vision-encoder location, beside its main model.
-///
-/// This replaced the old `qwen.mtp.gguf` PLE sidecar: upstream now ships the
-/// BF16 n-grams and the MTP block inside the main GGUF, so the second slot is
-/// free for the `mmproj` encoder `--vision` loads.
-#[must_use]
-pub fn default_qwen_vision_path() -> PathBuf {
-    managed_path(crate::manifest::EngineId::QWEN, "vision")
-}
-
-/// Default vision-encoder location. Loaded alongside the main model whenever
-/// the native engine opens the Vision-Exp checkpoint.
-///
-/// Sits beside the main model: `ds4vision.gguf` and `ds4vision.vision.gguf`.
-#[must_use]
-pub fn default_vision_path() -> PathBuf {
-    managed_path(crate::manifest::EngineId::DS4VISION, "vision")
-}
-
 /// Default `DeepSeek` V4.1 Flash model location.
 ///
 /// A separate name from [`default_model_path`] on purpose: the two sets are
@@ -348,12 +303,6 @@ pub fn default_vision_path() -> PathBuf {
 #[must_use]
 pub fn default_ds41_model_path() -> PathBuf {
     managed_path(crate::manifest::EngineId::DS41, "main")
-}
-
-/// Default V4.1 vision-encoder location, beside its main model.
-#[must_use]
-pub fn default_ds41_vision_path() -> PathBuf {
-    managed_path(crate::manifest::EngineId::DS41, "vision")
 }
 
 /// The `main` model path of the set this machine manages by default, under
@@ -365,12 +314,6 @@ pub fn default_ds41_vision_path() -> PathBuf {
 pub fn default_managed_model_path_in(root: &Path) -> PathBuf {
     crate::manifest::local_path_for_in(root, crate::manifest::EngineId::DS4VISION, "main")
         .unwrap_or_else(default_model_path)
-}
-
-/// [`default_managed_model_path_in`] rooted at `~/.plank`.
-#[must_use]
-pub fn default_managed_model_path() -> PathBuf {
-    default_managed_model_path_in(&crate::manifest::plank_dir())
 }
 
 /// Hugging Face download URL for the default Flash GGUF.
@@ -429,50 +372,81 @@ fn offer_target_in(root: &Path, path: &Path) -> Option<crate::manifest::EngineId
     (path == default_managed_model_path_in(root)).then_some(set)
 }
 
-/// Hugging Face download URL for the `DSpark` support GGUF.
-#[must_use]
-pub fn dspark_url() -> String {
-    file_url(DSPARK_FILE)
+/// The selected engine's companions, applied to `engine` where the user did
+/// not already decide. An explicit `--mtp-model` is kept; `--mtp-off` leaves
+/// `mtp_path` empty so nothing is fetched.
+pub fn apply_companions(sel: &crate::engines::Selection, engine: &mut crate::config::EngineTuning) {
+    engine.vision_path.clone_from(&sel.vision);
+    if engine.mtp && engine.mtp_path.is_none() {
+        engine.mtp_path.clone_from(&sel.mtp);
+        engine.mtp_path_explicit = false;
+    }
 }
 
-/// Hugging Face download URL for the vision-encoder GGUF.
+/// Download URL and size of `role` for the selected engine, from the catalog
+/// entry the selection was resolved from. `None` for a role the engine does
+/// not publish (path-only, or absent) and for a bare path.
 #[must_use]
-pub fn vision_url() -> String {
-    file_url(VISION_ENCODER_FILE)
+pub fn role_offer(sel: &crate::engines::Selection, role: &str) -> Option<(String, u64)> {
+    sel.id?;
+    let mut warn = Vec::new();
+    role_offer_in(&crate::engines::load(&mut warn), sel, role)
 }
 
-/// Ensures the `DSpark` support model exists at `path`, offering to download it
-/// when it is missing.
+/// [`role_offer`] against an explicit catalog, so a test never reads the
+/// real `~/.plank`.
+#[must_use]
+pub fn role_offer_in(
+    catalog: &crate::engines::Catalog,
+    sel: &crate::engines::Selection,
+    role: &str,
+) -> Option<(String, u64)> {
+    let id = sel.id?;
+    let f = catalog.get(id.as_str())?.files.get(role)?;
+    Some((f.url.clone(), f.bytes))
+}
+
+/// Ensures `role`'s file exists at `path`, offering to download it from the
+/// catalog when missing. Same prompt shape as the main model's.
 ///
-/// Deliberately simpler than [`ensure_model`]: no upgrade check. The support
-/// file is pinned to the target checkpoint rather than tracking a quant
-/// family, so "is there a newer build" is not a question worth asking on every
-/// launch — a mismatched drafter is refused by the engine at load.
+/// Deliberately simpler than [`ensure_model`]: no upgrade check. Upgrades of
+/// the whole set are the manifest's business (`check_manifest_at_startup`).
 ///
 /// # Errors
-/// Returns an error string when the user declines, when stdin is not a
-/// terminal (so no prompt is possible), or when the download fails.
-pub fn ensure_dspark(path: &Path) -> Result<(), String> {
+/// Declined prompt, no terminal, unmanaged role, or a failed download.
+pub fn ensure_role(sel: &crate::engines::Selection, role: &str, path: &Path) -> Result<(), String> {
     if path.exists() {
         return Ok(());
     }
+    let label = match role {
+        "mtp" => "mtp companion",
+        "vision" => "vision encoder",
+        _ => "model",
+    };
+    let Some((url, bytes)) = role_offer(sel, role) else {
+        return Err(format!("no {label} at {}", path.display()));
+    };
     if !std::io::stdin().is_terminal() {
         return Err(format!(
-            "no DSpark support model at {}; pass --mtp-model <path>, turn speculation off with --mtp-off, or run plank in a terminal to download it",
-            path.display()
+            "no {label} at {}; run plank in a terminal to download it (~{:.1} GB), or put the file at that path",
+            path.display(),
+            gb(bytes)
         ));
     }
     let resuming = partial_bytes(path) > 0;
-    eprintln!("No DSpark support model found at {}.", path.display());
+    eprintln!("No {label} found at {}.", path.display());
     if resuming {
         eprintln!(
             "A partial download exists ({:.1} GB); plank can resume it from Hugging Face:",
             gb(partial_bytes(path))
         );
     } else {
-        eprintln!("plank can download the DSpark support model (~5.6 GB) from Hugging Face:");
+        eprintln!(
+            "plank can download the {label} (~{:.1} GB) from Hugging Face:",
+            gb(bytes)
+        );
     }
-    eprintln!("  {}", dspark_url());
+    eprintln!("  {url}");
     eprint!(
         "{} it now? [Y/n] ",
         if resuming { "Resume" } else { "Download" }
@@ -484,60 +458,48 @@ pub fn ensure_dspark(path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     // Default to yes: Enter (empty) accepts, like the main model prompt.
     if matches!(answer.trim(), "n" | "N" | "no") {
-        return Err(
-            "no DSpark support model available; re-run with --mtp-off or pass --mtp-model <path>"
+        return Err(match role {
+            "mtp" => "no mtp companion available; re-run with --mtp-off or pass --mtp-model <path>"
                 .to_string(),
-        );
+            "vision" => "no vision encoder available; the view_image tool will refuse at call time"
+                .to_string(),
+            _ => format!("no {label} available"),
+        });
     }
-    download(&dspark_url(), path)
+    download(&url, path)
 }
 
-/// Resolves the `DSpark` support model for a run that asked for `--dspark`
-/// without naming one, fetching it if needed.
+/// Resolves the selected engine's side artifacts (vision encoder, `DSpark`
+/// support) into `engine`, fetching any that are missing, unless the model is
+/// a Qwen3.8-Flash-Next one.
 ///
-/// An explicit `--mtp` always wins and is left untouched — it is also how a
-/// legacy one-stage MTP drafter is supplied, which is a different file
-/// entirely. Does nothing unless `DSpark` was actually requested, so a normal
-/// run never pays for this.
+/// The companions come from the selection ([`apply_companions`]): an engine
+/// that declares no `mtp` or `vision` role, and a bare `--model PATH`, get
+/// none. An explicit `--mtp-model` is kept and never fetched.
 ///
-/// # Errors
-/// Propagates [`ensure_dspark`] failures: declined prompt, no terminal to
-/// prompt on, or a failed download.
-pub fn ensure_dspark_support(engine: &mut crate::config::EngineTuning) -> Result<(), String> {
-    if !engine.mtp || engine.mtp_path.is_some() {
-        return Ok(());
-    }
-    let path = default_dspark_path();
-    ensure_dspark(&path)?;
-    engine.mtp_path = Some(path);
-    Ok(())
-}
-
-/// Fetches the DS4 side artifacts (vision encoder, `DSpark` support) unless the
-/// model is a Qwen3.8-Flash-Next one.
+/// A Qwen run opens neither: the engine is not handed a vision encoder, and
+/// Qwen speculates from the MTP block embedded in its own main GGUF rather
+/// than from a draft checkpoint.
 ///
-/// Both are `DeepSeek` V4 files, and a Qwen run opens neither: the engine is
-/// not handed the vision encoder, and Qwen speculates from the MTP block
-/// embedded in its own main GGUF rather than from a draft checkpoint. Fetching
-/// them would cost ~7 GB for files this run never reads.
-///
-/// The vision encoder is also skipped for a `DeepSeek` checkpoint that is not
+/// The vision encoder is also dropped for a `DeepSeek` checkpoint that is not
 /// the pinned Vision-Exp model (`gguf::supports_vision`): the engine refuses
 /// to open such a model with an encoder, so plank never passes one and the run
-/// is text-only. Prompting for a ~0.9 GB download it could not use would be
-/// worse than useless.
+/// is text-only. Prompting for a download it could not use would be worse than
+/// useless.
 ///
-/// Speculation is *not* switched off here. Under the unified `--mtp` it stays
-/// meaningful for Qwen — it just runs off the embedded block, which needs no
-/// download and no companion file.
+/// Speculation is *not* switched off for Qwen. Under the unified `--mtp` it
+/// stays meaningful there — it just runs off the embedded block, which needs
+/// no download and no companion file.
 ///
 /// # Errors
-/// Propagates the underlying ensure failures for non-Qwen runs.
+/// Propagates [`ensure_role`] failures for non-Qwen runs.
 pub fn ensure_side_artifacts(
-    model_path: &Path,
+    sel: &crate::engines::Selection,
     ctx: i32,
     engine: &mut crate::config::EngineTuning,
 ) -> Result<(), String> {
+    let model_path = sel.main.as_path();
+    apply_companions(sel, engine);
     // Qwen takes none of this. The engine refuses to open a Qwen3.8 checkpoint
     // with SSD streaming on ("requires single-host Metal ... SSD streaming ...
     // not supported"), and the heuristic would enable it every time anyway: it
@@ -548,6 +510,11 @@ pub fn ensure_side_artifacts(
     // speculation runs off the block embedded in its own GGUF.
     if crate::gguf::family_of(model_path) == crate::gguf::ModelFamily::Qwen {
         crate::status::set_ssd_streaming(engine.ssd_streaming);
+        // Qwen opens no side artifact (see `ds4engine::model_supports_vision`).
+        engine.vision_path = None;
+        if !engine.mtp_path_explicit {
+            engine.mtp_path = None;
+        }
         return Ok(());
     }
     // A checkpoint too large to hold resident is streamed from SSD rather than
@@ -560,17 +527,27 @@ pub fn ensure_side_artifacts(
     // than read off `cfg` by the bar, because the auto-enable lands on the
     // caller's local `EngineTuning` copy and never goes back into `cfg`.
     crate::status::set_ssd_streaming(engine.ssd_streaming);
-    if crate::gguf::supports_vision(model_path) {
-        ensure_vision_encoder()?;
+    match engine.vision_path.clone() {
+        Some(v) if crate::gguf::supports_vision(model_path) => ensure_role(sel, "vision", &v)?,
+        _ => engine.vision_path = None,
     }
     // DSpark is implemented for V4 only (`refs/ds4/docs/MODELS.md` at bd66c40):
     // the engine refuses to open a V4.1 checkpoint at all when a draft model is
     // attached, so plank must not auto-pair one. A companion the user named
     // themselves still goes through, and still fails loudly there.
     if drop_dspark_for_family(crate::gguf::family_of(model_path), engine) {
+        if !engine.mtp_path_explicit {
+            engine.mtp_path = None;
+        }
         return Ok(());
     }
-    ensure_dspark_support(engine)
+    if engine.mtp
+        && !engine.mtp_path_explicit
+        && let Some(p) = engine.mtp_path.clone()
+    {
+        ensure_role(sel, "mtp", &p)?;
+    }
+    Ok(())
 }
 
 /// Fraction of installed RAM, as a percentage, that plank treats as available
@@ -752,7 +729,7 @@ fn drop_dspark_for_family(
     if family == crate::gguf::ModelFamily::Ds4 {
         return false;
     }
-    if engine.mtp && engine.mtp_path.is_none() {
+    if engine.mtp && !engine.mtp_path_explicit {
         engine.mtp = false;
         engine.mtp_strict = false;
         eprintln!(
@@ -760,56 +737,6 @@ fn drop_dspark_for_family(
         );
     }
     true
-}
-
-/// Ensures the vision-encoder GGUF exists at its default path, offering to
-/// download it if missing.
-///
-/// This runs on every native-engine startup alongside [`ensure_model`] for a
-/// model that can use the encoder. A missing encoder is then a hard error: the
-/// `view_image` tool would refuse at call time, and the model was trained to
-/// expect image tokens.
-///
-/// # Errors
-/// Returns an error string when the user declines, when stdin is not a
-/// terminal (so no prompt is possible), or when the download fails.
-pub fn ensure_vision_encoder() -> Result<(), String> {
-    let path = default_vision_path();
-    if path.exists() {
-        return Ok(());
-    }
-    if !std::io::stdin().is_terminal() {
-        return Err(format!(
-            "no vision encoder at {}; run plank in a terminal to download it (~0.9 GB), or put the file at that path",
-            path.display()
-        ));
-    }
-    let resuming = partial_bytes(&path) > 0;
-    eprintln!("No vision encoder found at {}.", path.display());
-    if resuming {
-        eprintln!(
-            "A partial download exists ({:.1} GB); plank can resume it from Hugging Face:",
-            gb(partial_bytes(&path))
-        );
-    } else {
-        eprintln!("plank can download the vision encoder (~0.9 GB) from Hugging Face:");
-    }
-    eprintln!("  {}", vision_url());
-    eprint!(
-        "{} it now? [Y/n] ",
-        if resuming { "Resume" } else { "Download" }
-    );
-    io::stderr().flush().ok();
-    let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .map_err(|e| e.to_string())?;
-    if matches!(answer.trim(), "n" | "N" | "no") {
-        return Err(
-            "no vision encoder available; the view_image tool will refuse at call time".to_string(),
-        );
-    }
-    download(&vision_url(), &path)
 }
 
 /// Ensures a model file exists at `path`, offering to download it if missing.
@@ -2113,24 +2040,6 @@ mod tests {
         assert!(default_model_path().ends_with(".plank/ds4vision.gguf"));
     }
 
-    #[test]
-    fn dspark_path_sits_beside_the_main_model() {
-        let main = default_model_path();
-        let spark = default_dspark_path();
-        assert_eq!(main.parent(), spark.parent());
-        assert!(spark.ends_with(".plank/ds4vision.mtp.gguf"));
-    }
-
-    #[test]
-    fn dspark_url_points_at_the_support_gguf() {
-        let url = dspark_url();
-        assert!(url.contains(DSPARK_FILE));
-        assert!(
-            url.contains("Vision-Exp"),
-            "must be the vision-experimental support: {url}"
-        );
-    }
-
     /// Measured file sizes of the checkpoints this rule has to separate.
     const V4_BYTES: u64 = 86_720_111_776;
     const V41_BYTES: u64 = 365_713_686_528;
@@ -2282,49 +2191,108 @@ mod tests {
         );
     }
 
-    /// The auto-resolved path is marked as plank's own choice, so a failed open
-    /// may retry without it.
-    #[test]
-    fn an_auto_resolved_companion_is_not_marked_explicit() {
-        let mut e = crate::config::EngineTuning::default();
-        // Only reached when the file already exists; skip when it does not, so
-        // the test never prompts or downloads.
-        if !default_dspark_path().exists() {
-            return;
-        }
-        assert!(ensure_dspark_support(&mut e).is_ok());
-        assert_eq!(e.mtp_path, Some(default_dspark_path()));
-        assert!(!e.mtp_path_explicit);
-        assert!(e.without_auto_companion().is_some());
+    fn catalog() -> crate::engines::Catalog {
+        crate::engines::parse(
+            crate::engines::COMPILED_IN,
+            crate::engines::Layer::Published,
+            &mut Vec::new(),
+        )
+        .expect("compiled-in catalog parses")
+    }
+
+    fn sel_for(root: &Path, name: &str) -> crate::engines::Selection {
+        crate::engines::resolve_in(root, &catalog(), crate::engines::Choice::Spec(name))
+            .expect("resolves")
     }
 
     #[test]
-    fn support_resolution_is_skipped_unless_mtp_was_asked_for() {
-        // --dspark-off: the resolver must not touch mtp_path, and so must never
-        // reach the filesystem or a prompt.
-        let mut e = crate::config::EngineTuning {
-            mtp: false,
-            ..crate::config::EngineTuning::default()
-        };
-        assert!(ensure_dspark_support(&mut e).is_ok());
-        assert_eq!(e.mtp_path, None);
-    }
-
-    #[test]
-    fn an_explicit_mtp_path_wins_over_the_default() {
-        // --mtp is also how a legacy one-stage MTP drafter is supplied, so it
-        // must survive --dspark untouched rather than being replaced by the
-        // DSpark default.
-        let mut e = crate::config::EngineTuning {
-            mtp: true,
-            mtp_path: Some(PathBuf::from("/somewhere/custom-drafter.gguf")),
-            ..crate::config::EngineTuning::default()
-        };
-        assert!(ensure_dspark_support(&mut e).is_ok());
-        assert_eq!(
-            e.mtp_path,
-            Some(PathBuf::from("/somewhere/custom-drafter.gguf"))
+    fn companions_come_from_the_engine() {
+        let root = std::env::temp_dir().join(format!("plank-comp-{}", std::process::id()));
+        let sel = sel_for(&root, "ds4vision");
+        assert!(sel.mtp.is_some() && sel.vision.is_some());
+        let mut t = crate::config::EngineTuning::default();
+        apply_companions(&sel, &mut t);
+        assert_eq!(t.vision_path, sel.vision);
+        assert_eq!(t.mtp_path, sel.mtp);
+        assert!(
+            !t.mtp_path_explicit,
+            "auto-picked, so the retry may drop it"
         );
+        assert!(t.without_auto_companion().is_some());
+    }
+
+    #[test]
+    fn an_explicit_mtp_model_wins_and_mtp_off_skips_it() {
+        let root = std::env::temp_dir().join(format!("plank-comp2-{}", std::process::id()));
+        let sel = sel_for(&root, "ds4vision");
+        let mut t = crate::config::EngineTuning {
+            mtp_path: Some("/mine.gguf".into()),
+            mtp_path_explicit: true,
+            ..Default::default()
+        };
+        apply_companions(&sel, &mut t);
+        assert_eq!(t.mtp_path.as_deref(), Some(Path::new("/mine.gguf")));
+        assert!(t.mtp_path_explicit);
+        let mut off = crate::config::EngineTuning {
+            mtp: false,
+            ..Default::default()
+        };
+        apply_companions(&sel, &mut off);
+        assert_eq!(off.mtp_path, None);
+    }
+
+    #[test]
+    fn a_bare_path_gets_no_companions() {
+        let root = std::env::temp_dir().join(format!("plank-comp3-{}", std::process::id()));
+        let sel = sel_for(&root, "/elsewhere/x.gguf");
+        let mut t = crate::config::EngineTuning::default();
+        apply_companions(&sel, &mut t);
+        assert_eq!(t.vision_path, None);
+        assert_eq!(t.mtp_path, None);
+    }
+
+    #[test]
+    fn role_offer_reads_url_and_bytes_from_the_catalog() {
+        let root = std::env::temp_dir().join(format!("plank-offer-{}", std::process::id()));
+        let sel = sel_for(&root, "qwen");
+        let (url, bytes) = role_offer_in(&catalog(), &sel, "vision").unwrap();
+        assert!(url.ends_with("mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"));
+        assert_eq!(bytes, 616_703_104);
+        assert!(role_offer_in(&catalog(), &sel, "mtp").is_none());
+        let bare = sel_for(&root, "/elsewhere/x.gguf");
+        assert!(role_offer_in(&catalog(), &bare, "vision").is_none());
+    }
+
+    /// The `DSpark` drafter sits beside the main model and comes from the
+    /// vision-experimental repository, as the engine's own catalog entry says.
+    #[test]
+    fn the_ds4vision_mtp_companion_is_the_vision_exp_support_gguf() {
+        let root = std::env::temp_dir().join(format!("plank-comp4-{}", std::process::id()));
+        let sel = sel_for(&root, "ds4vision");
+        let mtp = sel
+            .mtp
+            .clone()
+            .expect("ds4vision declares an mtp companion");
+        assert_eq!(mtp.parent(), sel.main.parent());
+        let (url, _) = role_offer_in(&catalog(), &sel, "mtp").expect("published");
+        assert!(url.contains("Vision-Exp-DSpark-support"), "{url}");
+    }
+
+    /// A tuning whose auto-picked companion was pre-filled is still dropped for
+    /// a family without a drafter, because the check is on "did the user name
+    /// it", not "is a path set".
+    #[test]
+    fn an_auto_filled_companion_is_dropped_by_the_family_gate() {
+        let mut e = crate::config::EngineTuning {
+            mtp_path: Some(PathBuf::from("/auto/drafter.gguf")),
+            mtp_path_explicit: false,
+            ..Default::default()
+        };
+        assert!(drop_dspark_for_family(
+            crate::gguf::ModelFamily::Ds41,
+            &mut e
+        ));
+        assert!(!e.mtp);
     }
 
     /// Writes a GGUF header declaring `arch`, which is all `gguf::family_of`
@@ -2345,6 +2313,20 @@ mod tests {
         path
     }
 
+    /// A selection for `id` whose main is `model` and whose companions are
+    /// files that do not exist, so any attempt to ensure one would try to
+    /// prompt on a non-terminal stdin and fail.
+    fn stub_selection(id: crate::manifest::EngineId, model: &Path) -> crate::engines::Selection {
+        let absent = model.with_extension("absent");
+        crate::engines::Selection {
+            id: Some(id),
+            main: model.to_path_buf(),
+            mtp: Some(absent.with_extension("mtp.absent")),
+            vision: Some(absent.with_extension("vision.absent")),
+            managed_main: false,
+        }
+    }
+
     /// A `DeepSeek` checkpoint that is not the pinned Vision-Exp model must
     /// not prompt for the vision encoder: the engine refuses to open it with
     /// one, so the download would be for a file the run can never pass. No
@@ -2354,11 +2336,16 @@ mod tests {
     #[test]
     fn a_non_vision_deepseek_model_skips_the_vision_encoder() {
         let model = stub_model("plain-ds4", "deepseek4");
+        let sel = stub_selection(crate::manifest::EngineId::DS4VISION, &model);
         let mut e = crate::config::EngineTuning {
             mtp: false,
             ..Default::default()
         };
-        assert!(ensure_side_artifacts(&model, 32768, &mut e).is_ok());
+        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert_eq!(
+            e.vision_path, None,
+            "never passed to a non-vision checkpoint"
+        );
         let _ = std::fs::remove_file(model);
     }
 
@@ -2386,12 +2373,14 @@ mod tests {
     #[test]
     fn a_qwen_model_skips_the_ds4_side_artifacts() {
         let model = stub_model("qwen", "qwen4exp");
+        let sel = stub_selection(crate::manifest::EngineId::QWEN, &model);
         let mut e = crate::config::EngineTuning {
             mtp: true,
             mtp_strict: true,
             ..Default::default()
         };
-        assert!(ensure_side_artifacts(&model, 32768, &mut e).is_ok());
+        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert_eq!(e.vision_path, None, "Qwen opens no side artifact");
         // Speculation stays on: under the unified `--mtp` a Qwen run
         // speculates from the block embedded in its own main GGUF, which needs
         // neither a download nor a companion file.

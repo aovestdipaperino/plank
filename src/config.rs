@@ -280,14 +280,17 @@ pub struct EngineTuning {
     /// options struct before that.
     pub mtp_path: Option<PathBuf>,
     /// Whether [`EngineTuning::mtp_path`] came from the user naming it
-    /// (`--mtp-model PATH`) rather than from plank resolving the default
-    /// `DSpark` file on disk ([`crate::download::ensure_dspark_support`]).
+    /// (`--mtp-model PATH`) rather than from plank taking the selected
+    /// engine's `mtp` companion ([`crate::download::apply_companions`]).
     ///
     /// The distinction is what lets a failed open retry without the companion:
     /// a file plank chose itself may be dropped when the checkpoint refuses it,
     /// while one the user named must fail loudly instead of being silently
     /// ignored.
     pub mtp_path_explicit: bool,
+    /// The vision encoder for this run: the selected engine's `vision` role,
+    /// or `None` for an engine without one and for a bare `--model PATH`.
+    pub vision_path: Option<PathBuf>,
     /// Draft tokens per MTP step from `--mtp-draft` (C default: 1).
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
@@ -383,6 +386,7 @@ impl Default for EngineTuning {
         Self {
             mtp_path: None,
             mtp_path_explicit: false,
+            vision_path: None,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
             mtp: true,

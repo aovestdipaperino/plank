@@ -925,7 +925,8 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // `cfg`: only the engine open needs it. A Qwen model skips both side
         // artifacts, since it opens neither.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&model, cfg.generation.ctx_size, &mut tuning)?;
+        let sel = cfg.selection.as_ref().expect("resolved by parse_config");
+        plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;
 
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
@@ -1212,7 +1213,8 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         // any other DeepSeek checkpoint runs text-only.
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&model_path, cfg.generation.ctx_size, &mut tuning)?;
+        let sel = cfg.selection.as_ref().expect("resolved by parse_config");
+        plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,
