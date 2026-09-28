@@ -2600,12 +2600,18 @@ impl crate::gpuyield::CycleHost for AgentCycle<'_, '_> {
         let bash = &mut self.agent.tool_ctx.bash;
         bash.replay_sandbox = self.sandbox.take();
         bash.last_foreground = None;
+        // The model comes back as soon as this returns, so the re-run waits
+        // for the command to exit rather than for the model's `refresh_sec`:
+        // a long job handed back as `status=running` would still be on the
+        // GPU when the reopen maps the model again.
+        bash.wait_to_exit = true;
         let out = dispatch(self.call, &mut self.agent.tool_ctx).output;
         // Consumed by the bash tool; cleared anyway in case a hook blocked the
         // call before it got there. The record is dropped so this result can
         // never start a second cycle.
         let bash = &mut self.agent.tool_ctx.bash;
         bash.replay_sandbox = None;
+        bash.wait_to_exit = false;
         bash.last_foreground = None;
         out
     }
@@ -35979,6 +35985,51 @@ or the user's next message aborts before its first token"
         assert!(
             logged(&log).iter().any(|e| e.starts_with("restore:second")),
             "the model is reloaded regardless: {:?}",
+            logged(&log)
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The re-run outlasts the model's `refresh_sec`: it must still come back
+    /// finished, and the model must not reopen while it runs.
+    #[test]
+    fn the_rerun_waits_for_the_command_to_exit_before_the_reopen() {
+        let dir = gpu_dir("long-rerun");
+        let counter = dir.join("runs");
+        let done = dir.join("done");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = test_agent_boxed(
+            &dir,
+            Box::new(GpuEngine::new("first", &log, &counter, &[])),
+            &cfg,
+        );
+        let (l, c, d) = (std::sync::Arc::clone(&log), counter.clone(), done.clone());
+        let reopen: crate::gpuyield::ReopenFn = Box::new(move || {
+            l.lock()
+                .unwrap()
+                .push(format!("reopen(exited={})", d.exists()));
+            Ok(Box::new(GpuEngine::new("second", &l, &c, &[])) as Box<dyn Engine>)
+        });
+        arm_gpu_yield(&mut agent, &dir, reopen);
+        let (cq, dq) = (counter.display(), done.display());
+        let command = format!(
+            "echo run >> '{cq}'; if [ \"$(wc -l < '{cq}')\" -eq 1 ]; then \
+             echo 'GPU not available: held by plank' >&2; exit 75; fi; \
+             sleep 2; touch '{dq}'; echo second-run-ok"
+        );
+        let call = crate::tools::test_call("bash", &[("command", &command), ("refresh_sec", "1")]);
+
+        let out = agent.run_tool_calls(&[call]);
+
+        assert!(!out.contains("status=running"), "{out}");
+        assert!(out.contains("status=done"), "{out}");
+        assert!(out.contains("exit_status=0"), "{out}");
+        assert!(out.contains("second-run-ok"), "{out}");
+        assert!(
+            logged(&log).contains(&"reopen(exited=true)".to_owned()),
+            "the reopen comes after the exit: {:?}",
             logged(&log)
         );
         drop(agent);

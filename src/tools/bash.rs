@@ -74,6 +74,12 @@ pub struct BashJobs {
     /// Set by the agent for a GPU-yield re-run: the sandbox decision the first
     /// run made, reused as-is so a one-command grant is not asked twice.
     pub replay_sandbox: Option<DecidedSandbox>,
+    /// Set by the agent for a GPU-yield re-run: the next `bash` call waits
+    /// for its command to exit (or hit its own timeout, or be interrupted)
+    /// instead of returning after `refresh_sec`, because the model is reopened
+    /// right after and must not share the GPU with a command still running.
+    /// Consumed by that call.
+    pub wait_to_exit: bool,
 }
 
 /// A sandbox decision already made for one command: the policy it ran under,
@@ -450,6 +456,26 @@ impl BashJob {
         }
         self.poll();
     }
+
+    /// Waits until the job is no longer running, however long that takes.
+    ///
+    /// The job's own timeout still ends it (`poll` enforces it) and a user
+    /// interrupt kills it as in [`refresh_for`](Self::refresh_for); nothing
+    /// else does. `refresh_sec` is capped at an hour while a timeout may run to
+    /// a day, so the refresh wait cannot stand in for this.
+    fn wait_for_exit(&mut self) {
+        while self.running {
+            self.poll();
+            if !self.running {
+                break;
+            }
+            if crate::interrupt::pending() {
+                self.terminate();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 impl Drop for BashJob {
@@ -657,8 +683,13 @@ impl BashJobs {
         idx: usize,
         refresh_sec: u64,
         sandbox: Option<crate::sandbox::Sandbox>,
+        wait_to_exit: bool,
     ) -> String {
-        self.jobs[idx].refresh_for(refresh_sec);
+        if wait_to_exit {
+            self.jobs[idx].wait_for_exit();
+        } else {
+            self.jobs[idx].refresh_for(refresh_sec);
+        }
         let job = &self.jobs[idx];
         self.last_foreground = (!job.running).then(|| crate::gpuyield::ForegroundExit {
             exit_status: job.exit_status,
@@ -857,7 +888,8 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
         return format!("Tool error: bash failed to start: {err}\n");
     }
     let idx = ctx.bash.jobs.len() - 1;
-    ctx.bash.foreground_result(idx, refresh, sandbox)
+    let wait = std::mem::take(&mut ctx.bash.wait_to_exit);
+    ctx.bash.foreground_result(idx, refresh, sandbox, wait)
 }
 
 /// Decides the sandbox policy one command runs under, asking about any
@@ -1189,6 +1221,25 @@ mod tests {
             "the head hides it: {out}"
         );
         assert!(ctx.bash.last_foreground.take().expect("recorded").needs_gpu);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wait_to_exit_outlasts_the_refresh_and_is_consumed() {
+        let (mut ctx, dir) = test_ctx();
+        ctx.bash.wait_to_exit = true;
+        let call = test_call(
+            "bash",
+            &[("command", "sleep 2; echo late"), ("refresh_sec", "1")],
+        );
+        let out = tool_bash(&mut ctx, &call);
+        assert!(out.contains("status=done"), "got: {out}");
+        assert!(out.contains("late"), "got: {out}");
+        assert!(!ctx.bash.wait_to_exit, "one call only");
+        assert!(
+            ctx.bash.last_foreground.is_some(),
+            "finished inside the call"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
