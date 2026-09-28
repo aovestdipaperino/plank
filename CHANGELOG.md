@@ -8,6 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A profile may recommend a model.** `recommendedModel` in the `profile` block names an engine that `--profile` runs use ahead of `engine.model`, but only when its main file is already on disk; `--model` still wins and nothing is downloaded.
 - **A local engine role may name a `url`.** In `~/.plank/engines.local.json` a
   role with a `path` can add an `https://` `url` (a Hugging Face `/blob/` page
   is accepted) that plank offers to download into that path when the file is

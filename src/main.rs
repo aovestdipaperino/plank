@@ -329,7 +329,28 @@ fn model_choice(cfg: &plank::config::AgentConfig) -> plank::engines::Choice<'_> 
     }
 }
 
-/// Resolves the model choice against the catalog. Must precede
+/// Whether the model choice came from `--model`, `-m` or `--model:` rather
+/// than from `engine.model`: only the command line outranks a profile's
+/// `recommendedModel`.
+fn model_from_cli(cfg: &plank::config::AgentConfig) -> bool {
+    cfg.model_spec.is_some()
+        && cfg.cli_provenance.get("engine.model") == Some(&plank::provenance::Origin::Cli)
+}
+
+/// The running profile's `recommendedModel`, when `--profile` activated one
+/// that declares it. Without `--profile` there is none, whatever the plugin
+/// declares.
+fn active_recommendation() -> Option<plank::engines::Recommendation<'static>> {
+    let active = plank::profile::active()?;
+    Some(plank::engines::Recommendation {
+        profile: &active.name,
+        engine: active.spec.recommended_model.as_deref()?,
+    })
+}
+
+/// Resolves the model choice against the catalog, letting the running
+/// profile's `recommended` engine outrank `engine.model` (but never the
+/// command line) when it is already on disk. Must precede
 /// `resolve_model_delta`, which reads the resolved `model_path`.
 ///
 /// Does not call `plank::engines::set_active`: the selection's `main` path
@@ -343,14 +364,30 @@ fn model_choice(cfg: &plank::config::AgentConfig) -> plank::engines::Choice<'_> 
 fn resolve_selection(
     cfg: &mut plank::config::AgentConfig,
     root: &std::path::Path,
+    recommended: Option<plank::engines::Recommendation<'_>>,
 ) -> Result<plank::engines::Catalog, String> {
     let mut warn = Vec::new();
     let catalog = plank::engines::load_in(root, &mut warn);
     for w in warn {
         eprintln!("plank: {w}");
     }
-    let (sel, note) = plank::engines::resolve_with_note_in(root, &catalog, model_choice(cfg))?;
-    if let Some(note) = note {
+    let choice = model_choice(cfg);
+    let from_cli = model_from_cli(cfg);
+    // A recommendation is for the local model a run would load, so a remote
+    // or provider run, which loads none, never announces one.
+    let local = cfg.remote_url.is_none() && cfg.provider.is_none();
+    let (sel, notes) = plank::engines::choose_with_recommendation_in(
+        root,
+        &catalog,
+        from_cli.then_some(choice),
+        recommended.filter(|_| local),
+        if from_cli {
+            plank::engines::Choice::Default
+        } else {
+            choice
+        },
+    )?;
+    for note in notes {
         eprintln!("plank: {note}");
     }
     cfg.model_path = Some(sel.main.clone());
@@ -405,19 +442,28 @@ fn parse_config(
     args: &[String],
     prog: &str,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
-    parse_config_in(settings, args, prog, &plank::manifest::plank_dir())
+    parse_config_in(
+        settings,
+        args,
+        prog,
+        &plank::manifest::plank_dir(),
+        active_recommendation(),
+    )
 }
 
-/// [`parse_config`] with the engine catalog and managed paths under `root`.
+/// [`parse_config`] with the engine catalog and managed paths under `root`,
+/// and the profile's `recommended` engine passed in rather than read from
+/// the active profile.
 fn parse_config_in(
     settings: &plank::settings::Settings,
     args: &[String],
     prog: &str,
     root: &std::path::Path,
+    recommended: Option<plank::engines::Recommendation<'_>>,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
     plank::config::parse_options_with(settings, args)
         .and_then(|mut cfg| {
-            match resolve_selection(&mut cfg, root)
+            match resolve_selection(&mut cfg, root, recommended)
                 .and_then(|catalog| resolve_model_delta(&mut cfg).map(|()| catalog))
             {
                 Ok(catalog) => finish_selection(&mut cfg, root, &catalog),
@@ -1461,7 +1507,7 @@ mod tests {
         let mut cfg =
             plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
         cfg.model_spec = Some(root.join("models/abl.ggd").display().to_string());
-        let catalog = resolve_selection(&mut cfg, &root).expect("a .ggd spec is a bare path");
+        let catalog = resolve_selection(&mut cfg, &root, None).expect("a .ggd spec is a bare path");
         assert!(cfg.selection.as_ref().unwrap().mtp.is_none());
         cfg.model_path = Some(clone.clone());
         cfg.model_delta = Some(plank::ggufdelta::Resolved {
@@ -1490,7 +1536,7 @@ mod tests {
         let mut cfg =
             plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
         cfg.model_spec = Some(other.display().to_string());
-        let catalog = resolve_selection(&mut cfg, &root).expect("resolves");
+        let catalog = resolve_selection(&mut cfg, &root, None).expect("resolves");
         finish_selection(&mut cfg, &root, &catalog);
         let sel = cfg.selection.as_ref().expect("selection");
         assert_eq!(sel.main, other);
@@ -1509,9 +1555,94 @@ mod tests {
         // An empty scratch root: the catalog is the compiled-in one and the
         // real `~/.plank` is never read.
         let root = std::env::temp_dir().join(format!("plank-dump-config-{}", std::process::id()));
-        let cfg =
-            parse_config_in(&settings, &args, "plank", &root).expect("dump-config must not abort");
+        let cfg = parse_config_in(&settings, &args, "plank", &root, None)
+            .expect("dump-config must not abort");
         assert!(cfg.dump_config);
         assert!(cfg.selection.is_none());
+    }
+
+    const HAL: Option<plank::engines::Recommendation<'static>> =
+        Some(plank::engines::Recommendation {
+            profile: "HAL",
+            engine: "qwen",
+        });
+
+    fn settings_model(spec: &str) -> plank::settings::Settings {
+        let mut s = plank::settings::Settings::default();
+        s.engine.model = Some(spec.into());
+        s
+    }
+
+    fn picked(
+        settings: &plank::settings::Settings,
+        args: &[&str],
+        root: &std::path::Path,
+    ) -> String {
+        let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+        let cfg = parse_config_in(settings, &args, "plank", root, HAL).expect("parses");
+        cfg.selection
+            .and_then(|s| s.id)
+            .map(|id| id.to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn only_a_command_line_model_counts_as_cli() {
+        let cfg = plank::config::AgentConfig::from_settings(&settings_model("ds41"));
+        assert!(!model_from_cli(&cfg), "engine.model is a settings choice");
+        for args in [["--model", "ds41"], ["-m", "ds41"]] {
+            let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+            let cfg = plank::config::parse_options_with(&settings_model("qwen"), &args).unwrap();
+            assert!(model_from_cli(&cfg), "{args:?}");
+        }
+        let cfg = plank::config::parse_options_with(
+            &plank::settings::Settings::default(),
+            &["--model:ds41".to_string()],
+        )
+        .unwrap();
+        assert!(model_from_cli(&cfg));
+    }
+
+    #[test]
+    fn an_installed_recommendation_outranks_engine_model_but_not_the_flag() {
+        let root = scratch_root("rec-precedence");
+        std::fs::write(root.join("qwen.gguf"), "q").expect("qwen main");
+        let settings = settings_model("ds41");
+        assert_eq!(picked(&settings, &[], &root), "qwen");
+        assert_eq!(picked(&settings, &["--model", "ds41"], &root), "ds41");
+        assert_eq!(
+            picked(&settings, &["--model:ds4vision"], &root),
+            "ds4vision"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_recommendation_not_on_disk_leaves_engine_model_in_charge() {
+        let root = scratch_root("rec-absent");
+        assert_eq!(picked(&settings_model("ds41"), &[], &root), "ds41");
+        assert_eq!(
+            picked(&plank::settings::Settings::default(), &[], &root),
+            "ds4vision"
+        );
+        assert!(!root.join("qwen.gguf").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dump_config_survives_a_bad_engine_model_under_a_recommendation() {
+        let root = scratch_root("rec-dump");
+        let args: Vec<String> = vec!["--dump-config".into()];
+        let cfg = parse_config_in(
+            &settings_model("not-an-engine-at-all"),
+            &args,
+            "plank",
+            &root,
+            HAL,
+        )
+        .expect("dump-config must not abort");
+        assert!(cfg.dump_config);
+        assert!(cfg.selection.is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

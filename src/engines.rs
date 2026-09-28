@@ -515,6 +515,71 @@ pub fn resolve_with_note_in(
     }
 }
 
+/// A profile's `recommendedModel`, as [`choose_with_recommendation_in`]
+/// takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recommendation<'a> {
+    /// The profile that recommends it, for the one line the choice prints.
+    pub profile: &'a str,
+    /// The engine name it recommends.
+    pub engine: &'a str,
+}
+
+/// Resolves the model a run loads when a profile may recommend one, and the
+/// lines to print once about it (a legacy-path note, the recommendation's
+/// outcome).
+///
+/// Precedence, highest first: `cli` (`--model`, `-m`, `--model:`); the
+/// recommended engine, but only when its main file is already on disk (a
+/// managed engine's derived path, or a local engine's `path`); then
+/// `settings`, which is `engine.model` or, when that is unset,
+/// [`Choice::Default`] (the `engines.local.json` default, else the
+/// catalog's). A recommendation is never downloaded: an unknown name or a
+/// missing file falls through to `settings` with one line saying so.
+///
+/// # Errors
+/// As [`resolve_with_note_in`], for whichever choice ends up deciding.
+pub fn choose_with_recommendation_in(
+    root: &Path,
+    catalog: &Catalog,
+    cli: Option<Choice<'_>>,
+    recommended: Option<Recommendation<'_>>,
+    settings: Choice<'_>,
+) -> Result<(Selection, Vec<String>), String> {
+    let with_note = |choice| {
+        resolve_with_note_in(root, catalog, choice)
+            .map(|(sel, note)| (sel, note.into_iter().collect::<Vec<_>>()))
+    };
+    if let Some(cli) = cli {
+        return with_note(cli);
+    }
+    let Some(Recommendation { profile, engine }) = recommended else {
+        return with_note(settings);
+    };
+    if catalog.get(engine).is_none() || EngineId::new(engine).is_none() {
+        let (sel, mut notes) = with_note(settings)?;
+        notes.push(format!(
+            "profile {profile} recommends {engine}, which is not an engine; ignoring it"
+        ));
+        return Ok((sel, notes));
+    }
+    let wanted = resolve_in(root, catalog, Choice::Named(engine))?;
+    if wanted.main.exists() {
+        return Ok((
+            wanted,
+            vec![format!("using {engine}, recommended by profile {profile}")],
+        ));
+    }
+    let (sel, mut notes) = with_note(settings)?;
+    let using = sel
+        .id
+        .map_or_else(|| sel.main.display().to_string(), |id| id.to_string());
+    notes.push(format!(
+        "profile {profile} recommends {engine}, which is not installed; using {using}"
+    ));
+    Ok((sel, notes))
+}
+
 /// Whether `a` and `b` name the same file: equal as written, equal once
 /// canonicalized (each side falling back to itself when it cannot be, e.g.
 /// because it does not exist yet), or the same inode, which also catches a
@@ -1155,5 +1220,139 @@ mod tests {
         assert_eq!(s.main, PathBuf::from("/m/mine.gguf"));
         assert_eq!(s.vision, Some(PathBuf::from("/m/v.gguf")));
         assert!(!s.managed_main, "path roles are never downloaded");
+    }
+
+    const HAL: Option<Recommendation<'static>> = Some(Recommendation {
+        profile: "HAL",
+        engine: "qwen",
+    });
+
+    fn compiled() -> Catalog {
+        parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn the_command_line_beats_a_recommendation_that_is_installed() {
+        let r = root("rec-cli");
+        std::fs::write(r.join("qwen.gguf"), "q").unwrap();
+        let (s, notes) = choose_with_recommendation_in(
+            &r,
+            &compiled(),
+            Some(Choice::Named("ds41")),
+            HAL,
+            Choice::Default,
+        )
+        .unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS41));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn an_installed_recommendation_beats_the_settings_model() {
+        let r = root("rec-used");
+        std::fs::write(r.join("qwen.gguf"), "q").unwrap();
+        let (s, notes) =
+            choose_with_recommendation_in(&r, &compiled(), None, HAL, Choice::Spec("ds41"))
+                .unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::QWEN));
+        assert_eq!(s.main, r.join("qwen.gguf"));
+        assert_eq!(notes, ["using qwen, recommended by profile HAL"]);
+    }
+
+    #[test]
+    fn a_recommendation_whose_file_is_missing_falls_to_the_settings_model() {
+        let r = root("rec-missing");
+        let (s, notes) =
+            choose_with_recommendation_in(&r, &compiled(), None, HAL, Choice::Spec("ds41"))
+                .unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS41));
+        assert_eq!(
+            notes,
+            ["profile HAL recommends qwen, which is not installed; using ds41"]
+        );
+        assert!(
+            !r.join("qwen.gguf").exists(),
+            "a recommendation never downloads"
+        );
+    }
+
+    #[test]
+    fn a_missing_recommendation_without_settings_falls_to_the_local_default() {
+        let r = root("rec-local-default");
+        let over = parse(
+            r#"{"default":"ds41","engines":{}}"#,
+            Layer::Local,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let c = layer(compiled(), over);
+        let (s, notes) = choose_with_recommendation_in(&r, &c, None, HAL, Choice::Default).unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS41));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let (s, _) =
+            choose_with_recommendation_in(&r, &compiled(), None, HAL, Choice::Default).unwrap();
+        assert_eq!(
+            s.id,
+            Some(crate::manifest::EngineId::DS4VISION),
+            "then the catalog default"
+        );
+    }
+
+    #[test]
+    fn a_local_engine_is_available_when_its_path_exists() {
+        let r = root("rec-local-path");
+        let main = r.join("elsewhere/mine.gguf");
+        let text = format!(
+            r#"{{"engines":{{"mine":{{"main":{{"path":"{}"}}}}}}}}"#,
+            main.display()
+        );
+        let c = layer(
+            compiled(),
+            parse(&text, Layer::Local, &mut Vec::new()).unwrap(),
+        );
+        let rec = Some(Recommendation {
+            profile: "EAP",
+            engine: "mine",
+        });
+        let (s, notes) = choose_with_recommendation_in(&r, &c, None, rec, Choice::Default).unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS4VISION));
+        assert_eq!(
+            notes,
+            ["profile EAP recommends mine, which is not installed; using ds4vision"]
+        );
+        std::fs::create_dir_all(main.parent().unwrap()).unwrap();
+        std::fs::write(&main, "m").unwrap();
+        let (s, notes) = choose_with_recommendation_in(&r, &c, None, rec, Choice::Default).unwrap();
+        assert_eq!(s.main, main);
+        assert_eq!(notes, ["using mine, recommended by profile EAP"]);
+    }
+
+    #[test]
+    fn an_unknown_recommendation_warns_and_falls_through() {
+        let r = root("rec-unknown");
+        let rec = Some(Recommendation {
+            profile: "HAL",
+            engine: "foo",
+        });
+        let (s, notes) =
+            choose_with_recommendation_in(&r, &compiled(), None, rec, Choice::Spec("qwen"))
+                .unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::QWEN));
+        assert_eq!(
+            notes,
+            ["profile HAL recommends foo, which is not an engine; ignoring it"]
+        );
+    }
+
+    #[test]
+    fn no_recommendation_resolves_exactly_as_before() {
+        let r = root("rec-none");
+        let c = compiled();
+        for choice in [Choice::Default, Choice::Spec("qwen"), Choice::Named("ds41")] {
+            let (s, notes) = choose_with_recommendation_in(&r, &c, None, None, choice).unwrap();
+            assert_eq!(s, resolve_in(&r, &c, choice).unwrap());
+            assert!(notes.is_empty());
+        }
+        assert!(choose_with_recommendation_in(&r, &c, None, None, Choice::Named("nope")).is_err());
     }
 }

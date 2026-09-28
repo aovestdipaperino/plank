@@ -1248,6 +1248,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         };
         assert!(spec.builtin_enabled("bash"));
         assert!(!spec.builtin_enabled("read"));
@@ -1269,6 +1270,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         }
     }
 

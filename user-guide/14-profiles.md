@@ -110,10 +110,13 @@ The manifest's `profile` block describes the agent:
 | `settings` | a settings layer, anything but `engine.*` | none |
 | `folderContext` | whether the session starts with the launch folder's git status and `.plank/MEMORY.md` | `false` |
 | `agentsMd` | whether `AGENTS.md` is read, offered and linked | `false` |
+| `recommendedModel` | an engine to run, such as `"qwen"`, used only when its model file is already on disk | the usual model choice |
 
 A malformed optional field warns and falls back to its default rather than stopping the launch. A malformed `tools.builtin` fails closed, to an empty list, so a typo never hands the agent more tools than you wrote down.
 
 `folderContext` and `agentsMd` default to `false` because most profiles are not about the folder you happen to launch them from. A mail assistant started in a code checkout should not be told the checkout's git status or offered an `AGENTS.md`. A coding-style profile sets both to `true`. Your own memory, `~/.plank/MEMORY.md`, is loaded either way.
+
+`recommendedModel` lets a profile suggest the engine it works best with, and plank takes the suggestion only if that engine is locally available. It outranks `engine.model` in your settings but never a `--model` you typed, and it never starts a download: when the engine is not installed, or is not an engine at all, plank prints one line saying so and picks the model the usual way.
 
 ### The prompt
 
@@ -129,11 +132,11 @@ An `.mcp.json` in the profile folder starts MCP servers for that profile only. T
 
 ```
 <!-- plank profile "hal", loaded from profile /Users/you/.plank/profiles/hal
-     displayName  HAL                          manifest
-     accent       #d0021b                      manifest
-     systemPrompt prompt.md                    manifest
-     tools        read more glob search ask    manifest (tools.builtin)
-     folderContext false                       default (off for a profile)
+     displayName      HAL                          manifest
+     accent           #d0021b                      manifest
+     systemPrompt     prompt.md                    manifest
+     tools            read more glob search ask    manifest (tools.builtin)
+     folderContext    false                        default (off for a profile)
      ...
 ```
 

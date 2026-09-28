@@ -28,6 +28,7 @@ for the Claude Code layout), alongside the plugin's existing `name`,
 | `settings` | object | no | no extra settings layer |
 | `folderContext` | boolean | no | `false`: no launch-folder context |
 | `agentsMd` | boolean | no | `false`: `AGENTS.md` is neither read nor offered |
+| `recommendedModel` | string, an engine name | no | none: the model is chosen as without a profile |
 
 `systemPrompt` is the only required field, and deliberately so: a `profile`
 block without a prompt is a skin over plank's own identity, and activating a
@@ -63,6 +64,23 @@ Both default to `false`, and a value that is not `true` or `false` warns and
 counts as `false`, so a typo never turns a context source on. A coding-style
 profile sets both to `true`. Without `--profile`, plank behaves as it always
 has: both are on.
+
+### Recommended model
+
+`recommendedModel` names an engine from the catalog (`engines.json`, layered
+with `~/.plank/engines.local.json`) that suits the profile, and plank uses it
+only if it is locally available: the engine's main model file must already
+exist on disk, at its derived managed path under `~/.plank` or at a local
+engine's `path`. A recommendation is never downloaded and never asked about.
+The model is chosen in this order: `--model`, `-m` or `--model:` on the
+command line; the recommendation, when its file is on disk; `engine.model`
+from settings; the `engines.local.json` default; the catalog default. A used
+recommendation prints `plank: using qwen, recommended by profile HAL`. An
+engine that is not installed prints one line naming the model used instead,
+and a name that is no engine prints one line saying it is ignored; either way
+the launch goes on with the next rule. A value that is not a non-empty string
+of lowercase letters, digits and dashes warns and is ignored, like any other
+malformed field. Without `--profile` the field has no effect.
 
 `tools.builtin`, if present, is expected to be an array of tool names: any
 other shape is a mistake, not a restriction the author meant, but a
@@ -151,7 +169,7 @@ no identity to run under.
 
 Everything else described in this document — a bad accent, a missing or
 broken logo, a malformed allow-list, an unusable settings object, a missing
-display name, a prompt without the tool-protocol token — warns and falls back rather than refusing to start.
+display name, a malformed or unavailable `recommendedModel`, a prompt without the tool-protocol token — warns and falls back rather than refusing to start.
 
 ## What actually changes on screen
 

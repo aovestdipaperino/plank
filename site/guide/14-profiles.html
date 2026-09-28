@@ -297,6 +297,12 @@ withheld</td>
 <td>whether <code>AGENTS.md</code> is read, offered and linked</td>
 <td><code>false</code></td>
 </tr>
+<tr>
+<td><code>recommendedModel</code></td>
+<td>an engine to run, such as <code>"qwen"</code>, used only when its
+model file is already on disk</td>
+<td>the usual model choice</td>
+</tr>
 </tbody>
 </table>
 <p>A malformed optional field warns and falls back to its default rather
@@ -310,6 +316,13 @@ should not be told the checkout's git status or offered an
 <code>AGENTS.md</code>. A coding-style profile sets both to
 <code>true</code>. Your own memory, <code>~/.plank/MEMORY.md</code>, is
 loaded either way.</p>
+<p><code>recommendedModel</code> lets a profile suggest the engine it
+works best with, and plank takes the suggestion only if that engine is
+locally available. It outranks <code>engine.model</code> in your
+settings but never a <code>--model</code> you typed, and it never starts
+a download: when the engine is not installed, or is not an engine at
+all, plank prints one line saying so and picks the model the usual
+way.</p>
 <h3 id="the-prompt">The prompt</h3>
 <p>The prompt file replaces plank's system prompt entirely. To keep tool
 calls working, include the token <code>{{plank:tool-protocol}}</code>
@@ -328,11 +341,11 @@ prompt and any <code>settings.json</code> or <code>.mcp.json</code> in
 the built-in editor as one buffer, under a header that says where each
 setting comes from:</p>
 <pre><code>&lt;!-- plank profile &quot;hal&quot;, loaded from profile /Users/you/.plank/profiles/hal
-     displayName  HAL                          manifest
-     accent       #d0021b                      manifest
-     systemPrompt prompt.md                    manifest
-     tools        read more glob search ask    manifest (tools.builtin)
-     folderContext false                       default (off for a profile)
+     displayName      HAL                          manifest
+     accent           #d0021b                      manifest
+     systemPrompt     prompt.md                    manifest
+     tools            read more glob search ask    manifest (tools.builtin)
+     folderContext    false                        default (off for a profile)
      ...</code></pre>
 <p>Saving checks the whole buffer first and writes only the files that
 changed. Because a profile is set up once at launch, a change then
