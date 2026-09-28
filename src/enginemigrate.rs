@@ -45,7 +45,18 @@ pub fn migrate_in(root: &Path) -> Vec<String> {
 
     for (old, id, role) in crate::engines::LEGACY_ARTIFACTS {
         if let Some(new) = crate::manifest::local_path_for_in(root, id, role) {
-            move_one(&root.join(old), &new, &mut warn);
+            let old = root.join(old);
+            move_one(&old, &new, &mut warn);
+            // A half-finished foreground download sits beside its artifact
+            // as `<stem>.part` plus the `<stem>.part.url` it came from; both
+            // follow the artifact so the next first-run offer resumes it.
+            for ext in ["part", "part.url"] {
+                move_one(
+                    &old.with_extension(ext),
+                    &new.with_extension(ext),
+                    &mut warn,
+                );
+            }
         }
     }
     for (old, id) in MANIFESTS {
@@ -473,5 +484,35 @@ mod tests {
                 .exists()
         );
         assert!(crate::downloader::job_path_in(&r, EngineId::DS4VISION).exists());
+    }
+
+    #[test]
+    fn a_foreground_partial_download_follows_its_artifact() {
+        let r = scratch("fg-part");
+        for (old, body) in [
+            ("ds4flash.part", "main-bytes"),
+            ("ds4flash.part.url", "https://h/main"),
+            ("ds4flash.vision.part", "v"),
+            ("ds4flash.dspark.part", "d"),
+            ("ds41flash.part", "m41"),
+            ("ds41flash.part.url", "https://h/m41"),
+        ] {
+            std::fs::write(r.join(old), body).unwrap();
+        }
+        assert!(migrate_in(&r).is_empty());
+        for (new, body) in [
+            ("ds4vision.part", "main-bytes"),
+            ("ds4vision.part.url", "https://h/main"),
+            ("ds4vision.vision.part", "v"),
+            ("ds4vision.mtp.part", "d"),
+            ("ds41.part", "m41"),
+            ("ds41.part.url", "https://h/m41"),
+        ] {
+            assert_eq!(std::fs::read_to_string(r.join(new)).unwrap(), body, "{new}");
+        }
+        assert!(!r.join("ds4flash.part").exists());
+        // The new names are exactly what the foreground downloader looks for.
+        let main = crate::manifest::local_path_for_in(&r, EngineId::DS4VISION, "main").unwrap();
+        assert!(main.with_extension("part").exists());
     }
 }

@@ -260,6 +260,14 @@ pub fn load_in(root: &Path, warn: &mut Vec<String>) -> Catalog {
             )),
         }
     }
+    if let Some(d) = cat.default.as_deref()
+        && !cat.engines.contains_key(d)
+    {
+        warn.push(format!(
+            "engines: the default `{d}` is not a known engine; using `{}`",
+            cat.default_name()
+        ));
+    }
     cat
 }
 
@@ -280,8 +288,17 @@ pub fn update_cache_in(root: &Path, fetched: &str) -> Option<Catalog> {
         .and_then(|t| parse(&t, Layer::Published, &mut Vec::new()).ok())
         .map_or(0, |c| c.version);
     if new.version > compiled.max(cached) {
+        // Written beside and renamed over, so a crash or a second plank never
+        // leaves a truncated cache that would silently read as absent.
         let _ = std::fs::create_dir_all(root);
-        let _ = std::fs::write(cache_path_in(root), fetched);
+        let path = cache_path_in(root);
+        let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        if std::fs::write(&tmp, fetched)
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
     Some(new)
 }
@@ -629,6 +646,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn a_local_default_naming_a_missing_engine_warns_and_falls_back() {
+        let r = root("ghost-default");
+        std::fs::write(r.join("engines.local.json"), r#"{"default":"ghost"}"#).unwrap();
+        let mut w = Vec::new();
+        let c = load_in(&r, &mut w);
+        assert_eq!(c.default_name(), "ds4vision");
+        assert_eq!(
+            w,
+            vec![
+                "engines: the default `ghost` is not a known engine; using `ds4vision`".to_string()
+            ]
+        );
+        let s = resolve_in(&r, &c, Choice::Default).unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS4VISION));
+    }
+
+    #[test]
+    fn a_valid_default_does_not_warn() {
+        let r = root("good-default");
+        std::fs::write(r.join("engines.local.json"), r#"{"default":"qwen"}"#).unwrap();
+        let mut w = Vec::new();
+        let _ = load_in(&r, &mut w);
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn the_cache_write_leaves_no_temporary_behind() {
+        let r = root("cache-atomic");
+        let fetched = one_engine(99, "a", "a", 1);
+        assert!(update_cache_in(&r, &fetched).is_some());
+        assert_eq!(
+            std::fs::read_to_string(r.join("engines.remote.json")).unwrap(),
+            fetched
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&r)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
