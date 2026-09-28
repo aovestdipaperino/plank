@@ -1080,6 +1080,10 @@ pub fn run_immediate(
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
+        // The same promise the bash tool's jobs get (`gpuyield`): a `!` or
+        // `!!` that exits 75 with the marker line gets the model unloaded
+        // for a second run.
+        .env(crate::gpuyield::ENV_VAR, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1566,6 +1570,17 @@ mod tests {
         assert_eq!(out.stderr, "err\n");
         assert_eq!(out.exit_code, 3);
         assert!(!out.interrupted);
+    }
+
+    #[test]
+    fn an_immediate_command_sees_the_gpu_yield_variable() {
+        let out = run_immediate(
+            std::path::Path::new("/tmp"),
+            "echo \"yield=$PLANK_GPU_YIELD\"",
+            &mut InterruptOnly(|| false),
+        )
+        .unwrap();
+        assert_eq!(out.stdout, "yield=1\n");
     }
 
     /// Records each line with the moment it arrived, for the streaming tests.
