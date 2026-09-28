@@ -493,6 +493,28 @@ fn post_cfg_early_exit(
     None
 }
 
+/// Whether this launch should run the one-way engine-layout migration.
+///
+/// `--help` and `--version` answer and exit without touching `~/.plank`, and
+/// `--dump-config` is a read-only diagnostic, so none of them may rename the
+/// user's model files. Every other launch migrates before the real
+/// `parse_config`, because the `engines.local.json` default a ds41-only
+/// install gets must exist before the catalog choice is resolved.
+fn should_migrate(provisional: &plank::config::AgentConfig) -> bool {
+    !(provisional.show_help || provisional.show_version || provisional.dump_config)
+}
+
+/// Renames any old `ModelSet` layout into the engine layout, when
+/// [`should_migrate`] allows it, printing one line per skipped move.
+fn migrate_engine_layout(provisional: &plank::config::AgentConfig) {
+    if !should_migrate(provisional) {
+        return;
+    }
+    for w in plank::enginemigrate::migrate() {
+        eprintln!("{w}");
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Before anything can move the process: `/edit-profile`'s restart re-runs
@@ -536,11 +558,6 @@ fn main() -> ExitCode {
             .unwrap_or_else(|_| {
                 plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
             });
-    // Renames any old `ModelSet` layout into the engine layout, before
-    // anything below reads a model path or checks/installs an artifact set.
-    for w in plank::enginemigrate::migrate() {
-        eprintln!("{w}");
-    }
     // `--help` is answered from the provisional parse, before `--chdir` and
     // before the plugin scan. Both of those can fail or print warnings, and
     // `plank --chdir /nonexistent --help` printing a chdir error instead of the
@@ -560,6 +577,7 @@ fn main() -> ExitCode {
         println!("{}", plank::logo::version_line());
         return ExitCode::SUCCESS;
     }
+    migrate_engine_layout(&provisional);
     // `--chdir` has to happen before the plugin scan (and therefore before
     // project settings, which are also cwd-scoped) rather than after, or the
     // plugin set built here would reflect the launch directory instead of the
@@ -1118,11 +1136,7 @@ fn run_serve(args: &[String]) -> ExitCode {
             .unwrap_or_else(|_| {
                 plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
             });
-    // Renames any old `ModelSet` layout into the engine layout, before
-    // anything below reads a model path or checks/installs an artifact set.
-    for w in plank::enginemigrate::migrate() {
-        eprintln!("{w}");
-    }
+    migrate_engine_layout(&provisional);
     let launch_cwd = std::env::current_dir().unwrap_or_default();
     let mut plugins = plank::plugins::load_default(&launch_cwd);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -1345,6 +1359,20 @@ mod tests {
         assert!(resolution_is_fatal(&cfg));
         cfg.dump_config = true;
         assert!(!resolution_is_fatal(&cfg));
+    }
+
+    #[test]
+    fn help_version_and_dump_config_never_migrate() {
+        let base = plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
+        assert!(should_migrate(&base));
+        for flag in ["--help", "--version", "--dump-config"] {
+            let cfg = plank::config::parse_options_with(
+                &plank::settings::Settings::default(),
+                &[flag.to_string()],
+            )
+            .expect("parses");
+            assert!(!should_migrate(&cfg), "{flag} must not migrate");
+        }
     }
 
     #[test]
