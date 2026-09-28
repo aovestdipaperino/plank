@@ -1679,8 +1679,9 @@ impl Session {
     /// Returns the reason, for the model: the route is not declared, the
     /// component is not loaded (or has struck out), it has no frame, it was
     /// a screensaver, it was not granted `fs`, a frame is already open (`a grid is already open`:
-    /// only an unopened grid may be replaced), or the RAM disk refused the
-    /// write.
+    /// only an unopened grid may be replaced), the file already exists on the
+    /// component's disk and is not the unopened grid's own, or the RAM disk
+    /// refused the write.
     pub fn stage_grid(
         &mut self,
         staging: crate::grid::GridStaging,
@@ -1717,6 +1718,17 @@ impl Session {
         }
         if self.frame_open {
             return Err("a grid is already open".to_string());
+        }
+        // The file may be one the user made in the component: writing over
+        // it, and removing it when the grid closes, would destroy it. Only
+        // the queued grid's own file may be replaced.
+        let is_grids_own = !self.grid_on_screen
+            && self
+                .active_grid
+                .as_ref()
+                .is_some_and(|g| g.component == component && g.file == file);
+        if !is_grids_own && self.host.ram_file(&component, &file).is_some() {
+            return Err(format!("{file} already exists on {component}'s disk"));
         }
         let staged = csv.into_bytes();
         self.host.ram_write(&component, &file, &staged)?;
@@ -4483,6 +4495,44 @@ mod tests {
             Some(&b"#,newer\n"[..])
         );
         assert_eq!(s.active_grid.as_ref().unwrap().staged, b"#,newer\n");
+    }
+
+    /// A file already on the component's disk that is not the queued grid's
+    /// (a CSV the user made in csvedit, say) is neither overwritten nor, at
+    /// close, deleted: the staging is refused and the file stays as it was.
+    #[test]
+    fn a_staging_over_a_file_that_is_not_the_grids_is_refused() {
+        let mut s = fit_session();
+        s.host
+            .ram_write(CSVEDIT, "transactions.csv", b"mine\n")
+            .unwrap();
+        let err = s
+            .stage_grid(staging("transactions.csv", "#,name\n"), &routes())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            format!("transactions.csv already exists on {CSVEDIT}'s disk")
+        );
+        assert_eq!(
+            s.host.ram_file(CSVEDIT, "/transactions.csv").as_deref(),
+            Some(&b"mine\n"[..])
+        );
+        assert!(s.registry.take_pending_frame().is_none());
+        assert!(s.active_grid.is_none());
+
+        // An older grid queued under another name is not the file's owner
+        // either, and survives the refusal.
+        s.stage_grid(staging("categories.csv", "#,old\n"), &routes())
+            .unwrap();
+        assert!(
+            s.stage_grid(staging("transactions.csv", "#\n"), &routes())
+                .is_err()
+        );
+        assert_eq!(s.active_grid.as_ref().unwrap().file, "categories.csv");
+        assert_eq!(
+            s.host.ram_file(CSVEDIT, "/transactions.csv").as_deref(),
+            Some(&b"mine\n"[..])
+        );
     }
 
     /// A refused newer staging leaves the older one exactly as it was.
