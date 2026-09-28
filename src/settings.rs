@@ -1373,7 +1373,7 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
 }
 
 /// Expands a leading `~/` against `$HOME`, leaving other paths untouched.
-fn expand_tilde(s: &str) -> PathBuf {
+pub(crate) fn expand_tilde(s: &str) -> PathBuf {
     match (s.strip_prefix("~/"), std::env::var_os("HOME")) {
         (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => PathBuf::from(s),

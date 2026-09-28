@@ -41,6 +41,7 @@ pub mod ds4web;
 pub use trace_stream::dsml;
 pub mod editor;
 pub mod engine;
+pub mod engines;
 pub mod errlog;
 pub mod experts;
 pub mod export;
