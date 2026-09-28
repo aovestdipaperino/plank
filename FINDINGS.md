@@ -2112,7 +2112,7 @@ weight — one real interruption cost 88 GiB.
 **2026-09-28:** the engine catalog replaced the single `ds4.manifest`/`qwen.manifest`
 pair with `engines.json` and a per-engine `<engine>.installed.json`. The rule
 above still holds, only per-engine now: `downloader::swap_staged` moves
-`staging/<engine>.installed.json` last, so its presence is the proof that
+`staging/<engine>/<engine>.installed.json` last, so its presence is the proof that
 engine's whole artifact set landed. `ds4.manifest` and `qwen.manifest` stay in
 the repo, byte-identical, only so an older plank binary upgrading past this
 change still finds a manifest it understands (`tests/c_parity.rs`).

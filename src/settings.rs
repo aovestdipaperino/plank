@@ -98,8 +98,9 @@ pub const ASK_MIN_OPTIONS: usize = 2;
 
 /// Engine defaults: the same knobs as `-m`, `-t`, `--backend`, `--power`, `-c`.
 ///
-/// `model` replaces what used to be a hardcoded convention — plank falls back
-/// to `~/.plank/ds4flash.gguf` only when neither this key nor `-m` is given.
+/// `model` takes the same values as `--model`: an engine name from the
+/// `engines.json` catalog, or a path. When neither this key nor `-m` is
+/// given, the catalog `default` engine is used.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineSettings {
     /// Model file to load; overridden by `-m`/`--model`.

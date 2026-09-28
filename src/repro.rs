@@ -49,7 +49,7 @@ pub struct ModelMeta<'a> {
     /// Tool-call dialect in force. Derived from `name`, recorded separately
     /// because a mismatch between the two is itself a bug worth seeing.
     pub syntax: &'a str,
-    /// `version` of the installed `ds4.manifest`, i.e. which artifact set is
+    /// `version` of the engine's installed record, i.e. which artifact set is
     /// on disk. `None` when no manifest is installed.
     pub artifact_version: Option<u32>,
     /// The companion GGUF in effect: the `DSpark` draft checkpoint for

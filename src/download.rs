@@ -865,9 +865,9 @@ fn play_tada() {}
 ///
 /// It used to also write a `.source` stamp naming the repo file the model came
 /// from, which was how a bumped `FILE` constant became visible to someone who
-/// already had a model. The manifest replaced that entirely: `~/.plank/ds4.manifest`
-/// records the whole installed set by version, so a per-file stamp has nothing
-/// left to say.
+/// already had a model. The manifest replaced that entirely: each engine's
+/// `~/.plank/engines/<engine>.installed.json` records its whole installed set
+/// by version, so a per-file stamp has nothing left to say.
 fn finish(dest: &Path) {
     let _ = dest;
     play_tada();

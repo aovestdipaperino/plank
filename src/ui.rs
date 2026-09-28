@@ -3725,16 +3725,13 @@ impl Agent<'_> {
             return "Tool error: view_image requires path\n".to_string();
         }
         if !self.engine.has_vision() {
-            return format!(
-                "{}Expected the encoder at {}.\n",
-                crate::tools::VIEW_IMAGE_NO_ENCODER,
-                crate::engines::active()
-                    .and_then(|s| s.vision.as_deref())
-                    .map_or_else(
-                        || "(this engine has no vision encoder)".to_string(),
-                        |p| p.display().to_string()
-                    )
-            );
+            let hint = crate::engines::active()
+                .and_then(|s| s.vision.as_deref())
+                .map_or_else(
+                    || "The selected engine declares no vision encoder.".to_string(),
+                    |p| format!("Expected the encoder at {}.", p.display()),
+                );
+            return format!("{}{hint}\n", crate::tools::VIEW_IMAGE_NO_ENCODER);
         }
         match self.engine.vision_encode_file(path) {
             Ok(emb) => {

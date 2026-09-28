@@ -528,7 +528,7 @@ fn main() -> ExitCode {
     // (`src/downloader.rs`), re-execing this same binary so the helper can
     // never disagree with the plank that spawned it. It loads no engine, reads
     // no settings and touches no session: it takes the download lock, works
-    // through `~/.plank/downloads/job.json`, and exits. Handled before every
+    // through its `~/.plank/downloads/job-<engine>.json`, and exits. Handled before every
     // other dispatch so nothing above can print to a stream that is /dev/null.
     if args.first().map(String::as_str) == Some("--model-downloader") {
         return ExitCode::from(u8::try_from(run_model_downloader(&args)).unwrap_or(1));
@@ -800,9 +800,10 @@ fn require_min_ram() -> Result<(), String> {
     Ok(())
 }
 
-/// Builds the inference engine: the real ds4 engine on macOS (from `-m`, else
-/// `engine.model` in settings.json, else the default `~/.plank/ds4flash.gguf`,
-/// downloading it if missing), else the stub.
+/// Builds the inference engine: the real ds4 engine on macOS (the engine or
+/// path chosen by `-m`, else `engine.model` in settings.json, else the catalog
+/// `default` engine, downloading a managed engine's files if missing), else
+/// the stub.
 /// The engines a session runs on: the main one, and — only when the main engine
 /// is a provider *and* a `provider: local` sub-agent definition exists — the
 /// local ds4 engine held for those sidechains.

@@ -1059,7 +1059,7 @@ pub fn log_path() -> PathBuf {
 ///
 /// Stored as the manifest's own bytes rather than a wrapper struct: the helper
 /// needs exactly the manifest, and a wrapper would be a second format to keep
-/// in sync with `ds4.manifest` for no gain.
+/// in sync with it for no gain.
 ///
 /// # Errors
 /// Propagates filesystem errors.

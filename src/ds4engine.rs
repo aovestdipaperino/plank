@@ -268,9 +268,9 @@ const STEADY_MIN_TOKENS: i32 = 8;
 
 /// Whether the engine is handed the vision encoder for this model.
 ///
-/// The encoder GGUF sits beside the main model at
-/// `~/.plank/ds4flash.vision.gguf` and is downloaded at startup when the model
-/// can use it. It is passed only when the C would accept it: `ds4_engine_open`
+/// The encoder GGUF is the selected engine's `vision` role (for the default
+/// engine, `~/.plank/ds4vision.vision.gguf`) and is downloaded at startup when
+/// the model can use it. It is passed only when the C would accept it: `ds4_engine_open`
 /// fails outright when `vision_path` is set and the main GGUF is not the pinned
 /// Vision-Exp checkpoint ("--vision requires ... the pinned `DeepSeek` V4 Flash
 /// Vision-Exp model"), so a language-only or re-quantized `DeepSeek`
