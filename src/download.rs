@@ -316,14 +316,11 @@ pub fn ensure_role(sel: &crate::engines::Selection, role: &str, path: &Path) -> 
     eprintln!("No {label} found at {}.", path.display());
     if resuming {
         eprintln!(
-            "A partial download exists ({:.1} GB); plank can resume it from Hugging Face:",
+            "A partial download exists ({:.1} GB); plank can resume it from:",
             gb(partial_bytes(path))
         );
     } else {
-        eprintln!(
-            "plank can download the {label} (~{:.1} GB) from Hugging Face:",
-            gb(bytes)
-        );
+        eprintln!("plank can download {label} (~{:.1} GB) from:", gb(bytes));
     }
     eprintln!("  {url}");
     eprint!(
@@ -654,11 +651,33 @@ pub fn ensure_model(sel: &crate::engines::Selection) -> Result<(), String> {
     if path.exists() {
         // Upgrades are the manifest's business (`check_manifest_at_startup`),
         // and they happen in the background rather than as a blocking prompt
-        // before the engine loads.
+        // before the engine loads. No catalog load needed for this path.
         return Ok(());
     }
-    let offer = main_offer_with(sel, || role_offer(sel, "main"));
-    let (Some((url, bytes)), true) = (offer, std::io::stdin().is_terminal()) else {
+    let mut warn = Vec::new();
+    ensure_model_in(
+        &crate::engines::load(&mut warn),
+        sel,
+        std::io::stdin().is_terminal(),
+    )
+}
+
+/// [`ensure_model`] against an explicit catalog and an injected TTY-ness, so a
+/// test never reads the real `~/.plank` and never blocks on stdin.
+///
+/// # Errors
+/// Same as [`ensure_model`].
+pub fn ensure_model_in(
+    catalog: &crate::engines::Catalog,
+    sel: &crate::engines::Selection,
+    is_tty: bool,
+) -> Result<(), String> {
+    let path = sel.main.as_path();
+    if path.exists() {
+        return Ok(());
+    }
+    let offer = main_offer_with(sel, || role_offer_in(catalog, sel, "main"));
+    let (Some((url, bytes)), true) = (offer, is_tty) else {
         return Err(format!(
             "no model at {}; pass --model <name|path> or download it first",
             path.display()
@@ -670,14 +689,11 @@ pub fn ensure_model(sel: &crate::engines::Selection) -> Result<(), String> {
     eprintln!("No model found at {}.", path.display());
     if resuming {
         eprintln!(
-            "A partial download exists ({:.1} GB); plank can resume it from Hugging Face:",
+            "A partial download exists ({:.1} GB); plank can resume it from:",
             gb(partial_bytes(path))
         );
     } else {
-        eprintln!(
-            "plank can download {label} (~{:.0} GB) from Hugging Face:",
-            gb(bytes)
-        );
+        eprintln!("plank can download {label} (~{:.0} GB) from:", gb(bytes));
     }
     eprintln!("  {url}");
     eprint!(
@@ -1597,15 +1613,28 @@ fn managed_id(sel: &crate::engines::Selection) -> Option<crate::manifest::Engine
     sel.id.filter(|_| sel.managed_main)
 }
 
-/// Installs anything a previous run staged for the selected engine, then
-/// checks the published catalog for a newer release of it. Never fatal.
-pub fn check_manifest_at_startup(sel: &crate::engines::Selection) {
+/// [`check_manifest_at_startup`] with `root`, `fetch`, `spawn` and `confirm`
+/// injected, so a test can drive the `managed_id` short-circuit end to end
+/// without touching the real `~/.plank` or a network.
+fn check_manifest_at_startup_with(
+    sel: &crate::engines::Selection,
+    root: &Path,
+    fetch: &dyn Fn() -> Option<String>,
+    spawn: &dyn Fn(crate::manifest::EngineId, &crate::manifest::Manifest) -> Result<(), String>,
+    confirm: &dyn Fn(&crate::manifest::Manifest, u32) -> Option<bool>,
+) {
     let Some(id) = managed_id(sel) else {
         return;
     };
-    check_manifest_at_startup_in(
+    check_manifest_at_startup_in(root, id, fetch, spawn, confirm);
+}
+
+/// Installs anything a previous run staged for the selected engine, then
+/// checks the published catalog for a newer release of it. Never fatal.
+pub fn check_manifest_at_startup(sel: &crate::engines::Selection) {
+    check_manifest_at_startup_with(
+        sel,
         &crate::manifest::plank_dir(),
-        id,
         &fetch_catalog,
         &crate::downloader::spawn_detached,
         &real_confirm,
@@ -2194,27 +2223,6 @@ mod tests {
         let _ = std::fs::remove_file(model);
     }
 
-    /// A V4.1 GGUF that is not on disk yet, at a path plank does not manage.
-    /// That must reach `ensure_model`'s graceful "no model at <path>" error —
-    /// never a panic, and never a prompt to fetch anything into that slot.
-    #[test]
-    fn an_absent_v41_model_errors_gracefully_rather_than_panicking() {
-        let root = crate::downloader::tests::tempdir();
-        std::fs::create_dir_all(&root).expect("mkdir");
-        let missing = root.join("ds41flash.gguf");
-        assert!(!missing.exists());
-        let sel = crate::engines::Selection {
-            id: Some(EngineId::DS41),
-            main: missing,
-            mtp: None,
-            vision: None,
-            managed_main: false,
-        };
-        let err = ensure_model(&sel).expect_err("an absent model must be an error");
-        assert!(err.starts_with("no model at "), "unexpected message: {err}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// A non-`DeepSeek` model must not reach for either side artifact: it
     /// opens neither the DS4 vision encoder nor a DS4 draft checkpoint. No
     /// download is stubbed here on purpose — if the gate regressed, the ensure
@@ -2430,10 +2438,57 @@ mod tests {
         let err = ensure_model(&sel).expect_err("a missing model is an error");
         assert!(err.contains("no model at"), "{err}");
         assert!(
-            !err.contains("DeepSeek"),
-            "must not offer the DeepSeek download for a non-default path: {err}"
+            err.contains("--model"),
+            "must point at --model rather than offer a download: {err}"
         );
     }
+
+    /// A managed engine's `main` missing on a non-TTY run (the normal case
+    /// under test) must error with the path named and must never start a
+    /// download: no `.part` file appears under the selection's own root.
+    /// Exercises the managed first-run branch of `ensure_model` that
+    /// `ensure_model` itself cannot: it always loads the real `~/.plank`
+    /// catalog.
+    #[test]
+    fn ensure_model_in_a_missing_managed_main_errors_without_downloading() {
+        let root = crate::downloader::tests::tempdir();
+        let sel = sel_for(&root, "qwen");
+        assert!(sel.managed_main, "qwen's main is catalog-managed");
+        assert!(!sel.main.exists());
+        let err = ensure_model_in(&catalog(), &sel, false)
+            .expect_err("no terminal to prompt on, so this must be an error");
+        assert!(
+            err.contains(&sel.main.display().to_string()),
+            "the error must name the missing path: {err}"
+        );
+        assert!(
+            !sel.main.with_extension("part").exists(),
+            "a non-TTY run must never start a download"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An existing `main` is `Ok` immediately, without ever consulting the
+    /// catalog: an empty [`crate::engines::Catalog`] proves it.
+    #[test]
+    fn ensure_model_in_an_existing_main_never_touches_the_catalog() {
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let main = root.join("present.gguf");
+        std::fs::write(&main, b"x").expect("write");
+        let sel = crate::engines::Selection {
+            id: Some(EngineId::QWEN),
+            main,
+            mtp: None,
+            vision: None,
+            managed_main: true,
+        };
+        assert!(ensure_model_in(&crate::engines::Catalog::default(), &sel, false).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The interactive TTY branch of `ensure_model_in` (the actual download
+    // prompt and transfer) reads real stdin and is not covered here.
 
     /// The first-run offer is the selected engine's own `main`, with the size
     /// its catalog entry publishes: the V4 engine offers the V4 file, the
@@ -2583,6 +2638,35 @@ mod tests {
         );
         let managed = sel_for(&root, "ds4vision");
         assert_eq!(managed_id(&managed), Some(EngineId::DS4VISION));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// End-to-end through `check_manifest_at_startup_with`: a bare-path
+    /// selection (`id: None`) must short-circuit on `managed_id` before ever
+    /// fetching, spawning or confirming, and before touching staging.
+    /// Panicking closures for `fetch`/`spawn`/`confirm` double as proof the
+    /// short-circuit runs first.
+    #[test]
+    fn check_manifest_at_startup_with_skips_a_bare_path_entirely() {
+        let root = crate::downloader::tests::tempdir();
+        let sel = crate::engines::Selection {
+            id: None,
+            main: root.join("some/custom/model.gguf"),
+            mtp: None,
+            vision: None,
+            managed_main: false,
+        };
+        check_manifest_at_startup_with(
+            &sel,
+            &root,
+            &|| panic!("a bare path must never fetch the catalog"),
+            &|_, _| panic!("a bare path must never spawn a download"),
+            &|_, _| panic!("a bare path must never be asked anything"),
+        );
+        assert!(
+            !root.join("staging").exists(),
+            "a bare path must never touch staging"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
