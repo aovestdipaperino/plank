@@ -48,6 +48,11 @@ pub(crate) enum Overlay {
         dialog: Handle<Dialog>,
         then: After,
     },
+    /// A bridged grid's row delete, which reaches the store at close.
+    DeleteRow {
+        dialog: Handle<Dialog>,
+        row: usize,
+    },
 }
 
 impl Overlay {
@@ -57,7 +62,8 @@ impl Overlay {
             | Self::RenameCol { dialog, .. }
             | Self::SaveAs { dialog, .. }
             | Self::Open { dialog, .. }
-            | Self::Unsaved { dialog, .. } => *dialog,
+            | Self::Unsaved { dialog, .. }
+            | Self::DeleteRow { dialog, .. } => *dialog,
         }
     }
 
@@ -70,7 +76,7 @@ impl Overlay {
             Self::EditCell { input, .. }
             | Self::RenameCol { input, .. }
             | Self::SaveAs { input, .. } => Some(*input),
-            Self::Open { .. } | Self::Unsaved { .. } => None,
+            Self::Open { .. } | Self::Unsaved { .. } | Self::DeleteRow { .. } => None,
         }
     }
 
@@ -246,4 +252,37 @@ pub(crate) fn unsaved(app: &mut Application, name: &str, then: After) -> Overlay
         dialog: app.desktop.add_typed(dialog),
         then,
     }
+}
+
+/// Asks before deleting body row `row` (0-based) of a bridged grid. Cancel
+/// is the default and holds the focus, so a reflexive Enter keeps the row.
+pub(crate) fn delete_row(app: &mut Application, row: usize) -> Overlay {
+    // Wide enough for the question on one line, row numbers included.
+    let w: i16 = 74;
+    let mut dialog = centred(app, w, 8, "Delete row");
+    dialog.add(StaticText::new(
+        Rect::new(1, 1, w - 3, 2),
+        &format!(
+            "Delete row {}? It is removed from the store when the grid closes.",
+            row + 1
+        ),
+    ));
+    buttons(
+        &mut dialog,
+        w,
+        3,
+        &[
+            ("~D~elete", CMD_DLG_OK, false),
+            ("Cancel", CMD_DLG_CANCEL, true),
+        ],
+    );
+    // The buttons are the last two children: Cancel is the second. The
+    // desktop focuses a window's first focusable child as it adds it, so the
+    // focus moves to Cancel only once the dialog is on the desktop.
+    let cancel = dialog.group().len() - 1;
+    let dialog = app.desktop.add_typed(dialog);
+    if let Some(d) = app.desktop.get_mut(dialog) {
+        d.set_focus_to_child(cancel);
+    }
+    Overlay::DeleteRow { dialog, row }
 }

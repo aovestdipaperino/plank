@@ -513,6 +513,11 @@ impl State {
                 }
                 self.refresh(app);
             }
+            Overlay::DeleteRow { row, .. } => {
+                self.close_overlay(app);
+                self.doc.delete_row(row);
+                self.refresh(app);
+            }
             Overlay::Unsaved { then, .. } => {
                 self.close_overlay(app);
                 match self.name.clone() {
@@ -555,6 +560,15 @@ impl State {
             return;
         }
         let (row, col) = self.selection(app);
+        // A bridged grid's deleted row is deleted from the store when the
+        // grid closes, so it is asked for first.
+        if self.bridged && command == CMD_ROW_DEL {
+            if row < self.doc.height() {
+                let o = dialogs::delete_row(app, row);
+                self.open_overlay(o);
+            }
+            return;
+        }
         match command {
             CMD_ROW_INS => self.doc.insert_row(row),
             CMD_ROW_DEL => self.doc.delete_row(row),
@@ -1210,14 +1224,72 @@ mod tests {
     }
 
     #[test]
-    fn bridged_row_insert_leaves_the_hash_cell_empty_and_delete_still_works() {
+    fn bridged_row_insert_leaves_the_hash_cell_empty() {
         let mut s = bridged_session();
         assert!(press(&mut s, "insert").is_none());
         assert_eq!(s.doc().height(), 3);
         assert_eq!(s.doc().cell(0, 0), "", "new row's # cell is empty");
+    }
 
+    const DELETE_PROMPT: &str = "Delete row 1? It is removed from the store when the grid closes.";
+
+    /// A bridged row delete removes the row from the store, so every way to
+    /// ask for one (Del, Ctrl+Y, Row > Delete) asks first, and Enter, the
+    /// reflex key, means Cancel.
+    #[test]
+    fn a_bridged_row_delete_asks_and_enter_or_escape_keeps_the_row() {
+        for (ask, answer) in [
+            ("delete", "enter"),
+            ("ctrl-y", "enter"),
+            ("delete", "escape"),
+            ("menu", "enter"),
+        ] {
+            let mut s = bridged_session();
+            if ask == "menu" {
+                assert!(s.key(Event::command(CMD_ROW_DEL)).is_none());
+            } else {
+                assert!(press(&mut s, ask).is_none());
+            }
+            s.step(80, 24);
+            assert!(screen(&s).contains(DELETE_PROMPT), "{ask}: {}", screen(&s));
+            assert_eq!(s.doc().height(), 2, "{ask}: nothing deleted yet");
+
+            assert!(press(&mut s, answer).is_none(), "{ask}/{answer}");
+            s.step(80, 24);
+            assert!(!screen(&s).contains(DELETE_PROMPT), "{ask}/{answer}");
+            assert_eq!(s.doc().height(), 2, "{ask}/{answer}: the row stays");
+            assert_eq!(s.doc().cell(0, 1), "alice");
+            assert!(!s.doc().is_modified());
+
+            // The table has the keys again.
+            press(&mut s, "insert");
+            assert_eq!(s.doc().height(), 3, "{ask}/{answer}");
+        }
+    }
+
+    #[test]
+    fn choosing_delete_in_the_bridged_confirm_removes_the_row() {
+        let mut s = bridged_session();
         assert!(press(&mut s, "delete").is_none());
-        assert_eq!(s.doc().height(), 2);
+        // Cancel has the focus; Tab moves it to Delete.
+        press(&mut s, "tab");
+        assert!(press(&mut s, "enter").is_none());
+        s.step(80, 24);
+        assert!(!screen(&s).contains(DELETE_PROMPT), "{}", screen(&s));
+        assert_eq!(s.doc().height(), 1);
+        assert_eq!(s.doc().cell(0, 1), "bob", "the selected row went");
+    }
+
+    #[test]
+    fn a_plain_row_delete_is_immediate_with_no_confirm() {
+        for key in ["delete", "ctrl-y"] {
+            let mut s = Session::open(80, 24, "a.csv", disk_with(&[("a.csv", "h\n1\n2\n")]));
+            s.step(80, 24);
+            assert!(press(&mut s, key).is_none());
+            s.step(80, 24);
+            assert_eq!(s.doc().height(), 1, "{key}");
+            assert!(!screen(&s).contains("Delete row"), "{key}: {}", screen(&s));
+        }
     }
 
     #[test]
