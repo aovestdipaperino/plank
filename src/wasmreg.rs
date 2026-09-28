@@ -1597,6 +1597,10 @@ pub struct Session {
     /// than a one-field handoff — the same shape `pending_aside` already uses
     /// for `/btw`.
     pub pending_open: Option<(String, String)>,
+    /// The grid an MCP server staged and this session honoured: on the
+    /// component's RAM disk, with its frame queued or open. One slot, set by
+    /// [`Session::stage_grid`].
+    pub active_grid: Option<crate::grid::ActiveGrid>,
     /// The plank home: where trust is recorded and where the `state`
     /// capability writes. Held once, here, because the host and the trust
     /// store both need it and two callers passing the same value into one
@@ -1622,6 +1626,7 @@ impl Session {
             registry: Registry::default(),
             host: crate::wasmhost::host(home),
             pending_open: None,
+            active_grid: None,
             home: home.map(Path::to_path_buf),
         }
     }
@@ -1642,6 +1647,67 @@ impl Session {
             .map_or_else(TrustStore::ephemeral, TrustStore::load);
         self.registry = Registry::build(&found, &trust, project, &mut *self.host);
         self.registry.warnings.clone()
+    }
+
+    /// Honours a grid an MCP server staged: writes its CSV onto the
+    /// component's RAM disk and queues the component's frame with the file as
+    /// its `arg`, for the UI to open at the next idle moment.
+    ///
+    /// `allowed` is the running profile's `grids` (MCP server name to
+    /// component id); a staging is honoured only when it names exactly that
+    /// pair. The component is found by exact id, never by path. One grid at a
+    /// time: a newer staging replaces the recorded one and removes its file,
+    /// but only once the new file is safely written, so a refusal leaves the
+    /// older grid as it was.
+    ///
+    /// # Errors
+    /// Returns the reason, for the model: the route is not declared, the
+    /// component is not loaded (or has struck out), it has no frame, it was
+    /// not granted `fs`, or the RAM disk refused the write.
+    pub fn stage_grid(
+        &mut self,
+        staging: crate::grid::GridStaging,
+        allowed: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let crate::grid::GridStaging {
+            server,
+            component,
+            file,
+            csv,
+            write_back,
+        } = staging;
+        if allowed.get(&server) != Some(&component) {
+            return Err(format!("this profile does not route {server}'s grids"));
+        }
+        let manifest = self
+            .registry
+            .loaded
+            .iter()
+            .find(|l| l.component.manifest.id == component && l.strikes < STRIKE_LIMIT)
+            .map(|l| &l.component.manifest)
+            .ok_or_else(|| format!("{component} is not loaded"))?;
+        if !manifest.surfaces.contains(&Surface::Frame) {
+            return Err(format!("{component} cannot show a frame"));
+        }
+        if !manifest.capabilities.contains(&Capability::Fs) {
+            return Err(format!("{component} has no fs grant"));
+        }
+        let staged = csv.into_bytes();
+        self.host.ram_write(&component, &file, &staged)?;
+        if let Some(older) = self.active_grid.take()
+            && (older.component != component || older.file != file)
+        {
+            self.host.ram_remove(&older.component, &older.file);
+        }
+        self.registry.pending_frame = Some((component.clone(), file.clone()));
+        self.active_grid = Some(crate::grid::ActiveGrid {
+            component,
+            file,
+            staged,
+            server,
+            write_back,
+        });
+        Ok(())
     }
 
     /// Frame components that a slash command may open, as `(id, description)`.
@@ -4059,5 +4125,239 @@ mod tests {
             self.sort_unstable();
             self
         }
+    }
+
+    // --- Grid staging -------------------------------------------------------
+
+    /// A host that keeps RAM disks in a map and refuses a file over a byte
+    /// limit, so the staging path can be tested without a runtime.
+    #[derive(Debug, Default)]
+    struct DiskHost {
+        files: BTreeMap<(String, String), Vec<u8>>,
+        limit: Option<usize>,
+    }
+
+    impl crate::wasmhost::WasmHost for DiskHost {
+        fn load(
+            &mut self,
+            _source: &str,
+            _wasm: &[u8],
+            _granted: &[&str],
+        ) -> Result<crate::wasmhost::LoadedPlugin, crate::wasmhost::WasmError> {
+            Err(crate::wasmhost::WasmError::Unsupported)
+        }
+
+        fn call(
+            &mut self,
+            _id: &str,
+            _export: &str,
+            _input: &[u8],
+        ) -> Result<Vec<u8>, crate::wasmhost::WasmError> {
+            Err(crate::wasmhost::WasmError::Unsupported)
+        }
+
+        fn ram_write(&mut self, id: &str, path: &str, bytes: &[u8]) -> Result<(), String> {
+            if self.limit.is_some_and(|l| bytes.len() > l) {
+                return Err(format!("'{id}' file {path} is over quota"));
+            }
+            let path = crate::wasmcaps::normalize_fs_path(path)?;
+            self.files.insert((id.to_string(), path), bytes.to_vec());
+            Ok(())
+        }
+
+        fn ram_remove(&mut self, id: &str, path: &str) {
+            if let Ok(path) = crate::wasmcaps::normalize_fs_path(path) {
+                self.files.remove(&(id.to_string(), path));
+            }
+        }
+
+        fn ram_file(&self, id: &str, path: &str) -> Option<Vec<u8>> {
+            let path = crate::wasmcaps::normalize_fs_path(path).ok()?;
+            self.files.get(&(id.to_string(), path)).cloned()
+        }
+    }
+
+    const CSVEDIT: &str = "dev.plank.csvedit";
+
+    fn grid_component(surfaces: Vec<Surface>, caps: Vec<Capability>) -> Loaded {
+        let mut component = component(Origin::UserScan, caps);
+        component.manifest.id = CSVEDIT.to_string();
+        component.manifest.surfaces = surfaces;
+        Loaded {
+            component,
+            strikes: 0,
+            tools: Vec::new(),
+            commands: Vec::new(),
+        }
+    }
+
+    fn grid_session(loaded: Vec<Loaded>) -> Session {
+        Session {
+            registry: Registry::with_loaded(loaded),
+            host: Box::new(DiskHost::default()),
+            pending_open: None,
+            active_grid: None,
+            home: None,
+        }
+    }
+
+    fn fit_session() -> Session {
+        grid_session(vec![grid_component(
+            vec![Surface::Frame],
+            vec![Capability::Fs],
+        )])
+    }
+
+    fn staging(file: &str, csv: &str) -> crate::grid::GridStaging {
+        crate::grid::GridStaging {
+            server: "chatbgt".to_string(),
+            component: CSVEDIT.to_string(),
+            file: file.to_string(),
+            csv: csv.to_string(),
+            write_back: crate::grid::WriteBack {
+                tool: "apply_grid".to_string(),
+                table: "categories".to_string(),
+                grid: "0badf00d".to_string(),
+            },
+        }
+    }
+
+    fn routes() -> BTreeMap<String, String> {
+        BTreeMap::from([("chatbgt".to_string(), CSVEDIT.to_string())])
+    }
+
+    #[test]
+    fn an_allowed_staging_lands_on_the_disk_and_queues_its_frame() {
+        let mut s = fit_session();
+        s.stage_grid(staging("categories.csv", "#,name\n1,Food\n"), &routes())
+            .unwrap();
+        assert_eq!(
+            s.host.ram_file(CSVEDIT, "/categories.csv").as_deref(),
+            Some(&b"#,name\n1,Food\n"[..])
+        );
+        assert_eq!(
+            s.registry.take_pending_frame(),
+            Some((CSVEDIT.to_string(), "categories.csv".to_string())),
+            "the frame opens with the file as its arg"
+        );
+        let active = s.active_grid.as_ref().expect("the staging is recorded");
+        assert_eq!(active.component, CSVEDIT);
+        assert_eq!(active.file, "categories.csv");
+        assert_eq!(active.server, "chatbgt");
+        assert_eq!(active.staged, b"#,name\n1,Food\n");
+        assert_eq!(active.write_back.grid, "0badf00d");
+    }
+
+    /// Each refusal says why, and none of them writes or queues anything.
+    #[test]
+    fn a_staging_that_is_not_honoured_says_why_and_writes_nothing() {
+        let cases: Vec<(Session, BTreeMap<String, String>, String)> = vec![
+            (
+                fit_session(),
+                BTreeMap::new(),
+                "this profile does not route chatbgt's grids".to_string(),
+            ),
+            (
+                fit_session(),
+                BTreeMap::from([("chatbgt".to_string(), "dev.plank.other".to_string())]),
+                "this profile does not route chatbgt's grids".to_string(),
+            ),
+            (
+                grid_session(Vec::new()),
+                routes(),
+                format!("{CSVEDIT} is not loaded"),
+            ),
+            (
+                {
+                    let mut struck = grid_component(vec![Surface::Frame], vec![Capability::Fs]);
+                    struck.strikes = STRIKE_LIMIT;
+                    grid_session(vec![struck])
+                },
+                routes(),
+                format!("{CSVEDIT} is not loaded"),
+            ),
+            (
+                grid_session(vec![grid_component(
+                    vec![Surface::Command],
+                    vec![Capability::Fs],
+                )]),
+                routes(),
+                format!("{CSVEDIT} cannot show a frame"),
+            ),
+            (
+                grid_session(vec![grid_component(vec![Surface::Frame], Vec::new())]),
+                routes(),
+                format!("{CSVEDIT} has no fs grant"),
+            ),
+        ];
+        for (mut s, allowed, reason) in cases {
+            let err = s
+                .stage_grid(staging("categories.csv", "#\n"), &allowed)
+                .unwrap_err();
+            assert_eq!(err, reason);
+            assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_none());
+            assert!(s.registry.take_pending_frame().is_none(), "{reason}");
+            assert!(s.active_grid.is_none(), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_refused_disk_write_is_the_reason_and_queues_nothing() {
+        let mut s = fit_session();
+        s.host = Box::new(DiskHost {
+            limit: Some(4),
+            ..DiskHost::default()
+        });
+        let err = s
+            .stage_grid(staging("big.csv", "#,name\n"), &routes())
+            .unwrap_err();
+        assert!(err.contains("over quota"), "{err}");
+        assert!(s.registry.take_pending_frame().is_none());
+        assert!(s.active_grid.is_none());
+    }
+
+    #[test]
+    fn a_newer_staging_replaces_the_older_and_removes_its_file() {
+        let mut s = fit_session();
+        s.stage_grid(staging("categories.csv", "#,old\n"), &routes())
+            .unwrap();
+        s.stage_grid(staging("rules.csv", "#,new\n"), &routes())
+            .unwrap();
+        assert!(
+            s.host.ram_file(CSVEDIT, "/categories.csv").is_none(),
+            "the older file is gone"
+        );
+        assert_eq!(
+            s.host.ram_file(CSVEDIT, "/rules.csv").as_deref(),
+            Some(&b"#,new\n"[..])
+        );
+        assert_eq!(
+            s.registry.take_pending_frame(),
+            Some((CSVEDIT.to_string(), "rules.csv".to_string()))
+        );
+        assert_eq!(s.active_grid.as_ref().unwrap().file, "rules.csv");
+
+        // The same name again: the new bytes stay, they are not removed as
+        // "the older file".
+        s.stage_grid(staging("rules.csv", "#,newer\n"), &routes())
+            .unwrap();
+        assert_eq!(
+            s.host.ram_file(CSVEDIT, "/rules.csv").as_deref(),
+            Some(&b"#,newer\n"[..])
+        );
+        assert_eq!(s.active_grid.as_ref().unwrap().staged, b"#,newer\n");
+    }
+
+    /// A refused newer staging leaves the older one exactly as it was.
+    #[test]
+    fn a_refused_newer_staging_keeps_the_older_one() {
+        let mut s = fit_session();
+        s.stage_grid(staging("categories.csv", "#,old\n"), &routes())
+            .unwrap();
+        let mut other = staging("rules.csv", "#\n");
+        other.server = "stranger".to_string();
+        assert!(s.stage_grid(other, &routes()).is_err());
+        assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_some());
+        assert_eq!(s.active_grid.as_ref().unwrap().file, "categories.csv");
     }
 }

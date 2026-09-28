@@ -20074,6 +20074,11 @@ fn new_agent(
             contribution_warnings.extend(warnings);
         }
     }
+    // Which MCP servers' grids may open in which frame component: only what
+    // the running profile declares, and nothing at all without `--profile`.
+    tool_ctx.grid_routes = crate::profile::active()
+        .map(|a| a.spec.grids.clone())
+        .unwrap_or_default();
     tool_ctx.hooks = crate::plugins::hooks_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     for w in &tool_ctx.hooks.warnings {
         eprintln!("{w}");
@@ -20360,6 +20365,9 @@ pub fn run_interactive(
     // /init there would splice a generation into an old conversation.
     let offer_init = offer_init && !resumed;
     let result = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        // Only the TUI can show a WASM frame, so only it may honour a grid an
+        // MCP server stages; every other front end refuses them.
+        agent.tool_ctx.frames_available = true;
         agent.run_tui(offer_init)
     } else {
         run_plain_flow(&mut agent, cfg, offer_init)

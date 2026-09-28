@@ -40,6 +40,23 @@ pub struct GridStaging {
     pub write_back: WriteBack,
 }
 
+/// The one grid plank has put on a component's RAM disk and queued (or
+/// opened) in its frame. Kept so the file can be compared with what was
+/// staged, and written back, when the frame closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveGrid {
+    /// The component whose disk holds the file.
+    pub component: String,
+    /// The file name, as the frame's `arg` and as the RAM-disk path.
+    pub file: String,
+    /// The bytes written, to tell an edited grid from an untouched one.
+    pub staged: Vec<u8>,
+    /// The MCP server the grid came from, which takes the write-back.
+    pub server: String,
+    /// Where an edited copy goes back.
+    pub write_back: WriteBack,
+}
+
 /// Splits `plank-frame://<component>/<file>` into its two parts.
 ///
 /// `None` unless both are present and plain: the component is a non-empty id

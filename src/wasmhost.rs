@@ -145,6 +145,21 @@ pub trait WasmHost: std::fmt::Debug + Send {
     fn ram_file(&self, _id: &str, _path: &str) -> Option<Vec<u8>> {
         None
     }
+
+    /// Writes a file onto `id`'s RAM disk on plank's behalf: a grid an MCP
+    /// server staged for the component. The caller checks that the component
+    /// may have it; the host applies the disk's quotas.
+    ///
+    /// # Errors
+    /// The no-op has no RAM disk; the real host refuses a bad path or a write
+    /// over quota, with the same message the component's own `fs` would get.
+    fn ram_write(&mut self, _id: &str, _path: &str, _bytes: &[u8]) -> Result<(), String> {
+        Err("no RAM disk".to_string())
+    }
+
+    /// Removes a file plank put on `id`'s RAM disk. Cleanup: a file that is
+    /// not there is not an error.
+    fn ram_remove(&mut self, _id: &str, _path: &str) {}
 }
 
 /// The always-available host: refuses everything, cheerfully.
@@ -584,11 +599,44 @@ mod extism_host {
                 .read(&path)
                 .map(<[u8]>::to_vec)
         }
+
+        // The disk key is the component id, the same key the `fs` host
+        // functions reach through the component's grants.
+        fn ram_write(&mut self, id: &str, path: &str, bytes: &[u8]) -> Result<(), String> {
+            crate::wasmcaps::ram_write(&self.disks, id, path, bytes)
+        }
+
+        fn ram_remove(&mut self, id: &str, path: &str) {
+            crate::wasmcaps::ram_remove(&self.disks, id, path);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// plank's own write onto a component's disk goes through the same
+    /// quotas as the component's `fs`, and reads back through `ram_file`.
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn a_host_ram_write_respects_quotas_and_reads_back() {
+        use super::WasmHost as _;
+        let mut host = super::ExtismHost::new(None);
+        host.ram_write("dev.plank.csvedit", "a.csv", b"#,x\n")
+            .unwrap();
+        assert_eq!(
+            host.ram_file("dev.plank.csvedit", "/a.csv").as_deref(),
+            Some(&b"#,x\n"[..])
+        );
+        let big = vec![0u8; crate::wasmcaps::FS_MAX_FILE_BYTES + 1];
+        let err = host
+            .ram_write("dev.plank.csvedit", "big.csv", &big)
+            .unwrap_err();
+        assert!(err.starts_with("'dev.plank.csvedit'"), "{err}");
+        assert!(host.ram_file("dev.plank.csvedit", "big.csv").is_none());
+        host.ram_remove("dev.plank.csvedit", "a.csv");
+        assert!(host.ram_file("dev.plank.csvedit", "a.csv").is_none());
+    }
 
     /// The budgets have to differ by surface, or the feature is just the old
     /// single timeout with more words.

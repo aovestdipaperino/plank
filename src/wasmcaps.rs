@@ -474,6 +474,36 @@ pub fn fs_remove(grants: &Grants, disks: &RamDisks, path: &str) -> Result<(), St
     }
 }
 
+/// Writes a file onto component `id`'s RAM disk on plank's own behalf (a
+/// staged grid), with no grant check: the caller has already decided the
+/// component may have it. Quotas and overlap refusals apply exactly as they do
+/// to the component's own `fs_write`.
+///
+/// # Errors
+/// For a bad path, over quota, or when the file would overlap a directory.
+pub fn ram_write(disks: &RamDisks, id: &str, path: &str, bytes: &[u8]) -> Result<(), String> {
+    let path = normalize_fs_path(path)?;
+    let mut map = disks
+        .lock()
+        .map_err(|_| "RAM disk lock poisoned".to_string())?;
+    map.entry(id.to_string())
+        .or_default()
+        .write(id, &path, bytes)
+}
+
+/// Removes a file from component `id`'s RAM disk on plank's own behalf.
+/// Cleanup, so a missing file, a missing disk or a bad path is not an error.
+pub fn ram_remove(disks: &RamDisks, id: &str, path: &str) {
+    let Ok(path) = normalize_fs_path(path) else {
+        return;
+    };
+    if let Ok(mut map) = disks.lock()
+        && let Some(disk) = map.get_mut(id)
+    {
+        disk.remove(&path);
+    }
+}
+
 /// Frames a byte-returning host call's result for the guest: `0` then the
 /// data, or `1` then the error text. A plain empty reply could not tell "empty
 /// file" from "refused".
@@ -927,6 +957,33 @@ mod tests {
         assert!(err.starts_with("'dev.plank.demo'"), "{err}");
         // Replacing a file with one of the same size fits.
         fs_write(&g, &d, "c0", &chunk).unwrap();
+    }
+
+    /// plank's own writes onto a component's disk (a staged grid) go through
+    /// the same quotas and overlap refusals as the component's `fs` calls,
+    /// and land on the disk keyed by the component id.
+    #[test]
+    fn a_host_write_respects_quotas_and_lands_on_the_components_disk() {
+        let d = disks();
+        ram_write(&d, "dev.plank.csvedit", "accounts.csv", b"#,name\n").unwrap();
+        let g = grants_for("dev.plank.csvedit", &["fs"], None);
+        assert_eq!(fs_read(&g, &d, "/accounts.csv").unwrap(), b"#,name\n");
+
+        let big = vec![0u8; FS_MAX_FILE_BYTES + 1];
+        let err = ram_write(&d, "dev.plank.csvedit", "big.csv", &big).unwrap_err();
+        assert!(err.starts_with("'dev.plank.csvedit'"), "{err}");
+        assert!(fs_read(&g, &d, "big.csv").is_err(), "nothing was written");
+
+        let err = ram_write(&d, "dev.plank.csvedit", "accounts.csv/x", b"1").unwrap_err();
+        assert!(err.contains("already exists as a file"), "{err}");
+        assert!(ram_write(&d, "dev.plank.csvedit", "../x", b"1").is_err());
+
+        ram_remove(&d, "dev.plank.csvedit", "accounts.csv");
+        assert!(fs_read(&g, &d, "accounts.csv").is_err());
+        // Removing what is not there, or from a disk that does not exist, is
+        // not an error: cleanup must never fail.
+        ram_remove(&d, "dev.plank.csvedit", "accounts.csv");
+        ram_remove(&d, "dev.nobody", "x");
     }
 
     #[test]
