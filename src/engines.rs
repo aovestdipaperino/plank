@@ -7,10 +7,10 @@
 //! `path`, because a remote catalog must never choose where plank writes.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::manifest::FileEntry;
+use crate::manifest::{EngineId, FileEntry};
 
 /// The catalog shipped in this build, and the offline first-launch fallback.
 pub const COMPILED_IN: &str = include_str!("../engines.json");
@@ -225,6 +225,183 @@ pub fn layer(mut base: Catalog, over: Catalog) -> Catalog {
     base
 }
 
+/// The cached fetched catalog under `root`.
+fn cache_path_in(root: &Path) -> PathBuf {
+    root.join("engines.remote.json")
+}
+
+/// The user's local layer under `root`.
+fn local_path_in(root: &Path) -> PathBuf {
+    root.join("engines.local.json")
+}
+
+/// The layered catalog under `root`: compiled-in, then the cache when it is
+/// strictly newer, then the local file. Never fails; problems become warnings.
+///
+/// # Panics
+/// Never in practice: the compiled-in catalog is validated by a unit test.
+#[must_use]
+pub fn load_in(root: &Path, warn: &mut Vec<String>) -> Catalog {
+    let mut cat = parse(COMPILED_IN, Layer::Published, warn)
+        .expect("the compiled-in catalog is validated by a unit test");
+    if let Ok(text) = std::fs::read_to_string(cache_path_in(root)) {
+        match parse(&text, Layer::Published, &mut Vec::new()) {
+            Ok(c) if c.version > cat.version => cat = layer(cat, c),
+            Ok(_) => {}
+            Err(e) => warn.push(format!("engines: ignoring the cached catalog: {e}")),
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(local_path_in(root)) {
+        match parse(&text, Layer::Local, warn) {
+            Ok(c) => cat = layer(cat, c),
+            Err(e) => warn.push(format!(
+                "engines: ignoring {}: {e}",
+                local_path_in(root).display()
+            )),
+        }
+    }
+    cat
+}
+
+/// [`load_in`] rooted at `~/.plank`.
+#[must_use]
+pub fn load(warn: &mut Vec<String>) -> Catalog {
+    load_in(&crate::manifest::plank_dir(), warn)
+}
+
+/// Records a freshly fetched catalog as the cache when it is newer than both
+/// the compiled-in catalog and the current cache. Returns it when it parses.
+#[must_use]
+pub fn update_cache_in(root: &Path, fetched: &str) -> Option<Catalog> {
+    let new = parse(fetched, Layer::Published, &mut Vec::new()).ok()?;
+    let compiled = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).map_or(0, |c| c.version);
+    let cached = std::fs::read_to_string(cache_path_in(root))
+        .ok()
+        .and_then(|t| parse(&t, Layer::Published, &mut Vec::new()).ok())
+        .map_or(0, |c| c.version);
+    if new.version > compiled.max(cached) {
+        let _ = std::fs::create_dir_all(root);
+        let _ = std::fs::write(cache_path_in(root), fetched);
+    }
+    Some(new)
+}
+
+/// What the user asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice<'a> {
+    /// Nothing: the catalog default.
+    Default,
+    /// `--model X` / `engine.model`: an engine name, else a path.
+    Spec(&'a str),
+    /// `--model:X`: must be an engine name.
+    Named(&'a str),
+}
+
+/// The model files a run will load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    /// The engine, or `None` for a bare path that matches no managed engine.
+    pub id: Option<EngineId>,
+    /// Main model file.
+    pub main: PathBuf,
+    /// The engine's mtp companion, if it declares one.
+    pub mtp: Option<PathBuf>,
+    /// The engine's vision encoder, if it declares one.
+    pub vision: Option<PathBuf>,
+    /// Whether `main` is a catalog download plank may fetch and upgrade.
+    pub managed_main: bool,
+}
+
+fn select(root: &Path, entry: &EngineEntry, id: EngineId) -> Selection {
+    let role = |r: &str| -> Option<PathBuf> {
+        entry.paths.get(r).cloned().or_else(|| {
+            entry
+                .files
+                .contains_key(r)
+                .then(|| crate::manifest::local_path_for_in(root, id, r))
+                .flatten()
+        })
+    };
+    Selection {
+        id: Some(id),
+        main: role("main").expect("parse guarantees a main role"),
+        mtp: role("mtp"),
+        vision: role("vision"),
+        managed_main: entry.files.contains_key("main"),
+    }
+}
+
+/// Resolves `choice` against `catalog`, with managed files under `root`.
+///
+/// # Errors
+/// An unknown name (for [`Choice::Named`]), or a bare word that is neither an
+/// engine nor an existing file (for [`Choice::Spec`]).
+pub fn resolve_in(root: &Path, catalog: &Catalog, choice: Choice<'_>) -> Result<Selection, String> {
+    let by_name = |name: &str| {
+        let entry = catalog.get(name)?;
+        let id = EngineId::new(name)?;
+        Some(select(root, entry, id))
+    };
+    match choice {
+        Choice::Default => by_name(catalog.default_name()).ok_or_else(|| {
+            format!(
+                "the default engine `{}` is not in the catalog",
+                catalog.default_name()
+            )
+        }),
+        Choice::Named(n) => by_name(n)
+            .ok_or_else(|| format!("unknown engine `{n}`; known engines: {}", catalog.names())),
+        Choice::Spec(s) => {
+            if let Some(sel) = by_name(s) {
+                return Ok(sel);
+            }
+            let path = crate::settings::expand_tilde(s);
+            let looks_like_path = s.contains('/') || path.extension().is_some() || path.exists();
+            if !looks_like_path {
+                return Err(format!(
+                    "no engine or file named `{s}`; known engines: {}",
+                    catalog.names()
+                ));
+            }
+            // A path that is exactly a managed engine's main selects the engine.
+            for (name, entry) in &catalog.engines {
+                if let Some(id) = EngineId::new(name) {
+                    let sel = select(root, entry, id);
+                    if sel.managed_main && sel.main == path {
+                        return Ok(sel);
+                    }
+                }
+            }
+            Ok(Selection {
+                id: None,
+                main: path,
+                mtp: None,
+                vision: None,
+                managed_main: false,
+            })
+        }
+    }
+}
+
+static ACTIVE: OnceLock<Selection> = OnceLock::new();
+
+/// Records this process's selection once, at startup.
+pub fn set_active(sel: Selection) {
+    let _ = ACTIVE.set(sel);
+}
+
+/// This process's selection, when startup recorded one.
+#[must_use]
+pub fn active() -> Option<&'static Selection> {
+    ACTIVE.get()
+}
+
+/// This process's engine, when it runs one from the catalog.
+#[must_use]
+pub fn active_id() -> Option<EngineId> {
+    active().and_then(|s| s.id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +559,143 @@ mod tests {
         let mut w = Vec::new();
         let c = parse(COMPILED_IN, Layer::Published, &mut w).unwrap();
         assert_eq!(c.names(), "ds41, ds4vision, qwen");
+    }
+
+    fn root(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("plank-engines-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_layers_cache_then_local() {
+        let r = root("load");
+        std::fs::write(r.join("engines.remote.json"), one_engine(99, "a", "a", 1)).unwrap();
+        std::fs::write(r.join("engines.local.json"), r#"{"default":"qwen"}"#).unwrap();
+        let mut w = Vec::new();
+        let c = load_in(&r, &mut w);
+        assert!(c.get("a").is_some(), "fetched cache layered");
+        assert!(c.get("ds4vision").is_some(), "compiled-in kept");
+        assert_eq!(c.default_name(), "qwen");
+    }
+
+    #[test]
+    fn a_cache_not_newer_than_the_compiled_in_catalog_is_ignored() {
+        let r = root("stale");
+        let compiled = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        // Same version as the compiled-in catalog: not strictly newer.
+        std::fs::write(
+            r.join("engines.remote.json"),
+            one_engine(compiled.version, "a", "a", 1),
+        )
+        .unwrap();
+        let c = load_in(&r, &mut Vec::new());
+        assert!(
+            c.get("a").is_none(),
+            "an equal-version cache must not be layered"
+        );
+    }
+
+    #[test]
+    fn a_broken_local_file_warns_and_is_ignored() {
+        let r = root("badlocal");
+        std::fs::write(r.join("engines.local.json"), "{nope").unwrap();
+        let mut w = Vec::new();
+        let c = load_in(&r, &mut w);
+        assert_eq!(c.default_name(), "ds4vision");
+        assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn the_cache_is_replaced_only_by_a_higher_version() {
+        let r = root("cache");
+        assert!(update_cache_in(&r, &one_engine(1000, "a", "a", 1)).is_some());
+        assert!(r.join("engines.remote.json").exists());
+        let before = std::fs::read_to_string(r.join("engines.remote.json")).unwrap();
+        assert!(
+            update_cache_in(&r, &one_engine(999, "b", "b", 1)).is_some(),
+            "still parses"
+        );
+        assert_eq!(
+            std::fs::read_to_string(r.join("engines.remote.json")).unwrap(),
+            before
+        );
+        assert!(update_cache_in(&r, "{garbage").is_none());
+    }
+
+    #[test]
+    fn default_choice_resolves_to_the_default_engines_derived_paths() {
+        let r = root("sel-default");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let s = resolve_in(&r, &c, Choice::Default).unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS4VISION));
+        assert_eq!(s.main, r.join("ds4vision.gguf"));
+        assert_eq!(s.mtp, Some(r.join("ds4vision.mtp.gguf")));
+        assert_eq!(s.vision, Some(r.join("ds4vision.vision.gguf")));
+        assert!(s.managed_main);
+    }
+
+    #[test]
+    fn a_spec_naming_an_engine_selects_it() {
+        let r = root("sel-name");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let s = resolve_in(&r, &c, Choice::Spec("qwen")).unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::QWEN));
+        assert_eq!(s.mtp, None);
+    }
+
+    #[test]
+    fn a_spec_that_is_a_path_gets_no_companions() {
+        let r = root("sel-path");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let s = resolve_in(&r, &c, Choice::Spec("/models/x.gguf")).unwrap();
+        assert_eq!(s.id, None);
+        assert_eq!(s.main, PathBuf::from("/models/x.gguf"));
+        assert!(s.mtp.is_none() && s.vision.is_none() && !s.managed_main);
+    }
+
+    #[test]
+    fn a_path_equal_to_a_managed_main_selects_that_engine() {
+        let r = root("sel-managed");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let p = r.join("qwen.gguf");
+        let s = resolve_in(&r, &c, Choice::Spec(p.to_str().unwrap())).unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::QWEN));
+        assert!(s.managed_main);
+    }
+
+    #[test]
+    fn an_unknown_bare_word_that_is_not_a_file_errors_with_the_known_list() {
+        let r = root("sel-unknown");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let e = resolve_in(&r, &c, Choice::Spec("nope")).unwrap_err();
+        assert_eq!(
+            e,
+            "no engine or file named `nope`; known engines: ds41, ds4vision, qwen"
+        );
+    }
+
+    #[test]
+    fn a_named_choice_must_be_an_engine() {
+        let r = root("sel-named");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        assert!(resolve_in(&r, &c, Choice::Named("ds41")).is_ok());
+        assert_eq!(
+            resolve_in(&r, &c, Choice::Named("x.gguf")).unwrap_err(),
+            "unknown engine `x.gguf`; known engines: ds41, ds4vision, qwen"
+        );
+    }
+
+    #[test]
+    fn a_local_path_role_overrides_the_derived_path() {
+        let r = root("sel-localpath");
+        let base = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let over = parse(r#"{"engines":{"mine":{"main":{"path":"/m/mine.gguf"},"vision":{"path":"/m/v.gguf"}}}}"#, Layer::Local, &mut Vec::new()).unwrap();
+        let c = layer(base, over);
+        let s = resolve_in(&r, &c, Choice::Spec("mine")).unwrap();
+        assert_eq!(s.main, PathBuf::from("/m/mine.gguf"));
+        assert_eq!(s.vision, Some(PathBuf::from("/m/v.gguf")));
+        assert!(!s.managed_main, "path roles are never downloaded");
     }
 }
