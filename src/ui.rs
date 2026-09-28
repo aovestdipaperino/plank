@@ -2705,7 +2705,15 @@ struct GpuYield {
     /// Where the C engine's stderr goes during a teardown and reload
     /// (`~/.plank/gpu-yield.log`); discarded when `None`.
     log: Option<std::path::PathBuf>,
+    /// Cycles run since the current top-level turn started, capped at
+    /// [`GPU_YIELD_CYCLES_PER_TURN`].
+    cycles_this_turn: u8,
 }
+
+/// Most GPU-yield cycles one turn may run. Each costs a full model reload, so
+/// a model that keeps launching GPU commands in one turn gets the refusal
+/// back instead of an unbounded run of reloads.
+const GPU_YIELD_CYCLES_PER_TURN: u8 = 2;
 
 impl GpuYield {
     fn new(reopen: Option<crate::gpuyield::ReopenFn>) -> Self {
@@ -3917,6 +3925,19 @@ impl Agent<'_> {
         let Some(slot) = self.gpu_slot() else {
             return first;
         };
+        if self.gpu_yield.cycles_this_turn >= GPU_YIELD_CYCLES_PER_TURN {
+            use std::fmt::Write as _;
+            let mut out = first;
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            let _ = writeln!(
+                out,
+                "GPU yield skipped: limit of {GPU_YIELD_CYCLES_PER_TURN} per turn reached"
+            );
+            return out;
+        }
+        self.gpu_yield.cycles_this_turn += 1;
         let command = call.arg_value("command").unwrap_or("").to_owned();
         let mut host = AgentCycle {
             agent: self,
@@ -4089,6 +4110,15 @@ impl Agent<'_> {
             .iter()
             .find(|(_, e)| e.is_gpu_placeholder())
             .map(|(k, _)| EngineSlot::Alt(k.clone()))
+    }
+
+    /// Turn-start bookkeeping for the GPU yield: at the top level the
+    /// per-turn cycle count starts over, and an owed reload is retried.
+    fn begin_turn_gpu_yield(&mut self) {
+        if self.alt_engine_depth == 0 && !self.in_sidechain() {
+            self.gpu_yield.cycles_this_turn = 0;
+        }
+        self.retry_gpu_reopen();
     }
 
     /// Retries a reopen that failed during an earlier cycle. Called at turn
@@ -5262,7 +5292,7 @@ impl Agent<'_> {
         self.tool_ctx.skill_invocations = 0;
         // A model a GPU-yield cycle could not bring back gets another try
         // before this turn needs it.
-        self.retry_gpu_reopen();
+        self.begin_turn_gpu_yield();
         // Turn boundary: the same place background job notifications join the
         // transcript. The resume disclosure comes first — this turn is about to
         // re-enter the engine, so the re-prefill it names is the one the user is
@@ -14918,7 +14948,7 @@ impl Agent<'_> {
             })
         });
         // After the status sink, so the retry's notice reaches the log.
-        self.retry_gpu_reopen();
+        self.begin_turn_gpu_yield();
         if let Some(reason) = self.fire_user_prompt_submit(&mut |w| {
             let _ = tx.send(UiEvent::Dim(w));
         }) {
@@ -15666,11 +15696,19 @@ impl Agent<'_> {
             && !self.in_sidechain()
             && !self.quiet_tools
             && self.memory_pass_allowed()
+            && self.gpu_yield.pending.is_none()
     }
 
     /// What the idle moment should spend itself on: a pending suggestion
     /// always first, then the oldest queued memory job.
+    ///
+    /// Nothing while a GPU-yield reload is owed: the engine is a placeholder
+    /// that fails every generation, and a memory job would spend its attempts
+    /// against it.
     fn idle_work(&self) -> crate::suggest::IdleWork {
+        if self.gpu_yield.pending.is_some() {
+            return crate::suggest::IdleWork::Nothing;
+        }
         crate::suggest::idle_work(self.suggestion_pending, self.memory_jobs_pending())
     }
 
@@ -15700,6 +15738,12 @@ impl Agent<'_> {
     fn process_memory_job(&mut self) -> bool {
         if self.in_sidechain() {
             return false; // never nest a pass inside another sidechain
+        }
+        if self.gpu_yield.pending.is_some() {
+            // The model is out after a failed GPU-yield reload: the job waits
+            // for the turn-start retry rather than failing against the
+            // placeholder.
+            return false;
         }
         let Some(mut job) = self.memory_jobs.pop_front() else {
             return false;
@@ -36028,6 +36072,7 @@ or the user's next message aborts before its first token"
             pending: None,
             snapshot_dir: Some(dir.to_path_buf()),
             log: Some(dir.join("gpu-yield.log")),
+            cycles_this_turn: 0,
         };
     }
 
@@ -36600,6 +36645,78 @@ or the user's next message aborts before its first token"
         );
         drop(agent);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_third_gpu_request_in_one_turn_gets_the_first_result_and_a_note() {
+        let dir = gpu_dir("cap");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let counters: Vec<_> = (0..3).map(|i| dir.join(format!("runs{i}"))).collect();
+        let first = GpuEngine::new("e0", &log, &counters[0], &[]);
+        let mut agent = test_agent_boxed(&dir, Box::new(first), &cfg);
+        let (l, c) = (std::sync::Arc::clone(&log), counters[0].clone());
+        arm_gpu_yield(
+            &mut agent,
+            &dir,
+            gpu_factory(&log, &counters[0], move || {
+                Ok(GpuEngine::new("again", &l, &c, &[]))
+            }),
+        );
+        let calls: Vec<ToolCall> = counters
+            .iter()
+            .map(|c| gpu_bash_call(&gpu_command(c, false)))
+            .collect();
+
+        let out = agent.run_tool_calls(&calls);
+
+        let reopens = logged(&log)
+            .iter()
+            .filter(|e| e.starts_with("reopen"))
+            .count();
+        assert_eq!(reopens, 2, "{:?}", logged(&log));
+        assert_eq!(runs(&counters[2]), 1, "the third ran once");
+        assert!(
+            out.contains("GPU yield skipped: limit of 2 per turn reached"),
+            "{out}"
+        );
+        assert!(out.contains("exit_status=75"), "the first result: {out}");
+        // A new turn starts the count over.
+        agent.begin_turn_gpu_yield();
+        std::fs::remove_file(&counters[2]).unwrap();
+        let out = agent.run_tool_calls(&calls[2..]);
+        assert!(out.contains("second-run-ok"), "{out}");
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idle_passes_wait_while_a_gpu_reload_is_owed() {
+        let _s = enable_suggestions_for_test();
+        let dir = gpu_dir("idle");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.memory_jobs.push_back(crate::memextract::MemoryJob {
+            task: "extract".to_owned(),
+            depth: 2,
+            attempts: 0,
+            resume: None,
+        });
+        agent.suggestion_pending = true;
+        agent.gpu_yield.pending = Some(PendingReopen { snapshot: None });
+
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::Nothing);
+        assert!(!agent.process_memory_job());
+        assert_eq!(agent.memory_jobs.len(), 1, "the job waits");
+        assert_eq!(agent.memory_jobs[0].attempts, 0, "no attempt spent");
+        assert!(!agent.generate_suggestion());
+
+        agent.gpu_yield.pending = None;
+        agent.suggestion_pending = true;
+        assert_eq!(agent.idle_work(), crate::suggest::IdleWork::Suggestion);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn gpu_stanza(command: &str) -> String {

@@ -26,6 +26,11 @@ const AGENT: &str = "plank";
 /// care about.
 pub fn available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    // Unit tests drive whole turns, and this writes straight to the real
+    // stdout, past the harness's capture.
+    if cfg!(test) {
+        return false;
+    }
     *AVAILABLE.get_or_init(|| {
         std::env::var_os("WARP_CLI_AGENT_PROTOCOL_VERSION").is_some()
             && std::env::var_os("WARP_CLIENT_VERSION").is_some()
