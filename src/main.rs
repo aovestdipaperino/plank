@@ -907,15 +907,16 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // `parse_config` resolved the catalog choice; offer to download the
         // model when it is not present.
         let model = cfg.model_path.clone().expect("resolved by parse_config");
+        let sel = cfg.selection.as_ref().expect("resolved by parse_config");
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
         // maps the file. Never fatal.
-        plank::download::check_manifest_at_startup(cfg.model_path.as_deref());
+        plank::download::check_manifest_at_startup(sel);
         // Mirrors the background downloader's state into the status bar. Cheap
         // and idempotent: it does nothing at all when no download is running.
         plank::downloader::spawn_watcher();
-        plank::download::ensure_model(&model)?;
+        plank::download::ensure_model(sel)?;
         // The vision encoder sits beside the main model and is fetched on
         // demand when the model can use it (the pinned Vision-Exp checkpoint);
         // any other DeepSeek checkpoint runs text-only.
@@ -928,7 +929,6 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // needs it. A Qwen model skips both side artifacts, since it opens
         // neither.
         let mut tuning = cfg.engine.clone();
-        let sel = cfg.selection.as_ref().expect("resolved by parse_config");
         plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;
 
         let backend = match cfg.backend {
@@ -1202,21 +1202,21 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         require_min_ram()?;
         acquire_model_lock()?;
         let model_path = cfg.model_path.clone().expect("resolved by parse_config");
+        let sel = cfg.selection.as_ref().expect("resolved by parse_config");
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
         // maps the file. Never fatal.
-        plank::download::check_manifest_at_startup(cfg.model_path.as_deref());
+        plank::download::check_manifest_at_startup(sel);
         // Mirrors the background downloader's state into the status bar. Cheap
         // and idempotent: it does nothing at all when no download is running.
         plank::downloader::spawn_watcher();
-        plank::download::ensure_model(&model_path)?;
+        plank::download::ensure_model(sel)?;
         // The vision encoder sits beside the main model and is fetched on
         // demand when the model can use it (the pinned Vision-Exp checkpoint);
         // any other DeepSeek checkpoint runs text-only.
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
-        let sel = cfg.selection.as_ref().expect("resolved by parse_config");
         plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
