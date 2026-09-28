@@ -58,6 +58,9 @@ struct State {
     closing: Option<String>,
     /// The name last saved to, cleared by the next change.
     last_saved: Option<String>,
+    /// Set at load when the doc's first header cell is `#`: a grid the
+    /// server owns the shape and name of.
+    bridged: bool,
 }
 
 /// One editing session: the application, its input, and the state.
@@ -208,6 +211,7 @@ impl Session {
         app.set_status_line(status_line(sw, sh));
 
         let (doc, name, message) = load(arg, &*disk);
+        let bridged = doc.header().first().is_some_and(|h| h == "#");
 
         let bounds = window_bounds(&app);
         let mut window = WindowBuilder::new().bounds(bounds).title("").build();
@@ -228,8 +232,23 @@ impl Session {
             overlay: None,
             closing: None,
             last_saved: None,
+            bridged,
         };
         state.refresh(&mut app);
+        if bridged {
+            // Disabling dims the menu items; the refusal messages below are
+            // what actually stops the action, keys included.
+            for c in [
+                CMD_NEW,
+                CMD_OPEN,
+                CMD_SAVE_AS,
+                CMD_RENAME_COL,
+                CMD_COL_INS,
+                CMD_COL_DEL,
+            ] {
+                app.disable_command(c);
+            }
+        }
         if arg == OPEN_DIALOG_ARG {
             state.open_picker(&mut app);
         }
@@ -508,11 +527,19 @@ impl State {
 
     fn edit_cell(&mut self, app: &mut Application) {
         let (row, col) = self.selection(app);
+        if self.bridged && col == 0 {
+            self.set_message(app, "the # column is fixed");
+            return;
+        }
         let o = dialogs::edit_cell(app, self.doc.cell(row, col), row, col);
         self.open_overlay(o);
     }
 
     fn rename_col(&mut self, app: &mut Application) {
+        if self.bridged {
+            self.set_message(app, "this grid's columns are fixed");
+            return;
+        }
         let (_, col) = self.selection(app);
         let current = self.doc.header().get(col).cloned().unwrap_or_default();
         let o = dialogs::rename_col(app, &current, col);
@@ -521,6 +548,10 @@ impl State {
 
     /// A row or column command at the selection.
     fn reshape(&mut self, app: &mut Application, command: CommandId) {
+        if self.bridged && matches!(command, CMD_COL_INS | CMD_COL_DEL) {
+            self.set_message(app, "this grid's columns are fixed");
+            return;
+        }
         let (row, col) = self.selection(app);
         match command {
             CMD_ROW_INS => self.doc.insert_row(row),
@@ -529,6 +560,11 @@ impl State {
             _ => self.doc.delete_col(col),
         }
         self.refresh(app);
+    }
+
+    /// The message for a bridged doc's refused New/Open/Save As.
+    fn stays_message(&self) -> String {
+        format!("this grid stays on {}", self.display_name())
     }
 }
 
@@ -614,8 +650,20 @@ impl AppHandler for State {
                 }
                 None => self.save_as(app, After::Nothing),
             },
+            CMD_SAVE_AS if self.bridged => {
+                let msg = self.stays_message();
+                self.set_message(app, &msg);
+            }
             CMD_SAVE_AS => self.save_as(app, After::Nothing),
+            CMD_NEW if self.bridged => {
+                let msg = self.stays_message();
+                self.set_message(app, &msg);
+            }
             CMD_NEW => self.guard(app, After::New),
+            CMD_OPEN if self.bridged => {
+                let msg = self.stays_message();
+                self.set_message(app, &msg);
+            }
             CMD_OPEN => self.guard(app, After::Open),
             CMD_EXIT => self.guard(app, After::Exit),
             CMD_ROW_INS | CMD_ROW_DEL | CMD_COL_INS | CMD_COL_DEL => self.reshape(app, command),
@@ -1040,6 +1088,145 @@ mod tests {
         for hint in ["Ctrl-R Row", "Ctrl-S Save", "Ctrl-Q Exit", "F10 Menu"] {
             assert!(bottom.contains(hint), "{hint}: {bottom}");
         }
+    }
+
+    /// A disk holding a bridged grid: its header's first cell is `#`.
+    fn bridged_disk() -> Box<dyn Disk> {
+        disk_with(&[("grid.csv", "#,name\n1,alice\n2,bob\n")])
+    }
+
+    fn bridged_session() -> Session {
+        let mut s = Session::open(80, 24, "grid.csv", bridged_disk());
+        s.step(80, 24);
+        s
+    }
+
+    #[test]
+    fn bridged_column_commands_are_refused() {
+        let mut s = bridged_session();
+        assert!(press(&mut s, "ctrl-l").is_none());
+        assert_eq!(s.doc().width(), 2, "no column inserted");
+        s.step(80, 24);
+        assert!(
+            screen(&s).contains("this grid's columns are fixed"),
+            "{}",
+            screen(&s)
+        );
+
+        assert!(press(&mut s, "ctrl-k").is_none());
+        assert_eq!(s.doc().width(), 2, "no column deleted");
+        s.step(80, 24);
+        assert!(
+            screen(&s).contains("this grid's columns are fixed"),
+            "{}",
+            screen(&s)
+        );
+
+        assert!(s.key(Event::command(CMD_RENAME_COL)).is_none());
+        s.step(80, 24);
+        assert!(
+            screen(&s).contains("this grid's columns are fixed"),
+            "{}",
+            screen(&s)
+        );
+        assert_eq!(s.doc().header()[0], "#", "no rename either");
+    }
+
+    #[test]
+    fn bridged_hash_cell_edit_is_refused() {
+        let mut s = bridged_session();
+        // Selection starts at (0, 0): the # cell.
+        assert!(press(&mut s, "enter").is_none());
+        s.step(80, 24);
+        assert!(
+            screen(&s).contains("the # column is fixed"),
+            "{}",
+            screen(&s)
+        );
+        assert!(!screen(&s).contains("Edit cell"), "no dialog opened");
+        assert_eq!(s.doc().cell(0, 0), "1");
+    }
+
+    #[test]
+    fn bridged_non_hash_cell_edit_still_works() {
+        let mut s = bridged_session();
+        press(&mut s, "right"); // move to column 1 ("name")
+        assert!(press(&mut s, "enter").is_none());
+        press(&mut s, "backspace");
+        press(&mut s, "backspace");
+        press(&mut s, "backspace");
+        press(&mut s, "backspace");
+        press(&mut s, "backspace");
+        type_str(&mut s, "carol");
+        press(&mut s, "enter");
+        s.step(80, 24);
+        assert_eq!(s.doc().cell(0, 1), "carol");
+    }
+
+    #[test]
+    fn bridged_ctrl_s_saves_to_the_same_name_with_no_save_as() {
+        let mut s = bridged_session();
+        press(&mut s, "right");
+        press(&mut s, "enter");
+        type_str(&mut s, "!");
+        press(&mut s, "enter");
+        assert!(press(&mut s, "ctrl-s").is_none(), "saves at once");
+        s.step(80, 24);
+        assert!(!s.doc().is_modified());
+        assert!(screen(&s).contains("saved grid.csv"), "{}", screen(&s));
+    }
+
+    #[test]
+    fn bridged_new_open_save_as_are_refused() {
+        let mut s = bridged_session();
+        assert!(s.key(Event::command(CMD_NEW)).is_none());
+        s.step(80, 24);
+        assert!(
+            screen(&s).contains("this grid stays on grid.csv"),
+            "{}",
+            screen(&s)
+        );
+        assert_eq!(s.doc().header()[0], "#", "New refused");
+
+        assert!(s.key(Event::command(CMD_OPEN)).is_none());
+        s.step(80, 24);
+        assert!(
+            screen(&s).contains("this grid stays on grid.csv"),
+            "{}",
+            screen(&s)
+        );
+        assert!(!screen(&s).contains("Open"), "no Open dialog");
+
+        assert!(s.key(Event::command(CMD_SAVE_AS)).is_none());
+        s.step(80, 24);
+        assert!(
+            screen(&s).contains("this grid stays on grid.csv"),
+            "{}",
+            screen(&s)
+        );
+        assert!(!screen(&s).contains("Save as"), "no Save As dialog");
+    }
+
+    #[test]
+    fn bridged_row_insert_leaves_the_hash_cell_empty_and_delete_still_works() {
+        let mut s = bridged_session();
+        assert!(press(&mut s, "insert").is_none());
+        assert_eq!(s.doc().height(), 3);
+        assert_eq!(s.doc().cell(0, 0), "", "new row's # cell is empty");
+
+        assert!(press(&mut s, "delete").is_none());
+        assert_eq!(s.doc().height(), 2);
+    }
+
+    #[test]
+    fn a_non_hash_doc_is_unaffected_by_bridged_mode() {
+        // Existing behavior: an ordinary doc allows column insert, rename
+        // and Save As without any refusal message.
+        let mut s = new_session();
+        assert!(press(&mut s, "ctrl-l").is_none());
+        assert_eq!(s.doc().width(), 4);
+        s.step(80, 24);
+        assert!(!screen(&s).contains("columns are fixed"), "{}", screen(&s));
     }
 
     #[test]
