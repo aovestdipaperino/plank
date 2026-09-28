@@ -5,11 +5,18 @@
   "author": "Enzo Lombardi",
   "profile": {
     "displayName": "ChatBGT",
+    "logo": "chatbgt.png",
     "accent": "#3fa9c5",
     "systemPrompt": "prompt.md",
     "folderContext": false,
     "agentsMd": false,
-    "tools": { "builtin": ["ask"] },
-    "grids": { "chatbgt": "dev.plank.csvedit" }
+    "tools": {
+      "builtin": [
+        "ask"
+      ]
+    },
+    "grids": {
+      "chatbgt": "dev.plank.csvedit"
+    }
   }
 }
