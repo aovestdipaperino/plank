@@ -307,6 +307,25 @@ is the last stage's. <code>mex generate … | tee gen.log</code> reports
 <code>tee</code>'s status, 0, so the cycle never starts; write
 <code>set -o pipefail; mex generate … | tee gen.log</code> to pass the
 75 through.</p>
+<p>The model does not have to wait for a refusal. When it knows a
+command needs the GPU, it can add <code>suspend_model="true"</code> to
+the <code>bash</code> call; plank's prompt tells it about the parameter,
+with the exact call form, whenever a local model is loaded. plank then
+prints <code>plank: suspending the model for this command</code>, saves
+the session and the KV cache, unloads the model, runs the command once
+to the end (the same waiting rules as a second run above), reloads the
+model and restores the cache. That run's result is what the model sees,
+and it is never repeated, even if the command still reports that the GPU
+is taken. It counts toward the limit of two per turn. When the parameter
+cannot apply, the command simply runs and its result ends with one line
+saying why:
+<code>suspend_model ignored: no local model to release</code> with a
+provider, a remote engine or no model to reload,
+<code>suspend_model ignored for background jobs</code> for a command
+that ends in <code>&amp;</code>, and
+<code>suspend_model ignored: limit of 2 per turn reached</code> past the
+limit. <code>1</code> and <code>yes</code> count as true too, in any
+case; any other value is ignored.</p>
 <p>This happens only when plank holds a local model; with a provider or
 a remote engine the first result is returned as it is. It applies to a
 command that finishes inside the <code>bash</code> call: a job still

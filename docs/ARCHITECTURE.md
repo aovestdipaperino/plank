@@ -382,6 +382,27 @@ between turns: one cycle each, outside the per-turn cap, skipped with a note
 if ever reached inside a sidechain. Background jobs, a local engine inside a
 fan-out slot and `plank serve` are not covered.
 
+The model can also ask before a command runs. `bash` accepts an extra
+`suspend_model` parameter (`tools::bash::suspend_model_requested`: `true`, `1`
+or `yes` in any case), which the trained bash schema deliberately does not
+declare, because that schema must stay byte-identical to the C. Both parsers
+already pass an unknown parameter through, so only plank's prompt changes: a
+short `# GPU commands` note (`sysprompt::GPU_SUSPEND_NOTE`) with the call form
+in the model's dialect goes after the working style, inside the trusted span
+on DSML (so V4.1 respells it with the rest), and only when `new_agent` holds a
+`ReopenFn`, so the Tier 1 fingerprint differs between a local and a provider
+launch but never within one. `Agent::dispatch_tool` routes such a call to
+`dispatch_suspended_bash`, which runs `gpuyield::run_suspended`: the same
+cycle body as `run_cycle` with its own notice and the `ToolRerun` as the
+command's only run, sandbox decided as usual. It counts against the per-turn
+cap and, since `ToolRerun` drops the `ForegroundExit`, a run that signals for
+the GPU anyway is returned, not cycled. With no releasable slot (Echo, a
+provider, a remote engine, a reload still owed), a command ending in a lone
+`&` (`backgrounds_itself`) or the cap reached, the call runs as any other and
+its result gets one line saying why the parameter was ignored. A stanza
+holding such a call goes call by call even when no cycle is armed, so the note
+is never lost to `dispatch_all`.
+
 ### Remote, hosted, and shared engines (`serve.rs`, `host.rs`, `remote/`)
 - `remote/provider.rs` — additional `Engine` impls for hosted providers
   (OpenAI-compatible and Anthropic Messages) over synchronous `ureq`+SSE.

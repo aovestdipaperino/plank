@@ -3197,6 +3197,21 @@ cycle looks for exactly one releasable engine. Each reopen also registers the
 C's `atexit(ds4_release_instance_lock)` again; the handler is idempotent, so the
 repeats are harmless.
 
+## `suspend_model` is deliberately missing from the trained bash schema
+
+**2026-09-28:** the `bash` tool's `suspend_model` parameter (unload the model
+before running a GPU-bound command) is not declared in the bash schema, on
+DSML or on Qwen. That schema line is part of the trained tools prompt, which
+`tests/c_parity.rs` holds byte-identical to the C, and a changed schema is a
+prompt the model was never trained on. Nothing needs the declaration: neither
+the DSML parser nor the Qwen parser checks parameter names against a schema,
+and `tool_bash` reads arguments by name, so an extra one passes through
+untouched. The parameter is taught instead by a plank-owned note
+(`sysprompt::GPU_SUSPEND_NOTE`) after the working style, with the call form
+in the model's own dialect, and only when plank holds a model it can reopen.
+Do not "fix" this by adding the property to the schema;
+`the_trained_bash_schema_never_declares_suspend_model` fails if you do.
+
 ## `ds4_engine_open` exits instead of failing, which a mid-session reload cannot catch
 
 **2026-09-28:** the C `model_open` calls `exit(1)` for a model, DSpark draft or
