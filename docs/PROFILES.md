@@ -103,11 +103,18 @@ quietly gained `bash` would not be).
 can render the tables that server returns, such as `dev.plank.csvedit` for
 the Turbo Vision CSV editor. It exists so a profile can opt a specific server
 into that handling without changing anything about servers it does not
-mention: only the pairs a manifest actually lists are routed, everything
-else behaves exactly as it does today. A malformed entry, a non-string
+mention: only the pairs a manifest actually lists are routed. A server's
+results are otherwise untouched, with one visible difference: a
+`plank-frame://` resource from a server the profile does not route is still
+taken out of the result, and the model sees a `grid not opened:` note in its
+place (`this profile does not route <server>'s grids`) rather than the item
+vanishing silently. A malformed entry, a non-string
 value, an empty key or an empty value, is dropped with a warning rather than
 routed, and the rest of the map is kept; a `grids` value that is not an
-object at all warns once and yields no routes. How plank actually turns a
+object at all warns once and yields no routes. A route is keyed by the MCP
+server's final name after every `.mcp.json` layer has merged, so a server of
+the same name configured in `./.mcp.json` or `~/.plank/.mcp.json` inherits the
+profile's route. How plank actually turns a
 tool result into a grid handed to the frame, and back, is described in
 [the Grid bridge section of WASM-PLUGINS.md](WASM-PLUGINS.md#grid-bridge).
 

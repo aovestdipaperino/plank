@@ -278,6 +278,20 @@ agent's own dispatcher already routes a leading `/` when it drains the queue, so
 a second parser in the page would only be a worse copy of it. `command` remains
 in the protocol and the terminal client still uses it.
 
+A queued `prompt` or `command` does not always run at the next idle tick. The
+TUI's idle loop asks `remote_lines_gate` (`src/ui.rs`) what the WASM frame on
+screen allows. With no frame up the lines run. An idle-rotation screensaver is
+treated as a local key would treat it: a queued line takes it down, resets the
+idle clock so the rotation does not put it straight back, and then runs. A frame
+someone asked for (a `/frame`, or a grid from the grid bridge) holds the lines
+in the queue until it closes, because a turn under an open frame could stage a
+grid over it or fight it for the screen. While they wait the remote is told so
+once, with a `dim` frame reading `waiting for the frame to close`
+(`remote_wait_notice_due`), so a prompt sent from elsewhere does not look lost;
+the notice repeats only after the frame has closed and another one holds lines
+again. There is no dedicated frame type for it, and no notice when the lines
+finally run: the `user_echo` of each line is that signal.
+
 ### 4.4 Session multiplexing and the coexistence policy
 
 **One controller, many mirrors.** Multiple clients may connect and all *see*

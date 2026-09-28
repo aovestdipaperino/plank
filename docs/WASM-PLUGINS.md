@@ -549,7 +549,11 @@ Whether a staging is honoured is decided by the host, and only for pairs the
 running profile declared. A profile's `grids` field maps an MCP server name to a
 component id (see [Grids in PROFILES.md](PROFILES.md#grids)), and
 `Session::stage_grid` honours a staging only when its server maps to exactly the
-component its URI names. A server cannot pick some other component by naming
+component its URI names. The server is identified by its final name once the
+MCP configs have merged (plugins, `~/.plank/.mcp.json`, `./.mcp.json`), not by
+where it was declared, so a same-named server in `./.mcp.json` or
+`~/.plank/.mcp.json` that replaces the one the profile expected inherits its
+route. A server cannot pick some other component by naming
 it, a component cannot ask for a server's grids, and without a profile nothing
 is routed at all. When the pair is declared, plank writes the CSV onto that
 component's RAM disk under the staged file name and queues the component's
@@ -565,7 +569,10 @@ must be loaded and not struck out, must have the `frame` surface, must not be a
 screensaver (one closes on any key, so no edit could be made in it, and the idle
 rotation could open it onto a grid nobody asked for), and must have been granted
 `fs`. A grid is never staged under a frame already on screen
-(`a grid is already open`). The write itself goes through the same `fs` quotas
+(`a grid is already open`), nor over a file already on the component's disk
+that is not the waiting grid's own (`<file> already exists on <component>'s
+disk`): the grid's file is removed when its frame closes, so staging over a CSV
+the user made in the component would first overwrite it and then delete it. The write itself goes through the same `fs` quotas
 as the component's own writes, so a grid over 4 MiB, or one that would push the
 disk past its file count or total, is refused with the quota's message and
 leaves the disk as it was. There is one grid at a time: a newer staging replaces
@@ -575,9 +582,13 @@ written, so a refused staging leaves the older grid in place.
 When the grid's frame closes, whether by the user quitting or by a trap,
 `Session::finish_grid` reads the file back from the RAM disk and removes it. An
 untouched file, or one the frame deleted, ends there. A changed one goes back:
-plank, not the model, calls the tool the server advertised in `writeBack` with
-`{"table", "grid", "csv"}`, through the same MCP path a model call takes, on a
-worker thread so a slow server never freezes the UI. The outcome leaves a dim
+plank, not the model, calls the tool the server named in `writeBack` with
+`{"table", "grid", "csv"}`, on a worker thread so a slow server never freezes
+the UI. The call is `mcp::call_tool_direct`: the same request path as a model
+call (a stopped server is restarted, an offline one reported as down) except
+that the tool need not appear in the server's `tools/list`. A server may hide
+its write-back tool so the model never sees or calls it; a model call to that
+name still gets `unknown mcp tool`. The outcome leaves a dim
 line in the scrollback and a `<system-reminder>` notice
 (`The user edited the <table> grid. ...`) that is queued and delivered ahead of
 the next prompt, so the model learns what the user changed before it answers
@@ -589,7 +600,9 @@ disk and an `arg` naming it, exactly as if the user had opened that file
 themselves.
 What it does with a bridged grid is its own business; csvedit keeps the
 columns and the file name fixed when the first header cell is `#` (see
-[the authoring guide](WASM-PLUGIN-AUTHORING.md#capabilities)).
+[the authoring guide](WASM-PLUGIN-AUTHORING.md#capabilities)), and asks before
+deleting a row, since a deleted row is deleted from the server's store when the
+grid closes.
 
 ## Glyph wire format
 
