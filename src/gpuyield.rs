@@ -66,6 +66,39 @@ pub fn output_file_needs_gpu(exit_status: i64, path: &Path) -> bool {
         .any(|line| line.starts_with(MARKER.as_bytes()))
 }
 
+/// Checks that every file a reopen will map is still a readable file, each
+/// named by its role (`model`, `DSpark draft model`, `vision encoder`).
+///
+/// The C `model_open` calls `exit` on a file it cannot open or map instead of
+/// returning an error, so a model deleted or moved while it was unloaded would
+/// end plank with no message. Checked on the Rust side first, the same case is
+/// an ordinary failed reopen: the placeholder stays and says which file.
+///
+/// # Errors
+/// Names the first file that is missing, unreadable or not a regular file.
+pub fn check_model_files<'p>(
+    files: impl IntoIterator<Item = (&'p str, &'p Path)>,
+) -> Result<(), String> {
+    for (role, path) in files {
+        let checked = std::fs::File::open(path)
+            .and_then(|f| f.metadata())
+            .and_then(|m| {
+                if m.is_file() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("not a regular file"))
+                }
+            });
+        if let Err(e) = checked {
+            return Err(format!(
+                "the {role} file {} cannot be read ({e})",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// How a foreground bash call's command ended, recorded by the bash tool when
 /// the command finished inside the call. A job still running when the call
 /// returned (a background job) leaves no record, so it never cycles.
@@ -320,6 +353,24 @@ mod tests {
         assert!(output_file_needs_gpu(75, &path));
         assert!(!output_file_needs_gpu(0, &path));
         assert!(!output_file_needs_gpu(75, &dir.join("missing")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_model_file_is_named() {
+        let dir = std::env::temp_dir().join(format!("plank-gpuyield-files-{}", nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("m.gguf");
+        std::fs::write(&model, b"GGUF").unwrap();
+        let mtp = dir.join("m.mtp.gguf");
+        assert!(check_model_files([("model", model.as_path())]).is_ok());
+        let err = check_model_files([("model", model.as_path()), ("DSpark draft model", &mtp)])
+            .unwrap_err();
+        assert!(err.contains("DSpark draft model"), "{err}");
+        assert!(err.contains("m.mtp.gguf"), "{err}");
+        // A directory where the file was is not a model either.
+        let err = check_model_files([("vision encoder", dir.as_path())]).unwrap_err();
+        assert!(err.contains("vision encoder"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

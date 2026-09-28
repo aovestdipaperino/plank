@@ -12,6 +12,7 @@
 
 use std::io::Read;
 use std::os::fd::{FromRawFd, RawFd};
+use std::path::Path;
 
 /// Guard that renders stderr lines in place until dropped.
 #[derive(Debug)]
@@ -128,52 +129,183 @@ fn render_lines(mut reader: std::fs::File, out: RawFd) {
     write_all(out, b"\r\x1b[K");
 }
 
-/// Serializes [`discarding`]. Its own lock, not [`CAPTURE_LOCK`]: a session
-/// created inside `f` takes that one through [`without_ds4_chatter`], and the
-/// same thread locking it twice would deadlock.
+/// Serializes [`discarding`] and [`logging_to`]. Its own lock, not
+/// [`CAPTURE_LOCK`]: a session created inside `f` takes that one through
+/// [`without_ds4_chatter`], and the same thread locking it twice would
+/// deadlock.
 static DISCARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Runs `f` with fd 2 pointed at `/dev/null`.
 ///
-/// For the C engine's teardown and reload in the middle of a session (the
-/// GPU-yield cycle): its load log is one row per line at startup, but here it
-/// would land on whatever the front end is drawing, the TUI's alternate
-/// screen included. Failures still reach the user through the `Result` the
-/// open returns, whose message is built on the Rust side.
+/// For the C engine's teardown in the middle of a session (the GPU-yield
+/// cycle): its log would land on whatever the front end is drawing, the
+/// TUI's alternate screen included. fd 2 comes back even when `f` panics.
 pub fn discarding<T>(f: impl FnOnce() -> T) -> T {
-    let Ok(_guard) = DISCARD_LOCK.lock() else {
+    redirected(None, f)
+}
+
+/// Runs `f` with fd 2 appended to the file at `log`, falling back to
+/// `/dev/null` when it cannot be opened.
+///
+/// For the C engine's reload in the middle of a session. The C `model_open`
+/// calls `exit` on a model it cannot map and on a contended instance lock, so
+/// while `f` runs an `atexit` hook stands ready: should the process end
+/// inside `f`, it hands fd 2 back, resets the terminal (a TUI would otherwise
+/// be left on the alternate screen in raw mode) and prints the last line of
+/// the log, so the user sees why plank stopped. Failures that return normally
+/// still reach the user through `f`'s own result.
+pub fn logging_to<T>(log: &Path, f: impl FnOnce() -> T) -> T {
+    redirected(Some(log), f)
+}
+
+/// Opens where [`redirected`] points fd 2: `log` for appending, else (or when
+/// that fails) `/dev/null`. Returns the fd and whether it is the log.
+fn open_sink(log: Option<&Path>) -> (RawFd, bool) {
+    use std::os::unix::ffi::OsStrExt as _;
+    if let Some(path) = log
+        && let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes())
+    {
+        // SAFETY: `c` is a valid NUL-terminated path.
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            return (fd, true);
+        }
+    }
+    // SAFETY: a constant NUL-terminated path.
+    (
+        unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) },
+        false,
+    )
+}
+
+/// Puts the real fd 2 back when dropped, panics included.
+struct Fd2Restore {
+    saved: RawFd,
+}
+
+impl Drop for Fd2Restore {
+    fn drop(&mut self) {
+        // Disarmed first: from here on an exit is not inside the reload.
+        EXIT_SAVED_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: `saved` is our dup of the real fd 2. Flush C stdio first so
+        // a buffered line cannot slip out after the fd comes back.
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+            libc::dup2(self.saved, libc::STDERR_FILENO);
+            libc::close(self.saved);
+        }
+    }
+}
+
+/// The real fd 2 while a [`logging_to`] redirect is live, `-1` otherwise.
+/// Read by [`report_exit_inside_redirect`].
+static EXIT_SAVED_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// The log a live [`logging_to`] redirect writes to.
+static EXIT_LOG: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+fn redirected<T>(log: Option<&Path>, f: impl FnOnce() -> T) -> T {
+    let Ok(_lock) = DISCARD_LOCK.lock() else {
         return f();
     };
-    // SAFETY: dup/open/dup2 on process-owned fds; every fd opened here is
-    // closed on every path.
+    let (sink, is_log) = open_sink(log);
+    // SAFETY: dup/dup2/close on process-owned fds; every fd opened here is
+    // closed on every path (`saved` by the guard).
     let saved = unsafe {
         let saved = libc::dup(libc::STDERR_FILENO);
-        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-        if saved < 0 || null < 0 || libc::dup2(null, libc::STDERR_FILENO) < 0 {
+        if saved < 0 || sink < 0 || libc::dup2(sink, libc::STDERR_FILENO) < 0 {
             if saved >= 0 {
                 libc::close(saved);
             }
-            if null >= 0 {
-                libc::close(null);
+            if sink >= 0 {
+                libc::close(sink);
             }
             None
         } else {
-            libc::close(null);
+            libc::close(sink);
             Some(saved)
         }
     };
     let Some(saved) = saved else {
         return f();
     };
-    let out = f();
-    // SAFETY: `saved` is our dup of the real fd 2. Flush C stdio first so a
-    // buffered line cannot slip out after the fd comes back.
+    let _restore = Fd2Restore { saved };
+    if is_log {
+        if let Ok(mut slot) = EXIT_LOG.lock() {
+            *slot = log.map(Path::to_path_buf);
+        }
+        arm_exit_report(saved);
+    }
+    f()
+}
+
+/// Registers [`report_exit_inside_redirect`] once and arms it for `saved`.
+fn arm_exit_report(saved: RawFd) {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        // SAFETY: registering a plain `extern "C"` function with no captures.
+        unsafe {
+            libc::atexit(report_exit_inside_redirect);
+        }
+    });
+    EXIT_SAVED_FD.store(saved, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Terminal modes the TUI turns on, turned off: keyboard enhancement flags,
+/// focus events, bracketed paste, mouse capture, the alternate screen, and
+/// a hidden cursor. Each is harmless on a terminal that never had it on.
+const TERMINAL_RESET: &str = "\x1b[<1u\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1015l\
+                              \x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h";
+
+/// What the exit hook prints: the last non-empty line of `log`, and where the
+/// rest is.
+#[must_use]
+fn exit_report(log: &Path) -> String {
+    use std::fmt::Write as _;
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let last = text.lines().rev().find(|l| !l.trim().is_empty());
+    let mut out = String::from(
+        "\r\nplank: the model engine ended the process while reloading the model \
+         after a GPU yield",
+    );
+    if let Some(line) = last {
+        out.push_str(": ");
+        out.push_str(line.trim());
+    }
+    let _ = write!(
+        out,
+        "\r\nplank: engine log: {}; /resume restores the session saved before the unload\r\n",
+        log.display()
+    );
+    out
+}
+
+/// The `atexit` hook behind [`logging_to`]. A no-op unless the process is
+/// exiting while a redirect is live, which only the C engine does.
+extern "C" fn report_exit_inside_redirect() {
+    let saved = EXIT_SAVED_FD.swap(-1, std::sync::atomic::Ordering::SeqCst);
+    if saved < 0 {
+        return;
+    }
+    let log = EXIT_LOG.try_lock().ok().and_then(|g| g.clone());
+    // SAFETY: plain writes and termios calls on process-owned fds at exit.
     unsafe {
         libc::fflush(std::ptr::null_mut());
         libc::dup2(saved, libc::STDERR_FILENO);
-        libc::close(saved);
+        if libc::isatty(libc::STDOUT_FILENO) != 0 {
+            write_all(libc::STDOUT_FILENO, TERMINAL_RESET.as_bytes());
+        }
     }
-    out
+    let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    if let Some(log) = log {
+        write_all(libc::STDERR_FILENO, exit_report(&log).as_bytes());
+    }
 }
 
 /// Known ds4 chatter: lines the C library prints on every session creation
@@ -284,5 +416,48 @@ mod tests {
         // Restored: the harness's own stderr still works afterwards, which is
         // the failure this would otherwise cause everywhere at once.
         eprint!("");
+    }
+
+    #[test]
+    fn the_exit_report_names_the_last_log_line_and_the_log() {
+        let dir = std::env::temp_dir().join(format!("plank-stderrline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("gpu-yield.log");
+        std::fs::write(&log, "ds4: loading\nds4: failed to mmap model.gguf\n\n").unwrap();
+        let report = exit_report(&log);
+        assert!(report.contains("failed to mmap model.gguf"), "{report}");
+        assert!(report.contains(&log.display().to_string()), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_redirect_writes_to_its_log_and_restores_fd_2_after_a_panic() {
+        let dir = std::env::temp_dir().join(format!("plank-stderrline-p-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("gpu-yield.log");
+        let caught = std::panic::catch_unwind(|| {
+            logging_to(&log, || {
+                // Straight to fd 2, the way the C engine writes.
+                write_all(libc::STDERR_FILENO, b"ds4: reload line\n");
+                panic!("inside the redirect");
+            })
+        });
+        assert!(caught.is_err());
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("ds4: reload line")
+        );
+        assert_eq!(
+            EXIT_SAVED_FD.load(std::sync::atomic::Ordering::SeqCst),
+            -1,
+            "the exit hook is disarmed"
+        );
+        // fd 2 is the real one again: a write lands nowhere near the log.
+        write_all(libc::STDERR_FILENO, b"");
+        let after = std::fs::read_to_string(&log).unwrap();
+        discarding(|| write_all(libc::STDERR_FILENO, b"ds4: discarded\n"));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), after);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

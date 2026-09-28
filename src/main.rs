@@ -1147,9 +1147,19 @@ fn make_local_engine(
         let ctx_size = cfg.generation.ctx_size;
         let (n_threads, power) = (cfg.n_threads, cfg.power_percent);
         let reopen: plank::gpuyield::ReopenFn = Box::new(move || {
-            // Probe first: a contended lock inside `ds4_engine_open` is an
-            // `exit(2)`, not an error, and another plank may have started
-            // while this one had the model unloaded.
+            // Everything the C would `exit` on, checked here first so it is an
+            // error instead: a file gone or unreadable since startup is an
+            // `exit(1)` inside `model_open`, and a contended lock inside
+            // `ds4_engine_open` is an `exit(2)` (another plank may have
+            // started while this one had the model unloaded).
+            let mut files = vec![("model", reopen_path.as_path())];
+            if let Some(p) = &opened_with.mtp_path {
+                files.push(("DSpark draft model", p.as_path()));
+            }
+            if let Some(p) = &opened_with.vision_path {
+                files.push(("vision encoder", p.as_path()));
+            }
+            plank::gpuyield::check_model_files(files)?;
             acquire_model_lock()?;
             Ds4Engine::open(
                 &reopen_path,

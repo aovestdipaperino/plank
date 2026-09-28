@@ -2541,13 +2541,22 @@ struct Agent<'a> {
     /// every dispatch.
     local_alt_warmed: bool,
     /// Parent engines set aside while an alternate engine's sidechain runs,
-    /// innermost last ([`Agent::run_sidechain_on`]). Held here rather than on
-    /// that function's stack so the GPU-yield cycle can reach a local parent
-    /// engine from inside a provider sub-agent's tool call.
-    parked_engines: Vec<Box<dyn Engine>>,
+    /// innermost last ([`Agent::run_sidechain_on`]), each with the transcript
+    /// prefix stashed beside it. Held here rather than on that function's
+    /// stack so the GPU-yield cycle can reach a local parent engine from
+    /// inside a provider sub-agent's tool call, and can save the whole
+    /// conversation before it unloads the model.
+    parked_engines: Vec<ParkedParent>,
     /// The GPU-yield cycle's reopen factory and any reopen still owed
     /// (`gpuyield`).
     gpu_yield: GpuYield,
+}
+
+/// A parent set aside by [`Agent::run_sidechain_on`]: its engine and the
+/// transcript prefix hidden from the sidechain.
+struct ParkedParent {
+    engine: Box<dyn Engine>,
+    transcript: Vec<Message>,
 }
 
 /// What the placeholder engine answers after a failed reopen.
@@ -2587,13 +2596,21 @@ impl crate::gpuyield::CycleHost for AgentCycle<'_, '_> {
     }
 
     fn release(&mut self) {
+        // Saved first: should the reload end the process inside the C,
+        // `/resume` still has the conversation up to this call.
+        self.agent.gpu_persist_session();
         let old = self
             .agent
             .gpu_placeholder(&self.slot, GPU_UNLOADED_FOR_RERUN.to_owned());
         // The last `Arc` to the model goes here, and with it the Metal state
         // and the instance lock (`ds4_engine_close`). Its teardown log would
-        // land on the front end's screen.
-        crate::stderrline::discarding(move || drop(old));
+        // land on the front end's screen, so it goes to this cycle's log,
+        // started afresh here.
+        let log = self.agent.gpu_yield.log.clone();
+        if let Some(path) = &log {
+            let _ = std::fs::remove_file(path);
+        }
+        with_engine_stderr(log.as_deref(), move || drop(old));
     }
 
     fn rerun(&mut self) -> String {
@@ -2636,6 +2653,16 @@ impl crate::gpuyield::CycleHost for AgentCycle<'_, '_> {
     }
 }
 
+/// Runs `f` (the C engine's teardown or reload) with fd 2 appended to `log`,
+/// or discarded when there is none, so its output never reaches the front
+/// end's screen (`stderrline::logging_to`).
+fn with_engine_stderr<T>(log: Option<&std::path::Path>, f: impl FnOnce() -> T) -> T {
+    match log {
+        Some(path) => crate::stderrline::logging_to(path, f),
+        None => crate::stderrline::discarding(f),
+    }
+}
+
 /// Which engine slot holds the local model, for the GPU-yield cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EngineSlot {
@@ -2658,12 +2685,19 @@ struct GpuYield {
     pending: Option<(EngineSlot, Option<crate::gpuyield::Snapshot>)>,
     /// Where snapshots are written; the system temp directory when `None`.
     snapshot_dir: Option<std::path::PathBuf>,
+    /// Where the C engine's stderr goes during a teardown and reload
+    /// (`~/.plank/gpu-yield.log`); discarded when `None`.
+    log: Option<std::path::PathBuf>,
 }
 
 impl GpuYield {
     fn new(reopen: Option<crate::gpuyield::ReopenFn>) -> Self {
+        let log = reopen
+            .is_some()
+            .then(|| crate::home::plank_home().join("gpu-yield.log"));
         Self {
             reopen,
+            log,
             ..Self::default()
         }
     }
@@ -3895,7 +3929,11 @@ impl Agent<'_> {
         if self.engine.can_release_gpu() {
             return Some(EngineSlot::Main);
         }
-        if let Some(i) = self.parked_engines.iter().position(|e| e.can_release_gpu()) {
+        if let Some(i) = self
+            .parked_engines
+            .iter()
+            .position(|p| p.engine.can_release_gpu())
+        {
             return Some(EngineSlot::Parked(i));
         }
         self.alt_engines
@@ -3907,7 +3945,7 @@ impl Agent<'_> {
     fn slot_mut(&mut self, slot: &EngineSlot) -> Option<&mut Box<dyn Engine>> {
         match slot {
             EngineSlot::Main => Some(&mut self.engine),
-            EngineSlot::Parked(i) => self.parked_engines.get_mut(*i),
+            EngineSlot::Parked(i) => self.parked_engines.get_mut(*i).map(|p| &mut p.engine),
             EngineSlot::Alt(key) => self.alt_engines.get_mut(key),
         }
     }
@@ -3920,6 +3958,42 @@ impl Agent<'_> {
             self.tool_ctx.publish_status(text);
         } else {
             eprintln!("{text}");
+        }
+    }
+
+    /// The conversation as the parent sees it, for a save taken from inside
+    /// a tool call: the transcript prefixes parked by
+    /// [`run_sidechain_on`](Self::run_sidechain_on), outermost first, then the
+    /// live transcript, cut back to the outermost sub-agent fork so no
+    /// sidechain turn is saved as if it were the user's.
+    fn parent_transcript(&self) -> Vec<Message> {
+        let mut full: Vec<Message> = self
+            .parked_engines
+            .iter()
+            .flat_map(|p| p.transcript.iter().cloned())
+            .chain(self.session.transcript.iter().cloned())
+            .collect();
+        if let Some(&at) = self.fork_points.first() {
+            full.truncate(at);
+        }
+        full
+    }
+
+    /// Saves the session through the normal save path before a GPU-yield
+    /// cycle unloads the model: the reload runs C code that can end the
+    /// process, and `/resume` is then the way back. Best-effort; the session
+    /// stays dirty, so the exit save still writes what comes after.
+    fn gpu_persist_session(&mut self) {
+        if !self.session.dirty {
+            return;
+        }
+        let parent = self.parent_transcript();
+        let live = std::mem::replace(&mut self.session.transcript, parent);
+        let saved = self.save_session();
+        self.session.transcript = live;
+        self.session.dirty = true;
+        if let Err(e) = saved {
+            crate::engine::kv_debug(|| format!("gpu yield: session not saved before unload: {e}"));
         }
     }
 
@@ -3940,7 +4014,7 @@ impl Agent<'_> {
             .reopen
             .as_mut()
             .ok_or_else(|| "no way to reopen the model".to_owned())?;
-        let mut engine = crate::stderrline::discarding(reopen)?;
+        let mut engine = with_engine_stderr(self.gpu_yield.log.as_deref(), reopen)?;
         engine.set_trusted_system_prefix(self.trusted_system_len);
         engine.set_think_mode(self.think);
         let current = self
@@ -11090,11 +11164,6 @@ the original is frozen and listed in /tree"
         run: impl FnOnce(&mut Self) -> T,
     ) -> T {
         let parent_engine = std::mem::replace(&mut self.engine, engine);
-        // Parked on the agent, not on this stack frame, so a GPU-yield cycle
-        // inside `run` can unload a local parent too. Popped below with no
-        // `?` in between, exactly as the swap itself.
-        self.parked_engines.push(parent_engine);
-        let parked = self.parked_engines.len();
         // The framed task is the last message; keep it, hide everything before.
         // `extract_state.processed_depth` is left alone across the stash: the
         // fork opened by the caller keeps `in_sidechain()` true for the whole
@@ -11106,6 +11175,15 @@ the original is frozen and listed in /tree"
             self.session.transcript = task.into_iter().collect();
             prefix
         };
+        // Parked on the agent, not on this stack frame, so a GPU-yield cycle
+        // inside `run` can unload a local parent too, and save the stashed
+        // prefix with the rest. Popped below with no `?` in between, exactly
+        // as the swap itself.
+        self.parked_engines.push(ParkedParent {
+            engine: parent_engine,
+            transcript: stashed,
+        });
+        let parked = self.parked_engines.len();
         self.alt_engine_depth += 1;
         let result = run(self);
         self.alt_engine_depth -= 1;
@@ -11113,7 +11191,10 @@ the original is frozen and listed in /tree"
         // leaked swap would leave the whole session pointed at the wrong engine,
         // which is the worst failure this design can produce.
         debug_assert_eq!(self.parked_engines.len(), parked, "parked stack unbalanced");
-        let parent_engine = self
+        let ParkedParent {
+            engine: parent_engine,
+            transcript: stashed,
+        } = self
             .parked_engines
             .pop()
             .expect("the parent engine parked above");
@@ -35893,6 +35974,7 @@ or the user's next message aborts before its first token"
             reopen: Some(reopen),
             pending: None,
             snapshot_dir: Some(dir.to_path_buf()),
+            log: Some(dir.join("gpu-yield.log")),
         };
     }
 
@@ -36230,12 +36312,16 @@ or the user's next message aborts before its first token"
             }),
         );
 
+        agent.session.push(Message::user("keep this conversation"));
         let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_command(&counter, false))]);
         assert!(out.contains("second-run-ok"), "{out}");
         assert!(
             !agent.engine.can_release_gpu(),
             "a placeholder holds the slot"
         );
+        let saved = std::fs::read_to_string(agent.store.path_for_id(&agent.session.id))
+            .expect("saved before the unload");
+        assert!(saved.contains("keep this conversation"), "{saved}");
         assert!(agent.gpu_yield.pending.is_some());
         assert!(
             !agent.gpu_yield_armed(),
@@ -36285,6 +36371,7 @@ or the user's next message aborts before its first token"
                 Ok(GpuEngine::new("main2", &l, &c, &[]))
             }),
         );
+        agent.session.push(Message::user("the parent's question"));
         agent.session.push(Message::user("task"));
         let call = gpu_bash_call(&gpu_command(&counter, false));
         let out = agent.run_sidechain_on(
@@ -36299,6 +36386,10 @@ or the user's next message aborts before its first token"
             "the reopened parent is main again"
         );
         assert!(logged(&log).contains(&"restore:main2:[4, 2]".to_owned()));
+        // Saved before the unload with the stashed prefix, not the
+        // sidechain's one-message view.
+        let saved = std::fs::read_to_string(agent.store.path_for_id(&agent.session.id)).unwrap();
+        assert!(saved.contains("the parent's question"), "{saved}");
         drop(agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
