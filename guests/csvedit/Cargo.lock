@@ -792,6 +792,7 @@ dependencies = [
 [[package]]
 name = "turbo-vision"
 version = "3.0.1"
+source = "git+https://github.com/aovestdipaperino/turbo-vision-4-rust?rev=d6610fd56b1fa60c4f160a19fa37504ee309b137#d6610fd56b1fa60c4f160a19fa37504ee309b137"
 dependencies = [
  "base64",
  "chrono",
