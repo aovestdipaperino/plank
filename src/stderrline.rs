@@ -211,9 +211,11 @@ static EXIT_SAVED_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI3
 static EXIT_LOG: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
 fn redirected<T>(log: Option<&Path>, f: impl FnOnce() -> T) -> T {
-    let Ok(_lock) = DISCARD_LOCK.lock() else {
-        return f();
-    };
+    // A panic inside an earlier `f` poisons the lock, but the drop guard put
+    // fd 2 back and the lock guards no data, so it is safe to go on using.
+    let _lock = DISCARD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (sink, is_log) = open_sink(log);
     // SAFETY: dup/dup2/close on process-owned fds; every fd opened here is
     // closed on every path (`saved` by the guard).
@@ -448,11 +450,17 @@ mod tests {
                 .unwrap()
                 .contains("ds4: reload line")
         );
-        assert_eq!(
-            EXIT_SAVED_FD.load(std::sync::atomic::Ordering::SeqCst),
-            -1,
-            "the exit hook is disarmed"
-        );
+        {
+            // Under the lock: another test's redirect arms the hook too.
+            let _held = DISCARD_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                EXIT_SAVED_FD.load(std::sync::atomic::Ordering::SeqCst),
+                -1,
+                "the exit hook is disarmed"
+            );
+        }
         // fd 2 is the real one again: a write lands nowhere near the log.
         write_all(libc::STDERR_FILENO, b"");
         let after = std::fs::read_to_string(&log).unwrap();
