@@ -1473,6 +1473,10 @@ fn arcade_command(line: &str) -> Option<&'static str> {
 /// no path can forget a mode. Idempotent: every write is best-effort and a
 /// mode already off stays off.
 fn restore_terminal() {
+    // First: an exit racing this teardown should see the TUI as already gone
+    // rather than write a reset sequence over a screen this call is in the
+    // middle of un-drawing.
+    crate::stderrline::set_tui_active(false);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         PopKeyboardEnhancementFlags,
@@ -2610,7 +2614,13 @@ impl crate::gpuyield::CycleHost for AgentCycle<'_, '_> {
         if let Some(path) = &log {
             let _ = std::fs::remove_file(path);
         }
-        with_engine_stderr(log.as_deref(), move || drop(old));
+        with_engine_stderr(
+            log.as_deref(),
+            crate::stderrline::Phase::Release,
+            move || {
+                drop(old);
+            },
+        );
     }
 
     fn rerun(&mut self) -> String {
@@ -2656,9 +2666,13 @@ impl crate::gpuyield::CycleHost for AgentCycle<'_, '_> {
 /// Runs `f` (the C engine's teardown or reload) with fd 2 appended to `log`,
 /// or discarded when there is none, so its output never reaches the front
 /// end's screen (`stderrline::logging_to`).
-fn with_engine_stderr<T>(log: Option<&std::path::Path>, f: impl FnOnce() -> T) -> T {
+fn with_engine_stderr<T>(
+    log: Option<&std::path::Path>,
+    phase: crate::stderrline::Phase,
+    f: impl FnOnce() -> T,
+) -> T {
     match log {
-        Some(path) => crate::stderrline::logging_to(path, f),
+        Some(path) => crate::stderrline::logging_to(path, phase, f),
         None => crate::stderrline::discarding(f),
     }
 }
@@ -4023,6 +4037,13 @@ impl Agent<'_> {
     /// stays dirty, so the exit save still writes what comes after.
     fn gpu_persist_session(&mut self) {
         if !self.session.dirty {
+            // Nothing changed since the last save, so whatever is on disk
+            // under this id (if any) already covers the conversation.
+            crate::stderrline::set_exit_resume(if self.session.id.is_empty() {
+                None
+            } else {
+                Some(self.session.id.clone())
+            });
             return;
         }
         let parent = self.parent_transcript();
@@ -4030,8 +4051,14 @@ impl Agent<'_> {
         let saved = self.save_session();
         self.session.transcript = live;
         self.session.dirty = true;
-        if let Err(e) = saved {
-            crate::engine::kv_debug(|| format!("gpu yield: session not saved before unload: {e}"));
+        match saved {
+            Ok(id) => crate::stderrline::set_exit_resume(Some(id)),
+            Err(e) => {
+                crate::engine::kv_debug(|| {
+                    format!("gpu yield: session not saved before unload: {e}")
+                });
+                crate::stderrline::set_exit_resume(None);
+            }
         }
     }
 
@@ -4052,7 +4079,11 @@ impl Agent<'_> {
             .reopen
             .as_mut()
             .ok_or_else(|| "no way to reopen the model".to_owned())?;
-        let mut engine = with_engine_stderr(self.gpu_yield.log.as_deref(), reopen)?;
+        let mut engine = with_engine_stderr(
+            self.gpu_yield.log.as_deref(),
+            crate::stderrline::Phase::Reload,
+            reopen,
+        )?;
         engine.set_trusted_system_prefix(self.trusted_system_len);
         engine.set_think_mode(self.think);
         let current = self
@@ -12236,6 +12267,11 @@ impl Agent<'_> {
             self.ui_remote = Some(Arc::new(Mutex::new(UiRemote::new(handle))));
         }
         let mut terminal = ratatui::init();
+        // Gates the exit hook's terminal-reset write (`stderrline`): only
+        // while the TUI actually owns the alternate screen and raw mode.
+        // Cleared in `restore_terminal`, the one teardown every exit path
+        // (clean, force quit, panic) runs through.
+        crate::stderrline::set_tui_active(true);
         // `ratatui::init` installs a panic hook that only leaves the alternate
         // screen and raw mode. Chain the full teardown in front of it, so a
         // panic does not leave the shell reading `ESC[<35;x;yM` mouse-motion
@@ -18581,6 +18617,10 @@ const EXIT_CONFIRM_TEXT: &str =
 /// and with the stream idle timeout in [`crate::remote`] it should never be
 /// reached in the network-drop case that motivated it.
 fn force_quit() -> ! {
+    // A force quit is a deliberate exit, not the C engine dying mid-redirect;
+    // disarm first so a GPU-yield cycle in flight cannot print a false
+    // "ended the process while reloading" report over this one.
+    crate::stderrline::disarm_exit_report();
     restore_terminal();
     // No destructor here can run (see above), so the mirror gets its farewell
     // explicitly or not at all — and this is the exit where a console left

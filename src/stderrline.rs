@@ -141,7 +141,28 @@ static DISCARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// cycle): its log would land on whatever the front end is drawing, the
 /// TUI's alternate screen included. fd 2 comes back even when `f` panics.
 pub fn discarding<T>(f: impl FnOnce() -> T) -> T {
-    redirected(None, f)
+    // The phase is never recorded: with no log, `redirected` never arms the
+    // exit hook, so this value is not read.
+    redirected(None, Phase::Release, f)
+}
+
+/// Which side of a GPU-yield cycle a [`logging_to`] redirect covers, printed
+/// in the exit report so a crash during teardown is not blamed on "reloading".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Tearing the old engine down (`ds4_engine_close`).
+    Release,
+    /// Bringing the engine back up after the yield.
+    Reload,
+}
+
+impl Phase {
+    fn verb(self) -> &'static str {
+        match self {
+            Phase::Release => "releasing",
+            Phase::Reload => "reloading",
+        }
+    }
 }
 
 /// Runs `f` with fd 2 appended to the file at `log`, falling back to
@@ -154,8 +175,8 @@ pub fn discarding<T>(f: impl FnOnce() -> T) -> T {
 /// be left on the alternate screen in raw mode) and prints the last line of
 /// the log, so the user sees why plank stopped. Failures that return normally
 /// still reach the user through `f`'s own result.
-pub fn logging_to<T>(log: &Path, f: impl FnOnce() -> T) -> T {
-    redirected(Some(log), f)
+pub fn logging_to<T>(log: &Path, phase: Phase, f: impl FnOnce() -> T) -> T {
+    redirected(Some(log), phase, f)
 }
 
 /// Opens where [`redirected`] points fd 2: `log` for appending, else (or when
@@ -207,10 +228,51 @@ impl Drop for Fd2Restore {
 /// Read by [`report_exit_inside_redirect`].
 static EXIT_SAVED_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-/// The log a live [`logging_to`] redirect writes to.
+/// The log a live [`logging_to`] redirect writes to; `None` both before a
+/// redirect and when the log could not be opened (rule 5: the hook still
+/// arms and reports, just without a last-line quote).
 static EXIT_LOG: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
-fn redirected<T>(log: Option<&Path>, f: impl FnOnce() -> T) -> T {
+/// The [`Phase`] of the live [`logging_to`] redirect, encoded as `0` for
+/// [`Phase::Release`] and `1` for [`Phase::Reload`].
+static EXIT_PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The session id to name in `/resume`, or `None` when nothing has been
+/// saved. Set by [`set_exit_resume`], read (via `try_lock`, never blocking)
+/// by [`report_exit_inside_redirect`].
+static EXIT_RESUME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Whether the TUI currently owns the terminal (alternate screen, raw mode).
+/// Set by the TUI front end on entry and cleared on exit; the exit hook only
+/// writes the terminal-reset sequence while this is `true`, so a plain-REPL
+/// crash does not paint alt-screen/mouse-mode escapes into a scrolling shell
+/// that never turned them on.
+static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks whether the TUI currently owns the terminal. See [`TUI_ACTIVE`].
+pub fn set_tui_active(active: bool) {
+    TUI_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Disarms the exit-report hook: a `process::exit` right after this call is
+/// a deliberate plank exit, not the C engine dying mid-redirect, so no
+/// misleading "ended the process while reloading" report should print.
+pub fn disarm_exit_report() {
+    EXIT_SAVED_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Records what `/resume` should say: the id of the session saved before a
+/// GPU-yield unload, or `None` when nothing was saved (rule 2). Uses a
+/// blocking lock, poison recovered, because this always runs outside the
+/// exit hook; the hook itself only ever `try_lock`s.
+pub fn set_exit_resume(id: Option<String>) {
+    let mut slot = EXIT_RESUME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = id;
+}
+
+fn redirected<T>(log: Option<&Path>, phase: Phase, f: impl FnOnce() -> T) -> T {
     // A panic inside an earlier `f` poisons the lock, but the drop guard put
     // fd 2 back and the lock guards no data, so it is safe to go on using.
     let _lock = DISCARD_LOCK
@@ -238,10 +300,21 @@ fn redirected<T>(log: Option<&Path>, f: impl FnOnce() -> T) -> T {
         return f();
     };
     let _restore = Fd2Restore { saved };
-    if is_log {
+    // Arm whenever the caller asked to log at all (`log.is_some()`), even if
+    // the file itself could not be opened: an exit is exactly as real either
+    // way, only the last-line quote is unavailable (rule 5).
+    if log.is_some() {
         if let Ok(mut slot) = EXIT_LOG.lock() {
-            *slot = log.map(Path::to_path_buf);
+            *slot = if is_log {
+                log.map(Path::to_path_buf)
+            } else {
+                None
+            };
         }
+        EXIT_PHASE.store(
+            u8::from(matches!(phase, Phase::Reload)),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         arm_exit_report(saved);
     }
     f()
@@ -265,26 +338,41 @@ fn arm_exit_report(saved: RawFd) {
 const TERMINAL_RESET: &str = "\x1b[<1u\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1015l\
                               \x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h";
 
-/// What the exit hook prints: the last non-empty line of `log`, and where the
-/// rest is.
+/// What the exit hook prints: the phase, the last non-empty line of `log`
+/// when there is one, and the `/resume` hint when `resume` names a saved
+/// session.
 #[must_use]
-fn exit_report(log: &Path) -> String {
+fn exit_report(log: Option<&Path>, phase: Phase, resume: Option<&str>) -> String {
     use std::fmt::Write as _;
-    let text = std::fs::read_to_string(log).unwrap_or_default();
-    let last = text.lines().rev().find(|l| !l.trim().is_empty());
-    let mut out = String::from(
-        "\r\nplank: the model engine ended the process while reloading the model \
-         after a GPU yield",
+    let mut out = format!(
+        "\r\nplank: the model engine ended the process while {} the model after a GPU yield",
+        phase.verb()
     );
-    if let Some(line) = last {
-        out.push_str(": ");
-        out.push_str(line.trim());
+    match log {
+        Some(log) => {
+            let text = std::fs::read_to_string(log).unwrap_or_default();
+            let last = text.lines().rev().find(|l| !l.trim().is_empty());
+            if let Some(line) = last {
+                out.push_str(": ");
+                out.push_str(line.trim());
+            }
+            let _ = write!(out, "\r\nplank: engine log: {}", log.display());
+        }
+        None => out.push('.'),
     }
-    let _ = write!(
-        out,
-        "\r\nplank: engine log: {}; /resume restores the session saved before the unload\r\n",
-        log.display()
-    );
+    match resume {
+        Some(id) => {
+            let _ = write!(
+                out,
+                "\r\nplank: run plank again and /resume {id} to restore the session saved \
+                 before the unload\r\n"
+            );
+        }
+        None => out.push_str(
+            "\r\nplank: the session could not be saved before the unload; /resume is not \
+             available\r\n",
+        ),
+    }
     out
 }
 
@@ -296,18 +384,28 @@ extern "C" fn report_exit_inside_redirect() {
         return;
     }
     let log = EXIT_LOG.try_lock().ok().and_then(|g| g.clone());
+    let resume = EXIT_RESUME.try_lock().ok().and_then(|g| g.clone());
+    let phase = if EXIT_PHASE.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+        Phase::Reload
+    } else {
+        Phase::Release
+    };
+    let tui_active = TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst);
     // SAFETY: plain writes and termios calls on process-owned fds at exit.
     unsafe {
         libc::fflush(std::ptr::null_mut());
         libc::dup2(saved, libc::STDERR_FILENO);
-        if libc::isatty(libc::STDOUT_FILENO) != 0 {
+        if tui_active && libc::isatty(libc::STDOUT_FILENO) != 0 {
             write_all(libc::STDOUT_FILENO, TERMINAL_RESET.as_bytes());
         }
     }
-    let _ = ratatui::crossterm::terminal::disable_raw_mode();
-    if let Some(log) = log {
-        write_all(libc::STDERR_FILENO, exit_report(&log).as_bytes());
+    if tui_active {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
     }
+    write_all(
+        libc::STDERR_FILENO,
+        exit_report(log.as_deref(), phase, resume.as_deref()).as_bytes(),
+    );
 }
 
 /// Known ds4 chatter: lines the C library prints on every session creation
@@ -426,10 +524,36 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("gpu-yield.log");
         std::fs::write(&log, "ds4: loading\nds4: failed to mmap model.gguf\n\n").unwrap();
-        let report = exit_report(&log);
+        let report = exit_report(Some(&log), Phase::Reload, Some("brave-hopper"));
         assert!(report.contains("failed to mmap model.gguf"), "{report}");
         assert!(report.contains(&log.display().to_string()), "{report}");
+        assert!(report.contains("reloading"), "{report}");
+        assert!(report.contains("/resume brave-hopper"), "{report}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_exit_report_names_the_phase() {
+        let report = exit_report(None, Phase::Release, Some("brave-hopper"));
+        assert!(report.contains("releasing"), "{report}");
+        assert!(!report.contains("reloading"), "{report}");
+    }
+
+    #[test]
+    fn the_exit_report_says_so_when_nothing_was_saved() {
+        let report = exit_report(None, Phase::Reload, None);
+        assert!(
+            report.contains("could not be saved"),
+            "{report}: expected the unsaved wording"
+        );
+        assert!(!report.contains("run plank again and /resume"), "{report}");
+    }
+
+    #[test]
+    fn the_exit_report_has_no_log_line_when_there_is_no_log() {
+        let report = exit_report(None, Phase::Reload, Some("brave-hopper"));
+        assert!(!report.contains("engine log:"), "{report}");
+        assert!(report.contains("/resume brave-hopper"), "{report}");
     }
 
     #[test]
@@ -438,7 +562,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("gpu-yield.log");
         let caught = std::panic::catch_unwind(|| {
-            logging_to(&log, || {
+            logging_to(&log, Phase::Reload, || {
                 // Straight to fd 2, the way the C engine writes.
                 write_all(libc::STDERR_FILENO, b"ds4: reload line\n");
                 panic!("inside the redirect");
@@ -467,5 +591,79 @@ mod tests {
         discarding(|| write_all(libc::STDERR_FILENO, b"ds4: discarded\n"));
         assert_eq!(std::fs::read_to_string(&log).unwrap(), after);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disarm_exit_report_clears_the_armed_fd() {
+        let dir = std::env::temp_dir().join(format!("plank-stderrline-d-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("gpu-yield.log");
+        logging_to(&log, Phase::Release, || {
+            assert_ne!(
+                EXIT_SAVED_FD.load(std::sync::atomic::Ordering::SeqCst),
+                -1,
+                "armed while the redirect is live"
+            );
+            disarm_exit_report();
+            assert_eq!(
+                EXIT_SAVED_FD.load(std::sync::atomic::Ordering::SeqCst),
+                -1,
+                "disarmed by a deliberate exit such as force_quit"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_that_fails_to_open_still_arms_the_hook() {
+        // A directory can't be opened O_WRONLY|O_CREAT, so `open_sink` falls
+        // back to `/dev/null`; the hook must arm anyway (rule 5).
+        let dir =
+            std::env::temp_dir().join(format!("plank-stderrline-noopen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        logging_to(&dir, Phase::Release, || {
+            assert_ne!(
+                EXIT_SAVED_FD.load(std::sync::atomic::Ordering::SeqCst),
+                -1,
+                "armed even though the log could not be opened"
+            );
+            let recorded = EXIT_LOG
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            assert_eq!(recorded, None, "nothing to quote a last line from");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_exit_resume_round_trips() {
+        set_exit_resume(Some("calm-otter".to_owned()));
+        assert_eq!(
+            EXIT_RESUME
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            Some("calm-otter".to_owned())
+        );
+        set_exit_resume(None);
+        assert_eq!(
+            EXIT_RESUME
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            None
+        );
+    }
+
+    #[test]
+    fn tui_active_flag_round_trips() {
+        // Gates the reset sequence in `report_exit_inside_redirect`: only
+        // checkable here as a plain get/set, since the write itself only
+        // happens from the real `atexit` hook.
+        set_tui_active(true);
+        assert!(TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst));
+        set_tui_active(false);
+        assert!(!TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
