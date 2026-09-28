@@ -3179,3 +3179,20 @@ with a scratch root, and a process launch goes through an injected spawner
 (`downloader::spawn_detached_in`), because a test binary run as a detached
 `--model-downloader` against the real home is exactly what this fallback turns
 a test into.
+
+## The model lock is the C engine's, and closing the engine is what releases it
+
+**2026-09-28:** `/tmp/ds4.lock` (`$DS4_LOCK_FILE`) is not held by plank.
+`acquire_model_lock` in `main.rs` only probes it and lets go; the C engine takes
+it inside `ds4_engine_open` (`ds4_acquire_instance_lock`, an `flock` on its own
+descriptor) and drops it in `ds4_engine_close` (`ds4_release_instance_lock`).
+So the GPU-yield cycle frees the lock by dropping the last `Arc<Ds4Model>`,
+not by any plank-side unlock. Two consequences worth knowing. A contended lock
+inside `ds4_engine_open` is `exit(2)`, not an error return, so a mid-session
+reopen must probe first or a second plank started while the model was out would
+kill this one; the probe narrows that window without closing it. And the flock
+is per open file description, so a second in-process open would contend with
+the first and exit too: there can only ever be one `Ds4Model`, which is why the
+cycle looks for exactly one releasable engine. Each reopen also registers the
+C's `atexit(ds4_release_instance_lock)` again; the handler is idempotent, so the
+repeats are harmless.

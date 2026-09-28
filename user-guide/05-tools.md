@@ -36,6 +36,14 @@ Bash commands are **tracked jobs**, not blocking one-shot calls: each owns a pro
 
 Every job runs in its own process group, and so do the commands you type with `!`. Stopping a job or hitting its timeout kills the whole tree, so a `sleep 600; echo ok` or a `cmd | tee` pipeline cannot outlive plank. A job that ran past its timeout is reaped by whatever tool call comes next, not only when the model polls it. Interrupting a running command (Ctrl-C in the REPL, Esc in the TUI) kills its group and reports exit status 143.
 
+#### Commands that need the GPU
+
+A local model holds the Mac's GPU for as long as plank runs, so a command that wants the GPU for itself, such as `mex` generating an image with a diffusion model, would have to fail or wait. plank sets `PLANK_GPU_YIELD=1` in every `bash` job to say it can step aside. A command that cannot get the GPU exits with status 75 and prints a line that starts with `GPU not available` (on stdout or stderr), for example `GPU not available: held by plank (PID 1234)`.
+
+When a `bash` call ends that way, plank prints one notice, saves the conversation's KV cache, unloads the model, runs the same command once more, then reloads the model with the settings it started with and restores the cache, so the next reply does not re-read the conversation. The model sees only the second run's result. If the second run fails the same way, that result is what the model gets; plank does not try a third time, and reloads the model regardless. Should the reload fail (another plank took the model lock in the meantime, say), replies fail with a message saying so and plank tries again at your next prompt.
+
+This happens only when plank holds a local model; with a provider or a remote engine the first result is returned as it is. It applies to a command that finishes inside the `bash` call: a job still running when the call returns, and so observed later through `bash_status` or a background notification, is never re-run. Commands you type with `!` do not get the variable.
+
 #### Background jobs
 
 `refresh_sec` is how long a `bash` or `bash_status` call waits before it gives up and reports `status=running`. `bash` waits 60 seconds by default; `bash_status` returns at once unless `refresh_sec` is given. Out of the box the model then has to poll: every `bash_status` is a generation pass that reads "still running" and asks again. With `tools.bashNotify` on, the wait moves to plank. The model leaves the job running and ends its turn, you get the prompt back, and when the job exits plank appends a `[BACKGROUND JOB NOTIFICATION]` message carrying the same observation `bash_status` would have returned, then starts a turn so the model can report. Each job is announced once, and never if the model polled it to completion itself. A job that finishes while a turn is still running is announced at the next tool boundary instead.

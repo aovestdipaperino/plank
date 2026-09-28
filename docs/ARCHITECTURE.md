@@ -287,6 +287,51 @@ loop — with piped stdin there is no live input to multiplex.
   unconditional-restore `RestoreOnDrop` guard. Shared by `generate_aside`,
   `/checkpoint`, and per-session KV payloads.
 
+### GPU yield (`gpuyield.rs`)
+
+A child command can need the GPU the loaded model occupies (`mex`, which runs a
+diffusion model on Metal, is the first). The protocol is small: the command
+exits 75 and prints a line starting with `GPU not available`, and plank sets
+`PLANK_GPU_YIELD=1` in every bash job so a tool knows plank can step aside.
+
+Detection lives at the bash layer: a foreground `bash` call whose command ended
+inside the call leaves a `ForegroundExit` on `BashJobs::last_foreground`, with
+the exit status, whether the whole output file (not the head the observation
+shows) has the marker at a line start, and the sandbox decision the run used.
+`Agent::dispatch_tool`, the per-call path of `run_tool_calls`, reads it. That
+seam is shared by `run_turn` (plain REPL and every headless mode),
+`worker_turn` (TUI), sub-agent rounds and fan-out rounds; a stanza goes call by
+call only while a cycle is armed, otherwise `dispatch_all` runs unchanged.
+
+The cycle (`gpuyield::run_cycle` over the agent as a `CycleHost`) runs inside
+the turn, on the thread that owns the agent, so no memory or suggestion pass
+can be touching the engine:
+
+1. a notice through `ToolContext::publish_status` (stderr when headless);
+2. `get_kv` into a nonce-signed file in the temp directory, freeing the RAM on
+   unified memory;
+3. the engine swapped for an `UnloadedEngine` placeholder and dropped. Only
+   `Ds4Model`'s drop calls `ds4_engine_close`, which frees the Metal state and
+   releases the instance lock the C took in `ds4_engine_open`; the
+   `Ds4Session`'s drop frees its live session and the System-1 decision
+   session. `Engine::can_release_gpu` is true only when that session is the
+   model's sole `Arc` owner, since forks for asides are call-scoped;
+4. the same call dispatched once more, with the first run's sandbox decision
+   replayed; its result is what the model sees, and it never cycles again;
+5. the `ReopenFn` that `make_local_engine` built from the exact resolved
+   parameters (companion retry included), which probes the lock first because
+   contention inside `ds4_engine_open` is an `exit(2)`; then
+   `set_trusted_system_prefix`, `set_think_mode`, and `set_kv`.
+
+A missing or refused snapshot leaves the fresh engine empty and re-warms the
+tiers from their disk checkpoints (`rewarm_after_reset`), so nothing but bytes
+captured a moment earlier is ever restored. A failed reopen keeps the
+placeholder, whose `generate` errors, and retries at the next turn start. The
+local engine can be `Agent::engine`, the `EngineKey::Local` alternate under a
+provider main agent, or a parent parked in `Agent::parked_engines` while a
+provider sidechain runs. Background jobs, `!` commands, a local engine inside a
+fan-out slot and `plank serve` are not covered.
+
 ### Remote, hosted, and shared engines (`serve.rs`, `host.rs`, `remote/`)
 - `remote/provider.rs` — additional `Engine` impls for hosted providers
   (OpenAI-compatible and Anthropic Messages) over synchronous `ureq`+SSE.

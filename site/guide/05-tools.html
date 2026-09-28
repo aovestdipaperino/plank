@@ -229,6 +229,31 @@ the whole tree, so a <code>sleep 600; echo ok</code> or a
 past its timeout is reaped by whatever tool call comes next, not only
 when the model polls it. Interrupting a running command (Ctrl-C in the
 REPL, Esc in the TUI) kills its group and reports exit status 143.</p>
+<h4 id="commands-that-need-the-gpu">Commands that need the GPU</h4>
+<p>A local model holds the Mac's GPU for as long as plank runs, so a
+command that wants the GPU for itself, such as <code>mex</code>
+generating an image with a diffusion model, would have to fail or wait.
+plank sets <code>PLANK_GPU_YIELD=1</code> in every <code>bash</code> job
+to say it can step aside. A command that cannot get the GPU exits with
+status 75 and prints a line that starts with
+<code>GPU not available</code> (on stdout or stderr), for example
+<code>GPU not available: held by plank (PID 1234)</code>.</p>
+<p>When a <code>bash</code> call ends that way, plank prints one notice,
+saves the conversation's KV cache, unloads the model, runs the same
+command once more, then reloads the model with the settings it started
+with and restores the cache, so the next reply does not re-read the
+conversation. The model sees only the second run's result. If the second
+run fails the same way, that result is what the model gets; plank does
+not try a third time, and reloads the model regardless. Should the
+reload fail (another plank took the model lock in the meantime, say),
+replies fail with a message saying so and plank tries again at your next
+prompt.</p>
+<p>This happens only when plank holds a local model; with a provider or
+a remote engine the first result is returned as it is. It applies to a
+command that finishes inside the <code>bash</code> call: a job still
+running when the call returns, and so observed later through
+<code>bash_status</code> or a background notification, is never re-run.
+Commands you type with <code>!</code> do not get the variable.</p>
 <h4 id="background-jobs">Background jobs</h4>
 <p><code>refresh_sec</code> is how long a <code>bash</code> or
 <code>bash_status</code> call waits before it gives up and reports
