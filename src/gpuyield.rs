@@ -230,7 +230,8 @@ pub trait CycleHost {
     fn save(&mut self) -> Option<Self::Snapshot>;
     /// Drops the engine, freeing the GPU and the model lock.
     fn release(&mut self);
-    /// Runs the command again, to exit, and returns its result.
+    /// Runs the command (again, after a refusal; for the first time, for a
+    /// `suspend_model` call), to exit, and returns its result.
     fn rerun(&mut self) -> Self::Output;
     /// Reopens the engine.
     ///
@@ -271,7 +272,23 @@ pub fn run_cycle<H: CycleHost>(
     command: &str,
     signal: Option<&str>,
 ) -> (H::Output, CycleEnd) {
-    host.notice(&notice(command, signal));
+    cycle_after_notice(host, &notice(command, signal))
+}
+
+/// The notice for a `bash` call the model sent with `suspend_model`.
+pub const SUSPEND_NOTICE: &str = "plank: suspending the model for this command";
+
+/// Runs the proactive cycle for a `bash` call sent with `suspend_model`: the
+/// same steps as [`run_cycle`], but there was no failed first run, so
+/// [`CycleHost::rerun`] is the command's only run and [`SUSPEND_NOTICE`] the
+/// notice.
+pub fn run_suspended<H: CycleHost>(host: &mut H) -> (H::Output, CycleEnd) {
+    cycle_after_notice(host, SUSPEND_NOTICE)
+}
+
+/// The shared body of [`run_cycle`] and [`run_suspended`].
+fn cycle_after_notice<H: CycleHost>(host: &mut H, text: &str) -> (H::Output, CycleEnd) {
+    host.notice(text);
     let snapshot = host.save();
     host.release();
     let output = host.rerun();
@@ -612,6 +629,22 @@ mod tests {
             ..Recorder::default()
         };
         let (out, end) = run_cycle(&mut host, "mex x", None);
+        assert_eq!(out, "second run\n");
+        assert_eq!(end, CycleEnd::Restored);
+        assert_eq!(
+            host.log,
+            ["notice", "save", "release", "rerun", "reopen", "restore:kv"]
+        );
+        assert_eq!(host.reruns, 1);
+    }
+
+    #[test]
+    fn a_suspended_run_takes_the_same_steps_with_its_own_notice() {
+        let mut host = Recorder {
+            have_snapshot: true,
+            ..Recorder::default()
+        };
+        let (out, end) = run_suspended(&mut host);
         assert_eq!(out, "second run\n");
         assert_eq!(end, CycleEnd::Restored);
         assert_eq!(

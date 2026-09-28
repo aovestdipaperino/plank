@@ -883,6 +883,34 @@ fn protected_grant(ctx: &mut ToolContext, what: Protected) -> WriteGrant {
     }
 }
 
+/// The `bash` tool's `suspend_model` parameter (`gpuyield`). Deliberately
+/// absent from the trained bash schema, which must stay byte-identical to the
+/// C (FINDINGS.md); plank's own prompt note teaches it instead.
+pub const SUSPEND_MODEL_PARAM: &str = "suspend_model";
+
+/// Whether `call` is a `bash` call asking plank to unload the model before
+/// running it. Liberal in what it reads: `true`, `1` or `yes` in any case,
+/// surrounding blanks ignored; any other value, or none, is false.
+#[must_use]
+pub fn suspend_model_requested(call: &ToolCall) -> bool {
+    call.name == "bash"
+        && call.arg_value(SUSPEND_MODEL_PARAM).is_some_and(|v| {
+            let v = v.trim();
+            ["true", "1", "yes"]
+                .iter()
+                .any(|t| v.eq_ignore_ascii_case(t))
+        })
+}
+
+/// Whether `cmd` puts itself in the background with a trailing `&` (not
+/// `&&`): the shell exits at once and the work goes on after the call, so
+/// unloading the model around it would buy nothing.
+#[must_use]
+pub fn backgrounds_itself(cmd: &str) -> bool {
+    let cmd = cmd.trim_end();
+    cmd.ends_with('&') && !cmd.ends_with("&&")
+}
+
 /// Implements the `bash` tool: start a job and wait up to `refresh_sec`.
 pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
     let cmd = call.arg_value("command").unwrap_or("");
@@ -1196,6 +1224,68 @@ mod tests {
         assert!(out.contains("<output>\nhello\n</output>\n"));
         assert!(ctx.bash.jobs.is_empty(), "finished job should be removed");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn parse_dsml(stanza: &str) -> ToolCall {
+        let mut p = crate::dsml::DsmlParser::new();
+        p.feed(stanza);
+        assert!(p.error().is_empty(), "{}", p.error());
+        p.calls().first().cloned().expect("one call")
+    }
+
+    fn dsml_bash(value: &str) -> String {
+        format!(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n\
+             <｜DSML｜parameter name=\"command\" string=\"true\">mex post.md</｜DSML｜parameter>\n\
+             <｜DSML｜parameter name=\"suspend_model\" string=\"false\">{value}</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        )
+    }
+
+    #[test]
+    fn the_dsml_parser_hands_suspend_model_through_on_bash() {
+        for yes in ["true", "TRUE", " True ", "1", "yes", "Yes"] {
+            let call = parse_dsml(&dsml_bash(yes));
+            assert_eq!(call.arg_value("command"), Some("mex post.md"));
+            assert!(suspend_model_requested(&call), "{yes:?}");
+        }
+        for no in ["false", "0", "no", "", "y", "truee"] {
+            assert!(
+                !suspend_model_requested(&parse_dsml(&dsml_bash(no))),
+                "{no:?}"
+            );
+        }
+        let plain = test_call("bash", &[("command", "mex post.md")]);
+        assert!(!suspend_model_requested(&plain), "absent is false");
+        let other = test_call("read", &[("path", "x"), ("suspend_model", "true")]);
+        assert!(!suspend_model_requested(&other), "bash only");
+    }
+
+    #[test]
+    fn the_qwen_parser_hands_suspend_model_through_on_bash() {
+        let parse = |value: &str| {
+            let mut p = trace_stream::qwen::QwenParser::new();
+            p.feed(format!(
+                "<tool_call>\n<function=bash>\n<parameter=command>\nmex post.md\n</parameter>\n\
+                 <parameter=suspend_model>\n{value}\n</parameter>\n</function>\n</tool_call>"
+            ));
+            p.finish();
+            assert!(p.error().is_none(), "{:?}", p.error());
+            p.calls().first().cloned().expect("one call")
+        };
+        assert!(suspend_model_requested(&parse("true")));
+        assert!(suspend_model_requested(&parse("YES")));
+        assert!(!suspend_model_requested(&parse("false")));
+        assert!(!suspend_model_requested(&parse("later")));
+    }
+
+    #[test]
+    fn a_trailing_ampersand_backgrounds_a_command_and_a_double_one_does_not() {
+        assert!(backgrounds_itself("mex post.md &"));
+        assert!(backgrounds_itself("nohup mex post.md > log 2>&1 &  \n"));
+        assert!(!backgrounds_itself("make && mex post.md"));
+        assert!(!backgrounds_itself("mex post.md 2>&1 | tail"));
+        assert!(!backgrounds_itself("true &&"));
     }
 
     #[test]
