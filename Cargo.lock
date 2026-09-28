@@ -6888,9 +6888,9 @@ dependencies = [
 
 [[package]]
 name = "turbo-debug-client"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9278b286e90dd2dd0a43d5a00c72ae900ee53df7fb2db47c0d58ceb04bd2165"
+checksum = "92dc14d6afac7c3db0ed752b3af56f61c075f30a37458973fccdfe0b71fa85fd"
 dependencies = [
  "libc",
 ]

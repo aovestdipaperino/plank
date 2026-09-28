@@ -623,10 +623,9 @@ fn build_tools_prompt_parts_with_wasm(
     // before any prompt is built, so the dialect can never be selected. The
     // arm is gated rather than left to fall through to DSML so that, if that
     // refusal is ever bypassed, the build fails to compile instead of quietly
-    // handing a Qwen model the wrong prompt. `--profile` is refused on a Qwen
-    // model for the same reason: a profile's prose never reaches this builder.
+    // handing a Qwen model the wrong prompt.
     if syntax == ToolSyntax::Qwen {
-        return build_qwen_tools_prompt_parts(mcp_servers, wasm_tools);
+        return build_qwen_tools_prompt_parts(profile_prompt_source(), mcp_servers, wasm_tools);
     }
     let mut out = trusted_prose(profile_prompt_source(), parity, syntax);
     let trusted_len = out.len();
@@ -688,17 +687,32 @@ fn trusted_prose(
 /// rendered chat (`agent_syntax_is_xml_tool_call`).
 const QWEN_SCHEMA_FENCE: &str = "\n</tools>";
 
+/// The Qwen tools prompt, or the active profile's in its place.
+///
+/// With a profile active the profile's text replaces the prose instead, and
+/// the fence moves into it: see [`compose_qwen_profile_prompt`].
 fn build_qwen_tools_prompt_parts(
+    profile: Option<(&str, &crate::profile::ProfileSpec)>,
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
 ) -> (String, usize) {
+    // Third-party schemas, in the fence either way.
+    let mut foreign = String::new();
+    crate::tools::mcp::append_tool_schemas(&mut foreign, mcp_servers);
+    crate::tools::mcp::append_resource_tool_schemas(&mut foreign, mcp_servers);
+    append_wasm_tool_schemas(&mut foreign, wasm_tools);
+
+    if let Some((text, spec)) = profile {
+        let mut out = compose_qwen_profile_prompt(text, spec, &foreign);
+        crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
+        return (out, 0);
+    }
+
     // Schemas belong inside the fence; server *instructions* are prose and
     // belong after it, with the rest of the guidance.
     let mut schemas = String::new();
     append_native_extra_schemas(&mut schemas);
-    crate::tools::mcp::append_tool_schemas(&mut schemas, mcp_servers);
-    crate::tools::mcp::append_resource_tool_schemas(&mut schemas, mcp_servers);
-    append_wasm_tool_schemas(&mut schemas, wasm_tools);
+    schemas.push_str(&foreign);
 
     let at = TOOLS_PROMPT_QWEN
         .find(QWEN_SCHEMA_FENCE)
@@ -710,6 +724,75 @@ fn build_qwen_tools_prompt_parts(
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     append_working_style(&mut out);
     (out, 0)
+}
+
+/// The opening of the Qwen schema fence, from the heading down to `<tools>`.
+const QWEN_TOOLS_OPEN: &str = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n";
+
+/// Composes a profile's prompt for a Qwen model, the counterpart of
+/// [`compose_profile_prompt`].
+///
+/// The dialects put their schemas in different places, so the token expands
+/// differently. Under DSML the call syntax precedes a schema block the
+/// composer appends; under Qwen the call-format instructions follow a
+/// `<tools>` fence, so [`TOOL_PROTOCOL_TOKEN`] expands to the whole Tools
+/// section of [`TOOLS_PROMPT_QWEN`] — the fence holding the allowed schemas,
+/// then the call format and its reminder — and stops before `# Rules`, which
+/// is plank's prose and is replaced like the rest of it. Without the token
+/// the fence alone is appended, so the model still sees its tools, as it does
+/// under DSML.
+///
+/// Builtins are taken as the verbatim Qwen schema lines and filtered by name;
+/// the native extras have no Qwen spelling and render as they do in the plain
+/// Qwen prompt. `foreign` (MCP and WASM schemas) goes in the fence last.
+fn compose_qwen_profile_prompt(
+    profile_text: &str,
+    spec: &crate::profile::ProfileSpec,
+    foreign: &str,
+) -> String {
+    let open = TOOLS_PROMPT_QWEN
+        .find(QWEN_TOOLS_OPEN)
+        .expect("the Qwen tools prompt opens its fence with the Tools heading");
+    let body_at = open + QWEN_TOOLS_OPEN.len();
+    let close = TOOLS_PROMPT_QWEN
+        .find(QWEN_SCHEMA_FENCE)
+        .expect("the Qwen tools prompt fences its schemas with </tools>");
+    let rules = TOOLS_PROMPT_QWEN
+        .find("\n# Rules")
+        .expect("the Qwen tools prompt ends with its Rules section");
+
+    let mut fence = String::from(QWEN_TOOLS_OPEN);
+    for line in TOOLS_PROMPT_QWEN[body_at..close].lines() {
+        let name = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v["function"]["name"].as_str().map(str::to_string));
+        if name.is_some_and(|n| spec.builtin_enabled(&n)) {
+            fence.push_str(line);
+            fence.push('\n');
+        }
+    }
+    let extras: Vec<crate::engine::ToolSpec> = native_extra_specs(true)
+        .into_iter()
+        .filter(|s| spec.builtin_enabled(&s.name))
+        .collect();
+    fence.push_str(&render_schema_objects(&extras));
+    fence.push_str(foreign);
+    fence.truncate(fence.trim_end().len());
+    fence.push_str("\n</tools>\n");
+
+    if profile_text.contains(TOOL_PROTOCOL_TOKEN) {
+        let mut protocol = fence;
+        // Everything after the fence up to `# Rules`: the call format.
+        protocol.push_str(TOOLS_PROMPT_QWEN[close + QWEN_SCHEMA_FENCE.len() + 1..rules].trim_end());
+        profile_text.replace(TOOL_PROTOCOL_TOKEN, &protocol)
+    } else {
+        let mut out = profile_text.to_string();
+        if !out.ends_with("\n\n") {
+            out.push_str(if out.ends_with('\n') { "\n" } else { "\n\n" });
+        }
+        out.push_str(&fence);
+        out
+    }
 }
 
 /// Plank-owned guidance on how to spend turns, appended after the native tool
@@ -824,6 +907,9 @@ fn append_wasm_tool_schemas(out: &mut String, tools: &[&crate::wasmreg::WasmTool
 /// The token a profile prompt may use to pull in the trained DSML call-syntax
 /// text instead of retyping it.
 ///
+/// On a Qwen model it expands to the Qwen Tools section instead, schemas
+/// included: see [`compose_qwen_profile_prompt`].
+///
 /// Expands to everything the base prompt says before `### Available Tool
 /// Schemas` — not just the call-shape grammar, but also its surrounding
 /// prose about specific builtins (`bash_status`, `bash_stop`, `google_search`,
@@ -882,6 +968,14 @@ pub fn tool_protocol_fragment(parity: bool) -> &'static str {
 #[must_use]
 pub fn render_schema_block(specs: &[crate::engine::ToolSpec]) -> String {
     let mut out = String::from("### Available Tool Schemas\n\n");
+    out.push_str(&render_schema_objects(specs));
+    out
+}
+
+/// The schema objects of [`render_schema_block`] without its heading, each
+/// followed by a blank line.
+fn render_schema_objects(specs: &[crate::engine::ToolSpec]) -> String {
+    let mut out = String::new();
     for spec in specs {
         out.push_str("{\n  \"type\": \"function\",\n  \"function\": {\n    \"name\": ");
         crate::tools::mcp::json_escape(&mut out, &spec.name);
@@ -2756,6 +2850,85 @@ mod tests {
             !out.contains("\"type\": \"function\""),
             "an empty allow-list must admit no builtin schema through the composer"
         );
+    }
+
+    fn allowing(tools: &[&str]) -> crate::profile::ProfileSpec {
+        crate::profile::ProfileSpec {
+            display_name: None,
+            logo: None,
+            accent: None,
+            system_prompt: std::path::PathBuf::from("/unused"),
+            builtin_tools: Some(tools.iter().map(|t| (*t).to_string()).collect()),
+            settings_json: None,
+            warnings: Vec::new(),
+            folder_context: false,
+            agents_md: false,
+        }
+    }
+
+    #[test]
+    fn a_qwen_profile_prompt_expands_the_token_to_the_fence_and_call_format() {
+        let text = format!("You are HAL.\n\n{TOOL_PROTOCOL_TOKEN}\n\nBe brief.\n");
+        let out = compose_qwen_profile_prompt(&text, &allowing(&["read", "glob"]), "");
+        assert!(out.starts_with("You are HAL.\n\n# Tools\n"), "{out}");
+        assert!(
+            out.ends_with("before emitting <tool_call>.\n\nBe brief.\n"),
+            "{out}"
+        );
+        let (fence, after) = out.split_once("</tools>").expect("one fence");
+        assert!(
+            fence.contains("{\"name\":\"read\","),
+            "the verbatim Qwen line"
+        );
+        assert!(
+            fence.contains("\"name\": \"glob\""),
+            "the allowed native extra"
+        );
+        assert!(!fence.contains("\"name\":\"bash\""), "bash is not allowed");
+        assert!(
+            after.contains("<function=example_function_name>"),
+            "{after}"
+        );
+        // plank's own prose is replaced, not kept beside the profile's.
+        assert!(!out.contains("You are a coding agent"), "{out}");
+        assert!(!out.contains("# Rules"), "{out}");
+        assert!(!out.contains("# Working style"), "{out}");
+    }
+
+    #[test]
+    fn a_qwen_profile_prompt_without_the_token_still_gets_its_schemas() {
+        let out = compose_qwen_profile_prompt("You are HAL.", &allowing(&["read"]), "");
+        assert!(out.starts_with("You are HAL.\n\n# Tools\n"), "{out}");
+        assert!(out.ends_with("</tools>\n"), "{out}");
+        assert!(out.contains("{\"name\":\"read\","), "{out}");
+        assert!(
+            !out.contains("<tool_call>"),
+            "no call format without the token"
+        );
+    }
+
+    #[test]
+    fn a_qwen_profile_puts_mcp_schemas_inside_the_fence() {
+        let text = format!("You are HAL.\n{TOOL_PROTOCOL_TOKEN}");
+        let foreign = "\n{\"type\": \"function\", \"function\": {\"name\": \"mail_list\"}}\n";
+        let out = compose_qwen_profile_prompt(&text, &allowing(&[]), foreign);
+        let (fence, _) = out.split_once("</tools>").expect("one fence");
+        assert!(fence.contains("mail_list"), "{out}");
+        assert!(
+            !fence.contains("\"name\":\"read\""),
+            "an empty allow-list admits no builtin"
+        );
+    }
+
+    #[test]
+    fn the_qwen_builder_uses_the_profile_when_one_is_active() {
+        let text = format!("You are HAL.\n{TOOL_PROTOCOL_TOKEN}");
+        let spec = allowing(&["read"]);
+        let (out, trusted) = build_qwen_tools_prompt_parts(Some((&text, &spec)), &[], &[]);
+        assert_eq!(trusted, 0, "the Qwen prompt has no trusted span");
+        assert!(out.starts_with("You are HAL.\n# Tools\n"), "{out}");
+        let (plain, _) = build_qwen_tools_prompt_parts(None, &[], &[]);
+        assert!(plain.starts_with("You are a coding agent"), "{plain}");
     }
 
     #[test]

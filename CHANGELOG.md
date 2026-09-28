@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`--profile` runs on a Qwen model.** The profile's prompt replaces the
+  Qwen prompt the way it replaces the DeepSeek one, and
+  `{{plank:tool-protocol}}` expands to the Qwen Tools section: the `<tools>`
+  fence with the allowed builtins, native extras and MCP/WASM schemas, then
+  the Qwen call format. Previously plank refused to start.
+
 ## [6.0.0] - 2026-09-27
 
 ### Added

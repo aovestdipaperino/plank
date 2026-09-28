@@ -8,6 +8,10 @@ A profile launches plank as a different agent. It brings its own system prompt, 
 plank --profile aovestdipaperino/plank-profiles:HAL
 ```
 
+The theming is what you notice first. HAL's manifest names a logo, a display name and a `#d0021b` accent, so the banner shows HAL's art and version above plank's, and the rules around the prompt turn red where plank's are green:
+
+![plank launched with --profile hal: HAL's pixel-art logo as the banner art beside HAL v0.3.1, plank v6.0.1 BETA and context 1.0M tokens, with the prompt framed by red rules instead of plank's green](https://raw.githubusercontent.com/aovestdipaperino/plank/main/assets/profile-hal.png)
+
 Under the hood a profile is an ordinary plugin whose `plugin.json` carries a `profile` block. Without `--profile` nothing about it is active, so installing one never changes a normal plank session.
 
 ## Launching a profile

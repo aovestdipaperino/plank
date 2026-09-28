@@ -3135,3 +3135,15 @@ bias or not, says "not worth remembering" to nearly every turn: a debiased mean
 P(yes) of about 0.15. Whether that is right is not something this run can tell:
 there is no ground truth here for which spans actually held a memory.
 Suggested correction: `memory.gateBias.ds4 = 9`. V4.1 and Qwen are unmeasured.
+
+## `--debug` finds tdk only through a lock file name both sides must agree on
+
+The mirror never dials port 7878 speculatively: `debugmirror::console_port`
+asks `turbo_debug_client::is_console_running`, which probes an `flock` on a
+fixed file in `$TMPDIR`. When the console was renamed to tdk (0.6.0) its marker
+became `tdk.lock`, but `turbo-debug-client` 0.2.0 still probed
+`turbo-debug-console.lock`, so every `--debug` launch saw "no console running"
+and stayed silent, with tdk up and listening. Nothing errors, by design. The fix
+was client 0.2.1, whose only change is the name; `Cargo.toml` pins
+`>= 0.2.1` so a fresh resolve cannot fall back. If the mirror goes quiet again,
+compare `lsof -p $(pgrep tdk) | grep lock` with the client's `LOCK_NAME` first.

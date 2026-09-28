@@ -490,26 +490,6 @@ pub fn resolve_profile(
     }
 }
 
-/// The message shown when `--profile` is combined with a Qwen model.
-///
-/// Qwen's prompt is a different document with a different schema fence, built
-/// whole by `sysprompt::build_qwen_tools_prompt_parts`; a profile's
-/// replacement prose does not reach it. Everything else about the profile —
-/// name, logo, accent, builtin allow-list — *would* apply, so the failure mode
-/// without this refusal is plank's own prose wearing the profile's identity,
-/// which is worse than not starting.
-#[must_use]
-pub fn refuse_under_qwen(name: &str) -> String {
-    format!(
-        concat!(
-            "plank: profile {name:?} cannot run on a Qwen model: a profile replaces the system ",
-            "prompt, and the Qwen prompt is built separately\n",
-            "plank: drop --profile, or run it on a DeepSeek model"
-        ),
-        name = name
-    )
-}
-
 /// The load-time warning for a profile prompt that never asks for the tool
 /// protocol, or `None` when it does.
 ///
@@ -591,15 +571,6 @@ mod tests {
             crate::sysprompt::TOOL_PROTOCOL_TOKEN
         );
         assert_eq!(missing_protocol_warning("chatbgt", &with), None);
-    }
-
-    #[test]
-    fn the_qwen_refusal_names_the_profile_and_the_reason() {
-        let msg = refuse_under_qwen("hal");
-        assert!(msg.contains("hal"), "{msg}");
-        assert!(msg.contains("Qwen"), "{msg}");
-        // The user needs to know what to do, not merely that it failed.
-        assert!(msg.contains("--profile"), "{msg}");
     }
 
     const FULL: &str = r#"{

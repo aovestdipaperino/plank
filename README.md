@@ -364,6 +364,12 @@ folder of a GitHub repository:
 plank --profile aovestdipaperino/plank-profiles:HAL
 ```
 
+The theming is the part you see first. HAL's manifest names a PNG logo, a display name and a `#d0021b` accent, and the TUI draws all three: the logo as the banner art, `HAL v0.3.1` above the plank version, and red in place of plank's green on the rules around the prompt:
+
+<p align="center">
+  <img src="assets/profile-hal.png" alt="plank launched with --profile hal: HAL's pixel-art logo, a red camera eye under the HAL nameplate, as the banner art beside HAL v0.3.1, plank v6.0.1 BETA and context 1.0M tokens, with the prompt framed by red rules instead of plank's green" width="700">
+</p>
+
 The first launch from a folder or a repository asks before installing it into
 `~/.plank/profiles/`; after that the same command launches the installed copy,
 and offers an update when the source's `version` goes up. `/install-profile`

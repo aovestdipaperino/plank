@@ -373,35 +373,6 @@ fn select_session_family(cfg: &plank::config::AgentConfig) {
     plank::session::set_family(plank::gguf::family_of(&resolve_model_path(cfg)));
 }
 
-/// Decides whether an active profile must refuse to start under `model`.
-///
-/// Pure and independent of `main`'s flow so the decision can be tested
-/// directly: a profile REPLACES the system prompt, but the Qwen prompt is a
-/// different document built whole elsewhere (`sysprompt::build_qwen_tools_prompt_parts`),
-/// so a profile's prose never reaches it. `active_profile_name` is `Some` only
-/// once a profile has actually been spliced in and activated; `model` must be
-/// resolved the same way the engine resolves it (see `resolve_model_path`),
-/// so this can't disagree with what actually loads — including the case
-/// where the model comes from `~/.plank/settings.json`'s `engine.model` with
-/// no CLI flag at all.
-fn qwen_profile_conflict(active_profile_name: Option<&str>, model: &std::path::Path) -> bool {
-    active_profile_name.is_some() && plank::gguf::family_of(model) == plank::gguf::ModelFamily::Qwen
-}
-
-/// Refuses startup here, before any engine load or terminal setup, if the
-/// profile activated earlier turns out to be running under a Qwen model once
-/// the real settings-and-CLI `cfg` is known. Common to both startup paths
-/// (`main` and `run_serve`) so neither can activate a profile against Qwen
-/// through a route the other didn't think to check.
-fn refuse_if_profile_conflicts_with_qwen(cfg: &plank::config::AgentConfig) -> Option<ExitCode> {
-    let name = plank::profile::active_name()?;
-    if qwen_profile_conflict(Some(name), &resolve_model_path(cfg)) {
-        eprintln!("{}", plank::profile::refuse_under_qwen(name));
-        return Some(ExitCode::from(2));
-    }
-    None
-}
-
 /// The detached downloader's entry point.
 ///
 /// Its model set is the second argument. A helper spawned by a plank that
@@ -415,9 +386,9 @@ fn run_model_downloader(args: &[String]) -> i32 {
 
 /// The checks that fire once the real `cfg` (settings + CLI, not the
 /// CLI-only `provisional` parse) is known, before anything user-visible:
-/// the profile-vs-Qwen guard, then the `--help`/`--version`/`--dump-config`
-/// backstops that the provisional parse already answers in practice but must
-/// be re-decided here against the layered settings.
+/// the `--help`/`--version`/`--dump-config` backstops that the provisional
+/// parse already answers in practice but must be re-decided here against the
+/// layered settings.
 ///
 /// Factored out of `main` (and reused by nothing else — `run_serve` has no
 /// help/version/dump-config surface) purely to keep `main` under the
@@ -426,14 +397,6 @@ fn post_cfg_early_exit(
     cfg: &plank::config::AgentConfig,
     settings: &plank::settings::Settings,
 ) -> Option<ExitCode> {
-    // A profile REPLACES the system prompt; the Qwen prompt is a different
-    // document built whole elsewhere, so a profile can't reach it. Checked
-    // against the real `cfg` so a Qwen model set only via
-    // `~/.plank/settings.json`'s `engine.model` (no CLI flag) is caught too —
-    // see `refuse_if_profile_conflicts_with_qwen`'s doc.
-    if let Some(code) = refuse_if_profile_conflicts_with_qwen(cfg) {
-        return Some(code);
-    }
     if cfg.show_help {
         print!("{}", usage());
         return Some(ExitCode::SUCCESS);
@@ -1100,10 +1063,6 @@ fn run_serve(args: &[String]) -> ExitCode {
         Ok(cfg) => cfg,
         Err(code) => return code,
     };
-    // See `main`'s matching call; the function doc has the full reasoning.
-    if let Some(code) = refuse_if_profile_conflicts_with_qwen(&cfg) {
-        return code;
-    }
     plank::interrupt::install();
 
     select_session_family(&cfg);
@@ -1282,79 +1241,13 @@ fn run(
 mod tests {
     use super::*;
 
-    /// Writes a minimal GGUF file whose only metadata key is
-    /// `general.architecture` = `arch`, matching the layout `gguf::Gguf`'s
-    /// test helper builds (magic, version, tensor count, kv count, then one
-    /// string-valued key). Just enough for `family_of` to classify it.
-    fn write_fake_gguf(name: &str, arch: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "plank-main-gguf-{}-{name}-{arch}",
-            std::process::id()
-        ));
-        let mut f = std::fs::File::create(&path).expect("create");
-        f.write_all(b"GGUF").unwrap();
-        f.write_all(&3u32.to_le_bytes()).unwrap(); // version
-        f.write_all(&0u64.to_le_bytes()).unwrap(); // tensor count
-        f.write_all(&1u64.to_le_bytes()).unwrap(); // kv count
-        let key = "general.architecture";
-        f.write_all(&(key.len() as u64).to_le_bytes()).unwrap();
-        f.write_all(key.as_bytes()).unwrap();
-        f.write_all(&8u32.to_le_bytes()).unwrap(); // string type
-        f.write_all(&(arch.len() as u64).to_le_bytes()).unwrap();
-        f.write_all(arch.as_bytes()).unwrap();
-        path
-    }
-
-    /// No active profile: never refuses, regardless of model family. Covers
-    /// plain (non-profile) startup on a Qwen model, which is legitimate.
-    #[test]
-    fn no_active_profile_never_conflicts() {
-        let qwen = write_fake_gguf("no-profile", "qwen4exp");
-        assert!(!qwen_profile_conflict(None, &qwen));
-        let _ = std::fs::remove_file(qwen);
-    }
-
-    /// A profile active, model resolves to Qwen: this is exactly the failure
-    /// mode the guard exists to prevent, including the settings.json-only
-    /// case this fix addresses — `qwen_profile_conflict` takes only the
-    /// already-resolved model path, so it can't tell (and doesn't need to)
-    /// whether that path came from `-m`, `--qwen`, or `engine.model` in
-    /// `~/.plank/settings.json`.
-    #[test]
-    fn active_profile_on_qwen_model_conflicts() {
-        let qwen = write_fake_gguf("profile-active", "qwen4exp");
-        assert!(qwen_profile_conflict(Some("my-profile"), &qwen));
-        let _ = std::fs::remove_file(qwen);
-    }
-
-    /// A profile active, model resolves to `DeepSeek`: no conflict.
-    #[test]
-    fn active_profile_on_ds4_model_does_not_conflict() {
-        let ds4 = write_fake_gguf("profile-active-ds4", "deepseek2");
-        assert!(!qwen_profile_conflict(Some("my-profile"), &ds4));
-        let _ = std::fs::remove_file(ds4);
-    }
-
-    /// A first run, before any model has been downloaded: the path does not
-    /// exist, `family_of` reads that as `Ds4` (the documented fallthrough),
-    /// so an active profile must not be wrongly refused.
-    #[test]
-    fn active_profile_on_missing_model_path_does_not_conflict() {
-        let missing = std::env::temp_dir().join(format!(
-            "plank-main-gguf-missing-{}-no-such-file",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&missing); // ensure absence
-        assert!(!qwen_profile_conflict(Some("my-profile"), &missing));
-    }
-
     /// `resolve_model_path` falls back to the default `DeepSeek` path when
     /// `cfg.model_path` is unset, exactly like `select_session_family` did
     /// before this refactor, and returns the configured path unchanged when
     /// one is set — including one that only ever came from a settings file
     /// (`AgentConfig::from_settings`/`parse_options_with` do not distinguish
     /// CLI from settings-file origin once parsed, which is the point: the
-    /// guard reads the same resolved value the engine will).
+    /// session family reads the same resolved value the engine will).
     #[test]
     fn resolve_model_path_matches_configured_or_falls_back_to_default() {
         let mut cfg =

@@ -81,7 +81,7 @@ quietly gained `bash` would not be).
 A profile's `systemPrompt` file is composed as-is except for one
 substitution: the literal text `{{plank:tool-protocol}}`, wherever it
 appears, expands to the trained DSML call-syntax text the model was actually
-trained against. A profile prompt should almost always include this token,
+trained against (on Qwen, to the Qwen call format: see [On Qwen](#on-qwen)). A profile prompt should almost always include this token,
 because without it the model has no idea how to format a tool call at all.
 A prompt without it still loads, since a chat-only profile may want exactly
 that, but startup prints a warning naming the profile so the omission is
@@ -339,10 +339,17 @@ into the plugin set at the highest precedence: its settings layer, its
 allow-list and its prompt all take effect as though it were the last (and
 therefore winning) plugin loaded.
 
-### Refused on Qwen
+### On Qwen
 
-`--profile` is refused outright when the active model is Qwen. Qwen's prompt
-is built by an entirely separate path (`sysprompt.rs`'s Qwen branch) that has
-no notion of a profile's own `systemPrompt`; running `--profile` there would
-silently ignore the very prompt the flag exists to install, so it is refused
-up front instead, naming the profile and pointing back at `--profile`.
+A profile runs on a Qwen model too, but its prompt is composed differently,
+because the Qwen prompt fences its schemas inside `<tools>` … `</tools>` and
+puts the call-format instructions after the fence rather than before a schema
+block. The token therefore expands to the whole Tools section of the Qwen
+prompt: the fence, holding the allowed builtins (the verbatim Qwen schema
+lines, filtered by name), the allowed native extras, and every MCP and WASM
+schema, followed by the call format and its reminder. It stops before the
+Qwen prompt's `# Rules`, which is plank's prose and is replaced along with the
+rest of it; plank's working-style, shell and git sections are left out for
+the same reason, as they are under DeepSeek. A prompt without the token gets
+the fence alone, appended at the end, so the model can see its tools but is
+not told how to call them.
