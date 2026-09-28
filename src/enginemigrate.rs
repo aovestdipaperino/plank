@@ -54,7 +54,8 @@ pub fn migrate_in(root: &Path) -> Vec<String> {
     // that would mean a ds4 install exists too.
     let ds41_only = root.join("ds41.manifest").exists()
         && !root.join("ds4.manifest").exists()
-        && !root.join("ds4flash.gguf").exists();
+        && !root.join("ds4flash.gguf").exists()
+        && !root.join("qwen.manifest").exists();
 
     for (old, id, role) in ARTIFACTS {
         if let Some(new) = crate::manifest::local_path_for_in(root, id, role) {
@@ -140,11 +141,19 @@ fn convert_manifest(from: &Path, to: &Path, warn: &mut Vec<String>) {
         let _ = std::fs::create_dir_all(parent);
     }
     let out = serde_json::to_string_pretty(&v).unwrap_or(text);
-    match std::fs::write(to, out) {
+    let tmp = to.with_extension(match to.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.tmp"),
+        None => "tmp".to_string(),
+    });
+    let result = std::fs::write(&tmp, out).and_then(|()| std::fs::rename(&tmp, to));
+    match result {
         Ok(()) => {
             let _ = std::fs::remove_file(from);
         }
-        Err(e) => warn.push(format!("plank: could not migrate {}: {e}", from.display())),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            warn.push(format!("plank: could not migrate {}: {e}", from.display()));
+        }
     }
 }
 
@@ -164,20 +173,30 @@ fn migrate_staging(root: &Path, warn: &mut Vec<String>) {
             .map(|e| e.path())
             .filter(|p| p.is_file())
             .collect();
+        let mut manifest_file = None;
+        let warn_before = warn.len();
         for f in files {
             let Some(name) = f.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
             if name == old_manifest {
-                convert_manifest(
-                    &f,
-                    &crate::manifest::staged_manifest_path_in(root, id),
-                    warn,
-                );
+                manifest_file = Some(f);
                 continue;
             }
             let renamed = name.replacen("dspark", "mtp", 1);
             move_one(&f, &new.join(renamed), warn);
+        }
+        // The staged manifest lands last, and only if every other move in this
+        // dir succeeded — otherwise the old manifest stays in place so a later
+        // run retries the whole directory together.
+        if let Some(f) = manifest_file
+            && warn.len() == warn_before
+        {
+            convert_manifest(
+                &f,
+                &crate::manifest::staged_manifest_path_in(root, id),
+                warn,
+            );
         }
         if old_leaf != "staging" {
             let _ = std::fs::remove_dir(&old);
@@ -357,6 +376,74 @@ mod tests {
         assert!(migrate_in(&r).is_empty());
         assert!(migrate_in(&r).is_empty());
         assert!(r.join("ds4vision.gguf").exists());
+    }
+
+    #[test]
+    fn ds41_and_qwen_both_present_does_not_default_to_ds41() {
+        let r = scratch("ds41-qwen");
+        std::fs::write(r.join("ds41.manifest"), old_manifest(&["main"])).unwrap();
+        std::fs::write(r.join("qwen.manifest"), old_manifest(&["main"])).unwrap();
+        let _ = migrate_in(&r);
+        assert!(!r.join("engines.local.json").exists());
+    }
+
+    #[test]
+    fn ds41_staging_files_move_into_the_ds41_staging_dir() {
+        let r = scratch("staging-ds41");
+        std::fs::create_dir_all(r.join("staging-ds41")).unwrap();
+        std::fs::write(r.join("staging-ds41/main.part"), "m").unwrap();
+        let _ = migrate_in(&r);
+        assert!(
+            crate::manifest::staging_dir_in(&r, EngineId::DS41)
+                .join("main.part")
+                .exists()
+        );
+        assert!(!r.join("staging-ds41").exists());
+    }
+
+    #[test]
+    fn staged_dspark_sha256_becomes_mtp_sha256() {
+        let r = scratch("staged-sha");
+        std::fs::create_dir_all(r.join("staging")).unwrap();
+        std::fs::write(r.join("staging/dspark.gguf.sha256"), "hash").unwrap();
+        let _ = migrate_in(&r);
+        let new = crate::manifest::staging_dir_in(&r, EngineId::DS4VISION).join("mtp.gguf.sha256");
+        assert!(new.exists());
+        assert_eq!(std::fs::read_to_string(new).unwrap(), "hash");
+    }
+
+    #[test]
+    fn convert_manifest_keeps_from_when_to_already_exists() {
+        let r = scratch("convert-keep");
+        std::fs::write(r.join("ds4.manifest"), old_manifest(&["main"])).unwrap();
+        let to = crate::manifest::installed_path_in(&r, EngineId::DS4VISION);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::write(&to, "preexisting").unwrap();
+        let w = migrate_in(&r);
+        assert!(r.join("ds4.manifest").exists());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "preexisting");
+        assert_eq!(
+            w.iter().filter(|m| m.contains("ds4.manifest")).count(),
+            1,
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn a_skipped_staging_move_keeps_the_old_manifest_in_place() {
+        let r = scratch("staging-order");
+        std::fs::create_dir_all(r.join("staging")).unwrap();
+        std::fs::write(r.join("staging/main.gguf"), "old").unwrap();
+        std::fs::write(r.join("staging/ds4.manifest"), old_manifest(&["main"])).unwrap();
+        let conflict_dir = crate::manifest::staging_dir_in(&r, EngineId::DS4VISION);
+        std::fs::create_dir_all(&conflict_dir).unwrap();
+        std::fs::write(conflict_dir.join("main.gguf"), "new").unwrap();
+        let _ = migrate_in(&r);
+        assert!(
+            !crate::manifest::staged_manifest_path_in(&r, EngineId::DS4VISION).exists(),
+            "manifest must not land while a sibling move was skipped"
+        );
+        assert!(r.join("staging/ds4.manifest").exists());
     }
 
     #[test]
