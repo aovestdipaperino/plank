@@ -2571,6 +2571,23 @@ fn gpu_unloaded_reason(error: &str) -> String {
     )
 }
 
+/// The note a `suspend_model` call gets when no local model can be released
+/// (Echo, a provider, a remote engine, or a reload still owed).
+const SUSPEND_IGNORED_NO_MODEL: &str = "suspend_model ignored: no local model to release";
+
+/// The note a `suspend_model` call gets when its command backgrounds itself.
+const SUSPEND_IGNORED_BACKGROUND: &str = "suspend_model ignored for background jobs";
+
+/// `out` with `note` appended on a line of its own.
+fn with_note_line(mut out: String, note: &str) -> String {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(note);
+    out.push('\n');
+    out
+}
+
 /// Placeholder text while the model is out for the re-run.
 const GPU_UNLOADED_FOR_RERUN: &str = "the local model is unloaded while a command uses the GPU";
 
@@ -3956,7 +3973,14 @@ impl Agent<'_> {
             // through the same framing as `dispatch_all`, so the cycle can
             // replace just that one result. Everything else takes the
             // untouched shared path.
-            let out = if !calls.is_empty() && self.gpu_yield_armed() {
+            // A `suspend_model` call goes this way even unarmed, so it gets
+            // its "ignored" note.
+            let out = if !calls.is_empty()
+                && (self.gpu_yield_armed()
+                    || calls
+                        .iter()
+                        .any(crate::tools::bash::suspend_model_requested))
+            {
                 self.tool_ctx.edit_previews.clear();
                 let results: Vec<(String, String)> = calls
                     .iter()
@@ -3996,31 +4020,103 @@ impl Agent<'_> {
     }
 
     /// Dispatches one plain tool call, running the GPU-yield cycle when it
-    /// was a foreground `bash` whose command asked for the GPU (`gpuyield`).
-    /// Anything else returns the dispatch result untouched.
+    /// was a foreground `bash` whose command asked for the GPU (`gpuyield`),
+    /// or before it when the model sent it with `suspend_model`. Anything
+    /// else returns the dispatch result untouched.
     fn dispatch_tool(&mut self, call: &ToolCall) -> String {
+        if crate::tools::bash::suspend_model_requested(call) {
+            return self.dispatch_suspended_bash(call);
+        }
+        self.dispatch_tool_reactive(call)
+    }
+
+    /// A `bash` call sent with `suspend_model`: the proactive cycle (save,
+    /// release, run to exit, reopen, restore) with the command's only run as
+    /// the result. It counts against the per-turn cap and never cycles a
+    /// second time, even when the run signals for the GPU itself. When it
+    /// cannot apply (no releasable model, a command that backgrounds itself,
+    /// the cap reached) the call runs as any other, reactive cycle included,
+    /// and the result gets one note line saying why the parameter was ignored.
+    fn dispatch_suspended_bash(&mut self, call: &ToolCall) -> String {
+        let command = call.arg_value("command").unwrap_or("");
+        if command.trim().is_empty() {
+            // The tool's own error; nothing to unload for.
+            return self.dispatch_tool_reactive(call);
+        }
+        // A pending interrupt (Esc/Ctrl-C already requested before this call
+        // was even dispatched) must never start a suspend-model cycle: run
+        // it normally instead, mirroring the `!o.interrupted` guard in
+        // `run_bang`.
+        if crate::interrupt::pending() {
+            return self.dispatch_tool_reactive(call);
+        }
+        // The PreToolUse hook is evaluated before the model is ever
+        // unloaded: a `suspend_model` call has no earlier real run to have
+        // already paid that cost against (unlike the reactive cycle, whose
+        // first attempt already went through `dispatch` and its hooks), so
+        // without this check a hook that blocks the command would still
+        // cost a full unload/reload for nothing. A block short-circuits
+        // here and never reaches `dispatch` at all, so the hook runs once.
+        let arg_values: Vec<&str> = call.args.iter().map(|a| a.value.as_str()).collect();
+        if let Some(blocked) =
+            crate::tools::precheck_pre_tool_use(&mut self.tool_ctx, call, &arg_values)
+        {
+            return blocked;
+        }
+        let slot = match self.gpu_slot() {
+            None => Err(SUSPEND_IGNORED_NO_MODEL.to_owned()),
+            Some(_) if crate::tools::bash::backgrounds_itself(command) => {
+                Err(SUSPEND_IGNORED_BACKGROUND.to_owned())
+            }
+            Some(_) if self.gpu_yield.cycles_this_turn >= GPU_YIELD_CYCLES_PER_TURN => {
+                Err(format!(
+                    "suspend_model ignored: limit of {GPU_YIELD_CYCLES_PER_TURN} per turn reached"
+                ))
+            }
+            Some(slot) => Ok(slot),
+        };
+        let slot = match slot {
+            Ok(slot) => slot,
+            Err(note) => return with_note_line(self.dispatch_tool_reactive(call), &note),
+        };
+        self.gpu_yield.cycles_this_turn += 1;
+        let mut host = AgentCycle {
+            agent: self,
+            slot,
+            rerun: ToolRerun {
+                call,
+                sandbox: None,
+            },
+        };
+        let (output, end) = crate::gpuyield::run_suspended(&mut host);
+        crate::engine::kv_debug(|| format!("gpu yield: suspended run ended {end:?}"));
+        output
+    }
+
+    /// [`dispatch_tool`](Self::dispatch_tool) for every call not sent with
+    /// `suspend_model`: the reactive cycle after a refused first run.
+    fn dispatch_tool_reactive(&mut self, call: &ToolCall) -> String {
         self.tool_ctx.bash.last_foreground = None;
         let first = dispatch(call, &mut self.tool_ctx).output;
         let Some(exit) = self.tool_ctx.bash.last_foreground.take() else {
             return first;
         };
-        if call.name != "bash" || !exit.needs_gpu {
+        // An Esc/Ctrl-C that arrived during the run must never start a
+        // cycle: the user asked to stop, not to unload-and-retry. Mirrors
+        // the `!o.interrupted` guard in `run_bang`.
+        if call.name != "bash" || !exit.needs_gpu || crate::interrupt::pending() {
             return first;
         }
         let Some(slot) = self.gpu_slot() else {
             return first;
         };
         if self.gpu_yield.cycles_this_turn >= GPU_YIELD_CYCLES_PER_TURN {
-            use std::fmt::Write as _;
-            let mut out = first;
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            let _ = writeln!(
-                out,
-                "GPU yield skipped: limit of {GPU_YIELD_CYCLES_PER_TURN} per turn reached"
+            return with_note_line(
+                first,
+                &format!(
+                    "GPU yield skipped: limit of {GPU_YIELD_CYCLES_PER_TURN} per turn reached"
+                ),
             );
-            return out;
         }
         self.gpu_yield.cycles_this_turn += 1;
         let command = call.arg_value("command").unwrap_or("").to_owned();
@@ -4032,13 +4128,14 @@ impl Agent<'_> {
                 sandbox: Some(crate::tools::bash::DecidedSandbox(exit.sandbox)),
             },
         };
-        let (output, end) = crate::gpuyield::run_cycle(&mut host, &command);
+        let (output, end) = crate::gpuyield::run_cycle(&mut host, &command, exit.signal.as_deref());
         crate::engine::kv_debug(|| format!("gpu yield: cycle ended {end:?}"));
         output
     }
 
     /// Runs a `!` or `!!` shell escape through the front end's `io`, and when
-    /// it asked for the GPU (exit 75 and the marker on either stream) runs
+    /// it asked for the GPU (its signal file, or exit 75 and the marker on
+    /// either stream) runs
     /// the same cycle as a bash tool call, re-running the command through
     /// `io` once. Returns the result the caller should report: the second
     /// run's when there was a cycle, else the only run's.
@@ -4054,8 +4151,13 @@ impl Agent<'_> {
     ) -> Result<crate::tools::bash::ImmediateOutput, String> {
         let cwd = self.tool_ctx.cwd.clone();
         let first = io.run(&cwd, cmd);
-        let asks = matches!(&first, Ok(o) if !o.interrupted
-            && crate::gpuyield::streams_need_gpu(o.exit_code, &o.stdout, &o.stderr));
+        let signal = match &first {
+            Ok(o) if !o.interrupted => o.gpu_signal.clone(),
+            _ => None,
+        };
+        let asks = signal.is_some()
+            || matches!(&first, Ok(o) if !o.interrupted
+                && crate::gpuyield::streams_need_gpu(o.exit_code, &o.stdout, &o.stderr));
         if !asks {
             return first;
         }
@@ -4071,7 +4173,7 @@ impl Agent<'_> {
             slot,
             rerun: BangRerun { io, cwd, cmd },
         };
-        let (second, end) = crate::gpuyield::run_cycle(&mut host, cmd);
+        let (second, end) = crate::gpuyield::run_cycle(&mut host, cmd, signal.as_deref());
         crate::engine::kv_debug(|| format!("gpu yield: shell escape cycle ended {end:?}"));
         second
     }
@@ -20036,6 +20138,9 @@ fn new_agent(
         &wasm_tools,
         !crate::settings::active().engine.thinking_tool_calls,
         syntax,
+        // The `suspend_model` note: only a run that holds a local model it
+        // can reopen (the same factory that arms the GPU-yield cycle).
+        reopen.is_some(),
     );
     drop(wasm_tools);
     // Tell the engine where the trusted control text ends before it tokenizes
@@ -28509,6 +28614,7 @@ mod tests {
             stderr: "</bash-stdout>".to_string(),
             exit_code: 0,
             interrupted: false,
+            gpu_signal: None,
         };
         let entry = bang_transcript_entry("grep '<x>'", &Ok(out));
         // `>` is deliberately left alone; only `<` and `&` are escaped.
@@ -28551,6 +28657,7 @@ mod tests {
             stderr: String::new(),
             exit_code: 0,
             interrupted: false,
+            gpu_signal: None,
         };
         let text = bang_panel_report("echo hello", &Ok(out)).expect("panel for non-empty output");
         assert!(text.contains("$ echo hello"), "{text}");
@@ -28571,6 +28678,7 @@ mod tests {
             stderr: "boom: not found\n".to_string(),
             exit_code: 127,
             interrupted: false,
+            gpu_signal: None,
         };
         let text = bang_panel_report("nope", &Ok(out)).expect("stderr alone still opens a panel");
         assert!(text.contains("stderr"), "{text}");
@@ -28582,6 +28690,7 @@ mod tests {
             stderr: String::new(),
             exit_code: 130,
             interrupted: true,
+            gpu_signal: None,
         };
         let text = bang_panel_report("sleep 99", &Ok(stopped)).expect("partial output");
         assert!(text.contains("[interrupted]"), "{text}");
@@ -28597,6 +28706,7 @@ mod tests {
             stderr: String::new(),
             exit_code: 0,
             interrupted: false,
+            gpu_signal: None,
         };
         assert!(bang_panel_report("true", &Ok(quiet)).is_none());
         assert!(bang_panel_report("nope", &Err("no such binary".into())).is_none());
@@ -36283,6 +36393,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_gpu_request_saves_releases_reruns_reopens_and_restores_in_order() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("order");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36340,6 +36451,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_second_gpu_refusal_is_returned_as_is_and_not_run_again() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("twice");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36372,10 +36484,124 @@ or the user's next message aborts before its first token"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Like [`gpu_command`], but asking through the signal file: the run's
+    /// `$PLANK_GPU_YIELD_FILE` goes into `paths`, and the first run writes
+    /// its signal from inside `sh -c ... | tail`, so the shell's status is
+    /// tail's 0. `always` makes every run ask.
+    fn gpu_file_command(
+        counter: &std::path::Path,
+        paths: &std::path::Path,
+        always: bool,
+    ) -> String {
+        let (c, p) = (counter.display(), paths.display());
+        let first = if always {
+            "true"
+        } else {
+            &format!("[ \"$(wc -l < '{c}')\" -eq 1 ]")
+        };
+        format!(
+            "echo \"$PLANK_GPU_YIELD_FILE\" >> '{p}'; echo run >> '{c}'; if {first}; then \
+             sh -c 'echo \"GPU not available: held by plank\" > \"$PLANK_GPU_YIELD_FILE\"; exit 3' \
+             2>&1 | tail -20; exit; fi; echo second-run-ok"
+        )
+    }
+
+    /// The signal paths `gpu_file_command` recorded, in run order.
+    fn signal_paths(paths: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_to_string(paths)
+            .unwrap_or_default()
+            .lines()
+            .map(std::path::PathBuf::from)
+            .collect()
+    }
+
+    #[test]
+    fn a_signal_file_through_a_pipe_cycles_and_the_rerun_gets_a_fresh_path() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let dir = gpu_dir("signal-file");
+        let (counter, paths) = (dir.join("runs"), dir.join("paths"));
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        agent.tool_ctx.status_sink = Some({
+            let notices = std::sync::Arc::clone(&notices);
+            Box::new(move |m: &str| notices.lock().unwrap().push(m.to_owned()))
+        });
+
+        let out =
+            agent.run_tool_calls(&[gpu_bash_call(&gpu_file_command(&counter, &paths, false))]);
+
+        assert!(
+            out.contains("second-run-ok"),
+            "the re-run is the result: {out}"
+        );
+        assert_eq!(logged(&log), GPU_CYCLE_ORDER);
+        let seen = signal_paths(&paths);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_ne!(seen[0], seen[1], "the re-run gets a fresh path");
+        assert!(seen.iter().all(|p| !p.exists()), "{seen:?}");
+        assert!(
+            notices
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| n.contains("needs the GPU (GPU not available: held by plank)")),
+            "the notice quotes the signal: {:?}",
+            notices.lock().unwrap()
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_signal_file_on_every_run_gets_one_rerun_and_the_second_result() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let dir = gpu_dir("signal-twice");
+        let (counter, paths) = (dir.join("runs"), dir.join("paths"));
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+
+        let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_file_command(&counter, &paths, true))]);
+
+        assert_eq!(runs(&counter), 2, "exactly one re-run");
+        assert!(out.contains("exit_status=0"), "{out}");
+        assert!(!out.contains("second-run-ok"), "{out}");
+        assert_eq!(logged(&log), GPU_CYCLE_ORDER, "the model is reloaded");
+        assert!(signal_paths(&paths).iter().all(|p| !p.exists()));
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_signal_file_is_deleted_even_when_no_cycle_can_run() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let dir = gpu_dir("signal-nocycle");
+        let (counter, paths) = (dir.join("runs"), dir.join("paths"));
+        let cfg = test_cfg();
+        let mut agent = test_agent_boxed(
+            &dir,
+            Box::new(crate::engine::EchoEngine::new(100_000)),
+            &cfg,
+        );
+
+        let out =
+            agent.run_tool_calls(&[gpu_bash_call(&gpu_file_command(&counter, &paths, false))]);
+
+        assert_eq!(runs(&counter), 1, "{out}");
+        let seen = signal_paths(&paths);
+        assert_eq!(seen.len(), 1);
+        assert!(!seen[0].exists(), "deleted without a cycle");
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The re-run outlasts the model's `refresh_sec`: it must still come back
     /// finished, and the model must not reopen while it runs.
     #[test]
     fn the_rerun_waits_for_the_command_to_exit_before_the_reopen() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("long-rerun");
         let counter = dir.join("runs");
         let done = dir.join("done");
@@ -36419,6 +36645,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_refused_restore_falls_back_to_the_rebuild_path() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("refused");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36455,6 +36682,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn an_engine_that_cannot_release_the_gpu_never_cycles() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("echo");
         let counter = dir.join("runs");
         let log: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
@@ -36513,6 +36741,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_background_bash_job_never_cycles() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("background");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36547,6 +36776,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn the_alternate_local_engine_is_cycled_under_a_provider_main_agent() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("alt");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36584,6 +36814,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_failed_reopen_leaves_a_placeholder_and_the_next_turn_retries() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("reopen-fails");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36653,6 +36884,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_local_parent_parked_under_a_provider_sidechain_is_cycled() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("parked");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36725,6 +36957,7 @@ or the user's next message aborts before its first token"
     /// provider's slot.
     #[test]
     fn a_retry_after_a_sidechain_reloads_into_the_slot_the_placeholder_moved_to() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("retry-sidechain");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36763,6 +36996,7 @@ or the user's next message aborts before its first token"
     /// the placeholder unwinds back into the main slot and is reloaded there.
     #[test]
     fn a_retry_after_a_parked_parent_failed_reloads_the_main_slot() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("retry-parked");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36793,6 +37027,7 @@ or the user's next message aborts before its first token"
     /// retried into that same alternate slot.
     #[test]
     fn a_retry_after_the_alt_slot_failed_reloads_the_alt_slot() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("retry-alt");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36821,6 +37056,7 @@ or the user's next message aborts before its first token"
     /// dropped (its snapshot file with it) and the factory is never called.
     #[test]
     fn a_retry_with_no_placeholder_left_drops_the_reload() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("retry-gone");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -36850,6 +37086,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_third_gpu_request_in_one_turn_gets_the_first_result_and_a_note() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("cap");
         let log = std::sync::Arc::default();
         let cfg = test_cfg();
@@ -36893,6 +37130,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn idle_passes_wait_while_a_gpu_reload_is_owed() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let _s = enable_suggestions_for_test();
         let dir = gpu_dir("idle");
         let cfg = test_cfg();
@@ -37070,8 +37308,236 @@ or the user's next message aborts before its first token"
         "restore:second:[4, 2]",
     ];
 
+    fn suspend_call(command: &str) -> ToolCall {
+        crate::tools::test_call("bash", &[("command", command), ("suspend_model", "true")])
+    }
+
+    /// Appends a line to `counter` and prints `ran-ok`.
+    fn counted(counter: &std::path::Path) -> String {
+        format!("echo run >> '{}'; echo ran-ok", counter.display())
+    }
+
+    #[test]
+    fn suspend_model_saves_releases_runs_reopens_and_restores_in_order() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let dir = gpu_dir("suspend-order");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+
+        let out = agent.run_tool_calls(&[suspend_call(&counted(&counter))]);
+
+        assert_eq!(runs(&counter), 1, "no first run: the command runs once");
+        assert_eq!(
+            logged(&log),
+            [
+                "save:first",
+                "release:first(runs=0)",
+                "reopen(runs=1)",
+                "think:second",
+                "restore:second:[4, 2]",
+            ],
+            "save, release, run, reopen, restore"
+        );
+        assert!(out.contains("ran-ok"), "the run is the result: {out}");
+        assert!(out.contains("exit_status=0"), "{out}");
+        assert!(!out.contains("suspend_model"), "{out}");
+        assert_eq!(
+            agent.gpu_yield.cycles_this_turn, 1,
+            "counts against the cap"
+        );
+        assert!(
+            agent.engine.can_release_gpu(),
+            "the reopened engine is live"
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clears the process-wide interrupt flag on drop, panic included, so a
+    /// failing assertion between [`crate::interrupt::request`] and the
+    /// matching `clear` can never leave the flag set for every other test
+    /// that shares the process.
+    struct ClearInterruptOnDrop;
+    impl Drop for ClearInterruptOnDrop {
+        fn drop(&mut self) {
+            crate::interrupt::clear();
+        }
+    }
+
+    #[test]
+    fn a_pending_interrupt_skips_the_suspend_model_cycle_entirely() {
+        let _guard = crate::interrupt::test_guard();
+        crate::interrupt::clear();
+        let _clear_on_drop = ClearInterruptOnDrop;
+        let dir = gpu_dir("suspend-interrupted");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        // Esc/Ctrl-C already arrived before this call was even dispatched;
+        // `suspend_model` must not still unload the model for it. The
+        // interrupt also kills the plain (non-suspended) run the call falls
+        // back to, same as any other bash job — that part is not new
+        // behavior, only the absence of a GPU-yield cycle is what this test
+        // is about.
+        crate::interrupt::request();
+
+        agent.run_tool_calls(&[suspend_call(&counted(&counter))]);
+
+        assert!(
+            logged(&log).is_empty(),
+            "no save/release/reopen when interrupted: {:?}",
+            logged(&log)
+        );
+        assert_eq!(
+            agent.gpu_yield.cycles_this_turn, 0,
+            "a skipped cycle does not count against the cap"
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `PreToolUse` hook group whose single hook always blocks (exit 2).
+    fn blocking_hook() -> Vec<crate::hooks::HookMatcher> {
+        vec![crate::hooks::HookMatcher {
+            matcher: String::new(),
+            hooks: vec![crate::hooks::HookDef {
+                command: "echo blocked >&2; exit 2".to_string(),
+                timeout_sec: 5,
+                is_async: false,
+                prompt: None,
+            }],
+        }]
+    }
+
+    #[test]
+    fn a_blocking_pretooluse_hook_skips_the_unload_entirely() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let dir = gpu_dir("suspend-hook-block");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        agent.tool_ctx.hooks.pre_tool_use = blocking_hook();
+
+        let out = agent.run_tool_calls(&[suspend_call(&counted(&counter))]);
+
+        assert_eq!(runs(&counter), 0, "the command never ran");
+        assert!(
+            logged(&log).is_empty(),
+            "no save/release/reopen for a blocked command: {:?}",
+            logged(&log)
+        );
+        assert!(out.contains("blocked by PreToolUse hook"), "{out}");
+        assert_eq!(agent.gpu_yield.cycles_this_turn, 0);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_gpu_signal_from_a_suspended_run_is_returned_not_cycled_again() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let dir = gpu_dir("suspend-signal");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+
+        let out = agent.run_tool_calls(&[suspend_call(&gpu_command(&counter, true))]);
+
+        assert_eq!(runs(&counter), 1, "never run a second time");
+        assert!(out.contains("exit_status=75"), "{out}");
+        assert!(out.contains("GPU not available"), "{out}");
+        let releases = logged(&log)
+            .iter()
+            .filter(|e| e.starts_with("release:"))
+            .count();
+        assert_eq!(releases, 1, "{:?}", logged(&log));
+        assert_eq!(agent.gpu_yield.cycles_this_turn, 1);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suspend_model_past_the_cap_runs_without_suspending_and_says_so() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let dir = gpu_dir("suspend-cap");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        agent.gpu_yield.cycles_this_turn = GPU_YIELD_CYCLES_PER_TURN;
+
+        let out = agent.run_tool_calls(&[suspend_call(&counted(&counter))]);
+
+        assert_eq!(runs(&counter), 1);
+        assert!(logged(&log).is_empty(), "{:?}", logged(&log));
+        assert!(out.contains("ran-ok"), "{out}");
+        assert!(
+            out.contains("suspend_model ignored: limit of 2 per turn reached\n"),
+            "{out}"
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suspend_model_on_a_self_backgrounding_command_is_ignored() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let dir = gpu_dir("suspend-background");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+
+        let out = agent.run_tool_calls(&[suspend_call(&format!("{} &", counted(&counter)))]);
+
+        assert!(logged(&log).is_empty(), "{:?}", logged(&log));
+        assert!(out.contains(SUSPEND_IGNORED_BACKGROUND), "{out}");
+        assert_eq!(agent.gpu_yield.cycles_this_turn, 0);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suspend_model_without_a_releasable_model_is_ignored() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        // Echo-like: a scripted engine and no reopen factory.
+        let dir = gpu_dir("suspend-echo");
+        let counter = dir.join("runs");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let out = agent.run_tool_calls(&[suspend_call(&counted(&counter))]);
+        assert!(out.contains("ran-ok"), "{out}");
+        assert!(out.contains(SUSPEND_IGNORED_NO_MODEL), "{out}");
+        drop(agent);
+
+        // Remote-like: armed, but the engine cannot release the GPU.
+        let log = std::sync::Arc::default();
+        let mut remote = GpuEngine::new("remote", &log, &counter, &[]);
+        remote.releasable = false;
+        let mut agent = test_agent_boxed(&dir, Box::new(remote), &cfg);
+        let (l, c) = (std::sync::Arc::clone(&log), counter.clone());
+        arm_gpu_yield(
+            &mut agent,
+            &dir,
+            gpu_factory(&log, &counter, move || {
+                Ok(GpuEngine::new("second", &l, &c, &[]))
+            }),
+        );
+        let out = agent.run_tool_calls(&[suspend_call(&counted(&counter))]);
+        assert!(out.contains(SUSPEND_IGNORED_NO_MODEL), "{out}");
+        assert!(!logged(&log).iter().any(|e| e.starts_with("save")));
+        assert_eq!(runs(&counter), 2);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_bang_that_asks_for_the_gpu_cycles_and_records_the_second_run() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-feedback");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37116,6 +37582,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_quiet_bang_cycles_into_a_panel_of_the_second_run_and_no_transcript() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-quiet");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37145,6 +37612,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn plain_repl_bangs_cycle_and_only_the_single_bang_is_recorded() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-plain");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37178,7 +37646,38 @@ or the user's next message aborts before its first token"
     }
 
     #[test]
+    fn single_and_double_bangs_honour_the_signal_file_once_per_escape() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let dir = gpu_dir("bang-signal");
+        let (counter, paths) = (dir.join("runs"), dir.join("paths"));
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        for (prefix, always) in [("!!", false), ("!", false), ("!", true), ("!!", true)] {
+            let _ = std::fs::remove_file(&counter);
+            let _ = std::fs::remove_file(&paths);
+            log.lock().unwrap().clear();
+            let cmd = gpu_file_command(&counter, &paths, always);
+            assert!(handle_plain_line(&mut agent, &format!("{prefix}{cmd}")).unwrap());
+            let at = format!("{prefix} always={always}");
+            assert_eq!(runs(&counter), 2, "{at}: one re-run per escape");
+            let reopens = logged(&log)
+                .iter()
+                .filter(|e| e.starts_with("reopen"))
+                .count();
+            assert_eq!(reopens, 1, "{at}: {:?}", logged(&log));
+            let seen = signal_paths(&paths);
+            assert_eq!(seen.len(), 2, "{at}");
+            assert_ne!(seen[0], seen[1], "{at}");
+            assert!(seen.iter().all(|p| !p.exists()), "{at}");
+        }
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_bang_without_the_marker_or_a_releasable_model_never_cycles() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-none");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37231,6 +37730,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_bang_refused_twice_reports_the_second_refusal_without_a_loop() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-twice");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();
@@ -37256,6 +37756,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn a_bang_inside_a_sidechain_skips_the_cycle_with_a_note() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = gpu_dir("bang-sidechain");
         let counter = dir.join("runs");
         let log = std::sync::Arc::default();

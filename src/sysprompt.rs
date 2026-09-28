@@ -605,7 +605,7 @@ fn build_tools_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> (String, usize) {
-    build_tools_prompt_parts_with_wasm(mcp_servers, &[], parity, ToolSyntax::Dsml)
+    build_tools_prompt_parts_with_wasm(mcp_servers, &[], parity, ToolSyntax::Dsml, false)
 }
 
 /// [`build_tools_prompt_parts`] with WASM component tools folded in.
@@ -618,6 +618,7 @@ fn build_tools_prompt_parts_with_wasm(
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
     syntax: ToolSyntax,
+    gpu_suspend: bool,
 ) -> (String, usize) {
     // Unreachable without the feature: `Ds4Model::open` refuses a Qwen model
     // before any prompt is built, so the dialect can never be selected. The
@@ -625,9 +626,14 @@ fn build_tools_prompt_parts_with_wasm(
     // refusal is ever bypassed, the build fails to compile instead of quietly
     // handing a Qwen model the wrong prompt.
     if syntax == ToolSyntax::Qwen {
-        return build_qwen_tools_prompt_parts(profile_prompt_source(), mcp_servers, wasm_tools);
+        return build_qwen_tools_prompt_parts(
+            profile_prompt_source(),
+            mcp_servers,
+            wasm_tools,
+            gpu_suspend,
+        );
     }
-    let mut out = trusted_prose(profile_prompt_source(), parity, syntax);
+    let mut out = trusted_prose(profile_prompt_source(), parity, syntax, gpu_suspend);
     let trusted_len = out.len();
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
@@ -641,10 +647,12 @@ fn build_tools_prompt_parts_with_wasm(
 ///
 /// Split out of [`build_tools_prompt_parts_with_wasm`] so the profile path
 /// can be tested under each dialect without the process-global profile.
+/// `gpu_suspend` adds [`GPU_SUSPEND_NOTE`] (see [`append_gpu_suspend_note`]).
 fn trusted_prose(
     profile: Option<(&str, &crate::profile::ProfileSpec)>,
     parity: bool,
     syntax: ToolSyntax,
+    gpu_suspend: bool,
 ) -> String {
     // A profile replaces the whole prose prompt; the schema block is still
     // generated, from the allow-listed builtins.
@@ -658,6 +666,9 @@ fn trusted_prose(
         append_working_style(&mut out);
         out
     };
+    if gpu_suspend && profile.is_none_or(|(_, spec)| spec.builtin_enabled("bash")) {
+        append_gpu_suspend_note(&mut out, syntax);
+    }
     // The V4.1 tag respelling happens here and nowhere else: at this point
     // `out` is entirely trusted prompt text (plank's own, or the installed
     // profile's), and not one byte of MCP, WASM or `-sys` text has been
@@ -695,6 +706,7 @@ fn build_qwen_tools_prompt_parts(
     profile: Option<(&str, &crate::profile::ProfileSpec)>,
     mcp_servers: &[crate::tools::mcp::McpServer],
     wasm_tools: &[&crate::wasmreg::WasmTool],
+    gpu_suspend: bool,
 ) -> (String, usize) {
     // Third-party schemas, in the fence either way.
     let mut foreign = String::new();
@@ -704,6 +716,9 @@ fn build_qwen_tools_prompt_parts(
 
     if let Some((text, spec)) = profile {
         let mut out = compose_qwen_profile_prompt(text, spec, &foreign);
+        if gpu_suspend && spec.builtin_enabled("bash") {
+            append_gpu_suspend_note(&mut out, ToolSyntax::Qwen);
+        }
         crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
         return (out, 0);
     }
@@ -723,6 +738,9 @@ fn build_qwen_tools_prompt_parts(
     out.push_str(&TOOLS_PROMPT_QWEN[at..]);
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     append_working_style(&mut out);
+    if gpu_suspend {
+        append_gpu_suspend_note(&mut out, ToolSyntax::Qwen);
+    }
     (out, 0)
 }
 
@@ -875,6 +893,43 @@ pub const GIT_RULES: &str = "- Commit only when the user asks. Never push unless
 - Pass the commit message through a heredoc: git commit -m \"$(cat <<'EOF' ... EOF)\".
 - Never use -i flags (rebase -i, add -i): there is no interactive input.
 ";
+
+/// plank's note on the `bash` tool's `suspend_model` parameter, which the
+/// trained bash schema deliberately does not declare (FINDINGS.md): the
+/// schema text is what the model was trained on and must stay byte-identical
+/// to the C, so the parameter is taught here, after the trained block, and
+/// only when plank holds a local model it can release (`gpuyield`). Followed
+/// by the one-line call form in the model's dialect.
+pub const GPU_SUSPEND_NOTE: &str = "bash also accepts suspend_model=\"true\": plank then unloads the model before running the command and reloads it afterwards, keeping this conversation. Use it only for a command that needs the GPU for itself, such as mex generating an illustration; it costs a model reload. Pass it as:
+";
+
+/// The `suspend_model` parameter as a DSML call spells it, in the trained
+/// prompt's own parameter form. Respelled for V4.1 with the rest of the
+/// trusted span.
+const GPU_SUSPEND_EXAMPLE_DSML: &str =
+    "<｜DSML｜parameter name=\"suspend_model\" string=\"false\">true</｜DSML｜parameter>\n";
+
+/// The `suspend_model` parameter as a Qwen call spells it, in the trained
+/// prompt's parameter form (value on its own line).
+const GPU_SUSPEND_EXAMPLE_QWEN: &str = "<parameter=suspend_model>\ntrue\n</parameter>\n";
+
+/// Appends [`GPU_SUSPEND_NOTE`] and the call form for `syntax` under its own
+/// heading. Deterministic for a given launch: whether plank holds a
+/// releasable model is fixed when the prompt is composed, so the Tier 1
+/// fingerprint differs between a local and a provider run but never within
+/// one.
+fn append_gpu_suspend_note(out: &mut String, syntax: ToolSyntax) {
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("\n# GPU commands\n\n");
+    out.push_str(GPU_SUSPEND_NOTE);
+    out.push_str(if syntax == ToolSyntax::Qwen {
+        GPU_SUSPEND_EXAMPLE_QWEN
+    } else {
+        GPU_SUSPEND_EXAMPLE_DSML
+    });
+}
 
 fn append_working_style(out: &mut String) {
     out.push('\n');
@@ -1798,7 +1853,14 @@ pub fn build_system_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> SplitSystemPrompt {
-    build_system_prompt_parts_with_wasm(user_system, mcp_servers, &[], parity, ToolSyntax::Dsml)
+    build_system_prompt_parts_with_wasm(
+        user_system,
+        mcp_servers,
+        &[],
+        parity,
+        ToolSyntax::Dsml,
+        false,
+    )
 }
 
 /// [`build_system_prompt_parts`] with WASM component tools folded in.
@@ -1814,12 +1876,13 @@ pub fn build_system_prompt_parts_with_wasm(
     wasm_tools: &[&crate::wasmreg::WasmTool],
     parity: bool,
     syntax: ToolSyntax,
+    gpu_suspend: bool,
 ) -> SplitSystemPrompt {
     // The DSML dialects share one tools prompt, V4.1 differing only by the
     // three tag names the builder respells inside the trusted span; Qwen is not
     // DSML at all and takes its own.
     let (mut text, trusted_len) =
-        build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity, syntax);
+        build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity, syntax, gpu_suspend);
     if crate::settings::active().git.sign_commits {
         text.push_str("\n\n");
         text.push_str(COMMIT_SIGNATURE_INSTRUCTION);
@@ -2529,8 +2592,9 @@ mod tests {
     /// and MCP text appended after the trusted span is never rewritten.
     #[test]
     fn dsml41_syntax_selects_the_rewritten_tools_prompt() {
-        let v4 = build_system_prompt_parts_with_wasm("", &[], &[], true, ToolSyntax::Dsml);
-        let v41 = build_system_prompt_parts_with_wasm("", &[], &[], true, ToolSyntax::Dsml41);
+        let v4 = build_system_prompt_parts_with_wasm("", &[], &[], true, ToolSyntax::Dsml, false);
+        let v41 =
+            build_system_prompt_parts_with_wasm("", &[], &[], true, ToolSyntax::Dsml41, false);
         assert_eq!(dsml41_tools_prompt(&v4.text), v41.text);
         assert!(v41.text.contains("<｜DSML｜ calls>"));
         assert!(!v41.text.contains("tool_calls"));
@@ -2870,6 +2934,67 @@ mod tests {
     }
 
     #[test]
+    fn the_trained_bash_schema_never_declares_suspend_model() {
+        assert!(!build_tools_prompt_base(true).contains("suspend_model"));
+        assert!(!build_tools_prompt(&[], true).contains("suspend_model"));
+        assert!(!TOOLS_PROMPT_QWEN.contains("suspend_model"));
+        let bash = parse_builtin_tool_schemas()
+            .into_iter()
+            .find(|s| s.name == "bash")
+            .expect("bash is a trained tool");
+        assert!(!bash.parameters.to_string().contains("suspend_model"));
+    }
+
+    #[test]
+    fn the_suspend_note_rides_only_on_a_releasable_model_in_each_dialect() {
+        for syntax in [ToolSyntax::Dsml, ToolSyntax::Dsml41] {
+            let (off, _) = build_tools_prompt_parts_with_wasm(&[], &[], true, syntax, false);
+            assert!(!off.contains("suspend_model"), "{syntax:?}");
+            let (on, trusted) = build_tools_prompt_parts_with_wasm(&[], &[], true, syntax, true);
+            assert!(on.contains(GPU_SUSPEND_NOTE), "{syntax:?}");
+            assert!(
+                on[..trusted].contains(GPU_SUSPEND_NOTE),
+                "inside the trusted span"
+            );
+            assert!(on.starts_with(&off), "appended after everything else");
+            let (again, _) = build_tools_prompt_parts_with_wasm(&[], &[], true, syntax, true);
+            assert_eq!(on, again, "deterministic, so the fingerprint is stable");
+        }
+        let (v4, _) = build_tools_prompt_parts_with_wasm(&[], &[], true, ToolSyntax::Dsml, true);
+        assert!(v4.ends_with(GPU_SUSPEND_EXAMPLE_DSML));
+        let (v41, _) = build_tools_prompt_parts_with_wasm(&[], &[], true, ToolSyntax::Dsml41, true);
+        assert!(v41.ends_with(&dsml41_tools_prompt(GPU_SUSPEND_EXAMPLE_DSML)));
+        let (qwen_off, _) = build_qwen_tools_prompt_parts(None, &[], &[], false);
+        assert!(!qwen_off.contains("suspend_model"));
+        let (qwen, _) = build_qwen_tools_prompt_parts(None, &[], &[], true);
+        assert!(qwen.contains(GPU_SUSPEND_NOTE));
+        assert!(qwen.ends_with(GPU_SUSPEND_EXAMPLE_QWEN));
+        assert!(!qwen.contains("｜DSML｜parameter name=\"suspend_model\""));
+    }
+
+    #[test]
+    fn the_suspend_note_follows_a_profiles_bash_allow_list() {
+        let text = format!("You are HAL.\n\n{TOOL_PROTOCOL_TOKEN}\n");
+        let with = trusted_prose(
+            Some((&text, &allowing(&["bash"]))),
+            true,
+            ToolSyntax::Dsml,
+            true,
+        );
+        assert!(with.contains(GPU_SUSPEND_NOTE));
+        let without = trusted_prose(
+            Some((&text, &allowing(&["read"]))),
+            true,
+            ToolSyntax::Dsml,
+            true,
+        );
+        assert!(!without.contains("suspend_model"));
+        let (qwen, _) =
+            build_qwen_tools_prompt_parts(Some((&text, &allowing(&["read"]))), &[], &[], true);
+        assert!(!qwen.contains("suspend_model"));
+    }
+
+    #[test]
     fn a_qwen_profile_prompt_expands_the_token_to_the_fence_and_call_format() {
         let text = format!("You are HAL.\n\n{TOOL_PROTOCOL_TOKEN}\n\nBe brief.\n");
         let out = compose_qwen_profile_prompt(&text, &allowing(&["read", "glob"]), "");
@@ -2927,10 +3052,10 @@ mod tests {
     fn the_qwen_builder_uses_the_profile_when_one_is_active() {
         let text = format!("You are HAL.\n{TOOL_PROTOCOL_TOKEN}");
         let spec = allowing(&["read"]);
-        let (out, trusted) = build_qwen_tools_prompt_parts(Some((&text, &spec)), &[], &[]);
+        let (out, trusted) = build_qwen_tools_prompt_parts(Some((&text, &spec)), &[], &[], false);
         assert_eq!(trusted, 0, "the Qwen prompt has no trusted span");
         assert!(out.starts_with("You are HAL.\n# Tools\n"), "{out}");
-        let (plain, _) = build_qwen_tools_prompt_parts(None, &[], &[]);
+        let (plain, _) = build_qwen_tools_prompt_parts(None, &[], &[], false);
         assert!(plain.starts_with("You are a coding agent"), "{plain}");
     }
 
@@ -3132,8 +3257,8 @@ mod tests {
             recommended_model: None,
         };
         let text = format!("You are ChatBGT. Mind each parameter.\n\n{TOOL_PROTOCOL_TOKEN}\n");
-        let v4 = trusted_prose(Some((&text, &spec)), true, ToolSyntax::Dsml);
-        let v41 = trusted_prose(Some((&text, &spec)), true, ToolSyntax::Dsml41);
+        let v4 = trusted_prose(Some((&text, &spec)), true, ToolSyntax::Dsml, false);
+        let v41 = trusted_prose(Some((&text, &spec)), true, ToolSyntax::Dsml41, false);
         assert!(v4.contains("tool_calls"), "the V4 protocol names its tags");
         assert_eq!(v41, dsml41_tools_prompt(&v4));
         assert!(v41.contains("<｜DSML｜ calls>"), "{v41}");

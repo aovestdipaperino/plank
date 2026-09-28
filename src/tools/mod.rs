@@ -418,6 +418,47 @@ pub fn withheld_before_dispatch(wasm: &crate::wasmreg::Session, name: &str) -> O
         .then(|| disabled_tool_error(name))
 }
 
+/// Runs the shell `PreToolUse` hooks for `call` and returns the model-visible
+/// block message when one of them blocks it (exit 2; its stderr is the
+/// message). Warnings, system messages and the stop reason are recorded on
+/// `ctx` either way. `None` means the call may proceed.
+///
+/// Factored out of [`dispatch`] so a caller that must decide something
+/// *before* dispatching — the GPU-yield `suspend_model` path needs to know
+/// whether the command will be blocked before it unloads the model for it —
+/// can run the exact same check `dispatch` would run, rather than
+/// discovering the block only after paying for the unload.
+pub(crate) fn precheck_pre_tool_use(
+    ctx: &mut ToolContext,
+    call: &ToolCall,
+    arg_values: &[&str],
+) -> Option<String> {
+    if ctx.hooks.pre_tool_use.is_empty() {
+        return None;
+    }
+    let input = crate::hooks::tool_event_input(
+        "PreToolUse",
+        &call.name,
+        &mcp::args_to_json(call),
+        None,
+        &ctx.cwd,
+    );
+    let pre = crate::hooks::run_event_args(
+        &ctx.hooks.pre_tool_use,
+        &call.name,
+        arg_values,
+        &input,
+        &ctx.cwd,
+    );
+    ctx.hook_warnings.extend(pre.warnings);
+    ctx.hook_warnings.extend(pre.system_messages);
+    if ctx.hook_stop.is_none() {
+        ctx.hook_stop = pre.stop_reason;
+    }
+    pre.block
+        .map(|msg| format!("Tool error: blocked by PreToolUse hook: {msg}\n"))
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     if call.name.is_empty() {
@@ -431,31 +472,8 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     let arg_values: Vec<&str> = call.args.iter().map(|a| a.value.as_str()).collect();
     // PreToolUse hooks: exit 2 blocks the tool, its stderr becomes the
     // model-visible tool error.
-    if !ctx.hooks.pre_tool_use.is_empty() {
-        let input = crate::hooks::tool_event_input(
-            "PreToolUse",
-            &call.name,
-            &mcp::args_to_json(call),
-            None,
-            &ctx.cwd,
-        );
-        let pre = crate::hooks::run_event_args(
-            &ctx.hooks.pre_tool_use,
-            &call.name,
-            &arg_values,
-            &input,
-            &ctx.cwd,
-        );
-        ctx.hook_warnings.extend(pre.warnings);
-        ctx.hook_warnings.extend(pre.system_messages);
-        if ctx.hook_stop.is_none() {
-            ctx.hook_stop = pre.stop_reason;
-        }
-        if let Some(msg) = pre.block {
-            return ToolResult::from_output(format!(
-                "Tool error: blocked by PreToolUse hook: {msg}\n"
-            ));
-        }
+    if let Some(msg) = precheck_pre_tool_use(ctx, call, &arg_values) {
+        return ToolResult::from_output(msg);
     }
     // pre_tool_use for WASM subscribers, after the shell hooks and before the
     // plan-mode gate: a component sees the same call a hook would have seen,

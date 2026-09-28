@@ -290,14 +290,26 @@ loop — with piped stdin there is no live input to multiplex.
 ### GPU yield (`gpuyield.rs`)
 
 A child command can need the GPU the loaded model occupies (`mex`, which runs a
-diffusion model on Metal, is the first). The protocol is small: the command
-exits 75 and prints a line starting with `GPU not available`, and plank sets
-`PLANK_GPU_YIELD=1` in every bash job so a tool knows plank can step aside.
+diffusion model on Metal, is the first). plank sets `PLANK_GPU_YIELD=1` in
+every bash job so a tool knows plank can step aside, and
+`PLANK_GPU_YIELD_FILE` naming a signal file for that run alone
+(`gpuyield::signal_path`: `$TMPDIR/plank-gpu-yield-<uid>/signal-<nonce>`,
+the directory created or tightened to 0700 and refused unless it is a real
+directory this user owns; the file is never created by plank). A command asks
+for the GPU by writing one line into that file, whatever its exit status, or
+by exiting 75 and printing a line starting with `GPU not available`. The file
+is the primary signal because models pipe almost everything, and in
+`mex x 2>&1 | tail -20` the shell's status is `tail`'s 0, which hides the 75.
 
 Detection lives at the bash layer: a foreground `bash` call whose command ended
 inside the call leaves a `ForegroundExit` on `BashJobs::last_foreground`, with
-the exit status, whether the whole output file (not the head the observation
-shows) has the marker at a line start, and the sandbox decision the run used.
+the exit status, the signal line (`gpuyield::take_signal`, which reads at most
+4 KiB, keeps the first non-blank line for the notice, and deletes the file
+whatever it held), whether that or the whole output file (not the head the
+observation shows) having the marker at a line start asks for the GPU, and the
+sandbox decision the run used. A job still running when the call returns keeps
+its signal path until it is reaped, and `BashJob`'s drop deletes the file, so a
+background job that signals is never retried and leaves nothing behind.
 `Agent::dispatch_tool`, the per-call path of `run_tool_calls`, reads it. That
 seam is shared by `run_turn` (plain REPL and every headless mode),
 `worker_turn` (TUI), sub-agent rounds and fan-out rounds; a stanza goes call by
@@ -319,8 +331,9 @@ can be touching the engine:
 4. the same call dispatched once more, with the first run's sandbox decision
    replayed and `BashJobs::wait_to_exit` set, so the call waits for the
    command to exit (its own timeout and a user interrupt still end it) rather
-   than returning `status=running` after `refresh_sec`; its result is what the
-   model sees, and it never cycles again;
+   than returning `status=running` after `refresh_sec`; being a new job it
+   gets a fresh signal path, its result is what the model sees, and it never
+   cycles again;
 5. the `ReopenFn` that `make_local_engine` built from the exact resolved
    parameters (companion retry included). It first checks that the model, the
    DSpark draft model and the vision encoder are readable regular files
@@ -352,11 +365,14 @@ because a sidechain unwinding moves it: a parked parent returns to
 placeholder left the reload is dropped. While one is owed, the idle slot runs
 no memory or suggestion pass. A turn runs at most two cycles
 (`GPU_YIELD_CYCLES_PER_TURN`); a third request gets its first result with a
-note. The re-run is an ordinary dispatch, so tool hooks fire for both runs.
+note, which is also what bounds a tool that writes its signal file on every
+run. The re-run is an ordinary dispatch, so tool hooks fire for both runs.
 The local engine can be `Agent::engine`, the `EngineKey::Local` alternate under
 a provider main agent, or a parent parked in `Agent::parked_engines` while a
 provider sidechain runs. The user's `!` and `!!` escapes get the same cycle
-through `Agent::run_bang`: `run_immediate` exports the variable too, and the
+through `Agent::run_bang`: `run_immediate` exports both variables too, with a
+fresh signal path per call, and hands back the signal line it read and deleted
+as `ImmediateOutput::gpu_signal`, and the
 cycle's re-run step is a `CycleRerun` the agent's host is generic over, the
 tool call's re-dispatch (`ToolRerun`) or the escape's second `run_immediate`
 through the front end's `BangIo` (`BangRerun`; console lines, or the TUI log
@@ -365,6 +381,39 @@ release, reopen, restore and the retry are one code path. An escape runs
 between turns: one cycle each, outside the per-turn cap, skipped with a note
 if ever reached inside a sidechain. Background jobs, a local engine inside a
 fan-out slot and `plank serve` are not covered.
+
+The model can also ask before a command runs. `bash` accepts an extra
+`suspend_model` parameter (`tools::bash::suspend_model_requested`: `true`, `1`
+or `yes` in any case), which the trained bash schema deliberately does not
+declare, because that schema must stay byte-identical to the C. Both parsers
+already pass an unknown parameter through, so only plank's prompt changes: a
+short `# GPU commands` note (`sysprompt::GPU_SUSPEND_NOTE`) with the call form
+in the model's dialect goes after the working style, inside the trusted span
+on DSML (so V4.1 respells it with the rest), and only when `new_agent` holds a
+`ReopenFn`, so the Tier 1 fingerprint differs between a local and a provider
+launch but never within one. `Agent::dispatch_tool` routes such a call to
+`dispatch_suspended_bash`, which runs `gpuyield::run_suspended`: the same
+cycle body as `run_cycle` with its own notice and the `ToolRerun` as the
+command's only run, sandbox decided as usual. It counts against the per-turn
+cap and, since `ToolRerun` drops the `ForegroundExit`, a run that signals for
+the GPU anyway is returned, not cycled. With no releasable slot (Echo, a
+provider, a remote engine, a reload still owed), a self-backgrounding command
+(`backgrounds_itself`) or the cap reached, the call runs as any other and
+its result gets one line saying why the parameter was ignored. A stanza
+holding such a call goes call by call even when no cycle is armed, so the note
+is never lost to `dispatch_all`. `backgrounds_itself` is a best-effort
+heuristic, not a shell parser: it scans for any unquoted, unescaped `&` that
+is not half of `&&`, `>&`, `&>` or `|&`, so `mex x &`, `(mex x &)` and
+`mex x & echo started` are all caught, but it can still be fooled by shell
+constructs it does not model (command substitution, here-docs, and the like).
+
+An interrupt (Esc in the TUI, Ctrl-C in the REPL) already pending when a
+`bash` call is dispatched, or one that arrives while its first run is still
+going, always wins over a GPU-yield cycle: `foreground_result` never trusts a
+signal file or an exit-75 marker from a run the interrupt killed, and both
+`dispatch_tool_reactive` and `dispatch_suspended_bash` check
+`crate::interrupt::pending()` before ever unloading. Esc/Ctrl-C must stop the
+command, not start an unload-run-reload cycle for it.
 
 ### Remote, hosted, and shared engines (`serve.rs`, `host.rs`, `remote/`)
 - `remote/provider.rs` — additional `Engine` impls for hosted providers

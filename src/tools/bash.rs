@@ -52,6 +52,9 @@ struct BashJob {
     pid: u32,
     child: Child,
     path: PathBuf,
+    /// The run's GPU-yield signal file (`PLANK_GPU_YIELD_FILE`), read once
+    /// by a foreground call and deleted when the job is reaped at the latest.
+    signal: Option<PathBuf>,
     start: Instant,
     timeout: Duration,
     shared: Arc<Shared>,
@@ -133,6 +136,29 @@ fn make_output_file(id: u64) -> Result<(PathBuf, std::fs::File), String> {
     Err("failed to create temporary output file: too many collisions".to_string())
 }
 
+/// A process's exit code, or `128 + signal` when a signal ended it.
+fn status_code(status: std::process::ExitStatus) -> i64 {
+    status.code().map_or_else(
+        || {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal().map_or(-1, |sig| 128 + i64::from(sig))
+        },
+        i64::from,
+    )
+}
+
+/// Exports the GPU-yield promise into `command` (`gpuyield`): `PLANK_GPU_YIELD`
+/// and a fresh signal-file path, which is returned so the caller can read it
+/// back and delete it.
+fn export_gpu_yield(command: &mut Command) -> Option<PathBuf> {
+    command.env(crate::gpuyield::ENV_VAR, "1");
+    let signal = crate::gpuyield::signal_path();
+    if let Some(path) = &signal {
+        command.env(crate::gpuyield::FILE_ENV_VAR, path);
+    }
+    signal
+}
+
 /// How long a process group gets to exit after SIGTERM before SIGKILL.
 const GROUP_KILL_GRACE: Duration = Duration::from_millis(500);
 
@@ -203,20 +229,7 @@ impl BashJob {
     }
 
     fn finalize(&mut self, status: std::process::ExitStatus) {
-        self.exit_status = status.code().map_or_else(
-            || {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    status.signal().map_or(-1, |sig| 128 + i64::from(sig))
-                }
-                #[cfg(not(unix))]
-                {
-                    -1
-                }
-            },
-            i64::from,
-        );
+        self.exit_status = status_code(status);
         self.running = false;
     }
 
@@ -482,6 +495,11 @@ impl Drop for BashJob {
     fn drop(&mut self) {
         // Kill the group, not just the shell, so nothing outlives plank.
         self.terminate();
+        // A background job that asked for the GPU is not retried, but its
+        // signal file must not outlive it.
+        if let Some(signal) = &self.signal {
+            let _ = std::fs::remove_file(signal);
+        }
         // The temp output file is intentionally kept: its path was shown to
         // the model as output_path and may be read with the file tools.
     }
@@ -518,13 +536,11 @@ impl BashJobs {
         } else {
             Command::new("/bin/sh")
         };
+        command.arg("-c").arg(cmd).current_dir(ctx_cwd);
+        // Tells a GPU-bound tool that plank can unload its model on request:
+        // a line in the signal file, or exit 75 plus the marker line.
+        let signal = export_gpu_yield(&mut command);
         let mut child = command
-            .arg("-c")
-            .arg(cmd)
-            .current_dir(ctx_cwd)
-            // Tells a GPU-bound tool that plank can unload its model on
-            // request (`gpuyield`): exit 75 plus the marker line.
-            .env(crate::gpuyield::ENV_VAR, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -553,6 +569,7 @@ impl BashJobs {
             pid,
             child,
             path,
+            signal,
             start: Instant::now(),
             timeout: Duration::from_secs(timeout_sec),
             shared,
@@ -676,8 +693,9 @@ impl BashJobs {
 
     /// The `bash` tool's wait-and-observe, which also records how the command
     /// ended in [`last_foreground`](Self::last_foreground) when it ended
-    /// inside the call. The GPU marker is looked for in the whole output file,
-    /// not in the observation, which may show only its head.
+    /// inside the call. The signal file is read (and deleted) first; the GPU
+    /// marker is looked for in the whole output file, not in the observation,
+    /// which may show only its head.
     fn foreground_result(
         &mut self,
         idx: usize,
@@ -691,10 +709,23 @@ impl BashJobs {
             self.jobs[idx].refresh_for(refresh_sec);
         }
         let job = &self.jobs[idx];
-        self.last_foreground = (!job.running).then(|| crate::gpuyield::ForegroundExit {
-            exit_status: job.exit_status,
-            needs_gpu: crate::gpuyield::output_file_needs_gpu(job.exit_status, &job.path),
-            sandbox,
+        // A pending interrupt means refresh_for/wait_for_exit killed the job
+        // itself: the signal file or exit code may still say "needs the
+        // GPU" (the kill can race a write, or land right after exit 75), but
+        // trusting that would unload and reload the model for a run the user
+        // asked to stop, not one that wants to try again. Esc/Ctrl-C must
+        // never lead to a cycle.
+        let interrupted = crate::interrupt::pending();
+        self.last_foreground = (!job.running).then(|| {
+            let signal = job.signal.as_deref().and_then(crate::gpuyield::take_signal);
+            crate::gpuyield::ForegroundExit {
+                exit_status: job.exit_status,
+                needs_gpu: !interrupted
+                    && (signal.is_some()
+                        || crate::gpuyield::output_file_needs_gpu(job.exit_status, &job.path)),
+                signal,
+                sandbox,
+            }
         });
         self.job_tool_result(idx, false, 0, false, true)
     }
@@ -860,6 +891,73 @@ fn protected_grant(ctx: &mut ToolContext, what: Protected) -> WriteGrant {
     }
 }
 
+/// The `bash` tool's `suspend_model` parameter (`gpuyield`). Deliberately
+/// absent from the trained bash schema, which must stay byte-identical to the
+/// C (FINDINGS.md); plank's own prompt note teaches it instead.
+pub const SUSPEND_MODEL_PARAM: &str = "suspend_model";
+
+/// Whether `call` is a `bash` call asking plank to unload the model before
+/// running it. Liberal in what it reads: `true`, `1` or `yes` in any case,
+/// surrounding blanks ignored; any other value, or none, is false.
+#[must_use]
+pub fn suspend_model_requested(call: &ToolCall) -> bool {
+    call.name == "bash"
+        && call.arg_value(SUSPEND_MODEL_PARAM).is_some_and(|v| {
+            let v = v.trim();
+            ["true", "1", "yes"]
+                .iter()
+                .any(|t| v.eq_ignore_ascii_case(t))
+        })
+}
+
+/// Whether `cmd` puts itself in the background with a trailing `&` (not
+/// `&&`): the shell exits at once and the work goes on after the call, so
+/// unloading the model around it would buy nothing.
+#[must_use]
+pub fn backgrounds_itself(cmd: &str) -> bool {
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        match c {
+            '\\' if !in_single => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '&' if !in_single && !in_double => {
+                if bare_ampersand_backgrounds(&chars, i) {
+                    return true;
+                }
+                // `&&`, `>&` or `&>` consume the second character too, so the
+                // loop below never re-examines it as its own operator.
+                if chars.get(i + 1) == Some(&'&') || chars.get(i + 1) == Some(&'>') {
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether the `&` at `chars[i]` is a bare backgrounding operator rather than
+/// half of `&&`, `>&`, `&>` or `|&` (none of which end a foreground
+/// subcommand). Quoting and escaping are resolved by the caller; this only
+/// looks at the immediate neighbors.
+fn bare_ampersand_backgrounds(chars: &[char], i: usize) -> bool {
+    let prev = i.checked_sub(1).and_then(|j| chars.get(j));
+    let next = chars.get(i + 1);
+    !matches!(next, Some('&' | '>')) && !matches!(prev, Some('>' | '|'))
+}
+
 /// Implements the `bash` tool: start a job and wait up to `refresh_sec`.
 pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
     let cmd = call.arg_value("command").unwrap_or("");
@@ -970,6 +1068,10 @@ pub struct ImmediateOutput {
     pub exit_code: i64,
     /// True when the user interrupted the command before it finished.
     pub interrupted: bool,
+    /// The line the command wrote into its GPU-yield signal file
+    /// (`PLANK_GPU_YIELD_FILE`), when it wrote one. The file is gone by the
+    /// time this is returned.
+    pub gpu_signal: Option<String>,
 }
 
 /// Which stream a line of `!` output arrived on.
@@ -1076,14 +1178,13 @@ pub fn run_immediate(
         })
     }
 
-    let mut child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(cwd)
-        // The same promise the bash tool's jobs get (`gpuyield`): a `!` or
-        // `!!` that exits 75 with the marker line gets the model unloaded
-        // for a second run.
-        .env(crate::gpuyield::ENV_VAR, "1")
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(cmd).current_dir(cwd);
+    // The same promise the bash tool's jobs get: a `!` or `!!` that writes
+    // its signal file, or exits 75 with the marker line, gets the model
+    // unloaded for a second run.
+    let signal = export_gpu_yield(&mut command);
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1123,7 +1224,12 @@ pub fn run_immediate(
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
-            Err(e) => return Err(format!("wait failed: {e}")),
+            Err(e) => {
+                if let Some(path) = &signal {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(format!("wait failed: {e}"));
+            }
         }
         if sink.tick() {
             interrupted = true;
@@ -1140,27 +1246,13 @@ pub fn run_immediate(
     out.flush(|l| sink.line(Stream::Stdout, l));
     err.flush(|l| sink.line(Stream::Stderr, l));
 
-    let exit_code = status.map_or(-1, |s| {
-        s.code().map_or_else(
-            || {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    s.signal().map_or(-1, |sig| 128 + i64::from(sig))
-                }
-                #[cfg(not(unix))]
-                {
-                    -1
-                }
-            },
-            i64::from,
-        )
-    });
+    let exit_code = status.map_or(-1, status_code);
     Ok(ImmediateOutput {
         stdout: out.full,
         stderr: err.full,
         exit_code,
         interrupted,
+        gpu_signal: signal.as_deref().and_then(crate::gpuyield::take_signal),
     })
 }
 
@@ -1171,6 +1263,7 @@ mod tests {
 
     #[test]
     fn bash_echo_round_trip() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(&mut ctx, &test_call("bash", &[("command", "echo hello")]));
         assert!(out.starts_with("bash job=1 pid="), "got: {out}");
@@ -1181,8 +1274,90 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    fn parse_dsml(stanza: &str) -> ToolCall {
+        let mut p = crate::dsml::DsmlParser::new();
+        p.feed(stanza);
+        assert!(p.error().is_empty(), "{}", p.error());
+        p.calls().first().cloned().expect("one call")
+    }
+
+    fn dsml_bash(value: &str) -> String {
+        format!(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n\
+             <｜DSML｜parameter name=\"command\" string=\"true\">mex post.md</｜DSML｜parameter>\n\
+             <｜DSML｜parameter name=\"suspend_model\" string=\"false\">{value}</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        )
+    }
+
+    #[test]
+    fn the_dsml_parser_hands_suspend_model_through_on_bash() {
+        for yes in ["true", "TRUE", " True ", "1", "yes", "Yes"] {
+            let call = parse_dsml(&dsml_bash(yes));
+            assert_eq!(call.arg_value("command"), Some("mex post.md"));
+            assert!(suspend_model_requested(&call), "{yes:?}");
+        }
+        for no in ["false", "0", "no", "", "y", "truee"] {
+            assert!(
+                !suspend_model_requested(&parse_dsml(&dsml_bash(no))),
+                "{no:?}"
+            );
+        }
+        let plain = test_call("bash", &[("command", "mex post.md")]);
+        assert!(!suspend_model_requested(&plain), "absent is false");
+        let other = test_call("read", &[("path", "x"), ("suspend_model", "true")]);
+        assert!(!suspend_model_requested(&other), "bash only");
+    }
+
+    #[test]
+    fn the_qwen_parser_hands_suspend_model_through_on_bash() {
+        let parse = |value: &str| {
+            let mut p = trace_stream::qwen::QwenParser::new();
+            p.feed(format!(
+                "<tool_call>\n<function=bash>\n<parameter=command>\nmex post.md\n</parameter>\n\
+                 <parameter=suspend_model>\n{value}\n</parameter>\n</function>\n</tool_call>"
+            ));
+            p.finish();
+            assert!(p.error().is_none(), "{:?}", p.error());
+            p.calls().first().cloned().expect("one call")
+        };
+        assert!(suspend_model_requested(&parse("true")));
+        assert!(suspend_model_requested(&parse("YES")));
+        assert!(!suspend_model_requested(&parse("false")));
+        assert!(!suspend_model_requested(&parse("later")));
+    }
+
+    #[test]
+    fn a_trailing_ampersand_backgrounds_a_command_and_a_double_one_does_not() {
+        assert!(backgrounds_itself("mex post.md &"));
+        assert!(backgrounds_itself("nohup mex post.md > log 2>&1 &  \n"));
+        assert!(!backgrounds_itself("make && mex post.md"));
+        assert!(!backgrounds_itself("mex post.md 2>&1 | tail"));
+        assert!(!backgrounds_itself("true &&"));
+    }
+
+    #[test]
+    fn a_bare_ampersand_anywhere_in_the_command_backgrounds_a_subcommand() {
+        assert!(backgrounds_itself("(mex x &)"));
+        assert!(backgrounds_itself("mex x & disown"));
+        assert!(backgrounds_itself("mex x & echo started"));
+        assert!(backgrounds_itself("mex x & sleep 1"));
+    }
+
+    #[test]
+    fn two_char_operators_and_quoted_ampersands_are_not_backgrounding() {
+        assert!(!backgrounds_itself("a && b"));
+        assert!(!backgrounds_itself("x >&2"));
+        assert!(!backgrounds_itself("x &> f"));
+        assert!(!backgrounds_itself(r#"echo "a & b""#));
+        assert!(!backgrounds_itself("echo 'a & b'"));
+        assert!(!backgrounds_itself("x |& tail"));
+        assert!(!backgrounds_itself(r"echo a \& b"));
+    }
+
     #[test]
     fn a_bash_job_sees_plank_gpu_yield() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -1194,6 +1369,7 @@ mod tests {
 
     #[test]
     fn a_foreground_call_records_how_its_command_ended() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let cmd = "echo 'GPU not available: held by plank (PID 1)' >&2; exit 75";
         tool_bash(&mut ctx, &test_call("bash", &[("command", cmd)]));
@@ -1214,8 +1390,154 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Runs `cmd` as a foreground `bash` call after recording the signal
+    /// path it was handed into `<dir>/path`; returns that path.
+    fn foreground_with_path(ctx: &mut ToolContext, dir: &std::path::Path, cmd: &str) -> PathBuf {
+        let rec = dir.join("path");
+        let full = format!(
+            "printf %s \"$PLANK_GPU_YIELD_FILE\" > '{}'; {cmd}",
+            rec.display()
+        );
+        tool_bash(ctx, &test_call("bash", &[("command", &full)]));
+        PathBuf::from(std::fs::read_to_string(&rec).expect("path recorded"))
+    }
+
+    #[test]
+    fn each_bash_command_gets_its_own_signal_path_and_none_is_left_behind() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        let a = foreground_with_path(&mut ctx, &dir, "true");
+        let b = foreground_with_path(&mut ctx, &dir, "true");
+        assert!(a.is_absolute(), "{}", a.display());
+        assert_ne!(a, b);
+        assert!(a.starts_with(std::env::temp_dir()), "{}", a.display());
+        assert!(!a.exists() && !b.exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_signal_file_asks_for_the_gpu_whatever_the_exit_status() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        let cmd = "echo 'GPU not available: held by plank' > \"$PLANK_GPU_YIELD_FILE\"; exit 0";
+        let path = foreground_with_path(&mut ctx, &dir, cmd);
+        let exit = ctx.bash.last_foreground.take().expect("recorded");
+        assert_eq!(exit.exit_status, 0);
+        assert!(exit.needs_gpu);
+        assert_eq!(
+            exit.signal.as_deref(),
+            Some("GPU not available: held by plank")
+        );
+        assert!(!path.exists(), "read and deleted");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_signal_file_survives_a_pipe_that_replaces_the_exit_status() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        let cmd = "sh -c 'echo \"GPU not available: x\" > \"$PLANK_GPU_YIELD_FILE\"; exit 3' 2>&1 | tail -20";
+        let path = foreground_with_path(&mut ctx, &dir, cmd);
+        let exit = ctx.bash.last_foreground.take().expect("recorded");
+        assert_eq!(exit.exit_status, 0, "tail's status");
+        assert!(exit.needs_gpu);
+        assert_eq!(exit.signal.as_deref(), Some("GPU not available: x"));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Clears the process-wide interrupt flag on drop (panic included), so a
+    /// failing assertion between raising it and clearing it cannot leave it
+    /// set for every other test sharing the process.
+    struct ClearInterruptOnDrop;
+    impl Drop for ClearInterruptOnDrop {
+        fn drop(&mut self) {
+            crate::interrupt::clear();
+        }
+    }
+
+    #[test]
+    fn an_interrupt_during_the_run_is_never_recorded_as_needing_the_gpu() {
+        // Held for the whole body, not just the run: the flag is live from
+        // just before `request()` to the final `clear()`, and every other
+        // bash-spawning test in this module takes the same guard, so none of
+        // them can observe this test's interrupt (or vice versa).
+        let _interrupt_guard = crate::interrupt::test_guard();
+        crate::interrupt::clear();
+        let _clear_on_drop = ClearInterruptOnDrop;
+        let (mut ctx, dir) = test_ctx();
+        // Writes the signal file immediately, then keeps running: without the
+        // interrupt this would be an unmistakable GPU request.
+        let cmd = "echo 'GPU not available: held' > \"$PLANK_GPU_YIELD_FILE\"; sleep 5; exit 75";
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            crate::interrupt::request();
+        });
+        let start = Instant::now();
+        foreground_with_path(&mut ctx, &dir, cmd);
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "the interrupt should have killed the job long before its own sleep finished"
+        );
+        let exit = ctx.bash.last_foreground.take().expect("recorded");
+        assert!(
+            !exit.needs_gpu,
+            "an interrupted run must never start the GPU-yield cycle, \
+             even though it wrote a signal file"
+        );
+        crate::interrupt::clear();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn no_signal_file_and_exit_0_is_no_gpu_request() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        // The marker without the file or exit 75 is still not a request.
+        foreground_with_path(&mut ctx, &dir, "echo 'GPU not available: x'");
+        let exit = ctx.bash.last_foreground.take().expect("recorded");
+        assert!(!exit.needs_gpu);
+        assert!(exit.signal.is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_background_jobs_signal_file_goes_when_the_job_is_reaped() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        let cmd = "sleep 2; echo 'GPU not available: x' > \"$PLANK_GPU_YIELD_FILE\"";
+        let rec = dir.join("path");
+        let full = format!(
+            "printf %s \"$PLANK_GPU_YIELD_FILE\" > '{}'; {cmd}",
+            rec.display()
+        );
+        let out = tool_bash(
+            &mut ctx,
+            &test_call("bash", &[("command", &full), ("refresh_sec", "1")]),
+        );
+        assert!(out.contains("status=running"), "got: {out}");
+        assert!(ctx.bash.last_foreground.is_none(), "never cycles");
+        let path = PathBuf::from(std::fs::read_to_string(&rec).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(path.exists(), "the job wrote its signal");
+        let out = tool_bash_status_or_stop(
+            &mut ctx,
+            &test_call("bash_status", &[("job", "1"), ("refresh_sec", "5")]),
+            false,
+        );
+        assert!(out.contains("status=done"), "got: {out}");
+        assert!(ctx.bash.jobs.is_empty(), "reaped");
+        assert!(!path.exists(), "the reap deleted it");
+        assert!(ctx.bash.last_foreground.is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn the_gpu_marker_is_found_past_the_observations_head() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         // Far more lines than the head shows, marker last.
         let cmd = "seq 1 5000; echo 'GPU not available: busy'; exit 75";
@@ -1230,6 +1552,7 @@ mod tests {
 
     #[test]
     fn wait_to_exit_outlasts_the_refresh_and_is_consumed() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         ctx.bash.wait_to_exit = true;
         let call = test_call(
@@ -1249,6 +1572,7 @@ mod tests {
 
     #[test]
     fn a_background_job_records_nothing_even_when_it_later_asks_for_the_gpu() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let cmd = "sleep 2; echo 'GPU not available: busy'; exit 75";
         let out = tool_bash(
@@ -1305,6 +1629,7 @@ mod tests {
     /// so it is never announced.
     #[test]
     fn take_finished_skips_jobs_the_model_observed_done() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(&mut ctx, &test_call("bash", &[("command", "echo now")]));
         assert!(out.contains(" status=done "));
@@ -1380,6 +1705,7 @@ mod tests {
 
     #[test]
     fn bash_nonzero_exit_and_stderr_capture() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -1397,6 +1723,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_sandbox_blocks_writes_outside_cwd() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         // The escape target lives under `$HOME` (outside cwd and temp), and
         // `sandbox-exec` itself can't apply a profile from inside a nested
         // sandbox — so skip both when `$HOME` isn't writable.
@@ -1473,6 +1800,7 @@ mod tests {
 
     #[test]
     fn bash_missing_command_errors() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         assert_eq!(
             tool_bash(&mut ctx, &test_call("bash", &[])),
@@ -1483,6 +1811,7 @@ mod tests {
 
     #[test]
     fn async_job_spawn_poll_and_stop() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         // refresh_sec=1 returns while the job is still running.
         let out = tool_bash(
@@ -1518,6 +1847,7 @@ mod tests {
 
     #[test]
     fn bash_status_waits_for_refresh_sec() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -1543,6 +1873,7 @@ mod tests {
 
     #[test]
     fn bash_status_without_refresh_returns_immediately() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         tool_bash(
             &mut ctx,
@@ -1581,6 +1912,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.stdout, "yield=1\n");
+    }
+
+    #[test]
+    fn an_immediate_command_gets_a_fresh_signal_path_and_its_signal_back() {
+        let run = |cmd: &str| {
+            run_immediate(
+                std::path::Path::new("/tmp"),
+                cmd,
+                &mut InterruptOnly(|| false),
+            )
+            .unwrap()
+        };
+        let a = run("printf %s \"$PLANK_GPU_YIELD_FILE\"");
+        let b = run("printf %s \"$PLANK_GPU_YIELD_FILE\"");
+        assert!(!a.stdout.is_empty());
+        assert_ne!(a.stdout, b.stdout);
+        assert!(a.gpu_signal.is_none());
+        let asked = run("printf %s \"$PLANK_GPU_YIELD_FILE\"; \
+             echo 'GPU not available: held' > \"$PLANK_GPU_YIELD_FILE\"");
+        assert_eq!(asked.exit_code, 0);
+        assert_eq!(asked.gpu_signal.as_deref(), Some("GPU not available: held"));
+        assert!(!std::path::Path::new(&asked.stdout).exists(), "deleted");
     }
 
     /// Records each line with the moment it arrived, for the streaming tests.
@@ -1723,6 +2076,7 @@ mod tests {
 
     #[test]
     fn stopping_a_job_kills_its_grandchildren() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -1753,6 +2107,7 @@ mod tests {
 
     #[test]
     fn an_unpolled_timed_out_job_is_swept_by_the_next_bash_call() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -1805,6 +2160,7 @@ mod tests {
 
     #[test]
     fn bash_timeout_kills_job() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(
             &mut ctx,
@@ -1823,6 +2179,7 @@ mod tests {
 
     #[test]
     fn bash_runs_in_context_cwd() {
+        let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
         std::fs::write(dir.join("marker.txt"), "x").unwrap();
         let out = tool_bash(

@@ -235,10 +235,26 @@ command that wants the GPU for itself, such as <code>mex</code>
 generating an image with a diffusion model, would have to fail or wait.
 plank sets <code>PLANK_GPU_YIELD=1</code> in every <code>bash</code>
 job, and in the commands you run with <code>!</code> and
-<code>!!</code>, to say it can step aside. A command that cannot get the
-GPU exits with status 75 and prints a line that starts with
-<code>GPU not available</code> (on stdout or stderr), for example
-<code>GPU not available: held by plank (PID 1234)</code>.</p>
+<code>!!</code>, to say it can step aside. Each of those commands also
+gets <code>PLANK_GPU_YIELD_FILE</code>, the path of a signal file that
+is new for every run and lives in a private directory under the system
+temp dir (<code>$TMPDIR/plank-gpu-yield-&lt;uid&gt;</code>, readable
+only by you). plank never creates the file. A command that cannot get
+the GPU asks for it in one of two ways. The first, and the one to
+prefer, is to write one line into that file, for example
+<code>GPU not available: held by plank (PID 1234)</code>, whatever it
+then exits with. The second is to exit with status 75 and print a line
+that starts with <code>GPU not available</code> (on stdout or
+stderr).</p>
+<p>The file matters because models almost always pipe a command's
+output: in <code>mex notes.md 2&gt;&amp;1 | tail -20</code> the shell
+reports the exit status of <code>tail</code>, which is 0, so the
+exit-status rule never sees the 75. The signal file does not depend on
+the exit status or on where the output went, so it works through pipes,
+<code>2&gt;&amp;1</code> and <code>tail</code>. <code>mex</code> uses it
+from version 0.2.4. plank reads the file after the command exits, quotes
+its line in the notice, and deletes it whether or not a cycle
+follows.</p>
 <p>When a <code>bash</code> call ends that way, plank prints one notice,
 saves the session and the conversation's KV cache, unloads the model,
 runs the same command once more, then reloads the model with the
@@ -252,7 +268,13 @@ the second run fails the same way, that result is what the model gets;
 plank does not try a third time, and reloads the model regardless. A
 turn gets at most two of these cycles; a third GPU request in the same
 turn returns its first result with the line
-<code>GPU yield skipped: limit of 2 per turn reached</code>.</p>
+<code>GPU yield skipped: limit of 2 per turn reached</code>. That cap is
+also what keeps a tool that writes its signal file on every run from
+reloading the model without end.</p>
+<p>Only a <code>bash</code> call that finishes inside the call can start
+a cycle. A background job, one still running when the call returned, is
+never retried, even when it writes its signal file; plank deletes that
+file when the job is reaped.</p>
 <p>A command you run yourself with <code>!</code> or <code>!!</code>
 gets the same treatment: the notice, the second run streaming where the
 first did, then
@@ -260,8 +282,8 @@ first did, then
 screen waits for the model to come back. Only the second run counts
 afterwards, for the exit line, for what <code>!</code> records for the
 model and for the <code>!!</code> panel. Each such command gets one
-cycle of its own, whatever the turn limit says, and a second refusal is
-shown as it is.</p>
+cycle of its own, whatever the turn limit says, and a second refusal, by
+either signal, is shown as it is.</p>
 <p>Hooks see both runs, because both really happened:
 <code>PreToolUse</code> and <code>PostToolUse</code> fire for the first
 run and again for the second, and any <code>PostToolUse</code> warning
@@ -282,15 +304,37 @@ since the session was saved before the unload, <code>/resume</code>
 picks the conversation up from the command that asked for the GPU.</p>
 <p>The exit status plank looks at is the command's, which for a pipeline
 is the last stage's. <code>mex generate … | tee gen.log</code> reports
-<code>tee</code>'s status, 0, so the cycle never starts; write
-<code>set -o pipefail; mex generate … | tee gen.log</code> to pass the
-75 through.</p>
+<code>tee</code>'s status, 0, so the exit-status rule never sees the 75;
+write <code>set -o pipefail; mex generate … | tee gen.log</code> to pass
+it through. A tool that writes the signal file instead still starts the
+cycle piped to <code>tee</code> or not, since the file does not depend
+on the exit status at all; <code>set -o pipefail</code> only matters for
+the exit-status route.</p>
+<p>The model does not have to wait for a refusal. When it knows a
+command needs the GPU, it can add <code>suspend_model="true"</code> to
+the <code>bash</code> call; plank's prompt tells it about the parameter,
+with the exact call form, whenever a local model is loaded. plank then
+prints <code>plank: suspending the model for this command</code>, saves
+the session and the KV cache, unloads the model, runs the command once
+to the end (the same waiting rules as a second run above), reloads the
+model and restores the cache. That run's result is what the model sees,
+and it is never repeated, even if the command still reports that the GPU
+is taken. It counts toward the limit of two per turn. When the parameter
+cannot apply, the command simply runs and its result ends with one line
+saying why:
+<code>suspend_model ignored: no local model to release</code> with a
+provider, a remote engine or no model to reload,
+<code>suspend_model ignored for background jobs</code> for a command
+that ends in <code>&amp;</code>, and
+<code>suspend_model ignored: limit of 2 per turn reached</code> past the
+limit. <code>1</code> and <code>yes</code> count as true too, in any
+case; any other value is ignored.</p>
 <p>This happens only when plank holds a local model; with a provider or
 a remote engine the first result is returned as it is. It applies to a
 command that finishes inside the <code>bash</code> call: a job still
 running when the call returns, and so observed later through
-<code>bash_status</code> or a background notification, is never re-run.
-Commands you type with <code>!</code> do not get the variable.</p>
+<code>bash_status</code> or a background notification, is never
+re-run.</p>
 <h4 id="background-jobs">Background jobs</h4>
 <p><code>refresh_sec</code> is how long a <code>bash</code> or
 <code>bash_status</code> call waits before it gives up and reports

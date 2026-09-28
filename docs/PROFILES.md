@@ -126,6 +126,14 @@ heavily should expect this and, if it matters, steer the model away from the
 withheld tools in their own prompt text rather than relying on the protocol
 prose to have been trimmed.
 
+The same expansion also carries the GPU-yield note: a profile whose
+`tools.builtin` allows `bash` (or omits `tools.builtin`, which allows every
+builtin) gets plank's own `# GPU commands` note (`sysprompt::GPU_SUSPEND_NOTE`,
+see `docs/ARCHITECTURE.md`) appended after it, the same as the default
+prompt, provided the launch has a `ReopenFn` (a local model, not a provider).
+A profile that withholds `bash` never sees this note, since there is nothing
+for `suspend_model` to apply to.
+
 ## The tool allow-list
 
 `tools.builtin`, when present, is the complete list of builtin tools the
