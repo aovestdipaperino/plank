@@ -304,9 +304,12 @@ since the session was saved before the unload, <code>/resume</code>
 picks the conversation up from the command that asked for the GPU.</p>
 <p>The exit status plank looks at is the command's, which for a pipeline
 is the last stage's. <code>mex generate … | tee gen.log</code> reports
-<code>tee</code>'s status, 0, so the cycle never starts; write
-<code>set -o pipefail; mex generate … | tee gen.log</code> to pass the
-75 through.</p>
+<code>tee</code>'s status, 0, so the exit-status rule never sees the 75;
+write <code>set -o pipefail; mex generate … | tee gen.log</code> to pass
+it through. A tool that writes the signal file instead still starts the
+cycle piped to <code>tee</code> or not, since the file does not depend
+on the exit status at all; <code>set -o pipefail</code> only matters for
+the exit-status route.</p>
 <p>The model does not have to wait for a refusal. When it knows a
 command needs the GPU, it can add <code>suspend_model="true"</code> to
 the <code>bash</code> call; plank's prompt tells it about the parameter,
@@ -330,8 +333,8 @@ case; any other value is ignored.</p>
 a remote engine the first result is returned as it is. It applies to a
 command that finishes inside the <code>bash</code> call: a job still
 running when the call returns, and so observed later through
-<code>bash_status</code> or a background notification, is never re-run.
-Commands you type with <code>!</code> do not get the variable.</p>
+<code>bash_status</code> or a background notification, is never
+re-run.</p>
 <h4 id="background-jobs">Background jobs</h4>
 <p><code>refresh_sec</code> is how long a <code>bash</code> or
 <code>bash_status</code> call waits before it gives up and reports

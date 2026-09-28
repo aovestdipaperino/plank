@@ -397,11 +397,23 @@ cycle body as `run_cycle` with its own notice and the `ToolRerun` as the
 command's only run, sandbox decided as usual. It counts against the per-turn
 cap and, since `ToolRerun` drops the `ForegroundExit`, a run that signals for
 the GPU anyway is returned, not cycled. With no releasable slot (Echo, a
-provider, a remote engine, a reload still owed), a command ending in a lone
-`&` (`backgrounds_itself`) or the cap reached, the call runs as any other and
+provider, a remote engine, a reload still owed), a self-backgrounding command
+(`backgrounds_itself`) or the cap reached, the call runs as any other and
 its result gets one line saying why the parameter was ignored. A stanza
 holding such a call goes call by call even when no cycle is armed, so the note
-is never lost to `dispatch_all`.
+is never lost to `dispatch_all`. `backgrounds_itself` is a best-effort
+heuristic, not a shell parser: it scans for any unquoted, unescaped `&` that
+is not half of `&&`, `>&`, `&>` or `|&`, so `mex x &`, `(mex x &)` and
+`mex x & echo started` are all caught, but it can still be fooled by shell
+constructs it does not model (command substitution, here-docs, and the like).
+
+An interrupt (Esc in the TUI, Ctrl-C in the REPL) already pending when a
+`bash` call is dispatched, or one that arrives while its first run is still
+going, always wins over a GPU-yield cycle: `foreground_result` never trusts a
+signal file or an exit-75 marker from a run the interrupt killed, and both
+`dispatch_tool_reactive` and `dispatch_suspended_bash` check
+`crate::interrupt::pending()` before ever unloading. Esc/Ctrl-C must stop the
+command, not start an unload-run-reload cycle for it.
 
 ### Remote, hosted, and shared engines (`serve.rs`, `host.rs`, `remote/`)
 - `remote/provider.rs` — additional `Engine` impls for hosted providers
