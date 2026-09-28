@@ -2916,8 +2916,8 @@ impl StatsRow {
     fn figure(kind: StatsRowKind, cells: [String; 3]) -> Self {
         let label = match kind {
             StatsRowKind::Heading => "",
-            StatsRowKind::Input => "  ↑ input",
-            StatsRowKind::Output => "  ↓ output",
+            StatsRowKind::Input => "  ↑ input/prefill",
+            StatsRowKind::Output => "  ↓ output/generated",
             StatsRowKind::Tools => "  · tools",
         };
         Self {
