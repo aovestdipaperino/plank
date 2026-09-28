@@ -525,6 +525,72 @@ granted per-plugin in the manifest. Nothing is granted by default.
 it is not a capability so much as a declaration that this plugin is not really
 sandboxed. `/plugins` renders such plugins with a visible warning marker.
 
+## Grid bridge
+
+A component's `fs` disk reaches no real file, and nothing a component does can
+move bytes on or off it. The grid bridge is the one sanctioned way data crosses
+it: plank itself, not the component, writes a table an MCP server produced onto
+the disk, and reads the edited copy back when the user is done. It exists so a
+server that owns some data (ChatBGT's transactions, say) can let the user edit
+a table of it in a real grid editor such as csvedit, without the model
+retyping every cell and without either side gaining a path to the other.
+
+It starts with a server. Next to its text, an MCP tool result may carry an
+embedded resource whose URI is `plank-frame://<component id>/<file>`, with
+`mimeType` `text/csv`, the CSV as its `text`, and a `_meta.writeBack` of
+`{"tool": "apply_grid", "table": <t>, "grid": <token>}` naming the tool that
+takes an edited copy back. The MCP client (`src/tools/mcp.rs`) takes such items
+out of the result before the model sees it and hands them over as
+`GridStaging`s (`src/grid.rs`). A `plank-frame://` resource that does not parse,
+whose file is anything but one plain name, or whose `writeBack` is incomplete,
+is dropped with `grid not opened: malformed plank-frame resource` in the text.
+
+Whether a staging is honoured is decided by the host, and only for pairs the
+running profile declared. A profile's `grids` field maps an MCP server name to a
+component id (see [Grids in PROFILES.md](PROFILES.md#grids)), and
+`Session::stage_grid` honours a staging only when its server maps to exactly the
+component its URI names. A server cannot pick some other component by naming
+it, a component cannot ask for a server's grids, and without a profile nothing
+is routed at all. When the pair is declared, plank writes the CSV onto that
+component's RAM disk under the staged file name and queues the component's
+frame with the file name as its `arg`; the UI opens it at the next idle moment,
+once the model's turn is over. The model's observation says what happened, one
+line per staging: `grid opened when you finish: <file>`, or
+`grid not opened: <reason>`.
+
+The reasons are the refusals, each checked before anything is written. Frames
+need the interactive TUI, so the plain REPL and the headless paths answer
+`grids need the interactive TUI`. The route must be declared, and the component
+must be loaded and not struck out, must have the `frame` surface, must not be a
+screensaver (one closes on any key, so no edit could be made in it, and the idle
+rotation could open it onto a grid nobody asked for), and must have been granted
+`fs`. A grid is never staged under a frame already on screen
+(`a grid is already open`). The write itself goes through the same `fs` quotas
+as the component's own writes, so a grid over 4 MiB, or one that would push the
+disk past its file count or total, is refused with the quota's message and
+leaves the disk as it was. There is one grid at a time: a newer staging replaces
+one still waiting to open, and removes the older file only once the new one is
+written, so a refused staging leaves the older grid in place.
+
+When the grid's frame closes, whether by the user quitting or by a trap,
+`Session::finish_grid` reads the file back from the RAM disk and removes it. An
+untouched file, or one the frame deleted, ends there. A changed one goes back:
+plank, not the model, calls the tool the server advertised in `writeBack` with
+`{"table", "grid", "csv"}`, through the same MCP path a model call takes, on a
+worker thread so a slow server never freezes the UI. The outcome leaves a dim
+line in the scrollback and a `<system-reminder>` notice
+(`The user edited the <table> grid. ...`) that is queued and delivered ahead of
+the next prompt, so the model learns what the user changed before it answers
+them. A reply from the write-back tool is never a request to open another frame:
+any stagings in it are ignored.
+
+A component learns nothing new from any of this. csvedit sees a file on its own
+disk and an `arg` naming it, exactly as if the user had opened that file
+themselves.
+What it does with a bridged grid is its own business; csvedit keeps the
+columns and the file name fixed when the first header cell is `#` (see
+[the authoring guide](WASM-PLUGIN-AUTHORING.md#capabilities)).
+
 ## Glyph wire format
 
 `frame_step` and `panel_step` return a packed buffer rather than JSON:

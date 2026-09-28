@@ -270,6 +270,20 @@ component id (`'<id>' was not granted the 'fs' capability`, `'<id>' file /t.csv
 is N bytes, more than the ...-byte limit`); a malformed path or a missing file
 is reported without it.
 
+Nothing your component does can put a file on its disk from outside, or take one
+off. The one sanctioned crossing is the grid bridge
+([WASM-PLUGINS.md](WASM-PLUGINS.md#grid-bridge)): when a running profile
+routes an MCP server's grids to your component, plank writes the server's CSV
+onto your disk and opens your frame with the file name as its `arg`, then
+reads the file back when the frame closes and hands a changed copy to the
+server. Your component needs `fs` and the `frame` surface, must not be a
+screensaver, and sees only an ordinary file; saving it in place under the same
+name is how an edit gets back. csvedit is the worked example: a grid whose
+first header cell is `#` opens in bridged mode, where the `#` column cannot be
+edited, columns cannot be added, removed or renamed, and New, Open and Save As
+are refused so Ctrl+S always saves to the staged name. Rows can still be added
+and deleted, and a new row's `#` cell is left empty.
+
 Declared but reaching nothing yet: `agent`, `session`. plank warns at load if
 you ask for one, because approving a capability that does not exist is worse
 than refusing it.

@@ -109,7 +109,7 @@ value, an empty key or an empty value, is dropped with a warning rather than
 routed, and the rest of the map is kept; a `grids` value that is not an
 object at all warns once and yields no routes. How plank actually turns a
 tool result into a grid handed to the frame, and back, is described in
-`docs/WASM-PLUGINS.md`.
+[the Grid bridge section of WASM-PLUGINS.md](WASM-PLUGINS.md#grid-bridge).
 
 ## The tool-protocol token
 
