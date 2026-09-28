@@ -29,6 +29,7 @@ for the Claude Code layout), alongside the plugin's existing `name`,
 | `folderContext` | boolean | no | `false`: no launch-folder context |
 | `agentsMd` | boolean | no | `false`: `AGENTS.md` is neither read nor offered |
 | `recommendedModel` | string, an engine name | no | none: the model is chosen as without a profile |
+| `grids` | object, MCP server name to component id | no | empty: no MCP server is routed to a grid |
 
 `systemPrompt` is the only required field, and deliberately so: a `profile`
 block without a prompt is a skin over plank's own identity, and activating a
@@ -95,6 +96,20 @@ listed. This is a deliberate safety property, not an oversight, and it is
 worth designing sample and real profiles to notice quickly if it fires
 (an agent that suddenly cannot read a file is a loud failure; one that
 quietly gained `bash` would not be).
+
+### Grids
+
+`grids` maps an MCP server's name to the id of a WASM frame component that
+can render the tables that server returns, such as `dev.plank.csvedit` for
+the Turbo Vision CSV editor. It exists so a profile can opt a specific server
+into that handling without changing anything about servers it does not
+mention: only the pairs a manifest actually lists are routed, everything
+else behaves exactly as it does today. A malformed entry, a non-string
+value, an empty key or an empty value, is dropped with a warning rather than
+routed, and the rest of the map is kept; a `grids` value that is not an
+object at all warns once and yields no routes. How plank actually turns a
+tool result into a grid handed to the frame, and back, is described in
+`docs/WASM-PLUGINS.md`.
 
 ## The tool-protocol token
 

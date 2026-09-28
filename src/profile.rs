@@ -3,6 +3,7 @@
 
 //! Profile specs: the `profile` block of a plugin manifest.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::tools::mcp::{Json, json_parse, json_write};
@@ -51,6 +52,11 @@ pub struct ProfileSpec {
     /// disk. Never downloaded and never asked about; `None` when absent or
     /// malformed.
     pub recommended_model: Option<String>,
+    /// `grids`: MCP server name to WASM frame component id, for servers
+    /// allowed to hand table data to a grid component. Empty unless the
+    /// manifest declares routes; a malformed entry is dropped with a
+    /// warning rather than widening what gets routed.
+    pub grids: BTreeMap<String, String>,
 }
 
 impl ProfileSpec {
@@ -192,6 +198,8 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
 
     let recommended_model = recommended_model_field(block, &mut warnings);
 
+    let grids = grids_field(block, &mut warnings);
+
     Some(ProfileSpec {
         display_name,
         logo,
@@ -203,7 +211,41 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
         folder_context,
         agents_md,
         recommended_model,
+        grids,
     })
+}
+
+/// `grids`: an object mapping MCP server name to WASM frame component id.
+///
+/// A non-object value warns and yields an empty map, the same fail-closed
+/// shape as `tools.builtin`: a malformed restriction must never widen what
+/// gets routed. Within an otherwise-valid object, an entry with a
+/// non-string value, or an empty key or value, warns and is dropped while
+/// the rest of the map is kept.
+fn grids_field(obj: &Json, warnings: &mut Vec<String>) -> BTreeMap<String, String> {
+    match obj.get("grids") {
+        None => BTreeMap::new(),
+        Some(Json::Obj(members)) => {
+            let mut out = BTreeMap::new();
+            for (key, value) in members {
+                match value {
+                    Json::Str(s) if !key.is_empty() && !s.is_empty() => {
+                        out.insert(key.clone(), s.clone());
+                    }
+                    _ => warnings.push(format!(
+                        "profile: grids entry {key:?} is malformed; skipping it"
+                    )),
+                }
+            }
+            out
+        }
+        Some(_) => {
+            warnings.push(
+                "profile: grids is not an object; routing no MCP servers to a grid".to_string(),
+            );
+            BTreeMap::new()
+        }
+    }
 }
 
 /// Pushes a warning for each `names` entry that matches no known builtin.
@@ -465,7 +507,7 @@ pub enum Resolution {
     /// No `--profile` was given; run as plain plank.
     None,
     /// Activate this profile.
-    Activate(ActiveProfile),
+    Activate(Box<ActiveProfile>),
     /// A bare `--profile`: list these names and exit successfully.
     List(Vec<String>),
     /// The name matched no plugin. Carries the available profile names so the
@@ -506,7 +548,7 @@ pub fn resolve_profile(
         return Resolution::NoSuchPlugin(name.to_string(), crate::plugins::profile_names(set));
     };
     match &plugin.profile {
-        Some(spec) => Resolution::Activate(ActiveProfile {
+        Some(spec) => Resolution::Activate(Box::new(ActiveProfile {
             name: plugin.name.clone(),
             spec: spec.clone(),
             // Filled in by `resolve_and_activate_profile` (main.rs) once it
@@ -514,7 +556,7 @@ pub fn resolve_profile(
             // filesystem access and stays pure.
             prompt: String::new(),
             version: plugin.version.clone(),
-        }),
+        })),
         None => Resolution::NotAProfile(name.to_string()),
     }
 }
@@ -559,6 +601,79 @@ mod tests {
         .expect("parses");
         assert!(spec.folder_context && spec.agents_md);
         assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+    }
+
+    #[test]
+    fn no_grids_means_empty_with_no_warning() {
+        let spec =
+            parse(r#"{"profile":{"systemPrompt":"p.md"}}"#, Path::new("/p")).expect("parses");
+        assert!(spec.grids.is_empty());
+        assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+    }
+
+    #[test]
+    fn a_valid_grids_map_parses() {
+        let spec = parse(
+            r#"{"profile":{"systemPrompt":"p.md","grids":{"chatbgt":"dev.plank.csvedit"}}}"#,
+            Path::new("/p"),
+        )
+        .expect("parses");
+        assert_eq!(
+            spec.grids.get("chatbgt").map(String::as_str),
+            Some("dev.plank.csvedit")
+        );
+        assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+    }
+
+    #[test]
+    fn a_non_object_grids_warns_and_yields_empty() {
+        let spec = parse(
+            r#"{"profile":{"systemPrompt":"p.md","grids":"chatbgt"}}"#,
+            Path::new("/p"),
+        )
+        .expect("parses");
+        assert!(spec.grids.is_empty());
+        assert_eq!(spec.warnings.len(), 1, "{:?}", spec.warnings);
+        assert!(spec.warnings[0].contains("grids"));
+    }
+
+    #[test]
+    fn a_non_string_grids_value_warns_and_is_dropped_while_others_stay() {
+        let spec = parse(
+            r#"{"profile":{"systemPrompt":"p.md","grids":{"chatbgt":"dev.plank.csvedit","other":7}}}"#,
+            Path::new("/p"),
+        )
+        .expect("parses");
+        assert_eq!(spec.grids.len(), 1);
+        assert_eq!(
+            spec.grids.get("chatbgt").map(String::as_str),
+            Some("dev.plank.csvedit")
+        );
+        assert_eq!(spec.warnings.len(), 1, "{:?}", spec.warnings);
+        assert!(spec.warnings[0].contains("other"));
+    }
+
+    #[test]
+    fn an_empty_grids_key_or_value_is_dropped() {
+        let spec = parse(
+            r#"{"profile":{"systemPrompt":"p.md","grids":{"":"dev.plank.csvedit","chatbgt":""}}}"#,
+            Path::new("/p"),
+        )
+        .expect("parses");
+        assert!(spec.grids.is_empty());
+        assert_eq!(spec.warnings.len(), 2, "{:?}", spec.warnings);
+    }
+
+    #[test]
+    fn the_chatbgt_fixture_manifest_parses_its_grids_route() {
+        let text = std::fs::read_to_string("tests/fixtures/profiles/chatbgt/plugin.json")
+            .expect("fixture readable");
+        let spec = parse(&text, Path::new("tests/fixtures/profiles/chatbgt")).expect("parses");
+        assert_eq!(spec.grids.len(), 1);
+        assert_eq!(
+            spec.grids.get("chatbgt").map(String::as_str),
+            Some("dev.plank.csvedit")
+        );
     }
 
     #[test]
@@ -954,6 +1069,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            grids: BTreeMap::new(),
         }
     }
 

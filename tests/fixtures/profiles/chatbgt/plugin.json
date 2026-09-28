@@ -1,0 +1,15 @@
+{
+  "name": "chatbgt",
+  "description": "Household budget analyst over chatbgt-mcp",
+  "version": "0.1.0",
+  "author": "Enzo Lombardi",
+  "profile": {
+    "displayName": "ChatBGT",
+    "accent": "#3fa9c5",
+    "systemPrompt": "prompt.md",
+    "folderContext": false,
+    "agentsMd": false,
+    "tools": { "builtin": ["ask"] },
+    "grids": { "chatbgt": "dev.plank.csvedit" }
+  }
+}

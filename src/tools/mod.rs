@@ -1267,6 +1267,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            grids: std::collections::BTreeMap::new(),
         };
         assert!(spec.builtin_enabled("bash"));
         assert!(!spec.builtin_enabled("read"));
@@ -1289,6 +1290,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            grids: std::collections::BTreeMap::new(),
         }
     }
 
