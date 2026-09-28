@@ -2804,6 +2804,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         };
         let specs: Vec<crate::engine::ToolSpec> = parse_builtin_tool_schemas()
             .into_iter()
@@ -2839,6 +2840,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         };
         let text = "You are ChatBGT.\n".to_string();
         let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
@@ -2863,6 +2865,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         }
     }
 
@@ -2948,6 +2951,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         };
         let text = "You are ChatBGT.\n".to_string();
         let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
@@ -2989,6 +2993,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         };
         let text = "You are ChatBGT.\n".to_string();
         let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
@@ -3090,6 +3095,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         };
         let text = format!("You are ChatBGT.\n\n{TOOL_PROTOCOL_TOKEN}\n");
         let (out, trusted) = compose_profile_prompt(&text, &spec, true);
@@ -3123,6 +3129,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         };
         let text = format!("You are ChatBGT. Mind each parameter.\n\n{TOOL_PROTOCOL_TOKEN}\n");
         let v4 = trusted_prose(Some((&text, &spec)), true, ToolSyntax::Dsml);
@@ -3153,6 +3160,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         };
         let text = TOOL_PROTOCOL_TOKEN.to_string();
         let (strict, _) = compose_profile_prompt(&text, &spec, true);
@@ -3173,6 +3181,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         };
         let (out, _) = compose_profile_prompt("Just prose.\n", &spec, true);
         assert!(out.starts_with("Just prose."));

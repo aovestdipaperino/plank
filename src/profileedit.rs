@@ -143,7 +143,7 @@ fn header(plugin: &Plugin, spec: &ProfileSpec) -> String {
     };
     let (folder_value, folder_source) = flag("folderContext", spec.folder_context);
     let (agents_value, agents_source) = flag("agentsMd", spec.agents_md);
-    let rows: [(&str, String, &str); 8] = [
+    let rows: [(&str, String, &str); 9] = [
         match &spec.display_name {
             Some(d) => ("displayName", d.clone(), "manifest"),
             None => (
@@ -182,9 +182,17 @@ fn header(plugin: &Plugin, spec: &ProfileSpec) -> String {
         },
         ("folderContext", folder_value, folder_source),
         ("agentsMd", agents_value, agents_source),
+        match &spec.recommended_model {
+            Some(m) => (
+                "recommendedModel",
+                m.clone(),
+                "manifest (used when on disk)",
+            ),
+            None => ("recommendedModel", "none".to_owned(), "default"),
+        },
     ];
     for (field, value, source) in rows {
-        let _ = writeln!(out, "     {field:<12} {value:<28} {source}");
+        let _ = writeln!(out, "     {field:<16} {value:<28} {source}");
     }
     out.push_str("     Edit inside the sections; save to write, quit to discard. -->\n");
     out
@@ -546,6 +554,21 @@ mod tests {
     }
 
     #[test]
+    fn the_header_shows_a_recommended_model_from_the_manifest() {
+        let manifest = MANIFEST.replace(
+            "\"agentsMd\": true",
+            "\"agentsMd\": true, \"recommendedModel\": \"qwen\"",
+        );
+        let (plugin, spec) = profile("header-rec", &manifest, Origin::ProjectScan);
+        let text = render(&plugin, &spec).expect("renders");
+        let row = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("recommendedModel"))
+            .unwrap_or_else(|| panic!("no recommendedModel row in:\n{text}"));
+        assert!(row.contains(" qwen ") && row.contains("manifest"), "{row}");
+    }
+
+    #[test]
     fn the_header_says_where_each_field_comes_from() {
         let (plugin, spec) = profile("header", MANIFEST, Origin::ProjectScan);
         let text = render(&plugin, &spec).expect("renders");
@@ -564,6 +587,10 @@ mod tests {
         assert!(row("settings").contains("ui.showThinking"));
         assert!(row("folderContext").contains("false") && row("folderContext").contains("default"));
         assert!(row("agentsMd").contains("true") && row("agentsMd").ends_with("manifest"));
+        assert!(
+            row("recommendedModel").contains("none")
+                && row("recommendedModel").ends_with("default")
+        );
         assert!(!text.contains("installed copy"));
     }
 

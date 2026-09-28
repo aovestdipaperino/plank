@@ -95,7 +95,7 @@ To keep a model of your own together with its companions, describe it as a local
   "default": "mine",
   "engines": {
     "mine": {
-      "main":   { "path": "~/models/my-ds4.gguf" },
+      "main":   { "path": "~/models/my-ds4.gguf", "url": "https://huggingface.co/owner/repo/blob/main/my-ds4.gguf" },
       "mtp":    { "path": "~/models/my-ds4.dspark.gguf" },
       "vision": { "path": "~/models/my-ds4.vision.gguf" }
     }
@@ -103,7 +103,7 @@ To keep a model of your own together with its companions, describe it as a local
 }
 ```
 
-`plank --model mine` then loads all three, and with `"default": "mine"` so does a plain `plank`. A local entry with the same name as a built-in engine replaces it.
+`plank --model mine` then loads all three, and with `"default": "mine"` so does a plain `plank`. A local entry with the same name as a built-in engine replaces it. A role that names a `path` may also give a `url` (an `https://` link, where a Hugging Face `/blob/` page is turned into its `/resolve/` download): when the file is missing, plank offers to download it into exactly that path, but it still never checks it for upgrades.
 
 Upgrading from a release before engines renames the files under `~/.plank` once, at the first launch: `ds4flash.gguf` becomes `ds4vision.gguf`, its drafter and encoder become `ds4vision.mtp.gguf` and `ds4vision.vision.gguf`, and the V4.1 files become `ds41.*`. Nothing is downloaded again, but it is one way: an older plank sharing the same `~/.plank` no longer finds its model and offers to fetch it.
 

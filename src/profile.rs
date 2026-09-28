@@ -46,6 +46,11 @@ pub struct ProfileSpec {
     /// `agentsMd`: whether `AGENTS.md` files are read, and offered or linked
     /// at launch. `false` unless the manifest says `true`.
     pub agents_md: bool,
+    /// `recommendedModel`: an engine name from the catalog that the run uses
+    /// when no `--model` was given and that engine's main file is already on
+    /// disk. Never downloaded and never asked about; `None` when absent or
+    /// malformed.
+    pub recommended_model: Option<String>,
 }
 
 impl ProfileSpec {
@@ -185,6 +190,8 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
     let folder_context = bool_field(block, "folderContext", &mut warnings);
     let agents_md = bool_field(block, "agentsMd", &mut warnings);
 
+    let recommended_model = recommended_model_field(block, &mut warnings);
+
     Some(ProfileSpec {
         display_name,
         logo,
@@ -195,6 +202,7 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
         warnings,
         folder_context,
         agents_md,
+        recommended_model,
     })
 }
 
@@ -241,7 +249,27 @@ fn warn_refused_engine_settings(members: &[(String, Json)], warnings: &mut Vec<S
     }
 }
 
-/// A non-empty string member, or `None`.
+/// `recommendedModel`: an engine name, or `None` with a warning when it is
+/// present but not a valid one (`crate::engines::valid_name`).
+fn recommended_model_field(obj: &Json, warnings: &mut Vec<String>) -> Option<String> {
+    match obj.get("recommendedModel") {
+        None => None,
+        Some(Json::Str(s)) if crate::engines::valid_name(s) => Some(s.clone()),
+        Some(Json::Str(s)) if !s.is_empty() => {
+            warnings.push(format!(
+                "profile: recommendedModel {s:?} is not a valid engine name; ignoring it"
+            ));
+            None
+        }
+        Some(_) => {
+            warnings.push(
+                "profile: recommendedModel is not a non-empty string; ignoring it".to_string(),
+            );
+            None
+        }
+    }
+}
+
 /// A boolean profile field: `false` when absent, and `false` with a warning
 /// when it is not a boolean, so a typo never turns a context source on.
 fn bool_field(obj: &Json, key: &str, warnings: &mut Vec<String>) -> bool {
@@ -255,6 +283,7 @@ fn bool_field(obj: &Json, key: &str, warnings: &mut Vec<String>) -> bool {
     }
 }
 
+/// A non-empty string member, or `None`.
 fn str_field(obj: &Json, key: &str) -> Option<String> {
     match obj.get(key) {
         Some(Json::Str(s)) if !s.is_empty() => Some(s.clone()),
@@ -530,6 +559,32 @@ mod tests {
         .expect("parses");
         assert!(spec.folder_context && spec.agents_md);
         assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+    }
+
+    #[test]
+    fn recommended_model_is_an_optional_engine_name() {
+        let root = Path::new("/p");
+        let spec = parse(r#"{"profile":{"systemPrompt":"p.md"}}"#, root).expect("parses");
+        assert_eq!(spec.recommended_model, None);
+        let spec = parse(
+            r#"{"profile":{"systemPrompt":"p.md","recommendedModel":"qwen"}}"#,
+            root,
+        )
+        .expect("parses");
+        assert_eq!(spec.recommended_model.as_deref(), Some("qwen"));
+        assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+    }
+
+    #[test]
+    fn a_malformed_recommended_model_warns_and_is_ignored() {
+        for bad in [r#""""#, "7", "true", r#""Qwen 3""#] {
+            let text =
+                format!(r#"{{"profile":{{"systemPrompt":"p.md","recommendedModel":{bad}}}}}"#);
+            let spec = parse(&text, Path::new("/p")).expect("parses");
+            assert_eq!(spec.recommended_model, None, "{bad}");
+            assert_eq!(spec.warnings.len(), 1, "{bad}: {:?}", spec.warnings);
+            assert!(spec.warnings[0].contains("recommendedModel"), "{bad}");
+        }
     }
 
     #[test]
@@ -898,6 +953,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         }
     }
 

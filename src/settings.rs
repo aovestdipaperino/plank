@@ -1246,10 +1246,17 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     // carries the file's value, i.e. no flag overrode it.
     // Compared against the user's spec, not the resolved path: `engine.model`
     // may name a catalog engine (`qwen`) that resolves to a file elsewhere.
-    if let Some(m) = &s.engine.model
-        && cfg.model_spec.as_deref() == Some(&*m.to_string_lossy())
+    // `cfg.model_spec` is the model that is actually loading: ordinarily the
+    // settings value, but a profile's `recommendedModel` may have overridden
+    // it (`main.rs`'s `resolve_selection` keeps `model_spec` in sync when
+    // that happens), so the note names the winner rather than replaying the
+    // settings file verbatim. A CLI `--model`/`-m` flag is reported by
+    // neither: it did not come from a settings file.
+    if s.engine.model.is_some()
+        && cfg.cli_provenance.get("engine.model") != Some(&crate::provenance::Origin::Cli)
+        && let Some(spec) = &cfg.model_spec
     {
-        parts.push(format!("model={}", m.display()));
+        parts.push(format!("model={spec}"));
     }
     if let Some(t) = s.engine.threads
         && cfg.n_threads == t
@@ -2267,6 +2274,30 @@ mod tests {
         assert!(note.contains("backend=cpu"), "{note}");
         assert!(note.contains("threads=3"), "{note}");
         assert!(note.contains("ctx=65536"), "{note}");
+    }
+
+    #[test]
+    fn the_note_names_the_settings_model() {
+        let s = from_json(r#"{"engine":{"model":"ds41"}}"#);
+        let note = note_for(&s, &[]).expect("a note");
+        assert!(note.contains("model=ds41"), "{note}");
+    }
+
+    #[test]
+    fn a_recommendation_that_overrode_engine_model_is_reported_by_name() {
+        // Finding 4: a profile's `recommendedModel` can win over
+        // `engine.model` (`main.rs`'s `resolve_selection` then updates
+        // `cfg.model_spec` to the engine that actually loaded). The note
+        // must follow that override rather than echoing the settings file's
+        // now-superseded value.
+        let s = from_json(r#"{"engine":{"model":"ds41"}}"#);
+        let flags: Vec<String> = Vec::new();
+        let mut cfg = crate::config::parse_options_with(&s, &flags).unwrap();
+        assert_eq!(cfg.model_spec.as_deref(), Some("ds41"));
+        cfg.model_spec = Some("qwen".to_string());
+        let note = startup_note(&s, &cfg).expect("a note");
+        assert!(note.contains("model=qwen"), "{note}");
+        assert!(!note.contains("ds41"), "{note}");
     }
 
     #[test]

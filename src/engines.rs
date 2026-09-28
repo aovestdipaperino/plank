@@ -62,6 +62,10 @@ pub struct EngineEntry {
     pub files: BTreeMap<String, FileEntry>,
     /// Local-only roles pointing at an existing file.
     pub paths: BTreeMap<String, PathBuf>,
+    /// For a `paths` role that also names a `url`: where to fetch the file
+    /// when that path does not exist, already normalised by [`download_url`].
+    /// The role stays unmanaged: no version, no hash, no upgrade.
+    pub path_urls: BTreeMap<String, String>,
     /// The engine's JSON object, verbatim, for the installed record.
     pub raw: String,
 }
@@ -180,6 +184,7 @@ fn parse_entry(name: &str, value: &serde_json::Value, layer: Layer) -> Result<En
         .unwrap_or(0);
     let mut files = BTreeMap::new();
     let mut paths = BTreeMap::new();
+    let mut path_urls = BTreeMap::new();
     for role in ROLES {
         let Some(r) = obj.get(role) else { continue };
         if let Some(p) = r.get("path").and_then(serde_json::Value::as_str) {
@@ -187,7 +192,27 @@ fn parse_entry(name: &str, value: &serde_json::Value, layer: Layer) -> Result<En
                 return Err(format!("{role}: a published entry may not name a path"));
             }
             paths.insert(role.to_string(), crate::settings::expand_tilde(p));
+            if let Some(u) = r.get("url") {
+                let u = u
+                    .as_str()
+                    .ok_or_else(|| format!("{role}: the url must be a string"))?;
+                let url = download_url(u)
+                    .ok_or_else(|| format!("{role}: the url must start with https:// (`{u}`)"))?;
+                path_urls.insert(role.to_string(), url);
+            }
             continue;
+        }
+        // A bare `url` is not a download entry: plank would have to choose the
+        // install path and could not verify the bytes without a sha256.
+        if layer == Layer::Local
+            && r.get("url").is_some()
+            && (r.get("sha256").is_none() || r.get("bytes").is_none())
+        {
+            return Err(format!(
+                "{role}: a url needs a path to download into; a url-only role would need \
+                 plank's install path and a sha256, so add a `path` or give a full download \
+                 entry (name, url, bytes, sha256)"
+            ));
         }
         let entry: FileEntry =
             serde_json::from_value(r.clone()).map_err(|e| format!("{role}: {e}"))?;
@@ -204,6 +229,7 @@ fn parse_entry(name: &str, value: &serde_json::Value, layer: Layer) -> Result<En
         version,
         files,
         paths,
+        path_urls,
         raw: serde_json::to_string(value).map_err(|e| e.to_string())?,
     };
     // Reuse the manifest validator (sha256 shape, https, nonzero bytes).
@@ -211,6 +237,45 @@ fn parse_entry(name: &str, value: &serde_json::Value, layer: Layer) -> Result<En
         return Err("an artifact entry is malformed (sha256, url or bytes)".to_string());
     }
     Ok(e)
+}
+
+/// The download URL for a local role's `url`: a Hugging Face file page
+/// (`https://huggingface.co/<owner>/<repo>/blob/<rev>/<path>`) becomes its
+/// `/resolve/` link, and any other `https://` URL is kept as written. A
+/// dataset (`.../datasets/<owner>/<repo>/blob/...`) or space
+/// (`.../spaces/<owner>/<repo>/blob/...`) repo is rewritten the same way,
+/// with the owner/repo shifted one segment later. `None` for anything that
+/// is not `https://`.
+#[must_use]
+pub fn download_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    if rest.is_empty() {
+        return None;
+    }
+    if let Some(tail) = rest.strip_prefix("huggingface.co/") {
+        for (prefix, kind) in [("datasets/", "datasets"), ("spaces/", "spaces")] {
+            if let Some(repo_tail) = tail.strip_prefix(prefix) {
+                let mut parts = repo_tail.splitn(4, '/');
+                if let (Some(owner), Some(repo), Some("blob"), Some(file)) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
+                {
+                    return Some(format!(
+                        "https://huggingface.co/{kind}/{owner}/{repo}/resolve/{file}"
+                    ));
+                }
+                return Some(url.to_string());
+            }
+        }
+        let mut parts = tail.splitn(4, '/');
+        if let (Some(owner), Some(repo), Some("blob"), Some(file)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        {
+            return Some(format!(
+                "https://huggingface.co/{owner}/{repo}/resolve/{file}"
+            ));
+        }
+    }
+    Some(url.to_string())
 }
 
 /// `over` stacked on `base`: whole-entry replacement per name; `over`'s
@@ -327,6 +392,11 @@ pub struct Selection {
     pub vision: Option<PathBuf>,
     /// Whether `main` is a catalog download plank may fetch and upgrade.
     pub managed_main: bool,
+    /// Where to fetch a missing local `path` role, by role, from the local
+    /// layer's `url`. Never makes a role managed: it is used only to download
+    /// a file that is absent into exactly that path. Empty for managed roles
+    /// and bare paths.
+    pub urls: BTreeMap<String, String>,
 }
 
 fn select(root: &Path, entry: &EngineEntry, id: EngineId) -> Selection {
@@ -345,6 +415,7 @@ fn select(root: &Path, entry: &EngineEntry, id: EngineId) -> Selection {
         mtp: role("mtp"),
         vision: role("vision"),
         managed_main: entry.files.contains_key("main"),
+        urls: entry.path_urls.clone(),
     }
 }
 
@@ -452,11 +523,89 @@ pub fn resolve_with_note_in(
                     mtp: None,
                     vision: None,
                     managed_main: false,
+                    urls: BTreeMap::new(),
                 },
                 None,
             ))
         }
     }
+}
+
+/// A profile's `recommendedModel`, as [`choose_with_recommendation_in`]
+/// takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recommendation<'a> {
+    /// The profile that recommends it, for the one line the choice prints.
+    pub profile: &'a str,
+    /// The engine name it recommends.
+    pub engine: &'a str,
+}
+
+/// Resolves the model a run loads when a profile may recommend one, and the
+/// lines to print once about it (a legacy-path note, the recommendation's
+/// outcome).
+///
+/// Precedence, highest first: `cli` (`--model`, `-m`, `--model:`); the
+/// recommended engine, but only when its main file is already on disk (a
+/// managed engine's derived path, or a local engine's `path`); then
+/// `settings`, which is `engine.model` or, when that is unset,
+/// [`Choice::Default`] (the `engines.local.json` default, else the
+/// catalog's). A recommendation is never downloaded: an unknown name or a
+/// missing file falls through to `settings` with one line saying so.
+///
+/// # Errors
+/// As [`resolve_with_note_in`], for whichever choice ends up deciding.
+pub fn choose_with_recommendation_in(
+    root: &Path,
+    catalog: &Catalog,
+    cli: Option<Choice<'_>>,
+    recommended: Option<Recommendation<'_>>,
+    settings: Choice<'_>,
+) -> Result<(Selection, Vec<String>), String> {
+    let with_note = |choice| {
+        resolve_with_note_in(root, catalog, choice)
+            .map(|(sel, note)| (sel, note.into_iter().collect::<Vec<_>>()))
+    };
+    if let Some(cli) = cli {
+        return with_note(cli);
+    }
+    let Some(Recommendation { profile, engine }) = recommended else {
+        return with_note(settings);
+    };
+    if catalog.get(engine).is_none() || EngineId::new(engine).is_none() {
+        let (sel, mut notes) = with_note(settings)?;
+        notes.push(format!(
+            "profile {profile} recommends {engine}, which is not an engine; ignoring it"
+        ));
+        return Ok((sel, notes));
+    }
+    let wanted = resolve_in(root, catalog, Choice::Named(engine))?;
+    if wanted.main.exists() && companions_available(&wanted) {
+        return Ok((
+            wanted,
+            vec![format!("using {engine}, recommended by profile {profile}")],
+        ));
+    }
+    let skip_note =
+        format!("profile {profile} recommends {engine}, which is not installed; skipping it");
+    let (sel, mut notes) = with_note(settings).map_err(|e| format!("{skip_note}: {e}"))?;
+    let using = sel
+        .id
+        .map_or_else(|| sel.main.display().to_string(), |id| id.to_string());
+    notes.push(format!(
+        "profile {profile} recommends {engine}, which is not installed; using {using}"
+    ));
+    Ok((sel, notes))
+}
+
+/// Whether `sel`'s `main` and every companion it declares (`mtp`, `vision`)
+/// already exist on disk. A recommendation only counts as "locally available"
+/// when this holds for it, so acting on it never leads to a download prompt.
+fn companions_available(sel: &Selection) -> bool {
+    [sel.mtp.as_deref(), sel.vision.as_deref()]
+        .into_iter()
+        .flatten()
+        .all(Path::exists)
 }
 
 /// Whether `a` and `b` name the same file: equal as written, equal once
@@ -514,6 +663,9 @@ pub fn inherit_companions_in(
             mtp: engine.mtp,
             vision: engine.vision,
             managed_main: false,
+            // A managed main is never a path role, so these are the
+            // companions' urls only.
+            urls: engine.urls,
         },
         None => sel,
     }
@@ -637,6 +789,114 @@ mod tests {
             e.to_manifest().is_none(),
             "path-only engines are never downloaded"
         );
+    }
+
+    #[test]
+    fn download_url_turns_a_hugging_face_page_into_its_download() {
+        assert_eq!(
+            download_url("https://huggingface.co/o/r/blob/main/m.gguf").as_deref(),
+            Some("https://huggingface.co/o/r/resolve/main/m.gguf")
+        );
+        let resolve = "https://huggingface.co/o/r/resolve/main/m.gguf";
+        assert_eq!(download_url(resolve).as_deref(), Some(resolve));
+        let other = "https://example.com/blob/main/m.gguf";
+        assert_eq!(download_url(other).as_deref(), Some(other));
+        assert_eq!(
+            download_url("http://huggingface.co/o/r/blob/main/m.gguf"),
+            None
+        );
+        assert_eq!(download_url("https://"), None);
+        assert_eq!(
+            download_url("https://huggingface.co/o/r/blob/v1.0/sub/dir/m.gguf").as_deref(),
+            Some("https://huggingface.co/o/r/resolve/v1.0/sub/dir/m.gguf")
+        );
+        assert_eq!(
+            download_url("https://huggingface.co/o/r/blob/main/m.gguf?download=true").as_deref(),
+            Some("https://huggingface.co/o/r/resolve/main/m.gguf?download=true")
+        );
+    }
+
+    #[test]
+    fn download_url_handles_dataset_and_space_repos() {
+        assert_eq!(
+            download_url("https://huggingface.co/datasets/o/r/blob/main/x").as_deref(),
+            Some("https://huggingface.co/datasets/o/r/resolve/main/x")
+        );
+        assert_eq!(
+            download_url("https://huggingface.co/spaces/o/r/blob/main/x").as_deref(),
+            Some("https://huggingface.co/spaces/o/r/resolve/main/x")
+        );
+        assert_eq!(
+            download_url("https://huggingface.co/datasets/o/blob/blob/main/x").as_deref(),
+            Some("https://huggingface.co/datasets/o/blob/resolve/main/x")
+        );
+    }
+
+    #[test]
+    fn a_local_path_role_may_name_a_url_which_is_normalised() {
+        let text = r#"{"engines":{"mine":{"main":{"path":"/m/mine.gguf","url":"https://huggingface.co/o/r/blob/main/mine.gguf"}}}}"#;
+        let mut w = Vec::new();
+        let c = parse(text, Layer::Local, &mut w).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        let e = c.get("mine").unwrap();
+        assert_eq!(e.paths.get("main"), Some(&PathBuf::from("/m/mine.gguf")));
+        assert_eq!(
+            e.path_urls.get("main").map(String::as_str),
+            Some("https://huggingface.co/o/r/resolve/main/mine.gguf")
+        );
+        assert!(e.to_manifest().is_none(), "still never managed");
+    }
+
+    #[test]
+    fn a_local_path_role_with_an_http_url_drops_the_engine() {
+        let text =
+            r#"{"engines":{"mine":{"main":{"path":"/m/mine.gguf","url":"http://h/mine.gguf"}}}}"#;
+        let mut w = Vec::new();
+        let c = parse(text, Layer::Local, &mut w).unwrap();
+        assert!(c.get("mine").is_none());
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("https://"), "{w:?}");
+    }
+
+    #[test]
+    fn a_local_url_without_a_path_drops_the_engine() {
+        let text = r#"{"engines":{"mine":{"main":{"url":"https://h/mine.gguf"}}}}"#;
+        let mut w = Vec::new();
+        let c = parse(text, Layer::Local, &mut w).unwrap();
+        assert!(c.get("mine").is_none());
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("needs a path") && w[0].contains("sha256"),
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn a_published_entry_may_not_name_a_path_even_with_a_url() {
+        let text = r#"{"version":1,"default":"x","engines":{"x":{"version":1,"main":{"path":"/evil.gguf","url":"https://h/m.gguf"}}}}"#;
+        let mut w = Vec::new();
+        let c = parse(text, Layer::Published, &mut w).unwrap();
+        assert!(c.get("x").is_none());
+        assert!(w[0].contains("may not name a path"), "{w:?}");
+    }
+
+    #[test]
+    fn resolve_carries_the_local_url_into_the_selection() {
+        let r = root("sel-localurl");
+        let base = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let over = parse(
+            r#"{"engines":{"mine":{"main":{"path":"/m/mine.gguf","url":"https://huggingface.co/o/r/blob/main/mine.gguf"},"vision":{"path":"/m/v.gguf"}}}}"#,
+            Layer::Local,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let s = resolve_in(&r, &layer(base, over), Choice::Spec("mine")).unwrap();
+        assert_eq!(
+            s.urls.get("main").map(String::as_str),
+            Some("https://huggingface.co/o/r/resolve/main/mine.gguf")
+        );
+        assert!(!s.urls.contains_key("vision"), "no url, none carried");
+        assert!(!s.managed_main, "a url never makes a path role managed");
     }
 
     #[test]
@@ -880,6 +1140,7 @@ mod tests {
             mtp: None,
             vision: None,
             managed_main: false,
+            urls: BTreeMap::new(),
         }
     }
 
@@ -1003,5 +1264,168 @@ mod tests {
         assert_eq!(s.main, PathBuf::from("/m/mine.gguf"));
         assert_eq!(s.vision, Some(PathBuf::from("/m/v.gguf")));
         assert!(!s.managed_main, "path roles are never downloaded");
+    }
+
+    const HAL: Option<Recommendation<'static>> = Some(Recommendation {
+        profile: "HAL",
+        engine: "qwen",
+    });
+
+    fn compiled() -> Catalog {
+        parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn the_command_line_beats_a_recommendation_that_is_installed() {
+        let r = root("rec-cli");
+        std::fs::write(r.join("qwen.gguf"), "q").unwrap();
+        let (s, notes) = choose_with_recommendation_in(
+            &r,
+            &compiled(),
+            Some(Choice::Named("ds41")),
+            HAL,
+            Choice::Default,
+        )
+        .unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS41));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn an_installed_recommendation_beats_the_settings_model() {
+        let r = root("rec-used");
+        std::fs::write(r.join("qwen.gguf"), "q").unwrap();
+        std::fs::write(r.join("qwen.vision.gguf"), "v").unwrap();
+        let (s, notes) =
+            choose_with_recommendation_in(&r, &compiled(), None, HAL, Choice::Spec("ds41"))
+                .unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::QWEN));
+        assert_eq!(s.main, r.join("qwen.gguf"));
+        assert_eq!(notes, ["using qwen, recommended by profile HAL"]);
+    }
+
+    #[test]
+    fn a_recommendation_with_a_missing_companion_falls_to_the_settings_model() {
+        let r = root("rec-missing-companion");
+        // Main is on disk, but the declared vision companion is not: the
+        // recommendation must not count as locally available, or picking it
+        // would lead straight into a download prompt.
+        std::fs::write(r.join("qwen.gguf"), "q").unwrap();
+        let (s, notes) =
+            choose_with_recommendation_in(&r, &compiled(), None, HAL, Choice::Spec("ds41"))
+                .unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS41));
+        assert_eq!(
+            notes,
+            ["profile HAL recommends qwen, which is not installed; using ds41"]
+        );
+    }
+
+    #[test]
+    fn a_recommendation_whose_file_is_missing_falls_to_the_settings_model() {
+        let r = root("rec-missing");
+        let (s, notes) =
+            choose_with_recommendation_in(&r, &compiled(), None, HAL, Choice::Spec("ds41"))
+                .unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS41));
+        assert_eq!(
+            notes,
+            ["profile HAL recommends qwen, which is not installed; using ds41"]
+        );
+        assert!(
+            !r.join("qwen.gguf").exists(),
+            "a recommendation never downloads"
+        );
+    }
+
+    #[test]
+    fn a_missing_recommendation_without_settings_falls_to_the_local_default() {
+        let r = root("rec-local-default");
+        let over = parse(
+            r#"{"default":"ds41","engines":{}}"#,
+            Layer::Local,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let c = layer(compiled(), over);
+        let (s, notes) = choose_with_recommendation_in(&r, &c, None, HAL, Choice::Default).unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS41));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let (s, _) =
+            choose_with_recommendation_in(&r, &compiled(), None, HAL, Choice::Default).unwrap();
+        assert_eq!(
+            s.id,
+            Some(crate::manifest::EngineId::DS4VISION),
+            "then the catalog default"
+        );
+    }
+
+    #[test]
+    fn a_local_engine_is_available_when_its_path_exists() {
+        let r = root("rec-local-path");
+        let main = r.join("elsewhere/mine.gguf");
+        let text = format!(
+            r#"{{"engines":{{"mine":{{"main":{{"path":"{}"}}}}}}}}"#,
+            main.display()
+        );
+        let c = layer(
+            compiled(),
+            parse(&text, Layer::Local, &mut Vec::new()).unwrap(),
+        );
+        let rec = Some(Recommendation {
+            profile: "EAP",
+            engine: "mine",
+        });
+        let (s, notes) = choose_with_recommendation_in(&r, &c, None, rec, Choice::Default).unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS4VISION));
+        assert_eq!(
+            notes,
+            ["profile EAP recommends mine, which is not installed; using ds4vision"]
+        );
+        std::fs::create_dir_all(main.parent().unwrap()).unwrap();
+        std::fs::write(&main, "m").unwrap();
+        let (s, notes) = choose_with_recommendation_in(&r, &c, None, rec, Choice::Default).unwrap();
+        assert_eq!(s.main, main);
+        assert_eq!(notes, ["using mine, recommended by profile EAP"]);
+    }
+
+    #[test]
+    fn a_skipped_recommendation_note_survives_an_invalid_settings_model() {
+        let r = root("rec-missing-and-invalid-settings");
+        let err = choose_with_recommendation_in(&r, &compiled(), None, HAL, Choice::Named("nope"))
+            .unwrap_err();
+        assert!(
+            err.contains("profile HAL recommends qwen, which is not installed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_recommendation_warns_and_falls_through() {
+        let r = root("rec-unknown");
+        let rec = Some(Recommendation {
+            profile: "HAL",
+            engine: "foo",
+        });
+        let (s, notes) =
+            choose_with_recommendation_in(&r, &compiled(), None, rec, Choice::Spec("qwen"))
+                .unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::QWEN));
+        assert_eq!(
+            notes,
+            ["profile HAL recommends foo, which is not an engine; ignoring it"]
+        );
+    }
+
+    #[test]
+    fn no_recommendation_resolves_exactly_as_before() {
+        let r = root("rec-none");
+        let c = compiled();
+        for choice in [Choice::Default, Choice::Spec("qwen"), Choice::Named("ds41")] {
+            let (s, notes) = choose_with_recommendation_in(&r, &c, None, None, choice).unwrap();
+            assert_eq!(s, resolve_in(&r, &c, choice).unwrap());
+            assert!(notes.is_empty());
+        }
+        assert!(choose_with_recommendation_in(&r, &c, None, None, Choice::Named("nope")).is_err());
     }
 }

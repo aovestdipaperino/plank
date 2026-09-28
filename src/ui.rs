@@ -23899,6 +23899,7 @@ mod tests {
             warnings: Vec::new(),
             folder_context: false,
             agents_md: false,
+            recommended_model: None,
         }
     }
 
