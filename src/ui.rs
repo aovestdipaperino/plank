@@ -12994,32 +12994,13 @@ impl Agent<'_> {
                     },
                     finished,
                 )?;
-                if quit {
-                    // Ctrl-D during the call: the same door as Ctrl-D at
-                    // the prompt. The calls have finished by now; a notice
-                    // with no next turn to precede is simply not delivered.
-                    if !confirm_quit_idle(
-                        terminal,
-                        &mut log,
-                        &mut view,
-                        &mut sub_pane,
-                        &mut btw_panel,
-                        &mut report,
-                        &input,
-                        &idle_status,
-                        selection.current(),
-                        &task_view,
-                        config_form.as_ref(),
-                        kv_pane.as_ref(),
-                        resume_pane.as_ref(),
-                        &arcade,
-                        wasm_frame.as_ref(),
-                        rem,
-                    )? {
-                        continue;
-                    }
-                    break;
-                }
+                // Ctrl-D is gated on `TurnShared::memory_pass`
+                // (`tui_turn_inner`'s busy loop), and this pass runs with
+                // `interruptible = false`, so the busy loop never arms that
+                // key and `quit` can never come back true here. Quitting
+                // mid-write-back simply waits the call out, which is bounded
+                // by `mcp.timeoutSecs`.
+                debug_assert!(!quit, "grid write-back is not Ctrl-D-interruptible");
                 continue;
             }
 
@@ -14660,7 +14641,11 @@ impl Agent<'_> {
     /// Unlike a quiet pass this is not interruptible: it is work the user
     /// asked for by saving, so a prompt typed meanwhile waits in the queue
     /// and becomes the next turn when the calls return, with their notices
-    /// ahead of it. Returns `true` on Ctrl-D, as [`Self::tui_quiet_pass`].
+    /// ahead of it. Ctrl-D during the call is inert, same as mid-turn: the
+    /// busy loop only arms it for an interruptible pass. Quitting simply
+    /// waits for the write-back to finish, bounded by `mcp.timeoutSecs`.
+    /// Always returns `Ok(false)`; kept `Result<bool, String>` to share
+    /// [`Self::tui_background_pass`] with [`Self::tui_quiet_pass`].
     fn tui_grid_write_back(
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
@@ -14699,6 +14684,7 @@ impl Agent<'_> {
             .as_deref()
             .map_or(&local_shared, |r| r.shared.as_ref());
         shared.memory_pass.store(interruptible, Ordering::Relaxed);
+        shared.background_pass.store(true, Ordering::Relaxed);
         let live = LiveCommands::capture(self);
         let run = run_worker_ui(
             terminal,
@@ -14716,6 +14702,7 @@ impl Agent<'_> {
             |tx| body(self, &tx),
         );
         shared.memory_pass.store(false, Ordering::Relaxed);
+        shared.background_pass.store(false, Ordering::Relaxed);
         // Read before the interrupt reset below: the Ctrl-D arm raised that
         // interrupt to stop the pass, and clearing it must not lose the
         // reason. Taken rather than peeked, so a persistent remote
@@ -15856,23 +15843,30 @@ impl Agent<'_> {
     }
 
     /// The turn-start drain: every queued host notice goes in just ahead of
-    /// the user message that starts the turn (a typed prompt, a skill or a
-    /// job notification), so the order is `[notice, prompt, reply]`. With no
-    /// such message at the end (a continuation turn), the notices are
-    /// appended. That message has not reached the model yet, so inserting
-    /// before it disturbs no cached prefix. Returns how many joined.
+    /// the whole trailing run of plain user messages (a typed prompt, a
+    /// skill, or several queued prompts submitted back to back — anything
+    /// that is a plain `User` message and not a tool result), so the order is
+    /// `[notice, prompt1, prompt2, ..., reply]` rather than splitting the
+    /// notice into the middle of that run. With no such run at the end (a
+    /// continuation turn whose last message is a tool result, or an empty
+    /// transcript), the notices are appended. None of that run has reached
+    /// the model yet, so inserting ahead of it disturbs no cached prefix.
+    /// Returns how many joined.
     fn drain_host_notices_before_prompt(&mut self) -> usize {
         if self.in_sidechain() || self.tool_ctx.host_notices.is_empty() {
             return 0;
         }
         let notices = std::mem::take(&mut self.tool_ctx.host_notices);
         let transcript = &self.session.transcript;
-        let at = match transcript.last() {
-            Some(m) if m.role == crate::session::Role::User && !m.is_tool_user() => {
-                transcript.len() - 1
+        let mut at = transcript.len();
+        while at > 0 {
+            let m = &transcript[at - 1];
+            if m.role == crate::session::Role::User && !m.is_tool_user() {
+                at -= 1;
+            } else {
+                break;
             }
-            _ => transcript.len(),
-        };
+        }
         let n = notices.len();
         for (i, text) in notices.into_iter().enumerate() {
             self.session.insert(at + i, Message::user(text));
@@ -19734,17 +19728,17 @@ fn busy_ui_loop(
                         // Submitting anything retires an open `/usage` report.
                         report = None;
                         if line.is_empty() {
-                        } else if shared.memory_pass.load(Ordering::Relaxed)
-                            && btw_question(&line).is_some()
-                        {
+                        } else if let Some(msg) = btw_question(&line).and_then(|_| {
+                            crate::worker::btw_gate(
+                                shared.background_pass.load(Ordering::Relaxed),
+                                shared.memory_pass.load(Ordering::Relaxed),
+                            )
+                        }) {
                             // No main task to ask beside during a quiet
-                            // background pass, and nothing to preempt that
-                            // would resume: a plain prompt is the way to have
-                            // the model now.
-                            log.push_dim(
-                                "[/btw has nothing to run beside right now — \
-                                 just type your prompt; it starts at once]",
-                            );
+                            // background pass (interruptible) or a grid
+                            // write-back (not): a plain prompt is the way to
+                            // have the model now, or the draft simply waits.
+                            log.push_dim(msg);
                         } else if btw_question(&line).is_some() {
                             // A `/btw` gets priority: it preempts the running
                             // main pass so the side question is answered now,
@@ -38152,6 +38146,41 @@ or the user's next message aborts before its first token"
         assert_eq!(texts[1], "hi");
         assert!(texts[2].contains("Noted."), "{texts:#?}");
         assert!(agent.tool_ctx.host_notices.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two queued prompts submitted back to back during a grid write-back
+    /// (`[line1, line2]`, both plain `User` messages, nothing drained
+    /// between them) must not be split by the reminder: it goes ahead of the
+    /// whole trailing run, giving `[reminder, line1, line2]`, never
+    /// `[line1, reminder, line2]`.
+    #[test]
+    fn a_host_notice_precedes_the_whole_trailing_run_of_prompts() {
+        let dir = std::env::temp_dir().join(format!(
+            "plank-ui-host-notice-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::AgentConfig::default();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let (_, reminder) =
+            grid_write_back_notice("categories", &Ok("categories: 1 updated".into()));
+        agent.tool_ctx.host_notices.push(reminder.clone());
+        agent.session.push(Message::user("line1"));
+        agent.session.push(Message::user("line2"));
+
+        agent.drain_host_notices_before_prompt();
+
+        let texts: Vec<&str> = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(texts, [reminder.as_str(), "line1", "line2"], "{texts:#?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
