@@ -20042,6 +20042,9 @@ fn new_agent(
         &wasm_tools,
         !crate::settings::active().engine.thinking_tool_calls,
         syntax,
+        // The `suspend_model` note: only a run that holds a local model it
+        // can reopen (the same factory that arms the GPU-yield cycle).
+        reopen.is_some(),
     );
     drop(wasm_tools);
     // Tell the engine where the trusted control text ends before it tokenizes
