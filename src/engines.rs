@@ -62,6 +62,10 @@ pub struct EngineEntry {
     pub files: BTreeMap<String, FileEntry>,
     /// Local-only roles pointing at an existing file.
     pub paths: BTreeMap<String, PathBuf>,
+    /// For a `paths` role that also names a `url`: where to fetch the file
+    /// when that path does not exist, already normalised by [`download_url`].
+    /// The role stays unmanaged: no version, no hash, no upgrade.
+    pub path_urls: BTreeMap<String, String>,
     /// The engine's JSON object, verbatim, for the installed record.
     pub raw: String,
 }
@@ -180,6 +184,7 @@ fn parse_entry(name: &str, value: &serde_json::Value, layer: Layer) -> Result<En
         .unwrap_or(0);
     let mut files = BTreeMap::new();
     let mut paths = BTreeMap::new();
+    let mut path_urls = BTreeMap::new();
     for role in ROLES {
         let Some(r) = obj.get(role) else { continue };
         if let Some(p) = r.get("path").and_then(serde_json::Value::as_str) {
@@ -187,7 +192,27 @@ fn parse_entry(name: &str, value: &serde_json::Value, layer: Layer) -> Result<En
                 return Err(format!("{role}: a published entry may not name a path"));
             }
             paths.insert(role.to_string(), crate::settings::expand_tilde(p));
+            if let Some(u) = r.get("url") {
+                let u = u
+                    .as_str()
+                    .ok_or_else(|| format!("{role}: the url must be a string"))?;
+                let url = download_url(u)
+                    .ok_or_else(|| format!("{role}: the url must start with https:// (`{u}`)"))?;
+                path_urls.insert(role.to_string(), url);
+            }
             continue;
+        }
+        // A bare `url` is not a download entry: plank would have to choose the
+        // install path and could not verify the bytes without a sha256.
+        if layer == Layer::Local
+            && r.get("url").is_some()
+            && (r.get("sha256").is_none() || r.get("bytes").is_none())
+        {
+            return Err(format!(
+                "{role}: a url needs a path to download into; a url-only role would need \
+                 plank's install path and a sha256, so add a `path` or give a full download \
+                 entry (name, url, bytes, sha256)"
+            ));
         }
         let entry: FileEntry =
             serde_json::from_value(r.clone()).map_err(|e| format!("{role}: {e}"))?;
@@ -204,6 +229,7 @@ fn parse_entry(name: &str, value: &serde_json::Value, layer: Layer) -> Result<En
         version,
         files,
         paths,
+        path_urls,
         raw: serde_json::to_string(value).map_err(|e| e.to_string())?,
     };
     // Reuse the manifest validator (sha256 shape, https, nonzero bytes).
@@ -211,6 +237,29 @@ fn parse_entry(name: &str, value: &serde_json::Value, layer: Layer) -> Result<En
         return Err("an artifact entry is malformed (sha256, url or bytes)".to_string());
     }
     Ok(e)
+}
+
+/// The download URL for a local role's `url`: a Hugging Face file page
+/// (`https://huggingface.co/<owner>/<repo>/blob/<rev>/<path>`) becomes its
+/// `/resolve/` link, and any other `https://` URL is kept as written. `None`
+/// for anything that is not `https://`.
+#[must_use]
+pub fn download_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    if rest.is_empty() {
+        return None;
+    }
+    if let Some(tail) = rest.strip_prefix("huggingface.co/") {
+        let mut parts = tail.splitn(4, '/');
+        if let (Some(owner), Some(repo), Some("blob"), Some(file)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        {
+            return Some(format!(
+                "https://huggingface.co/{owner}/{repo}/resolve/{file}"
+            ));
+        }
+    }
+    Some(url.to_string())
 }
 
 /// `over` stacked on `base`: whole-entry replacement per name; `over`'s
@@ -327,6 +376,11 @@ pub struct Selection {
     pub vision: Option<PathBuf>,
     /// Whether `main` is a catalog download plank may fetch and upgrade.
     pub managed_main: bool,
+    /// Where to fetch a missing local `path` role, by role, from the local
+    /// layer's `url`. Never makes a role managed: it is used only to download
+    /// a file that is absent into exactly that path. Empty for managed roles
+    /// and bare paths.
+    pub urls: BTreeMap<String, String>,
 }
 
 fn select(root: &Path, entry: &EngineEntry, id: EngineId) -> Selection {
@@ -345,6 +399,7 @@ fn select(root: &Path, entry: &EngineEntry, id: EngineId) -> Selection {
         mtp: role("mtp"),
         vision: role("vision"),
         managed_main: entry.files.contains_key("main"),
+        urls: entry.path_urls.clone(),
     }
 }
 
@@ -452,6 +507,7 @@ pub fn resolve_with_note_in(
                     mtp: None,
                     vision: None,
                     managed_main: false,
+                    urls: BTreeMap::new(),
                 },
                 None,
             ))
@@ -514,6 +570,9 @@ pub fn inherit_companions_in(
             mtp: engine.mtp,
             vision: engine.vision,
             managed_main: false,
+            // A managed main is never a path role, so these are the
+            // companions' urls only.
+            urls: engine.urls,
         },
         None => sel,
     }
@@ -637,6 +696,98 @@ mod tests {
             e.to_manifest().is_none(),
             "path-only engines are never downloaded"
         );
+    }
+
+    #[test]
+    fn download_url_turns_a_hugging_face_page_into_its_download() {
+        assert_eq!(
+            download_url("https://huggingface.co/o/r/blob/main/m.gguf").as_deref(),
+            Some("https://huggingface.co/o/r/resolve/main/m.gguf")
+        );
+        let resolve = "https://huggingface.co/o/r/resolve/main/m.gguf";
+        assert_eq!(download_url(resolve).as_deref(), Some(resolve));
+        let other = "https://example.com/blob/main/m.gguf";
+        assert_eq!(download_url(other).as_deref(), Some(other));
+        assert_eq!(
+            download_url("http://huggingface.co/o/r/blob/main/m.gguf"),
+            None
+        );
+        assert_eq!(download_url("https://"), None);
+        assert_eq!(
+            download_url("https://huggingface.co/o/r/blob/v1.0/sub/dir/m.gguf").as_deref(),
+            Some("https://huggingface.co/o/r/resolve/v1.0/sub/dir/m.gguf")
+        );
+        assert_eq!(
+            download_url("https://huggingface.co/o/r/blob/main/m.gguf?download=true").as_deref(),
+            Some("https://huggingface.co/o/r/resolve/main/m.gguf?download=true")
+        );
+    }
+
+    #[test]
+    fn a_local_path_role_may_name_a_url_which_is_normalised() {
+        let text = r#"{"engines":{"mine":{"main":{"path":"/m/mine.gguf","url":"https://huggingface.co/o/r/blob/main/mine.gguf"}}}}"#;
+        let mut w = Vec::new();
+        let c = parse(text, Layer::Local, &mut w).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        let e = c.get("mine").unwrap();
+        assert_eq!(e.paths.get("main"), Some(&PathBuf::from("/m/mine.gguf")));
+        assert_eq!(
+            e.path_urls.get("main").map(String::as_str),
+            Some("https://huggingface.co/o/r/resolve/main/mine.gguf")
+        );
+        assert!(e.to_manifest().is_none(), "still never managed");
+    }
+
+    #[test]
+    fn a_local_path_role_with_an_http_url_drops_the_engine() {
+        let text =
+            r#"{"engines":{"mine":{"main":{"path":"/m/mine.gguf","url":"http://h/mine.gguf"}}}}"#;
+        let mut w = Vec::new();
+        let c = parse(text, Layer::Local, &mut w).unwrap();
+        assert!(c.get("mine").is_none());
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("https://"), "{w:?}");
+    }
+
+    #[test]
+    fn a_local_url_without_a_path_drops_the_engine() {
+        let text = r#"{"engines":{"mine":{"main":{"url":"https://h/mine.gguf"}}}}"#;
+        let mut w = Vec::new();
+        let c = parse(text, Layer::Local, &mut w).unwrap();
+        assert!(c.get("mine").is_none());
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("needs a path") && w[0].contains("sha256"),
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn a_published_entry_may_not_name_a_path_even_with_a_url() {
+        let text = r#"{"version":1,"default":"x","engines":{"x":{"version":1,"main":{"path":"/evil.gguf","url":"https://h/m.gguf"}}}}"#;
+        let mut w = Vec::new();
+        let c = parse(text, Layer::Published, &mut w).unwrap();
+        assert!(c.get("x").is_none());
+        assert!(w[0].contains("may not name a path"), "{w:?}");
+    }
+
+    #[test]
+    fn resolve_carries_the_local_url_into_the_selection() {
+        let r = root("sel-localurl");
+        let base = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let over = parse(
+            r#"{"engines":{"mine":{"main":{"path":"/m/mine.gguf","url":"https://huggingface.co/o/r/blob/main/mine.gguf"},"vision":{"path":"/m/v.gguf"}}}}"#,
+            Layer::Local,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let s = resolve_in(&r, &layer(base, over), Choice::Spec("mine")).unwrap();
+        assert_eq!(
+            s.urls.get("main").map(String::as_str),
+            Some("https://huggingface.co/o/r/resolve/main/mine.gguf")
+        );
+        assert!(!s.urls.contains_key("vision"), "no url, none carried");
+        assert!(!s.managed_main, "a url never makes a path role managed");
     }
 
     #[test]
@@ -880,6 +1031,7 @@ mod tests {
             mtp: None,
             vision: None,
             managed_main: false,
+            urls: BTreeMap::new(),
         }
     }
 

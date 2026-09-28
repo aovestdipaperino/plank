@@ -300,7 +300,7 @@ is layered over the catalog, is the only place a role may name a
   &quot;default&quot;: &quot;mine&quot;,
   &quot;engines&quot;: {
     &quot;mine&quot;: {
-      &quot;main&quot;:   { &quot;path&quot;: &quot;~/models/my-ds4.gguf&quot; },
+      &quot;main&quot;:   { &quot;path&quot;: &quot;~/models/my-ds4.gguf&quot;, &quot;url&quot;: &quot;https://huggingface.co/owner/repo/blob/main/my-ds4.gguf&quot; },
       &quot;mtp&quot;:    { &quot;path&quot;: &quot;~/models/my-ds4.dspark.gguf&quot; },
       &quot;vision&quot;: { &quot;path&quot;: &quot;~/models/my-ds4.vision.gguf&quot; }
     }
@@ -308,7 +308,12 @@ is layered over the catalog, is the only place a role may name a
 }</code></pre>
 <p><code>plank --model mine</code> then loads all three, and with
 <code>"default": "mine"</code> so does a plain <code>plank</code>. A
-local entry with the same name as a built-in engine replaces it.</p>
+local entry with the same name as a built-in engine replaces it. A role
+that names a <code>path</code> may also give a <code>url</code> (an
+<code>https://</code> link, where a Hugging Face <code>/blob/</code>
+page is turned into its <code>/resolve/</code> download): when the file
+is missing, plank offers to download it into exactly that path, but it
+still never checks it for upgrades.</p>
 <p>Upgrading from a release before engines renames the files under
 <code>~/.plank</code> once, at the first launch:
 <code>ds4flash.gguf</code> becomes <code>ds4vision.gguf</code>, its

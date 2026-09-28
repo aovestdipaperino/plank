@@ -258,11 +258,14 @@ pub fn apply_companions(sel: &crate::engines::Selection, engine: &mut crate::con
 }
 
 /// Download URL and size of `role` for the selected engine, from the catalog
-/// entry the selection was resolved from. `None` for a role the engine does
-/// not publish (path-only, or absent) and for a bare path.
+/// entry the selection was resolved from, else from the local layer's `url`
+/// for that role (whose size is unknown, hence `None`). `None` for a role
+/// with neither, and for a bare path.
 #[must_use]
-pub fn role_offer(sel: &crate::engines::Selection, role: &str) -> Option<(String, u64)> {
-    sel.id?;
+pub fn role_offer(sel: &crate::engines::Selection, role: &str) -> Option<(String, Option<u64>)> {
+    if sel.id.is_none() {
+        return role_offer_in(&crate::engines::Catalog::default(), sel, role);
+    }
     let mut warn = Vec::new();
     role_offer_in(&crate::engines::load(&mut warn), sel, role)
 }
@@ -274,10 +277,21 @@ pub fn role_offer_in(
     catalog: &crate::engines::Catalog,
     sel: &crate::engines::Selection,
     role: &str,
-) -> Option<(String, u64)> {
-    let id = sel.id?;
-    let f = catalog.get(id.as_str())?.files.get(role)?;
-    Some((f.url.clone(), f.bytes))
+) -> Option<(String, Option<u64>)> {
+    let published = sel
+        .id
+        .and_then(|id| catalog.get(id.as_str())?.files.get(role))
+        .map(|f| (f.url.clone(), Some(f.bytes)));
+    published.or_else(|| sel.urls.get(role).map(|u| (u.clone(), None)))
+}
+
+/// A download size for a prompt: `~N GB` with `decimals` places, or
+/// `size unknown` when the server gave no Content-Length.
+fn size_text(bytes: Option<u64>, decimals: usize) -> String {
+    bytes.map_or_else(
+        || "size unknown".to_string(),
+        |b| format!("~{:.decimals$} GB", gb(b)),
+    )
 }
 
 /// Ensures `role`'s file exists at `path`, offering to download it from the
@@ -307,11 +321,12 @@ pub fn ensure_role(sel: &crate::engines::Selection, role: &str, path: &Path) -> 
             ""
         };
         return Err(format!(
-            "no {label} at {}; run plank in a terminal to download it (~{:.1} GB), or put the file at that path{hatch}",
+            "no {label} at {}; run plank in a terminal to download it ({}) from {url}, or put the file at that path{hatch}",
             path.display(),
-            gb(bytes)
+            size_text(bytes, 1)
         ));
     }
+    let bytes = bytes.or_else(|| content_length(&url));
     let resuming = partial_bytes(path) > 0;
     eprintln!("No {label} found at {}.", path.display());
     if resuming {
@@ -320,7 +335,7 @@ pub fn ensure_role(sel: &crate::engines::Selection, role: &str, path: &Path) -> 
             gb(partial_bytes(path))
         );
     } else {
-        eprintln!("plank can download {label} (~{:.1} GB) from:", gb(bytes));
+        eprintln!("plank can download {label} ({}) from:", size_text(bytes, 1));
     }
     eprintln!("  {url}");
     eprint!(
@@ -624,18 +639,19 @@ fn drop_dspark_for_family(
 }
 
 /// Download URL and size of the selected engine's `main`, when plank manages
-/// that file, from `lookup` (the catalog's `main` entry, in practice).
+/// that file, from `lookup` (the catalog's `main` entry, in practice), or the
+/// local layer's `url` for a `main` given as a `path` (size unknown).
 ///
-/// Only a managed engine's own `main` path is ever offered: a bare `--model`
-/// path that does not exist is the user's own file, and offering a download
-/// for any missing path meant a mistyped path proposed fetching hundreds of
-/// GB into the wrong slot.
+/// Only a managed engine's own `main` path, or a local path the user paired
+/// with a url, is ever offered: a bare `--model` path that does not exist is
+/// the user's own file, and offering a download for any missing path meant a
+/// mistyped path proposed fetching hundreds of GB into the wrong slot.
 fn main_offer_with(
     sel: &crate::engines::Selection,
-    lookup: impl FnOnce() -> Option<(String, u64)>,
-) -> Option<(String, u64)> {
+    lookup: impl FnOnce() -> Option<(String, Option<u64>)>,
+) -> Option<(String, Option<u64>)> {
     if !sel.managed_main {
-        return None;
+        return sel.urls.get("main").map(|u| (u.clone(), None));
     }
     lookup()
 }
@@ -678,12 +694,26 @@ pub fn ensure_model_in(
         return Ok(());
     }
     let offer = main_offer_with(sel, || role_offer_in(catalog, sel, "main"));
-    let (Some((url, bytes)), true) = (offer, is_tty) else {
+    let Some((url, bytes)) = offer else {
         return Err(format!(
             "no model at {}; pass --model <name|path> or download it first",
             path.display()
         ));
     };
+    if !is_tty {
+        return Err(if sel.managed_main {
+            format!(
+                "no model at {}; pass --model <name|path> or download it first",
+                path.display()
+            )
+        } else {
+            format!(
+                "no model at {}; run plank in a terminal to download it from {url}, or put the file at that path",
+                path.display()
+            )
+        });
+    }
+    let bytes = bytes.or_else(|| content_length(&url));
     let label = sel.id.map_or("the model", |id| id.as_str());
     // A leftover .part file means a previous download can be resumed.
     let resuming = partial_bytes(path) > 0;
@@ -694,7 +724,7 @@ pub fn ensure_model_in(
             gb(partial_bytes(path))
         );
     } else {
-        eprintln!("plank can download {label} (~{:.0} GB) from:", gb(bytes));
+        eprintln!("plank can download {label} ({}) from:", size_text(bytes, 0));
     }
     eprintln!("  {url}");
     eprint!(
@@ -2132,7 +2162,7 @@ mod tests {
         let sel = sel_for(&root, "qwen");
         let (url, bytes) = role_offer_in(&catalog(), &sel, "vision").unwrap();
         assert!(url.ends_with("mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"));
-        assert_eq!(bytes, 616_703_104);
+        assert_eq!(bytes, Some(616_703_104));
         assert!(role_offer_in(&catalog(), &sel, "mtp").is_none());
         let bare = sel_for(&root, "/elsewhere/x.gguf");
         assert!(role_offer_in(&catalog(), &bare, "vision").is_none());
@@ -2199,6 +2229,7 @@ mod tests {
             mtp: Some(absent.with_extension("mtp.absent")),
             vision: Some(absent.with_extension("vision.absent")),
             managed_main: false,
+            urls: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2278,6 +2309,7 @@ mod tests {
             mtp: None,
             vision: None,
             managed_main: false,
+            urls: std::collections::BTreeMap::new(),
         };
         let mut e = crate::config::EngineTuning::default();
         assert!(e.mtp, "speculation defaults to on");
@@ -2304,6 +2336,7 @@ mod tests {
             mtp: None,
             vision: None,
             managed_main: false,
+            urls: std::collections::BTreeMap::new(),
         };
         let mut e = crate::config::EngineTuning::default();
         assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
@@ -2435,6 +2468,7 @@ mod tests {
             mtp: None,
             vision: None,
             managed_main: false,
+            urls: std::collections::BTreeMap::new(),
         };
         let catalog = crate::engines::parse(
             crate::engines::COMPILED_IN,
@@ -2489,6 +2523,7 @@ mod tests {
             mtp: None,
             vision: None,
             managed_main: true,
+            urls: std::collections::BTreeMap::new(),
         };
         assert!(ensure_model_in(&crate::engines::Catalog::default(), &sel, false).is_ok());
         let _ = std::fs::remove_dir_all(&root);
@@ -2508,12 +2543,12 @@ mod tests {
         let (url, bytes) = main_offer_with(&v4, || role_offer_in(&catalog(), &v4, "main"))
             .expect("v4 main is offered");
         assert!(url.contains("DeepSeek-V4-Flash-Vision-Exp"), "{url}");
-        assert_eq!(bytes, 86_720_111_776);
+        assert_eq!(bytes, Some(86_720_111_776));
         let v41 = sel_for(&root, "ds41");
         let (url, bytes) = main_offer_with(&v41, || role_offer_in(&catalog(), &v41, "main"))
             .expect("v41 main is offered");
         assert!(url.contains("DeepSeek-V4.1-Flash-Q2"), "{url}");
-        assert_eq!(bytes, 365_713_686_528);
+        assert_eq!(bytes, Some(365_713_686_528));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2530,6 +2565,86 @@ mod tests {
             None,
             "an arbitrary explicit path is never the offer target"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A local engine whose roles are `path`s with a `url`, layered on the
+    /// compiled-in catalog, resolved under `root`. The paths sit under `root`
+    /// so nothing touches the real `~/.plank`.
+    fn local_url_selection(root: &Path) -> (crate::engines::Catalog, crate::engines::Selection) {
+        let text = format!(
+            r#"{{"engines":{{"mine":{{"main":{{"path":"{m}","url":"https://huggingface.co/o/r/blob/main/mine.gguf"}},"vision":{{"path":"{v}","url":"https://example.com/v.gguf"}}}}}}}}"#,
+            m = root.join("models/mine.gguf").display(),
+            v = root.join("models/mine-vision.gguf").display(),
+        );
+        let over = crate::engines::parse(&text, crate::engines::Layer::Local, &mut Vec::new())
+            .expect("local layer parses");
+        let cat = crate::engines::layer(catalog(), over);
+        let sel = crate::engines::resolve_in(root, &cat, crate::engines::Choice::Spec("mine"))
+            .expect("mine resolves");
+        (cat, sel)
+    }
+
+    /// A missing local `main` with a url, on a non-TTY run, names both the
+    /// path and the url in its error and never starts a download.
+    #[test]
+    fn ensure_model_in_a_missing_local_main_with_a_url_names_path_and_url() {
+        let root = crate::downloader::tests::tempdir();
+        let (cat, sel) = local_url_selection(&root);
+        assert!(!sel.managed_main);
+        let err = ensure_model_in(&cat, &sel, false).expect_err("no terminal, so an error");
+        assert!(err.contains(&sel.main.display().to_string()), "{err}");
+        assert!(
+            err.contains("https://huggingface.co/o/r/resolve/main/mine.gguf"),
+            "{err}"
+        );
+        assert!(!sel.main.exists());
+        assert!(!sel.main.with_extension("part").exists());
+        assert!(
+            !root.join("models").exists(),
+            "a non-TTY run creates nothing"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With no catalog download entry for a role, the local url is offered,
+    /// size unknown; a role with neither is not offered.
+    #[test]
+    fn role_offer_in_falls_back_to_the_local_url() {
+        let root = crate::downloader::tests::tempdir();
+        let (cat, sel) = local_url_selection(&root);
+        assert_eq!(
+            role_offer_in(&cat, &sel, "vision"),
+            Some(("https://example.com/v.gguf".to_string(), None))
+        );
+        assert_eq!(role_offer_in(&cat, &sel, "mtp"), None);
+        assert_eq!(
+            main_offer_with(&sel, || panic!("a local main never reads the catalog")),
+            Some((
+                "https://huggingface.co/o/r/resolve/main/mine.gguf".to_string(),
+                None
+            ))
+        );
+        assert_eq!(size_text(None, 1), "size unknown");
+        assert_eq!(size_text(Some(1_500_000_000), 1), "~1.5 GB");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A url on a local path role never makes it managed: the startup
+    /// upgrade check skips it before fetching anything.
+    #[test]
+    fn check_manifest_at_startup_with_skips_a_local_engine_with_a_url() {
+        let root = crate::downloader::tests::tempdir();
+        let (_, sel) = local_url_selection(&root);
+        assert_eq!(managed_id(&sel), None);
+        check_manifest_at_startup_with(
+            &sel,
+            &root,
+            &|| panic!("a local engine must never fetch the catalog"),
+            &|_, _| panic!("a local engine must never spawn a download"),
+            &|_, _| panic!("a local engine must never be asked anything"),
+        );
+        assert!(!root.join("staging").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2662,6 +2777,7 @@ mod tests {
             mtp: None,
             vision: None,
             managed_main: false,
+            urls: std::collections::BTreeMap::new(),
         };
         check_manifest_at_startup_with(
             &sel,
@@ -2689,6 +2805,7 @@ mod tests {
             mtp: None,
             vision: None,
             managed_main: false,
+            urls: std::collections::BTreeMap::new(),
         };
         let sel = crate::engines::inherit_companions_in(root, &catalog(), &base, clone);
         assert_eq!(

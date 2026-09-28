@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A local engine role may name a `url`.** In `~/.plank/engines.local.json` a
+  role with a `path` can add an `https://` `url` (a Hugging Face `/blob/` page
+  is accepted) that plank offers to download into that path when the file is
+  missing; the role stays unmanaged and is never upgraded.
 - **Engines come from an `engines.json` catalog.** A named *engine* is a main
   model plus its optional `mtp` and `vision` companions. The catalog ships
   compiled in, is refreshed from the repository at most once a day, and can
