@@ -331,31 +331,91 @@ fn select(root: &Path, entry: &EngineEntry, id: EngineId) -> Selection {
     }
 }
 
+/// Pre-catalog artifact names under `~/.plank`, and the engine role each one
+/// became. `enginemigrate` renames them; [`resolve_with_note_in`] still
+/// accepts the old main paths so a config written before the move keeps
+/// working.
+pub const LEGACY_ARTIFACTS: [(&str, EngineId, &str); 5] = [
+    ("ds4flash.gguf", EngineId::DS4VISION, "main"),
+    ("ds4flash.vision.gguf", EngineId::DS4VISION, "vision"),
+    ("ds4flash.dspark.gguf", EngineId::DS4VISION, "mtp"),
+    ("ds41flash.gguf", EngineId::DS41, "main"),
+    ("ds41flash.vision.gguf", EngineId::DS41, "vision"),
+];
+
+/// The engine and role a pre-catalog artifact `path` under `root` now
+/// belongs to, plus its old file name. The file itself is usually gone by
+/// now (the migration moved it), so the directory is compared, not the file.
+#[must_use]
+pub fn legacy_artifact(root: &Path, path: &Path) -> Option<(EngineId, &'static str, &'static str)> {
+    let leaf = path.file_name()?.to_str()?;
+    let (old, id, role) = LEGACY_ARTIFACTS
+        .into_iter()
+        .find(|(old, _, _)| *old == leaf)?;
+    let parent = path.parent()?;
+    let same_dir = parent == root
+        || matches!(
+            (parent.canonicalize(), root.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        );
+    same_dir.then_some((id, role, old))
+}
+
+/// The one line a legacy artifact path gets when it resolves to its engine.
+fn legacy_note(old: &str, id: EngineId) -> String {
+    format!("~/.plank/{old} is now the {id} engine; use --model {id}")
+}
+
 /// Resolves `choice` against `catalog`, with managed files under `root`.
+///
+/// # Errors
+/// As [`resolve_with_note_in`].
+pub fn resolve_in(root: &Path, catalog: &Catalog, choice: Choice<'_>) -> Result<Selection, String> {
+    resolve_with_note_in(root, catalog, choice).map(|(sel, _)| sel)
+}
+
+/// Resolves `choice` against `catalog`, with managed files under `root`, and
+/// returns a deprecation note to print once when the choice named a
+/// pre-catalog path (`~/.plank/ds4flash.gguf`, `~/.plank/ds41flash.gguf`)
+/// that now belongs to an engine.
 ///
 /// # Errors
 /// An unknown name (for [`Choice::Named`]), or a bare word that is neither an
 /// engine nor an existing file (for [`Choice::Spec`]).
-pub fn resolve_in(root: &Path, catalog: &Catalog, choice: Choice<'_>) -> Result<Selection, String> {
+pub fn resolve_with_note_in(
+    root: &Path,
+    catalog: &Catalog,
+    choice: Choice<'_>,
+) -> Result<(Selection, Option<String>), String> {
     let by_name = |name: &str| {
         let entry = catalog.get(name)?;
         let id = EngineId::new(name)?;
         Some(select(root, entry, id))
     };
     match choice {
-        Choice::Default => by_name(catalog.default_name()).ok_or_else(|| {
-            format!(
-                "the default engine `{}` is not in the catalog",
-                catalog.default_name()
-            )
-        }),
+        Choice::Default => by_name(catalog.default_name())
+            .map(|sel| (sel, None))
+            .ok_or_else(|| {
+                format!(
+                    "the default engine `{}` is not in the catalog",
+                    catalog.default_name()
+                )
+            }),
         Choice::Named(n) => by_name(n)
+            .map(|sel| (sel, None))
             .ok_or_else(|| format!("unknown engine `{n}`; known engines: {}", catalog.names())),
         Choice::Spec(s) => {
             if let Some(sel) = by_name(s) {
-                return Ok(sel);
+                return Ok((sel, None));
             }
             let path = crate::settings::expand_tilde(s);
+            // A config written before the engine catalog names the old main
+            // file, which the migration has since renamed.
+            if let Some((id, "main", old)) = legacy_artifact(root, &path)
+                && let Some(sel) = by_name(id.as_str())
+            {
+                return Ok((sel, Some(legacy_note(old, id))));
+            }
             let looks_like_path = s.contains('/') || path.extension().is_some() || path.exists();
             if !looks_like_path {
                 return Err(format!(
@@ -368,17 +428,20 @@ pub fn resolve_in(root: &Path, catalog: &Catalog, choice: Choice<'_>) -> Result<
                 if let Some(id) = EngineId::new(name) {
                     let sel = select(root, entry, id);
                     if sel.managed_main && sel.main == path {
-                        return Ok(sel);
+                        return Ok((sel, None));
                     }
                 }
             }
-            Ok(Selection {
-                id: None,
-                main: path,
-                mtp: None,
-                vision: None,
-                managed_main: false,
-            })
+            Ok((
+                Selection {
+                    id: None,
+                    main: path,
+                    mtp: None,
+                    vision: None,
+                    managed_main: false,
+                },
+                None,
+            ))
         }
     }
 }
@@ -685,6 +748,55 @@ mod tests {
             resolve_in(&r, &c, Choice::Named("x.gguf")).unwrap_err(),
             "unknown engine `x.gguf`; known engines: ds41, ds4vision, qwen"
         );
+    }
+
+    #[test]
+    fn the_old_ds4_main_path_selects_ds4vision_with_a_note() {
+        let r = root("sel-legacy-ds4");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let p = r.join("ds4flash.gguf");
+        let (s, note) = resolve_with_note_in(&r, &c, Choice::Spec(p.to_str().unwrap())).unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS4VISION));
+        assert_eq!(s.main, r.join("ds4vision.gguf"));
+        assert_eq!(s.mtp, Some(r.join("ds4vision.mtp.gguf")));
+        assert!(s.managed_main);
+        assert_eq!(
+            note.as_deref(),
+            Some("~/.plank/ds4flash.gguf is now the ds4vision engine; use --model ds4vision")
+        );
+    }
+
+    #[test]
+    fn the_old_ds41_main_path_selects_ds41_with_a_note() {
+        let r = root("sel-legacy-ds41");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let p = r.join("ds41flash.gguf");
+        let (s, note) = resolve_with_note_in(&r, &c, Choice::Spec(p.to_str().unwrap())).unwrap();
+        assert_eq!(s.id, Some(crate::manifest::EngineId::DS41));
+        assert_eq!(s.main, r.join("ds41.gguf"));
+        assert_eq!(
+            note.as_deref(),
+            Some("~/.plank/ds41flash.gguf is now the ds41 engine; use --model ds41")
+        );
+    }
+
+    #[test]
+    fn an_old_file_name_outside_the_plank_dir_is_just_a_path() {
+        let r = root("sel-legacy-elsewhere");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        let (s, note) =
+            resolve_with_note_in(&r, &c, Choice::Spec("/models/ds4flash.gguf")).unwrap();
+        assert_eq!(s.id, None);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn plain_choices_carry_no_note() {
+        let r = root("sel-no-note");
+        let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
+        for choice in [Choice::Default, Choice::Spec("qwen"), Choice::Named("ds41")] {
+            assert!(resolve_with_note_in(&r, &c, choice).unwrap().1.is_none());
+        }
     }
 
     #[test]

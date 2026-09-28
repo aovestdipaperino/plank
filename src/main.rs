@@ -348,7 +348,10 @@ fn resolve_selection(
     for w in warn {
         eprintln!("plank: {w}");
     }
-    let sel = plank::engines::resolve_in(root, &catalog, model_choice(cfg))?;
+    let (sel, note) = plank::engines::resolve_with_note_in(root, &catalog, model_choice(cfg))?;
+    if let Some(note) = note {
+        eprintln!("plank: {note}");
+    }
     cfg.model_path = Some(sel.main.clone());
     cfg.selection = Some(sel);
     Ok(())

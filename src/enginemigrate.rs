@@ -10,15 +10,6 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::EngineId;
 
-/// Old artifact name → (engine, role).
-const ARTIFACTS: [(&str, EngineId, &str); 5] = [
-    ("ds4flash.gguf", EngineId::DS4VISION, "main"),
-    ("ds4flash.vision.gguf", EngineId::DS4VISION, "vision"),
-    ("ds4flash.dspark.gguf", EngineId::DS4VISION, "mtp"),
-    ("ds41flash.gguf", EngineId::DS41, "main"),
-    ("ds41flash.vision.gguf", EngineId::DS41, "vision"),
-];
-
 /// Old installed manifest → engine. Order matters only for the ds41 default
 /// rule (decided before any move, from the raw filesystem state).
 const MANIFESTS: [(&str, EngineId); 3] = [
@@ -52,7 +43,7 @@ pub fn migrate_in(root: &Path) -> Vec<String> {
         && !root.join("ds4flash.gguf").exists()
         && !root.join("qwen.manifest").exists();
 
-    for (old, id, role) in ARTIFACTS {
+    for (old, id, role) in crate::engines::LEGACY_ARTIFACTS {
         if let Some(new) = crate::manifest::local_path_for_in(root, id, role) {
             move_one(&root.join(old), &new, &mut warn);
         }
