@@ -2649,7 +2649,7 @@ impl crate::gpuyield::CycleHost for AgentCycle<'_, '_> {
         let reason = gpu_unloaded_reason(error);
         self.agent.gpu_notice(&reason);
         let _ = self.agent.gpu_placeholder(&self.slot, reason);
-        self.agent.gpu_yield.pending = Some((self.slot.clone(), snapshot));
+        self.agent.gpu_yield.pending = Some(PendingReopen { snapshot });
     }
 }
 
@@ -2674,15 +2674,32 @@ enum EngineSlot {
     Alt(EngineKey),
 }
 
+/// A reload still owed after a failed reopen: the KV snapshot to restore
+/// once the model is back. No slot is kept, because a sidechain unwinding
+/// moves the placeholder (`Agent::gpu_placeholder_slot` finds it).
+struct PendingReopen {
+    snapshot: Option<crate::gpuyield::Snapshot>,
+}
+
+impl Drop for PendingReopen {
+    /// A snapshot never restored (plank quits, or the placeholder is gone)
+    /// takes its `$TMPDIR` file with it.
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            snapshot.discard();
+        }
+    }
+}
+
 /// The agent's half of the GPU-yield cycle (`gpuyield`).
 #[derive(Default)]
 struct GpuYield {
     /// Reopens the local model with its startup parameters. `None` when no
     /// local model was loaded, which disarms the cycle entirely.
     reopen: Option<crate::gpuyield::ReopenFn>,
-    /// A reopen that failed: the slot holding the placeholder, and the KV
-    /// snapshot still to restore. Retried at the next turn start.
-    pending: Option<(EngineSlot, Option<crate::gpuyield::Snapshot>)>,
+    /// A reopen that failed, retried at the next turn start into whichever
+    /// slot then holds the placeholder.
+    pending: Option<PendingReopen>,
     /// Where snapshots are written; the system temp directory when `None`.
     snapshot_dir: Option<std::path::PathBuf>,
     /// Where the C engine's stderr goes during a teardown and reload
@@ -4053,13 +4070,49 @@ impl Agent<'_> {
         }
     }
 
+    /// The slot holding the GPU-yield placeholder, wherever it is now: the
+    /// cycle that failed may have run inside a sidechain whose unwinding
+    /// moved it (a parked parent back to [`Agent::engine`], a sidechain's
+    /// local engine into [`Agent::alt_engines`]).
+    fn gpu_placeholder_slot(&self) -> Option<EngineSlot> {
+        if self.engine.is_gpu_placeholder() {
+            return Some(EngineSlot::Main);
+        }
+        if let Some(i) = self
+            .parked_engines
+            .iter()
+            .position(|p| p.engine.is_gpu_placeholder())
+        {
+            return Some(EngineSlot::Parked(i));
+        }
+        self.alt_engines
+            .iter()
+            .find(|(_, e)| e.is_gpu_placeholder())
+            .map(|(k, _)| EngineSlot::Alt(k.clone()))
+    }
+
     /// Retries a reopen that failed during an earlier cycle. Called at turn
     /// start, so a model that could not come back (another instance took the
     /// lock, say) gets another chance without restarting plank.
+    ///
+    /// Only at the top level: inside a sidechain the placeholder may be
+    /// parked or about to move. The slot is found before the factory runs, so
+    /// a placeholder that is gone (replaced by an engine switch) drops the
+    /// owed reload instead of loading the model into some other slot.
     fn retry_gpu_reopen(&mut self) {
-        let Some((slot, snapshot)) = self.gpu_yield.pending.take() else {
+        if self.gpu_yield.pending.is_none() || self.alt_engine_depth != 0 || self.in_sidechain() {
+            return;
+        }
+        let Some(slot) = self.gpu_placeholder_slot() else {
+            crate::engine::kv_debug(|| "gpu yield: placeholder gone; reload dropped".to_owned());
+            self.gpu_yield.pending = None;
             return;
         };
+        let snapshot = self
+            .gpu_yield
+            .pending
+            .take()
+            .and_then(|mut p| p.snapshot.take());
         match self.gpu_reopen_into(&slot) {
             Ok(()) => {
                 match snapshot {
@@ -4076,7 +4129,7 @@ impl Agent<'_> {
                 let reason = gpu_unloaded_reason(&e);
                 self.gpu_notice(&reason);
                 let _ = self.gpu_placeholder(&slot, reason);
-                self.gpu_yield.pending = Some((slot, snapshot));
+                self.gpu_yield.pending = Some(PendingReopen { snapshot });
             }
         }
     }
@@ -36390,6 +36443,161 @@ or the user's next message aborts before its first token"
         // sidechain's one-message view.
         let saved = std::fs::read_to_string(agent.store.path_for_id(&agent.session.id)).unwrap();
         assert!(saved.contains("the parent's question"), "{saved}");
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A factory whose first reopen fails and whose later ones hand back a
+    /// fresh `id` engine, plus the count of calls made.
+    fn flaky_gpu_factory(
+        log: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        counter: &std::path::Path,
+        id: &'static str,
+    ) -> (
+        crate::gpuyield::ReopenFn,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (l, c, a) = (
+            std::sync::Arc::clone(log),
+            counter.to_path_buf(),
+            std::sync::Arc::clone(&attempts),
+        );
+        let factory = gpu_factory(log, counter, move || {
+            if a.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                Err("lock held by another instance".to_owned())
+            } else {
+                Ok(GpuEngine::new(id, &l, &c, &[]))
+            }
+        });
+        (factory, attempts)
+    }
+
+    /// A failed reopen inside a local sidechain under a provider main agent:
+    /// the placeholder unwinds into `alt_engines[Local]`, the retry waits for
+    /// the top level, and the model goes back there, never into the
+    /// provider's slot.
+    #[test]
+    fn a_retry_after_a_sidechain_reloads_into_the_slot_the_placeholder_moved_to() {
+        let dir = gpu_dir("retry-sidechain");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let provider = Box::new(crate::engine::EchoEngine::new(100_000));
+        let mut agent = test_agent_boxed(&dir, provider, &cfg);
+        let (factory, attempts) = flaky_gpu_factory(&log, &counter, "later");
+        arm_gpu_yield(&mut agent, &dir, factory);
+        agent.session.push(Message::user("task"));
+        let call = gpu_bash_call(&gpu_command(&counter, false));
+        let local = Box::new(GpuEngine::new("local", &log, &counter, &[]));
+        let out = agent.run_sidechain_on(EngineKey::Local, local, |a| {
+            let out = a.run_tool_calls(std::slice::from_ref(&call));
+            a.retry_gpu_reopen();
+            assert!(a.gpu_yield.pending.is_some(), "no retry inside a sidechain");
+            out
+        });
+        assert!(out.contains("second-run-ok"), "{out}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(agent.alt_engines[&EngineKey::Local].is_gpu_placeholder());
+
+        agent.retry_gpu_reopen();
+
+        assert!(agent.gpu_yield.pending.is_none());
+        assert!(agent.alt_engines[&EngineKey::Local].can_release_gpu());
+        assert!(
+            !agent.engine.can_release_gpu() && !agent.engine.is_gpu_placeholder(),
+            "the provider main slot is untouched"
+        );
+        assert!(logged(&log).contains(&"restore:later:[4, 2]".to_owned()));
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed reopen of a local parent parked under a provider sidechain:
+    /// the placeholder unwinds back into the main slot and is reloaded there.
+    #[test]
+    fn a_retry_after_a_parked_parent_failed_reloads_the_main_slot() {
+        let dir = gpu_dir("retry-parked");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let main = Box::new(GpuEngine::new("main", &log, &counter, &[]));
+        let mut agent = test_agent_boxed(&dir, main, &cfg);
+        let (factory, _) = flaky_gpu_factory(&log, &counter, "main2");
+        arm_gpu_yield(&mut agent, &dir, factory);
+        agent.session.push(Message::user("task"));
+        let call = gpu_bash_call(&gpu_command(&counter, false));
+        let provider = Box::new(crate::engine::EchoEngine::new(100_000));
+        let out = agent.run_sidechain_on(EngineKey::Local, provider, |a| {
+            a.run_tool_calls(std::slice::from_ref(&call))
+        });
+        assert!(out.contains("second-run-ok"), "{out}");
+        assert!(agent.engine.is_gpu_placeholder(), "back in the main slot");
+
+        agent.retry_gpu_reopen();
+
+        assert!(agent.engine.can_release_gpu());
+        assert!(agent.alt_engines.values().all(|e| !e.can_release_gpu()));
+        assert!(agent.gpu_yield.pending.is_none());
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed reopen of the alternate local engine at the top level is
+    /// retried into that same alternate slot.
+    #[test]
+    fn a_retry_after_the_alt_slot_failed_reloads_the_alt_slot() {
+        let dir = gpu_dir("retry-alt");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let provider = Box::new(crate::engine::EchoEngine::new(100_000));
+        let mut agent = test_agent_boxed(&dir, provider, &cfg);
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(GpuEngine::new("alt", &log, &counter, &[])),
+        );
+        let (factory, _) = flaky_gpu_factory(&log, &counter, "alt2");
+        arm_gpu_yield(&mut agent, &dir, factory);
+        let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_command(&counter, false))]);
+        assert!(out.contains("second-run-ok"), "{out}");
+        assert!(agent.alt_engines[&EngineKey::Local].is_gpu_placeholder());
+
+        agent.retry_gpu_reopen();
+
+        assert!(agent.alt_engines[&EngineKey::Local].can_release_gpu());
+        assert!(!agent.engine.can_release_gpu() && !agent.engine.is_gpu_placeholder());
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the placeholder gone before the retry, the owed reload is
+    /// dropped (its snapshot file with it) and the factory is never called.
+    #[test]
+    fn a_retry_with_no_placeholder_left_drops_the_reload() {
+        let dir = gpu_dir("retry-gone");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let main = Box::new(GpuEngine::new("main", &log, &counter, &[]));
+        let mut agent = test_agent_boxed(&dir, main, &cfg);
+        let (factory, attempts) = flaky_gpu_factory(&log, &counter, "main2");
+        arm_gpu_yield(&mut agent, &dir, factory);
+        agent.run_tool_calls(&[gpu_bash_call(&gpu_command(&counter, false))]);
+        assert!(agent.gpu_yield.pending.is_some());
+        agent.engine = Box::new(crate::engine::EchoEngine::new(100_000));
+
+        agent.retry_gpu_reopen();
+
+        assert!(agent.gpu_yield.pending.is_none());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(
+            !std::fs::read_dir(&dir).unwrap().flatten().any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("plank-gpu-yield-")),
+            "the snapshot file went with the reload"
+        );
         drop(agent);
         let _ = std::fs::remove_dir_all(&dir);
     }

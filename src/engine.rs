@@ -1167,6 +1167,14 @@ pub trait Engine: Debug + Send {
         false
     }
 
+    /// Whether this is the stand-in a GPU-yield cycle leaves in a slot whose
+    /// model it unloaded (`gpuyield::UnloadedEngine`). The retry after a
+    /// failed reload looks for it, wherever the slot has moved since, rather
+    /// than remembering a position that a sidechain unwinding invalidates.
+    fn is_gpu_placeholder(&self) -> bool {
+        false
+    }
+
     /// Begins a warm walk: resets the cumulative warm token buffer to the
     /// system prompt's tokens. No prefill happens yet.
     ///

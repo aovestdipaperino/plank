@@ -310,6 +310,10 @@ impl Engine for UnloadedEngine {
     fn is_local(&self) -> bool {
         true
     }
+
+    fn is_gpu_placeholder(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -506,6 +510,7 @@ mod tests {
         let mut e = UnloadedEngine::new(4096, "ds4".into(), "model unloaded".into());
         assert_eq!(e.ctx_size(), 4096);
         assert!(!e.can_release_gpu());
+        assert!(e.is_gpu_placeholder());
         let err = e
             .generate(
                 Prompt::Flat(""),
