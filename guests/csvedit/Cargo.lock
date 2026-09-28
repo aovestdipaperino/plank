@@ -414,6 +414,7 @@ dependencies = [
  "extism-pdk",
  "plank-guest-support",
  "turbo-vision",
+ "tv-extensions",
 ]
 
 [[package]]
@@ -792,7 +793,7 @@ dependencies = [
 [[package]]
 name = "turbo-vision"
 version = "3.0.1"
-source = "git+https://github.com/aovestdipaperino/turbo-vision-4-rust?rev=37d71c25f84c395f93f2eb531676df9684c1aabf#37d71c25f84c395f93f2eb531676df9684c1aabf"
+source = "git+https://github.com/aovestdipaperino/turbo-vision-4-rust?rev=eae2cc843ed9744f8d5ece9571d3c2bcbedf602d#eae2cc843ed9744f8d5ece9571d3c2bcbedf602d"
 dependencies = [
  "base64",
  "chrono",
@@ -801,6 +802,14 @@ dependencies = [
  "simplelog",
  "tracing",
  "unicode-width",
+]
+
+[[package]]
+name = "tv-extensions"
+version = "0.1.0"
+source = "git+https://github.com/aovestdipaperino/tv-extensions?rev=1fe197d12300abbda3d55ef410855198c5e657b1#1fe197d12300abbda3d55ef410855198c5e657b1"
+dependencies = [
+ "turbo-vision",
 ]
 
 [[package]]

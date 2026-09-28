@@ -17,9 +17,11 @@ crate-type = ["cdylib", "rlib"]
 extism-pdk = "1"
 plank-guest-support = { path = "../support" }
 # Turbo Vision without its terminal (`default-features = false` drops the
-# `native` feature: crossterm and arboard), from the `wasm-host-driven`
-# branch until a release carries HostBackend and Application::pump.
-turbo-vision = { git = "https://github.com/aovestdipaperino/turbo-vision-4-rust", rev = "37d71c25f84c395f93f2eb531676df9684c1aabf", default-features = false }
+# `native` feature: crossterm and arboard). Pinned to the same core rev
+# tv-extensions uses, so the two resolve to one turbo-vision.
+turbo-vision = { git = "https://github.com/aovestdipaperino/turbo-vision-4-rust", rev = "eae2cc843ed9744f8d5ece9571d3c2bcbedf602d", default-features = false }
+# HostBackend, pump and the separator Grid.
+tv-extensions = { git = "https://github.com/aovestdipaperino/tv-extensions", rev = "1fe197d12300abbda3d55ef410855198c5e657b1" }
 
 [profile.release]
 opt-level = "s"

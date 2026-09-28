@@ -415,8 +415,12 @@ buffers sized to the `w`/`h` you were handed rather than to a worst case.
   `/csvedit:open <name.csv>`) that saves to the `fs` RAM disk. It is the one
   guest built for `wasm32-wasip1` rather than `wasm32-unknown-unknown`, because
   Turbo Vision reads the clock; it gets WASI with no preopened directories, so
-  the RAM disk is still the only storage it can reach. Its Extism glue is one
-  file, `src/frame.rs`, and everything behind it is tested natively. Its keys
+  the RAM disk is still the only storage it can reach. It drives Turbo Vision
+  through [`tv-extensions`](https://github.com/aovestdipaperino/tv-extensions)
+  (`host::HostBackend` and `host::pump` for a host-stepped app, `grid::Grid`
+  for the table with column separators), which keeps those pieces out of the
+  turbo-vision core crate. Its Extism glue is one file, `src/frame.rs`, and
+  everything behind it is tested natively. Its keys
   are chosen so a stock Mac keyboard can type every one, since a Mac terminal
   types Option as a character (no Alt+X), has no Insert key and hides F10
   behind fn: Enter edits a cell, Ctrl+S saves, Ctrl+O opens, Ctrl+Q exits

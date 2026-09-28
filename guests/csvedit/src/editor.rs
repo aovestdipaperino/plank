@@ -2,8 +2,8 @@
 //! line, and non-modal dialogs for editing, naming and confirming.
 //!
 //! plank pushes one key per call and asks for a screen per step, so this is a
-//! Turbo Vision `Application` driven by [`Application::pump`], never by a
-//! blocking run loop, and every dialog is a plain desktop window whose
+//! Turbo Vision `Application` driven by [`tv_extensions::host::pump`], never
+//! by a blocking run loop, and every dialog is a plain desktop window whose
 //! buttons send commands back to the [`State`] handler.
 
 use turbo_vision::app::{AppHandler, Application};
@@ -15,15 +15,17 @@ use turbo_vision::core::event::{
 use turbo_vision::core::geometry::Rect;
 use turbo_vision::core::menu_data::{Menu, MenuItem, MenuItemBuilder};
 use turbo_vision::core::status_data::StatusItemBuilder;
-use turbo_vision::terminal::{HostBackend, HostInput, Terminal};
+use turbo_vision::terminal::Terminal;
 use turbo_vision::views::View;
 use turbo_vision::views::group::GroupLike;
 use turbo_vision::views::handle::Handle;
 use turbo_vision::views::menu_bar::{MenuBar, SubMenu};
 use turbo_vision::views::paramtext::ParamText;
 use turbo_vision::views::status_line::StatusLine;
-use turbo_vision::views::table::{Column, Table};
+use turbo_vision::views::table::Column;
 use turbo_vision::views::window::{Window, WindowBuilder};
+use tv_extensions::grid::Grid;
+use tv_extensions::host::{HostBackend, HostInput};
 
 use crate::commands::{
     CMD_COL_DEL, CMD_COL_INS, CMD_DISCARD, CMD_DLG_CANCEL, CMD_DLG_OK, CMD_EDIT_CELL, CMD_EXIT,
@@ -51,7 +53,7 @@ struct State {
     name: Option<String>,
     disk: Box<dyn Disk>,
     window: Handle<Window>,
-    table: Handle<Table>,
+    table: Handle<Grid>,
     message: Handle<ParamText>,
     overlay: Option<Overlay>,
     /// Set when the editor wants the frame closed.
@@ -218,8 +220,7 @@ impl Session {
         // Closing the window is closing the editor, which asks first.
         window.set_auto_close(false);
         let (table_r, message_r) = interior_bounds(bounds);
-        let mut grid = Table::new(table_r, CMD_EDIT_CELL);
-        grid.set_column_separator(true);
+        let grid = Grid::new(table_r, CMD_EDIT_CELL);
         let table = window.add_typed(grid);
         let message = window.add_typed(ParamText::new(message_r, &message));
         let window = app.desktop.add_typed(window);
@@ -261,7 +262,7 @@ impl Session {
     /// `line` for the scrollback.
     pub fn key(&mut self, ev: Event) -> Option<String> {
         self.input.push(ev);
-        let running = self.app.pump(&mut self.state);
+        let running = tv_extensions::host::pump(&mut self.app, &mut self.state);
         if self.state.closing.is_none() && !running {
             self.state.closing = Some(self.state.close_line());
         }
@@ -272,7 +273,7 @@ impl Session {
     pub fn step(&mut self, w: u16, h: u16) {
         let before = self.app.terminal.size();
         self.input.set_size(w, h);
-        self.app.pump(&mut self.state);
+        tv_extensions::host::pump(&mut self.app, &mut self.state);
         if self.app.terminal.size() != before {
             self.state.relayout(&mut self.app);
             self.app.draw();
@@ -318,7 +319,7 @@ impl State {
         self.name.as_deref().unwrap_or("untitled.csv")
     }
 
-    fn table<'a>(&self, app: &'a mut Application) -> Option<&'a mut Table> {
+    fn table<'a>(&self, app: &'a mut Application) -> Option<&'a mut Grid> {
         app.desktop.get_mut(self.window)?.get_mut(self.table)
     }
 
