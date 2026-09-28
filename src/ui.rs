@@ -1541,6 +1541,25 @@ fn remote_lines_gate(frame: Option<bool>, queued: bool) -> RemoteLines {
     }
 }
 
+/// The dim line a remote controller gets when its queued lines are held
+/// behind an open frame, so a prompt sent from elsewhere does not look lost.
+const REMOTE_WAIT_NOTICE: &str = "waiting for the frame to close";
+
+/// Whether to broadcast [`REMOTE_WAIT_NOTICE`] now: when the gate holds
+/// lines that are queued, once per wait. `noticed` carries "already said"
+/// across idle ticks and clears whenever the gate stops waiting.
+fn remote_wait_notice_due(gate: RemoteLines, queued: bool, noticed: &mut bool) -> bool {
+    if gate != RemoteLines::Wait {
+        *noticed = false;
+        return false;
+    }
+    if queued && !*noticed {
+        *noticed = true;
+        return true;
+    }
+    false
+}
+
 /// What a grid's write-back leaves behind: the scrollback line (the first
 /// line of the server's summary, or the failure) and the `<system-reminder>`
 /// that tells the model, at the next turn boundary, what the user changed.
@@ -12828,6 +12847,8 @@ impl Agent<'_> {
         // Grids whose frame closed with the file changed, waiting for the
         // write-back pass after this tick's paint (`tui_grid_write_back`).
         let mut grid_write_backs: Vec<crate::grid::FinishedGrid> = Vec::new();
+        // Whether the remote has been told its lines wait for a frame.
+        let mut remote_wait_noticed = false;
         loop {
             // A `/exit` confirmed mid-turn: the turn has stopped, leave now.
             if quit_requested() {
@@ -13086,10 +13107,14 @@ impl Agent<'_> {
                 // pass below: the lines stay queued in `shared` and run once
                 // it closes. A screensaver is taken down instead, since a
                 // remote line is activity.
-                let gate = remote_lines_gate(
-                    wasm_frame.as_ref().map(|f| f.screensaver),
-                    self.remote.as_ref().is_some_and(|r| r.shared.has_queued()),
-                );
+                let remote_queued = self.remote.as_ref().is_some_and(|r| r.shared.has_queued());
+                let gate =
+                    remote_lines_gate(wasm_frame.as_ref().map(|f| f.screensaver), remote_queued);
+                if remote_wait_notice_due(gate, remote_queued, &mut remote_wait_noticed)
+                    && let Some(r) = &self.remote
+                {
+                    r.bus.broadcast(UiEvent::Dim(REMOTE_WAIT_NOTICE.to_owned()));
+                }
                 if gate == RemoteLines::DismissScreensaver {
                     if let Some(open) = &wasm_frame {
                         if let Some(line) = self.tool_ctx.wasm.close_frame(open) {
@@ -38261,5 +38286,44 @@ or the user's next message aborts before its first token"
             RemoteLines::Wait,
             "an empty queue is no reason to take a screensaver down"
         );
+    }
+
+    /// A remote whose lines are held behind an open frame is told so, once
+    /// per wait: not on every idle tick, and not when nothing is queued.
+    #[test]
+    fn a_remote_is_told_once_that_its_lines_wait_for_the_frame() {
+        let mut noticed = false;
+        assert!(!remote_wait_notice_due(
+            RemoteLines::Wait,
+            false,
+            &mut noticed
+        ));
+        assert!(remote_wait_notice_due(
+            RemoteLines::Wait,
+            true,
+            &mut noticed
+        ));
+        assert!(
+            !remote_wait_notice_due(RemoteLines::Wait, true, &mut noticed),
+            "not again on the next tick"
+        );
+        // The frame closes and the lines run: the next wait notices again.
+        assert!(!remote_wait_notice_due(
+            RemoteLines::Run,
+            true,
+            &mut noticed
+        ));
+        assert!(remote_wait_notice_due(
+            RemoteLines::Wait,
+            true,
+            &mut noticed
+        ));
+        assert!(!remote_wait_notice_due(
+            RemoteLines::DismissScreensaver,
+            true,
+            &mut noticed
+        ));
+        assert!(!noticed, "a screensaver is no wait");
+        assert_eq!(REMOTE_WAIT_NOTICE, "waiting for the frame to close");
     }
 }
