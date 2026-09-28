@@ -7,8 +7,9 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v6.1.0 is out**, and the beta channel is on 6.1.1. Most of it is about how
-plank finds its models, plus a way to lend the GPU to other tools.
+**v6.1.0 is out**, and the beta channel is on 6.1.2. Most of it is about how
+plank finds its models, plus a way to lend the GPU to other tools, which works
+end to end from the 6.1.2 beta with `mex` 0.2.4.
 
 **Models are named engines now.** Plank used to know its three model sets by
 hard-coded file names. It now reads an `engines.json` catalog, where each
@@ -55,16 +56,25 @@ stays yours: plank never checks it for updates.
 **Commands that need the GPU get it.** A local model holds the Mac's GPU for
 as long as plank runs, so a tool that wants it for itself used to fail or
 thrash. `mex` generating an illustration with its diffusion model is the first
-such tool. Now a command that cannot get the GPU exits with status 75 and
-prints a line starting with `GPU not available`, and plank does the rest. It
-saves its cache, unloads the model, runs the command again, reloads the model
-and restores the cache, and the conversation carries on without reading the
-whole transcript back in. It works for commands the model runs, and for the
-ones you run yourself with `!` and `!!`. Every command plank starts sees
-`PLANK_GPU_YIELD=1`, so a tool can tell that asking is worth it. `mex` 0.2.3
-already does. The [tools chapter](/guide/05-tools) covers the limits: a
-pipeline such as `mex post.md | tee log` hides the exit status, and background
-jobs are left alone.
+such tool. When a command cannot get the GPU, plank saves its cache, unloads
+the model, runs the command again, reloads the model and restores the cache,
+and the conversation carries on without reading the whole transcript back in.
+It works for commands the model runs and for the ones you run yourself with
+`!` and `!!`.
+
+A tool asks in one of two ways. It can exit with status 75 and print a line
+starting with `GPU not available`, or it can write that line to the file
+named by `PLANK_GPU_YIELD_FILE`, which plank sets for every command it runs.
+The file is the one that survives a pipeline such as `mex post.md 2>&1 | tail`,
+which hides the exit status, so it arrived in the 6.1.2 beta after 6.1.0 was
+seen missing exactly that case. `mex` 0.2.4 uses both, and stops a post
+conversion before anything is uploaded.
+
+The model can also ask up front. A `bash` call with `suspend_model="true"`
+unloads the model before the command runs and reloads it afterwards, so a
+command known to need the GPU does not have to fail first. The
+[tools chapter](/guide/05-tools) covers the limits: at most two hand-offs per
+turn, background jobs are left alone, and pressing Esc never starts one.
 
 **A profile can recommend a model.** `recommendedModel` in a profile's
 manifest names the engine it works best with. plank uses it ahead of your

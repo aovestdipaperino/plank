@@ -10,8 +10,20 @@ it.
 
 ## In the betas
 
-The 6.1.1 beta opens on the same code as stable 6.1.0. Install with `brew install
+Riding ahead of stable 6.1.0 in the 6.1.2 beta. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
+
+### 6.1.2
+
+**The GPU hand-off works through pipes.** Every command plank runs gets
+`PLANK_GPU_YIELD_FILE`; a tool that cannot get the GPU writes one line there,
+and plank runs the unload, re-run and reload cycle whatever the exit status,
+so `mex post.md 2>&1 | tail` works. `mex` 0.2.4 writes it, and stops a post
+conversion before uploading.
+
+**The model can suspend itself.** A `bash` call with `suspend_model="true"`
+unloads the model before the command and reloads it afterwards, for a command
+known to need the GPU. Pressing Esc never starts a hand-off.
 
 ### 5.1.5
 
@@ -207,7 +219,7 @@ exits with status 75 and prints a line starting with `GPU not available`;
 plank then unloads its model, runs the command again, reloads the model and
 restores its cache, so the conversation carries on without a re-prefill. It
 covers commands the model runs and the ones you run with `!` and `!!`. Every
-command sees `PLANK_GPU_YIELD=1`, and `mex` 0.2.3 speaks the protocol.
+command sees `PLANK_GPU_YIELD=1`.
 
 **A profile can recommend a model.** `recommendedModel` names the engine a
 profile works best with; plank uses it ahead of `engine.model` when its files

@@ -139,9 +139,10 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v6.1.0 is out</strong>, and the beta channel is on 6.1.1.
+<p><strong>v6.1.0 is out</strong>, and the beta channel is on 6.1.2.
 Most of it is about how plank finds its models, plus a way to lend the
-GPU to other tools.</p>
+GPU to other tools, which works end to end from the 6.1.2 beta with
+<code>mex</code> 0.2.4.</p>
 <p><strong>Models are named engines now.</strong> Plank used to know its
 three model sets by hard-coded file names. It now reads an
 <code>engines.json</code> catalog, where each engine is a main model
@@ -186,19 +187,26 @@ never checks it for updates.</p>
 <p><strong>Commands that need the GPU get it.</strong> A local model
 holds the Mac's GPU for as long as plank runs, so a tool that wants it
 for itself used to fail or thrash. <code>mex</code> generating an
-illustration with its diffusion model is the first such tool. Now a
-command that cannot get the GPU exits with status 75 and prints a line
-starting with <code>GPU not available</code>, and plank does the rest.
-It saves its cache, unloads the model, runs the command again, reloads
-the model and restores the cache, and the conversation carries on
-without reading the whole transcript back in. It works for commands the
-model runs, and for the ones you run yourself with <code>!</code> and
-<code>!!</code>. Every command plank starts sees
-<code>PLANK_GPU_YIELD=1</code>, so a tool can tell that asking is worth
-it. <code>mex</code> 0.2.3 already does. The <a
-href="/guide/05-tools">tools chapter</a> covers the limits: a pipeline
-such as <code>mex post.md | tee log</code> hides the exit status, and
-background jobs are left alone.</p>
+illustration with its diffusion model is the first such tool. When a
+command cannot get the GPU, plank saves its cache, unloads the model,
+runs the command again, reloads the model and restores the cache, and
+the conversation carries on without reading the whole transcript back
+in. It works for commands the model runs and for the ones you run
+yourself with <code>!</code> and <code>!!</code>.</p>
+<p>A tool asks in one of two ways. It can exit with status 75 and print
+a line starting with <code>GPU not available</code>, or it can write
+that line to the file named by <code>PLANK_GPU_YIELD_FILE</code>, which
+plank sets for every command it runs. The file is the one that survives
+a pipeline such as <code>mex post.md 2&gt;&amp;1 | tail</code>, which
+hides the exit status, so it arrived in the 6.1.2 beta after 6.1.0 was
+seen missing exactly that case. <code>mex</code> 0.2.4 uses both, and
+stops a post conversion before anything is uploaded.</p>
+<p>The model can also ask up front. A <code>bash</code> call with
+<code>suspend_model="true"</code> unloads the model before the command
+runs and reloads it afterwards, so a command known to need the GPU does
+not have to fail first. The <a href="/guide/05-tools">tools chapter</a>
+covers the limits: at most two hand-offs per turn, background jobs are
+left alone, and pressing Esc never starts one.</p>
 <p><strong>A profile can recommend a model.</strong>
 <code>recommendedModel</code> in a profile's manifest names the engine
 it works best with. plank uses it ahead of your
