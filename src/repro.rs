@@ -64,6 +64,14 @@ pub struct ModelMeta<'a> {
     /// can read rather than somewhere a click starts an 87 GB download. Empty
     /// when no manifest is installed or its URL is not a Hugging Face link.
     pub hf_url: &'a str,
+    /// Set when the active selection inherited an engine's companions
+    /// without being that engine's managed main (`managed_main == false` but
+    /// `id.is_some()`) — a `.ggd` delta patched onto a managed engine's
+    /// base. Names the loaded weights file so the report does not read as
+    /// though `weights_file`/`hf_url`/`artifact_version` above describe the
+    /// bytes actually loaded, when they in fact describe the unpatched base.
+    /// Empty for an ordinary managed engine or a fully bare path.
+    pub delta_clone_of: &'a str,
 }
 
 /// Runtime facts worth recording alongside the transcript, gathered from the
@@ -403,39 +411,9 @@ fn write_passes(out: &mut String, passes: &[PassNote]) {
     }
 }
 
-#[must_use]
-pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -> String {
-    let g = &cfg.generation;
-    let mut out = String::new();
-    let _ = writeln!(out, "# plank repro {}", meta.version);
-    let _ = writeln!(out);
-    let _ = writeln!(out, "- date: {}", meta.date);
-    let note = if meta.note.is_empty() {
-        "(none)"
-    } else {
-        meta.note
-    };
-    let _ = writeln!(out, "- note: {note}");
-    if !meta.session_id.is_empty() {
-        let _ = writeln!(out, "- session: {}", meta.session_id);
-    }
-    if !meta.session_path.is_empty() {
-        let _ = writeln!(out, "- session file: {}", meta.session_path);
-    }
-    if !meta.session_tag.is_empty() {
-        let _ = writeln!(out, "- tag: {}", meta.session_tag);
-    }
-    let _ = writeln!(out, "- context size: {}", meta.ctx_size);
-    let _ = writeln!(out, "- transcript tokens: {}", meta.transcript_tokens);
-    let _ = writeln!(out, "- last ctx used: {}", meta.last_ctx_used);
-    let _ = writeln!(out, "- power: {}%", meta.power_percent);
-    let _ = writeln!(out);
-
-    // Its own section rather than more lines on the header list: this is the
-    // block a maintainer reads first, and burying the weights' identity under
-    // sampling knobs is what made "which model was this?" a question worth
-    // asking of a report that already answered it.
-    let m = &meta.model;
+/// Writes the `## Model` section: the weights' identity, split out of
+/// [`build_report`] so that function stays under the line-count lint.
+fn write_model_section(out: &mut String, m: &ModelMeta, cfg: &AgentConfig) {
     let _ = writeln!(out, "## Model");
     let _ = writeln!(out);
     if m.name.is_empty() {
@@ -471,10 +449,52 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     if !m.hf_url.is_empty() {
         let _ = writeln!(out, "- hugging face: {}", m.hf_url);
     }
+    if !m.delta_clone_of.is_empty() {
+        let _ = writeln!(
+            out,
+            "- weights are a patched clone ({}) of the engine above's base; the artifact set, weights file and hugging face lines describe that unpatched base, not the loaded bytes",
+            m.delta_clone_of
+        );
+    }
     if let Some(backend) = &cfg.backend {
         let _ = writeln!(out, "- backend: {backend:?}");
     }
     let _ = writeln!(out);
+}
+
+#[must_use]
+pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -> String {
+    let g = &cfg.generation;
+    let mut out = String::new();
+    let _ = writeln!(out, "# plank repro {}", meta.version);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- date: {}", meta.date);
+    let note = if meta.note.is_empty() {
+        "(none)"
+    } else {
+        meta.note
+    };
+    let _ = writeln!(out, "- note: {note}");
+    if !meta.session_id.is_empty() {
+        let _ = writeln!(out, "- session: {}", meta.session_id);
+    }
+    if !meta.session_path.is_empty() {
+        let _ = writeln!(out, "- session file: {}", meta.session_path);
+    }
+    if !meta.session_tag.is_empty() {
+        let _ = writeln!(out, "- tag: {}", meta.session_tag);
+    }
+    let _ = writeln!(out, "- context size: {}", meta.ctx_size);
+    let _ = writeln!(out, "- transcript tokens: {}", meta.transcript_tokens);
+    let _ = writeln!(out, "- last ctx used: {}", meta.last_ctx_used);
+    let _ = writeln!(out, "- power: {}%", meta.power_percent);
+    let _ = writeln!(out);
+
+    // Its own section rather than more lines on the header list: this is the
+    // block a maintainer reads first, and burying the weights' identity under
+    // sampling knobs is what made "which model was this?" a question worth
+    // asking of a report that already answered it.
+    write_model_section(&mut out, &meta.model, cfg);
 
     let _ = writeln!(out, "## Generation");
     let _ = writeln!(out);
@@ -663,6 +683,7 @@ mod tests {
                 companion: "/home/u/.plank/ds4flash.dspark.gguf",
                 weights_file: "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS.gguf",
                 hf_url: "https://huggingface.co/antirez/deepseek-v4-gguf",
+                delta_clone_of: "",
             },
             version: "9.9.9",
             date: "2026-07-19T10:00:00",
@@ -750,6 +771,35 @@ mod tests {
             !generation.contains("- name:") && !generation.contains("- model:"),
             "the model is recorded once, in its own section: {generation}"
         );
+    }
+
+    /// A `.ggd` delta patched onto a managed engine's base carries that
+    /// engine's `weights_file`/`hf_url`/`artifact_version` (they come from
+    /// the base's installed manifest), so without a note the section reads
+    /// as though the unpatched base is what got loaded. `delta_clone_of`
+    /// names the actual, patched file.
+    #[test]
+    fn a_delta_clone_names_itself_next_to_its_base_engine_info() {
+        let cfg = AgentConfig::default();
+        let mut m = meta();
+        m.model.delta_clone_of = "abliterated (clone of ds4vision, id a1b2c3d4e5f6)";
+        let report = build_report(&m, &cfg, "[user]\nhi\n");
+        let section = report
+            .split_once("## Model\n")
+            .expect("a Model section")
+            .1
+            .split_once("## Generation")
+            .expect("followed by Generation")
+            .0;
+        // The base engine's own facts are still there...
+        assert!(section.contains("- weights file: DeepSeek-V4-Flash-Vision-Exp-IQ2XXS.gguf"));
+        // ...but now qualified: the report says whose weights those lines
+        // actually describe.
+        assert!(
+            section.contains("abliterated (clone of ds4vision, id a1b2c3d4e5f6)"),
+            "{section}"
+        );
+        assert!(section.contains("patched clone"), "{section}");
     }
 
     /// An absent engine and an absent manifest are stated, not left blank: a

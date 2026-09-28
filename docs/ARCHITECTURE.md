@@ -174,8 +174,9 @@ because the invariant that makes a swap safe is per-engine: the staged
 landed, and one shared staging area would let a half-staged download of one
 engine read as proof about another. The helper's bookkeeping under
 `~/.plank/downloads/` is machine-wide on purpose, since only one download runs
-at a time: `state.json`, `declined`, `lock` and `manifest-check` are shared by
-every engine.
+at a time: `state.json`, `declined` and `lock` are shared by every engine.
+`manifest-check`, which records when the catalog was last fetched, lives one
+level up at `~/.plank/manifest-check`, also shared by every engine.
 
 Every engine in `engines.json` is managed this way, keyed by its own
 monotonic `version`; `ds4vision` is the catalog's `default` and is what a

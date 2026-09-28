@@ -86,7 +86,7 @@ To use a model you already have somewhere else, give `--model` (or `-m`) a path 
 plank --model ~/models/my-ds4.gguf
 ```
 
-A bare path loads that file and nothing else. plank never downloads or upgrades it, and looks for no drafter or encoder beside it, so a DeepSeek model loaded this way runs without speculative decoding unless you name a drafter with `--mtp-model`. `--model:<name>` is the strict form: it must name an engine and never falls back to a path, which is what a script wants. Set either permanently with `engine.model` in `settings.json`.
+A bare path loads that file and nothing else. plank never downloads or upgrades it, and looks for no drafter or encoder beside it, so a DeepSeek model loaded this way runs without speculative decoding unless you name a drafter with `--mtp-model`. There are two exceptions: a path to a managed engine's main file under any other name (a symlink or hard link included) selects that engine with all its companions, and a `.ggd` delta built on a managed engine's main inherits that engine's companions while the patched clone itself is never upgraded. `--model:<name>` is the strict form: it must name an engine and never falls back to a path, which is what a script wants. Set either permanently with `engine.model` in `settings.json`.
 
 To keep a model of your own together with its companions, describe it as a local engine in `~/.plank/engines.local.json`. That file is layered over the catalog, is the only place a role may name a `path`, and can also change the default:
 

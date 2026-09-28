@@ -540,6 +540,17 @@ fn migrate_engine_layout(provisional: &plank::config::AgentConfig) {
     if !should_migrate(provisional) {
         return;
     }
+    migrate_engine_layout_unconditionally();
+}
+
+/// Renames any old `ModelSet` layout into the engine layout, unconditionally.
+///
+/// `plank serve` has no `--help`/`--version`/`--dump-config` early exits of
+/// its own — it always goes on to `make_engine` — so it must always migrate
+/// first, unlike `main`'s gated [`migrate_engine_layout`]. Skipping this
+/// would let `plank serve --help` on an old home reach `make_engine` without
+/// ever having migrated, and offer an 87 GB download.
+fn migrate_engine_layout_unconditionally() {
     for w in plank::enginemigrate::migrate() {
         eprintln!("{w}");
     }
@@ -1167,7 +1178,7 @@ fn run_serve(args: &[String]) -> ExitCode {
             .unwrap_or_else(|_| {
                 plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
             });
-    migrate_engine_layout(&provisional);
+    migrate_engine_layout_unconditionally();
     let launch_cwd = std::env::current_dir().unwrap_or_default();
     let mut plugins = plank::plugins::load_default(&launch_cwd);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -1404,6 +1415,31 @@ mod tests {
             .expect("parses");
             assert!(!should_migrate(&cfg), "{flag} must not migrate");
         }
+    }
+
+    #[test]
+    fn serve_migrates_regardless_of_should_migrate() {
+        // `run_serve` has no early exit for `--help`/`--version`/`--dump-config`
+        // — it always reaches `make_engine` — so its migration call must not be
+        // gated by `should_migrate` the way `main`'s is.
+        // `migrate_engine_layout_unconditionally` (what `run_serve` calls) takes
+        // no `AgentConfig` at all, so there is nothing for a flag to gate — the
+        // type signature itself is the guarantee. This test pins that: `main`'s
+        // own launch still skips migration for these flags, via the separate,
+        // gated `migrate_engine_layout`/`should_migrate` path.
+        for flag in ["--help", "--version", "--dump-config"] {
+            let cfg = plank::config::parse_options_with(
+                &plank::settings::Settings::default(),
+                &[flag.to_string()],
+            )
+            .expect("parses");
+            assert!(
+                !should_migrate(&cfg),
+                "{flag} still must not migrate main's own launch"
+            );
+        }
+        // Not calling `migrate_engine_layout_unconditionally` here: it reads and
+        // writes the real `~/.plank`, which tests must never touch.
     }
 
     fn scratch_root(tag: &str) -> std::path::PathBuf {

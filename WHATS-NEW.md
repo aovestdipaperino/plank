@@ -10,6 +10,9 @@ it.
 
 ## In the betas
 
+Riding ahead of stable 5.1.0 in the 5.1.5 beta. Install with `brew install
+aovestdipaperino/tap/plank-agent-beta`.
+
 ### Next release
 
 **Models are named engines now.** plank used to know three model sets by
@@ -28,11 +31,11 @@ renames `~/.plank/ds4flash.gguf` and its siblings to `ds4vision.gguf`,
 `~/.plank`, though, will not find its model any more and will offer to fetch
 it, so upgrade every copy you run together. A bare `--model /some/file.gguf`
 now loads just that file: no drafter or encoder is picked up beside it, so pass
-`--mtp-model` for speculation, or describe the file as a local engine.
-
-
-Riding ahead of stable 5.1.0 in the 5.1.5 beta. Install with `brew install
-aovestdipaperino/tap/plank-agent-beta`.
+`--mtp-model` for speculation, or describe the file as a local engine. Two
+exceptions: a path that is the same file as a managed engine's main, including
+through a symlink or hard link, selects that engine instead, and a `.ggd`
+delta built on a managed engine's main inherits that engine's companions,
+though the delta itself is never upgraded.
 
 ### 5.1.5
 
