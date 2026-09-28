@@ -1755,22 +1755,29 @@ fn invoke_mcp_tool(servers: &mut [McpServer], full_name: &str, arguments: &str) 
             "Tool error: malformed mcp tool name, expected mcp__server__tool\n",
         );
     };
-    invoke_on(servers, server_name, tool_name, arguments)
+    invoke_on(
+        servers,
+        server_name,
+        tool_name,
+        arguments,
+        Advertised::Required,
+    )
 }
 
 /// Calls `tool` on the server named `server` for plank itself, not for the
 /// model: the grid write-back when a frame closes on an edited grid.
 ///
 /// The same request path as a model's `mcp__*` call (restart of a stopped
-/// server, the offline check, the advertised-tool check, the flattening), so
-/// the write-back tool must be one the server lists. `Ok` is the result's
+/// server, the offline check, the flattening) minus the advertised-tool
+/// check: a server may hide its write-back tool from `tools/list` so the
+/// model never sees it, and plank must still reach it. `Ok` is the result's
 /// text; a tool error (`isError`) or a failure to call is `Err`, without the
 /// `Tool error: ` prefix. A grid the reply stages is ignored: a write-back
 /// is not a request to open another frame.
 ///
 /// # Errors
-/// The server is unknown, down or does not list `tool`, the request failed,
-/// or the tool reported an error.
+/// The server is unknown or down, the request failed, or the tool reported
+/// an error (which covers a tool the server does not have at all).
 pub fn call_tool_direct(
     servers: &mut [McpServer],
     server: &str,
@@ -1781,13 +1788,23 @@ pub fn call_tool_direct(
         text,
         stagings: _,
         is_error,
-    } = invoke_on(servers, server, tool, args_json);
+    } = invoke_on(servers, server, tool, args_json, Advertised::NotRequired);
     if is_error {
         let err = text.strip_prefix("Tool error: ").unwrap_or(&text);
         Err(err.trim_end().to_string())
     } else {
         Ok(text.trim_end().to_string())
     }
+}
+
+/// Whether [`invoke_on`] insists the tool is one the server lists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Advertised {
+    /// A model's call: an unlisted name is a hallucination, refused before
+    /// anything reaches the server.
+    Required,
+    /// plank's own call: the tool may be deliberately hidden from the model.
+    NotRequired,
 }
 
 /// Body of [`invoke_mcp_tool`] once the name is split, shared with
@@ -1797,6 +1814,7 @@ fn invoke_on(
     server_name: &str,
     tool_name: &str,
     arguments: &str,
+    advertised: Advertised,
 ) -> McpOutput {
     // An offline shadow matches too: its tools are advertised in the prompt, so
     // a call must be answered with "the server is down" rather than the generic
@@ -1812,7 +1830,7 @@ fn invoke_on(
     if server.is_offline() {
         return McpOutput::error(offline_tool_error(&server.name));
     }
-    if server.find_tool(tool_name).is_none() {
+    if advertised == Advertised::Required && server.find_tool(tool_name).is_none() {
         return McpOutput::error(format!(
             "Tool error: unknown mcp tool: mcp__{server_name}__{tool_name}\n"
         ));
@@ -2951,10 +2969,78 @@ done
             ),
             Ok("Tool error: is just what the row says".to_string())
         );
-        let err = call_tool_direct(&mut servers, "fin", "undo", "{}").unwrap_err();
-        assert!(err.contains("unknown mcp tool"), "{err}");
         let err = call_tool_direct(&mut servers, "nobody", "apply_grid", "{}").unwrap_err();
         assert!(err.contains("not available"), "{err}");
+    }
+
+    /// The write-back tool may be hidden from `tools/list` so the model never
+    /// sees it: plank's direct call still reaches it, while a model's call to
+    /// the same name is refused before anything goes on the wire.
+    #[test]
+    fn a_direct_call_reaches_a_tool_the_server_does_not_advertise() {
+        let wire = std::env::temp_dir().join(format!(
+            "plank-mcp-hidden-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let script = format!(
+            r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"protocolVersion\":\"2024-11-05\"}}}}" ;;
+    *'"tools/list"'*)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"tools\":[{{\"name\":\"echo\",\"description\":\"e\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}" ;;
+    *'"tools/call"'*)
+      printf '%s\n' "$line" >> '{wire}'
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"applied 1 change\"}}]}}}}" ;;
+    *)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"error\":{{\"message\":\"method not found\"}}}}" ;;
+  esac
+done
+"#,
+            wire = wire.display()
+        );
+        let path = write_temp_config(&format!(
+            "{{\"mcpServers\":{{\"fin\":{{\"command\":\"sh\",\"args\":[\"-c\",{}]}}}}}}",
+            {
+                let mut esc = String::new();
+                json_escape(&mut esc, &script);
+                esc
+            }
+        ));
+        let mut servers = start_servers(config_load(&path));
+        std::fs::remove_file(&path).ok();
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].find_tool("apply_grid").is_none(), "hidden");
+
+        // The model's route refuses the unadvertised name, and sends nothing.
+        let call = ToolCall {
+            name: "mcp__fin__apply_grid".to_string(),
+            args: Vec::new(),
+        };
+        let out = tool_mcp_call(&mut servers, &call);
+        assert!(out.is_error);
+        assert!(out.text.contains("unknown mcp tool"), "{}", out.text);
+        assert!(
+            !wire.exists(),
+            "a refused model call must not reach the server"
+        );
+
+        // plank's own write-back goes through.
+        assert_eq!(
+            call_tool_direct(&mut servers, "fin", "apply_grid", r#"{"grid":"g"}"#),
+            Ok("applied 1 change".to_string())
+        );
+        let sent = std::fs::read_to_string(&wire).expect("the direct call reached the server");
+        std::fs::remove_file(&wire).ok();
+        assert!(
+            sent.contains(r#""name":"apply_grid","arguments":{"grid":"g"}"#),
+            "{sent}"
+        );
     }
 
     /// A `tools/call` result with `content` items given as raw JSON text.
