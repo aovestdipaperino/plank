@@ -329,9 +329,13 @@ fn model_choice(cfg: &plank::config::AgentConfig) -> plank::engines::Choice<'_> 
     }
 }
 
-/// Resolves the model choice against the catalog and records it as the
-/// process's active selection. Must precede `resolve_model_delta`, which
-/// reads the resolved `model_path`.
+/// Resolves the model choice against the catalog. Must precede
+/// `resolve_model_delta`, which reads the resolved `model_path`.
+///
+/// Does not call `plank::engines::set_active`: the selection's `main` path
+/// still names the pre-delta model here, and a `.ggd` spec gets rewritten to
+/// the patched clone afterward. `parse_config` activates the final,
+/// delta-adjusted selection once both steps have run.
 fn resolve_selection(cfg: &mut plank::config::AgentConfig) -> Result<(), String> {
     let mut warn = Vec::new();
     let catalog = plank::engines::load(&mut warn);
@@ -341,14 +345,26 @@ fn resolve_selection(cfg: &mut plank::config::AgentConfig) -> Result<(), String>
     let sel =
         plank::engines::resolve_in(&plank::manifest::plank_dir(), &catalog, model_choice(cfg))?;
     cfg.model_path = Some(sel.main.clone());
-    plank::engines::set_active(sel.clone());
     cfg.selection = Some(sel);
     Ok(())
+}
+
+/// Whether a `resolve_selection`/`resolve_model_delta` error must abort
+/// startup. `--dump-config` is a diagnostic: `Settings::from_settings`
+/// promises "a settings file must never stop plank from starting", so a bad
+/// `engine.model` must still let the dump print (with no selection) rather
+/// than exit before printing anything. Every other run keeps failing fast.
+fn resolution_is_fatal(cfg: &plank::config::AgentConfig) -> bool {
+    !cfg.dump_config
 }
 
 /// The real config parse, with the model choice resolved against the engine
 /// catalog and a `.ggd` model swapped for its patched clone. Errors are
 /// already printed under `prog`; the caller just returns the code.
+///
+/// Invariant on return: `cfg.selection.as_ref().map(|s| &s.main) ==
+/// cfg.model_path.as_ref()` whenever a selection is present, and
+/// `plank::engines::ACTIVE` holds that same, final selection.
 fn parse_config(
     settings: &plank::settings::Settings,
     args: &[String],
@@ -356,8 +372,21 @@ fn parse_config(
 ) -> Result<plank::config::AgentConfig, ExitCode> {
     plank::config::parse_options_with(settings, args)
         .and_then(|mut cfg| {
-            resolve_selection(&mut cfg)?;
-            resolve_model_delta(&mut cfg).map(|()| cfg)
+            if let Err(e) = resolve_selection(&mut cfg).and_then(|()| resolve_model_delta(&mut cfg))
+            {
+                if resolution_is_fatal(&cfg) {
+                    return Err(e);
+                }
+                eprintln!("plank: {e}");
+                cfg.selection = None;
+            } else if let (Some(sel), Some(path)) = (cfg.selection.as_mut(), cfg.model_path.clone())
+            {
+                sel.main = path;
+            }
+            if let Some(sel) = cfg.selection.clone() {
+                plank::engines::set_active(sel);
+            }
+            Ok(cfg)
         })
         .map_err(|msg| {
             eprintln!("{prog}: {msg}");
@@ -1286,5 +1315,27 @@ mod tests {
         assert_eq!(model_choice(&cfg), plank::engines::Choice::Spec("qwen"));
         cfg.model_named = true;
         assert_eq!(model_choice(&cfg), plank::engines::Choice::Named("qwen"));
+    }
+
+    #[test]
+    fn resolution_is_fatal_unless_dumping_config() {
+        let mut cfg =
+            plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
+        assert!(resolution_is_fatal(&cfg));
+        cfg.dump_config = true;
+        assert!(!resolution_is_fatal(&cfg));
+    }
+
+    #[test]
+    fn dump_config_survives_a_bad_engine_model() {
+        let settings = plank::settings::Settings::default();
+        let args: Vec<String> = vec![
+            "--model".into(),
+            "definitely-not-a-real-engine-name".into(),
+            "--dump-config".into(),
+        ];
+        let cfg = parse_config(&settings, &args, "plank").expect("dump-config must not abort");
+        assert!(cfg.dump_config);
+        assert!(cfg.selection.is_none());
     }
 }
