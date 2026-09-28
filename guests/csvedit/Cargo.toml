@@ -19,7 +19,7 @@ plank-guest-support = { path = "../support" }
 # Turbo Vision without its terminal (`default-features = false` drops the
 # `native` feature: crossterm and arboard), from the `wasm-host-driven`
 # branch until a release carries HostBackend and Application::pump.
-turbo-vision = { git = "https://github.com/aovestdipaperino/turbo-vision-4-rust", rev = "d6610fd56b1fa60c4f160a19fa37504ee309b137", default-features = false }
+turbo-vision = { git = "https://github.com/aovestdipaperino/turbo-vision-4-rust", rev = "37d71c25f84c395f93f2eb531676df9684c1aabf", default-features = false }
 
 [profile.release]
 opt-level = "s"

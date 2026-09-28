@@ -218,7 +218,9 @@ impl Session {
         // Closing the window is closing the editor, which asks first.
         window.set_auto_close(false);
         let (table_r, message_r) = interior_bounds(bounds);
-        let table = window.add_typed(Table::new(table_r, CMD_EDIT_CELL));
+        let mut grid = Table::new(table_r, CMD_EDIT_CELL);
+        grid.set_column_separator(true);
+        let table = window.add_typed(grid);
         let message = window.add_typed(ParamText::new(message_r, &message));
         let window = app.desktop.add_typed(window);
 
