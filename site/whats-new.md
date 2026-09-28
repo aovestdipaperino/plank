@@ -7,9 +7,49 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v6.0.0 is out**, and the beta channel is on 6.0.1. The patch number
-is still the channel: `.0` is stable, anything above it is beta. The major
-number moved for one reason: profiles.
+**v6.1.0 is out**, and the beta channel is on 6.1.1. This one is about how
+plank finds its models.
+
+**Models are named engines now.** Plank used to know its three model sets by
+hard-coded file names. It now reads an `engines.json` catalog, where each
+engine is a main model plus the drafter and the vision encoder that go with
+it. Three ship today: `ds4vision` (DeepSeek V4 Flash with vision, the
+default), `ds41` (DeepSeek V4.1 Flash) and `qwen` (Qwen3.8-Flash-Next). The
+catalog is built into the binary, refreshes from the repository once a day,
+and each engine upgrades on its own schedule, so a new Qwen build never
+re-downloads DeepSeek.
+
+```sh
+plank --model qwen          # an engine by name, with everything it needs
+plank --model:ds41          # the same, but the word must be an engine
+plank --model ~/x.gguf      # still works: a file loads as itself
+```
+
+`--qwen` is gone in favour of `--model qwen`. You can describe your own models
+in `~/.plank/engines.local.json`, pointing each role at a file you already
+have; plank never downloads or upgrades those. The
+[installation chapter](/guide/01-installation) shows the format.
+
+**Your model files get new names, and that is one way.** The first launch
+renames `~/.plank/ds4flash.gguf` and its siblings to `ds4vision.gguf`,
+`ds4vision.mtp.gguf` and `ds4vision.vision.gguf`, and the V4.1 files to
+`ds41.*`. Nothing is downloaded again. An older plank pointed at the same
+`~/.plank` will not find its model any more and will offer to fetch it, so
+upgrade every copy you run together. A settings file or command line that
+still names `~/.plank/ds4flash.gguf` keeps working and prints a one-line note
+naming the engine to use instead.
+
+A bare `--model /some/file.gguf` now loads just that file, with no drafter or
+encoder picked up beside it: pass `--mtp-model` for speculation, or describe
+the file as a local engine. Two exceptions keep existing setups whole. A path
+that is the same file as an engine's main model, including through a symlink
+or a hard link, selects that engine, and a `.ggd` weight delta built on an
+engine's main model inherits that engine's drafter and encoder, though the
+delta itself is never upgraded.
+
+## v6.0: plank can be a different agent
+
+**v6.0.0** moved the major number for one reason: profiles.
 
 **Plank can be a different agent.** A profile gives it its own system prompt,
 its own set of tools, its own settings, and its own logo, name and colour, so

@@ -182,18 +182,49 @@ against the echo stub. Fine for working on the UI and tools; useless for
 actual generation.</li>
 </ul>
 <h2 id="getting-the-model">Getting the model</h2>
-<p>Real inference needs the DeepSeek V4 Flash GGUF. On first run, with
-no <code>-m</code> flag and nothing at the default path
-(<code>~/.plank/ds4flash.gguf</code>), plank offers to fetch the
+<p>plank knows its models as named <em>engines</em>: a main model plus
+the companions it runs with, a drafter for speculative decoding
+(<code>mtp</code>) and a vision encoder (<code>vision</code>). They are
+listed in <code>engines.json</code>, a small catalog that ships inside
+plank and is refreshed from the repository at most once a day. Three are
+built in:</p>
+<table>
+<thead>
+<tr>
+<th>Engine</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ds4vision</code></td>
+<td>DeepSeek V4 Flash with its DSpark drafter and vision encoder. The
+default.</td>
+</tr>
+<tr>
+<td><code>ds41</code></td>
+<td>DeepSeek V4.1 Flash with its vision encoder.</td>
+</tr>
+<tr>
+<td><code>qwen</code></td>
+<td>Qwen3.8-Flash-Next.</td>
+</tr>
+</tbody>
+</table>
+<p>Pick one with <code>--model &lt;name&gt;</code>, for example
+<code>plank --model ds41</code>. Real inference with no choice at all
+runs the default engine: on first run, with nothing at its path
+(<code>~/.plank/ds4vision.gguf</code>), plank offers to fetch the
 quantized model (~87 GB) from Hugging Face. One keypress and it
 downloads in place with live progress, and an interruption resumes where
-it stopped rather than starting over.</p>
-<p>DeepSeek V4.1 Flash is supported too, as a family of its own with its
-own tool-call dialect and its own <code>.ds41.kv</code> transcripts.
-plank ships no manifest for it, so it is not offered for download: point
-<code>-m</code> at a V4.1 GGUF and the family, the dialect and the
-companion paths all follow from the file's own architecture field. It is
-large enough that plank will usually turn on SSD streaming for you.</p>
+it stopped rather than starting over. Any other engine is offered the
+same way the first time you pick it.</p>
+<p>DeepSeek V4.1 Flash is a family of its own, with its own tool-call
+dialect and its own <code>.ds41.kv</code> transcripts.
+<code>--model ds41</code> fetches and runs it; pointing
+<code>--model</code> at a V4.1 GGUF path works too, and the family and
+dialect follow from the file's own architecture field. It is large
+enough that plank will usually turn on SSD streaming for you.</p>
 <p>Things worth knowing before you start an 87 GB transfer:</p>
 <ul>
 <li><strong>It resumes.</strong> The download streams to a
@@ -209,26 +240,26 @@ counters, plus a rotation of two hundred status messages.</li>
 there is nobody to answer the prompt, so plank exits with instructions
 rather than hanging your script.</li>
 </ul>
-<p>The DSpark draft checkpoint (~5.6 GB) follows the same path —
-speculative decoding is on by default, so it resolves to
-<code>~/.plank/ds4flash.dspark.gguf</code> and is offered for download
-with the same prompt, resume and progress (<code>--mtp-off</code> skips
-it). See <a
+<p>The DSpark draft checkpoint (~5.6 GB) follows the same path.
+Speculative decoding is on by default, so for <code>ds4vision</code> it
+resolves to <code>~/.plank/ds4vision.mtp.gguf</code> and is offered for
+download with the same prompt, resume and progress
+(<code>--mtp-off</code> skips it). See <a
 href="08-configuration.html#speculative-decoding">Configuration</a>.</p>
 <h2 id="staying-on-the-current-model">Staying on the current model</h2>
 <p>Once a model is installed, plank checks for a newer one at most once
-a day by fetching a manifest — <code>ds4.manifest</code> for DeepSeek,
-<code>qwen.manifest</code> for Qwen — a small file naming that set's
-artifacts and a version number. When a newer version appears, plank asks
-first: <code>Download it in the background? [y/N]</code>, defaulting to
-no. Say yes and it starts in a detached background process rather than
-blocking the session: it keeps running even if you quit plank or close
-the terminal, so closing the laptop lid mid-transfer costs nothing but
-time. Say no (or just press Enter) and nothing downloads yet; run
+a day by fetching <code>engines.json</code>, where each engine carries
+its own version number and the artifacts that make it up. When a newer
+version of the engine you run appears, plank asks first:
+<code>Download it in the background? [y/N]</code>, defaulting to no. Say
+yes and it starts in a detached background process rather than blocking
+the session: it keeps running even if you quit plank or close the
+terminal, so closing the laptop lid mid-transfer costs nothing but time.
+Say no (or just press Enter) and nothing downloads yet; run
 <code>/model download</code> whenever you are ready to start it. A
 dropped connection or a stopped helper leaves verified artifacts and
-partial files in <code>~/.plank/staging/</code>; nothing resumes it
-automatically, but accepting the next daily offer or running
+partial files in <code>~/.plank/staging/&lt;engine&gt;/</code>; nothing
+resumes it automatically, but accepting the next daily offer or running
 <code>/model download</code> picks up right where it left off,
 re-downloading only what wasn't finished. Only one such download runs
 per machine, whichever plank noticed the update first.</p>
@@ -246,10 +277,46 @@ not installed the moment the download finishes — a running plank has the
 current model mapped into memory, so the swap happens at the next launch
 instead. Expect a fresh model to be in effect the next time you start
 plank, not mid-session.</p>
-<p>To use a model you already have somewhere else:</p>
-<pre class="sh"><code>plank -m ~/models/ds4flash.gguf</code></pre>
-<p>or set it permanently with <code>engine.model</code> in
+<p>To use a model you already have somewhere else, give
+<code>--model</code> (or <code>-m</code>) a path instead of a name:</p>
+<pre class="sh"><code>plank --model ~/models/my-ds4.gguf</code></pre>
+<p>A bare path loads that file and nothing else. plank never downloads
+or upgrades it, and looks for no drafter or encoder beside it, so a
+DeepSeek model loaded this way runs without speculative decoding unless
+you name a drafter with <code>--mtp-model</code>. There are two
+exceptions: a path to a managed engine's main file under any other name
+(a symlink or hard link included) selects that engine with all its
+companions, and a <code>.ggd</code> delta built on a managed engine's
+main inherits that engine's companions while the patched clone itself is
+never upgraded. <code>--model:&lt;name&gt;</code> is the strict form: it
+must name an engine and never falls back to a path, which is what a
+script wants. Set either permanently with <code>engine.model</code> in
 <code>settings.json</code>.</p>
+<p>To keep a model of your own together with its companions, describe it
+as a local engine in <code>~/.plank/engines.local.json</code>. That file
+is layered over the catalog, is the only place a role may name a
+<code>path</code>, and can also change the default:</p>
+<pre class="json"><code>{
+  &quot;default&quot;: &quot;mine&quot;,
+  &quot;engines&quot;: {
+    &quot;mine&quot;: {
+      &quot;main&quot;:   { &quot;path&quot;: &quot;~/models/my-ds4.gguf&quot; },
+      &quot;mtp&quot;:    { &quot;path&quot;: &quot;~/models/my-ds4.dspark.gguf&quot; },
+      &quot;vision&quot;: { &quot;path&quot;: &quot;~/models/my-ds4.vision.gguf&quot; }
+    }
+  }
+}</code></pre>
+<p><code>plank --model mine</code> then loads all three, and with
+<code>"default": "mine"</code> so does a plain <code>plank</code>. A
+local entry with the same name as a built-in engine replaces it.</p>
+<p>Upgrading from a release before engines renames the files under
+<code>~/.plank</code> once, at the first launch:
+<code>ds4flash.gguf</code> becomes <code>ds4vision.gguf</code>, its
+drafter and encoder become <code>ds4vision.mtp.gguf</code> and
+<code>ds4vision.vision.gguf</code>, and the V4.1 files become
+<code>ds41.*</code>. Nothing is downloaded again, but it is one way: an
+older plank sharing the same <code>~/.plank</code> no longer finds its
+model and offers to fetch it.</p>
 <h2 id="no-model-no-problem-sort-of">No model, no problem (sort of)</h2>
 <p>Without a model file plank runs against a built-in echo engine. Every
 command, tool, session feature and UI element works; the "model" just
@@ -265,22 +332,32 @@ it is what you will see if you launch on an unsupported platform.</p>
 </thead>
 <tbody>
 <tr>
-<td><code>~/.plank/ds4flash.gguf</code></td>
-<td>default model location</td>
+<td><code>~/.plank/&lt;engine&gt;.gguf</code></td>
+<td>an engine's main model, for example <code>ds4vision.gguf</code> (the
+default), <code>ds41.gguf</code> or <code>qwen.gguf</code></td>
 </tr>
 <tr>
-<td><code>~/.plank/ds4flash.dspark.gguf</code></td>
-<td>DSpark draft model, for DeepSeek speculation
-(<code>--mtp</code>)</td>
+<td><code>~/.plank/&lt;engine&gt;.mtp.gguf</code></td>
+<td>an engine's drafter, for speculation (<code>--mtp</code>):
+<code>ds4vision.mtp.gguf</code> is DeepSeek V4's DSpark model</td>
 </tr>
 <tr>
-<td><code>~/.plank/qwen.gguf</code></td>
-<td>Qwen3.8-Flash-Next main model, when <code>--qwen</code> is used</td>
+<td><code>~/.plank/&lt;engine&gt;.vision.gguf</code></td>
+<td>an engine's vision encoder. <code>qwen.vision.gguf</code> is
+installed with the engine, but plank does not load one for Qwen yet</td>
 </tr>
 <tr>
-<td><code>~/.plank/qwen.vision.gguf</code></td>
-<td>Qwen3.8-Flash-Next vision encoder (installed by the manifest; plank
-does not load one yet)</td>
+<td><code>~/.plank/engines/</code></td>
+<td>one <code>&lt;engine&gt;.installed.json</code> per installed engine,
+recording which version is on disk</td>
+</tr>
+<tr>
+<td><code>~/.plank/engines.local.json</code></td>
+<td>your own engines and default, layered over the catalog</td>
+</tr>
+<tr>
+<td><code>~/.plank/staging/&lt;engine&gt;/</code></td>
+<td>background downloads in progress, installed at the next launch</td>
 </tr>
 <tr>
 <td><code>~/.plank/kvcache/</code></td>

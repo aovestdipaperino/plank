@@ -491,7 +491,8 @@ metadata that anything reading the image later would want. The vision
 encoder does its own resizing at encode time, from the original
 file.</p>
 <p><strong>The model can see it.</strong> plank ships a vision encoder
-alongside the main model, at <code>~/.plank/ds4flash.vision.gguf</code>,
+alongside the main model, the engine's <code>vision</code> companion
+(<code>~/.plank/ds4vision.vision.gguf</code> for the default engine),
 and offers it to the model without any setup on your part: it is
 downloaded on first launch if it is missing, and the
 <code>view_image</code> tool is always available. Paste a screenshot of

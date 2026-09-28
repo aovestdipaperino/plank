@@ -177,8 +177,9 @@ form.</p>
 <tbody>
 <tr>
 <td><code>model</code></td>
-<td><code>~/.plank/ds4flash.gguf</code></td>
-<td>model file (<code>~</code> expanded). Same as <code>-m</code>.</td>
+<td>the catalog default, <code>ds4vision</code></td>
+<td>an engine name from <code>engines.json</code>, or a model file path
+(<code>~</code> expanded). Same as <code>-m</code>.</td>
 </tr>
 <tr>
 <td><code>threads</code></td>
@@ -611,8 +612,16 @@ likely to want:</p>
 </thead>
 <tbody>
 <tr>
-<td><code>-m, --model PATH</code></td>
-<td>load a ds4 GGUF model</td>
+<td><code>-m, --model NAME|PATH</code></td>
+<td>run a named engine (<code>ds4vision</code>, <code>ds41</code>,
+<code>qwen</code>, or one of yours from
+<code>~/.plank/engines.local.json</code>) with its companions, or load a
+GGUF file on its own</td>
+</tr>
+<tr>
+<td><code>--model:NAME</code></td>
+<td>run a named engine, and fail rather than read <code>NAME</code> as a
+path</td>
 </tr>
 <tr>
 <td><code>-t, --threads N</code></td>
@@ -794,10 +803,12 @@ verification pass can advance the stream by several tokens. DeepSeek
 V4.1 Flash has no drafter upstream, so plank never pairs one with it and
 decodes target-only there. <code>--mtp-off</code> turns speculation off
 explicitly.</p>
-<p>On V4 the support model (~5.6 GB) needs no flag of its own: it
-resolves to <code>~/.plank/ds4flash.dspark.gguf</code> and is offered
-for download through the same resumable path as the main model, unless
-<code>--mtp-model</code> names one.</p>
+<p>On V4 the support model (~5.6 GB) needs no flag of its own: it is the
+<code>ds4vision</code> engine's <code>mtp</code> companion, resolves to
+<code>~/.plank/ds4vision.mtp.gguf</code>, and is offered for download
+through the same resumable path as the main model, unless
+<code>--mtp-model</code> names one. A model loaded by a bare path has no
+companions, so speculation there needs <code>--mtp-model</code>.</p>
 <p>A drafter plank paired for you is no longer able to stop a model from
 loading. The engine refuses to open a model at all when the draft
 checkpoint does not match it, so a checkpoint the default drafter does
