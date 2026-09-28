@@ -375,13 +375,17 @@ fn select_session_family(cfg: &plank::config::AgentConfig) {
 
 /// The detached downloader's entry point.
 ///
-/// Its model set is the second argument. A helper spawned by a plank that
-/// predates two sets passes none, which reads as `ds4` — the set plank managed
-/// when there was only one.
+/// Its engine is the second argument. A helper spawned by a plank that
+/// predates engines passes `ds4` or none, which reads as `ds4vision` — the
+/// engine plank managed when there was only one.
 fn run_model_downloader(args: &[String]) -> i32 {
-    let set =
-        plank::manifest::ModelSet::from_str_or_default(args.get(1).map_or("", String::as_str));
-    plank::downloader::run_helper(set)
+    let Some(id) =
+        plank::manifest::EngineId::from_legacy_arg(args.get(1).map_or("", String::as_str))
+    else {
+        eprintln!("plank: --model-downloader: invalid engine name");
+        return 2;
+    };
+    plank::downloader::run_helper(id)
 }
 
 /// The checks that fire once the real `cfg` (settings + CLI, not the

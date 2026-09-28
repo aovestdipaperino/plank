@@ -714,19 +714,23 @@ fn qwen_syntax_reminder_matches_c_source() {
 /// surface as a failed download on a user's machine.
 #[test]
 fn the_committed_manifests_parse_and_name_installable_kinds() {
-    for (set, name) in [
-        (plank::manifest::ModelSet::Ds4, "ds4.manifest"),
-        (plank::manifest::ModelSet::Qwen, "qwen.manifest"),
+    use plank::manifest::EngineId;
+    // The legacy per-set files predate the engine catalog, and still spell
+    // the drafter `dspark`; it installs as the `mtp` role.
+    let kinds_ds4: &[&str] = &["main", "vision", "dspark"];
+    let kinds_qwen: &[&str] = &["main", "vision"];
+    for (id, name, kinds) in [
+        (EngineId::DS4VISION, "ds4.manifest", kinds_ds4),
+        (EngineId::QWEN, "qwen.manifest", kinds_qwen),
     ] {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
         let m = plank::manifest::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(set.manifest_name(), name, "set names its own file");
 
         // Every kind this build installs for the set must be present, or a
         // swap would never find the set complete and would silently install
         // nothing at all.
-        for kind in set.kinds() {
+        for kind in kinds {
             let entry = m
                 .files
                 .get(*kind)
@@ -736,8 +740,9 @@ fn the_committed_manifests_parse_and_name_installable_kinds() {
                 entry.url.starts_with("https://"),
                 "{name}: {kind} url is not https"
             );
+            let role = if *kind == "dspark" { "mtp" } else { kind };
             assert!(
-                plank::manifest::local_path_for(set, kind).is_some(),
+                plank::manifest::local_path_for(id, role).is_some(),
                 "{name}: {kind} has nowhere to install"
             );
         }

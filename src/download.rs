@@ -3,7 +3,7 @@
 
 //! Model auto-download with a playful progress display.
 //!
-//! When no `-m` is given, plank looks for `~/.plank/ds4flash.gguf`. If it is
+//! When no `-m` is given, plank looks for `~/.plank/ds4vision.gguf`. If it is
 //! missing, it offers to fetch the `DeepSeek` V4 Flash GGUF from Hugging Face
 //! (`huggingface.co`),
 //! streaming a magenta progress bar with a rotating series of messages.
@@ -278,11 +278,16 @@ const MESSAGES: [&str; 200] = [
     "Any moment now, sentience with a smile...",
 ];
 
+/// Where engine `id`'s artifact of `role` installs under `~/.plank`, for a
+/// role this module names itself and so always knows.
+fn managed_path(id: crate::manifest::EngineId, role: &str) -> PathBuf {
+    crate::manifest::local_path_for(id, role).expect("a known artifact role")
+}
+
 /// Default model location used when `-m` is not supplied.
 #[must_use]
 pub fn default_model_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    crate::home::plank_home_in(home).join("ds4flash.gguf")
+    managed_path(crate::manifest::EngineId::DS4VISION, "main")
 }
 
 /// Hugging Face download URL for `file` in [`REPO`].
@@ -299,24 +304,22 @@ fn repo_file_url(repo: &str, file: &str) -> String {
 /// without an explicit `--mtp`.
 ///
 /// Sits beside the main model and mirrors its name so the pairing is legible
-/// on disk: `ds4flash.gguf` and `ds4flash.dspark.gguf`.
+/// on disk: `ds4vision.gguf` and `ds4vision.mtp.gguf`.
 #[must_use]
 pub fn default_dspark_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    crate::home::plank_home_in(home).join("ds4flash.dspark.gguf")
+    managed_path(crate::manifest::EngineId::DS4VISION, "mtp")
 }
 
 /// Default Qwen3.8-Flash-Next model location, selected by `--qwen`.
 ///
-/// Deliberately outside the `ds4flash.*` family, which the `DeepSeek` manifest
+/// Deliberately outside the `ds4vision.*` family, which the `DeepSeek` manifest
 /// owns: a staged upgrade moves those names into place, and a name it
 /// recognized would be replaced under the user's feet. Qwen has its own
 /// manifest (`qwen.manifest`), so this path is managed the same way V4 and
 /// V4.1 are — an existing symlink here is adopted by size rather than replaced.
 #[must_use]
 pub fn default_qwen_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    crate::home::plank_home_in(home).join("qwen.gguf")
+    managed_path(crate::manifest::EngineId::QWEN, "main")
 }
 
 /// Default Qwen vision-encoder location, beside its main model.
@@ -326,18 +329,16 @@ pub fn default_qwen_path() -> PathBuf {
 /// free for the `mmproj` encoder `--vision` loads.
 #[must_use]
 pub fn default_qwen_vision_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    crate::home::plank_home_in(home).join("qwen.vision.gguf")
+    managed_path(crate::manifest::EngineId::QWEN, "vision")
 }
 
 /// Default vision-encoder location. Loaded alongside the main model whenever
 /// the native engine opens the Vision-Exp checkpoint.
 ///
-/// Sits beside the main model: `ds4flash.gguf` and `ds4flash.vision.gguf`.
+/// Sits beside the main model: `ds4vision.gguf` and `ds4vision.vision.gguf`.
 #[must_use]
 pub fn default_vision_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    crate::home::plank_home_in(home).join("ds4flash.vision.gguf")
+    managed_path(crate::manifest::EngineId::DS4VISION, "vision")
 }
 
 /// Default `DeepSeek` V4.1 Flash model location.
@@ -346,29 +347,23 @@ pub fn default_vision_path() -> PathBuf {
 /// wholly disjoint on disk, so a V4.1 install can never overwrite a V4 one.
 #[must_use]
 pub fn default_ds41_model_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    crate::home::plank_home_in(home).join("ds41flash.gguf")
+    managed_path(crate::manifest::EngineId::DS41, "main")
 }
 
 /// Default V4.1 vision-encoder location, beside its main model.
 #[must_use]
 pub fn default_ds41_vision_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    crate::home::plank_home_in(home).join("ds41flash.vision.gguf")
+    managed_path(crate::manifest::EngineId::DS41, "vision")
 }
 
 /// The `main` model path of the set this machine manages by default, under
 /// `root`.
 ///
-/// What `-m` falls back to. It follows [`crate::manifest::default_set_for_root`]
-/// so the model that loads belongs to the set whose manifest plank tracks: a
-/// fresh install takes V4, as does an install with V4 already recorded or on
-/// disk; only a root recording `ds41.manifest` manages V4.1. Falls back to
-/// [`default_model_path`] only if a set ever stops declaring a `main`
-/// artifact, which no set does.
+/// What `-m` falls back to: the `ds4vision` engine's `main` artifact, the
+/// managed default until the engine catalog chooses one.
 #[must_use]
 pub fn default_managed_model_path_in(root: &Path) -> PathBuf {
-    crate::manifest::local_path_for_in(root, crate::manifest::default_set_for_root(root), "main")
+    crate::manifest::local_path_for_in(root, crate::manifest::EngineId::DS4VISION, "main")
         .unwrap_or_else(default_model_path)
 }
 
@@ -398,11 +393,11 @@ fn qwen_model_url() -> String {
 /// Uncompiled-in size estimate for a set's `main` artifact, in GB, used only
 /// when no manifest is on hand to give an exact figure. From
 /// `refs/ds4/docs/MODELS.md`.
-fn fallback_main_gb(set: crate::manifest::ModelSet) -> f64 {
+fn fallback_main_gb(set: crate::manifest::EngineId) -> f64 {
     match set {
-        crate::manifest::ModelSet::Ds4 => 87.0,
-        crate::manifest::ModelSet::Ds41 => 341.0,
-        crate::manifest::ModelSet::Qwen => 177.0,
+        crate::manifest::EngineId::DS41 => 341.0,
+        crate::manifest::EngineId::QWEN => 177.0,
+        _ => 87.0,
     }
 }
 
@@ -412,7 +407,7 @@ fn fallback_main_gb(set: crate::manifest::ModelSet) -> f64 {
 /// or a previously installed manifest — over the hardcoded estimate, so a
 /// figure the manifest has already revised is reported rather than a stale
 /// compiled-in guess.
-fn main_artifact_gb(root: &Path, set: crate::manifest::ModelSet) -> f64 {
+fn main_artifact_gb(root: &Path, set: crate::manifest::EngineId) -> f64 {
     let from_manifest = |m: crate::manifest::Manifest| m.files.get("main").map(|e| e.bytes);
     crate::downloader::read_job_in(root, set)
         .and_then(from_manifest)
@@ -429,8 +424,8 @@ fn main_artifact_gb(root: &Path, set: crate::manifest::ModelSet) -> f64 {
 /// managed path for a set other than the root's current default — an
 /// explicit `-m` that does not exist is the user's own file, and offering a
 /// download for it risked fetching hundreds of GB into the wrong slot.
-fn offer_target_in(root: &Path, path: &Path) -> Option<crate::manifest::ModelSet> {
-    let set = crate::manifest::default_set_for_root(root);
+fn offer_target_in(root: &Path, path: &Path) -> Option<crate::manifest::EngineId> {
+    let set = crate::manifest::EngineId::DS4VISION;
     (path == default_managed_model_path_in(root)).then_some(set)
 }
 
@@ -852,9 +847,9 @@ fn ensure_model_in(root: &Path, path: &Path) -> Result<(), String> {
         ));
     }
     let (label, url) = match set {
-        crate::manifest::ModelSet::Ds4 => ("DeepSeek V4 Flash", model_url()),
-        crate::manifest::ModelSet::Ds41 => ("DeepSeek V4.1 Flash", ds41_model_url()),
-        crate::manifest::ModelSet::Qwen => ("Qwen3.8 Flash Next", qwen_model_url()),
+        crate::manifest::EngineId::DS41 => ("DeepSeek V4.1 Flash", ds41_model_url()),
+        crate::manifest::EngineId::QWEN => ("Qwen3.8 Flash Next", qwen_model_url()),
+        _ => ("DeepSeek V4 Flash", model_url()),
     };
     // A leftover .part file means a previous download can be resumed.
     let resuming = partial_bytes(path) > 0;
@@ -1524,8 +1519,16 @@ const MANIFEST_CHECK_FILE: &str = "manifest-check";
 /// Fetches the manifest, bounded by [`MANIFEST_TIMEOUT_SECS`]. `None` on any
 /// failure — offline, timeout, HTTP error — so the caller stays quiet.
 #[cfg(not(test))]
-fn fetch_manifest(set: crate::manifest::ModelSet) -> Option<String> {
-    let url = format!("{MANIFEST_BASE_URL}/{}", set.manifest_name());
+fn fetch_manifest(set: crate::manifest::EngineId) -> Option<String> {
+    // Interim: the per-engine `*.manifest` files are replaced by the
+    // `engines.json` catalog, which is what the upgrade check will read.
+    let name = match set {
+        crate::manifest::EngineId::DS4VISION => "ds4.manifest",
+        crate::manifest::EngineId::DS41 => "ds41.manifest",
+        crate::manifest::EngineId::QWEN => "qwen.manifest",
+        _ => return None,
+    };
+    let url = format!("{MANIFEST_BASE_URL}/{name}");
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(MANIFEST_TIMEOUT_SECS)))
         .build()
@@ -1543,7 +1546,7 @@ fn fetch_manifest(set: crate::manifest::ModelSet) -> Option<String> {
 
 /// Test builds never touch the network.
 #[cfg(test)]
-fn fetch_manifest(_set: crate::manifest::ModelSet) -> Option<String> {
+fn fetch_manifest(_set: crate::manifest::EngineId) -> Option<String> {
     None
 }
 
@@ -1627,7 +1630,7 @@ fn note_last_run_outcome_in(root: &Path) {
 }
 
 /// Whether an artifact of `kind` is present on disk under `root`.
-fn artifact_installed_in(root: &Path, set: crate::manifest::ModelSet, kind: &str) -> bool {
+fn artifact_installed_in(root: &Path, set: crate::manifest::EngineId, kind: &str) -> bool {
     crate::manifest::local_path_for_in(root, set, kind).is_some_and(|p| p.exists())
 }
 
@@ -1673,9 +1676,9 @@ fn confirm_background_download(manifest: &crate::manifest::Manifest, from: u32) 
 /// staging directory — leaves the existing model in place and returns.
 fn check_manifest_at_startup_in(
     root: &Path,
-    set: crate::manifest::ModelSet,
-    fetch: &dyn Fn(crate::manifest::ModelSet) -> Option<String>,
-    spawn: &dyn Fn(crate::manifest::ModelSet, &crate::manifest::Manifest) -> Result<(), String>,
+    set: crate::manifest::EngineId,
+    fetch: &dyn Fn(crate::manifest::EngineId) -> Option<String>,
+    spawn: &dyn Fn(crate::manifest::EngineId, &crate::manifest::Manifest) -> Result<(), String>,
     confirm: &dyn Fn(&crate::manifest::Manifest, u32) -> Option<bool>,
 ) {
     // Anything a previous run verified gets installed first, before the engine
@@ -1702,13 +1705,17 @@ fn check_manifest_at_startup_in(
         let path = crate::manifest::local_path_for_in(root, set, kind)?;
         std::fs::metadata(path).map(|m| m.len()).ok()
     };
-    match crate::manifest::decide(remote, installed.as_ref(), set.kinds(), &size_of) {
+    match crate::manifest::decide(remote, installed.as_ref(), &crate::engines::ROLES, &size_of) {
         crate::manifest::Decision::UpToDate => {}
         crate::manifest::Decision::Adopt(m) => {
             // The files on disk are already this release; record that and say
             // nothing. Without this, every existing user is offered an 87 GB
             // re-download the day the manifest ships.
-            let _ = std::fs::write(crate::manifest::installed_path_in(root, set), &m.raw);
+            let path = crate::manifest::installed_path_in(root, set);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(path, &m.raw);
         }
         crate::manifest::Decision::Offer { manifest, from } => {
             // First-run acquisition belongs to `ensure_model`, not the
@@ -1779,27 +1786,25 @@ fn check_manifest_at_startup_in(
 /// Two different questions meet here. With `Some(path)` it is "which set does
 /// *this* model belong to", answered by the path alone: a V4.1 GGUF means the
 /// V4.1 set even on a machine that has only ever managed V4. With `None` it is
-/// "which set should this machine manage", answered by what `root` already
-/// records — [`crate::manifest::default_set_for_root`] — so a fresh install
-/// manages the V4 set, exactly as an install already recording
-/// `ds4.manifest` does.
+/// "which set should this machine manage", answered for now by the managed
+/// default, `ds4vision`.
 #[must_use]
 pub fn manifest_set_for_model_in(
-    root: &Path,
+    _root: &Path,
     model_path: Option<&Path>,
-) -> Option<crate::manifest::ModelSet> {
+) -> Option<crate::manifest::EngineId> {
     match model_path {
-        None => Some(crate::manifest::default_set_for_root(root)),
-        Some(p) if p == default_model_path() => Some(crate::manifest::ModelSet::Ds4),
-        Some(p) if p == default_ds41_model_path() => Some(crate::manifest::ModelSet::Ds41),
-        Some(p) if p == default_qwen_path() => Some(crate::manifest::ModelSet::Qwen),
+        None => Some(crate::manifest::EngineId::DS4VISION),
+        Some(p) if p == default_model_path() => Some(crate::manifest::EngineId::DS4VISION),
+        Some(p) if p == default_ds41_model_path() => Some(crate::manifest::EngineId::DS41),
+        Some(p) if p == default_qwen_path() => Some(crate::manifest::EngineId::QWEN),
         Some(_) => None,
     }
 }
 
 /// [`manifest_set_for_model_in`] rooted at `~/.plank`.
 #[must_use]
-pub fn manifest_set_for_model(model_path: Option<&Path>) -> Option<crate::manifest::ModelSet> {
+pub fn manifest_set_for_model(model_path: Option<&Path>) -> Option<crate::manifest::EngineId> {
     manifest_set_for_model_in(&crate::manifest::plank_dir(), model_path)
 }
 
@@ -1819,8 +1824,8 @@ pub fn check_manifest_at_startup(model_path: Option<&Path>) {
 fn check_manifest_at_startup_with(
     model_path: Option<&Path>,
     root: &Path,
-    fetch: &dyn Fn(crate::manifest::ModelSet) -> Option<String>,
-    spawn: &dyn Fn(crate::manifest::ModelSet, &crate::manifest::Manifest) -> Result<(), String>,
+    fetch: &dyn Fn(crate::manifest::EngineId) -> Option<String>,
+    spawn: &dyn Fn(crate::manifest::EngineId, &crate::manifest::Manifest) -> Result<(), String>,
     confirm: &dyn Fn(&crate::manifest::Manifest, u32) -> Option<bool>,
 ) {
     let Some(set) = manifest_set_for_model_in(root, model_path) else {
@@ -2105,7 +2110,7 @@ mod tests {
 
     #[test]
     fn default_path_is_under_plank() {
-        assert!(default_model_path().ends_with(".plank/ds4flash.gguf"));
+        assert!(default_model_path().ends_with(".plank/ds4vision.gguf"));
     }
 
     #[test]
@@ -2113,7 +2118,7 @@ mod tests {
         let main = default_model_path();
         let spark = default_dspark_path();
         assert_eq!(main.parent(), spark.parent());
-        assert!(spark.ends_with(".plank/ds4flash.dspark.gguf"));
+        assert!(spark.ends_with(".plank/ds4vision.mtp.gguf"));
     }
 
     #[test]
@@ -2357,40 +2362,6 @@ mod tests {
         let _ = std::fs::remove_file(model);
     }
 
-    /// The fallback for a missing `-m` follows the machine's default set, so
-    /// the model that loads belongs to the set whose manifest plank tracks. A
-    /// fresh install would otherwise track a manifest for a set other than the
-    /// GGUF it loads.
-    #[test]
-    fn the_default_model_path_follows_the_roots_default_set() {
-        use crate::manifest::ModelSet;
-        let root = crate::downloader::tests::tempdir();
-        std::fs::create_dir_all(&root).expect("mkdir");
-        let v4 = crate::manifest::local_path_for_in(&root, ModelSet::Ds4, "main").expect("v4");
-        let v41 = crate::manifest::local_path_for_in(&root, ModelSet::Ds41, "main").expect("v41");
-        // Fresh: the V4 model, the default set.
-        assert_eq!(default_managed_model_path_in(&root), v4);
-        // V4 weights on disk, nothing recorded — the existing installed base.
-        std::fs::write(&v4, b"gguf").expect("write");
-        assert_eq!(default_managed_model_path_in(&root), v4);
-        // And with the V4 manifest recorded.
-        std::fs::remove_file(&v4).expect("rm");
-        std::fs::write(
-            crate::manifest::installed_path_in(&root, ModelSet::Ds4),
-            "{}",
-        )
-        .expect("write");
-        assert_eq!(default_managed_model_path_in(&root), v4);
-        // Only a root recording the V4.1 manifest resolves the V4.1 model.
-        std::fs::write(
-            crate::manifest::installed_path_in(&root, ModelSet::Ds41),
-            "{}",
-        )
-        .expect("write");
-        assert_eq!(default_managed_model_path_in(&root), v41);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// A V4.1 GGUF that is not on disk yet. That
     /// must reach `ensure_model`'s graceful "no model at <path>" error — never
     /// a panic, and never a prompt to fetch V4 into the V4.1 slot.
@@ -2449,19 +2420,19 @@ mod tests {
     /// since the flag resolves to a default path.
     #[test]
     fn the_managed_paths_map_to_their_set() {
-        use crate::manifest::ModelSet;
+        use crate::manifest::EngineId;
         let root = crate::downloader::tests::tempdir();
         assert_eq!(
             manifest_set_for_model_in(&root, Some(&default_model_path())),
-            Some(ModelSet::Ds4)
+            Some(EngineId::DS4VISION)
         );
         assert_eq!(
             manifest_set_for_model_in(&root, Some(&default_ds41_model_path())),
-            Some(ModelSet::Ds41)
+            Some(EngineId::DS41)
         );
         assert_eq!(
             manifest_set_for_model_in(&root, Some(&default_qwen_path())),
-            Some(ModelSet::Qwen)
+            Some(EngineId::QWEN)
         );
         // A path plank does not manage gets no manifest check at all: it is
         // the user's file, and plank must never propose replacing it.
@@ -2472,53 +2443,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// With no `-m`, the set is the machine's default: V4 on a fresh root and
-    /// on a root that already records `ds4.manifest`, V4.1 only where
-    /// `ds41.manifest` is recorded. The middle case is the no-migration
-    /// guarantee.
-    #[test]
-    fn no_model_flag_takes_the_roots_default_set_and_never_migrates_v4() {
-        use crate::manifest::ModelSet;
-        let root = crate::downloader::tests::tempdir();
-        // Fresh: nothing recorded at all.
-        assert_eq!(
-            manifest_set_for_model_in(&root, None),
-            Some(ModelSet::Ds4),
-            "a fresh install manages the V4 set"
-        );
-        // An existing V4 install stays on V4.
-        std::fs::write(
-            crate::manifest::installed_path_in(&root, ModelSet::Ds4),
-            "{}",
-        )
-        .expect("write");
-        assert_eq!(
-            manifest_set_for_model_in(&root, None),
-            Some(ModelSet::Ds4),
-            "an existing V4 install is never migrated to the V4.1 set"
-        );
-        // An explicit `-m` at the V4 default path still resolves to V4 even on
-        // an otherwise-fresh machine: that is the path question, not the
-        // machine-default question.
-        let fresh = crate::downloader::tests::tempdir();
-        assert_eq!(
-            manifest_set_for_model_in(&fresh, Some(&default_model_path())),
-            Some(ModelSet::Ds4)
-        );
-        // A root recording the V4.1 manifest stays on V4.1.
-        std::fs::write(
-            crate::manifest::installed_path_in(&fresh, ModelSet::Ds41),
-            "{}",
-        )
-        .expect("write");
-        assert_eq!(
-            manifest_set_for_model_in(&fresh, None),
-            Some(ModelSet::Ds41)
-        );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&fresh);
-    }
-
     /// An existing V4 install sees no change at all from the fresh-install
     /// default: startup still fetches and decides against the V4 set, and the
     /// V4.1 set is never consulted.
@@ -2527,11 +2451,11 @@ mod tests {
         use std::cell::Cell;
         let root = crate::downloader::tests::tempdir();
         std::fs::write(
-            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            installed_at(&root, crate::manifest::EngineId::DS4VISION),
             manifest_text(4, 100),
         )
         .expect("write");
-        let seen: Cell<Option<crate::manifest::ModelSet>> = Cell::new(None);
+        let seen: Cell<Option<crate::manifest::EngineId>> = Cell::new(None);
         let text = manifest_text(4, 100);
         check_manifest_at_startup_with(
             None,
@@ -2545,11 +2469,11 @@ mod tests {
         );
         assert_eq!(
             seen.get(),
-            Some(crate::manifest::ModelSet::Ds4),
+            Some(crate::manifest::EngineId::DS4VISION),
             "an existing V4 install keeps managing the V4 set"
         );
         assert!(
-            !crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds41).exists(),
+            !crate::manifest::installed_path_in(&root, crate::manifest::EngineId::DS41).exists(),
             "nothing is recorded for the V4.1 set"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -2563,7 +2487,7 @@ mod tests {
     fn a_fresh_install_is_not_offered_the_download_at_launch() {
         use std::cell::Cell;
         let root = crate::downloader::tests::tempdir();
-        let seen: Cell<Option<crate::manifest::ModelSet>> = Cell::new(None);
+        let seen: Cell<Option<crate::manifest::EngineId>> = Cell::new(None);
         let text = manifest_text(7, 100);
         check_manifest_at_startup_with(
             None,
@@ -2577,7 +2501,7 @@ mod tests {
         );
         assert_eq!(
             seen.get(),
-            Some(crate::manifest::ModelSet::Ds4),
+            Some(crate::manifest::EngineId::DS4VISION),
             "a fresh root manages the V4 set"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -2606,23 +2530,23 @@ mod tests {
         let path = default_managed_model_path_in(&root);
         assert_eq!(
             path,
-            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds4, "main")
+            crate::manifest::local_path_for_in(&root, crate::manifest::EngineId::DS4VISION, "main")
                 .expect("v4 main path"),
             "a fresh root's default path is the V4 managed main path"
         );
         assert_eq!(
             offer_target_in(&root, &path),
-            Some(crate::manifest::ModelSet::Ds4),
+            Some(crate::manifest::EngineId::DS4VISION),
             "a fresh root's own default path must be offered, not errored"
         );
         assert!(
-            (main_artifact_gb(&root, crate::manifest::ModelSet::Ds4) - 87.0).abs() < 0.01,
+            (main_artifact_gb(&root, crate::manifest::EngineId::DS4VISION) - 87.0).abs() < 0.01,
             "no manifest on hand yet: falls back to the V4 87 GB estimate"
         );
         // The V4.1 managed path is not this root's default, so it is never
         // offered: a V4.1 GGUF is reached by an explicit `-m`.
         let v41 =
-            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds41, "main")
+            crate::manifest::local_path_for_in(&root, crate::manifest::EngineId::DS41, "main")
                 .expect("v41 main path");
         assert_eq!(offer_target_in(&root, &v41), None);
         let _ = std::fs::remove_dir_all(&root);
@@ -2636,23 +2560,23 @@ mod tests {
         let root = crate::downloader::tests::tempdir();
         std::fs::create_dir_all(&root).expect("mkdir");
         std::fs::write(
-            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            installed_at(&root, crate::manifest::EngineId::DS4VISION),
             "{}",
         )
         .expect("write");
         let path = default_managed_model_path_in(&root);
         assert_eq!(
             path,
-            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds4, "main")
+            crate::manifest::local_path_for_in(&root, crate::manifest::EngineId::DS4VISION, "main")
                 .expect("v4 main path"),
             "an existing V4 install stays on the V4 managed path"
         );
         assert_eq!(
             offer_target_in(&root, &path),
-            Some(crate::manifest::ModelSet::Ds4)
+            Some(crate::manifest::EngineId::DS4VISION)
         );
         assert!(
-            (main_artifact_gb(&root, crate::manifest::ModelSet::Ds4) - 87.0).abs() < 0.01,
+            (main_artifact_gb(&root, crate::manifest::EngineId::DS4VISION) - 87.0).abs() < 0.01,
             "no manifest bytes on hand: falls back to the V4 87 GB estimate"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -2680,6 +2604,14 @@ mod tests {
     }
 
     /// A well-formed manifest naming only `main`, at `version` and `bytes`.
+    /// The installed record's path for `id` under `root`, with its directory
+    /// created so a test can write it.
+    fn installed_at(root: &Path, id: crate::manifest::EngineId) -> PathBuf {
+        let path = crate::manifest::installed_path_in(root, id);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        path
+    }
+
     fn manifest_text(version: u32, bytes: u64) -> String {
         format!(
             r#"{{"version":{version},"released":"t","notes":"","files":{{
@@ -2693,11 +2625,11 @@ mod tests {
     /// never reaches the background download.
     fn spy_spawn() -> (
         std::sync::Arc<std::sync::atomic::AtomicBool>,
-        impl Fn(crate::manifest::ModelSet, &crate::manifest::Manifest) -> Result<(), String>,
+        impl Fn(crate::manifest::EngineId, &crate::manifest::Manifest) -> Result<(), String>,
     ) {
         let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = called.clone();
-        let spawn = move |_: crate::manifest::ModelSet, _: &crate::manifest::Manifest| {
+        let spawn = move |_: crate::manifest::EngineId, _: &crate::manifest::Manifest| {
             flag.store(true, Ordering::Relaxed);
             Ok(())
         };
@@ -2718,7 +2650,7 @@ mod tests {
         // confirm stub that panics if called doubles as proof of that.
         check_manifest_at_startup_in(
             &root,
-            crate::manifest::ModelSet::Ds4,
+            crate::manifest::EngineId::DS4VISION,
             &|_| Some(text.clone()),
             &spawn,
             &|_, _| panic!("must not even ask on a bare first run"),
@@ -2728,7 +2660,7 @@ mod tests {
             "must not spawn a background download on a bare first run"
         );
         assert!(
-            crate::downloader::read_job_in(&root, crate::manifest::ModelSet::Ds4).is_none(),
+            crate::downloader::read_job_in(&root, crate::manifest::EngineId::DS4VISION).is_none(),
             "finding 4: a bare first run must not plant a job either — \
              `/model download` right after would trigger a redundant full \
              background re-fetch of the file `ensure_model` is about to get \
@@ -2770,7 +2702,7 @@ mod tests {
         let root = crate::downloader::tests::tempdir();
         let installed = manifest_text(3, 100);
         std::fs::write(
-            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            installed_at(&root, crate::manifest::EngineId::DS4VISION),
             &installed,
         )
         .expect("installed");
@@ -2781,7 +2713,7 @@ mod tests {
         let (called, spawn) = spy_spawn();
         check_manifest_at_startup_in(
             &root,
-            crate::manifest::ModelSet::Ds4,
+            crate::manifest::EngineId::DS4VISION,
             &|_| Some(remote_text.clone()),
             &spawn,
             &|_, _| panic!("a declined version must not even reach the confirm prompt"),
@@ -2853,7 +2785,7 @@ mod tests {
         let root = crate::downloader::tests::tempdir();
         let installed = manifest_text(3, 100);
         std::fs::write(
-            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            installed_at(&root, crate::manifest::EngineId::DS4VISION),
             &installed,
         )
         .expect("installed");
@@ -2862,7 +2794,7 @@ mod tests {
         // `confirm` returns `Some(false)`: the user is asked and says no.
         check_manifest_at_startup_in(
             &root,
-            crate::manifest::ModelSet::Ds4,
+            crate::manifest::EngineId::DS4VISION,
             &|_| Some(remote_text.clone()),
             &spawn,
             &|_, _| Some(false),
@@ -2886,7 +2818,7 @@ mod tests {
         let root = crate::downloader::tests::tempdir();
         let installed = manifest_text(3, 100);
         std::fs::write(
-            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            installed_at(&root, crate::manifest::EngineId::DS4VISION),
             &installed,
         )
         .expect("installed");
@@ -2894,7 +2826,7 @@ mod tests {
         let (called, spawn) = spy_spawn();
         check_manifest_at_startup_in(
             &root,
-            crate::manifest::ModelSet::Ds4,
+            crate::manifest::EngineId::DS4VISION,
             &|_| Some(remote_text.clone()),
             &spawn,
             &|_, _| None,
@@ -2920,7 +2852,7 @@ mod tests {
         error: Option<&str>,
     ) -> crate::downloader::State {
         crate::downloader::State {
-            set: crate::manifest::ModelSet::Ds4.as_str().to_string(),
+            set: crate::manifest::EngineId::DS4VISION.as_str().to_string(),
             pid: std::process::id(),
             version,
             current: String::new(),
@@ -2943,7 +2875,7 @@ mod tests {
         let root = crate::downloader::tests::tempdir();
         let installed = manifest_text(3, 100);
         std::fs::write(
-            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            installed_at(&root, crate::manifest::EngineId::DS4VISION),
             &installed,
         )
         .expect("installed");
@@ -2958,7 +2890,7 @@ mod tests {
         let (called, spawn) = spy_spawn();
         check_manifest_at_startup_in(
             &root,
-            crate::manifest::ModelSet::Ds4,
+            crate::manifest::EngineId::DS4VISION,
             &|_| Some(remote_text.clone()),
             &spawn,
             &|_, _| Some(true),
@@ -2974,7 +2906,7 @@ mod tests {
         let root = crate::downloader::tests::tempdir();
         let installed = manifest_text(3, 100);
         std::fs::write(
-            crate::manifest::installed_path_in(&root, crate::manifest::ModelSet::Ds4),
+            installed_at(&root, crate::manifest::EngineId::DS4VISION),
             &installed,
         )
         .expect("installed");
@@ -2989,7 +2921,7 @@ mod tests {
         let (called, spawn) = spy_spawn();
         check_manifest_at_startup_in(
             &root,
-            crate::manifest::ModelSet::Ds4,
+            crate::manifest::EngineId::DS4VISION,
             &|_| Some(remote_text.clone()),
             &spawn,
             &|_, _| panic!("a Delete-cancelled version must not even reach the confirm prompt"),
@@ -3008,7 +2940,7 @@ mod tests {
         let root = crate::downloader::tests::tempdir();
         std::fs::create_dir_all(&root).expect("root");
         std::fs::write(
-            crate::manifest::local_path_for_in(&root, crate::manifest::ModelSet::Ds4, "main")
+            crate::manifest::local_path_for_in(&root, crate::manifest::EngineId::DS4VISION, "main")
                 .expect("main path"),
             vec![0u8; 100],
         )
@@ -3018,7 +2950,7 @@ mod tests {
         let (called, spawn) = spy_spawn();
         check_manifest_at_startup_in(
             &root,
-            crate::manifest::ModelSet::Ds4,
+            crate::manifest::EngineId::DS4VISION,
             &|_| Some(text.clone()),
             &spawn,
             &|_, _| panic!("an adopt must not reach the confirm prompt"),
@@ -3026,7 +2958,7 @@ mod tests {
         assert!(!called.load(Ordering::Relaxed), "an adopt must not spawn");
         let recorded = crate::manifest::read_at(&crate::manifest::installed_path_in(
             &root,
-            crate::manifest::ModelSet::Ds4,
+            crate::manifest::EngineId::DS4VISION,
         ))
         .expect("installed manifest recorded");
         assert_eq!(recorded.version, 3);

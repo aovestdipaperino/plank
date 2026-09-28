@@ -33,6 +33,18 @@ pub enum ModelFamily {
     Ds41,
 }
 
+impl ModelFamily {
+    /// The family's short name, as diagnostics spell it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ds4 => "ds4",
+            Self::Ds41 => "ds41",
+            Self::Qwen => "qwen",
+        }
+    }
+}
+
 impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
     /// The two enums answer the same question from different sides — the
     /// dialect is read from the engine's reported shape name after opening,
@@ -271,10 +283,8 @@ pub fn file_detail(label: &str, path: Option<&Path>) -> Option<String> {
 /// the engine's own complaint about it is a parse error deep in a tensor
 /// table. plank already knows the expected byte count, so it can say so.
 #[must_use]
-pub fn artifact_size_mismatch(path: &Path, family: ModelFamily) -> Option<String> {
+pub fn artifact_size_mismatch(path: &Path) -> Option<String> {
     let on_disk = std::fs::metadata(path).ok()?.len();
-    let set = crate::manifest::ModelSet::for_family(family);
-    let manifest = crate::manifest::read_at(&crate::manifest::installed_path(set))?;
     let same = |a: &Path, b: &Path| {
         a == b
             || match (a.canonicalize(), b.canonicalize()) {
@@ -282,13 +292,26 @@ pub fn artifact_size_mismatch(path: &Path, family: ModelFamily) -> Option<String
                 _ => false,
             }
     };
-    let (_, entry) = manifest.files.iter().find(|(kind, _)| {
-        crate::manifest::local_path_for(set, kind).is_some_and(|p| same(&p, path))
-    })?;
+    let (id, entry) = crate::manifest::installed_ids_in(&crate::manifest::plank_dir())
+        .into_iter()
+        .filter_map(|id| {
+            Some((
+                id,
+                crate::manifest::read_at(&crate::manifest::installed_path(id))?,
+            ))
+        })
+        .find_map(|(id, m)| {
+            m.files
+                .into_iter()
+                .find(|(role, _)| {
+                    crate::manifest::local_path_for(id, role).is_some_and(|p| same(&p, path))
+                })
+                .map(|f| (id, f.1))
+        })?;
     (entry.bytes != on_disk).then(|| {
         format!(
             "- SIZE MISMATCH: the installed {} manifest records {} for this artifact, but the file is {} — an interrupted or truncated install",
-            set.as_str(),
+            id.as_str(),
             crate::kvpane::human_bytes(entry.bytes),
             crate::kvpane::human_bytes(on_disk)
         )
@@ -370,7 +393,7 @@ pub fn open_failure_detail(attempt: &OpenAttempt) -> String {
         msg,
         "
 - opened as: {} family, {backend} backend, context {ctx_size} tokens",
-        crate::manifest::ModelSet::for_family(family).as_str()
+        family.as_str()
     );
     if let Some(line) = file_detail("model file", Some(path)) {
         let _ = write!(
@@ -379,7 +402,7 @@ pub fn open_failure_detail(attempt: &OpenAttempt) -> String {
 {line}"
         );
     }
-    if let Some(line) = artifact_size_mismatch(path, family) {
+    if let Some(line) = artifact_size_mismatch(path) {
         let _ = write!(
             msg,
             "

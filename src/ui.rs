@@ -9640,8 +9640,13 @@ the original is frozen and listed in /tree"
         // the transcript.
         let model_name = self.engine.model_name();
         let syntax = self.tool_syntax();
-        let family = crate::manifest::ModelSet::for_family(crate::gguf::ModelFamily::from(syntax));
-        let installed = crate::manifest::read_at(&crate::manifest::installed_path(family));
+        let family = crate::gguf::ModelFamily::from(syntax);
+        // Interim: the first installed engine, until the active engine is
+        // tracked explicitly.
+        let installed = crate::manifest::installed_ids_in(&crate::manifest::plank_dir())
+            .first()
+            .copied()
+            .and_then(|id| crate::manifest::read_at(&crate::manifest::installed_path(id)));
         let artifact_version = installed.as_ref().map(|m| m.version);
         // The `main` entry is the weights themselves; its URL carries the
         // Hugging Face repo the set came from.
