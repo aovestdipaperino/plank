@@ -8,14 +8,28 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::manifest::FileEntry;
 
 /// The catalog shipped in this build, and the offline first-launch fallback.
 pub const COMPILED_IN: &str = include_str!("../engines.json");
 
-/// The default engine when no layer names a valid one.
-const FALLBACK_DEFAULT: &str = "ds4vision";
+/// The default engine when no layer names a valid one: derived from the
+/// compiled-in catalog's own `default` field.
+fn compiled_in_default() -> &'static str {
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let raw: serde_json::Value = serde_json::from_str(COMPILED_IN)
+                .expect("compiled-in engines catalog must be valid JSON");
+            raw.get("default")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .expect("compiled-in engines catalog must declare a default")
+        })
+        .as_str()
+}
 
 /// Roles this build knows how to load. Others are carried in `raw` only.
 pub const ROLES: [&str; 3] = ["main", "mtp", "vision"];
@@ -102,7 +116,7 @@ impl Catalog {
     pub fn default_name(&self) -> &str {
         match &self.default {
             Some(d) if self.engines.contains_key(d) => d,
-            _ => FALLBACK_DEFAULT,
+            _ => compiled_in_default(),
         }
     }
 
@@ -244,6 +258,12 @@ mod tests {
         }
         assert!(c.get("ds4vision").unwrap().files.contains_key("mtp"));
         assert!(!c.get("qwen").unwrap().files.contains_key("mtp"));
+    }
+
+    #[test]
+    fn the_fallback_default_is_the_compiled_in_catalogs_own() {
+        let raw: serde_json::Value = serde_json::from_str(COMPILED_IN).unwrap();
+        assert_eq!(compiled_in_default(), raw["default"].as_str().unwrap());
     }
 
     #[test]
