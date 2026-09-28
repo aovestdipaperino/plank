@@ -4,11 +4,14 @@
 //! GPU yield: unloading the local model so a child command can have the GPU.
 //!
 //! A command that needs the GPU plank's loaded model occupies (the first is
-//! `mex`, which runs a diffusion model on Metal) follows a small protocol: it
-//! exits with [`EXIT_CODE`] and prints a line starting with [`MARKER`]. plank
-//! exports [`ENV_VAR`]`=1` into every bash-tool job, and into the user's `!`
-//! and `!!` shell escapes, so the tool knows plank can step aside. When a
-//! foreground bash call or a shell escape ends that way, the agent saves the
+//! `mex`, which runs a diffusion model on Metal) follows a small protocol.
+//! plank exports [`ENV_VAR`]`=1` into every bash-tool job, and into the
+//! user's `!` and `!!` shell escapes, so the tool knows plank can step aside,
+//! and [`FILE_ENV_VAR`] naming a fresh signal file for that one run. The tool
+//! asks for the GPU by writing one line into that file (the primary signal:
+//! it survives pipes, `2>&1` and `| tail`, which replace the exit status), or
+//! by exiting with [`EXIT_CODE`] and printing a line starting with [`MARKER`].
+//! When a foreground bash call or a shell escape ends either way, the agent saves the
 //! live KV, drops the engine (which frees the Metal state and the model lock),
 //! runs the command once more, reopens the model with its startup parameters
 //! and restores the KV (`docs/ARCHITECTURE.md`, "GPU yield").
@@ -30,6 +33,80 @@ pub const MARKER: &str = "GPU not available";
 
 /// Environment variable plank sets to `1` in the bash tool's jobs.
 pub const ENV_VAR: &str = "PLANK_GPU_YIELD";
+
+/// Environment variable naming the run's signal file (see [`signal_path`]).
+/// plank never creates the file; a tool that wants the GPU writes one line
+/// into it, whatever it then exits with.
+pub const FILE_ENV_VAR: &str = "PLANK_GPU_YIELD_FILE";
+
+/// Longest signal line kept for the notice, in characters.
+const SIGNAL_LINE_MAX: usize = 200;
+
+/// Most bytes of a signal file ever read: one line is all it may carry.
+const SIGNAL_READ_MAX: u64 = 4096;
+
+/// A fresh signal-file path for one command run, in a directory only this
+/// user can enter (`$TMPDIR/plank-gpu-yield-<uid>`, mode 0700). The file
+/// itself is not created. `None` when the directory cannot be made safe, in
+/// which case the run gets no [`FILE_ENV_VAR`] and only the exit-status rule
+/// applies.
+#[must_use]
+pub fn signal_path() -> Option<PathBuf> {
+    let dir = signal_dir(&std::env::temp_dir())?;
+    Some(dir.join(format!("signal-{}", nonce())))
+}
+
+/// Creates (or checks) the per-user signal directory under `base`: a real
+/// directory, owned by this user, mode 0700.
+fn signal_dir(base: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    // SAFETY: getuid(2) has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let dir = base.join(format!("plank-gpu-yield-{uid}"));
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => return Some(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    if !meta.is_dir() || meta.uid() != uid {
+        return None;
+    }
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    Some(dir)
+}
+
+/// Reads a run's signal file and deletes it, whatever it held. Returns the
+/// first non-blank line (control characters dropped, capped at
+/// [`SIGNAL_LINE_MAX`] characters) when the file exists and is non-empty, or
+/// [`MARKER`] when it holds only blanks; `None` when there is no file or it
+/// is empty.
+#[must_use]
+pub fn take_signal(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path)
+        .and_then(|f| f.take(SIGNAL_READ_MAX).read_to_end(&mut bytes))
+        .is_ok();
+    let _ = std::fs::remove_file(path);
+    if !read || bytes.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let line = text
+        .lines()
+        .map(|l| {
+            l.chars()
+                .filter(|c| !c.is_control())
+                .take(SIGNAL_LINE_MAX)
+                .collect::<String>()
+        })
+        .map(|l| l.trim().to_owned())
+        .find(|l| !l.is_empty());
+    Some(line.unwrap_or_else(|| MARKER.to_owned()))
+}
 
 /// Reopens the local engine with the parameters it was first opened with.
 ///
@@ -114,19 +191,28 @@ pub fn check_model_files<'p>(
 pub struct ForegroundExit {
     /// The command's exit status.
     pub exit_status: i64,
-    /// [`needs_gpu`] over the command's whole output.
+    /// Whether the command asked for the GPU: its signal file, or
+    /// [`needs_gpu`] over its whole output.
     pub needs_gpu: bool,
+    /// The line the command wrote into its signal file, when it did.
+    pub signal: Option<String>,
     /// The sandbox policy the command actually ran under, grants included, so
     /// the re-run needs no second permission prompt. `None` ran unsandboxed.
     pub sandbox: Option<crate::sandbox::Sandbox>,
 }
 
-/// The one line shown when the cycle starts.
+/// The one line shown when the cycle starts, quoting the command's signal
+/// line when it wrote one.
 #[must_use]
-pub fn notice(command: &str) -> String {
+pub fn notice(command: &str, signal: Option<&str>) -> String {
     let first = command.lines().next().unwrap_or("").trim();
     let name = first.split_whitespace().next().unwrap_or("the command");
-    format!("plank: {name} needs the GPU; unloading the model and running it again")
+    match signal {
+        Some(line) => format!(
+            "plank: {name} needs the GPU ({line}); unloading the model and running it again"
+        ),
+        None => format!("plank: {name} needs the GPU; unloading the model and running it again"),
+    }
 }
 
 /// The steps of one cycle, as the agent performs them. Split out so the order
@@ -175,12 +261,17 @@ pub enum CycleEnd {
 }
 
 /// Runs one cycle: notice, save, release, re-run, reopen, restore. Returns the
-/// re-run's result and how the engine came back.
+/// re-run's result and how the engine came back. `signal` is the line the
+/// first run wrote into its signal file, for the notice.
 ///
 /// The re-run happens exactly once, whatever it returns: a command that fails
 /// the same way again gets that result, and the model is reloaded regardless.
-pub fn run_cycle<H: CycleHost>(host: &mut H, command: &str) -> (H::Output, CycleEnd) {
-    host.notice(&notice(command));
+pub fn run_cycle<H: CycleHost>(
+    host: &mut H,
+    command: &str,
+    signal: Option<&str>,
+) -> (H::Output, CycleEnd) {
+    host.notice(&notice(command, signal));
     let snapshot = host.save();
     host.release();
     let output = host.rerun();
@@ -400,9 +491,66 @@ mod tests {
     #[test]
     fn the_notice_names_the_command() {
         assert_eq!(
-            notice("mex generate --prompt cat"),
+            notice("mex generate --prompt cat", None),
             "plank: mex needs the GPU; unloading the model and running it again"
         );
+        assert_eq!(
+            notice("mex x.md", Some("GPU not available: held by plank")),
+            "plank: mex needs the GPU (GPU not available: held by plank); \
+             unloading the model and running it again"
+        );
+    }
+
+    #[test]
+    fn each_signal_path_is_fresh_in_a_private_directory_and_not_created() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let a = signal_path().expect("a path");
+        let b = signal_path().expect("a path");
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), b.parent());
+        assert!(!a.exists(), "plank never creates the file");
+        let dir = a.parent().unwrap();
+        assert!(dir.starts_with(std::env::temp_dir()));
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn a_loose_signal_directory_is_tightened_and_a_file_in_its_place_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = std::env::temp_dir().join(format!("plank-gpuyield-sigdir-{}", nonce()));
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = signal_dir(&base).expect("created");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(signal_dir(&base).as_deref(), Some(dir.as_path()));
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::write(&dir, b"").unwrap();
+        assert!(signal_dir(&base).is_none(), "not a directory");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_signal_is_read_once_and_the_file_always_goes() {
+        let dir = std::env::temp_dir().join(format!("plank-gpuyield-sig-{}", nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("signal");
+        assert_eq!(take_signal(&path), None, "no file");
+        std::fs::write(&path, "\nGPU not available: held\x07 by plank\nmore\n").unwrap();
+        assert_eq!(
+            take_signal(&path).as_deref(),
+            Some("GPU not available: held by plank")
+        );
+        assert!(!path.exists());
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(take_signal(&path), None, "an empty file is no signal");
+        assert!(!path.exists(), "deleted anyway");
+        std::fs::write(&path, " \n").unwrap();
+        assert_eq!(take_signal(&path).as_deref(), Some(MARKER));
+        std::fs::write(&path, "x".repeat(10_000)).unwrap();
+        assert_eq!(take_signal(&path).map(|l| l.len()), Some(SIGNAL_LINE_MAX));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Records every step in order, with scripted outcomes.
@@ -463,7 +611,7 @@ mod tests {
             have_snapshot: true,
             ..Recorder::default()
         };
-        let (out, end) = run_cycle(&mut host, "mex x");
+        let (out, end) = run_cycle(&mut host, "mex x", None);
         assert_eq!(out, "second run\n");
         assert_eq!(end, CycleEnd::Restored);
         assert_eq!(
@@ -480,7 +628,7 @@ mod tests {
             restore_fails: true,
             ..Recorder::default()
         };
-        let (_, end) = run_cycle(&mut host, "mex");
+        let (_, end) = run_cycle(&mut host, "mex", None);
         assert_eq!(end, CycleEnd::Rebuilt);
         assert_eq!(host.log.last().map(String::as_str), Some("rebuild"));
     }
@@ -488,7 +636,7 @@ mod tests {
     #[test]
     fn no_snapshot_rebuilds_without_a_restore() {
         let mut host = Recorder::default();
-        let (_, end) = run_cycle(&mut host, "mex");
+        let (_, end) = run_cycle(&mut host, "mex", None);
         assert_eq!(end, CycleEnd::Rebuilt);
         assert!(!host.log.iter().any(|s| s.starts_with("restore")));
     }
@@ -500,7 +648,7 @@ mod tests {
             reopen_fails: true,
             ..Recorder::default()
         };
-        let (out, end) = run_cycle(&mut host, "mex");
+        let (out, end) = run_cycle(&mut host, "mex", None);
         assert_eq!(out, "second run\n");
         assert_eq!(end, CycleEnd::Unloaded("no model".into()));
         assert_eq!(host.log.last().map(String::as_str), Some("park:kv"));

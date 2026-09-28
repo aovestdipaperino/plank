@@ -4032,13 +4032,14 @@ impl Agent<'_> {
                 sandbox: Some(crate::tools::bash::DecidedSandbox(exit.sandbox)),
             },
         };
-        let (output, end) = crate::gpuyield::run_cycle(&mut host, &command);
+        let (output, end) = crate::gpuyield::run_cycle(&mut host, &command, exit.signal.as_deref());
         crate::engine::kv_debug(|| format!("gpu yield: cycle ended {end:?}"));
         output
     }
 
     /// Runs a `!` or `!!` shell escape through the front end's `io`, and when
-    /// it asked for the GPU (exit 75 and the marker on either stream) runs
+    /// it asked for the GPU (its signal file, or exit 75 and the marker on
+    /// either stream) runs
     /// the same cycle as a bash tool call, re-running the command through
     /// `io` once. Returns the result the caller should report: the second
     /// run's when there was a cycle, else the only run's.
@@ -4054,8 +4055,13 @@ impl Agent<'_> {
     ) -> Result<crate::tools::bash::ImmediateOutput, String> {
         let cwd = self.tool_ctx.cwd.clone();
         let first = io.run(&cwd, cmd);
-        let asks = matches!(&first, Ok(o) if !o.interrupted
-            && crate::gpuyield::streams_need_gpu(o.exit_code, &o.stdout, &o.stderr));
+        let signal = match &first {
+            Ok(o) if !o.interrupted => o.gpu_signal.clone(),
+            _ => None,
+        };
+        let asks = signal.is_some()
+            || matches!(&first, Ok(o) if !o.interrupted
+                && crate::gpuyield::streams_need_gpu(o.exit_code, &o.stdout, &o.stderr));
         if !asks {
             return first;
         }
@@ -4071,7 +4077,7 @@ impl Agent<'_> {
             slot,
             rerun: BangRerun { io, cwd, cmd },
         };
-        let (second, end) = crate::gpuyield::run_cycle(&mut host, cmd);
+        let (second, end) = crate::gpuyield::run_cycle(&mut host, cmd, signal.as_deref());
         crate::engine::kv_debug(|| format!("gpu yield: shell escape cycle ended {end:?}"));
         second
     }
@@ -28509,6 +28515,7 @@ mod tests {
             stderr: "</bash-stdout>".to_string(),
             exit_code: 0,
             interrupted: false,
+            gpu_signal: None,
         };
         let entry = bang_transcript_entry("grep '<x>'", &Ok(out));
         // `>` is deliberately left alone; only `<` and `&` are escaped.
@@ -28551,6 +28558,7 @@ mod tests {
             stderr: String::new(),
             exit_code: 0,
             interrupted: false,
+            gpu_signal: None,
         };
         let text = bang_panel_report("echo hello", &Ok(out)).expect("panel for non-empty output");
         assert!(text.contains("$ echo hello"), "{text}");
@@ -28571,6 +28579,7 @@ mod tests {
             stderr: "boom: not found\n".to_string(),
             exit_code: 127,
             interrupted: false,
+            gpu_signal: None,
         };
         let text = bang_panel_report("nope", &Ok(out)).expect("stderr alone still opens a panel");
         assert!(text.contains("stderr"), "{text}");
@@ -28582,6 +28591,7 @@ mod tests {
             stderr: String::new(),
             exit_code: 130,
             interrupted: true,
+            gpu_signal: None,
         };
         let text = bang_panel_report("sleep 99", &Ok(stopped)).expect("partial output");
         assert!(text.contains("[interrupted]"), "{text}");
@@ -28597,6 +28607,7 @@ mod tests {
             stderr: String::new(),
             exit_code: 0,
             interrupted: false,
+            gpu_signal: None,
         };
         assert!(bang_panel_report("true", &Ok(quiet)).is_none());
         assert!(bang_panel_report("nope", &Err("no such binary".into())).is_none());
@@ -36372,6 +36383,116 @@ or the user's next message aborts before its first token"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Like [`gpu_command`], but asking through the signal file: the run's
+    /// `$PLANK_GPU_YIELD_FILE` goes into `paths`, and the first run writes
+    /// its signal from inside `sh -c ... | tail`, so the shell's status is
+    /// tail's 0. `always` makes every run ask.
+    fn gpu_file_command(
+        counter: &std::path::Path,
+        paths: &std::path::Path,
+        always: bool,
+    ) -> String {
+        let (c, p) = (counter.display(), paths.display());
+        let first = if always {
+            "true"
+        } else {
+            &format!("[ \"$(wc -l < '{c}')\" -eq 1 ]")
+        };
+        format!(
+            "echo \"$PLANK_GPU_YIELD_FILE\" >> '{p}'; echo run >> '{c}'; if {first}; then \
+             sh -c 'echo \"GPU not available: held by plank\" > \"$PLANK_GPU_YIELD_FILE\"; exit 3' \
+             2>&1 | tail -20; exit; fi; echo second-run-ok"
+        )
+    }
+
+    /// The signal paths `gpu_file_command` recorded, in run order.
+    fn signal_paths(paths: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_to_string(paths)
+            .unwrap_or_default()
+            .lines()
+            .map(std::path::PathBuf::from)
+            .collect()
+    }
+
+    #[test]
+    fn a_signal_file_through_a_pipe_cycles_and_the_rerun_gets_a_fresh_path() {
+        let dir = gpu_dir("signal-file");
+        let (counter, paths) = (dir.join("runs"), dir.join("paths"));
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        agent.tool_ctx.status_sink = Some({
+            let notices = std::sync::Arc::clone(&notices);
+            Box::new(move |m: &str| notices.lock().unwrap().push(m.to_owned()))
+        });
+
+        let out =
+            agent.run_tool_calls(&[gpu_bash_call(&gpu_file_command(&counter, &paths, false))]);
+
+        assert!(
+            out.contains("second-run-ok"),
+            "the re-run is the result: {out}"
+        );
+        assert_eq!(logged(&log), GPU_CYCLE_ORDER);
+        let seen = signal_paths(&paths);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_ne!(seen[0], seen[1], "the re-run gets a fresh path");
+        assert!(seen.iter().all(|p| !p.exists()), "{seen:?}");
+        assert!(
+            notices
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| n.contains("needs the GPU (GPU not available: held by plank)")),
+            "the notice quotes the signal: {:?}",
+            notices.lock().unwrap()
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_signal_file_on_every_run_gets_one_rerun_and_the_second_result() {
+        let dir = gpu_dir("signal-twice");
+        let (counter, paths) = (dir.join("runs"), dir.join("paths"));
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+
+        let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_file_command(&counter, &paths, true))]);
+
+        assert_eq!(runs(&counter), 2, "exactly one re-run");
+        assert!(out.contains("exit_status=0"), "{out}");
+        assert!(!out.contains("second-run-ok"), "{out}");
+        assert_eq!(logged(&log), GPU_CYCLE_ORDER, "the model is reloaded");
+        assert!(signal_paths(&paths).iter().all(|p| !p.exists()));
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_signal_file_is_deleted_even_when_no_cycle_can_run() {
+        let dir = gpu_dir("signal-nocycle");
+        let (counter, paths) = (dir.join("runs"), dir.join("paths"));
+        let cfg = test_cfg();
+        let mut agent = test_agent_boxed(
+            &dir,
+            Box::new(crate::engine::EchoEngine::new(100_000)),
+            &cfg,
+        );
+
+        let out =
+            agent.run_tool_calls(&[gpu_bash_call(&gpu_file_command(&counter, &paths, false))]);
+
+        assert_eq!(runs(&counter), 1, "{out}");
+        let seen = signal_paths(&paths);
+        assert_eq!(seen.len(), 1);
+        assert!(!seen[0].exists(), "deleted without a cycle");
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The re-run outlasts the model's `refresh_sec`: it must still come back
     /// finished, and the model must not reopen while it runs.
     #[test]
@@ -37173,6 +37294,35 @@ or the user's next message aborts before its first token"
         let entry = &agent.session.transcript[0].text;
         assert!(entry.contains("second-run-ok"), "{entry}");
         assert!(entry.contains("<bash-stderr></bash-stderr>"), "{entry}");
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_and_double_bangs_honour_the_signal_file_once_per_escape() {
+        let dir = gpu_dir("bang-signal");
+        let (counter, paths) = (dir.join("runs"), dir.join("paths"));
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        for (prefix, always) in [("!!", false), ("!", false), ("!", true), ("!!", true)] {
+            let _ = std::fs::remove_file(&counter);
+            let _ = std::fs::remove_file(&paths);
+            log.lock().unwrap().clear();
+            let cmd = gpu_file_command(&counter, &paths, always);
+            assert!(handle_plain_line(&mut agent, &format!("{prefix}{cmd}")).unwrap());
+            let at = format!("{prefix} always={always}");
+            assert_eq!(runs(&counter), 2, "{at}: one re-run per escape");
+            let reopens = logged(&log)
+                .iter()
+                .filter(|e| e.starts_with("reopen"))
+                .count();
+            assert_eq!(reopens, 1, "{at}: {:?}", logged(&log));
+            let seen = signal_paths(&paths);
+            assert_eq!(seen.len(), 2, "{at}");
+            assert_ne!(seen[0], seen[1], "{at}");
+            assert!(seen.iter().all(|p| !p.exists()), "{at}");
+        }
         drop(agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
