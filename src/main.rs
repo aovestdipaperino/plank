@@ -920,10 +920,13 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // demand when the model can use it (the pinned Vision-Exp checkpoint);
         // any other DeepSeek checkpoint runs text-only.
         // Speculation is on by default; without `--mtp-model` a DeepSeek run
-        // resolves the default support GGUF and fetches it on demand
-        // (`--mtp-off` skips that). Kept local rather than written back into
-        // `cfg`: only the engine open needs it. A Qwen model skips both side
-        // artifacts, since it opens neither.
+        // takes its companion from the selected engine's `mtp` role and
+        // fetches it on demand (`--mtp-off` skips that). A run with no such
+        // companion — a bare `--model PATH`, or an engine that declares
+        // none — has speculation turned off instead of failing to open. Kept
+        // local rather than written back into `cfg`: only the engine open
+        // needs it. A Qwen model skips both side artifacts, since it opens
+        // neither.
         let mut tuning = cfg.engine.clone();
         let sel = cfg.selection.as_ref().expect("resolved by parse_config");
         plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;

@@ -427,8 +427,13 @@ pub fn ensure_role(sel: &crate::engines::Selection, role: &str, path: &Path) -> 
         return Err(format!("no {label} at {}", path.display()));
     };
     if !std::io::stdin().is_terminal() {
+        let hatch = if role == "mtp" {
+            "; pass --mtp-model <path> or turn speculation off with --mtp-off"
+        } else {
+            ""
+        };
         return Err(format!(
-            "no {label} at {}; run plank in a terminal to download it (~{:.1} GB), or put the file at that path",
+            "no {label} at {}; run plank in a terminal to download it (~{:.1} GB), or put the file at that path{hatch}",
             path.display(),
             gb(bytes)
         ));
@@ -540,6 +545,13 @@ pub fn ensure_side_artifacts(
             engine.mtp_path = None;
         }
         return Ok(());
+    }
+    if engine.mtp && engine.mtp_path.is_none() {
+        engine.mtp = false;
+        engine.mtp_strict = false;
+        eprintln!(
+            "note: speculative decoding disabled (no mtp companion for this model; pass --mtp-model <path> to enable it)"
+        );
     }
     if engine.mtp
         && !engine.mtp_path_explicit
@@ -2398,6 +2410,58 @@ mod tests {
             "the engine rejects a Qwen open with SSD streaming on"
         );
         let _ = std::fs::remove_file(model);
+    }
+
+    /// A Ds4-family run whose selection has no `mtp` companion at all (a bare
+    /// `--model PATH`, or a local-layer engine with no `mtp` role) must not
+    /// leave `engine.mtp` on with a `None` path: `Ds4Model::open` would then
+    /// pass `dspark: true` with a null path and the C engine refuses to open
+    /// ("ds4: --dspark requires --mtp-model FILE"). Speculation must be turned
+    /// off instead. No companion is stubbed here on purpose — if the gate
+    /// regressed, `ensure_role` would try to prompt on a non-terminal stdin
+    /// and fail.
+    #[test]
+    fn a_ds4_model_with_no_mtp_companion_disables_speculation() {
+        // An unreadable/non-GGUF path reads as `Ds4` (`gguf::family_of`'s
+        // fallthrough), so no real checkpoint is needed for this family.
+        let model =
+            std::env::temp_dir().join(format!("plank-side-no-mtp-{}.absent", std::process::id()));
+        let sel = crate::engines::Selection {
+            id: Some(crate::manifest::EngineId::DS4VISION),
+            main: model.clone(),
+            mtp: None,
+            vision: None,
+            managed_main: false,
+        };
+        let mut e = crate::config::EngineTuning::default();
+        assert!(e.mtp, "speculation defaults to on");
+        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert!(
+            !e.mtp,
+            "speculation disabled: no mtp companion for this model"
+        );
+        assert_eq!(e.mtp_path, None);
+    }
+
+    /// Invariant guarded by the fix above: `Ds4Model::open` must never be
+    /// asked to pass `dspark: true` with no path, so `mtp` and `mtp_path`
+    /// must never disagree in that direction after `ensure_side_artifacts`.
+    #[test]
+    fn ensure_side_artifacts_never_leaves_mtp_on_with_no_path() {
+        let model = std::env::temp_dir().join(format!(
+            "plank-side-no-mtp-inv-{}.absent",
+            std::process::id()
+        ));
+        let sel = crate::engines::Selection {
+            id: Some(crate::manifest::EngineId::DS4VISION),
+            main: model,
+            mtp: None,
+            vision: None,
+            managed_main: false,
+        };
+        let mut e = crate::config::EngineTuning::default();
+        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert!(!e.mtp || e.mtp_path.is_some());
     }
 
     /// A missing model that is *not* the `DeepSeek` default must never trigger

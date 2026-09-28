@@ -310,8 +310,9 @@ fn report_text_only(
         );
     } else {
         eprintln!(
-            "note: the selected engine declares no vision encoder, so it runs \
-             text-only; view_image will be refused"
+            "note: no vision encoder is configured for this model (a bare --model path \
+             gets none; an engine from engines.json supplies one), so it runs text-only; \
+             view_image will be refused"
         );
     }
 }

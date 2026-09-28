@@ -300,7 +300,9 @@ pub struct EngineTuning {
     /// One name, one meaning — "predict more than one token per step" — and a
     /// different mechanism per family. A `DeepSeek` run speculates with its
     /// `DSpark` draft checkpoint, taken from `--mtp` when given and otherwise
-    /// resolved to `~/.plank/ds4flash.dspark.gguf` and downloaded if absent. A
+    /// resolved from the selected engine's `mtp` role and downloaded if
+    /// absent; a run with no such companion (a bare `--model PATH`, or an
+    /// engine that declares none) has speculation turned off instead. A
     /// Qwen run speculates with the MTP block embedded in its own main GGUF,
     /// so it needs no companion for this at all — its `--mtp` path is the PLE
     /// sidecar, which is required whether speculation is on or off.
