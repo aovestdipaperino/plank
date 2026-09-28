@@ -268,9 +268,9 @@ const STEADY_MIN_TOKENS: i32 = 8;
 
 /// Whether the engine is handed the vision encoder for this model.
 ///
-/// The encoder GGUF sits beside the main model at
-/// `~/.plank/ds4flash.vision.gguf` and is downloaded at startup when the model
-/// can use it. It is passed only when the C would accept it: `ds4_engine_open`
+/// The encoder GGUF is the selected engine's `vision` role (for the default
+/// engine, `~/.plank/ds4vision.vision.gguf`) and is downloaded at startup when
+/// the model can use it. It is passed only when the C would accept it: `ds4_engine_open`
 /// fails outright when `vision_path` is set and the main GGUF is not the pinned
 /// Vision-Exp checkpoint ("--vision requires ... the pinned `DeepSeek` V4 Flash
 /// Vision-Exp model"), so a language-only or re-quantized `DeepSeek`
@@ -294,7 +294,7 @@ fn model_supports_vision(family: crate::gguf::ModelFamily, path: &Path) -> bool 
 fn report_text_only(
     family: crate::gguf::ModelFamily,
     model_supports_vision: bool,
-    vision_path: &Path,
+    vision_path: Option<&Path>,
 ) {
     if family == crate::gguf::ModelFamily::Qwen {
         eprintln!("note: Qwen3.8 runs text-only in plank; view_image will be refused");
@@ -303,10 +303,16 @@ fn report_text_only(
             "note: this checkpoint is not the DeepSeek V4 Flash Vision-Exp model, \
              so it runs text-only; view_image will be refused"
         );
-    } else {
+    } else if let Some(vision_path) = vision_path {
         eprintln!(
             "warning: vision encoder not loaded from {}; view_image will be refused",
             vision_path.display()
+        );
+    } else {
+        eprintln!(
+            "note: no vision encoder is configured for this model (a bare --model path \
+             gets none; an engine from engines.json supplies one), so it runs text-only; \
+             view_image will be refused"
         );
     }
 }
@@ -373,13 +379,15 @@ impl Ds4Model {
         let mtp_path = mtp_companion(family, tuning.mtp_path.as_deref());
         let c_mtp = c_opt_path(mtp_path, "mtp model")?;
         let c_steering = c_opt_path(tuning.dir_steering_file.as_deref(), "dir-steering file")?;
-        let vision_path = crate::download::default_vision_path();
+        // The encoder the selected engine declares, passed only to a model
+        // that can take one: the engine refuses to open any other checkpoint
+        // with an encoder attached.
         let model_supports_vision = model_supports_vision(family, path);
-        let c_vision = if model_supports_vision {
-            c_opt_path(Some(&vision_path), "vision encoder")?
-        } else {
-            None
-        };
+        let vision_path = tuning
+            .vision_path
+            .as_deref()
+            .filter(|_| model_supports_vision);
+        let c_vision = c_opt_path(vision_path, "vision encoder")?;
         let as_ptr = |c: &Option<CString>| c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let opts = ffi::Ds4EngineOptions {
             model_path: c_path.as_ptr(),
@@ -450,7 +458,7 @@ impl Ds4Model {
             // Everything the message can establish without the engine lives in
             // `gguf`, which is always compiled and so CI-tested; this side
             // supplies only what is FFI-shaped.
-            let vision = model_supports_vision.then_some(vision_path.as_path());
+            let vision = vision_path;
             return Err(EngineError::new(crate::gguf::open_failure_detail(
                 &crate::gguf::OpenAttempt {
                     path,
@@ -466,7 +474,7 @@ impl Ds4Model {
         }
         // SAFETY: `engine` is non-null and valid, checked just above.
         if !unsafe { ffi::ds4_engine_has_vision(engine) } {
-            report_text_only(family, model_supports_vision, &vision_path);
+            report_text_only(family, model_supports_vision, vision_path);
         }
         Ok(Self {
             engine,

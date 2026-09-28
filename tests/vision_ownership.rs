@@ -35,9 +35,9 @@ fn write_test_png(path: &std::path::Path) {
 
 #[test]
 fn two_turns_over_an_image_message_do_not_double_free_the_embedding() {
-    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    let model = home.join(".plank/ds4flash.gguf");
-    let vision = home.join(".plank/ds4flash.vision.gguf");
+    let id = plank::manifest::EngineId::DS4VISION;
+    let model = plank::manifest::local_path_for(id, "main").expect("main role");
+    let vision = plank::manifest::local_path_for(id, "vision").expect("vision role");
     if !model.exists() || !vision.exists() {
         eprintln!("skipping: no model at {} (+ vision)", model.display());
         return;
@@ -52,6 +52,7 @@ fn two_turns_over_an_image_message_do_not_double_free_the_embedding() {
     // is about ownership, not decode speed, so keep the plain target path.
     let tuning = plank::config::EngineTuning {
         mtp: false,
+        vision_path: Some(vision.clone()),
         ..plank::config::EngineTuning::default()
     };
     let mut session = plank::ds4engine::Ds4Session::open(
@@ -146,9 +147,9 @@ fn two_turns_over_an_image_message_do_not_double_free_the_embedding() {
 /// every way that could break the section match — so assert the image lands.
 #[test]
 fn a_view_image_tool_result_grounds_its_image() {
-    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    let model = home.join(".plank/ds4flash.gguf");
-    let vision = home.join(".plank/ds4flash.vision.gguf");
+    let id = plank::manifest::EngineId::DS4VISION;
+    let model = plank::manifest::local_path_for(id, "main").expect("main role");
+    let vision = plank::manifest::local_path_for(id, "vision").expect("vision role");
     if !model.exists() || !vision.exists() {
         eprintln!("skipping: no model at {} (+ vision)", model.display());
         return;
@@ -161,6 +162,7 @@ fn a_view_image_tool_result_grounds_its_image() {
 
     let tuning = plank::config::EngineTuning {
         mtp: false,
+        vision_path: Some(vision.clone()),
         ..plank::config::EngineTuning::default()
     };
     let mut session = plank::ds4engine::Ds4Session::open(

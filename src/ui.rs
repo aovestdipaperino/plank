@@ -3725,11 +3725,18 @@ impl Agent<'_> {
             return "Tool error: view_image requires path\n".to_string();
         }
         if !self.engine.has_vision() {
-            return format!(
-                "{}Expected the encoder at {}.\n",
-                crate::tools::VIEW_IMAGE_NO_ENCODER,
-                crate::download::default_vision_path().display()
+            let selection = crate::engines::active();
+            let hint = selection.and_then(|s| s.vision.as_deref()).map_or_else(
+                || {
+                    if selection.and_then(|s| s.id).is_some() {
+                        "The selected engine declares no vision encoder.".to_string()
+                    } else {
+                        "No vision encoder is configured for this model.".to_string()
+                    }
+                },
+                |p| format!("Expected the encoder at {}.", p.display()),
             );
+            return format!("{}{hint}\n", crate::tools::VIEW_IMAGE_NO_ENCODER);
         }
         match self.engine.vision_encode_file(path) {
             Ok(emb) => {
@@ -9640,8 +9647,9 @@ the original is frozen and listed in /tree"
         // the transcript.
         let model_name = self.engine.model_name();
         let syntax = self.tool_syntax();
-        let family = crate::manifest::ModelSet::for_family(crate::gguf::ModelFamily::from(syntax));
-        let installed = crate::manifest::read_at(&crate::manifest::installed_path(family));
+        let family = crate::gguf::ModelFamily::from(syntax);
+        let installed = crate::engines::active_id()
+            .and_then(|id| crate::manifest::read_at(&crate::manifest::installed_path(id)));
         let artifact_version = installed.as_ref().map(|m| m.version);
         // The `main` entry is the weights themselves; its URL carries the
         // Hugging Face repo the set came from.
@@ -9657,6 +9665,20 @@ the original is frozen and listed in /tree"
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
+        // `managed_main == false` with `id.is_some()` is an inheriting
+        // selection: a `.ggd` delta patched onto a managed engine's base, so
+        // `installed`/`weights_file`/`hf_url` above describe that base, not
+        // the patched clone actually loaded. Name the clone so `/repro`
+        // doesn't read as though the weights were unpatched.
+        let delta_clone_of = crate::engines::active()
+            .filter(|s| !s.managed_main && s.id.is_some())
+            .map(|s| {
+                self.cfg.model_delta.as_ref().map_or_else(
+                    || s.main.display().to_string(),
+                    crate::ggufdelta::Resolved::describe,
+                )
+            })
+            .unwrap_or_default();
         let meta = crate::repro::Meta {
             model: crate::repro::ModelMeta {
                 name: &model_name,
@@ -9670,6 +9692,7 @@ the original is frozen and listed in /tree"
                 companion: &companion,
                 weights_file: &weights_file,
                 hf_url: &hf_url,
+                delta_clone_of: &delta_clone_of,
             },
             version: &version,
             date: &date,

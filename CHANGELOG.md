@@ -6,7 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Engines come from an `engines.json` catalog.** A named *engine* is a main
+  model plus its optional `mtp` and `vision` companions. The catalog ships
+  compiled in, is refreshed from the repository at most once a day, and can
+  be extended or overridden by `~/.plank/engines.local.json`, the only layer
+  allowed to point a role at a local `path`. The built-in engines are
+  `ds4vision` (the default: DeepSeek V4 Flash with its drafter and vision
+  encoder), `ds41` and `qwen`. Upgrade checks and first-run downloads are per
+  engine.
+- **`--model <name|path>` picks an engine or a file.** An engine name selects
+  that engine with all its companions; anything else is read as a path.
+  `--model:<name>` insists on an engine name and errors on anything else, for
+  scripts that must never fall back to a path. `engine.model` in
+  `settings.json` takes the same values.
+
+### Removed
+
+- **`--qwen`.** Use `--model qwen`; the old flag now fails with that hint.
+
 ### Changed
+
+- **Breaking: the model files under `~/.plank` are renamed, one way.** At
+  the first launch of this release, `ds4flash.gguf`, `ds4flash.vision.gguf`
+  and `ds4flash.dspark.gguf` become `ds4vision.gguf`, `ds4vision.vision.gguf`
+  and `ds4vision.mtp.gguf`, the `ds41flash.*` files become `ds41.*`, the
+  `*.manifest` install records move to `~/.plank/engines/<engine>.installed.json`,
+  and staged downloads move to `~/.plank/staging/<engine>/`. The general
+  shape is `~/.plank/<engine>[.mtp|.vision].gguf`. Nothing is re-downloaded,
+  but an **older plank release sharing the same `~/.plank` will no longer find
+  its model** and will offer to download it again. A config that still names
+  `~/.plank/ds4flash.gguf` or `~/.plank/ds41flash.gguf` keeps working and
+  prints one line naming the engine to use instead.
+- **Breaking: a bare `--model PATH` gets no companions, unless it is a
+  managed engine's main.** A path to a managed engine's main file, under any
+  name (a symlink or hard link included), selects that engine with all its
+  companions. A `.ggd` delta whose base is a managed engine's main inherits
+  that engine's drafter and vision encoder, so an abliterated V4 delta still
+  gets both, while the patched clone itself is never upgraded or
+  re-downloaded. Any other path, or a delta on any other base, is loaded on
+  its own: no drafter and no vision encoder are looked up beside it, so a
+  DeepSeek model given this way runs without speculative decoding unless
+  `--mtp-model` names a drafter. To keep a custom file's companions, declare
+  it as a local engine with `path` entries in `~/.plank/engines.local.json`.
 
 - **`--profile` runs on a Qwen model.** The profile's prompt replaces the
   Qwen prompt the way it replaces the DeepSeek one, and

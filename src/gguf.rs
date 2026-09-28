@@ -33,6 +33,18 @@ pub enum ModelFamily {
     Ds41,
 }
 
+impl ModelFamily {
+    /// The family's short name, as diagnostics spell it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ds4 => "ds4",
+            Self::Ds41 => "ds41",
+            Self::Qwen => "qwen",
+        }
+    }
+}
+
 impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
     /// The two enums answer the same question from different sides — the
     /// dialect is read from the engine's reported shape name after opening,
@@ -271,10 +283,14 @@ pub fn file_detail(label: &str, path: Option<&Path>) -> Option<String> {
 /// the engine's own complaint about it is a parse error deep in a tensor
 /// table. plank already knows the expected byte count, so it can say so.
 #[must_use]
-pub fn artifact_size_mismatch(path: &Path, family: ModelFamily) -> Option<String> {
+pub fn artifact_size_mismatch(path: &Path) -> Option<String> {
+    artifact_size_mismatch_in(&crate::manifest::plank_dir(), path)
+}
+
+/// [`artifact_size_mismatch`] against the installed manifests under `root`.
+#[must_use]
+pub fn artifact_size_mismatch_in(root: &Path, path: &Path) -> Option<String> {
     let on_disk = std::fs::metadata(path).ok()?.len();
-    let set = crate::manifest::ModelSet::for_family(family);
-    let manifest = crate::manifest::read_at(&crate::manifest::installed_path(set))?;
     let same = |a: &Path, b: &Path| {
         a == b
             || match (a.canonicalize(), b.canonicalize()) {
@@ -282,13 +298,27 @@ pub fn artifact_size_mismatch(path: &Path, family: ModelFamily) -> Option<String
                 _ => false,
             }
     };
-    let (_, entry) = manifest.files.iter().find(|(kind, _)| {
-        crate::manifest::local_path_for(set, kind).is_some_and(|p| same(&p, path))
-    })?;
+    let (id, entry) = crate::manifest::installed_ids_in(root)
+        .into_iter()
+        .filter_map(|id| {
+            Some((
+                id,
+                crate::manifest::read_at(&crate::manifest::installed_path_in(root, id))?,
+            ))
+        })
+        .find_map(|(id, m)| {
+            m.files
+                .into_iter()
+                .find(|(role, _)| {
+                    crate::manifest::local_path_for_in(root, id, role)
+                        .is_some_and(|p| same(&p, path))
+                })
+                .map(|f| (id, f.1))
+        })?;
     (entry.bytes != on_disk).then(|| {
         format!(
             "- SIZE MISMATCH: the installed {} manifest records {} for this artifact, but the file is {} — an interrupted or truncated install",
-            set.as_str(),
+            id.as_str(),
             crate::kvpane::human_bytes(entry.bytes),
             crate::kvpane::human_bytes(on_disk)
         )
@@ -339,6 +369,13 @@ pub struct OpenAttempt<'a> {
 /// as a number.
 #[must_use]
 pub fn open_failure_detail(attempt: &OpenAttempt) -> String {
+    open_failure_detail_in(&crate::manifest::plank_dir(), attempt)
+}
+
+/// [`open_failure_detail`] with the size check reading installed manifests
+/// under `root`, so a test never looks at the real `~/.plank`.
+#[must_use]
+pub fn open_failure_detail_in(root: &Path, attempt: &OpenAttempt) -> String {
     use std::fmt::Write as _;
     let OpenAttempt {
         path,
@@ -370,7 +407,7 @@ pub fn open_failure_detail(attempt: &OpenAttempt) -> String {
         msg,
         "
 - opened as: {} family, {backend} backend, context {ctx_size} tokens",
-        crate::manifest::ModelSet::for_family(family).as_str()
+        family.as_str()
     );
     if let Some(line) = file_detail("model file", Some(path)) {
         let _ = write!(
@@ -379,7 +416,7 @@ pub fn open_failure_detail(attempt: &OpenAttempt) -> String {
 {line}"
         );
     }
-    if let Some(line) = artifact_size_mismatch(path, family) {
+    if let Some(line) = artifact_size_mismatch_in(root, path) {
         let _ = write!(
             msg,
             "
@@ -696,23 +733,29 @@ mod tests {
     /// line for anything that is fine.
     #[test]
     fn the_open_failure_message_names_every_fact_it_has() {
+        // An empty root: no installed manifest, so no size line, and the real
+        // `~/.plank` is never read.
+        let root = detail_tmp("root");
         let model = detail_tmp("attempt.gguf");
         std::fs::write(&model, vec![0u8; 4096]).expect("write");
         let drafter = detail_tmp("attempt.dspark.gguf");
         let _ = std::fs::remove_file(&drafter);
-        let msg = open_failure_detail(&OpenAttempt {
-            path: &model,
-            rc: -3,
-            engine_null: true,
-            family: ModelFamily::Qwen,
-            backend: "Metal",
-            ctx_size: 1_048_576,
-            companions: &[
-                ("mtp draft model", Some(&drafter)),
-                ("vision encoder", None),
-            ],
-            metal_kernels_missing: true,
-        });
+        let msg = open_failure_detail_in(
+            &root,
+            &OpenAttempt {
+                path: &model,
+                rc: -3,
+                engine_null: true,
+                family: ModelFamily::Qwen,
+                backend: "Metal",
+                ctx_size: 1_048_576,
+                companions: &[
+                    ("mtp draft model", Some(&drafter)),
+                    ("vision encoder", None),
+                ],
+                metal_kernels_missing: true,
+            },
+        );
         assert!(msg.starts_with("failed to open model "), "{msg}");
         assert!(msg.contains("returned -3"), "{msg}");
         assert!(
@@ -730,16 +773,19 @@ mod tests {
 
         // A non-zero code and a null engine are different news, and only one
         // of them is reported per failure.
-        let msg = open_failure_detail(&OpenAttempt {
-            path: &model,
-            rc: 0,
-            engine_null: true,
-            family: ModelFamily::Ds4,
-            backend: "Cpu",
-            ctx_size: 8192,
-            companions: &[],
-            metal_kernels_missing: false,
-        });
+        let msg = open_failure_detail_in(
+            &root,
+            &OpenAttempt {
+                path: &model,
+                rc: 0,
+                engine_null: true,
+                family: ModelFamily::Ds4,
+                backend: "Cpu",
+                ctx_size: 8192,
+                companions: &[],
+                metal_kernels_missing: false,
+            },
+        );
         assert!(msg.contains("success but returned no engine"), "{msg}");
         assert!(!msg.contains("returned 0"), "{msg}");
         assert!(!msg.contains("DS4_METAL_DIR"), "{msg}");

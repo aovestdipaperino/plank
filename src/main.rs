@@ -306,30 +306,134 @@ fn report_kvcache_migration() {
     }
 }
 
-/// Resolves the model path that will actually load, from the real `cfg`
-/// (parsed against the fully-loaded settings, not the CLI-only provisional
-/// parse). Shared by every consumer that needs to know which model family is
-/// loading, so none of them can resolve it a different way and disagree.
+/// The model path that will actually load, from the real `cfg` (parsed
+/// against the fully-loaded settings, not the CLI-only provisional parse).
+/// Shared by every consumer that needs to know which model family is loading,
+/// so none of them can resolve it a different way and disagree.
 ///
-/// The fallback follows the set this machine manages rather than always
-/// naming the V4 path. A path that does not exist yet — a first run, before
-/// the download — is probed by name, so it still tags the family of the model
-/// that is about to land.
+/// `parse_config` has already resolved the catalog choice into a path. A path
+/// that does not exist yet — a first run, before the download — is probed by
+/// name, so it still tags the family of the model that is about to land.
 fn resolve_model_path(cfg: &plank::config::AgentConfig) -> std::path::PathBuf {
     cfg.model_path
         .clone()
-        .unwrap_or_else(plank::download::default_managed_model_path)
+        .expect("parse_config resolves the model before anything reads it")
 }
 
-/// The real config parse, with a `.ggd` model swapped for its patched clone.
-/// Errors are already printed under `prog`; the caller just returns the code.
+/// The user's model choice, as the catalog resolver takes it.
+fn model_choice(cfg: &plank::config::AgentConfig) -> plank::engines::Choice<'_> {
+    match (cfg.model_spec.as_deref(), cfg.model_named) {
+        (None, _) => plank::engines::Choice::Default,
+        (Some(s), true) => plank::engines::Choice::Named(s),
+        (Some(s), false) => plank::engines::Choice::Spec(s),
+    }
+}
+
+/// Resolves the model choice against the catalog. Must precede
+/// `resolve_model_delta`, which reads the resolved `model_path`.
+///
+/// Does not call `plank::engines::set_active`: the selection's `main` path
+/// still names the pre-delta model here, and a `.ggd` spec gets rewritten to
+/// the patched clone afterward. `parse_config` activates the final,
+/// delta-adjusted selection once both steps have run.
+///
+/// The catalog and managed paths come from `root`, which is `~/.plank` in
+/// every real run and a scratch directory in tests. The loaded catalog is
+/// returned so [`finish_selection`] can reuse it rather than load it twice.
+fn resolve_selection(
+    cfg: &mut plank::config::AgentConfig,
+    root: &std::path::Path,
+) -> Result<plank::engines::Catalog, String> {
+    let mut warn = Vec::new();
+    let catalog = plank::engines::load_in(root, &mut warn);
+    for w in warn {
+        eprintln!("plank: {w}");
+    }
+    let (sel, note) = plank::engines::resolve_with_note_in(root, &catalog, model_choice(cfg))?;
+    if let Some(note) = note {
+        eprintln!("plank: {note}");
+    }
+    cfg.model_path = Some(sel.main.clone());
+    cfg.selection = Some(sel);
+    Ok(catalog)
+}
+
+/// Points the selection at the final `model_path`, and gives a `.ggd`
+/// delta patched onto a managed engine's `main` that engine's companions
+/// (`engines::inherit_companions_in`), so an abliterated V4 delta still gets
+/// the vision encoder and the `DSpark` drafter. The clone itself stays
+/// unmanaged: it is never upgraded or re-downloaded.
+///
+/// Runs after `resolve_model_delta` and before `set_active`, keeping the
+/// invariant `selection.main == model_path`.
+fn finish_selection(
+    cfg: &mut plank::config::AgentConfig,
+    root: &std::path::Path,
+    catalog: &plank::engines::Catalog,
+) {
+    let Some(path) = cfg.model_path.clone() else {
+        return;
+    };
+    let Some(mut sel) = cfg.selection.take() else {
+        return;
+    };
+    sel.main = path;
+    if let Some(delta) = &cfg.model_delta {
+        sel = plank::engines::inherit_companions_in(root, catalog, &delta.base, sel);
+    }
+    cfg.selection = Some(sel);
+}
+
+/// Whether a `resolve_selection`/`resolve_model_delta` error must abort
+/// startup. `--dump-config` is a diagnostic: `Settings::from_settings`
+/// promises "a settings file must never stop plank from starting", so a bad
+/// `engine.model` must still let the dump print (with no selection) rather
+/// than exit before printing anything. Every other run keeps failing fast.
+fn resolution_is_fatal(cfg: &plank::config::AgentConfig) -> bool {
+    !cfg.dump_config
+}
+
+/// The real config parse, with the model choice resolved against the engine
+/// catalog and a `.ggd` model swapped for its patched clone. Errors are
+/// already printed under `prog`; the caller just returns the code.
+///
+/// Invariant on return: `cfg.selection.as_ref().map(|s| &s.main) ==
+/// cfg.model_path.as_ref()` whenever a selection is present, and
+/// `plank::engines::ACTIVE` holds that same, final selection.
 fn parse_config(
     settings: &plank::settings::Settings,
     args: &[String],
     prog: &str,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
+    parse_config_in(settings, args, prog, &plank::manifest::plank_dir())
+}
+
+/// [`parse_config`] with the engine catalog and managed paths under `root`.
+fn parse_config_in(
+    settings: &plank::settings::Settings,
+    args: &[String],
+    prog: &str,
+    root: &std::path::Path,
+) -> Result<plank::config::AgentConfig, ExitCode> {
     plank::config::parse_options_with(settings, args)
-        .and_then(|mut cfg| resolve_model_delta(&mut cfg).map(|()| cfg))
+        .and_then(|mut cfg| {
+            match resolve_selection(&mut cfg, root)
+                .and_then(|catalog| resolve_model_delta(&mut cfg).map(|()| catalog))
+            {
+                Ok(catalog) => finish_selection(&mut cfg, root, &catalog),
+                Err(e) => {
+                    if resolution_is_fatal(&cfg) {
+                        return Err(e);
+                    }
+                    eprintln!("plank: {e}");
+                    cfg.selection = None;
+                }
+            }
+            if let Some(sel) = cfg.selection.clone() {
+                plank::engines::set_active(sel);
+            }
+            Ok(cfg)
+        })
         .map_err(|msg| {
             eprintln!("{prog}: {msg}");
             ExitCode::from(2)
@@ -375,13 +479,17 @@ fn select_session_family(cfg: &plank::config::AgentConfig) {
 
 /// The detached downloader's entry point.
 ///
-/// Its model set is the second argument. A helper spawned by a plank that
-/// predates two sets passes none, which reads as `ds4` — the set plank managed
-/// when there was only one.
+/// Its engine is the second argument. A helper spawned by a plank that
+/// predates engines passes `ds4` or none, which reads as `ds4vision` — the
+/// engine plank managed when there was only one.
 fn run_model_downloader(args: &[String]) -> i32 {
-    let set =
-        plank::manifest::ModelSet::from_str_or_default(args.get(1).map_or("", String::as_str));
-    plank::downloader::run_helper(set)
+    let Some(id) =
+        plank::manifest::EngineId::from_legacy_arg(args.get(1).map_or("", String::as_str))
+    else {
+        eprintln!("plank: --model-downloader: invalid engine name");
+        return 2;
+    };
+    plank::downloader::run_helper(id)
 }
 
 /// The checks that fire once the real `cfg` (settings + CLI, not the
@@ -415,6 +523,39 @@ fn post_cfg_early_exit(
     None
 }
 
+/// Whether this launch should run the one-way engine-layout migration.
+///
+/// `--help` and `--version` answer and exit without touching `~/.plank`, and
+/// `--dump-config` is a read-only diagnostic, so none of them may rename the
+/// user's model files. Every other launch migrates before the real
+/// `parse_config`, because the `engines.local.json` default a ds41-only
+/// install gets must exist before the catalog choice is resolved.
+fn should_migrate(provisional: &plank::config::AgentConfig) -> bool {
+    !(provisional.show_help || provisional.show_version || provisional.dump_config)
+}
+
+/// Renames any old `ModelSet` layout into the engine layout, when
+/// [`should_migrate`] allows it, printing one line per skipped move.
+fn migrate_engine_layout(provisional: &plank::config::AgentConfig) {
+    if !should_migrate(provisional) {
+        return;
+    }
+    migrate_engine_layout_unconditionally();
+}
+
+/// Renames any old `ModelSet` layout into the engine layout, unconditionally.
+///
+/// `plank serve` has no `--help`/`--version`/`--dump-config` early exits of
+/// its own — it always goes on to `make_engine` — so it must always migrate
+/// first, unlike `main`'s gated [`migrate_engine_layout`]. Skipping this
+/// would let `plank serve --help` on an old home reach `make_engine` without
+/// ever having migrated, and offer an 87 GB download.
+fn migrate_engine_layout_unconditionally() {
+    for w in plank::enginemigrate::migrate() {
+        eprintln!("{w}");
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Before anything can move the process: `/edit-profile`'s restart re-runs
@@ -425,7 +566,7 @@ fn main() -> ExitCode {
     // (`src/downloader.rs`), re-execing this same binary so the helper can
     // never disagree with the plank that spawned it. It loads no engine, reads
     // no settings and touches no session: it takes the download lock, works
-    // through `~/.plank/downloads/job.json`, and exits. Handled before every
+    // through its `~/.plank/downloads/job-<engine>.json`, and exits. Handled before every
     // other dispatch so nothing above can print to a stream that is /dev/null.
     if args.first().map(String::as_str) == Some("--model-downloader") {
         return ExitCode::from(u8::try_from(run_model_downloader(&args)).unwrap_or(1));
@@ -477,6 +618,7 @@ fn main() -> ExitCode {
         println!("{}", plank::logo::version_line());
         return ExitCode::SUCCESS;
     }
+    migrate_engine_layout(&provisional);
     // `--chdir` has to happen before the plugin scan (and therefore before
     // project settings, which are also cwd-scoped) rather than after, or the
     // plugin set built here would reflect the launch directory instead of the
@@ -696,9 +838,10 @@ fn require_min_ram() -> Result<(), String> {
     Ok(())
 }
 
-/// Builds the inference engine: the real ds4 engine on macOS (from `-m`, else
-/// `engine.model` in settings.json, else the default `~/.plank/ds4flash.gguf`,
-/// downloading it if missing), else the stub.
+/// Builds the inference engine: the real ds4 engine on macOS (the engine or
+/// path chosen by `-m`, else `engine.model` in settings.json, else the catalog
+/// `default` engine, downloading a managed engine's files if missing), else
+/// the stub.
 /// The engines a session runs on: the main one, and — only when the main engine
 /// is a provider *and* a `provider: local` sub-agent definition exists — the
 /// local ds4 engine held for those sidechains.
@@ -837,31 +980,32 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // fast here with a clear message instead.
         acquire_model_lock()?;
 
-        // With no explicit model, fall back to the default location and offer
-        // to download it when it is not present.
-        let model = cfg
-            .model_path
-            .clone()
-            .unwrap_or_else(plank::download::default_managed_model_path);
+        // `parse_config` resolved the catalog choice; offer to download the
+        // model when it is not present.
+        let model = cfg.model_path.clone().expect("resolved by parse_config");
+        let sel = cfg.selection.as_ref().expect("resolved by parse_config");
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
         // maps the file. Never fatal.
-        plank::download::check_manifest_at_startup(cfg.model_path.as_deref());
+        plank::download::check_manifest_at_startup(sel);
         // Mirrors the background downloader's state into the status bar. Cheap
         // and idempotent: it does nothing at all when no download is running.
         plank::downloader::spawn_watcher();
-        plank::download::ensure_model(&model)?;
+        plank::download::ensure_model(sel)?;
         // The vision encoder sits beside the main model and is fetched on
         // demand when the model can use it (the pinned Vision-Exp checkpoint);
         // any other DeepSeek checkpoint runs text-only.
         // Speculation is on by default; without `--mtp-model` a DeepSeek run
-        // resolves the default support GGUF and fetches it on demand
-        // (`--mtp-off` skips that). Kept local rather than written back into
-        // `cfg`: only the engine open needs it. A Qwen model skips both side
-        // artifacts, since it opens neither.
+        // takes its companion from the selected engine's `mtp` role and
+        // fetches it on demand (`--mtp-off` skips that). A run with no such
+        // companion — a bare `--model PATH` or a `.ggd` on no managed base,
+        // or an engine that declares none — has speculation turned off
+        // instead of failing to open. Kept local rather than written back
+        // into `cfg`: only the engine open needs it. A Qwen model skips both side artifacts, since it opens
+        // neither.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&model, cfg.generation.ctx_size, &mut tuning)?;
+        plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;
 
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
@@ -925,10 +1069,9 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
     }
     #[cfg(not(ds4_engine))]
     {
-        if let Some(model) = &cfg.model_path {
+        if let Some(model) = &cfg.model_spec {
             return Err(format!(
-                "-m {} requires the ds4 engine, which is not built on this platform",
-                model.display()
+                "-m {model} requires the ds4 engine, which is not built on this platform"
             ));
         }
         Ok(Box::new(EchoEngine::new(cfg.generation.ctx_size)))
@@ -1035,6 +1178,7 @@ fn run_serve(args: &[String]) -> ExitCode {
             .unwrap_or_else(|_| {
                 plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
             });
+    migrate_engine_layout_unconditionally();
     let launch_cwd = std::env::current_dir().unwrap_or_default();
     let mut plugins = plank::plugins::load_default(&launch_cwd);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -1129,25 +1273,23 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
 
         require_min_ram()?;
         acquire_model_lock()?;
-        let model_path = cfg
-            .model_path
-            .clone()
-            .unwrap_or_else(plank::download::default_managed_model_path);
+        let model_path = cfg.model_path.clone().expect("resolved by parse_config");
+        let sel = cfg.selection.as_ref().expect("resolved by parse_config");
         // Install anything a previous run downloaded and verified, then decide
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
         // maps the file. Never fatal.
-        plank::download::check_manifest_at_startup(cfg.model_path.as_deref());
+        plank::download::check_manifest_at_startup(sel);
         // Mirrors the background downloader's state into the status bar. Cheap
         // and idempotent: it does nothing at all when no download is running.
         plank::downloader::spawn_watcher();
-        plank::download::ensure_model(&model_path)?;
+        plank::download::ensure_model(sel)?;
         // The vision encoder sits beside the main model and is fetched on
         // demand when the model can use it (the pinned Vision-Exp checkpoint);
         // any other DeepSeek checkpoint runs text-only.
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(&model_path, cfg.generation.ctx_size, &mut tuning)?;
+        plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,
@@ -1178,10 +1320,9 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
     #[cfg(not(ds4_engine))]
     {
         use std::sync::Arc;
-        if let Some(model) = &cfg.model_path {
+        if let Some(model) = &cfg.model_spec {
             return Err(format!(
-                "-m {} requires the ds4 engine, which is not built on this platform",
-                model.display()
+                "-m {model} requires the ds4 engine, which is not built on this platform"
             ));
         }
         let model = Arc::new(plank::host::EchoSharedModel::new(cfg.generation.ctx_size));
@@ -1241,25 +1382,136 @@ fn run(
 mod tests {
     use super::*;
 
-    /// `resolve_model_path` falls back to the default `DeepSeek` path when
-    /// `cfg.model_path` is unset, exactly like `select_session_family` did
-    /// before this refactor, and returns the configured path unchanged when
-    /// one is set — including one that only ever came from a settings file
-    /// (`AgentConfig::from_settings`/`parse_options_with` do not distinguish
-    /// CLI from settings-file origin once parsed, which is the point: the
-    /// session family reads the same resolved value the engine will).
     #[test]
-    fn resolve_model_path_matches_configured_or_falls_back_to_default() {
+    fn choice_is_named_default_or_spec() {
         let mut cfg =
             plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
-        cfg.model_path = None;
-        assert_eq!(
-            resolve_model_path(&cfg),
-            plank::download::default_managed_model_path()
-        );
+        cfg.model_spec = None;
+        assert_eq!(model_choice(&cfg), plank::engines::Choice::Default);
+        cfg.model_spec = Some("qwen".into());
+        assert_eq!(model_choice(&cfg), plank::engines::Choice::Spec("qwen"));
+        cfg.model_named = true;
+        assert_eq!(model_choice(&cfg), plank::engines::Choice::Named("qwen"));
+    }
 
-        let configured = std::path::PathBuf::from("/from/settings.gguf");
-        cfg.model_path = Some(configured.clone());
-        assert_eq!(resolve_model_path(&cfg), configured);
+    #[test]
+    fn resolution_is_fatal_unless_dumping_config() {
+        let mut cfg =
+            plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
+        assert!(resolution_is_fatal(&cfg));
+        cfg.dump_config = true;
+        assert!(!resolution_is_fatal(&cfg));
+    }
+
+    #[test]
+    fn help_version_and_dump_config_never_migrate() {
+        let base = plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
+        assert!(should_migrate(&base));
+        for flag in ["--help", "--version", "--dump-config"] {
+            let cfg = plank::config::parse_options_with(
+                &plank::settings::Settings::default(),
+                &[flag.to_string()],
+            )
+            .expect("parses");
+            assert!(!should_migrate(&cfg), "{flag} must not migrate");
+        }
+    }
+
+    #[test]
+    fn serve_migrates_regardless_of_should_migrate() {
+        // `run_serve` has no early exit for `--help`/`--version`/`--dump-config`
+        // — it always reaches `make_engine` — so its migration call must not be
+        // gated by `should_migrate` the way `main`'s is.
+        // `migrate_engine_layout_unconditionally` (what `run_serve` calls) takes
+        // no `AgentConfig` at all, so there is nothing for a flag to gate — the
+        // type signature itself is the guarantee. This test pins that: `main`'s
+        // own launch still skips migration for these flags, via the separate,
+        // gated `migrate_engine_layout`/`should_migrate` path.
+        for flag in ["--help", "--version", "--dump-config"] {
+            let cfg = plank::config::parse_options_with(
+                &plank::settings::Settings::default(),
+                &[flag.to_string()],
+            )
+            .expect("parses");
+            assert!(
+                !should_migrate(&cfg),
+                "{flag} still must not migrate main's own launch"
+            );
+        }
+        // Not calling `migrate_engine_layout_unconditionally` here: it reads and
+        // writes the real `~/.plank`, which tests must never touch.
+    }
+
+    fn scratch_root(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("plank-main-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("scratch root");
+        p
+    }
+
+    /// A resolved delta, as `resolve_model_delta` leaves it, without a real
+    /// `.ggd`: the selection must follow the clone and inherit the base
+    /// engine's companions without becoming managed.
+    #[test]
+    fn a_delta_on_the_managed_v4_base_inherits_its_companions() {
+        let root = scratch_root("delta-inherit");
+        let base = root.join("ds4vision.gguf");
+        std::fs::write(&base, "m").expect("base");
+        let clone = root.join("models/patched/abl.gguf");
+        let mut cfg =
+            plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
+        cfg.model_spec = Some(root.join("models/abl.ggd").display().to_string());
+        let catalog = resolve_selection(&mut cfg, &root).expect("a .ggd spec is a bare path");
+        assert!(cfg.selection.as_ref().unwrap().mtp.is_none());
+        cfg.model_path = Some(clone.clone());
+        cfg.model_delta = Some(plank::ggufdelta::Resolved {
+            path: clone.clone(),
+            base,
+            label: "abl".into(),
+            id: "0123456789ab".into(),
+        });
+        finish_selection(&mut cfg, &root, &catalog);
+        let sel = cfg.selection.as_ref().expect("selection");
+        assert_eq!(sel.main, clone);
+        assert_eq!(cfg.model_path.as_ref(), Some(&sel.main));
+        assert_eq!(sel.id, Some(plank::manifest::EngineId::DS4VISION));
+        assert_eq!(sel.mtp, Some(root.join("ds4vision.mtp.gguf")));
+        assert_eq!(sel.vision, Some(root.join("ds4vision.vision.gguf")));
+        assert!(!sel.managed_main);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No delta: `finish_selection` only aligns `main` with `model_path`.
+    #[test]
+    fn without_a_delta_the_selection_is_untouched_but_for_main() {
+        let root = scratch_root("delta-none");
+        let other = root.join("mine.gguf");
+        std::fs::write(&other, "o").expect("file");
+        let mut cfg =
+            plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
+        cfg.model_spec = Some(other.display().to_string());
+        let catalog = resolve_selection(&mut cfg, &root).expect("resolves");
+        finish_selection(&mut cfg, &root, &catalog);
+        let sel = cfg.selection.as_ref().expect("selection");
+        assert_eq!(sel.main, other);
+        assert!(sel.id.is_none() && sel.mtp.is_none() && sel.vision.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dump_config_survives_a_bad_engine_model() {
+        let settings = plank::settings::Settings::default();
+        let args: Vec<String> = vec![
+            "--model".into(),
+            "definitely-not-a-real-engine-name".into(),
+            "--dump-config".into(),
+        ];
+        // An empty scratch root: the catalog is the compiled-in one and the
+        // real `~/.plank` is never read.
+        let root = std::env::temp_dir().join(format!("plank-dump-config-{}", std::process::id()));
+        let cfg =
+            parse_config_in(&settings, &args, "plank", &root).expect("dump-config must not abort");
+        assert!(cfg.dump_config);
+        assert!(cfg.selection.is_none());
     }
 }

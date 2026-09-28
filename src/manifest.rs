@@ -15,122 +15,66 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// The artifact kinds plank knows how to install for `DeepSeek` V4.
+/// An engine's name, validated and interned so it stays `Copy`.
 ///
-/// A manifest may name others (see [`parse`]); those are carried through and
-/// ignored, so a future release can add a fourth artifact without breaking
-/// every client that predates it.
-pub const KINDS: [&str; 3] = ["main", "vision", "dspark"];
+/// Every artifact path in this module is scoped by one of these. Engines are
+/// kept wholly separate on disk — separate installed records, separate staging
+/// directories — because the invariant that makes a swap safe is per-engine:
+/// the installed record moves *last*, so its presence proves that engine landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EngineId(&'static str);
 
-/// The artifact kinds plank knows how to install for `DeepSeek` V4.1.
-///
-/// No `dspark`: upstream's `refs/ds4/docs/MODELS.md` states the `DSpark`
-/// drafter is not implemented for V4.1, so there is no such artifact to fetch.
-pub const DS41_KINDS: [&str; 2] = ["main", "vision"];
+impl EngineId {
+    /// `DeepSeek` V4 Flash Vision-Experimental, the shipped default.
+    pub const DS4VISION: Self = Self("ds4vision");
+    /// `DeepSeek` V4.1 Flash.
+    pub const DS41: Self = Self("ds41");
+    /// Qwen3.8-Flash-Next.
+    pub const QWEN: Self = Self("qwen");
 
-/// The artifact kinds a Qwen3.8-Flash-Next release has.
-///
-/// The same two as V4.1, and for the same reason on each side: upstream now
-/// ships the BF16 n-grams and the MTP block inside the main GGUF, so the old
-/// `mtp` sidecar kind is gone, and `ggml-org` publishes an `mmproj` vision
-/// encoder that `--vision` loads.
-pub const QWEN_KINDS: [&str; 2] = ["main", "vision"];
-
-/// Which model set a manifest, staging area, and install location belong to.
-///
-/// Every artifact path in this module is scoped by one of these. The two sets
-/// are kept wholly separate on disk — separate manifest files, separate
-/// staging directories — because the invariant that makes a swap safe is
-/// per-set: the manifest moves *last*, so its presence proves that set landed.
-/// Sharing one staging area would let a half-staged Qwen download be read as
-/// proof about the `DeepSeek` set, or the reverse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ModelSet {
-    /// `DeepSeek` V4 Flash: main model, vision encoder, `DSpark` drafter.
-    #[default]
-    Ds4,
-    /// `DeepSeek` V4.1 Flash: main model and vision encoder only.
-    Ds41,
-    /// Qwen3.8-Flash-Next: main model and vision encoder.
-    Qwen,
-}
-
-/// Every variant of [`ModelSet`], so the path-disjointness invariant can be
-/// asserted across the whole set rather than a hardcoded pair.
-///
-/// Adding a variant without adding it here would silently narrow that test,
-/// which is why `every_set_variant_is_listed` exhaustively matches on a
-/// variant to force this list to be revisited.
-pub const ALL_SETS: [ModelSet; 3] = [ModelSet::Ds4, ModelSet::Ds41, ModelSet::Qwen];
-
-impl ModelSet {
-    /// The set a model of this family belongs to.
-    #[must_use]
-    pub fn for_family(family: crate::gguf::ModelFamily) -> Self {
-        match family {
-            crate::gguf::ModelFamily::Ds4 => Self::Ds4,
-            crate::gguf::ModelFamily::Ds41 => Self::Ds41,
-            crate::gguf::ModelFamily::Qwen => Self::Qwen,
-        }
-    }
-
-    /// The artifact kinds this build installs for the set.
-    #[must_use]
-    pub fn kinds(self) -> &'static [&'static str] {
-        match self {
-            Self::Ds4 => &KINDS,
-            Self::Ds41 => &DS41_KINDS,
-            Self::Qwen => &QWEN_KINDS,
-        }
-    }
-
-    /// Filename of the set's manifest, both remote and installed.
+    /// A validated, interned id, or `None` for an invalid name.
     ///
-    /// Only `ds4.manifest` is actually published: the V4.1 set is reached by
-    /// an explicit `-m` and is not managed, so its name resolves to a file
-    /// that exists nowhere. That is deliberate and already handled — the
-    /// startup fetch answers `None` on a 404 exactly as it does when offline,
-    /// and `check_manifest_at_startup_in` returns silently, having already
-    /// stamped the 24-hour check file, so nothing is printed and nothing is
-    /// re-fetched until tomorrow.
+    /// Interning leaks one small string per distinct name for the process
+    /// lifetime; the catalog holds a handful, so that is the price of `Copy`.
     #[must_use]
-    pub fn manifest_name(self) -> &'static str {
-        match self {
-            Self::Ds4 => "ds4.manifest",
-            Self::Ds41 => "ds41.manifest",
-            Self::Qwen => "qwen.manifest",
+    pub fn new(name: &str) -> Option<Self> {
+        use std::sync::{Mutex, OnceLock};
+        static POOL: OnceLock<Mutex<std::collections::BTreeSet<&'static str>>> = OnceLock::new();
+        if !crate::engines::valid_name(name) {
+            return None;
         }
+        let mut pool = POOL
+            .get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(s) = pool.get(name) {
+            return Some(Self(s));
+        }
+        let s: &'static str = Box::leak(name.to_string().into_boxed_str());
+        pool.insert(s);
+        Some(Self(s))
     }
 
-    /// Leaf of the set's staging directory under `~/.plank`.
-    #[must_use]
-    pub fn staging_leaf(self) -> &'static str {
-        match self {
-            Self::Ds4 => "staging",
-            Self::Ds41 => "staging-ds41",
-            Self::Qwen => "staging-qwen",
-        }
-    }
-
-    /// The set's name as the CLI spells it, for the detached helper's argv.
+    /// The name, as the CLI and the on-disk layout spell it.
     #[must_use]
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ds4 => "ds4",
-            Self::Ds41 => "ds41",
-            Self::Qwen => "qwen",
-        }
+        self.0
     }
 
-    /// Parses [`Self::as_str`]. Anything unrecognized reads as `Ds4`, which is
-    /// what a helper spawned by an older plank passes: nothing.
+    /// Parses the detached helper's argv. A helper spawned by a plank that
+    /// predates engines passes `ds4` or nothing, which is today's `ds4vision`.
     #[must_use]
-    pub fn from_str_or_default(s: &str) -> Self {
+    pub fn from_legacy_arg(s: &str) -> Option<Self> {
         match s {
-            "ds41" => Self::Ds41,
-            "qwen" => Self::Qwen,
-            _ => Self::Ds4,
+            "" | "ds4" => Some(Self::DS4VISION),
+            other => Self::new(other),
         }
+    }
+}
+
+impl std::fmt::Display for EngineId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
     }
 }
 
@@ -257,32 +201,38 @@ pub fn plank_dir() -> PathBuf {
     crate::home::plank_home_in(home)
 }
 
-/// The installed manifest: what the files currently under `root` are.
+/// The installed record: what the files of engine `id` under `root` are.
 #[must_use]
-pub fn installed_path_in(root: &Path, set: ModelSet) -> PathBuf {
-    root.join(set.manifest_name())
+pub fn installed_path_in(root: &Path, id: EngineId) -> PathBuf {
+    root.join("engines").join(format!("{id}.installed.json"))
 }
 
-/// The installed manifest: what the files currently in `~/.plank` are.
+/// The installed record: what the files of engine `id` in `~/.plank` are.
 ///
 /// Written only by a successful swap, and written *last*, so its presence is
-/// proof the whole set landed.
+/// proof the whole engine landed.
 #[must_use]
-pub fn installed_path(set: ModelSet) -> PathBuf {
-    installed_path_in(&plank_dir(), set)
+pub fn installed_path(id: EngineId) -> PathBuf {
+    installed_path_in(&plank_dir(), id)
 }
 
-/// Where in-flight and verified-but-not-yet-installed artifacts live, under
-/// `root`.
+/// Where in-flight and verified-but-not-yet-installed artifacts of engine
+/// `id` live, under `root`.
 #[must_use]
-pub fn staging_dir_in(root: &Path, set: ModelSet) -> PathBuf {
-    root.join(set.staging_leaf())
+pub fn staging_dir_in(root: &Path, id: EngineId) -> PathBuf {
+    root.join("staging").join(id.as_str())
 }
 
 /// Where in-flight and verified-but-not-yet-installed artifacts live.
 #[must_use]
-pub fn staging_dir(set: ModelSet) -> PathBuf {
-    staging_dir_in(&plank_dir(), set)
+pub fn staging_dir(id: EngineId) -> PathBuf {
+    staging_dir_in(&plank_dir(), id)
+}
+
+/// The staged installed record: moved to [`installed_path_in`] last.
+#[must_use]
+pub fn staged_manifest_path_in(root: &Path, id: EngineId) -> PathBuf {
+    staging_dir_in(root, id).join(format!("{id}.installed.json"))
 }
 
 /// Helper-process bookkeeping under `root`: lock, job, state, cancel flag, log.
@@ -297,83 +247,43 @@ pub fn downloads_dir() -> PathBuf {
     downloads_dir_in(&plank_dir())
 }
 
-/// Where an artifact of `kind` is installed under `root`.
-///
-/// Derives the filename directly rather than delegating to `download::`,
-/// whose `default_*_path` functions each read `HOME` independently: those
-/// filenames (`ds4flash.gguf`, `ds4flash.vision.gguf`, `ds4flash.dspark.gguf`)
-/// are mirrored here so a test can pass an explicit root.
-#[must_use]
-pub fn local_path_for_in(root: &Path, set: ModelSet, kind: &str) -> Option<PathBuf> {
-    match (set, kind) {
-        (ModelSet::Ds4, "main") => Some(root.join("ds4flash.gguf")),
-        (ModelSet::Ds4, "vision") => Some(root.join("ds4flash.vision.gguf")),
-        (ModelSet::Ds4, "dspark") => Some(root.join("ds4flash.dspark.gguf")),
-        (ModelSet::Ds41, "main") => Some(root.join("ds41flash.gguf")),
-        (ModelSet::Ds41, "vision") => Some(root.join("ds41flash.vision.gguf")),
-        // The same name `--qwen` defaults to, so a download installs exactly
-        // where the flag looks — and a user's existing symlink there is adopted
-        // by size rather than replaced.
-        (ModelSet::Qwen, "main") => Some(root.join("qwen.gguf")),
-        (ModelSet::Qwen, "vision") => Some(root.join("qwen.vision.gguf")),
-        _ => None,
-    }
-}
-
-/// Where an artifact of `kind` is installed.
+/// Where engine `id`'s artifact of `role` is installed under `root`, or
+/// `None` for a role this build does not know.
 ///
 /// Deliberately local knowledge rather than a manifest field: a manifest that
 /// could name its own destination path would be a manifest that could write
-/// anywhere on disk.
+/// anywhere on disk. The filename is derived from the engine name alone, so
+/// two engines can never land on the same file.
 #[must_use]
-pub fn local_path_for(set: ModelSet, kind: &str) -> Option<PathBuf> {
-    match (set, kind) {
-        (ModelSet::Ds4, "main") => Some(crate::download::default_model_path()),
-        (ModelSet::Ds4, "vision") => Some(crate::download::default_vision_path()),
-        (ModelSet::Ds4, "dspark") => Some(crate::download::default_dspark_path()),
-        (ModelSet::Ds41, "main") => Some(crate::download::default_ds41_model_path()),
-        (ModelSet::Ds41, "vision") => Some(crate::download::default_ds41_vision_path()),
-        (ModelSet::Qwen, "main") => Some(crate::download::default_qwen_path()),
-        (ModelSet::Qwen, "vision") => Some(crate::download::default_qwen_vision_path()),
+pub fn local_path_for_in(root: &Path, id: EngineId, role: &str) -> Option<PathBuf> {
+    match role {
+        "main" => Some(root.join(format!("{id}.gguf"))),
+        "mtp" | "vision" => Some(root.join(format!("{id}.{role}.gguf"))),
         _ => None,
     }
 }
 
-/// Which set a plank rooted at `root` manages by default.
-///
-/// A fresh install — nothing recorded and nothing on disk — takes `Ds4`: V4 is
-/// the default set plank manages and ships a manifest for, and V4.1 is reached
-/// only by pointing `-m` at a V4.1 GGUF. An install that already records
-/// `ds4.manifest` stays on `Ds4` too, and one that somehow records
-/// `ds41.manifest` keeps managing the V4.1 set.
-///
-/// The recorded manifest is not the only evidence of a V4 install. The entire
-/// installed base predates manifests: those machines have the V4 weights on
-/// disk and *no* `ds4.manifest`, and are exactly who adopt-on-first-sight
-/// exists for. The check is kept even though a fresh root now resolves `Ds4`
-/// anyway: it is the evidence that makes the classification true rather than
-/// coincidental, and it keeps the guarantee if the fresh-install default ever
-/// moves again. So a V4 `main` artifact present on disk counts as a V4 install
-/// too.
+/// Where engine `id`'s artifact of `role` is installed under `~/.plank`.
 #[must_use]
-pub fn default_set_for_root(root: &Path) -> ModelSet {
-    if installed_path_in(root, ModelSet::Ds41).exists() {
-        return ModelSet::Ds41;
-    }
-    if installed_path_in(root, ModelSet::Ds4).exists() || artifact_installed_in(root, ModelSet::Ds4)
-    {
-        return ModelSet::Ds4;
-    }
-    ModelSet::Ds4
+pub fn local_path_for(id: EngineId, role: &str) -> Option<PathBuf> {
+    local_path_for_in(&plank_dir(), id, role)
 }
 
-/// Whether `set`'s `main` artifact is present under `root`.
-///
-/// Only `main` is consulted: the vision and dspark artifacts are optional
-/// side-fetches, so their absence says nothing about which set is installed.
+/// Engines with an installed record under `root`, sorted.
 #[must_use]
-pub fn artifact_installed_in(root: &Path, set: ModelSet) -> bool {
-    local_path_for_in(root, set, "main").is_some_and(|p| p.exists())
+pub fn installed_ids_in(root: &Path) -> Vec<EngineId> {
+    let Ok(dir) = std::fs::read_dir(root.join("engines")) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<EngineId> = dir
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            EngineId::new(name.strip_suffix(".installed.json")?)
+        })
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// Reads and parses the manifest at `path`, if it is there and valid.
@@ -407,9 +317,9 @@ pub enum Decision {
 /// from the filesystem because a wrong answer here costs the user an 87 GB
 /// download, which is worth testing exhaustively without a disk.
 ///
-/// Only kinds in both [`KINDS`] and the manifest are considered: a manifest
+/// Only roles in both `kinds` and the manifest are considered: a manifest
 /// entry this build does not know how to install cannot block adoption, and a
-/// kind the manifest omits cannot be demanded on disk.
+/// role the manifest omits cannot be demanded on disk.
 #[must_use]
 pub fn decide(
     remote: Manifest,
@@ -488,7 +398,7 @@ mod tests {
     /// tests can tell entries apart at a glance.
     const SHA_MAIN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const SHA_VISION: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-    const SHA_DSPARK: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const SHA_MTP: &str = "3333333333333333333333333333333333333333333333333333333333333333";
     const SHA_OTHER: &str = "4444444444444444444444444444444444444444444444444444444444444444";
 
     /// A complete, well-formed manifest, used by most tests here.
@@ -501,7 +411,7 @@ mod tests {
           "files": {{
             "main":   {{ "name": "m.gguf", "url": "https://example.invalid/m", "bytes": 100, "sha256": "{SHA_MAIN}" }},
             "vision": {{ "name": "v.gguf", "url": "https://example.invalid/v", "bytes": 200, "sha256": "{SHA_VISION}" }},
-            "dspark": {{ "name": "d.gguf", "url": "https://example.invalid/d", "bytes": 300, "sha256": "{SHA_DSPARK}" }}
+            "mtp":    {{ "name": "d.gguf", "url": "https://example.invalid/d", "bytes": 300, "sha256": "{SHA_MTP}" }}
           }}
         }}"#
         )
@@ -535,9 +445,9 @@ mod tests {
         // The manifest must be able to grow a fourth artifact before the
         // client reading it knows what that artifact is.
         let text = sample().replace(
-            r#""dspark":"#,
+            r#""mtp":"#,
             &format!(
-                r#""futureproof": {{ "name": "f.gguf", "url": "https://example.invalid/f", "bytes": 1, "sha256": "{SHA_OTHER}" }}, "dspark":"#
+                r#""futureproof": {{ "name": "f.gguf", "url": "https://example.invalid/f", "bytes": 1, "sha256": "{SHA_OTHER}" }}, "mtp":"#
             ),
         );
         let m = parse(&text).expect("unknown kind parses");
@@ -546,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_dspark_entry_parses() {
+    fn a_missing_mtp_entry_parses() {
         // Not every release has to ship all three. Absence is a fact for
         // `decide` (Task 2) to act on, not a parse failure.
         let text = format!(
@@ -556,7 +466,7 @@ mod tests {
         );
         let m = parse(&text).expect("partial manifest parses");
         assert!(m.files.contains_key("main"));
-        assert!(!m.files.contains_key("dspark"));
+        assert!(!m.files.contains_key("mtp"));
     }
 
     #[test]
@@ -578,42 +488,40 @@ mod tests {
     fn in_variants_nest_under_the_given_root() {
         let root = Path::new("/tmp/some-root");
         assert_eq!(
-            installed_path_in(root, crate::manifest::ModelSet::Ds4),
-            root.join("ds4.manifest")
+            installed_path_in(root, EngineId::DS4VISION),
+            root.join("engines/ds4vision.installed.json")
         );
         assert_eq!(
-            staging_dir_in(root, crate::manifest::ModelSet::Ds4),
-            root.join("staging")
+            staging_dir_in(root, EngineId::DS4VISION),
+            root.join("staging/ds4vision")
         );
         assert_eq!(downloads_dir_in(root), root.join("downloads"));
         assert_eq!(
-            local_path_for_in(root, crate::manifest::ModelSet::Ds4, "main"),
-            Some(root.join("ds4flash.gguf"))
+            local_path_for_in(root, EngineId::DS4VISION, "main"),
+            Some(root.join("ds4vision.gguf"))
         );
         assert_eq!(
-            local_path_for_in(root, crate::manifest::ModelSet::Ds4, "vision"),
-            Some(root.join("ds4flash.vision.gguf"))
+            local_path_for_in(root, EngineId::DS4VISION, "vision"),
+            Some(root.join("ds4vision.vision.gguf"))
         );
         assert_eq!(
-            local_path_for_in(root, crate::manifest::ModelSet::Ds4, "dspark"),
-            Some(root.join("ds4flash.dspark.gguf"))
+            local_path_for_in(root, EngineId::DS4VISION, "mtp"),
+            Some(root.join("ds4vision.mtp.gguf"))
         );
-        assert_eq!(
-            local_path_for_in(root, crate::manifest::ModelSet::Ds4, "bogus"),
-            None
-        );
-    }
-
-    #[test]
-    fn kinds_are_the_three_artifacts() {
-        assert_eq!(KINDS, ["main", "vision", "dspark"]);
+        assert_eq!(local_path_for_in(root, EngineId::DS4VISION, "bogus"), None);
     }
 
     #[test]
     fn paths_nest_under_the_plank_directory() {
         let root = plank_dir();
-        assert_eq!(installed_path(ModelSet::Ds4), root.join("ds4.manifest"));
-        assert_eq!(staging_dir(ModelSet::Ds4), root.join("staging"));
+        assert_eq!(
+            installed_path(EngineId::DS4VISION),
+            root.join("engines/ds4vision.installed.json")
+        );
+        assert_eq!(
+            staging_dir(EngineId::DS4VISION),
+            root.join("staging/ds4vision")
+        );
         assert_eq!(downloads_dir(), root.join("downloads"));
     }
 
@@ -627,7 +535,7 @@ mod tests {
         match kind {
             "main" => Some(100),
             "vision" => Some(200),
-            "dspark" => Some(300),
+            "mtp" => Some(300),
             _ => None,
         }
     }
@@ -637,7 +545,12 @@ mod tests {
         let remote = parse(&sample()).expect("parses");
         let installed = parse(&sample()).expect("parses");
         assert!(matches!(
-            decide(remote, Some(&installed), &KINDS, &all_present),
+            decide(
+                remote,
+                Some(&installed),
+                &crate::engines::ROLES,
+                &all_present
+            ),
             Decision::UpToDate
         ));
     }
@@ -646,7 +559,12 @@ mod tests {
     fn a_newer_remote_is_offered() {
         let remote = parse(&sample_at(4)).expect("parses");
         let installed = parse(&sample()).expect("parses");
-        match decide(remote, Some(&installed), &KINDS, &all_present) {
+        match decide(
+            remote,
+            Some(&installed),
+            &crate::engines::ROLES,
+            &all_present,
+        ) {
             Decision::Offer { manifest, from } => {
                 assert_eq!(manifest.version, 4);
                 assert_eq!(from, 3);
@@ -661,7 +579,12 @@ mod tests {
         let remote = parse(&sample_at(2)).expect("parses");
         let installed = parse(&sample()).expect("parses");
         assert!(matches!(
-            decide(remote, Some(&installed), &KINDS, &all_present),
+            decide(
+                remote,
+                Some(&installed),
+                &crate::engines::ROLES,
+                &all_present
+            ),
             Decision::UpToDate
         ));
     }
@@ -675,184 +598,74 @@ mod tests {
         let root = Path::new("/tmp/plank-set-test");
         for (a, b) in [
             (
-                installed_path_in(root, ModelSet::Ds4),
-                installed_path_in(root, ModelSet::Qwen),
+                installed_path_in(root, EngineId::DS4VISION),
+                installed_path_in(root, EngineId::QWEN),
             ),
             (
-                staging_dir_in(root, ModelSet::Ds4),
-                staging_dir_in(root, ModelSet::Qwen),
+                staging_dir_in(root, EngineId::DS4VISION),
+                staging_dir_in(root, EngineId::QWEN),
             ),
         ] {
             assert_ne!(a, b);
         }
         assert_ne!(
-            local_path_for_in(root, ModelSet::Ds4, "main"),
-            local_path_for_in(root, ModelSet::Qwen, "main"),
+            local_path_for_in(root, EngineId::DS4VISION, "main"),
+            local_path_for_in(root, EngineId::QWEN, "main"),
         );
     }
 
-    /// Each set installs only its own kinds. Qwen's old `mtp` sidecar is gone
-    /// — upstream ships the n-grams inside the main GGUF — so an `mtp` entry in
-    /// either manifest must resolve to nothing, and a `dspark` entry must not
-    /// install a `DeepSeek` drafter for a model that never loads one.
-    #[test]
-    fn a_set_resolves_only_its_own_kinds() {
-        let root = Path::new("/tmp/plank-set-test");
-        assert_eq!(ModelSet::Ds4.kinds(), &["main", "vision", "dspark"]);
-        assert_eq!(ModelSet::Qwen.kinds(), &["main", "vision"]);
-        assert!(local_path_for_in(root, ModelSet::Qwen, "mtp").is_none());
-        assert!(local_path_for_in(root, ModelSet::Qwen, "dspark").is_none());
-        assert!(local_path_for_in(root, ModelSet::Ds4, "mtp").is_none());
-        assert_eq!(ModelSet::Ds41.kinds(), &["main", "vision"]);
-        // V4.1 has no `DSpark` drafter upstream, so it must not resolve one.
-        assert!(local_path_for_in(root, ModelSet::Ds41, "dspark").is_none());
-    }
-
-    /// The V4.1 set, end to end: family mapping, kinds, manifest name, staging
-    /// leaf, CLI name and install paths.
-    #[test]
-    fn ds41_set_is_wired_end_to_end() {
-        let s = ModelSet::for_family(crate::gguf::ModelFamily::Ds41);
-        assert_eq!(s, ModelSet::Ds41);
-        assert_eq!(s.kinds(), &["main", "vision"]);
-        assert_eq!(s.manifest_name(), "ds41.manifest");
-        assert_eq!(s.staging_leaf(), "staging-ds41");
-        assert_eq!(s.as_str(), "ds41");
-        assert_eq!(ModelSet::from_str_or_default("ds41"), ModelSet::Ds41);
-        assert!(!s.kinds().contains(&"dspark"));
-        // The V4 family must not have been dragged along with it.
-        assert_eq!(
-            ModelSet::for_family(crate::gguf::ModelFamily::Ds4),
-            ModelSet::Ds4
-        );
-        let root = Path::new("/tmp/plank-set-test");
-        assert_eq!(
-            local_path_for_in(root, ModelSet::Ds41, "main"),
-            Some(root.join("ds41flash.gguf"))
-        );
-        assert_eq!(
-            local_path_for_in(root, ModelSet::Ds41, "vision"),
-            Some(root.join("ds41flash.vision.gguf"))
-        );
-    }
-
-    /// The one manifest that ships must keep parsing: it is compiled in, and a
-    /// malformed one is only noticed here. There is deliberately no V4.1
-    /// manifest — V4.1 is reached by an explicit `-m`, never managed.
-    #[test]
-    fn the_shipped_ds4_manifest_parses() {
-        let m = parse(include_str!("../ds4.manifest")).expect("ds4.manifest parses");
-        assert!(m.files.contains_key("dspark"));
-    }
-
-    /// A fresh install manages the V4 set — plank ships no V4.1 manifest, and
-    /// V4.1 is reached only through an explicit `-m`. An install that already
-    /// records the V4 manifest is likewise never migrated, and a root that
-    /// somehow records `ds41.manifest` keeps managing V4.1.
-    #[test]
-    fn a_fresh_install_defaults_to_ds4_and_a_recorded_set_is_never_migrated() {
-        let root = crate::downloader::tests::tempdir();
-        std::fs::create_dir_all(&root).expect("mkdir");
-        assert_eq!(default_set_for_root(&root), ModelSet::Ds4);
-        std::fs::write(root.join("ds4.manifest"), "{}").expect("write");
-        assert_eq!(default_set_for_root(&root), ModelSet::Ds4);
-        // A root recording the V4.1 manifest stays on V4.1.
-        std::fs::write(root.join("ds41.manifest"), "{}").expect("write");
-        assert_eq!(default_set_for_root(&root), ModelSet::Ds41);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The regression this guards: every machine in the existing installed
-    /// base has the V4 weights on disk and no recorded manifest, because it
-    /// predates manifests. Read as fresh it would be pointed at the V4.1 set,
-    /// whose artifacts are absent, and `ds4.manifest` would never be adopted —
-    /// so V4 upgrade offers would stop forever. The on-disk check keeps that
-    /// classification true on its own evidence, not on the fresh default.
-    #[test]
-    fn v4_weights_on_disk_with_no_recorded_manifest_still_default_to_ds4() {
-        let root = crate::downloader::tests::tempdir();
-        std::fs::create_dir_all(&root).expect("mkdir");
-        // Nothing at all: genuinely fresh.
-        assert_eq!(default_set_for_root(&root), ModelSet::Ds4);
-        let main = local_path_for_in(&root, ModelSet::Ds4, "main").expect("v4 main path");
-        std::fs::write(&main, b"gguf").expect("write");
-        assert_eq!(
-            default_set_for_root(&root),
-            ModelSet::Ds4,
-            "a pre-manifest V4 install must not be read as a fresh machine"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// `ALL_SETS` must list every variant. The exhaustive match makes adding a
-    /// variant a compile error here rather than a silently narrowed invariant
-    /// below.
-    #[test]
-    fn every_set_variant_is_listed() {
-        for set in ALL_SETS {
-            match set {
-                ModelSet::Ds4 | ModelSet::Ds41 | ModelSet::Qwen => {}
-            }
-        }
-        assert_eq!(ALL_SETS.len(), 3);
-        // No duplicates, or the disjointness test would compare a set to
-        // itself and pass vacuously.
-        for (i, a) in ALL_SETS.iter().enumerate() {
-            for b in &ALL_SETS[i + 1..] {
-                assert_ne!(a, b);
-            }
-        }
-    }
-
-    /// Two sets must never collide on any path they write.
+    /// Two engines must never collide on any path they write.
     ///
-    /// Load-bearing, not cosmetic: the swap's guarantee is that the manifest
-    /// file moves *last*, so its presence proves that set landed whole. Share
-    /// a staging directory between two sets and a half-staged download of one
-    /// could be read as proof about the other. Iterates every variant rather
-    /// than a hardcoded pair so it keeps holding for the next family.
+    /// Load-bearing, not cosmetic: the swap's guarantee is that the installed
+    /// record moves *last*, so its presence proves that engine landed whole.
+    /// Share a staging directory or a job file between two engines and a
+    /// half-staged download of one could be read as proof about the other.
     #[test]
     fn the_sets_never_share_a_path() {
         let root = Path::new("/tmp/plank-set-disjoint");
-        for (i, a) in ALL_SETS.iter().enumerate() {
-            for b in &ALL_SETS[i + 1..] {
+        let ids = [EngineId::DS4VISION, EngineId::DS41, EngineId::QWEN];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
                 let (a, b) = (*a, *b);
-                assert_ne!(a.staging_leaf(), b.staging_leaf(), "{a:?} vs {b:?}");
-                assert_ne!(a.manifest_name(), b.manifest_name(), "{a:?} vs {b:?}");
-                assert_ne!(a.as_str(), b.as_str(), "{a:?} vs {b:?}");
+                assert_ne!(a.as_str(), b.as_str(), "{a} vs {b}");
                 assert_ne!(
                     staging_dir_in(root, a),
                     staging_dir_in(root, b),
-                    "{a:?} vs {b:?}"
+                    "{a} vs {b}"
                 );
                 assert_ne!(
                     installed_path_in(root, a),
                     installed_path_in(root, b),
-                    "{a:?} vs {b:?}"
+                    "{a} vs {b}"
                 );
-                // The job file too: one set's pending job must never be read
-                // as the other's, or a helper would download one set against
-                // the other's manifest.
+                assert_ne!(
+                    staged_manifest_path_in(root, a),
+                    staged_manifest_path_in(root, b),
+                    "{a} vs {b}"
+                );
+                // The job file too: one engine's pending job must never be
+                // read as the other's, or a helper would download one engine
+                // against the other's manifest.
                 assert_ne!(
                     crate::downloader::job_path_in(root, a),
                     crate::downloader::job_path_in(root, b),
-                    "{a:?} vs {b:?}"
+                    "{a} vs {b}"
                 );
-                // Every install path of one set, against every install path of
-                // the other: two sets sharing a kind name must still land on
-                // different files.
-                for ka in a.kinds() {
-                    for kb in b.kinds() {
+                // Every install path of one engine, against every install path
+                // of the other: two engines sharing a role name must still
+                // land on different files.
+                for ka in crate::engines::ROLES {
+                    for kb in crate::engines::ROLES {
                         let (pa, pb) = (
                             local_path_for_in(root, a, ka),
                             local_path_for_in(root, b, kb),
                         );
-                        assert!(pa.is_some() && pb.is_some(), "{a:?}/{ka} {b:?}/{kb}");
-                        assert_ne!(pa, pb, "{a:?}/{ka} collides with {b:?}/{kb}");
+                        assert!(pa.is_some() && pb.is_some(), "{a}/{ka} {b}/{kb}");
+                        assert_ne!(pa, pb, "{a}/{ka} collides with {b}/{kb}");
                         assert_ne!(
                             local_path_for(a, ka),
                             local_path_for(b, kb),
-                            "{a:?}/{ka} collides with {b:?}/{kb}"
+                            "{a}/{ka} collides with {b}/{kb}"
                         );
                     }
                 }
@@ -860,23 +673,21 @@ mod tests {
         }
     }
 
-    /// The helper is handed its set in argv, and one spawned by a plank that
-    /// predates two sets passes nothing.
+    /// The helper is handed its engine in argv, and one spawned by a plank
+    /// that predates engines passes nothing.
     #[test]
     fn the_set_round_trips_through_argv() {
-        for set in ALL_SETS {
-            assert_eq!(ModelSet::from_str_or_default(set.as_str()), set, "{set:?}");
+        for id in [EngineId::DS4VISION, EngineId::DS41, EngineId::QWEN] {
+            assert_eq!(EngineId::from_legacy_arg(id.as_str()), Some(id), "{id}");
         }
-        assert_eq!(ModelSet::from_str_or_default("ds41"), ModelSet::Ds41);
-        assert_eq!(ModelSet::from_str_or_default("qwen"), ModelSet::Qwen);
-        assert_eq!(ModelSet::from_str_or_default("ds4"), ModelSet::Ds4);
+        assert_eq!(EngineId::from_legacy_arg("ds4"), Some(EngineId::DS4VISION));
         // An older helper passes nothing at all; that path must keep working.
-        assert_eq!(ModelSet::from_str_or_default(""), ModelSet::Ds4);
-        assert_eq!(ModelSet::from_str_or_default("glm"), ModelSet::Ds4);
+        assert_eq!(EngineId::from_legacy_arg(""), Some(EngineId::DS4VISION));
     }
 
-    /// Adoption is per-set, so a Qwen manifest is adopted on the two files it
-    /// names without a `DeepSeek` artifact in sight.
+    /// Adoption considers only the roles a manifest lists, so a Qwen manifest
+    /// naming `main` and `mtp` is adopted on those two files without a vision
+    /// encoder in sight.
     #[test]
     fn a_qwen_manifest_adopts_on_its_own_two_kinds() {
         let remote = parse(
@@ -892,7 +703,7 @@ mod tests {
             "mtp" => Some(20),
             _ => None,
         };
-        match decide(remote, None, ModelSet::Qwen.kinds(), &size_of) {
+        match decide(remote, None, &crate::engines::ROLES, &size_of) {
             Decision::Adopt(m) => assert_eq!(m.version, 1),
             other => panic!("expected adoption, got {other:?}"),
         }
@@ -903,7 +714,7 @@ mod tests {
         // Adopt-on-first-sight. Without this rule, every existing user is offered
         // an 87 GB re-download the day this ships.
         let remote = parse(&sample()).expect("parses");
-        match decide(remote, None, &KINDS, &all_present) {
+        match decide(remote, None, &crate::engines::ROLES, &all_present) {
             Decision::Adopt(m) => assert_eq!(m.version, 3),
             other => panic!("expected adoption, got {other:?}"),
         }
@@ -919,7 +730,7 @@ mod tests {
                 all_present(kind)
             }
         };
-        match decide(remote, None, &KINDS, &sizes) {
+        match decide(remote, None, &crate::engines::ROLES, &sizes) {
             Decision::Offer { from, .. } => assert_eq!(from, 0),
             other => panic!("expected an offer, got {other:?}"),
         }
@@ -929,13 +740,13 @@ mod tests {
     fn no_installed_manifest_and_a_missing_file_offers() {
         let remote = parse(&sample()).expect("parses");
         let sizes = |kind: &str| {
-            if kind == "dspark" {
+            if kind == "mtp" {
                 None
             } else {
                 all_present(kind)
             }
         };
-        match decide(remote, None, &KINDS, &sizes) {
+        match decide(remote, None, &crate::engines::ROLES, &sizes) {
             Decision::Offer { from, .. } => assert_eq!(from, 0),
             other => panic!("expected an offer, got {other:?}"),
         }
@@ -943,7 +754,7 @@ mod tests {
 
     #[test]
     fn adoption_only_considers_kinds_the_manifest_actually_lists() {
-        // A manifest with no dspark entry must not demand a dspark file on disk.
+        // A manifest with no mtp entry must not demand an mtp file on disk.
         let text = format!(
             r#"{{"version":1,"released":"x","notes":"","files":{{
             "main": {{ "name": "m.gguf", "url": "https://example.invalid/m", "bytes": 100, "sha256": "{SHA_MAIN}" }}
@@ -952,7 +763,7 @@ mod tests {
         let remote = parse(&text).expect("parses");
         let sizes = |kind: &str| (kind == "main").then_some(100);
         assert!(matches!(
-            decide(remote, None, &KINDS, &sizes),
+            decide(remote, None, &crate::engines::ROLES, &sizes),
             Decision::Adopt(_)
         ));
     }
@@ -962,14 +773,14 @@ mod tests {
         // `futureproof` is in the manifest but this build cannot install it, so it
         // must not block adoption or the size check.
         let text = sample().replace(
-            r#""dspark":"#,
+            r#""mtp":"#,
             &format!(
-                r#""futureproof": {{ "name": "f.gguf", "url": "https://example.invalid/f", "bytes": 7, "sha256": "{SHA_OTHER}" }}, "dspark":"#
+                r#""futureproof": {{ "name": "f.gguf", "url": "https://example.invalid/f", "bytes": 7, "sha256": "{SHA_OTHER}" }}, "mtp":"#
             ),
         );
         let remote = parse(&text).expect("parses");
         assert!(matches!(
-            decide(remote, None, &KINDS, &all_present),
+            decide(remote, None, &crate::engines::ROLES, &all_present),
             Decision::Adopt(_)
         ));
     }
@@ -982,7 +793,7 @@ mod tests {
         // release at the same version as "up to date".
         let text = r#"{"version":5,"released":"x","notes":"","files":{}}"#;
         let remote = parse(text).expect("parses");
-        match decide(remote, None, &KINDS, &|_| None) {
+        match decide(remote, None, &crate::engines::ROLES, &|_| None) {
             Decision::Offer { from, .. } => assert_eq!(from, 0),
             other => panic!("expected an offer, got {other:?}"),
         }
@@ -1020,6 +831,84 @@ mod tests {
                 "{scheme:?} must not be accepted as a manifest url"
             );
         }
+    }
+
+    #[test]
+    fn engine_ids_validate_and_intern() {
+        let a = EngineId::new("my-engine").expect("valid");
+        let b = EngineId::new(&String::from("my-engine")).expect("valid");
+        assert_eq!(a, b);
+        assert_eq!(a.as_str(), "my-engine");
+        assert!(EngineId::new("Bad").is_none());
+        assert_eq!(EngineId::new("ds4vision"), Some(EngineId::DS4VISION));
+    }
+
+    #[test]
+    fn legacy_helper_args_map_onto_engines() {
+        assert_eq!(EngineId::from_legacy_arg(""), Some(EngineId::DS4VISION));
+        assert_eq!(EngineId::from_legacy_arg("ds4"), Some(EngineId::DS4VISION));
+        assert_eq!(EngineId::from_legacy_arg("ds41"), Some(EngineId::DS41));
+        assert_eq!(EngineId::from_legacy_arg("qwen"), Some(EngineId::QWEN));
+        assert_eq!(EngineId::from_legacy_arg("NOPE"), None);
+    }
+
+    #[test]
+    fn install_paths_are_derived_from_the_engine_name() {
+        let root = Path::new("/r");
+        let id = EngineId::new("foo").unwrap();
+        assert_eq!(
+            local_path_for_in(root, id, "main"),
+            Some(root.join("foo.gguf"))
+        );
+        assert_eq!(
+            local_path_for_in(root, id, "mtp"),
+            Some(root.join("foo.mtp.gguf"))
+        );
+        assert_eq!(
+            local_path_for_in(root, id, "vision"),
+            Some(root.join("foo.vision.gguf"))
+        );
+        assert_eq!(local_path_for_in(root, id, "future"), None);
+        assert_eq!(
+            installed_path_in(root, id),
+            root.join("engines/foo.installed.json")
+        );
+        assert_eq!(staging_dir_in(root, id), root.join("staging/foo"));
+        assert_eq!(
+            staged_manifest_path_in(root, id),
+            root.join("staging/foo/foo.installed.json")
+        );
+    }
+
+    #[test]
+    fn engines_never_share_a_path() {
+        let root = Path::new("/r");
+        let ids = [EngineId::DS4VISION, EngineId::DS41, EngineId::QWEN];
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            for p in [installed_path_in(root, id), staging_dir_in(root, id)]
+                .into_iter()
+                .chain(
+                    crate::engines::ROLES
+                        .iter()
+                        .filter_map(|r| local_path_for_in(root, id, r)),
+                )
+            {
+                assert!(seen.insert(p.clone()), "{} shared", p.display());
+            }
+        }
+    }
+
+    #[test]
+    fn installed_ids_are_found_by_scanning_the_engines_dir() {
+        let root = std::env::temp_dir().join(format!("plank-ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("engines")).unwrap();
+        std::fs::write(root.join("engines/qwen.installed.json"), "{}").unwrap();
+        std::fs::write(root.join("engines/Bad.installed.json"), "{}").unwrap();
+        std::fs::write(root.join("engines/notes.txt"), "").unwrap();
+        assert_eq!(installed_ids_in(&root), vec![EngineId::QWEN]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

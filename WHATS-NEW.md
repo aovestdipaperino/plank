@@ -13,6 +13,30 @@ it.
 Riding ahead of stable 5.1.0 in the 5.1.5 beta. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
 
+### Next release
+
+**Models are named engines now.** plank used to know three model sets by
+hard-coded file names. It now reads an `engines.json` catalog: each engine is
+a main model plus its drafter and vision encoder, the catalog ships inside the
+binary and refreshes from the repository once a day, and
+`~/.plank/engines.local.json` lets you add your own. `plank --model ds41` or
+`plank --model qwen` picks an engine with everything it needs, and
+`--model:<name>` does the same but refuses to read the word as a path.
+`--qwen` is gone in favour of `--model qwen`.
+
+**Your model files get new names, and that is one way.** The first launch
+renames `~/.plank/ds4flash.gguf` and its siblings to `ds4vision.gguf`,
+`ds4vision.mtp.gguf` and `ds4vision.vision.gguf`, and the V4.1 files to
+`ds41.*`. Nothing is downloaded again. An older plank pointed at the same
+`~/.plank`, though, will not find its model any more and will offer to fetch
+it, so upgrade every copy you run together. A bare `--model /some/file.gguf`
+now loads just that file: no drafter or encoder is picked up beside it, so pass
+`--mtp-model` for speculation, or describe the file as a local engine. Two
+exceptions: a path that is the same file as a managed engine's main, including
+through a symlink or hard link, selects that engine instead, and a `.ggd`
+delta built on a managed engine's main inherits that engine's companions,
+though the delta itself is never upgraded.
+
 ### 5.1.5
 
 **`cargo`, `npm` and `go` work under the sandbox again.** A build that had to

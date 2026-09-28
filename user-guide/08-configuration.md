@@ -47,7 +47,7 @@ Changes write `./.plank/settings.json` and apply immediately. The one-key form b
 
 | Key | Default | What |
 |---|---|---|
-| `model` | `~/.plank/ds4flash.gguf` | model file (`~` expanded). Same as `-m`. |
+| `model` | the catalog default, `ds4vision` | an engine name from `engines.json`, or a model file path (`~` expanded). Same as `-m`. |
 | `threads` | engine default | worker threads. Same as `-t`. |
 | `backend` | platform default | `metal`, `cuda`, or `cpu`. Same as `--backend`. |
 | `power` | unset | GPU power cap percent. Same as `--power`. |
@@ -165,7 +165,8 @@ One limitation: settings come from the directory plank launches in, so project s
 
 | Flag | What |
 |---|---|
-| `-m, --model PATH` | load a ds4 GGUF model |
+| `-m, --model NAME\|PATH` | run a named engine (`ds4vision`, `ds41`, `qwen`, or one of yours from `~/.plank/engines.local.json`) with its companions, or load a GGUF file on its own |
+| `--model:NAME` | run a named engine, and fail rather than read `NAME` as a path |
 | `-t, --threads N` | worker thread count |
 | `--backend NAME` | `metal`, `cuda`, or `cpu` |
 | `--metal` / `--cuda` / `--cpu` | the same, as switches |
@@ -218,7 +219,7 @@ One limitation: settings come from the directory plank launches in, so project s
 
 Speculative decoding is **on by default** under one name, `--mtp`. DeepSeek V4 Flash uses its auxiliary DSpark draft checkpoint: it proposes up to five tokens ahead and the main model verifies them, committing only the prefix it agrees with, so one verification pass can advance the stream by several tokens. DeepSeek V4.1 Flash has no drafter upstream, so plank never pairs one with it and decodes target-only there. `--mtp-off` turns speculation off explicitly.
 
-On V4 the support model (~5.6 GB) needs no flag of its own: it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download through the same resumable path as the main model, unless `--mtp-model` names one.
+On V4 the support model (~5.6 GB) needs no flag of its own: it is the `ds4vision` engine's `mtp` companion, resolves to `~/.plank/ds4vision.mtp.gguf`, and is offered for download through the same resumable path as the main model, unless `--mtp-model` names one. A model loaded by a bare path has no companions, so speculation there needs `--mtp-model`.
 
 A drafter plank paired for you is no longer able to stop a model from loading. The engine refuses to open a model at all when the draft checkpoint does not match it, so a checkpoint the default drafter does not fit used to fail until you found `--mtp-off`; plank now retries the open once without the companion it chose and reports the original error only if that fails too. A companion you named with `--mtp-model` is never dropped. When speculation turns out not to run, the temperature you would have been sampling at is restored rather than left pinned at 0.
 

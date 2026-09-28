@@ -98,8 +98,9 @@ pub const ASK_MIN_OPTIONS: usize = 2;
 
 /// Engine defaults: the same knobs as `-m`, `-t`, `--backend`, `--power`, `-c`.
 ///
-/// `model` replaces what used to be a hardcoded convention — plank falls back
-/// to `~/.plank/ds4flash.gguf` only when neither this key nor `-m` is given.
+/// `model` takes the same values as `--model`: an engine name from the
+/// `engines.json` catalog, or a path. When neither this key nor `-m` is
+/// given, the catalog `default` engine is used.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineSettings {
     /// Model file to load; overridden by `-m`/`--model`.
@@ -1243,8 +1244,10 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
 
     // Engine and safety keys: reported only when the parsed config still
     // carries the file's value, i.e. no flag overrode it.
+    // Compared against the user's spec, not the resolved path: `engine.model`
+    // may name a catalog engine (`qwen`) that resolves to a file elsewhere.
     if let Some(m) = &s.engine.model
-        && cfg.model_path.as_ref() == Some(m)
+        && cfg.model_spec.as_deref() == Some(&*m.to_string_lossy())
     {
         parts.push(format!("model={}", m.display()));
     }
@@ -1373,7 +1376,7 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
 }
 
 /// Expands a leading `~/` against `$HOME`, leaving other paths untouched.
-fn expand_tilde(s: &str) -> PathBuf {
+pub(crate) fn expand_tilde(s: &str) -> PathBuf {
     match (s.strip_prefix("~/"), std::env::var_os("HOME")) {
         (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => PathBuf::from(s),

@@ -2109,6 +2109,14 @@ end-of-*chunk*, not end-of-file. Before this, any interruption of a multi-hour
 download restarted from zero and the whole `.part` rehash machinery was dead
 weight — one real interruption cost 88 GiB.
 
+**2026-09-28:** the engine catalog replaced the single `ds4.manifest`/`qwen.manifest`
+pair with `engines.json` and a per-engine `<engine>.installed.json`. The rule
+above still holds, only per-engine now: `downloader::swap_staged` moves
+`staging/<engine>/<engine>.installed.json` last, so its presence is the proof that
+engine's whole artifact set landed. `ds4.manifest` and `qwen.manifest` stay in
+the repo, byte-identical, only so an older plank binary upgrading past this
+change still finds a manifest it understands (`tests/c_parity.rs`).
+
 ## A `</think>` splice has to be decided before the truncate, or the branch is dead
 
 `Ds4Session`'s prompt reconciliation truncates the token buffer to the common
@@ -3147,3 +3155,27 @@ and stayed silent, with tdk up and listening. Nothing errors, by design. The fix
 was client 0.2.1, whose only change is the name; `Cargo.toml` pins
 `>= 0.2.1` so a fresh resolve cannot fall back. If the mirror goes quiet again,
 compare `lsof -p $(pgrep tdk) | grep lock` with the client's `LOCK_NAME` first.
+
+## The engine layout migration is one way, and `HOME=$(mktemp -d)` does not isolate a dev run
+
+**2026-09-28:** the engine catalog renames the model files under `~/.plank`
+at first launch (`ds4flash.gguf` becomes `ds4vision.gguf`, `ds41flash.gguf`
+becomes `ds41.gguf`, companions and install records follow; see
+`enginemigrate.rs`). Nothing renames them back. An older plank release sharing
+the same `~/.plank` looks for the old names, finds nothing, and offers a full
+re-download, so mixing releases on one home costs a model download rather than
+an error. `engines::resolve_with_note_in` keeps an old `~/.plank/ds4flash.gguf`
+or `ds41flash.gguf` in a config working in the new release, with a one-line
+note; it cannot help the old release.
+
+Testing a migration by hand needs a truly empty home, and on this machine
+`HOME=$(mktemp -d)` is not one. `home::plank_home_in` falls back to the shared
+`/Users/.plank` when `$HOME/.plank` is absent, and here `/Users/.plank` is a
+symlink to the real home's `.plank`, so a run under a fresh `$HOME` migrates
+and downloads into the real one. Create the directory first
+(`mkdir "$HOME/.plank"`) so the fallback never applies. Tests follow the same
+rule the other way: every path they touch goes through an `_in(root)` seam
+with a scratch root, and a process launch goes through an injected spawner
+(`downloader::spawn_detached_in`), because a test binary run as a detached
+`--model-downloader` against the real home is exactly what this fallback turns
+a test into.

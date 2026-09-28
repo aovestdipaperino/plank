@@ -46,9 +46,9 @@ cargo build --release
 
 - **With `refs/ds4` present:** `build.rs` builds `libds4core.a` from the Metal-backend objects and links the required frameworks, enabling the `ds4_engine` cfg.
 - **Missing submodule:** plank still builds, but without the native engine it uses the echo engine only (useful for development/CI).
-- **Three model families, one build.** DeepSeek V4 Flash, V4.1 Flash and Qwen3.8-Flash-Next are all compiled in and told apart from the GGUF's own `general.architecture`; each has its own tool-call dialect, artifact set and transcript extension (`.ds4.kv` / `.ds41.kv` / `.qwn.kv`). Qwen was retired once, when upstream deleted its Metal kernels; upstream has since merged it properly and publishes the weights, so it is back unconditionally — no cargo feature to enable, and `--qwen` is always there.
+- **Three model families, one build.** DeepSeek V4 Flash, V4.1 Flash and Qwen3.8-Flash-Next are all compiled in and told apart from the GGUF's own `general.architecture`; each has its own tool-call dialect, artifact set and transcript extension (`.ds4.kv` / `.ds41.kv` / `.qwn.kv`). Qwen was retired once, when upstream deleted its Metal kernels; upstream has since merged it properly and publishes the weights, so it is back unconditionally, addressed as the `qwen` engine with `--model qwen`.
 
-You will also need a GGUF model file (e.g. `ds4flash.gguf`) for real inference; see the `download_model.sh` script in `refs/ds4`.
+You will also need a GGUF model file for real inference; use `--model <name|path>` to pick one, either a catalog engine name (`ds4vision`, `ds41`, `qwen`) or a path of your own. See the `download_model.sh` script in `refs/ds4`.
 
 ## Usage
 
@@ -61,7 +61,7 @@ Run with a prompt argument for one-shot headless mode.
 
 ### Model download
 
-Real inference needs the DeepSeek V4 Flash GGUF — the official (non-preview) `-0731` build of 2026-07-31. You can point plank at any copy with `-m <path>`, but with no flag it looks in the default location (`~/.plank/ds4flash.gguf`) and, when nothing is there, offers to fetch the quantized model (~87 GB) from Hugging Face — one keypress and it downloads in place with live progress:
+Real inference needs the DeepSeek V4 Flash GGUF — the official (non-preview) `-0731` build of 2026-07-31. You can point plank at any copy with `-m <path>`, but with no flag it resolves the default engine, `ds4vision`, to `~/.plank/ds4vision.gguf` and, when nothing is there, offers to fetch the quantized model (~87 GB) from Hugging Face — one keypress and it downloads in place with live progress:
 
 <p align="center">
   <img src="assets/model-download.gif" alt="Model download progress UI" width="700">
@@ -73,7 +73,7 @@ Details worth knowing:
 - **Guarded.** The default quant needs ~82 GB resident, so plank refuses to download or load on machines with less than 96 GB of RAM — you find out before spending hours on the transfer, not after.
 - **Honest about the wait.** An 87 GB download takes a while; the progress bar keeps you company with size/rate counters and a rotation of two hundred status messages ("Almost sentient. Please hold." among them).
 - **Playable.** A round of [breakout](#the-arcade) sits above the gauge, because hours is a long time to watch a bar fill. It is decoration and never delays the transfer: Esc puts it away, and `q` or Ctrl-C abort the download from anywhere, so a rally can't trap you.
-- **Kept current.** The build a model was downloaded from is recorded beside it, so a newer default is noticed instead of being masked forever by an existing file. Inferred from the filename when there's no stamp, which covers symlinking `ds4flash.gguf` at a GGUF you keep elsewhere; unknown never means re-download.
+- **Kept current.** Each engine in the `engines.json` catalog carries its own monotonic `version`; plank checks the catalog at most once a day and offers an upgrade only when an installed engine's version is behind, so a symlinked or manually placed GGUF is left alone rather than re-downloaded.
 - **Headless-safe.** With stdin not attached to a terminal there is no prompt to answer, so plank exits with instructions instead of hanging a script.
 
 Without a model (or on non-macOS platforms) plank still runs against a built-in echo stub — useful for developing the UI and tools, not for real inference.
@@ -82,7 +82,7 @@ Without a model (or on non-macOS platforms) plank still runs against a built-in 
 
 Speculative decoding — multi-token prediction, `--mtp` — is **on by default**, with a different mechanism per model family. DeepSeek uses its auxiliary DSpark draft checkpoint for V4 Flash: it reads hidden states from the main model, proposes up to five tokens ahead, and the main model verifies them and commits only the prefix it agrees with, so one verification pass can advance the stream by several tokens. V4.1 Flash ships no drafter, so it decodes target-only. `--mtp-off` turns it off for target-only decode.
 
-On DeepSeek the support model (~5.6 GB) does not need a flag of its own. It resolves to `~/.plank/ds4flash.dspark.gguf` and, when missing, is offered for download through the same resumable, playable path as the main model. `--mtp-model <path>` overrides it.
+On DeepSeek the support model (~5.6 GB) does not need a flag of its own. It resolves to `~/.plank/<engine>.mtp.gguf` alongside the main model (`~/.plank/ds4vision.mtp.gguf` for the default engine) and, when missing, is offered for download through the same resumable, playable path as the main model. `--mtp-model <path>` overrides it.
 
 ```sh
 plank --temp 0
@@ -208,7 +208,7 @@ A few keys cannot take effect until you restart, because what they configure is 
 
 | Group | Key | Default | What it does |
 |---|---|---|---|
-| `engine` | `model` | `~/.plank/ds4flash.gguf` | Model file to load (`~` expanded). Same as `-m`. |
+| `engine` | `model` | the catalog default (`ds4vision`) | An engine name or a path (`~` expanded). Same as `-m`/`--model`. |
 | | `threads` | engine default | Worker threads. Same as `-t`. |
 | | `backend` | platform default | `metal`, `cuda`, or `cpu`. Same as `--backend`. |
 | | `power` | unset | GPU power cap percent. Same as `--power`. |
