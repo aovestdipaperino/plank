@@ -121,7 +121,7 @@ Project-scoped `./.plank` is a different thing and is unaffected.
 
 ## Module reference
 
-### Model families (`gguf.rs`, `manifest::ModelSet`, `trace_stream::syntax`)
+### Model families (`gguf.rs`, `engines.rs`, `trace_stream::syntax`)
 plank supports two model families and tells them apart three times, from three
 different sources, because each answer is needed at a different moment.
 
@@ -130,7 +130,7 @@ separate model: different weights, tokenizer and vision encoder, and its own
 DSML dialect (the same markers respelled with a leading space). Nothing
 captured under one family may be replayed under the other, so the split runs
 all the way down — `ModelFamily::Ds4`/`Ds41`, `ToolSyntax::Dsml`/`Dsml41`,
-`ModelSet::Ds4`/`Ds41`, and `.ds4.kv`/`.ds41.kv` transcripts.
+and `.ds4.kv`/`.ds41.kv` transcripts.
 
 Retiring a family is a third thing, neither supporting it nor deleting it.
 plank once served Qwen3.8-Flash-Next; upstream removed its Metal kernels, so
@@ -166,17 +166,20 @@ syntax reminder, and the model-visible error text. It lives in `trace-stream`
 because the renderer needs it and that crate cannot depend on plank; `From` is
 the single place the two enums are reconciled.
 
-`manifest::ModelSet` scopes everything on disk: manifest file, staging
-directory, install slots, artifact kinds, remote URL. The sets share nothing,
-because the invariant that makes a swap safe is per-set — the manifest moves
-last, so its presence proves that set landed, and one shared staging area would
-let a half-staged download of one family read as proof about the other.
+`engines.rs` scopes everything on disk per named engine: catalog entry,
+staging directory, install slots (`main`/`mtp`/`vision`), remote URLs. Engines
+share nothing on disk, because the invariant that makes a swap safe is
+per-engine — the staged `<engine>.installed.json` moves last, so its presence
+proves that engine's set landed, and one shared staging area would let a
+half-staged download of one engine read as proof about another.
 
-Only the V4 set is actually *managed*: `ds4.manifest` is the one manifest in
-the repo, and `default_set_for_root` answers `Ds4` for a fresh install. V4.1 is
-reached by pointing `-m` at a V4.1 GGUF — the family, dialect, transcript
-extension and install paths all follow from the file — and its manifest fetch
-simply 404s, which the startup flow already treats like being offline: nothing
+Every engine in `engines.json` is managed this way, keyed by its own
+monotonic `version`; `ds4vision` is the catalog's `default` and is what a
+fresh install resolves to with no `--model` given. V4.1 (`ds41`) is a named
+engine like any other, reached with `--model ds41` or by pointing `-m` at a
+V4.1 GGUF path directly — the family, dialect, transcript extension and
+install paths all follow from the file when loaded by path. An engine whose
+remote fetch 404s or times out is treated like being offline: nothing
 printed, nothing offered, and the 24-hour check file stamped before the fetch
 so it is not retried until tomorrow.
 
@@ -647,7 +650,7 @@ groups:
 
 | Group | Keys | Replaces |
 |---|---|---|
-| `engine` | `model`, `threads`, `backend`, `power`, `ctx` | `-m`/`-t`/`--backend`/`--power`/`-c`, and the hardcoded `~/.plank/ds4flash.gguf` fallback |
+| `engine` | `model`, `threads`, `backend`, `power`, `ctx` | `-m`/`-t`/`--backend`/`--power`/`-c`, and the catalog default (`ds4vision`) fallback |
 | `ui` | `respectGitignore`, `popupRows`, `indexRefreshSecs`, `historySize`, `showToolCalls`, `showToolResults`, `showThinking`, `screensaver`, `screensaverFace` | magic numbers in `complete.rs` and `ui.rs` |
 | `safety` | `sandbox`, `btwSuspend` | the defaults behind `--sandbox`/`--no-sandbox` and `--btw-suspend`/`--disable-btw-suspend` |
 | `mcp` | `timeoutSecs` | `MCP_TIMEOUT_SEC` in `tools/mcp.rs` |
