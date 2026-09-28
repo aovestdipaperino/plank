@@ -290,14 +290,26 @@ loop — with piped stdin there is no live input to multiplex.
 ### GPU yield (`gpuyield.rs`)
 
 A child command can need the GPU the loaded model occupies (`mex`, which runs a
-diffusion model on Metal, is the first). The protocol is small: the command
-exits 75 and prints a line starting with `GPU not available`, and plank sets
-`PLANK_GPU_YIELD=1` in every bash job so a tool knows plank can step aside.
+diffusion model on Metal, is the first). plank sets `PLANK_GPU_YIELD=1` in
+every bash job so a tool knows plank can step aside, and
+`PLANK_GPU_YIELD_FILE` naming a signal file for that run alone
+(`gpuyield::signal_path`: `$TMPDIR/plank-gpu-yield-<uid>/signal-<nonce>`,
+the directory created or tightened to 0700 and refused unless it is a real
+directory this user owns; the file is never created by plank). A command asks
+for the GPU by writing one line into that file, whatever its exit status, or
+by exiting 75 and printing a line starting with `GPU not available`. The file
+is the primary signal because models pipe almost everything, and in
+`mex x 2>&1 | tail -20` the shell's status is `tail`'s 0, which hides the 75.
 
 Detection lives at the bash layer: a foreground `bash` call whose command ended
 inside the call leaves a `ForegroundExit` on `BashJobs::last_foreground`, with
-the exit status, whether the whole output file (not the head the observation
-shows) has the marker at a line start, and the sandbox decision the run used.
+the exit status, the signal line (`gpuyield::take_signal`, which reads at most
+4 KiB, keeps the first non-blank line for the notice, and deletes the file
+whatever it held), whether that or the whole output file (not the head the
+observation shows) having the marker at a line start asks for the GPU, and the
+sandbox decision the run used. A job still running when the call returns keeps
+its signal path until it is reaped, and `BashJob`'s drop deletes the file, so a
+background job that signals is never retried and leaves nothing behind.
 `Agent::dispatch_tool`, the per-call path of `run_tool_calls`, reads it. That
 seam is shared by `run_turn` (plain REPL and every headless mode),
 `worker_turn` (TUI), sub-agent rounds and fan-out rounds; a stanza goes call by
@@ -319,8 +331,9 @@ can be touching the engine:
 4. the same call dispatched once more, with the first run's sandbox decision
    replayed and `BashJobs::wait_to_exit` set, so the call waits for the
    command to exit (its own timeout and a user interrupt still end it) rather
-   than returning `status=running` after `refresh_sec`; its result is what the
-   model sees, and it never cycles again;
+   than returning `status=running` after `refresh_sec`; being a new job it
+   gets a fresh signal path, its result is what the model sees, and it never
+   cycles again;
 5. the `ReopenFn` that `make_local_engine` built from the exact resolved
    parameters (companion retry included). It first checks that the model, the
    DSpark draft model and the vision encoder are readable regular files
@@ -352,11 +365,14 @@ because a sidechain unwinding moves it: a parked parent returns to
 placeholder left the reload is dropped. While one is owed, the idle slot runs
 no memory or suggestion pass. A turn runs at most two cycles
 (`GPU_YIELD_CYCLES_PER_TURN`); a third request gets its first result with a
-note. The re-run is an ordinary dispatch, so tool hooks fire for both runs.
+note, which is also what bounds a tool that writes its signal file on every
+run. The re-run is an ordinary dispatch, so tool hooks fire for both runs.
 The local engine can be `Agent::engine`, the `EngineKey::Local` alternate under
 a provider main agent, or a parent parked in `Agent::parked_engines` while a
 provider sidechain runs. The user's `!` and `!!` escapes get the same cycle
-through `Agent::run_bang`: `run_immediate` exports the variable too, and the
+through `Agent::run_bang`: `run_immediate` exports both variables too, with a
+fresh signal path per call, and hands back the signal line it read and deleted
+as `ImmediateOutput::gpu_signal`, and the
 cycle's re-run step is a `CycleRerun` the agent's host is generic over, the
 tool call's re-dispatch (`ToolRerun`) or the escape's second `run_immediate`
 through the front end's `BangIo` (`BangRerun`; console lines, or the TUI log

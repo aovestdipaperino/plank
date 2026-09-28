@@ -9,6 +9,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **Commands that need the GPU get it.** A `bash` command that exits 75 and prints a line starting with `GPU not available` makes plank unload its local model, run the command once more, then reload the model and restore the KV cache, so the conversation continues without a re-prefill. Every `bash` job sees `PLANK_GPU_YIELD=1`, and so do the `!` and `!!` shell escapes, which get the same cycle (one per escape, the second run's output shown and recorded). Background jobs are not covered.
+- **GPU requests survive pipes.** Every `bash` job and every `!`/`!!` escape also gets `PLANK_GPU_YIELD_FILE`, a fresh signal-file path per run in a private directory under the system temp dir. A command that writes one line there asks for the GPU whatever its exit status, so `mex x.md 2>&1 | tail -20`, whose status is `tail`'s 0, now cycles too (mex 0.2.4 uses the file). The exit-75-plus-marker rule still works. The file is deleted after it is read, and a background job's at reap, since background jobs still never cycle.
 - **A profile may recommend a model.** `recommendedModel` in the `profile` block names an engine that `--profile` runs use ahead of `engine.model`, but only when its main file is already on disk; `--model` still wins and nothing is downloaded.
 - **A local engine role may name a `url`.** In `~/.plank/engines.local.json` a
   role with a `path` can add an `https://` `url` (a Hugging Face `/blob/` page
