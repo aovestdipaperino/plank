@@ -128,6 +128,54 @@ fn render_lines(mut reader: std::fs::File, out: RawFd) {
     write_all(out, b"\r\x1b[K");
 }
 
+/// Serializes [`discarding`]. Its own lock, not [`CAPTURE_LOCK`]: a session
+/// created inside `f` takes that one through [`without_ds4_chatter`], and the
+/// same thread locking it twice would deadlock.
+static DISCARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Runs `f` with fd 2 pointed at `/dev/null`.
+///
+/// For the C engine's teardown and reload in the middle of a session (the
+/// GPU-yield cycle): its load log is one row per line at startup, but here it
+/// would land on whatever the front end is drawing, the TUI's alternate
+/// screen included. Failures still reach the user through the `Result` the
+/// open returns, whose message is built on the Rust side.
+pub fn discarding<T>(f: impl FnOnce() -> T) -> T {
+    let Ok(_guard) = DISCARD_LOCK.lock() else {
+        return f();
+    };
+    // SAFETY: dup/open/dup2 on process-owned fds; every fd opened here is
+    // closed on every path.
+    let saved = unsafe {
+        let saved = libc::dup(libc::STDERR_FILENO);
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if saved < 0 || null < 0 || libc::dup2(null, libc::STDERR_FILENO) < 0 {
+            if saved >= 0 {
+                libc::close(saved);
+            }
+            if null >= 0 {
+                libc::close(null);
+            }
+            None
+        } else {
+            libc::close(null);
+            Some(saved)
+        }
+    };
+    let Some(saved) = saved else {
+        return f();
+    };
+    let out = f();
+    // SAFETY: `saved` is our dup of the real fd 2. Flush C stdio first so a
+    // buffered line cannot slip out after the fd comes back.
+    unsafe {
+        libc::fflush(std::ptr::null_mut());
+        libc::dup2(saved, libc::STDERR_FILENO);
+        libc::close(saved);
+    }
+    out
+}
+
 /// Known ds4 chatter: lines the C library prints on every session creation
 /// that say nothing a user of plank can act on.
 ///

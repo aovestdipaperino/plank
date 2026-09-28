@@ -1153,6 +1153,20 @@ pub trait Engine: Debug + Send {
         false
     }
 
+    /// Whether dropping this engine frees the GPU it occupies: the model's
+    /// Metal memory and the process's model lock (`docs/ARCHITECTURE.md`,
+    /// "GPU yield").
+    ///
+    /// The agent asks this before unloading the model so a child command can
+    /// have the GPU. A local engine answers `true` only when it is the sole
+    /// owner of its loaded model, since a model another session still shares
+    /// stays mapped when this one goes. Engines that run nothing on this
+    /// machine's GPU (the echo stub, providers, remote hosts) keep the default
+    /// `false`, and the agent then leaves the command's result alone.
+    fn can_release_gpu(&self) -> bool {
+        false
+    }
+
     /// Begins a warm walk: resets the cumulative warm token buffer to the
     /// system prompt's tokens. No prefill happens yet.
     ///
