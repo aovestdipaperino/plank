@@ -3179,3 +3179,35 @@ with a scratch root, and a process launch goes through an injected spawner
 (`downloader::spawn_detached_in`), because a test binary run as a detached
 `--model-downloader` against the real home is exactly what this fallback turns
 a test into.
+
+## The model lock is the C engine's, and closing the engine is what releases it
+
+**2026-09-28:** `/tmp/ds4.lock` (`$DS4_LOCK_FILE`) is not held by plank.
+`acquire_model_lock` in `main.rs` only probes it and lets go; the C engine takes
+it inside `ds4_engine_open` (`ds4_acquire_instance_lock`, an `flock` on its own
+descriptor) and drops it in `ds4_engine_close` (`ds4_release_instance_lock`).
+So the GPU-yield cycle frees the lock by dropping the last `Arc<Ds4Model>`,
+not by any plank-side unlock. Two consequences worth knowing. A contended lock
+inside `ds4_engine_open` is `exit(2)`, not an error return, so a mid-session
+reopen must probe first or a second plank started while the model was out would
+kill this one; the probe narrows that window without closing it. And the flock
+is per open file description, so a second in-process open would contend with
+the first and exit too: there can only ever be one `Ds4Model`, which is why the
+cycle looks for exactly one releasable engine. Each reopen also registers the
+C's `atexit(ds4_release_instance_lock)` again; the handler is idempotent, so the
+repeats are harmless.
+
+## `ds4_engine_open` exits instead of failing, which a mid-session reload cannot catch
+
+**2026-09-28:** the C `model_open` calls `exit(1)` for a model, DSpark draft or
+vision file it cannot open, read or map, and the instance lock calls `exit(2)`
+on contention. At startup that is only an abrupt message; during the GPU-yield
+reload it ends a running session. plank narrows it from the Rust side: the
+`ReopenFn` checks every file it will map is a readable regular file and probes
+the lock first, the session is saved before the model is released, and an
+`atexit` hook armed only for the reload (`stderrline::logging_to`) restores
+fd 2 and the terminal and prints the last line of `~/.plank/gpu-yield.log`.
+What stays open is a failure no check foresees (a file that is readable but
+cannot be mapped, say) and a plank that takes the lock between the probe and
+the open. The lasting fix is an option for `ds4_engine_open` to return an error
+instead of calling `exit`, which belongs in `refs/ds4`.

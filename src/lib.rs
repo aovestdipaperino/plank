@@ -52,6 +52,7 @@ pub mod ffi;
 pub mod gguf;
 pub mod ggufdelta;
 pub mod goal;
+pub mod gpuyield;
 pub mod guard;
 pub mod home;
 pub mod hooks;

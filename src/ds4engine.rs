@@ -2424,6 +2424,13 @@ impl Engine for Ds4Session {
         Ok(())
     }
 
+    fn can_release_gpu(&self) -> bool {
+        // Dropping this session closes the model only when no sibling (a fork,
+        // a host session) still holds the `Arc`: the last owner's drop is what
+        // runs `ds4_engine_close`, which frees the Metal state and the lock.
+        Arc::strong_count(&self.model) == 1
+    }
+
     fn release_session(&mut self) -> bool {
         if self.session.is_null() {
             return false;

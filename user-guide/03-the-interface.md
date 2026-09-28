@@ -155,6 +155,8 @@ Either form is **your** command, not the model's, so it is **never sandboxed** â
 
 The marker is coloured as you type, by where the output goes: **red `!`** feeds the command and its output to the model, **green `!!`** keeps it between you and the shell. That is the only difference between the two forms and the only thing you cannot see once the line is typed. When the command finishes, plank says `done.` in green â€” a command that printed nothing is otherwise indistinguishable from one still running. An interrupted command says `[interrupted]` instead, and a non-zero exit adds `[exit code: N]`.
 
+Both forms run with `PLANK_GPU_YIELD=1` set, so a command that needs the GPU the local model holds (see [Commands that need the GPU](05-tools.md#commands-that-need-the-gpu)) makes plank unload the model, run the command a second time and reload the model, exactly as for the model's own `bash` calls; what you see and what `!` records is the second run.
+
 ## Pasting images
 
 Paste an image (or a path to one) into the prompt and plank attaches it. On macOS an image on the clipboard arrives as an empty paste, which is the signal plank uses; pasting the *path* to an image file works too, including a file dragged onto the terminal. Either way the file is deduplicated by content into `~/.plank/image-cache/` and attached to your message.

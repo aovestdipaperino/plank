@@ -67,7 +67,25 @@ struct BashJob {
 pub struct BashJobs {
     jobs: Vec<BashJob>,
     next_id: i64,
+    /// How the last `bash` call's command ended, when it ended inside the
+    /// call (`gpuyield`). Cleared by the agent before each dispatch; a job
+    /// still running when the call returned leaves it `None`.
+    pub last_foreground: Option<crate::gpuyield::ForegroundExit>,
+    /// Set by the agent for a GPU-yield re-run: the sandbox decision the first
+    /// run made, reused as-is so a one-command grant is not asked twice.
+    pub replay_sandbox: Option<DecidedSandbox>,
+    /// Set by the agent for a GPU-yield re-run: the next `bash` call waits
+    /// for its command to exit (or hit its own timeout, or be interrupted)
+    /// instead of returning after `refresh_sec`, because the model is reopened
+    /// right after and must not share the GPU with a command still running.
+    /// Consumed by that call.
+    pub wait_to_exit: bool,
 }
+
+/// A sandbox decision already made for one command: the policy it ran under,
+/// or `None` when it ran unsandboxed.
+#[derive(Debug, Clone)]
+pub struct DecidedSandbox(pub Option<crate::sandbox::Sandbox>);
 
 fn spawn_reader(shared: &Arc<Shared>, mut stream: impl std::io::Read + Send + 'static) {
     let shared = Arc::clone(shared);
@@ -438,6 +456,26 @@ impl BashJob {
         }
         self.poll();
     }
+
+    /// Waits until the job is no longer running, however long that takes.
+    ///
+    /// The job's own timeout still ends it (`poll` enforces it) and a user
+    /// interrupt kills it as in [`refresh_for`](Self::refresh_for); nothing
+    /// else does. `refresh_sec` is capped at an hour while a timeout may run to
+    /// a day, so the refresh wait cannot stand in for this.
+    fn wait_for_exit(&mut self) {
+        while self.running {
+            self.poll();
+            if !self.running {
+                break;
+            }
+            if crate::interrupt::pending() {
+                self.terminate();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 impl Drop for BashJob {
@@ -484,6 +522,9 @@ impl BashJobs {
             .arg("-c")
             .arg(cmd)
             .current_dir(ctx_cwd)
+            // Tells a GPU-bound tool that plank can unload its model on
+            // request (`gpuyield`): exit 75 plus the marker line.
+            .env(crate::gpuyield::ENV_VAR, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -631,6 +672,31 @@ impl BashJobs {
             self.jobs.remove(idx);
         }
         obs
+    }
+
+    /// The `bash` tool's wait-and-observe, which also records how the command
+    /// ended in [`last_foreground`](Self::last_foreground) when it ended
+    /// inside the call. The GPU marker is looked for in the whole output file,
+    /// not in the observation, which may show only its head.
+    fn foreground_result(
+        &mut self,
+        idx: usize,
+        refresh_sec: u64,
+        sandbox: Option<crate::sandbox::Sandbox>,
+        wait_to_exit: bool,
+    ) -> String {
+        if wait_to_exit {
+            self.jobs[idx].wait_for_exit();
+        } else {
+            self.jobs[idx].refresh_for(refresh_sec);
+        }
+        let job = &self.jobs[idx];
+        self.last_foreground = (!job.running).then(|| crate::gpuyield::ForegroundExit {
+            exit_status: job.exit_status,
+            needs_gpu: crate::gpuyield::output_file_needs_gpu(job.exit_status, &job.path),
+            sandbox,
+        });
+        self.job_tool_result(idx, false, 0, false, true)
     }
 }
 
@@ -808,6 +874,27 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
         3600,
     ))
     .unwrap_or(60);
+    // A GPU-yield re-run reuses the first run's decision verbatim: asking
+    // about a protected root again would turn one grant into two prompts.
+    let sandbox = match ctx.bash.replay_sandbox.take() {
+        Some(DecidedSandbox(decided)) => decided,
+        None => resolve_sandbox(ctx, cmd),
+    };
+    ctx.bash.sweep();
+    if let Err(err) = ctx
+        .bash
+        .start(&ctx.cwd.clone(), cmd, timeout, sandbox.as_ref())
+    {
+        return format!("Tool error: bash failed to start: {err}\n");
+    }
+    let idx = ctx.bash.jobs.len() - 1;
+    let wait = std::mem::take(&mut ctx.bash.wait_to_exit);
+    ctx.bash.foreground_result(idx, refresh, sandbox, wait)
+}
+
+/// Decides the sandbox policy one command runs under, asking about any
+/// protected root it names. `None` runs it unsandboxed.
+fn resolve_sandbox(ctx: &mut ToolContext, cmd: &str) -> Option<crate::sandbox::Sandbox> {
     // The protected roots are read-only under the sandbox unless the user says
     // otherwise. Ask only about the families the command actually names, and
     // only when it is not provably read-only, so ordinary commands and
@@ -831,22 +918,19 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
             }
         }
     }
+    if !ctx.sandbox.should_sandbox(cmd) {
+        return None;
+    }
     // A one-command grant rides on a throwaway copy of the policy, leaving the
     // session's own grant set clear.
-    let once_policy = (!once.is_empty()).then(|| crate::sandbox::Sandbox {
-        granted: ctx.sandbox.granted.union(&once).copied().collect(),
-        ..ctx.sandbox.clone()
-    });
-    let sandbox = ctx
-        .sandbox
-        .should_sandbox(cmd)
-        .then(|| once_policy.as_ref().unwrap_or(&ctx.sandbox));
-    ctx.bash.sweep();
-    if let Err(err) = ctx.bash.start(&ctx.cwd.clone(), cmd, timeout, sandbox) {
-        return format!("Tool error: bash failed to start: {err}\n");
-    }
-    let idx = ctx.bash.jobs.len() - 1;
-    ctx.bash.job_tool_result(idx, true, refresh, false, true)
+    Some(if once.is_empty() {
+        ctx.sandbox.clone()
+    } else {
+        crate::sandbox::Sandbox {
+            granted: ctx.sandbox.granted.union(&once).copied().collect(),
+            ..ctx.sandbox.clone()
+        }
+    })
 }
 
 /// Implements `bash_status` and (`stop = true`) `bash_stop`.
@@ -996,6 +1080,10 @@ pub fn run_immediate(
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
+        // The same promise the bash tool's jobs get (`gpuyield`): a `!` or
+        // `!!` that exits 75 with the marker line gets the model unloaded
+        // for a second run.
+        .env(crate::gpuyield::ENV_VAR, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1090,6 +1178,93 @@ mod tests {
         assert!(out.contains("exit_status=0\n"));
         assert!(out.contains("<output>\nhello\n</output>\n"));
         assert!(ctx.bash.jobs.is_empty(), "finished job should be removed");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_bash_job_sees_plank_gpu_yield() {
+        let (mut ctx, dir) = test_ctx();
+        let out = tool_bash(
+            &mut ctx,
+            &test_call("bash", &[("command", "echo \"yield=$PLANK_GPU_YIELD\"")]),
+        );
+        assert!(out.contains("<output>\nyield=1\n</output>\n"), "got: {out}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_foreground_call_records_how_its_command_ended() {
+        let (mut ctx, dir) = test_ctx();
+        let cmd = "echo 'GPU not available: held by plank (PID 1)' >&2; exit 75";
+        tool_bash(&mut ctx, &test_call("bash", &[("command", cmd)]));
+        let exit = ctx
+            .bash
+            .last_foreground
+            .take()
+            .expect("a finished call records");
+        assert_eq!(exit.exit_status, 75);
+        assert!(exit.needs_gpu, "the marker on stderr counts");
+
+        tool_bash(&mut ctx, &test_call("bash", &[("command", "exit 75")]));
+        let exit = ctx.bash.last_foreground.take().expect("recorded");
+        assert!(
+            !exit.needs_gpu,
+            "75 without the marker is not a GPU request"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_gpu_marker_is_found_past_the_observations_head() {
+        let (mut ctx, dir) = test_ctx();
+        // Far more lines than the head shows, marker last.
+        let cmd = "seq 1 5000; echo 'GPU not available: busy'; exit 75";
+        let out = tool_bash(&mut ctx, &test_call("bash", &[("command", cmd)]));
+        assert!(
+            !out.contains("GPU not available"),
+            "the head hides it: {out}"
+        );
+        assert!(ctx.bash.last_foreground.take().expect("recorded").needs_gpu);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wait_to_exit_outlasts_the_refresh_and_is_consumed() {
+        let (mut ctx, dir) = test_ctx();
+        ctx.bash.wait_to_exit = true;
+        let call = test_call(
+            "bash",
+            &[("command", "sleep 2; echo late"), ("refresh_sec", "1")],
+        );
+        let out = tool_bash(&mut ctx, &call);
+        assert!(out.contains("status=done"), "got: {out}");
+        assert!(out.contains("late"), "got: {out}");
+        assert!(!ctx.bash.wait_to_exit, "one call only");
+        assert!(
+            ctx.bash.last_foreground.is_some(),
+            "finished inside the call"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_background_job_records_nothing_even_when_it_later_asks_for_the_gpu() {
+        let (mut ctx, dir) = test_ctx();
+        let cmd = "sleep 2; echo 'GPU not available: busy'; exit 75";
+        let out = tool_bash(
+            &mut ctx,
+            &test_call("bash", &[("command", cmd), ("refresh_sec", "1")]),
+        );
+        assert!(out.contains("status=running"), "got: {out}");
+        assert!(ctx.bash.last_foreground.is_none());
+        // Observing it finish later is `bash_status`, which never records.
+        let out = tool_bash_status_or_stop(
+            &mut ctx,
+            &test_call("bash_status", &[("job", "1"), ("refresh_sec", "5")]),
+            false,
+        );
+        assert!(out.contains("exit_status=75"), "got: {out}");
+        assert!(ctx.bash.last_foreground.is_none());
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1395,6 +1570,17 @@ mod tests {
         assert_eq!(out.stderr, "err\n");
         assert_eq!(out.exit_code, 3);
         assert!(!out.interrupted);
+    }
+
+    #[test]
+    fn an_immediate_command_sees_the_gpu_yield_variable() {
+        let out = run_immediate(
+            std::path::Path::new("/tmp"),
+            "echo \"yield=$PLANK_GPU_YIELD\"",
+            &mut InterruptOnly(|| false),
+        )
+        .unwrap();
+        assert_eq!(out.stdout, "yield=1\n");
     }
 
     /// Records each line with the moment it arrived, for the streaming tests.
