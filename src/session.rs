@@ -505,6 +505,22 @@ impl Session {
         self.dirty = true;
     }
 
+    /// Inserts `message` at `index` of the live transcript, stamping it like
+    /// [`Self::push`]. For a message that must precede one not yet sent to
+    /// the model (a host notice ahead of the prompt that starts a turn);
+    /// anything earlier may already sit in the KV cache, and an off-path
+    /// branch parented at or after `index` would move with it.
+    ///
+    /// # Panics
+    /// When `index` is past the end of the transcript.
+    pub fn insert(&mut self, index: usize, mut message: Message) {
+        if message.at == 0 {
+            message.at = unix_now();
+        }
+        self.transcript.insert(index, message);
+        self.dirty = true;
+    }
+
     /// The session as a tree: the active branch plus the off-path nodes.
     #[must_use]
     pub fn tree(&self) -> crate::branch::BranchTree {

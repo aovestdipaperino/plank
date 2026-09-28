@@ -1818,7 +1818,7 @@ impl Session {
         Some(crate::grid::FinishedGrid {
             server: grid.server,
             write_back: grid.write_back,
-            csv: String::from_utf8_lossy(&now).into_owned(),
+            csv: String::from_utf8(now).ok(),
         })
     }
 
@@ -4632,10 +4632,27 @@ mod tests {
         assert_eq!(finished.write_back.tool, "apply_grid");
         assert_eq!(finished.write_back.table, "categories");
         assert_eq!(finished.write_back.grid, "0badf00d");
-        assert_eq!(finished.csv, "#,name\n1,Groceries\n");
+        assert_eq!(finished.csv.as_deref(), Some("#,name\n1,Groceries\n"));
         assert!(s.active_grid.is_none());
         assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_none());
         assert_eq!(s.finish_grid(&open), None, "finished once");
+    }
+
+    /// A saved file that is not UTF-8 comes back without text, so plank can
+    /// report it rather than send a lossy copy; the grid is still cleaned up.
+    #[test]
+    fn a_grid_saved_as_invalid_utf8_comes_back_without_text() {
+        let mut s = opening_session();
+        let open = open_grid(&mut s, "#,name\n1,Food\n");
+        s.host
+            .ram_write(CSVEDIT, "categories.csv", b"#,name\n1,\xff\xfe\n")
+            .unwrap();
+        s.close_frame(&open);
+        let finished = s.finish_grid(&open).expect("the bytes changed");
+        assert_eq!(finished.csv, None);
+        assert_eq!(finished.write_back.table, "categories");
+        assert!(s.active_grid.is_none());
+        assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_none());
     }
 
     /// A frame that traps may have saved before it did; what is on the disk
@@ -4654,7 +4671,7 @@ mod tests {
             .unwrap();
         assert!(s.frame_key(&open, "q", Some('q')).is_err());
         let finished = s.finish_grid(&open).expect("the partial save goes back");
-        assert_eq!(finished.csv, "#,name\n1,Rent\n");
+        assert_eq!(finished.csv.as_deref(), Some("#,name\n1,Rent\n"));
         assert!(s.active_grid.is_none());
         assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_none());
     }

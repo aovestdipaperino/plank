@@ -1574,14 +1574,19 @@ pub struct McpOutput {
     pub text: String,
     /// `plank-frame://` resources removed from the result, in content order.
     pub stagings: Vec<GridStaging>,
+    /// The call failed or the result carried `isError`; `text` then starts
+    /// with `Tool error: `. Decided from the result, never from the text, so
+    /// a successful reply that happens to read "Tool error: ..." stays one.
+    pub is_error: bool,
 }
 
 impl McpOutput {
-    /// A text-only result: an error, or anything else with no stagings.
+    /// A failed call: the text is the model-facing `Tool error: ` message.
     fn error(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             stagings: Vec::new(),
+            is_error: true,
         }
     }
 }
@@ -1772,10 +1777,16 @@ pub fn call_tool_direct(
     tool: &str,
     args_json: &str,
 ) -> Result<String, String> {
-    let McpOutput { text, stagings: _ } = invoke_on(servers, server, tool, args_json);
-    match text.strip_prefix("Tool error: ") {
-        Some(err) => Err(err.trim_end().to_string()),
-        None => Ok(text.trim_end().to_string()),
+    let McpOutput {
+        text,
+        stagings: _,
+        is_error,
+    } = invoke_on(servers, server, tool, args_json);
+    if is_error {
+        let err = text.strip_prefix("Tool error: ").unwrap_or(&text);
+        Err(err.trim_end().to_string())
+    } else {
+        Ok(text.trim_end().to_string())
     }
 }
 
@@ -1819,7 +1830,8 @@ fn invoke_on(
     };
 
     let mut out = String::new();
-    if matches!(result.get("isError"), Some(Json::Bool(true))) {
+    let is_error = matches!(result.get("isError"), Some(Json::Bool(true)));
+    if is_error {
         out.push_str("Tool error: ");
     }
     let stagings = append_content_staged(&mut out, &server.name, &result);
@@ -1829,6 +1841,7 @@ fn invoke_on(
     McpOutput {
         text: out,
         stagings,
+        is_error,
     }
 }
 
@@ -2879,6 +2892,8 @@ while IFS= read -r line; do
       printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"protocolVersion\":\"2024-11-05\"}}}}" ;;
     *'"tools/list"'*)
       printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"tools\":[{{\"name\":\"apply_grid\",\"description\":\"a\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}" ;;
+    *'"literal"'*)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"Tool error: is just what the row says\"}}]}}}}" ;;
     *'"stale"'*)
       printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"isError\":true,\"content\":[{{\"type\":\"text\",\"text\":\"reopen the grid\"}}]}}}}" ;;
     *'"tools/call"'*)
@@ -2924,6 +2939,17 @@ done
                 r#"{"table":"categories","grid":"stale","csv":""}"#
             ),
             Err("reopen the grid".to_string())
+        );
+        // Success is decided by `isError`, not by how the text happens to
+        // start: a reply that merely reads "Tool error: ..." is still `Ok`.
+        assert_eq!(
+            call_tool_direct(
+                &mut servers,
+                "fin",
+                "apply_grid",
+                r#"{"table":"categories","grid":"literal","csv":""}"#
+            ),
+            Ok("Tool error: is just what the row says".to_string())
         );
         let err = call_tool_direct(&mut servers, "fin", "undo", "{}").unwrap_err();
         assert!(err.contains("unknown mcp tool"), "{err}");

@@ -65,22 +65,25 @@ pub struct FinishedGrid {
     pub server: String,
     /// The tool, table and token to send it with.
     pub write_back: WriteBack,
-    /// The file as the frame left it, read back from the RAM disk.
-    pub csv: String,
+    /// The file as the frame left it, read back from the RAM disk; `None`
+    /// when it is not valid UTF-8, which plank reports rather than sending
+    /// a lossy copy the server would take for the user's edit.
+    pub csv: Option<String>,
 }
 
 impl FinishedGrid {
     /// The write-back tool's arguments as a JSON object:
-    /// `{"table", "grid", "csv"}`.
+    /// `{"table", "grid", "csv"}`; `None` when the file is not UTF-8.
     #[must_use]
-    pub fn arguments(&self) -> String {
+    pub fn arguments(&self) -> Option<String> {
         use crate::wasmreg::json_str;
-        format!(
+        let csv = self.csv.as_deref()?;
+        Some(format!(
             "{{\"table\":{},\"grid\":{},\"csv\":{}}}",
             json_str(&self.write_back.table),
             json_str(&self.write_back.grid),
-            json_str(&self.csv)
-        )
+            json_str(csv)
+        ))
     }
 }
 
@@ -116,12 +119,28 @@ mod tests {
                 table: "categories".to_string(),
                 grid: "0badf00d".to_string(),
             },
-            csv: "#,name\n1,\"Food\"\n".to_string(),
+            csv: Some("#,name\n1,\"Food\"\n".to_string()),
         };
         assert_eq!(
-            finished.arguments(),
-            r##"{"table":"categories","grid":"0badf00d","csv":"#,name\n1,\"Food\"\n"}"##
+            finished.arguments().as_deref(),
+            Some(r##"{"table":"categories","grid":"0badf00d","csv":"#,name\n1,\"Food\"\n"}"##)
         );
+    }
+
+    /// A file that is not UTF-8 has no arguments: it is reported, never sent
+    /// as lossy text the server would take for the user's edit.
+    #[test]
+    fn a_grid_that_is_not_utf8_has_no_arguments() {
+        let finished = FinishedGrid {
+            server: "chatbgt".to_string(),
+            write_back: WriteBack {
+                tool: "apply_grid".to_string(),
+                table: "categories".to_string(),
+                grid: "0badf00d".to_string(),
+            },
+            csv: None,
+        };
+        assert_eq!(finished.arguments(), None);
     }
 
     #[test]
