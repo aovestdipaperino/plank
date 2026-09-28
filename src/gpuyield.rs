@@ -6,8 +6,9 @@
 //! A command that needs the GPU plank's loaded model occupies (the first is
 //! `mex`, which runs a diffusion model on Metal) follows a small protocol: it
 //! exits with [`EXIT_CODE`] and prints a line starting with [`MARKER`]. plank
-//! exports [`ENV_VAR`]`=1` into every bash-tool job so the tool knows plank can
-//! step aside. When a foreground bash call ends that way, the agent saves the
+//! exports [`ENV_VAR`]`=1` into every bash-tool job, and into the user's `!`
+//! and `!!` shell escapes, so the tool knows plank can step aside. When a
+//! foreground bash call or a shell escape ends that way, the agent saves the
 //! live KV, drops the engine (which frees the Metal state and the model lock),
 //! runs the command once more, reopens the model with its startup parameters
 //! and restores the KV (`docs/ARCHITECTURE.md`, "GPU yield").
@@ -46,6 +47,13 @@ pub type ReopenFn = Box<dyn FnMut() -> Result<Box<dyn Engine>, String> + Send>;
 #[must_use]
 pub fn needs_gpu(exit_status: i64, output: &str) -> bool {
     exit_status == EXIT_CODE && output.lines().any(|l| l.starts_with(MARKER))
+}
+
+/// [`needs_gpu`] over output captured as two streams (a `!` or `!!` shell
+/// escape): the marker counts on either.
+#[must_use]
+pub fn streams_need_gpu(exit_status: i64, stdout: &str, stderr: &str) -> bool {
+    needs_gpu(exit_status, stdout) || needs_gpu(exit_status, stderr)
 }
 
 /// [`needs_gpu`] over an output file too large to hold as one string: the
@@ -126,6 +134,9 @@ pub fn notice(command: &str) -> String {
 pub trait CycleHost {
     /// What [`save`](Self::save) captured.
     type Snapshot;
+    /// What [`rerun`](Self::rerun) produces: a tool result for a bash call,
+    /// the captured streams for a shell escape.
+    type Output;
     /// Shows the notice through the front end's status path.
     fn notice(&mut self, text: &str);
     /// Captures the live KV, or `None` when there is none to capture (no
@@ -133,8 +144,8 @@ pub trait CycleHost {
     fn save(&mut self) -> Option<Self::Snapshot>;
     /// Drops the engine, freeing the GPU and the model lock.
     fn release(&mut self);
-    /// Runs the command again and returns its tool result.
-    fn rerun(&mut self) -> String;
+    /// Runs the command again, to exit, and returns its result.
+    fn rerun(&mut self) -> Self::Output;
     /// Reopens the engine.
     ///
     /// # Errors
@@ -164,11 +175,11 @@ pub enum CycleEnd {
 }
 
 /// Runs one cycle: notice, save, release, re-run, reopen, restore. Returns the
-/// re-run's tool result and how the engine came back.
+/// re-run's result and how the engine came back.
 ///
 /// The re-run happens exactly once, whatever it returns: a command that fails
 /// the same way again gets that result, and the model is reloaded regardless.
-pub fn run_cycle<H: CycleHost>(host: &mut H, command: &str) -> (String, CycleEnd) {
+pub fn run_cycle<H: CycleHost>(host: &mut H, command: &str) -> (H::Output, CycleEnd) {
     host.notice(&notice(command));
     let snapshot = host.save();
     host.release();
@@ -347,6 +358,14 @@ mod tests {
     }
 
     #[test]
+    fn either_captured_stream_can_carry_the_marker() {
+        assert!(streams_need_gpu(75, "GPU not available\n", ""));
+        assert!(streams_need_gpu(75, "", "GPU not available: held\n"));
+        assert!(!streams_need_gpu(75, "busy\n", "try later\n"));
+        assert!(!streams_need_gpu(1, "", "GPU not available\n"));
+    }
+
+    #[test]
     fn the_file_scan_matches_the_string_rule() {
         let dir = std::env::temp_dir().join(format!("plank-gpuyield-scan-{}", nonce()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -398,6 +417,7 @@ mod tests {
 
     impl CycleHost for Recorder {
         type Snapshot = &'static str;
+        type Output = String;
         fn notice(&mut self, _text: &str) {
             self.log.push("notice".into());
         }

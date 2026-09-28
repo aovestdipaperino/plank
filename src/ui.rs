@@ -2574,21 +2574,108 @@ fn gpu_unloaded_reason(error: &str) -> String {
 /// Placeholder text while the model is out for the re-run.
 const GPU_UNLOADED_FOR_RERUN: &str = "the local model is unloaded while a command uses the GPU";
 
-/// The agent as a [`crate::gpuyield::CycleHost`]: one cycle over one slot and
-/// one tool call.
-struct AgentCycle<'s, 'a> {
+/// The agent as a [`crate::gpuyield::CycleHost`]: one cycle over one slot,
+/// re-running whatever `rerun` names (a bash tool call, or a `!`/`!!` shell
+/// escape). Everything but the re-run and where the notices go is shared.
+struct AgentCycle<'s, 'a, R> {
     agent: &'s mut Agent<'a>,
     slot: EngineSlot,
-    call: &'s ToolCall,
+    rerun: R,
+}
+
+/// The part of a GPU-yield cycle that differs by what asked for the GPU: the
+/// second run itself, and where the cycle's notices are shown.
+trait CycleRerun<'a> {
+    /// What the second run returns.
+    type Output;
+    /// Shows a notice; the agent's status path unless the caller has its own.
+    fn notice(&mut self, agent: &Agent<'a>, text: &str) {
+        agent.gpu_notice(text);
+    }
+    /// Runs the command again, waiting for it to exit.
+    fn rerun(&mut self, agent: &mut Agent<'a>) -> Self::Output;
+}
+
+/// The re-run of a model-issued `bash` call, through the tool dispatch.
+struct ToolRerun<'c> {
+    call: &'c ToolCall,
     /// The first run's sandbox decision, handed to the re-run once.
     sandbox: Option<crate::tools::bash::DecidedSandbox>,
 }
 
-impl crate::gpuyield::CycleHost for AgentCycle<'_, '_> {
+impl<'a> CycleRerun<'a> for ToolRerun<'_> {
+    type Output = String;
+
+    fn rerun(&mut self, agent: &mut Agent<'a>) -> String {
+        let bash = &mut agent.tool_ctx.bash;
+        bash.replay_sandbox = self.sandbox.take();
+        bash.last_foreground = None;
+        // The model comes back as soon as this returns, so the re-run waits
+        // for the command to exit rather than for the model's `refresh_sec`:
+        // a long job handed back as `status=running` would still be on the
+        // GPU when the reopen maps the model again.
+        bash.wait_to_exit = true;
+        let out = dispatch(self.call, &mut agent.tool_ctx).output;
+        // Consumed by the bash tool; cleared anyway in case a hook blocked the
+        // call before it got there. The record is dropped so this result can
+        // never start a second cycle.
+        let bash = &mut agent.tool_ctx.bash;
+        bash.replay_sandbox = None;
+        bash.wait_to_exit = false;
+        bash.last_foreground = None;
+        out
+    }
+}
+
+/// A front end's half of a `!` or `!!` shell escape: running the command
+/// through its own streaming sink (console lines, or the TUI log and its
+/// redraws), and showing a status line where the escape's other lines go.
+trait BangIo {
+    /// Runs `cmd` in `cwd` to exit or interruption (`run_immediate`).
+    fn run(
+        &mut self,
+        cwd: &std::path::Path,
+        cmd: &str,
+    ) -> Result<crate::tools::bash::ImmediateOutput, String>;
+    /// Shows one status line, before anything slow that follows it.
+    fn notice(&mut self, text: &str);
+}
+
+/// Shown once a shell escape's re-run has exited and the reload begins: the
+/// front end is blocked until the model is back.
+const GPU_BANG_RELOADING: &str = "plank: reloading the model, this takes a moment";
+
+/// The re-run of a `!` or `!!` shell escape, streamed into the same sink as
+/// the first run so the user sees it.
+struct BangRerun<'i> {
+    io: &'i mut dyn BangIo,
+    cwd: std::path::PathBuf,
+    cmd: &'i str,
+}
+
+impl<'a> CycleRerun<'a> for BangRerun<'_> {
+    type Output = Result<crate::tools::bash::ImmediateOutput, String>;
+
+    fn notice(&mut self, _agent: &Agent<'a>, text: &str) {
+        crate::engine::kv_debug(|| text.to_owned());
+        self.io.notice(text);
+    }
+
+    fn rerun(&mut self, _agent: &mut Agent<'a>) -> Self::Output {
+        // `run_immediate` already waits for the exit (or an interrupt), so
+        // the reopen that follows never races the command for the GPU.
+        let out = self.io.run(&self.cwd, self.cmd);
+        self.io.notice(GPU_BANG_RELOADING);
+        out
+    }
+}
+
+impl<'a, R: CycleRerun<'a>> crate::gpuyield::CycleHost for AgentCycle<'_, 'a, R> {
     type Snapshot = crate::gpuyield::Snapshot;
+    type Output = R::Output;
 
     fn notice(&mut self, text: &str) {
-        self.agent.gpu_notice(text);
+        self.rerun.notice(self.agent, text);
     }
 
     fn save(&mut self) -> Option<Self::Snapshot> {
@@ -2623,24 +2710,8 @@ impl crate::gpuyield::CycleHost for AgentCycle<'_, '_> {
         );
     }
 
-    fn rerun(&mut self) -> String {
-        let bash = &mut self.agent.tool_ctx.bash;
-        bash.replay_sandbox = self.sandbox.take();
-        bash.last_foreground = None;
-        // The model comes back as soon as this returns, so the re-run waits
-        // for the command to exit rather than for the model's `refresh_sec`:
-        // a long job handed back as `status=running` would still be on the
-        // GPU when the reopen maps the model again.
-        bash.wait_to_exit = true;
-        let out = dispatch(self.call, &mut self.agent.tool_ctx).output;
-        // Consumed by the bash tool; cleared anyway in case a hook blocked the
-        // call before it got there. The record is dropped so this result can
-        // never start a second cycle.
-        let bash = &mut self.agent.tool_ctx.bash;
-        bash.replay_sandbox = None;
-        bash.wait_to_exit = false;
-        bash.last_foreground = None;
-        out
+    fn rerun(&mut self) -> R::Output {
+        self.rerun.rerun(self.agent)
     }
 
     fn reopen(&mut self) -> Result<(), String> {
@@ -2657,7 +2728,7 @@ impl crate::gpuyield::CycleHost for AgentCycle<'_, '_> {
 
     fn park(&mut self, snapshot: Option<Self::Snapshot>, error: &str) {
         let reason = gpu_unloaded_reason(error);
-        self.agent.gpu_notice(&reason);
+        self.rerun.notice(self.agent, &reason);
         let _ = self.agent.gpu_placeholder(&self.slot, reason);
         self.agent.gpu_yield.pending = Some(PendingReopen { snapshot });
     }
@@ -3956,12 +4027,53 @@ impl Agent<'_> {
         let mut host = AgentCycle {
             agent: self,
             slot,
-            call,
-            sandbox: Some(crate::tools::bash::DecidedSandbox(exit.sandbox)),
+            rerun: ToolRerun {
+                call,
+                sandbox: Some(crate::tools::bash::DecidedSandbox(exit.sandbox)),
+            },
         };
         let (output, end) = crate::gpuyield::run_cycle(&mut host, &command);
         crate::engine::kv_debug(|| format!("gpu yield: cycle ended {end:?}"));
         output
+    }
+
+    /// Runs a `!` or `!!` shell escape through the front end's `io`, and when
+    /// it asked for the GPU (exit 75 and the marker on either stream) runs
+    /// the same cycle as a bash tool call, re-running the command through
+    /// `io` once. Returns the result the caller should report: the second
+    /// run's when there was a cycle, else the only run's.
+    ///
+    /// A shell escape runs between turns, so the per-turn cap does not apply:
+    /// each escape gets at most one cycle, and a second refusal comes back
+    /// as-is. It should never run inside a sidechain; if it somehow does, the
+    /// cycle is skipped with a note rather than unloading a parked engine.
+    fn run_bang(
+        &mut self,
+        cmd: &str,
+        io: &mut dyn BangIo,
+    ) -> Result<crate::tools::bash::ImmediateOutput, String> {
+        let cwd = self.tool_ctx.cwd.clone();
+        let first = io.run(&cwd, cmd);
+        let asks = matches!(&first, Ok(o) if !o.interrupted
+            && crate::gpuyield::streams_need_gpu(o.exit_code, &o.stdout, &o.stderr));
+        if !asks {
+            return first;
+        }
+        let Some(slot) = self.gpu_slot() else {
+            return first;
+        };
+        if self.alt_engine_depth != 0 || self.in_sidechain() {
+            io.notice("plank: GPU yield skipped: the model cannot be unloaded inside a sub-agent");
+            return first;
+        }
+        let mut host = AgentCycle {
+            agent: self,
+            slot,
+            rerun: BangRerun { io, cwd, cmd },
+        };
+        let (second, end) = crate::gpuyield::run_cycle(&mut host, cmd);
+        crate::engine::kv_debug(|| format!("gpu yield: shell escape cycle ended {end:?}"));
+        second
     }
 
     /// Whether a `bash` result could start the GPU-yield cycle right now.
@@ -13676,14 +13788,7 @@ impl Agent<'_> {
                             continue;
                         }
                         log.push_user_echo(&line);
-                        let result = Self::tui_bang(
-                            &self.tool_ctx.cwd.clone(),
-                            &cmd,
-                            &mut log,
-                            terminal,
-                            &mut view,
-                            !feedback,
-                        );
+                        let result = self.tui_bang(&cmd, &mut log, terminal, &mut view, !feedback);
                         if feedback {
                             self.session
                                 .push(Message::user(bang_transcript_entry(&cmd, &result)));
@@ -13798,84 +13903,29 @@ impl Agent<'_> {
     /// the whole thing in a [`tui::ReportPanel`] instead. The command still
     /// runs through the same sink, so the status line keeps counting seconds
     /// and Esc still interrupts: a slow `!!` never looks frozen.
+    ///
+    /// A command that asks for the GPU (`gpuyield`) gets the same cycle as a
+    /// bash tool call, run here on the UI thread: the notices go into the log
+    /// with a redraw each, the second run streams like the first, and the UI
+    /// stays blocked through the reload, as it is when the worker runs the
+    /// tool path. The outcome line is the final run's.
     fn tui_bang(
-        cwd: &std::path::Path,
+        &mut self,
         cmd: &str,
         log: &mut OutputLog,
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
         quiet: bool,
     ) -> Result<crate::tools::bash::ImmediateOutput, String> {
-        // Output streams into the log as it arrives (issue #22): the sink's
-        // `line` appends and `tick` redraws, so a long-running command shows
-        // progress instead of dumping everything at exit. Both halves need
-        // `&mut log`, which is why this is one sink and not two closures.
-        struct Sink<'a, 'b> {
-            log: &'a mut OutputLog,
-            terminal: &'a mut ratatui::DefaultTerminal,
-            view: &'a mut tui::OutputView,
-            cmd: &'b str,
-            start: Instant,
-            dirty: bool,
-            quiet: bool,
-        }
-        impl crate::tools::bash::ImmediateSink for Sink<'_, '_> {
-            fn line(&mut self, _stream: crate::tools::bash::Stream, text: &str) {
-                if self.quiet {
-                    return;
-                }
-                self.log.push_dim(text.to_owned());
-                self.dirty = true;
-            }
-            fn tick(&mut self) -> bool {
-                let status = format!(
-                    "{} {} ({}s, Esc to stop)",
-                    if self.quiet { "!!" } else { "!" },
-                    self.cmd,
-                    self.start.elapsed().as_secs()
-                );
-                let (log, view) = (&*self.log, &mut *self.view);
-                let _ = self.terminal.draw(|f| {
-                    tui::draw(
-                        f,
-                        log,
-                        None,
-                        &status,
-                        view,
-                        None,
-                        &tui::TaskView::default(),
-                        None,
-                        &tui::RosterView::default(),
-                    );
-                });
-                crate::cursor::place();
-                self.dirty = false;
-                while event::poll(Duration::ZERO).unwrap_or(false) {
-                    if let Ok(Event::Key(k)) = event::read()
-                        && k.kind == KeyEventKind::Press
-                        && (matches!(k.code, KeyCode::Esc)
-                            || (matches!(k.code, KeyCode::Char('c'))
-                                && k.modifiers.contains(KeyModifiers::CONTROL)))
-                    {
-                        return true;
-                    }
-                }
-                false
-            }
-        }
-        let start = Instant::now();
-        let mut sink = Sink {
+        let mut io = TuiBang {
             log,
             terminal,
             view,
-            cmd,
-            start,
-            dirty: false,
             quiet,
         };
-        let result = crate::tools::bash::run_immediate(cwd, cmd, &mut sink);
+        let result = self.run_bang(cmd, &mut io);
         if !quiet {
-            bang_log_outcome(cmd, &result, log);
+            bang_log_outcome(cmd, &result, io.log);
         }
         result
     }
@@ -20329,6 +20379,26 @@ impl crate::tools::bash::ImmediateSink for BangConsoleSink {
     }
 }
 
+/// The plain REPL's [`BangIo`]: lines stream to the console through
+/// [`BangConsoleSink`], and notices print to stdout like the escape's other
+/// status lines.
+struct BangConsole;
+
+impl BangIo for BangConsole {
+    fn run(
+        &mut self,
+        cwd: &std::path::Path,
+        cmd: &str,
+    ) -> Result<crate::tools::bash::ImmediateOutput, String> {
+        crate::tools::bash::run_immediate(cwd, cmd, &mut BangConsoleSink)
+    }
+
+    fn notice(&mut self, text: &str) {
+        println!("{text}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 /// Warning that opens a `!` command's transcript entry, so the model treats the
 /// recorded command and its output as background the user happened to run and
 /// not as a request addressed to it.
@@ -20379,6 +20449,98 @@ fn bang_head(text: &str) -> String {
         out.push_str("[output truncated]\n");
     }
     out
+}
+
+/// The TUI's [`BangIo`]: output streams into the log as it arrives (issue
+/// #22), each poll tick redraws the frame and checks for Esc/Ctrl-C, and a
+/// notice is pushed and drawn at once so it is on screen before the slow step
+/// that follows it.
+struct TuiBang<'x> {
+    log: &'x mut OutputLog,
+    terminal: &'x mut ratatui::DefaultTerminal,
+    view: &'x mut tui::OutputView,
+    /// The `!!` shape: streamed lines stay out of the scrollback, because the
+    /// caller shows them in a panel; the status line and notices still show.
+    quiet: bool,
+}
+
+/// Draws the TUI frame a running shell escape shows, with `status` in the
+/// status line.
+fn draw_bang_frame(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+    status: &str,
+) {
+    let _ = terminal.draw(|f| {
+        tui::draw(
+            f,
+            log,
+            None,
+            status,
+            view,
+            None,
+            &tui::TaskView::default(),
+            None,
+            &tui::RosterView::default(),
+        );
+    });
+    crate::cursor::place();
+}
+
+impl BangIo for TuiBang<'_> {
+    fn run(
+        &mut self,
+        cwd: &std::path::Path,
+        cmd: &str,
+    ) -> Result<crate::tools::bash::ImmediateOutput, String> {
+        // Both halves of the sink need `&mut log`, which is why this is one
+        // sink and not two closures.
+        struct Sink<'a, 'b> {
+            io: &'a mut TuiBang<'b>,
+            cmd: &'a str,
+            start: Instant,
+        }
+        impl crate::tools::bash::ImmediateSink for Sink<'_, '_> {
+            fn line(&mut self, _stream: crate::tools::bash::Stream, text: &str) {
+                if !self.io.quiet {
+                    self.io.log.push_dim(text.to_owned());
+                }
+            }
+            fn tick(&mut self) -> bool {
+                let status = format!(
+                    "{} {} ({}s, Esc to stop)",
+                    if self.io.quiet { "!!" } else { "!" },
+                    self.cmd,
+                    self.start.elapsed().as_secs()
+                );
+                draw_bang_frame(self.io.terminal, self.io.log, self.io.view, &status);
+                while event::poll(Duration::ZERO).unwrap_or(false) {
+                    if let Ok(Event::Key(k)) = event::read()
+                        && k.kind == KeyEventKind::Press
+                        && (matches!(k.code, KeyCode::Esc)
+                            || (matches!(k.code, KeyCode::Char('c'))
+                                && k.modifiers.contains(KeyModifiers::CONTROL)))
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+        let mut sink = Sink {
+            io: self,
+            cmd,
+            start: Instant::now(),
+        };
+        crate::tools::bash::run_immediate(cwd, cmd, &mut sink)
+    }
+
+    fn notice(&mut self, text: &str) {
+        self.log.push_dim(text.to_owned());
+        self.view.follow = true;
+        draw_bang_frame(self.terminal, self.log, self.view, text);
+    }
 }
 
 /// Writes a finished `!` command's outcome into the TUI scrollback: the
@@ -20534,8 +20696,7 @@ fn handle_plain_line(agent: &mut Agent<'_>, line: &str) -> Result<bool, String> 
             );
             return Ok(true);
         }
-        let result =
-            crate::tools::bash::run_immediate(&agent.tool_ctx.cwd, cmd, &mut BangConsoleSink);
+        let result = agent.run_bang(cmd, &mut BangConsole);
         match &result {
             Ok(out) => {
                 if out.interrupted {
@@ -36838,5 +36999,281 @@ or the user's next message aborts before its first token"
             drop(agent);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    // ── GPU yield for `!` and `!!` shell escapes ────────────────────────
+
+    /// A front end's [`BangIo`] as the tests see it: every streamed line (unless
+    /// `quiet`, the `!!` shape) and every notice lands in `lines`, in order.
+    #[derive(Default)]
+    struct TestBangIo {
+        quiet: bool,
+        lines: Vec<String>,
+        notices: Vec<String>,
+    }
+
+    impl BangIo for TestBangIo {
+        fn run(
+            &mut self,
+            cwd: &std::path::Path,
+            cmd: &str,
+        ) -> Result<crate::tools::bash::ImmediateOutput, String> {
+            struct Sink<'a>(&'a mut Vec<String>, bool);
+            impl crate::tools::bash::ImmediateSink for Sink<'_> {
+                fn line(&mut self, _stream: crate::tools::bash::Stream, text: &str) {
+                    if !self.1 {
+                        self.0.push(text.to_owned());
+                    }
+                }
+                fn tick(&mut self) -> bool {
+                    false
+                }
+            }
+            crate::tools::bash::run_immediate(cwd, cmd, &mut Sink(&mut self.lines, self.quiet))
+        }
+
+        fn notice(&mut self, text: &str) {
+            self.notices.push(text.to_owned());
+            self.lines.push(text.to_owned());
+        }
+    }
+
+    /// An agent on a releasable [`GpuEngine`] ("first") with the cycle armed
+    /// to reopen into "second".
+    fn gpu_bang_agent<'c>(
+        dir: &std::path::Path,
+        log: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        counter: &std::path::Path,
+        cfg: &'c crate::config::AgentConfig,
+    ) -> Agent<'c> {
+        let mut agent = test_agent_boxed(
+            dir,
+            Box::new(GpuEngine::new("first", log, counter, &[])),
+            cfg,
+        );
+        let (l, c) = (std::sync::Arc::clone(log), counter.to_path_buf());
+        arm_gpu_yield(
+            &mut agent,
+            dir,
+            gpu_factory(log, counter, move || {
+                Ok(GpuEngine::new("second", &l, &c, &[]))
+            }),
+        );
+        agent
+    }
+
+    const GPU_CYCLE_ORDER: [&str; 5] = [
+        "save:first",
+        "release:first(runs=1)",
+        "reopen(runs=2)",
+        "think:second",
+        "restore:second:[4, 2]",
+    ];
+
+    #[test]
+    fn a_bang_that_asks_for_the_gpu_cycles_and_records_the_second_run() {
+        let dir = gpu_dir("bang-feedback");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        // A bang is not in a turn: the per-turn cap does not hold it back.
+        agent.gpu_yield.cycles_this_turn = GPU_YIELD_CYCLES_PER_TURN;
+        let cmd = gpu_command(&counter, false);
+        let mut io = TestBangIo::default();
+
+        let result = agent.run_bang(&cmd, &mut io);
+
+        assert_eq!(logged(&log), GPU_CYCLE_ORDER);
+        assert_eq!(runs(&counter), 2);
+        assert_eq!(agent.gpu_yield.cycles_this_turn, GPU_YIELD_CYCLES_PER_TURN);
+        let out = result.as_ref().expect("ran");
+        assert_eq!(out.exit_code, 0);
+        let entry = bang_transcript_entry(&cmd, &result);
+        assert!(entry.contains("second-run-ok"), "{entry}");
+        assert!(entry.contains("<bash-stderr></bash-stderr>"), "{entry}");
+        assert!(!entry.contains("bash-exit-code"), "{entry}");
+        // Both runs streamed, the notices between and after them.
+        let at = |needle: &str| io.lines.iter().position(|l| l.contains(needle));
+        assert!(
+            at("GPU not available") < at("needs the GPU"),
+            "{:?}",
+            io.lines
+        );
+        assert!(at("needs the GPU") < at("second-run-ok"), "{:?}", io.lines);
+        assert!(
+            at("second-run-ok") < at(GPU_BANG_RELOADING),
+            "{:?}",
+            io.lines
+        );
+        assert!(
+            agent.engine.can_release_gpu(),
+            "the reopened engine is live"
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_quiet_bang_cycles_into_a_panel_of_the_second_run_and_no_transcript() {
+        let dir = gpu_dir("bang-quiet");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        let before = agent.session.transcript.len();
+        let cmd = gpu_command(&counter, false);
+        let mut io = TestBangIo {
+            quiet: true,
+            ..TestBangIo::default()
+        };
+
+        let result = agent.run_bang(&cmd, &mut io);
+
+        assert_eq!(logged(&log), GPU_CYCLE_ORDER);
+        let panel = bang_panel_report(&cmd, &result).expect("panel");
+        assert!(panel.contains("second-run-ok"), "{panel}");
+        assert!(!panel.contains("stderr"), "{panel}");
+        assert!(!panel.contains("exit code"), "{panel}");
+        // Quiet keeps the streamed lines out of the log, never the notices.
+        assert_eq!(io.lines, io.notices);
+        assert_eq!(io.notices.len(), 2, "{:?}", io.notices);
+        assert_eq!(agent.session.transcript.len(), before);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_repl_bangs_cycle_and_only_the_single_bang_is_recorded() {
+        let dir = gpu_dir("bang-plain");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        let cmd = gpu_command(&counter, false);
+
+        assert!(handle_plain_line(&mut agent, &format!("!!{cmd}")).unwrap());
+        assert_eq!(logged(&log), GPU_CYCLE_ORDER);
+        assert!(agent.session.transcript.is_empty(), "`!!` records nothing");
+
+        std::fs::remove_file(&counter).unwrap();
+        log.lock().unwrap().clear();
+        assert!(handle_plain_line(&mut agent, &format!("!{cmd}")).unwrap());
+        assert_eq!(
+            logged(&log),
+            [
+                "save:second",
+                "release:second(runs=1)",
+                "reopen(runs=2)",
+                "think:second",
+                "restore:second:[4, 2]",
+            ]
+        );
+        assert_eq!(agent.session.transcript.len(), 1);
+        let entry = &agent.session.transcript[0].text;
+        assert!(entry.contains("second-run-ok"), "{entry}");
+        assert!(entry.contains("<bash-stderr></bash-stderr>"), "{entry}");
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bang_without_the_marker_or_a_releasable_model_never_cycles() {
+        let dir = gpu_dir("bang-none");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let c = counter.display();
+        let no_marker = format!("echo run >> '{c}'; echo 'try again later'; exit 75");
+
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        let out = agent
+            .run_bang(&no_marker, &mut TestBangIo::default())
+            .unwrap();
+        assert_eq!((out.exit_code, runs(&counter)), (75, 1));
+        drop(agent);
+
+        // The echo stub and a remote-style engine keep the first result.
+        let mut remote = GpuEngine::new("remote", &log, &counter, &[]);
+        remote.releasable = false;
+        let engines: [Box<dyn Engine>; 2] = [
+            Box::new(crate::engine::EchoEngine::new(100_000)),
+            Box::new(remote),
+        ];
+        for engine in engines {
+            std::fs::remove_file(&counter).unwrap();
+            let mut agent = test_agent_boxed(&dir, engine, &cfg);
+            let (l, c2) = (std::sync::Arc::clone(&log), counter.clone());
+            arm_gpu_yield(
+                &mut agent,
+                &dir,
+                gpu_factory(&log, &counter, move || {
+                    Ok(GpuEngine::new("second", &l, &c2, &[]))
+                }),
+            );
+            let mut io = TestBangIo::default();
+            let out = agent
+                .run_bang(&gpu_command(&counter, false), &mut io)
+                .unwrap();
+            assert_eq!((out.exit_code, runs(&counter)), (75, 1));
+            assert!(out.stderr.contains("GPU not available"), "{out:?}");
+            assert!(io.notices.is_empty(), "{:?}", io.notices);
+        }
+        assert!(
+            !logged(&log)
+                .iter()
+                .any(|e| e.starts_with("reopen") || e.starts_with("save")),
+            "{:?}",
+            logged(&log)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bang_refused_twice_reports_the_second_refusal_without_a_loop() {
+        let dir = gpu_dir("bang-twice");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        let cmd = gpu_command(&counter, true);
+
+        let result = agent.run_bang(&cmd, &mut TestBangIo::default());
+
+        assert_eq!(runs(&counter), 2, "exactly one re-run");
+        assert_eq!(logged(&log), GPU_CYCLE_ORDER, "the model is reloaded");
+        let out = result.as_ref().unwrap();
+        assert_eq!(out.exit_code, 75);
+        assert!(out.stdout.contains("GPU not available"), "{out:?}");
+        let entry = bang_transcript_entry(&cmd, &result);
+        assert!(
+            entry.contains("<bash-exit-code>75</bash-exit-code>"),
+            "{entry}"
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bang_inside_a_sidechain_skips_the_cycle_with_a_note() {
+        let dir = gpu_dir("bang-sidechain");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = gpu_bang_agent(&dir, &log, &counter, &cfg);
+        agent.alt_engine_depth = 1;
+        let mut io = TestBangIo::default();
+
+        let out = agent
+            .run_bang(&gpu_command(&counter, false), &mut io)
+            .unwrap();
+
+        assert_eq!((out.exit_code, runs(&counter)), (75, 1));
+        assert_eq!(io.notices.len(), 1, "{:?}", io.notices);
+        assert!(io.notices[0].contains("skipped"), "{:?}", io.notices);
+        assert!(logged(&log).is_empty(), "{:?}", logged(&log));
+        agent.alt_engine_depth = 0;
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
