@@ -3196,3 +3196,18 @@ the first and exit too: there can only ever be one `Ds4Model`, which is why the
 cycle looks for exactly one releasable engine. Each reopen also registers the
 C's `atexit(ds4_release_instance_lock)` again; the handler is idempotent, so the
 repeats are harmless.
+
+## `ds4_engine_open` exits instead of failing, which a mid-session reload cannot catch
+
+**2026-09-28:** the C `model_open` calls `exit(1)` for a model, DSpark draft or
+vision file it cannot open, read or map, and the instance lock calls `exit(2)`
+on contention. At startup that is only an abrupt message; during the GPU-yield
+reload it ends a running session. plank narrows it from the Rust side: the
+`ReopenFn` checks every file it will map is a readable regular file and probes
+the lock first, the session is saved before the model is released, and an
+`atexit` hook armed only for the reload (`stderrline::logging_to`) restores
+fd 2 and the terminal and prints the last line of `~/.plank/gpu-yield.log`.
+What stays open is a failure no check foresees (a file that is readable but
+cannot be mapped, say) and a plank that takes the lock between the probe and
+the open. The lasting fix is an option for `ds4_engine_open` to return an error
+instead of calling `exit`, which belongs in `refs/ds4`.

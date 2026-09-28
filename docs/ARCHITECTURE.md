@@ -317,18 +317,44 @@ can be touching the engine:
    session. `Engine::can_release_gpu` is true only when that session is the
    model's sole `Arc` owner, since forks for asides are call-scoped;
 4. the same call dispatched once more, with the first run's sandbox decision
-   replayed; its result is what the model sees, and it never cycles again;
+   replayed and `BashJobs::wait_to_exit` set, so the call waits for the
+   command to exit (its own timeout and a user interrupt still end it) rather
+   than returning `status=running` after `refresh_sec`; its result is what the
+   model sees, and it never cycles again;
 5. the `ReopenFn` that `make_local_engine` built from the exact resolved
-   parameters (companion retry included), which probes the lock first because
-   contention inside `ds4_engine_open` is an `exit(2)`; then
+   parameters (companion retry included). It first checks that the model, the
+   DSpark draft model and the vision encoder are readable regular files
+   (`gpuyield::check_model_files`) and probes the lock, because the C calls
+   `exit(1)` on a file it cannot map and `exit(2)` on a contended lock; then
    `set_trusted_system_prefix`, `set_think_mode`, and `set_kv`.
+
+Before step 3 the session is saved through the normal save path, with the
+prefixes a provider sidechain parked beside its parent engine put back and
+anything past the outermost sub-agent fork cut off, so `/resume` can recover
+if the process dies in the C. Steps 3 and 5 run with fd 2 appended to
+`~/.plank/gpu-yield.log` (`stderrline::logging_to`, restored by a drop guard),
+and while the reload runs an `atexit` hook is armed: should the C `exit`
+anyway (a failure the checks do not foresee, or a plank that took the lock
+between the probe and the open), it restores fd 2, resets the terminal the TUI
+left in raw mode on the alternate screen, and prints the log's last line.
+Making `ds4_engine_open` return an error instead is the lasting fix, and lives
+in `refs/ds4` (`FINDINGS.md`).
 
 A missing or refused snapshot leaves the fresh engine empty and re-warms the
 tiers from their disk checkpoints (`rewarm_after_reset`), so nothing but bytes
 captured a moment earlier is ever restored. A failed reopen keeps the
-placeholder, whose `generate` errors, and retries at the next turn start. The
-local engine can be `Agent::engine`, the `EngineKey::Local` alternate under a
-provider main agent, or a parent parked in `Agent::parked_engines` while a
+placeholder, whose `generate` errors, and owes a reload (`GpuYield::pending`,
+holding only the snapshot, whose file goes when it is dropped). The retry runs
+at the next top-level turn start, never inside a sidechain, and looks the
+placeholder up by `Engine::is_gpu_placeholder` before calling the factory,
+because a sidechain unwinding moves it: a parked parent returns to
+`Agent::engine`, a sidechain's local engine goes into `alt_engines`. With no
+placeholder left the reload is dropped. While one is owed, the idle slot runs
+no memory or suggestion pass. A turn runs at most two cycles
+(`GPU_YIELD_CYCLES_PER_TURN`); a third request gets its first result with a
+note. The re-run is an ordinary dispatch, so tool hooks fire for both runs.
+The local engine can be `Agent::engine`, the `EngineKey::Local` alternate under
+a provider main agent, or a parent parked in `Agent::parked_engines` while a
 provider sidechain runs. Background jobs, `!` commands, a local engine inside a
 fan-out slot and `plank serve` are not covered.
 

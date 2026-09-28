@@ -239,15 +239,42 @@ status 75 and prints a line that starts with
 <code>GPU not available</code> (on stdout or stderr), for example
 <code>GPU not available: held by plank (PID 1234)</code>.</p>
 <p>When a <code>bash</code> call ends that way, plank prints one notice,
-saves the conversation's KV cache, unloads the model, runs the same
-command once more, then reloads the model with the settings it started
-with and restores the cache, so the next reply does not re-read the
-conversation. The model sees only the second run's result. If the second
-run fails the same way, that result is what the model gets; plank does
-not try a third time, and reloads the model regardless. Should the
-reload fail (another plank took the model lock in the meantime, say),
-replies fail with a message saying so and plank tries again at your next
-prompt.</p>
+saves the session and the conversation's KV cache, unloads the model,
+runs the same command once more, then reloads the model with the
+settings it started with and restores the cache, so the next reply does
+not re-read the conversation. The second run is waited out to the end,
+however long it takes: the model's <code>refresh_sec</code> does not
+apply to it, only the command's own <code>timeout_sec</code> or your Esc
+(Ctrl-C in the plain REPL) stops it, and the model is reloaded only once
+the command has exited. The model sees only the second run's result. If
+the second run fails the same way, that result is what the model gets;
+plank does not try a third time, and reloads the model regardless. A
+turn gets at most two of these cycles; a third GPU request in the same
+turn returns its first result with the line
+<code>GPU yield skipped: limit of 2 per turn reached</code>.</p>
+<p>Hooks see both runs, because both really happened:
+<code>PreToolUse</code> and <code>PostToolUse</code> fire for the first
+run and again for the second, and any <code>PostToolUse</code> warning
+from the first run stays in the result.</p>
+<p>Before reloading, plank checks that the model file and its companions
+(the DSpark draft model, the vision encoder) are still there and
+readable. If one is gone, or another plank took the model lock in the
+meantime, the reload fails cleanly: replies fail with a message naming
+the cause, the background memory and suggestion passes wait, and plank
+tries again at your next prompt. The engine's own output during the
+unload and the reload goes to <code>~/.plank/gpu-yield.log</code> rather
+than onto the screen. One risk remains: the engine ends the whole
+process, rather than reporting an error, when it cannot load a model for
+a reason those checks do not catch, or when another plank grabs the lock
+between the check and the load. plank then puts the terminal back,
+prints the last line of <code>~/.plank/gpu-yield.log</code>, and exits;
+since the session was saved before the unload, <code>/resume</code>
+picks the conversation up from the command that asked for the GPU.</p>
+<p>The exit status plank looks at is the command's, which for a pipeline
+is the last stage's. <code>mex generate … | tee gen.log</code> reports
+<code>tee</code>'s status, 0, so the cycle never starts; write
+<code>set -o pipefail; mex generate … | tee gen.log</code> to pass the
+75 through.</p>
 <p>This happens only when plank holds a local model; with a provider or
 a remote engine the first result is returned as it is. It applies to a
 command that finishes inside the <code>bash</code> call: a job still
