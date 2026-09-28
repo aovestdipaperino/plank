@@ -45,11 +45,6 @@ const JOBS: [(&str, EngineId); 3] = [
 #[must_use]
 pub fn migrate_in(root: &Path) -> Vec<String> {
     let mut warn = Vec::new();
-    // A live helper is writing into the old staging dir; moving it underneath
-    // would corrupt its download. The next launch migrates instead.
-    if crate::downloader::running_in(root) {
-        return warn;
-    }
     // Decided before anything moves: only `ds41.manifest` recorded, nothing
     // that would mean a ds4 install exists too.
     let ds41_only = root.join("ds41.manifest").exists()
@@ -69,12 +64,19 @@ pub fn migrate_in(root: &Path) -> Vec<String> {
             &mut warn,
         );
     }
-    migrate_staging(root, &mut warn);
-    for (old, id) in JOBS {
-        let from = root.join("downloads").join(old);
-        let to = crate::downloader::job_path_in(root, id);
-        if from != to {
-            convert_manifest(&from, &to, &mut warn);
+    // A helper spawned by an older plank writes only under the old staging
+    // dirs and reads its job file, so those two steps wait while one holds
+    // the lock: moving them underneath it would corrupt its download. The
+    // top-level renames above are safe, since no helper touches them, and a
+    // later launch finishes the rest.
+    if !crate::downloader::running_in(root) {
+        migrate_staging(root, &mut warn);
+        for (old, id) in JOBS {
+            let from = root.join("downloads").join(old);
+            let to = crate::downloader::job_path_in(root, id);
+            if from != to {
+                convert_manifest(&from, &to, &mut warn);
+            }
         }
     }
     let local = root.join("engines.local.json");
@@ -447,15 +449,38 @@ mod tests {
     }
 
     #[test]
-    fn migration_waits_while_a_downloader_holds_the_lock() {
+    fn a_live_downloader_defers_only_staging_and_jobs() {
         let r = scratch("locked");
         std::fs::write(r.join("ds4flash.gguf"), "m").unwrap();
-        let _held = crate::downloader::try_lock_in(&r).expect("lock");
+        std::fs::write(r.join("ds4.manifest"), old_manifest(&["main"])).unwrap();
+        std::fs::create_dir_all(r.join("staging-qwen")).unwrap();
+        std::fs::write(r.join("staging-qwen/main.part"), "q").unwrap();
+        std::fs::create_dir_all(r.join("downloads")).unwrap();
+        std::fs::write(r.join("downloads/job.json"), old_manifest(&["main"])).unwrap();
+        let held = crate::downloader::try_lock_in(&r).expect("lock");
         let w = migrate_in(&r);
-        assert!(w.is_empty(), "deferral is silent");
+        assert!(w.is_empty(), "deferral is silent: {w:?}");
         assert!(
-            r.join("ds4flash.gguf").exists(),
-            "nothing moved under a live helper"
+            r.join("ds4vision.gguf").exists() && !r.join("ds4flash.gguf").exists(),
+            "a top-level artifact no helper touches moves even while locked"
         );
+        assert!(crate::manifest::installed_path_in(&r, EngineId::DS4VISION).exists());
+        assert!(
+            r.join("staging-qwen/main.part").exists(),
+            "the old staging dir a live helper writes into stays put"
+        );
+        assert!(r.join("downloads/job.json").exists());
+        assert!(!crate::downloader::job_path_in(&r, EngineId::DS4VISION).exists());
+        assert!(!crate::manifest::staging_dir_in(&r, EngineId::QWEN).exists());
+
+        // Once the helper is gone, the next launch finishes the job.
+        drop(held);
+        assert!(migrate_in(&r).is_empty());
+        assert!(
+            crate::manifest::staging_dir_in(&r, EngineId::QWEN)
+                .join("main.part")
+                .exists()
+        );
+        assert!(crate::downloader::job_path_in(&r, EngineId::DS4VISION).exists());
     }
 }
