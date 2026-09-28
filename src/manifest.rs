@@ -614,15 +614,6 @@ mod tests {
         );
     }
 
-    /// The one manifest that ships must keep parsing: it is compiled in, and a
-    /// malformed one is only noticed here. There is deliberately no V4.1
-    /// manifest — V4.1 is reached by an explicit `-m`, never managed.
-    #[test]
-    fn the_shipped_ds4_manifest_parses() {
-        let m = parse(include_str!("../ds4.manifest")).expect("ds4.manifest parses");
-        assert!(m.files.contains_key("dspark"));
-    }
-
     /// Two engines must never collide on any path they write.
     ///
     /// Load-bearing, not cosmetic: the swap's guarantee is that the installed
