@@ -1541,6 +1541,21 @@ fn remote_lines_gate(frame: Option<bool>, queued: bool) -> RemoteLines {
     }
 }
 
+/// What a grid's write-back leaves behind: the scrollback line (the first
+/// line of the server's summary, or the failure) and the `<system-reminder>`
+/// that tells the model, at the next turn boundary, what the user changed.
+fn grid_write_back_notice(table: &str, outcome: &Result<String, String>) -> (String, String) {
+    let summary = match outcome {
+        Ok(text) => text.clone(),
+        Err(e) => format!("grid write-back failed: {e}"),
+    };
+    let line = summary.lines().next().unwrap_or_default().to_string();
+    let reminder = format!(
+        "<system-reminder>\nThe user edited the {table} grid. {summary}\n</system-reminder>"
+    );
+    (line, reminder)
+}
+
 /// Injects the session-start context as **two** user messages — project-stable
 /// first, then session-volatile — so Tier 2 and Tier 3 of the KV cache are
 /// distinct, separately-checkpointable spans (issues #60, #64).
@@ -5590,6 +5605,7 @@ impl Agent<'_> {
             return Ok(());
         }
         self.maybe_append_system_prompt_reminder();
+        self.drain_host_notices();
         // One clock for the whole turn: elapsed time accumulates across the
         // generate → tools → generate loop instead of restarting per pass.
         let turn_start = Instant::now();
@@ -12879,6 +12895,11 @@ impl Agent<'_> {
                         .step_frame(open, dt_ms, w, h.saturating_sub(1), now_ms)
                 {
                     log.push_dim(e);
+                    // A trapped grid may have saved first: what is on its
+                    // disk goes back like any other save.
+                    if let Some(line) = self.finish_grid_frame(open) {
+                        log.push_dim(line);
+                    }
                     wasm_frame = None;
                     arcade_hover_reporting(false);
                 }
@@ -13033,13 +13054,21 @@ impl Agent<'_> {
                     self.remote.as_ref().is_some_and(|r| r.shared.has_queued()),
                 );
                 if gate == RemoteLines::DismissScreensaver {
-                    if let Some(open) = &wasm_frame
-                        && let Some(line) = self.tool_ctx.wasm.close_frame(open)
-                    {
-                        log.push_dim(line);
+                    if let Some(open) = &wasm_frame {
+                        if let Some(line) = self.tool_ctx.wasm.close_frame(open) {
+                            log.push_dim(line);
+                        }
+                        if let Some(line) = self.finish_grid_frame(open) {
+                            log.push_dim(line);
+                        }
                     }
                     wasm_frame = None;
                     arcade_hover_reporting(false);
+                    // Remote lines are activity: without this the idle clock
+                    // is already past its threshold, and after lines that
+                    // start no turn (slash commands only) the rotation would
+                    // put the screensaver straight back up.
+                    last_activity = Instant::now();
                 }
                 if gate != RemoteLines::Wait
                     && let Some(r) = self.remote.clone()
@@ -13242,10 +13271,13 @@ impl Agent<'_> {
             // on. A component opened by `/frame` is *not* dismissed here — the
             // user asked for that one and owns when it closes.
             if wasm_frame.as_ref().is_some_and(|f| f.screensaver) && from_user {
-                if let Some(open) = &wasm_frame
-                    && let Some(line) = self.tool_ctx.wasm.close_frame(open)
-                {
-                    log.push_dim(line);
+                if let Some(open) = &wasm_frame {
+                    if let Some(line) = self.tool_ctx.wasm.close_frame(open) {
+                        log.push_dim(line);
+                    }
+                    if let Some(line) = self.finish_grid_frame(open) {
+                        log.push_dim(line);
+                    }
                 }
                 wasm_frame = None;
                 arcade_hover_reporting(false);
@@ -13267,11 +13299,17 @@ impl Agent<'_> {
                                 if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
                                     log.push_dim(line);
                                 }
+                                if let Some(line) = self.finish_grid_frame(open) {
+                                    log.push_dim(line);
+                                }
                                 wasm_frame = None;
                                 arcade_hover_reporting(false);
                             }
                             Err(e) => {
                                 log.push_dim(e);
+                                if let Some(line) = self.finish_grid_frame(open) {
+                                    log.push_dim(line);
+                                }
                                 wasm_frame = None;
                                 arcade_hover_reporting(false);
                             }
@@ -13503,11 +13541,17 @@ impl Agent<'_> {
                         if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
                             log.push_dim(line);
                         }
+                        if let Some(line) = self.finish_grid_frame(open) {
+                            log.push_dim(line);
+                        }
                         wasm_frame = None;
                         arcade_hover_reporting(false);
                     }
                     Err(e) => {
                         log.push_dim(e);
+                        if let Some(line) = self.finish_grid_frame(open) {
+                            log.push_dim(line);
+                        }
                         wasm_frame = None;
                         arcade_hover_reporting(false);
                     }
@@ -15213,6 +15257,7 @@ impl Agent<'_> {
             return Ok(());
         }
         self.maybe_reminder_notify(&mut note);
+        self.drain_host_notices();
         // One clock for the whole turn: elapsed time accumulates across the
         // generate → tools → generate loop instead of restarting per pass.
         let turn_start = Instant::now();
@@ -15691,6 +15736,7 @@ impl Agent<'_> {
     /// idle). Off unless `tools.bashNotify` is set; sidechains never drain,
     /// since the jobs belong to the main transcript (`docs/BACKGROUND-TASKS.md`).
     fn drain_job_notifications(&mut self) -> usize {
+        self.drain_host_notices();
         if !crate::settings::active().tools.bash_notify || self.in_sidechain() {
             return 0;
         }
@@ -15700,6 +15746,49 @@ impl Agent<'_> {
         };
         self.session.push(Message::user(text));
         finished.len()
+    }
+
+    /// Appends every queued host notice (a grid's write-back outcome) as a
+    /// user message, returning how many joined.
+    ///
+    /// The sibling of [`Self::drain_job_notifications`], called at the same
+    /// boundaries plus the start of every turn: a grid closes only at the
+    /// idle prompt, so without the turn start its notice would wait for a
+    /// tool round that may never come. Not gated on `tools.bashNotify`,
+    /// which is about bash. Sidechains never drain: the notice belongs to
+    /// the main transcript.
+    fn drain_host_notices(&mut self) -> usize {
+        if self.in_sidechain() || self.tool_ctx.host_notices.is_empty() {
+            return 0;
+        }
+        let notices = std::mem::take(&mut self.tool_ctx.host_notices);
+        let n = notices.len();
+        for text in notices {
+            self.session.push(Message::user(text));
+        }
+        n
+    }
+
+    /// Finishes the grid behind a frame that just closed, normally or by a
+    /// trap: when its file changed, plank (not the model) calls the server's
+    /// write-back tool with the new CSV, queues the outcome for the model as
+    /// a host notice and returns its first line for the scrollback. `None`
+    /// when the frame was not a grid or the grid was left unchanged.
+    ///
+    /// The call runs on the UI thread. It is one request to a local stdio
+    /// server, so it is brief, but a server that stalls holds the screen
+    /// for as long as its request timeout.
+    fn finish_grid_frame(&mut self, frame: &crate::wasmreg::OpenFrame) -> Option<String> {
+        let finished = self.tool_ctx.wasm.finish_grid(frame)?;
+        let outcome = crate::tools::mcp::call_tool_direct(
+            &mut self.tool_ctx.mcp,
+            &finished.server,
+            &finished.write_back.tool,
+            &finished.arguments(),
+        );
+        let (line, reminder) = grid_write_back_notice(&finished.write_back.table, &outcome);
+        self.tool_ctx.host_notices.push(reminder);
+        Some(line)
     }
 
     /// Plain-stdout mirror of `tui_memory_pass`: runs one queued job and
@@ -37841,6 +37930,73 @@ or the user's next message aborts before its first token"
         agent.alt_engine_depth = 0;
         drop(agent);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_grid_write_back_leaves_a_line_and_a_reminder() {
+        let (line, reminder) = grid_write_back_notice(
+            "categories",
+            &Ok("categories: 1 updated, 0 created\nrow 3: renamed".to_string()),
+        );
+        assert_eq!(line, "categories: 1 updated, 0 created");
+        assert_eq!(
+            reminder,
+            "<system-reminder>\nThe user edited the categories grid. \
+             categories: 1 updated, 0 created\nrow 3: renamed\n</system-reminder>"
+        );
+        let (line, reminder) = grid_write_back_notice("rules", &Err("reopen the grid".to_string()));
+        assert_eq!(line, "grid write-back failed: reopen the grid");
+        assert_eq!(
+            reminder,
+            "<system-reminder>\nThe user edited the rules grid. \
+             grid write-back failed: reopen the grid\n</system-reminder>"
+        );
+    }
+
+    /// A host notice joins the transcript at the next turn's start, after the
+    /// user's line and before the model answers, and only once.
+    #[test]
+    fn a_host_notice_joins_the_next_turn_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "plank-ui-host-notice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptedEngine {
+            replies: vec!["Noted.\n".to_string(), "Again.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let (_, reminder) =
+            grid_write_back_notice("categories", &Ok("categories: 1 updated".into()));
+        agent.tool_ctx.host_notices.push(reminder.clone());
+        agent.session.push(Message::user("hi"));
+
+        let shared = TurnShared::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        agent.session.push(Message::user("and now"));
+        agent.worker_turn(&tx, &shared).unwrap();
+
+        let texts: Vec<&str> = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(texts.len(), 5, "got: {texts:#?}");
+        assert_eq!(texts[0], "hi");
+        assert_eq!(texts[1], reminder);
+        assert!(texts[2].contains("Noted."), "{texts:#?}");
+        assert_eq!(texts[3], "and now");
+        assert!(texts[4].contains("Again."), "{texts:#?}");
+        assert!(agent.tool_ctx.host_notices.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

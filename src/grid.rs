@@ -57,6 +57,33 @@ pub struct ActiveGrid {
     pub write_back: WriteBack,
 }
 
+/// A grid whose frame closed with the file changed: what plank sends back to
+/// the server that staged it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedGrid {
+    /// The MCP server that takes the write-back.
+    pub server: String,
+    /// The tool, table and token to send it with.
+    pub write_back: WriteBack,
+    /// The file as the frame left it, read back from the RAM disk.
+    pub csv: String,
+}
+
+impl FinishedGrid {
+    /// The write-back tool's arguments as a JSON object:
+    /// `{"table", "grid", "csv"}`.
+    #[must_use]
+    pub fn arguments(&self) -> String {
+        use crate::wasmreg::json_str;
+        format!(
+            "{{\"table\":{},\"grid\":{},\"csv\":{}}}",
+            json_str(&self.write_back.table),
+            json_str(&self.write_back.grid),
+            json_str(&self.csv)
+        )
+    }
+}
+
 /// Splits `plank-frame://<component>/<file>` into its two parts.
 ///
 /// `None` unless both are present and plain: the component is a non-empty id
@@ -79,6 +106,23 @@ pub fn parse_frame_uri(uri: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_finished_grid_names_its_table_token_and_csv() {
+        let finished = FinishedGrid {
+            server: "chatbgt".to_string(),
+            write_back: WriteBack {
+                tool: "apply_grid".to_string(),
+                table: "categories".to_string(),
+                grid: "0badf00d".to_string(),
+            },
+            csv: "#,name\n1,\"Food\"\n".to_string(),
+        };
+        assert_eq!(
+            finished.arguments(),
+            r##"{"table":"categories","grid":"0badf00d","csv":"#,name\n1,\"Food\"\n"}"##
+        );
+    }
 
     #[test]
     fn a_frame_uri_splits_into_component_and_file() {

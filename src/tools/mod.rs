@@ -207,6 +207,10 @@ pub struct ToolContext {
     /// Whether a front end that can show a WASM frame is running: true only
     /// for the Ratatui TUI. Without it every grid staging is refused.
     pub frames_available: bool,
+    /// Messages plank itself has for the model, each already wrapped in a
+    /// `<system-reminder>`: a grid's write-back outcome. The sibling of the
+    /// bash job table's notifications, drained at the same turn boundary.
+    pub host_notices: Vec<String>,
 }
 
 /// An MCP tool's observation once its grid stagings are honoured or refused.
@@ -356,6 +360,7 @@ impl ToolContext {
             memory_log_path: None,
             grid_routes: BTreeMap::new(),
             frames_available: false,
+            host_notices: Vec::new(),
         }
     }
 

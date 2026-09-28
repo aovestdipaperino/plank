@@ -1750,6 +1750,43 @@ fn invoke_mcp_tool(servers: &mut [McpServer], full_name: &str, arguments: &str) 
             "Tool error: malformed mcp tool name, expected mcp__server__tool\n",
         );
     };
+    invoke_on(servers, server_name, tool_name, arguments)
+}
+
+/// Calls `tool` on the server named `server` for plank itself, not for the
+/// model: the grid write-back when a frame closes on an edited grid.
+///
+/// The same request path as a model's `mcp__*` call (restart of a stopped
+/// server, the offline check, the advertised-tool check, the flattening), so
+/// the write-back tool must be one the server lists. `Ok` is the result's
+/// text; a tool error (`isError`) or a failure to call is `Err`, without the
+/// `Tool error: ` prefix. A grid the reply stages is ignored: a write-back
+/// is not a request to open another frame.
+///
+/// # Errors
+/// The server is unknown, down or does not list `tool`, the request failed,
+/// or the tool reported an error.
+pub fn call_tool_direct(
+    servers: &mut [McpServer],
+    server: &str,
+    tool: &str,
+    args_json: &str,
+) -> Result<String, String> {
+    let McpOutput { text, stagings: _ } = invoke_on(servers, server, tool, args_json);
+    match text.strip_prefix("Tool error: ") {
+        Some(err) => Err(err.trim_end().to_string()),
+        None => Ok(text.trim_end().to_string()),
+    }
+}
+
+/// Body of [`invoke_mcp_tool`] once the name is split, shared with
+/// [`call_tool_direct`].
+fn invoke_on(
+    servers: &mut [McpServer],
+    server_name: &str,
+    tool_name: &str,
+    arguments: &str,
+) -> McpOutput {
     // An offline shadow matches too: its tools are advertised in the prompt, so
     // a call must be answered with "the server is down" rather than the generic
     // unavailable message reserved for a name that is not configured at all.
@@ -1765,7 +1802,9 @@ fn invoke_mcp_tool(servers: &mut [McpServer], full_name: &str, arguments: &str) 
         return McpOutput::error(offline_tool_error(&server.name));
     }
     if server.find_tool(tool_name).is_none() {
-        return McpOutput::error(format!("Tool error: unknown mcp tool: {full_name}\n"));
+        return McpOutput::error(format!(
+            "Tool error: unknown mcp tool: mcp__{server_name}__{tool_name}\n"
+        ));
     }
 
     let mut params = String::from("{\"name\":");
@@ -2816,6 +2855,80 @@ done
             tool_mcp_invoke(&mut servers, &call).text,
             "buried ran with depth=2\n"
         );
+    }
+
+    /// plank's own write-back: server and tool in, a real `tools/call` with
+    /// the given arguments on the wire, the result text out. A tool error
+    /// and an unadvertised tool are `Err`, and a grid the reply carries is
+    /// not honoured.
+    #[test]
+    fn a_direct_call_sends_a_real_tools_call_and_returns_its_text() {
+        let wire = std::env::temp_dir().join(format!(
+            "plank-mcp-direct-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let script = format!(
+            r##"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"protocolVersion\":\"2024-11-05\"}}}}" ;;
+    *'"tools/list"'*)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"tools\":[{{\"name\":\"apply_grid\",\"description\":\"a\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}" ;;
+    *'"stale"'*)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"isError\":true,\"content\":[{{\"type\":\"text\",\"text\":\"reopen the grid\"}}]}}}}" ;;
+    *'"tools/call"'*)
+      printf '%s\n' "$line" >> '{wire}'
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"categories: 1 updated\nno other changes\"}},{{\"type\":\"resource\",\"resource\":{{\"uri\":\"plank-frame://csvedit/x.csv\",\"mimeType\":\"text/csv\",\"text\":\"#\n\",\"_meta\":{{\"writeBack\":{{\"tool\":\"apply_grid\",\"table\":\"t\",\"grid\":\"00000000\"}}}}}}}}]}}}}" ;;
+    *)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"error\":{{\"message\":\"method not found\"}}}}" ;;
+  esac
+done
+"##,
+            wire = wire.display()
+        );
+        let path = write_temp_config(&format!(
+            "{{\"mcpServers\":{{\"fin\":{{\"command\":\"sh\",\"args\":[\"-c\",{}]}}}}}}",
+            {
+                let mut esc = String::new();
+                json_escape(&mut esc, &script);
+                esc
+            }
+        ));
+        let mut servers = start_servers(config_load(&path));
+        std::fs::remove_file(&path).ok();
+        assert_eq!(servers.len(), 1);
+
+        let args = r##"{"table":"categories","grid":"0badf00d","csv":"#,name\n1,Food\n"}"##;
+        assert_eq!(
+            call_tool_direct(&mut servers, "fin", "apply_grid", args),
+            Ok("categories: 1 updated\nno other changes".to_string())
+        );
+        let sent = std::fs::read_to_string(&wire).expect("the call reached the server");
+        std::fs::remove_file(&wire).ok();
+        assert!(sent.contains(r#""method":"tools/call""#), "{sent}");
+        assert!(
+            sent.contains(&format!(r#""name":"apply_grid","arguments":{args}"#)),
+            "{sent}"
+        );
+
+        assert_eq!(
+            call_tool_direct(
+                &mut servers,
+                "fin",
+                "apply_grid",
+                r#"{"table":"categories","grid":"stale","csv":""}"#
+            ),
+            Err("reopen the grid".to_string())
+        );
+        let err = call_tool_direct(&mut servers, "fin", "undo", "{}").unwrap_err();
+        assert!(err.contains("unknown mcp tool"), "{err}");
+        let err = call_tool_direct(&mut servers, "nobody", "apply_grid", "{}").unwrap_err();
+        assert!(err.contains("not available"), "{err}");
     }
 
     /// A `tools/call` result with `content` items given as raw JSON text.

@@ -1607,6 +1607,13 @@ pub struct Session {
     /// tells an open grid from one still waiting to open, and why a grid is
     /// never staged over, or opened over, a frame already up.
     frame_open: bool,
+    /// Whether the frame [`Session::open_frame`] last opened was the active
+    /// grid's: its component, with the grid's file as its `arg`. A `/frame`
+    /// for another face of the same component is not the grid, and closing
+    /// it must leave the queued grid alone. Cleared by
+    /// [`Session::finish_grid`], and outlives a trap so the grid can still be
+    /// finished after one.
+    grid_on_screen: bool,
     /// The plank home: where trust is recorded and where the `state`
     /// capability writes. Held once, here, because the host and the trust
     /// store both need it and two callers passing the same value into one
@@ -1634,6 +1641,7 @@ impl Session {
             pending_open: None,
             active_grid: None,
             frame_open: false,
+            grid_on_screen: false,
             home: home.map(Path::to_path_buf),
         }
     }
@@ -1670,7 +1678,7 @@ impl Session {
     /// # Errors
     /// Returns the reason, for the model: the route is not declared, the
     /// component is not loaded (or has struck out), it has no frame, it was
-    /// not granted `fs`, a frame is already open (`a grid is already open`:
+    /// a screensaver, it was not granted `fs`, a frame is already open (`a grid is already open`:
     /// only an unopened grid may be replaced), or the RAM disk refused the
     /// write.
     pub fn stage_grid(
@@ -1698,6 +1706,12 @@ impl Session {
         if !manifest.surfaces.contains(&Surface::Frame) {
             return Err(format!("{component} cannot show a frame"));
         }
+        // A screensaver closes on any activity, so an edit could never be
+        // made in it, and the idle rotation could open it onto someone
+        // else's grid.
+        if manifest.kind == FrameKind::Screensaver {
+            return Err(format!("{component} is a screensaver"));
+        }
         if !manifest.capabilities.contains(&Capability::Fs) {
             return Err(format!("{component} has no fs grant"));
         }
@@ -1714,6 +1728,9 @@ impl Session {
             self.host.ram_remove(&older.component, &older.file);
         }
         self.registry.pending_frame = Some((component.clone(), file.clone()));
+        // No frame is open (checked above), so no grid is on screen: the new
+        // one is only queued.
+        self.grid_on_screen = false;
         self.active_grid = Some(crate::grid::ActiveGrid {
             component,
             file,
@@ -1749,6 +1766,7 @@ impl Session {
     /// was the grid.
     pub fn abandon_unopened_grid(&mut self, id: &str, file: &str) -> bool {
         let is_it = !self.frame_open
+            && !self.grid_on_screen
             && self
                 .active_grid
                 .as_ref()
@@ -1756,8 +1774,52 @@ impl Session {
         if is_it {
             self.active_grid = None;
             self.host.ram_remove(id, file);
+            // Its frame, still queued, would open onto a file that is gone.
+            if self
+                .registry
+                .pending_frame
+                .as_ref()
+                .is_some_and(|(pid, pfile)| pid == id && pfile == file)
+            {
+                self.registry.pending_frame = None;
+            }
         }
         is_it
+    }
+
+    /// Ends the active grid once its frame has closed, normally or by a
+    /// trap: reads the file back from the RAM disk, then forgets the grid
+    /// and removes the file.
+    ///
+    /// Returns what to write back when the bytes differ from what was
+    /// staged, `None` when they are unchanged or when `frame` was not the
+    /// grid's frame (another face of the same component, opened while the
+    /// grid waited, which leaves the grid queued). A trapped frame is
+    /// treated like a closed one: what it saved before trapping is on the
+    /// disk and goes back like any other save.
+    pub fn finish_grid(&mut self, frame: &OpenFrame) -> Option<crate::grid::FinishedGrid> {
+        if !self.grid_on_screen
+            || self
+                .active_grid
+                .as_ref()
+                .is_none_or(|g| g.component != frame.id)
+        {
+            return None;
+        }
+        self.grid_on_screen = false;
+        let grid = self.active_grid.take()?;
+        let now = self.host.ram_file(&grid.component, &grid.file);
+        self.host.ram_remove(&grid.component, &grid.file);
+        // A file the frame deleted is not an edit plank can send.
+        let now = now?;
+        if now == grid.staged {
+            return None;
+        }
+        Some(crate::grid::FinishedGrid {
+            server: grid.server,
+            write_back: grid.write_back,
+            csv: String::from_utf8_lossy(&now).into_owned(),
+        })
     }
 
     /// Frame components that a slash command may open, as `(id, description)`.
@@ -1906,6 +1968,10 @@ impl Session {
             });
         }
         self.frame_open = true;
+        self.grid_on_screen = self
+            .active_grid
+            .as_ref()
+            .is_some_and(|g| g.component == id && g.file == arg);
         Ok(OpenFrame {
             id: id.to_string(),
             screensaver: false,
@@ -4194,6 +4260,9 @@ mod tests {
         limit: Option<usize>,
         /// Whether a call succeeds (with an empty object), so a frame opens.
         opens: bool,
+        /// Whether every call but `frame_open` traps, so a frame opens and
+        /// then fails.
+        traps: bool,
     }
 
     impl crate::wasmhost::WasmHost for DiskHost {
@@ -4209,9 +4278,12 @@ mod tests {
         fn call(
             &mut self,
             _id: &str,
-            _export: &str,
+            export: &str,
             _input: &[u8],
         ) -> Result<Vec<u8>, crate::wasmhost::WasmError> {
+            if self.traps && export != "frame_open" {
+                return Err(crate::wasmhost::WasmError::Unsupported);
+            }
             if self.opens {
                 Ok(b"{}".to_vec())
             } else {
@@ -4261,6 +4333,7 @@ mod tests {
             pending_open: None,
             active_grid: None,
             frame_open: false,
+            grid_on_screen: false,
             home: None,
         }
     }
@@ -4523,6 +4596,119 @@ mod tests {
         assert_eq!(
             s.take_next_frame(),
             Some((CSVEDIT.to_string(), "categories.csv".to_string()))
+        );
+    }
+
+    // --- Write-back on close ------------------------------------------------
+
+    /// Stages a grid and opens its frame, as the tick loop would.
+    fn open_grid(s: &mut Session, csv: &str) -> OpenFrame {
+        s.stage_grid(staging("categories.csv", csv), &routes())
+            .unwrap();
+        let (id, file) = s.take_next_frame().expect("the grid is queued");
+        s.open_frame(&id, &file, 80, 24, 0).unwrap()
+    }
+
+    #[test]
+    fn an_untouched_grid_is_not_written_back_but_is_cleaned_up() {
+        let mut s = opening_session();
+        let open = open_grid(&mut s, "#,name\n1,Food\n");
+        s.close_frame(&open);
+        assert_eq!(s.finish_grid(&open), None);
+        assert!(s.active_grid.is_none());
+        assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_none());
+    }
+
+    #[test]
+    fn a_saved_grid_is_handed_back_with_its_new_csv() {
+        let mut s = opening_session();
+        let open = open_grid(&mut s, "#,name\n1,Food\n");
+        s.host
+            .ram_write(CSVEDIT, "categories.csv", b"#,name\n1,Groceries\n")
+            .unwrap();
+        s.close_frame(&open);
+        let finished = s.finish_grid(&open).expect("the bytes changed");
+        assert_eq!(finished.server, "chatbgt");
+        assert_eq!(finished.write_back.tool, "apply_grid");
+        assert_eq!(finished.write_back.table, "categories");
+        assert_eq!(finished.write_back.grid, "0badf00d");
+        assert_eq!(finished.csv, "#,name\n1,Groceries\n");
+        assert!(s.active_grid.is_none());
+        assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_none());
+        assert_eq!(s.finish_grid(&open), None, "finished once");
+    }
+
+    /// A frame that traps may have saved before it did; what is on the disk
+    /// is written back all the same, and the grid is cleaned up.
+    #[test]
+    fn a_trapped_grid_frame_still_writes_back_what_it_saved() {
+        let mut s = fit_session();
+        s.host = Box::new(DiskHost {
+            opens: true,
+            traps: true,
+            ..DiskHost::default()
+        });
+        let open = open_grid(&mut s, "#,name\n");
+        s.host
+            .ram_write(CSVEDIT, "categories.csv", b"#,name\n1,Rent\n")
+            .unwrap();
+        assert!(s.frame_key(&open, "q", Some('q')).is_err());
+        let finished = s.finish_grid(&open).expect("the partial save goes back");
+        assert_eq!(finished.csv, "#,name\n1,Rent\n");
+        assert!(s.active_grid.is_none());
+        assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_none());
+    }
+
+    /// The same component opened by `/frame` for another face while a grid
+    /// waits is not the grid's frame: closing it leaves the grid queued.
+    #[test]
+    fn closing_another_frame_of_the_component_leaves_the_grid_queued() {
+        let mut s = opening_session();
+        s.stage_grid(staging("categories.csv", "#,name\n"), &routes())
+            .unwrap();
+        let open = s.open_frame(CSVEDIT, "typed", 80, 24, 0).unwrap();
+        s.close_frame(&open);
+        assert_eq!(s.finish_grid(&open), None);
+        assert!(s.active_grid.is_some());
+        assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_some());
+        assert_eq!(
+            s.take_next_frame(),
+            Some((CSVEDIT.to_string(), "categories.csv".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_screensaver_is_never_a_grid() {
+        let mut saver = grid_component(vec![Surface::Frame], vec![Capability::Fs]);
+        saver.component.manifest.kind = FrameKind::Screensaver;
+        let mut s = grid_session(vec![saver]);
+        let err = s
+            .stage_grid(staging("categories.csv", "#\n"), &routes())
+            .unwrap_err();
+        assert_eq!(err, format!("{CSVEDIT} is a screensaver"));
+        assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_none());
+        assert!(s.active_grid.is_none());
+    }
+
+    /// An abandoned grid takes its queued frame with it, so a later tick
+    /// does not open a frame onto a file that is gone.
+    #[test]
+    fn an_abandoned_grid_takes_its_queued_frame_with_it() {
+        let mut s = fit_session();
+        s.stage_grid(staging("categories.csv", "#,name\n"), &routes())
+            .unwrap();
+        assert!(s.abandon_unopened_grid(CSVEDIT, "categories.csv"));
+        assert!(s.registry.take_pending_frame().is_none());
+
+        // Some other queued frame is not the grid's and stays.
+        let mut s = fit_session();
+        s.stage_grid(staging("categories.csv", "#,name\n"), &routes())
+            .unwrap();
+        s.registry.pending_frame = Some((CSVEDIT.to_string(), "other".to_string()));
+        assert!(s.abandon_unopened_grid(CSVEDIT, "categories.csv"));
+        assert_eq!(
+            s.registry.take_pending_frame(),
+            Some((CSVEDIT.to_string(), "other".to_string()))
         );
     }
 }

@@ -586,12 +586,15 @@ impl TurnShared {
         )
     }
 
-    /// Whether any user line is queued, without taking it.
+    /// Whether any user line worth running is queued, without taking it.
+    /// A blank line does not count: the idle loop skips it when the queue
+    /// runs, so it must not be what takes a screensaver down.
     #[must_use]
     pub fn has_queued(&self) -> bool {
+        let any = |q: &Vec<String>| q.iter().any(|l| !l.trim().is_empty());
         self.queued
             .lock()
-            .map_or_else(|e| !e.into_inner().is_empty(), |q| !q.is_empty())
+            .map_or_else(|e| any(&e.into_inner()), |q| any(&q))
     }
 
     /// Queues one user line for the worker.
@@ -924,5 +927,12 @@ mod tests {
         assert_eq!(shared.take_queued(), vec!["one", "two"]);
         assert!(!shared.has_queued());
         assert!(shared.take_queued().is_empty());
+
+        // Blank lines are skipped when the queue runs, so they are not
+        // reason enough to take a screensaver down.
+        shared.push_queued("  \n".into());
+        assert!(!shared.has_queued());
+        shared.push_queued("go".into());
+        assert!(shared.has_queued());
     }
 }
