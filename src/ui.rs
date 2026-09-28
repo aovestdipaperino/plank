@@ -2540,6 +2540,131 @@ struct Agent<'a> {
     /// its KV. Set before the walk runs, so a failed warm is not retried on
     /// every dispatch.
     local_alt_warmed: bool,
+    /// Parent engines set aside while an alternate engine's sidechain runs,
+    /// innermost last ([`Agent::run_sidechain_on`]). Held here rather than on
+    /// that function's stack so the GPU-yield cycle can reach a local parent
+    /// engine from inside a provider sub-agent's tool call.
+    parked_engines: Vec<Box<dyn Engine>>,
+    /// The GPU-yield cycle's reopen factory and any reopen still owed
+    /// (`gpuyield`).
+    gpu_yield: GpuYield,
+}
+
+/// What the placeholder engine answers after a failed reopen.
+fn gpu_unloaded_reason(error: &str) -> String {
+    format!(
+        "plank: the model could not be reloaded after a command used the GPU ({error}); \
+         it will be retried at the next prompt"
+    )
+}
+
+/// Placeholder text while the model is out for the re-run.
+const GPU_UNLOADED_FOR_RERUN: &str = "the local model is unloaded while a command uses the GPU";
+
+/// The agent as a [`crate::gpuyield::CycleHost`]: one cycle over one slot and
+/// one tool call.
+struct AgentCycle<'s, 'a> {
+    agent: &'s mut Agent<'a>,
+    slot: EngineSlot,
+    call: &'s ToolCall,
+    /// The first run's sandbox decision, handed to the re-run once.
+    sandbox: Option<crate::tools::bash::DecidedSandbox>,
+}
+
+impl crate::gpuyield::CycleHost for AgentCycle<'_, '_> {
+    type Snapshot = crate::gpuyield::Snapshot;
+
+    fn notice(&mut self, text: &str) {
+        self.agent.gpu_notice(text);
+    }
+
+    fn save(&mut self) -> Option<Self::Snapshot> {
+        let dir = self.agent.gpu_yield.snapshot_dir();
+        let engine = self.agent.slot_mut(&self.slot)?;
+        engine
+            .get_kv()
+            .map(|kv| crate::gpuyield::Snapshot::store(kv, &dir))
+    }
+
+    fn release(&mut self) {
+        let old = self
+            .agent
+            .gpu_placeholder(&self.slot, GPU_UNLOADED_FOR_RERUN.to_owned());
+        // The last `Arc` to the model goes here, and with it the Metal state
+        // and the instance lock (`ds4_engine_close`). Its teardown log would
+        // land on the front end's screen.
+        crate::stderrline::discarding(move || drop(old));
+    }
+
+    fn rerun(&mut self) -> String {
+        let bash = &mut self.agent.tool_ctx.bash;
+        bash.replay_sandbox = self.sandbox.take();
+        bash.last_foreground = None;
+        let out = dispatch(self.call, &mut self.agent.tool_ctx).output;
+        // Consumed by the bash tool; cleared anyway in case a hook blocked the
+        // call before it got there. The record is dropped so this result can
+        // never start a second cycle.
+        let bash = &mut self.agent.tool_ctx.bash;
+        bash.replay_sandbox = None;
+        bash.last_foreground = None;
+        out
+    }
+
+    fn reopen(&mut self) -> Result<(), String> {
+        self.agent.gpu_reopen_into(&self.slot)
+    }
+
+    fn restore(&mut self, snapshot: Self::Snapshot) -> Result<(), String> {
+        self.agent.gpu_restore(&self.slot, snapshot)
+    }
+
+    fn rebuild(&mut self, why: &str) {
+        self.agent.gpu_rebuild(&self.slot, why);
+    }
+
+    fn park(&mut self, snapshot: Option<Self::Snapshot>, error: &str) {
+        let reason = gpu_unloaded_reason(error);
+        self.agent.gpu_notice(&reason);
+        let _ = self.agent.gpu_placeholder(&self.slot, reason);
+        self.agent.gpu_yield.pending = Some((self.slot.clone(), snapshot));
+    }
+}
+
+/// Which engine slot holds the local model, for the GPU-yield cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EngineSlot {
+    /// [`Agent::engine`].
+    Main,
+    /// [`Agent::parked_engines`] at this index.
+    Parked(usize),
+    /// [`Agent::alt_engines`] under this key.
+    Alt(EngineKey),
+}
+
+/// The agent's half of the GPU-yield cycle (`gpuyield`).
+#[derive(Default)]
+struct GpuYield {
+    /// Reopens the local model with its startup parameters. `None` when no
+    /// local model was loaded, which disarms the cycle entirely.
+    reopen: Option<crate::gpuyield::ReopenFn>,
+    /// A reopen that failed: the slot holding the placeholder, and the KV
+    /// snapshot still to restore. Retried at the next turn start.
+    pending: Option<(EngineSlot, Option<crate::gpuyield::Snapshot>)>,
+    /// Where snapshots are written; the system temp directory when `None`.
+    snapshot_dir: Option<std::path::PathBuf>,
+}
+
+impl GpuYield {
+    fn new(reopen: Option<crate::gpuyield::ReopenFn>) -> Self {
+        Self {
+            reopen,
+            ..Self::default()
+        }
+    }
+
+    fn snapshot_dir(&self) -> std::path::PathBuf {
+        self.snapshot_dir.clone().unwrap_or_else(std::env::temp_dir)
+    }
 }
 
 /// Identity of an alternate sub-agent engine: provider, resolved base URL,
@@ -3671,13 +3796,27 @@ impl Agent<'_> {
                 } else if call.name == "view_image" {
                     self.run_view_image(call)
                 } else {
-                    dispatch(call, &mut self.tool_ctx).output
+                    self.dispatch_tool(call)
                 };
                 results.push((call.name.clone(), out));
             }
             append_advisories(nudges, format_tool_results(&results))
         } else if !calls.iter().any(needs_engine) {
-            append_advisories(nudges, dispatch_all(calls, &mut self.tool_ctx))
+            // A stanza that could start the GPU-yield cycle goes call by call,
+            // through the same framing as `dispatch_all`, so the cycle can
+            // replace just that one result. Everything else takes the
+            // untouched shared path.
+            let out = if !calls.is_empty() && self.gpu_yield_armed() {
+                self.tool_ctx.edit_previews.clear();
+                let results: Vec<(String, String)> = calls
+                    .iter()
+                    .map(|call| (call.name.clone(), self.dispatch_tool(call)))
+                    .collect();
+                format_tool_results(&results)
+            } else {
+                dispatch_all(calls, &mut self.tool_ctx)
+            };
+            append_advisories(nudges, out)
         } else if calls.is_empty() {
             "Tool error: empty tool call block\n".to_string()
         } else if let Some(results) = self.run_agent_fanout(calls) {
@@ -3698,11 +3837,167 @@ impl Agent<'_> {
                 } else if call.name == "view_image" {
                     self.run_view_image(call)
                 } else {
-                    dispatch(call, &mut self.tool_ctx).output
+                    self.dispatch_tool(call)
                 };
                 results.push((call.name.clone(), out));
             }
             append_advisories(nudges, format_tool_results(&results))
+        }
+    }
+
+    /// Dispatches one plain tool call, running the GPU-yield cycle when it
+    /// was a foreground `bash` whose command asked for the GPU (`gpuyield`).
+    /// Anything else returns the dispatch result untouched.
+    fn dispatch_tool(&mut self, call: &ToolCall) -> String {
+        self.tool_ctx.bash.last_foreground = None;
+        let first = dispatch(call, &mut self.tool_ctx).output;
+        let Some(exit) = self.tool_ctx.bash.last_foreground.take() else {
+            return first;
+        };
+        if call.name != "bash" || !exit.needs_gpu {
+            return first;
+        }
+        let Some(slot) = self.gpu_slot() else {
+            return first;
+        };
+        let command = call.arg_value("command").unwrap_or("").to_owned();
+        let mut host = AgentCycle {
+            agent: self,
+            slot,
+            call,
+            sandbox: Some(crate::tools::bash::DecidedSandbox(exit.sandbox)),
+        };
+        let (output, end) = crate::gpuyield::run_cycle(&mut host, &command);
+        crate::engine::kv_debug(|| format!("gpu yield: cycle ended {end:?}"));
+        output
+    }
+
+    /// Whether a `bash` result could start the GPU-yield cycle right now.
+    fn gpu_yield_armed(&self) -> bool {
+        self.gpu_slot().is_some()
+    }
+
+    /// The slot whose engine would free the GPU if dropped, when the cycle is
+    /// armed: a reopen factory exists, no earlier reopen is still owed, and
+    /// some reachable engine can release. Only one ds4 model can be open per
+    /// process, so there is at most one.
+    fn gpu_slot(&self) -> Option<EngineSlot> {
+        self.gpu_yield.reopen.as_ref()?;
+        if self.gpu_yield.pending.is_some() {
+            return None;
+        }
+        if self.engine.can_release_gpu() {
+            return Some(EngineSlot::Main);
+        }
+        if let Some(i) = self.parked_engines.iter().position(|e| e.can_release_gpu()) {
+            return Some(EngineSlot::Parked(i));
+        }
+        self.alt_engines
+            .iter()
+            .find(|(_, e)| e.can_release_gpu())
+            .map(|(k, _)| EngineSlot::Alt(k.clone()))
+    }
+
+    fn slot_mut(&mut self, slot: &EngineSlot) -> Option<&mut Box<dyn Engine>> {
+        match slot {
+            EngineSlot::Main => Some(&mut self.engine),
+            EngineSlot::Parked(i) => self.parked_engines.get_mut(*i),
+            EngineSlot::Alt(key) => self.alt_engines.get_mut(key),
+        }
+    }
+
+    /// Shows a GPU-yield notice on the front end's status path, or on stderr
+    /// when there is none (the headless modes).
+    fn gpu_notice(&self, text: &str) {
+        crate::engine::kv_debug(|| text.to_owned());
+        if self.tool_ctx.status_sink.is_some() {
+            self.tool_ctx.publish_status(text);
+        } else {
+            eprintln!("{text}");
+        }
+    }
+
+    /// Puts `engine`-shaped placeholder in `slot` failing with `reason`, and
+    /// returns what was there.
+    fn gpu_placeholder(&mut self, slot: &EngineSlot, reason: String) -> Option<Box<dyn Engine>> {
+        let current = self.slot_mut(slot)?;
+        let placeholder =
+            crate::gpuyield::UnloadedEngine::new(current.ctx_size(), current.model_name(), reason);
+        Some(std::mem::replace(current, Box::new(placeholder)))
+    }
+
+    /// Opens the model again through the factory, configures it exactly as
+    /// `new_agent` configured the original, and puts it in `slot`.
+    fn gpu_reopen_into(&mut self, slot: &EngineSlot) -> Result<(), String> {
+        let reopen = self
+            .gpu_yield
+            .reopen
+            .as_mut()
+            .ok_or_else(|| "no way to reopen the model".to_owned())?;
+        let mut engine = crate::stderrline::discarding(reopen)?;
+        engine.set_trusted_system_prefix(self.trusted_system_len);
+        engine.set_think_mode(self.think);
+        let current = self
+            .slot_mut(slot)
+            .ok_or_else(|| "the model's engine slot is gone".to_owned())?;
+        *current = engine;
+        Ok(())
+    }
+
+    /// Restores `snapshot` into the reopened engine in `slot`.
+    fn gpu_restore(
+        &mut self,
+        slot: &EngineSlot,
+        snapshot: crate::gpuyield::Snapshot,
+    ) -> Result<(), String> {
+        let cache = snapshot.load()?;
+        let engine = self
+            .slot_mut(slot)
+            .ok_or_else(|| "the model's engine slot is gone".to_owned())?;
+        engine.set_kv(&cache).map_err(|e| e.to_string())
+    }
+
+    /// The fallback after a missing or refused snapshot: the reopened engine
+    /// is empty, so it rebuilds from the transcript through the paths it
+    /// already has. The main engine re-warms its tiers from their disk
+    /// checkpoints now; an alternate local engine is re-warmed at its next
+    /// dispatch; a parked parent rebuilds at its next pass.
+    fn gpu_rebuild(&mut self, slot: &EngineSlot, why: &str) {
+        crate::engine::kv_debug(|| format!("gpu yield: {why}; rebuilding"));
+        match slot {
+            EngineSlot::Main if self.alt_engine_depth == 0 => {
+                self.rewarm_after_reset(&mut || {});
+            }
+            EngineSlot::Main | EngineSlot::Alt(_) => self.local_alt_warmed = false,
+            EngineSlot::Parked(_) => {}
+        }
+    }
+
+    /// Retries a reopen that failed during an earlier cycle. Called at turn
+    /// start, so a model that could not come back (another instance took the
+    /// lock, say) gets another chance without restarting plank.
+    fn retry_gpu_reopen(&mut self) {
+        let Some((slot, snapshot)) = self.gpu_yield.pending.take() else {
+            return;
+        };
+        match self.gpu_reopen_into(&slot) {
+            Ok(()) => {
+                match snapshot {
+                    Some(snap) => {
+                        if let Err(e) = self.gpu_restore(&slot, snap) {
+                            self.gpu_rebuild(&slot, &format!("KV restore refused ({e})"));
+                        }
+                    }
+                    None => self.gpu_rebuild(&slot, "no KV snapshot to restore"),
+                }
+                self.gpu_notice("plank: model reloaded");
+            }
+            Err(e) => {
+                let reason = gpu_unloaded_reason(&e);
+                self.gpu_notice(&reason);
+                let _ = self.gpu_placeholder(&slot, reason);
+                self.gpu_yield.pending = Some((slot, snapshot));
+            }
         }
     }
 
@@ -4832,6 +5127,9 @@ impl Agent<'_> {
         crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
+        // A model a GPU-yield cycle could not bring back gets another try
+        // before this turn needs it.
+        self.retry_gpu_reopen();
         // Turn boundary: the same place background job notifications join the
         // transcript. The resume disclosure comes first — this turn is about to
         // re-enter the engine, so the re-prefill it names is the one the user is
@@ -10786,6 +11084,11 @@ the original is frozen and listed in /tree"
         run: impl FnOnce(&mut Self) -> T,
     ) -> T {
         let parent_engine = std::mem::replace(&mut self.engine, engine);
+        // Parked on the agent, not on this stack frame, so a GPU-yield cycle
+        // inside `run` can unload a local parent too. Popped below with no
+        // `?` in between, exactly as the swap itself.
+        self.parked_engines.push(parent_engine);
+        let parked = self.parked_engines.len();
         // The framed task is the last message; keep it, hide everything before.
         // `extract_state.processed_depth` is left alone across the stash: the
         // fork opened by the caller keeps `in_sidechain()` true for the whole
@@ -10803,6 +11106,11 @@ the original is frozen and listed in /tree"
         // Unconditional, and with no `?` between the swap in and the swap out: a
         // leaked swap would leave the whole session pointed at the wrong engine,
         // which is the worst failure this design can produce.
+        debug_assert_eq!(self.parked_engines.len(), parked, "parked stack unbalanced");
+        let parent_engine = self
+            .parked_engines
+            .pop()
+            .expect("the parent engine parked above");
         let alt = std::mem::replace(&mut self.engine, parent_engine);
         self.alt_engines.insert(key, alt);
         // No `clear_suggestion()` needed: the restore is the stashed prefix
@@ -14469,6 +14777,8 @@ impl Agent<'_> {
                 let _ = tx.send(UiEvent::Markdown(doc.to_owned()));
             })
         });
+        // After the status sink, so the retry's notice reaches the log.
+        self.retry_gpu_reopen();
         if let Some(reason) = self.fire_user_prompt_submit(&mut |w| {
             let _ = tx.send(UiEvent::Dim(w));
         }) {
@@ -19293,6 +19603,7 @@ fn new_agent(
     cfg: &AgentConfig,
     show_footer: bool,
     local_engine: Option<Box<dyn Engine>>,
+    reopen: Option<crate::gpuyield::ReopenFn>,
     plugins: crate::plugins::PluginSet,
 ) -> Result<Agent<'_>, String> {
     let store = SessionStore::open(SessionStore::default_dir()).map_err(|e| e.to_string())?;
@@ -19596,6 +19907,8 @@ fn new_agent(
             .collect(),
         local_alt_warmed: false,
         warm_note: None,
+        parked_engines: Vec::new(),
+        gpu_yield: GpuYield::new(reopen),
     };
     // Speculation may have fallen away since the flags were parsed, and the 0
     // `config::finalize` pinned for it then has nothing left to serve.
@@ -19611,6 +19924,7 @@ pub fn run_interactive(
     engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     local_engine: Option<Box<dyn Engine>>,
+    reopen: Option<crate::gpuyield::ReopenFn>,
     plugins: crate::plugins::PluginSet,
 ) -> Result<Option<crate::profileedit::Restart>, String> {
     // Before the agent collects its session context, so a freshly linked
@@ -19638,7 +19952,7 @@ pub fn run_interactive(
             false
         }
     };
-    let mut agent = new_agent(engine, cfg, true, local_engine, plugins)?;
+    let mut agent = new_agent(engine, cfg, true, local_engine, reopen, plugins)?;
 
     // The notification mode is seeded (and kept live) by
     // `settings::install`/`reinstall`, not here — see their doc comments.
@@ -20189,9 +20503,10 @@ pub fn run_headless(
     engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     local_engine: Option<Box<dyn Engine>>,
+    reopen: Option<crate::gpuyield::ReopenFn>,
     plugins: crate::plugins::PluginSet,
 ) -> Result<u8, String> {
-    let mut agent = new_agent(engine, cfg, false, local_engine, plugins)?;
+    let mut agent = new_agent(engine, cfg, false, local_engine, reopen, plugins)?;
     // The notification mode is seeded (and kept live) by
     // `settings::install`/`reinstall`, not here — see their doc comments.
     agent.warm_plain()?;
@@ -22646,6 +22961,8 @@ mod tests {
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            parked_engines: Vec::new(),
+            gpu_yield: GpuYield::default(),
             warm_note: None,
         };
         // The same settling the real constructor does, so a test agent over an
@@ -26373,6 +26690,7 @@ mod tests {
             &cfg,
             false,
             Some(Box::new(local)),
+            None,
             crate::plugins::PluginSet::default(),
         )
         .expect("an agent");
@@ -28452,6 +28770,8 @@ mod tests {
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            parked_engines: Vec::new(),
+            gpu_yield: GpuYield::default(),
             warm_note: None,
         };
 
@@ -28586,6 +28906,8 @@ mod tests {
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            parked_engines: Vec::new(),
+            gpu_yield: GpuYield::default(),
             warm_note: None,
         };
 
@@ -29972,6 +30294,8 @@ mod tests {
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            parked_engines: Vec::new(),
+            gpu_yield: GpuYield::default(),
             warm_note: None,
         };
         agent.session.push(Message::user("go"));
@@ -30251,6 +30575,8 @@ mod tests {
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            parked_engines: Vec::new(),
+            gpu_yield: GpuYield::default(),
             warm_note: None,
         };
         agent.session.push(Message::user("go"));
@@ -30281,9 +30607,7 @@ mod tests {
         // but a real interrupt never continues with a <tool_result>, so
         // `close_open_think` must not append a synthetic `</think>` here
         // (finding 1's second named case, distinct from parity-mode discard).
-        let dir =
-            std::env::temp_dir().join(format!("plank-ui-think-interrupt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("think-interrupt");
         let engine = ScriptedEngine {
             replies: vec![
                 concat!(
@@ -30369,6 +30693,8 @@ mod tests {
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            parked_engines: Vec::new(),
+            gpu_yield: GpuYield::default(),
             warm_note: None,
         };
         agent.session.push(Message::user("go"));
@@ -30474,6 +30800,8 @@ mod tests {
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            parked_engines: Vec::new(),
+            gpu_yield: GpuYield::default(),
             warm_note: None,
         };
         agent.session.push(Message::user("go"));
@@ -30528,9 +30856,7 @@ mod tests {
 
     #[test]
     fn payload_save_resume_strip_flow() {
-        let dir = std::env::temp_dir().join(format!("plank-ui-kv-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = fresh_scratch_dir("kv-test");
         let cfg = crate::config::AgentConfig::default();
         let store = SessionStore::open(&dir).unwrap();
         let mut agent = Agent {
@@ -30602,6 +30928,8 @@ mod tests {
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            parked_engines: Vec::new(),
+            gpu_yield: GpuYield::default(),
             warm_note: None,
         };
         agent.session.push(Message::user("kv payload flow"));
@@ -33249,6 +33577,8 @@ or the user's next message aborts before its first token"
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            parked_engines: Vec::new(),
+            gpu_yield: GpuYield::default(),
             warm_note: None,
         };
         agent.session.push(Message::user("please count the tests"));
@@ -34710,8 +35040,7 @@ or the user's next message aborts before its first token"
 
     #[test]
     fn turn_loop_executes_tool_calls_and_finishes() {
-        let dir = std::env::temp_dir().join(format!("plank-ui-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("test");
         let stanza = concat!(
             "I'll run a command.\n",
             "<｜DSML｜tool_calls>",
@@ -34733,14 +35062,13 @@ or the user's next message aborts before its first token"
         // test (`tool_call_inside_think_is_dispatched_and_the_block_is_closed`).
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
-        let store = SessionStore::open(&dir).unwrap();
         let mut agent = Agent {
             engine: Box::new(engine),
             cfg: &cfg,
             gen_opts: cfg.generation.clone(),
             resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
-            store,
+            store: SessionStore::open(&dir).unwrap(),
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
@@ -34803,6 +35131,8 @@ or the user's next message aborts before its first token"
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            parked_engines: Vec::new(),
+            gpu_yield: GpuYield::default(),
             warm_note: None,
         };
         agent.session.push(Message::user("run echo"));
@@ -35392,5 +35722,614 @@ or the user's next message aborts before its first token"
         // The full prompt was collected — not truncated at 4096.
         assert_eq!(prompt.as_deref(), Some(payload.as_str()));
         assert!(eof, "EOF was reached");
+    }
+
+    // ── GPU yield (`gpuyield`) ──────────────────────────────────────────
+
+    /// A local-model stand-in for the GPU-yield cycle. Every step it sees goes
+    /// into `log`; `release` records how many times the command had run when
+    /// the engine was dropped, which pins release before the re-run.
+    #[derive(Debug)]
+    struct GpuEngine {
+        id: &'static str,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        counter: std::path::PathBuf,
+        releasable: bool,
+        refuse_restore: bool,
+        inner: ScriptedEngine,
+    }
+
+    fn runs(counter: &std::path::Path) -> usize {
+        std::fs::read_to_string(counter).map_or(0, |s| s.lines().count())
+    }
+
+    impl GpuEngine {
+        fn new(
+            id: &'static str,
+            log: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+            counter: &std::path::Path,
+            replies: &[&str],
+        ) -> Self {
+            Self {
+                id,
+                log: std::sync::Arc::clone(log),
+                counter: counter.to_path_buf(),
+                releasable: true,
+                refuse_restore: false,
+                inner: ScriptedEngine {
+                    replies: replies.iter().map(|r| (*r).to_string()).collect(),
+                    ..ScriptedEngine::default()
+                },
+            }
+        }
+
+        fn push(&self, what: String) {
+            self.log.lock().unwrap().push(what);
+        }
+    }
+
+    impl Drop for GpuEngine {
+        fn drop(&mut self) {
+            self.push(format!("release:{}(runs={})", self.id, runs(&self.counter)));
+        }
+    }
+
+    impl Engine for GpuEngine {
+        fn generate(
+            &mut self,
+            prompt: crate::engine::Prompt<'_>,
+            opts: &crate::engine::GenerationOptions,
+            interrupt: &dyn Fn() -> bool,
+            greedy: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(EngineEvent),
+        ) -> Result<crate::engine::GenerationStats, crate::engine::EngineError> {
+            self.push(format!("generate:{}", self.id));
+            self.inner
+                .generate(prompt, opts, interrupt, greedy, on_event)
+        }
+
+        fn ctx_size(&self) -> i32 {
+            100_000
+        }
+
+        fn is_local(&self) -> bool {
+            true
+        }
+
+        fn can_release_gpu(&self) -> bool {
+            self.releasable
+        }
+
+        fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
+            self.push(format!("save:{}", self.id));
+            Some(crate::kvcache::KVCache::new(
+                vec![4, 2],
+                crate::ds4tokens::TokenTranscript::new(),
+            ))
+        }
+
+        fn set_kv(
+            &mut self,
+            cache: &crate::kvcache::KVCache,
+        ) -> Result<(), crate::engine::EngineError> {
+            if self.refuse_restore {
+                self.push(format!("restore-refused:{}", self.id));
+                return Err(crate::engine::EngineError::new("signature mismatch"));
+            }
+            self.push(format!("restore:{}:{:?}", self.id, cache.kv()));
+            Ok(())
+        }
+
+        fn set_think_mode(&mut self, _mode: ThinkMode) {
+            self.push(format!("think:{}", self.id));
+        }
+
+        fn warm_reset(&mut self, _system: &str) -> Result<(), crate::engine::EngineError> {
+            self.push(format!("rebuild:{}", self.id));
+            Ok(())
+        }
+    }
+
+    /// Runs the command once per line appended to `counter`: the first run
+    /// asks for the GPU, later ones succeed, unless `always` keeps failing.
+    fn gpu_command(counter: &std::path::Path, always: bool) -> String {
+        let c = counter.display();
+        if always {
+            format!("echo run >> '{c}'; echo 'GPU not available: held by plank'; exit 75")
+        } else {
+            format!(
+                "echo run >> '{c}'; if [ \"$(wc -l < '{c}')\" -eq 1 ]; then \
+                 echo 'GPU not available: held by plank (PID 1)' >&2; exit 75; fi; \
+                 echo second-run-ok"
+            )
+        }
+    }
+
+    fn gpu_bash_call(command: &str) -> ToolCall {
+        crate::tools::test_call("bash", &[("command", command)])
+    }
+
+    /// A factory that logs the reopen with the run count at that moment and
+    /// hands back a fresh engine built by `make`.
+    fn gpu_factory(
+        log: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        counter: &std::path::Path,
+        make: impl Fn() -> Result<GpuEngine, String> + Send + 'static,
+    ) -> crate::gpuyield::ReopenFn {
+        let log = std::sync::Arc::clone(log);
+        let counter = counter.to_path_buf();
+        Box::new(move || {
+            log.lock()
+                .unwrap()
+                .push(format!("reopen(runs={})", runs(&counter)));
+            make().map(|e| Box::new(e) as Box<dyn Engine>)
+        })
+    }
+
+    /// [`scratch_dir`], emptied first.
+    fn fresh_scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = scratch_dir(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn gpu_dir(name: &str) -> std::path::PathBuf {
+        fresh_scratch_dir(&format!("gpuyield-{name}"))
+    }
+
+    fn arm_gpu_yield(
+        agent: &mut Agent<'_>,
+        dir: &std::path::Path,
+        reopen: crate::gpuyield::ReopenFn,
+    ) {
+        agent.gpu_yield = GpuYield {
+            reopen: Some(reopen),
+            pending: None,
+            snapshot_dir: Some(dir.to_path_buf()),
+        };
+    }
+
+    fn logged(log: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_gpu_request_saves_releases_reruns_reopens_and_restores_in_order() {
+        let dir = gpu_dir("order");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = test_agent_boxed(
+            &dir,
+            Box::new(GpuEngine::new("first", &log, &counter, &[])),
+            &cfg,
+        );
+        let (l, c) = (std::sync::Arc::clone(&log), counter.clone());
+        arm_gpu_yield(
+            &mut agent,
+            &dir,
+            gpu_factory(&log, &counter, move || {
+                Ok(GpuEngine::new("second", &l, &c, &[]))
+            }),
+        );
+
+        let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_command(&counter, false))]);
+
+        assert!(
+            out.contains("second-run-ok"),
+            "the re-run is the result: {out}"
+        );
+        assert!(out.contains("exit_status=0"), "{out}");
+        assert!(!out.contains("GPU not available"), "{out}");
+        assert_eq!(runs(&counter), 2);
+        assert_eq!(
+            logged(&log),
+            [
+                "save:first",
+                "release:first(runs=1)",
+                "reopen(runs=2)",
+                "think:second",
+                "restore:second:[4, 2]",
+            ],
+            "save, release, re-run, reopen, restore"
+        );
+        assert!(
+            agent.engine.can_release_gpu(),
+            "the reopened engine is live"
+        );
+        assert!(agent.gpu_yield.pending.is_none());
+        // The snapshot file is gone once restored.
+        assert!(
+            !std::fs::read_dir(&dir).unwrap().flatten().any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("plank-gpu-yield-")),
+            "snapshot left behind"
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_gpu_refusal_is_returned_as_is_and_not_run_again() {
+        let dir = gpu_dir("twice");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = test_agent_boxed(
+            &dir,
+            Box::new(GpuEngine::new("first", &log, &counter, &[])),
+            &cfg,
+        );
+        let (l, c) = (std::sync::Arc::clone(&log), counter.clone());
+        arm_gpu_yield(
+            &mut agent,
+            &dir,
+            gpu_factory(&log, &counter, move || {
+                Ok(GpuEngine::new("second", &l, &c, &[]))
+            }),
+        );
+
+        let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_command(&counter, true))]);
+
+        assert_eq!(runs(&counter), 2, "exactly one re-run");
+        assert!(out.contains("exit_status=75"), "{out}");
+        assert!(out.contains("GPU not available"), "{out}");
+        assert!(
+            logged(&log).iter().any(|e| e.starts_with("restore:second")),
+            "the model is reloaded regardless: {:?}",
+            logged(&log)
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_restore_falls_back_to_the_rebuild_path() {
+        let dir = gpu_dir("refused");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = test_agent_boxed(
+            &dir,
+            Box::new(GpuEngine::new("first", &log, &counter, &[])),
+            &cfg,
+        );
+        let (l, c) = (std::sync::Arc::clone(&log), counter.clone());
+        arm_gpu_yield(
+            &mut agent,
+            &dir,
+            gpu_factory(&log, &counter, move || {
+                let mut e = GpuEngine::new("second", &l, &c, &[]);
+                e.refuse_restore = true;
+                Ok(e)
+            }),
+        );
+
+        let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_command(&counter, false))]);
+
+        assert!(out.contains("second-run-ok"), "{out}");
+        let log = logged(&log);
+        let refused = log.iter().position(|e| e == "restore-refused:second");
+        let rebuilt = log.iter().position(|e| e == "rebuild:second");
+        assert!(
+            refused.is_some() && rebuilt > refused,
+            "refusal then the tier rebuild: {log:?}"
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_engine_that_cannot_release_the_gpu_never_cycles() {
+        let dir = gpu_dir("echo");
+        let counter = dir.join("runs");
+        let log: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let (l, c) = (std::sync::Arc::clone(&log), counter.clone());
+        let factory = move || Ok(GpuEngine::new("second", &l, &c, &[]));
+
+        // The echo stub, even with a factory armed.
+        let mut agent = test_agent_boxed(
+            &dir,
+            Box::new(crate::engine::EchoEngine::new(100_000)),
+            &cfg,
+        );
+        arm_gpu_yield(
+            &mut agent,
+            &dir,
+            gpu_factory(&log, &counter, factory.clone()),
+        );
+        let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_command(&counter, false))]);
+        assert!(
+            out.contains("GPU not available"),
+            "first result unchanged: {out}"
+        );
+        assert_eq!(runs(&counter), 1);
+        drop(agent);
+
+        // A remote or provider engine: says it cannot release.
+        std::fs::remove_file(&counter).unwrap();
+        let mut remote = GpuEngine::new("remote", &log, &counter, &[]);
+        remote.releasable = false;
+        let mut agent = test_agent_boxed(&dir, Box::new(remote), &cfg);
+        arm_gpu_yield(&mut agent, &dir, gpu_factory(&log, &counter, factory));
+        let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_command(&counter, false))]);
+        assert!(out.contains("GPU not available"), "{out}");
+        assert_eq!(runs(&counter), 1);
+        drop(agent);
+
+        // A local engine with no factory (nothing could reopen it).
+        std::fs::remove_file(&counter).unwrap();
+        let agent_engine = GpuEngine::new("unarmed", &log, &counter, &[]);
+        let mut agent = test_agent_boxed(&dir, Box::new(agent_engine), &cfg);
+        let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_command(&counter, false))]);
+        assert!(out.contains("GPU not available"), "{out}");
+        assert_eq!(runs(&counter), 1);
+        drop(agent);
+
+        assert!(
+            !logged(&log)
+                .iter()
+                .any(|e| e.starts_with("reopen") || e.starts_with("save")),
+            "nothing was saved or reopened: {:?}",
+            logged(&log)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_background_bash_job_never_cycles() {
+        let dir = gpu_dir("background");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = test_agent_boxed(
+            &dir,
+            Box::new(GpuEngine::new("first", &log, &counter, &[])),
+            &cfg,
+        );
+        let (l, c) = (std::sync::Arc::clone(&log), counter.clone());
+        arm_gpu_yield(
+            &mut agent,
+            &dir,
+            gpu_factory(&log, &counter, move || {
+                Ok(GpuEngine::new("second", &l, &c, &[]))
+            }),
+        );
+        let command = format!("sleep 2; {}", gpu_command(&counter, true));
+        let call = crate::tools::test_call("bash", &[("command", &command), ("refresh_sec", "1")]);
+
+        let out = agent.run_tool_calls(&[call]);
+        assert!(out.contains("status=running"), "{out}");
+        let status = crate::tools::test_call("bash_status", &[("job", "1"), ("refresh_sec", "5")]);
+        let out = agent.run_tool_calls(&[status]);
+        assert!(out.contains("exit_status=75"), "{out}");
+
+        assert_eq!(runs(&counter), 1);
+        assert!(logged(&log).is_empty(), "{:?}", logged(&log));
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_alternate_local_engine_is_cycled_under_a_provider_main_agent() {
+        let dir = gpu_dir("alt");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = test_agent_boxed(
+            &dir,
+            Box::new(crate::engine::EchoEngine::new(100_000)),
+            &cfg,
+        );
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(GpuEngine::new("alt", &log, &counter, &[])),
+        );
+        agent.local_alt_warmed = true;
+        let (l, c) = (std::sync::Arc::clone(&log), counter.clone());
+        arm_gpu_yield(
+            &mut agent,
+            &dir,
+            gpu_factory(&log, &counter, move || {
+                Ok(GpuEngine::new("alt2", &l, &c, &[]))
+            }),
+        );
+
+        let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_command(&counter, false))]);
+
+        assert!(out.contains("second-run-ok"), "{out}");
+        let log = logged(&log);
+        assert!(log.contains(&"release:alt(runs=1)".to_owned()), "{log:?}");
+        assert!(log.contains(&"restore:alt2:[4, 2]".to_owned()), "{log:?}");
+        assert!(agent.alt_engines[&EngineKey::Local].can_release_gpu());
+        assert!(agent.local_alt_warmed, "an exact restore keeps it warm");
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_reopen_leaves_a_placeholder_and_the_next_turn_retries() {
+        let dir = gpu_dir("reopen-fails");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = test_agent_boxed(
+            &dir,
+            Box::new(GpuEngine::new("first", &log, &counter, &[])),
+            &cfg,
+        );
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (l, c, a) = (
+            std::sync::Arc::clone(&log),
+            counter.clone(),
+            attempts.clone(),
+        );
+        arm_gpu_yield(
+            &mut agent,
+            &dir,
+            gpu_factory(&log, &counter, move || {
+                if a.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    Err("lock held by another instance".to_owned())
+                } else {
+                    Ok(GpuEngine::new("later", &l, &c, &[]))
+                }
+            }),
+        );
+
+        let out = agent.run_tool_calls(&[gpu_bash_call(&gpu_command(&counter, false))]);
+        assert!(out.contains("second-run-ok"), "{out}");
+        assert!(
+            !agent.engine.can_release_gpu(),
+            "a placeholder holds the slot"
+        );
+        assert!(agent.gpu_yield.pending.is_some());
+        assert!(
+            !agent.gpu_yield_armed(),
+            "no second cycle while a reopen is owed"
+        );
+        let err = agent
+            .engine
+            .generate(
+                crate::engine::Prompt::Flat(""),
+                &crate::engine::GenerationOptions::default(),
+                &|| false,
+                &|| false,
+                &mut |_| {},
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not be reloaded"), "{err}");
+
+        agent.retry_gpu_reopen();
+        assert!(agent.engine.can_release_gpu());
+        assert!(agent.gpu_yield.pending.is_none());
+        assert!(
+            logged(&log).contains(&"restore:later:[4, 2]".to_owned()),
+            "the parked snapshot is restored: {:?}",
+            logged(&log)
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_local_parent_parked_under_a_provider_sidechain_is_cycled() {
+        let dir = gpu_dir("parked");
+        let counter = dir.join("runs");
+        let log = std::sync::Arc::default();
+        let cfg = test_cfg();
+        let mut agent = test_agent_boxed(
+            &dir,
+            Box::new(GpuEngine::new("main", &log, &counter, &[])),
+            &cfg,
+        );
+        let (l, c) = (std::sync::Arc::clone(&log), counter.clone());
+        arm_gpu_yield(
+            &mut agent,
+            &dir,
+            gpu_factory(&log, &counter, move || {
+                Ok(GpuEngine::new("main2", &l, &c, &[]))
+            }),
+        );
+        agent.session.push(Message::user("task"));
+        let call = gpu_bash_call(&gpu_command(&counter, false));
+        let out = agent.run_sidechain_on(
+            EngineKey::Local,
+            Box::new(crate::engine::EchoEngine::new(100_000)),
+            |a| a.run_tool_calls(std::slice::from_ref(&call)),
+        );
+        assert!(out.contains("second-run-ok"), "{out}");
+        assert!(agent.parked_engines.is_empty(), "the parent came back");
+        assert!(
+            agent.engine.can_release_gpu(),
+            "the reopened parent is main again"
+        );
+        assert!(logged(&log).contains(&"restore:main2:[4, 2]".to_owned()));
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn gpu_stanza(command: &str) -> String {
+        format!(
+            "Generating.\n<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">\
+             <｜DSML｜parameter name=\"command\" string=\"true\">{command}</｜DSML｜parameter｜>\
+             </｜DSML｜invoke｜></｜DSML｜tool_calls｜>"
+        )
+    }
+
+    /// Both front ends reach the cycle through `run_tool_calls`: the plain
+    /// REPL and every headless mode through `run_turn`, the TUI through
+    /// `worker_turn`. The pass after the tool round runs on the reopened
+    /// engine and sees the re-run's output.
+    #[test]
+    fn both_front_ends_cycle_mid_turn_and_continue_on_the_reopened_engine() {
+        let _no_extract = disable_auto_extract_for_test();
+        let _no_suggest = disable_suggestions_for_test();
+        for tui in [false, true] {
+            let dir = gpu_dir(if tui { "turn-tui" } else { "turn-plain" });
+            let counter = dir.join("runs");
+            let log = std::sync::Arc::default();
+            let cfg = test_cfg();
+            let first = GpuEngine::new(
+                "first",
+                &log,
+                &counter,
+                &[&gpu_stanza(&gpu_command(&counter, false))],
+            );
+            let mut agent = test_agent_boxed(&dir, Box::new(first), &cfg);
+            let (l, c) = (std::sync::Arc::clone(&log), counter.clone());
+            arm_gpu_yield(
+                &mut agent,
+                &dir,
+                gpu_factory(&log, &counter, move || {
+                    Ok(GpuEngine::new("second", &l, &c, &["All done.\n"]))
+                }),
+            );
+            agent.session.push(Message::user("draw a cat"));
+
+            if tui {
+                let shared = TurnShared::default();
+                let (tx, rx) = std::sync::mpsc::channel();
+                agent.worker_turn(&tx, &shared).unwrap();
+                let notices: Vec<String> = rx
+                    .try_iter()
+                    .filter_map(|ev| match ev {
+                        UiEvent::SystemStatus(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    notices.iter().any(|n| n.contains("needs the GPU")),
+                    "the notice reaches the TUI log: {notices:?}"
+                );
+            } else {
+                agent.run_turn().unwrap();
+            }
+
+            let log = logged(&log);
+            let at = |e: &str| log.iter().position(|x| x == e);
+            assert!(
+                at("generate:first") < at("save:first")
+                    && at("save:first") < at("release:first(runs=1)")
+                    && at("release:first(runs=1)") < at("reopen(runs=2)")
+                    && at("reopen(runs=2)") < at("restore:second:[4, 2]")
+                    && at("restore:second:[4, 2]") < at("generate:second"),
+                "tui={tui}: {log:?}"
+            );
+            let result = agent
+                .session
+                .transcript
+                .iter()
+                .find(|m| m.text.contains("<tool_result>"))
+                .map(|m| m.text.clone())
+                .unwrap_or_default();
+            assert!(result.contains("second-run-ok"), "tui={tui}: {result}");
+            assert!(!result.contains("GPU not available"), "tui={tui}: {result}");
+            drop(agent);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

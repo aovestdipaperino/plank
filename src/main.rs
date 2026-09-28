@@ -787,7 +787,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match run(engine.main, engine.local, &cfg, plugins) {
+    match run(engine.main, engine.local, engine.reopen, &cfg, plugins) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("plank: {e}");
@@ -912,6 +912,10 @@ struct Engines {
     /// the main agent is remote. Loading it costs the full ~82 GB residency, so
     /// it is never speculative.
     local: Option<Box<dyn Engine>>,
+    /// Reopens whichever of the two is the local ds4 engine, with the exact
+    /// parameters it was opened with, for the GPU-yield cycle (`gpuyield`).
+    /// `None` when no local model is loaded.
+    reopen: Option<plank::gpuyield::ReopenFn>,
 }
 
 /// Whether any sub-agent definition visible from `cwd` asks for the local
@@ -940,6 +944,7 @@ fn make_engine(cfg: &AgentConfig, plugins: &plank::plugins::PluginSet) -> Result
         return Ok(Engines {
             main: Box::new(engine),
             local: None,
+            reopen: None,
         });
     }
     // Provider engine (flavor b, issue #26): third-party LLM APIs behind the
@@ -1006,14 +1011,18 @@ fn make_engine(cfg: &AgentConfig, plugins: &plank::plugins::PluginSet) -> Result
         } else {
             None
         };
+        let (local, reopen) = local.map_or((None, None), |(e, r)| (Some(e), r));
         return Ok(Engines {
             main: Box::new(engine),
             local,
+            reopen,
         });
     }
+    let (main, reopen) = make_local_engine(cfg)?;
     Ok(Engines {
-        main: make_local_engine(cfg)?,
+        main,
         local: None,
+        reopen,
     })
 }
 
@@ -1021,10 +1030,17 @@ fn make_engine(cfg: &AgentConfig, plugins: &plank::plugins::PluginSet) -> Result
 /// `provider: local` sub-agent definition needs one under a provider main agent
 /// — as the spare handed to the `Agent` (see [`make_engine`]).
 ///
+/// Also returns the factory that reopens the same model with the same resolved
+/// parameters (the tuning that actually opened, after any companion retry),
+/// which the GPU-yield cycle calls after it has dropped the engine. The echo
+/// stub has nothing to reopen.
+///
 /// # Errors
 /// Returns a message when RAM is insufficient, another instance holds the model,
 /// the model file is absent and cannot be fetched, or the engine fails to open.
-fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
+fn make_local_engine(
+    cfg: &AgentConfig,
+) -> Result<(Box<dyn Engine>, Option<plank::gpuyield::ReopenFn>), String> {
     #[cfg(ds4_engine)]
     {
         use plank::config::Backend;
@@ -1086,7 +1102,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
                 cfg.power_percent,
                 &tuning,
             ) {
-                Ok(engine) => return Ok(engine),
+                Ok(engine) => return Ok((engine, tuning.clone())),
                 Err(e) => e.to_string(),
             };
             // The C refuses to open a checkpoint at all when the DSpark draft
@@ -1108,6 +1124,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
                 cfg.power_percent,
                 &solo,
             )
+            .map(|engine| (engine, solo))
             // Report the original failure, with the retry's as context: the
             // retry only rules the companion out, it does not diagnose a
             // corrupt model.
@@ -1118,7 +1135,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             })
         })();
         drop(replacer);
-        let engine = opened?;
+        let (engine, opened_with) = opened?;
         eprintln!(
             "plank: model ready: {}{}",
             engine.model_name(),
@@ -1126,7 +1143,26 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
                 .as_ref()
                 .map_or_else(String::new, |d| format!(" ({})", d.describe()))
         );
-        Ok(Box::new(engine))
+        let reopen_path = model;
+        let ctx_size = cfg.generation.ctx_size;
+        let (n_threads, power) = (cfg.n_threads, cfg.power_percent);
+        let reopen: plank::gpuyield::ReopenFn = Box::new(move || {
+            // Probe first: a contended lock inside `ds4_engine_open` is an
+            // `exit(2)`, not an error, and another plank may have started
+            // while this one had the model unloaded.
+            acquire_model_lock()?;
+            Ds4Engine::open(
+                &reopen_path,
+                backend,
+                ctx_size,
+                n_threads,
+                power,
+                &opened_with,
+            )
+            .map(|engine| Box::new(engine) as Box<dyn Engine>)
+            .map_err(|e| e.to_string())
+        });
+        Ok((Box::new(engine), Some(reopen)))
     }
     #[cfg(not(ds4_engine))]
     {
@@ -1135,7 +1171,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
                 "-m {model} requires the ds4 engine, which is not built on this platform"
             ));
         }
-        Ok(Box::new(EchoEngine::new(cfg.generation.ctx_size)))
+        Ok((Box::new(EchoEngine::new(cfg.generation.ctx_size)), None))
     }
 }
 
@@ -1394,6 +1430,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
 fn run(
     engine: Box<dyn Engine>,
     local_engine: Option<Box<dyn Engine>>,
+    reopen: Option<plank::gpuyield::ReopenFn>,
     cfg: &AgentConfig,
     plugins: plank::plugins::PluginSet,
 ) -> Result<u8, String> {
@@ -1405,7 +1442,7 @@ fn run(
     }
     let color = std::io::stdout().is_terminal();
     if cfg.ui.is_headless() {
-        return plank::ui::run_headless(engine, cfg, local_engine, plugins);
+        return plank::ui::run_headless(engine, cfg, local_engine, reopen, plugins);
     }
     plank::title::set(plank::title::State::Loading);
     // The full-screen TUI (a real terminal on both ends) draws its own header,
@@ -1428,7 +1465,7 @@ fn run(
         }
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
-    match plank::ui::run_interactive(engine, cfg, local_engine, plugins)? {
+    match plank::ui::run_interactive(engine, cfg, local_engine, reopen, plugins)? {
         None => Ok(0),
         // `/edit-profile` asked to reopen the session under the edited
         // profile. `exec_restart` returns only when the exec failed.
