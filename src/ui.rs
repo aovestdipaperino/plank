@@ -1514,6 +1514,33 @@ fn arcade_hover_reporting(on: bool) {
     let _ = out.flush();
 }
 
+/// What the idle loop does with a remote controller's queued lines, given the
+/// WASM frame on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteLines {
+    /// Nothing is up: drain the queue and run it.
+    Run,
+    /// An idle-rotation screensaver is up and lines are waiting: take it down
+    /// first, as any local activity would, then run them. Without this a
+    /// remote prompt sent while the laptop sat idle would wait for someone to
+    /// touch its keyboard.
+    DismissScreensaver,
+    /// A frame someone asked for is up (a `/frame`, a grid): leave the queue
+    /// untouched until it closes, because a turn under an open frame could
+    /// stage a grid over it or fight it for the screen.
+    Wait,
+}
+
+/// `frame` is `None` with nothing open, else whether the open frame is a
+/// screensaver; `queued` is whether the remote controller has lines waiting.
+fn remote_lines_gate(frame: Option<bool>, queued: bool) -> RemoteLines {
+    match frame {
+        None => RemoteLines::Run,
+        Some(true) if queued => RemoteLines::DismissScreensaver,
+        Some(_) => RemoteLines::Wait,
+    }
+}
+
 /// Injects the session-start context as **two** user messages — project-stable
 /// first, then session-volatile — so Tier 2 and Tier 3 of the KV cache are
 /// distinct, separately-checkpointable spans (issues #60, #64).
@@ -12797,12 +12824,16 @@ impl Agent<'_> {
             // Two ways in: a `/frame` the user typed, or a component's own
             // command asking to open its frame — which is how one module
             // holding many faces gives each of them a command.
-            let pending = self
-                .tool_ctx
-                .wasm
-                .pending_open
-                .take()
-                .or_else(|| self.tool_ctx.wasm.registry.take_pending_frame());
+            //
+            // Only with nothing open: a second request waits in its slot for
+            // the first frame to close, rather than replacing it on the next
+            // tick without a `frame_close`. Nothing else waits on these slots,
+            // so holding them starves nothing.
+            let pending = if wasm_frame.is_none() {
+                self.tool_ctx.wasm.take_next_frame()
+            } else {
+                None
+            };
             if let Some((id, face)) = pending {
                 let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
                 match self.tool_ctx.wasm.open_frame(
@@ -12819,7 +12850,13 @@ impl Agent<'_> {
                         // the same reason the arcade does.
                         arcade_hover_reporting(true);
                     }
-                    Err(e) => log.push_dim(e),
+                    Err(e) => {
+                        log.push_dim(e);
+                        // A grid whose frame will not open is dropped with its
+                        // file. There is no idle path that reaches the model,
+                        // so the log line is the whole notice.
+                        self.tool_ctx.wasm.abandon_unopened_grid(&id, &face);
+                    }
                 }
             }
             if let Some(open) = wasm_frame.as_mut() {
@@ -12987,7 +13024,26 @@ impl Agent<'_> {
                 // Remote-driven input (issue #25): a remote controller's
                 // `prompt`/`command` frames start a local turn just as if typed
                 // here, so the local screen and the remote mirror stay in sync.
-                if let Some(r) = self.remote.clone() {
+                // Held while a frame is up, like the job wake and the memory
+                // pass below: the lines stay queued in `shared` and run once
+                // it closes. A screensaver is taken down instead, since a
+                // remote line is activity.
+                let gate = remote_lines_gate(
+                    wasm_frame.as_ref().map(|f| f.screensaver),
+                    self.remote.as_ref().is_some_and(|r| r.shared.has_queued()),
+                );
+                if gate == RemoteLines::DismissScreensaver {
+                    if let Some(open) = &wasm_frame
+                        && let Some(line) = self.tool_ctx.wasm.close_frame(open)
+                    {
+                        log.push_dim(line);
+                    }
+                    wasm_frame = None;
+                    arcade_hover_reporting(false);
+                }
+                if gate != RemoteLines::Wait
+                    && let Some(r) = self.remote.clone()
+                {
                     let queued = r.shared.take_queued();
                     let mut run = false;
                     for line in queued {
@@ -37785,5 +37841,22 @@ or the user's next message aborts before its first token"
         agent.alt_engine_depth = 0;
         drop(agent);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_lines_wait_for_an_open_frame_and_wake_a_screensaver() {
+        assert_eq!(remote_lines_gate(None, true), RemoteLines::Run);
+        assert_eq!(remote_lines_gate(None, false), RemoteLines::Run);
+        assert_eq!(remote_lines_gate(Some(false), true), RemoteLines::Wait);
+        assert_eq!(remote_lines_gate(Some(false), false), RemoteLines::Wait);
+        assert_eq!(
+            remote_lines_gate(Some(true), true),
+            RemoteLines::DismissScreensaver
+        );
+        assert_eq!(
+            remote_lines_gate(Some(true), false),
+            RemoteLines::Wait,
+            "an empty queue is no reason to take a screensaver down"
+        );
     }
 }

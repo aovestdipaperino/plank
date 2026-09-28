@@ -586,6 +586,14 @@ impl TurnShared {
         )
     }
 
+    /// Whether any user line is queued, without taking it.
+    #[must_use]
+    pub fn has_queued(&self) -> bool {
+        self.queued
+            .lock()
+            .map_or_else(|e| !e.into_inner().is_empty(), |q| !q.is_empty())
+    }
+
     /// Queues one user line for the worker.
     pub fn push_queued(&self, line: String) {
         match self.queued.lock() {
@@ -912,7 +920,9 @@ mod tests {
         let shared = TurnShared::default();
         shared.push_queued("one".into());
         shared.push_queued("two".into());
+        assert!(shared.has_queued());
         assert_eq!(shared.take_queued(), vec!["one", "two"]);
+        assert!(!shared.has_queued());
         assert!(shared.take_queued().is_empty());
     }
 }

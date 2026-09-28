@@ -1601,6 +1601,12 @@ pub struct Session {
     /// component's RAM disk, with its frame queued or open. One slot, set by
     /// [`Session::stage_grid`].
     pub active_grid: Option<crate::grid::ActiveGrid>,
+    /// Whether a frame is on screen: set by [`Session::open_frame`], cleared
+    /// by [`Session::close_frame`] and by any frame call that traps (the UI
+    /// drops a trapped frame without closing it). This is how the session
+    /// tells an open grid from one still waiting to open, and why a grid is
+    /// never staged over, or opened over, a frame already up.
+    frame_open: bool,
     /// The plank home: where trust is recorded and where the `state`
     /// capability writes. Held once, here, because the host and the trust
     /// store both need it and two callers passing the same value into one
@@ -1627,6 +1633,7 @@ impl Session {
             host: crate::wasmhost::host(home),
             pending_open: None,
             active_grid: None,
+            frame_open: false,
             home: home.map(Path::to_path_buf),
         }
     }
@@ -1663,7 +1670,9 @@ impl Session {
     /// # Errors
     /// Returns the reason, for the model: the route is not declared, the
     /// component is not loaded (or has struck out), it has no frame, it was
-    /// not granted `fs`, or the RAM disk refused the write.
+    /// not granted `fs`, a frame is already open (`a grid is already open`:
+    /// only an unopened grid may be replaced), or the RAM disk refused the
+    /// write.
     pub fn stage_grid(
         &mut self,
         staging: crate::grid::GridStaging,
@@ -1692,8 +1701,13 @@ impl Session {
         if !manifest.capabilities.contains(&Capability::Fs) {
             return Err(format!("{component} has no fs grant"));
         }
+        if self.frame_open {
+            return Err("a grid is already open".to_string());
+        }
         let staged = csv.into_bytes();
         self.host.ram_write(&component, &file, &staged)?;
+        // The older file goes only after the new one is written, so for the
+        // length of the write both count toward the component's quota.
         if let Some(older) = self.active_grid.take()
             && (older.component != component || older.file != file)
         {
@@ -1708,6 +1722,42 @@ impl Session {
             write_back,
         });
         Ok(())
+    }
+
+    /// Whether a frame is on screen, as far as this session knows.
+    #[must_use]
+    pub fn frame_is_open(&self) -> bool {
+        self.frame_open
+    }
+
+    /// The next frame to open: a typed `/frame` first, then one a component
+    /// or a grid queued. Nothing while a frame is open, so a second request
+    /// waits in its slot for the first to close instead of replacing it
+    /// without a `frame_close`.
+    pub fn take_next_frame(&mut self) -> Option<(String, String)> {
+        if self.frame_open {
+            return None;
+        }
+        self.pending_open
+            .take()
+            .or_else(|| self.registry.take_pending_frame())
+    }
+
+    /// Drops the active grid when it is `(id, file)` and its frame failed to
+    /// open: removes its file and forgets it, so no orphan grid is left on the
+    /// RAM disk waiting for a frame that is not coming. Returns whether it
+    /// was the grid.
+    pub fn abandon_unopened_grid(&mut self, id: &str, file: &str) -> bool {
+        let is_it = !self.frame_open
+            && self
+                .active_grid
+                .as_ref()
+                .is_some_and(|g| g.component == id && g.file == file);
+        if is_it {
+            self.active_grid = None;
+            self.host.ram_remove(id, file);
+        }
+        is_it
     }
 
     /// Frame components that a slash command may open, as `(id, description)`.
@@ -1855,6 +1905,7 @@ impl Session {
                 format!("{id}: {e}")
             });
         }
+        self.frame_open = true;
         Ok(OpenFrame {
             id: id.to_string(),
             screensaver: false,
@@ -1901,6 +1952,7 @@ impl Session {
             .call(&frame.id, export, payload.as_bytes())
             .map_err(|e| {
                 self.registry.strike(&frame.id);
+                self.frame_open = false;
                 format!("{}: {e}", frame.id)
             })?;
         let decoded = if text_only {
@@ -1915,6 +1967,7 @@ impl Session {
             }
             Err(e) => {
                 self.registry.strike(&frame.id);
+                self.frame_open = false;
                 Err(format!("{}: {e}", frame.id))
             }
         }
@@ -1924,7 +1977,8 @@ impl Session {
     /// `text` the typed character with its case, when the key types one.
     ///
     /// # Errors
-    /// Returns the message to show when the call traps; the caller closes.
+    /// Returns the message to show when the call traps; the frame then counts
+    /// as closed and the caller drops it.
     pub fn frame_key(
         &mut self,
         frame: &OpenFrame,
@@ -1937,6 +1991,7 @@ impl Session {
             .call(&frame.id, "frame_key", payload.as_bytes())
             .map_err(|e| {
                 self.registry.strike(&frame.id);
+                self.frame_open = false;
                 format!("{}: {e}", frame.id)
             })?;
         Ok(parse_frame_outcome(&bytes))
@@ -1975,6 +2030,7 @@ impl Session {
             .call(&frame.id, "frame_mouse", payload.as_bytes())
             .map_err(|e| {
                 self.registry.strike(&frame.id);
+                self.frame_open = false;
                 format!("{}: {e}", frame.id)
             })?;
         Ok(parse_frame_outcome(&bytes))
@@ -1982,6 +2038,7 @@ impl Session {
 
     /// Closes a frame, returning any scrollback line it asked to leave behind.
     pub fn close_frame(&mut self, frame: &OpenFrame) -> Option<String> {
+        self.frame_open = false;
         let bytes = self.host.call(&frame.id, "frame_close", b"").ok()?;
         let text = String::from_utf8_lossy(&bytes);
         let Some(Json::Obj(fields)) = json_parse(&text) else {
@@ -4135,6 +4192,8 @@ mod tests {
     struct DiskHost {
         files: BTreeMap<(String, String), Vec<u8>>,
         limit: Option<usize>,
+        /// Whether a call succeeds (with an empty object), so a frame opens.
+        opens: bool,
     }
 
     impl crate::wasmhost::WasmHost for DiskHost {
@@ -4153,7 +4212,11 @@ mod tests {
             _export: &str,
             _input: &[u8],
         ) -> Result<Vec<u8>, crate::wasmhost::WasmError> {
-            Err(crate::wasmhost::WasmError::Unsupported)
+            if self.opens {
+                Ok(b"{}".to_vec())
+            } else {
+                Err(crate::wasmhost::WasmError::Unsupported)
+            }
         }
 
         fn ram_write(&mut self, id: &str, path: &str, bytes: &[u8]) -> Result<(), String> {
@@ -4197,6 +4260,7 @@ mod tests {
             host: Box::new(DiskHost::default()),
             pending_open: None,
             active_grid: None,
+            frame_open: false,
             home: None,
         }
     }
@@ -4359,5 +4423,106 @@ mod tests {
         assert!(s.stage_grid(other, &routes()).is_err());
         assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_some());
         assert_eq!(s.active_grid.as_ref().unwrap().file, "categories.csv");
+    }
+
+    /// A session whose host lets frames open, so the open-frame flag can be
+    /// driven without a runtime.
+    fn opening_session() -> Session {
+        let mut s = fit_session();
+        s.host = Box::new(DiskHost {
+            opens: true,
+            ..DiskHost::default()
+        });
+        s
+    }
+
+    #[test]
+    fn a_grid_is_refused_while_a_frame_is_open_and_accepted_after_it_closes() {
+        let mut s = opening_session();
+        let open = s.open_frame(CSVEDIT, "", 80, 24, 0).unwrap();
+        assert!(s.frame_is_open());
+        let err = s
+            .stage_grid(staging("categories.csv", "#,name\n"), &routes())
+            .unwrap_err();
+        assert_eq!(err, "a grid is already open");
+        assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_none());
+        assert!(s.registry.take_pending_frame().is_none());
+        assert!(s.active_grid.is_none());
+
+        s.close_frame(&open);
+        assert!(!s.frame_is_open());
+        s.stage_grid(staging("categories.csv", "#,name\n"), &routes())
+            .unwrap();
+        assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_some());
+    }
+
+    /// A frame the UI drops because a call trapped never reaches
+    /// `close_frame`, so the trap itself has to end it.
+    #[test]
+    fn a_frame_that_traps_is_no_longer_open() {
+        let mut s = opening_session();
+        let open = s.open_frame(CSVEDIT, "", 80, 24, 0).unwrap();
+        s.host = Box::new(DiskHost::default());
+        assert!(s.frame_key(&open, "q", Some('q')).is_err());
+        assert!(!s.frame_is_open(), "a trapped key ends the frame");
+
+        let mut s = opening_session();
+        let open = s.open_frame(CSVEDIT, "", 80, 24, 0).unwrap();
+        s.host = Box::new(DiskHost::default());
+        let mut open = open;
+        assert!(s.step_frame(&mut open, 16, 80, 24, 0).is_err());
+        assert!(!s.frame_is_open(), "a trapped step ends the frame");
+    }
+
+    #[test]
+    fn a_grid_whose_frame_cannot_open_leaves_nothing_behind() {
+        let mut s = fit_session();
+        s.stage_grid(staging("categories.csv", "#,name\n"), &routes())
+            .unwrap();
+        let (id, file) = s.take_next_frame().expect("the grid is queued");
+        assert!(s.open_frame(&id, &file, 80, 24, 0).is_err());
+        assert!(!s.frame_is_open());
+        assert!(s.abandon_unopened_grid(&id, &file));
+        assert!(s.active_grid.is_none());
+        assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_none());
+    }
+
+    /// A `/frame` for some other face failing to open is not the grid's
+    /// failure: the grid stays staged.
+    #[test]
+    fn another_frame_failing_to_open_leaves_the_grid_alone() {
+        let mut s = fit_session();
+        s.stage_grid(staging("categories.csv", "#,name\n"), &routes())
+            .unwrap();
+        assert!(!s.abandon_unopened_grid(CSVEDIT, "rules.csv"));
+        assert!(!s.abandon_unopened_grid("dev.plank.other", "categories.csv"));
+        assert!(s.active_grid.is_some());
+        assert!(s.host.ram_file(CSVEDIT, "/categories.csv").is_some());
+    }
+
+    /// While a frame is up nothing else is taken to open over it; once it
+    /// closes the typed `/frame` goes first and the grid after it, so
+    /// neither is lost.
+    #[test]
+    fn a_queued_frame_waits_for_the_open_one_to_close() {
+        let mut s = opening_session();
+        s.stage_grid(staging("categories.csv", "#,name\n"), &routes())
+            .unwrap();
+        s.pending_open = Some((CSVEDIT.to_string(), "typed".to_string()));
+        let open = s.open_frame(CSVEDIT, "other", 80, 24, 0).unwrap();
+        assert!(s.take_next_frame().is_none());
+        assert!(s.pending_open.is_some(), "the typed frame is kept");
+        s.close_frame(&open);
+        assert_eq!(
+            s.take_next_frame(),
+            Some((CSVEDIT.to_string(), "typed".to_string()))
+        );
+        let open = s.open_frame(CSVEDIT, "typed", 80, 24, 0).unwrap();
+        assert!(s.take_next_frame().is_none(), "the grid waits its turn");
+        s.close_frame(&open);
+        assert_eq!(
+            s.take_next_frame(),
+            Some((CSVEDIT.to_string(), "categories.csv".to_string()))
+        );
     }
 }
