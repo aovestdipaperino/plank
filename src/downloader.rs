@@ -1169,24 +1169,48 @@ pub fn try_lock_in(root: &Path) -> Option<std::fs::File> {
 /// Detached deliberately: the download outlives the plank that started it, and
 /// outlives the terminal that plank was typed into. `setsid` in the child is
 /// what breaks it off the controlling terminal, and all three standard streams
-/// go to `/dev/null` so nothing it writes can ever land in a user's session —
+/// go to `/dev/null` so nothing it writes can ever land in a user's session;
 /// diagnostics go to [`log_path`] instead.
 ///
 /// # Errors
 /// Returns a message when the job cannot be recorded or the child cannot be
-/// spawned. There is deliberately no in-process fallback — a foreground 87 GB
-/// download is exactly what this whole feature exists to avoid — so callers
+/// spawned. There is deliberately no in-process fallback (a foreground 87 GB
+/// download is exactly what this whole feature exists to avoid), so callers
 /// report the error and nothing downloads; `/model download` is how the user
 /// retries.
 pub fn spawn_detached(
     set: crate::manifest::EngineId,
     manifest: &crate::manifest::Manifest,
 ) -> Result<(), String> {
-    if running() {
+    spawn_detached_in(&crate::manifest::plank_dir(), set, manifest, &launch_helper)
+}
+
+/// [`spawn_detached`] against `root`, with the process launch injected.
+///
+/// Everything that touches disk (the running probe, the job file, the cancel
+/// flag) goes through `root`, and `launch` is the only step that starts a
+/// process, so a test can pass a temporary root and a stub `launch` and never
+/// reach the real `~/.plank` or spawn a helper.
+///
+/// # Errors
+/// As [`spawn_detached`], plus whatever `launch` returns.
+pub fn spawn_detached_in(
+    root: &Path,
+    set: crate::manifest::EngineId,
+    manifest: &crate::manifest::Manifest,
+    launch: &dyn Fn(crate::manifest::EngineId) -> Result<(), String>,
+) -> Result<(), String> {
+    if running_in(root) {
         return Ok(());
     }
-    write_job(set, manifest).map_err(|e| format!("cannot record the download job: {e}"))?;
-    clear_cancel();
+    write_job_in(root, set, manifest)
+        .map_err(|e| format!("cannot record the download job: {e}"))?;
+    clear_cancel_in(root);
+    launch(set)
+}
+
+/// Starts `plank --model-downloader <set>` as a detached child.
+fn launch_helper(set: crate::manifest::EngineId) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find plank's own path: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
     // The set travels in argv rather than in the job file: the helper needs it
@@ -1557,7 +1581,10 @@ pub fn cancel_prompt() -> Option<String> {
 /// Starts a download for the recorded job under `root`, for `/model download`.
 /// Returns the line to show the user.
 #[must_use]
-pub fn start_from_manifest_in(root: &Path) -> String {
+pub fn start_from_manifest_in(
+    root: &Path,
+    spawn: &dyn Fn(crate::manifest::EngineId, &crate::manifest::Manifest) -> Result<(), String>,
+) -> String {
     if running_in(root) {
         return "A model download is already running.".to_string();
     }
@@ -1565,7 +1592,7 @@ pub fn start_from_manifest_in(root: &Path) -> String {
         return "No model download is pending. plank checks for one at startup, once a day."
             .to_string();
     };
-    match spawn_detached(set, &manifest) {
+    match spawn(set, &manifest) {
         Ok(()) => format!(
             "Downloading model manifest version {} in the background.",
             manifest.version
@@ -1578,7 +1605,7 @@ pub fn start_from_manifest_in(root: &Path) -> String {
 /// line to show the user.
 #[must_use]
 pub fn start_from_manifest() -> String {
-    start_from_manifest_in(&crate::manifest::plank_dir())
+    start_from_manifest_in(&crate::manifest::plank_dir(), &spawn_detached)
 }
 
 /// Applies a `/model cancel` request against state under `root`. Returns the
@@ -3316,10 +3343,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn spawn_detached_in_records_the_job_under_root_and_launches_once() {
+        // I6: every file this touches must land under the given root, and the
+        // only process start goes through `launch`, so a test never writes
+        // the real `~/.plank` or spawns a detached helper.
+        let dir = tempdir();
+        request_cancel_in(&dir, Cancel::Keep).expect("stale cancel flag");
+        let manifest = manifest_for_version(7, &[("main", b"abc", &"a".repeat(64))]);
+        let launched = std::cell::RefCell::new(Vec::new());
+        spawn_detached_in(&dir, crate::manifest::EngineId::DS41, &manifest, &|id| {
+            launched.borrow_mut().push(id);
+            Ok(())
+        })
+        .expect("stub launch succeeds");
+        assert_eq!(*launched.borrow(), vec![crate::manifest::EngineId::DS41]);
+        assert_eq!(
+            read_job_in(&dir, crate::manifest::EngineId::DS41).map(|m| m.version),
+            Some(7)
+        );
+        assert!(read_cancel_in(&dir).is_none(), "the stale flag is cleared");
+    }
+
+    #[test]
+    fn spawn_detached_in_does_nothing_while_a_helper_holds_the_lock() {
+        let dir = tempdir();
+        let _held = try_lock_in(&dir).expect("take the helper lock");
+        let manifest = manifest_for_version(7, &[("main", b"abc", &"a".repeat(64))]);
+        spawn_detached_in(&dir, crate::manifest::EngineId::DS41, &manifest, &|_| {
+            panic!("a running helper must not be launched twice")
+        })
+        .expect("a running helper is not an error");
+        assert!(read_job_in(&dir, crate::manifest::EngineId::DS41).is_none());
+    }
+
+    #[test]
     fn start_from_manifest_reports_nothing_pending() {
         let dir = tempdir();
         assert_eq!(
-            start_from_manifest_in(&dir),
+            start_from_manifest_in(&dir, &|_, _| panic!("nothing pending must not spawn")),
             "No model download is pending. plank checks for one at startup, once a day."
         );
     }

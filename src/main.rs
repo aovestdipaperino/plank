@@ -336,14 +336,19 @@ fn model_choice(cfg: &plank::config::AgentConfig) -> plank::engines::Choice<'_> 
 /// still names the pre-delta model here, and a `.ggd` spec gets rewritten to
 /// the patched clone afterward. `parse_config` activates the final,
 /// delta-adjusted selection once both steps have run.
-fn resolve_selection(cfg: &mut plank::config::AgentConfig) -> Result<(), String> {
+///
+/// The catalog and managed paths come from `root`, which is `~/.plank` in
+/// every real run and a scratch directory in tests.
+fn resolve_selection(
+    cfg: &mut plank::config::AgentConfig,
+    root: &std::path::Path,
+) -> Result<(), String> {
     let mut warn = Vec::new();
-    let catalog = plank::engines::load(&mut warn);
+    let catalog = plank::engines::load_in(root, &mut warn);
     for w in warn {
         eprintln!("plank: {w}");
     }
-    let sel =
-        plank::engines::resolve_in(&plank::manifest::plank_dir(), &catalog, model_choice(cfg))?;
+    let sel = plank::engines::resolve_in(root, &catalog, model_choice(cfg))?;
     cfg.model_path = Some(sel.main.clone());
     cfg.selection = Some(sel);
     Ok(())
@@ -370,9 +375,20 @@ fn parse_config(
     args: &[String],
     prog: &str,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
+    parse_config_in(settings, args, prog, &plank::manifest::plank_dir())
+}
+
+/// [`parse_config`] with the engine catalog and managed paths under `root`.
+fn parse_config_in(
+    settings: &plank::settings::Settings,
+    args: &[String],
+    prog: &str,
+    root: &std::path::Path,
+) -> Result<plank::config::AgentConfig, ExitCode> {
     plank::config::parse_options_with(settings, args)
         .and_then(|mut cfg| {
-            if let Err(e) = resolve_selection(&mut cfg).and_then(|()| resolve_model_delta(&mut cfg))
+            if let Err(e) =
+                resolve_selection(&mut cfg, root).and_then(|()| resolve_model_delta(&mut cfg))
             {
                 if resolution_is_fatal(&cfg) {
                     return Err(e);
@@ -1339,7 +1355,11 @@ mod tests {
             "definitely-not-a-real-engine-name".into(),
             "--dump-config".into(),
         ];
-        let cfg = parse_config(&settings, &args, "plank").expect("dump-config must not abort");
+        // An empty scratch root: the catalog is the compiled-in one and the
+        // real `~/.plank` is never read.
+        let root = std::env::temp_dir().join(format!("plank-dump-config-{}", std::process::id()));
+        let cfg =
+            parse_config_in(&settings, &args, "plank", &root).expect("dump-config must not abort");
         assert!(cfg.dump_config);
         assert!(cfg.selection.is_none());
     }

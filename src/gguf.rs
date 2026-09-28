@@ -284,6 +284,12 @@ pub fn file_detail(label: &str, path: Option<&Path>) -> Option<String> {
 /// table. plank already knows the expected byte count, so it can say so.
 #[must_use]
 pub fn artifact_size_mismatch(path: &Path) -> Option<String> {
+    artifact_size_mismatch_in(&crate::manifest::plank_dir(), path)
+}
+
+/// [`artifact_size_mismatch`] against the installed manifests under `root`.
+#[must_use]
+pub fn artifact_size_mismatch_in(root: &Path, path: &Path) -> Option<String> {
     let on_disk = std::fs::metadata(path).ok()?.len();
     let same = |a: &Path, b: &Path| {
         a == b
@@ -292,19 +298,20 @@ pub fn artifact_size_mismatch(path: &Path) -> Option<String> {
                 _ => false,
             }
     };
-    let (id, entry) = crate::manifest::installed_ids_in(&crate::manifest::plank_dir())
+    let (id, entry) = crate::manifest::installed_ids_in(root)
         .into_iter()
         .filter_map(|id| {
             Some((
                 id,
-                crate::manifest::read_at(&crate::manifest::installed_path(id))?,
+                crate::manifest::read_at(&crate::manifest::installed_path_in(root, id))?,
             ))
         })
         .find_map(|(id, m)| {
             m.files
                 .into_iter()
                 .find(|(role, _)| {
-                    crate::manifest::local_path_for(id, role).is_some_and(|p| same(&p, path))
+                    crate::manifest::local_path_for_in(root, id, role)
+                        .is_some_and(|p| same(&p, path))
                 })
                 .map(|f| (id, f.1))
         })?;
@@ -362,6 +369,13 @@ pub struct OpenAttempt<'a> {
 /// as a number.
 #[must_use]
 pub fn open_failure_detail(attempt: &OpenAttempt) -> String {
+    open_failure_detail_in(&crate::manifest::plank_dir(), attempt)
+}
+
+/// [`open_failure_detail`] with the size check reading installed manifests
+/// under `root`, so a test never looks at the real `~/.plank`.
+#[must_use]
+pub fn open_failure_detail_in(root: &Path, attempt: &OpenAttempt) -> String {
     use std::fmt::Write as _;
     let OpenAttempt {
         path,
@@ -402,7 +416,7 @@ pub fn open_failure_detail(attempt: &OpenAttempt) -> String {
 {line}"
         );
     }
-    if let Some(line) = artifact_size_mismatch(path) {
+    if let Some(line) = artifact_size_mismatch_in(root, path) {
         let _ = write!(
             msg,
             "
@@ -719,23 +733,29 @@ mod tests {
     /// line for anything that is fine.
     #[test]
     fn the_open_failure_message_names_every_fact_it_has() {
+        // An empty root: no installed manifest, so no size line, and the real
+        // `~/.plank` is never read.
+        let root = detail_tmp("root");
         let model = detail_tmp("attempt.gguf");
         std::fs::write(&model, vec![0u8; 4096]).expect("write");
         let drafter = detail_tmp("attempt.dspark.gguf");
         let _ = std::fs::remove_file(&drafter);
-        let msg = open_failure_detail(&OpenAttempt {
-            path: &model,
-            rc: -3,
-            engine_null: true,
-            family: ModelFamily::Qwen,
-            backend: "Metal",
-            ctx_size: 1_048_576,
-            companions: &[
-                ("mtp draft model", Some(&drafter)),
-                ("vision encoder", None),
-            ],
-            metal_kernels_missing: true,
-        });
+        let msg = open_failure_detail_in(
+            &root,
+            &OpenAttempt {
+                path: &model,
+                rc: -3,
+                engine_null: true,
+                family: ModelFamily::Qwen,
+                backend: "Metal",
+                ctx_size: 1_048_576,
+                companions: &[
+                    ("mtp draft model", Some(&drafter)),
+                    ("vision encoder", None),
+                ],
+                metal_kernels_missing: true,
+            },
+        );
         assert!(msg.starts_with("failed to open model "), "{msg}");
         assert!(msg.contains("returned -3"), "{msg}");
         assert!(
@@ -753,16 +773,19 @@ mod tests {
 
         // A non-zero code and a null engine are different news, and only one
         // of them is reported per failure.
-        let msg = open_failure_detail(&OpenAttempt {
-            path: &model,
-            rc: 0,
-            engine_null: true,
-            family: ModelFamily::Ds4,
-            backend: "Cpu",
-            ctx_size: 8192,
-            companions: &[],
-            metal_kernels_missing: false,
-        });
+        let msg = open_failure_detail_in(
+            &root,
+            &OpenAttempt {
+                path: &model,
+                rc: 0,
+                engine_null: true,
+                family: ModelFamily::Ds4,
+                backend: "Cpu",
+                ctx_size: 8192,
+                companions: &[],
+                metal_kernels_missing: false,
+            },
+        );
         assert!(msg.contains("success but returned no engine"), "{msg}");
         assert!(!msg.contains("returned 0"), "{msg}");
         assert!(!msg.contains("DS4_METAL_DIR"), "{msg}");

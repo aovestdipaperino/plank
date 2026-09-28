@@ -2435,7 +2435,13 @@ mod tests {
             vision: None,
             managed_main: false,
         };
-        let err = ensure_model(&sel).expect_err("a missing model is an error");
+        let catalog = crate::engines::parse(
+            crate::engines::COMPILED_IN,
+            crate::engines::Layer::Published,
+            &mut Vec::new(),
+        )
+        .expect("compiled-in catalog");
+        let err = ensure_model_in(&catalog, &sel, false).expect_err("a missing model is an error");
         assert!(err.contains("no model at"), "{err}");
         assert!(
             err.contains("--model"),
@@ -2785,7 +2791,12 @@ mod tests {
             "a decline must not itself start the download"
         );
 
-        let message = crate::downloader::start_from_manifest_in(&root);
+        let (started, spawn) = spy_spawn();
+        let message = crate::downloader::start_from_manifest_in(&root, &spawn);
+        assert!(
+            started.load(Ordering::Relaxed),
+            "the pending job must be handed to the spawner"
+        );
         assert_eq!(
             message, "Downloading model manifest version 4 in the background.",
             "a declined version must still be startable by hand: {message}"
@@ -2817,7 +2828,12 @@ mod tests {
             "a headless run must not itself start the download"
         );
 
-        let message = crate::downloader::start_from_manifest_in(&root);
+        let (started, spawn) = spy_spawn();
+        let message = crate::downloader::start_from_manifest_in(&root, &spawn);
+        assert!(
+            started.load(Ordering::Relaxed),
+            "the pending job must be handed to the spawner"
+        );
         assert_eq!(
             message, "Downloading model manifest version 4 in the background.",
             "a headless offer must still be startable by hand: {message}"
