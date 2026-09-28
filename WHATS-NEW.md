@@ -10,32 +10,8 @@ it.
 
 ## In the betas
 
-The beta channel is on 6.0.1. Install with `brew install
+The 6.1.1 beta opens on the same code as stable 6.1.0. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
-
-### Next release
-
-**Models are named engines now.** plank used to know three model sets by
-hard-coded file names. It now reads an `engines.json` catalog: each engine is
-a main model plus its drafter and vision encoder, the catalog ships inside the
-binary and refreshes from the repository once a day, and
-`~/.plank/engines.local.json` lets you add your own. `plank --model ds41` or
-`plank --model qwen` picks an engine with everything it needs, and
-`--model:<name>` does the same but refuses to read the word as a path.
-`--qwen` is gone in favour of `--model qwen`.
-
-**Your model files get new names, and that is one way.** The first launch
-renames `~/.plank/ds4flash.gguf` and its siblings to `ds4vision.gguf`,
-`ds4vision.mtp.gguf` and `ds4vision.vision.gguf`, and the V4.1 files to
-`ds41.*`. Nothing is downloaded again. An older plank pointed at the same
-`~/.plank`, though, will not find its model any more and will offer to fetch
-it, so upgrade every copy you run together. A bare `--model /some/file.gguf`
-now loads just that file: no drafter or encoder is picked up beside it, so pass
-`--mtp-model` for speculation, or describe the file as a local engine. Two
-exceptions: a path that is the same file as a managed engine's main, including
-through a symlink or hard link, selects that engine instead, and a `.ggd`
-delta built on a managed engine's main inherits that engine's companions,
-though the delta itself is never upgraded.
 
 ### 5.1.5
 
@@ -201,6 +177,47 @@ own line while the agent works. If you never want the AGENTS.md offer in a
 folder, "Don't ask for this folder" now records that.
 
 ## Stable releases
+
+### 6.1.0
+
+**Models are named engines now.** plank used to know three model sets by
+hard-coded file names. It now reads an `engines.json` catalog: each engine is
+a main model plus its drafter and vision encoder, the catalog ships inside the
+binary and refreshes from the repository once a day, and
+`~/.plank/engines.local.json` lets you add your own. `plank --model ds41` or
+`plank --model qwen` picks an engine with everything it needs, and
+`--model:<name>` does the same but refuses to read the word as a path.
+`--qwen` is gone in favour of `--model qwen`.
+
+**Your model files get new names, and that is one way.** The first launch
+renames `~/.plank/ds4flash.gguf` and its siblings to `ds4vision.gguf`,
+`ds4vision.mtp.gguf` and `ds4vision.vision.gguf`, and the V4.1 files to
+`ds41.*`. Nothing is downloaded again. An older plank pointed at the same
+`~/.plank`, though, will not find its model any more and will offer to fetch
+it, so upgrade every copy you run together. A bare `--model /some/file.gguf`
+now loads just that file: no drafter or encoder is picked up beside it, so pass
+`--mtp-model` for speculation, or describe the file as a local engine. Two
+exceptions: a path that is the same file as a managed engine's main, including
+through a symlink or hard link, selects that engine instead, and a `.ggd`
+delta built on a managed engine's main inherits that engine's companions,
+though the delta itself is never upgraded.
+
+**Commands that need the GPU get it.** A command that cannot get the GPU
+exits with status 75 and prints a line starting with `GPU not available`;
+plank then unloads its model, runs the command again, reloads the model and
+restores its cache, so the conversation carries on without a re-prefill. It
+covers commands the model runs and the ones you run with `!` and `!!`. Every
+command sees `PLANK_GPU_YIELD=1`, and `mex` 0.2.3 speaks the protocol.
+
+**A profile can recommend a model.** `recommendedModel` names the engine a
+profile works best with; plank uses it ahead of `engine.model` when its files
+are on disk, never over `--model`. HAL recommends `qwen`.
+
+**Local engines can name a `url`.** A role in `~/.plank/engines.local.json`
+can add an `https://` url, a Hugging Face file page included, that plank
+offers to download into its `path` when the file is missing.
+
+`/stats` labels its rows `↑ input/prefill` and `↓ output/generated`.
 
 ### 5.0.0
 

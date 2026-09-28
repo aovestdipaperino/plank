@@ -34,6 +34,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`/stats` labels.** The rows read `↑ input/prefill` and `↓ output/generated`,
+  with the arrows the status bar already used.
 - **Breaking: the model files under `~/.plank` are renamed, one way.** At
   the first launch of this release, `ds4flash.gguf`, `ds4flash.vision.gguf`
   and `ds4flash.dspark.gguf` become `ds4vision.gguf`, `ds4vision.vision.gguf`

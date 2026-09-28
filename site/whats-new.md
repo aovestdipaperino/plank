@@ -7,8 +7,8 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**Coming in the next release.** These changes are on `main` and not in a
-published build yet. They are about how plank finds its models.
+**v6.1.0 is out**, and the beta channel is on 6.1.1. Most of it is about how
+plank finds its models, plus a way to lend the GPU to other tools.
 
 **Models are named engines now.** Plank used to know its three model sets by
 hard-coded file names. It now reads an `engines.json` catalog, where each
@@ -46,6 +46,34 @@ that is the same file as an engine's main model, including through a symlink
 or a hard link, selects that engine, and a `.ggd` weight delta built on an
 engine's main model inherits that engine's drafter and encoder, though the
 delta itself is never upgraded.
+
+A local engine can also say where to fetch a file it does not have yet. Give a
+role a `url` beside its `path`, including a Hugging Face file page, and plank
+offers to download it into that path the first time it is missing. The engine
+stays yours: plank never checks it for updates.
+
+**Commands that need the GPU get it.** A local model holds the Mac's GPU for
+as long as plank runs, so a tool that wants it for itself used to fail or
+thrash. `mex` generating an illustration with its diffusion model is the first
+such tool. Now a command that cannot get the GPU exits with status 75 and
+prints a line starting with `GPU not available`, and plank does the rest. It
+saves its cache, unloads the model, runs the command again, reloads the model
+and restores the cache, and the conversation carries on without reading the
+whole transcript back in. It works for commands the model runs, and for the
+ones you run yourself with `!` and `!!`. Every command plank starts sees
+`PLANK_GPU_YIELD=1`, so a tool can tell that asking is worth it. `mex` 0.2.3
+already does. The [tools chapter](/guide/05-tools) covers the limits: a
+pipeline such as `mex post.md | tee log` hides the exit status, and background
+jobs are left alone.
+
+**A profile can recommend a model.** `recommendedModel` in a profile's
+manifest names the engine it works best with. plank uses it ahead of your
+`engine.model` setting, but only when that engine's files are already on disk,
+and never over a `--model` you typed. HAL recommends `qwen`. The
+[profiles chapter](/guide/14-profiles) has the details.
+
+**Smaller things.** `/stats` now labels its rows `↑ input/prefill` and
+`↓ output/generated`, with the same arrows as the status bar.
 
 ## v6.0: plank can be a different agent
 
