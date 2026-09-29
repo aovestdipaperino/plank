@@ -23,6 +23,12 @@ thread_local! {
     /// The row-count summary from the last `frame_close`, consumed once by
     /// the next `tool_resume`.
     static LAST_SUMMARY: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Set by `tool_call` and consumed by the very next `frame_open`: only a
+    /// tool-invoked edit pays for capturing `ORIGINAL` and diffing at close.
+    /// A grid-bridge or `/csvedit` open (no `tool_call` first) never sets
+    /// this, so it never reads the file twice or runs a summary nobody
+    /// asked for.
+    static PENDING_TOOL_OPEN: RefCell<bool> = const { RefCell::new(false) };
 }
 
 #[plugin_fn]
@@ -68,8 +74,10 @@ pub fn command_run(input: String) -> FnResult<String> {
 pub fn frame_open(input: String) -> FnResult<String> {
     let (w, h) = (dim(int(&input, "w")), dim(int(&input, "h")));
     let arg = text(&input, "arg");
-    let original = crate::disk::Disk::read(&PlankDisk, &arg).unwrap_or_default();
-    ORIGINAL.with(|o| *o.borrow_mut() = Some((arg.clone(), original)));
+    if PENDING_TOOL_OPEN.with(|p| p.replace(false)) {
+        let original = crate::disk::Disk::read(&PlankDisk, &arg).unwrap_or_default();
+        ORIGINAL.with(|o| *o.borrow_mut() = Some((arg.clone(), original)));
+    }
     SESSION.with(|s| *s.borrow_mut() = Some(Session::open(w, h, &arg, Box::new(PlankDisk))));
     Ok("{}".to_string())
 }
@@ -117,6 +125,11 @@ pub fn frame_close() -> FnResult<String> {
 /// {...}}`) in. `text` only ever finds the *first* occurrence of a key
 /// anywhere in the payload, so scoping to `args` first keeps a same-named
 /// top-level field from shadowing it (and vice versa).
+///
+/// This is a brace-depth scan, not a JSON parser: a path containing a
+/// literal brace character would miscount depth and truncate. Acceptable
+/// for `edit_csv`'s one string field, a file path, where a brace is not a
+/// realistic input.
 fn args_field(input: &str, key: &str) -> String {
     let Some((_, rest)) = input.split_once("\"args\":") else {
         return String::new();
@@ -155,6 +168,10 @@ pub fn tool_call(input: String) -> FnResult<String> {
     if path.is_empty() {
         return Ok("error: edit_csv needs a path".to_string());
     }
+    // The host always calls frame_open next for a frame directive, so this
+    // flag is consumed by the very next frame_open and never lingers into
+    // an unrelated later open.
+    PENDING_TOOL_OPEN.with(|p| *p.borrow_mut() = true);
     Ok(format!(
         "{{\"frame\": {{\"path\": {}, \"file\": \"data.csv\"}}}}",
         json_string(&path)

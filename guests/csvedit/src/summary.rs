@@ -1,12 +1,25 @@
 //! What changed between two CSV texts, in counts only: the model is told how
 //! many rows changed, never what they hold.
 
-/// Row counts between `before` and `after`: rows are aligned by longest
-/// common subsequence, so a row that survives unmoved (even sandwiched
-/// between edits elsewhere) is never miscounted as a change. Each gap
-/// between aligned rows is paired off by position (changed), with any
-/// remainder added or deleted. Header changes are reported as `columns
-/// changed`.
+/// LCS is only run on a middle whose cell count (`rows_before *
+/// rows_after`) is at most this, roughly a 500x500 square. `lcs_pairs`
+/// allocates and fills an `(n+1)x(m+1)` table, so an unbounded middle is a
+/// blocking `frame_close` paying O(n*m) time and memory: at csvedit's
+/// 10,000-row ceiling that is ~400 MB. A common prefix and suffix are
+/// trimmed before this check, so the limit only bites a middle that is
+/// itself large — the common case (a handful of edited rows in a big file)
+/// trims down to a tiny middle and always gets the exact alignment.
+const LCS_CELL_LIMIT: usize = 250_000;
+
+/// Row counts between `before` and `after`. A common prefix and a common
+/// suffix of identical rows are trimmed first (cheap, and the common case).
+/// The remaining middle is aligned by longest common subsequence when small
+/// enough (see [`LCS_CELL_LIMIT`]) — so a row that survives unmoved, even
+/// sandwiched between edits elsewhere in the middle, is never miscounted as
+/// a change — or, above that limit, paired off by position: `changed` is
+/// the shorter side and the remainder is `added`/`deleted`, which slightly
+/// over-counts `changed` on a large edit but never runs an unbounded table.
+/// Header changes are reported as `columns changed`.
 #[must_use]
 pub fn summarize(before: &str, after: &str) -> String {
     let rows = |t: &str| t.lines().map(str::to_owned).collect::<Vec<_>>();
@@ -17,10 +30,17 @@ pub fn summarize(before: &str, after: &str) -> String {
     } else if b.first() != a.first() {
         return "columns changed".to_string();
     }
-    let (b, a) = (
-        b.get(1..).unwrap_or(&[]).to_vec(),
-        a.get(1..).unwrap_or(&[]).to_vec(),
-    );
+    let (b, a) = (b.get(1..).unwrap_or(&[]), a.get(1..).unwrap_or(&[]));
+
+    let prefix = b.iter().zip(a).take_while(|(x, y)| x == y).count();
+    let (b, a) = (&b[prefix..], &a[prefix..]);
+    let suffix = b
+        .iter()
+        .rev()
+        .zip(a.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (b, a) = (&b[..b.len() - suffix], &a[..a.len() - suffix]);
 
     let (mut changed, mut added, mut deleted) = (0usize, 0usize, 0usize);
     let mut gap = |gb: usize, ga: usize| {
@@ -31,12 +51,19 @@ pub fn summarize(before: &str, after: &str) -> String {
             deleted += gb - ga;
         }
     };
-    let (mut pi, mut pj) = (0usize, 0usize);
-    for (mi, mj) in lcs_pairs(&b, &a) {
-        gap(mi - pi, mj - pj);
-        (pi, pj) = (mi + 1, mj + 1);
+    if b.len().saturating_mul(a.len()) <= LCS_CELL_LIMIT {
+        let (mut pi, mut pj) = (0usize, 0usize);
+        for (mi, mj) in lcs_pairs(b, a) {
+            gap(mi - pi, mj - pj);
+            (pi, pj) = (mi + 1, mj + 1);
+        }
+        gap(b.len() - pi, a.len() - pj);
+    } else {
+        // The middle is too big to align exactly without an unbounded
+        // table: pair it off by position instead, same as a single LCS gap
+        // spanning the whole middle would.
+        gap(b.len(), a.len());
     }
-    gap(b.len() - pi, a.len() - pj);
 
     let count = |n: usize, what: &str| format!("{n} row{} {what}", if n == 1 { "" } else { "s" });
     if changed > 0 {
@@ -115,5 +142,36 @@ mod tests {
     fn a_new_file_and_a_changed_header_are_reported() {
         assert_eq!(summarize("", "a,b\n1,2\n"), "new file, 1 row added");
         assert_eq!(summarize("a,b\n1,2\n", "a,c\n1,2\n"), "columns changed");
+    }
+
+    /// A one-row change deep inside a large file trims down to a tiny
+    /// middle, so it stays exact (not the fallback's overcount) and fast:
+    /// this must run in well under a second even though it is 10,000 rows.
+    #[test]
+    fn a_single_change_in_ten_thousand_rows_is_exact_and_fast() {
+        let mut before = String::from("name,qty\n");
+        for i in 0..10_000 {
+            before.push_str(&format!("row{i},1\n"));
+        }
+        let mut after = before.clone();
+        after = after.replace("row5000,1\n", "row5000,9\n");
+        assert_eq!(summarize(&before, &after), "1 row changed");
+    }
+
+    /// A middle too big for the LCS cell limit (3,000x3,000 = 9,000,000
+    /// cells, well above [`super::LCS_CELL_LIMIT`]'s ~250,000) must fall
+    /// back to positional pairing rather than building the full DP table —
+    /// this asserts it returns promptly, which an unbounded table would not.
+    #[test]
+    fn a_large_middle_falls_back_without_building_a_big_table() {
+        let mut before = String::from("name,qty\n");
+        let mut after = String::from("name,qty\n");
+        for i in 0..3_000 {
+            before.push_str(&format!("before-row{i},1\n"));
+            after.push_str(&format!("after-row{i},1\n"));
+        }
+        // Entirely distinct rows on both sides: the fallback pairs them
+        // 1:1 as "changed" since both sides are the same length.
+        assert_eq!(summarize(&before, &after), "3000 rows changed");
     }
 }

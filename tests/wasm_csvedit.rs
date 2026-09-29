@@ -192,6 +192,181 @@ fn csvedit_tool_call_replies_with_a_frame_directive() {
     assert_eq!(directive.file, "data.csv");
 }
 
+/// The full tool round-trip: `tool_call` stages the directive, `frame_open`
+/// loads the staged file, a key sequence edits one cell and saves, and
+/// `frame_close` + `tool_resume` reports the row-count summary — only
+/// because `tool_call` ran first (the gate from fix round 1: an ordinary
+/// grid-bridge or `/csvedit` open never pays for this).
+#[test]
+fn csvedit_tool_edit_reports_a_changed_row_through_resume() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load(ID, &wasm, &["fs", "files", "log"]).expect("load");
+
+    let out = String::from_utf8(
+        h.call(
+            ID,
+            "tool_call",
+            br#"{"name": "edit_csv", "args": {"path": "x.csv"}}"#,
+        )
+        .expect("tool_call"),
+    )
+    .unwrap();
+    let directive = plank::tools::frames::parse_frame_directive(&out).expect("a frame directive");
+    assert_eq!(directive.file, "data.csv");
+
+    h.ram_write(ID, "/data.csv", b"A,B,C\n1,2,3\n")
+        .expect("stage the file plank would have written");
+
+    h.call(
+        ID,
+        "frame_open",
+        br#"{"w": 80, "h": 24, "seed": 1, "arg": "data.csv", "config": {}}"#,
+    )
+    .expect("frame_open");
+
+    let hm = h.as_mut();
+    key(hm, "enter", None); // begin editing the first cell
+    for c in "42".chars() {
+        key(hm, &c.to_string(), Some(c));
+    }
+    key(hm, "enter", None); // commit the cell
+    key(hm, "ctrl-s", None); // save: name is already "data.csv", no dialog
+
+    assert_eq!(
+        hm.ram_file(ID, "/data.csv").as_deref(),
+        Some(&b"A,B,C\n42,2,3\n"[..]),
+        "the edit landed on the RAM disk"
+    );
+
+    let closed = String::from_utf8(h.call(ID, "frame_close", b"").unwrap()).unwrap();
+    assert!(closed.contains("saved"), "{closed}");
+
+    let resumed = String::from_utf8(
+        h.call(
+            ID,
+            "tool_resume",
+            br#"{"path": "x.csv", "changed": true, "written": true, "error": null}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resumed, "1 row changed in x.csv");
+}
+
+/// A close with no edits at all reports "no changes", not a stale summary
+/// from an earlier tool-invoked edit.
+#[test]
+fn csvedit_tool_resume_reports_no_changes_after_a_clean_close() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load(ID, &wasm, &["fs", "files", "log"]).expect("load");
+
+    h.call(
+        ID,
+        "tool_call",
+        br#"{"name": "edit_csv", "args": {"path": "x.csv"}}"#,
+    )
+    .expect("tool_call");
+    h.ram_write(ID, "/data.csv", b"A,B,C\n1,2,3\n")
+        .expect("stage");
+    h.call(
+        ID,
+        "frame_open",
+        br#"{"w": 80, "h": 24, "seed": 1, "arg": "data.csv", "config": {}}"#,
+    )
+    .expect("frame_open");
+    h.call(ID, "frame_close", b"").expect("frame_close");
+
+    let resumed = String::from_utf8(
+        h.call(
+            ID,
+            "tool_resume",
+            br#"{"path": "x.csv", "changed": false, "written": false, "error": null}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resumed, "no changes to x.csv");
+}
+
+/// A host-reported error (e.g. the write failed) is surfaced alongside
+/// whatever the editor itself observed.
+#[test]
+fn csvedit_tool_resume_surfaces_a_host_error() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load(ID, &wasm, &["fs", "files", "log"]).expect("load");
+
+    h.call(
+        ID,
+        "tool_call",
+        br#"{"name": "edit_csv", "args": {"path": "x.csv"}}"#,
+    )
+    .expect("tool_call");
+    h.ram_write(ID, "/data.csv", b"A,B,C\n1,2,3\n")
+        .expect("stage");
+    h.call(
+        ID,
+        "frame_open",
+        br#"{"w": 80, "h": 24, "seed": 1, "arg": "data.csv", "config": {}}"#,
+    )
+    .expect("frame_open");
+    h.call(ID, "frame_close", b"").expect("frame_close");
+
+    let resumed = String::from_utf8(
+        h.call(
+            ID,
+            "tool_resume",
+            br#"{"path": "x.csv", "changed": false, "written": false, "error": "cannot write x.csv: refused"}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        resumed,
+        "error: no changes in the editor, but cannot write x.csv: refused"
+    );
+}
+
+/// A grid-bridge / `/csvedit` open with no preceding `tool_call` never
+/// records `ORIGINAL`, so it never pays for a diff and leaves `tool_resume`
+/// reporting "no changes" regardless of what was actually edited.
+#[test]
+fn csvedit_a_non_tool_open_never_records_a_summary() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load(ID, &wasm, &["fs", "files", "log"]).expect("load");
+
+    h.ram_write(ID, "/data.csv", b"A,B,C\n1,2,3\n")
+        .expect("stage");
+    h.call(
+        ID,
+        "frame_open",
+        br#"{"w": 80, "h": 24, "seed": 1, "arg": "data.csv", "config": {}}"#,
+    )
+    .expect("frame_open");
+    let hm = h.as_mut();
+    key(hm, "enter", None);
+    for c in "42".chars() {
+        key(hm, &c.to_string(), Some(c));
+    }
+    key(hm, "enter", None);
+    key(hm, "ctrl-s", None);
+    h.call(ID, "frame_close", b"").expect("frame_close");
+
+    let resumed = String::from_utf8(
+        h.call(
+            ID,
+            "tool_resume",
+            br#"{"path": "x.csv", "changed": true, "written": true, "error": null}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resumed, "no changes to x.csv");
+}
+
 #[test]
 fn csvedit_command_run_round_trips_a_quoted_and_backslashed_name() {
     let wasm = guest_or_skip!();

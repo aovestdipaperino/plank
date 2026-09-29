@@ -15,6 +15,9 @@ pub mod bash;
 pub mod diff;
 pub mod edit;
 pub mod files;
+// `pub`, not `pub(crate)`: `tests/wasm_csvedit.rs` is an external integration
+// test binary and needs `parse_frame_directive` to assert on a guest's
+// `tool_call` reply without parsing its own copy of the JSON shape.
 pub mod frames;
 pub mod mcp;
 pub mod mcp_advert;
