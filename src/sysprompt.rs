@@ -1432,7 +1432,8 @@ fn append_remember_schema(out: &mut String) {
          \x20     \"properties\": {\n\
          \x20       \"text\": {\"type\": \"string\", \"description\": \"the fact, one sentence\"},\n\
          \x20       \"type\": {\"type\": \"string\", \"description\": \"one of: user, feedback, project, reference\"},\n\
-         \x20       \"scope\": {\"type\": \"string\", \"description\": \"'user' to follow the user across projects, 'project' for this checkout; defaults to project\"}\n\
+         \x20       \"scope\": {\"type\": \"string\", \"description\": \"where it is stored, independent of type: 'project' (the default) for anything tied to this checkout, 'user' only for facts that hold in every folder\"},\n\
+         \x20       \"profile\": {\"type\": \"string\", \"description\": \"'all' to share it with every profile; otherwise it loads only for the one running now\"}\n\
          \x20     },\n\
          \x20     \"required\": [\"text\", \"type\"]\n\
          \x20   }\n\

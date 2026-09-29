@@ -447,7 +447,8 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
       "properties": {
         "text": {"type": "string", "description": "the fact, one sentence"},
         "type": {"type": "string", "description": "one of: user, feedback, project, reference"},
-        "scope": {"type": "string", "description": "'user' to follow the user across projects, 'project' for this checkout; defaults to project"}
+        "scope": {"type": "string", "description": "where it is stored, independent of type: 'project' (the default) for anything tied to this checkout, 'user' only for facts that hold in every folder"},
+        "profile": {"type": "string", "description": "'all' to share it with every profile; otherwise it loads only for the one running now"}
       },
       "required": ["text", "type"]
     }

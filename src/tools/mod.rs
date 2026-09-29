@@ -1127,18 +1127,22 @@ fn tool_remember(ctx: &mut ToolContext, call: &ToolCall) -> String {
     } else {
         crate::memory::Scope::Project
     };
+    let scope = crate::memory::effective_scope(scope, &ctx.cwd);
+    // Written for the running profile unless the model shares it with all.
+    let audience =
+        if call.arg_value("profile").unwrap_or("").trim() == crate::memory::Audience::ALL_TAG {
+            crate::memory::Audience::All
+        } else {
+            crate::memory::Audience::of(crate::memory::active_profile())
+        };
     let date = crate::context::current_local_iso_date();
     let entry = crate::memory::Entry {
         date,
         kind,
+        audience,
         text: text.to_string(),
     };
-    match crate::memory::remember(
-        scope,
-        &ctx.cwd,
-        &format!("[{}] {text}", kind.tag()),
-        &entry.date,
-    ) {
+    match crate::memory::remember(scope, &ctx.cwd, &entry.body(), &entry.date) {
         Ok(path) => {
             crate::memory::log_change_to(
                 ctx.memory_log_path.as_deref(),

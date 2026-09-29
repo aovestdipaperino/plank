@@ -7776,7 +7776,9 @@ impl Agent<'_> {
                     "{}",
                     self.debug_line(&format!("[saved to {}]", path.display()))
                 ),
-                Err(e) => println!("{e}\nusage: /remember [user] <text> (default scope: project)"),
+                Err(e) => println!(
+                    "{e}\nusage: /remember [user] [all] [<type>] <text> (default scope: project, this profile only)"
+                ),
             },
             "/forget" => {
                 let pattern = arg.trim();
@@ -11993,16 +11995,45 @@ the original is frozen and listed in /tree"
     }
 }
 
-/// Parses `/remember [user] <text>` and appends to the right memory scope:
-/// a leading `user` word selects the user file, everything else lands in the
-/// project file.
+/// Parses `/remember [user] [all] [<type>] <text>` and appends to the right
+/// memory scope: a leading `user` word selects the user file, everything
+/// else lands in the project file; a leading `[all]` (bracketed, so a note
+/// that opens with the word "all" stays a note) shares the entry with every
+/// profile, which otherwise loads only for the one running now; an optional
+/// `[type]` tag picks the entry type (`project` when absent).
 fn remember_from_arg(cwd: &std::path::Path, arg: &str) -> Result<std::path::PathBuf, String> {
-    let arg = arg.trim();
-    let (scope, text) = match arg.split_once(char::is_whitespace) {
-        Some(("user", rest)) => (crate::memory::Scope::User, rest),
-        _ => (crate::memory::Scope::Project, arg),
+    let date = crate::context::current_local_iso_date();
+    let (scope, all, text) = remember_words(arg);
+    // Parsed as the bullet it becomes, so a typed `[feedback]` is the type.
+    let Some(mut entry) = crate::memory::parse_entries(&format!("- ({date}) {text}"))
+        .into_iter()
+        .next()
+    else {
+        return Err("nothing to remember".to_string());
     };
-    crate::memory::remember(scope, cwd, text, &crate::context::current_local_iso_date())
+    if all {
+        entry.audience = crate::memory::Audience::All;
+    } else if entry.audience == crate::memory::Audience::Plain {
+        entry.audience = crate::memory::Audience::of(crate::memory::active_profile());
+    }
+    crate::memory::remember(scope, cwd, &entry.body(), &date)
+}
+
+/// Splits `/remember`'s leading `user` word and `[all]` tag, in either
+/// order, off the text.
+fn remember_words(arg: &str) -> (crate::memory::Scope, bool, &str) {
+    let mut scope = crate::memory::Scope::Project;
+    let mut all = false;
+    let mut rest = arg.trim();
+    while let Some((word, tail)) = rest.split_once(char::is_whitespace) {
+        match word {
+            "user" if scope == crate::memory::Scope::Project => scope = crate::memory::Scope::User,
+            "[all]" if !all => all = true,
+            _ => break,
+        }
+        rest = tail.trim_start();
+    }
+    (scope, all, rest)
 }
 
 /// The `/btw` side panel: `Some` while it splits the screen (main 60% / btw
@@ -15976,7 +16007,9 @@ impl Agent<'_> {
             self.extract_state.cancel();
             return false;
         }
-        let entries = crate::memextract::current_entries(&self.tool_ctx.cwd);
+        let project_scope = crate::profile::folder_context_enabled();
+        let active = crate::memory::active_profile();
+        let entries = crate::memextract::current_entries(&self.tool_ctx.cwd, project_scope, active);
         let slice = self.session.transcript[from.min(depth)..depth].to_vec();
 
         // The System-1 gate. Skipped entirely when off, and skipped once the
@@ -15990,7 +16023,7 @@ impl Agent<'_> {
             return false;
         }
 
-        let task = crate::memextract::build_prompt(&slice, &entries);
+        let task = crate::memextract::build_prompt(&slice, &entries, project_scope, active);
         self.extract_state.finish(depth);
         self.memory_jobs.push_back(crate::memextract::MemoryJob {
             task,
@@ -16151,7 +16184,14 @@ impl Agent<'_> {
             report
                 .as_deref()
                 .and_then(crate::memextract::extract_verdict_array)
-                .and_then(|json| crate::memory::parse_verdicts(json).ok())
+                .and_then(|json| {
+                    crate::memory::parse_verdicts(
+                        json,
+                        crate::memory::active_profile(),
+                        crate::profile::folder_context_enabled(),
+                    )
+                    .ok()
+                })
         } else {
             None
         };
@@ -17682,7 +17722,7 @@ impl Agent<'_> {
                 Ok(path) => log.push_dim(format!("[saved to {}]", path.display())),
                 Err(e) => {
                     log.push_plain(e);
-                    log.push_plain("usage: /remember [user] <text> (default scope: project)");
+                    log.push_plain("usage: /remember [user] [all] [<type>] <text> (default scope: project, this profile only)");
                 }
             },
             "/forget" => {
@@ -35702,6 +35742,22 @@ or the user's next message aborts before its first token"
     }
 
     #[test]
+    fn remember_words_take_user_and_a_bracketed_all_in_either_order() {
+        use crate::memory::Scope;
+        assert_eq!(remember_words("user [all] x"), (Scope::User, true, "x"));
+        assert_eq!(remember_words("[all] user x"), (Scope::User, true, "x"));
+        assert_eq!(
+            remember_words("[feedback] x"),
+            (Scope::Project, false, "[feedback] x")
+        );
+        // A note that opens with the bare word stays a note.
+        assert_eq!(
+            remember_words("all tests pass"),
+            (Scope::Project, false, "all tests pass")
+        );
+    }
+
+    #[test]
     fn compaction_shrinking_the_transcript_neither_disables_nor_skips_the_pass() {
         let dir = scratch_dir("memextract-compact");
         let cfg = test_cfg();
@@ -35732,7 +35788,8 @@ or the user's next message aborts before its first token"
         }
         assert!(
             agent.maybe_extract_memories(std::time::Duration::MAX),
-            "covers depth 0..6"
+            "covers depth 0..6: {:?}",
+            agent.pending_memory_notice
         );
         agent.session.push(Message::user("new-q"));
         agent.session.push(Message::assistant("new-a"));

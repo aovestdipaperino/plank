@@ -477,8 +477,19 @@ pub fn render_excerpt(slice: &[Message]) -> String {
 /// Builds the pass's prompt: the bounded transcript excerpt
 /// ([`render_excerpt`]), the current entries with their ids, and the
 /// verdict contract.
+///
+/// `project_scope` is whether the session loads the project file at all (a
+/// profile without `folderContext` does not): when it does not, the scope
+/// choice is not offered, since [`crate::memory::parse_verdicts`] sends every
+/// `ADD` to the user file anyway. `active` names the running profile, which
+/// new entries are written for unless shared with `"profile": "all"`.
 #[must_use]
-pub fn build_prompt(slice: &[Message], entries: &[(Scope, Entry)]) -> String {
+pub fn build_prompt(
+    slice: &[Message],
+    entries: &[(Scope, Entry)],
+    project_scope: bool,
+    active: Option<&str>,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::from(
         "You are the memory extraction pass. Read the conversation excerpt below and \
@@ -488,14 +499,42 @@ pub fn build_prompt(slice: &[Message], entries: &[(Scope, Entry)]) -> String {
          not in the code or git history, and pointers to external systems. Never save \
          code patterns, architecture, file paths, git history, debugging recipes, or \
          anything already stated in AGENTS.md. Convert relative dates to absolute ones.\n\n\
-         Reply with a JSON array and nothing else. Each element is one of:\n\
-         {\"verdict\": \"ADD\", \"text\": ..., \"type\": user|feedback|project|reference, \
-         \"scope\": user|project}\n\
-         {\"verdict\": \"UPDATE\", \"id\": ..., \"text\": ...}  (supersede an existing entry)\n\
+         Reply with a JSON array and nothing else. Each element is one of:\n",
+    );
+    if project_scope {
+        out.push_str(
+            "{\"verdict\": \"ADD\", \"text\": ..., \"type\": user|feedback|project|reference, \
+             \"scope\": user|project}\n",
+        );
+    } else {
+        out.push_str(
+            "{\"verdict\": \"ADD\", \"text\": ..., \"type\": user|feedback|project|reference}\n",
+        );
+    }
+    out.push_str(
+        "{\"verdict\": \"UPDATE\", \"id\": ..., \"text\": ...}  (supersede an existing entry)\n\
          {\"verdict\": \"DELETE\", \"id\": ...}  (it is redundant or wrong)\n\
          {\"verdict\": \"USED\", \"id\": ...}  (this entry bore on the work in the excerpt)\n\
-         An empty array is a valid and common answer.\n\n\
-         Existing entries:\n",
+         An empty array is a valid and common answer.\n\n",
+    );
+    // Without this the model reads `"scope": "user"` as "about the user" and
+    // files nearly everything globally, where it then loads in every folder.
+    if project_scope {
+        out.push_str(
+            "\"scope\" is where an entry is stored, not what it is about: \"project\" (the \
+             default) for anything tied to the work in this folder, \"user\" only for facts \
+             that hold in every folder, like who the user is. When unsure, use \"project\".\n",
+        );
+    }
+    let who = active.map_or_else(
+        || "this plain session (no profile)".to_string(),
+        |name| format!("the \"{name}\" profile"),
+    );
+    let _ = write!(
+        out,
+        "New entries load only for {who}; add \"profile\": \"all\" to an ADD only for facts \
+         true in every profile, like the user's name.\n\n\
+         Existing entries:\n"
     );
     if entries.is_empty() {
         out.push_str("(none)\n");
@@ -515,21 +554,37 @@ pub fn build_prompt(slice: &[Message], entries: &[(Scope, Entry)]) -> String {
     out
 }
 
-/// Reads every entry from both scopes, for the prompt. The file is the
-/// whole truth here: a model `forget` deletes its entry outright, so there
-/// is no hidden state to filter against.
+/// Reads, for the prompt, every entry the session itself loads: both scopes
+/// (only the user one when `include_project` is false), and only the
+/// entries `active`'s audience sees. The file is the whole truth here: a
+/// model `forget` deletes its entry outright, so there is no hidden state to
+/// filter against. Another profile's entries are left out so the pass can
+/// neither rewrite nor delete them.
 #[must_use]
-pub fn current_entries(cwd: &std::path::Path) -> Vec<(Scope, Entry)> {
+pub fn current_entries(
+    cwd: &std::path::Path,
+    include_project: bool,
+    active: Option<&str>,
+) -> Vec<(Scope, Entry)> {
     let mut out = Vec::new();
+    let user = crate::memory::path_for(Scope::User, cwd);
     for scope in [Scope::User, Scope::Project] {
+        if scope == Scope::Project && !include_project {
+            continue;
+        }
         let Some(path) = crate::memory::path_for(scope, cwd) else {
             continue;
         };
+        if scope == Scope::Project && user.as_ref() == Some(&path) {
+            continue;
+        }
         let Ok(body) = std::fs::read_to_string(&path) else {
             continue;
         };
         for e in crate::memory::parse_entries(&body) {
-            out.push((scope, e));
+            if e.audience.visible_to(active) {
+                out.push((scope, e));
+            }
         }
     }
     out
@@ -800,7 +855,7 @@ mod tests {
         use crate::memory::{Verdict, parse_verdicts};
         let reply = "```json\n[{\"verdict\": \"DELETE\", \"id\": \"def456\"}]\n```";
         let json = extract_verdict_array(reply).expect("array found");
-        let verdicts = parse_verdicts(json).expect("parses");
+        let verdicts = parse_verdicts(json, None, true).expect("parses");
         assert_eq!(
             verdicts,
             vec![Verdict::Delete {
@@ -811,10 +866,22 @@ mod tests {
 
     #[test]
     fn build_prompt_documents_the_four_verdict_words() {
-        let out = build_prompt(&[], &[]);
+        let out = build_prompt(&[], &[], true, None);
         for word in ["ADD", "UPDATE", "DELETE", "USED"] {
             assert!(out.contains(word), "prompt should mention verdict {word}");
         }
+    }
+
+    #[test]
+    fn the_prompt_says_scope_is_storage_and_names_the_profile() {
+        let out = build_prompt(&[], &[], true, Some("hal"));
+        assert!(out.contains("\"scope\" is where an entry is stored, not what it is about"));
+        assert!(out.contains("the \"hal\" profile"));
+        assert!(out.contains("\"profile\": \"all\""));
+        // Without folder context the scope choice is not offered at all.
+        let out = build_prompt(&[], &[], false, None);
+        assert!(!out.contains("\"scope\""));
+        assert!(out.contains("this plain session (no profile)"));
     }
 
     #[test]
@@ -828,7 +895,7 @@ mod tests {
             {"verdict": "USED", "id": "aaa111"}
         ]"#;
 
-        let verdicts = parse_verdicts(json).expect("valid JSON contract parses");
+        let verdicts = parse_verdicts(json, None, true).expect("valid JSON contract parses");
         assert_eq!(verdicts.len(), 4);
         assert_eq!(
             verdicts[0],
@@ -836,6 +903,7 @@ mod tests {
                 text: "prefers tabs".to_string(),
                 kind: Kind::User,
                 scope: Scope::User,
+                audience: crate::memory::Audience::Plain,
             }
         );
         assert_eq!(
@@ -877,8 +945,8 @@ mod tests {
             Message::user(format!("<tool_result>{big}</tool_result>")),
             Message::assistant("the log says hello"),
         ];
-        let out = build_prompt(&slice, &[]);
-        let fixed = build_prompt(&[], &[]).len();
+        let out = build_prompt(&slice, &[], true, None);
+        let fixed = build_prompt(&[], &[], true, None).len();
         assert!(
             out.len() <= fixed + EXCERPT_MAX_BYTES,
             "prompt is {} bytes, excerpt cap is {EXCERPT_MAX_BYTES}",

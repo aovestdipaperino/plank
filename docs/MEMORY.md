@@ -65,6 +65,47 @@ Tier 2 context ahead of the first user turn, user scope first. Either or both
 files can be absent; `load_default` returns `None` only when neither has
 renderable content, in which case no memory section appears at all.
 
+Launched from the home directory itself, the two paths are one file. Every
+loop that visits both scopes (`memory::scopes_for`) then visits it once, so
+nothing renders twice and no verdict applies twice, and writes land in the
+user scope (`memory::effective_scope`). A profile without `folderContext`
+never loads the project file, so its writes go to the user file as well:
+an entry stored where the session cannot see it would never come back.
+
+Scope is *where* an entry is stored, independent of its type. A `[user]`
+fact about how the user works on this repository is a project-scope entry.
+The extraction prompt says so explicitly, because without it the model read
+`"scope": "user"` as "about the user" and filed nearly everything in the
+global file, where it then loaded in every folder.
+
+### Profile segregation
+
+Each entry also has an audience: an optional second tag right after the
+type tag.
+
+```markdown
+- (2026-09-29) [project] a plain plank entry, no audience tag
+- (2026-09-29) [feedback] [hal] loads only under --profile hal
+- (2026-09-29) [user] [all] loads for every profile and for plain plank
+```
+
+No audience tag means the plain run with no `--profile`. `[name]` is one
+profile by its plugin name, and `[all]` is every profile plus the plain run
+(`memory::Audience`, `visible_to`). The tag is read only right after a type
+tag and only in the plugin-name grammar, so a legacy untagged line, or prose
+that opens with `[Illustration: ...]`, keeps its bracket as text. It is not
+part of the entry id (`Entry::id` hashes the text), so re-tagging keeps the
+usage counters.
+
+Every read filters by the running profile (`memory::active_profile`): the
+session-start render (`load_scoped_as`), the entries the extraction pass
+sees (`memextract::current_entries`) and therefore the ids it can update,
+delete or credit, and `/forget` and the `forget` tool (`forget_where_to`), so
+a coding session cannot delete what HAL remembers. `/memory` still edits the
+raw files, tags included. Writes stamp the running profile unless they ask
+for `[all]`: the `remember` tool's `profile: "all"`, an extraction `ADD`'s
+`"profile": "all"`, or `/remember [all] ...`.
+
 ### The four entry types, and what must never be saved
 
 Every entry carries a type, written as a `[tag]` right after the date:
@@ -264,8 +305,9 @@ Advertised to the model after the parity-frozen prompt region
 `false` removes both tools from the model's tool table, returning `unknown
 tool` if called anyway):
 
-- **`remember(text, type, scope)`** appends a dated, tagged bullet to the
-  named scope's file (default `project`). It writes immediately and logs the
+- **`remember(text, type, scope, profile)`** appends a dated, tagged bullet
+  to the named scope's file (default `project`), for the running profile
+  unless `profile` is `all`. It writes immediately and logs the
   change under the reason `remember tool`, but — per Part 1 — the entry is
   not visible in context until the next session start; the tool's own reply
   says so.
@@ -288,8 +330,11 @@ turn.
 
 The user-typed equivalents, on both front ends:
 
-- `/remember [user] <text>` — default scope is `project`; prefixing `user `
-  writes to the user scope instead. Writes through `memory::remember`
+- `/remember [user] [all] [<type>] <text>`: default scope is `project`;
+  prefixing `user ` writes to the user scope instead, and `[all]` (always
+  bracketed, so a note opening with the word "all" stays a note) shares the
+  entry with every profile. A leading `[type]` picks the type, `project`
+  when absent. Writes through `memory::remember`
   directly and is **not** logged to the audit log; only the tools and the
   pass write there.
 - `/forget <pattern>` — a case-insensitive substring match against every
