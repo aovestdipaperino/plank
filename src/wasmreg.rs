@@ -167,10 +167,13 @@ impl Capability {
         matches!(self, Self::Exec | Self::Net)
     }
 
-    /// True when a host function actually stands behind this grant.
+    /// True when a host function, or the host itself, honours this grant.
     ///
-    /// `notify`, `agent` and `session` parse, appear in the approval prompt and
-    /// reach nothing; `net` and `exec` are left out on purpose.
+    /// `files` is handled entirely on the host side (the frame directive in
+    /// `tools::frames`) rather than through a `WasmHost` trait function, but
+    /// it is fully implemented, so it counts as wired just like the others.
+    /// `agent` and `session` parse, appear in the approval prompt and reach
+    /// nothing; `net` and `exec` are left out on purpose.
     /// Approving a capability that does not exist is worse than refusing it —
     /// the user has consented to something, and nothing tells them it was
     /// nothing — so the loader warns rather than staying silent.
@@ -178,7 +181,13 @@ impl Capability {
     pub fn is_wired(self) -> bool {
         matches!(
             self,
-            Self::Log | Self::Print | Self::State | Self::Sound | Self::Notify | Self::Fs
+            Self::Log
+                | Self::Print
+                | Self::State
+                | Self::Sound
+                | Self::Notify
+                | Self::Fs
+                | Self::Files
         )
     }
 
@@ -3957,6 +3966,10 @@ mod tests {
             Capability::Sound,
             Capability::Notify,
             Capability::Fs,
+            // `files` reaches no `WasmHost` trait function, but the host
+            // itself honours it fully in `tools::frames`, so it counts as
+            // wired: it must not warn as unimplemented.
+            Capability::Files,
         ] {
             assert!(c.is_wired(), "{c:?}");
         }
@@ -3965,10 +3978,6 @@ mod tests {
             Capability::Session,
             Capability::Net,
             Capability::Exec,
-            // `files` is handled entirely on the host side (the frame
-            // directive in `tools::frames`), so it stands up no host
-            // function of its own either.
-            Capability::Files,
         ] {
             assert!(!c.is_wired(), "{c:?}");
         }

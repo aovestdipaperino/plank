@@ -33,9 +33,10 @@ pub fn parse_frame_directive(output: &str) -> Option<FrameDirective> {
 }
 
 /// Honours `d` for `component`: checks the `files` grant and the path for
-/// writing before anything else, stages the file (empty when missing), runs
-/// the editor, writes back only a changed file, atomically, and lets the
-/// component report through its optional `tool_resume` export.
+/// writing before anything else, refuses a target that is itself a symlink
+/// (nothing here canonicalises it for us), stages the file (empty when
+/// missing), runs the editor, writes back only a changed file, atomically,
+/// and lets the component report through its optional `tool_resume` export.
 pub fn run_edit_directive(ctx: &mut ToolContext, component: &str, d: FrameDirective) -> String {
     let FrameDirective { path, file } = d;
     let has_files = ctx.wasm.registry.loaded.iter().any(|l| {
@@ -52,6 +53,19 @@ pub fn run_edit_directive(ctx: &mut ToolContext, component: &str, d: FrameDirect
         Ok(p) => p,
         Err(e) => return e,
     };
+    // `resolve_for_write` joins `cwd` with the raw path; it does not
+    // canonicalise, so a target that is itself a symlink would otherwise be
+    // read through and then silently replaced by `write_atomically`'s
+    // rename (which drops the link and leaves a plain file in its place).
+    // Refuse it outright instead of guessing which side the model meant.
+    if let Ok(meta) = std::fs::symlink_metadata(&target)
+        && meta.file_type().is_symlink()
+    {
+        return format!(
+            "Tool error: {} is a symlink; refusing to edit through it\n",
+            target.display()
+        );
+    }
     let bytes = match std::fs::read(&target) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -78,9 +92,61 @@ pub fn run_edit_directive(ctx: &mut ToolContext, component: &str, d: FrameDirect
     resume(ctx, component, &target, changed, written, error.as_deref())
 }
 
+/// A sibling temp name unique to this process and call, so `a.csv` and
+/// `a.tsv` (or two concurrent edits of the same file name in different
+/// directories) never collide.
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn temp_sibling(target: &std::path::Path) -> std::path::PathBuf {
+    let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    target.with_file_name(format!("{name}.{}.{n}.plank-edit.tmp", std::process::id()))
+}
+
+/// Writes `bytes` to a fresh sibling of `target` and renames it into place.
+///
+/// The sibling is opened with `create_new`, which refuses an already
+/// existing path — including a dangling or live symlink planted at that
+/// name — instead of following it, closing the containment hole an
+/// attacker-controlled cwd (e.g. via a sandboxed `bash` call) would
+/// otherwise have through a predictable temp name. The temp file is removed
+/// on every failure path, including a failed write, and the original
+/// file's permissions (when it existed) are carried over before the
+/// rename so the replacement is not left more permissive than the file it
+/// replaces.
+/// Opens `path` for writing only if nothing is there yet: `create_new`
+/// refuses an existing path outright, including a dangling or live symlink,
+/// rather than following it. This is what keeps a predictable temp name from
+/// becoming a write-anywhere primitive.
+fn create_new(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
 fn write_atomically(target: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = target.with_extension("plank-edit.tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    use std::io::Write as _;
+    let tmp = temp_sibling(target);
+    let mut file = create_new(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+    if let Err(e) = file.write_all(bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot write {}: {e}", tmp.display()));
+    }
+    drop(file);
+    if let Ok(original) = std::fs::metadata(target)
+        && let Err(e) = std::fs::set_permissions(&tmp, original.permissions())
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "cannot preserve permissions on {}: {e}",
+            tmp.display()
+        ));
+    }
     std::fs::rename(&tmp, target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("cannot replace {}: {e}", target.display())
@@ -88,7 +154,10 @@ fn write_atomically(target: &std::path::Path, bytes: &[u8]) -> Result<(), String
 }
 
 /// The tool's final output: the component's `tool_resume` reply when it has
-/// the export, else plank's own line.
+/// the export, else plank's own line. A trapping `tool_resume` costs the
+/// component a strike, the same accounting `Registry::run_tool` applies to
+/// a trapping `tool_call`, and still reports the real outcome through
+/// plank's own line rather than swallowing it.
 fn resume(
     ctx: &mut ToolContext,
     component: &str,
@@ -99,29 +168,35 @@ fn resume(
 ) -> String {
     use crate::wasmreg::json_str;
     let path = target.display().to_string();
+    let fallback = |error: Option<&str>| match (error, changed) {
+        (Some(e), _) => format!("Tool error: {e}\n"),
+        (None, true) => format!("saved changes to {path}\n"),
+        (None, false) => format!("no changes to {path}\n"),
+    };
     if ctx.wasm.host.has_export(component, "tool_resume") {
         let payload = format!(
             "{{\"path\": {}, \"changed\": {changed}, \"written\": {written}, \"error\": {}}}",
             json_str(&path),
             error.map_or_else(|| "null".to_string(), json_str)
         );
-        if let Ok(bytes) = ctx
+        match ctx
             .wasm
             .host
             .call(component, "tool_resume", payload.as_bytes())
         {
-            let mut out = String::from_utf8_lossy(&bytes).into_owned();
-            if !out.ends_with('\n') {
-                out.push('\n');
+            Ok(bytes) => {
+                let mut out = String::from_utf8_lossy(&bytes).into_owned();
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                return out;
             }
-            return out;
+            Err(_) => {
+                ctx.wasm.registry.strike(component);
+            }
         }
     }
-    match (error, changed) {
-        (Some(e), _) => format!("Tool error: {e}\n"),
-        (None, true) => format!("saved changes to {path}\n"),
-        (None, false) => format!("no changes to {path}\n"),
-    }
+    fallback(error)
 }
 
 /// Runs `component` as an editor on `bytes`, staged as `file` on its RAM
@@ -412,9 +487,8 @@ mod tests {
     #[test]
     fn an_edited_file_is_written_back_and_a_missing_one_starts_empty() {
         let dir = tempdir("directive-edit");
-        let ctx = files_ctx(&dir);
+        let mut ctx = files_ctx(&dir);
         let bridge = crate::framebridge::FrameBridge::new();
-        let mut ctx = ctx;
         ctx.frame_bridge = Some(bridge.clone());
         let h = ui_thread(bridge, Some(b"a,b\n1,2\n"), FrameClose::Closed);
         let (_ctx, out) = lend_bounded(ctx, |ctx| {
@@ -433,6 +507,7 @@ mod tests {
             out,
             format!("saved changes to {}\n", dir.join("new.csv").display())
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -443,9 +518,8 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
-        let ctx = files_ctx(&dir);
+        let mut ctx = files_ctx(&dir);
         let bridge = crate::framebridge::FrameBridge::new();
-        let mut ctx = ctx;
         ctx.frame_bridge = Some(bridge.clone());
         let h = ui_thread(bridge, None, FrameClose::Closed);
         let (_ctx, out) = lend_bounded(ctx, |ctx| {
@@ -470,8 +544,12 @@ mod tests {
             out,
             format!("no changes to {}\n", dir.join("a.csv").display())
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// No UI thread is ever started here on purpose: a quota check that
+    /// staged (and so lent) before rejecting the file would hang instead of
+    /// failing, and `lend_bounded` turns that hang into a timeout panic.
     #[test]
     fn a_file_over_the_disk_quota_is_refused_before_editing() {
         let dir = tempdir("directive-big");
@@ -479,16 +557,105 @@ mod tests {
         std::fs::write(dir.join("big.csv"), &big).unwrap();
         let mut ctx = files_ctx(&dir);
         ctx.frame_bridge = Some(crate::framebridge::FrameBridge::new());
-        let out = run_edit_directive(
-            &mut ctx,
-            ID,
-            FrameDirective {
-                path: "big.csv".into(),
-                file: "data.csv".into(),
-            },
-        );
+        let (_ctx, out) = lend_bounded(ctx, |ctx| {
+            run_edit_directive(
+                ctx,
+                ID,
+                FrameDirective {
+                    path: "big.csv".into(),
+                    file: "data.csv".into(),
+                },
+            )
+        });
         assert!(out.starts_with("Tool error: "), "{out}");
         assert!(out.contains("too large"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path outside every writable root is refused by `resolve_for_write`
+    /// itself, before the file is read, the quota is checked, or anything
+    /// is lent. No UI thread runs, and `lend_bounded` bounds the call so a
+    /// regression that started lending anyway fails instead of hanging.
+    #[test]
+    fn a_directive_outside_the_write_roots_is_refused_and_never_lends() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let dir = tempdir("directive-escape");
+        let mut ctx = files_ctx(&dir);
+        ctx.sandbox.enabled = true;
+        ctx.frame_bridge = Some(crate::framebridge::FrameBridge::new());
+        let target =
+            std::path::PathBuf::from(home).join(".plank/plank_frames_containment_test.csv");
+        let directive_path = target.to_string_lossy().into_owned();
+        let (_ctx, out) = lend_bounded(ctx, move |ctx| {
+            run_edit_directive(
+                ctx,
+                ID,
+                FrameDirective {
+                    path: directive_path,
+                    file: "data.csv".into(),
+                },
+            )
+        });
+        assert_eq!(
+            out,
+            format!(
+                "Tool error: frame path escapes workspace: {}\n",
+                target.display()
+            )
+        );
+        assert!(!target.exists(), "a refused directive must not write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pre-existing symlink at the target itself must not be silently
+    /// replaced by a regular file: `resolve_for_write` does not canonicalise
+    /// its result (see `run_edit_directive`'s comment), so the check has to
+    /// happen explicitly.
+    #[test]
+    fn a_symlinked_target_is_refused_not_replaced() {
+        let dir = tempdir("directive-target-symlink");
+        let outside = dir.join("outside.csv");
+        std::fs::write(&outside, b"untouched\n").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link.csv")).unwrap();
+        let mut ctx = files_ctx(&dir);
+        ctx.frame_bridge = Some(crate::framebridge::FrameBridge::new());
+        let (_ctx, out) = lend_bounded(ctx, |ctx| {
+            run_edit_directive(
+                ctx,
+                ID,
+                FrameDirective {
+                    path: "link.csv".into(),
+                    file: "data.csv".into(),
+                },
+            )
+        });
+        assert!(out.contains("is a symlink"), "{out}");
+        assert!(
+            std::fs::symlink_metadata(dir.join("link.csv"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive untouched"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `create_new` is the one thing standing between a predictable temp
+    /// name and a write-anywhere primitive: it must refuse an existing path,
+    /// including a symlink, rather than follow it.
+    #[test]
+    fn create_new_refuses_an_existing_path_including_a_symlink() {
+        let dir = tempdir("create-new-symlink");
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, b"untouched\n").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(create_new(&link).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
