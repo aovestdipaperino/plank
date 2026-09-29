@@ -194,12 +194,13 @@ fn write_atomically(target: &std::path::Path, bytes: &[u8]) -> Result<(), String
 /// The tool's final output: the component's `tool_resume` reply when it has
 /// the export, else plank's own line. A trapping `tool_resume` costs the
 /// component a strike, the same accounting `Registry::run_tool` applies to
-/// a trapping `tool_call` (`Registry::strike`, `wasmreg.rs`), and still
+/// a trapping `tool_call` (`Registry::strike`, `wasmreg.rs`) — including the
+/// "disabled for this session" note once the strike limit is hit — and still
 /// reports the real outcome through plank's own line rather than swallowing
 /// it. The trap's own text is not otherwise surfaced anywhere the model or
-/// the user would see it — the same "log it, don't propagate it" trade-off
-/// `Registry::dispatch` makes for a trapping event subscriber — so it is
-/// printed to stderr, in the same `"{id}: {e}"` shape those call sites use.
+/// the user would see it, so it goes to `crate::errlog` (never stderr: this
+/// path only runs under the TUI, which owns the terminal's alternate screen,
+/// and nothing redirects stderr while it runs).
 fn resume(
     ctx: &mut ToolContext,
     component: &str,
@@ -234,8 +235,15 @@ fn resume(
                 return out;
             }
             Err(e) => {
-                eprintln!("plank: {component}: tool_resume trapped: {e}");
-                ctx.wasm.registry.strike(component);
+                crate::errlog::log_error("wasm", &format!("{component}: tool_resume trapped: {e}"));
+                if ctx.wasm.registry.strike(component) {
+                    let base = fallback(error);
+                    return format!(
+                        "{} (disabled for this session after {} failures)\n",
+                        base.trim_end_matches('\n'),
+                        crate::wasmreg::STRIKE_LIMIT
+                    );
+                }
             }
         }
     }
@@ -415,6 +423,18 @@ mod tests {
     use super::*;
 
     const ID: &str = "dev.plank.csvedit";
+
+    /// Removes the directory on drop, so a test that builds a scratch
+    /// directory outside the system temp dir (e.g. under `$HOME`, which
+    /// nothing else here cleans up between runs) cannot leak it when an
+    /// assertion in between panics.
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn without_a_bridge_nothing_opens() {
@@ -735,6 +755,11 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&outside).unwrap();
+        // A drop guard rather than a bare cleanup line at the bottom: a
+        // failed assertion below must not leak this directory under
+        // `$HOME`, where nothing else in this test module cleans up
+        // between runs the way `tempdir` does for the system temp dir.
+        let _outside_guard = RemoveOnDrop(outside.clone());
         let sub = dir.join("sub");
         let outside_for_thread = outside.clone();
         let h = std::thread::spawn(move || {
@@ -782,7 +807,6 @@ mod tests {
         );
         assert!(out.starts_with("Tool error: "), "{out}");
         assert!(out.contains("escapes workspace"), "{out}");
-        let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_file(dir.join("sub"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -850,7 +874,33 @@ mod tests {
         ctx.wasm.host = Box::new(ResumeTrapHost::default());
         let bridge = crate::framebridge::FrameBridge::new();
         ctx.frame_bridge = Some(bridge.clone());
-        let h = ui_thread(bridge, Some(b"a,b\n1,2\n"), FrameClose::Closed);
+        // `resume` calls `tool_resume` regardless of whether the edit
+        // changed anything, so an untouched edit (nothing staged) is enough
+        // to trap it every time without needing distinct content per round.
+        let mut ctx = ctx;
+        for n in 1..crate::wasmreg::STRIKE_LIMIT {
+            let h = ui_thread(bridge.clone(), None, FrameClose::Closed);
+            let (next_ctx, out) = lend_bounded(ctx, |ctx| {
+                run_edit_directive(
+                    ctx,
+                    ID,
+                    FrameDirective {
+                        path: "a.csv".into(),
+                        file: "data.csv".into(),
+                    },
+                )
+            });
+            h.join().unwrap();
+            ctx = next_ctx;
+            assert_eq!(
+                out,
+                format!("no changes to {}\n", dir.join("a.csv").display()),
+                "strike {n}"
+            );
+        }
+        // The strike that hits the limit adds the same "disabled" note
+        // `Registry::run_tool` appends to a trapping `tool_call`.
+        let h = ui_thread(bridge, None, FrameClose::Closed);
         let (ctx, out) = lend_bounded(ctx, |ctx| {
             run_edit_directive(
                 ctx,
@@ -864,7 +914,11 @@ mod tests {
         h.join().unwrap();
         assert_eq!(
             out,
-            format!("saved changes to {}\n", dir.join("a.csv").display())
+            format!(
+                "no changes to {} (disabled for this session after {} failures)\n",
+                dir.join("a.csv").display(),
+                crate::wasmreg::STRIKE_LIMIT
+            )
         );
         let strikes = ctx
             .wasm
@@ -874,7 +928,7 @@ mod tests {
             .find(|l| l.component.manifest.id == ID)
             .unwrap()
             .strikes;
-        assert_eq!(strikes, 1, "a trapping tool_resume costs a strike");
+        assert_eq!(strikes, crate::wasmreg::STRIKE_LIMIT, "every trap struck");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
