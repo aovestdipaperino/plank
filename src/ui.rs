@@ -2379,6 +2379,10 @@ struct Agent<'a> {
     /// so nothing captured against it — payload, rung, micro-compaction — may
     /// be written as if it were the session's own (see [`Agent::in_sidechain`]).
     sidechain_depth: usize,
+    /// True while a turn a remote controller started is running, so a tool
+    /// call that would open a frame editor on the local screen, which nobody
+    /// may be watching, is refused instead (`ToolContext::editor_refusal`).
+    turn_from_remote: bool,
     /// Open clean-room sidechains running on an alternate engine
     /// ([`run_sidechain_on`](Self::run_sidechain_on)). While it is non-zero
     /// `self.engine` is not the session's own, so nothing about the
@@ -4000,6 +4004,21 @@ impl Agent<'_> {
         out
     }
 
+    /// Says, through `ToolContext::editor_refusal`, why a frame editor may
+    /// not open for the next dispatch, if it may not: a sub-agent's call has
+    /// no screen of its own, and a turn a remote controller started has
+    /// nobody at the local one. Set before every dispatch, so a reason never
+    /// outlives the state it came from.
+    fn refresh_editor_refusal(&mut self) {
+        self.tool_ctx.editor_refusal = if self.in_sidechain() {
+            Some("editors cannot open inside a sub-agent".to_string())
+        } else if self.turn_from_remote {
+            Some("the editor needs the local screen".to_string())
+        } else {
+            None
+        };
+    }
+
     /// The dispatch half of [`Self::run_tool_calls`]: routes the stanza to
     /// the right executor and frames the results.
     fn dispatch_stanza(
@@ -4009,6 +4028,9 @@ impl Agent<'_> {
         has_block: bool,
         needs_engine: impl Fn(&ToolCall) -> bool,
     ) -> String {
+        // `dispatch_all` below bypasses `dispatch_tool`, so the refusal is
+        // chosen here too.
+        self.refresh_editor_refusal();
         if has_block {
             // Per-call dispatch so blocked calls get hard error results instead
             // of running. Non-blocked calls in the same stanza still dispatch.
@@ -4157,6 +4179,7 @@ impl Agent<'_> {
     /// [`dispatch_tool`](Self::dispatch_tool) for every call not sent with
     /// `suspend_model`: the reactive cycle after a refused first run.
     fn dispatch_tool_reactive(&mut self, call: &ToolCall) -> String {
+        self.refresh_editor_refusal();
         self.tool_ctx.bash.last_foreground = None;
         let first = dispatch(call, &mut self.tool_ctx).output;
         let Some(exit) = self.tool_ctx.bash.last_foreground.take() else {
@@ -12538,6 +12561,9 @@ impl Agent<'_> {
         let ask_bridge = crate::tools::ask::AskBridge::new();
         self.tool_ctx.asker = Some(Box::new(crate::tools::ask::BridgeAsker(ask_bridge.clone())));
         self.tool_ctx.ask_bridge = Some(ask_bridge);
+        // The busy loop drives the frames tool calls lend the WASM session
+        // for (`FrameBridge`); without it they are refused.
+        self.tool_ctx.frame_bridge = Some(crate::framebridge::FrameBridge::new());
         // stdout is the alternate screen from here on: drop the REPL's
         // print-to-stdout status sink. `worker_turn` installs a channel-backed
         // one for the duration of each turn.
@@ -12932,23 +12958,12 @@ impl Agent<'_> {
                 }
             }
             if let Some(open) = wasm_frame.as_mut() {
-                let dt = wasm_frame_last.elapsed();
-                wasm_frame_last = Instant::now();
-                let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
-                let now_ms = u64::try_from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_millis()),
-                )
-                .unwrap_or(0);
-                let dt_ms = u64::try_from(dt.as_millis()).unwrap_or(u64::MAX);
+                let size = terminal.size().map_or((80, 24), |s| (s.width, s.height));
                 // A step that fails closes the frame and says why: a
                 // full-screen component that can no longer say what to draw
                 // would otherwise sit there looking like a hang.
                 if let Err(e) =
-                    self.tool_ctx
-                        .wasm
-                        .step_frame(open, dt_ms, w, h.saturating_sub(1), now_ms)
+                    frame_step(&mut self.tool_ctx.wasm, open, &mut wasm_frame_last, size)
                 {
                     log.push_dim(e);
                     // A trapped grid may have saved first: what is on its
@@ -13203,7 +13218,10 @@ impl Agent<'_> {
                         }
                     }
                     if run {
-                        self.tui_turn(
+                        // Cleared before the `?`, so a failed turn does not
+                        // leave the next local one refusing editors.
+                        self.turn_from_remote = true;
+                        let turn = self.tui_turn(
                             terminal,
                             &mut log,
                             &mut view,
@@ -13211,7 +13229,9 @@ impl Agent<'_> {
                             &mut btw_panel,
                             &mut arcade,
                             &mut sub_pane,
-                        )?;
+                        );
+                        self.turn_from_remote = false;
+                        turn?;
                         // A remote-driven turn is time the user was not idle
                         // at the prompt: start the screensaver clock from the
                         // moment the UI comes back to idle, not from before
@@ -13381,23 +13401,21 @@ impl Agent<'_> {
                     let (w, h) = terminal
                         .size()
                         .map_or((80, 23), |s| (s.width, s.height.saturating_sub(1)));
-                    if let Some(mouse) = tui::frame_mouse_event(m, w, h) {
-                        match self.tool_ctx.wasm.frame_mouse(open, &mouse) {
-                            Ok(crate::wasmreg::FrameOutcome::Stay) => {}
-                            Ok(crate::wasmreg::FrameOutcome::Close(line)) => {
-                                if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
-                                    log.push_dim(line);
-                                }
-                                grid_write_backs.extend(self.tool_ctx.wasm.finish_grid(open));
-                                wasm_frame = None;
-                                arcade_hover_reporting(false);
+                    match frame_mouse_event(&mut self.tool_ctx.wasm, open, *m, (w, h)) {
+                        Ok(crate::wasmreg::FrameOutcome::Stay) => {}
+                        Ok(crate::wasmreg::FrameOutcome::Close(line)) => {
+                            if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
+                                log.push_dim(line);
                             }
-                            Err(e) => {
-                                log.push_dim(e);
-                                grid_write_backs.extend(self.tool_ctx.wasm.finish_grid(open));
-                                wasm_frame = None;
-                                arcade_hover_reporting(false);
-                            }
+                            grid_write_backs.extend(self.tool_ctx.wasm.finish_grid(open));
+                            wasm_frame = None;
+                            arcade_hover_reporting(false);
+                        }
+                        Err(e) => {
+                            log.push_dim(e);
+                            grid_write_backs.extend(self.tool_ctx.wasm.finish_grid(open));
+                            wasm_frame = None;
+                            arcade_hover_reporting(false);
                         }
                     }
                 }
@@ -13615,12 +13633,7 @@ impl Agent<'_> {
             // An open component owns every key, on the same terms as the
             // arcade below it.
             if let Some(open) = &wasm_frame {
-                let code = tui::key_code_name(key);
-                match self
-                    .tool_ctx
-                    .wasm
-                    .frame_key(open, &code, tui::key_text(key))
-                {
+                match frame_key_event(&mut self.tool_ctx.wasm, open, key) {
                     Ok(crate::wasmreg::FrameOutcome::Stay) => {}
                     Ok(crate::wasmreg::FrameOutcome::Close(line)) => {
                         if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
@@ -14748,6 +14761,7 @@ impl Agent<'_> {
             bus.as_deref(),
             ui_remote.as_deref(),
             None,
+            None,
             &live,
             |tx| body(self, &tx),
         );
@@ -14853,6 +14867,7 @@ impl Agent<'_> {
             // the tool context before the closure borrows `self`. Only the main
             // turn dispatches tools (and thus `ask`); the btw drain never does.
             let ask_bridge = self.tool_ctx.ask_bridge.clone();
+            let frame_bridge = self.tool_ctx.frame_bridge.clone();
             // Snapshot the read-only reports so `/context` & co. stay usable
             // while the worker owns the engine for this turn.
             let live = LiveCommands::capture(self);
@@ -14879,6 +14894,7 @@ impl Agent<'_> {
                     bus_ref,
                     rem,
                     ask_bridge.as_ref(),
+                    frame_bridge.as_ref(),
                     &live,
                     |tx| self.worker_turn(&tx, shared),
                 );
@@ -14928,6 +14944,7 @@ impl Agent<'_> {
                     shared,
                     bus_ref,
                     rem,
+                    None,
                     None,
                     &live,
                     |tx| {
@@ -14992,6 +15009,7 @@ impl Agent<'_> {
                             shared,
                             bus_ref,
                             rem,
+                            None,
                             None,
                             &live,
                             |tx| self.adjudicate_worker(&tx, shared),
@@ -17315,6 +17333,7 @@ impl Agent<'_> {
             bus.as_deref(),
             ui_remote.as_deref(),
             None,
+            None,
             &live,
             |tx| {
                 self.drain_btw(&tx, &shared);
@@ -18606,6 +18625,182 @@ fn run_pick_panel(
     }
 }
 
+/// One tick of an open WASM frame: measures the wall-clock delta since `last`
+/// (render events and polls arrive irregularly, so it cannot be inferred) and
+/// steps the component at `size`, one row short for the status line.
+fn frame_step(
+    session: &mut crate::wasmreg::Session,
+    open: &mut crate::wasmreg::OpenFrame,
+    last: &mut Instant,
+    size: (u16, u16),
+) -> Result<(), String> {
+    let dt = last.elapsed();
+    *last = Instant::now();
+    let (w, h) = size;
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+    )
+    .unwrap_or(0);
+    let dt_ms = u64::try_from(dt.as_millis()).unwrap_or(u64::MAX);
+    session.step_frame(open, dt_ms, w, h.saturating_sub(1), now_ms)
+}
+
+/// Hands a key press to an open WASM frame.
+fn frame_key_event(
+    session: &mut crate::wasmreg::Session,
+    open: &crate::wasmreg::OpenFrame,
+    key: KeyEvent,
+) -> Result<crate::wasmreg::FrameOutcome, String> {
+    let code = tui::key_code_name(key);
+    session.frame_key(open, &code, tui::key_text(key))
+}
+
+/// Hands a mouse event to an open WASM frame. `area` is the frame's own area
+/// (the terminal less the status row); an event the component has no name
+/// for is absorbed as `Stay`.
+fn frame_mouse_event(
+    session: &mut crate::wasmreg::Session,
+    open: &crate::wasmreg::OpenFrame,
+    mouse: ratatui::crossterm::event::MouseEvent,
+    area: (u16, u16),
+) -> Result<crate::wasmreg::FrameOutcome, String> {
+    match tui::frame_mouse_event(&mouse, area.0, area.1) {
+        Some(mouse) => session.frame_mouse(open, &mouse),
+        None => Ok(crate::wasmreg::FrameOutcome::Stay),
+    }
+}
+
+/// Takes a session a tool call lent through `bridge`, runs `drive` on it, and
+/// always gives it back — whatever `drive` returns, error included.
+///
+/// The worker is blocked in `FrameBridge::lend` until the session comes back,
+/// and `run_worker_ui` joins it before the thread scope can end: a path that
+/// returned without giving back would hang plank. So `drive` has no way to
+/// return without handing the session over, and this is the only place that
+/// gives it back.
+fn serve_lent_frame(
+    bridge: &crate::framebridge::FrameBridge,
+    drive: impl FnOnce(
+        crate::wasmreg::Session,
+        crate::framebridge::FrameRequest,
+    ) -> (
+        crate::wasmreg::Session,
+        crate::framebridge::FrameClose,
+        Result<(), String>,
+    ),
+) -> Result<(), String> {
+    let Some((session, req)) = bridge.take() else {
+        return Ok(());
+    };
+    let (session, close, result) = drive(session, req);
+    bridge.give_back(session, close);
+    result
+}
+
+/// Gives back, as failed, any session a tool call parks on `bridge` until
+/// `finished` says the worker is gone. For the busy loop's exits: once it
+/// stops serving the bridge, a worker that lends (or has just lent) would
+/// otherwise wait on it forever, and the join after it with it. Polls, since
+/// a lend can land between a check and the worker's exit.
+fn release_lent_frames(bridge: &crate::framebridge::FrameBridge, finished: impl Fn() -> bool) {
+    loop {
+        if let Some((session, _)) = bridge.take() {
+            bridge.give_back(
+                session,
+                crate::framebridge::FrameClose::Failed(
+                    "the screen went away before the frame could open".to_string(),
+                ),
+            );
+        }
+        if finished() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Drives a frame a tool call lent the WASM session for, until it closes,
+/// then hands the session back. Modal, like `run_ask_panel`: the worker is
+/// blocked on the bridge, so nothing else needs servicing, and every key goes
+/// to the component, Ctrl-C included (the component's own close, or a trap,
+/// are the only ways out).
+fn run_frame_panel(
+    terminal: &mut ratatui::DefaultTerminal,
+    bridge: &crate::framebridge::FrameBridge,
+) -> Result<(), String> {
+    serve_lent_frame(bridge, |session, req| drive_frame(terminal, session, &req))
+}
+
+/// `run_frame_panel`'s body. Returns the session with every outcome, so the
+/// caller can give it back on each of them; the `Result` is a terminal
+/// failure the busy loop must see, the `FrameClose` what the tool call does.
+fn drive_frame(
+    terminal: &mut ratatui::DefaultTerminal,
+    mut session: crate::wasmreg::Session,
+    req: &crate::framebridge::FrameRequest,
+) -> (
+    crate::wasmreg::Session,
+    crate::framebridge::FrameClose,
+    Result<(), String>,
+) {
+    use crate::framebridge::FrameClose;
+    use crate::wasmreg::FrameOutcome;
+    let size = |t: &ratatui::DefaultTerminal| t.size().map_or((80, 24), |s| (s.width, s.height));
+    let (w, h) = size(terminal);
+    let mut open = match session.open_frame(
+        &req.component,
+        &req.file,
+        w,
+        h.saturating_sub(1),
+        arcade_seed(),
+    ) {
+        Ok(open) => open,
+        Err(e) => return (session, FrameClose::Failed(e), Ok(())),
+    };
+    // The component owns the pointer while it is up, as at idle.
+    arcade_hover_reporting(true);
+    let mut last = Instant::now();
+    let (close, result) = loop {
+        if let Err(e) = frame_step(&mut session, &mut open, &mut last, size(terminal)) {
+            break (FrameClose::Failed(e), Ok(()));
+        }
+        if let Err(e) = terminal.draw(|f| tui::draw_wasm_frame(f, &open)) {
+            let _ = session.close_frame(&open);
+            break (FrameClose::Failed(e.to_string()), Err(e.to_string()));
+        }
+        let ev = match next_event(None, Duration::from_millis(16)) {
+            Ok(Some(ev)) => ev,
+            Ok(None) => continue,
+            Err(e) => {
+                let _ = session.close_frame(&open);
+                break (FrameClose::Failed(e.clone()), Err(e));
+            }
+        };
+        let outcome = match ev {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                frame_key_event(&mut session, &open, key)
+            }
+            Event::Mouse(m) => {
+                let (w, h) = size(terminal);
+                frame_mouse_event(&mut session, &open, m, (w, h.saturating_sub(1)))
+            }
+            _ => Ok(FrameOutcome::Stay),
+        };
+        match outcome {
+            Ok(FrameOutcome::Stay) => {}
+            Ok(FrameOutcome::Close(_)) => {
+                let _ = session.close_frame(&open);
+                break (FrameClose::Closed, Ok(()));
+            }
+            Err(e) => break (FrameClose::Failed(e), Ok(())),
+        }
+    };
+    arcade_hover_reporting(false);
+    (session, close, result)
+}
+
 /// Drives an interactive `ask` question (issue #34): renders the option panel
 /// into the input region and reads keys until the user answers, declines
 /// (Escape), or interrupts (Ctrl-C). Blocks the UI loop while up — the worker
@@ -18959,6 +19154,7 @@ fn run_worker_ui<T: Send>(
     bus: Option<&BroadcastBus>,
     remote: Option<&Mutex<UiRemote>>,
     ask: Option<&crate::tools::ask::AskBridge>,
+    frames: Option<&crate::framebridge::FrameBridge>,
     live: &LiveCommands,
     job: impl FnOnce(Sender<UiEvent>) -> T + Send,
 ) -> Result<T, String> {
@@ -18978,6 +19174,7 @@ fn run_worker_ui<T: Send>(
             bus,
             remote,
             ask,
+            frames,
             live,
             || handle.is_finished(),
         );
@@ -18993,6 +19190,12 @@ fn run_worker_ui<T: Send>(
             {
                 bridge.respond(crate::tools::ask::AskOutcome::Interrupted);
             }
+        }
+        // Nothing serves the frame bridge any more: a session the worker lent
+        // (or lends on its way out) goes straight back as failed, or the join
+        // below would wait on a worker waiting on this thread.
+        if let Some(bridge) = frames {
+            release_lent_frames(bridge, || handle.is_finished());
         }
         let out = handle
             .join()
@@ -19184,6 +19387,7 @@ fn busy_ui_loop(
     bus: Option<&BroadcastBus>,
     remote: Option<&Mutex<UiRemote>>,
     ask: Option<&crate::tools::ask::AskBridge>,
+    frames: Option<&crate::framebridge::FrameBridge>,
     live_cmds: &LiveCommands,
     done: impl Fn() -> bool,
 ) -> Result<(), String> {
@@ -19284,6 +19488,14 @@ fn busy_ui_loop(
             continue;
         }
         ask_notified = false;
+        // A frame a tool call opened takes the whole screen until it closes;
+        // the worker is blocked on the bridge meanwhile, like `ask` above.
+        if let Some(bridge) = frames
+            && bridge.is_pending()
+        {
+            run_frame_panel(terminal, bridge)?;
+            continue;
+        }
         while let Ok(ev) = rx.try_recv() {
             // Mirror every worker event onto the remote bus so remote clients
             // see the same stream as the local TUI (issue #25, dual-path).
@@ -20557,6 +20769,7 @@ fn new_agent(
         first_turn_done: false,
         pressure_stop: false,
         sidechain_depth: 0,
+        turn_from_remote: false,
         alt_engine_depth: 0,
         extract_state: crate::memextract::ExtractState::default(),
         memory_gate: false,
@@ -22403,6 +22616,85 @@ mod tests {
     }
 
     #[test]
+    fn editor_refusal_follows_the_sidechain_and_the_remote_turn() {
+        let dir = scratch_dir("editor-refusal");
+        std::fs::write(dir.join("f.txt"), "x\n").unwrap();
+        let path = dir.join("f.txt").display().to_string();
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        agent.turn_from_remote = true;
+        agent.dispatch_tool(&read_call(&path));
+        assert_eq!(
+            agent.tool_ctx.editor_refusal,
+            Some("the editor needs the local screen".into())
+        );
+
+        agent.turn_from_remote = false;
+        agent.sidechain_depth = 1;
+        agent.dispatch_tool(&read_call(&path));
+        assert_eq!(
+            agent.tool_ctx.editor_refusal,
+            Some("editors cannot open inside a sub-agent".into())
+        );
+
+        agent.sidechain_depth = 0;
+        agent.dispatch_tool(&read_call(&path));
+        assert_eq!(agent.tool_ctx.editor_refusal, None);
+    }
+
+    fn lend_one(
+        bridge: &crate::framebridge::FrameBridge,
+    ) -> std::thread::JoinHandle<crate::framebridge::FrameClose> {
+        let worker = bridge.clone();
+        std::thread::spawn(move || {
+            let req = crate::framebridge::FrameRequest {
+                component: "dev.plank.x".into(),
+                file: "data.csv".into(),
+            };
+            worker.lend(crate::wasmreg::Session::default(), req).1
+        })
+    }
+
+    fn wait_pending(bridge: &crate::framebridge::FrameBridge) {
+        while !bridge.is_pending() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_lent_frame_goes_back_even_when_driving_it_fails() {
+        use crate::framebridge::{FrameBridge, FrameClose};
+        let bridge = FrameBridge::new();
+        let worker = lend_one(&bridge);
+        wait_pending(&bridge);
+        let r = serve_lent_frame(&bridge, |session, req| {
+            assert_eq!(req.file, "data.csv");
+            (
+                session,
+                FrameClose::Failed("terminal gone".into()),
+                Err("terminal gone".into()),
+            )
+        });
+        assert_eq!(r, Err("terminal gone".to_string()));
+        assert_eq!(
+            worker.join().unwrap(),
+            FrameClose::Failed("terminal gone".into())
+        );
+        // Nothing parked: serving is a no-op.
+        assert_eq!(serve_lent_frame(&bridge, |_, _| unreachable!()), Ok(()));
+    }
+
+    #[test]
+    fn a_lent_frame_nobody_serves_is_released_as_failed() {
+        use crate::framebridge::{FrameBridge, FrameClose};
+        let bridge = FrameBridge::new();
+        let worker = lend_one(&bridge);
+        release_lent_frames(&bridge, || worker.is_finished());
+        assert!(matches!(worker.join().unwrap(), FrameClose::Failed(_)));
+    }
+
+    #[test]
     fn a_suppressed_yield_does_not_wedge_the_hysteresis() {
         use crate::mempressure::PressureLevel;
         let dir = scratch_dir("pressure-suppressed");
@@ -23744,6 +24036,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            turn_from_remote: false,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             memory_gate: false,
@@ -29559,6 +29852,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            turn_from_remote: false,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             memory_gate: false,
@@ -29695,6 +29989,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            turn_from_remote: false,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             memory_gate: false,
@@ -31083,6 +31378,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            turn_from_remote: false,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             memory_gate: false,
@@ -31364,6 +31660,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            turn_from_remote: false,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             memory_gate: false,
@@ -31459,14 +31756,13 @@ mod tests {
         };
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
-        let store = SessionStore::open(&dir).unwrap();
         let mut agent = Agent {
             engine: Box::new(engine),
             cfg: &cfg,
             gen_opts: cfg.generation.clone(),
             resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
-            store,
+            store: SessionStore::open(&dir).unwrap(),
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
@@ -31482,6 +31778,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            turn_from_remote: false,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             memory_gate: false,
@@ -31589,6 +31886,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            turn_from_remote: false,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             memory_gate: false,
@@ -31694,14 +31992,13 @@ mod tests {
     fn payload_save_resume_strip_flow() {
         let dir = fresh_scratch_dir("kv-test");
         let cfg = crate::config::AgentConfig::default();
-        let store = SessionStore::open(&dir).unwrap();
         let mut agent = Agent {
             engine: Box::new(KvEngine),
             cfg: &cfg,
             gen_opts: cfg.generation.clone(),
             resume_temp: crate::engine::GenerationOptions::default().temperature,
             session: Session::new(),
-            store,
+            store: SessionStore::open(&dir).unwrap(),
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
@@ -31717,6 +32014,7 @@ mod tests {
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            turn_from_remote: false,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             memory_gate: false,
@@ -34366,6 +34664,7 @@ or the user's next message aborts before its first token"
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            turn_from_remote: false,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             memory_gate: false,
@@ -35920,6 +36219,7 @@ or the user's next message aborts before its first token"
             first_turn_done: false,
             pressure_stop: false,
             sidechain_depth: 0,
+            turn_from_remote: false,
             alt_engine_depth: 0,
             extract_state: crate::memextract::ExtractState::default(),
             memory_gate: false,
@@ -35976,11 +36276,10 @@ or the user's next message aborts before its first token"
 
         // user, assistant(tool call), user(tool result), assistant(final)
         assert_eq!(agent.session.transcript.len(), 4);
-        let tool_result = &agent.session.transcript[2].text;
-        assert!(tool_result.contains("plank-e2e"), "got: {tool_result}");
-        assert!(tool_result.starts_with("<tool_result>"));
-        let last = &agent.session.transcript[3].text;
-        assert!(last.contains("The command printed"));
+        let t = &agent.session.transcript;
+        assert!(t[2].text.contains("plank-e2e"), "got: {}", t[2].text);
+        assert!(t[2].text.starts_with("<tool_result>"));
+        assert!(t[3].text.contains("The command printed"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
