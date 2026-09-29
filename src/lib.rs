@@ -48,6 +48,7 @@ pub mod experts;
 pub mod export;
 pub mod feedback;
 pub mod ffi;
+pub mod framebridge;
 #[cfg(ds4_engine)]
 pub mod gguf;
 pub mod ggufdelta;

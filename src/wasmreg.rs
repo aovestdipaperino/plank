@@ -1664,6 +1664,69 @@ impl Session {
         self.registry.warnings.clone()
     }
 
+    /// Whether `component` can run as an editor: loaded and not struck out,
+    /// with a frame, not a screensaver, and with a RAM disk to edit on.
+    ///
+    /// # Errors
+    /// The reason, worded for the model.
+    pub fn check_editor(&self, component: &str) -> Result<(), String> {
+        let manifest = self
+            .registry
+            .loaded
+            .iter()
+            .find(|l| l.component.manifest.id == component && l.strikes < STRIKE_LIMIT)
+            .map(|l| &l.component.manifest)
+            .ok_or_else(|| format!("{component} is not loaded"))?;
+        if !manifest.surfaces.contains(&Surface::Frame) {
+            return Err(format!("{component} cannot show a frame"));
+        }
+        // A screensaver closes on any activity, so an edit could never be
+        // made in it.
+        if manifest.kind == FrameKind::Screensaver {
+            return Err(format!("{component} is a screensaver"));
+        }
+        if !manifest.capabilities.contains(&Capability::Fs) {
+            return Err(format!("{component} has no fs grant"));
+        }
+        Ok(())
+    }
+
+    /// Writes `bytes` onto `component`'s RAM disk as `file`, for an editor
+    /// frame to open. A file already there may be one the user made in the
+    /// component, so it is never written over.
+    ///
+    /// # Errors
+    /// The file exists, the path is bad, or the write is over quota.
+    pub fn stage_editor_file(
+        &mut self,
+        component: &str,
+        file: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if self.host.ram_file(component, file).is_some() {
+            return Err(format!("{file} already exists on {component}'s disk"));
+        }
+        self.host.ram_write(component, file, bytes)
+    }
+
+    /// Reads `file` back after the editor closed and removes it: `Saved` when
+    /// it differs from `staged`, `Unchanged` when it does not or the frame
+    /// deleted it.
+    pub fn collect_editor_file(
+        &mut self,
+        component: &str,
+        file: &str,
+        staged: &[u8],
+    ) -> crate::framebridge::FrameResult {
+        use crate::framebridge::FrameResult;
+        let now = self.host.ram_file(component, file);
+        self.host.ram_remove(component, file);
+        match now {
+            Some(bytes) if bytes != staged => FrameResult::Saved(bytes),
+            _ => FrameResult::Unchanged,
+        }
+    }
+
     /// Honours a grid an MCP server staged: writes its CSV onto the
     /// component's RAM disk and queues the component's frame with the file as
     /// its `arg`, for the UI to open at the next idle moment.
@@ -1697,25 +1760,7 @@ impl Session {
         if allowed.get(&server) != Some(&component) {
             return Err(format!("this profile does not route {server}'s grids"));
         }
-        let manifest = self
-            .registry
-            .loaded
-            .iter()
-            .find(|l| l.component.manifest.id == component && l.strikes < STRIKE_LIMIT)
-            .map(|l| &l.component.manifest)
-            .ok_or_else(|| format!("{component} is not loaded"))?;
-        if !manifest.surfaces.contains(&Surface::Frame) {
-            return Err(format!("{component} cannot show a frame"));
-        }
-        // A screensaver closes on any activity, so an edit could never be
-        // made in it, and the idle rotation could open it onto someone
-        // else's grid.
-        if manifest.kind == FrameKind::Screensaver {
-            return Err(format!("{component} is a screensaver"));
-        }
-        if !manifest.capabilities.contains(&Capability::Fs) {
-            return Err(format!("{component} has no fs grant"));
-        }
+        self.check_editor(&component)?;
         if self.frame_open {
             return Err("a grid is already open".to_string());
         }
@@ -3235,8 +3280,206 @@ pub fn module_sha256(path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
+
+    pub(crate) fn component(origin: Origin, caps: Vec<Capability>) -> WasmComponent {
+        WasmComponent {
+            plugin: "demo".to_string(),
+            origin,
+            path: PathBuf::from("/nowhere/demo.wasm"),
+            manifest: WasmManifest {
+                id: "dev.plank.demo".to_string(),
+                abi: 1,
+                module: "demo.wasm".to_string(),
+                surfaces: vec![Surface::Frame],
+                capabilities: caps,
+                kind: FrameKind::default(),
+                frames: Vec::new(),
+                veiled: false,
+                min_size: (0, 0),
+                events: Vec::new(),
+                config: Vec::new(),
+            },
+        }
+    }
+
+    /// A host that keeps RAM disks in a map and refuses a file over a byte
+    /// limit, so the staging path can be tested without a runtime.
+    #[derive(Debug, Default)]
+    pub(crate) struct DiskHost {
+        pub(crate) files: BTreeMap<(String, String), Vec<u8>>,
+        pub(crate) limit: Option<usize>,
+        /// Whether a call succeeds (with an empty object), so a frame opens.
+        pub(crate) opens: bool,
+        /// Whether every call but `frame_open` traps, so a frame opens and
+        /// then fails.
+        pub(crate) traps: bool,
+    }
+
+    impl crate::wasmhost::WasmHost for DiskHost {
+        fn load(
+            &mut self,
+            _source: &str,
+            _wasm: &[u8],
+            _granted: &[&str],
+        ) -> Result<crate::wasmhost::LoadedPlugin, crate::wasmhost::WasmError> {
+            Err(crate::wasmhost::WasmError::Unsupported)
+        }
+
+        fn call(
+            &mut self,
+            _id: &str,
+            export: &str,
+            _input: &[u8],
+        ) -> Result<Vec<u8>, crate::wasmhost::WasmError> {
+            if self.traps && export != "frame_open" {
+                return Err(crate::wasmhost::WasmError::Unsupported);
+            }
+            if self.opens {
+                Ok(b"{}".to_vec())
+            } else {
+                Err(crate::wasmhost::WasmError::Unsupported)
+            }
+        }
+
+        fn ram_write(&mut self, id: &str, path: &str, bytes: &[u8]) -> Result<(), String> {
+            if self.limit.is_some_and(|l| bytes.len() > l) {
+                return Err(format!("'{id}' file {path} is over quota"));
+            }
+            let path = crate::wasmcaps::normalize_fs_path(path)?;
+            self.files.insert((id.to_string(), path), bytes.to_vec());
+            Ok(())
+        }
+
+        fn ram_remove(&mut self, id: &str, path: &str) {
+            if let Ok(path) = crate::wasmcaps::normalize_fs_path(path) {
+                self.files.remove(&(id.to_string(), path));
+            }
+        }
+
+        fn ram_file(&self, id: &str, path: &str) -> Option<Vec<u8>> {
+            let path = crate::wasmcaps::normalize_fs_path(path).ok()?;
+            self.files.get(&(id.to_string(), path)).cloned()
+        }
+    }
+
+    pub(crate) const CSVEDIT: &str = "dev.plank.csvedit";
+
+    pub(crate) fn editor_component(surfaces: Vec<Surface>, caps: Vec<Capability>) -> Loaded {
+        let mut component = component(Origin::UserScan, caps);
+        component.manifest.id = CSVEDIT.to_string();
+        component.manifest.surfaces = surfaces;
+        Loaded {
+            component,
+            strikes: 0,
+            tools: Vec::new(),
+            commands: Vec::new(),
+        }
+    }
+
+    pub(crate) fn editor_session(loaded: Vec<Loaded>) -> Session {
+        Session {
+            registry: Registry::with_loaded(loaded),
+            host: Box::new(DiskHost::default()),
+            pending_open: None,
+            active_grid: None,
+            frame_open: false,
+            grid_on_screen: false,
+            home: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::framebridge::FrameResult;
+
+    #[test]
+    fn check_editor_names_every_reason_a_component_cannot_edit() {
+        let s = editor_session(vec![editor_component(
+            vec![Surface::Frame],
+            vec![Capability::Fs],
+        )]);
+        assert_eq!(s.check_editor(CSVEDIT), Ok(()));
+        assert_eq!(
+            s.check_editor("dev.plank.nobody"),
+            Err("dev.plank.nobody is not loaded".to_string())
+        );
+        let s = editor_session(vec![editor_component(
+            vec![Surface::Command],
+            vec![Capability::Fs],
+        )]);
+        assert_eq!(
+            s.check_editor(CSVEDIT),
+            Err(format!("{CSVEDIT} cannot show a frame"))
+        );
+        let s = editor_session(vec![editor_component(vec![Surface::Frame], vec![])]);
+        assert_eq!(
+            s.check_editor(CSVEDIT),
+            Err(format!("{CSVEDIT} has no fs grant"))
+        );
+        let mut saver = editor_component(vec![Surface::Frame], vec![Capability::Fs]);
+        saver.component.manifest.kind = FrameKind::Screensaver;
+        let s = editor_session(vec![saver]);
+        assert_eq!(
+            s.check_editor(CSVEDIT),
+            Err(format!("{CSVEDIT} is a screensaver"))
+        );
+    }
+
+    #[test]
+    fn an_editor_file_is_staged_once_and_collected_by_what_changed() {
+        let mut s = editor_session(vec![editor_component(
+            vec![Surface::Frame],
+            vec![Capability::Fs],
+        )]);
+        s.stage_editor_file(CSVEDIT, "data.csv", b"a,b\n").unwrap();
+        assert_eq!(
+            s.stage_editor_file(CSVEDIT, "data.csv", b"x\n"),
+            Err(format!("data.csv already exists on {CSVEDIT}'s disk"))
+        );
+        // Untouched: unchanged, and the file is gone either way.
+        assert_eq!(
+            s.collect_editor_file(CSVEDIT, "data.csv", b"a,b\n"),
+            FrameResult::Unchanged
+        );
+        assert_eq!(s.host.ram_file(CSVEDIT, "data.csv"), None);
+        // Edited.
+        s.stage_editor_file(CSVEDIT, "data.csv", b"a,b\n").unwrap();
+        s.host
+            .ram_write(CSVEDIT, "data.csv", b"a,b\n1,2\n")
+            .unwrap();
+        assert_eq!(
+            s.collect_editor_file(CSVEDIT, "data.csv", b"a,b\n"),
+            FrameResult::Saved(b"a,b\n1,2\n".to_vec())
+        );
+        // Deleted by the frame: nothing to send.
+        s.stage_editor_file(CSVEDIT, "data.csv", b"a,b\n").unwrap();
+        s.host.ram_remove(CSVEDIT, "data.csv");
+        assert_eq!(
+            s.collect_editor_file(CSVEDIT, "data.csv", b"a,b\n"),
+            FrameResult::Unchanged
+        );
+    }
+
+    #[test]
+    fn an_editor_file_over_quota_is_refused() {
+        let mut s = editor_session(vec![editor_component(
+            vec![Surface::Frame],
+            vec![Capability::Fs],
+        )]);
+        s.host = Box::new(DiskHost {
+            limit: Some(3),
+            ..DiskHost::default()
+        });
+        let err = s
+            .stage_editor_file(CSVEDIT, "data.csv", b"abcd")
+            .unwrap_err();
+        assert!(err.contains("over quota"), "{err}");
+    }
 
     #[test]
     fn frame_key_payload_adds_text_only_when_present() {
@@ -4025,27 +4268,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    fn component(origin: Origin, caps: Vec<Capability>) -> WasmComponent {
-        WasmComponent {
-            plugin: "demo".to_string(),
-            origin,
-            path: PathBuf::from("/nowhere/demo.wasm"),
-            manifest: WasmManifest {
-                id: "dev.plank.demo".to_string(),
-                abi: 1,
-                module: "demo.wasm".to_string(),
-                surfaces: vec![Surface::Frame],
-                capabilities: caps,
-                kind: FrameKind::default(),
-                frames: Vec::new(),
-                veiled: false,
-                min_size: (0, 0),
-                events: Vec::new(),
-                config: Vec::new(),
-            },
-        }
-    }
-
     /// The four ways trust can withhold a component, each distinguishable —
     /// "it didn't load" cannot tell them apart from the outside, and each has a
     /// different answer.
@@ -4429,94 +4651,8 @@ mod tests {
 
     // --- Grid staging -------------------------------------------------------
 
-    /// A host that keeps RAM disks in a map and refuses a file over a byte
-    /// limit, so the staging path can be tested without a runtime.
-    #[derive(Debug, Default)]
-    struct DiskHost {
-        files: BTreeMap<(String, String), Vec<u8>>,
-        limit: Option<usize>,
-        /// Whether a call succeeds (with an empty object), so a frame opens.
-        opens: bool,
-        /// Whether every call but `frame_open` traps, so a frame opens and
-        /// then fails.
-        traps: bool,
-    }
-
-    impl crate::wasmhost::WasmHost for DiskHost {
-        fn load(
-            &mut self,
-            _source: &str,
-            _wasm: &[u8],
-            _granted: &[&str],
-        ) -> Result<crate::wasmhost::LoadedPlugin, crate::wasmhost::WasmError> {
-            Err(crate::wasmhost::WasmError::Unsupported)
-        }
-
-        fn call(
-            &mut self,
-            _id: &str,
-            export: &str,
-            _input: &[u8],
-        ) -> Result<Vec<u8>, crate::wasmhost::WasmError> {
-            if self.traps && export != "frame_open" {
-                return Err(crate::wasmhost::WasmError::Unsupported);
-            }
-            if self.opens {
-                Ok(b"{}".to_vec())
-            } else {
-                Err(crate::wasmhost::WasmError::Unsupported)
-            }
-        }
-
-        fn ram_write(&mut self, id: &str, path: &str, bytes: &[u8]) -> Result<(), String> {
-            if self.limit.is_some_and(|l| bytes.len() > l) {
-                return Err(format!("'{id}' file {path} is over quota"));
-            }
-            let path = crate::wasmcaps::normalize_fs_path(path)?;
-            self.files.insert((id.to_string(), path), bytes.to_vec());
-            Ok(())
-        }
-
-        fn ram_remove(&mut self, id: &str, path: &str) {
-            if let Ok(path) = crate::wasmcaps::normalize_fs_path(path) {
-                self.files.remove(&(id.to_string(), path));
-            }
-        }
-
-        fn ram_file(&self, id: &str, path: &str) -> Option<Vec<u8>> {
-            let path = crate::wasmcaps::normalize_fs_path(path).ok()?;
-            self.files.get(&(id.to_string(), path)).cloned()
-        }
-    }
-
-    const CSVEDIT: &str = "dev.plank.csvedit";
-
-    fn grid_component(surfaces: Vec<Surface>, caps: Vec<Capability>) -> Loaded {
-        let mut component = component(Origin::UserScan, caps);
-        component.manifest.id = CSVEDIT.to_string();
-        component.manifest.surfaces = surfaces;
-        Loaded {
-            component,
-            strikes: 0,
-            tools: Vec::new(),
-            commands: Vec::new(),
-        }
-    }
-
-    fn grid_session(loaded: Vec<Loaded>) -> Session {
-        Session {
-            registry: Registry::with_loaded(loaded),
-            host: Box::new(DiskHost::default()),
-            pending_open: None,
-            active_grid: None,
-            frame_open: false,
-            grid_on_screen: false,
-            home: None,
-        }
-    }
-
     fn fit_session() -> Session {
-        grid_session(vec![grid_component(
+        editor_session(vec![editor_component(
             vec![Surface::Frame],
             vec![Capability::Fs],
         )])
@@ -4577,21 +4713,21 @@ mod tests {
                 "this profile does not route chatbgt's grids".to_string(),
             ),
             (
-                grid_session(Vec::new()),
+                editor_session(Vec::new()),
                 routes(),
                 format!("{CSVEDIT} is not loaded"),
             ),
             (
                 {
-                    let mut struck = grid_component(vec![Surface::Frame], vec![Capability::Fs]);
+                    let mut struck = editor_component(vec![Surface::Frame], vec![Capability::Fs]);
                     struck.strikes = STRIKE_LIMIT;
-                    grid_session(vec![struck])
+                    editor_session(vec![struck])
                 },
                 routes(),
                 format!("{CSVEDIT} is not loaded"),
             ),
             (
-                grid_session(vec![grid_component(
+                editor_session(vec![editor_component(
                     vec![Surface::Command],
                     vec![Capability::Fs],
                 )]),
@@ -4599,7 +4735,7 @@ mod tests {
                 format!("{CSVEDIT} cannot show a frame"),
             ),
             (
-                grid_session(vec![grid_component(vec![Surface::Frame], Vec::new())]),
+                editor_session(vec![editor_component(vec![Surface::Frame], Vec::new())]),
                 routes(),
                 format!("{CSVEDIT} has no fs grant"),
             ),
@@ -4911,9 +5047,9 @@ mod tests {
 
     #[test]
     fn a_screensaver_is_never_a_grid() {
-        let mut saver = grid_component(vec![Surface::Frame], vec![Capability::Fs]);
+        let mut saver = editor_component(vec![Surface::Frame], vec![Capability::Fs]);
         saver.component.manifest.kind = FrameKind::Screensaver;
-        let mut s = grid_session(vec![saver]);
+        let mut s = editor_session(vec![saver]);
         let err = s
             .stage_grid(staging("categories.csv", "#\n"), &routes())
             .unwrap_err();
