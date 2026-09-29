@@ -1958,18 +1958,39 @@ mod tests {
     }
 
     /// An editor context routing chatbgt's grids to csvedit, with a bridge
-    /// whose stand-in TUI applies `edit` and closes the frame.
-    fn routed_ctx_with_ui(
-        edit: Option<&'static [u8]>,
+    /// whose stand-in TUI serves one lend per entry of `edits`, applying it
+    /// and closing the frame.
+    fn routed_ctx_serving(
+        edits: Vec<Option<&'static [u8]>>,
     ) -> (ToolContext, std::thread::JoinHandle<()>) {
         let mut ctx = crate::tools::frames::editor_ctx();
         ctx.grid_routes
             .insert("chatbgt".into(), "dev.plank.csvedit".into());
         let bridge = crate::framebridge::FrameBridge::new();
         ctx.frame_bridge = Some(bridge.clone());
-        let ui =
-            crate::tools::frames::ui_thread(bridge, edit, crate::framebridge::FrameClose::Closed);
+        let ui = crate::tools::frames::ui_thread_serving(
+            bridge,
+            edits,
+            crate::framebridge::FrameClose::Closed,
+        );
         (ctx, ui)
+    }
+
+    fn routed_ctx_with_ui(
+        edit: Option<&'static [u8]>,
+    ) -> (ToolContext, std::thread::JoinHandle<()>) {
+        routed_ctx_serving(vec![edit])
+    }
+
+    /// `grid_observation` from a worker-like thread, bounded so a lend that
+    /// never comes back fails the test instead of hanging it.
+    fn observe(
+        ctx: ToolContext,
+        text: &str,
+        stagings: Vec<crate::grid::GridStaging>,
+    ) -> (ToolContext, String) {
+        let text = text.to_string();
+        crate::tools::frames::lend_bounded(ctx, move |ctx| grid_observation(ctx, text, stagings))
     }
 
     #[test]
@@ -1993,28 +2014,74 @@ mod tests {
         assert_eq!(out, "grid not opened: editors need the interactive TUI\n");
     }
 
+    /// A route to a component that is not loaded is refused by the editor
+    /// check, before anything is staged or lent.
     #[test]
-    fn an_unedited_grid_closes_without_changes_and_calls_nothing() {
-        let (mut ctx, ui) = routed_ctx_with_ui(None);
-        let out = grid_observation(&mut ctx, "grid staged\n".into(), vec![staging()]);
+    fn a_grid_routed_to_a_component_that_is_not_loaded_is_not_opened() {
+        let mut ctx = crate::tools::frames::editor_ctx();
+        ctx.grid_routes
+            .insert("chatbgt".into(), "dev.plank.nobody".into());
+        ctx.frame_bridge = Some(crate::framebridge::FrameBridge::new());
+        let mut grid = staging();
+        grid.component = "dev.plank.nobody".into();
+        let (_, out) = observe(ctx, "grid staged\n", vec![grid]);
+        assert_eq!(
+            out,
+            "grid staged\ngrid not opened: dev.plank.nobody is not loaded\n"
+        );
+    }
+
+    /// The exact text also shows no write-back was attempted: the test
+    /// context has no MCP server, so a call would have failed visibly.
+    #[test]
+    fn an_unedited_grid_closes_without_changes() {
+        let (ctx, ui) = routed_ctx_with_ui(None);
+        let (_, out) = observe(ctx, "grid staged\n", vec![staging()]);
         ui.join().unwrap();
         assert_eq!(out, "grid staged\ngrid closed without changes\n");
     }
 
     #[test]
     fn an_edited_grid_is_written_back_in_the_same_observation() {
-        let (mut ctx, ui) = routed_ctx_with_ui(Some(b"#,x\n1,y\n"));
-        let out = grid_observation(&mut ctx, "grid staged\n".into(), vec![staging()]);
+        let (ctx, ui) = routed_ctx_with_ui(Some(b"#,x\n1,y\n"));
+        let (_, out) = observe(ctx, "grid staged\n", vec![staging()]);
         ui.join().unwrap();
         // No MCP server is configured in the test context, so the write-back
-        // call fails; what matters is that it was attempted, in this call.
-        assert!(
-            out.starts_with("grid staged\ngrid closed: write-back failed: "),
-            "{out}"
+        // call fails; what matters is that it was attempted, in this call,
+        // and that the CSV never reaches the model.
+        assert_eq!(
+            out,
+            "grid staged\ngrid closed: write-back failed: mcp server not available\n"
         );
-        assert!(
-            !out.contains("1,y"),
-            "the CSV never reaches the model: {out}"
+    }
+
+    /// A saved file that is not UTF-8 is reported without a call, never sent
+    /// as a lossy copy the server would take for the user's edit.
+    #[test]
+    fn a_grid_saved_as_invalid_utf8_is_not_written_back() {
+        let (ctx, ui) = routed_ctx_with_ui(Some(b"\xff\xfe"));
+        let (_, out) = observe(ctx, "grid staged\n", vec![staging()]);
+        ui.join().unwrap();
+        assert_eq!(
+            out,
+            "grid staged\ngrid closed: write-back failed: the grid file is not UTF-8\n"
+        );
+    }
+
+    /// Two grids in one result each get an editor, one after the other, and
+    /// a line of their own, in order.
+    #[test]
+    fn two_grids_in_one_result_are_served_in_turn() {
+        let (ctx, ui) = routed_ctx_serving(vec![Some(b"#,x\n1,y\n"), None]);
+        let mut second = staging();
+        second.file = "second.csv".into();
+        let (_, out) = observe(ctx, "grid staged\n", vec![staging(), second]);
+        ui.join().unwrap();
+        assert_eq!(
+            out,
+            "grid staged\n\
+             grid closed: write-back failed: mcp server not available\n\
+             grid closed without changes\n"
         );
     }
 

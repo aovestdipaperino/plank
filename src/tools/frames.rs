@@ -64,36 +64,104 @@ pub(crate) fn editor_ctx() -> ToolContext {
     ctx
 }
 
-/// A thread standing in for the TUI: it takes the session `bridge` lends,
-/// lets `edit` change the staged file on the RAM disk, and gives it back with
-/// `close`. It panics if nothing is lent within ten seconds, so a regression
-/// that never lends fails at `join` instead of hanging the test run.
+/// How long a test waits for either side of a lend: the stand-in TUI for a
+/// session to be lent, and the lender for the call to return. Generous, so
+/// only a lend that never happens or never comes back trips it.
+#[cfg(test)]
+pub(crate) const LEND_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Gives a taken session back when dropped, so a stand-in TUI that panics
+/// between `take` and `give_back` still releases the lender (with
+/// `FrameClose::Failed`) instead of leaving it spinning.
+#[cfg(test)]
+struct GiveBack {
+    bridge: crate::framebridge::FrameBridge,
+    session: Option<crate::wasmreg::Session>,
+    close: FrameClose,
+}
+
+#[cfg(test)]
+impl Drop for GiveBack {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            let close = if std::thread::panicking() {
+                FrameClose::Failed("the stand-in TUI panicked".to_string())
+            } else {
+                self.close.clone()
+            };
+            self.bridge.give_back(session, close);
+        }
+    }
+}
+
+/// A thread standing in for the TUI: it serves one lend per entry of
+/// `edits`, in order, each time letting the entry change the staged file on
+/// the RAM disk and giving the session back with `close`.
+///
+/// The give-back runs from a drop guard, so a panic after `take` still
+/// releases the lender. The thread panics if a lend does not arrive within
+/// [`LEND_WAIT`]; that only makes `join` fail, and does not unblock a lender
+/// that lends later, so the lending side must be bounded too
+/// ([`lend_bounded`]).
+#[cfg(test)]
+pub(crate) fn ui_thread_serving(
+    bridge: crate::framebridge::FrameBridge,
+    edits: Vec<Option<&'static [u8]>>,
+    close: FrameClose,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        for edit in edits {
+            let deadline = std::time::Instant::now() + LEND_WAIT;
+            let (session, req) = loop {
+                if let Some(lent) = bridge.take() {
+                    break lent;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no session was lent within {LEND_WAIT:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            let mut guard = GiveBack {
+                bridge: bridge.clone(),
+                session: Some(session),
+                close: close.clone(),
+            };
+            if let (Some(bytes), Some(session)) = (edit, guard.session.as_mut()) {
+                session
+                    .host
+                    .ram_write(&req.component, &req.file, bytes)
+                    .unwrap();
+            }
+        }
+    })
+}
+
+/// [`ui_thread_serving`] for a single lend.
 #[cfg(test)]
 pub(crate) fn ui_thread(
     bridge: crate::framebridge::FrameBridge,
     edit: Option<&'static [u8]>,
     close: FrameClose,
 ) -> std::thread::JoinHandle<()> {
+    ui_thread_serving(bridge, vec![edit], close)
+}
+
+/// Runs `call` on `ctx` from a thread of its own, as the worker would, and
+/// waits at most [`LEND_WAIT`] for it: a lend nobody gives back becomes a
+/// test failure instead of a hung run (the stuck thread is leaked).
+#[cfg(test)]
+pub(crate) fn lend_bounded<T: Send + 'static>(
+    mut ctx: ToolContext,
+    call: impl FnOnce(&mut ToolContext) -> T + Send + 'static,
+) -> (ToolContext, T) {
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if let Some((mut session, req)) = bridge.take() {
-                if let Some(bytes) = edit {
-                    session
-                        .host
-                        .ram_write(&req.component, &req.file, bytes)
-                        .unwrap();
-                }
-                bridge.give_back(session, close);
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "no session was lent within ten seconds"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    })
+        let out = call(&mut ctx);
+        let _ = tx.send((ctx, out));
+    });
+    rx.recv_timeout(LEND_WAIT)
+        .expect("the lent session never came back")
 }
 
 #[cfg(test)]
@@ -150,10 +218,8 @@ mod tests {
         let bridge = crate::framebridge::FrameBridge::new();
         c.frame_bridge = Some(bridge.clone());
         let h = ui_thread(bridge, Some(b"a\n1\n"), FrameClose::Closed);
-        assert_eq!(
-            run_frame_blocking(&mut c, ID, "data.csv", b"a\n"),
-            FrameResult::Saved(b"a\n1\n".to_vec())
-        );
+        let (c, out) = lend_bounded(c, |c| run_frame_blocking(c, ID, "data.csv", b"a\n"));
+        assert_eq!(out, FrameResult::Saved(b"a\n1\n".to_vec()));
         h.join().unwrap();
         assert!(
             c.wasm.check_editor(ID).is_ok(),
@@ -172,16 +238,12 @@ mod tests {
         let bridge = crate::framebridge::FrameBridge::new();
         c.frame_bridge = Some(bridge.clone());
         let h = ui_thread(bridge.clone(), None, FrameClose::Closed);
-        assert_eq!(
-            run_frame_blocking(&mut c, ID, "data.csv", b"a\n"),
-            FrameResult::Unchanged
-        );
+        let (c, out) = lend_bounded(c, |c| run_frame_blocking(c, ID, "data.csv", b"a\n"));
+        assert_eq!(out, FrameResult::Unchanged);
         h.join().unwrap();
         let h = ui_thread(bridge, None, FrameClose::Failed("trapped".into()));
-        assert_eq!(
-            run_frame_blocking(&mut c, ID, "data.csv", b"a\n"),
-            FrameResult::Failed("trapped".into())
-        );
+        let (c, out) = lend_bounded(c, |c| run_frame_blocking(c, ID, "data.csv", b"a\n"));
+        assert_eq!(out, FrameResult::Failed("trapped".into()));
         h.join().unwrap();
         assert_eq!(c.wasm.host.ram_file(ID, "data.csv"), None);
     }
