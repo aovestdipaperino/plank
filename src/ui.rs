@@ -14667,11 +14667,14 @@ impl Agent<'_> {
         h: &mut TuiHandles<'_>,
         body: impl FnOnce(&mut Self, &Sender<UiEvent>) + Send,
     ) -> Result<bool, String> {
-        // The busy loop below repaints with the live `input`, so a ghost left
-        // on it would stay lit for the whole pass — a prompt that looks like
-        // it is taking input while plank is busy. Clear it here rather than
-        // at each caller: every route into a quiet pass wants it dark.
-        h.input.ghost = None;
+        // A quiet pass is not a turn: a typed prompt interrupts it and runs at
+        // once, so the prompt really is taking input and the suggestion stays
+        // lit and acceptable (`ghost_accept_key` in the busy loop). Darkening
+        // it here hid a suggestion that had just landed behind the memory
+        // pass the idle slot starts right after it, for the whole pass. The
+        // depth check in `current_suggestion` keeps a stale one dark.
+        h.input.ghost = self.current_suggestion().map(str::to_owned);
+        let offered = h.input.ghost.is_some();
         // The remote bridge's persistent `TurnShared` when there is one, so
         // a remote prompt typed during the pass lands in the same queue a
         // local one does, exactly as in `tui_turn_inner`.
@@ -14706,6 +14709,11 @@ impl Agent<'_> {
         );
         shared.memory_pass.store(false, Ordering::Relaxed);
         shared.background_pass.store(false, Ordering::Relaxed);
+        // The busy loop placed or dismissed the ghost: either way the offer
+        // is spent, or the idle loop would light it again from the agent.
+        if offered && h.input.ghost.is_none() {
+            self.clear_suggestion();
+        }
         // Read before the interrupt reset below: the Ctrl-D arm raised that
         // interrupt to stop the pass, and clearing it must not lose the
         // reason. Taken rather than peeked, so a persistent remote
@@ -16149,21 +16157,20 @@ impl Agent<'_> {
         // because this is housekeeping, not something the user asked for.
         self.extract_state.begin_pass();
         let fork_at = self.begin_sidechain(job.task.clone(), true);
-        let prompt = match self.memory_pass_prompt(&mut job) {
-            Ok(prompt) => prompt,
-            Err(interrupted) => {
+        // The prefill and the generation share one quiet window, so the job
+        // has one console window from start to finish. Two windows left the
+        // first one disconnected once its prefill ended, while the pass went
+        // on streaming into a second one under another name.
+        let (done, result) = self.run_sidechain_quietly(|agent| {
+            match agent.memory_pass_prompt(&mut job) {
+                Ok(prompt) => agent.run_memory_round_with(&prompt),
                 // Cut off (or failed) during the prefill itself. The partial
-                // prefill, when there is one, is already on the job; the
-                // fork closes as always.
-                let done = self.close_quiet_sidechain();
-                self.end_subagent_fork(fork_at, "memory", &job.task, done);
-                self.extract_state.end_pass();
-                self.requeue_memory_job(job, interrupted);
-                return false;
+                // prefill, when there is one, is already on the job, and the
+                // arms below requeue it exactly as a cut-off generation.
+                Err(true) => Err(QUIET_ABORT_INTERRUPTED.to_owned()),
+                Err(false) => Err("memory pass: prefill failed".to_owned()),
             }
-        };
-        let (done, result) =
-            self.run_sidechain_quietly(|agent| agent.run_memory_round_with(&prompt));
+        });
         let report = self.end_subagent_fork(fork_at, "memory", &job.task, done);
         self.extract_state.end_pass();
 
@@ -16347,27 +16354,8 @@ impl Agent<'_> {
         word_mod: bool,
         roster_selecting: bool,
     ) -> bool {
-        input.buf.text().is_empty()
-            && input.popup.is_none()
-            && input.slash.is_none()
-            && self.current_suggestion().is_some()
-            && match key.code {
-                // `roster_selecting` excludes Tab for the same reason it
-                // excludes Enter: with the sub-agent roster selected, Tab
-                // toggles roster focus. Placing the suggestion there would
-                // leave Tab and Enter disagreeing about whose key it is.
-                KeyCode::Tab | KeyCode::Right => !word_mod && !roster_selecting,
-                KeyCode::Enter => {
-                    // CONTROL alongside SHIFT and ALT: Ctrl+Enter submitted
-                    // nothing over an empty prompt before this feature, and
-                    // an accept-and-send is not what it should start meaning.
-                    !key.modifiers.contains(KeyModifiers::SHIFT)
-                        && !key.modifiers.contains(KeyModifiers::ALT)
-                        && !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !roster_selecting
-                }
-                _ => false,
-            }
+        self.current_suggestion().is_some()
+            && ghost_accept_key(key, input, word_mod, roster_selecting)
     }
 
     /// Puts the offered suggestion into the prompt, cursor at the end, and
@@ -16538,8 +16526,8 @@ impl Agent<'_> {
     /// zero. The prefill is the long phase of the pass on a local model, so
     /// this is the case that matters most.
     ///
-    /// Runs inside the sidechain's quiet window so its footer status and
-    /// console routing match the generation that follows.
+    /// Called from inside the job's quiet window (`process_memory_job`), so
+    /// its footer status and console routing are the generation's own.
     fn prefill_memory_prompt(&mut self, prompt_text: &str) -> MemoryPrefill {
         if self
             .engine
@@ -16550,12 +16538,10 @@ impl Agent<'_> {
         }
         let mut opts = self.pass_opts();
         opts.n_predict = 0;
-        let (_done, result) = self.run_sidechain_quietly(|agent| {
-            agent
-                .generate_quiet_with(prompt_text, Instant::now(), &opts)
-                .map(|pass| pass.stats.interrupted)
-                .map_err(|abort| abort.error)
-        });
+        let result = self
+            .generate_quiet_with(prompt_text, Instant::now(), &opts)
+            .map(|pass| pass.stats.interrupted)
+            .map_err(|abort| abort.error);
         match result {
             Ok(false) if !crate::interrupt::pending() => MemoryPrefill::Done(self.engine.get_kv()),
             Ok(_) => MemoryPrefill::Interrupted(self.engine.get_kv()),
@@ -16564,13 +16550,6 @@ impl Agent<'_> {
             }
             Err(_) => MemoryPrefill::Failed,
         }
-    }
-
-    /// The console window a sidechain that never generated still owes its
-    /// fork end, so the dump records an empty window rather than none.
-    fn close_quiet_sidechain(&mut self) -> SubagentDone {
-        let (done, _unit) = self.run_sidechain_quietly(|_agent| Ok::<(), String>(()));
-        done
     }
 
     /// Records a memory pass whose reply yielded no verdicts, in the
@@ -19010,6 +18989,54 @@ struct TuiHandles<'a> {
     sub: &'a mut tui::SubPane,
 }
 
+/// How long the status stream may be silent before the busy loop starts
+/// advancing the progress line itself. Longer than the gap between tokens,
+/// so a streaming pass is drawn from its own statuses.
+const STATUS_QUIET: Duration = Duration::from_millis(250);
+
+/// The progress line for `st` as it reads `silence` after it was published:
+/// the same text, with the turn clock moved on by the silence.
+fn progress_after(st: &Status, silence: Duration) -> Option<String> {
+    let mut st = st.clone();
+    st.elapsed_secs += silence.as_secs_f64();
+    status::progress_brief(&st)
+}
+
+/// Whether this keystroke takes an offered suggestion rather than doing its
+/// ordinary job, given that one is offered: the key half of
+/// `Agent::suggestion_accept_key`, shared with the busy loop, which shows the
+/// ghost over a quiet pass and cannot ask the agent (it is on the worker).
+///
+/// Only over an empty buffer with neither menu open: the completion popup
+/// and the slash menu own Tab and Enter while they are up.
+fn ghost_accept_key(
+    key: KeyEvent,
+    input: &TuiInput,
+    word_mod: bool,
+    roster_selecting: bool,
+) -> bool {
+    input.buf.text().is_empty()
+        && input.popup.is_none()
+        && input.slash.is_none()
+        && match key.code {
+            // `roster_selecting` excludes Tab for the same reason it
+            // excludes Enter: with the sub-agent roster selected, Tab
+            // toggles roster focus. Placing the suggestion there would
+            // leave Tab and Enter disagreeing about whose key it is.
+            KeyCode::Tab | KeyCode::Right => !word_mod && !roster_selecting,
+            KeyCode::Enter => {
+                // CONTROL alongside SHIFT and ALT: Ctrl+Enter submitted
+                // nothing over an empty prompt before this feature, and
+                // an accept-and-send is not what it should start meaning.
+                !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !roster_selecting
+            }
+            _ => false,
+        }
+}
+
 /// Runs `job` on a scoped worker thread while the UI thread keeps the
 /// terminal live (the C's worker/UI split). The worker owns the agent for
 /// the duration of the job and reports through the channel; the UI applies
@@ -19308,6 +19335,9 @@ fn busy_ui_loop(
     // True while the progress line is showing the compaction bar, so it is
     // cleared exactly once when the pass ends.
     let mut compacting_line = false;
+    // The last status the worker published and when it arrived, so the
+    // progress line keeps moving between them; see `progress_after`.
+    let mut last_status: Option<(Status, Instant)> = None;
     // When the main-task interrupt was raised, so an interrupt the worker never
     // acknowledges can escalate to a force quit. Invariant: `Some` only while
     // `shared.interrupt` is still raised. The worker clears that flag when it
@@ -19379,6 +19409,7 @@ fn busy_ui_loop(
             }
             match ev {
                 UiEvent::Status(st) => {
+                    last_status = Some((st.clone(), Instant::now()));
                     // The animated progress (throbber + verb + stats) always
                     // lives on a line pinned below the output, not in the
                     // footer — independent of showThinking.
@@ -19537,6 +19568,22 @@ fn busy_ui_loop(
                 compacting_line = false;
             }
             None => {}
+        }
+        // The worker publishes a status only on engine events, so while a
+        // tool runs nothing arrives and the line froze on the last token: the
+        // shimmer still and the clock stopped. Usually for a second; for the
+        // minutes a GPU yield takes (unload, the command, reload), long
+        // enough to look hung. Once the stream goes quiet the line is rebuilt
+        // every frame, clock advanced by the silence. Not while a sub-agent
+        // holds the engine: the main line then says it is waiting, and the
+        // sub-agent's own statuses keep arriving.
+        if !compacting_line
+            && !sub.running()
+            && let Some((st, at)) = last_status.as_ref()
+            && at.elapsed() >= STATUS_QUIET
+            && let Some(progress) = progress_after(st, at.elapsed())
+        {
+            log.set_progress(Some(tui::progress_line(&progress)));
         }
         // An interrupt the worker has not acknowledged within the grace period
         // means it is wedged somewhere that cannot poll the flag. Say so, and
@@ -19780,6 +19827,26 @@ fn busy_ui_loop(
                         log.push_dim("[still running]");
                     }
                     continue;
+                }
+                // A suggestion lit over a quiet pass (`tui_quiet_pass`) takes
+                // the idle loop's three keys: Tab/Right place it, Enter places
+                // and sends it through the submit arm below, which interrupts
+                // the pass. Any other key dismisses it; the agent forgets it
+                // once the pass returns. Ahead of the roster arms, as at idle.
+                if input.ghost.is_some() {
+                    if ghost_accept_key(key, input, word_mod, sub.selecting) {
+                        if let Some(text) = input.ghost.take() {
+                            input.hist_idx = None;
+                            input.buf.set_text(&text);
+                            input.buf.move_end();
+                        }
+                        if key.code != KeyCode::Enter {
+                            input.sync_popup();
+                            continue;
+                        }
+                    } else {
+                        input.ghost = None;
+                    }
                 }
                 match key.code {
                     // The roster keys, mirroring the idle loop — mid-turn is
@@ -24413,6 +24480,50 @@ mod tests {
             "a sub-agent turn suggests nothing"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// While a tool runs no status arrives, so the busy loop redraws the last
+    /// one with the clock moved on: a GPU yield no longer freezes the line.
+    #[test]
+    fn a_quiet_status_stream_still_advances_the_turn_clock() {
+        let st = Status {
+            state: crate::status::WorkerState::Generating,
+            elapsed_secs: 712.0,
+            ..Status::default()
+        };
+        let then = progress_after(&st, Duration::ZERO).expect("a generating line");
+        let later = progress_after(&st, Duration::from_secs(60)).expect("still one");
+        assert!(then.contains("11m 52s"), "{then}");
+        assert!(later.contains("12m 52s"), "{later}");
+        // A pass with no progress line (the memory pass) stays without one.
+        let memory = Status {
+            memory_pass: true,
+            ..st
+        };
+        assert!(progress_after(&memory, Duration::from_secs(60)).is_none());
+    }
+
+    /// The busy loop's ghost keys are the idle loop's: Tab/Right/plain Enter
+    /// over an empty prompt, nothing over typed text, the roster's own keys
+    /// left alone.
+    #[test]
+    fn the_ghost_takes_the_same_keys_over_a_quiet_pass() {
+        let mut input = TuiInput::new();
+        assert!(ghost_accept_key(key(KeyCode::Tab), &input, false, false));
+        assert!(ghost_accept_key(key(KeyCode::Right), &input, false, false));
+        assert!(ghost_accept_key(key(KeyCode::Enter), &input, false, false));
+        assert!(!ghost_accept_key(key(KeyCode::Right), &input, true, false));
+        assert!(!ghost_accept_key(key(KeyCode::Tab), &input, false, true));
+        assert!(!ghost_accept_key(
+            key(KeyCode::Char('a')),
+            &input,
+            false,
+            false
+        ));
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert!(!ghost_accept_key(shift_enter, &input, false, false));
+        input.buf.set_text("typed");
+        assert!(!ghost_accept_key(key(KeyCode::Tab), &input, false, false));
     }
 
     #[test]
@@ -35365,6 +35476,49 @@ or the user's next message aborts before its first token"
             agent.session.transcript.is_empty(),
             "the sidechain folded away"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A memory job is one console window from its prefill to its reply.
+    /// It used to open one for the prefill-only pass and another for the
+    /// generation, so the window a developer was watching showed the pass
+    /// disconnected while it went on streaming under a second name.
+    #[test]
+    fn a_memory_job_streams_through_one_console_window() {
+        use crate::debugmirror::test_support as dm;
+        let _g = dm::lock();
+        dm::reset();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        let _settings_guard = crate::settings::install_for_test(settings);
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-one-window");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            // The prefill-only pass, then the generation.
+            replies: vec![String::new(), "[]".to_string()],
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 10,
+                common: 10,
+            }),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        let (port, rx) = dm::fake_console_keeping_sockets();
+        dm::use_console(port);
+        assert!(agent.process_memory_job());
+        let wait = std::time::Duration::from_millis(300);
+        let names: Vec<String> = std::iter::from_fn(|| rx.recv_timeout(wait).ok())
+            .map(|(hello, _sock)| hello)
+            // The parent's own window may be dialed along the way; only the
+            // sidechain's windows are the point here.
+            .filter(|hello| hello.contains(":subagent-"))
+            .collect();
+        assert_eq!(names.len(), 1, "one window for the whole job: {names:?}");
+        dm::reset();
         std::fs::remove_dir_all(&dir).ok();
     }
 
