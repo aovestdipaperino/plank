@@ -174,6 +174,25 @@ fn csvedit_commands_open_the_frame_with_the_file_name() {
 }
 
 #[test]
+fn csvedit_tool_call_replies_with_a_frame_directive() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load(ID, &wasm, &["fs", "files", "log"]).expect("load");
+    let out = String::from_utf8(
+        h.call(
+            ID,
+            "tool_call",
+            br#"{"name": "edit_csv", "args": {"path": "x.csv"}}"#,
+        )
+        .expect("tool_call"),
+    )
+    .unwrap();
+    let directive = plank::tools::frames::parse_frame_directive(&out).expect("a frame directive");
+    assert_eq!(directive.path, "x.csv");
+    assert_eq!(directive.file, "data.csv");
+}
+
+#[test]
 fn csvedit_command_run_round_trips_a_quoted_and_backslashed_name() {
     let wasm = guest_or_skip!();
     let mut h = host(None);

@@ -15,3 +15,4 @@ pub mod editor;
 pub mod frame;
 pub mod keys;
 pub mod paint;
+pub mod summary;

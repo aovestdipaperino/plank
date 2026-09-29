@@ -4005,11 +4005,12 @@ mod tests {
     fn the_shipped_guest_manifests_parse_clean() {
         // screensavers and arcades import only `plank_abi`, so they ask for
         // nothing beyond the implicit log. csvedit imports the `fs` host
-        // functions and nothing else. A grant added here without a matching
-        // host call would prompt the user to approve a capability that
-        // reaches no code.
+        // functions for its own frame session and `files` for the
+        // `edit_csv` tool's host-staged file. A grant added here without a
+        // matching host call would prompt the user to approve a capability
+        // that reaches no code.
         let log_only = vec![Capability::Log];
-        let fs_and_log = vec![Capability::Log, Capability::Fs];
+        let fs_and_log = vec![Capability::Log, Capability::Fs, Capability::Files];
         for (guest, id, module, caps) in [
             (
                 "screensavers",
@@ -4037,6 +4038,9 @@ mod tests {
             assert_eq!(m.module, module, "{guest}");
             assert!(m.surfaces.contains(&Surface::Frame), "{guest}");
             assert!(m.surfaces.contains(&Surface::Command), "{guest}");
+            if guest == "csvedit" {
+                assert!(m.surfaces.contains(&Surface::Tool), "{guest}");
+            }
             let mut got = m.capabilities.clone();
             got.sort();
             assert_eq!(&got, caps, "{guest} grants exactly what it calls");

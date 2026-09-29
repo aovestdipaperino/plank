@@ -17,6 +17,12 @@ use crate::keys::{payload_text, translate};
 
 thread_local! {
     static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
+    /// The file name and its text as they stood when the frame opened, so
+    /// `frame_close` can diff against what is on disk when it closes.
+    static ORIGINAL: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+    /// The row-count summary from the last `frame_close`, consumed once by
+    /// the next `tool_resume`.
+    static LAST_SUMMARY: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 #[plugin_fn]
@@ -62,6 +68,8 @@ pub fn command_run(input: String) -> FnResult<String> {
 pub fn frame_open(input: String) -> FnResult<String> {
     let (w, h) = (dim(int(&input, "w")), dim(int(&input, "h")));
     let arg = text(&input, "arg");
+    let original = crate::disk::Disk::read(&PlankDisk, &arg).unwrap_or_default();
+    ORIGINAL.with(|o| *o.borrow_mut() = Some((arg.clone(), original)));
     SESSION.with(|s| *s.borrow_mut() = Some(Session::open(w, h, &arg, Box::new(PlankDisk))));
     Ok("{}".to_string())
 }
@@ -93,10 +101,79 @@ pub fn frame_step(input: String) -> FnResult<Vec<u8>> {
 
 #[plugin_fn]
 pub fn frame_close() -> FnResult<String> {
+    if let Some((name, before)) = ORIGINAL.with(|o| o.borrow_mut().take()) {
+        let now = crate::disk::Disk::read(&PlankDisk, &name).unwrap_or_default();
+        LAST_SUMMARY.with(|s| *s.borrow_mut() = Some(crate::summary::summarize(&before, &now)));
+    }
     let line = SESSION.with(|s| s.borrow_mut().take().map(|s| s.close_line()));
     Ok(match line {
         Some(l) => format!("{{\"scrollback\": {}}}", json_string(&l)),
         None => "{}".to_string(),
+    })
+}
+
+/// Reads a string field out of the `"args": {...}` sub-object of a flat JSON
+/// payload, the shape plank sends `tool_call` (`{"name": ..., "args":
+/// {...}}`) in. `text` only ever finds the *first* occurrence of a key
+/// anywhere in the payload, so scoping to `args` first keeps a same-named
+/// top-level field from shadowing it (and vice versa).
+fn args_field(input: &str, key: &str) -> String {
+    let Some((_, rest)) = input.split_once("\"args\":") else {
+        return String::new();
+    };
+    let rest = rest.trim_start();
+    let Some(mut body) = rest.strip_prefix('{') else {
+        return String::new();
+    };
+    let mut depth = 1usize;
+    let mut end = 0usize;
+    for (i, c) in body.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    body = &body[..end];
+    text(&format!("{{{body}}}"), key)
+}
+
+#[plugin_fn]
+pub fn tool_specs() -> FnResult<String> {
+    Ok(r#"[{"name": "edit_csv", "description": "Open a CSV file in a grid editor for the user to edit. Blocks until they close it and reports what changed; the file's contents are not returned. A missing file opens as an empty table.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "The CSV file to edit."}}, "required": ["path"]}}]"#.to_string())
+}
+
+#[plugin_fn]
+pub fn tool_call(input: String) -> FnResult<String> {
+    let path = args_field(&input, "path");
+    if path.is_empty() {
+        return Ok("error: edit_csv needs a path".to_string());
+    }
+    Ok(format!(
+        "{{\"frame\": {{\"path\": {}, \"file\": \"data.csv\"}}}}",
+        json_string(&path)
+    ))
+}
+
+#[plugin_fn]
+pub fn tool_resume(input: String) -> FnResult<String> {
+    let path = text(&input, "path");
+    let error = text(&input, "error");
+    let summary = LAST_SUMMARY
+        .with(|s| s.borrow_mut().take())
+        .unwrap_or_else(|| "no changes".to_string());
+    Ok(if !error.is_empty() {
+        format!("error: {summary} in the editor, but {error}")
+    } else if summary == "no changes" {
+        format!("no changes to {path}")
+    } else {
+        format!("{summary} in {path}")
     })
 }
 

@@ -15,7 +15,7 @@ pub mod bash;
 pub mod diff;
 pub mod edit;
 pub mod files;
-mod frames;
+pub mod frames;
 pub mod mcp;
 pub mod mcp_advert;
 pub mod web;

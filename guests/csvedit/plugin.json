@@ -7,8 +7,8 @@
     {
       "id": "dev.plank.csvedit",
       "module": "csvedit.wasm",
-      "surfaces": ["command", "frame"],
-      "capabilities": ["fs", "log"],
+      "surfaces": ["command", "frame", "tool"],
+      "capabilities": ["fs", "files", "log"],
       "min_size": { "w": 60, "h": 16 }
     }
   ]
