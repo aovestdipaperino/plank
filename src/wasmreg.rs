@@ -102,6 +102,10 @@ pub enum Capability {
     /// A private in-memory scratch disk, empty at session start and dropped
     /// at exit. Reaches no real file.
     Fs,
+    /// The one real file a tool call names: read onto the component's RAM
+    /// disk and written back through plank's write rules. Host-side only; it
+    /// adds no host function.
+    Files,
     /// An explicit host list.
     Net,
     /// Shell. See [`Capability::undoes_the_sandbox`].
@@ -124,6 +128,7 @@ impl Capability {
             "notify" => Self::Notify,
             "state" => Self::State,
             "fs" => Self::Fs,
+            "files" => Self::Files,
             "net" => Self::Net,
             "exec" => Self::Exec,
             "agent" => Self::Agent,
@@ -142,6 +147,7 @@ impl Capability {
             Self::Notify => "notify",
             Self::State => "state",
             Self::Fs => "fs",
+            Self::Files => "files",
             Self::Net => "net",
             Self::Exec => "exec",
             Self::Agent => "agent",
@@ -197,6 +203,9 @@ impl Capability {
     pub fn note(self) -> Option<&'static str> {
         match self {
             Self::Fs => Some("a private in-memory scratch disk, cleared when plank exits"),
+            Self::Files => {
+                Some("the one file a tool call names, written back under plank's write rules")
+            }
             _ => None,
         }
     }
@@ -3956,9 +3965,24 @@ mod tests {
             Capability::Session,
             Capability::Net,
             Capability::Exec,
+            // `files` is handled entirely on the host side (the frame
+            // directive in `tools::frames`), so it stands up no host
+            // function of its own either.
+            Capability::Files,
         ] {
             assert!(!c.is_wired(), "{c:?}");
         }
+    }
+
+    /// `files` parses, labels and round-trips like every other capability.
+    #[test]
+    fn the_files_capability_round_trips() {
+        assert_eq!(Capability::parse("files"), Some(Capability::Files));
+        assert_eq!(Capability::Files.label(), "files");
+        assert_eq!(
+            Capability::Files.note(),
+            Some("the one file a tool call names, written back under plank's write rules")
+        );
     }
 
     /// The manifests plank actually ships must parse with this parser.

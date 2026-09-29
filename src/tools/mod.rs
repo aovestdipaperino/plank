@@ -661,9 +661,20 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         // never shadow it.
         name if ctx.wasm.registry.tools().iter().any(|t| t.exposed == name) => {
             let args = mcp::args_to_json(call);
+            let component = ctx
+                .wasm
+                .registry
+                .tools()
+                .into_iter()
+                .find(|t| t.exposed == name)
+                .map(|t| t.component.clone())
+                .unwrap_or_default();
             let wasm = &mut ctx.wasm;
             match wasm.registry.run_tool(&mut *wasm.host, name, &args) {
-                Ok(output) => output,
+                Ok(output) => match frames::parse_frame_directive(&output) {
+                    Some(d) => frames::run_edit_directive(ctx, &component, d),
+                    None => output,
+                },
                 Err(e) => format!("Tool error: {e}\n"),
             }
         }

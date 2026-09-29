@@ -6,6 +6,124 @@
 use super::ToolContext;
 use crate::framebridge::{FrameClose, FrameRequest, FrameResult};
 
+/// A `tool_call` reply asking plank to run the component's frame on a real
+/// file: `{"frame": {"path": <as the model gave it>, "file": <RAM-disk name>}}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameDirective {
+    /// The file to edit, as the model named it.
+    pub path: String,
+    /// The name it is staged under on the component's RAM disk.
+    pub file: String,
+}
+
+/// Recognises a frame directive; anything else is an ordinary tool output.
+#[must_use]
+pub fn parse_frame_directive(output: &str) -> Option<FrameDirective> {
+    use crate::tools::mcp::{Json, json_parse};
+    let json = json_parse(output.trim())?;
+    let frame = json.get("frame")?;
+    let field = |k: &str| match frame.get(k) {
+        Some(Json::Str(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
+    Some(FrameDirective {
+        path: field("path")?,
+        file: field("file")?,
+    })
+}
+
+/// Honours `d` for `component`: checks the `files` grant and the path for
+/// writing before anything else, stages the file (empty when missing), runs
+/// the editor, writes back only a changed file, atomically, and lets the
+/// component report through its optional `tool_resume` export.
+pub fn run_edit_directive(ctx: &mut ToolContext, component: &str, d: FrameDirective) -> String {
+    let FrameDirective { path, file } = d;
+    let has_files = ctx.wasm.registry.loaded.iter().any(|l| {
+        l.component.manifest.id == component
+            && l.component
+                .manifest
+                .capabilities
+                .contains(&crate::wasmreg::Capability::Files)
+    });
+    if !has_files {
+        return format!("Tool error: {component} has no files grant\n");
+    }
+    let target = match ctx.resolve_for_write("frame", &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let bytes = match std::fs::read(&target) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return format!("Tool error: cannot read {}: {e}\n", target.display()),
+    };
+    if bytes.len() > crate::wasmcaps::FS_MAX_FILE_BYTES {
+        return format!(
+            "Tool error: {} is too large for the editor ({} bytes; the limit is {})\n",
+            target.display(),
+            bytes.len(),
+            crate::wasmcaps::FS_MAX_FILE_BYTES
+        );
+    }
+    let (changed, written, error) = match run_frame_blocking(ctx, component, &file, &bytes) {
+        FrameResult::Saved(new) => match write_atomically(&target, &new) {
+            Ok(()) => (true, true, None),
+            Err(e) => (true, false, Some(e)),
+        },
+        FrameResult::Unchanged => (false, false, None),
+        FrameResult::Refused(r) | FrameResult::Failed(r) => {
+            return format!("Tool error: {r}\n");
+        }
+    };
+    resume(ctx, component, &target, changed, written, error.as_deref())
+}
+
+fn write_atomically(target: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = target.with_extension("plank-edit.tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, target).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot replace {}: {e}", target.display())
+    })
+}
+
+/// The tool's final output: the component's `tool_resume` reply when it has
+/// the export, else plank's own line.
+fn resume(
+    ctx: &mut ToolContext,
+    component: &str,
+    target: &std::path::Path,
+    changed: bool,
+    written: bool,
+    error: Option<&str>,
+) -> String {
+    use crate::wasmreg::json_str;
+    let path = target.display().to_string();
+    if ctx.wasm.host.has_export(component, "tool_resume") {
+        let payload = format!(
+            "{{\"path\": {}, \"changed\": {changed}, \"written\": {written}, \"error\": {}}}",
+            json_str(&path),
+            error.map_or_else(|| "null".to_string(), json_str)
+        );
+        if let Ok(bytes) = ctx
+            .wasm
+            .host
+            .call(component, "tool_resume", payload.as_bytes())
+        {
+            let mut out = String::from_utf8_lossy(&bytes).into_owned();
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            return out;
+        }
+    }
+    match (error, changed) {
+        (Some(e), _) => format!("Tool error: {e}\n"),
+        (None, true) => format!("saved changes to {path}\n"),
+        (None, false) => format!("no changes to {path}\n"),
+    }
+}
+
 /// Runs `component` as an editor on `bytes`, staged as `file` on its RAM
 /// disk, and blocks until the user closes it.
 ///
@@ -164,6 +282,16 @@ pub(crate) fn lend_bounded<T: Send + 'static>(
         .expect("the lent session never came back")
 }
 
+/// Removes any old copy first, so a test that never cleans up after a panic
+/// cannot leak state into a later run.
+#[cfg(test)]
+fn tempdir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("plank-frames-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +358,137 @@ mod tests {
             None,
             "the file is removed"
         );
+    }
+
+    #[test]
+    fn a_frame_directive_is_recognised_and_anything_else_is_not() {
+        assert_eq!(
+            parse_frame_directive(r#"{"frame": {"path": "a.csv", "file": "data.csv"}}"#),
+            Some(FrameDirective {
+                path: "a.csv".into(),
+                file: "data.csv".into()
+            })
+        );
+        assert_eq!(parse_frame_directive("plain text"), None);
+        assert_eq!(parse_frame_directive(r#"{"output": "x"}"#), None);
+        assert_eq!(
+            parse_frame_directive(r#"{"frame": {"path": "a.csv"}}"#),
+            None
+        );
+    }
+
+    fn files_ctx(dir: &std::path::Path) -> ToolContext {
+        use crate::wasmreg::test_support::{editor_component, editor_session};
+        use crate::wasmreg::{Capability, Surface};
+        let mut ctx = ToolContext::new(dir.to_path_buf());
+        ctx.wasm = editor_session(vec![editor_component(
+            vec![Surface::Frame, Surface::Tool],
+            vec![Capability::Fs, Capability::Files],
+        )]);
+        ctx
+    }
+
+    #[test]
+    fn a_directive_without_the_files_grant_is_an_error() {
+        use crate::wasmreg::test_support::{editor_component, editor_session};
+        use crate::wasmreg::{Capability, Surface};
+        let dir = tempdir("directive-nogrant");
+        let mut ctx = ToolContext::new(dir.clone());
+        ctx.wasm = editor_session(vec![editor_component(
+            vec![Surface::Frame],
+            vec![Capability::Fs],
+        )]);
+        let out = run_edit_directive(
+            &mut ctx,
+            ID,
+            FrameDirective {
+                path: "a.csv".into(),
+                file: "data.csv".into(),
+            },
+        );
+        assert!(out.contains("has no files grant"), "{out}");
+    }
+
+    #[test]
+    fn an_edited_file_is_written_back_and_a_missing_one_starts_empty() {
+        let dir = tempdir("directive-edit");
+        let ctx = files_ctx(&dir);
+        let bridge = crate::framebridge::FrameBridge::new();
+        let mut ctx = ctx;
+        ctx.frame_bridge = Some(bridge.clone());
+        let h = ui_thread(bridge, Some(b"a,b\n1,2\n"), FrameClose::Closed);
+        let (_ctx, out) = lend_bounded(ctx, |ctx| {
+            run_edit_directive(
+                ctx,
+                ID,
+                FrameDirective {
+                    path: "new.csv".into(),
+                    file: "data.csv".into(),
+                },
+            )
+        });
+        h.join().unwrap();
+        assert_eq!(std::fs::read(dir.join("new.csv")).unwrap(), b"a,b\n1,2\n");
+        assert_eq!(
+            out,
+            format!("saved changes to {}\n", dir.join("new.csv").display())
+        );
+    }
+
+    #[test]
+    fn an_unchanged_file_is_not_rewritten() {
+        let dir = tempdir("directive-same");
+        std::fs::write(dir.join("a.csv"), b"x\n").unwrap();
+        let before = std::fs::metadata(dir.join("a.csv"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let ctx = files_ctx(&dir);
+        let bridge = crate::framebridge::FrameBridge::new();
+        let mut ctx = ctx;
+        ctx.frame_bridge = Some(bridge.clone());
+        let h = ui_thread(bridge, None, FrameClose::Closed);
+        let (_ctx, out) = lend_bounded(ctx, |ctx| {
+            run_edit_directive(
+                ctx,
+                ID,
+                FrameDirective {
+                    path: "a.csv".into(),
+                    file: "data.csv".into(),
+                },
+            )
+        });
+        h.join().unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.join("a.csv"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            out,
+            format!("no changes to {}\n", dir.join("a.csv").display())
+        );
+    }
+
+    #[test]
+    fn a_file_over_the_disk_quota_is_refused_before_editing() {
+        let dir = tempdir("directive-big");
+        let big = vec![b'x'; crate::wasmcaps::FS_MAX_FILE_BYTES + 1];
+        std::fs::write(dir.join("big.csv"), &big).unwrap();
+        let mut ctx = files_ctx(&dir);
+        ctx.frame_bridge = Some(crate::framebridge::FrameBridge::new());
+        let out = run_edit_directive(
+            &mut ctx,
+            ID,
+            FrameDirective {
+                path: "big.csv".into(),
+                file: "data.csv".into(),
+            },
+        );
+        assert!(out.starts_with("Tool error: "), "{out}");
+        assert!(out.contains("too large"), "{out}");
     }
 
     #[test]
