@@ -373,8 +373,11 @@ with no conceptual redesign — and so `tools/mod.rs` can merge both registries
 into one dispatch table with one collision policy.
 
 **Opening a blocking editor.** A `tool_call` reply may, instead of an ordinary
-observation, be a frame directive: `{"frame": {"path": "<as the model gave
-it>", "file": "<name to stage it under on the component's own RAM disk>"}}`.
+observation, be a frame directive: `{"frame": {"path": "<the real file to edit>", "file":
+"<name to stage it under on the component's own RAM disk>"}}`. The component
+chooses `path`: plank applies the write roots to whatever it names, and how
+that relates to the model-visible arguments (csvedit passes its `path`
+argument through) is the component's business.
 This is what `edit_csv` uses (`guests/csvedit`, `src/tools/frames.rs`): plank
 resolves and checks `path` for writing, reads it (empty if missing) onto the
 component's disk as `file`, runs the component's `frame` surface to
@@ -387,7 +390,9 @@ without that export plank answers with one of `saved changes to <path>`,
 capability (below) — it is checked before anything else — and everything
 [Grid bridge](#grid-bridge) says about refusals, containment and the write
 applies here too, since `edit_csv` is built on the very same
-`frames::run_frame_blocking`.
+`frames::run_frame_blocking`. One difference from `write` and `edit`: a
+`path` that is itself a symlink is refused outright rather than followed or
+replaced.
 
 **Prompt-cache warning.** Adding or removing a `tool` plugin changes the tool
 list, which changes the system prompt, which invalidates `sysprompt.kv`. Tool
@@ -532,7 +537,7 @@ granted per-plugin in the manifest. Nothing is granted by default.
 | `notify` | `plank_notify(title, body)` | Desktop/terminal notification |
 | `state` | `plank_state_get(key)`, `plank_state_set(key, val)` | A per-plugin KV store under `~/.plank/plugins/<id>/state`. The *only* persistence most plugins need, and it needs no filesystem grant. Quotas: 1 MiB per value, 255-byte keys, 256 keys and 16 MiB in total per component (`STATE_MAX_*` in `src/wasmcaps.rs`); an over-quota `state_set` is refused with a `'<id>' ...` error before anything is written |
 | `fs` | `plank_fs_read(path)`, `plank_fs_write(path, bytes)`, `plank_fs_list(dir)`, `plank_fs_remove(path)` | A private in-memory scratch disk per component, empty at session start and cleared when plank exits; it reaches no real file. Paths are `/`-rooted, `..`, NUL and backslash are refused, and a write that would make one path both a file and a directory is refused. Quotas: 4 MiB per file, 256 files and 16 MiB in total per component (`FS_MAX_*` in `src/wasmcaps.rs`). The grant is checked before the path, and grant, quota and overlap refusals start with `'<id>'` and change nothing |
-| `files` | none (host-side only) | "the one file a tool call names, written back under plank's write rules" — the note shown at trust time. No host function; `tool_call` asks for it by replying with a frame directive (`{"frame": {"path", "file"}}`, see the `tool` surface above), and plank itself reads and writes the real path, checked with `resolve_for_write` before the edit and again immediately before the write |
+| `files` | none (host-side only) | "the one file a tool call names, written back under plank's write rules" — the note shown at trust time. No host function; `tool_call` asks for it by replying with a frame directive (`{"frame": {"path", "file"}}`, see the `tool` surface above), and plank itself reads and writes the real path, checked with `resolve_for_write` before the edit and again immediately before the write. The component chooses the directive's `path` (plank applies the write roots to whatever it names), and a target that is itself a symlink is refused outright, unlike `write`/`edit` |
 | `net` | Extism `allowed_hosts` | Explicit host list |
 | `exec` | `plank_exec(cmd) -> {out, code}` | **Escape hatch.** Grants shell. Requires explicit user confirmation at install and is flagged in `/plugins` |
 | `agent` | `plank_prompt(text)` | Submits a prompt to the model as if typed. Rate-limited to prevent loops |

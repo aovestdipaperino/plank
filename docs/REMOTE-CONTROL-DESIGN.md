@@ -297,7 +297,10 @@ go through this gate at all: a remote-driven turn cannot open one — a
 remote-started turn never has anyone at the local screen to drive it —
 so the tool call itself refuses with `the editor needs the local screen`
 (`Agent::refresh_editor_refusal`, set from `Agent::turn_from_remote`) rather
-than waiting for a frame to close.
+than waiting for a frame to close. The origin belongs to the turn, not the
+line: a line queued during a turn runs with the origin of the turn that picks
+it up, so a remote line drained by a local turn may open an editor and a local
+line drained by a remote turn may not.
 
 ### 4.4 Session multiplexing and the coexistence policy
 

@@ -290,6 +290,50 @@ fn csvedit_tool_resume_reports_no_changes_after_a_clean_close() {
     assert_eq!(resumed, "no changes to x.csv");
 }
 
+/// Saving an untouched CRLF file rewrites it as LF (the writer always emits
+/// LF) while every row compares equal, so the host reports `changed` and the
+/// row summary is empty: the resume line must say the file was rewritten, not
+/// `no changes`.
+#[test]
+fn csvedit_tool_resume_reports_a_rewrite_with_no_row_changes() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load(ID, &wasm, &["fs", "files", "log"]).expect("load");
+
+    h.call(
+        ID,
+        "tool_call",
+        br#"{"name": "edit_csv", "args": {"path": "x.csv"}}"#,
+    )
+    .expect("tool_call");
+    h.ram_write(ID, "/data.csv", b"A,B,C\r\n1,2,3\r\n")
+        .expect("stage");
+    h.call(
+        ID,
+        "frame_open",
+        br#"{"w": 80, "h": 24, "seed": 1, "arg": "data.csv", "config": {}}"#,
+    )
+    .expect("frame_open");
+    key(h.as_mut(), "ctrl-s", None);
+    assert_eq!(
+        h.as_mut().ram_file(ID, "/data.csv").as_deref(),
+        Some(&b"A,B,C\n1,2,3\n"[..]),
+        "the save rewrote the line endings"
+    );
+    h.call(ID, "frame_close", b"").expect("frame_close");
+
+    let resumed = String::from_utf8(
+        h.call(
+            ID,
+            "tool_resume",
+            br#"{"path": "x.csv", "changed": true, "written": true, "error": null}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resumed, "rewrote x.csv (no row changes)");
+}
+
 /// A host-reported error (e.g. the write failed) is surfaced alongside
 /// whatever the editor itself observed.
 #[test]
@@ -331,7 +375,8 @@ fn csvedit_tool_resume_surfaces_a_host_error() {
 
 /// A grid-bridge / `/csvedit` open with no preceding `tool_call` never
 /// records `ORIGINAL`, so it never pays for a diff and leaves `tool_resume`
-/// reporting "no changes" regardless of what was actually edited.
+/// with no row summary: the host's `changed` flag is all it reports
+/// ("saved changes"), never row counts from a diff it did not run.
 #[test]
 fn csvedit_a_non_tool_open_never_records_a_summary() {
     let wasm = guest_or_skip!();
@@ -364,7 +409,7 @@ fn csvedit_a_non_tool_open_never_records_a_summary() {
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(resumed, "no changes to x.csv");
+    assert_eq!(resumed, "saved changes to x.csv");
 }
 
 /// A `tool_call` whose directive plank never honours (refused before
@@ -415,7 +460,7 @@ fn csvedit_a_refused_directive_never_leaks_into_a_later_grid_open() {
     )
     .unwrap();
     assert_eq!(
-        resumed, "no changes to x.csv",
+        resumed, "saved changes to x.csv",
         "the stale marker from the refused tool_call must not have attached to this open"
     );
 }
@@ -470,7 +515,7 @@ fn csvedit_a_slash_command_after_tool_call_never_leaks_into_its_own_open() {
     )
     .unwrap();
     assert_eq!(
-        resumed, "no changes to x.csv",
+        resumed, "saved changes to x.csv",
         "command_run must have cleared the marker before this open"
     );
 }

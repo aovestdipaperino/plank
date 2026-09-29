@@ -288,9 +288,12 @@ new row's `#` cell is left empty.
 
 The other crossing is the `files` capability, host-side only (no host
 function of its own): a `tool_call` reply of `{"frame": {"path", "file"}}`
-asks plank to run your `frame` surface as a blocking editor on a real file
-named by the model, the way csvedit's own `edit_csv` tool does
-(`guests/csvedit/src/frame.rs`). plank checks and stages the file, runs your
+asks plank to run your `frame` surface as a blocking editor on a real file,
+the way csvedit's own `edit_csv` tool does (`guests/csvedit/src/frame.rs`).
+You choose `path`: plank applies its write roots to whatever you name, and
+how it relates to the arguments the model passed (csvedit forwards its `path`
+argument) is up to you. A `path` that is itself a symlink is refused
+outright, unlike plank's own `write` and `edit`. plank checks and stages the file, runs your
 frame to completion exactly as the grid bridge does, and calls your
 `tool_resume(json: {path, changed, written, error}) -> string` export, if you
 have one, so you can report the outcome in your own words — without it, plank

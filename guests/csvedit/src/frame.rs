@@ -204,16 +204,15 @@ pub fn tool_call(input: String) -> FnResult<String> {
 pub fn tool_resume(input: String) -> FnResult<String> {
     let path = text(&input, "path");
     let error = text(&input, "error");
-    let summary = LAST_SUMMARY
-        .with(|s| s.borrow_mut().take())
-        .unwrap_or_else(|| "no changes".to_string());
-    Ok(if !error.is_empty() {
-        format!("error: {summary} in the editor, but {error}")
-    } else if summary == "no changes" {
-        format!("no changes to {path}")
-    } else {
-        format!("{summary} in {path}")
-    })
+    let summary = LAST_SUMMARY.with(|s| s.borrow_mut().take());
+    let rewrote =
+        crate::summary::flag(&input, "changed") || crate::summary::flag(&input, "written");
+    Ok(crate::summary::resume_line(
+        &path,
+        summary.as_deref(),
+        &error,
+        rewrote,
+    ))
 }
 
 fn dim(v: u64) -> u16 {

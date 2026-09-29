@@ -22,6 +22,8 @@ const LCS_CELL_LIMIT: usize = 250_000;
 /// Header changes are reported as `columns changed`.
 #[must_use]
 pub fn summarize(before: &str, after: &str) -> String {
+    // Counts lines, not CSV records: a quoted field with an embedded newline
+    // counts as two rows (a known limitation; the summary is not a parser).
     let rows = |t: &str| t.lines().map(str::to_owned).collect::<Vec<_>>();
     let (b, a) = (rows(before), rows(after));
     let mut parts = Vec::new();
@@ -113,9 +115,44 @@ fn lcs_pairs(b: &[String], a: &[String]) -> Vec<(usize, usize)> {
     pairs
 }
 
+/// The line `tool_resume` returns, from the row `summary` of the last
+/// tool-invoked close (`None` when none was recorded), the host's `error`
+/// (empty when none) and whether the host `rewrote` the target (its
+/// `changed` or `written` flag).
+///
+/// A rewrite with no row changes is reported as such rather than as `no
+/// changes`: [`summarize`] compares lines, which drops a `\r`, and the
+/// writer always emits LF, so saving an untouched CRLF file rewrites it on
+/// disk while every row compares equal. With no recorded summary the host's
+/// own flag is all there is, so a rewrite reads as the host's fallback line.
+#[must_use]
+pub fn resume_line(path: &str, summary: Option<&str>, error: &str, rewrote: bool) -> String {
+    let rows = summary.unwrap_or("no changes");
+    if !error.is_empty() {
+        format!("error: {rows} in the editor, but {error}")
+    } else if rows != "no changes" {
+        format!("{rows} in {path}")
+    } else if !rewrote {
+        format!("no changes to {path}")
+    } else if summary.is_some() {
+        format!("rewrote {path} (no row changes)")
+    } else {
+        format!("saved changes to {path}")
+    }
+}
+
+/// Reads a JSON boolean field out of a flat payload; anything absent or not
+/// literally `true` reads as `false`.
+#[must_use]
+pub fn flag(input: &str, key: &str) -> bool {
+    input
+        .split_once(&format!("\"{key}\":"))
+        .is_some_and(|(_, rest)| rest.trim_start().starts_with("true"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::summarize;
+    use super::{flag, resume_line, summarize};
 
     #[test]
     fn counts_changed_added_and_deleted_rows_without_values() {
@@ -173,5 +210,42 @@ mod tests {
         // Entirely distinct rows on both sides: the fallback pairs them
         // 1:1 as "changed" since both sides are the same length.
         assert_eq!(summarize(&before, &after), "3000 rows changed");
+    }
+
+    #[test]
+    fn a_rewrite_with_no_row_changes_says_so() {
+        let none = Some("no changes");
+        assert_eq!(
+            resume_line("a.csv", none, "", true),
+            "rewrote a.csv (no row changes)"
+        );
+        assert_eq!(resume_line("a.csv", none, "", false), "no changes to a.csv");
+        assert_eq!(
+            resume_line("a.csv", Some("1 row changed"), "", true),
+            "1 row changed in a.csv"
+        );
+        assert_eq!(
+            resume_line("a.csv", none, "disk full", true),
+            "error: no changes in the editor, but disk full"
+        );
+    }
+
+    /// No recorded summary (the open was not tool-invoked): the host's flag
+    /// decides, and nothing claims row counts it never computed.
+    #[test]
+    fn without_a_summary_the_hosts_flag_decides() {
+        assert_eq!(resume_line("a.csv", None, "", false), "no changes to a.csv");
+        assert_eq!(
+            resume_line("a.csv", None, "", true),
+            "saved changes to a.csv"
+        );
+    }
+
+    #[test]
+    fn flag_reads_only_a_literal_true() {
+        let p = r#"{"path": "a.csv", "changed": true, "written": false, "error": null}"#;
+        assert!(flag(p, "changed"));
+        assert!(!flag(p, "written"));
+        assert!(!flag(p, "missing"));
     }
 }
