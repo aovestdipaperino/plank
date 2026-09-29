@@ -23,12 +23,24 @@ thread_local! {
     /// The row-count summary from the last `frame_close`, consumed once by
     /// the next `tool_resume`.
     static LAST_SUMMARY: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// Set by `tool_call` and consumed by the very next `frame_open`: only a
-    /// tool-invoked edit pays for capturing `ORIGINAL` and diffing at close.
-    /// A grid-bridge or `/csvedit` open (no `tool_call` first) never sets
-    /// this, so it never reads the file twice or runs a summary nobody
-    /// asked for.
-    static PENDING_TOOL_OPEN: RefCell<bool> = const { RefCell::new(false) };
+    /// Set by `tool_call` to the RAM-disk name it named in the frame
+    /// directive, and always cleared by the very next `frame_open` — but
+    /// `ORIGINAL` is only recorded when that open's own `arg` matches, so a
+    /// directive plank refused before calling `frame_open` at all (no
+    /// bridge, a sub-agent, `editor_refusal`, a missing `files` grant, a
+    /// containment/symlink refusal, over quota) cannot attach itself to a
+    /// later, unrelated open. It is also cleared by `command_run` (a slash
+    /// command means the tool path is over) and at the start of every
+    /// `tool_call` (a fresh call starts clean, in case a previous one never
+    /// got its `frame_open` either).
+    ///
+    /// The remaining edge case — a refused `edit_csv` directive followed by
+    /// a later `frame_open` whose `arg` happens to also be `"data.csv"` —
+    /// is accepted: grid-bridge files are never named `data.csv` and a
+    /// `/csvedit` open uses the user's own file name, so only another
+    /// tool-invoked open of the RAM-disk staging name could collide, and
+    /// that is exactly the case this flag is meant to recognise anyway.
+    static PENDING_TOOL_OPEN: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 #[plugin_fn]
@@ -51,6 +63,9 @@ pub fn command_specs() -> FnResult<String> {
 /// treated as `new`.
 #[plugin_fn]
 pub fn command_run(input: String) -> FnResult<String> {
+    // A slash command means the tool path is over: a pending tool-invoked
+    // open (if any) is now stale.
+    PENDING_TOOL_OPEN.with(|p| *p.borrow_mut() = None);
     let name = text(&input, "name");
     let args = text(&input, "args");
     let arg = args.trim();
@@ -74,7 +89,12 @@ pub fn command_run(input: String) -> FnResult<String> {
 pub fn frame_open(input: String) -> FnResult<String> {
     let (w, h) = (dim(int(&input, "w")), dim(int(&input, "h")));
     let arg = text(&input, "arg");
-    if PENDING_TOOL_OPEN.with(|p| p.replace(false)) {
+    // Always clear the pending marker on the very next open, whatever it
+    // opens: only when it names the same file the tool call staged is the
+    // marker actually acted on, which is what rules out a stale marker from
+    // a directive plank never honoured attaching to a later, unrelated open.
+    let pending = PENDING_TOOL_OPEN.with(|p| p.borrow_mut().take());
+    if pending.as_deref() == Some(arg.as_str()) {
         let original = crate::disk::Disk::read(&PlankDisk, &arg).unwrap_or_default();
         ORIGINAL.with(|o| *o.borrow_mut() = Some((arg.clone(), original)));
     }
@@ -164,17 +184,19 @@ pub fn tool_specs() -> FnResult<String> {
 
 #[plugin_fn]
 pub fn tool_call(input: String) -> FnResult<String> {
+    // A fresh call starts clean, in case an earlier one's frame_open never
+    // arrived (the host refused the directive before opening the frame).
+    PENDING_TOOL_OPEN.with(|p| *p.borrow_mut() = None);
     let path = args_field(&input, "path");
     if path.is_empty() {
         return Ok("error: edit_csv needs a path".to_string());
     }
-    // The host always calls frame_open next for a frame directive, so this
-    // flag is consumed by the very next frame_open and never lingers into
-    // an unrelated later open.
-    PENDING_TOOL_OPEN.with(|p| *p.borrow_mut() = true);
+    let file = "data.csv";
+    PENDING_TOOL_OPEN.with(|p| *p.borrow_mut() = Some(file.to_string()));
     Ok(format!(
-        "{{\"frame\": {{\"path\": {}, \"file\": \"data.csv\"}}}}",
-        json_string(&path)
+        "{{\"frame\": {{\"path\": {}, \"file\": {}}}}}",
+        json_string(&path),
+        json_string(file)
     ))
 }
 

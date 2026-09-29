@@ -367,6 +367,114 @@ fn csvedit_a_non_tool_open_never_records_a_summary() {
     assert_eq!(resumed, "no changes to x.csv");
 }
 
+/// A `tool_call` whose directive plank never honours (refused before
+/// `frame_open`: no bridge, a sub-agent, `editor_refusal`, a missing
+/// `files` grant, containment/symlink, over quota — none reproduced here,
+/// since the point is the guest side of the leak) must not attach its
+/// pending marker to a later, unrelated `frame_open`. This drives a
+/// grid-style open of a different file name straight after the `tool_call`,
+/// with no `frame_open` of `data.csv` in between.
+#[test]
+fn csvedit_a_refused_directive_never_leaks_into_a_later_grid_open() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load(ID, &wasm, &["fs", "files", "log"]).expect("load");
+
+    h.call(
+        ID,
+        "tool_call",
+        br#"{"name": "edit_csv", "args": {"path": "x.csv"}}"#,
+    )
+    .expect("tool_call");
+    // No frame_open of data.csv follows: plank refused the directive.
+
+    h.ram_write(ID, "/other.csv", b"A,B,C\n1,2,3\n")
+        .expect("stage");
+    h.call(
+        ID,
+        "frame_open",
+        br#"{"w": 80, "h": 24, "seed": 1, "arg": "other.csv", "config": {}}"#,
+    )
+    .expect("frame_open");
+    let hm = h.as_mut();
+    key(hm, "enter", None);
+    for c in "42".chars() {
+        key(hm, &c.to_string(), Some(c));
+    }
+    key(hm, "enter", None);
+    key(hm, "ctrl-s", None);
+    h.call(ID, "frame_close", b"").expect("frame_close");
+
+    let resumed = String::from_utf8(
+        h.call(
+            ID,
+            "tool_resume",
+            br#"{"path": "x.csv", "changed": true, "written": true, "error": null}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        resumed, "no changes to x.csv",
+        "the stale marker from the refused tool_call must not have attached to this open"
+    );
+}
+
+/// A `tool_call` followed by a slash command (the tool path abandoned in
+/// favour of `/csvedit`) must not leave its pending marker to attach to
+/// that command's own `frame_open`, even when it happens to open
+/// `data.csv` too.
+#[test]
+fn csvedit_a_slash_command_after_tool_call_never_leaks_into_its_own_open() {
+    let wasm = guest_or_skip!();
+    let mut h = host(None);
+    h.load(ID, &wasm, &["fs", "files", "log"]).expect("load");
+
+    h.call(
+        ID,
+        "tool_call",
+        br#"{"name": "edit_csv", "args": {"path": "x.csv"}}"#,
+    )
+    .expect("tool_call");
+    h.call(
+        ID,
+        "command_run",
+        br#"{"name": "open", "args": "data.csv"}"#,
+    )
+    .expect("command_run");
+
+    h.ram_write(ID, "/data.csv", b"A,B,C\n1,2,3\n")
+        .expect("stage");
+    h.call(
+        ID,
+        "frame_open",
+        br#"{"w": 80, "h": 24, "seed": 1, "arg": "data.csv", "config": {}}"#,
+    )
+    .expect("frame_open");
+    let hm = h.as_mut();
+    key(hm, "enter", None);
+    for c in "42".chars() {
+        key(hm, &c.to_string(), Some(c));
+    }
+    key(hm, "enter", None);
+    key(hm, "ctrl-s", None);
+    h.call(ID, "frame_close", b"").expect("frame_close");
+
+    let resumed = String::from_utf8(
+        h.call(
+            ID,
+            "tool_resume",
+            br#"{"path": "x.csv", "changed": true, "written": true, "error": null}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        resumed, "no changes to x.csv",
+        "command_run must have cleared the marker before this open"
+    );
+}
+
 #[test]
 fn csvedit_command_run_round_trips_a_quoted_and_backslashed_name() {
     let wasm = guest_or_skip!();
