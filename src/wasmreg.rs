@@ -794,20 +794,36 @@ fn parse_frame_fields(
 /// Discovers every WASM component contributed by `set`.
 ///
 /// Components are keyed by id across the whole set: two plugins declaring the
-/// same id is a collision, and the *later* plugin loses, matching how the
-/// plugin loader resolves contributions by load order. It warns rather than
-/// failing, for the same reason it does there.
+/// same id is a collision, and the *later* plugin loses. It warns rather than
+/// failing, for the same reason the plugin loader does.
+///
+/// The one exception is the running profile (spliced last): its copy replaces
+/// a scanned one, because the profile routes its grids to the component it
+/// bundles, and a stale standalone install of the same id would otherwise
+/// shadow it. Only the profile gets this: letting any later plugin win would
+/// let a project's plugin swap new bytes in under an id the user already
+/// trusted, and the re-prompt that follows would look like an ordinary update.
 #[must_use]
 pub fn discover(set: &PluginSet) -> WasmSet {
     let mut out = WasmSet::default();
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for plugin in &set.plugins {
         for m in discover_in(plugin, &mut out.warnings) {
-            if let Some(first) = seen.get(&m.manifest.id) {
-                out.warnings.push(format!(
-                    "wasm component '{}' is declared by both '{first}' and '{}'; keeping {first}'s",
-                    m.manifest.id, plugin.name
-                ));
+            if let Some(first) = seen.get(&m.manifest.id).cloned() {
+                if plugin.origin == Origin::Profile {
+                    out.warnings.push(format!(
+                        "wasm component '{}' is declared by both '{first}' and '{}'; keeping the running profile {}'s",
+                        m.manifest.id, plugin.name, plugin.name
+                    ));
+                    out.components.retain(|c| c.manifest.id != m.manifest.id);
+                    seen.insert(m.manifest.id.clone(), plugin.name.clone());
+                    out.components.push(m);
+                } else {
+                    out.warnings.push(format!(
+                        "wasm component '{}' is declared by both '{first}' and '{}'; keeping {first}'s",
+                        m.manifest.id, plugin.name
+                    ));
+                }
                 continue;
             }
             seen.insert(m.manifest.id.clone(), plugin.name.clone());
@@ -4147,6 +4163,40 @@ mod tests {
         assert_eq!(set.components[0].plugin, "alpha");
         assert!(
             set.warnings.iter().any(|w| w.contains("both 'alpha'")),
+            "{:?}",
+            set.warnings
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The running profile's own copy of a component beats a scanned plugin
+    /// declaring the same id, though the profile is spliced last: a stale
+    /// standalone install must not shadow what the profile bundles (and
+    /// routes its grids to). The loser is still named.
+    #[test]
+    fn the_running_profiles_copy_of_an_id_wins() {
+        let root = temp_dir("dup-id-profile");
+        let scanned = plugin_dir(
+            &root,
+            "standalone",
+            &FULL.replace("\"demo\"", "\"standalone\""),
+            &["demo.wasm"],
+        );
+        let mut profile = plugin_dir(
+            &root,
+            "bundler",
+            &FULL.replace("\"demo\"", "\"bundler\""),
+            &["demo.wasm"],
+        );
+        profile.origin = Origin::Profile;
+        let set = discover(&set_of(vec![scanned, profile]));
+        assert_eq!(set.components.len(), 1, "{:?}", set.warnings);
+        assert_eq!(set.components[0].plugin, "bundler");
+        assert_eq!(set.components[0].origin, Origin::Profile);
+        assert!(
+            set.warnings
+                .iter()
+                .any(|w| w.contains("keeping the running profile bundler's")),
             "{:?}",
             set.warnings
         );

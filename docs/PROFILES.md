@@ -127,6 +127,10 @@ first, so a stray Enter changes nothing), the plain REPL asks `[y/N]`, and a
 piped stdin declines. Only a component that is new, changed or asking for more
 is offered; one with a bad signature or one the user disabled is not, and
 declining leaves it held until `/plugins trust <id>`.
+If a separately installed plugin declares the same component id, the running
+profile's copy is the one kept (with a warning naming both), so a stale
+standalone install cannot shadow what the profile bundles. Everywhere else the
+first plugin to declare an id keeps it.
 
 ## The tool-protocol token
 
