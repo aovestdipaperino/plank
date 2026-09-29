@@ -212,27 +212,22 @@ pub struct ToolContext {
     /// id its `plank-frame://` resources may open in. Empty without
     /// `--profile`, so no staging is ever honoured there.
     pub grid_routes: BTreeMap<String, String>,
-    /// Whether a front end that can show a WASM frame is running: true only
-    /// for the Ratatui TUI. Without it every grid staging is refused.
-    pub frames_available: bool,
-    /// Messages plank itself has for the model, each already wrapped in a
-    /// `<system-reminder>`: a grid's write-back outcome. The sibling of the
-    /// bash job table's notifications, drained at the same turn boundary.
-    pub host_notices: Vec<String>,
 }
 
-/// An MCP tool's observation once its grid stagings are honoured or refused.
+/// An MCP tool's observation once its grids have been edited or refused.
 ///
-/// Decided here, while the result is still on its way to the model, so every
-/// outcome reaches the model in that tool's own observation: `grid opened when
-/// you finish: <file>` when the grid is on the component's RAM disk with its
-/// frame queued, `grid not opened: <reason>` otherwise. A result that was only
-/// a grid read `(no output)`; the note replaces that.
+/// Each grid runs as a blocking editor inside this tool call
+/// (`frames::run_frame_blocking`); an edited one is written back through the
+/// staging's own write-back tool before the observation is returned, so the
+/// model learns what was applied in this same result. The CSV itself never
+/// appears in the text. A result that was only a grid read `(no output)`; the
+/// outcome line replaces that.
 fn grid_observation(
     ctx: &mut ToolContext,
     mut text: String,
     stagings: Vec<crate::grid::GridStaging>,
 ) -> String {
+    use crate::framebridge::FrameResult;
     if stagings.is_empty() {
         return text;
     }
@@ -243,20 +238,41 @@ fn grid_observation(
         text.push('\n');
     }
     for staging in stagings {
-        let file = staging.file.clone();
-        let outcome = if ctx.frames_available {
-            ctx.wasm.stage_grid(staging, &ctx.grid_routes)
+        let routed = ctx.grid_routes.get(&staging.server) == Some(&staging.component);
+        let line = if routed {
+            match frames::run_frame_blocking(
+                ctx,
+                &staging.component,
+                &staging.file,
+                staging.csv.as_bytes(),
+            ) {
+                FrameResult::Saved(bytes) => match String::from_utf8(bytes) {
+                    Ok(csv) => {
+                        let args = crate::grid::write_back_arguments(&staging.write_back, &csv);
+                        match mcp::call_tool_direct(
+                            &mut ctx.mcp,
+                            &staging.server,
+                            &staging.write_back.tool,
+                            &args,
+                        ) {
+                            Ok(reply) => format!("grid closed: {}", reply.trim_end()),
+                            Err(e) => format!("grid closed: write-back failed: {e}"),
+                        }
+                    }
+                    Err(_) => {
+                        "grid closed: write-back failed: the grid file is not UTF-8".to_string()
+                    }
+                },
+                FrameResult::Unchanged => "grid closed without changes".to_string(),
+                FrameResult::Refused(r) | FrameResult::Failed(r) => format!("grid not opened: {r}"),
+            }
         } else {
-            Err("grids need the interactive TUI".to_string())
+            format!(
+                "grid not opened: this profile does not route {}'s grids",
+                staging.server
+            )
         };
-        match outcome {
-            Ok(()) => {
-                let _ = writeln!(text, "grid opened when you finish: {file}");
-            }
-            Err(reason) => {
-                let _ = writeln!(text, "grid not opened: {reason}");
-            }
-        }
+        let _ = writeln!(text, "{line}");
     }
     text
 }
@@ -369,8 +385,6 @@ impl ToolContext {
             wrote_memory: false,
             memory_log_path: None,
             grid_routes: BTreeMap::new(),
-            frames_available: false,
-            host_notices: Vec::new(),
         }
     }
 
@@ -1929,48 +1943,39 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    fn grid_staging(server: &str) -> crate::grid::GridStaging {
+    fn staging() -> crate::grid::GridStaging {
         crate::grid::GridStaging {
-            server: server.to_string(),
+            server: "chatbgt".to_string(),
             component: "dev.plank.csvedit".to_string(),
-            file: "categories.csv".to_string(),
-            csv: "#,name\n".to_string(),
+            file: "grid.csv".to_string(),
+            csv: "#,x\n1,a\n".to_string(),
             write_back: crate::grid::WriteBack {
                 tool: "apply_grid".to_string(),
-                table: "categories".to_string(),
-                grid: "0badf00d".to_string(),
+                table: "rules".to_string(),
+                grid: "t0".to_string(),
             },
         }
     }
 
-    /// Without frames every staging is refused for that reason alone, before
-    /// routes or components are looked at, and the reason reaches the model.
-    #[test]
-    fn without_frames_a_grid_is_refused_for_needing_the_tui() {
-        let mut ctx = ToolContext::new("/tmp");
-        ctx.grid_routes =
-            BTreeMap::from([("chatbgt".to_string(), "dev.plank.csvedit".to_string())]);
-        let out = grid_observation(
-            &mut ctx,
-            "grid staged: categories, 1 rows\n".to_string(),
-            vec![grid_staging("chatbgt")],
-        );
-        assert_eq!(
-            out,
-            "grid staged: categories, 1 rows\ngrid not opened: grids need the interactive TUI\n"
-        );
-        assert!(ctx.wasm.registry.take_pending_frame().is_none());
+    /// An editor context routing chatbgt's grids to csvedit, with a bridge
+    /// whose stand-in TUI applies `edit` and closes the frame.
+    fn routed_ctx_with_ui(
+        edit: Option<&'static [u8]>,
+    ) -> (ToolContext, std::thread::JoinHandle<()>) {
+        let mut ctx = crate::tools::frames::editor_ctx();
+        ctx.grid_routes
+            .insert("chatbgt".into(), "dev.plank.csvedit".into());
+        let bridge = crate::framebridge::FrameBridge::new();
+        ctx.frame_bridge = Some(bridge.clone());
+        let ui =
+            crate::tools::frames::ui_thread(bridge, edit, crate::framebridge::FrameClose::Closed);
+        (ctx, ui)
     }
 
     #[test]
-    fn a_refused_grid_appends_its_reason_to_the_observation() {
-        let mut ctx = ToolContext::new("/tmp");
-        ctx.frames_available = true;
-        let out = grid_observation(
-            &mut ctx,
-            "grid staged\n".to_string(),
-            vec![grid_staging("chatbgt")],
-        );
+    fn a_grid_without_a_route_is_not_opened() {
+        let mut ctx = crate::tools::frames::editor_ctx();
+        let out = grid_observation(&mut ctx, "grid staged\n".into(), vec![staging()]);
         assert_eq!(
             out,
             "grid staged\ngrid not opened: this profile does not route chatbgt's grids\n"
@@ -1980,14 +1985,37 @@ mod tests {
     /// A result that was only a grid showed `(no output)`; the note replaces
     /// it rather than sitting under a claim that nothing came back.
     #[test]
-    fn a_grid_only_result_replaces_no_output_with_the_note() {
-        let mut ctx = ToolContext::new("/tmp");
-        let out = grid_observation(
-            &mut ctx,
-            "(no output)\n".to_string(),
-            vec![grid_staging("chatbgt")],
+    fn a_grid_outside_the_tui_is_not_opened() {
+        let mut ctx = crate::tools::frames::editor_ctx();
+        ctx.grid_routes
+            .insert("chatbgt".into(), "dev.plank.csvedit".into());
+        let out = grid_observation(&mut ctx, "(no output)\n".into(), vec![staging()]);
+        assert_eq!(out, "grid not opened: editors need the interactive TUI\n");
+    }
+
+    #[test]
+    fn an_unedited_grid_closes_without_changes_and_calls_nothing() {
+        let (mut ctx, ui) = routed_ctx_with_ui(None);
+        let out = grid_observation(&mut ctx, "grid staged\n".into(), vec![staging()]);
+        ui.join().unwrap();
+        assert_eq!(out, "grid staged\ngrid closed without changes\n");
+    }
+
+    #[test]
+    fn an_edited_grid_is_written_back_in_the_same_observation() {
+        let (mut ctx, ui) = routed_ctx_with_ui(Some(b"#,x\n1,y\n"));
+        let out = grid_observation(&mut ctx, "grid staged\n".into(), vec![staging()]);
+        ui.join().unwrap();
+        // No MCP server is configured in the test context, so the write-back
+        // call fails; what matters is that it was attempted, in this call.
+        assert!(
+            out.starts_with("grid staged\ngrid closed: write-back failed: "),
+            "{out}"
         );
-        assert_eq!(out, "grid not opened: grids need the interactive TUI\n");
+        assert!(
+            !out.contains("1,y"),
+            "the CSV never reaches the model: {out}"
+        );
     }
 
     #[test]

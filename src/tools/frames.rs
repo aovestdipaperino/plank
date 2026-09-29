@@ -12,8 +12,6 @@ use crate::framebridge::{FrameClose, FrameRequest, FrameResult};
 /// Refused, with nothing staged or lent, outside the TUI, when the agent set
 /// a refusal, inside a sub-agent, when an editor is already open, or when the
 /// component cannot edit. The file is removed from the disk in every case.
-// Wired up by Task 4 (`grid_observation`); unused on its own until then.
-#[allow(dead_code)]
 pub fn run_frame_blocking(
     ctx: &mut ToolContext,
     component: &str,
@@ -52,50 +50,61 @@ pub fn run_frame_blocking(
     }
 }
 
+/// A context whose WASM session holds one editor component,
+/// `dev.plank.csvedit`, with a frame surface and the `fs` capability.
+#[cfg(test)]
+pub(crate) fn editor_ctx() -> ToolContext {
+    use crate::wasmreg::test_support::{editor_component, editor_session};
+    use crate::wasmreg::{Capability, Surface};
+    let mut ctx = ToolContext::new(std::env::temp_dir());
+    ctx.wasm = editor_session(vec![editor_component(
+        vec![Surface::Frame],
+        vec![Capability::Fs],
+    )]);
+    ctx
+}
+
+/// A thread standing in for the TUI: it takes the session `bridge` lends,
+/// lets `edit` change the staged file on the RAM disk, and gives it back with
+/// `close`. It panics if nothing is lent within ten seconds, so a regression
+/// that never lends fails at `join` instead of hanging the test run.
+#[cfg(test)]
+pub(crate) fn ui_thread(
+    bridge: crate::framebridge::FrameBridge,
+    edit: Option<&'static [u8]>,
+    close: FrameClose,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some((mut session, req)) = bridge.take() {
+                if let Some(bytes) = edit {
+                    session
+                        .host
+                        .ram_write(&req.component, &req.file, bytes)
+                        .unwrap();
+                }
+                bridge.give_back(session, close);
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no session was lent within ten seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wasmreg::test_support::{editor_component, editor_session};
-    use crate::wasmreg::{Capability, Surface};
 
     const ID: &str = "dev.plank.csvedit";
 
-    fn ctx() -> ToolContext {
-        let mut ctx = ToolContext::new(std::env::temp_dir());
-        ctx.wasm = editor_session(vec![editor_component(
-            vec![Surface::Frame],
-            vec![Capability::Fs],
-        )]);
-        ctx
-    }
-
-    /// A UI thread that takes the lent session, lets `edit` change the disk,
-    /// and returns `close`.
-    fn ui(
-        bridge: crate::framebridge::FrameBridge,
-        edit: Option<&'static [u8]>,
-        close: FrameClose,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            loop {
-                if let Some((mut session, req)) = bridge.take() {
-                    if let Some(bytes) = edit {
-                        session
-                            .host
-                            .ram_write(&req.component, &req.file, bytes)
-                            .unwrap();
-                    }
-                    bridge.give_back(session, close);
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        })
-    }
-
     #[test]
     fn without_a_bridge_nothing_opens() {
-        let mut c = ctx();
+        let mut c = editor_ctx();
         assert_eq!(
             run_frame_blocking(&mut c, ID, "data.csv", b"a\n"),
             FrameResult::Refused("editors need the interactive TUI".into())
@@ -104,7 +113,7 @@ mod tests {
 
     #[test]
     fn the_agents_refusal_wins_and_lends_nothing() {
-        let mut c = ctx();
+        let mut c = editor_ctx();
         c.frame_bridge = Some(crate::framebridge::FrameBridge::new());
         c.editor_refusal = Some("the editor needs the local screen".into());
         assert_eq!(
@@ -116,7 +125,7 @@ mod tests {
 
     #[test]
     fn a_sub_agent_cannot_open_an_editor() {
-        let mut c = ctx();
+        let mut c = editor_ctx();
         c.frame_bridge = Some(crate::framebridge::FrameBridge::new());
         c.subagent_depth = 1;
         assert_eq!(
@@ -127,7 +136,7 @@ mod tests {
 
     #[test]
     fn a_component_check_failure_is_a_refusal() {
-        let mut c = ctx();
+        let mut c = editor_ctx();
         c.frame_bridge = Some(crate::framebridge::FrameBridge::new());
         assert_eq!(
             run_frame_blocking(&mut c, "dev.plank.nobody", "data.csv", b"a\n"),
@@ -137,10 +146,10 @@ mod tests {
 
     #[test]
     fn an_edit_comes_back_saved_and_the_session_is_restored() {
-        let mut c = ctx();
+        let mut c = editor_ctx();
         let bridge = crate::framebridge::FrameBridge::new();
         c.frame_bridge = Some(bridge.clone());
-        let h = ui(bridge, Some(b"a\n1\n"), FrameClose::Closed);
+        let h = ui_thread(bridge, Some(b"a\n1\n"), FrameClose::Closed);
         assert_eq!(
             run_frame_blocking(&mut c, ID, "data.csv", b"a\n"),
             FrameResult::Saved(b"a\n1\n".to_vec())
@@ -159,16 +168,16 @@ mod tests {
 
     #[test]
     fn an_untouched_editor_is_unchanged_and_a_failure_says_why() {
-        let mut c = ctx();
+        let mut c = editor_ctx();
         let bridge = crate::framebridge::FrameBridge::new();
         c.frame_bridge = Some(bridge.clone());
-        let h = ui(bridge.clone(), None, FrameClose::Closed);
+        let h = ui_thread(bridge.clone(), None, FrameClose::Closed);
         assert_eq!(
             run_frame_blocking(&mut c, ID, "data.csv", b"a\n"),
             FrameResult::Unchanged
         );
         h.join().unwrap();
-        let h = ui(bridge, None, FrameClose::Failed("trapped".into()));
+        let h = ui_thread(bridge, None, FrameClose::Failed("trapped".into()));
         assert_eq!(
             run_frame_blocking(&mut c, ID, "data.csv", b"a\n"),
             FrameResult::Failed("trapped".into())

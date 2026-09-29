@@ -1,9 +1,9 @@
 //! End to end through the grid bridge, host and guest halves together: a grid
-//! an MCP server staged goes onto csvedit's RAM disk, opens in its frame, is
-//! edited and saved there, and comes back out of `finish_grid` when the frame
-//! closes.
+//! goes onto csvedit's RAM disk, opens in its frame, is edited and saved
+//! there, and comes back out of `collect_editor_file` when the frame closes.
 //!
-//! The MCP server and the write-back call are not here: what is under test is
+//! The MCP server, the write-back call and the tool call that lends the
+//! session to the TUI are not here: what is under test is
 //! the crossing of the component's RAM disk, which is the part only the real
 //! guest can prove. Like `wasm_csvedit`, this runs only with
 //! `--features plugins` and a guest built by `guests/build.sh`; without the
@@ -11,10 +11,9 @@
 
 #![cfg(feature = "plugins")]
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use plank::grid::{GridStaging, WriteBack};
+use plank::framebridge::FrameResult;
 use plank::plugins::Origin;
 use plank::wasmreg::{
     Capability, FrameKind, FrameOutcome, Loaded, OpenFrame, Registry, Session, Surface,
@@ -22,7 +21,6 @@ use plank::wasmreg::{
 };
 
 const ID: &str = "dev.plank.csvedit";
-const SERVER: &str = "chatbgt";
 const FILE: &str = "transactions.csv";
 const W: u16 = 80;
 const H: u16 = 24;
@@ -98,34 +96,18 @@ fn session(wasm: &[u8]) -> Session {
     session
 }
 
-/// The profile's `grids`: this server's grids go to csvedit.
-fn routes() -> BTreeMap<String, String> {
-    BTreeMap::from([(SERVER.to_string(), ID.to_string())])
+/// The grid as a server exports it.
+fn staged() -> String {
+    format!("{HEADER}\n{ROW_1}\n{ROW_2}\n")
 }
 
-fn staging() -> GridStaging {
-    GridStaging {
-        server: SERVER.to_string(),
-        component: ID.to_string(),
-        file: FILE.to_string(),
-        csv: format!("{HEADER}\n{ROW_1}\n{ROW_2}\n"),
-        write_back: WriteBack {
-            tool: "apply_grid".to_string(),
-            table: "transactions".to_string(),
-            grid: "0a1b2c3d".to_string(),
-        },
-    }
-}
-
-/// Stages the grid and opens the frame the staging queued, the way the UI
-/// loop does at its next idle moment.
+/// Stages the grid on csvedit's disk and opens its frame on it, the way a
+/// lent session is driven once the TUI takes it.
 fn stage_and_open(session: &mut Session) -> OpenFrame {
     session
-        .stage_grid(staging(), &routes())
-        .expect("a declared route to a fit component is honoured");
-    let (id, arg) = session.take_next_frame().expect("the grid's frame queued");
-    assert_eq!((id.as_str(), arg.as_str()), (ID, FILE));
-    let mut frame = session.open_frame(&id, &arg, W, H, 1).expect("open");
+        .stage_editor_file(ID, FILE, staged().as_bytes())
+        .expect("staged on the RAM disk");
+    let mut frame = session.open_frame(ID, FILE, W, H, 0).expect("open");
     session
         .step_frame(&mut frame, 16, W, H, 0)
         .expect("first paint");
@@ -145,14 +127,14 @@ fn type_str(session: &mut Session, frame: &OpenFrame, text: &str) {
 }
 
 /// Exits with ctrl-q, closes the frame as the UI does after a closing key,
-/// and finishes the grid.
-fn quit(session: &mut Session, frame: &OpenFrame) -> Option<plank::grid::FinishedGrid> {
+/// and collects the file.
+fn quit(session: &mut Session, frame: &OpenFrame) -> FrameResult {
     assert!(
         matches!(press(session, frame, "ctrl-q"), FrameOutcome::Close(_)),
         "ctrl-q closes a saved or untouched grid"
     );
     session.close_frame(frame);
-    session.finish_grid(frame)
+    session.collect_editor_file(ID, FILE, staged().as_bytes())
 }
 
 fn cells(line: &str) -> Vec<&str> {
@@ -179,10 +161,10 @@ fn a_grid_staged_edited_in_csvedit_and_handed_back() {
     // Bridged, ctrl-s saves in place under the staged name.
     assert_eq!(press(&mut session, &frame, "ctrl-s"), FrameOutcome::Stay);
 
-    let finished = quit(&mut session, &frame).expect("an edited grid is handed back");
-    assert_eq!(finished.server, SERVER);
-    assert_eq!(finished.write_back, staging().write_back);
-    let csv = finished.csv.expect("UTF-8");
+    let FrameResult::Saved(bytes) = quit(&mut session, &frame) else {
+        panic!("an edited grid comes back saved");
+    };
+    let csv = String::from_utf8(bytes).expect("UTF-8");
     let lines: Vec<&str> = csv.lines().collect();
     assert_eq!(lines.len(), 3, "{csv}");
     assert_eq!(cells(lines[0]), cells(HEADER), "{csv}");
@@ -191,9 +173,8 @@ fn a_grid_staged_edited_in_csvedit_and_handed_back() {
     assert_eq!(cells(lines[1]), edited, "{csv}");
     assert_eq!(cells(lines[2]), cells(ROW_2), "{csv}");
 
-    // The grid is over: its file is gone and nothing is left to finish.
+    // The grid is over: its file is gone from the disk.
     assert!(session.host.ram_file(ID, FILE).is_none());
-    assert!(session.active_grid.is_none());
 }
 
 #[test]
@@ -201,6 +182,6 @@ fn an_untouched_grid_hands_nothing_back() {
     let wasm = guest_or_skip!();
     let mut session = session(&wasm);
     let frame = stage_and_open(&mut session);
-    assert!(quit(&mut session, &frame).is_none());
+    assert_eq!(quit(&mut session, &frame), FrameResult::Unchanged);
     assert!(session.host.ram_file(ID, FILE).is_none());
 }

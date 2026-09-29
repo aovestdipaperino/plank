@@ -40,51 +40,16 @@ pub struct GridStaging {
     pub write_back: WriteBack,
 }
 
-/// The one grid plank has put on a component's RAM disk and queued (or
-/// opened) in its frame. Kept so the file can be compared with what was
-/// staged, and written back, when the frame closes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveGrid {
-    /// The component whose disk holds the file.
-    pub component: String,
-    /// The file name, as the frame's `arg` and as the RAM-disk path.
-    pub file: String,
-    /// The bytes written, to tell an edited grid from an untouched one.
-    pub staged: Vec<u8>,
-    /// The MCP server the grid came from, which takes the write-back.
-    pub server: String,
-    /// Where an edited copy goes back.
-    pub write_back: WriteBack,
-}
-
-/// A grid whose frame closed with the file changed: what plank sends back to
-/// the server that staged it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FinishedGrid {
-    /// The MCP server that takes the write-back.
-    pub server: String,
-    /// The tool, table and token to send it with.
-    pub write_back: WriteBack,
-    /// The file as the frame left it, read back from the RAM disk; `None`
-    /// when it is not valid UTF-8, which plank reports rather than sending
-    /// a lossy copy the server would take for the user's edit.
-    pub csv: Option<String>,
-}
-
-impl FinishedGrid {
-    /// The write-back tool's arguments as a JSON object:
-    /// `{"table", "grid", "csv"}`; `None` when the file is not UTF-8.
-    #[must_use]
-    pub fn arguments(&self) -> Option<String> {
-        use crate::wasmreg::json_str;
-        let csv = self.csv.as_deref()?;
-        Some(format!(
-            "{{\"table\":{},\"grid\":{},\"csv\":{}}}",
-            json_str(&self.write_back.table),
-            json_str(&self.write_back.grid),
-            json_str(csv)
-        ))
-    }
+/// The write-back tool's arguments as a JSON object: `{"table", "grid", "csv"}`.
+#[must_use]
+pub fn write_back_arguments(write_back: &WriteBack, csv: &str) -> String {
+    use crate::wasmreg::json_str;
+    format!(
+        "{{\"table\":{},\"grid\":{},\"csv\":{}}}",
+        json_str(&write_back.table),
+        json_str(&write_back.grid),
+        json_str(csv)
+    )
 }
 
 /// Splits `plank-frame://<component>/<file>` into its two parts.
@@ -111,36 +76,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_finished_grid_names_its_table_token_and_csv() {
-        let finished = FinishedGrid {
-            server: "chatbgt".to_string(),
-            write_back: WriteBack {
-                tool: "apply_grid".to_string(),
-                table: "categories".to_string(),
-                grid: "0badf00d".to_string(),
-            },
-            csv: Some("#,name\n1,\"Food\"\n".to_string()),
+    fn write_back_arguments_name_the_table_token_and_csv() {
+        let write_back = WriteBack {
+            tool: "apply_grid".to_string(),
+            table: "categories".to_string(),
+            grid: "0badf00d".to_string(),
         };
         assert_eq!(
-            finished.arguments().as_deref(),
-            Some(r##"{"table":"categories","grid":"0badf00d","csv":"#,name\n1,\"Food\"\n"}"##)
+            write_back_arguments(&write_back, "#,name\n1,\"Food\"\n"),
+            r##"{"table":"categories","grid":"0badf00d","csv":"#,name\n1,\"Food\"\n"}"##
         );
-    }
-
-    /// A file that is not UTF-8 has no arguments: it is reported, never sent
-    /// as lossy text the server would take for the user's edit.
-    #[test]
-    fn a_grid_that_is_not_utf8_has_no_arguments() {
-        let finished = FinishedGrid {
-            server: "chatbgt".to_string(),
-            write_back: WriteBack {
-                tool: "apply_grid".to_string(),
-                table: "categories".to_string(),
-                grid: "0badf00d".to_string(),
-            },
-            csv: None,
-        };
-        assert_eq!(finished.arguments(), None);
     }
 
     #[test]

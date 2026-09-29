@@ -407,12 +407,11 @@ pub struct TurnShared {
     /// queued line: the user wants the model, and the pass goes back where it
     /// came from for the next idle moment.
     pub memory_pass: AtomicBool,
-    /// Set by the front end for the whole duration of *any* quiet background
-    /// pass — interruptible (`memory_pass`) or not (a grid write-back). Where
-    /// `memory_pass` only tells the busy loop whether a submitted prompt may
-    /// interrupt the pass, this tells it whether a pass is running at all, so
-    /// a mid-pass `/btw` can be rejected even when the pass itself cannot be
-    /// preempted (`btw_gate`).
+    /// Set by the front end for the whole duration of a quiet background
+    /// pass (the memory pass, a suggestion). Where `memory_pass` tells the
+    /// busy loop that a submitted prompt may interrupt the pass, this tells
+    /// it that a pass is running at all, so a mid-pass `/btw` is rejected
+    /// (`btw_gate`).
     pub background_pass: AtomicBool,
     /// Set by the busy loop's Ctrl-D arm while a quiet background pass is
     /// running: the user wants out, and work they never asked for must not
@@ -476,28 +475,16 @@ pub const BTW_RESUME_MARKER: &str = "[btw — resuming]";
 
 /// Whether a `/btw` submitted right now has anything to run beside, and if
 /// not, what to tell the user. Pure so it can be unit-tested without a
-/// worker: `background_pass` is `TurnShared::background_pass`, `interruptible`
-/// is `TurnShared::memory_pass`. During a real turn (`background_pass` false)
-/// there is always a main pass to preempt. During a quiet, interruptible pass
-/// (the memory pass, a suggestion) a `/btw` has nothing to preempt and
-/// nothing would resume, so it is rejected. A grid write-back is a background
-/// pass too, but not interruptible — the same rejection applies, with wording
-/// that points at the write-back rather than a generic background pass.
+/// worker: `background_pass` is `TurnShared::background_pass`. During a real
+/// turn (`background_pass` false) there is always a main pass to preempt.
+/// During a quiet background pass (the memory pass, a suggestion) a `/btw`
+/// has nothing to preempt and nothing would resume, so it is rejected.
 #[must_use]
-pub fn btw_gate(background_pass: bool, interruptible: bool) -> Option<&'static str> {
-    if background_pass && interruptible {
-        Some(
-            "[/btw has nothing to run beside right now — \
-             just type your prompt; it starts at once]",
-        )
-    } else if background_pass {
-        Some(
-            "[/btw can't run while the grid write-back is in progress — \
-             it's kept as a draft; ask again once it finishes]",
-        )
-    } else {
-        None
-    }
+pub fn btw_gate(background_pass: bool) -> Option<&'static str> {
+    background_pass.then_some(
+        "[/btw has nothing to run beside right now — \
+         just type your prompt; it starts at once]",
+    )
 }
 
 #[cfg(test)]
@@ -506,22 +493,13 @@ mod btw_gate_tests {
 
     #[test]
     fn no_background_pass_allows_btw() {
-        assert_eq!(btw_gate(false, false), None);
-        // interruptible with no background pass never happens in practice,
-        // but the predicate is total: only `background_pass` gates it.
-        assert_eq!(btw_gate(false, true), None);
+        assert_eq!(btw_gate(false), None);
     }
 
     #[test]
-    fn interruptible_background_pass_rejects_with_nothing_to_run_beside() {
-        let msg = btw_gate(true, true).expect("rejected");
+    fn a_background_pass_rejects_with_nothing_to_run_beside() {
+        let msg = btw_gate(true).expect("rejected");
         assert!(msg.contains("nothing to run beside"));
-    }
-
-    #[test]
-    fn non_interruptible_background_pass_rejects_with_write_back_wording() {
-        let msg = btw_gate(true, false).expect("rejected");
-        assert!(msg.contains("write-back"));
     }
 }
 

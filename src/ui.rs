@@ -1525,9 +1525,9 @@ enum RemoteLines {
     /// remote prompt sent while the laptop sat idle would wait for someone to
     /// touch its keyboard.
     DismissScreensaver,
-    /// A frame someone asked for is up (a `/frame`, a grid): leave the queue
-    /// untouched until it closes, because a turn under an open frame could
-    /// stage a grid over it or fight it for the screen.
+    /// A frame someone asked for is up (a `/frame`): leave the queue
+    /// untouched until it closes, because a turn under an open frame would
+    /// fight it for the screen.
     Wait,
 }
 
@@ -1558,21 +1558,6 @@ fn remote_wait_notice_due(gate: RemoteLines, queued: bool, noticed: &mut bool) -
         return true;
     }
     false
-}
-
-/// What a grid's write-back leaves behind: the scrollback line (the first
-/// line of the server's summary, or the failure) and the `<system-reminder>`
-/// that tells the model, at the next turn boundary, what the user changed.
-fn grid_write_back_notice(table: &str, outcome: &Result<String, String>) -> (String, String) {
-    let summary = match outcome {
-        Ok(text) => text.clone(),
-        Err(e) => format!("grid write-back failed: {e}"),
-    };
-    let line = summary.lines().next().unwrap_or_default().to_string();
-    let reminder = format!(
-        "<system-reminder>\nThe user edited the {table} grid. {summary}\n</system-reminder>"
-    );
-    (line, reminder)
 }
 
 /// Injects the session-start context as **two** user messages — project-stable
@@ -5630,14 +5615,6 @@ impl Agent<'_> {
         crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
-        // A grid's write-back notice goes in ahead of the prompt that starts
-        // this turn, so the model reads what the user changed before what
-        // they now ask. Grids close only at the idle prompt, so a notice is
-        // always pending here rather than at a tool round. There is no idle
-        // wake for one on purpose: the user already has the summary as a
-        // scrollback line, and waking a slow local model just to acknowledge
-        // it is not worth the wait.
-        self.drain_host_notices_before_prompt();
         // A model a GPU-yield cycle could not bring back gets another try
         // before this turn needs it.
         self.begin_turn_gpu_yield();
@@ -12906,9 +12883,6 @@ impl Agent<'_> {
         // otherwise the per-tick capture is pure waste.
         let capture_crt = crate::settings::active().ui.crt_off && std::io::stdout().is_terminal();
         let mut crt_frame: Option<image::RgbaImage> = None;
-        // Grids whose frame closed with the file changed, waiting for the
-        // write-back pass after this tick's paint (`tui_grid_write_back`).
-        let mut grid_write_backs: Vec<crate::grid::FinishedGrid> = Vec::new();
         // Whether the remote has been told its lines wait for a frame.
         let mut remote_wait_noticed = false;
         loop {
@@ -12959,13 +12933,7 @@ impl Agent<'_> {
                         // the same reason the arcade does.
                         arcade_hover_reporting(true);
                     }
-                    Err(e) => {
-                        log.push_dim(e);
-                        // A grid whose frame will not open is dropped with its
-                        // file. There is no idle path that reaches the model,
-                        // so the log line is the whole notice.
-                        self.tool_ctx.wasm.abandon_unopened_grid(&id, &face);
-                    }
+                    Err(e) => log.push_dim(e),
                 }
             }
             if let Some(open) = wasm_frame.as_mut() {
@@ -12977,9 +12945,6 @@ impl Agent<'_> {
                     frame_step(&mut self.tool_ctx.wasm, open, &mut wasm_frame_last, size)
                 {
                     log.push_dim(e);
-                    // A trapped grid may have saved first: what is on its
-                    // disk goes back like any other save.
-                    grid_write_backs.extend(self.tool_ctx.wasm.finish_grid(open));
                     wasm_frame = None;
                     arcade_hover_reporting(false);
                 }
@@ -13046,35 +13011,6 @@ impl Agent<'_> {
                 crt_frame = Some(frame_to_image(&completed_buffer));
             }
             remote_service(rem);
-            // A frame that closed on an edited grid, just painted gone: send
-            // the edit back now, on a worker behind the busy loop, so a slow
-            // or restarting server never freezes the screen. Not gated on an
-            // empty input like the idle work below: a user who starts typing
-            // does not cancel the write-back, and a line they submit during
-            // it becomes the next turn with the notice ahead of it.
-            if !grid_write_backs.is_empty() {
-                let finished = std::mem::take(&mut grid_write_backs);
-                let quit = self.tui_grid_write_back(
-                    terminal,
-                    &mut TuiHandles {
-                        log: &mut log,
-                        view: &mut view,
-                        input: &mut input,
-                        btw: &mut btw_panel,
-                        arcade: &mut arcade,
-                        sub: &mut sub_pane,
-                    },
-                    finished,
-                )?;
-                // Ctrl-D is gated on `TurnShared::memory_pass`
-                // (`tui_turn_inner`'s busy loop), and this pass runs with
-                // `interruptible = false`, so the busy loop never arms that
-                // key and `quit` can never come back true here. Quitting
-                // mid-write-back simply waits the call out, which is bounded
-                // by `mcp.timeoutSecs`.
-                debug_assert!(!quit, "grid write-back is not Ctrl-D-interruptible");
-                continue;
-            }
 
             // 200 ms is five frames a second — fine for an idle prompt, far too
             // slow for a game. An open easter egg polls at the shared 20 Hz
@@ -13167,14 +13103,10 @@ impl Agent<'_> {
                     r.bus.broadcast(UiEvent::Dim(REMOTE_WAIT_NOTICE.to_owned()));
                 }
                 if gate == RemoteLines::DismissScreensaver {
-                    if let Some(open) = &wasm_frame {
-                        if let Some(line) = self.tool_ctx.wasm.close_frame(open) {
-                            log.push_dim(line);
-                        }
-                        // A no-op: a screensaver is never a grid (`stage_grid`
-                        // refuses one), so there is nothing to finish. Kept so
-                        // every frame exit finishes its grid, should that change.
-                        grid_write_backs.extend(self.tool_ctx.wasm.finish_grid(open));
+                    if let Some(open) = &wasm_frame
+                        && let Some(line) = self.tool_ctx.wasm.close_frame(open)
+                    {
+                        log.push_dim(line);
                     }
                     wasm_frame = None;
                     arcade_hover_reporting(false);
@@ -13397,14 +13329,10 @@ impl Agent<'_> {
             // on. A component opened by `/frame` is *not* dismissed here — the
             // user asked for that one and owns when it closes.
             if wasm_frame.as_ref().is_some_and(|f| f.screensaver) && from_user {
-                if let Some(open) = &wasm_frame {
-                    if let Some(line) = self.tool_ctx.wasm.close_frame(open) {
-                        log.push_dim(line);
-                    }
-                    // A no-op: a screensaver is never a grid (`stage_grid`
-                    // refuses one), so there is nothing to finish. Kept so
-                    // every frame exit finishes its grid, should that change.
-                    grid_write_backs.extend(self.tool_ctx.wasm.finish_grid(open));
+                if let Some(open) = &wasm_frame
+                    && let Some(line) = self.tool_ctx.wasm.close_frame(open)
+                {
+                    log.push_dim(line);
                 }
                 wasm_frame = None;
                 arcade_hover_reporting(false);
@@ -13425,13 +13353,11 @@ impl Agent<'_> {
                             if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
                                 log.push_dim(line);
                             }
-                            grid_write_backs.extend(self.tool_ctx.wasm.finish_grid(open));
                             wasm_frame = None;
                             arcade_hover_reporting(false);
                         }
                         Err(e) => {
                             log.push_dim(e);
-                            grid_write_backs.extend(self.tool_ctx.wasm.finish_grid(open));
                             wasm_frame = None;
                             arcade_hover_reporting(false);
                         }
@@ -13657,13 +13583,11 @@ impl Agent<'_> {
                         if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
                             log.push_dim(line);
                         }
-                        grid_write_backs.extend(self.tool_ctx.wasm.finish_grid(open));
                         wasm_frame = None;
                         arcade_hover_reporting(false);
                     }
                     Err(e) => {
                         log.push_dim(e);
-                        grid_write_backs.extend(self.tool_ctx.wasm.finish_grid(open));
                         wasm_frame = None;
                         arcade_hover_reporting(false);
                     }
@@ -14712,43 +14636,6 @@ impl Agent<'_> {
         h: &mut TuiHandles<'_>,
         body: impl FnOnce(&mut Self, &Sender<UiEvent>) + Send,
     ) -> Result<bool, String> {
-        self.tui_background_pass(terminal, h, true, body)
-    }
-
-    /// Sends the edited grids back to their servers through
-    /// [`Self::write_back_grids`], on a worker behind the busy UI loop so
-    /// the screen keeps painting while a server answers or restarts.
-    ///
-    /// Unlike a quiet pass this is not interruptible: it is work the user
-    /// asked for by saving, so a prompt typed meanwhile waits in the queue
-    /// and becomes the next turn when the calls return, with their notices
-    /// ahead of it. Ctrl-D during the call is inert, same as mid-turn: the
-    /// busy loop only arms it for an interruptible pass. Quitting simply
-    /// waits for the write-back to finish, bounded by `mcp.timeoutSecs`.
-    /// Always returns `Ok(false)`; kept `Result<bool, String>` to share
-    /// [`Self::tui_background_pass`] with [`Self::tui_quiet_pass`].
-    fn tui_grid_write_back(
-        &mut self,
-        terminal: &mut ratatui::DefaultTerminal,
-        h: &mut TuiHandles<'_>,
-        finished: Vec<crate::grid::FinishedGrid>,
-    ) -> Result<bool, String> {
-        self.tui_background_pass(terminal, h, false, move |agent, tx| {
-            agent.write_back_grids(finished, tx);
-        })
-    }
-
-    /// The shared body of [`Self::tui_quiet_pass`] and
-    /// [`Self::tui_grid_write_back`]. `interruptible` sets
-    /// `TurnShared::memory_pass`, which makes a submitted prompt stop `body`;
-    /// without it a prompt is only queued, as during a turn.
-    fn tui_background_pass(
-        &mut self,
-        terminal: &mut ratatui::DefaultTerminal,
-        h: &mut TuiHandles<'_>,
-        interruptible: bool,
-        body: impl FnOnce(&mut Self, &Sender<UiEvent>) + Send,
-    ) -> Result<bool, String> {
         // The busy loop below repaints with the live `input`, so a ghost left
         // on it would stay lit for the whole pass — a prompt that looks like
         // it is taking input while plank is busy. Clear it here rather than
@@ -14764,7 +14651,7 @@ impl Agent<'_> {
         let shared: &TurnShared = remote
             .as_deref()
             .map_or(&local_shared, |r| r.shared.as_ref());
-        shared.memory_pass.store(interruptible, Ordering::Relaxed);
+        shared.memory_pass.store(true, Ordering::Relaxed);
         shared.background_pass.store(true, Ordering::Relaxed);
         let live = LiveCommands::capture(self);
         let run = run_worker_ui(
@@ -15362,11 +15249,6 @@ impl Agent<'_> {
         crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
-        // Mirror of `run_turn`: a grid's write-back notice goes in ahead of
-        // the prompt that starts this turn, and deliberately without an idle
-        // wake, since the user already has the summary as a scrollback line
-        // and waking a slow local model to acknowledge it is not wanted.
-        self.drain_host_notices_before_prompt();
         self.tool_ctx.tasks.clone_from(&self.session.tasks);
         // Mirror of the plain path's turn-boundary poll (`run_turn`), including
         // the resume disclosure that must precede the re-prefill it describes.
@@ -15896,7 +15778,6 @@ impl Agent<'_> {
     /// idle). Off unless `tools.bashNotify` is set; sidechains never drain,
     /// since the jobs belong to the main transcript (`docs/BACKGROUND-TASKS.md`).
     fn drain_job_notifications(&mut self) -> usize {
-        self.drain_host_notices();
         if !crate::settings::active().tools.bash_notify || self.in_sidechain() {
             return 0;
         }
@@ -15906,85 +15787,6 @@ impl Agent<'_> {
         };
         self.session.push(Message::user(text));
         finished.len()
-    }
-
-    /// Appends every queued host notice (a grid's write-back outcome) as a
-    /// user message, returning how many joined.
-    ///
-    /// The sibling of [`Self::drain_job_notifications`], called at the same
-    /// tool-round boundaries. The start of a turn uses
-    /// [`Self::drain_host_notices_before_prompt`] instead. Not gated on
-    /// `tools.bashNotify`, which is about bash. Sidechains never drain: the
-    /// notice belongs to the main transcript.
-    fn drain_host_notices(&mut self) -> usize {
-        if self.in_sidechain() || self.tool_ctx.host_notices.is_empty() {
-            return 0;
-        }
-        let notices = std::mem::take(&mut self.tool_ctx.host_notices);
-        let n = notices.len();
-        for text in notices {
-            self.session.push(Message::user(text));
-        }
-        n
-    }
-
-    /// The turn-start drain: every queued host notice goes in just ahead of
-    /// the whole trailing run of plain user messages (a typed prompt, a
-    /// skill, or several queued prompts submitted back to back — anything
-    /// that is a plain `User` message and not a tool result), so the order is
-    /// `[notice, prompt1, prompt2, ..., reply]` rather than splitting the
-    /// notice into the middle of that run. With no such run at the end (a
-    /// continuation turn whose last message is a tool result, or an empty
-    /// transcript), the notices are appended. None of that run has reached
-    /// the model yet, so inserting ahead of it disturbs no cached prefix.
-    /// Returns how many joined.
-    fn drain_host_notices_before_prompt(&mut self) -> usize {
-        if self.in_sidechain() || self.tool_ctx.host_notices.is_empty() {
-            return 0;
-        }
-        let notices = std::mem::take(&mut self.tool_ctx.host_notices);
-        let transcript = &self.session.transcript;
-        let mut at = transcript.len();
-        while at > 0 {
-            let m = &transcript[at - 1];
-            if m.role == crate::session::Role::User && !m.is_tool_user() {
-                at -= 1;
-            } else {
-                break;
-            }
-        }
-        let n = notices.len();
-        for (i, text) in notices.into_iter().enumerate() {
-            self.session.insert(at + i, Message::user(text));
-        }
-        n
-    }
-
-    /// Writes back each grid whose frame closed with its file changed: plank
-    /// (not the model) calls the server's write-back tool with the new CSV,
-    /// queues the outcome for the model as a host notice, and sends the first
-    /// line of it to the scrollback over `tx`.
-    ///
-    /// The body of the TUI's write-back pass, so it runs on a worker thread
-    /// behind the busy UI loop (`tui_grid_write_back`): a request to a
-    /// server that stalls, or a restart of one that died, can take several
-    /// `mcp.timeoutSecs`, and the screen must keep painting meanwhile. A file
-    /// that is not UTF-8 is reported without a call.
-    fn write_back_grids(&mut self, finished: Vec<crate::grid::FinishedGrid>, tx: &Sender<UiEvent>) {
-        for grid in finished {
-            let outcome = match grid.arguments() {
-                Some(args) => crate::tools::mcp::call_tool_direct(
-                    &mut self.tool_ctx.mcp,
-                    &grid.server,
-                    &grid.write_back.tool,
-                    &args,
-                ),
-                None => Err("the grid file is not UTF-8".to_string()),
-            };
-            let (line, reminder) = grid_write_back_notice(&grid.write_back.table, &outcome);
-            self.tool_ctx.host_notices.push(reminder);
-            let _ = tx.send(UiEvent::Dim(line));
-        }
     }
 
     /// Plain-stdout mirror of `tui_memory_pass`: runs one queued job and
@@ -20034,15 +19836,11 @@ fn busy_ui_loop(
                         report = None;
                         if line.is_empty() {
                         } else if let Some(msg) = btw_question(&line).and_then(|_| {
-                            crate::worker::btw_gate(
-                                shared.background_pass.load(Ordering::Relaxed),
-                                shared.memory_pass.load(Ordering::Relaxed),
-                            )
+                            crate::worker::btw_gate(shared.background_pass.load(Ordering::Relaxed))
                         }) {
                             // No main task to ask beside during a quiet
-                            // background pass (interruptible) or a grid
-                            // write-back (not): a plain prompt is the way to
-                            // have the model now, or the draft simply waits.
+                            // background pass: a plain prompt is the way to
+                            // have the model now.
                             log.push_dim(msg);
                         } else if btw_question(&line).is_some() {
                             // A `/btw` gets priority: it preempts the running
@@ -20926,9 +20724,6 @@ pub fn run_interactive(
     // /init there would splice a generation into an old conversation.
     let offer_init = offer_init && !resumed;
     let result = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        // Only the TUI can show a WASM frame, so only it may honour a grid an
-        // MCP server stages; every other front end refuses them.
-        agent.tool_ctx.frames_available = true;
         agent.run_tui(offer_init)
     } else {
         run_plain_flow(&mut agent, cfg, offer_init)
@@ -38521,210 +38316,6 @@ or the user's next message aborts before its first token"
         agent.alt_engine_depth = 0;
         drop(agent);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_grid_write_back_leaves_a_line_and_a_reminder() {
-        let (line, reminder) = grid_write_back_notice(
-            "categories",
-            &Ok("categories: 1 updated, 0 created\nrow 3: renamed".to_string()),
-        );
-        assert_eq!(line, "categories: 1 updated, 0 created");
-        assert_eq!(
-            reminder,
-            "<system-reminder>\nThe user edited the categories grid. \
-             categories: 1 updated, 0 created\nrow 3: renamed\n</system-reminder>"
-        );
-        let (line, reminder) = grid_write_back_notice("rules", &Err("reopen the grid".to_string()));
-        assert_eq!(line, "grid write-back failed: reopen the grid");
-        assert_eq!(
-            reminder,
-            "<system-reminder>\nThe user edited the rules grid. \
-             grid write-back failed: reopen the grid\n</system-reminder>"
-        );
-    }
-
-    /// A host notice joins the transcript at the next turn's start, ahead of
-    /// the prompt the user just typed and so before the model answers, and
-    /// only once: `[reminder, prompt, reply]`, never `[prompt, reminder]`.
-    #[test]
-    fn a_host_notice_joins_the_next_turn_once() {
-        let dir = std::env::temp_dir().join(format!(
-            "plank-ui-host-notice-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let engine = ScriptedEngine {
-            replies: vec!["Noted.\n".to_string(), "Again.\n".to_string()],
-            ..ScriptedEngine::default()
-        };
-        let mut cfg = crate::config::AgentConfig::default();
-        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
-        let mut agent = test_agent(&dir, engine, &cfg);
-        let (_, reminder) =
-            grid_write_back_notice("categories", &Ok("categories: 1 updated".into()));
-        agent.tool_ctx.host_notices.push(reminder.clone());
-        agent.session.push(Message::user("hi"));
-
-        let shared = TurnShared::default();
-        let (tx, _rx) = std::sync::mpsc::channel();
-        agent.worker_turn(&tx, &shared).unwrap();
-        agent.session.push(Message::user("and now"));
-        agent.worker_turn(&tx, &shared).unwrap();
-
-        let texts: Vec<&str> = agent
-            .session
-            .transcript
-            .iter()
-            .map(|m| m.text.as_str())
-            .collect();
-        assert_eq!(texts.len(), 5, "got: {texts:#?}");
-        assert_eq!(texts[0], reminder);
-        assert_eq!(texts[1], "hi");
-        assert!(texts[2].contains("Noted."), "{texts:#?}");
-        assert_eq!(texts[3], "and now");
-        assert!(texts[4].contains("Again."), "{texts:#?}");
-        assert!(agent.tool_ctx.host_notices.is_empty());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The plain REPL's mirror: `run_turn` puts the notice ahead of the
-    /// prompt too.
-    #[test]
-    fn a_host_notice_precedes_the_prompt_on_the_plain_path() {
-        let dir = std::env::temp_dir().join(format!(
-            "plank-ui-host-notice-plain-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let engine = ScriptedEngine {
-            replies: vec!["Noted.\n".to_string()],
-            ..ScriptedEngine::default()
-        };
-        let mut cfg = crate::config::AgentConfig::default();
-        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
-        let mut agent = test_agent(&dir, engine, &cfg);
-        let (_, reminder) = grid_write_back_notice("rules", &Ok("rules: 2 updated".into()));
-        agent.tool_ctx.host_notices.push(reminder.clone());
-        agent.session.push(Message::user("hi"));
-
-        agent.run_turn().unwrap();
-
-        let texts: Vec<&str> = agent
-            .session
-            .transcript
-            .iter()
-            .map(|m| m.text.as_str())
-            .collect();
-        assert_eq!(texts.len(), 3, "got: {texts:#?}");
-        assert_eq!(texts[0], reminder);
-        assert_eq!(texts[1], "hi");
-        assert!(texts[2].contains("Noted."), "{texts:#?}");
-        assert!(agent.tool_ctx.host_notices.is_empty());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Two queued prompts submitted back to back during a grid write-back
-    /// (`[line1, line2]`, both plain `User` messages, nothing drained
-    /// between them) must not be split by the reminder: it goes ahead of the
-    /// whole trailing run, giving `[reminder, line1, line2]`, never
-    /// `[line1, reminder, line2]`.
-    #[test]
-    fn a_host_notice_precedes_the_whole_trailing_run_of_prompts() {
-        let dir = std::env::temp_dir().join(format!(
-            "plank-ui-host-notice-run-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = crate::config::AgentConfig::default();
-        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let (_, reminder) =
-            grid_write_back_notice("categories", &Ok("categories: 1 updated".into()));
-        agent.tool_ctx.host_notices.push(reminder.clone());
-        agent.session.push(Message::user("line1"));
-        agent.session.push(Message::user("line2"));
-
-        agent.drain_host_notices_before_prompt();
-
-        let texts: Vec<&str> = agent
-            .session
-            .transcript
-            .iter()
-            .map(|m| m.text.as_str())
-            .collect();
-        assert_eq!(texts, [reminder.as_str(), "line1", "line2"], "{texts:#?}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The write-back body is what the TUI runs on a worker thread behind the
-    /// busy loop: each finished grid leaves its scrollback line on the
-    /// channel and its reminder in the queue when its call returns. A file
-    /// that is not UTF-8 is reported without a call; a server that is not
-    /// there fails with the MCP error rather than hanging.
-    #[test]
-    fn grid_write_backs_run_off_the_ui_thread_and_queue_their_notices() {
-        let dir = std::env::temp_dir().join(format!(
-            "plank-ui-grid-write-back-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = crate::config::AgentConfig::default();
-        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let grid = |csv: Option<&str>| crate::grid::FinishedGrid {
-            server: "chatbgt".to_string(),
-            write_back: crate::grid::WriteBack {
-                tool: "apply_grid".to_string(),
-                table: "categories".to_string(),
-                grid: "0badf00d".to_string(),
-            },
-            csv: csv.map(str::to_owned),
-        };
-        let finished = vec![grid(None), grid(Some("#,name\n1,Food\n"))];
-        let (tx, rx) = std::sync::mpsc::channel();
-        let ui_thread = std::thread::current().id();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                assert_ne!(std::thread::current().id(), ui_thread);
-                agent.write_back_grids(finished, &tx);
-            });
-        });
-        drop(tx);
-        let lines: Vec<String> = rx
-            .into_iter()
-            .filter_map(|e| match e {
-                UiEvent::Dim(line) => Some(line),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            lines,
-            [
-                "grid write-back failed: the grid file is not UTF-8",
-                "grid write-back failed: mcp server not available",
-            ]
-        );
-        assert_eq!(
-            agent.tool_ctx.host_notices,
-            [
-                "<system-reminder>\nThe user edited the categories grid. \
-                 grid write-back failed: the grid file is not UTF-8\n</system-reminder>",
-                "<system-reminder>\nThe user edited the categories grid. \
-                 grid write-back failed: mcp server not available\n</system-reminder>",
-            ]
-        );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

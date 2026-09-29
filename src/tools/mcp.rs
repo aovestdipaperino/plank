@@ -1765,7 +1765,8 @@ fn invoke_mcp_tool(servers: &mut [McpServer], full_name: &str, arguments: &str) 
 }
 
 /// Calls `tool` on the server named `server` for plank itself, not for the
-/// model: the grid write-back when a frame closes on an edited grid.
+/// model: the grid write-back once an editor closes on an edited grid,
+/// still inside the tool call that staged it (`tools::grid_observation`).
 ///
 /// The same request path as a model's `mcp__*` call (restart of a stopped
 /// server, the offline check, the flattening) minus the advertised-tool
