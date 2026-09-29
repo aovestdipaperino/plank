@@ -35,8 +35,11 @@ pub fn parse_frame_directive(output: &str) -> Option<FrameDirective> {
 /// Honours `d` for `component`: checks the `files` grant and the path for
 /// writing before anything else, refuses a target that is itself a symlink
 /// (nothing here canonicalises it for us), stages the file (empty when
-/// missing), runs the editor, writes back only a changed file, atomically,
-/// and lets the component report through its optional `tool_resume` export.
+/// missing), runs the editor, re-checks containment and the symlink guard
+/// immediately before the write (the editor runs for however long the human
+/// takes, and the first check is stale by then), writes back only a changed
+/// file, atomically, and lets the component report through its optional
+/// `tool_resume` export.
 pub fn run_edit_directive(ctx: &mut ToolContext, component: &str, d: FrameDirective) -> String {
     let FrameDirective { path, file } = d;
     let has_files = ctx.wasm.registry.loaded.iter().any(|l| {
@@ -49,23 +52,10 @@ pub fn run_edit_directive(ctx: &mut ToolContext, component: &str, d: FrameDirect
     if !has_files {
         return format!("Tool error: {component} has no files grant\n");
     }
-    let target = match ctx.resolve_for_write("frame", &path) {
+    let target = match resolve_write_target(ctx, &path) {
         Ok(p) => p,
-        Err(e) => return e,
+        Err(e) => return format!("Tool error: {e}\n"),
     };
-    // `resolve_for_write` joins `cwd` with the raw path; it does not
-    // canonicalise, so a target that is itself a symlink would otherwise be
-    // read through and then silently replaced by `write_atomically`'s
-    // rename (which drops the link and leaves a plain file in its place).
-    // Refuse it outright instead of guessing which side the model meant.
-    if let Ok(meta) = std::fs::symlink_metadata(&target)
-        && meta.file_type().is_symlink()
-    {
-        return format!(
-            "Tool error: {} is a symlink; refusing to edit through it\n",
-            target.display()
-        );
-    }
     let bytes = match std::fs::read(&target) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -80,8 +70,19 @@ pub fn run_edit_directive(ctx: &mut ToolContext, component: &str, d: FrameDirect
         );
     }
     let (changed, written, error) = match run_frame_blocking(ctx, component, &file, &bytes) {
-        FrameResult::Saved(new) => match write_atomically(&target, &new) {
-            Ok(()) => (true, true, None),
+        // The editor was open for however long a human takes to close it;
+        // `target` was resolved and checked before that wait started, so it
+        // is re-resolved and re-checked here rather than trusted. A
+        // background job can turn a parent directory into a symlink to
+        // somewhere outside the write roots in the minutes in between, and
+        // plank's own process is not sandboxed the way a model-initiated
+        // `bash` call is — nothing else stands between a stale path and an
+        // unsandboxed write.
+        FrameResult::Saved(new) => match resolve_write_target(ctx, &path) {
+            Ok(revalidated) => match write_atomically(&revalidated, &new) {
+                Ok(()) => (true, true, None),
+                Err(e) => (true, false, Some(e)),
+            },
             Err(e) => (true, false, Some(e)),
         },
         FrameResult::Unchanged => (false, false, None),
@@ -92,11 +93,48 @@ pub fn run_edit_directive(ctx: &mut ToolContext, component: &str, d: FrameDirect
     resume(ctx, component, &target, changed, written, error.as_deref())
 }
 
+/// Resolves `path` for writing and refuses a target that is itself a
+/// symlink. Returns a bare reason (no `"Tool error: "` prefix, no trailing
+/// newline) so every caller — the first check and the pre-write recheck
+/// alike — can fold it into a uniform error line itself.
+///
+/// `resolve_for_write` joins `cwd` with the raw path; it does not
+/// canonicalise its result, so a target that is itself a symlink would
+/// otherwise be read through and then silently replaced by
+/// `write_atomically`'s rename (which drops the link and leaves a plain
+/// file in its place). Refuse it outright instead of guessing which side
+/// the model meant.
+fn resolve_write_target(ctx: &ToolContext, path: &str) -> Result<std::path::PathBuf, String> {
+    let target = match ctx.resolve_for_write("frame", path) {
+        Ok(p) => p,
+        Err(e) => {
+            let reason = e
+                .strip_prefix("Tool error: ")
+                .unwrap_or(&e)
+                .trim_end_matches('\n')
+                .to_string();
+            return Err(reason);
+        }
+    };
+    if let Ok(meta) = std::fs::symlink_metadata(&target)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "{} is a symlink; refusing to edit through it",
+            target.display()
+        ));
+    }
+    Ok(target)
+}
+
 /// A sibling temp name unique to this process and call, so `a.csv` and
 /// `a.tsv` (or two concurrent edits of the same file name in different
 /// directories) never collide.
 static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Builds that unique sibling name for `target`, from its full file name
+/// (not `with_extension`, so two different extensions on the same stem
+/// cannot collide) plus this process's id and a monotonic counter.
 fn temp_sibling(target: &std::path::Path) -> std::path::PathBuf {
     let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = target
@@ -106,17 +144,6 @@ fn temp_sibling(target: &std::path::Path) -> std::path::PathBuf {
     target.with_file_name(format!("{name}.{}.{n}.plank-edit.tmp", std::process::id()))
 }
 
-/// Writes `bytes` to a fresh sibling of `target` and renames it into place.
-///
-/// The sibling is opened with `create_new`, which refuses an already
-/// existing path — including a dangling or live symlink planted at that
-/// name — instead of following it, closing the containment hole an
-/// attacker-controlled cwd (e.g. via a sandboxed `bash` call) would
-/// otherwise have through a predictable temp name. The temp file is removed
-/// on every failure path, including a failed write, and the original
-/// file's permissions (when it existed) are carried over before the
-/// rename so the replacement is not left more permissive than the file it
-/// replaces.
 /// Opens `path` for writing only if nothing is there yet: `create_new`
 /// refuses an existing path outright, including a dangling or live symlink,
 /// rather than following it. This is what keeps a predictable temp name from
@@ -128,6 +155,17 @@ fn create_new(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// Writes `bytes` to a fresh sibling of `target` and renames it into place.
+///
+/// The sibling is opened with [`create_new`], which refuses an already
+/// existing path — including a dangling or live symlink planted at that
+/// name — instead of following it, closing the containment hole an
+/// attacker-controlled cwd (e.g. via a sandboxed `bash` call) would
+/// otherwise have through a predictable temp name. The temp file is removed
+/// on every failure path, including a failed write, and the original
+/// file's permissions (when it existed) are carried over before the
+/// rename so the replacement is not left more permissive than the file it
+/// replaces.
 fn write_atomically(target: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
     let tmp = temp_sibling(target);
@@ -156,8 +194,12 @@ fn write_atomically(target: &std::path::Path, bytes: &[u8]) -> Result<(), String
 /// The tool's final output: the component's `tool_resume` reply when it has
 /// the export, else plank's own line. A trapping `tool_resume` costs the
 /// component a strike, the same accounting `Registry::run_tool` applies to
-/// a trapping `tool_call`, and still reports the real outcome through
-/// plank's own line rather than swallowing it.
+/// a trapping `tool_call` (`Registry::strike`, `wasmreg.rs`), and still
+/// reports the real outcome through plank's own line rather than swallowing
+/// it. The trap's own text is not otherwise surfaced anywhere the model or
+/// the user would see it — the same "log it, don't propagate it" trade-off
+/// `Registry::dispatch` makes for a trapping event subscriber — so it is
+/// printed to stderr, in the same `"{id}: {e}"` shape those call sites use.
 fn resume(
     ctx: &mut ToolContext,
     component: &str,
@@ -191,7 +233,8 @@ fn resume(
                 }
                 return out;
             }
-            Err(_) => {
+            Err(e) => {
+                eprintln!("plank: {component}: tool_resume trapped: {e}");
                 ctx.wasm.registry.strike(component);
             }
         }
@@ -613,6 +656,7 @@ mod tests {
     /// replaced by a regular file: `resolve_for_write` does not canonicalise
     /// its result (see `run_edit_directive`'s comment), so the check has to
     /// happen explicitly.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_target_is_refused_not_replaced() {
         let dir = tempdir("directive-target-symlink");
@@ -646,6 +690,7 @@ mod tests {
     /// `create_new` is the one thing standing between a predictable temp
     /// name and a write-anywhere primitive: it must refuse an existing path,
     /// including a symlink, rather than follow it.
+    #[cfg(unix)]
     #[test]
     fn create_new_refuses_an_existing_path_including_a_symlink() {
         let dir = tempdir("create-new-symlink");
@@ -655,6 +700,181 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         assert!(create_new(&link).is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"untouched\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Containment is checked once before the editor opens, and the editor
+    /// then runs for however long a human takes to close it — minutes, in
+    /// the real TUI. A background `bash` job in the same session can spend
+    /// that window replacing a parent directory of the target with a
+    /// symlink to somewhere outside the write roots; plank's own process is
+    /// not sandboxed the way a model-initiated `bash` call is, so a stale
+    /// path is a real write-anywhere primitive, not just a theoretical one.
+    ///
+    /// The swap happens from inside the stand-in UI thread's edit step
+    /// (after it has taken the lent session and written the edit, before
+    /// giving it back), which is the one place guaranteed to run strictly
+    /// between the first containment check and the rewrite: `run_edit_directive`
+    /// finishes every check before the lend, and cannot resume past the
+    /// `Saved` arm until the give-back unblocks it.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_symlinked_to_outside_the_write_roots_while_the_editor_is_open_is_caught_before_the_write()
+     {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let dir = tempdir("directive-toctou");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let mut ctx = files_ctx(&dir);
+        ctx.sandbox.enabled = true;
+        let bridge = crate::framebridge::FrameBridge::new();
+        ctx.frame_bridge = Some(bridge.clone());
+        let outside = std::path::PathBuf::from(home).join(format!(
+            "plank_frames_toctou_outside_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let sub = dir.join("sub");
+        let outside_for_thread = outside.clone();
+        let h = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + LEND_WAIT;
+            let (session, req) = loop {
+                if let Some(lent) = bridge.take() {
+                    break lent;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no session was lent within {LEND_WAIT:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            let mut guard = GiveBack {
+                bridge: bridge.clone(),
+                session: Some(session),
+                close: FrameClose::Closed,
+            };
+            if let Some(session) = guard.session.as_mut() {
+                session
+                    .host
+                    .ram_write(&req.component, &req.file, b"a,b\n9,9\n")
+                    .unwrap();
+            }
+            // The attack: a background job replaces `sub` with a symlink to
+            // somewhere outside every write root while the editor is open.
+            std::fs::remove_dir_all(&sub).unwrap();
+            std::os::unix::fs::symlink(&outside_for_thread, &sub).unwrap();
+        });
+        let (_ctx, out) = lend_bounded(ctx, |ctx| {
+            run_edit_directive(
+                ctx,
+                ID,
+                FrameDirective {
+                    path: "sub/a.csv".into(),
+                    file: "data.csv".into(),
+                },
+            )
+        });
+        h.join().unwrap();
+        assert!(
+            !outside.join("a.csv").exists(),
+            "must not write outside the write roots"
+        );
+        assert!(out.starts_with("Tool error: "), "{out}");
+        assert!(out.contains("escapes workspace"), "{out}");
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_file(dir.join("sub"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host whose `tool_resume` export exists but always traps, so the
+    /// fallback path and the strike accounting can be tested without a real
+    /// runtime. Everything else behaves like [`test_support::DiskHost`]'s
+    /// RAM disk.
+    #[derive(Debug, Default)]
+    struct ResumeTrapHost {
+        files: std::collections::BTreeMap<(String, String), Vec<u8>>,
+    }
+
+    impl crate::wasmhost::WasmHost for ResumeTrapHost {
+        fn load(
+            &mut self,
+            _source: &str,
+            _wasm: &[u8],
+            _granted: &[&str],
+        ) -> Result<crate::wasmhost::LoadedPlugin, crate::wasmhost::WasmError> {
+            Err(crate::wasmhost::WasmError::Unsupported)
+        }
+
+        fn call(
+            &mut self,
+            _id: &str,
+            export: &str,
+            _input: &[u8],
+        ) -> Result<Vec<u8>, crate::wasmhost::WasmError> {
+            if export == "tool_resume" {
+                return Err(crate::wasmhost::WasmError::Trap("resume boomed".into()));
+            }
+            Ok(b"{}".to_vec())
+        }
+
+        fn has_export(&self, _id: &str, export: &str) -> bool {
+            export == "tool_resume"
+        }
+
+        fn ram_write(&mut self, id: &str, path: &str, bytes: &[u8]) -> Result<(), String> {
+            let path = crate::wasmcaps::normalize_fs_path(path)?;
+            self.files.insert((id.to_string(), path), bytes.to_vec());
+            Ok(())
+        }
+
+        fn ram_remove(&mut self, id: &str, path: &str) {
+            if let Ok(path) = crate::wasmcaps::normalize_fs_path(path) {
+                self.files.remove(&(id.to_string(), path));
+            }
+        }
+
+        fn ram_file(&self, id: &str, path: &str) -> Option<Vec<u8>> {
+            let path = crate::wasmcaps::normalize_fs_path(path).ok()?;
+            self.files.get(&(id.to_string(), path)).cloned()
+        }
+    }
+
+    /// A trapping `tool_resume` must not be swallowed: the fallback line
+    /// still reports the real outcome, and the component is struck the same
+    /// way a trapping `tool_call` would be (`Registry::run_tool`).
+    #[test]
+    fn a_trapping_tool_resume_falls_back_and_strikes() {
+        let dir = tempdir("directive-resume-trap");
+        let mut ctx = files_ctx(&dir);
+        ctx.wasm.host = Box::new(ResumeTrapHost::default());
+        let bridge = crate::framebridge::FrameBridge::new();
+        ctx.frame_bridge = Some(bridge.clone());
+        let h = ui_thread(bridge, Some(b"a,b\n1,2\n"), FrameClose::Closed);
+        let (ctx, out) = lend_bounded(ctx, |ctx| {
+            run_edit_directive(
+                ctx,
+                ID,
+                FrameDirective {
+                    path: "a.csv".into(),
+                    file: "data.csv".into(),
+                },
+            )
+        });
+        h.join().unwrap();
+        assert_eq!(
+            out,
+            format!("saved changes to {}\n", dir.join("a.csv").display())
+        );
+        let strikes = ctx
+            .wasm
+            .registry
+            .loaded
+            .iter()
+            .find(|l| l.component.manifest.id == ID)
+            .unwrap()
+            .strikes;
+        assert_eq!(strikes, 1, "a trapping tool_resume costs a strike");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
