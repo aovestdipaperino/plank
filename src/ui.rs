@@ -4004,6 +4004,17 @@ impl Agent<'_> {
         out
     }
 
+    /// Runs `f` with [`Agent::turn_from_remote`] raised, and lowers it again
+    /// however `f` ends, so a remote line's turn never leaves the next local
+    /// one refusing editors. A closure rather than a drop guard because the
+    /// guard would hold the `&mut self` that `f` needs.
+    fn with_turn_from_remote<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.turn_from_remote = true;
+        let out = f(self);
+        self.turn_from_remote = false;
+        out
+    }
+
     /// Says, through `ToolContext::editor_refusal`, why a frame editor may
     /// not open for the next dispatch, if it may not: a sub-agent's call has
     /// no screen of its own, and a turn a remote controller started has
@@ -13176,67 +13187,74 @@ impl Agent<'_> {
                 if gate != RemoteLines::Wait
                     && let Some(r) = self.remote.clone()
                 {
-                    let queued = r.shared.take_queued();
-                    let mut run = false;
-                    for line in queued {
-                        let line = line.trim().to_owned();
-                        if line.is_empty() {
-                            continue;
+                    // Everything a remote line runs — a prompt's turn, and the
+                    // turns a slash command starts from inside `tui_slash`
+                    // (skills, component commands, `/subagent`, `/init`, an
+                    // armed `/goal`) — is remote-driven, so editors are refused
+                    // for all of it. `with_turn_from_remote` clears the flag on
+                    // every way out, the quit and each error included.
+                    let quit = self.with_turn_from_remote(|this| -> Result<bool, String> {
+                        let queued = r.shared.take_queued();
+                        let mut run = false;
+                        for line in queued {
+                            let line = line.trim().to_owned();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            if line.starts_with('/') {
+                                if !this.tui_slash(
+                                    &line,
+                                    &mut log,
+                                    terminal,
+                                    &mut view,
+                                    &mut input,
+                                    &mut btw_panel,
+                                    &mut config_form,
+                                    &mut kv_pane,
+                                    &mut resume_pane,
+                                    &mut arcade,
+                                    &mut sub_pane,
+                                    &mut report,
+                                ) {
+                                    return Ok(true);
+                                }
+                                // `/goal` arms a loop instead of running one: it
+                                // cannot start a turn from inside `tui_slash`,
+                                // which has no terminal handles of its own.
+                                // `self.goal` is `None` at every prompt, so this
+                                // means exactly "`/goal` just started one".
+                                if this.goal.is_some() {
+                                    run = true;
+                                }
+                            } else {
+                                r.bus.broadcast(UiEvent::UserEcho(line.clone()));
+                                log.push_user_echo(&line);
+                                this.session.push(Message::user(line));
+                                run = true;
+                            }
                         }
-                        if line.starts_with('/') {
-                            if !self.tui_slash(
-                                &line,
-                                &mut log,
+                        if run {
+                            this.tui_turn(
                                 terminal,
+                                &mut log,
                                 &mut view,
                                 &mut input,
                                 &mut btw_panel,
-                                &mut config_form,
-                                &mut kv_pane,
-                                &mut resume_pane,
                                 &mut arcade,
                                 &mut sub_pane,
-                                &mut report,
-                            ) {
-                                input.history.save(&hist_path).ok();
-                                remote_abandon(rem);
-                                return Ok(crt_frame);
-                            }
-                            // `/goal` arms a loop instead of running one: it
-                            // cannot start a turn from inside `tui_slash`, which
-                            // has no terminal handles of its own. `self.goal` is
-                            // `None` at every prompt, so this means exactly
-                            // "`/goal` just started one".
-                            if self.goal.is_some() {
-                                run = true;
-                            }
-                        } else {
-                            r.bus.broadcast(UiEvent::UserEcho(line.clone()));
-                            log.push_user_echo(&line);
-                            self.session.push(Message::user(line));
-                            run = true;
+                            )?;
+                            // A remote-driven turn is time the user was not
+                            // idle at the prompt: start the screensaver clock
+                            // from the moment the UI comes back to idle, not
+                            // from before the turn.
+                            last_activity = Instant::now();
                         }
-                    }
-                    if run {
-                        // Cleared before the `?`, so a failed turn does not
-                        // leave the next local one refusing editors.
-                        self.turn_from_remote = true;
-                        let turn = self.tui_turn(
-                            terminal,
-                            &mut log,
-                            &mut view,
-                            &mut input,
-                            &mut btw_panel,
-                            &mut arcade,
-                            &mut sub_pane,
-                        );
-                        self.turn_from_remote = false;
-                        turn?;
-                        // A remote-driven turn is time the user was not idle
-                        // at the prompt: start the screensaver clock from the
-                        // moment the UI comes back to idle, not from before
-                        // the turn.
-                        last_activity = Instant::now();
+                        Ok(false)
+                    })?;
+                    if quit {
+                        input.history.save(&hist_path).ok();
+                        remote_abandon(rem);
+                        return Ok(crt_frame);
                     }
                 }
                 // A background job finished while the prompt sat idle: wake
@@ -18680,6 +18698,11 @@ fn frame_mouse_event(
 /// returned without giving back would hang plank. So `drive` has no way to
 /// return without handing the session over, and this is the only place that
 /// gives it back.
+///
+/// `Ok(true)` when a frame was served. `Ok(false)` when nothing was parked,
+/// which includes the moment after a give-back while the bridge still reads
+/// pending until the worker's next poll: the caller then carries on with its
+/// loop rather than spinning straight back here.
 fn serve_lent_frame(
     bridge: &crate::framebridge::FrameBridge,
     drive: impl FnOnce(
@@ -18690,13 +18713,13 @@ fn serve_lent_frame(
         crate::framebridge::FrameClose,
         Result<(), String>,
     ),
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let Some((session, req)) = bridge.take() else {
-        return Ok(());
+        return Ok(false);
     };
     let (session, close, result) = drive(session, req);
     bridge.give_back(session, close);
-    result
+    result.map(|()| true)
 }
 
 /// Gives back, as failed, any session a tool call parks on `bridge` until
@@ -18725,11 +18748,11 @@ fn release_lent_frames(bridge: &crate::framebridge::FrameBridge, finished: impl 
 /// then hands the session back. Modal, like `run_ask_panel`: the worker is
 /// blocked on the bridge, so nothing else needs servicing, and every key goes
 /// to the component, Ctrl-C included (the component's own close, or a trap,
-/// are the only ways out).
+/// are the only ways out). Whether a frame was served, as `serve_lent_frame`.
 fn run_frame_panel(
     terminal: &mut ratatui::DefaultTerminal,
     bridge: &crate::framebridge::FrameBridge,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     serve_lent_frame(bridge, |session, req| drive_frame(terminal, session, &req))
 }
 
@@ -18764,6 +18787,8 @@ fn drive_frame(
     let mut last = Instant::now();
     let (close, result) = loop {
         if let Err(e) = frame_step(&mut session, &mut open, &mut last, size(terminal)) {
+            // No `close_frame`, as on the idle loop's step-trap path: the
+            // component just trapped, so it is not asked to run anything more.
             break (FrameClose::Failed(e), Ok(()));
         }
         if let Err(e) = terminal.draw(|f| tui::draw_wasm_frame(f, &open)) {
@@ -19492,8 +19517,8 @@ fn busy_ui_loop(
         // the worker is blocked on the bridge meanwhile, like `ask` above.
         if let Some(bridge) = frames
             && bridge.is_pending()
+            && run_frame_panel(terminal, bridge)?
         {
-            run_frame_panel(terminal, bridge)?;
             continue;
         }
         while let Ok(ev) = rx.try_recv() {
@@ -22643,24 +22668,77 @@ mod tests {
         assert_eq!(agent.tool_ctx.editor_refusal, None);
     }
 
+    #[test]
+    fn a_plain_stanza_chooses_the_editor_refusal_too() {
+        // A read-only stanza with no GPU yield armed goes to `dispatch_all`,
+        // which never reaches `dispatch_tool`: `dispatch_stanza` must choose
+        // the refusal itself.
+        let dir = scratch_dir("editor-refusal-stanza");
+        std::fs::write(dir.join("f.txt"), "x\n").unwrap();
+        let path = dir.join("f.txt").display().to_string();
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let calls = [read_call(&path)];
+        let nudges = [crate::guard::Nudge::None];
+
+        agent.turn_from_remote = true;
+        agent.dispatch_stanza(&calls, &nudges, false, |_| false);
+        assert_eq!(
+            agent.tool_ctx.editor_refusal,
+            Some("the editor needs the local screen".into())
+        );
+
+        agent.turn_from_remote = false;
+        agent.dispatch_stanza(&calls, &nudges, false, |_| false);
+        assert_eq!(agent.tool_ctx.editor_refusal, None);
+    }
+
+    #[test]
+    fn the_remote_flag_is_lowered_however_the_remote_lines_end() {
+        let dir = scratch_dir("remote-flag");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let ok: Result<bool, String> = agent.with_turn_from_remote(|a| {
+            assert!(a.turn_from_remote);
+            Ok(true)
+        });
+        assert_eq!(ok, Ok(true));
+        assert!(!agent.turn_from_remote);
+        let err: Result<bool, String> = agent.with_turn_from_remote(|a| {
+            assert!(a.turn_from_remote);
+            Err("turn failed".into())
+        });
+        assert!(err.is_err());
+        assert!(!agent.turn_from_remote);
+    }
+
+    /// Lends a session from a worker thread; the receiver yields how it came
+    /// back, so a test can bound the wait instead of hanging on a missing
+    /// give-back.
     fn lend_one(
         bridge: &crate::framebridge::FrameBridge,
-    ) -> std::thread::JoinHandle<crate::framebridge::FrameClose> {
+    ) -> std::sync::mpsc::Receiver<crate::framebridge::FrameClose> {
         let worker = bridge.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let req = crate::framebridge::FrameRequest {
                 component: "dev.plank.x".into(),
                 file: "data.csv".into(),
             };
-            worker.lend(crate::wasmreg::Session::default(), req).1
-        })
+            let _ = tx.send(worker.lend(crate::wasmreg::Session::default(), req).1);
+        });
+        rx
     }
 
     fn wait_pending(bridge: &crate::framebridge::FrameBridge) {
+        let start = Instant::now();
         while !bridge.is_pending() {
+            assert!(start.elapsed() < Duration::from_secs(5), "never lent");
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+
+    const GIVE_BACK_WAIT: Duration = Duration::from_secs(5);
 
     #[test]
     fn a_lent_frame_goes_back_even_when_driving_it_fails() {
@@ -22678,11 +22756,22 @@ mod tests {
         });
         assert_eq!(r, Err("terminal gone".to_string()));
         assert_eq!(
-            worker.join().unwrap(),
-            FrameClose::Failed("terminal gone".into())
+            worker.recv_timeout(GIVE_BACK_WAIT),
+            Ok(FrameClose::Failed("terminal gone".into()))
         );
-        // Nothing parked: serving is a no-op.
-        assert_eq!(serve_lent_frame(&bridge, |_, _| unreachable!()), Ok(()));
+        // Nothing parked: serving reports that, so the busy loop carries on.
+        assert_eq!(serve_lent_frame(&bridge, |_, _| unreachable!()), Ok(false));
+    }
+
+    #[test]
+    fn a_served_frame_says_so() {
+        use crate::framebridge::{FrameBridge, FrameClose};
+        let bridge = FrameBridge::new();
+        let worker = lend_one(&bridge);
+        wait_pending(&bridge);
+        let r = serve_lent_frame(&bridge, |session, _| (session, FrameClose::Closed, Ok(())));
+        assert_eq!(r, Ok(true));
+        assert_eq!(worker.recv_timeout(GIVE_BACK_WAIT), Ok(FrameClose::Closed));
     }
 
     #[test]
@@ -22690,8 +22779,24 @@ mod tests {
         use crate::framebridge::{FrameBridge, FrameClose};
         let bridge = FrameBridge::new();
         let worker = lend_one(&bridge);
-        release_lent_frames(&bridge, || worker.is_finished());
-        assert!(matches!(worker.join().unwrap(), FrameClose::Failed(_)));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let released = bridge.clone();
+        // Released on its own thread and finished by the first result, so
+        // a release that never gives back fails the timeout below.
+        std::thread::spawn(move || {
+            let close = std::sync::Mutex::new(None);
+            release_lent_frames(&released, || {
+                if let Ok(c) = worker.try_recv() {
+                    *close.lock().unwrap() = Some(c);
+                }
+                close.lock().unwrap().is_some()
+            });
+            let _ = done_tx.send(close.into_inner().unwrap().unwrap());
+        });
+        assert!(matches!(
+            done_rx.recv_timeout(GIVE_BACK_WAIT),
+            Ok(FrameClose::Failed(_))
+        ));
     }
 
     #[test]
