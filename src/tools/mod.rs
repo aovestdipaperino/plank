@@ -15,6 +15,7 @@ pub mod bash;
 pub mod diff;
 pub mod edit;
 pub mod files;
+mod frames;
 pub mod mcp;
 pub mod mcp_advert;
 pub mod web;
@@ -185,6 +186,13 @@ pub struct ToolContext {
     /// worker's [`asker`](Self::asker) parks requests here for the event loop to
     /// render). `None` for the plain REPL (stdin asker) and non-interactive mode.
     pub ask_bridge: Option<ask::AskBridge>,
+    /// The TUI's frame rendezvous (`crate::framebridge`): a tool that runs an
+    /// editor frame lends the WASM session through it. `None` outside the
+    /// TUI, which is what refuses every editor there.
+    pub frame_bridge: Option<crate::framebridge::FrameBridge>,
+    /// Set by the agent before each dispatch when an editor must not open for
+    /// a reason only the agent knows (a sidechain, a remote-driven turn).
+    pub editor_refusal: Option<String>,
     /// Live browser session for the web tools, created lazily on first web use
     /// and reused across turns (like the C agent keeping Chrome alive). Only on
     /// `ds4_engine` builds; the curl path needs no handle.
@@ -354,6 +362,8 @@ impl ToolContext {
             touched_tree: false,
             asker: None,
             ask_bridge: None,
+            frame_bridge: None,
+            editor_refusal: None,
             #[cfg(ds4_engine)]
             web_browser: None,
             wrote_memory: false,
