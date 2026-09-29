@@ -372,6 +372,23 @@ MCP server whose logic is pure computation can be recompiled as a WASM plugin
 with no conceptual redesign — and so `tools/mod.rs` can merge both registries
 into one dispatch table with one collision policy.
 
+**Opening a blocking editor.** A `tool_call` reply may, instead of an ordinary
+observation, be a frame directive: `{"frame": {"path": "<as the model gave
+it>", "file": "<name to stage it under on the component's own RAM disk>"}}`.
+This is what `edit_csv` uses (`guests/csvedit`, `src/tools/frames.rs`): plank
+resolves and checks `path` for writing, reads it (empty if missing) onto the
+component's disk as `file`, runs the component's `frame` surface to
+completion the way [Grid bridge](#grid-bridge) does, re-checks `path`
+immediately before writing a changed file back atomically, and calls the
+component's `tool_resume` export, if it has one, with
+`{"path", "changed", "written", "error"}` so it can shape its own final line;
+without that export plank answers with one of `saved changes to <path>`,
+`no changes to <path>`, or the error. The directive requires the `files`
+capability (below) — it is checked before anything else — and everything
+[Grid bridge](#grid-bridge) says about refusals, containment and the write
+applies here too, since `edit_csv` is built on the very same
+`frames::run_frame_blocking`.
+
 **Prompt-cache warning.** Adding or removing a `tool` plugin changes the tool
 list, which changes the system prompt, which invalidates `sysprompt.kv`. Tool
 plugins must be resolved *before* the system prompt is fingerprinted, and
@@ -515,6 +532,7 @@ granted per-plugin in the manifest. Nothing is granted by default.
 | `notify` | `plank_notify(title, body)` | Desktop/terminal notification |
 | `state` | `plank_state_get(key)`, `plank_state_set(key, val)` | A per-plugin KV store under `~/.plank/plugins/<id>/state`. The *only* persistence most plugins need, and it needs no filesystem grant. Quotas: 1 MiB per value, 255-byte keys, 256 keys and 16 MiB in total per component (`STATE_MAX_*` in `src/wasmcaps.rs`); an over-quota `state_set` is refused with a `'<id>' ...` error before anything is written |
 | `fs` | `plank_fs_read(path)`, `plank_fs_write(path, bytes)`, `plank_fs_list(dir)`, `plank_fs_remove(path)` | A private in-memory scratch disk per component, empty at session start and cleared when plank exits; it reaches no real file. Paths are `/`-rooted, `..`, NUL and backslash are refused, and a write that would make one path both a file and a directory is refused. Quotas: 4 MiB per file, 256 files and 16 MiB in total per component (`FS_MAX_*` in `src/wasmcaps.rs`). The grant is checked before the path, and grant, quota and overlap refusals start with `'<id>'` and change nothing |
+| `files` | none (host-side only) | "the one file a tool call names, written back under plank's write rules" — the note shown at trust time. No host function; `tool_call` asks for it by replying with a frame directive (`{"frame": {"path", "file"}}`, see the `tool` surface above), and plank itself reads and writes the real path, checked with `resolve_for_write` before the edit and again immediately before the write |
 | `net` | Extism `allowed_hosts` | Explicit host list |
 | `exec` | `plank_exec(cmd) -> {out, code}` | **Escape hatch.** Grants shell. Requires explicit user confirmation at install and is flagged in `/plugins` |
 | `agent` | `plank_prompt(text)` | Submits a prompt to the model as if typed. Rate-limited to prevent loops |
@@ -545,55 +563,66 @@ out of the result before the model sees it and hands them over as
 whose file is anything but one plain name, or whose `writeBack` is incomplete,
 is dropped with `grid not opened: malformed plank-frame resource` in the text.
 
-Whether a staging is honoured is decided by the host, and only for pairs the
-running profile declared. A profile's `grids` field maps an MCP server name to a
-component id (see [Grids in PROFILES.md](PROFILES.md#grids)), and
-`Session::stage_grid` honours a staging only when its server maps to exactly the
-component its URI names. The server is identified by its final name once the
-MCP configs have merged (plugins, `~/.plank/.mcp.json`, `./.mcp.json`), not by
-where it was declared, so a same-named server in `./.mcp.json` or
-`~/.plank/.mcp.json` that replaces the one the profile expected inherits its
-route. A server cannot pick some other component by naming
-it, a component cannot ask for a server's grids, and without a profile nothing
-is routed at all. When the pair is declared, plank writes the CSV onto that
-component's RAM disk under the staged file name and queues the component's
-frame with the file name as its `arg`; the UI opens it at the next idle moment,
-once the model's turn is over. The model's observation says what happened, one
-line per staging: `grid opened when you finish: <file>`, or
-`grid not opened: <reason>`.
+Every staging is handled synchronously, inside the same tool call that
+produced it: `grid_observation` (`src/tools/mod.rs`) walks the stagings after
+the MCP call returns and, for each one the running profile routes, opens the
+grid and blocks — there is no deferred path, nothing queued for a later
+turn, no write-back run off elsewhere, and nothing for `/btw` to wait on. A profile's `grids` field maps an
+MCP server name to a component id (see [Grids in
+PROFILES.md](PROFILES.md#grids)); the server is identified by its final name
+once the MCP configs have merged (plugins, `~/.plank/.mcp.json`,
+`./.mcp.json`), not by where it was declared, so a same-named server that
+replaces the one the profile expected inherits its route. A server cannot pick
+some other component by naming it, a component cannot ask for a server's
+grids, and without a profile nothing is routed: an unrouted staging's line is
+`grid not opened: this profile does not route <server>'s grids`.
 
-The reasons are the refusals, each checked before anything is written. Frames
-need the interactive TUI, so the plain REPL and the headless paths answer
-`grids need the interactive TUI`. The route must be declared, and the component
-must be loaded and not struck out, must have the `frame` surface, must not be a
-screensaver (one closes on any key, so no edit could be made in it, and the idle
-rotation could open it onto a grid nobody asked for), and must have been granted
-`fs`. A grid is never staged under a frame already on screen
-(`a grid is already open`), nor over a file already on the component's disk
-that is not the waiting grid's own (`<file> already exists on <component>'s
-disk`): the grid's file is removed when its frame closes, so staging over a CSV
-the user made in the component would first overwrite it and then delete it. The write itself goes through the same `fs` quotas
-as the component's own writes, so a grid over 4 MiB, or one that would push the
-disk past its file count or total, is refused with the quota's message and
-leaves the disk as it was. There is one grid at a time: a newer staging replaces
-one still waiting to open, and removes the older file only once the new one is
-written, so a refused staging leaves the older grid in place.
+For a routed staging, `grid_observation` calls
+`frames::run_frame_blocking` (`src/tools/frames.rs`), the same function
+`edit_csv` uses (see the `tool` surface above). It stages the CSV onto the
+component's RAM disk under the staged file name and lends the whole WASM
+session, through `FrameBridge` (`src/framebridge.rs`), to the TUI's busy
+loop — the same rendezvous `ask` uses to block a tool call on a panel. The
+worker thread that is running this tool call parks the session on the bridge
+and waits; the busy loop (`run_frame_panel`/`serve_lent_frame`/`drive_frame`
+in `src/ui.rs`) takes it, runs `frame_open`/`frame_step`/`frame_key`/
+`frame_mouse`/`frame_close` against it exactly as it would for a directly
+opened frame, and gives the session back when the component closes it. The
+frame is modal while it is up: every key goes to the component, Ctrl-C
+included — the component's own close, or a trap, are the only ways out — and
+nothing else on the worker's turn can run until it returns.
 
-When the grid's frame closes, whether by the user quitting or by a trap,
-`Session::finish_grid` reads the file back from the RAM disk and removes it. An
-untouched file, or one the frame deleted, ends there. A changed one goes back:
-plank, not the model, calls the tool the server named in `writeBack` with
-`{"table", "grid", "csv"}`, on a worker thread so a slow server never freezes
-the UI. The call is `mcp::call_tool_direct`: the same request path as a model
-call (a stopped server is restarted, an offline one reported as down) except
-that the tool need not appear in the server's `tools/list`. A server may hide
-its write-back tool so the model never sees or calls it; a model call to that
-name still gets `unknown mcp tool`. The outcome leaves a dim
-line in the scrollback and a `<system-reminder>` notice
-(`The user edited the <table> grid. ...`) that is queued and delivered ahead of
-the next prompt, so the model learns what the user changed before it answers
-them. A reply from the write-back tool is never a request to open another frame:
-any stagings in it are ignored.
+`run_frame_blocking` refuses before anything is staged or lent, for five
+reasons: outside the TUI (`editors need the interactive TUI`), inside a
+sub-agent (`editors cannot open inside a sub-agent`), in a turn a remote
+controller started rather than the local screen (`the editor needs the local
+screen`, see `Agent::refresh_editor_refusal`), while another editor is already
+on screen or another frame is pending (`an editor is already open`), and a
+bucket of component checks from `Session::check_editor`: not loaded, no
+`frame` surface, a screensaver (one closes on any key, so no edit could be
+made in it), or no `fs` grant, each spelled out by name. The write itself
+goes through the same `fs` quotas as the component's own writes, so a grid
+over 4 MiB, or one that would push the disk past its file count or total, is
+refused with the quota's message; and a file already staged under that name
+(one the user made in the component) is never overwritten. Every refusal
+becomes `grid not opened: <reason>` in the model's observation.
+
+When the frame closes, `Session::collect_editor_file` reads the staged file
+back and removes it. Nothing changed, or the frame deleted it: `grid closed
+without changes`. Something changed: `grid_observation` calls the tool the
+server named in `writeBack`, with `{"table", "grid", "csv"}`, through
+`mcp::call_tool_direct` — the same request path as a model call (a stopped
+server is restarted, an offline one reported as down) except that the tool
+need not appear in the server's `tools/list`, so a server can hide its
+write-back tool from the model (a model call to that name still gets `unknown
+mcp tool`). No separate worker thread is needed for this call: the tool call
+was already running off the UI thread, which is the whole reason the frame
+could lend the session to begin with. The reply becomes the observation line
+verbatim: `grid closed: <reply>`, or, if the call fails, `grid closed:
+write-back failed: <error>` (including when the closed file is not valid
+UTF-8). A reply from the write-back tool is never a request to open another
+frame: any stagings in it are ignored. The model learns what happened from
+this one result, not from a later notice.
 
 A component learns nothing new from any of this. csvedit sees a file on its own
 disk and an `arg` naming it, exactly as if the user had opened that file

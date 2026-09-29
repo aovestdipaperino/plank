@@ -218,7 +218,8 @@ silently**: an update that asks for more re-prompts even with a valid signature.
 
 Wired today: `log`, `print`, `state` (a per-component KV store — the only
 persistence most components need, and it needs no filesystem grant), `fs` (a
-private RAM disk, below), `sound`, and `notify`.
+private RAM disk, below), `sound`, `notify`, and `files` (host-side only, no
+guest function — below).
 
 `state` has quotas, checked before anything touches the disk: 1 MiB per value,
 255-byte keys, 256 keys, 16 MiB in total per component. An over-quota
@@ -271,18 +272,31 @@ is N bytes, more than the ...-byte limit`); a malformed path or a missing file
 is reported without it.
 
 Nothing your component does can put a file on its disk from outside, or take one
-off. The one sanctioned crossing is the grid bridge
+off. The grid bridge is one sanctioned crossing
 ([WASM-PLUGINS.md](WASM-PLUGINS.md#grid-bridge)): when a running profile
 routes an MCP server's grids to your component, plank writes the server's CSV
-onto your disk and opens your frame with the file name as its `arg`, then
-reads the file back when the frame closes and hands a changed copy to the
-server. Your component needs `fs` and the `frame` surface, must not be a
-screensaver, and sees only an ordinary file; saving it in place under the same
-name is how an edit gets back. csvedit is the worked example: a grid whose
-first header cell is `#` opens in bridged mode, where the `#` column cannot be
-edited, columns cannot be added, removed or renamed, and New, Open and Save As
-are refused so Ctrl+S always saves to the staged name. Rows can still be added
-and deleted, and a new row's `#` cell is left empty.
+onto your disk and opens your frame with the file name as its `arg`, blocking
+the tool call that produced the table until you close it, then reads the file
+back and hands a changed copy to the server in the same call. Your component
+needs `fs` and the `frame` surface, must not be a screensaver, and sees only
+an ordinary file; saving it in place under the same name is how an edit gets
+back. csvedit is the worked example: a grid whose first header cell is `#`
+opens in bridged mode, where the `#` column cannot be edited, columns cannot
+be added, removed or renamed, and New, Open and Save As are refused so Ctrl+S
+always saves to the staged name. Rows can still be added and deleted, and a
+new row's `#` cell is left empty.
+
+The other crossing is the `files` capability, host-side only (no host
+function of its own): a `tool_call` reply of `{"frame": {"path", "file"}}`
+asks plank to run your `frame` surface as a blocking editor on a real file
+named by the model, the way csvedit's own `edit_csv` tool does
+(`guests/csvedit/src/frame.rs`). plank checks and stages the file, runs your
+frame to completion exactly as the grid bridge does, and calls your
+`tool_resume(json: {path, changed, written, error}) -> string` export, if you
+have one, so you can report the outcome in your own words — without it, plank
+answers with a plain `saved changes to <path>` / `no changes to <path>` /
+error line. A trapping `tool_resume` costs you a strike, same as a trapping
+`tool_call`.
 
 Declared but reaching nothing yet: `agent`, `session`. plank warns at load if
 you ask for one, because approving a capability that does not exist is worse

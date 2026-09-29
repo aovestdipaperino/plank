@@ -282,15 +282,22 @@ A queued `prompt` or `command` does not always run at the next idle tick. The
 TUI's idle loop asks `remote_lines_gate` (`src/ui.rs`) what the WASM frame on
 screen allows. With no frame up the lines run. An idle-rotation screensaver is
 treated as a local key would treat it: a queued line takes it down, resets the
-idle clock so the rotation does not put it straight back, and then runs. A frame
-someone asked for (a `/frame`, or a grid from the grid bridge) holds the lines
-in the queue until it closes, because a turn under an open frame could stage a
-grid over it or fight it for the screen. While they wait the remote is told so
-once, with a `dim` frame reading `waiting for the frame to close`
-(`remote_wait_notice_due`), so a prompt sent from elsewhere does not look lost;
-the notice repeats only after the frame has closed and another one holds lines
-again. There is no dedicated frame type for it, and no notice when the lines
-finally run: the `user_echo` of each line is that signal.
+idle clock so the rotation does not put it straight back, and then runs. A
+frame someone asked for (`/frame`) holds the lines in the queue until it
+closes, because a turn under an open frame would fight it for the screen.
+While they wait the remote is told so once, with a `dim` frame reading
+`waiting for the frame to close` (`remote_wait_notice_due`), so a prompt sent
+from elsewhere does not look lost; the notice repeats only after the frame
+has closed and another one holds lines again. There is no dedicated frame
+type for it, and no notice when the lines finally run: the `user_echo` of
+each line is that signal.
+
+A blocking editor (a grid, or `edit_csv`) is a different case, and does not
+go through this gate at all: a remote-driven turn cannot open one — a
+remote-started turn never has anyone at the local screen to drive it —
+so the tool call itself refuses with `the editor needs the local screen`
+(`Agent::refresh_editor_refusal`, set from `Agent::turn_from_remote`) rather
+than waiting for a frame to close.
 
 ### 4.4 Session multiplexing and the coexistence policy
 
