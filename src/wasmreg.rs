@@ -2128,6 +2128,13 @@ impl Session {
         }
     }
 
+    /// The held components the running profile bundles, to ask about at
+    /// launch. See [`profile_trust_offers`].
+    #[must_use]
+    pub fn profile_trust_offers(&self) -> Vec<TrustOffer> {
+        profile_trust_offers(&self.registry)
+    }
+
     /// Approves a held component and loads it, without waiting for a restart.
     ///
     /// # Errors
@@ -2822,6 +2829,99 @@ impl Registry {
     }
 }
 
+/// A component's capabilities as the user is shown them: each label, with the
+/// note that explains what it reaches when it has one.
+fn wanted_capabilities(component: &WasmComponent) -> String {
+    component
+        .manifest
+        .capabilities
+        .iter()
+        .map(|c| match c.note() {
+            Some(note) => format!("{} ({note})", c.label()),
+            None => c.label().to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A held component the running profile bundles, offered for approval when
+/// plank starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustOffer {
+    /// The component id, for [`Session::approve`].
+    pub id: String,
+    /// The question to put to the user: what bundles it, why it is held, and
+    /// what it wants.
+    pub question: String,
+}
+
+/// The held components worth asking about at launch: those the running
+/// profile bundles, held only because they are new, changed or asking for
+/// more.
+///
+/// A profile's components are asked about up front, unlike every other
+/// plugin's, because launching the profile is already the user choosing them:
+/// the profile routes its grids to them, so the first thing it does would
+/// otherwise be to fail and send the user off to type `/plugins trust`. A bad
+/// signature is never offered, since approving it would wave through the one
+/// verdict that means something is wrong, and a component the user disabled
+/// stays disabled.
+#[must_use]
+pub fn profile_trust_offers(registry: &Registry) -> Vec<TrustOffer> {
+    use std::fmt::Write as _;
+
+    registry
+        .held
+        .iter()
+        .filter(|(c, d)| {
+            c.origin == Origin::Profile
+                && matches!(
+                    d,
+                    Decision::Unknown | Decision::Changed | Decision::Widened(_)
+                )
+        })
+        .map(|(component, decision)| {
+            let mut question = format!(
+                "The {} profile bundles the plugin {}, which is held because {}. \
+                 It wants: {}.",
+                component.plugin,
+                component.manifest.id,
+                decision.reason(),
+                wanted_capabilities(component)
+            );
+            if component.is_privileged() {
+                question.push_str(" ⚠ This is not a sandboxed component.");
+            }
+            let _ = write!(question, " Trust it and load it now?");
+            TrustOffer {
+                id: component.manifest.id.clone(),
+                question,
+            }
+        })
+        .collect()
+}
+
+/// What to tell the user once they have answered `offer`: approving loads the
+/// component at once, and declining leaves it held with the command that
+/// approves it later.
+pub fn answer_trust_offer(
+    session: &mut Session,
+    offer: &TrustOffer,
+    trust: bool,
+    project: &Path,
+) -> String {
+    if !trust {
+        return format!(
+            "left {} off; /plugins trust {} approves it later",
+            offer.id, offer.id
+        );
+    }
+    match session.approve(&offer.id, project) {
+        Ok(name) => format!("approved and loaded wasm component '{name}'"),
+        Err(e) => e,
+    }
+}
+
 /// Renders the held-components section of `/plugins`: what was found, why it
 /// is not running, and the exact command that would approve it.
 ///
@@ -2845,16 +2945,7 @@ pub fn render_held(registry: &Registry) -> String {
             component.origin.label(),
             decision.reason()
         );
-        let caps: Vec<String> = component
-            .manifest
-            .capabilities
-            .iter()
-            .map(|c| match c.note() {
-                Some(note) => format!("{} ({note})", c.label()),
-                None => c.label().to_string(),
-            })
-            .collect();
-        let _ = write!(out, "    wants: {}", caps.join(", "));
+        let _ = write!(out, "    wants: {}", wanted_capabilities(component));
         if component.is_privileged() {
             out.push_str("  ⚠ this is not a sandboxed component");
         }
@@ -4044,6 +4135,80 @@ mod tests {
             Decision::Trusted
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Only a profile's own components are offered at launch, and only for the
+    /// verdicts a user can sensibly wave through: a bad signature or a
+    /// component the user disabled is never put to them as a yes/no.
+    #[test]
+    fn launch_offers_cover_only_a_profiles_new_changed_or_widened_components() {
+        let offered = |origin, decision| {
+            let registry = Registry {
+                held: vec![(component(origin, vec![Capability::Fs]), decision)],
+                ..Registry::default()
+            };
+            !profile_trust_offers(&registry).is_empty()
+        };
+        assert!(offered(Origin::Profile, Decision::Unknown));
+        assert!(offered(Origin::Profile, Decision::Changed));
+        assert!(offered(
+            Origin::Profile,
+            Decision::Widened(vec![Capability::State])
+        ));
+        assert!(!offered(
+            Origin::Profile,
+            Decision::BadSignature("tampered".to_string())
+        ));
+        assert!(!offered(Origin::Profile, Decision::Disabled));
+        assert!(!offered(Origin::UserScan, Decision::Unknown));
+        assert!(!offered(Origin::ProjectScan, Decision::Unknown));
+    }
+
+    /// The question has to say what bundles the component, why it is held and
+    /// what it reaches, and flag one that is not sandboxed.
+    #[test]
+    fn a_launch_offer_says_who_bundles_it_why_and_what_it_wants() {
+        let mut c = component(Origin::Profile, vec![Capability::Fs]);
+        c.plugin = "chatbgt".to_string();
+        let registry = Registry {
+            held: vec![(c, Decision::Unknown)],
+            ..Registry::default()
+        };
+        let offers = profile_trust_offers(&registry);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].id, "dev.plank.demo");
+        let q = &offers[0].question;
+        assert!(q.contains("chatbgt profile"), "{q}");
+        assert!(q.contains("dev.plank.demo"), "{q}");
+        assert!(q.contains("not seen before"), "{q}");
+        assert!(q.contains("fs (a private in-memory scratch disk"), "{q}");
+        assert!(!q.contains("not a sandboxed"), "{q}");
+
+        let greedy = Registry {
+            held: vec![(
+                component(Origin::Profile, vec![Capability::Exec]),
+                Decision::Unknown,
+            )],
+            ..Registry::default()
+        };
+        let q = &profile_trust_offers(&greedy)[0].question;
+        assert!(q.contains("not a sandboxed component"), "{q}");
+    }
+
+    /// Declining keeps the component held and names the command that approves
+    /// it later; approving something that is not held reports why, and
+    /// records nothing.
+    #[test]
+    fn answering_a_launch_offer_declines_or_reports_the_approval() {
+        let mut session = Session::default();
+        let offer = TrustOffer {
+            id: "dev.plank.demo".to_string(),
+            question: String::new(),
+        };
+        let no = answer_trust_offer(&mut session, &offer, false, Path::new("/repo"));
+        assert!(no.contains("/plugins trust dev.plank.demo"), "{no}");
+        let yes = answer_trust_offer(&mut session, &offer, true, Path::new("/repo"));
+        assert!(yes.contains("no held wasm component"), "{yes}");
     }
 
     /// A corrupt trust file must lose approvals, never grant them: asking

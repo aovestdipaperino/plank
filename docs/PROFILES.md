@@ -118,6 +118,16 @@ profile's route. How plank actually turns a
 tool result into a grid handed to the frame, and back, is described in
 [the Grid bridge section of WASM-PLUGINS.md](WASM-PLUGINS.md#grid-bridge).
 
+The component a route names can ship inside the profile itself: a `wasm`
+section in the profile's `plugin.json` and the module under its `wasm/`
+directory, exactly as any plugin bundles one. A bundled component still needs
+the user's approval, but it is asked for when the profile launches rather than
+left for `/plugins trust`: the TUI shows a Trust / Not now panel (Not now
+first, so a stray Enter changes nothing), the plain REPL asks `[y/N]`, and a
+piped stdin declines. Only a component that is new, changed or asking for more
+is offered; one with a bad signature or one the user disabled is not, and
+declining leaves it held until `/plugins trust <id>`.
+
 ## The tool-protocol token
 
 A profile's `systemPrompt` file is composed as-is except for one

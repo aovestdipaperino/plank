@@ -872,6 +872,16 @@ containment.
 
   A first install is never made quiet by a signature: the design buys quiet
   *updates*, and the capabilities still get shown once.
+- **A profile's own components are asked about at launch.** Everywhere else
+  approval is a typed `/plugins trust <id>`, because a question before the
+  first turn is the wrong moment and a component the user never uses should
+  never need an answer. A component bundled by the running `--profile` is the
+  exception (`wasmreg::profile_trust_offers`): choosing the profile is choosing
+  it, and its grids would otherwise fail on first use. Only `Unknown`,
+  `Changed` and `Widened` verdicts are offered; `BadSignature` and `Disabled`
+  never are. The TUI asks through the same yes/no panel as other
+  confirmations and the plain REPL through `[y/N]` on a terminal stdin; the
+  answer goes through `Session::approve`, the path `/plugins trust` uses.
 - **Capability grants are per-install and never widened silently.** A plugin
   update that adds `exec` or `net` re-prompts even when its signature is valid.
 - **Project-local plugins are the sharp edge.** `./.plank/plugins/` means

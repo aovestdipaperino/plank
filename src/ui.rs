@@ -11733,7 +11733,10 @@ the original is frozen and listed in /tree"
     /// component and loads it immediately. Approval is a deliberate, typed act
     /// rather than a startup prompt: a modal question before the first turn is
     /// exactly the wrong moment to ask, and a component the user never uses
-    /// should never have to be answered for at all.
+    /// should never have to be answered for at all. The one exception is a
+    /// component the running profile bundles, which is asked about at launch
+    /// ([`crate::wasmreg::profile_trust_offers`]): choosing the profile is
+    /// choosing it.
     /// `/plugins info|disable|enable|reload`: the subcommands that read or
     /// write the trust store.
     ///
@@ -12771,6 +12774,28 @@ impl Agent<'_> {
         // screensaver is waiting for. A running turn never reaches this loop,
         // so a long generation cannot be mistaken for an idle user.
         let mut last_activity = Instant::now();
+        // A component the running profile bundles is asked about now, before
+        // the profile's first grid would find it held. "Not now" is listed
+        // first so a stray Enter changes nothing.
+        let project = self.tool_ctx.cwd.clone();
+        for offer in self.tool_ctx.wasm.profile_trust_offers() {
+            let trust = run_yes_no_panel(
+                terminal,
+                &log,
+                &mut view,
+                "Plugin",
+                &offer.question,
+                ("Not now", "leave it off; /plugins trust approves it later"),
+                ("Trust", "record the approval and load it now"),
+            );
+            let outcome = crate::wasmreg::answer_trust_offer(
+                &mut self.tool_ctx.wasm,
+                &offer,
+                trust,
+                &project,
+            );
+            log.push_dim(format!("plank: {outcome}"));
+        }
         // No AGENTS.md and no CLAUDE.md to link: offer to generate one before
         // anything else runs, through the same panel every other question
         // uses. Declining just starts the session.
@@ -18434,6 +18459,24 @@ fn ask_agentsmd_offer_on_stdin() -> crate::agentsmd::Offer {
     parse_agentsmd_offer(&answer)
 }
 
+/// The plain-REPL form of the launch trust offer: only `y`/`yes` trusts, so
+/// Enter alone changes nothing, the same default as the TUI panel. A piped
+/// stdin is never read, and declines.
+fn ask_trust_offer_on_stdin(question: &str) -> bool {
+    if !std::io::stdin().is_terminal() {
+        println!("{question} — declined (stdin is not a terminal)");
+        return false;
+    }
+    println!("{question}");
+    print!("trust it? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 /// Maps a `[Y/n/d]` line to an [`Offer`](crate::agentsmd::Offer): empty
 /// and `y`/`yes` generate, `d`/`don't`/`dont` skip the folder, anything else
 /// is "Not now".
@@ -20718,6 +20761,15 @@ fn run_plain_flow(
     crate::title::set(crate::title::State::Idle);
     if let Some(history) = agent.resumed_history() {
         print!("{history}");
+    }
+    // The plain mirror of the TUI's launch trust panel for a profile's
+    // bundled components.
+    let project = agent.tool_ctx.cwd.clone();
+    for offer in agent.tool_ctx.wasm.profile_trust_offers() {
+        let trust = ask_trust_offer_on_stdin(&offer.question);
+        let outcome =
+            crate::wasmreg::answer_trust_offer(&mut agent.tool_ctx.wasm, &offer, trust, &project);
+        println!("plank: {outcome}");
     }
     // No AGENTS.md and no CLAUDE.md to link: offer to generate one, the plain
     // mirror of the TUI's three-way panel. A non-terminal stdin declines.
