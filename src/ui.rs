@@ -14654,6 +14654,9 @@ impl Agent<'_> {
         shared.memory_pass.store(true, Ordering::Relaxed);
         shared.background_pass.store(true, Ordering::Relaxed);
         let live = LiveCommands::capture(self);
+        // Served, never `None`: a lend made during the pass is then answered
+        // or released by construction rather than by no tool asking.
+        let frame_bridge = self.tool_ctx.frame_bridge.clone();
         let run = run_worker_ui(
             terminal,
             &mut *h.log,
@@ -14666,7 +14669,7 @@ impl Agent<'_> {
             bus.as_deref(),
             ui_remote.as_deref(),
             None,
-            None,
+            frame_bridge.as_ref(),
             &live,
             |tx| body(self, &tx),
         );
@@ -14850,7 +14853,7 @@ impl Agent<'_> {
                     bus_ref,
                     rem,
                     None,
-                    None,
+                    frame_bridge.as_ref(),
                     &live,
                     |tx| {
                         self.drain_btw(&tx, shared);
@@ -14915,7 +14918,7 @@ impl Agent<'_> {
                             bus_ref,
                             rem,
                             None,
-                            None,
+                            frame_bridge.as_ref(),
                             &live,
                             |tx| self.adjudicate_worker(&tx, shared),
                         )
@@ -17141,6 +17144,9 @@ impl Agent<'_> {
         let shared = TurnShared::default();
         shared.push_btw(question.to_owned());
         let live = LiveCommands::capture(self);
+        // Served, never `None`: a lend made during the pass is then answered
+        // or released by construction rather than by no tool asking.
+        let frame_bridge = self.tool_ctx.frame_bridge.clone();
         run_worker_ui(
             terminal,
             log,
@@ -17153,7 +17159,7 @@ impl Agent<'_> {
             bus.as_deref(),
             ui_remote.as_deref(),
             None,
-            None,
+            frame_bridge.as_ref(),
             &live,
             |tx| {
                 self.drain_btw(&tx, &shared);

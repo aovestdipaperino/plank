@@ -50,6 +50,19 @@ pub fn log_error(source: &str, detail: &str) {
     append_entry(&path, source, detail);
 }
 
+/// [`log_error`] to an explicit destination: `Some(path)` appends there,
+/// `None` falls back to the real `~/.plank/errors.log`.
+///
+/// Callers holding a `ToolContext` pass its `error_log_path`, so a test can
+/// redirect the log without ever setting `HOME` (see [`error_log_path_in`]).
+/// Best-effort, like [`log_error`].
+pub fn log_error_to(dest: Option<&std::path::Path>, source: &str, detail: &str) {
+    match dest {
+        Some(path) => append_entry(path, source, detail),
+        None => log_error(source, detail),
+    }
+}
+
 /// The body of [`log_error`], with the destination already resolved.
 fn append_entry(path: &std::path::Path, source: &str, detail: &str) {
     if let Some(dir) = path.parent()
@@ -143,6 +156,20 @@ mod tests {
             std::fs::read_to_string(&path)
                 .unwrap()
                 .contains("web: first")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An explicit destination is written as given, never under `$HOME`.
+    #[test]
+    fn log_error_to_writes_the_explicit_path() {
+        let home = scratch_home("explicit");
+        let path = home.join("nested").join("errors.log");
+        log_error_to(Some(&path), "wasm", "trapped");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("] wasm: trapped\n")
         );
         let _ = std::fs::remove_dir_all(&home);
     }

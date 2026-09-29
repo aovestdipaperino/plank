@@ -211,6 +211,11 @@ pub struct ToolContext {
     /// `memory::apply_verdicts_to`'s `log_dest`, and for the same reason: it
     /// lets a test redirect the audit log without ever setting `HOME`.
     pub memory_log_path: Option<PathBuf>,
+    /// Overrides where tool-side failures (a trapping `tool_resume`) are
+    /// appended; `None` uses the real `~/.plank/errors.log` (production
+    /// behavior). Same reason as `memory_log_path`: a test redirects it
+    /// without setting `HOME` (`errlog::log_error_to`).
+    pub error_log_path: Option<PathBuf>,
     /// The running profile's `grids`: MCP server name to the frame component
     /// id its `plank-frame://` resources may open in. Empty without
     /// `--profile`, so no staging is ever honoured there.
@@ -387,6 +392,7 @@ impl ToolContext {
             web_browser: None,
             wrote_memory: false,
             memory_log_path: None,
+            error_log_path: None,
             grid_routes: BTreeMap::new(),
         }
     }

@@ -235,7 +235,11 @@ fn resume(
                 return out;
             }
             Err(e) => {
-                crate::errlog::log_error("wasm", &format!("{component}: tool_resume trapped: {e}"));
+                crate::errlog::log_error_to(
+                    ctx.error_log_path.as_deref(),
+                    "wasm",
+                    &format!("{component}: tool_resume trapped: {e}"),
+                );
                 if ctx.wasm.registry.strike(component) {
                     let base = fallback(error);
                     return format!(
@@ -450,8 +454,11 @@ mod tests {
         let mut c = editor_ctx();
         c.frame_bridge = Some(crate::framebridge::FrameBridge::new());
         c.editor_refusal = Some("the editor needs the local screen".into());
+        // Bounded: with a bridge and no UI thread, a refusal that ran after
+        // the lend would hang instead of failing.
+        let (c, out) = lend_bounded(c, |c| run_frame_blocking(c, ID, "data.csv", b"a\n"));
         assert_eq!(
-            run_frame_blocking(&mut c, ID, "data.csv", b"a\n"),
+            out,
             FrameResult::Refused("the editor needs the local screen".into())
         );
         assert_eq!(c.wasm.host.ram_file(ID, "data.csv"), None, "nothing staged");
@@ -462,8 +469,9 @@ mod tests {
         let mut c = editor_ctx();
         c.frame_bridge = Some(crate::framebridge::FrameBridge::new());
         c.subagent_depth = 1;
+        let (_c, out) = lend_bounded(c, |c| run_frame_blocking(c, ID, "data.csv", b"a\n"));
         assert_eq!(
-            run_frame_blocking(&mut c, ID, "data.csv", b"a\n"),
+            out,
             FrameResult::Refused("editors cannot open inside a sub-agent".into())
         );
     }
@@ -472,8 +480,11 @@ mod tests {
     fn a_component_check_failure_is_a_refusal() {
         let mut c = editor_ctx();
         c.frame_bridge = Some(crate::framebridge::FrameBridge::new());
+        let (_c, out) = lend_bounded(c, |c| {
+            run_frame_blocking(c, "dev.plank.nobody", "data.csv", b"a\n")
+        });
         assert_eq!(
-            run_frame_blocking(&mut c, "dev.plank.nobody", "data.csv", b"a\n"),
+            out,
             FrameResult::Refused("dev.plank.nobody is not loaded".into())
         );
     }
@@ -874,10 +885,12 @@ mod tests {
         ctx.wasm.host = Box::new(ResumeTrapHost::default());
         let bridge = crate::framebridge::FrameBridge::new();
         ctx.frame_bridge = Some(bridge.clone());
+        // Never the real `~/.plank/errors.log`: the trap is logged here.
+        let error_log = dir.join("errors.log");
+        ctx.error_log_path = Some(error_log.clone());
         // `resume` calls `tool_resume` regardless of whether the edit
         // changed anything, so an untouched edit (nothing staged) is enough
         // to trap it every time without needing distinct content per round.
-        let mut ctx = ctx;
         for n in 1..crate::wasmreg::STRIKE_LIMIT {
             let h = ui_thread(bridge.clone(), None, FrameClose::Closed);
             let (next_ctx, out) = lend_bounded(ctx, |ctx| {
@@ -929,6 +942,13 @@ mod tests {
             .unwrap()
             .strikes;
         assert_eq!(strikes, crate::wasmreg::STRIKE_LIMIT, "every trap struck");
+        let log = std::fs::read_to_string(&error_log).expect("the trap was logged");
+        let traps: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(&format!("] wasm: {ID}: tool_resume trapped: ")))
+            .collect();
+        assert_eq!(traps.len(), crate::wasmreg::STRIKE_LIMIT as usize, "{log}");
+        assert!(traps.iter().all(|l| l.contains("resume boomed")), "{log}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
