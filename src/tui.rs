@@ -5389,10 +5389,14 @@ fn anim_tick_ms() -> u64 {
     crate::anim::clock_ms().unwrap_or(0)
 }
 
-/// Pushes the accent word with a shimmer: a graded highlight sweeps
-/// right-to-left across the word, one column per `SHIMMER_STEP_MS`, over a
-/// cycle of word width + 20 columns (so the highlight rests off-text between
-/// sweeps).
+/// Pushes the accent word with a shimmer: a graded highlight sweeps across the
+/// word over a cycle of word width + 20 columns, so the highlight rests
+/// off-text between sweeps.
+///
+/// Which way it travels and how fast come from `anim`, not from this function:
+/// [`crate::anim::VerbAnim::Sweep`] carries the direction and the milliseconds
+/// per column, so the prefill verb can run fast and left-to-right while
+/// generation keeps the slower right-to-left sweep.
 ///
 /// Each column inside the window takes its own shade from
 /// [`crate::status::SHIMMER_RAMP`] by distance from the center — brightest in
@@ -5405,6 +5409,7 @@ fn push_shimmered(
     tick_ms: u64,
     theme: Style,
     shimmer: Option<crate::profile::Shimmer>,
+    anim: crate::anim::VerbAnim,
 ) {
     // Without a profile the word rests in the theme accent and the built-in
     // ramp sweeps it. With one, the word rests in the profile's `secondary`
@@ -5418,10 +5423,23 @@ fn push_shimmered(
         ),
     };
     let half = i64::try_from(ramp.len().saturating_sub(1)).unwrap_or(0);
-    let width = i64::try_from(word.chars().count()).unwrap_or(0);
-    let cycle = width + 20;
-    let step = i64::try_from(tick_ms / crate::status::SHIMMER_STEP_MS).unwrap_or(0);
-    let center = width + 10 - step % cycle;
+    let width = word.chars().count();
+    // `sweep_window` supplies only the centre and the direction. Its own
+    // `SWEEP_HALF` is 1, while the highlight here is as wide as the ramp is
+    // deep (`ramp.len() - 1`, i.e. 2 either side), so the window's extent is
+    // recovered from its centre rather than used directly, and
+    // `sweep_contains` is deliberately not called.
+    let (lo, hi) = match anim {
+        crate::anim::VerbAnim::Sweep { reverse, step_ms } => {
+            crate::anim::sweep_window(width, tick_ms, step_ms, 20, reverse)
+        }
+        // Task 4 replaces this arm. Until then a flash renders as the ordinary
+        // sweep, so this task provably changes nothing.
+        crate::anim::VerbAnim::Flash { .. } => {
+            crate::anim::sweep_window(width, tick_ms, crate::anim::SWEEP_SLOW_MS, 20, false)
+        }
+    };
+    let center = i64::midpoint(lo, hi);
     // One shade per column, then coalesce equal-styled neighbours so a sweep
     // costs a handful of spans rather than one per character.
     let mut runs: Vec<(String, Style)> = Vec::new();
@@ -5572,7 +5590,8 @@ pub fn progress_line(text: &str) -> Line<'static> {
     let base = Style::default();
     let theme = base.fg(theme_accent()).add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
-    push_accented(&mut spans, text, anim_tick_ms(), base, theme);
+    let anim = crate::status::verb_anim(crate::status::current_verb_phase());
+    push_accented(&mut spans, text, anim_tick_ms(), base, theme, anim);
     Line::from(spans)
 }
 
@@ -5582,6 +5601,7 @@ fn push_accented(
     tick_ms: u64,
     base: Style,
     theme: Style,
+    anim: crate::anim::VerbAnim,
 ) {
     let range = seg
         .find("prefill")
@@ -5594,7 +5614,14 @@ fn push_accented(
         });
     if let Some((start, end)) = range {
         spans.push(Span::styled(seg[..start].to_string(), base));
-        push_shimmered(spans, &seg[start..end], tick_ms, theme, theme_shimmer());
+        push_shimmered(
+            spans,
+            &seg[start..end],
+            tick_ms,
+            theme,
+            theme_shimmer(),
+            anim,
+        );
         spans.push(Span::styled(seg[end..].to_string(), base));
     } else {
         spans.push(Span::styled(seg.to_string(), base));
@@ -5669,12 +5696,30 @@ fn tip_on_own_line(input_hidden: bool, tick_ms: u64) -> bool {
         && !crate::status::rotating_tip(tick_ms).is_empty()
 }
 
+/// The status bar's two rows. The verb's animation follows the phase of the
+/// most recent [`crate::status::prefill_label`] call.
+///
+/// The phase is read here and passed down rather than read deeper in, so
+/// [`status_bar_lines_with`] stays a pure function of its arguments and the
+/// tests never touch the global.
 fn status_bar_lines(
     text: &str,
     tick_ms: u64,
     base: Style,
     tasks: &TaskView,
     input_hidden: bool,
+) -> Vec<Line<'static>> {
+    let anim = crate::status::verb_anim(crate::status::current_verb_phase());
+    status_bar_lines_with(text, tick_ms, base, tasks, input_hidden, anim)
+}
+
+fn status_bar_lines_with(
+    text: &str,
+    tick_ms: u64,
+    base: Style,
+    tasks: &TaskView,
+    input_hidden: bool,
+    anim: crate::anim::VerbAnim,
 ) -> Vec<Line<'static>> {
     let theme = base
         .fg(Color::Indexed(crate::status::THEME_COLOR))
@@ -5728,7 +5773,7 @@ fn status_bar_lines(
         .find('[')
         .and_then(|open| text[open..].find(']').map(|i| (open, open + i)));
     if let Some((open, close)) = bar {
-        push_accented(&mut spans, &text[..=open], tick_ms, base, theme);
+        push_accented(&mut spans, &text[..=open], tick_ms, base, theme, anim);
         for ch in text[open + 1..close].chars() {
             let style = match ch {
                 '▶' => theme,
@@ -5739,7 +5784,7 @@ fn status_bar_lines(
         }
         spans.push(Span::styled(text[close..].to_string(), base));
     } else {
-        push_accented(&mut spans, text, tick_ms, base, theme);
+        push_accented(&mut spans, text, tick_ms, base, theme, anim);
     }
     // Task counter (issue #35): appended to the bracketed status region, themed
     // green while work is in flight and dim gray once the list is complete. An
@@ -5775,7 +5820,19 @@ fn status_bar_lines(
     if let Some(running) = crate::status::tool_activity() {
         spans.push(Span::styled(" | ".to_string(), base));
         if crate::status::tool_blink_on(tick_ms) {
-            push_shimmered(&mut spans, &running, tick_ms, theme, theme_shimmer());
+            // The running-tool label is not the verb: it keeps the ordinary
+            // sweep whatever the verb is doing.
+            push_shimmered(
+                &mut spans,
+                &running,
+                tick_ms,
+                theme,
+                theme_shimmer(),
+                crate::anim::VerbAnim::Sweep {
+                    reverse: false,
+                    step_ms: crate::anim::SWEEP_SLOW_MS,
+                },
+            );
         } else {
             // Off half of the blink: same glyphs at the same width, dimmed, so
             // the label pulses without the line jittering around it.
@@ -8469,10 +8526,51 @@ mod tests {
     /// Both status rows flattened into one span list, for assertions about
     /// content rather than placement.
     fn status_spans(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> Vec<Span<'static>> {
-        status_bar_lines(text, tick_ms, base, tasks, false)
+        status_spans_as(
+            text,
+            tick_ms,
+            base,
+            tasks,
+            crate::anim::VerbAnim::Sweep {
+                reverse: false,
+                step_ms: crate::anim::SWEEP_SLOW_MS,
+            },
+        )
+    }
+
+    fn status_spans_as(
+        text: &str,
+        tick_ms: u64,
+        base: Style,
+        tasks: &TaskView,
+        anim: crate::anim::VerbAnim,
+    ) -> Vec<Span<'static>> {
+        status_bar_lines_with(text, tick_ms, base, tasks, false, anim)
             .into_iter()
             .flat_map(|l| l.spans)
             .collect()
+    }
+
+    /// `status_bar_lines` with the slow sweep pinned, so no test reads the
+    /// process-global verb phase.
+    fn status_bar_lines_pinned(
+        text: &str,
+        tick_ms: u64,
+        base: Style,
+        tasks: &TaskView,
+        input_hidden: bool,
+    ) -> Vec<Line<'static>> {
+        status_bar_lines_with(
+            text,
+            tick_ms,
+            base,
+            tasks,
+            input_hidden,
+            crate::anim::VerbAnim::Sweep {
+                reverse: false,
+                step_ms: crate::anim::SWEEP_SLOW_MS,
+            },
+        )
     }
 
     #[test]
@@ -8512,7 +8610,7 @@ mod tests {
         let camera = crate::status::CAMERA_MARK;
         let origin = crate::status::engine_origin_label();
         let text = format!("~/Code/plank {glyph} main | {camera} | {origin} | ctx 12% | idle");
-        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
+        let rows = status_bar_lines_pinned(&text, 0, base, &TaskView::default(), false);
         let first: Vec<_> = rows[0].spans.iter().collect();
 
         let branch = first
@@ -8639,7 +8737,7 @@ mod tests {
         let text = format!("~/x | {} med | ctx 12% | idle", crate::status::THINK_MARK);
         let tip_spans = |rotation: u64| -> Vec<(String, Option<Color>, bool)> {
             let tick = crate::status::TIP_ROTATE_MS * rotation;
-            status_bar_lines(&text, tick, base, &TaskView::default(), false)
+            status_bar_lines_pinned(&text, tick, base, &TaskView::default(), false)
                 .into_iter()
                 .flat_map(|l| l.spans)
                 .filter(|s| s.content.contains('💡'))
@@ -8675,7 +8773,7 @@ mod tests {
         let base = Style::default();
         let text = format!("~/x | {} med | ctx 12% | idle", crate::status::THINK_MARK);
         // tick 0 sits inside the tip's visibility window.
-        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), true);
+        let rows = status_bar_lines_pinned(&text, 0, base, &TaskView::default(), true);
         assert_eq!(rows.len(), 3, "a busy tip takes a third row: {rows:?}");
         let tip_row: String = rows[2].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
@@ -8704,7 +8802,7 @@ mod tests {
         crate::status::clear_flash_tip();
         let base = Style::default();
         let text = format!("~/x | {} med | ctx 12% | idle", crate::status::THINK_MARK);
-        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
+        let rows = status_bar_lines_pinned(&text, 0, base, &TaskView::default(), false);
         assert_eq!(rows.len(), 2, "idle keeps two rows: {rows:?}");
         let tail_row: String = rows[1].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
@@ -8823,7 +8921,7 @@ mod tests {
         let mark = crate::status::THINK_MARK;
         let text = format!("~/x | {mark} med | ctx 12% | generating");
         let rows = || -> Vec<String> {
-            status_bar_lines(&text, 0, base, &TaskView::default(), false)
+            status_bar_lines_pinned(&text, 0, base, &TaskView::default(), false)
                 .into_iter()
                 .map(|l| l.spans.iter().map(|sp| sp.content.to_string()).collect())
                 .collect()
@@ -8865,7 +8963,7 @@ mod tests {
         let origin = crate::status::engine_origin_label();
         let text =
             format!("~/Code/plank {glyph} main | {mark} 3 · +12 -4 | {origin} | ctx 12% | idle");
-        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
+        let rows = status_bar_lines_pinned(&text, 0, base, &TaskView::default(), false);
         let row: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(
             row,
@@ -8904,7 +9002,7 @@ mod tests {
         let _guard = crate::status::origin_test_guard();
         let origin = crate::status::engine_origin_label();
         let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
-        let rows = status_bar_lines(&text, 0, base, &TaskView::default(), false);
+        let rows = status_bar_lines_pinned(&text, 0, base, &TaskView::default(), false);
         assert_eq!(rows.len(), 2, "two rows");
 
         let row =
@@ -8981,7 +9079,8 @@ mod tests {
         let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
         let mut term = Terminal::new(TestBackend::new(70, 2)).unwrap();
         term.draw(|f| {
-            let rows = status_bar_lines(&text, 0, Style::default(), &TaskView::default(), false);
+            let rows =
+                status_bar_lines_pinned(&text, 0, Style::default(), &TaskView::default(), false);
             f.render_widget(ratatui::widgets::Paragraph::new(rows), f.area());
         })
         .unwrap();
@@ -10325,6 +10424,73 @@ mod tests {
         assert!(text.contains("rename"), "{text}");
         assert!(text.contains("session-0"), "prefilled with the id: {text}");
         assert!(text.contains("Enter to rename"), "{text}");
+    }
+
+    // Prefill sweeps the other way from generation. Tracking the brightest
+    // column's position over successive ticks is what distinguishes them: a
+    // regression that ignores `reverse` leaves both walking the same way.
+    #[test]
+    fn prefill_sweeps_the_opposite_way_from_generation() {
+        let base = Style::default();
+        let theme = base.fg(theme_accent()).add_modifier(Modifier::BOLD);
+        let brightest =
+            Color::Indexed(crate::status::SHIMMER_RAMP[crate::status::SHIMMER_RAMP.len() - 1]);
+        let word = "Pondering…";
+        // One full cycle, so the centre never wraps back within the sample.
+        let cycle = u64::try_from(word.chars().count()).unwrap() + 20;
+
+        // The column the bright centre sits on at each step of one sweep,
+        // skipping the steps where it rests off-text.
+        let centres = |anim: crate::anim::VerbAnim, step_ms: u64| -> Vec<usize> {
+            (0..cycle)
+                .filter_map(|step| {
+                    let mut spans = Vec::new();
+                    push_shimmered(&mut spans, word, step * step_ms, theme, None, anim);
+                    let mut col = 0usize;
+                    for s in &spans {
+                        if s.style.fg == Some(brightest) {
+                            return Some(col);
+                        }
+                        col += s.content.chars().count();
+                    }
+                    None
+                })
+                .collect()
+        };
+
+        let fast = centres(
+            crate::anim::VerbAnim::Sweep {
+                reverse: true,
+                step_ms: crate::anim::SWEEP_FAST_MS,
+            },
+            crate::anim::SWEEP_FAST_MS,
+        );
+        let slow = centres(
+            crate::anim::VerbAnim::Sweep {
+                reverse: false,
+                step_ms: crate::anim::SWEEP_SLOW_MS,
+            },
+            crate::anim::SWEEP_SLOW_MS,
+        );
+
+        assert!(
+            fast.len() > 2,
+            "prefill sweep never crossed the word: {fast:?}"
+        );
+        assert!(
+            slow.len() > 2,
+            "generation sweep never crossed the word: {slow:?}"
+        );
+        // Left-to-right: the centre's column increases. Right-to-left: it decreases.
+        assert!(
+            fast.windows(2).all(|w| w[0] <= w[1]),
+            "prefill should sweep left-to-right: {fast:?}"
+        );
+        assert!(
+            slow.windows(2).all(|w| w[0] >= w[1]),
+            "generation should sweep right-to-left: {slow:?}"
+        );
+        assert!(fast.first() < fast.last() && slow.first() > slow.last());
     }
 }
 
