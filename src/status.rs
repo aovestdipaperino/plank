@@ -845,6 +845,7 @@ pub fn format_ctx_size(ctx_size: i32) -> String {
 /// actually doing at that instant, so "Chiseling" never shows up while the
 /// model is still reading the prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum VerbPhase {
     /// Sampling inside a `<think>` block: reasoning, not answering yet.
     Thinking,
@@ -856,6 +857,65 @@ pub enum VerbPhase {
     Prefill,
     /// The 1-in-[`FUN_ODDS`] escape hatch, drawn regardless of phase.
     Fun,
+}
+
+impl VerbPhase {
+    /// The phase for a byte read out of [`VERB_PHASE`]. An unknown byte maps to
+    /// [`VerbPhase::Generating`], the default effect: a stale or corrupt global
+    /// must cost a cosmetic frame, never a panic inside a repaint.
+    #[must_use]
+    pub fn from_u8(b: u8) -> Self {
+        match b {
+            x if x == Self::Thinking as u8 => Self::Thinking,
+            x if x == Self::Tool as u8 => Self::Tool,
+            x if x == Self::Prefill as u8 => Self::Prefill,
+            x if x == Self::Fun as u8 => Self::Fun,
+            _ => Self::Generating,
+        }
+    }
+}
+
+/// The phase of the most recent [`prefill_label`] call, so the renderer can pick
+/// the verb's animation without the phase being threaded through every
+/// `progress_line` call site.
+///
+/// Published rather than passed for the same reason [`verb_phase`] reads the
+/// process-global [`tools_running`] rather than taking it as an argument: by the
+/// time the Ratatui front end paints the verb it holds a formatted string, and
+/// the phase that produced it is long out of scope.
+static VERB_PHASE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(VerbPhase::Generating as u8);
+
+/// The phase of the most recently rendered verb. See [`VERB_PHASE`].
+#[must_use]
+pub fn current_verb_phase() -> VerbPhase {
+    VerbPhase::from_u8(VERB_PHASE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Which animation paints the verb for `phase`.
+///
+/// Prefill sweeps the other way and four times faster, so "reading the prompt"
+/// is distinguishable at a glance from "writing the answer". A running tool
+/// stops the travel altogether and pulses the whole word: nothing is being
+/// produced token by token, so nothing should look like it is moving along the
+/// text. Everything else keeps the established sweep.
+#[must_use]
+pub fn verb_anim(phase: VerbPhase) -> crate::anim::VerbAnim {
+    match phase {
+        VerbPhase::Prefill => crate::anim::VerbAnim::Sweep {
+            reverse: true,
+            step_ms: crate::anim::SWEEP_FAST_MS,
+        },
+        VerbPhase::Tool => crate::anim::VerbAnim::Flash {
+            period_ms: crate::anim::FLASH_PERIOD_MS,
+        },
+        VerbPhase::Thinking | VerbPhase::Generating | VerbPhase::Fun => {
+            crate::anim::VerbAnim::Sweep {
+                reverse: false,
+                step_ms: crate::anim::SWEEP_SLOW_MS,
+            }
+        }
+    }
 }
 
 /// Reasoning verbs, shown while the stream is inside a `<think>` block.
@@ -1137,6 +1197,7 @@ pub fn verb_phase(st: &Status) -> VerbPhase {
 #[must_use]
 pub fn prefill_label(st: &Status) -> &'static str {
     let phase = verb_phase(st);
+    VERB_PHASE.store(phase as u8, std::sync::atomic::Ordering::Relaxed);
     let pool = verbs_for(phase);
     let idx = if phase == VerbPhase::Fun {
         (st.prefill_label / FUN_ODDS) as usize % pool.len()
@@ -3998,5 +4059,66 @@ mod tests {
     fn user_echo_formats() {
         assert_eq!(format_user_prompt_echo("hi", false), "* hi\n\n");
         assert!(format_user_prompt_echo("hi", true).contains("\x1b[1;91m*"));
+    }
+
+    #[test]
+    fn verb_anim_maps_each_phase_to_its_effect() {
+        use crate::anim::{FLASH_PERIOD_MS, SWEEP_FAST_MS, SWEEP_SLOW_MS, VerbAnim};
+        let slow = VerbAnim::Sweep {
+            reverse: false,
+            step_ms: SWEEP_SLOW_MS,
+        };
+        assert_eq!(
+            verb_anim(VerbPhase::Prefill),
+            VerbAnim::Sweep {
+                reverse: true,
+                step_ms: SWEEP_FAST_MS,
+            }
+        );
+        assert_eq!(
+            verb_anim(VerbPhase::Tool),
+            VerbAnim::Flash {
+                period_ms: FLASH_PERIOD_MS,
+            }
+        );
+        assert_eq!(verb_anim(VerbPhase::Generating), slow);
+        assert_eq!(verb_anim(VerbPhase::Thinking), slow);
+        assert_eq!(verb_anim(VerbPhase::Fun), slow);
+    }
+
+    #[test]
+    fn current_verb_phase_follows_the_last_rendered_verb() {
+        // `prefill_label` is the only writer, so rendering a verb for a status
+        // in a known state is what publishes the phase. The guard keeps other
+        // status tests from racing the process-global tool activity.
+        let _lock = origin_test_guard();
+        clear_tool_activity();
+        // 1 is not a multiple of FUN_ODDS, so the phase is not the fun pool.
+        let st = Status {
+            prefill_label: 1,
+            state: WorkerState::Prefill,
+            ..Status::default()
+        };
+        let _ = prefill_label(&st);
+        assert_eq!(current_verb_phase(), VerbPhase::Prefill);
+
+        let st = Status {
+            state: WorkerState::Generating,
+            thinking: true,
+            ..st
+        };
+        let _ = prefill_label(&st);
+        assert_eq!(current_verb_phase(), VerbPhase::Thinking);
+    }
+
+    #[test]
+    fn verb_phase_round_trips_through_the_atomic() {
+        for phase in ALL_PHASES {
+            assert_eq!(VerbPhase::from_u8(phase as u8), phase);
+        }
+        // An out-of-range byte falls back to the default effect rather than
+        // panicking: a stale global must degrade cosmetically, never crash a
+        // repaint.
+        assert_eq!(VerbPhase::from_u8(200), VerbPhase::Generating);
     }
 }
