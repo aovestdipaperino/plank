@@ -83,10 +83,9 @@ pub struct FakeGpuEngine {
     restored: usize,
     /// The model name this engine reports.
     ///
-    /// Key material: `kvtier::system_fingerprint` hashes it, so a fake run
-    /// keys its checkpoints exactly where the real engine would — which is
-    /// what lets a `--fake-gpu` launch and a real one share a cache and what
-    /// makes the reproduction faithful.
+    /// Key material: `kvtier::system_fingerprint` hashes it, which is why
+    /// [`namespaced`] suffixes it. Sharing the real engine's name would make
+    /// a fake run read *and write* real checkpoints — see that function.
     model: String,
     ctx: i32,
     /// Whether this engine reports the trusted/untrusted split, mirroring the
@@ -96,8 +95,34 @@ pub struct FakeGpuEngine {
     steps: Vec<Step>,
 }
 
+/// The suffix that keeps fake checkpoints out of the real cache namespace.
+pub const NAMESPACE_SUFFIX: &str = " (fake-gpu)";
+
+/// The model name a fake run keys its checkpoints under: `model` plus
+/// [`NAMESPACE_SUFFIX`].
+///
+/// This mode originally reported the real engine's name, on the reasoning that
+/// keying where a real run keys makes the reproduction faithful. That was
+/// backwards, and the first manual run proved it: `kvtier::warm` walks the
+/// tiers deepest-first and restores the first checkpoint that loads, so the
+/// fake engine loaded a genuine multi-hundred-megabyte KV blob it cannot
+/// interpret — and then *wrote its own 106-byte snapshot back over it* at the
+/// same fingerprint. A diagnostic that silently destroys two tiers of the
+/// user's cache causes precisely the re-prefill it exists to investigate.
+///
+/// The suffix is the whole fix. Every other fingerprint input stays exactly as
+/// a real run computes it, so the keying logic is still exercised faithfully
+/// and two fake launches share checkpoints with each other; they simply cannot
+/// collide with a real launch's.
+#[must_use]
+pub fn namespaced(model: &str) -> String {
+    format!("{model}{NAMESPACE_SUFFIX}")
+}
+
 impl FakeGpuEngine {
-    /// A fake engine reporting `model` and a `ctx`-token window.
+    /// A fake engine standing in for `model`, with a `ctx`-token window.
+    ///
+    /// `model` is the real engine name; the engine reports it [`namespaced`].
     #[must_use]
     pub fn new(model: &str, ctx: i32) -> Self {
         Self {
@@ -105,7 +130,7 @@ impl FakeGpuEngine {
             resident: 0,
             prefilled: 0,
             restored: 0,
-            model: model.to_string(),
+            model: namespaced(model),
             ctx,
             splits_tail: true,
             steps: Vec::new(),
@@ -294,24 +319,37 @@ mod tests {
     }
 
     #[test]
-    fn the_model_name_is_reported_so_checkpoints_key_where_a_real_run_keys() {
-        // The whole point of the mode: a fake launch must land on the same
-        // fingerprint a real one would, or it reproduces nothing.
+    fn a_fake_run_never_keys_where_a_real_run_keys() {
+        // The safety property, and the reason this mode is allowed to write to
+        // the shared cache at all. `kvtier::warm` restores the first checkpoint
+        // that loads and later writes its own back at the same fingerprint, so
+        // a shared namespace means a fake run overwrites real checkpoints —
+        // destroying the cache it was asked to investigate.
         let e = engine();
-        assert_eq!(e.model_name(), "DeepSeek V4 Flash Vision Experimental");
-        let fp_fake = crate::kvtier::system_fingerprint(
-            &e.model_name(),
-            "SYSTEM",
-            crate::engine::ThinkMode::default(),
-            0,
-        );
+        assert_ne!(e.model_name(), "DeepSeek V4 Flash Vision Experimental");
+        let think = crate::engine::ThinkMode::default();
+        let fp_fake = crate::kvtier::system_fingerprint(&e.model_name(), "SYSTEM", think, 0);
         let fp_real = crate::kvtier::system_fingerprint(
             "DeepSeek V4 Flash Vision Experimental",
             "SYSTEM",
-            crate::engine::ThinkMode::default(),
+            think,
             0,
         );
-        assert_eq!(fp_fake, fp_real);
+        assert_ne!(
+            fp_fake, fp_real,
+            "a fake run must not share a fingerprint with a real one"
+        );
+    }
+
+    #[test]
+    fn two_fake_runs_of_the_same_engine_do_share_a_fingerprint() {
+        // The other half: the namespace must be stable, or two fake launches
+        // could never restore each other's checkpoints and the mode could not
+        // demonstrate a hit at all.
+        let think = crate::engine::ThinkMode::default();
+        let a = crate::kvtier::system_fingerprint(&engine().model_name(), "SYSTEM", think, 0);
+        let b = crate::kvtier::system_fingerprint(&engine().model_name(), "SYSTEM", think, 0);
+        assert_eq!(a, b);
     }
 
     #[test]
