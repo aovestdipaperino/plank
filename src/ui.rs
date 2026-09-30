@@ -12676,6 +12676,7 @@ impl Agent<'_> {
                 .as_deref(),
             &crate::logo::version_label(),
             &status::format_ctx_size(self.engine.ctx_size()),
+            &self.engine.model_name(),
         );
         let art = tui::ansi_to_lines(&crate::logo::active_art(crate::logo::DEFAULT_WIDTH));
         for line in Self::masthead(art, &version) {
@@ -22081,15 +22082,27 @@ fn resume_command(profile: Option<&str>, short: &str) -> String {
 const NO_ACTIVE_PROFILE: &str =
     "/edit-profile: no profile is active; start plank with --profile NAME";
 
-/// The TUI masthead's text: plank's own line, or for a profile three lines
-/// (its name and version, plank's version for bug reports, the context size)
-/// that [`Agent::masthead`] stacks beside the logo instead of letting one long
-/// line wrap over it.
-fn masthead_label(profile_name: Option<&str>, version: &str, ctx: &str) -> String {
-    match profile_name {
+/// The TUI masthead's text, with a trailing `model <name>` row: for a profile
+/// four lines (its name and version, plank's version for bug reports, the
+/// context size, and the running model), for plain plank its own line followed
+/// by the same model row, that [`Agent::masthead`] stacks beside the logo
+/// instead of letting one long line wrap over it.
+///
+/// `model` is the running engine's name; the masthead is where a user confirms
+/// which model is actually answering, which matters for a profile whose
+/// `recommendedModel` may or may not have loaded but is worth showing plainly
+/// either way. It is omitted when empty (the echo stub), which the separate
+/// no-model lines cover.
+fn masthead_label(profile_name: Option<&str>, version: &str, ctx: &str, model: &str) -> String {
+    use std::fmt::Write as _;
+    let mut label = match profile_name {
         Some(name) => format!("{name}\nplank {version}\ncontext {ctx} tokens"),
         None => format!("plank {version} 🪵 Agent, context {ctx} tokens"),
+    };
+    if !model.is_empty() {
+        let _ = write!(label, "\nmodel {model}");
     }
+    label
 }
 
 #[cfg(test)]
@@ -22119,13 +22132,22 @@ mod tests {
     #[test]
     fn the_masthead_names_the_profile_and_keeps_the_plank_version() {
         assert_eq!(
-            masthead_label(None, "v5.3.1", "1M"),
-            "plank v5.3.1 🪵 Agent, context 1M tokens"
+            masthead_label(None, "v5.3.1", "1M", "DeepSeek V4 Flash"),
+            "plank v5.3.1 🪵 Agent, context 1M tokens\nmodel DeepSeek V4 Flash"
         );
-        let hal = masthead_label(Some("HAL v0.3.1"), "v5.3.1", "1M");
-        assert_eq!(hal, "HAL v0.3.1\nplank v5.3.1\ncontext 1M tokens");
+        let hal = masthead_label(Some("HAL v0.3.1"), "v5.3.1", "1M", "DeepSeek V4 Flash");
+        assert_eq!(
+            hal,
+            "HAL v0.3.1\nplank v5.3.1\ncontext 1M tokens\nmodel DeepSeek V4 Flash"
+        );
         assert!(hal.contains("plank v5.3.1"), "{hal}");
         assert!(!hal.contains("🪵"), "{hal}");
+        // The echo stub has no name, and the no-model lines cover it instead, so
+        // the masthead drops the model row rather than printing a bare "model ".
+        let stub = masthead_label(Some("HAL v0.3.1"), "v5.3.1", "1M", "");
+        assert_eq!(stub, "HAL v0.3.1\nplank v5.3.1\ncontext 1M tokens");
+        let plain_stub = masthead_label(None, "v5.3.1", "1M", "");
+        assert_eq!(plain_stub, "plank v5.3.1 🪵 Agent, context 1M tokens");
     }
 
     #[test]
