@@ -194,6 +194,12 @@ pub struct AgentConfig {
     /// --resolved`. Populated by [`parse_options_with`]; empty when no flag
     /// shadowed a settings key.
     pub cli_provenance: std::collections::BTreeMap<String, crate::provenance::Origin>,
+    /// True when `--dump-profiles` was given: print every installed profile
+    /// and exit. A read-only diagnostic, like [`Self::dump_config`].
+    pub dump_profiles: bool,
+    /// True when `--dump-engines` was given: print the resolved engine catalog
+    /// and exit. A read-only diagnostic, like [`Self::dump_config`].
+    pub dump_engines: bool,
     /// True when `--dump-config` was given: print the resolved configuration
     /// (every effective key with its origin) and exit, without starting a
     /// session. Works under `--ui console`.
@@ -509,6 +515,8 @@ impl Default for AgentConfig {
             temp_explicit: false,
             cli_provenance: std::collections::BTreeMap::new(),
             dump_config: false,
+            dump_profiles: false,
+            dump_engines: false,
         }
     }
 }
@@ -679,6 +687,10 @@ Options:
                            to ~/.plank/kvcache at exit
       --dump-config        print every effective setting with the layer it came
                            from (default, plugin, ~/.plank, ./.plank, CLI) and exit
+      --dump-profiles      print every installed profile with the fields it
+                           resolves to (accent, secondary, tools, grids) and exit
+      --dump-engines       print the engine catalog: every engine, its roles,
+                           and whether each file is on disk, and exit
       --skills on|off      whether skills are available (default on); off loads
                            none, built-in or otherwise, so no /skill slash
                            command and nothing for the `skill` tool to resolve
@@ -1562,6 +1574,8 @@ pub fn parse_options_with(
             "--show-memory-stats" => c.show_memory_stats = true,
             "--no-session" => c.save_session = false,
             "--dump-config" => c.dump_config = true,
+            "--dump-profiles" => c.dump_profiles = true,
+            "--dump-engines" => c.dump_engines = true,
             "--minimal-prompt" => c.minimal_prompt = true,
             // Bare `--ui-remote` means an ephemeral port. A following bare
             // number is almost certainly someone meaning to pin one, so
@@ -1945,6 +1959,27 @@ mod tests {
                 .unwrap()
                 .show_memory_stats
         );
+    }
+
+    #[test]
+    fn the_dump_flags_are_parsed_independently() {
+        let c = parse_options(&args(&["--dump-profiles"])).unwrap();
+        assert!(c.dump_profiles);
+        assert!(!c.dump_engines && !c.dump_config);
+
+        let c = parse_options(&args(&["--dump-engines"])).unwrap();
+        assert!(c.dump_engines);
+        assert!(!c.dump_profiles && !c.dump_config);
+    }
+
+    #[test]
+    fn the_dump_flags_are_listed_in_the_usage_text() {
+        let u = super::usage();
+        assert!(
+            u.contains("--dump-profiles"),
+            "usage missing --dump-profiles"
+        );
+        assert!(u.contains("--dump-engines"), "usage missing --dump-engines");
     }
 
     #[test]

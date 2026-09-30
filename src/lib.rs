@@ -38,6 +38,7 @@ pub mod ds4engine;
 pub mod ds4tokens;
 #[cfg(ds4_engine)]
 pub mod ds4web;
+pub mod dump;
 pub use trace_stream::dsml;
 pub mod editor;
 pub mod engine;

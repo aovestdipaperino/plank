@@ -581,6 +581,25 @@ fn post_cfg_early_exit(
         print!("{}", plank::provenance::render_resolved(settings, cfg));
         return Some(ExitCode::SUCCESS);
     }
+    // The same contract for the other two configurations plank resolves at
+    // launch but never otherwise shows: read-only, no session, no UI.
+    if cfg.dump_profiles {
+        // `profiles::dir` roots at `$HOME` and appends `.plank/profiles`,
+        // where `engines::load_in` takes `~/.plank` itself. Handing either one
+        // the other's root silently reads an empty directory.
+        match home_dir() {
+            Some(home) => print!("{}", plank::dump::render_profiles_in(&home)),
+            None => eprintln!("plank: no home directory; cannot list profiles"),
+        }
+        return Some(ExitCode::SUCCESS);
+    }
+    if cfg.dump_engines {
+        print!(
+            "{}",
+            plank::dump::render_engines_in(&plank::manifest::plank_dir())
+        );
+        return Some(ExitCode::SUCCESS);
+    }
     None
 }
 
@@ -592,7 +611,11 @@ fn post_cfg_early_exit(
 /// `parse_config`, because the `engines.local.json` default a ds41-only
 /// install gets must exist before the catalog choice is resolved.
 fn should_migrate(provisional: &plank::config::AgentConfig) -> bool {
-    !(provisional.show_help || provisional.show_version || provisional.dump_config)
+    !(provisional.show_help
+        || provisional.show_version
+        || provisional.dump_config
+        || provisional.dump_profiles
+        || provisional.dump_engines)
 }
 
 /// Renames any old `ModelSet` layout into the engine layout, when
@@ -1517,7 +1540,13 @@ mod tests {
     fn help_version_and_dump_config_never_migrate() {
         let base = plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
         assert!(should_migrate(&base));
-        for flag in ["--help", "--version", "--dump-config"] {
+        for flag in [
+            "--help",
+            "--version",
+            "--dump-config",
+            "--dump-profiles",
+            "--dump-engines",
+        ] {
             let cfg = plank::config::parse_options_with(
                 &plank::settings::Settings::default(),
                 &[flag.to_string()],
@@ -1537,7 +1566,13 @@ mod tests {
         // type signature itself is the guarantee. This test pins that: `main`'s
         // own launch still skips migration for these flags, via the separate,
         // gated `migrate_engine_layout`/`should_migrate` path.
-        for flag in ["--help", "--version", "--dump-config"] {
+        for flag in [
+            "--help",
+            "--version",
+            "--dump-config",
+            "--dump-profiles",
+            "--dump-engines",
+        ] {
             let cfg = plank::config::parse_options_with(
                 &plank::settings::Settings::default(),
                 &[flag.to_string()],
