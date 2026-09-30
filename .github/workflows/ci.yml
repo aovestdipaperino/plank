@@ -79,9 +79,8 @@ jobs:
           sh spike/build-guest.sh
           sh guests/build.sh
 
-      - name: Test the shared guest crate
-        run: cargo test --manifest-path guests/support/Cargo.toml
-
+      # guests/csvedit is the plank-csvedit submodule; the checkout above is
+      # recursive, so it is present here at its pinned commit.
       - name: Test the CSV editor guest natively
         run: cargo test --manifest-path guests/csvedit/Cargo.toml --lib
 

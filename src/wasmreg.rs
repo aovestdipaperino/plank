@@ -4041,6 +4041,12 @@ mod tests {
                 .join("guests")
                 .join(guest)
                 .join("plugin.json");
+            // csvedit is the plank-csvedit submodule, absent from a checkout
+            // that never initialised it; the other two live in this tree.
+            if guest == "csvedit" && !path.exists() {
+                eprintln!("skipping csvedit: guests/csvedit submodule not checked out");
+                continue;
+            }
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             let (manifests, warnings) = parse_manifest_section(&text);

@@ -204,8 +204,9 @@ glyph:  u16 x | u16 y | u32 ch (UTF-32) | u8 r | u8 g | u8 b | u8 flags
 ```
 
 `flags` bit 0 is bold; bit 1 says a background colour follows as three more
-bytes, so the common case stays ten bytes per glyph. `guests/support` encodes
-this for you, and decoding is total — a malformed buffer costs you the frame,
+bytes, so the common case stays ten bytes per glyph.
+[`plank-guest-support`](https://github.com/aovestdipaperino/plank-guest-support)
+encodes this for you, and decoding is total — a malformed buffer costs you the frame,
 never the session.
 
 `StepParams` carries `{dt_ms, w, h, now_ms}`, and `dt_ms` is clamped host-side —
@@ -427,8 +428,12 @@ buffers sized to the `w`/`h` you were handed rather than to a worst case.
 ## Worked examples in this repo
 
 - `guests/screensavers` and `guests/arcades` — real `frame` + `command`
-  components, sharing `guests/support` for the RNG and glyph packing.
-- `guests/csvedit`: a full-screen Turbo Vision CSV editor (`/csvedit:new`,
+  components, sharing
+  [`plank-guest-support`](https://github.com/aovestdipaperino/plank-guest-support)
+  (pinned by git rev) for the RNG and glyph packing.
+- `guests/csvedit`, a submodule of its own repository,
+  [`plank-csvedit`](https://github.com/aovestdipaperino/plank-csvedit): a
+  full-screen Turbo Vision CSV editor (`/csvedit:new`,
   `/csvedit:open <name.csv>`) that saves to the `fs` RAM disk. It is the one
   guest built for `wasm32-wasip1` rather than `wasm32-unknown-unknown`, because
   Turbo Vision reads the clock; it gets WASI with no preopened directories, so

@@ -16,3 +16,6 @@
 [submodule "refs/edit"]
 	path = refs/edit
 	url = https://github.com/microsoft/edit
+[submodule "guests/csvedit"]
+	path = guests/csvedit
+	url = https://github.com/aovestdipaperino/plank-csvedit

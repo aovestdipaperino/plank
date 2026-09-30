@@ -190,6 +190,7 @@ dependencies = [
 [[package]]
 name = "plank-guest-support"
 version = "0.1.0"
+source = "git+https://github.com/aovestdipaperino/plank-guest-support?rev=058b7422b1082670828fb4167b241a2793c6d8f1#058b7422b1082670828fb4167b241a2793c6d8f1"
 
 [[package]]
 name = "proc-macro-crate"

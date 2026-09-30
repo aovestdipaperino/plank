@@ -24,9 +24,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 extism-pdk = "1"
-# The shared half of a guest: RNG, glyph packing, JSON readers. A path
-# dependency rather than a copied file, because the copies had already drifted.
-plank-guest-support = { path = "../support" }
+# The shared half of a guest: RNG, glyph packing, JSON readers. One
+# crate pinned by rev rather than a copied file, because the copies had
+# already drifted; its own repository, so plank-csvedit pins the same one.
+plank-guest-support = { git = "https://github.com/aovestdipaperino/plank-guest-support", rev = "058b7422b1082670828fb4167b241a2793c6d8f1" }
 
 [profile.release]
 opt-level = "s"
