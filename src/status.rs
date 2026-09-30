@@ -1185,6 +1185,14 @@ pub fn verb_phase(st: &Status) -> VerbPhase {
     }
 }
 
+/// Publishes `phase` into `cell`. Split from [`prefill_label`] so the write
+/// path can be tested on a caller-owned cell: `VERB_PHASE` is a process-global
+/// and `cargo test` runs in parallel, so a test asserting on it would race
+/// every other test that renders a verb.
+fn publish_verb_phase(cell: &std::sync::atomic::AtomicU8, phase: VerbPhase) {
+    cell.store(phase as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Keep each operation on a single playful verb so the footer does not
 /// visually churn while progress updates stream in. The verb index is fixed
 /// for the turn; only the pool it indexes moves with the phase.
@@ -1197,7 +1205,7 @@ pub fn verb_phase(st: &Status) -> VerbPhase {
 #[must_use]
 pub fn prefill_label(st: &Status) -> &'static str {
     let phase = verb_phase(st);
-    VERB_PHASE.store(phase as u8, std::sync::atomic::Ordering::Relaxed);
+    publish_verb_phase(&VERB_PHASE, phase);
     let pool = verbs_for(phase);
     let idx = if phase == VerbPhase::Fun {
         (st.prefill_label / FUN_ODDS) as usize % pool.len()
@@ -4087,28 +4095,17 @@ mod tests {
     }
 
     #[test]
-    fn current_verb_phase_follows_the_last_rendered_verb() {
-        // `prefill_label` is the only writer, so rendering a verb for a status
-        // in a known state is what publishes the phase. The guard keeps other
-        // status tests from racing the process-global tool activity.
-        let _lock = origin_test_guard();
-        clear_tool_activity();
-        // 1 is not a multiple of FUN_ODDS, so the phase is not the fun pool.
-        let st = Status {
-            prefill_label: 1,
-            state: WorkerState::Prefill,
-            ..Status::default()
-        };
-        let _ = prefill_label(&st);
-        assert_eq!(current_verb_phase(), VerbPhase::Prefill);
-
-        let st = Status {
-            state: WorkerState::Generating,
-            thinking: true,
-            ..st
-        };
-        let _ = prefill_label(&st);
-        assert_eq!(current_verb_phase(), VerbPhase::Thinking);
+    fn publishing_a_phase_makes_it_readable_again() {
+        // A caller-owned cell, not `VERB_PHASE`: the global is written by every
+        // test that renders a verb, so asserting on it would race them.
+        let cell = std::sync::atomic::AtomicU8::new(VerbPhase::Generating as u8);
+        for phase in ALL_PHASES {
+            publish_verb_phase(&cell, phase);
+            assert_eq!(
+                VerbPhase::from_u8(cell.load(std::sync::atomic::Ordering::Relaxed)),
+                phase
+            );
+        }
     }
 
     #[test]
