@@ -1062,14 +1062,43 @@ fn make_engine(cfg: &AgentConfig, plugins: &plank::plugins::PluginSet) -> Result
 /// # Errors
 /// Returns a message when RAM is insufficient, another instance holds the model,
 /// the model file is absent and cannot be fetched, or the engine fails to open.
+/// The `--fake-gpu` stand-in engine.
+///
+/// Built before any of the real engine's gates, and deliberately so: the mode
+/// exists to run *beside* an instance that already holds the model, so it skips
+/// the RAM floor, the single-instance lock and the model download alike.
+///
+/// It reports the engine name the catalog resolved, not a placeholder, because
+/// `kvtier::system_fingerprint` hashes the model name: keying anywhere else
+/// would put the fake run's checkpoints in a corner of the cache no real run
+/// ever looks at, and the reproduction would be of nothing.
+///
+/// There is no [`plank::gpuyield::ReopenFn`]: nothing was loaded, so nothing
+/// can be reopened, and arming the GPU-yield cycle around an absent model
+/// would be theatre.
+fn make_fake_engine(cfg: &AgentConfig) -> Box<dyn Engine> {
+    plank::fakegpu::set_active(true);
+    let model = cfg
+        .selection
+        .as_ref()
+        .and_then(|s| s.id)
+        .map_or_else(|| "fake-gpu".to_string(), |id| id.as_str().to_string());
+    eprintln!("plank: --fake-gpu, no model will be loaded; KV checkpoints key on {model:?}");
+    Box::new(plank::fakegpu::FakeGpuEngine::new(
+        &model,
+        cfg.generation.ctx_size,
+    ))
+}
+
 fn make_local_engine(
     cfg: &AgentConfig,
 ) -> Result<(Box<dyn Engine>, Option<plank::gpuyield::ReopenFn>), String> {
+    if cfg.fake_gpu {
+        return Ok((make_fake_engine(cfg), None));
+    }
     #[cfg(ds4_engine)]
     {
-        use plank::config::Backend;
-        use plank::ds4engine::Ds4Engine;
-        use plank::ffi::Ds4Backend;
+        use plank::{config::Backend, ds4engine::Ds4Engine, ffi::Ds4Backend};
 
         // The default quant needs ~82 GB resident; refuse on machines that
         // cannot hold it, before downloading or loading anything.

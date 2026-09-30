@@ -69,8 +69,18 @@ pub enum Step {
 pub struct FakeGpuEngine {
     /// Cumulative warm text, the stand-in for the token buffer.
     warm: String,
-    /// How much of `warm` has been "prefilled".
+    /// Bytes of `warm` already covered by KV — restored from a checkpoint or
+    /// prefilled by an earlier sync. What a real engine would not pay for
+    /// again.
+    resident: usize,
+    /// Bytes this run actually had to prefill, across all syncs.
+    ///
+    /// The number the whole mode exists to report: a launch that resumed
+    /// properly prefills almost nothing, and one that did not prefills the
+    /// entire prompt.
     prefilled: usize,
+    /// Bytes restored from checkpoints.
+    restored: usize,
     /// The model name this engine reports.
     ///
     /// Key material: `kvtier::system_fingerprint` hashes it, so a fake run
@@ -92,7 +102,9 @@ impl FakeGpuEngine {
     pub fn new(model: &str, ctx: i32) -> Self {
         Self {
             warm: String::new(),
+            resident: 0,
             prefilled: 0,
+            restored: 0,
             model: model.to_string(),
             ctx,
             splits_tail: true,
@@ -113,9 +125,8 @@ impl FakeGpuEngine {
         &self.steps
     }
 
-    /// Bytes "prefilled" since the last reset — what a real run would have
-    /// paid for, and the number that should be *small* when a checkpoint was
-    /// restored.
+    /// Bytes this run had to prefill — what a real run would have paid for,
+    /// and the number that should be *small* when a checkpoint was restored.
     #[must_use]
     pub fn prefilled_bytes(&self) -> usize {
         self.prefilled
@@ -124,23 +135,16 @@ impl FakeGpuEngine {
     /// A one-line summary of what this launch actually did, for the report.
     #[must_use]
     pub fn summary(&self) -> String {
-        let restored: usize = self
-            .steps
-            .iter()
-            .filter_map(|s| match s {
-                Step::Restore { bytes } => Some(*bytes),
-                _ => None,
-            })
-            .sum();
-        let verdict = if restored == 0 {
+        let verdict = if self.restored == 0 {
             "rebuilt from zero"
-        } else if self.prefilled > restored {
-            "restored, then extended"
+        } else if self.prefilled == 0 {
+            "fully restored"
         } else {
-            "restored"
+            "restored, then extended"
         };
         format!(
-            "fake-gpu: {verdict} — {restored} bytes restored, {} bytes prefilled, {} warm steps",
+            "fake-gpu: {verdict} — {} bytes restored, {} bytes prefilled, {} warm steps",
+            self.restored,
             self.prefilled,
             self.steps.len()
         )
@@ -151,8 +155,30 @@ impl FakeGpuEngine {
     /// A digest rather than the text itself: it must change when the text
     /// changes (or a mismatched restore would look successful) without a
     /// checkpoint file growing to the size of the prompt.
+    /// The snapshot bytes standing for `text`: its length, then a digest.
+    ///
+    /// A digest rather than the text itself so a checkpoint file does not grow
+    /// to the size of the prompt, and it must change with the text or a
+    /// mismatched restore would look successful. The length rides along
+    /// because a restore has to say *how much* it covered — without it the
+    /// mode could report that something resumed but not that it saved
+    /// anything, which is the only number worth having.
     fn digest(text: &str) -> Vec<u8> {
-        crate::session::sha1_hex(text.as_bytes()).into_bytes()
+        format!(
+            "{}:{}",
+            text.len(),
+            crate::session::sha1_hex(text.as_bytes())
+        )
+        .into_bytes()
+    }
+
+    /// The covered length recorded in a snapshot by [`digest`].
+    fn snapshot_len(bytes: &[u8]) -> usize {
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|s| s.split_once(':'))
+            .and_then(|(n, _)| n.parse().ok())
+            .unwrap_or(0)
     }
 }
 
@@ -183,10 +209,19 @@ impl Engine for FakeGpuEngine {
         // `Notice` is the channel for "why the system-prompt cache is being
         // rebuilt", which is precisely this mode's verdict.
         on_event(EngineEvent::Notice(self.summary()));
-        on_event(EngineEvent::Text(
-            "[fake-gpu] no model loaded\n".to_string(),
-        ));
-        Ok(GenerationStats::default())
+        // And on stderr regardless of front end. The verdict is the entire
+        // output of this mode, and routing it only through the chat stream
+        // would hide it behind whatever the renderer decides is visible text —
+        // which, with no dialect markers to split on, is nothing.
+        eprintln!("plank: {}", self.summary());
+        let reply = "[fake-gpu] no model loaded\n".to_string();
+        let generated = self.count_tokens(&reply).max(1);
+        on_event(EngineEvent::Text(reply));
+        Ok(GenerationStats {
+            generated,
+            ctx_used: total,
+            ..GenerationStats::default()
+        })
     }
 
     fn ctx_size(&self) -> i32 {
@@ -203,7 +238,7 @@ impl Engine for FakeGpuEngine {
 
     fn warm_reset(&mut self, system: &str) -> Result<(), EngineError> {
         self.warm = system.to_string();
-        self.prefilled = 0;
+        self.resident = 0;
         self.steps.push(Step::Reset {
             bytes: system.len(),
         });
@@ -219,12 +254,13 @@ impl Engine for FakeGpuEngine {
     }
 
     fn warm_sync(&mut self, _on_event: &mut dyn FnMut(EngineEvent)) -> Result<bool, EngineError> {
-        // "Prefill" whatever the buffer gained since the last sync. A restore
-        // that really took effect shows up here as a small number.
-        self.prefilled = self.warm.len();
-        self.steps.push(Step::Prefill {
-            bytes: self.warm.len(),
-        });
+        // Prefill only what the buffer gained beyond what is already resident.
+        // A restore that really took effect shows up here as a small number —
+        // that difference is the entire signal this mode produces.
+        let new = self.warm.len().saturating_sub(self.resident);
+        self.resident = self.warm.len();
+        self.prefilled += new;
+        self.steps.push(Step::Prefill { bytes: new });
         Ok(true)
     }
 
@@ -241,9 +277,10 @@ impl Engine for FakeGpuEngine {
         // tier walk requires is that the restore be *accounted for*, and that
         // the buffer afterwards describe the restored prefix, which the walk's
         // own `warm_append` of every tier then rebuilds.
-        self.steps.push(Step::Restore {
-            bytes: cache.kv().len(),
-        });
+        let covered = Self::snapshot_len(cache.kv());
+        self.resident = self.resident.max(covered);
+        self.restored += covered;
+        self.steps.push(Step::Restore { bytes: covered });
         Ok(())
     }
 }
@@ -344,6 +381,50 @@ mod tests {
         fresh.set_kv(&snap).expect("restore");
         assert!(fresh.summary().contains("restored"), "{}", fresh.summary());
         assert!(!fresh.summary().contains("rebuilt"), "{}", fresh.summary());
+    }
+
+    #[test]
+    fn a_restore_is_credited_and_only_the_extension_is_prefilled() {
+        // The mode's entire output is this arithmetic: a launch that resumed
+        // pays for the tail only. If `set_kv` stopped marking bytes resident,
+        // every run would read as a full rebuild and the mode would report a
+        // cache bug that was not there.
+        let mut warm = engine();
+        warm.warm_reset(&"S".repeat(1000)).expect("reset");
+        let snap = warm.get_kv().expect("kv");
+
+        let mut fresh = engine();
+        fresh.warm_reset(&"S".repeat(1000)).expect("reset");
+        fresh.set_kv(&snap).expect("restore");
+        fresh.warm_append(Some(&"T".repeat(40))).expect("append");
+        fresh.warm_sync(&mut |_| {}).expect("sync");
+
+        assert_eq!(fresh.prefilled_bytes(), 40, "only the tail is prefilled");
+        assert!(
+            fresh.summary().contains("1000 bytes restored"),
+            "{}",
+            fresh.summary()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_records_the_length_it_covers() {
+        let mut e = engine();
+        e.warm_reset("0123456789").expect("reset");
+        let snap = e.get_kv().expect("kv");
+        assert_eq!(FakeGpuEngine::snapshot_len(snap.kv()), 10);
+    }
+
+    #[test]
+    fn a_corrupt_snapshot_credits_nothing_rather_than_guessing() {
+        let mut e = engine();
+        let junk = crate::kvcache::KVCache::new(
+            b"not-a-snapshot".to_vec(),
+            crate::ds4tokens::TokenTranscript::default(),
+        );
+        e.set_kv(&junk).expect("set_kv never fails");
+        assert_eq!(e.restored, 0);
+        assert!(e.summary().contains("rebuilt from zero"), "{}", e.summary());
     }
 
     #[test]

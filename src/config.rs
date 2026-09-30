@@ -194,6 +194,13 @@ pub struct AgentConfig {
     /// --resolved`. Populated by [`parse_options_with`]; empty when no flag
     /// shadowed a settings key.
     pub cli_provenance: std::collections::BTreeMap<String, crate::provenance::Origin>,
+    /// True when `--fake-gpu` was given: run on a stand-in engine that keeps a
+    /// real KV identity but loads no model, ignoring the single-instance lock.
+    ///
+    /// For reproducing cache-behaviour bugs ("switching X re-prefills") on a
+    /// machine that is already running plank, which is normally the only
+    /// machine that can reproduce them.
+    pub fake_gpu: bool,
     /// True when `--dump-profiles` was given: print every installed profile
     /// and exit. A read-only diagnostic, like [`Self::dump_config`].
     pub dump_profiles: bool,
@@ -515,6 +522,7 @@ impl Default for AgentConfig {
             temp_explicit: false,
             cli_provenance: std::collections::BTreeMap::new(),
             dump_config: false,
+            fake_gpu: false,
             dump_profiles: false,
             dump_engines: false,
         }
@@ -687,6 +695,11 @@ Options:
                            to ~/.plank/kvcache at exit
       --dump-config        print every effective setting with the layer it came
                            from (default, plugin, ~/.plank, ./.plank, CLI) and exit
+      --fake-gpu           run without loading a model, on a stand-in engine
+                           that still writes and restores KV checkpoints. Ignores
+                           the single-instance lock, so it runs beside a real
+                           plank. For reproducing cache bugs; timings are
+                           meaningless
       --dump-profiles      print every installed profile with the fields it
                            resolves to (accent, secondary, tools, grids) and exit
       --dump-engines       print the engine catalog: every engine, its roles,
@@ -1574,6 +1587,7 @@ pub fn parse_options_with(
             "--show-memory-stats" => c.show_memory_stats = true,
             "--no-session" => c.save_session = false,
             "--dump-config" => c.dump_config = true,
+            "--fake-gpu" => c.fake_gpu = true,
             "--dump-profiles" => c.dump_profiles = true,
             "--dump-engines" => c.dump_engines = true,
             "--minimal-prompt" => c.minimal_prompt = true,
