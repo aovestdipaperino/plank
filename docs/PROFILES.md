@@ -24,6 +24,7 @@ for the Claude Code layout), alongside the plugin's existing `name`,
 | `displayName` | string | no | the plugin's own `name` |
 | `logo` | string, path to a PNG | no | plank's own logo |
 | `accent` | string | no | plank's built-in green |
+| `secondary` | string | no | derived from `accent`, or the built-in ramp when neither is set |
 | `tools.builtin` | array of strings | no | every builtin tool is offered |
 | `settings` | object | no | no extra settings layer |
 | `folderContext` | boolean | no | `false`: no launch-folder context |
@@ -40,6 +41,8 @@ profile at all, and `--profile` treats the plugin as though it had none.
 Every other field degrades on its own rather than failing the whole profile.
 An `accent` that is neither a bare ANSI index (`"160"`) nor a `#rrggbb` hex
 triple is ignored with a warning and plank's default green is used instead.
+A `secondary` that does not parse warns the same way and falls back to the
+derived value, so a typo costs the declared shade but never the profile.
 A `logo` that does not point at a readable, decodable PNG falls back to
 plank's own art, also with a warning; the sample profile in this repository
 ships without a `logo` key specifically to exercise that fallback. A
@@ -223,6 +226,28 @@ display name, a malformed or unavailable `recommendedModel`, a prompt without th
 terminal window title (`title.rs`). It does not currently reach the Ratatui
 status bar footer, despite what the introduction above might suggest — the
 footer still shows plank's own segments regardless of the active profile.
+
+### `secondary`: the far end of the shimmer
+
+While a turn runs, the status verb (`Patching…`, `Thinking…`) carries a
+highlight that sweeps across the word. `secondary` is the color at the center
+of that sweep: the shimmer ranges from `accent` at the edges to `secondary` in
+the middle, so the animation belongs to the profile rather than to plank.
+
+It takes the same two forms as `accent` — a bare ANSI index or a `#rrggbb`
+triple — and there are three cases:
+
+* **Neither `accent` nor `secondary`.** The built-in ramp is used unchanged, so
+  a plain run and every profile that has not opted in look exactly as before.
+* **`accent` only.** A secondary is derived by lightening the accent toward
+  white, so the sweep follows the profile's own hue instead of plank's olive.
+* **`secondary` set.** It is the center of the sweep, whether it is lighter or
+  darker than the accent. Nothing requires it to be the brighter end: a dark
+  `secondary` such as `"#444444"` reads as a shadow crossing the word rather
+  than a highlight travelling along it.
+
+The shades are quantized to the xterm 6×6×6 color cube, matching the built-in
+ramp, so the sweep renders on a 256-color terminal.
 
 `accent` only paints anything on the interactive Ratatui TUI. The
 plain-stdout path (used when output is piped, or under `--ui console`)

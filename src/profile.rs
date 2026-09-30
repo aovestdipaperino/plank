@@ -31,6 +31,17 @@ pub struct ProfileSpec {
     pub logo: Option<PathBuf>,
     /// UI accent; the built-in green when absent.
     pub accent: Option<Accent>,
+    /// `secondary`: the far end of the status verb's shimmer sweep, which
+    /// ranges from [`accent`](Self::accent) to this color.
+    ///
+    /// `None` with an accent set derives one (`anim::derived_secondary`), so an
+    /// accented profile never shimmers in the built-in olive. `None` with no
+    /// accent leaves the hand-picked `status::SHIMMER_RAMP` alone, which is
+    /// what keeps plank's own look unchanged.
+    ///
+    /// Nothing requires it to be lighter than the accent: plank's own profile
+    /// uses `#444444`, so its sweep reads as a shadow crossing the word.
+    pub secondary: Option<Accent>,
     /// The file holding the whole system prompt. The one required field.
     pub system_prompt: PathBuf,
     /// Builtin tools the profile allows. `None` means all of them.
@@ -74,6 +85,37 @@ impl ProfileSpec {
     }
 }
 
+/// The default UI accent when a profile declares none (`crate::tui`'s
+/// built-in green).
+pub const DEFAULT_ACCENT: Accent = Accent::Indexed(114);
+
+/// An [`Accent`] as an RGB triple, for interpolation.
+#[must_use]
+pub fn accent_rgb(a: Accent) -> crate::anim::Rgb {
+    match a {
+        Accent::Indexed(i) => crate::anim::indexed_to_rgb(i),
+        Accent::Rgb(r, g, b) => (r, g, b),
+    }
+}
+
+/// The shimmer shades for a profile's `accent`/`secondary` pair, or `None` to
+/// leave the hand-picked `crate::status::SHIMMER_RAMP` in place.
+///
+/// A profile that declares neither keeps the built-in ramp, which is what makes
+/// this change invisible to a plain run and to every existing profile that has
+/// not opted in. Declaring only an `accent` derives the far end
+/// ([`crate::anim::derived_secondary`]) so the sweep follows the profile's hue;
+/// declaring only a `secondary` sweeps from the default accent toward it.
+#[must_use]
+pub fn shimmer_ramp(accent: Option<Accent>, secondary: Option<Accent>) -> Option<[u8; 3]> {
+    if accent.is_none() && secondary.is_none() {
+        return None;
+    }
+    let near = accent_rgb(accent.unwrap_or(DEFAULT_ACCENT));
+    let far = secondary.map_or_else(|| crate::anim::derived_secondary(near), accent_rgb);
+    Some(crate::anim::shimmer_ramp(near, far))
+}
+
 /// Parses an ANSI index (`"160"`) or a hex triple (`"#c04040"`).
 #[must_use]
 pub fn parse_accent(s: &str) -> Option<Accent> {
@@ -95,6 +137,24 @@ pub fn parse_accent(s: &str) -> Option<Accent> {
     s.parse::<u8>().ok().map(Accent::Indexed)
 }
 
+/// One optional color field (`accent`, `secondary`), parsed by
+/// [`parse_accent`]. An unparseable value warns — naming `fallback` so the
+/// message says what happens instead — and yields `None`, never failing the
+/// profile over a color.
+fn color_field(
+    block: &Json,
+    key: &str,
+    fallback: &str,
+    warnings: &mut Vec<String>,
+) -> Option<Accent> {
+    let raw = str_field(block, key)?;
+    let parsed = parse_accent(&raw);
+    if parsed.is_none() {
+        warnings.push(format!("profile: unrecognized {key} {raw:?}; {fallback}"));
+    }
+    parsed
+}
+
 /// Parses the `profile` block out of a plugin manifest.
 ///
 /// `None` when the manifest does not parse, has no `profile` object, or that
@@ -111,18 +171,13 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
     let system_prompt = str_field(block, "systemPrompt")?;
     let mut warnings = Vec::new();
 
-    let accent = match str_field(block, "accent") {
-        None => None,
-        Some(raw) => {
-            let parsed = parse_accent(&raw);
-            if parsed.is_none() {
-                warnings.push(format!(
-                    "profile: unrecognized accent {raw:?}; using the default"
-                ));
-            }
-            parsed
-        }
-    };
+    let accent = color_field(block, "accent", "using the default", &mut warnings);
+    let secondary = color_field(
+        block,
+        "secondary",
+        "deriving one from the accent",
+        &mut warnings,
+    );
 
     let builtin_tools = match block.get("tools").and_then(|t| t.get("builtin")) {
         None => None,
@@ -204,6 +259,7 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
         display_name,
         logo,
         accent,
+        secondary,
         system_prompt: resolve(root, &system_prompt),
         builtin_tools,
         settings_json,
@@ -903,6 +959,70 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_with_neither_accent_nor_secondary_keeps_the_builtin_ramp() {
+        // The guard on plank's own look: nothing declared, nothing generated.
+        assert_eq!(shimmer_ramp(None, None), None);
+    }
+
+    #[test]
+    fn a_declared_secondary_is_the_far_end_of_the_sweep() {
+        // EAP: cream on its accent.
+        let ramp = shimmer_ramp(Some(Accent::Indexed(106)), Some(Accent::Rgb(231, 229, 199)))
+            .expect("a declared pair generates a ramp");
+        assert_eq!(ramp[2], crate::anim::cube_index_rgb((231, 229, 199)));
+    }
+
+    #[test]
+    fn an_accent_alone_derives_its_secondary() {
+        let derived = shimmer_ramp(Some(Accent::Rgb(0xc0, 0x40, 0x40)), None)
+            .expect("an accent alone still generates a ramp");
+        let explicit = shimmer_ramp(
+            Some(Accent::Rgb(0xc0, 0x40, 0x40)),
+            Some(Accent::Rgb(
+                crate::anim::derived_secondary((0xc0, 0x40, 0x40)).0,
+                crate::anim::derived_secondary((0xc0, 0x40, 0x40)).1,
+                crate::anim::derived_secondary((0xc0, 0x40, 0x40)).2,
+            )),
+        )
+        .expect("ramp");
+        assert_eq!(derived, explicit);
+        // And it is not the built-in olive, which is the point.
+        assert_ne!(derived, crate::status::SHIMMER_RAMP);
+    }
+
+    #[test]
+    fn a_secondary_alone_sweeps_from_the_default_accent() {
+        let ramp = shimmer_ramp(None, Some(Accent::Rgb(0x44, 0x44, 0x44))).expect("ramp");
+        let same =
+            shimmer_ramp(Some(DEFAULT_ACCENT), Some(Accent::Rgb(0x44, 0x44, 0x44))).expect("ramp");
+        assert_eq!(ramp, same);
+    }
+
+    #[test]
+    fn a_bad_secondary_warns_and_falls_back_to_the_derived_one() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md", "accent": "160",
+                        "secondary": "chartreuse" } }"#;
+        let spec = parse(text, Path::new("/tmp")).expect("spec");
+        assert_eq!(spec.accent, Some(Accent::Indexed(160)));
+        assert_eq!(spec.secondary, None);
+        assert!(spec.warnings.iter().any(|w| w.contains("secondary")));
+        // The accent still drives a ramp, so a typo degrades to derived rather
+        // than back to the built-in olive.
+        assert!(shimmer_ramp(spec.accent, spec.secondary).is_some());
+    }
+
+    #[test]
+    fn secondary_parses_the_two_documented_profile_values() {
+        let text = r##"{ "profile": { "systemPrompt": "p.md", "secondary": "#e7e5c7" } }"##;
+        let spec = parse(text, Path::new("/tmp")).expect("spec");
+        assert_eq!(spec.secondary, Some(Accent::Rgb(231, 229, 199)));
+
+        let text = r##"{ "profile": { "systemPrompt": "p.md", "secondary": "#444444" } }"##;
+        let spec = parse(text, Path::new("/tmp")).expect("spec");
+        assert_eq!(spec.secondary, Some(Accent::Rgb(68, 68, 68)));
+    }
+
+    #[test]
     fn accent_parses_an_ansi_index_and_a_hex_triple() {
         assert_eq!(parse_accent("0"), Some(Accent::Indexed(0)));
         assert_eq!(parse_accent("255"), Some(Accent::Indexed(255)));
@@ -1062,6 +1182,7 @@ mod tests {
             display_name: Some("HAL".to_string()),
             logo: None,
             accent: None,
+            secondary: None,
             system_prompt: PathBuf::from("/p/prompt.md"),
             builtin_tools: tools,
             settings_json: None,

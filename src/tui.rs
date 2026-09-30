@@ -1908,6 +1908,19 @@ fn theme_accent() -> Color {
     )
 }
 
+/// The shimmer shades sweeping the status verb.
+///
+/// The active profile's `accent`/`secondary` pair when it declares either, else
+/// `None` for the built-in [`crate::status::SHIMMER_RAMP`]. Resolved once,
+/// like [`theme_accent`]: a profile never changes mid-process.
+fn theme_shimmer_ramp() -> Option<[u8; 3]> {
+    static RAMP: std::sync::OnceLock<Option<[u8; 3]>> = std::sync::OnceLock::new();
+    *RAMP.get_or_init(|| {
+        let spec = crate::profile::active().map(|a| a.spec.clone())?;
+        crate::profile::shimmer_ramp(spec.accent, spec.secondary)
+    })
+}
+
 /// A cheap, cloneable snapshot of the task list for rendering (issue #35): the
 /// status-bar counter plus the strip rows. Sent worker→UI over
 /// [`crate::worker::UiEvent::Tasks`] and passed straight into [`draw`], so
@@ -3950,7 +3963,7 @@ fn tone_fg(c: Color, tone: Tone) -> Color {
         }
         Tone::Context => unreachable!(),
     }
-    Color::Indexed(cube_index(r, g, b))
+    Color::Indexed(crate::anim::cube_index(r, g, b))
 }
 
 /// Relative luminance of a 0…255 RGB triple, normalised to 0…1.
@@ -3980,25 +3993,6 @@ fn damp(r: &mut f32, g: &mut f32, b: &mut f32, max: f32) {
     for v in [r, g, b] {
         *v *= t;
     }
-}
-
-/// Nearest xterm 6×6×6 colour-cube index for a 0…255 RGB triple.
-fn cube_index(red: f32, green: f32, blue: f32) -> u8 {
-    const LEVELS: [f32; 6] = [0.0, 95.0, 135.0, 175.0, 215.0, 255.0];
-    let quantise = |value: f32| -> u8 {
-        let value = value.clamp(0.0, 255.0);
-        let mut best = 0u8;
-        let mut best_dist = f32::MAX;
-        for (slot, level) in LEVELS.iter().enumerate() {
-            let dist = (value - level).abs();
-            if dist < best_dist {
-                best_dist = dist;
-                best = u8::try_from(slot).unwrap_or(0);
-            }
-        }
-        best
-    };
-    16 + 36 * quantise(red) + 6 * quantise(green) + quantise(blue)
 }
 
 /// RGB for the colours the highlighter can hand back: the 16 ANSI names, the
@@ -5403,8 +5397,14 @@ fn anim_tick_ms() -> u64 {
 /// the middle, easing back into the theme color at the edges — so the sweep
 /// looks like light travelling over the word rather than a white block sliding
 /// along it.
-fn push_shimmered(spans: &mut Vec<Span<'static>>, word: &str, tick_ms: u64, theme: Style) {
-    let ramp = crate::status::SHIMMER_RAMP;
+fn push_shimmered(
+    spans: &mut Vec<Span<'static>>,
+    word: &str,
+    tick_ms: u64,
+    theme: Style,
+    ramp: Option<[u8; 3]>,
+) {
+    let ramp = ramp.unwrap_or(crate::status::SHIMMER_RAMP);
     let half = i64::try_from(ramp.len().saturating_sub(1)).unwrap_or(0);
     let width = i64::try_from(word.chars().count()).unwrap_or(0);
     let cycle = width + 20;
@@ -5582,7 +5582,13 @@ fn push_accented(
         });
     if let Some((start, end)) = range {
         spans.push(Span::styled(seg[..start].to_string(), base));
-        push_shimmered(spans, &seg[start..end], tick_ms, theme);
+        push_shimmered(
+            spans,
+            &seg[start..end],
+            tick_ms,
+            theme,
+            theme_shimmer_ramp(),
+        );
         spans.push(Span::styled(seg[end..].to_string(), base));
     } else {
         spans.push(Span::styled(seg.to_string(), base));
@@ -5763,7 +5769,7 @@ fn status_bar_lines(
     if let Some(running) = crate::status::tool_activity() {
         spans.push(Span::styled(" | ".to_string(), base));
         if crate::status::tool_blink_on(tick_ms) {
-            push_shimmered(&mut spans, &running, tick_ms, theme);
+            push_shimmered(&mut spans, &running, tick_ms, theme, theme_shimmer_ramp());
         } else {
             // Off half of the blink: same glyphs at the same width, dimmed, so
             // the label pulses without the line jittering around it.

@@ -218,6 +218,116 @@ pub fn stall_color(base: Rgb, red: Rgb, intensity: f32) -> Rgb {
     lerp_rgb(base, red, intensity)
 }
 
+/// xterm-256 palette index to RGB: 0-15 base colors, 16-231 the 6x6x6 cube,
+/// 232-255 the 24-step grayscale ramp.
+///
+/// Lives here beside [`lerp_rgb`] because it is pure color math with no
+/// business logic, and both the status shimmer and `crate::ui` need it to turn
+/// an indexed accent into something interpolable.
+#[must_use]
+#[allow(clippy::many_single_char_names)]
+pub fn indexed_to_rgb(i: u8) -> Rgb {
+    const BASE: [Rgb; 16] = [
+        (0, 0, 0),
+        (205, 0, 0),
+        (0, 205, 0),
+        (205, 205, 0),
+        (0, 0, 238),
+        (205, 0, 205),
+        (0, 205, 205),
+        (229, 229, 229),
+        (127, 127, 127),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (92, 92, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    match i {
+        0..=15 => BASE[i as usize],
+        16..=231 => {
+            let n = i - 16;
+            let steps = [0u8, 95, 135, 175, 215, 255];
+            let r = steps[(n / 36) as usize];
+            let g = steps[((n / 6) % 6) as usize];
+            let b = steps[(n % 6) as usize];
+            (r, g, b)
+        }
+        232..=255 => {
+            let v = 8 + 10 * (i - 232);
+            (v, v, v)
+        }
+    }
+}
+
+/// Nearest xterm 6x6x6 colour-cube index for a 0-255 RGB triple.
+#[must_use]
+pub fn cube_index(red: f32, green: f32, blue: f32) -> u8 {
+    const LEVELS: [f32; 6] = [0.0, 95.0, 135.0, 175.0, 215.0, 255.0];
+    let quantise = |value: f32| -> u8 {
+        let value = value.clamp(0.0, 255.0);
+        let mut best = 0u8;
+        let mut best_dist = f32::MAX;
+        for (slot, level) in LEVELS.iter().enumerate() {
+            let dist = (value - level).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = u8::try_from(slot).unwrap_or(0);
+            }
+        }
+        best
+    };
+    16 + 36 * quantise(red) + 6 * quantise(green) + quantise(blue)
+}
+
+/// [`cube_index`] for an [`Rgb`] triple.
+#[must_use]
+pub fn cube_index_rgb(c: Rgb) -> u8 {
+    cube_index(f32::from(c.0), f32::from(c.1), f32::from(c.2))
+}
+
+/// How far a derived shimmer secondary sits from its accent toward white.
+///
+/// A profile that sets only an `accent` still gets a sweep in its own hue
+/// rather than the built-in olive, which is the whole point of deriving one.
+///
+/// This deliberately does *not* try to reproduce the built-in ramp. That ramp
+/// lifts the theme green 106 `#87af00` toward 192 `#d7ff87` by 0.67, 1.00 and
+/// 0.53 on R, G and B — it was picked by eye, not by formula, and no single
+/// factor lands on it. So the built-in keeps its own hand-picked
+/// `crate::status::SHIMMER_RAMP` and this constant only has to make an
+/// arbitrary accent read as lit: far enough to be visibly brighter at the
+/// sweep's center, short of washing the hue out to white.
+pub const DERIVED_SECONDARY_T: f32 = 0.45;
+
+/// The secondary shimmer color for a profile that declared an accent but no
+/// secondary: the accent lightened toward white by [`DERIVED_SECONDARY_T`].
+#[must_use]
+pub fn derived_secondary(accent: Rgb) -> Rgb {
+    lerp_rgb(accent, (255, 255, 255), DERIVED_SECONDARY_T)
+}
+
+/// The shimmer shades sweeping the status verb, interpolated from `accent` to
+/// `secondary` and quantized to the xterm cube.
+///
+/// Ordered outermost column first, matching `crate::status::SHIMMER_RAMP`'s
+/// contract, so the last entry lands on the center of the highlight and is the
+/// secondary exactly. The length is deliberately three: the sweep window is
+/// `2 * (len - 1) + 1` columns, so keeping it preserves the geometry and the
+/// existing shimmer tests, and only the shades differ.
+#[must_use]
+pub fn shimmer_ramp(accent: Rgb, secondary: Rgb) -> [u8; 3] {
+    let mut out = [0u8; 3];
+    for (i, slot) in out.iter_mut().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        let t = (i + 1) as f32 / 3.0;
+        *slot = cube_index_rgb(lerp_rgb(accent, secondary, t));
+    }
+    out
+}
+
 /// Fixed cycle for the reduced-motion pulse (dim half, bright half).
 pub const REDUCED_PULSE_MS: u64 = 1000;
 
@@ -356,6 +466,82 @@ mod tests {
         let red = (255, 0, 0);
         assert_eq!(stall_color(base, red, 0.0), base);
         assert_eq!(stall_color(base, red, 1.0), red);
+    }
+
+    #[test]
+    fn indexed_and_cube_round_trip_through_the_theme_green() {
+        // 106 is the theme color. Note it is #87af00 — `status::SHIMMER_RAMP`
+        // long documented it as #87af5f, which is really 107.
+        assert_eq!(indexed_to_rgb(106), (0x87, 0xaf, 0x00));
+        assert_eq!(cube_index_rgb((0x87, 0xaf, 0x00)), 106);
+        assert_eq!(indexed_to_rgb(107), (0x87, 0xaf, 0x5f));
+        // 192 is the built-in ramp's brightest shade, #d7ff87.
+        assert_eq!(indexed_to_rgb(192), (0xd7, 0xff, 0x87));
+        assert_eq!(cube_index_rgb((0xd7, 0xff, 0x87)), 192);
+    }
+
+    #[test]
+    fn the_ramp_ends_on_the_secondary_and_eases_from_the_accent() {
+        let accent = indexed_to_rgb(106);
+        let secondary = indexed_to_rgb(192);
+        let ramp = shimmer_ramp(accent, secondary);
+        // The center column is the secondary exactly.
+        assert_eq!(ramp[2], 192);
+        // The outermost column sits nearer the accent than the center does.
+        let dist = |i: u8| {
+            let c = indexed_to_rgb(i);
+            let d = |a: u8, b: u8| f32::from(a) - f32::from(b);
+            d(c.0, accent.0).powi(2) + d(c.1, accent.1).powi(2) + d(c.2, accent.2).powi(2)
+        };
+        assert!(
+            dist(ramp[0]) < dist(ramp[2]),
+            "ramp should ease out of the accent: {ramp:?}"
+        );
+    }
+
+    #[test]
+    fn an_indexed_accent_gives_the_same_ramp_as_its_hex_equivalent() {
+        let from_index = shimmer_ramp(indexed_to_rgb(106), indexed_to_rgb(192));
+        let from_hex = shimmer_ramp((0x87, 0xaf, 0x00), (0xd7, 0xff, 0x87));
+        assert_eq!(from_index, from_hex);
+    }
+
+    #[test]
+    fn a_derived_secondary_is_lighter_and_keeps_the_accent_hue() {
+        for accent in [(0xc0, 0x40, 0x40), (0x87, 0xaf, 0x00), (0x40, 0x40, 0xc0)] {
+            let d = derived_secondary(accent);
+            let lum = |c: Rgb| {
+                0.2126 * f32::from(c.0) + 0.7152 * f32::from(c.1) + 0.0722 * f32::from(c.2)
+            };
+            assert!(
+                lum(d) > lum(accent),
+                "{accent:?} -> {d:?} should be lighter"
+            );
+            // Short of white: the hue must survive the lift, or every accent
+            // would shimmer the same washed-out color.
+            assert!(d != (255, 255, 255), "{accent:?} washed out to white");
+            // The dominant channel stays dominant.
+            let arg_max = |c: Rgb| {
+                if c.0 >= c.1 && c.0 >= c.2 {
+                    0
+                } else if c.1 >= c.2 {
+                    1
+                } else {
+                    2
+                }
+            };
+            assert_eq!(arg_max(d), arg_max(accent), "hue shifted: {accent:?}");
+        }
+    }
+
+    #[test]
+    fn a_ramp_may_run_dark_as_well_as_light() {
+        // plank's own profile secondary is #444444, darker than the accent, so
+        // the sweep reads as a shadow rather than a highlight. Nothing in the
+        // ramp may assume the secondary is the brighter end.
+        let ramp = shimmer_ramp(indexed_to_rgb(106), (0x44, 0x44, 0x44));
+        assert_eq!(ramp[2], cube_index_rgb((0x44, 0x44, 0x44)));
+        assert_ne!(ramp[0], ramp[2]);
     }
 
     #[test]

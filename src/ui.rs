@@ -425,7 +425,7 @@ fn color_to_rgb(c: ratatui::style::Color) -> (u8, u8, u8) {
         Color::LightMagenta => (255, 0, 255),
         Color::LightCyan => (0, 255, 255),
         Color::White => (255, 255, 255),
-        Color::Indexed(i) => indexed_to_rgb(i),
+        Color::Indexed(i) => crate::anim::indexed_to_rgb(i),
     }
 }
 
@@ -483,45 +483,6 @@ fn frame_to_image(buf: &ratatui::buffer::Buffer) -> image::RgbaImage {
         }
     }
     img
-}
-
-/// xterm-256 palette index to RGB: 0-15 base colors, 16-231 the 6x6x6 cube,
-/// 232-255 the 24-step grayscale ramp.
-#[allow(clippy::many_single_char_names)]
-fn indexed_to_rgb(i: u8) -> (u8, u8, u8) {
-    const BASE: [(u8, u8, u8); 16] = [
-        (0, 0, 0),
-        (205, 0, 0),
-        (0, 205, 0),
-        (205, 205, 0),
-        (0, 0, 238),
-        (205, 0, 205),
-        (0, 205, 205),
-        (229, 229, 229),
-        (127, 127, 127),
-        (255, 0, 0),
-        (0, 255, 0),
-        (255, 255, 0),
-        (92, 92, 255),
-        (255, 0, 255),
-        (0, 255, 255),
-        (255, 255, 255),
-    ];
-    match i {
-        0..=15 => BASE[i as usize],
-        16..=231 => {
-            let n = i - 16;
-            let steps = [0u8, 95, 135, 175, 215, 255];
-            let r = steps[(n / 36) as usize];
-            let g = steps[((n / 6) % 6) as usize];
-            let b = steps[(n % 6) as usize];
-            (r, g, b)
-        }
-        232..=255 => {
-            let v = 8 + 10 * (i - 232);
-            (v, v, v)
-        }
-    }
 }
 
 /// The single event source both TUI key loops use.
@@ -25390,6 +25351,7 @@ mod tests {
             display_name: None,
             logo: None,
             accent: None,
+            secondary: None,
             system_prompt: std::path::PathBuf::from("/unused"),
             builtin_tools: Some(allowed.iter().map(|s| (*s).to_string()).collect()),
             settings_json: None,
