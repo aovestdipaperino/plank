@@ -903,6 +903,12 @@ impl Parser {
     }
 
     /// True when this parser reads the Qwen dialect.
+    /// Whether a Qwen run has just closed a stanza and is waiting to learn
+    /// if another follows (see `QwenParser::awaits_another_stanza`).
+    fn awaits_another_stanza(&self) -> bool {
+        matches!(self, Self::Qwen(p) if p.awaits_another_stanza())
+    }
+
     fn is_qwen(&self) -> bool {
         matches!(self, Self::Qwen(_))
     }
@@ -2564,6 +2570,32 @@ impl<S: RenderSink> StreamRenderer<S> {
         let mut i = 0;
         while i < buf.len() {
             let rem = &buf[i..];
+            if self.dsml_active
+                && self.parser.awaits_another_stanza()
+                && !matches!(rem[0], b' ' | b'\t' | b'\r' | b'\n')
+            {
+                // A Qwen run has no terminator: it ends at the first byte that
+                // cannot open another `<tool_call>`. Hold a partial opener
+                // until it decides, then settle the run *before* that byte, so
+                // it is read as what it is — often a `<think>` — instead of
+                // being swallowed into the stanza just closed. A whole opener
+                // goes in at once: fed a byte at a time, its tail would no
+                // longer look like one to this check.
+                if rem.starts_with(QWEN_START) {
+                    for &b in QWEN_START {
+                        self.feed_dsml_byte(b);
+                    }
+                    i += QWEN_START.len();
+                    continue;
+                }
+                if !finish && is_partial_prefix(rem, QWEN_START) {
+                    self.pending = rem.to_vec();
+                    break;
+                }
+                self.parser.finish();
+                self.settle_parser_state();
+                continue;
+            }
             if !self.dsml_active && rem.starts_with(THINK_OPEN) {
                 self.flush_start_tail();
                 self.post_think_gap = false;
@@ -4618,13 +4650,16 @@ mod qwen_dialect_tests {
     #[derive(Debug, Default)]
     struct Cap {
         visible: String,
+        think: String,
     }
 
     impl RenderSink for Cap {
         fn visible_text(&mut self, text: &str) {
             self.visible.push_str(text);
         }
-        fn think_text(&mut self, _text: &str) {}
+        fn think_text(&mut self, text: &str) {
+            self.think.push_str(text);
+        }
     }
 
     const CALL: &str = "<tool_call>\n<function=read>\n<parameter=path>\nsrc/a.rs\n</parameter>\n</function>\n</tool_call>";
@@ -4820,6 +4855,79 @@ mod qwen_dialect_tests {
         assert!(
             sr.finished().error.is_some(),
             "a bare opener with no stanza behind it is reported, not silent"
+        );
+    }
+
+    /// Streams `chunks` through a fresh renderer, one `push` per chunk.
+    fn run_chunks<'a>(chunks: impl IntoIterator<Item = &'a str>) -> StreamRenderer<Cap> {
+        let mut sr = StreamRenderer::new(Cap::default());
+        for chunk in chunks {
+            sr.push(chunk);
+        }
+        sr.finish();
+        sr
+    }
+
+    /// After `</tool_call>` the parser waits to see whether a second stanza
+    /// follows, so the bytes that answer "no" arrive while the stanza is still
+    /// open. A `<think>` there used to be split down the middle: `<th` was
+    /// taken as a candidate `<tool_call>` and swallowed into the stanza, and
+    /// `ink>` leaked out as visible text in front of the thought.
+    fn assert_think_after_call(sr: &StreamRenderer<Cap>) {
+        let done = sr.finished();
+        assert_eq!(done.calls.len(), 1, "{:?}", sr.sink.visible);
+        assert_eq!(done.error, None);
+        assert!(
+            !sr.sink.visible.contains("ink>") && !sr.sink.visible.contains("<th"),
+            "think tag leaked: {:?}",
+            sr.sink.visible
+        );
+        assert!(
+            sr.sink.think.contains("I'll run mex"),
+            "thought rendered as thinking: {:?}",
+            sr.sink.think
+        );
+        assert!(
+            sr.sink.visible.contains("Now uploading"),
+            "{:?}",
+            sr.sink.visible
+        );
+    }
+
+    const THINK_AFTER: &str = "<think>I'll run mex</think>Now uploading";
+
+    #[test]
+    fn a_think_right_after_a_call_is_not_split() {
+        let text = format!("{CALL}{THINK_AFTER}");
+        assert_think_after_call(&run(&text));
+    }
+
+    #[test]
+    fn a_think_right_after_a_call_is_not_split_across_chunks() {
+        let text = format!("{CALL}{THINK_AFTER}");
+        let cut = CALL.len() + "<th".len();
+        assert_think_after_call(&run_chunks([&text[..cut], &text[cut..]]));
+    }
+
+    #[test]
+    fn a_think_right_after_a_call_is_not_split_byte_by_byte() {
+        let text = format!("{CALL}\n{THINK_AFTER}");
+        let bytes: Vec<String> = text.chars().map(String::from).collect();
+        assert_think_after_call(&run_chunks(bytes.iter().map(String::as_str)));
+    }
+
+    /// Prose that shares a longer prefix with `<tool_call>` than `<think>`
+    /// does is held until it diverges, then shown whole.
+    #[test]
+    fn prose_resembling_a_second_opener_survives_byte_by_byte() {
+        let text = format!("{CALL}<tool_cab>");
+        let bytes: Vec<String> = text.chars().map(String::from).collect();
+        let sr = run_chunks(bytes.iter().map(String::as_str));
+        assert_eq!(sr.finished().calls.len(), 1);
+        assert!(
+            sr.sink.visible.contains("<tool_cab>"),
+            "{:?}",
+            sr.sink.visible
         );
     }
 }

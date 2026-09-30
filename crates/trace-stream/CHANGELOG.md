@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.6
+
+- A `<think>` right after a Qwen `</tool_call>` is no longer split in two.
+  The run stays open after a stanza in case another `<tool_call>` follows, and
+  the `<th` it shares with that opener was swallowed into the closed stanza,
+  leaving `ink>` as visible text in front of the thought. The renderer now
+  settles the run before the first byte that cannot open another stanza.
+
 ## 0.1.5
 
 - Qwen3.8's tool-call dialect (`<tool_call>` / `<function=…>` /

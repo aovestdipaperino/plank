@@ -102,6 +102,17 @@ impl QwenParser {
         is_partial_prefix(&value[lt..], PARAM_CLOSE)
     }
 
+    /// True between a stanza's `</tool_call>` and whatever follows it, while
+    /// it is still open whether a second `<tool_call>` comes next.
+    ///
+    /// The renderer needs this to hand the answer back: the bytes that rule a
+    /// second stanza out are not the stanza's, and feeding them in here first
+    /// would swallow them (a `<think>` right after a call lost its `<th`).
+    #[must_use]
+    pub fn awaits_another_stanza(&self) -> bool {
+        self.after_call && self.state == DsmlState::Structural
+    }
+
     /// Resets to a fresh parser, discarding all results.
     pub fn reset(&mut self) {
         *self = Self::new();
