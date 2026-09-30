@@ -12,9 +12,28 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-/// One `key: value` line, indented under an entry.
+/// The key column's width: the longest key any row prints (`recommendedModel`,
+/// 16) plus a two-space gutter, so even that key leaves a gap before its value
+/// instead of butting up against the single separating space and reading as
+/// misaligned against the shorter keys around it.
+const KEY_WIDTH: usize = 18;
+
+/// One `key: value` line, indented under an entry. Keys pad to [`KEY_WIDTH`] so
+/// every value starts in the same column.
 fn row(out: &mut String, key: &str, value: &str) {
-    let _ = writeln!(out, "    {key:<16} {value}");
+    let _ = writeln!(out, "    {key:<KEY_WIDTH$} {value}");
+}
+
+/// Resets SGR attributes after a colored span.
+const RESET: &str = "\x1b[0m";
+
+/// The SGR foreground escape for an [`crate::profile::Accent`], so a colored
+/// terminal can render the profile's header in its own accent.
+fn accent_ansi(a: crate::profile::Accent) -> String {
+    match a {
+        crate::profile::Accent::Indexed(i) => format!("\x1b[38;5;{i}m"),
+        crate::profile::Accent::Rgb(r, g, b) => format!("\x1b[38;2;{r};{g};{b}m"),
+    }
 }
 
 /// An [`crate::profile::Accent`] as it would be written in a manifest, so the
@@ -38,8 +57,12 @@ fn accent_text(a: crate::profile::Accent) -> String {
 /// diagnostic, where a directory that is silently not a profile is exactly
 /// what the user is trying to understand. Such a directory is reported with
 /// the reason instead of being skipped.
+///
+/// `color` enables ANSI: the header (name and version) is painted in the
+/// profile's accent when it declares one. The caller passes whether stdout is a
+/// terminal, so a redirected dump stays plain text.
 #[must_use]
-pub fn render_profiles_in(home: &Path) -> String {
+pub fn render_profiles_in(home: &Path, color: bool) -> String {
     let mut out = String::new();
     let dir = crate::profiles::dir(home);
     let _ = writeln!(out, "profiles in {}", dir.display());
@@ -67,86 +90,105 @@ pub fn render_profiles_in(home: &Path) -> String {
     }
 
     for path in dirs {
-        let _ = writeln!(out);
-        let name = path
-            .file_name()
-            .map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned());
-        let version = crate::profiles::version_of(&path).unwrap_or_else(|| "-".to_string());
-        let _ = writeln!(out, "  {name}  v{version}");
-
-        let Some((manifest, root)) = read_manifest(&path) else {
-            row(&mut out, "error", "no readable plugin.json");
-            continue;
-        };
-        let Some(spec) = crate::profile::parse(&manifest, &root) else {
-            // A `profile` block without `systemPrompt` is a skin, not a
-            // profile, and is deliberately not activatable. Say so rather than
-            // printing nothing.
-            row(&mut out, "error", "no profile block, or no systemPrompt");
-            continue;
-        };
-
-        if let Some(d) = &spec.display_name {
-            row(&mut out, "displayName", d);
-        }
-        row(
-            &mut out,
-            "systemPrompt",
-            &spec.system_prompt.display().to_string(),
-        );
-        row(
-            &mut out,
-            "accent",
-            &spec
-                .accent
-                .map_or_else(|| "(default green)".to_string(), accent_text),
-        );
-        row(
-            &mut out,
-            "secondary",
-            &spec.secondary.map_or_else(
-                || {
-                    if spec.accent.is_some() {
-                        "(derived from accent)".to_string()
-                    } else {
-                        "(built-in ramp)".to_string()
-                    }
-                },
-                accent_text,
-            ),
-        );
-        if let Some(l) = &spec.logo {
-            row(&mut out, "logo", &l.display().to_string());
-        }
-        row(&mut out, "folderContext", &spec.folder_context.to_string());
-        row(&mut out, "agentsMd", &spec.agents_md.to_string());
-        if let Some(m) = &spec.recommended_model {
-            row(&mut out, "recommendedModel", m);
-        }
-        row(
-            &mut out,
-            "tools.builtin",
-            &spec
-                .builtin_tools
-                .as_ref()
-                .map_or_else(|| "(all)".to_string(), |t| t.join(", ")),
-        );
-        if !spec.grids.is_empty() {
-            let grids: Vec<String> = spec
-                .grids
-                .iter()
-                .map(|(server, id)| format!("{server} -> {id}"))
-                .collect();
-            row(&mut out, "grids", &grids.join(", "));
-        }
-        if let Some(source) = read_source(&path) {
-            row(&mut out, "source", &source);
-        }
-        for w in &spec.warnings {
-            row(&mut out, "warning", w);
-        }
+        render_one_profile(&mut out, &path, color);
     }
     out
+}
+
+/// Renders one profile directory: a blank line, the accent-painted header, and
+/// either the field rows or the reason the directory is not an activatable
+/// profile. Split from [`render_profiles_in`] so the per-profile body stays one
+/// readable unit rather than a loop long enough to lint.
+fn render_one_profile(out: &mut String, path: &Path, color: bool) {
+    let _ = writeln!(out);
+    let name = path
+        .file_name()
+        .map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned());
+    let version = crate::profiles::version_of(path).unwrap_or_else(|| "-".to_string());
+
+    // Parse before printing the header, so it can be painted in the profile's
+    // own accent. The manifest is read once; its error cases are still reported
+    // below, after the header, exactly as before.
+    let manifest = read_manifest(path);
+    let spec = manifest
+        .as_ref()
+        .and_then(|(text, root)| crate::profile::parse(text, root));
+    let header = format!("  {name}  v{version}");
+    match spec.as_ref().and_then(|s| s.accent).filter(|_| color) {
+        Some(accent) => {
+            let _ = writeln!(out, "{}{header}{RESET}", accent_ansi(accent));
+        }
+        None => {
+            let _ = writeln!(out, "{header}");
+        }
+    }
+
+    if manifest.is_none() {
+        row(out, "error", "no readable plugin.json");
+        return;
+    }
+    let Some(spec) = spec else {
+        // A `profile` block without `systemPrompt` is a skin, not a profile, and
+        // is deliberately not activatable. Say so rather than printing nothing.
+        row(out, "error", "no profile block, or no systemPrompt");
+        return;
+    };
+
+    if let Some(d) = &spec.display_name {
+        row(out, "displayName", d);
+    }
+    row(out, "systemPrompt", &spec.system_prompt.display().to_string());
+    row(
+        out,
+        "accent",
+        &spec
+            .accent
+            .map_or_else(|| "(default green)".to_string(), accent_text),
+    );
+    row(
+        out,
+        "secondary",
+        &spec.secondary.map_or_else(
+            || {
+                if spec.accent.is_some() {
+                    "(derived from accent)".to_string()
+                } else {
+                    "(built-in ramp)".to_string()
+                }
+            },
+            accent_text,
+        ),
+    );
+    if let Some(l) = &spec.logo {
+        row(out, "logo", &l.display().to_string());
+    }
+    row(out, "folderContext", &spec.folder_context.to_string());
+    row(out, "agentsMd", &spec.agents_md.to_string());
+    if let Some(m) = &spec.recommended_model {
+        row(out, "recommendedModel", m);
+    }
+    row(
+        out,
+        "tools.builtin",
+        &spec
+            .builtin_tools
+            .as_ref()
+            .map_or_else(|| "(all)".to_string(), |t| t.join(", ")),
+    );
+    if !spec.grids.is_empty() {
+        let grids: Vec<String> = spec
+            .grids
+            .iter()
+            .map(|(server, id)| format!("{server} -> {id}"))
+            .collect();
+        row(out, "grids", &grids.join(", "));
+    }
+    if let Some(source) = read_source(path) {
+        row(out, "source", &source);
+    }
+    for w in &spec.warnings {
+        row(out, "warning", w);
+    }
 }
 
 /// A profile directory's manifest text and the root its paths resolve against.
@@ -277,7 +319,7 @@ mod tests {
     #[test]
     fn an_empty_profiles_dir_says_so_rather_than_printing_nothing() {
         let tmp = temp_root();
-        let out = render_profiles_in(tmp.as_path());
+        let out = render_profiles_in(tmp.as_path(), false);
         assert!(out.contains("(none installed)"), "{out}");
     }
 
@@ -291,11 +333,76 @@ mod tests {
                 "displayName":"HAL","systemPrompt":"prompt.md",
                 "accent":"#ffffff","secondary":"#d0021b"}}"##,
         );
-        let out = render_profiles_in(tmp.as_path());
+        let out = render_profiles_in(tmp.as_path(), false);
         assert!(out.contains("hal  v0.3.3"), "{out}");
         assert!(out.contains("HAL"), "{out}");
         assert!(out.contains("#ffffff"), "{out}");
         assert!(out.contains("#d0021b"), "{out}");
+    }
+
+    #[test]
+    fn the_header_wears_the_accent_only_when_color_is_on() {
+        let tmp = temp_root();
+        profile(
+            tmp.as_path(),
+            "red",
+            r##"{"name":"red","version":"1.2.3","profile":{
+                "systemPrompt":"p.md","accent":"#ff2b2b"}}"##,
+        );
+        // Colored: the header sits inside the accent's truecolor escape, then a
+        // reset. The name and version stay intact inside the span.
+        let colored = render_profiles_in(tmp.as_path(), true);
+        assert!(
+            colored.contains("\x1b[38;2;255;43;43m  red  v1.2.3\x1b[0m"),
+            "{colored:?}"
+        );
+        // Plain: no escapes at all, whatever the accent.
+        let plain = render_profiles_in(tmp.as_path(), false);
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+        assert!(plain.contains("  red  v1.2.3"), "{plain}");
+    }
+
+    #[test]
+    fn a_header_without_an_accent_is_never_colored() {
+        let tmp = temp_root();
+        profile(
+            tmp.as_path(),
+            "plainprofile",
+            r#"{"name":"plainprofile","profile":{"systemPrompt":"p.md"}}"#,
+        );
+        // Color is on, but with no accent declared there is nothing to paint.
+        let out = render_profiles_in(tmp.as_path(), true);
+        assert!(!out.contains('\x1b'), "{out:?}");
+    }
+
+    #[test]
+    fn every_value_starts_in_the_same_column_even_after_the_longest_key() {
+        let tmp = temp_root();
+        profile(
+            tmp.as_path(),
+            "wide",
+            r#"{"name":"wide","profile":{"systemPrompt":"p.md",
+                "displayName":"Wide","recommendedModel":"some-engine"}}"#,
+        );
+        let out = render_profiles_in(tmp.as_path(), false);
+        // The column where a value begins: index of the value after the key
+        // pad. `recommendedModel` is the longest key any row prints, so if it
+        // aligns with a short key like `displayName`, every row does.
+        let value_col = |key: &str| {
+            let line = out
+                .lines()
+                .find(|l| l.trim_start().starts_with(key))
+                .unwrap_or_else(|| panic!("no {key} row in\n{out}"));
+            let after = &line[line.find(key).unwrap() + key.len()..];
+            let spaces = after.len() - after.trim_start().len();
+            (line.find(key).unwrap() + key.len() + spaces, spaces)
+        };
+        let (short_col, _) = value_col("displayName");
+        let (long_col, long_gutter) = value_col("recommendedModel");
+        assert_eq!(short_col, long_col, "values misaligned:\n{out}");
+        // The longest key must still leave a gutter, not butt up against its
+        // value with the single separating space.
+        assert!(long_gutter >= 2, "longest key has no gutter:\n{out}");
     }
 
     #[test]
@@ -311,7 +418,7 @@ mod tests {
             "plain",
             r#"{"name":"plain","profile":{"systemPrompt":"p.md"}}"#,
         );
-        let out = render_profiles_in(tmp.as_path());
+        let out = render_profiles_in(tmp.as_path(), false);
         // The distinction the flag exists to make visible: an accent alone
         // derives its far end, nothing declared keeps the built-in ramp.
         assert!(out.contains("(derived from accent)"), "{out}");
@@ -328,7 +435,7 @@ mod tests {
             "real",
             r#"{"name":"real","profile":{"systemPrompt":"p.md"}}"#,
         );
-        let out = render_profiles_in(tmp.as_path());
+        let out = render_profiles_in(tmp.as_path(), false);
         assert!(out.contains("real"), "{out}");
         assert!(!out.contains(".replacing"), "{out}");
     }
@@ -341,7 +448,7 @@ mod tests {
             "skin",
             r#"{"name":"skin","profile":{"accent":"160"}}"#,
         );
-        let out = render_profiles_in(tmp.as_path());
+        let out = render_profiles_in(tmp.as_path(), false);
         assert!(out.contains("skin"), "{out}");
         assert!(
             out.contains("no profile block, or no systemPrompt"),
@@ -357,7 +464,7 @@ mod tests {
             "typo",
             r#"{"name":"typo","profile":{"systemPrompt":"p.md","secondary":"chartreuse"}}"#,
         );
-        let out = render_profiles_in(tmp.as_path());
+        let out = render_profiles_in(tmp.as_path(), false);
         assert!(out.contains("warning"), "{out}");
         assert!(out.contains("secondary"), "{out}");
     }

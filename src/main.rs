@@ -588,7 +588,10 @@ fn post_cfg_early_exit(
         // where `engines::load_in` takes `~/.plank` itself. Handing either one
         // the other's root silently reads an empty directory.
         match home_dir() {
-            Some(home) => print!("{}", plank::dump::render_profiles_in(&home)),
+            Some(home) => print!(
+                "{}",
+                plank::dump::render_profiles_in(&home, std::io::stdout().is_terminal())
+            ),
             None => eprintln!("plank: no home directory; cannot list profiles"),
         }
         return Some(ExitCode::SUCCESS);
