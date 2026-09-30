@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The spinner verb's animation now follows the phase, not just its wording.**
+  Prefill sweeps fast and left-to-right, generation and thinking keep the
+  established slow right-to-left sweep, and a running tool stops the travel
+  altogether: the whole word pulses on a two-second sine, because a dispatch
+  produces nothing token by token and nothing should look like it is moving
+  along the text. Reduced motion holds the verb at its resting colour.
+
 ## [6.1.2] - 2026-09-28
 
 ### Added

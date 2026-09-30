@@ -616,7 +616,16 @@ started under and refuses to resume it under another.
   readout appends `~<eta> left` from `prefill_eta` once the rate is known and
   tokens remain, so it never shows a bogus `~0s left`). Also owns
   the rotating status-bar tips (`TIPS`/`rotating_tip`), shown in yellow at the
-  tail of the bar and advanced off the animation clock. The git diff stat
+  tail of the bar and advanced off the animation clock. The verb's effect is
+  chosen by `status::verb_anim` from the phase that `status::prefill_label`
+  publishes through `publish_verb_phase` into a process-global and that
+  `status::current_verb_phase` reads back at paint time. It is published rather
+  than passed because by the time the renderer sees the verb it is a formatted
+  string inside a larger line, and threading the phase would touch every
+  `progress_line` caller in `ui.rs` to deliver something the renderer can simply
+  read. `tui::push_shimmered` branches on the resulting `anim::VerbAnim`: the
+  sweep walks the ramp column by column, the flash paints one span. The
+  running-tool label keeps the ordinary sweep whatever the verb does. The git diff stat
   (`+N -M`) uses `git2`'s tree-to-workdir-with-index diff. libgit2 treats
   untracked files as binary blobs, so `DiffStats::insertions` reports 0 lines
   for them; `diff_stats` manually counts lines in each `Delta::Untracked` file
