@@ -625,7 +625,11 @@ started under and refuses to resume it under another.
   `progress_line` caller in `ui.rs` to deliver something the renderer can simply
   read. `tui::push_shimmered` branches on the resulting `anim::VerbAnim`: the
   sweep walks the ramp column by column, the flash paints one span. The
-  running-tool label keeps the ordinary sweep whatever the verb does. The git diff stat
+  running-tool label keeps the ordinary sweep whatever the verb does, and
+  reduced motion renders both effects flat, since a sweep's resting position
+  clears the word by one column while the highlight is two columns wide.
+
+  The git diff stat
   (`+N -M`) uses `git2`'s tree-to-workdir-with-index diff. libgit2 treats
   untracked files as binary blobs, so `DiffStats::insertions` reports 0 lines
   for them; `diff_stats` manually counts lines in each `Delta::Untracked` file

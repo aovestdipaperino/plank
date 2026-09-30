@@ -5446,6 +5446,21 @@ fn push_shimmered(
         return;
     }
 
+    // A sweep's resting position clears the text by `SWEEP_HALF` (1) column,
+    // but this highlight is `ramp.len() - 1` (2) columns wide either side, so a
+    // frozen clock parks it *touching* the word and leaves an edge character
+    // tinted. Reduced motion therefore renders flat here too, the same as the
+    // flash arm above, rather than relying on the rest position to be clear.
+    if crate::anim::reduced_motion() {
+        spans.push(Span::styled(word.to_string(), theme));
+        return;
+    }
+
+    let crate::anim::VerbAnim::Sweep { reverse, step_ms } = anim else {
+        // The flash returned above; this makes the arm structurally impossible
+        // rather than guarding it with a sentinel the loop would overflow on.
+        return;
+    };
     let half = i64::try_from(ramp.len().saturating_sub(1)).unwrap_or(0);
     let width = word.chars().count();
     // `sweep_window` supplies only the centre and the direction. Its own
@@ -5453,13 +5468,7 @@ fn push_shimmered(
     // deep (`ramp.len() - 1`, i.e. 2 either side), so the window's extent is
     // recovered from its centre rather than used directly, and
     // `sweep_contains` is deliberately not called.
-    let (lo, hi) = match anim {
-        crate::anim::VerbAnim::Sweep { reverse, step_ms } => {
-            crate::anim::sweep_window(width, tick_ms, step_ms, 20, reverse)
-        }
-        // Handled above by the early return.
-        crate::anim::VerbAnim::Flash { .. } => (i64::MIN, i64::MIN),
-    };
+    let (lo, hi) = crate::anim::sweep_window(width, tick_ms, step_ms, 20, reverse);
     let center = i64::midpoint(lo, hi);
     // One shade per column, then coalesce equal-styled neighbours so a sweep
     // costs a handful of spans rather than one per character.
@@ -10517,6 +10526,45 @@ mod tests {
     // During a tool dispatch the verb does not sweep: every column takes the
     // same colour and the whole word pulses together. A regression to the
     // sweep shows up here as more than one distinct foreground on the word.
+    // Reduced motion must leave the verb completely still. The sweep's resting
+    // position is only one column clear of the text while the highlight is two
+    // columns wide either side, so a frozen clock would otherwise leave the
+    // word's first or last character permanently tinted: a stuck highlight
+    // rather than a still word, and exactly what someone who turns motion off
+    // is trying to get rid of.
+    #[test]
+    fn a_frozen_sweep_leaves_the_word_completely_flat() {
+        let _motion = crate::anim::reduced_motion_test_guard();
+        let base = Style::default();
+        let theme = base.add_modifier(Modifier::BOLD);
+        crate::anim::set_reduced_motion(true);
+        for anim in [
+            crate::anim::VerbAnim::Sweep {
+                reverse: false,
+                step_ms: crate::anim::SWEEP_SLOW_MS,
+            },
+            crate::anim::VerbAnim::Sweep {
+                reverse: true,
+                step_ms: crate::anim::SWEEP_FAST_MS,
+            },
+        ] {
+            let mut spans = Vec::new();
+            push_shimmered(&mut spans, "Pondering", 0, theme, None, anim);
+            assert_eq!(
+                spans.len(),
+                1,
+                "a still verb is one span, not a word with a tinted edge: {spans:?}"
+            );
+            for shade in crate::status::SHIMMER_RAMP {
+                assert_ne!(
+                    spans[0].style.fg,
+                    Some(Color::Indexed(shade)),
+                    "the frozen verb is wearing a sweep shade"
+                );
+            }
+        }
+    }
+
     #[test]
     fn verb_flash_paints_the_whole_word_one_colour() {
         let _guard = crate::anim::reduced_motion_test_guard();
