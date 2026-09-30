@@ -10,7 +10,9 @@ it.
 
 ## In the betas
 
-Riding ahead of stable 6.1.0 in the 6.1.2 beta. Install with `brew install
+The beta channel has just restarted at 6.2.1, whose code is identical to
+stable 6.2.0, so nothing is riding ahead of stable right now. Everything the
+6.1.x betas below carried is in 6.2.0. Install with `brew install
 aovestdipaperino/tap/plank-agent-beta`.
 
 ### 6.1.2
@@ -189,6 +191,48 @@ own line while the agent works. If you never want the AGENTS.md offer in a
 folder, "Don't ask for this folder" now records that.
 
 ## Stable releases
+
+### 6.2.0
+
+**A tool call can open a real editor and wait for it.** Until now a WASM
+component could draw a screen, but nothing could hand it the session in the
+middle of a tool dispatch and get it back afterwards. It can now: the component
+takes over the TUI modally, the way the `ask` panel does, and the tool call
+reports what happened in its own result rather than through a notice that
+arrives later. That is what makes the next two things possible.
+
+**`edit_csv` opens a spreadsheet you actually edit.** The model names a file,
+you get a real table with column separators, and the tool learns what changed
+from the counts rather than from a description. A row delete asks first.
+
+**Grids: an MCP server's data, edited and written back.** A profile can route a
+server's frame resources to a component. plank strips them out before the model
+sees them, stages them, opens the editor, and writes what you saved back to the
+server itself, keeping each grid's shape and name across the round trip.
+
+**The spinner verb's animation follows what plank is doing.** It used to sweep
+the same way whatever was happening. Now prefill sweeps fast and
+left-to-right, generation and thinking keep the familiar slower right-to-left
+sweep, and while a tool runs the verb stops travelling altogether and pulses as
+a whole, because a tool dispatch produces nothing token by token and nothing
+should look like it is moving along the text.
+
+**The window title says READY with a blinking cursor.** The log icon is gone
+and the idle title ends in a block blinking at the Commodore 64's rate, 400ms
+on, 400ms off. Both the idle and the loading title carry the running profile's
+name, so a profile no longer loads as itself and then goes ready as Plank.
+
+**Memory is filed per profile**, a profile's shimmer sweeps toward its own
+colours rather than always toward plank's green, and a profile's bundled
+component is offered for trust once at launch instead of needing a typed
+command.
+
+**Report panels scroll with the wheel and the arrows.** The `!!` output panel
+and every other report answered only PageUp and PageDown; a wheel gesture was
+scrolling the output log hidden behind the panel, so nothing visible moved.
+
+This release also promotes everything that shipped in the 6.1.x betas,
+including the GPU hand-off through pipes and `suspend_model`.
 
 ### 6.1.0
 

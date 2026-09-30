@@ -6,6 +6,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [6.2.0] - 2026-09-30
+
+The blocking-frame release: a WASM component can now take over the screen
+inside a tool call, edit something, and hand the session back, which is what
+turns a spreadsheet into something the user edits rather than something the
+model describes.
+
+### Added
+
+- **A tool call can open a real editor and wait for it.** A WASM component with
+  a `frame` surface can borrow the whole TUI from inside a tool dispatch, run
+  modally like the `ask` panel, and give the session back when it closes. The
+  call reports what happened in its own result rather than through a deferred
+  notice, so the model learns the outcome at the point it asked. Refusals are
+  explicit: outside the TUI, inside a sub-agent, on a remote-driven turn, with
+  another editor already open, or when the component is not loaded, has no
+  `frame` surface, is a screensaver, or lacks the `fs` grant.
+- **`edit_csv`, which opens a CSV for the user and reports what changed.**
+  Behind the `files` capability: the model names a file, the user edits it in a
+  real table with column separators, and the tool result carries the counts. A
+  bridged row delete asks first, and a rewrite that changes no rows says so
+  rather than reading as no change at all.
+- **Grids: an MCP server's data, edited in a frame and written back.** A
+  profile may route a server's `plank-frame://` resources to a component. Plank
+  strips them out before the model sees them, stages them on the component's
+  RAM disk, opens the frame, and writes the saved result back to the server
+  itself. Grids keep their shape and their name across the round trip.
+- **A profile's bundled components are offered for trust at launch.** Only the
+  running profile's own component, and only when new, changed or widened: a Not
+  now / Trust panel in the TUI, `[y/N]` on a terminal stdin. Every other
+  component still waits for a typed `/plugins trust <id>`.
+- **Per-profile memory.** Memory is filed against the running profile instead
+  of everything landing in one global pile.
+- **A tool component can edit the one file a call names**, behind the `files`
+  grant, with containment re-checked immediately before the write rather than
+  only before the edit.
+- **`--dump-profiles` and `--dump-engines`**, which print what plank resolved.
+- **`--fake-gpu`**, which reproduces the GPU-yield KV-cache behaviour without a
+  model, keying its fake checkpoints in their own namespace so a real cache is
+  never touched.
+
 ### Changed
 
 - **The spinner verb's animation now follows the phase, not just its wording.**
@@ -14,6 +55,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   altogether: the whole word pulses on a two-second sine, because a dispatch
   produces nothing token by token and nothing should look like it is moving
   along the text. Reduced motion holds the verb at its resting colour.
+- **The idle window title ends in a blinking block.** `Plank - READY` followed
+  by a cursor blinking at the Commodore 64's own rate: its KERNAL inverted the
+  cursor every 20 frames, 400ms on a PAL machine. The log icon is gone, and
+  both the idle and the launch title take the running profile's name, so a
+  profile no longer loads as itself and goes ready as Plank. Reduced motion
+  holds the block lit.
+- **The masthead names the running model.**
+- **A profile's shimmer sweeps toward its own secondary colour**, so a profile
+  with a red accent no longer shimmers green. The accent is the colour that
+  travels and the secondary is what it travels over; chatbgt takes a white
+  accent with its blue as the shimmer.
+- **A remote is told its lines are waiting** while a frame is open, instead of
+  them queueing silently.
+
+### Fixed
+
+- **The report panel scrolls with the wheel and the arrows.** The `!!` output
+  panel, and every other report panel, only ever answered PageUp/PageDown: the
+  wheel handlers carried no guard for an open panel, so a wheel gesture scrolled
+  the output log hidden behind it and nothing visible moved.
+- **Reduced motion leaves the verb completely still.** The sweep rests its
+  highlight one column clear of the word while the highlight is two columns
+  wide, so a frozen clock left the first or last character permanently tinted.
+- **A grid never opens over, or is replaced under, an open frame**, its notice
+  comes before the next prompt, and the write-back never freezes the UI.
+- **A refused `edit_csv` directive no longer leaks into a later open**, and the
+  summary's cost is bounded and gated to tool-invoked edits.
+- **`call_tool_direct` reaches a write-back tool the server hides.**
+- **The running profile's bundled component beats a scanned plugin** of the
+  same id.
+- **The input ghost stays lit over a memory pass**, background jobs get one
+  console window each, and the clock stays live while a tool runs.
+- **No dead quit path**, `/btw` waits out a write-back, and notices lead the
+  whole prompt run.
+- **Remote slash commands refuse editors too**, and there is no spin after a
+  give-back.
+- **A trapping `tool_resume` goes to the error log rather than stderr**, and
+  its trap log is hermetic.
+- **The temp-file symlink hole in the `files` grant is closed**, and `files` is
+  wired rather than unwired.
 
 ## [6.1.2] - 2026-09-28
 

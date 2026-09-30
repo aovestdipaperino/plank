@@ -7,9 +7,41 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v6.1.0 is out**, and the beta channel is on 6.1.2. Most of it is about how
-plank finds its models, plus a way to lend the GPU to other tools, which works
-end to end from the 6.1.2 beta with `mex` 0.2.4.
+**v6.2.0 is out.** Its centrepiece is that a tool call can now hand you a real
+editor and wait: a WASM component takes over the screen from inside the
+dispatch, modally, the way the `ask` panel does, and the call reports what
+happened in its own result instead of leaving a notice for later. Everything
+below follows from that.
+
+**`edit_csv` opens a spreadsheet you actually edit.** The model names a file,
+you get a real table with column separators, and the tool learns what changed
+from the counts rather than from a description. Deleting a row asks first.
+
+**Grids put an MCP server's data in that editor.** A profile can route a
+server's frame resources to a component: plank strips them out before the model
+sees them, stages them, opens the editor, and writes what you saved back to the
+server, keeping each grid's shape and name across the round trip.
+
+**The spinner verb animates by what plank is doing.** It used to sweep the same
+way whatever was happening. Now prefill sweeps fast and left-to-right,
+generation and thinking keep the familiar slower right-to-left sweep, and while
+a tool runs the verb stops travelling and pulses as a whole, because a tool
+dispatch produces nothing token by token and nothing should look like it is
+moving along the text.
+
+**The window title says `READY` with a blinking block**, at the Commodore 64's
+own cursor rate. The log icon is gone, and both the idle and the loading title
+carry the running profile's name, so a profile no longer loads as itself and
+then goes ready as Plank.
+
+Memory is filed per profile now, a profile's shimmer sweeps toward its own
+colours instead of plank's green, a profile's bundled component is offered for
+trust once at launch, and report panels finally scroll with the wheel and the
+arrows rather than only PageUp and PageDown.
+
+Everything the 6.1.x betas carried is in this release too, including the GPU
+hand-off through pipes and `suspend_model`. The beta channel restarts at
+6.2.1 with the same code.
 
 **Models are named engines now.** Plank used to know its three model sets by
 hard-coded file names. It now reads an `engines.json` catalog, where each
