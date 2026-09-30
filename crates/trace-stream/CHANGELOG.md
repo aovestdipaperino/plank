@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7
+
+- A `</think>` quoted in backticks inside a thought no longer ends it. Both
+  `StreamRenderer` and `TokenRenderer` took the quoted tag for the control
+  token, so it vanished and the rest of the thought rendered as answer text.
+  Inline code spans are now tracked while thinking; a span ends at its line,
+  so an unmatched backtick cannot hold the thought open past the real close.
+
 ## 0.1.6
 
 - A `<think>` right after a Qwen `</tool_call>` is no longer split in two.

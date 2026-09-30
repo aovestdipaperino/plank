@@ -1371,6 +1371,7 @@ pub struct TokenRenderer<W: Write> {
     capture: Option<TailCapture>,
 
     in_think: bool,
+    think_span: ThinkCodeSpan,
     color_open: bool,
     last_output_newline: bool,
     wrote_visible_output: bool,
@@ -1425,6 +1426,7 @@ impl<W: Write> TokenRenderer<W> {
             opts,
             capture: None,
             in_think: false,
+            think_span: ThinkCodeSpan::default(),
             color_open: false,
             last_output_newline: false,
             wrote_visible_output: false,
@@ -1476,6 +1478,9 @@ impl<W: Write> TokenRenderer<W> {
 
     /// Sets thinking mode: grey text, markdown disabled.
     pub fn set_in_think(&mut self, in_think: bool) {
+        if in_think != self.in_think {
+            self.think_span.reset();
+        }
         self.in_think = in_think;
     }
 
@@ -2179,12 +2184,14 @@ impl<W: Write> TokenRenderer<W> {
         let mut i = 0;
         while i < buf.len() {
             let cur = &buf[i..];
-            if cur.starts_with(THINK_OPEN) {
+            let quoted = self.in_think && self.think_span.quoted();
+            if !quoted && cur.starts_with(THINK_OPEN) {
                 self.in_think = true;
+                self.think_span.reset();
                 i += THINK_OPEN.len();
                 continue;
             }
-            if cur.starts_with(THINK_CLOSE) {
+            if !quoted && cur.starts_with(THINK_CLOSE) {
                 self.in_think = false;
                 self.reset_color();
                 if !self.last_output_newline {
@@ -2196,14 +2203,70 @@ impl<W: Write> TokenRenderer<W> {
                 continue;
             }
             if !finish
+                && !quoted
                 && cur[0] == b'<'
                 && (is_partial_prefix(cur, THINK_OPEN) || is_partial_prefix(cur, THINK_CLOSE))
             {
                 self.pending = cur.to_vec();
                 return;
             }
+            if self.in_think {
+                self.think_span.feed(cur[0]);
+            }
             self.write_char(cur[0]);
             i += 1;
+        }
+    }
+}
+
+/// Tracks inline code spans in thinking text, so a `</think>` the model quotes
+/// in backticks reads as what it is (a mention of the tag) instead of ending
+/// the thought and spilling the rest of it into the answer.
+///
+/// Only single and double backtick spans count; a fence run (three or more)
+/// is left alone. A span never outlives its line, so an unmatched backtick
+/// cannot hold the thought open past the next newline.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ThinkCodeSpan {
+    /// Length of the backtick run being read, not yet settled.
+    run: usize,
+    /// Length of the run that opened the current span; 0 outside one.
+    open: usize,
+}
+
+impl ThinkCodeSpan {
+    /// Notes one byte of thinking text.
+    pub(crate) fn feed(&mut self, c: u8) {
+        if c == b'`' {
+            self.run += 1;
+            return;
+        }
+        self.settle();
+        if c == b'\n' {
+            self.open = 0;
+        }
+    }
+
+    /// Whether the next byte sits inside a code span.
+    pub(crate) fn quoted(self) -> bool {
+        let mut s = self;
+        s.settle();
+        s.open != 0
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn settle(&mut self) {
+        let run = std::mem::take(&mut self.run);
+        if run == 0 || run >= 3 {
+            return;
+        }
+        if self.open == 0 {
+            self.open = run;
+        } else if self.open == run {
+            self.open = 0;
         }
     }
 }
@@ -2266,6 +2329,25 @@ mod tests {
         // Neutered, not swallowed: the payload stays readable as plain text.
         assert!(out.contains("before") && out.contains("after"));
         assert!(out.contains("banner "));
+    }
+
+    #[test]
+    fn think_close_quoted_in_backticks_stays_thinking_text() {
+        let mut r = renderer(RenderOptions {
+            use_color: false,
+            format_thinking: true,
+            format_markdown: true,
+        });
+        r.set_in_think(true);
+        r.write("handles `</think>` inside values");
+        r.set_in_think(false);
+        r.write("\nanswer");
+        r.finish();
+        let out = output(r);
+        assert!(
+            out.starts_with("handles `</think>` inside values\nanswer"),
+            "{out:?}"
+        );
     }
 
     #[test]

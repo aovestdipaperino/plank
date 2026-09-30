@@ -18,6 +18,7 @@ use crate::dsml::{
     DsmlParser, DsmlState, MARKER_NAMES, ToolCall, tag_prefix_len, tag_prefix_partial,
 };
 use crate::qwen::QwenParser;
+use crate::render::ThinkCodeSpan;
 use crate::syntax::{DsmlTags, ToolSyntax};
 
 /// Told to the model when it emitted a tool call inside `<think>`.
@@ -934,6 +935,9 @@ pub struct StreamRenderer<S> {
     viz: ToolViz,
     scan: DsmlScan,
     in_think: bool,
+    /// Inline code spans in the current thought; a `</think>` inside one is
+    /// quoted text, not the control token.
+    think_span: ThinkCodeSpan,
     dsml_active: bool,
     dsml_ignored: bool,
     /// Held-back bytes that may begin `<think>` / `</think>`.
@@ -1060,6 +1064,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             viz: ToolViz::default(),
             scan: DsmlScan::Between,
             in_think: false,
+            think_span: ThinkCodeSpan::default(),
             freeze_on_error: false,
             dsml_active: false,
             dsml_ignored: false,
@@ -1208,6 +1213,7 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// opening tag of its own.
     pub fn begin_in_think(&mut self) {
         self.in_think = true;
+        self.think_span.reset();
         self.think_status_reset();
     }
 
@@ -2596,10 +2602,12 @@ impl<S: RenderSink> StreamRenderer<S> {
                 self.settle_parser_state();
                 continue;
             }
-            if !self.dsml_active && rem.starts_with(THINK_OPEN) {
+            let quoted = self.in_think && !self.dsml_active && self.think_span.quoted();
+            if !self.dsml_active && !quoted && rem.starts_with(THINK_OPEN) {
                 self.flush_start_tail();
                 self.post_think_gap = false;
                 self.in_think = true;
+                self.think_span.reset();
                 self.think_status_reset();
                 // The plain-DSML tail is not fed while thinking, so bytes from
                 // before the block must not glue onto bytes from after it and
@@ -2608,7 +2616,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                 i += THINK_OPEN.len();
                 continue;
             }
-            if rem.starts_with(THINK_CLOSE) && self.think_close_is_control() {
+            if !quoted && rem.starts_with(THINK_CLOSE) && self.think_close_is_control() {
                 if self.dsml_active {
                     // The model closed its thought part-way through a stanza.
                     // `</think>` is a control token, never stanza content, so
@@ -2635,7 +2643,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                 i += THINK_CLOSE.len();
                 continue;
             }
-            if rem.starts_with(THINK_CLOSE) {
+            if !quoted && rem.starts_with(THINK_CLOSE) {
                 // Not a control token here (the branch above owns that case):
                 // it is inside a parameter value and is about to be fed to the
                 // parser as content. Remember it, in case the stanza never
@@ -2643,6 +2651,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                 self.think_close_swallowed = true;
             }
             if !finish
+                && !quoted
                 && rem[0] == b'<'
                 && self.think_close_is_control()
                 && (is_partial_prefix(rem, THINK_OPEN) || is_partial_prefix(rem, THINK_CLOSE))
@@ -2655,6 +2664,9 @@ impl<S: RenderSink> StreamRenderer<S> {
             if self.dsml_active {
                 self.feed_dsml_byte(c);
             } else {
+                if self.in_think {
+                    self.think_span.feed(c);
+                }
                 // In-think bytes still flow through the DSML start detector so
                 // an accidental in-think tool stanza is suppressed cleanly.
                 self.normal_byte(c);
@@ -3742,6 +3754,52 @@ mod tests {
             Some("close it with </think> when done")
         );
         assert!(fin.error.is_none(), "{:?}", fin.error);
+    }
+
+    /// A thought that quotes the tag in backticks is talking about it, not
+    /// ending: the quoted `</think>` stays thinking text and the block closes
+    /// at the real token. Fed a byte at a time too, since the span state has
+    /// to survive a tag held back across chunks.
+    #[test]
+    fn think_close_quoted_in_backticks_inside_think_is_text() {
+        let text = "<think>the parser handles `</think>` inside values.\nmore</think>answer";
+        for chunked in [false, true] {
+            let mut sr = StreamRenderer::new(Cap::default());
+            if chunked {
+                for ch in text.chars() {
+                    sr.push(ch.to_string());
+                }
+            } else {
+                sr.push(text);
+            }
+            sr.finish();
+            let cap = sr.sink();
+            assert!(
+                cap.think
+                    .contains("handles `</think>` inside values.\nmore"),
+                "chunked={chunked}: {:?}",
+                cap.think
+            );
+            assert!(!cap.visible.contains("inside"), "{:?}", cap.visible);
+            assert!(cap.visible.contains("answer"), "{:?}", cap.visible);
+        }
+    }
+
+    /// An unmatched backtick cannot hold the thought open past its line: the
+    /// span ends at the newline, so the real `</think>` still closes it.
+    #[test]
+    fn unmatched_backtick_in_think_does_not_swallow_the_close() {
+        let sr = run_chunked("<think>a stray ` here\n</think>answer");
+        assert!(
+            sr.sink().visible.contains("answer"),
+            "{:?}",
+            sr.sink().visible
+        );
+        assert!(
+            !sr.sink().think.contains("</think>"),
+            "{:?}",
+            sr.sink().think
+        );
     }
 
     /// A stanza that both opens and closes inside thinking is still rejected —
