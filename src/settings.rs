@@ -2508,6 +2508,8 @@ mod tests {
         // are now the one choke point, mirroring `reducedMotion`.
         use crate::notify::{self, NotifyMode};
 
+        let _motion = crate::anim::reduced_motion_test_guard();
+
         let mut s = Settings::default();
         s.ui.notifications = NotifyMode::Never;
         install(s);

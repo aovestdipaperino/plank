@@ -43,6 +43,36 @@ pub fn set_reduced_motion(on: bool) {
     REDUCED_MOTION.store(on, Ordering::Relaxed);
 }
 
+/// Serialises the tests that flip the process-global reduced-motion flag.
+///
+/// `cargo test` runs the suite in parallel and [`set_reduced_motion`] is
+/// process-wide, so without this two tests can observe each other's flag.
+/// Mirrors `crate::status::origin_test_guard`.
+#[cfg(test)]
+pub(crate) fn reduced_motion_test_guard() -> ReducedMotionGuard {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ReducedMotionGuard(
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Holds the reduced-motion test lock and restores the flag when it drops.
+///
+/// Restoring on drop rather than at the end of each test is what makes a
+/// panicking test harmless: an assertion that fires while the flag is on would
+/// otherwise leave every later test running in reduced motion, turning one
+/// failure into a cascade that looks nothing like its cause.
+#[cfg(test)]
+pub(crate) struct ReducedMotionGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl Drop for ReducedMotionGuard {
+    fn drop(&mut self) {
+        set_reduced_motion(false);
+    }
+}
+
 /// Whether reduced-motion mode is currently active.
 #[must_use]
 pub fn reduced_motion() -> bool {
@@ -390,6 +420,7 @@ mod tests {
 
     #[test]
     fn reduced_motion_stops_the_clock() {
+        let _motion = crate::anim::reduced_motion_test_guard();
         set_reduced_motion(false);
         assert!(clock_ms().is_some());
         set_reduced_motion(true);

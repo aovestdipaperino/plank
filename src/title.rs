@@ -344,6 +344,7 @@ mod tests {
     /// and resumes where it left off, and stops once the title leaves Busy.
     #[test]
     fn tick_steps_the_glyph_only_while_busy() {
+        let _motion = crate::anim::reduced_motion_test_guard();
         let _serial = TITLE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

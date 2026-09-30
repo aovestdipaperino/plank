@@ -25221,6 +25221,7 @@ mod tests {
     /// into the file that `/config` writes in full.
     #[test]
     fn loopguard_off_then_config_of_another_key_does_not_persist_it() {
+        let _motion = crate::anim::reduced_motion_test_guard();
         let _g = crate::debugmirror::test_support::lock();
         let mut settings = crate::settings::Settings::default();
         settings.tools.loop_guards = true;
@@ -25257,6 +25258,7 @@ mod tests {
     /// in force.
     #[test]
     fn config_loop_guards_persists_and_clears_the_override() {
+        let _motion = crate::anim::reduced_motion_test_guard();
         let _g = crate::debugmirror::test_support::lock();
         let mut settings = crate::settings::Settings::default();
         settings.tools.loop_guards = true;
@@ -28223,6 +28225,7 @@ mod tests {
     /// that `/config` writes in full.
     #[test]
     fn a_click_then_config_of_another_key_does_not_persist_the_click() {
+        let _motion = crate::anim::reduced_motion_test_guard();
         let _g = crate::debugmirror::test_support::lock();
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = false;
@@ -28259,6 +28262,7 @@ mod tests {
     /// clears the click's override, so what the user typed is what shows.
     #[test]
     fn config_show_thinking_persists_and_clears_the_override() {
+        let _motion = crate::anim::reduced_motion_test_guard();
         let _g = crate::debugmirror::test_support::lock();
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = false;
@@ -31023,6 +31027,7 @@ mod tests {
     /// path; only a bare `/config` opens the modal form.
     #[test]
     fn tui_config_with_an_argument_sets_the_value_instead_of_opening_the_form() {
+        let _motion = crate::anim::reduced_motion_test_guard();
         // Installing settings runs `debugmirror::reconcile`, and with
         // showThinking on that clears the mirror registry process-wide; take
         // the console lock so a concurrent console test is not disconnected.

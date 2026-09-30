@@ -5422,6 +5422,30 @@ fn push_shimmered(
             theme.fg(Color::Indexed(crate::anim::cube_index_rgb(s.rest))),
         ),
     };
+    // The flash paints every column alike, so it never builds a window and
+    // never walks the ramp: it interpolates the resting colour toward the
+    // ramp's brightest shade and pushes the word as one span.
+    if let crate::anim::VerbAnim::Flash { period_ms } = anim {
+        let rest = shimmer.map_or_else(
+            || crate::anim::indexed_to_rgb(crate::status::THEME_COLOR),
+            |s| s.rest,
+        );
+        let bright = crate::anim::indexed_to_rgb(ramp[ramp.len() - 1]);
+        // The shared clock reports 0 under reduced motion, and a sine sits at
+        // its midpoint there: a permanently half-lit verb rather than a still
+        // one. So the flag is checked here rather than inferred from the tick.
+        let c = if crate::anim::reduced_motion() {
+            rest
+        } else {
+            crate::anim::flash_color(rest, bright, tick_ms, period_ms)
+        };
+        spans.push(Span::styled(
+            word.to_string(),
+            theme.fg(Color::Indexed(crate::anim::cube_index_rgb(c))),
+        ));
+        return;
+    }
+
     let half = i64::try_from(ramp.len().saturating_sub(1)).unwrap_or(0);
     let width = word.chars().count();
     // `sweep_window` supplies only the centre and the direction. Its own
@@ -5433,11 +5457,8 @@ fn push_shimmered(
         crate::anim::VerbAnim::Sweep { reverse, step_ms } => {
             crate::anim::sweep_window(width, tick_ms, step_ms, 20, reverse)
         }
-        // Task 4 replaces this arm. Until then a flash renders as the ordinary
-        // sweep, so this task provably changes nothing.
-        crate::anim::VerbAnim::Flash { .. } => {
-            crate::anim::sweep_window(width, tick_ms, crate::anim::SWEEP_SLOW_MS, 20, false)
-        }
+        // Handled above by the early return.
+        crate::anim::VerbAnim::Flash { .. } => (i64::MIN, i64::MIN),
     };
     let center = i64::midpoint(lo, hi);
     // One shade per column, then coalesce equal-styled neighbours so a sweep
@@ -10491,6 +10512,129 @@ mod tests {
             "generation should sweep right-to-left: {slow:?}"
         );
         assert!(fast.first() < fast.last() && slow.first() > slow.last());
+    }
+
+    // During a tool dispatch the verb does not sweep: every column takes the
+    // same colour and the whole word pulses together. A regression to the
+    // sweep shows up here as more than one distinct foreground on the word.
+    #[test]
+    fn verb_flash_paints_the_whole_word_one_colour() {
+        let _guard = crate::anim::reduced_motion_test_guard();
+        let base = Style::default();
+        let theme = base.fg(theme_accent()).add_modifier(Modifier::BOLD);
+        let flash = crate::anim::VerbAnim::Flash {
+            period_ms: crate::anim::FLASH_PERIOD_MS,
+        };
+        let mut seen = Vec::new();
+        for step in 0..40u64 {
+            let mut spans = Vec::new();
+            push_shimmered(&mut spans, "Chiseling…", step * 50, theme, None, flash);
+            assert_eq!(
+                spans.len(),
+                1,
+                "the flash is one span, not a graded sweep: {spans:?}"
+            );
+            assert_eq!(spans[0].content.as_ref(), "Chiseling…");
+            seen.push(spans[0].style.fg);
+        }
+        // It is a pulse, not a static colour: several distinct shades appear
+        // over one period.
+        seen.sort_by_key(|c| format!("{c:?}"));
+        seen.dedup();
+        assert!(seen.len() > 3, "the flash does not pulse: {seen:?}");
+    }
+
+    // The flash stays inside the theme's own hue, exactly as the sweep does.
+    #[test]
+    fn verb_flash_never_goes_pure_white() {
+        let _guard = crate::anim::reduced_motion_test_guard();
+        let base = Style::default();
+        let theme = base.fg(theme_accent()).add_modifier(Modifier::BOLD);
+        let flash = crate::anim::VerbAnim::Flash {
+            period_ms: crate::anim::FLASH_PERIOD_MS,
+        };
+        for step in 0..40u64 {
+            let mut spans = Vec::new();
+            push_shimmered(&mut spans, "Chiseling…", step * 50, theme, None, flash);
+            let fg = spans[0].style.fg;
+            assert_ne!(fg, Some(Color::Indexed(231)));
+            assert_ne!(fg, Some(Color::White));
+        }
+    }
+
+    // Reduced motion freezes the clock to 0, where a sine sits at its midpoint.
+    // A half-lit verb is not a still one, so the flash arm checks the flag
+    // itself and renders the resting colour.
+    // A profile's flash must use the profile's own colours, not the built-in
+    // olive. This is the branch the ordering inside `push_shimmered` exists to
+    // protect: the ramp and the resting style are resolved before the flash
+    // returns, so a flash under a profile pulses `rest` toward that profile's
+    // brightest shade. Resolving them after the return would leave this
+    // rendering in the default hue with no other test noticing.
+    #[test]
+    fn a_profile_flash_pulses_in_the_profile_colours() {
+        let _motion = crate::anim::reduced_motion_test_guard();
+        let base = Style::default();
+        let theme = base.add_modifier(Modifier::BOLD);
+        let rest: crate::anim::Rgb = (0x80, 0x00, 0x40); // nothing like the olive
+        let shimmer = crate::profile::Shimmer {
+            rest,
+            ramp: [0xa0, 0xc0, 0xe0],
+        };
+        let flash = crate::anim::VerbAnim::Flash {
+            period_ms: crate::anim::FLASH_PERIOD_MS,
+        };
+
+        // At rest (reduced motion) the word sits in the profile's own resting
+        // colour, not the theme's.
+        crate::anim::set_reduced_motion(true);
+        let mut spans = Vec::new();
+        push_shimmered(&mut spans, "Chiseling…", 0, theme, Some(shimmer), flash);
+        crate::anim::set_reduced_motion(false);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].style.fg,
+            Some(Color::Indexed(crate::anim::cube_index_rgb(rest))),
+            "a profile's flash must rest in the profile's own colour"
+        );
+
+        // And while it pulses it never falls back to the built-in theme colour.
+        for step in 0..40u64 {
+            let mut spans = Vec::new();
+            push_shimmered(
+                &mut spans,
+                "Chiseling…",
+                step * 50,
+                theme,
+                Some(shimmer),
+                flash,
+            );
+            assert_ne!(
+                spans[0].style.fg,
+                Some(Color::Indexed(crate::status::THEME_COLOR)),
+                "the profile flash fell back to the built-in theme colour"
+            );
+        }
+    }
+
+    #[test]
+    fn verb_flash_is_flat_at_rest_under_reduced_motion() {
+        let _guard = crate::anim::reduced_motion_test_guard();
+        let base = Style::default();
+        let theme = base.fg(theme_accent()).add_modifier(Modifier::BOLD);
+        let flash = crate::anim::VerbAnim::Flash {
+            period_ms: crate::anim::FLASH_PERIOD_MS,
+        };
+        crate::anim::set_reduced_motion(true);
+        let mut spans = Vec::new();
+        push_shimmered(&mut spans, "Chiseling…", 0, theme, None, flash);
+        crate::anim::set_reduced_motion(false);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].style.fg,
+            Some(Color::Indexed(crate::status::THEME_COLOR)),
+            "reduced motion must render the resting colour, not a half-lit sine"
+        );
     }
 }
 
