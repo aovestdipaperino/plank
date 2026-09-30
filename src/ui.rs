@@ -13371,6 +13371,20 @@ impl Agent<'_> {
             }
             if let Event::Mouse(m) = &ev {
                 match m.kind {
+                    // A report panel is drawn over the output pane, so the
+                    // wheel has to scroll the panel and not the log hidden
+                    // behind it: scrolling something invisible is exactly what
+                    // made the panel look unscrollable.
+                    MouseEventKind::ScrollUp if report.is_some() => {
+                        if let Some(panel) = report.as_mut() {
+                            panel.scroll(-3);
+                        }
+                    }
+                    MouseEventKind::ScrollDown if report.is_some() => {
+                        if let Some(panel) = report.as_mut() {
+                            panel.scroll(3);
+                        }
+                    }
                     MouseEventKind::ScrollUp => {
                         // Selection endpoints are content-anchored, so scrolling
                         // leaves them alone — the highlight tracks the text.
@@ -13924,6 +13938,19 @@ impl Agent<'_> {
                 }
                 KeyCode::Home => input.buf.move_home(),
                 KeyCode::End => input.buf.move_end(),
+                // While a report is up it owns the arrows, the way it already
+                // owns Esc and PageUp/PageDown: the panel is what the reader is
+                // looking at, and Esc gets the prompt (and its history) back.
+                KeyCode::Up if report.is_some() => {
+                    if let Some(panel) = report.as_mut() {
+                        panel.scroll(-1);
+                    }
+                }
+                KeyCode::Down if report.is_some() => {
+                    if let Some(panel) = report.as_mut() {
+                        panel.scroll(1);
+                    }
+                }
                 KeyCode::Up => input.history_move(-1),
                 KeyCode::Down => input.history_move(1),
                 // Esc while idle dismisses a `/btw` panel left open from an
@@ -20163,6 +20190,18 @@ fn busy_ui_loop(
                             input.buf.move_end();
                         }
                     }
+                    // The report owns the arrows while it is up; see the
+                    // twin handler in the other input loop.
+                    KeyCode::Up if report.is_some() => {
+                        if let Some(panel) = report.as_mut() {
+                            panel.scroll(-1);
+                        }
+                    }
+                    KeyCode::Down if report.is_some() => {
+                        if let Some(panel) = report.as_mut() {
+                            panel.scroll(1);
+                        }
+                    }
                     KeyCode::Up => input.history_move(-1),
                     KeyCode::Down => input.history_move(1),
                     _ => {}
@@ -20180,6 +20219,18 @@ fn busy_ui_loop(
                 input.sync_popup();
             }
             Event::Mouse(m) => match m.kind {
+                // A report panel is drawn over the output pane, so the wheel
+                // scrolls the panel and not the log hidden behind it.
+                MouseEventKind::ScrollUp if report.is_some() => {
+                    if let Some(panel) = report.as_mut() {
+                        panel.scroll(-3);
+                    }
+                }
+                MouseEventKind::ScrollDown if report.is_some() => {
+                    if let Some(panel) = report.as_mut() {
+                        panel.scroll(3);
+                    }
+                }
                 MouseEventKind::ScrollUp => {
                     let v = sub.active_view(view);
                     v.follow = false;

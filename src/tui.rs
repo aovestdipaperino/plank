@@ -7461,6 +7461,68 @@ mod tests {
         );
     }
 
+    /// Scrolling a report panel moves the report, which is what the `!!`
+    /// output panel needs: the wheel and the arrows reach `ReportPanel::scroll`
+    /// only while the panel is open, and before this was wired up they moved
+    /// the output log hidden *behind* the panel instead, so nothing visible
+    /// changed and the panel looked like it could not scroll at all.
+    #[test]
+    fn scrolling_a_report_panel_moves_the_report() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::fmt::Write as _;
+        let mut long = String::new();
+        for i in 0..80 {
+            let _ = writeln!(long, "row {i}");
+        }
+        let mut panel = ReportPanel::new("!! seq 1 80", &long);
+
+        let first_row = |panel: &mut ReportPanel| -> String {
+            let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &OutputLog::new(),
+                    Some(InputState::new("", 0)),
+                    "idle",
+                    &mut OutputView::default(),
+                    None,
+                    &TaskView::default(),
+                    None,
+                    &RosterView::default(),
+                );
+                draw_report(f, Some(""), panel, 0);
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            let rows: Vec<String> = (0..24)
+                .map(|y| (0..40).map(|x| buf[(x, y)].symbol().to_owned()).collect())
+                .collect();
+            let top = rows
+                .iter()
+                .position(|r| r.contains("Esc closes"))
+                .expect("the panel title is drawn");
+            rows[top + 1].clone()
+        };
+
+        // It opens at the top of the report.
+        let opened = first_row(&mut panel);
+        assert!(opened.contains("row 0"), "opened at {opened:?}");
+
+        // Scrolling down shows later rows...
+        panel.scroll(5);
+        let scrolled = first_row(&mut panel);
+        assert!(
+            !scrolled.contains("row 0"),
+            "the panel did not scroll: still {scrolled:?}"
+        );
+
+        // ...and scrolling back up returns to the start.
+        panel.scroll(-5);
+        let back = first_row(&mut panel);
+        assert!(back.contains("row 0"), "did not scroll back: {back:?}");
+    }
+
     /// A `/usage`-style report lands in a bordered panel above the prompt
     /// rather than in the scrollback, is titled with its Esc hint, and never
     /// takes more than half the screen even when the report is long.
