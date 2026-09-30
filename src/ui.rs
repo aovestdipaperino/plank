@@ -12888,6 +12888,13 @@ impl Agent<'_> {
                 clip_checked = Instant::now();
             }
             remote_drain(rem);
+            // Blink the idle title's cursor. Unconditional because `title::tick`
+            // is a no-op unless an animating title is up and skips the write
+            // when the text has not changed, and because the phase is taken
+            // from the shared clock rather than counted here: this loop's poll
+            // cadence changes with what is on screen, and the cursor should
+            // not change rate with it.
+            crate::title::tick();
             // Advance an open easter egg by the real elapsed time. `step`
             // clamps a long delta itself, so a modal that just opened (or a
             // suspended terminal) resumes smoothly instead of jumping.

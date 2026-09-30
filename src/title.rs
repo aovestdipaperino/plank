@@ -4,8 +4,10 @@
 //! Terminal window title, kept in sync with what plank is doing.
 //!
 //! A handful of states, so the window (and tab) names plank's phase at a
-//! glance: `🚀 Plank loading...` before a front end is up, `🪵 Plank - READY.`
-//! while idle at the prompt, `⠿⠇ <prompt>` while a turn runs (the
+//! glance: `🚀 Plank loading...` before a front end is up, `Plank - READY█`
+//! while idle at the prompt (both named after the running profile when there
+//! is one; the block blinks at the Commodore 64's own cursor rate, restepped
+//! once per [`tick`]), `⠿⠇ <prompt>` while a turn runs (the
 //! expert-routing glyph of [`crate::experts`], restepped once per [`tick`],
 //! unless reduced motion is on),
 //! `❓ waiting for you...` while the `ask` tool holds the turn open for an
@@ -53,7 +55,14 @@ const TITLE_PROMPT_MAX: usize = 20;
 
 /// Title shown while starting up — including the KV-cache prefill, which is the
 /// slowest launch step and the one most likely to be looked at.
-const LOADING: &str = "🚀 Plank loading...";
+///
+/// Named after the running profile like the idle title, so a profile's window
+/// says what is starting rather than always saying Plank. Safe at this point in
+/// the launch: `resolve_and_activate_profile` installs the profile before the
+/// front end that sets this title is reached.
+fn loading_title() -> String {
+    format!("\u{1F680} {} loading...", agent_name())
+}
 
 /// Title shown while `/insights` is reading back the user's own history.
 const INTROSPECTING: &str = "👀 introspecting...";
@@ -64,23 +73,70 @@ const COMPACTING: &str = "🗑️ compacting...";
 /// Title shown while the `ask` tool is waiting on the user's choice.
 const ASKING: &str = "❓ waiting for you...";
 
+/// Half-period of the idle title's cursor, in milliseconds.
+///
+/// The Commodore 64's own rate. Its KERNAL reloads a blink counter with 20 and
+/// decrements it once per raster interrupt, so the cursor inverts every 20
+/// frames: 400ms on a PAL machine's ~50Hz, 333ms on an NTSC ~60Hz one. PAL is
+/// the one worth copying, being the machine this prompt is quoting.
+pub const CURSOR_BLINK_MS: u64 = 400;
+
+/// The block the idle title ends in, standing in for the C64's block cursor.
+const CURSOR: char = '\u{2588}';
+
+/// What to call the agent in a window title: the running profile's display
+/// name, else Plank.
+///
+/// `crate::profile::display_name` falls back to a lowercase "plank"; the
+/// unprofiled window has always said "Plank", so that fallback is spelled out
+/// here rather than inherited.
+fn agent_name() -> &'static str {
+    match crate::profile::active() {
+        Some(_) => crate::profile::display_name(),
+        None => "Plank",
+    }
+}
+
+/// Whether the idle cursor is lit at `now_ms`: a square wave of
+/// [`CURSOR_BLINK_MS`] on, the same off.
+#[must_use]
+fn cursor_lit(now_ms: u64) -> bool {
+    (now_ms / CURSOR_BLINK_MS).is_multiple_of(2)
+}
+
+/// The idle title: the agent's name, `READY`, and the cursor, lit or not.
+///
+/// The name is the profile's when one is running, so a profile's window says
+/// what the user is actually talking to rather than always saying Plank.
+fn idle_title(lit: bool) -> String {
+    let name = agent_name();
+    // An unlit cursor is a space rather than nothing, so the title keeps its
+    // width and the tab does not twitch a character narrower twice a second.
+    let cursor = if lit { CURSOR } else { ' ' };
+    format!("{name} - READY{cursor}")
+}
+
+/// The idle title at the current moment, with the cursor held lit under
+/// reduced motion: a still block still reads as a prompt, while a blank one
+/// would look like the title had simply lost a character.
+fn idle_title_now() -> String {
+    idle_title(crate::anim::clock_ms().is_none_or(cursor_lit))
+}
+
 /// Formats the window title for `state`. A [`State::Busy`] prompt is collapsed
 /// to one line and truncated past [`TITLE_PROMPT_MAX`] characters; a
 /// whitespace-only prompt degrades to the plain loading form.
 #[must_use]
 pub fn window_title(state: State<'_>) -> String {
     match state {
-        State::Loading => LOADING.to_string(),
-        State::Idle => match crate::profile::active() {
-            Some(_) => format!("🪵 {} - READY.", crate::profile::display_name()),
-            None => "🪵 Plank - READY.".to_string(),
-        },
+        State::Loading => loading_title(),
+        State::Idle => idle_title_now(),
         State::Introspecting => INTROSPECTING.to_string(),
         State::Compacting => COMPACTING.to_string(),
         State::Asking => ASKING.to_string(),
         State::Busy(p) => match collapse_prompt(p) {
             Some(prompt) => busy_title(&prompt, 0),
-            None => LOADING.to_string(),
+            None => loading_title(),
         },
     }
 }
@@ -117,30 +173,56 @@ fn busy_title(prompt: &str, frame: usize) -> String {
     }
 }
 
-/// The running busy animation: the collapsed prompt and the frame last shown.
-/// `Some` only while the title is a [`State::Busy`] one; any other state
-/// clears it, and [`Scoped`] parks and restores it with the title it displaces.
-static BUSY: std::sync::Mutex<Option<(String, usize)>> = std::sync::Mutex::new(None);
+/// What [`tick`] should restep, if anything.
+///
+/// Two titles move: the busy one's routing glyph and the idle one's cursor.
+/// Every other state is a fixed string, so the tick has nothing to do and must
+/// not rewrite the title at all: a state such as `ask`'s is showing precisely
+/// because the user is meant to notice it, and repainting it on a timer would
+/// be pure escape-sequence traffic. [`Scoped`] parks and restores this with the
+/// title it displaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Anim {
+    /// Nothing to restep.
+    Still,
+    /// A busy title: the collapsed prompt and the frame last shown.
+    Busy(String, usize),
+    /// The idle title, whose cursor blinks.
+    Idle,
+}
 
-fn busy_lock() -> std::sync::MutexGuard<'static, Option<(String, usize)>> {
-    BUSY.lock()
+static ANIM: std::sync::Mutex<Anim> = std::sync::Mutex::new(Anim::Still);
+
+fn anim_lock() -> std::sync::MutexGuard<'static, Anim> {
+    ANIM.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Advances the busy routing glyph one frame, if a [`State::Busy`] title is
-/// showing. Called from the TUI's redraw loop; a no-op at any other title, and
-/// under reduced motion (`ui.reducedMotion`), where the glyph stays at frame 0.
+/// Restep whichever title is animating: the busy routing glyph by one frame,
+/// or the idle cursor to whatever the clock says it should be now.
+///
+/// Called from both TUI loops, the busy one and the idle one. A no-op at any
+/// other title, and under reduced motion (`ui.reducedMotion`), where the glyph
+/// stays at frame 0 and the cursor stays lit.
+///
+/// The cursor's phase comes from the shared clock rather than from a counter of
+/// ticks, so it keeps the C64's rate whatever cadence the calling loop happens
+/// to poll at, and a loop that stalls resumes in phase instead of carrying the
+/// stall forward forever.
 pub fn tick() {
     if crate::anim::reduced_motion() {
         return;
     }
     let next = {
-        let mut busy = busy_lock();
-        let Some((prompt, frame)) = busy.as_mut() else {
-            return;
-        };
-        *frame = frame.wrapping_add(1);
-        busy_title(prompt, *frame)
+        let mut anim = anim_lock();
+        match &mut *anim {
+            Anim::Still => return,
+            Anim::Idle => idle_title_now(),
+            Anim::Busy(prompt, frame) => {
+                *frame = frame.wrapping_add(1);
+                busy_title(prompt, *frame)
+            }
+        }
     };
     set_text(&next);
 }
@@ -154,18 +236,30 @@ static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 pub fn set(state: State<'_>) {
     // Record the prompt for `tick` only when the title is actually a busy one —
     // a blank prompt degrades to the loading form and must not animate.
-    *busy_lock() = match state {
-        State::Busy(p) => collapse_prompt(p).map(|prompt| (prompt, 0)),
-        _ => None,
+    *anim_lock() = match state {
+        State::Busy(p) => collapse_prompt(p).map_or(Anim::Still, |prompt| Anim::Busy(prompt, 0)),
+        State::Idle => Anim::Idle,
+        _ => Anim::Still,
     };
     set_text(&window_title(state));
 }
 
 /// Writes an already-formatted title, recording it as the current one.
 fn set_text(title: &str) {
-    *LAST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(title.to_owned());
+    {
+        let mut last = LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The idle cursor is resteped every time the input loop goes round,
+        // which is several times per blink, so most ticks ask for the title
+        // already on screen. Writing it again would be escape traffic for
+        // nothing; recording it and returning keeps the tick cheap enough to
+        // call unconditionally.
+        if last.as_deref() == Some(title) {
+            return;
+        }
+        *last = Some(title.to_owned());
+    }
     let mut err = std::io::stderr();
     if !err.is_terminal() {
         return;
@@ -188,9 +282,9 @@ fn set_text(title: &str) {
 #[derive(Debug)]
 pub struct Scoped {
     title: Option<String>,
-    /// The busy animation that was running, parked while the guard lives so
-    /// `tick` does not step the glyph over the displaced title.
-    busy: Option<(String, usize)>,
+    /// The animation that was running, parked while the guard lives so `tick`
+    /// does not step a glyph or a cursor over the displaced title.
+    anim: Anim,
 }
 
 impl Scoped {
@@ -201,15 +295,15 @@ impl Scoped {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let busy = busy_lock().take();
+        let anim = std::mem::replace(&mut *anim_lock(), Anim::Still);
         crate::title::set(state);
-        Self { title, busy }
+        Self { title, anim }
     }
 }
 
 impl Drop for Scoped {
     fn drop(&mut self) {
-        *busy_lock() = self.busy.take();
+        *anim_lock() = std::mem::replace(&mut self.anim, Anim::Still);
         if let Some(previous) = self.title.take() {
             set_text(&previous);
         }
@@ -230,9 +324,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loading_and_idle_are_fixed_strings() {
+    fn the_still_titles_are_fixed_strings() {
+        // The idle title is deliberately absent: its cursor blinks, so it is
+        // not a fixed string and is covered by the cursor tests below.
         assert_eq!(window_title(State::Loading), "🚀 Plank loading...");
-        assert_eq!(window_title(State::Idle), "🪵 Plank - READY.");
         assert_eq!(window_title(State::Introspecting), "👀 introspecting...");
         assert_eq!(window_title(State::Compacting), "🗑️ compacting...");
         assert_eq!(window_title(State::Asking), "❓ waiting for you...");
@@ -296,8 +391,58 @@ mod tests {
     fn the_idle_title_uses_the_agent_name() {
         // No profile is installed in the test process, so this is the plank
         // wording — the assertion exists so a profile-aware rewrite that
-        // breaks the default is caught.
-        assert_eq!(window_title(State::Idle), "🪵 Plank - READY.");
+        // breaks the default is caught. Asserted as a prefix because the
+        // trailing cursor depends on the clock: pinning the whole string here
+        // would be a test that fails half the times it runs.
+        let title = window_title(State::Idle);
+        assert!(
+            title.starts_with("Plank - READY"),
+            "idle title is {title:?}"
+        );
+        assert!(
+            !title.contains('\u{1FAB5}'),
+            "the log icon is gone: {title:?}"
+        );
+    }
+
+    /// Both the launch title and the idle one name the same agent, so a
+    /// profile cannot load as itself and then go ready as Plank.
+    #[test]
+    fn both_titles_name_the_same_agent() {
+        let loading = window_title(State::Loading);
+        let idle = window_title(State::Idle);
+        assert!(loading.contains(agent_name()), "loading is {loading:?}");
+        assert!(idle.contains(agent_name()), "idle is {idle:?}");
+        // No profile is installed in the test process, so this is the default
+        // wording; it is what a profile-aware rewrite must not break.
+        assert_eq!(agent_name(), "Plank");
+        assert_eq!(loading, "\u{1F680} Plank loading...");
+    }
+
+    /// The cursor is a square wave at the Commodore 64's rate: lit for
+    /// [`CURSOR_BLINK_MS`], dark for the same, starting lit.
+    #[test]
+    fn the_cursor_blinks_at_c64_timings() {
+        assert_eq!(CURSOR_BLINK_MS, 400, "20 frames at PAL's ~50Hz");
+        assert!(cursor_lit(0));
+        assert!(cursor_lit(CURSOR_BLINK_MS - 1));
+        assert!(!cursor_lit(CURSOR_BLINK_MS));
+        assert!(!cursor_lit(2 * CURSOR_BLINK_MS - 1));
+        assert!(cursor_lit(2 * CURSOR_BLINK_MS), "and back on");
+        // Every phase is one of exactly two renderings, and they differ only
+        // in the cursor.
+        assert_eq!(idle_title(true), "Plank - READY\u{2588}");
+        assert_eq!(idle_title(false), "Plank - READY ");
+    }
+
+    /// Reduced motion stops the blink by holding the cursor lit. A still block
+    /// still reads as a prompt; a blank one would look like a dropped
+    /// character.
+    #[test]
+    fn reduced_motion_holds_the_cursor_lit() {
+        let _motion = crate::anim::reduced_motion_test_guard();
+        crate::anim::set_reduced_motion(true);
+        assert_eq!(idle_title_now(), idle_title(true));
     }
 
     #[test]
@@ -343,7 +488,7 @@ mod tests {
     /// `tick` advances only a busy title, is parked by a `Scoped` displacement
     /// and resumes where it left off, and stops once the title leaves Busy.
     #[test]
-    fn tick_steps_the_glyph_only_while_busy() {
+    fn tick_steps_the_busy_glyph_and_leaves_still_titles_alone() {
         let _motion = crate::anim::reduced_motion_test_guard();
         let _serial = TITLE_TEST_LOCK
             .lock()
@@ -378,9 +523,13 @@ mod tests {
             Some(frame(2).as_str()),
             "resumes from where it was"
         );
+        // An idle title animates too now, so a tick leaves an idle title up
+        // rather than the busy one it replaced — but which phase of the cursor
+        // is showing depends on the clock, so only the stable part is pinned.
         set(State::Idle);
         tick();
-        assert_eq!(last().as_deref(), Some("🪵 Plank - READY."));
+        let idle = last().expect("an idle title is up");
+        assert!(idle.starts_with("Plank - READY"), "got {idle:?}");
         crate::anim::set_reduced_motion(true);
         set(State::Busy("go"));
         tick();
