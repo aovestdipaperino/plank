@@ -1908,14 +1908,16 @@ fn theme_accent() -> Color {
     )
 }
 
-/// The shimmer shades sweeping the status verb.
+/// How the running profile paints the status verb.
 ///
 /// The active profile's `accent`/`secondary` pair when it declares either, else
-/// `None` for the built-in [`crate::status::SHIMMER_RAMP`]. Resolved once,
-/// like [`theme_accent`]: a profile never changes mid-process.
-fn theme_shimmer_ramp() -> Option<[u8; 3]> {
-    static RAMP: std::sync::OnceLock<Option<[u8; 3]>> = std::sync::OnceLock::new();
-    *RAMP.get_or_init(|| {
+/// `None` for the built-in [`crate::status::SHIMMER_RAMP`] over the default
+/// accent. Resolved once, like [`theme_accent`]: a profile never changes
+/// mid-process.
+fn theme_shimmer() -> Option<crate::profile::Shimmer> {
+    static SHIMMER: std::sync::OnceLock<Option<crate::profile::Shimmer>> =
+        std::sync::OnceLock::new();
+    *SHIMMER.get_or_init(|| {
         let spec = crate::profile::active().map(|a| a.spec.clone())?;
         crate::profile::shimmer_ramp(spec.accent, spec.secondary)
     })
@@ -5402,9 +5404,19 @@ fn push_shimmered(
     word: &str,
     tick_ms: u64,
     theme: Style,
-    ramp: Option<[u8; 3]>,
+    shimmer: Option<crate::profile::Shimmer>,
 ) {
-    let ramp = ramp.unwrap_or(crate::status::SHIMMER_RAMP);
+    // Without a profile the word rests in the theme accent and the built-in
+    // ramp sweeps it. With one, the word rests in the profile's `secondary`
+    // and its accent is what travels, so the resting style changes too — the
+    // sweep is the accent moving over the secondary, not the other way round.
+    let (ramp, theme) = match shimmer {
+        None => (crate::status::SHIMMER_RAMP, theme),
+        Some(s) => (
+            s.ramp,
+            theme.fg(Color::Indexed(crate::anim::cube_index_rgb(s.rest))),
+        ),
+    };
     let half = i64::try_from(ramp.len().saturating_sub(1)).unwrap_or(0);
     let width = i64::try_from(word.chars().count()).unwrap_or(0);
     let cycle = width + 20;
@@ -5582,13 +5594,7 @@ fn push_accented(
         });
     if let Some((start, end)) = range {
         spans.push(Span::styled(seg[..start].to_string(), base));
-        push_shimmered(
-            spans,
-            &seg[start..end],
-            tick_ms,
-            theme,
-            theme_shimmer_ramp(),
-        );
+        push_shimmered(spans, &seg[start..end], tick_ms, theme, theme_shimmer());
         spans.push(Span::styled(seg[end..].to_string(), base));
     } else {
         spans.push(Span::styled(seg.to_string(), base));
@@ -5769,7 +5775,7 @@ fn status_bar_lines(
     if let Some(running) = crate::status::tool_activity() {
         spans.push(Span::styled(" | ".to_string(), base));
         if crate::status::tool_blink_on(tick_ms) {
-            push_shimmered(&mut spans, &running, tick_ms, theme, theme_shimmer_ramp());
+            push_shimmered(&mut spans, &running, tick_ms, theme, theme_shimmer());
         } else {
             // Off half of the blink: same glyphs at the same width, dimmed, so
             // the label pulses without the line jittering around it.

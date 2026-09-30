@@ -1476,6 +1476,36 @@ covers the system prompt, and the sub-agent roster is part of the system prompt,
 so a project with its own `.plank/agents` keys Tier 1 differently from the same
 model in any other directory.
 
+### A dev build re-prefills, and that is correct
+
+The most-reported "miss" is not one. Tier 1's key covers the system prompt
+text, so a build whose prompt text moved has a different `fp1` by
+construction, and restoring the old checkpoint under it would prefill from a KV
+that does not describe those tokens. The re-prefill is the correct outcome.
+
+This is easy to mistake for a cache bug because the prompt moves far more often
+than it looks like it should. It is not only the prose: the tool schemas are in
+it, so a commit that adds a tool, renames an argument, or rewrites one
+description changes the prompt. Any commit touching `tests/fixtures/tools_prompt.txt`,
+`tools_prompt_dsml41.txt` or `system_prompt_reminder.txt` moved model-facing
+text and cost one re-prefill per prompt in use. During heavy development that
+is several a day, and a `trusted_len` that climbs launch over launch —
+24002, 24387, 24528, 24587, 24728 over three days of development — is the
+signature. Two launches under different profiles each paying a prefill is the
+same thing seen twice: a profile supplies its own whole system prompt, so it is
+a separate `fp1` meeting a new binary for the first time, not eviction. The GC
+keeps siblings on purpose (`kvgc.rs`), so neither profile displaces the other.
+
+What this does cost is structural, and worth knowing before optimizing: the
+tool schema sits at **offset 0** of the trusted span, ahead of all ~24 KB of
+it. The most volatile part of the prompt is at the very front, so a three-line
+change to one tool description leaves nothing behind it reusable. The obvious
+remedy — moving volatile text later — is not available, because the prompt must
+stay byte-identical to the C reference (`tests/c_parity.rs`); what is available,
+if this is ever worth paying for, is an extra checkpoint at the end of the
+C-trained block, the same split `splits_system_tail` performs for MCP
+definitions taken one boundary earlier.
+
 `kv_debug` logging reports, per generate, the prompt length, the cached prefix,
 the percentage reused, and — on a full rebuild — that the prompt was a strict
 prefix of a longer live KV. `reconcile` logs the first divergent span with both

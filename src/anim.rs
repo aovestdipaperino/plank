@@ -302,28 +302,31 @@ pub fn cube_index_rgb(c: Rgb) -> u8 {
 /// sweep's center, short of washing the hue out to white.
 pub const DERIVED_SECONDARY_T: f32 = 0.45;
 
-/// The secondary shimmer color for a profile that declared an accent but no
-/// secondary: the accent lightened toward white by [`DERIVED_SECONDARY_T`].
+/// The resting colour for a profile that declared an accent but no
+/// `secondary`: the accent lightened toward white by [`DERIVED_SECONDARY_T`],
+/// so the word reads in the profile's hue while its accent sweeps across.
 #[must_use]
 pub fn derived_secondary(accent: Rgb) -> Rgb {
     lerp_rgb(accent, (255, 255, 255), DERIVED_SECONDARY_T)
 }
 
-/// The shimmer shades sweeping the status verb, interpolated from `accent` to
-/// `secondary` and quantized to the xterm cube.
+/// The shimmer shades sweeping the status verb, interpolated from the word's
+/// resting colour to the highlight and quantized to the xterm cube.
 ///
 /// Ordered outermost column first, matching `crate::status::SHIMMER_RAMP`'s
-/// contract, so the last entry lands on the center of the highlight and is the
-/// secondary exactly. The length is deliberately three: the sweep window is
+/// contract, so the last entry lands on the center of the sweep and is the
+/// highlight exactly. `crate::profile::shimmer_ramp` passes the profile's
+/// `secondary` as `rest` and its `accent` as `highlight`: the accent is the
+/// thing that travels. The length is deliberately three: the sweep window is
 /// `2 * (len - 1) + 1` columns, so keeping it preserves the geometry and the
 /// existing shimmer tests, and only the shades differ.
 #[must_use]
-pub fn shimmer_ramp(accent: Rgb, secondary: Rgb) -> [u8; 3] {
+pub fn shimmer_ramp(rest: Rgb, highlight: Rgb) -> [u8; 3] {
     let mut out = [0u8; 3];
     for (i, slot) in out.iter_mut().enumerate() {
         #[allow(clippy::cast_precision_loss)]
         let t = (i + 1) as f32 / 3.0;
-        *slot = cube_index_rgb(lerp_rgb(accent, secondary, t));
+        *slot = cube_index_rgb(lerp_rgb(rest, highlight, t));
     }
     out
 }

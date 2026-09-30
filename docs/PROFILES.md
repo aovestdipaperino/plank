@@ -24,7 +24,7 @@ for the Claude Code layout), alongside the plugin's existing `name`,
 | `displayName` | string | no | the plugin's own `name` |
 | `logo` | string, path to a PNG | no | plank's own logo |
 | `accent` | string | no | plank's built-in green |
-| `secondary` | string | no | derived from `accent`, or the built-in ramp when neither is set |
+| `secondary` | string | no | the word's resting colour; derived from `accent`, or the built-in ramp when neither is set |
 | `tools.builtin` | array of strings | no | every builtin tool is offered |
 | `settings` | object | no | no extra settings layer |
 | `folderContext` | boolean | no | `false`: no launch-folder context |
@@ -230,21 +230,27 @@ footer still shows plank's own segments regardless of the active profile.
 ### `secondary`: the far end of the shimmer
 
 While a turn runs, the status verb (`Patching…`, `Thinking…`) carries a
-highlight that sweeps across the word. `secondary` is the color at the center
-of that sweep: the shimmer ranges from `accent` at the edges to `secondary` in
-the middle, so the animation belongs to the profile rather than to plank.
+highlight that sweeps across the word. `secondary` is the colour the word
+**rests** in; the `accent` is the highlight that **travels** across it. The
+sweep therefore runs `secondary` at the edges to `accent` at its centre.
 
-It takes the same two forms as `accent` — a bare ANSI index or a `#rrggbb`
-triple — and there are three cases:
+The way round to remember: the accent is the thing moving, not the background
+it moves over.
 
-* **Neither `accent` nor `secondary`.** The built-in ramp is used unchanged, so
-  a plain run and every profile that has not opted in look exactly as before.
-* **`accent` only.** A secondary is derived by lightening the accent toward
-  white, so the sweep follows the profile's own hue instead of plank's olive.
-* **`secondary` set.** It is the center of the sweep, whether it is lighter or
-  darker than the accent. Nothing requires it to be the brighter end: a dark
-  `secondary` such as `"#444444"` reads as a shadow crossing the word rather
-  than a highlight travelling along it.
+`secondary` takes the same two forms as `accent` — a bare ANSI index or a
+`#rrggbb` triple — and there are three cases:
+
+* **Neither `accent` nor `secondary`.** The built-in ramp over plank's default
+  accent, unchanged, so a plain run and every profile that has not opted in
+  look exactly as before.
+* **`accent` only.** A resting colour is derived by lightening the accent
+  toward white, so the word reads in the profile's own hue while its accent
+  sweeps across.
+* **`secondary` set.** The word rests in it, whether it is lighter or darker
+  than the accent. Nothing requires either to be the brighter one: HAL rests in
+  its red `#d0021b` with a white accent washing over it, and a dark resting
+  colour such as `"#444444"` gives a dim word the accent lights up as it
+  passes.
 
 The shades are quantized to the xterm 6×6×6 color cube, matching the built-in
 ramp, so the sweep renders on a 256-color terminal.

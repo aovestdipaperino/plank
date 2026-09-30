@@ -47,6 +47,7 @@ pub mod engines;
 pub mod errlog;
 pub mod experts;
 pub mod export;
+pub mod fakegpu;
 pub mod feedback;
 pub mod ffi;
 pub mod framebridge;

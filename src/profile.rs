@@ -98,22 +98,41 @@ pub fn accent_rgb(a: Accent) -> crate::anim::Rgb {
     }
 }
 
-/// The shimmer shades for a profile's `accent`/`secondary` pair, or `None` to
-/// leave the hand-picked `crate::status::SHIMMER_RAMP` in place.
+/// How a profile paints the status verb: the colour the word rests in, and the
+/// shades the highlight sweeps through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shimmer {
+    /// The word's resting colour — the profile's `secondary`.
+    pub rest: crate::anim::Rgb,
+    /// Sweep shades, outermost column first, ending on the accent.
+    pub ramp: [u8; 3],
+}
+
+/// How a profile paints the status verb, or `None` to leave the hand-picked
+/// `crate::status::SHIMMER_RAMP` and the default accent in place.
 ///
-/// A profile that declares neither keeps the built-in ramp, which is what makes
-/// this change invisible to a plain run and to every existing profile that has
-/// not opted in. Declaring only an `accent` derives the far end
-/// ([`crate::anim::derived_secondary`]) so the sweep follows the profile's hue;
-/// declaring only a `secondary` sweeps from the default accent toward it.
+/// The word rests in the `secondary` and the **accent is the travelling
+/// highlight**: the sweep runs secondary -> accent, brightest (in the accent's
+/// own colour) at its centre. That is the way round to remember — the accent is
+/// the thing moving, not the background it moves over.
+///
+/// A profile that declares neither colour keeps the built-in ramp, which is
+/// what makes this invisible to a plain run and to every profile that has not
+/// opted in. Declaring only an `accent` derives the resting colour from it
+/// ([`crate::anim::derived_secondary`]) so the word still reads in the
+/// profile's own hue; declaring only a `secondary` rests in it and sweeps
+/// toward the default accent.
 #[must_use]
-pub fn shimmer_ramp(accent: Option<Accent>, secondary: Option<Accent>) -> Option<[u8; 3]> {
+pub fn shimmer_ramp(accent: Option<Accent>, secondary: Option<Accent>) -> Option<Shimmer> {
     if accent.is_none() && secondary.is_none() {
         return None;
     }
-    let near = accent_rgb(accent.unwrap_or(DEFAULT_ACCENT));
-    let far = secondary.map_or_else(|| crate::anim::derived_secondary(near), accent_rgb);
-    Some(crate::anim::shimmer_ramp(near, far))
+    let highlight = accent_rgb(accent.unwrap_or(DEFAULT_ACCENT));
+    let rest = secondary.map_or_else(|| crate::anim::derived_secondary(highlight), accent_rgb);
+    Some(Shimmer {
+        rest,
+        ramp: crate::anim::shimmer_ramp(rest, highlight),
+    })
 }
 
 /// Parses an ANSI index (`"160"`) or a hex triple (`"#c04040"`).
@@ -965,37 +984,42 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_secondary_is_the_far_end_of_the_sweep() {
-        // EAP: cream on its accent.
-        let ramp = shimmer_ramp(Some(Accent::Indexed(106)), Some(Accent::Rgb(231, 229, 199)))
-            .expect("a declared pair generates a ramp");
-        assert_eq!(ramp[2], crate::anim::cube_index_rgb((231, 229, 199)));
-    }
-
-    #[test]
-    fn an_accent_alone_derives_its_secondary() {
-        let derived = shimmer_ramp(Some(Accent::Rgb(0xc0, 0x40, 0x40)), None)
-            .expect("an accent alone still generates a ramp");
-        let explicit = shimmer_ramp(
-            Some(Accent::Rgb(0xc0, 0x40, 0x40)),
-            Some(Accent::Rgb(
-                crate::anim::derived_secondary((0xc0, 0x40, 0x40)).0,
-                crate::anim::derived_secondary((0xc0, 0x40, 0x40)).1,
-                crate::anim::derived_secondary((0xc0, 0x40, 0x40)).2,
-            )),
+    fn the_word_rests_in_the_secondary_and_the_accent_travels() {
+        // The role assignment, pinned: EAP rests cream and its dark red is the
+        // highlight sweeping across. Getting this backwards is exactly the
+        // mistake this pair of colours cannot reveal by eye in a test.
+        let s = shimmer_ramp(
+            Some(Accent::Rgb(0x7a, 0x1f, 0x2b)),
+            Some(Accent::Rgb(231, 229, 199)),
         )
-        .expect("ramp");
-        assert_eq!(derived, explicit);
-        // And it is not the built-in olive, which is the point.
-        assert_ne!(derived, crate::status::SHIMMER_RAMP);
+        .expect("a declared pair generates a shimmer");
+        assert_eq!(s.rest, (231, 229, 199), "the word rests in the secondary");
+        assert_eq!(
+            s.ramp[2],
+            crate::anim::cube_index_rgb((0x7a, 0x1f, 0x2b)),
+            "the sweep centre is the accent"
+        );
     }
 
     #[test]
-    fn a_secondary_alone_sweeps_from_the_default_accent() {
-        let ramp = shimmer_ramp(None, Some(Accent::Rgb(0x44, 0x44, 0x44))).expect("ramp");
-        let same =
-            shimmer_ramp(Some(DEFAULT_ACCENT), Some(Accent::Rgb(0x44, 0x44, 0x44))).expect("ramp");
-        assert_eq!(ramp, same);
+    fn an_accent_alone_derives_the_resting_colour() {
+        let accent = (0xc0, 0x40, 0x40);
+        let derived = shimmer_ramp(Some(Accent::Rgb(accent.0, accent.1, accent.2)), None)
+            .expect("an accent alone still generates a shimmer");
+        assert_eq!(derived.rest, crate::anim::derived_secondary(accent));
+        // The accent is still what the sweep lands on.
+        assert_eq!(derived.ramp[2], crate::anim::cube_index_rgb(accent));
+        // And it is not the built-in olive, which is the point.
+        assert_ne!(derived.ramp, crate::status::SHIMMER_RAMP);
+    }
+
+    #[test]
+    fn a_secondary_alone_sweeps_toward_the_default_accent() {
+        let a = shimmer_ramp(None, Some(Accent::Rgb(0x44, 0x44, 0x44))).expect("shimmer");
+        let b = shimmer_ramp(Some(DEFAULT_ACCENT), Some(Accent::Rgb(0x44, 0x44, 0x44)))
+            .expect("shimmer");
+        assert_eq!(a, b);
+        assert_eq!(a.rest, (0x44, 0x44, 0x44));
     }
 
     #[test]
@@ -1006,8 +1030,8 @@ mod tests {
         assert_eq!(spec.accent, Some(Accent::Indexed(160)));
         assert_eq!(spec.secondary, None);
         assert!(spec.warnings.iter().any(|w| w.contains("secondary")));
-        // The accent still drives a ramp, so a typo degrades to derived rather
-        // than back to the built-in olive.
+        // The accent still drives a shimmer, so a typo degrades to a derived
+        // resting colour rather than back to the built-in olive.
         assert!(shimmer_ramp(spec.accent, spec.secondary).is_some());
     }
 
