@@ -344,6 +344,45 @@ pub fn reduced_pulse(now_ms: u64, period_ms: u64) -> bool {
     now_ms % period < period / 2
 }
 
+/// Milliseconds per column for the fast sweep, used while the prompt is still
+/// prefilling. Fast enough to read as "taking it in quickly" against the slow
+/// sweep of generation.
+pub const SWEEP_FAST_MS: u64 = 50;
+
+/// Milliseconds per column for the ordinary sweep, used while the model
+/// generates or thinks. Same value as `crate::status::SHIMMER_STEP_MS`, which
+/// is deliberately left in place: that constant belongs to the footer's content
+/// layer and is named by existing tests, while this one belongs to the
+/// animation layer.
+pub const SWEEP_SLOW_MS: u64 = 200;
+
+/// Period of the whole-word flash used while a tool dispatch is in flight.
+pub const FLASH_PERIOD_MS: u64 = 2000;
+
+/// Which animation paints the status verb.
+///
+/// The verb says *that* work is in flight; which effect it uses says *what
+/// kind*. A sweep is the model working on the text — one highlight travelling
+/// over the word. A flash is the machine working instead, so nothing travels
+/// and the whole word pulses together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerbAnim {
+    /// A graded highlight travels across the word, one column per `step_ms`.
+    /// `reverse` sends it left-to-right instead of right-to-left.
+    Sweep {
+        /// Left-to-right when `true`, right-to-left when `false`.
+        reverse: bool,
+        /// Milliseconds of travel per display column.
+        step_ms: u64,
+    },
+    /// Every column takes the same colour, oscillating between the resting
+    /// colour and the highlight on a sine of `period_ms`.
+    Flash {
+        /// Milliseconds for one full dim -> bright -> dim cycle.
+        period_ms: u64,
+    },
+}
+
 #[cfg(test)]
 #[allow(clippy::float_cmp, clippy::cast_possible_wrap)]
 mod tests {
@@ -555,5 +594,47 @@ mod tests {
         assert!(!reduced_pulse(500, 1000));
         assert!(!reduced_pulse(999, 1000));
         assert!(reduced_pulse(1000, 1000));
+    }
+
+    #[test]
+    fn verb_flash_rests_at_the_base_and_peaks_at_the_highlight() {
+        let base: Rgb = (0x87, 0xaf, 0x5f);
+        let bright: Rgb = (0xd7, 0xff, 0x87);
+        let period = FLASH_PERIOD_MS;
+        // sine01 is 0.5 at t=0, 1.0 a quarter period later, 0.0 at three
+        // quarters. So the flash is fully bright at period/4 and fully at rest
+        // at 3*period/4.
+        assert_eq!(flash_color(base, bright, period / 4, period), bright);
+        assert_eq!(flash_color(base, bright, 3 * period / 4, period), base);
+        // In between it never leaves the interval between the two endpoints.
+        for step in 0..40u64 {
+            let c = flash_color(base, bright, step * 50, period);
+            assert!(c.0 >= base.0 && c.0 <= bright.0, "r out of range: {c:?}");
+            assert!(c.1 >= base.1 && c.1 <= bright.1, "g out of range: {c:?}");
+            assert!(c.2 >= base.2 && c.2 <= bright.2, "b out of range: {c:?}");
+        }
+    }
+
+    #[test]
+    fn verb_anim_timings_are_the_values_the_spec_names() {
+        // Pinned to literals. These three numbers are the whole difference
+        // between the effects, so a drift in any of them should fail here
+        // rather than quietly changing how the footer moves.
+        assert_eq!(SWEEP_FAST_MS, 50);
+        assert_eq!(SWEEP_SLOW_MS, 200);
+        assert_eq!(FLASH_PERIOD_MS, 2000);
+        // The prefill sweep must outpace the one it is meant to be
+        // distinguishable from. Checked at compile time, so a regression is a
+        // build error rather than a test failure.
+        const { assert!(SWEEP_FAST_MS < SWEEP_SLOW_MS) }
+        // The fields are readable by the pattern later tasks match on.
+        let VerbAnim::Sweep { reverse, step_ms } = (VerbAnim::Sweep {
+            reverse: true,
+            step_ms: SWEEP_FAST_MS,
+        }) else {
+            panic!("constructed a Sweep but it did not match as one");
+        };
+        assert!(reverse);
+        assert_eq!(step_ms, SWEEP_FAST_MS);
     }
 }
