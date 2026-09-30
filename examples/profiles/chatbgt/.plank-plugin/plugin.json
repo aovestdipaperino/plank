@@ -5,7 +5,8 @@
   "author": "Enzo Lombardi",
   "profile": {
     "displayName": "ChatBGT",
-    "accent": "#3fa9c5",
+    "accent": "#ffffff",
+    "secondary": "#3fa9c5",
     "systemPrompt": "prompt.md",
     "tools": { "builtin": ["read", "more", "glob", "search", "bash", "ask"] },
     "settings": { "ui": { "showThinking": false } }

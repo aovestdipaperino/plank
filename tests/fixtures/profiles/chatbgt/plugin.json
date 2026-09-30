@@ -6,7 +6,8 @@
   "profile": {
     "displayName": "ChatBGT",
     "logo": "chatbgt.png",
-    "accent": "#3fa9c5",
+    "accent": "#ffffff",
+    "secondary": "#3fa9c5",
     "systemPrompt": "prompt.md",
     "folderContext": false,
     "agentsMd": false,
