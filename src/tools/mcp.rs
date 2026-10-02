@@ -2529,7 +2529,13 @@ done
         assert!(defs[0].1[0].1.contains("\"a\""));
 
         // The same server known only globally contributes nothing to Tier 2.
-        assert!(local_tool_defs(&servers, &[]).is_empty());
+        assert_eq!(
+            local_tool_defs(&servers, &[]),
+            [] as [(
+                std::string::String,
+                std::vec::Vec<(std::string::String, std::string::String)>
+            ); 0]
+        );
         let material = crate::kvtier::tool_defs_material(&defs);
         assert!(material.starts_with("demo/alpha\u{1}"), "{material:?}");
         std::fs::remove_file(local).ok();
@@ -2586,7 +2592,7 @@ done
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "web");
         assert_eq!(list[0].url, "http://127.0.0.1:9/mcp");
-        assert!(list[0].command.is_empty());
+        assert_eq!(list[0].command, "");
         assert_eq!(
             list[0].headers,
             vec![("Authorization".to_string(), "Bearer tok".to_string())]
@@ -3102,13 +3108,13 @@ done
             r#"{"type":"resource","resource":{"uri":"plank-frame://csvedit/a.csv","text":"x\n"}}"#;
         let mut out = String::new();
         let stagings = append_content_staged(&mut out, "fin", &call_result(item, ""));
-        assert!(stagings.is_empty());
+        assert_eq!(stagings, [] as [crate::grid::GridStaging; 0]);
         assert_eq!(out, note);
         // An incomplete writeBack is as malformed as a missing one.
         let item = FRAME_ITEM.replace(r#","grid":"0a1b2c3d""#, "");
         let mut out = String::new();
         let stagings = append_content_staged(&mut out, "fin", &call_result(&item, ""));
-        assert!(stagings.is_empty());
+        assert_eq!(stagings, [] as [crate::grid::GridStaging; 0]);
         assert_eq!(out, note);
     }
 
@@ -3118,7 +3124,7 @@ done
         let result = call_result(&format!(r#"{{"type":"text","text":"done"}},{item}"#), "");
         let mut out = String::new();
         let stagings = append_content_staged(&mut out, "fin", &result);
-        assert!(stagings.is_empty());
+        assert_eq!(stagings, [] as [crate::grid::GridStaging; 0]);
         // Today's behaviour: an item with no top-level `text` is skipped.
         assert_eq!(out, "done\n");
     }
@@ -3131,7 +3137,7 @@ done
         );
         let mut out = String::new();
         let stagings = append_content_staged(&mut out, "fin", &result);
-        assert!(stagings.is_empty());
+        assert_eq!(stagings, [] as [crate::grid::GridStaging; 0]);
         assert_eq!(out, "one\ntwo\n");
     }
 
@@ -3425,7 +3431,10 @@ done
         );
         assert_eq!(servers.len(), 1, "the server must survive");
         assert_eq!(servers[0].tools.len(), 1, "its tools must survive");
-        assert!(servers[0].resources.is_empty());
+        assert_eq!(
+            servers[0].resources,
+            [] as [crate::tools::mcp::McpResource; 0]
+        );
     }
 
     #[test]
@@ -3445,7 +3454,10 @@ done
     #[test]
     fn a_missing_resources_key_yields_none() {
         let root = json_parse("{}").expect("parses");
-        assert!(parse_resources(&root).is_empty());
+        assert_eq!(
+            parse_resources(&root),
+            [] as [crate::tools::mcp::McpResource; 0]
+        );
     }
 
     #[test]

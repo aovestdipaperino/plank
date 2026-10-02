@@ -2178,10 +2178,10 @@ mod tests {
             true,
         );
         assert_eq!(names(&merged), vec!["demo:greet", "greet"]);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].winner.as_deref(), Some("demo"));
-        assert!(claims[0].shadowed.is_empty());
+        assert_eq!(claims[0].shadowed, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2280,7 +2280,7 @@ mod tests {
         assert_eq!(names(&merged), vec!["demo:greet"]);
         assert!(!merged.iter().any(|i| i.name == "greet"));
         // No collision warnings: there is no bare name to collide on.
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
         // No plugin wins the bare name.
         assert_eq!(claims.len(), 1);
         assert!(claims[0].winner.is_none());
@@ -2306,7 +2306,7 @@ mod tests {
             "user"
         );
         // No warning: the plugin skill was never going to take the bare name.
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
         assert_eq!(claims.len(), 1);
         assert!(claims[0].winner.is_none());
         assert_eq!(claims[0].shadowed, vec!["demo".to_string()]);
@@ -2403,7 +2403,7 @@ mod tests {
         // Plugin skills are namespaced only: the bare name is never registered.
         assert!(!skills.iter().any(|s| s.name == "greet"));
         assert!(skills.iter().any(|s| s.name == "demo:greet"));
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2434,7 +2434,7 @@ mod tests {
         assert!(skills.iter().any(|s| s.name == "demo:greet"));
         // Plugin skills are namespaced only, so a local skill with the same
         // bare name is the expected case — no collision warning.
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2536,7 +2536,7 @@ mod tests {
         let (servers, warnings) = mcp_servers(&set);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "weather");
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
     }
 
     #[test]

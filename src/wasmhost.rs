@@ -707,7 +707,7 @@ mod tests {
     fn the_noop_host_refuses_everything_without_panicking() {
         let mut h = NoWasmHost;
         assert_eq!(h.load("x.wasm", b"\0asm", &[]), Err(WasmError::Unsupported));
-        assert!(h.drain_printed().is_empty());
+        assert_eq!(h.drain_printed(), [] as [std::string::String; 0]);
         assert_eq!(h.call("any", "plank_abi", b""), Err(WasmError::Unsupported));
         assert!(!h.has_export("any", "plank_abi"));
         assert!(!h.is_live(), "the no-op must not claim it can run plugins");

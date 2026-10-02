@@ -484,7 +484,7 @@ mod tests {
             variables("{{b}} then {{ a }} then {{b}}"),
             vec!["b".to_string(), "a".to_string()]
         );
-        assert!(variables("no holes here").is_empty());
+        assert_eq!(variables("no holes here"), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -539,7 +539,10 @@ mod tests {
         );
         assert_eq!(variables(t.body.as_str()), vec!["v".to_string()]);
         let unterminated = tpl("u", "half {{open and done");
-        assert!(variables(&unterminated.body).is_empty());
+        assert_eq!(
+            variables(&unterminated.body),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(render(&unterminated, "").unwrap(), "half {{open and done");
     }
 

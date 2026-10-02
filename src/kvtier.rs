@@ -960,7 +960,7 @@ mod tests {
         assert_eq!(tiers[1].kind, TierKind::ProjectStable);
         assert!(!tiers[1].cacheable());
         // Still keyed, so a caller that later gains a store can reuse the fp.
-        assert!(!tiers[1].fingerprint.is_empty());
+        assert_ne!(tiers[1].fingerprint, "");
     }
 
     #[test]
@@ -1460,7 +1460,10 @@ mod warm_tests {
             "a miss, and it says which kind"
         );
         assert_eq!(e.reset_to, None, "the engine was not touched at all");
-        assert!(e.appended.is_empty());
+        assert_eq!(
+            e.appended,
+            [] as [std::option::Option<std::string::String>; 0]
+        );
         assert!(e.synced.is_empty(), "restore never prefills");
 
         // Seed the checkpoint the way a local-main session would, then re-run:
