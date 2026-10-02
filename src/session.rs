@@ -3031,7 +3031,10 @@ mod tests {
         assert_eq!(loaded.transcript[2].text, "done");
 
         // Second pass: nothing left to do, and nothing rewritten.
-        assert!(store.retitle_all().unwrap().is_empty());
+        assert_eq!(
+            store.retitle_all().unwrap(),
+            [] as [(std::string::String, std::string::String); 0]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3338,7 +3341,7 @@ hello\n";
         // The hard backward-compat requirement: no branches on disk, and the
         // linear transcript reads back as a one-branch tree whose active path
         // is the whole transcript.
-        assert!(s.branches.is_empty());
+        assert_eq!(s.branches, [] as [crate::branch::OffNode; 0]);
         let tree = s.tree();
         assert_eq!(tree.branch_count(), 1);
         assert_eq!(tree.len(), 2);
@@ -4662,7 +4665,7 @@ hello\n";
         store.save(&mut other).unwrap();
         plant_rungs("other");
         store.delete("new-name").unwrap();
-        assert!(rung_files("new-name").is_empty());
+        assert_eq!(rung_files("new-name"), [] as [std::string::String; 0]);
         assert_eq!(
             rung_files("other").len(),
             4,
@@ -4671,7 +4674,7 @@ hello\n";
 
         // `delete_all` sweeps the rest.
         assert_eq!(store.delete_all().unwrap(), 1);
-        assert!(rung_files("other").is_empty());
+        assert_eq!(rung_files("other"), [] as [std::string::String; 0]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4796,7 +4799,7 @@ hello\n";
         // No stamps and no project: absent fields read as absent, not as bad
         // data.
         assert!(loaded.transcript.iter().all(|m| m.at == 0));
-        assert!(loaded.cwd.is_empty());
+        assert_eq!(loaded.cwd, "");
         assert!(loaded.render.is_none());
 
         store.save(&mut loaded).unwrap();

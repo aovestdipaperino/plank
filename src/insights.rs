@@ -4118,7 +4118,7 @@ Tool result 3 (read):\nfine\n</tool_result>",
         // A report regenerated with nothing new shows no strip at all.
         let same = delta(&state, &before, 0);
         assert!(same.is_empty());
-        assert!(delta_html(&same, 0).is_empty());
+        assert_eq!(delta_html(&same, 0), "");
     }
 
     #[test]

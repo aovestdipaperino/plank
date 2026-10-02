@@ -485,7 +485,10 @@ mod tests {
     #[test]
     fn empty_list_injects_nothing() {
         assert_eq!(TaskList::new().inject_block(None), None);
-        assert!(TaskList::new().strip_rows().is_empty());
+        assert_eq!(
+            TaskList::new().strip_rows(),
+            [] as [(std::string::String, bool); 0]
+        );
     }
 
     #[test]
@@ -510,7 +513,7 @@ mod tests {
             list.add(format!("task {i}"), None);
         }
         // Nothing in progress: no strip.
-        assert!(list.strip_rows().is_empty());
+        assert_eq!(list.strip_rows(), [] as [(std::string::String, bool); 0]);
         list.update(
             3,
             Some(TaskStatus::InProgress),
@@ -536,7 +539,7 @@ mod tests {
         assert_eq!(list.strip_rows().len(), 1);
         list.update(1, Some(TaskStatus::Completed), None, None)
             .unwrap();
-        assert!(list.strip_rows().is_empty());
+        assert_eq!(list.strip_rows(), [] as [(std::string::String, bool); 0]);
     }
 
     #[test]
@@ -617,6 +620,6 @@ mod tests {
             )
             .starts_with("Tool error: task update needs at least one")
         );
-        assert!(done.is_empty());
+        assert_eq!(done, [] as [std::string::String; 0]);
     }
 }

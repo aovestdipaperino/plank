@@ -349,13 +349,13 @@ mod tests {
     fn pinning_beats_expiry() {
         let mut n = node(KvRole::Session, "kept", None, 999);
         n.pinned = true;
-        assert!(doomed(&[n], &[]).is_empty());
+        assert_eq!(doomed(&[n], &[]), [] as [std::string::String; 0]);
     }
 
     #[test]
     fn the_active_chain_beats_expiry() {
         let nodes = vec![node(KvRole::System, "live", None, 999)];
-        assert!(doomed(&nodes, &["live"]).is_empty());
+        assert_eq!(doomed(&nodes, &["live"]), [] as [std::string::String; 0]);
         assert_eq!(doomed(&nodes, &[]), vec!["live".to_owned()]);
     }
 
@@ -368,7 +368,7 @@ mod tests {
             node(KvRole::System, "old-sys", None, 999),
             node(KvRole::Session, "live-sess", Some("old-sys"), 1),
         ];
-        assert!(doomed(&nodes, &[]).is_empty());
+        assert_eq!(doomed(&nodes, &[]), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -393,7 +393,7 @@ mod tests {
             node(KvRole::System, "sys-b", None, 2),
             node(KvRole::System, "sys-c", None, 3),
         ];
-        assert!(doomed(&nodes, &["sys-a"]).is_empty());
+        assert_eq!(doomed(&nodes, &["sys-a"]), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -446,10 +446,9 @@ mod tests {
             node(KvRole::Session, "a", None, 1),
             node(KvRole::Session, "b", None, 2),
         ];
-        assert!(
-            plan_sweep(&nodes, &[], &budget_only(0), NOW)
-                .doomed
-                .is_empty()
+        assert_eq!(
+            plan_sweep(&nodes, &[], &budget_only(0), NOW).doomed,
+            [] as [usize; 0]
         );
     }
 
@@ -457,10 +456,9 @@ mod tests {
     fn a_total_under_budget_evicts_nothing() {
         let nodes = vec![node(KvRole::Session, "a", None, 1)];
         // `node` builds 100-byte blobs.
-        assert!(
-            plan_sweep(&nodes, &[], &budget_only(1_000), NOW)
-                .doomed
-                .is_empty()
+        assert_eq!(
+            plan_sweep(&nodes, &[], &budget_only(1_000), NOW).doomed,
+            [] as [usize; 0]
         );
     }
 

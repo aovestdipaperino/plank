@@ -474,7 +474,7 @@ mod tests {
         // Empty buffer: nothing to splice into.
         let mut empty = TokenTranscript::new();
         empty.splice_last_span("x", &[1], 1);
-        assert!(empty.tokens().is_empty());
+        assert_eq!(empty.tokens(), [] as [i32; 0]);
     }
 
     /// The merge is a span-index change and nothing more: the ids and their

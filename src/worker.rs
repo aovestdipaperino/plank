@@ -962,7 +962,7 @@ mod tests {
         assert!(shared.has_queued());
         assert_eq!(shared.take_queued(), vec!["one", "two"]);
         assert!(!shared.has_queued());
-        assert!(shared.take_queued().is_empty());
+        assert_eq!(shared.take_queued(), [] as [std::string::String; 0]);
 
         // Blank lines are skipped when the queue runs, so they are not
         // reason enough to take a screensaver down.

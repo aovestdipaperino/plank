@@ -425,7 +425,7 @@ mod tests {
     fn terminal_bundle_id_maps_known_and_defaults() {
         // The mapping is env-driven; assert the default branch explicitly since
         // TERM_PROGRAM under the test harness is unspecified.
-        assert!(!host_terminal_bundle_id().is_empty());
+        assert_ne!(host_terminal_bundle_id(), "");
     }
 
     #[test]

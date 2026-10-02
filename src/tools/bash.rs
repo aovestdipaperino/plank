@@ -1633,7 +1633,7 @@ mod tests {
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(&mut ctx, &test_call("bash", &[("command", "echo now")]));
         assert!(out.contains(" status=done "));
-        assert!(ctx.bash.take_finished().is_empty());
+        assert_eq!(ctx.bash.take_finished(), [] as [std::string::String; 0]);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1926,7 +1926,7 @@ mod tests {
         };
         let a = run("printf %s \"$PLANK_GPU_YIELD_FILE\"");
         let b = run("printf %s \"$PLANK_GPU_YIELD_FILE\"");
-        assert!(!a.stdout.is_empty());
+        assert_ne!(a.stdout, "");
         assert_ne!(a.stdout, b.stdout);
         assert!(a.gpu_signal.is_none());
         let asked = run("printf %s \"$PLANK_GPU_YIELD_FILE\"; \

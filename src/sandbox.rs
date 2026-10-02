@@ -783,7 +783,7 @@ mod tests {
         );
         assert!(roots.contains(&real(&repo.join(".git"))), "{roots:?}");
         // A normal clone keeps `.git` inside the cwd and needs no extra root.
-        assert!(worktree_git_roots(&repo).is_empty());
+        assert_eq!(worktree_git_roots(&repo), [] as [std::path::PathBuf; 0]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1105,8 +1105,8 @@ mod tests {
             ConfigSource::Project,
         );
         assert!(sb.enabled, "a checkout must not switch the sandbox off");
-        assert!(sb.writable_paths.is_empty());
-        assert!(sb.excluded_commands.is_empty());
+        assert_eq!(sb.writable_paths, [] as [std::path::PathBuf; 0]);
+        assert_eq!(sb.excluded_commands, [] as [std::string::String; 0]);
         assert!(sb.should_sandbox("rm -rf /"));
 
         // Turning it on from the project file is tightening, so it is honoured

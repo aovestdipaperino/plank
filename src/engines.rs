@@ -1424,7 +1424,7 @@ mod tests {
         for choice in [Choice::Default, Choice::Spec("qwen"), Choice::Named("ds41")] {
             let (s, notes) = choose_with_recommendation_in(&r, &c, None, None, choice).unwrap();
             assert_eq!(s, resolve_in(&r, &c, choice).unwrap());
-            assert!(notes.is_empty());
+            assert_eq!(notes, [] as [std::string::String; 0]);
         }
         assert!(choose_with_recommendation_in(&r, &c, None, None, Choice::Named("nope")).is_err());
     }

@@ -1605,7 +1605,10 @@ mod tests {
 
         // Dropping the mirror retires it from the live set too.
         drop(sub);
-        assert!(reconcile().subagents_new.is_empty());
+        assert_eq!(
+            reconcile().subagents_new,
+            [] as [crate::debugmirror::MirrorId; 0]
+        );
         reset();
     }
 

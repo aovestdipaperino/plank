@@ -846,7 +846,7 @@ mod tests {
             Some(&["bash".to_string(), "ask".to_string()][..])
         );
         assert!(spec.settings_json.is_some());
-        assert!(spec.warnings.is_empty());
+        assert_eq!(spec.warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -974,7 +974,7 @@ mod tests {
     fn unknown_fields_are_ignored() {
         let text = r#"{ "profile": { "systemPrompt": "p.md", "futureThing": 3 } }"#;
         let spec = parse(text, Path::new("/p")).expect("still a profile");
-        assert!(spec.warnings.is_empty());
+        assert_eq!(spec.warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1119,7 +1119,7 @@ mod tests {
         let text = r#"{ "profile": { "systemPrompt": "p.md" } }"#;
         let spec = parse(text, Path::new("/p")).expect("a profile");
         assert_eq!(spec.display_name, None);
-        assert!(spec.warnings.is_empty());
+        assert_eq!(spec.warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1134,7 +1134,7 @@ mod tests {
     fn an_absent_logo_is_silent() {
         let text = r#"{ "profile": { "systemPrompt": "p.md" } }"#;
         let spec = parse(text, Path::new("/p")).expect("a profile");
-        assert!(spec.warnings.is_empty());
+        assert_eq!(spec.warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1149,7 +1149,7 @@ mod tests {
     fn an_absent_settings_is_silent() {
         let text = r#"{ "profile": { "systemPrompt": "p.md" } }"#;
         let spec = parse(text, Path::new("/p")).expect("a profile");
-        assert!(spec.warnings.is_empty());
+        assert_eq!(spec.warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1169,7 +1169,7 @@ mod tests {
         let text = r#"{ "profile": { "systemPrompt": "p.md" } }"#;
         let spec = parse(text, Path::new("/p")).expect("a profile");
         assert_eq!(spec.builtin_tools, None);
-        assert!(spec.warnings.is_empty());
+        assert_eq!(spec.warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1240,7 +1240,7 @@ mod tests {
     fn a_bare_flag_lists_the_available_profiles() {
         let set = crate::plugins::PluginSet::default();
         match resolve_profile(Some(""), false, &set) {
-            Resolution::List(names) => assert!(names.is_empty()),
+            Resolution::List(names) => assert_eq!(names, [] as [std::string::String; 0]),
             other => panic!("expected a listing, got {other:?}"),
         }
     }
@@ -1263,7 +1263,7 @@ mod tests {
         match resolve_profile(Some("nope"), false, &set) {
             Resolution::NoSuchPlugin(name, available) => {
                 assert_eq!(name, "nope");
-                assert!(available.is_empty());
+                assert_eq!(available, [] as [std::string::String; 0]);
             }
             other => panic!("expected NoSuchPlugin, got {other:?}"),
         }
