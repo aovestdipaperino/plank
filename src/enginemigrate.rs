@@ -377,8 +377,8 @@ mod tests {
         let r = scratch("idem");
         std::fs::write(r.join("ds4flash.gguf"), "m").unwrap();
         std::fs::write(r.join("ds4.manifest"), old_manifest(&["main"])).unwrap();
-        assert!(migrate_in(&r).is_empty());
-        assert!(migrate_in(&r).is_empty());
+        assert_eq!(migrate_in(&r), [] as [std::string::String; 0]);
+        assert_eq!(migrate_in(&r), [] as [std::string::String; 0]);
         assert!(r.join("ds4vision.gguf").exists());
     }
 
@@ -477,7 +477,7 @@ mod tests {
 
         // Once the helper is gone, the next launch finishes the job.
         drop(held);
-        assert!(migrate_in(&r).is_empty());
+        assert_eq!(migrate_in(&r), [] as [std::string::String; 0]);
         assert!(
             crate::manifest::staging_dir_in(&r, EngineId::QWEN)
                 .join("main.part")
@@ -499,7 +499,7 @@ mod tests {
         ] {
             std::fs::write(r.join(old), body).unwrap();
         }
-        assert!(migrate_in(&r).is_empty());
+        assert_eq!(migrate_in(&r), [] as [std::string::String; 0]);
         for (new, body) in [
             ("ds4vision.part", "main-bytes"),
             ("ds4vision.part.url", "https://h/main"),

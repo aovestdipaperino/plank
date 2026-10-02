@@ -4121,7 +4121,7 @@ mod tests {
         let root = temp_dir("missing-module");
         let p = plugin_dir(&root, "demo", FULL, &[]);
         let set = discover(&set_of(vec![p]));
-        assert!(set.components.is_empty());
+        assert_eq!(set.components, [] as [crate::wasmreg::WasmComponent; 0]);
         assert!(
             set.warnings.iter().any(|w| w.contains("missing module")),
             "{:?}",

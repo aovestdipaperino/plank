@@ -837,7 +837,7 @@ mod tests {
     #[test]
     fn the_wall_and_paddle_fill_whatever_screen_they_get() {
         let b = Breakout::new(1);
-        assert!(b.glyphs(MIN_W - 1, MIN_H).is_empty());
+        assert_eq!(b.glyphs(MIN_W - 1, MIN_H), [] as [crate::arcade::Glyph; 0]);
         for (w, h) in [(MIN_W, MIN_H), (80, 24), (200, 60)] {
             let g = b.glyphs(w, h);
             assert!(!g.is_empty(), "nothing drawn at {w}x{h}");

@@ -230,7 +230,10 @@ fn a_command_component_registers_and_runs() {
     // Ephemeral trust with no home: nothing is approved, so nothing loads.
     assert!(session.registry.loaded.is_empty());
     assert_eq!(session.registry.held.len(), 1);
-    assert!(session.registry.commands().is_empty());
+    assert_eq!(
+        session.registry.commands(),
+        [] as [(&str, &plank::wasmreg::CommandSpec); 0]
+    );
 
     // Approving it loads it *and* registers its commands, without a restart.
     let name = session
@@ -341,7 +344,10 @@ fn a_component_claiming_command_without_the_exports_is_refused() {
         reg.warnings
     );
     // And it contributes nothing to the menu, which is the user-visible point.
-    assert!(reg.commands().is_empty());
+    assert_eq!(
+        reg.commands(),
+        [] as [(&str, &plank::wasmreg::CommandSpec); 0]
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1507,7 +1513,7 @@ fn screensaver_faces_are_enumerable_and_resolvable_by_address() {
         .open_frame(&component, &face, 60, 30, 1)
         .expect("a pinned face opens");
     session.step_frame(&mut frame, 33, 60, 30, 0).expect("step");
-    assert!(!frame.last.glyphs.is_empty());
+    assert_ne!(frame.last.glyphs, [] as [plank::arcade::Glyph; 0]);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1517,7 +1523,10 @@ fn screensaver_faces_are_enumerable_and_resolvable_by_address() {
 fn an_arcade_contributes_no_screensaver_face() {
     let wasm = guest_or_skip!();
     let (root, session) = frame_session("faces-arcade", &wasm, r#", "kind": "arcade""#);
-    assert!(session.screensaver_faces().is_empty());
+    assert_eq!(
+        session.screensaver_faces(),
+        [] as [plank::wasmreg::FaceRef; 0]
+    );
     assert_eq!(session.resolve_screensaver_face("demo:bounce"), None);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1567,8 +1576,11 @@ fn the_arcades_plugin_is_never_a_screensaver() {
         eprintln!("skipping: run guests/build.sh first");
         return;
     };
-    assert!(session.screensaver_faces().is_empty());
-    assert!(session.idle_frames().is_empty());
+    assert_eq!(
+        session.screensaver_faces(),
+        [] as [plank::wasmreg::FaceRef; 0]
+    );
+    assert_eq!(session.idle_frames(), [] as [&str; 0]);
     assert_eq!(
         session.openable_frames().len(),
         1,
