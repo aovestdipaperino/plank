@@ -956,7 +956,10 @@ mod tests {
             "Tool error: edit path escapes workspace: ../plank_edit_outside_test.txt\n"
         );
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "one\n");
-        assert!(ctx.edit_previews.is_empty());
+        assert_eq!(
+            ctx.edit_previews,
+            [] as [crate::tools::diff::EditPreview; 0]
+        );
         // Inside cwd still works.
         std::fs::write(dir.join("f.txt"), "one\n").unwrap();
         let out = tool_edit(

@@ -460,7 +460,7 @@ mod tests {
         // directly instead of going through `sh -c`.
         let path = Path::new("/work/my report.html");
         let (program, args) = browser_command(path);
-        assert!(!program.is_empty());
+        assert_ne!(program, "");
         assert_eq!(
             args.last().map(std::ffi::OsString::as_os_str),
             Some(path.as_os_str())

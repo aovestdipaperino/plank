@@ -1627,7 +1627,7 @@ mod tests {
         let (kept, dropped) =
             select_for_render(&entries, &MetaStore::default(), &Budgets::default());
         assert_eq!(kept, entries);
-        assert!(dropped.is_empty());
+        assert_eq!(dropped, [] as [crate::memory::Entry; 0]);
     }
 
     fn two_sources(dir: &Path) -> Vec<Source> {
@@ -2479,7 +2479,7 @@ mod tests {
             Some(&user),
         )
         .expect_err("a write the directory refuses must surface as an error");
-        assert!(!err.is_empty());
+        assert_ne!(err, "");
         assert_eq!(std::fs::read(&path).unwrap(), before, "byte-identical");
 
         // The `/remember` path, the same.
@@ -2693,10 +2693,9 @@ mod tests {
         assert!(log_text.contains("\"action\": \"forget\""));
         assert!(log_text.contains("Ship the BETA"));
 
-        assert!(
-            forget_matching_to(&dir, "nothing here", Some(&log), Some(&user))
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            forget_matching_to(&dir, "nothing here", Some(&log), Some(&user)).unwrap(),
+            [] as [std::string::String; 0]
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2915,7 +2914,7 @@ mod tests {
         let entries = parse_entries(&big);
         let (kept, dropped) =
             select_for_render(&entries, &MetaStore::default(), &Budgets::default());
-        assert!(!dropped.is_empty());
+        assert_ne!(dropped, [] as [crate::memory::Entry; 0]);
         let newest_dropped = dropped.iter().map(|e| e.date.as_str()).max().unwrap();
         let oldest_kept = kept.iter().map(|e| e.date.as_str()).min().unwrap();
         assert!(

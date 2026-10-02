@@ -2497,7 +2497,7 @@ mod tests {
         let read = specs.iter().find(|s| s.name == "read").unwrap();
         assert_eq!(read.parameters["type"], "object");
         assert!(read.parameters["properties"].get("path").is_some());
-        assert!(!read.description.is_empty());
+        assert_ne!(read.description, "");
     }
 
     #[test]

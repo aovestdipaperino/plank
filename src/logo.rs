@@ -188,7 +188,7 @@ mod tests {
     fn version_line_has_version_and_commit() {
         let line = super::version_line();
         assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
-        assert!(!super::commit_id().is_empty());
+        assert_ne!(super::commit_id(), "");
         assert!(line.contains(super::commit_id()), "{line}");
     }
 

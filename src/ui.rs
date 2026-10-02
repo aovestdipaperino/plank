@@ -20330,22 +20330,23 @@ fn busy_ui_loop(
                     toggle_tasks_report(&mut report, task_view.report());
                     selection.cancel();
                 }
-                // A click on a roster row selects it and opens its output.
-                MouseEventKind::Down(MouseButton::Left)
-                    if let Some(run) = tui::roster_click(m.column, m.row) =>
-                {
-                    sub.click_run(run);
-                    selection.cancel();
-                }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    input_drag = tui::last_input_rect()
-                        .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false));
-                    // A press outside the prompt starts an output-pane
-                    // selection instead, exactly as at idle.
-                    if input_drag {
+                    // A click on a roster row selects it and opens its output.
+                    // (Not an `if let` match guard: those are unstable on our
+                    // MSRV, Rust 1.93.)
+                    if let Some(run) = tui::roster_click(m.column, m.row) {
+                        sub.click_run(run);
                         selection.cancel();
                     } else {
-                        selection.press(sub.active_view(view).top, m.column, m.row);
+                        input_drag = tui::last_input_rect()
+                            .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false));
+                        // A press outside the prompt starts an output-pane
+                        // selection instead, exactly as at idle.
+                        if input_drag {
+                            selection.cancel();
+                        } else {
+                            selection.press(sub.active_view(view).top, m.column, m.row);
+                        }
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) if input_drag => {
@@ -24645,7 +24646,7 @@ mod tests {
         );
         assert!(input.ghost.is_none(), "and the ghost with it");
         // Nothing was submitted: the text is sitting in the prompt.
-        assert!(agent.session.transcript.is_empty());
+        assert_eq!(agent.session.transcript, [] as [crate::session::Message; 0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -25551,7 +25552,7 @@ mod tests {
         agent.payload_dirty = true;
         agent.flush_kv_end_of_turn();
         agent.anchor_rung_before_tool_result(compact::MICROCOMPACT_MIN_BYTES + 1);
-        assert!(agent.ladder.rungs().is_empty());
+        assert_eq!(agent.ladder.rungs(), []);
     }
 
     /// A rung whose `spans` already reaches the edit index contains the span
@@ -26686,7 +26687,7 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         let (_addr, token) = agent.remote_on("127.0.0.1:0", None, true).expect("binds");
-        assert!(!token.is_empty());
+        assert_ne!(token, "");
         agent.remote_off();
     }
 
@@ -26789,7 +26790,7 @@ mod tests {
         // `off` when already off says so rather than erroring.
         let noop = agent.remote_toggle_lines("/rc", "off");
         assert!(!agent.remote_is_on());
-        assert!(!noop.is_empty());
+        assert_ne!(noop, [] as [std::string::String; 0]);
 
         // "ON" (uppercase) works the same as "on" — case-insensitive argument.
         let upper = agent.remote_toggle_lines("/rc", "ON");
@@ -28886,7 +28887,7 @@ mod tests {
         // stamps the session id so a resume can find it.
         agent.session.push(Message::user("hello there"));
         let (id, path) = agent.save_for_exit().expect("used session should save");
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
         assert!(path.exists(), "session file written: {}", path.display());
         assert_eq!(agent.session.id, id);
         // The id resolves through the store, which is what `/resume <id>` uses.
@@ -29147,7 +29148,7 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = branch_agent(&dir, &cfg);
         agent.fork_branch("2", false).unwrap();
-        assert!(!agent.session.branches.is_empty());
+        assert_ne!(agent.session.branches, [] as [crate::branch::OffNode; 0]);
         agent.rebuild_after_compact("summary");
         assert!(
             agent.session.branches.is_empty(),
@@ -29254,7 +29255,7 @@ mod tests {
         // Nothing at all: no scaffolding message is invented.
         let mut session = Session::new();
         push_session_context(&mut session, &ContextContent::default());
-        assert!(session.transcript.is_empty());
+        assert_eq!(session.transcript, [] as [crate::session::Message; 0]);
     }
 
     #[test]
@@ -30744,7 +30745,7 @@ mod tests {
         let mut never = |_q: &str| -> bool { panic!("nothing to overwrite") };
         agent.rename_session("renamed-one", &mut never).unwrap();
         assert_eq!(agent.session.id, "renamed-one");
-        assert!(agent.ladder.rungs().is_empty());
+        assert_eq!(agent.ladder.rungs(), []);
         assert!(rung_files(&agent).is_empty(), "nothing under the new id");
         let leftovers: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
@@ -32476,7 +32477,7 @@ mod tests {
         assert_eq!(last.role, crate::session::Role::Assistant);
         assert_eq!(last.text, "half a thought about the");
         // And the parent's own transcript is still exactly as it was.
-        assert!(agent.session.transcript.is_empty());
+        assert_eq!(agent.session.transcript, [] as [crate::session::Message; 0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -33228,7 +33229,7 @@ mod tests {
             "{}",
             pass.assistant_text
         );
-        assert!(pass.calls.is_empty());
+        assert_eq!(pass.calls, [] as [trace_stream::dsml::ToolCall; 0]);
         assert!(pass.tool_error.is_none());
     }
 
@@ -35760,7 +35761,7 @@ or the user's next message aborts before its first token"
              PLANK_SUGGEST_DEBUG=1 and fix the PROMPT, not the sanitizer"
         );
         let text = agent.suggestion.as_ref().unwrap().text.clone();
-        assert!(!text.is_empty());
+        assert_ne!(text, "");
         assert!(
             !text.starts_with('/') && !text.starts_with('!'),
             "a command must never reach the input line: {text:?}"
@@ -36486,7 +36487,7 @@ or the user's next message aborts before its first token"
         );
         assert_eq!(agent.session.transcript[3].text, "also check the docs");
         assert!(agent.session.transcript[4].text.contains("Done."));
-        assert!(shared.take_queued().is_empty());
+        assert_eq!(shared.take_queued(), [] as [std::string::String; 0]);
 
         // The UI channel saw rendered text, the drain join, and status
         // snapshots from generation.
@@ -36579,7 +36580,10 @@ or the user's next message aborts before its first token"
         assert!(note.contains("background-done\n"));
         assert!(texts[4].contains("Done."));
         // Announced once: the table forgot the job.
-        assert!(agent.tool_ctx.bash.take_finished().is_empty());
+        assert_eq!(
+            agent.tool_ctx.bash.take_finished(),
+            [] as [std::string::String; 0]
+        );
 
         let events: Vec<UiEvent> = rx.try_iter().collect();
         assert!(
@@ -36867,8 +36871,8 @@ or the user's next message aborts before its first token"
         let f = r.captured.as_ref().unwrap();
         assert_eq!(f.cols, 10);
         assert_eq!(f.rows, 3);
-        assert!(!f.ansi.is_empty());
-        assert!(!f.tree.is_empty());
+        assert_ne!(f.ansi, "");
+        assert_ne!(f.tree, "");
     }
 
     #[test]

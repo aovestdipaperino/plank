@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn names_is_empty_when_the_root_does_not_exist() {
         let home = tmpdir("names-empty");
-        assert!(names(&home).is_empty());
+        assert_eq!(names(&home), [] as [std::string::String; 0]);
         let _ = std::fs::remove_dir_all(&home);
     }
 

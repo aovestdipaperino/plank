@@ -783,7 +783,7 @@ mod tests {
         );
         assert!(roots.contains(&real(&repo.join(".git"))), "{roots:?}");
         // A normal clone keeps `.git` inside the cwd and needs no extra root.
-        assert!(worktree_git_roots(&repo).is_empty());
+        assert_eq!(worktree_git_roots(&repo), [] as [std::path::PathBuf; 0]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -841,6 +841,18 @@ mod tests {
         }
     }
 
+    /// A `(subpath "…")` profile entry for `path`.
+    fn subpath(path: &Path) -> String {
+        format!("(subpath \"{}\")", path.display())
+    }
+
+    /// The fake home's cargo home. `CARGO_HOME` overrides `~/.cargo`, and
+    /// rustup sets it for every cargo it runs, `cargo test` included, so the
+    /// tests resolve it the way the code does rather than assume `~/.cargo`.
+    fn fake_cargo_home() -> PathBuf {
+        cargo_home(Path::new(FAKE_HOME))
+    }
+
     fn profile_for(sb: &Sandbox, granted: &[Protected]) -> String {
         sb.profile_at(
             Path::new("/nonexistent/work"),
@@ -854,7 +866,7 @@ mod tests {
     fn protected_roots_are_not_writable_until_granted() {
         let mut sb = test_sandbox();
         let plank = format!("(subpath \"{FAKE_PLANK_HOME}\")");
-        let cargo_bin = format!("(subpath \"{FAKE_HOME}/.cargo/bin\")");
+        let cargo_bin = subpath(&fake_cargo_home().join("bin"));
 
         // Denied (and the default): no grant reaches the profile at all.
         let none = profile_for(&sb, &[]);
@@ -891,33 +903,45 @@ mod tests {
     fn toolchain_caches_are_writable_but_path_bins_are_not() {
         let sb = test_sandbox();
         let p = profile_for(&sb, &[]);
+        let home = Path::new(FAKE_HOME);
+        let cargo = fake_cargo_home();
+        // RUSTUP_HOME and GOMODCACHE/GOPATH override the defaults the same
+        // way CARGO_HOME does, and rustup sets RUSTUP_HOME under cargo test.
+        let rustup = env_dir("RUSTUP_HOME").unwrap_or_else(|| home.join(".rustup"));
+        let gomod = env_dir("GOMODCACHE").unwrap_or_else(|| {
+            env_dir("GOPATH")
+                .unwrap_or_else(|| home.join("go"))
+                .join("pkg/mod")
+        });
         for cache in [
-            ".cargo/registry",
-            ".cargo/git",
-            ".rustup/downloads",
-            ".rustup/tmp",
-            ".npm/_cacache",
-            ".cache",
-            "Library/Caches",
-            "go/pkg/mod",
+            cargo.join("registry"),
+            cargo.join("git"),
+            rustup.join("downloads"),
+            rustup.join("tmp"),
+            home.join(".npm/_cacache"),
+            home.join(".cache"),
+            home.join("Library/Caches"),
+            gomod,
         ] {
             assert!(
-                p.contains(&format!("(subpath \"{FAKE_HOME}/{cache}\")")),
-                "{cache} should be writable by default"
+                p.contains(&subpath(&cache)),
+                "{} should be writable by default",
+                cache.display()
             );
         }
         // Never the whole of ~/.cargo, which would carry bin with it.
-        assert!(!p.contains(&format!("(subpath \"{FAKE_HOME}/.cargo\")")));
-        assert!(!p.contains(&format!("(subpath \"{FAKE_HOME}/.cargo/bin\")")));
+        assert!(!p.contains(&subpath(&cargo)));
+        assert!(!p.contains(&subpath(&cargo.join("bin"))));
 
         // And the containment check the file tools use agrees with the profile.
         let cwd = Path::new("/nonexistent/work");
         let granted = BTreeSet::new();
         let roots = sb.write_roots_at(cwd, Some(Path::new(FAKE_HOME)), None, &granted);
         let under = |p: &str| roots.iter().any(|r| Path::new(p).starts_with(r));
-        assert!(under("/nonexistent/home/.cargo/registry/cache/x"));
-        assert!(!under("/nonexistent/home/.cargo/bin/plank-replay"));
-        assert!(!under("/nonexistent/home/.cargo/config.toml"));
+        let under_cargo = |rel: &str| under(&cargo.join(rel).to_string_lossy());
+        assert!(under_cargo("registry/cache/x"));
+        assert!(!under_cargo("bin/plank-replay"));
+        assert!(!under_cargo("config.toml"));
     }
 
     #[test]
@@ -1105,8 +1129,8 @@ mod tests {
             ConfigSource::Project,
         );
         assert!(sb.enabled, "a checkout must not switch the sandbox off");
-        assert!(sb.writable_paths.is_empty());
-        assert!(sb.excluded_commands.is_empty());
+        assert_eq!(sb.writable_paths, [] as [std::path::PathBuf; 0]);
+        assert_eq!(sb.excluded_commands, [] as [std::string::String; 0]);
         assert!(sb.should_sandbox("rm -rf /"));
 
         // Turning it on from the project file is tightening, so it is honoured

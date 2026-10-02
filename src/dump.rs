@@ -137,7 +137,11 @@ fn render_one_profile(out: &mut String, path: &Path, color: bool) {
     if let Some(d) = &spec.display_name {
         row(out, "displayName", d);
     }
-    row(out, "systemPrompt", &spec.system_prompt.display().to_string());
+    row(
+        out,
+        "systemPrompt",
+        &spec.system_prompt.display().to_string(),
+    );
     row(
         out,
         "accent",

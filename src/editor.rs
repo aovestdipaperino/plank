@@ -1952,7 +1952,10 @@ mod tests {
         let cmd = resolve_editor_command(Some("code -w --new-window"), None);
         assert_eq!(cmd.program, "code");
         assert_eq!(cmd.args, vec!["-w", "--new-window"]);
-        assert!(resolve_editor_command(Some("vim"), None).args.is_empty());
+        assert_eq!(
+            resolve_editor_command(Some("vim"), None).args,
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]

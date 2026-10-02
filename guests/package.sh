@@ -22,9 +22,14 @@ sh ./build.sh >/dev/null
 
 for guest in screensavers arcades csvedit; do
   # csvedit is the one WASI guest (see build.sh); the others are freestanding.
+  # It is also the plank-tv crate, so its artifact is plank_tv.wasm.
   target=wasm32-unknown-unknown
-  [ "$guest" = csvedit ] && target=wasm32-wasip1
-  built="$ROOT/$guest/target/$target/release/plank_$guest.wasm"
+  crate="plank_$guest"
+  if [ "$guest" = csvedit ]; then
+    target=wasm32-wasip1
+    crate=plank_tv
+  fi
+  built="$ROOT/$guest/target/$target/release/$crate.wasm"
   if [ ! -f "$built" ]; then
     echo "missing build output: $built" >&2
     exit 1

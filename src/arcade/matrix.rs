@@ -451,8 +451,8 @@ mod tests {
     #[test]
     fn a_zero_sized_area_paints_nothing() {
         let r = Rain::new(1);
-        assert!(r.glyphs(0, 24).is_empty());
-        assert!(r.glyphs(80, 0).is_empty());
+        assert_eq!(r.glyphs(0, 24), [] as [crate::arcade::Glyph; 0]);
+        assert_eq!(r.glyphs(80, 0), [] as [crate::arcade::Glyph; 0]);
     }
 
     /// Every column moves down every frame — unless it just finished its pass
