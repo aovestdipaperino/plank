@@ -31,6 +31,8 @@ for the Claude Code layout), alongside the plugin's existing `name`,
 | `agentsMd` | boolean | no | `false`: `AGENTS.md` is neither read nor offered |
 | `recommendedModel` | string, an engine name | no | none: the model is chosen as without a profile |
 | `grids` | object, MCP server name to component id | no | empty: no MCP server is routed to a grid |
+| `verbs` | array of strings, or object of phase to array | no | plank's own status verbs |
+| `additionalVerbs` | array of strings, or object of phase to array | no | plank's own status verbs, nothing added |
 
 `systemPrompt` is the only required field, and deliberately so: a `profile`
 block without a prompt is a skin over plank's own identity, and activating a
@@ -68,6 +70,35 @@ Both default to `false`, and a value that is not `true` or `false` warns and
 counts as `false`, so a typo never turns a context source on. A coding-style
 profile sets both to `true`. Without `--profile`, plank behaves as it always
 has: both are on.
+
+### Status verbs
+
+The status bar names what the agent is doing with a verb drawn once per turn
+from a pool for the current phase: `thinking` (inside a `<think>` block),
+`generating` (ordinary output), `tool` (a tool dispatch running), `prefill`
+(reading the context), and the rare `fun` pool that wins one turn in twenty
+whatever the phase. A profile can reshape that vocabulary in one of two ways,
+and declaring both is refused with a warning, leaving plank's own verbs:
+
+- `verbs` replaces the built-in pools.
+- `additionalVerbs` appends to them.
+
+Either takes an array, which then applies to every phase, or an object keyed
+by phase names, each holding an array:
+
+```json
+"verbs": {
+  "thinking": ["Scheming", "Plotting"],
+  "tool": ["Smiting", "Torching"],
+  "fun": ["Fiddling 🎻"]
+}
+```
+
+A phase the object leaves out keeps its built-in pool, even under `verbs`, so
+no phase is ever left with nothing to say. An unknown phase key, a non-string
+or empty entry, or a phase whose value is not an array warns and is skipped
+while the rest is kept; a value that is neither an array nor an object, or one
+naming no verbs at all, warns and is ignored. Verbs are read once at launch.
 
 ### Recommended model
 

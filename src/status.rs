@@ -1206,13 +1206,37 @@ fn publish_verb_phase(cell: &std::sync::atomic::AtomicU8, phase: VerbPhase) {
 pub fn prefill_label(st: &Status) -> &'static str {
     let phase = verb_phase(st);
     publish_verb_phase(&VERB_PHASE, phase);
-    let pool = verbs_for(phase);
-    let idx = if phase == VerbPhase::Fun {
-        (st.prefill_label / FUN_ODDS) as usize % pool.len()
+    pick_verb(phase, st.prefill_label, crate::profile::active_verbs())
+}
+
+/// The verb `seed` lands on in `phase`'s pool, as the active profile shapes
+/// it: `verbs` swaps a phase's built-in pool for the profile's, while
+/// `additionalVerbs` appends the profile's after the built-ins. A phase the
+/// profile left empty keeps its built-ins either way. Indexes across the
+/// concatenation without building it, since this runs on every frame.
+#[must_use]
+pub fn pick_verb(
+    phase: VerbPhase,
+    seed: u32,
+    verbs: Option<&'static crate::profile::ProfileVerbs>,
+) -> &'static str {
+    let builtin = verbs_for(phase);
+    let extra: &'static [String] = verbs.map_or(&[], |v| &v.pools[phase as usize]);
+    let builtin = if verbs.is_some_and(|v| v.replace) && !extra.is_empty() {
+        &[][..]
     } else {
-        st.prefill_label as usize % pool.len()
+        builtin
     };
-    pool[idx]
+    let len = builtin.len() + extra.len();
+    let idx = if phase == VerbPhase::Fun {
+        (seed / FUN_ODDS) as usize % len
+    } else {
+        seed as usize % len
+    };
+    builtin
+        .get(idx)
+        .copied()
+        .unwrap_or_else(|| extra[idx - builtin.len()].as_str())
 }
 
 /// Picks a stable random verb seed for a new turn, seeded from wall-clock.
@@ -3507,6 +3531,46 @@ mod tests {
             prefill_label(&generating),
             GENERATING_VERBS[seed as usize % GENERATING_VERBS.len()]
         );
+    }
+
+    fn leaked_verbs(replace: bool, pools: [&[&str]; 5]) -> &'static crate::profile::ProfileVerbs {
+        Box::leak(Box::new(crate::profile::ProfileVerbs {
+            replace,
+            pools: pools.map(|p| p.iter().map(|s| (*s).to_string()).collect()),
+        }))
+    }
+
+    #[test]
+    fn replacing_verbs_draw_only_from_the_profile() {
+        let v = leaked_verbs(true, [&["Hexing", "Cursing"], &[], &[], &[], &[]]);
+        let drawn: std::collections::HashSet<_> = (0..40)
+            .map(|s| pick_verb(VerbPhase::Thinking, s, Some(v)))
+            .collect();
+        assert_eq!(drawn, ["Hexing", "Cursing"].into_iter().collect());
+        // A phase the profile left empty keeps its built-ins.
+        assert!(GENERATING_VERBS.contains(&pick_verb(VerbPhase::Generating, 3, Some(v))));
+    }
+
+    #[test]
+    fn additional_verbs_extend_the_builtin_pool() {
+        let v = leaked_verbs(false, [&[], &[], &["Smelting"], &[], &[]]);
+        let n = TOOL_VERBS.len();
+        #[allow(clippy::cast_possible_truncation)]
+        let drawn: std::collections::HashSet<_> = (0..=n as u32)
+            .map(|s| pick_verb(VerbPhase::Tool, s, Some(v)))
+            .collect();
+        assert_eq!(drawn.len(), n + 1);
+        assert!(drawn.contains("Smelting"));
+        assert!(TOOL_VERBS.iter().all(|t| drawn.contains(t)));
+    }
+
+    #[test]
+    fn profile_fun_verbs_spread_across_the_pool() {
+        let v = leaked_verbs(true, [&[], &[], &[], &[], &["A", "B", "C"]]);
+        let drawn: std::collections::HashSet<_> = (0..3)
+            .map(|k| pick_verb(VerbPhase::Fun, k * FUN_ODDS, Some(v)))
+            .collect();
+        assert_eq!(drawn.len(), 3);
     }
 
     #[test]

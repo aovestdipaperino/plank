@@ -111,12 +111,24 @@ The manifest's `profile` block describes the agent:
 | `folderContext` | whether the session starts with the launch folder's git status and `.plank/MEMORY.md` | `false` |
 | `agentsMd` | whether `AGENTS.md` is read, offered and linked | `false` |
 | `recommendedModel` | an engine to run, such as `"qwen"`, used only when its model file and every companion it declares are already on disk | the usual model choice |
+| `verbs` | the status-bar verbs, replacing plank's own | plank's verbs |
+| `additionalVerbs` | status-bar verbs added to plank's own; cannot be combined with `verbs` | nothing added |
 
 A malformed optional field warns and falls back to its default rather than stopping the launch. A malformed `tools.builtin` fails closed, to an empty list, so a typo never hands the agent more tools than you wrote down.
 
 `folderContext` and `agentsMd` default to `false` because most profiles are not about the folder you happen to launch them from. A mail assistant started in a code checkout should not be told the checkout's git status or offered an `AGENTS.md`. A coding-style profile sets both to `true`. Your own memory, `~/.plank/MEMORY.md`, is loaded either way.
 
 `recommendedModel` lets a profile suggest the engine it works best with, and plank takes the suggestion only if that engine is locally available: its main model file and every companion it declares must already exist on disk. It outranks `engine.model` in your settings but never a `--model` you typed, and it never starts a download: when the engine is not installed (main or a companion missing), or is not an engine at all, plank prints one line saying so and picks the model the usual way.
+
+`verbs` and `additionalVerbs` give a profile its own voice in the status bar, the word that says what the agent is doing while you wait. `verbs` swaps plank's vocabulary out and `additionalVerbs` mixes more into it; declare one or the other, since a manifest with both gets a warning and plank's own verbs. Either can be a plain list, used whatever the agent is doing, or an object that sorts the words by moment: `thinking`, `generating`, `tool` (a tool is running), `prefill` (reading the context) and `fun` (the rare one-in-twenty surprise). A moment the object leaves out keeps plank's words for it. The three published profiles each replace the lot: d3v1l schemes and smites, EAP muses and versifies, HAL computes and actuates.
+
+```json
+"verbs": {
+  "thinking": ["Computing", "Calculating"],
+  "tool": ["Actuating", "Engaging"],
+  "fun": ["Singing Daisy 🌼"]
+}
+```
 
 ### The prompt
 

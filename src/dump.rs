@@ -137,7 +137,11 @@ fn render_one_profile(out: &mut String, path: &Path, color: bool) {
     if let Some(d) = &spec.display_name {
         row(out, "displayName", d);
     }
-    row(out, "systemPrompt", &spec.system_prompt.display().to_string());
+    row(
+        out,
+        "systemPrompt",
+        &spec.system_prompt.display().to_string(),
+    );
     row(
         out,
         "accent",
@@ -182,6 +186,20 @@ fn render_one_profile(out: &mut String, path: &Path, color: bool) {
             .map(|(server, id)| format!("{server} -> {id}"))
             .collect();
         row(out, "grids", &grids.join(", "));
+    }
+    if let Some(v) = &spec.verbs {
+        let counts: Vec<String> = crate::profile::VERB_PHASE_KEYS
+            .iter()
+            .zip(&v.pools)
+            .filter(|(_, pool)| !pool.is_empty())
+            .map(|(phase, pool)| format!("{phase} {}", pool.len()))
+            .collect();
+        let key = if v.replace {
+            "verbs"
+        } else {
+            "additionalVerbs"
+        };
+        row(out, key, &counts.join(", "));
     }
     if let Some(source) = read_source(path) {
         row(out, "source", &source);

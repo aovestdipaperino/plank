@@ -68,6 +68,26 @@ pub struct ProfileSpec {
     /// manifest declares routes; a malformed entry is dropped with a
     /// warning rather than widening what gets routed.
     pub grids: BTreeMap<String, String>,
+    /// `verbs` or `additionalVerbs`: the status-bar verb pools the profile
+    /// replaces or extends. `None` keeps plank's own vocabulary.
+    pub verbs: Option<ProfileVerbs>,
+}
+
+/// The phase keys of a per-phase `verbs` object, in the order
+/// [`ProfileVerbs::pools`] is indexed (`crate::status::VerbPhase` as `u8`).
+pub const VERB_PHASE_KEYS: [&str; 5] = ["thinking", "generating", "tool", "prefill", "fun"];
+
+/// A profile's status-bar verbs, from `verbs` (replacing plank's pools) or
+/// `additionalVerbs` (appended to them). The two are mutually exclusive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileVerbs {
+    /// `true` for `verbs`, `false` for `additionalVerbs`.
+    pub replace: bool,
+    /// One pool per phase, indexed as [`VERB_PHASE_KEYS`]. An empty pool
+    /// leaves that phase's built-in verbs alone, even under `replace`, so a
+    /// per-phase object that omits a phase never leaves it with nothing to
+    /// show.
+    pub pools: [Vec<String>; 5],
 }
 
 impl ProfileSpec {
@@ -274,6 +294,8 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
 
     let grids = grids_field(block, &mut warnings);
 
+    let verbs = verbs_field(block, &mut warnings);
+
     Some(ProfileSpec {
         display_name,
         logo,
@@ -287,7 +309,88 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
         agents_md,
         recommended_model,
         grids,
+        verbs,
     })
+}
+
+/// `verbs` / `additionalVerbs`: either an array of strings, used for every
+/// phase, or an object keyed by [`VERB_PHASE_KEYS`] with an array each.
+///
+/// Declaring both is a contradiction the parser will not guess at: it warns
+/// and keeps plank's own verbs. A malformed value warns and is ignored; a
+/// malformed entry or unknown phase key inside an otherwise-valid value warns
+/// and is dropped while the rest is kept.
+fn verbs_field(obj: &Json, warnings: &mut Vec<String>) -> Option<ProfileVerbs> {
+    let (key, value, replace) = match (obj.get("verbs"), obj.get("additionalVerbs")) {
+        (None, None) => return None,
+        (Some(_), Some(_)) => {
+            warnings.push(
+                "profile: verbs and additionalVerbs are mutually exclusive; using the default verbs"
+                    .to_string(),
+            );
+            return None;
+        }
+        (Some(v), None) => ("verbs", v, true),
+        (None, Some(v)) => ("additionalVerbs", v, false),
+    };
+    let mut pools: [Vec<String>; 5] = Default::default();
+    match value {
+        Json::Arr(_) => {
+            let pool = verb_list(value, key, warnings);
+            for slot in &mut pools {
+                slot.clone_from(&pool);
+            }
+        }
+        Json::Obj(members) => {
+            for (phase, list) in members {
+                let Some(i) = VERB_PHASE_KEYS.iter().position(|k| k == phase) else {
+                    warnings.push(format!(
+                        "profile: {key} has unknown phase {phase:?}; skipping it"
+                    ));
+                    continue;
+                };
+                pools[i] = verb_list(list, &format!("{key}.{phase}"), warnings);
+            }
+        }
+        _ => {
+            warnings.push(format!(
+                "profile: {key} is neither an array nor an object; using the default verbs"
+            ));
+            return None;
+        }
+    }
+    if pools.iter().all(Vec::is_empty) {
+        warnings.push(format!(
+            "profile: {key} names no verbs; using the default verbs"
+        ));
+        return None;
+    }
+    Some(ProfileVerbs { replace, pools })
+}
+
+/// The non-empty strings of one verb array; anything else warns.
+fn verb_list(value: &Json, what: &str, warnings: &mut Vec<String>) -> Vec<String> {
+    let Json::Arr(items) = value else {
+        warnings.push(format!("profile: {what} is not an array; skipping it"));
+        return Vec::new();
+    };
+    let mut bad = false;
+    let out = items
+        .iter()
+        .filter_map(|v| match v {
+            Json::Str(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            _ => {
+                bad = true;
+                None
+            }
+        })
+        .collect();
+    if bad {
+        warnings.push(format!(
+            "profile: {what} has a non-string or empty entry; skipping it"
+        ));
+    }
+    out
 }
 
 /// `grids`: an object mapping MCP server name to WASM frame component id.
@@ -457,6 +560,12 @@ pub fn active() -> Option<&'static ActiveProfile> {
 #[must_use]
 pub fn active_name() -> Option<&'static str> {
     ACTIVE.get().map(|a| a.name.as_str())
+}
+
+/// The active profile's status-bar verbs, or `None` for plank's own.
+#[must_use]
+pub fn active_verbs() -> Option<&'static ProfileVerbs> {
+    ACTIVE.get().and_then(|a| a.spec.verbs.as_ref())
 }
 
 /// What to call the agent in the banner, window title and status bar:
@@ -662,6 +771,56 @@ mod tests {
         assert_eq!(title_of("HAL", "0.3.1"), "HAL v0.3.1");
         assert_eq!(title_of("HAL", "v1.2"), "HAL v1.2", "no doubled v");
         assert_eq!(title_of("HAL", "  "), "HAL", "no version, name alone");
+    }
+
+    fn verbs_of(block: &str) -> (Option<ProfileVerbs>, Vec<String>) {
+        let text = format!(r#"{{"profile":{{"systemPrompt":"p.md",{block}}}}}"#);
+        let spec = parse(&text, Path::new("/p")).expect("parses");
+        (spec.verbs, spec.warnings)
+    }
+
+    #[test]
+    fn verbs_absent_keeps_the_builtins() {
+        let spec = parse(r#"{"profile":{"systemPrompt":"p.md"}}"#, Path::new("/p")).unwrap();
+        assert_eq!(spec.verbs, None);
+    }
+
+    #[test]
+    fn a_verbs_array_replaces_every_phase() {
+        let (v, w) = verbs_of(r#""verbs":["Hexing","Cursing"]"#);
+        let v = v.expect("verbs");
+        assert!(v.replace && w.is_empty());
+        assert!(v.pools.iter().all(|p| p == &["Hexing", "Cursing"]));
+    }
+
+    #[test]
+    fn additional_verbs_by_phase_extend() {
+        let (v, w) = verbs_of(r#""additionalVerbs":{"tool":["Smelting"],"fun":["Yawning"]}"#);
+        let v = v.expect("verbs");
+        assert!(!v.replace && w.is_empty());
+        assert_eq!(v.pools[2], ["Smelting"]);
+        assert_eq!(v.pools[4], ["Yawning"]);
+        assert!(v.pools[0].is_empty());
+    }
+
+    #[test]
+    fn verbs_and_additional_verbs_are_mutually_exclusive() {
+        let (v, w) = verbs_of(r#""verbs":["A"],"additionalVerbs":["B"]"#);
+        assert_eq!(v, None);
+        assert!(w[0].contains("mutually exclusive"), "{w:?}");
+    }
+
+    #[test]
+    fn malformed_verbs_warn_and_keep_what_is_valid() {
+        let (v, w) = verbs_of(r#""verbs":{"thinking":["Brooding",3,""],"dreaming":["X"]}"#);
+        assert_eq!(v.expect("verbs").pools[0], ["Brooding"]);
+        assert_eq!(w.len(), 2, "{w:?}");
+        let (v, w) = verbs_of(r#""verbs":"Hexing""#);
+        assert_eq!(v, None);
+        assert_eq!(w.len(), 1);
+        let (v, w) = verbs_of(r#""additionalVerbs":[]"#);
+        assert_eq!(v, None);
+        assert!(w[0].contains("names no verbs"));
     }
 
     #[test]
@@ -1215,6 +1374,7 @@ mod tests {
             agents_md: false,
             recommended_model: None,
             grids: BTreeMap::new(),
+            verbs: None,
         }
     }
 
