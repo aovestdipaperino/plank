@@ -20330,22 +20330,23 @@ fn busy_ui_loop(
                     toggle_tasks_report(&mut report, task_view.report());
                     selection.cancel();
                 }
-                // A click on a roster row selects it and opens its output.
-                MouseEventKind::Down(MouseButton::Left)
-                    if let Some(run) = tui::roster_click(m.column, m.row) =>
-                {
-                    sub.click_run(run);
-                    selection.cancel();
-                }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    input_drag = tui::last_input_rect()
-                        .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false));
-                    // A press outside the prompt starts an output-pane
-                    // selection instead, exactly as at idle.
-                    if input_drag {
+                    // A click on a roster row selects it and opens its output.
+                    // (Not an `if let` match guard: those are unstable on our
+                    // MSRV, Rust 1.93.)
+                    if let Some(run) = tui::roster_click(m.column, m.row) {
+                        sub.click_run(run);
                         selection.cancel();
                     } else {
-                        selection.press(sub.active_view(view).top, m.column, m.row);
+                        input_drag = tui::last_input_rect()
+                            .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false));
+                        // A press outside the prompt starts an output-pane
+                        // selection instead, exactly as at idle.
+                        if input_drag {
+                            selection.cancel();
+                        } else {
+                            selection.press(sub.active_view(view).top, m.column, m.row);
+                        }
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) if input_drag => {
