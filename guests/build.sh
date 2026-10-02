@@ -13,7 +13,7 @@ for guest in screensavers arcades; do
   (cd "$guest" && cargo build --release --target wasm32-unknown-unknown)
   echo "guest: $(pwd)/$guest/target/wasm32-unknown-unknown/release/plank_$guest.wasm"
 done
-# csvedit is the plank-csvedit submodule (`git submodule update --init
+# csvedit is the plank-tv submodule (`git submodule update --init
 # guests/csvedit`), and it needs WASI: Turbo Vision reads the clock.
 (cd csvedit && cargo build --release --target wasm32-wasip1)
-echo "guest: $(pwd)/csvedit/target/wasm32-wasip1/release/plank_csvedit.wasm"
+echo "guest: $(pwd)/csvedit/target/wasm32-wasip1/release/plank_tv.wasm"

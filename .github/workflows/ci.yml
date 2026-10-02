@@ -79,7 +79,7 @@ jobs:
           sh spike/build-guest.sh
           sh guests/build.sh
 
-      # guests/csvedit is the plank-csvedit submodule; the checkout above is
+      # guests/csvedit is the plank-tv submodule; the checkout above is
       # recursive, so it is present here at its pinned commit.
       - name: Test the CSV editor guest natively
         run: cargo test --manifest-path guests/csvedit/Cargo.toml --lib

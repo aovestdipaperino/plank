@@ -4041,7 +4041,7 @@ mod tests {
                 .join("guests")
                 .join(guest)
                 .join("plugin.json");
-            // csvedit is the plank-csvedit submodule, absent from a checkout
+            // csvedit is the plank-tv submodule, absent from a checkout
             // that never initialised it; the other two live in this tree.
             if guest == "csvedit" && !path.exists() {
                 eprintln!("skipping csvedit: guests/csvedit submodule not checked out");
