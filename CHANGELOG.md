@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A profile can bring its own status verbs.** `verbs` replaces plank's
+  vocabulary and `additionalVerbs` adds to it; the two are mutually exclusive,
+  and a manifest declaring both warns and keeps plank's verbs. Either is a list
+  used for every phase, or an object keyed by `thinking`, `generating`, `tool`,
+  `prefill` and `fun`, where a phase left out keeps its built-in pool. Malformed
+  entries warn and are skipped. `--dump-profiles` shows the per-phase counts.
+  The published d3v1l (devilish), HAL (mechanical) and the EAP (poetic)
+  profiles now replace the verbs with their own.
+
 ## [6.2.0] - 2026-09-30
 
 The blocking-frame release: a WASM component can now take over the screen

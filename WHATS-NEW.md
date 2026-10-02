@@ -10,10 +10,17 @@ it.
 
 ## In the betas
 
-The beta channel has just restarted at 6.2.1, whose code is identical to
-stable 6.2.0, so nothing is riding ahead of stable right now. Everything the
-6.1.x betas below carried is in 6.2.0. Install with `brew install
-aovestdipaperino/tap/plank-agent-beta`.
+Install with `brew install aovestdipaperino/tap/plank-agent-beta`. Everything
+the 6.1.x betas below carried is in stable 6.2.0.
+
+### 6.2.2
+
+**Profiles speak in their own verbs.** The status-bar word that says what the
+agent is up to can now come from the profile: `verbs` replaces plank's
+vocabulary, `additionalVerbs` adds to it, as one list or sorted by moment
+(thinking, generating, running a tool, reading the context, and the rare fun
+one). d3v1l schemes and smites, EAP muses and versifies, HAL computes and
+actuates.
 
 ### 6.1.2
 

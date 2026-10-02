@@ -7,6 +7,13 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v6.2.2 beta: profiles speak in their own verbs.** The word in the status bar
+that says what the agent is doing can now come from the profile, replacing
+plank's vocabulary with `verbs` or mixing more in with `additionalVerbs`. The
+published profiles use it: d3v1l is Scheming and Smiting, EAP is Musing and
+Versifying, HAL is Computing and Actuating, and each keeps a few rare surprises
+of its own, like HAL Singing Daisy.
+
 **v6.2.0 is out.** Its centrepiece is that a tool call can now hand you a real
 editor and wait: a WASM component takes over the screen from inside the
 dispatch, modally, the way the `ask` panel does, and the call reports what

@@ -303,6 +303,17 @@ withheld</td>
 model file and every companion it declares are already on disk</td>
 <td>the usual model choice</td>
 </tr>
+<tr>
+<td><code>verbs</code></td>
+<td>the status-bar verbs, replacing plank's own</td>
+<td>plank's verbs</td>
+</tr>
+<tr>
+<td><code>additionalVerbs</code></td>
+<td>status-bar verbs added to plank's own; cannot be combined with
+<code>verbs</code></td>
+<td>nothing added</td>
+</tr>
 </tbody>
 </table>
 <p>A malformed optional field warns and falls back to its default rather
@@ -324,6 +335,24 @@ your settings but never a <code>--model</code> you typed, and it never
 starts a download: when the engine is not installed (main or a companion
 missing), or is not an engine at all, plank prints one line saying so
 and picks the model the usual way.</p>
+<p><code>verbs</code> and <code>additionalVerbs</code> give a profile
+its own voice in the status bar, the word that says what the agent is
+doing while you wait. <code>verbs</code> swaps plank's vocabulary out
+and <code>additionalVerbs</code> mixes more into it; declare one or the
+other, since a manifest with both gets a warning and plank's own verbs.
+Either can be a plain list, used whatever the agent is doing, or an
+object that sorts the words by moment: <code>thinking</code>,
+<code>generating</code>, <code>tool</code> (a tool is running),
+<code>prefill</code> (reading the context) and <code>fun</code> (the
+rare one-in-twenty surprise). A moment the object leaves out keeps
+plank's words for it. The three published profiles each replace the lot:
+d3v1l schemes and smites, EAP muses and versifies, HAL computes and
+actuates.</p>
+<pre class="json"><code>&quot;verbs&quot;: {
+  &quot;thinking&quot;: [&quot;Computing&quot;, &quot;Calculating&quot;],
+  &quot;tool&quot;: [&quot;Actuating&quot;, &quot;Engaging&quot;],
+  &quot;fun&quot;: [&quot;Singing Daisy 🌼&quot;]
+}</code></pre>
 <h3 id="the-prompt">The prompt</h3>
 <p>The prompt file replaces plank's system prompt entirely. To keep tool
 calls working, include the token <code>{{plank:tool-protocol}}</code>
