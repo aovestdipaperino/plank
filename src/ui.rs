@@ -2264,22 +2264,22 @@ pub(crate) fn render_mcp_report(servers: &[crate::tools::mcp::McpServer], color:
     out
 }
 
-/// The NATO phonetic alphabet, lowercase, in the conventional spellings
-/// (`juliett` with two t's, `x-ray` hyphenated). Source of truth for the
-/// default sub-agent names; see `nato_label`.
-const NATO_ALPHABET: [&str; 26] = [
-    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett",
-    "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
-    "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu",
+/// Famous agents from film, television and literature, lowercase surnames
+/// (or the name they go by). Source of truth for the default sub-agent names;
+/// see `agent_label`.
+const AGENT_NAMES: [&str; 26] = [
+    "bond", "hunt", "fox", "mulder", "scully", "bourne", "smiley", "ryan", "bauer", "starling",
+    "cooper", "salt", "palmer", "solo", "kuryakin", "peel", "steed", "bristow", "archer", "smart",
+    "coulson", "romanoff", "leiter", "carter", "kay", "jay",
 ];
 
 /// The label for the `n`-th unnamed sub-agent of a session, counting from zero:
-/// `alpha`, `bravo`, ... `zulu`, then `alpha-2` ... `zulu-2`, `alpha-3`, and so
-/// on. It never runs out and never repeats, so a log can always tell two
-/// unnamed sub-agents apart.
-fn nato_label(n: usize) -> String {
-    let word = NATO_ALPHABET[n % NATO_ALPHABET.len()];
-    let lap = n / NATO_ALPHABET.len();
+/// `bond`, `hunt`, ... `jay`, then `bond-2` ... `jay-2`, `bond-3`, and so on.
+/// It never runs out and never repeats, so a log can always tell two unnamed
+/// sub-agents apart.
+fn agent_label(n: usize) -> String {
+    let word = AGENT_NAMES[n % AGENT_NAMES.len()];
+    let lap = n / AGENT_NAMES.len();
     if lap == 0 {
         word.to_string()
     } else {
@@ -2533,8 +2533,8 @@ struct Agent<'a> {
     console_seen: usize,
     /// How many *unnamed* sub-agents this session has already labelled. Every
     /// one of them used to be called `sub-agent`, which made a log holding
-    /// several of them unreadable; instead each draws the next NATO phonetic
-    /// word from `nato_label`. One counter per session covers both entry points
+    /// several of them unreadable; instead each draws the next famous agent's
+    /// name from `agent_label`. One counter per session covers both entry points
     /// (the `agent` tool and `/subagent`) and any nesting, so no two unnamed
     /// sub-agents in a session ever share a name. Reset with the session.
     unnamed_subagents: usize,
@@ -7246,7 +7246,7 @@ impl Agent<'_> {
     /// counter. A *named* sub-agent never calls this, so naming one in the
     /// middle of a run does not skip a word.
     fn next_unnamed_subagent_label(&mut self) -> String {
-        let label = nato_label(self.unnamed_subagents);
+        let label = agent_label(self.unnamed_subagents);
         self.unnamed_subagents += 1;
         label
     }
@@ -34743,7 +34743,7 @@ or the user's next message aborts before its first token"
             matches!(
                 got.first(),
                 Some(crate::worker::UiEvent::Dim(d))
-                    if d == &crate::tui::subagent_signpost("alpha")
+                    if d == &crate::tui::subagent_signpost("bond")
             ),
             "first event should be the Dim signpost: {got:?}"
         );
@@ -34763,53 +34763,53 @@ or the user's next message aborts before its first token"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The generated names are the NATO alphabet, lowercase, and they wrap with
-    /// a lap suffix rather than running out or repeating.
+    /// The generated names are the famous-agent roster, and they wrap with a
+    /// lap suffix rather than running out or repeating.
     #[test]
-    fn nato_labels_run_alpha_bravo_charlie_and_wrap_past_zulu() {
-        assert_eq!(nato_label(0), "alpha");
-        assert_eq!(nato_label(1), "bravo");
-        assert_eq!(nato_label(2), "charlie");
-        assert_eq!(nato_label(3), "delta");
-        // The conventional spellings, not the naive ones.
-        assert_eq!(nato_label(9), "juliett");
-        assert_eq!(nato_label(23), "x-ray");
-        assert_eq!(nato_label(25), "zulu");
-        // Past zulu the alphabet starts again with a lap suffix.
-        assert_eq!(nato_label(26), "alpha-2");
-        assert_eq!(nato_label(27), "bravo-2");
-        assert_eq!(nato_label(51), "zulu-2");
-        assert_eq!(nato_label(52), "alpha-3");
+    fn agent_labels_run_bond_hunt_fox_and_wrap_past_jay() {
+        assert_eq!(agent_label(0), "bond");
+        assert_eq!(agent_label(1), "hunt");
+        assert_eq!(agent_label(2), "fox");
+        assert_eq!(agent_label(3), "mulder");
+        assert_eq!(agent_label(25), "jay");
+        // Past the last name the roster starts again with a lap suffix.
+        assert_eq!(agent_label(26), "bond-2");
+        assert_eq!(agent_label(27), "hunt-2");
+        assert_eq!(agent_label(51), "jay-2");
+        assert_eq!(agent_label(52), "bond-3");
         // ... and never repeats: 1000 draws, 1000 distinct labels.
-        let all: std::collections::HashSet<String> = (0..1000).map(nato_label).collect();
+        let all: std::collections::HashSet<String> = (0..1000).map(agent_label).collect();
         assert_eq!(all.len(), 1000);
+        // The roster itself holds no duplicates, or a lap could repeat a name.
+        let roster: std::collections::HashSet<&str> = AGENT_NAMES.into_iter().collect();
+        assert_eq!(roster.len(), AGENT_NAMES.len());
     }
 
     /// One counter per session, shared by every unnamed sub-agent, and a `/new`
-    /// or `/clear` puts it back to `alpha` so a post-reset log reads the same.
+    /// or `/clear` puts it back to `bond` so a post-reset log reads the same.
     #[test]
     fn the_unnamed_sub_agent_counter_is_per_session_and_resets_with_it() {
-        let dir = scratch_dir("nato-counter");
+        let dir = scratch_dir("agent-names-counter");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        assert_eq!(agent.next_unnamed_subagent_label(), "alpha");
-        assert_eq!(agent.next_unnamed_subagent_label(), "bravo");
-        assert_eq!(agent.next_unnamed_subagent_label(), "charlie");
+        assert_eq!(agent.next_unnamed_subagent_label(), "bond");
+        assert_eq!(agent.next_unnamed_subagent_label(), "hunt");
+        assert_eq!(agent.next_unnamed_subagent_label(), "fox");
         agent.reset_session_state();
         assert_eq!(
             agent.next_unnamed_subagent_label(),
-            "alpha",
-            "a session reset restarts the alphabet"
+            "bond",
+            "a session reset restarts the roster"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The `agent` tool's unnamed sub-agents draw successive NATO names, and a
+    /// The `agent` tool's unnamed sub-agents draw successive agent names, and a
     /// *named* one keeps its name without consuming a slot — so naming one in
     /// the middle does not skip a word.
     #[test]
-    fn unnamed_agent_tool_calls_are_labelled_alpha_then_bravo() {
-        let dir = scratch_dir("nato-agent-tool");
+    fn unnamed_agent_tool_calls_are_labelled_bond_then_hunt() {
+        let dir = scratch_dir("agent-names-agent-tool");
         let engine = ScriptedEngine {
             replies: vec![
                 "one\n".to_string(),
@@ -34841,11 +34841,11 @@ or the user's next message aborts before its first token"
         assert_eq!(
             labels,
             vec![
-                "alpha".to_string(),
+                "bond".to_string(),
                 "reviewer".to_string(),
-                "bravo".to_string()
+                "hunt".to_string()
             ],
-            "the named run keeps its name and consumes no NATO slot"
+            "the named run keeps its name and consumes no roster slot"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -34853,14 +34853,14 @@ or the user's next message aborts before its first token"
     /// The other entry point — `/subagent` with no `:<name>` — draws from the
     /// same per-session sequence, so the two never collide in one log.
     #[test]
-    fn the_subagent_command_shares_the_nato_sequence() {
-        let dir = scratch_dir("nato-slash");
+    fn the_subagent_command_shares_the_agent_sequence() {
+        let dir = scratch_dir("agent-names-slash");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         // Both sites call the same draw, so the sequence is shared: standing in
         // for one of them here still proves the other cannot repeat it.
-        assert_eq!(agent.next_unnamed_subagent_label(), "alpha");
-        assert_eq!(agent.next_unnamed_subagent_label(), "bravo");
+        assert_eq!(agent.next_unnamed_subagent_label(), "bond");
+        assert_eq!(agent.next_unnamed_subagent_label(), "hunt");
         assert_eq!(agent.unnamed_subagents, 2);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -35009,7 +35009,7 @@ or the user's next message aborts before its first token"
             "one finished sidechain kept"
         );
         let dump = agent.sidechain_dumps.back().unwrap();
-        assert_eq!(dump.label, "alpha");
+        assert_eq!(dump.label, "bond");
         assert_eq!(dump.outcome, "report");
         assert!(
             dump.messages.iter().any(|m| m.text.contains("echo 42")),

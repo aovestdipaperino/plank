@@ -278,7 +278,7 @@ fn subagent_name(raw: &str, label: &str, ordinal: usize) -> String {
 }
 
 /// Most characters of a sub-agent label that go on the wire. Long enough for
-/// any NATO word or a sensible definition name, short enough that the session
+/// any default agent name or a sensible definition name, short enough that the session
 /// part keeps at least ~30 bytes of the console's 64-byte name limit.
 const LABEL_BUDGET: usize = 24;
 
@@ -883,13 +883,13 @@ mod tests {
     }
 
     /// The console window carries the roster label, so the user finds
-    /// `alpha` in both places rather than `alpha` on screen and `subagent-1`
+    /// `bond` in both places rather than `bond` on screen and `subagent-1`
     /// in the console. A long or exotic label is clipped, never refused.
     #[test]
     fn a_labelled_subagent_window_is_named_after_its_roster_label() {
         assert_eq!(
-            subagent_name("mellow-pauling", "alpha", 1),
-            "plank:mellow-pauling:alpha"
+            subagent_name("mellow-pauling", "bond", 1),
+            "plank:mellow-pauling:bond"
         );
         assert_eq!(
             subagent_name("mellow-pauling", "code reviewer ✨", 2),
