@@ -201,7 +201,6 @@ pub struct DsmlParser {
     parse_pos: usize,
     current: Option<PendingCall>,
     param_name: Option<String>,
-    param_is_string: bool,
     param_value_start: usize,
     /// Element name when the open parameter used the shorthand form
     /// (`<｜DSML｜command …>` instead of `<｜DSML｜parameter name="command" …>`),
@@ -210,6 +209,15 @@ pub struct DsmlParser {
     /// thing that keeps a `</` inside a `write` payload from ending the value —
     /// is never relaxed.
     param_elem: Option<String>,
+    /// True when the open parameter was spelled without the DSML marker
+    /// (`<parameter name="command">`), which is the one case its bare
+    /// `</parameter>` closer is accepted; see [`bare_open_is`].
+    param_bare: bool,
+    /// The open parameter's `string` attribute: `Some(true)` for
+    /// `string="true"`, `Some(false)` for any other value, `None` when the tag
+    /// had none. A bare parameter usually has none, and its value is then
+    /// classified when it closes ([`looks_like_json_literal`]).
+    param_string_attr: Option<bool>,
     /// True while the raw tail looks like a partial parameter close tag, so
     /// online rendering can hide it before the full tag arrives.
     param_close_prefix: bool,
@@ -483,10 +491,16 @@ impl DsmlParser {
                     };
                     let value_bytes =
                         &self.raw[self.param_value_start..self.param_value_start + end];
+                    // `string="true"` decides, as in the C; with no attribute a
+                    // bare parameter is classified by its value and any other
+                    // is not a string.
+                    let is_string = self.param_string_attr.unwrap_or_else(|| {
+                        self.param_bare && !looks_like_json_literal(value_bytes)
+                    });
                     // Only a string value carries the escape; a non-string one
                     // is JSON text, where `&lt;` escapes nothing. The C guards
                     // it the same way (`if (is_string)`).
-                    let unescaped = self.param_is_string.then(|| {
+                    let unescaped = is_string.then(|| {
                         let close = &self.raw[self.param_value_start + end..][..tag_len];
                         unescape_close_delimiter(value_bytes, &close[1..])
                     });
@@ -494,7 +508,7 @@ impl DsmlParser {
                     let arg = ToolArg {
                         name: self.param_name.take().unwrap_or_default(),
                         value: String::from_utf8_lossy(value).into_owned(),
-                        is_string: self.param_is_string,
+                        is_string,
                     };
                     self.current
                         .get_or_insert_with(Default::default)
@@ -516,13 +530,17 @@ impl DsmlParser {
                     }
 
                     let rest = &self.raw[self.parse_pos..];
-                    if let Some(close_len) = close_tag_at(rest, tags.calls_name) {
+                    if let Some(close_len) = close_tag_at(rest, tags.calls_name)
+                        .or_else(|| bare_close_at(rest, tags.calls_name))
+                    {
                         self.push_current();
                         self.parse_pos += close_len;
                         self.state = DsmlState::Done;
                         return;
                     }
-                    if let Some(close_len) = close_tag_at(rest, tags.invoke_name) {
+                    if let Some(close_len) = close_tag_at(rest, tags.invoke_name)
+                        .or_else(|| bare_close_at(rest, tags.invoke_name))
+                    {
                         self.push_current();
                         self.parse_pos += close_len;
                         continue;
@@ -558,11 +576,11 @@ impl DsmlParser {
         // open, so consuming the tag and moving on is idempotent, and strictly
         // better than the alternatives: erroring costs the turn, and treating it
         // as a name invents a `tool_calls` call that swallows the parameters.
-        if open_tag_is(tag, tags.calls_name) {
+        if open_tag_is(tag, tags.calls_name) || bare_open_is(tag, tags.calls_name) {
             self.parse_pos += tag_len;
             return true;
         }
-        if open_tag_is(tag, tags.invoke_name) {
+        if open_tag_is(tag, tags.invoke_name) || bare_open_is(tag, tags.invoke_name) {
             let Some(name) = parse_attr(tag, "name") else {
                 self.set_error("tool invoke without name");
                 return false;
@@ -574,7 +592,7 @@ impl DsmlParser {
                 return false;
             }
             self.open_invoke(name, tag_len);
-        } else if open_tag_is(tag, tags.param_name) {
+        } else if open_tag_is(tag, tags.param_name) || bare_open_is(tag, tags.param_name) {
             let Some(name) = parse_attr(tag, "name") else {
                 self.set_error("tool parameter without name");
                 return false;
@@ -587,6 +605,7 @@ impl DsmlParser {
             }
             self.param_elem = None;
             self.open_param(name, tag, tag_len);
+            self.param_bare = bare_open_is(tag, tags.param_name);
         } else if let Some(elem) = self.shorthand_param_name(tag) {
             self.param_elem = Some(elem.clone());
             self.open_param(elem, tag, tag_len);
@@ -612,7 +631,8 @@ impl DsmlParser {
     /// Enters `ParamValue` for a parameter named `name` opened by `tag`.
     fn open_param(&mut self, name: String, tag: &str, tag_len: usize) {
         self.param_name = Some(name);
-        self.param_is_string = parse_attr(tag, "string").as_deref() == Some("true");
+        self.param_string_attr = parse_attr(tag, "string").map(|v| v == "true");
+        self.param_bare = false;
         self.parse_pos += tag_len;
         self.param_value_start = self.parse_pos;
         self.param_scan_from = self.parse_pos;
@@ -710,11 +730,17 @@ impl DsmlParser {
             };
             let at = self.param_scan_from + pos;
             let tail = &self.raw[at..];
-            if let Some(tag_len) = names.iter().find_map(|n| close_tag_at(tail, n)) {
+            let bare = self.param_bare;
+            if let Some(tag_len) = names.iter().find_map(|n| {
+                close_tag_at(tail, n).or_else(|| bare.then(|| bare_close_at(tail, n)).flatten())
+            }) {
                 return Some((at - self.param_value_start, tag_len));
             }
             self.param_scan_from = at;
-            if names.iter().any(|n| close_tag_partial(tail, n)) {
+            if names
+                .iter()
+                .any(|n| close_tag_partial(tail, n) || (bare && bare_close_partial(tail, n)))
+            {
                 return None;
             }
             let attrs = names.iter().map(|n| (n, close_tag_has_attrs(tail, n)));
@@ -1042,6 +1068,70 @@ fn parameter_close_tail(tail: &[u8], complete: &mut bool) -> bool {
 }
 
 /// Extracts a `name="value"` attribute from a tag, if present.
+/// Whether `tag` opens element `name` *without* the DSML marker:
+/// `<invoke name="bash">` where `<｜DSML｜invoke name="bash">` belongs.
+///
+/// `repro-1790964046` is why: after a reasoning stop the model's markup
+/// decayed to exactly this spelling inside a correctly opened
+/// `<｜DSML｜tool_calls>`, and the strict rejection fed it the same error 256
+/// times. Only ever consulted inside an open stanza, and only for the three
+/// structural element names, so prose and code outside a stanza are never
+/// read as calls. A bare *closer* is narrower still: `</invoke>` and
+/// `</tool_calls>` are accepted between tags, where no value is open, but
+/// `</parameter>` ends a value only when that parameter was itself opened
+/// bare, so a literal `</parameter>` inside a canonical `write` payload can
+/// never cut it short.
+pub(crate) fn bare_open_is(tag: &str, name: &str) -> bool {
+    let t = tag.as_bytes();
+    t.first() == Some(&b'<')
+        && t[1..].starts_with(name.as_bytes())
+        && t.get(1 + name.len())
+            .is_some_and(|&c| c == b'>' || c.is_ascii_whitespace())
+}
+
+/// Length of a marker-less closing tag `</name>` (whitespace allowed before
+/// the `>`) at the start of `s`.
+pub(crate) fn bare_close_at(s: &[u8], name: &str) -> Option<usize> {
+    let mut i = 2 + name.len();
+    if !s.starts_with(b"</") || !s[2..].starts_with(name.as_bytes()) {
+        return None;
+    }
+    while i < s.len() && s[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    (s.get(i) == Some(&b'>')).then_some(i + 1)
+}
+
+/// True when `s` could still grow into [`bare_close_at`]'s tag: a proper
+/// prefix of `</name`, or `</name` followed only by whitespace so far.
+pub(crate) fn bare_close_partial(s: &[u8], name: &str) -> bool {
+    let head_len = 2 + name.len();
+    if s.len() < head_len {
+        let mut head = b"</".to_vec();
+        head.extend_from_slice(name.as_bytes());
+        return head.starts_with(s);
+    }
+    bare_close_at(s, name).is_none()
+        && s.starts_with(b"</")
+        && s[2..].starts_with(name.as_bytes())
+        && s[head_len..].iter().all(u8::is_ascii_whitespace)
+}
+
+/// Whether a parameter value reads as a JSON literal: a number, `true`,
+/// `false`, `null`, or text opening an object, array or string. Used only for
+/// a bare parameter with no `string` attribute, where the model gave no
+/// verdict: a shell command must reach an MCP server as a JSON string, not be
+/// pasted into the arguments object raw, and a `1000` should stay a number.
+fn looks_like_json_literal(value: &[u8]) -> bool {
+    let v = String::from_utf8_lossy(value);
+    let v = v.trim();
+    matches!(v, "true" | "false" | "null")
+        || v.parse::<f64>().is_ok()
+        || v.starts_with('{')
+        || v.starts_with('[')
+        || (v.len() >= 2 && v.starts_with('"') && v.ends_with('"'))
+}
+
 fn parse_attr(tag: &str, name: &str) -> Option<String> {
     let pat = format!("{name}=\"");
     let start = tag.find(&pat)? + pat.len();
@@ -1151,6 +1241,78 @@ mod tests {
     fn feed_bytewise(p: &mut DsmlParser, s: &str) {
         for b in s.as_bytes() {
             p.feed([*b]);
+        }
+    }
+
+    /// The stanza `repro-1790964046` emitted 256 times: a correct opener, then
+    /// every inner tag without the DSML marker and no `string` attribute.
+    const BARE_STANZA: &str = "<｜DSML｜tool_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">cd /x && grep -rn \"fn a\\|fn b\" src | head</parameter>\n</invoke>\n</tool_calls>";
+
+    #[test]
+    fn a_stanza_with_bare_inner_tags_parses() {
+        for bytewise in [false, true] {
+            let mut p = DsmlParser::new();
+            if bytewise {
+                feed_bytewise(&mut p, BARE_STANZA);
+            } else {
+                feed_all(&mut p, BARE_STANZA);
+            }
+            assert_eq!(p.state(), DsmlState::Done, "{}", p.error());
+            let call = &p.calls()[0];
+            assert_eq!(call.name, "bash");
+            assert_eq!(
+                call.arg_value("command"),
+                Some("cd /x && grep -rn \"fn a\\|fn b\" src | head")
+            );
+            assert!(
+                call.args[0].is_string,
+                "a shell command is not a JSON literal"
+            );
+        }
+    }
+
+    #[test]
+    fn decayed_and_canonical_tags_mix_in_one_stanza() {
+        let mut p = DsmlParser::new();
+        feed_all(
+            &mut p,
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">\n<｜DSML｜parameter name=\"path\" string=\"true\">a.rs</｜DSML｜parameter>\n<parameter name=\"start_line\">1000</parameter>\n</invoke>\n</｜DSML｜tool_calls>",
+        );
+        assert_eq!(p.state(), DsmlState::Done, "{}", p.error());
+        let args = &p.calls()[0].args;
+        assert_eq!((args[0].value.as_str(), args[0].is_string), ("a.rs", true));
+        assert_eq!((args[1].value.as_str(), args[1].is_string), ("1000", false));
+    }
+
+    #[test]
+    fn a_bare_closer_never_ends_a_canonical_value() {
+        let mut p = DsmlParser::new();
+        feed_all(
+            &mut p,
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write\">\n<｜DSML｜parameter name=\"content\" string=\"true\">x</parameter></invoke>y</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+        );
+        assert_eq!(p.state(), DsmlState::Done, "{}", p.error());
+        assert_eq!(
+            p.calls()[0].arg_value("content"),
+            Some("x</parameter></invoke>y")
+        );
+    }
+
+    #[test]
+    fn bare_tags_outside_a_known_element_still_error() {
+        let mut p = DsmlParser::new();
+        feed_all(&mut p, "<｜DSML｜tool_calls>\n<invoker name=\"bash\">");
+        assert_eq!(p.state(), DsmlState::Error);
+        assert!(p.error().contains("unexpected DSML tag"), "{}", p.error());
+    }
+
+    #[test]
+    fn json_literals_are_told_from_text() {
+        for v in ["1000", "-2.5", "true", "null", "{\"a\":1}", "[1]", "\"s\""] {
+            assert!(looks_like_json_literal(v.as_bytes()), "{v}");
+        }
+        for v in ["ls -la", "cd /x && make", "", "\"open"] {
+            assert!(!looks_like_json_literal(v.as_bytes()), "{v}");
         }
     }
 

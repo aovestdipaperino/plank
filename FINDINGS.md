@@ -3226,3 +3226,25 @@ What stays open is a failure no check foresees (a file that is readable but
 cannot be mapped, say) and a plank that takes the lock between the probe and
 the open. The lasting fix is an option for `ds4_engine_open` to return an error
 instead of calling `exit`, which belongs in `refs/ds4`.
+
+## Decayed DSML: the marker drops off the inner tags
+
+**2026-10-02:** after a reasoning stop the model's markup decayed to a correct
+`<｜DSML｜tool_calls>` opener around inner tags with no marker at all:
+`<invoke name="bash">`, `<parameter name="command">` (no `string`
+attribute), `</parameter>`, `</invoke>`, `</tool_calls>`
+(`repro-1790964046`). The C rejects this as `unexpected DSML tag`, and the
+model answered the rejection with the identical stanza 256 times. plank
+(`trace-stream` 0.1.8) accepts it, as narrowly as the shorthand forms above:
+only inside an already-open stanza, only the three structural element names
+(`bare_open_is`), so prose and code outside a stanza and any other bare tag
+still error. The closer is the trap again: a bare `</parameter>` ends a value
+only when that parameter was itself opened bare (`param_bare`), so a canonical
+`write` payload containing the literal text is never truncated. A bare
+parameter with no `string` attribute is classified when it closes
+(`looks_like_json_literal`): a shell command must reach an MCP server as a
+JSON string, not be pasted into the arguments object raw, while `1000` stays a
+number. `viz.rs::scan_dsml_tag` mirrors all of it, or the call would run with
+no banner. Not accepted: a closer cut short (`</para`), which is token damage
+rather than a spelling.
+

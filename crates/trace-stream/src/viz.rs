@@ -15,7 +15,8 @@
 //! `agent_stream_renderer` from `ds4_agent.c`.
 
 use crate::dsml::{
-    DsmlParser, DsmlState, MARKER_NAMES, ToolCall, tag_prefix_len, tag_prefix_partial,
+    DsmlParser, DsmlState, MARKER_NAMES, ToolCall, bare_close_at, bare_close_partial, bare_open_is,
+    tag_prefix_len, tag_prefix_partial,
 };
 use crate::qwen::QwenParser;
 use crate::render::ThinkCodeSpan;
@@ -725,6 +726,10 @@ struct ToolViz {
     tool_name: String,
     param_name: String,
     param_end_tail: Vec<u8>,
+    /// The open parameter was spelled without the DSML marker, so its bare
+    /// `</parameter>` ends the value here exactly as it does in the parser
+    /// (`dsml::bare_open_is`).
+    param_bare: bool,
     /// Qwen puts a newline between `<parameter=…>` and the value, and another
     /// before `</parameter>`; both are syntax, not content (`QwenParser`
     /// strips them from the parsed value). This suppresses the leading one so
@@ -1754,6 +1759,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.viz.param_kind = param_kind_for(&self.viz.tool_name, name);
         self.viz.param_active = true;
         self.viz.param_end_tail.clear();
+        self.viz.param_bare = false;
 
         if self.viz.read_style {
             return;
@@ -1909,7 +1915,12 @@ impl<S: RenderSink> StreamRenderer<S> {
                 // on a Qwen stanza is what used to reach `dsml_tag_names` with
                 // `ToolSyntax::Qwen` and abort the render.
                 let (_, param_name) = self.dsml_tag_names();
-                parameter_close_tail(&self.viz.param_end_tail, param_name, &mut complete)
+                let tail = &self.viz.param_end_tail;
+                parameter_close_tail(tail, param_name, &mut complete)
+                    || (self.viz.param_bare && {
+                        complete = bare_close_at(tail, param_name) == Some(tail.len());
+                        complete || bare_close_partial(tail, param_name)
+                    })
             };
             if is_close_tail {
                 if complete {
@@ -2074,15 +2085,21 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
         let b = tag.as_bytes();
         let (invoke_name, param_name) = self.dsml_tag_names();
-        if tag_prefix_len(b, true, invoke_name).is_some() {
+        // The marker-less spellings sit beside the marked ones because the
+        // parser accepts them inside an open stanza (`dsml::bare_open_is`);
+        // without them here a decayed call would run with no banner.
+        if tag_prefix_len(b, true, invoke_name).is_some() || bare_close_at(b, invoke_name).is_some()
+        {
             self.viz_invoke_end();
-        } else if tag_prefix_len(b, false, invoke_name).is_some() {
+        } else if tag_prefix_len(b, false, invoke_name).is_some() || bare_open_is(&tag, invoke_name)
+        {
             let name = parse_attr(&tag, "name").unwrap_or_else(|| "tool".to_string());
             self.viz_tool(&name);
-        } else if tag_prefix_len(b, false, param_name).is_some()
+        } else if (tag_prefix_len(b, false, param_name).is_some() || bare_open_is(&tag, param_name))
             && let Some(name) = parse_attr(&tag, "name")
         {
             self.viz_param_begin(&name);
+            self.viz.param_bare = bare_open_is(&tag, param_name);
             self.scan = DsmlScan::Value;
         } else if parse_attr(&tag, "name").is_none()
             && let Some(elem) = crate::dsml::element_name(&tag)
@@ -2750,6 +2767,25 @@ mod tests {
         sr.push(text);
         sr.finish();
         sr
+    }
+
+    /// The decayed stanza from `repro-1790964046` reaches dispatch through
+    /// the renderer, not only through the bare parser.
+    #[test]
+    fn a_bare_inner_tag_stanza_finishes_as_a_call() {
+        let sr = run_chunked(
+            "</think>\n\n<｜DSML｜tool_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>\n</tool_calls>",
+        );
+        let f = sr.finished();
+        assert_eq!(f.error, None);
+        assert_eq!(f.calls.len(), 1);
+        assert_eq!(f.calls[0].arg_value("command"), Some("ls"));
+        let shown = &sr.sink().visible;
+        assert!(shown.contains("bash"), "the call has its banner: {shown:?}");
+        assert!(
+            !shown.contains("</parameter>"),
+            "the bare closer is syntax: {shown:?}"
+        );
     }
 
     fn pseudo_tool_renderer() -> StreamRenderer<Cap> {

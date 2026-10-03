@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.8
+
+- A stanza whose inner tags lost the DSML marker now parses. Inside an opened
+  `<｜DSML｜tool_calls>`, `<invoke name="…">`, `<parameter name="…">`,
+  `</invoke>` and `</tool_calls>` are read as their marked forms, the
+  spelling a model's markup decayed to after a reasoning stop. A bare
+  `</parameter>` ends a value only when that parameter was itself opened
+  bare, so a literal one inside a canonical value is still value text. A bare
+  parameter with no `string` attribute is a string unless its value reads as
+  a JSON literal.
+
 ## 0.1.7
 
 - A `</think>` quoted in backticks inside a thought no longer ends it. Both
