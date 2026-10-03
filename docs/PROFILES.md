@@ -34,6 +34,11 @@ for the Claude Code layout), alongside the plugin's existing `name`,
 | `verbs` | array of strings, or object of phase to array | no | plank's own status verbs |
 | `additionalVerbs` | array of strings, or object of phase to array | no | plank's own status verbs, nothing added |
 
+The prompt file is the whole identity: plank's default `-sys` line ("You are
+a helpful coding assistant running inside ds4-agent.") is not appended under a
+profile, neither at launch nor in the periodic reminder. A `-sys` given on the
+command line still is, as an explicit addition.
+
 `systemPrompt` is the only required field, and deliberately so: a `profile`
 block without a prompt is a skin over plank's own identity, and activating a
 skin as though it were a full agent would misrepresent what is running. A

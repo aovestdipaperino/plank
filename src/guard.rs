@@ -225,6 +225,56 @@ impl Nudge {
     }
 }
 
+/// Consecutive byte-identical failed passes before the turn is ended.
+///
+/// A failed pass is one whose output never reached dispatch: malformed DSML,
+/// a preflight refusal. Those never reach [`LoopGuard::observe`], so before
+/// this cap nothing bounded them at all, and `repro-1790964046` spent 22
+/// minutes on 256 copies of one malformed call. Three is the same
+/// deterministic-loop threshold as [`STANZA_TRIP`]: at temperature 0 the pass
+/// after an identical error is the identical pass.
+const FAILED_PASS_TRIP: u32 = 3;
+
+/// Counts consecutive failed passes that repeat the previous one exactly:
+/// the same assistant text answered with the same error.
+///
+/// Anything else — a pass that dispatched, answered, or failed differently —
+/// starts the count over, so a model that is changing its markup between
+/// attempts, even badly, is never cut off for it.
+#[derive(Debug, Default)]
+pub struct FailedPassStreak {
+    last: Option<(String, String)>,
+    count: u32,
+}
+
+impl FailedPassStreak {
+    /// Records a failed pass and returns the run length it extends.
+    pub fn note(&mut self, assistant: &str, error: &str) -> u32 {
+        let same = self
+            .last
+            .as_ref()
+            .is_some_and(|(a, e)| a == assistant && e == error);
+        self.count = if same { self.count + 1 } else { 1 };
+        if !same {
+            self.last = Some((assistant.to_owned(), error.to_owned()));
+        }
+        self.count
+    }
+
+    /// Ends the run: the pass did not fail.
+    pub fn reset(&mut self) {
+        self.last = None;
+        self.count = 0;
+    }
+
+    /// Whether the turn should end: the last [`FAILED_PASS_TRIP`] passes
+    /// failed identically.
+    #[must_use]
+    pub fn tripped(&self) -> bool {
+        guards_enabled() && self.count >= FAILED_PASS_TRIP
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +445,27 @@ mod tests {
         let nudge = g.observe("read", d.clone());
         let text = nudge.as_block().expect("block after threshold");
         assert!(text.contains("refused"), "{text}");
+    }
+
+    #[test]
+    fn identical_failed_passes_trip_on_the_third() {
+        let mut s = FailedPassStreak::default();
+        assert_eq!(s.note("<invoke>", "bad tag"), 1);
+        assert_eq!(s.note("<invoke>", "bad tag"), 2);
+        assert!(!s.tripped());
+        assert_eq!(s.note("<invoke>", "bad tag"), 3);
+        assert_eq!(s.tripped(), guards_enabled());
+    }
+
+    #[test]
+    fn a_changed_attempt_or_a_good_pass_starts_over() {
+        let mut s = FailedPassStreak::default();
+        s.note("a", "e");
+        s.note("a", "e");
+        assert_eq!(s.note("b", "e"), 1, "different markup");
+        assert_eq!(s.note("b", "f"), 1, "different error");
+        s.note("b", "f");
+        s.reset();
+        assert_eq!(s.note("b", "f"), 1, "a good pass in between");
     }
 }

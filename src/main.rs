@@ -392,8 +392,13 @@ fn resolve_selection(
             choice
         },
     )?;
+    let color = std::io::stderr().is_terminal();
     for note in notes {
-        eprintln!("plank: {note}");
+        if note.warning && color {
+            eprintln!("\x1b[33mplank: {}\x1b[0m", note.text);
+        } else {
+            eprintln!("plank: {}", note.text);
+        }
     }
     // The recommendation, when it won, replaces `engine.model` as the thing
     // actually loading: keep `model_spec` in sync so anything that reports
@@ -478,6 +483,7 @@ fn parse_config_in(
 ) -> Result<plank::config::AgentConfig, ExitCode> {
     plank::config::parse_options_with(settings, args)
         .and_then(|mut cfg| {
+            cfg.drop_default_system_under_profile(plank::profile::active().is_some());
             match resolve_selection(&mut cfg, root, recommended)
                 .and_then(|catalog| resolve_model_delta(&mut cfg).map(|()| catalog))
             {

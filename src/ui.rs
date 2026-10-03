@@ -654,6 +654,11 @@ const REPEAT_LOOP_WINDOW: usize = 8192;
 /// A single line on purpose: a `\`-continued literal would strip indentation.
 /// Shown when [`crate::guard::LoopGuard::tripped`] ends a turn: the model
 /// re-emitted the same refused tool calls three passes running.
+/// Shown when [`crate::guard::FailedPassStreak`] ends a turn: the model
+/// answered the same tool error with the same malformed output three passes
+/// running, so the error is not reaching it and nothing else will.
+const FAILED_PASS_TRIPPED_NOTICE: &str = "turn stopped: the model sent the same malformed tool call three times in a row, and the error did not change it. Rephrase the request or try again.";
+
 const LOOP_TRIPPED_NOTICE: &str = "turn stopped: the model re-issued the same refused tool calls three times in a row. Rephrase the request or give it what it is missing.";
 
 const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating the same text over and over. Do not resume that reasoning. Decide now and act: emit the tool calls for the change you already planned, or answer the user. Your next reply has no reasoning step: write the answer, or the tool calls, directly.";
@@ -5618,6 +5623,8 @@ impl Agent<'_> {
         let mut repeat_trips = 0usize;
         // The draft rung's own tally; see `MAIN_DRAFT_TRIP_CAP`.
         let mut draft_trips = 0usize;
+        // Byte-identical failed passes in a row; see `FailedPassStreak`.
+        let mut failed_streak = crate::guard::FailedPassStreak::default();
         // Bytes generated since the last tool call with an effect; see
         // `NO_PROGRESS_BYTE_BUDGET`.
         let mut ungrounded = 0usize;
@@ -5782,6 +5789,7 @@ impl Agent<'_> {
                     err,
                     self.tool_syntax(),
                 );
+                failed_streak.note(self.last_assistant_text(), &payload);
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
                 )));
@@ -5791,10 +5799,18 @@ impl Agent<'_> {
                 if draft_trips >= MAIN_DRAFT_TRIP_CAP {
                     return self.stop_turn(MAIN_DRAFT_TRIPS_NOTICE);
                 }
+                if failed_streak.tripped() {
+                    if let Some(line) = self.loop_repro_line() {
+                        println!("{}", self.debug_line(&line));
+                    }
+                    self.stub_repeated_reasoning();
+                    return self.stop_turn(FAILED_PASS_TRIPPED_NOTICE);
+                }
                 let woke = self.drain_job_notifications();
                 self.print_job_wake(woke);
                 continue;
             }
+            failed_streak.reset();
             if !finished.calls.is_empty() {
                 let calls = finished.calls.to_vec();
                 let observations = self.run_tool_calls(&calls);
@@ -5851,6 +5867,7 @@ impl Agent<'_> {
                     if let Some(line) = self.loop_repro_line() {
                         println!("{}", self.debug_line(&line));
                     }
+                    self.stub_repeated_reasoning();
                     return self.stop_turn(LOOP_TRIPPED_NOTICE);
                 }
                 // Checked after the results are in the transcript, so the
@@ -6457,6 +6474,65 @@ impl Agent<'_> {
         crate::engine::kv_debug(|| {
             format!("guard: stubbed {before}B of stopped reasoning down to {after}B")
         });
+    }
+
+    /// After a refusal trip, stubs the reasoning of the trailing run of
+    /// assistant passes that are byte-identical to the last one, returning
+    /// how many were rewritten.
+    ///
+    /// A refusal trip is three stanzas the model re-emitted verbatim, and
+    /// the verbatim copies are the template: in `repro-loop-1790956412` the
+    /// model typed "keep going"'s answer as a tenth copy of the same plan,
+    /// because the turn ended with nine of them on screen. Unlike
+    /// [`Self::stub_last_reasoning`] this reaches behind the live end, so the
+    /// next sync diverges mid-transcript; `rescue_prefix_before_rebuild`
+    /// restores the deepest rung below the edit, and rungs past it simply
+    /// miss on their truncated-transcript fingerprint, so the ladder needs no
+    /// call here either. Run after the repro dump, which keeps the originals.
+    fn stub_repeated_reasoning(&mut self) -> usize {
+        let transcript = &mut self.session.transcript;
+        let Some(last) = transcript
+            .iter()
+            .rposition(|m| m.role == crate::session::Role::Assistant)
+        else {
+            return 0;
+        };
+        let template = transcript[last].text.clone();
+        let mut stubbed = 0;
+        for m in transcript
+            .iter_mut()
+            .rev()
+            .filter(|m| m.role == crate::session::Role::Assistant)
+        {
+            if m.text != template {
+                break;
+            }
+            let before = m.text.len();
+            stub_stopped_reasoning(&mut m.text);
+            if m.text.len() != before {
+                stubbed += 1;
+            }
+        }
+        if stubbed > 0 {
+            self.payload_dirty = true;
+            self.clear_suggestion();
+            crate::engine::kv_debug(|| {
+                format!(
+                    "guard: stubbed the reasoning of {stubbed} repeated pass(es) after a refusal trip"
+                )
+            });
+        }
+        stubbed
+    }
+
+    /// The text of the transcript's last assistant message, or empty.
+    fn last_assistant_text(&self) -> &str {
+        self.session
+            .transcript
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::session::Role::Assistant)
+            .map_or("", |m| m.text.as_str())
     }
 
     /// The durable goal *only while it is being worked*. Model-facing
@@ -15348,6 +15424,8 @@ impl Agent<'_> {
         let mut repeat_trips = 0usize;
         // The draft rung's own tally; see `MAIN_DRAFT_TRIP_CAP`.
         let mut draft_trips = 0usize;
+        // Byte-identical failed passes in a row; see `FailedPassStreak`.
+        let mut failed_streak = crate::guard::FailedPassStreak::default();
         // Bytes generated since the last tool call with an effect; see
         // `NO_PROGRESS_BYTE_BUDGET`.
         let mut ungrounded = 0usize;
@@ -15493,6 +15571,7 @@ impl Agent<'_> {
             // next tool dispatch (BTW-DESIGN §4.4 drain points 1 and 2).
             self.drain_btw(tx, shared);
             if let Some(PassFailure { payload, .. }) = out.error {
+                failed_streak.note(self.last_assistant_text(), &payload);
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
                 )));
@@ -15501,6 +15580,13 @@ impl Agent<'_> {
                 }
                 if draft_trips >= MAIN_DRAFT_TRIP_CAP {
                     return self.stop_turn(MAIN_DRAFT_TRIPS_NOTICE);
+                }
+                if failed_streak.tripped() {
+                    if let Some(line) = self.loop_repro_line() {
+                        let _ = tx.send(UiEvent::Dim(line));
+                    }
+                    self.stub_repeated_reasoning();
+                    return self.stop_turn(FAILED_PASS_TRIPPED_NOTICE);
                 }
                 self.drain_queued(shared, tx);
                 let woke = self.drain_job_notifications();
@@ -15514,6 +15600,7 @@ impl Agent<'_> {
                 shared.set_context(self.context_breakdown());
                 continue;
             }
+            failed_streak.reset();
             if !out.calls.is_empty() {
                 let observations = self.run_tool_calls(&out.calls);
                 self.sync_tasks_after_dispatch();
@@ -15565,6 +15652,7 @@ impl Agent<'_> {
                     if let Some(line) = self.loop_repro_line() {
                         let _ = tx.send(UiEvent::Dim(line));
                     }
+                    self.stub_repeated_reasoning();
                     return self.stop_turn(LOOP_TRIPPED_NOTICE);
                 }
                 // Checked after the results are in the transcript, so the
@@ -32848,6 +32936,72 @@ mod tests {
         let mut no_think = "plain answer".to_string();
         stub_stopped_reasoning(&mut no_think);
         assert_eq!(no_think, "plain answer");
+    }
+
+    #[test]
+    fn identical_malformed_passes_end_the_turn_on_the_third() {
+        // `repro-1790964046`: 256 copies of one malformed stanza, each fed
+        // back the same parse error, for 22 minutes. Parse failures never
+        // reach the loop guard, so nothing bounded them.
+        let dir = scratch_dir("failed-pass-streak");
+        let cfg = test_cfg();
+        let bad = "</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>".to_string();
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec![bad; 8],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("go"));
+        agent.run_turn().unwrap();
+        assert!(
+            crate::guard::guards_enabled(),
+            "the guards are armed by default"
+        );
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            3,
+            "stopped at the third copy"
+        );
+        assert!(agent.guard_stopped);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_refusal_trip_stubs_every_repeated_pass_and_nothing_before_them() {
+        let dir = scratch_dir("refusal-trip-stub");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let earlier = "Read the first chunk.</think>\n<call read 500>";
+        let copy = "Let me continue reading the rest (1000-2007).</think>\n<call read 1000>";
+        agent.session.push(Message::user("inspect it"));
+        agent.session.push(Message::assistant(earlier));
+        agent
+            .session
+            .push(Message::user("<tool_result>lines 500-999</tool_result>"));
+        for _ in 0..3 {
+            agent.session.push(Message::assistant(copy));
+            agent
+                .session
+                .push(Message::user("<tool_result>refused</tool_result>"));
+        }
+        assert_eq!(agent.stub_repeated_reasoning(), 3);
+        let assistants: Vec<&str> = agent
+            .session
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::session::Role::Assistant)
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(assistants[0], earlier, "a differing pass is left alone");
+        for text in &assistants[1..] {
+            assert!(!text.contains("1000-2007"), "{text}");
+            assert!(text.contains(STOPPED_REASONING_STUB));
+            assert!(text.ends_with("<call read 1000>"), "visible output is kept");
+        }
+        // Idempotent: the copies now differ from nothing they were before.
+        assert_eq!(agent.stub_repeated_reasoning(), 0);
     }
 
     #[test]

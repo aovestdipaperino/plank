@@ -531,6 +531,39 @@ pub fn resolve_with_note_in(
     }
 }
 
+/// One startup line from [`choose_with_recommendation_in`]: what was chosen,
+/// or why a recommendation was passed over. `warning` lets the caller paint
+/// the second kind differently without matching on the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    /// The line, without the `plank: ` prefix.
+    pub text: String,
+    /// Whether the line reports a recommendation that was not honoured.
+    pub warning: bool,
+}
+
+impl Note {
+    fn info(text: String) -> Self {
+        Self {
+            text,
+            warning: false,
+        }
+    }
+
+    fn warning(text: String) -> Self {
+        Self {
+            text,
+            warning: true,
+        }
+    }
+}
+
+impl PartialEq<&str> for Note {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
 /// A profile's `recommendedModel`, as [`choose_with_recommendation_in`]
 /// takes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,10 +594,10 @@ pub fn choose_with_recommendation_in(
     cli: Option<Choice<'_>>,
     recommended: Option<Recommendation<'_>>,
     settings: Choice<'_>,
-) -> Result<(Selection, Vec<String>), String> {
+) -> Result<(Selection, Vec<Note>), String> {
     let with_note = |choice| {
         resolve_with_note_in(root, catalog, choice)
-            .map(|(sel, note)| (sel, note.into_iter().collect::<Vec<_>>()))
+            .map(|(sel, note)| (sel, note.into_iter().map(Note::info).collect::<Vec<_>>()))
     };
     if let Some(cli) = cli {
         return with_note(cli);
@@ -574,16 +607,18 @@ pub fn choose_with_recommendation_in(
     };
     if catalog.get(engine).is_none() || EngineId::new(engine).is_none() {
         let (sel, mut notes) = with_note(settings)?;
-        notes.push(format!(
+        notes.push(Note::warning(format!(
             "profile {profile} recommends {engine}, which is not an engine; ignoring it"
-        ));
+        )));
         return Ok((sel, notes));
     }
     let wanted = resolve_in(root, catalog, Choice::Named(engine))?;
     if wanted.main.exists() && companions_available(&wanted) {
         return Ok((
             wanted,
-            vec![format!("using {engine}, recommended by profile {profile}")],
+            vec![Note::info(format!(
+                "using {engine}, recommended by profile {profile}"
+            ))],
         ));
     }
     let skip_note =
@@ -592,9 +627,9 @@ pub fn choose_with_recommendation_in(
     let using = sel
         .id
         .map_or_else(|| sel.main.display().to_string(), |id| id.to_string());
-    notes.push(format!(
+    notes.push(Note::warning(format!(
         "profile {profile} recommends {engine}, which is not installed; using {using}"
-    ));
+    )));
     Ok((sel, notes))
 }
 
@@ -1302,6 +1337,7 @@ mod tests {
         assert_eq!(s.id, Some(crate::manifest::EngineId::QWEN));
         assert_eq!(s.main, r.join("qwen.gguf"));
         assert_eq!(notes, ["using qwen, recommended by profile HAL"]);
+        assert!(!notes[0].warning, "an honoured recommendation is not");
     }
 
     #[test]
@@ -1319,6 +1355,7 @@ mod tests {
             notes,
             ["profile HAL recommends qwen, which is not installed; using ds41"]
         );
+        assert!(notes[0].warning);
     }
 
     #[test]
@@ -1414,6 +1451,10 @@ mod tests {
         assert_eq!(
             notes,
             ["profile HAL recommends foo, which is not an engine; ignoring it"]
+        );
+        assert!(
+            notes[0].warning,
+            "a passed-over recommendation is a warning"
         );
     }
 

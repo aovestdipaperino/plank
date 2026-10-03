@@ -17,6 +17,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The published d3v1l (devilish), HAL (mechanical) and the EAP (poetic)
   profiles now replace the verbs with their own.
 
+### Changed
+
+- A profile recommendation that is passed over (not an engine, or not
+  installed) prints its startup line in yellow on a terminal.
+
+
+### Fixed
+
+- **A malformed tool call repeated verbatim now ends the turn.** A pass whose
+  tool call fails to parse never reached the loop guard, so a model sending
+  the same malformed call over and over was never stopped; one session ran
+  256 such passes in 22 minutes. Three identical failed passes in a row now
+  end the turn, with a loop dump, in both the TUI and the plain REPL.
+- **Tool calls whose inner tags lost the DSML marker now run.** Inside a
+  correctly opened stanza, `<invoke>`, `<parameter>`, `</invoke>` and
+  `</tool_calls>` without the marker are read as the marked forms, with a
+  tool banner as usual (`trace-stream` 0.1.8).
+- **Re-reading a chunk already on screen no longer re-sends it.** A `read` or
+  `more` whose exact output is still in the conversation returns its header
+  and one line naming where the unread part starts, instead of the same
+  lines again. A looping model copying its own last pass used to get the
+  same 500 lines four times before the loop guard refused the call.
+- **A refusal trip removes the copied reasoning.** When the loop guard ends a
+  turn because the model re-issued the same refused calls, the reasoning of
+  those identical passes is replaced by the stopped-reasoning stub, so
+  "keep going" no longer resumes from a context that ends in copies of the
+  plan that looped.
+- **A profile is no longer told it is a ds4-agent coding assistant.** The C's
+  default `-sys` line was appended after a profile's prompt and repeated in
+  every reminder, contradicting the profile's own identity. Under a profile
+  the default is dropped; a `-sys` you pass is kept.
+
+
 ## [6.2.0] - 2026-09-30
 
 The blocking-frame release: a WASM component can now take over the screen

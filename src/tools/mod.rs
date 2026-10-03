@@ -689,6 +689,11 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         }
         other => format!("Tool error: unknown tool: {other}\n"),
     };
+    let output = if matches!(call.name.as_str(), "read" | "more") {
+        already_shown(&output, &ctx.current_transcript).unwrap_or(output)
+    } else {
+        output
+    };
     // Compared before the hooks run: a PostToolUse hook may well write a file
     // of its own, and the hook's work is not the model's progress.
     if tree_before.is_some()
@@ -937,6 +942,53 @@ pub fn dispatch_all(calls: &[ToolCall], ctx: &mut ToolContext) -> String {
         }
     }
     all
+}
+
+/// Outputs shorter than this are returned as they are even when repeated:
+/// a short result costs little to show again, and the dedup is for the
+/// 500-line chunk a looping model asks for over and over.
+const ALREADY_SHOWN_MIN_BYTES: usize = 256;
+
+/// A one-line stand-in for a `read`/`more` result that is already in the
+/// conversation byte for byte, or `None` to return `output` as it is.
+///
+/// Byte-identical output means the same path, the same range and an
+/// unchanged file, and finding it in `transcript` means the earlier copy is
+/// still there to look at: not compacted away, not stubbed by
+/// micro-compaction. At temperature 0 a model that re-reads a chunk it just
+/// got is copying its own last pass, and handing it the same 500 lines makes
+/// the next prompt the same shape again; a short pointer to what it already
+/// has, naming where the unread part starts, is a materially different
+/// prompt from the first repeat on (`docs/LOOP-FINDINGS.md`).
+fn already_shown(output: &str, transcript: &[crate::session::Message]) -> Option<String> {
+    if output.len() < ALREADY_SHOWN_MIN_BYTES || output.starts_with("Tool error") {
+        return None;
+    }
+    if !transcript.iter().any(|m| m.text.contains(output)) {
+        return None;
+    }
+    let first = output.lines().next().unwrap_or("");
+    let header = if first.contains("continue_offset=") {
+        format!("{first}\n")
+    } else {
+        String::new()
+    };
+    let next = continue_offset(output).map_or_else(String::new, |n| {
+        format!(" The unread part starts at continue_offset={n}.")
+    });
+    Some(format!(
+        "{header}[Not repeated: this exact output is already in the conversation above, from an identical earlier call, and the file has not changed since. Use what is shown there instead of reading it again.{next}]\n"
+    ))
+}
+
+/// The value of the last `continue_offset=<n>` in a read result.
+fn continue_offset(output: &str) -> Option<u64> {
+    let at = output.rfind("continue_offset=")? + "continue_offset=".len();
+    let digits: String = output[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// Parses a bash timeout in seconds, clamped to `1..=86400`.
@@ -1323,6 +1375,69 @@ mod tests {
     /// The `compact` tool does nothing but ask: compaction rewrites the
     /// transcript the turn is generating from, so it has to happen between
     /// rounds, and the flag is the whole mechanism.
+    /// Writes a 2000-line file and returns the read call for its 500..999
+    /// chunk, the shape `repro-loop-1790956412` asked for nine times.
+    fn chunk_read(dir: &std::path::Path) -> ToolCall {
+        let body: String = (1..=2000).fold(String::new(), |mut acc, n| {
+            let _ = writeln!(acc, "line {n} of the file");
+            acc
+        });
+        std::fs::write(dir.join("big.rs"), body).unwrap();
+        test_call(
+            "read",
+            &[
+                ("path", "big.rs"),
+                ("start_line", "500"),
+                ("max_lines", "500"),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_repeated_read_already_in_the_transcript_is_not_shown_again() {
+        let (mut ctx, dir) = test_ctx();
+        let call = chunk_read(&dir);
+        let first = dispatch(&call, &mut ctx).output;
+        assert!(first.contains("line 700 of the file"), "{first}");
+        ctx.current_transcript = vec![crate::session::Message::user(format!(
+            "<tool_result>Tool result 1 (read):\n{first}</tool_result>"
+        ))];
+        let second = dispatch(&call, &mut ctx).output;
+        assert!(second.contains("Not repeated"), "{second}");
+        assert!(!second.contains("line 700 of the file"));
+        assert!(second.contains("continue_offset=1000"), "{second}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_read_is_shown_in_full_when_the_earlier_copy_is_gone_or_stale() {
+        let (mut ctx, dir) = test_ctx();
+        let call = chunk_read(&dir);
+        let first = dispatch(&call, &mut ctx).output;
+        // Nothing in the transcript: compacted away, or a fresh session.
+        assert_eq!(dispatch(&call, &mut ctx).output, first);
+        // The earlier copy is there but the file changed in that range since.
+        ctx.current_transcript = vec![crate::session::Message::user(first.clone())];
+        let body: String = (1..=2000).fold(String::new(), |mut acc, n| {
+            let _ = writeln!(acc, "edited {n}");
+            acc
+        });
+        std::fs::write(dir.join("big.rs"), body).unwrap();
+        let again = dispatch(&call, &mut ctx).output;
+        assert!(again.contains("edited 700"), "{again}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn continue_offset_takes_the_last_one() {
+        assert_eq!(continue_offset("a continue_offset=5; b"), Some(5));
+        assert_eq!(
+            continue_offset("x continue_offset=5\ny continue_offset=12."),
+            Some(12)
+        );
+        assert_eq!(continue_offset("none here"), None);
+    }
+
     #[test]
     fn the_compact_tool_only_raises_the_request_flag() {
         let mut ctx = ToolContext::new(std::env::temp_dir());

@@ -530,6 +530,20 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    /// Drops the C's default `-sys` line when a profile supplies the prompt.
+    ///
+    /// The default ("You are a helpful coding assistant running inside
+    /// ds4-agent.") is an identity, and a profile's prompt is a different
+    /// one: appending it after "You are d3v1l, …" and re-injecting it with
+    /// every reminder told the model two things about who it is. A `-sys`
+    /// the user typed is kept, since that is an explicit addition rather
+    /// than a default riding along.
+    pub fn drop_default_system_under_profile(&mut self, profile_active: bool) {
+        if profile_active && self.system == DEFAULT_SYSTEM_PROMPT {
+            self.system.clear();
+        }
+    }
+
     /// Builds a config whose defaults come from `settings.json`.
     ///
     /// Only the keys the file is allowed to hold are consulted; an
@@ -1851,6 +1865,18 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn a_profile_drops_the_default_identity_but_keeps_an_explicit_sys() {
+        let mut c = AgentConfig::default();
+        c.drop_default_system_under_profile(false);
+        assert_eq!(c.system, DEFAULT_SYSTEM_PROMPT, "no profile, no change");
+        c.drop_default_system_under_profile(true);
+        assert!(c.system.is_empty(), "the default yields to the profile");
+        c.system = "Answer in Italian.".to_owned();
+        c.drop_default_system_under_profile(true);
+        assert_eq!(c.system, "Answer in Italian.");
     }
 
     #[test]

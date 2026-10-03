@@ -99,6 +99,8 @@ argument for the design.
 | 2026-09-15 | *(this change)* | `settings::suspend_loop_guards()`, a scope that silences every rung for the duration of a turn plank drives from a canned multi-phase prompt; `/init` is the only caller. Layered *below* the `/loopguard` session override and *above* the persisted `tools.loopGuards`, so a user who said something explicit still outranks a canned prompt | the `/init` phases re-read and re-survey by design — the interview, the `task` survey and the write all revisit the same tree — which is precisely the shape `LoopGuard::observe` refuses; a turn the user asked for was being blocked mid-phase for following its own prompt |
 | 2026-09-14 | *(this change)* | the no-progress budget moved behind its own `tools.noProgressGuard`, default **off**, ANDed with `tools.loopGuards` in `guard::no_progress_guard_enabled` | the byte budget is a volume heuristic, and read-only investigation turns are legitimate; opting in keeps the other rungs on by default |
 | 2026-09-08 | *(this change)* | `tools.loopGuards` and `/loopguard` (alias `/lg`): one switch over every rung — `LoopGuard::observe`/`tripped`, the gated `RepeatGuard` (cycles and think budget), the no-progress budget. Read through `guard::guards_enabled()` at each check, never captured at turn start, so the switch lands on a generation already streaming; `🔁` in the footer while armed, and the tripped marker moved to `♻ looping` | diagnosing the guards themselves, where every rung fires before the behaviour under study can be observed |
+| 2026-10-02 | *(this change)* | `read`/`more` answer a repeat whose exact output is still in the transcript with one line naming the `continue_offset` instead of the content (`tools::already_shown`); a refusal trip stubs the reasoning of every trailing byte-identical pass (`Agent::stub_repeated_reasoning`) | `repro-loop-1790956412`: one 500-line chunk re-read four times and refused four more, then copied again after "keep going" |
+| 2026-10-02 | *(this change)* | `guard::FailedPassStreak`: three byte-identical failed passes (same assistant text, same tool error) end the turn, both front ends, after the dump and `stub_repeated_reasoning`; the DSML parser accepts marker-less inner tags inside an open stanza (`trace-stream` 0.1.8) | `repro-1790964046`: 256 copies of one malformed stanza over 22 minutes, never counted because a parse failure never reaches `LoopGuard::observe` |
 
 Two patterns run through the table. First, every detector started advisory
 or per-pass and had to grow a rung that *ends the turn*: at temperature 0 a
@@ -1082,3 +1084,102 @@ Throughput also fell from about 37 to about 21 tokens per second between passes
 was at 87k tokens by the end. That is the context penalty measured in
 `FINDINGS.md`, not a loop symptom, but it doubles the wall-clock cost of every
 re-derivation that follows.
+
+
+## A paging plan written as a fixed range is copied after the range moves
+
+`repro-loop-1790956412` (session `wacky-roosevelt`, 2026-10-02, the d3v1l
+profile on the abliterated IQ2XXS clone, `--think-low`, temperature 0) was a
+security review of tokensave paging through a 2,007-line `src/upgrade.rs` in
+500-line chunks. Pass 15 reasoned "Let me continue reading the rest of
+upgrade.rs (1000-2007)", read `start_line=1000`, and got lines 1000–1499 back
+with `continue_offset=1500`. Every pass from 16 on was that pass again, byte
+for byte: the same 182 bytes of reasoning, the same call. Four of them ran
+and returned the same 500 lines at about 45 seconds each, the 6th, 7th and
+8th were refused, the refusal trip ended the turn, and the user's "keep going"
+produced a ninth copy that was refused at once.
+
+The plan named the chunk by its start line, not as "the next chunk", so it
+stayed true-looking after the read it described had happened. Once the result
+landed, the end of the prompt was the plan, the call and the 500 lines, and at
+temperature 0 with that little reasoning the likeliest next pass is the last
+pass. The result's own `continue_offset=1500; call more` hint lost to the
+verbatim template every time. The guards behaved exactly as documented above;
+the per-pass cycle rung shows `-` throughout because each pass was far too
+short to repeat inside itself. What the dump shows is two gaps.
+
+The first is latency. The identical-call counter only refuses at the 6th call,
+so four full re-reads went into the context before anything changed. Fixed
+2026-10-02 in `tools::dispatch`: a `read` or `more` whose output is at least
+256 bytes and already appears verbatim in `ToolContext::current_transcript`
+is replaced by its header line and a note saying it is not repeated, with the
+next `continue_offset`. Byte-identical output is the whole test: it implies
+the same path, the same range and an unchanged file, and finding it in the
+transcript means the earlier copy is still visible, not compacted away or
+stubbed by micro-compaction, so the check cannot hide anything the model
+cannot already see. That changes the prompt materially from the first repeat
+on, which is the only lever that works at temperature 0.
+
+The second is that a refusal trip left the copies in place. The reasoning
+stub (`stub_last_reasoning`) ran only on the reasoning-cycle stop, and only on
+the last message; at a refusal trip the last message is the tool result, and
+the template is not one message but the whole run of identical passes. "Keep
+going" therefore resumed a context ending in nine copies of the same plan, and
+the model typed a tenth. Fixed the same day: on a trip, after the dump is
+written, `Agent::stub_repeated_reasoning` stubs the `<think>` block of every
+trailing assistant message byte-identical to the last one and stops at the
+first that differs. This rewrites behind the live end, unlike the
+last-message stub, and needs nothing extra for it: `rescue_prefix_before_rebuild`
+restores the deepest rung below the edit, and rungs past it miss on their
+truncated-transcript fingerprint.
+
+Not proven by this dump, and worth watching: the session ran a 2-bit quant
+with an abliteration delta under `--think-low`, which leaves little headroom
+to notice a repeat. Nothing here separates that from the general
+temperature-0 behaviour.
+
+
+## A parse failure is not a tool call, so nothing counted it
+
+`repro-1790964046` (session `nifty-chandrasekhar`, 2026-10-02, the same d3v1l
+profile and abliterated IQ2XXS clone at temperature 0) ran 1h12m, and its last
+22 minutes were 256 back-to-back passes of 90 tokens with no reasoning, each
+answered `invalid DSML tool call` and each identical to the one before, until
+the user saved the dump by hand.
+
+It began as the previous entry's loop. The model issued the same `grep` for
+the third time and got the advisory; its reasoning then cycled and was stopped
+with `REPEAT_LOOP_ERROR` and one reply-only pass. It re-issued the `grep`, and
+over four passes the markup decayed: first only `<parameter>` lost its DSML
+marker, then the parameter closer was cut to `</para`, then every inner tag was
+bare, `<invoke name="bash">`, `<parameter name="command">` with no `string`
+attribute, `</invoke>`, `</tool_calls>`, inside a correct
+`<｜DSML｜tool_calls>` opener. From there the same text came out every pass.
+Reply-only is one-shot (`std::mem::take`), so the zero-reasoning passes after
+the first were the model copying that too.
+
+The guards never saw any of it. `LoopGuard::observe` counts calls on their way
+to dispatch, and a pass whose stanza fails to parse never gets there. In both
+turn loops the failed-pass branch capped reasoning stops and draft stops and
+nothing else: a DSML error was pushed back as a tool result and the loop went
+round again, unbounded, with an identical prompt each time but for the growing
+tail of identical copies.
+
+Two fixes, the same day. `guard::FailedPassStreak` counts consecutive failed
+passes whose assistant text and error are byte-identical to the previous one;
+on the third, both front ends write the dump, stub the copied reasoning, and
+end the turn (`FAILED_PASS_TRIPPED_NOTICE`). A pass that dispatches, answers,
+or fails differently starts the count over, so a model changing its markup
+between attempts is never cut off for it. And the parser now accepts the bare
+spelling, narrowly: only inside an already-open DSML stanza, only for the three
+structural element names, with a bare `</parameter>` honoured only for a
+parameter that was opened bare. That is the same reasoning as the shorthand
+forms in `FINDINGS.md`: rejecting an unambiguous call is not neutral, it
+costs the turn. With it, this call would have run and the identical-call guard
+would have refused it within three more passes.
+
+Possible contributor, not verified: the error's syntax reminder rides inside a
+tool result, which is tokenized as plain text so that it cannot forge control
+tokens. The model may therefore see `｜DSML｜` there as spelled-out BPE pieces
+rather than the special token it has to emit, in which case the reminder
+teaches the shape and not the token.
