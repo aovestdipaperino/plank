@@ -82,7 +82,18 @@ const ASKING: &str = "❓ waiting for you...";
 pub const CURSOR_BLINK_MS: u64 = 400;
 
 /// The block the idle title ends in, standing in for the C64's block cursor.
-const CURSOR: char = '\u{2588}';
+const CURSOR: &str = "\u{2588}";
+
+/// The unlit cursor: an em space, then a word joiner.
+///
+/// Terminal.app draws titles in the proportional system font, so the blank
+/// has to match the block's width *there*, or everything after it in the
+/// window title slides back and forth twice a second. Measured in
+/// `NSFont.titleBarFont` (13pt): the block is 13.00pt wide, an em space 12.92,
+/// the braille blank this replaced 8.89 and a plain space 3.28. The word
+/// joiner is zero-width and not whitespace, so the em space is never the
+/// title's trailing character and nothing that trims titles can drop it.
+const BLANK_CURSOR: &str = "\u{2003}\u{2060}";
 
 /// What to call the agent in a window title: the running profile's display
 /// name, else Plank.
@@ -110,9 +121,9 @@ fn cursor_lit(now_ms: u64) -> bool {
 /// what the user is actually talking to rather than always saying Plank.
 fn idle_title(lit: bool) -> String {
     let name = agent_name();
-    // An unlit cursor is a space rather than nothing, so the title keeps its
-    // width and the tab does not twitch a character narrower twice a second.
-    let cursor = if lit { CURSOR } else { ' ' };
+    // An unlit cursor is a blank as wide as the block rather than nothing, so
+    // the title keeps its width and nothing after it moves twice a second.
+    let cursor = if lit { CURSOR } else { BLANK_CURSOR };
     format!("{name} - READY{cursor}")
 }
 
@@ -432,7 +443,7 @@ mod tests {
         // Every phase is one of exactly two renderings, and they differ only
         // in the cursor.
         assert_eq!(idle_title(true), "Plank - READY\u{2588}");
-        assert_eq!(idle_title(false), "Plank - READY ");
+        assert_eq!(idle_title(false), "Plank - READY\u{2003}\u{2060}");
     }
 
     /// Reduced motion stops the blink by holding the cursor lit. A still block
