@@ -2268,7 +2268,7 @@ pub(crate) fn render_mcp_report(servers: &[crate::tools::mcp::McpServer], color:
 /// (or the name they go by). Source of truth for the default sub-agent names;
 /// see `agent_label`.
 const AGENT_NAMES: [&str; 26] = [
-    "bond", "hunt", "fox", "mulder", "scully", "bourne", "smiley", "ryan", "bauer", "starling",
+    "bond", "hunt", "powers", "mulder", "scully", "bourne", "smiley", "ryan", "bauer", "starling",
     "cooper", "salt", "palmer", "solo", "kuryakin", "peel", "steed", "bristow", "archer", "smart",
     "coulson", "romanoff", "leiter", "carter", "kay", "jay",
 ];
@@ -34766,10 +34766,10 @@ or the user's next message aborts before its first token"
     /// The generated names are the famous-agent roster, and they wrap with a
     /// lap suffix rather than running out or repeating.
     #[test]
-    fn agent_labels_run_bond_hunt_fox_and_wrap_past_jay() {
+    fn agent_labels_run_bond_hunt_powers_and_wrap_past_jay() {
         assert_eq!(agent_label(0), "bond");
         assert_eq!(agent_label(1), "hunt");
-        assert_eq!(agent_label(2), "fox");
+        assert_eq!(agent_label(2), "powers");
         assert_eq!(agent_label(3), "mulder");
         assert_eq!(agent_label(25), "jay");
         // Past the last name the roster starts again with a lap suffix.
@@ -34794,7 +34794,7 @@ or the user's next message aborts before its first token"
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         assert_eq!(agent.next_unnamed_subagent_label(), "bond");
         assert_eq!(agent.next_unnamed_subagent_label(), "hunt");
-        assert_eq!(agent.next_unnamed_subagent_label(), "fox");
+        assert_eq!(agent.next_unnamed_subagent_label(), "powers");
         agent.reset_session_state();
         assert_eq!(
             agent.next_unnamed_subagent_label(),
