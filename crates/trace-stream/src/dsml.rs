@@ -491,6 +491,12 @@ impl DsmlParser {
                     };
                     let value_bytes =
                         &self.raw[self.param_value_start..self.param_value_start + end];
+                    if let Some(at) = swallowed_stanza_at(value_bytes, &tags) {
+                        let name = self.param_name.clone().unwrap_or_default();
+                        let err = swallowed_stanza_error(&name, &value_bytes[..at]);
+                        self.set_error(err);
+                        return;
+                    }
                     // `string="true"` decides, as in the C; with no attribute a
                     // bare parameter is classified by its value and any other
                     // is not a string.
@@ -927,6 +933,81 @@ fn close_tag_partial(s: &[u8], name: &str) -> bool {
         i += 1;
     }
     true
+}
+
+/// Offset of a tool-call stanza that opened inside a parameter value and was
+/// still open when the value ended, or `None` when the value is just data.
+///
+/// The shape is a model that left the value without closing it: in
+/// `dorky-beethoven` a `write` payload reached a literal `<think>`, the model
+/// closed the thought it believed it had opened and emitted a new stanza with
+/// the write still open. That stanza's own parameter closer is the first one
+/// the value meets, so it ended the value, and the write ran with the other
+/// call as the tail of the file, five times, each reported as a success.
+///
+/// Narrow on purpose, because a payload may quote a stanza (a fixture, a doc
+/// about the syntax). Such a quote has to escape its parameter closers anyway,
+/// or it would end the value itself, so what marks the swallowed case is a
+/// stanza opener, then an invoke, then a parameter opener with no escaped
+/// closer after it: the closer that ended the value is that parameter's own.
+fn swallowed_stanza_at(value: &[u8], tags: &crate::syntax::DsmlTags) -> Option<usize> {
+    let start = rfind_bytes(value, tags.start.as_bytes())?;
+    let after = &value[start..];
+    let invoke = find_bytes(after, tags.invoke.as_bytes())?;
+    // `</｜DSML｜parameter>` without its `/` and `>`: the opener's prefix.
+    let close = tags.param_close.trim_end_matches('>');
+    let param_open = format!("<{}", &close[2..]);
+    let param = rfind_bytes(&after[invoke..], param_open.as_bytes())?;
+    let tail = &after[invoke + param..];
+    // Any escape level spells the closer as `…lt;/｜DSML｜parameter`.
+    let escaped = format!("lt;{}", &close[1..]);
+    find_bytes(tail, escaped.as_bytes())
+        .is_none()
+        .then_some(start)
+}
+
+/// The last occurrence of `needle` in `hay`.
+fn rfind_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len())
+        .rev()
+        .find(|&i| hay[i..].starts_with(needle))
+}
+
+/// The tool error for [`swallowed_stanza_at`]: which parameter never closed,
+/// the bytes it broke off after, so the model can see the cause, and, when
+/// those bytes hold a think tag, how to write one as data.
+fn swallowed_stanza_error(param: &str, before: &[u8]) -> String {
+    let before = String::from_utf8_lossy(before);
+    let trimmed = before.trim_end();
+    let skip = trimmed.chars().count().saturating_sub(60);
+    // Echoed escaped: a raw think tag in a tool result is the very token that
+    // derailed the call, and the model reads this result next.
+    let raw: String = trimmed.chars().skip(skip).collect();
+    let tail = raw
+        .replace("<think>", "&lt;think&gt;")
+        .replace("</think>", "&lt;/think&gt;");
+    let mut err = format!(
+        concat!(
+            "parameter \"{param}\" was never closed: a new tool-call stanza began ",
+            "inside its value, so that stanza's own parameter close tag ended it. ",
+            "Nothing was run. The value broke off after: `{tail}`. Emit the call ",
+            "again with the whole value, closed by its own close tag, and send any ",
+            "other call afterwards in the same stanza."
+        ),
+        param = param,
+        tail = tail,
+    );
+    if raw.contains("think>") {
+        err.push_str(concat!(
+            " The value contains a literal think tag, which you cannot emit as ",
+            "data: in code write it split, as \"<\" \"think>\" or \"<\" + \"think>\"; ",
+            "in prose write &lt;think&gt;."
+        ));
+    }
+    err
 }
 
 /// The tool error for a fused close-and-open tag, naming the mistake and both
@@ -2263,6 +2344,95 @@ mod tests {
                 Some("echo '</｜DSML｜inv' "),
                 "cut {cut}"
             );
+        }
+    }
+
+    /// The stanza `dorky-beethoven` wrote five times: a `write` whose payload
+    /// held a literal `<think>`, where the model left the value, closed the
+    /// thought it believed it had opened, and emitted a fresh stanza with the
+    /// write still open. That stanza's own parameter closer is the first one
+    /// the value meets, so it ended the value and the file got the bash call.
+    fn swallowed_stanza(syntax: crate::syntax::ToolSyntax) -> String {
+        let t = syntax.dsml_tags().unwrap();
+        let param_open = t.param_close.replacen("</", "<", 1);
+        let param_open = param_open.trim_end_matches('>');
+        format!(
+            concat!(
+                "{start}\n{invoke} name=\"write\">\n",
+                "{param} name=\"content\" string=\"true\">",
+                "    ap.add_argument(\"--think\", help=\"capture after <think>;</think>\n\n",
+                "{start}\n{invoke} name=\"bash\">\n",
+                "{param} name=\"command\" string=\"true\">python3 -m py_compile x.py{close}\n",
+                "</{marker}{invoke_name}>\n</{marker}{calls_name}>",
+            ),
+            start = t.start,
+            invoke = t.invoke,
+            param = param_open,
+            close = t.param_close,
+            marker = "｜DSML｜",
+            invoke_name = t.invoke_name,
+            calls_name = t.calls_name,
+        )
+    }
+
+    #[test]
+    fn a_stanza_opened_inside_a_parameter_value_is_rejected() {
+        for syntax in crate::syntax::ToolSyntax::ALL {
+            for bytewise in [false, true] {
+                let s = swallowed_stanza(syntax);
+                let mut p = DsmlParser::new();
+                if bytewise {
+                    feed_bytewise(&mut p, &s);
+                } else {
+                    feed_all(&mut p, &s);
+                }
+                assert_eq!(p.state(), DsmlState::Error, "{syntax:?}");
+                assert!(p.calls().is_empty(), "{syntax:?}: nothing may run");
+                let err = p.error();
+                assert!(err.contains("\"content\""), "{err}");
+                assert!(
+                    err.contains("capture after &lt;think&gt;;&lt;/think&gt;"),
+                    "{err}"
+                );
+                assert!(!err.contains("<think>"), "{err}");
+                assert!(err.contains("\"<\" \"think>\""), "{err}");
+            }
+        }
+    }
+
+    /// A payload may quote a whole stanza, as a fixture or a doc about the
+    /// syntax does, as long as it escapes the parameter closer, which it must
+    /// anyway. Then every nested parameter it opens is closed inside the value
+    /// and the value's own closer is really its own.
+    #[test]
+    fn a_quoted_stanza_with_escaped_closers_is_still_a_write() {
+        let quoted = concat!(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls&lt;/｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n",
+        );
+        let mut p = DsmlParser::new();
+        feed_bytewise(&mut p, &write_stanza(quoted));
+        assert_eq!(p.state(), DsmlState::Done, "{}", p.error());
+        assert!(
+            p.calls()[0]
+                .arg_value("content")
+                .unwrap()
+                .ends_with("</｜DSML｜tool_calls>\n")
+        );
+    }
+
+    /// Prose naming the markers, with no parameter left open, is just text.
+    #[test]
+    fn prose_mentioning_the_stanza_opener_is_still_a_write() {
+        for value in [
+            "Scanning free text for the opening `<｜DSML｜tool_calls>` marker.",
+            "`<｜DSML｜tool_calls>` then `<｜DSML｜invoke name=\"x\">`, nothing else.",
+        ] {
+            let mut p = DsmlParser::new();
+            feed_bytewise(&mut p, &write_stanza(value));
+            assert_eq!(p.state(), DsmlState::Done, "{value:?}: {}", p.error());
+            assert_eq!(p.calls()[0].arg_value("content"), Some(value));
         }
     }
 }

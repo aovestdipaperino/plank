@@ -574,6 +574,26 @@ test` and review the diff before committing.
   turn is swallowed as stanza content. That predates this change and is not
   distinguishable from a real call at the point it matters.
 
+- **A literal `<think>` in a `write` payload derails the model, and the next
+  stanza becomes the file.** `dorky-beethoven` wrote an argparse help string
+  `"capture after <think>…"`; at that token the model behaved as if it had
+  entered reasoning, emitted `;</think>`, and opened a fresh stanza with a
+  `bash` call while the write's `content` was still open. Because a parameter
+  value is payload, the first `</｜DSML｜parameter>` it met was the bash
+  command's, so the write "succeeded" with 3481 bytes (the Python up to
+  `<think>`, then the whole bash stanza) and the bash call never ran.
+  Temperature 0 made the five retries byte-identical, the model concluded the
+  write tool "truncates at 3481 bytes", and the no-progress budget never fired
+  because each write set `last_written`. The parser now rejects the call
+  (`swallowed_stanza_at` in `crates/trace-stream/src/dsml.rs`) when a value
+  holds a stanza opener, an invoke, and a parameter opener with no escaped
+  closer after it, which is exactly "the closer that ended this value belongs
+  to a nested call". A legitimately quoted stanza must escape its parameter
+  closers anyway (or it ends the value itself), so it still parses. The error
+  echoes the bytes before the break with think tags escaped, since the raw tag
+  is what derailed the model, and tells it to write the tag split
+  (`"<" "think>"`).
+
 - **The shorthand has two levels, and only one of them was accepted.** The
   parameter form (`<｜DSML｜command …>` for `<｜DSML｜parameter name="command" …>`)
   was tolerated; the identical rewrite one level up was not. In
