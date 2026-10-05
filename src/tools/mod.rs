@@ -477,6 +477,16 @@ fn disabled_tool_error(name: &str) -> String {
     format!("Tool error: unknown tool: {name}\n")
 }
 
+/// Set by `--tools off` (and `--minimal-prompt`): the session advertised no
+/// tools, so every call, component tools included, is answered as unknown.
+static TOOLS_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether this session offers tools at all. Called once at session
+/// construction.
+pub fn set_tools_enabled(on: bool) {
+    TOOLS_OFF.store(!on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// True when `name` is dispatched by a profile's own components (an MCP
 /// server or a WASM component) rather than the builtin table, and so is
 /// exempt from the profile's builtin allow-list.
@@ -502,6 +512,9 @@ fn withheld_tool_response(ctx: &ToolContext, call: &ToolCall) -> Option<ToolResu
 /// from both call sites is what keeps them from drifting apart.
 #[must_use]
 pub fn withheld_before_dispatch(wasm: &crate::wasmreg::Session, name: &str) -> Option<String> {
+    if TOOLS_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return Some(disabled_tool_error(name));
+    }
     (!is_component_tool(wasm, name) && !crate::profile::builtin_enabled(name))
         .then(|| disabled_tool_error(name))
 }

@@ -77,6 +77,72 @@ pub struct Ds4Model {
     /// each freshly spawned shared session so attach never cold-prefills the
     /// system prompt (design §6). `None` for the single-owner path.
     warm: Mutex<Option<SessionSnapshot>>,
+    /// The activation edit this model was opened under, as KV key material:
+    /// `None` when no steering vector is loaded. Captured at open because the
+    /// C keeps no accessor for the file or the attention scale — only the live
+    /// FFN scale is readable, and that one is tracked per session.
+    steering: Option<SteeringKey>,
+    /// FFN steering scale the engine was opened with. Each session starts here
+    /// and may move away from it through `/steer`, so this is the floor the C
+    /// gives a freshly created session, not the current setting.
+    steering_ffn0: f32,
+    /// `--dir-steering-from user`: the FFN edit is held at zero while the
+    /// prompt tiers prefill and armed at the start of `generate`.
+    steer_from_user: bool,
+}
+
+/// Bitwise identity of two steering scales.
+///
+/// Deliberately exact, not within a tolerance: this value is KV-fingerprint key
+/// material, rendered into [`steering_variant`] and hashed. Two scales that a
+/// tolerance would call equal produce two different keys and two different KVs,
+/// so "close enough" here would mean restoring a checkpoint that does not match.
+/// `NaN` cannot reach this — `/steer` rejects it — and `-0.0` is normalized away
+/// at the same point, so the two representations of zero never split a key.
+fn same_scale(a: f32, b: f32) -> bool {
+    a.to_bits() == b.to_bits()
+}
+
+/// Reads `path` and digests it, so two different vectors at one filename are
+/// two different keys. An unreadable file yields `None`: the engine open that
+/// follows reports it far better than a cache key could, and a key invented
+/// here would outlive the failure.
+fn steering_key(path: Option<&std::path::Path>, attn: f32) -> Option<SteeringKey> {
+    let path = path?;
+    let bytes = std::fs::read(path).ok()?;
+    let digest = crate::session::sha1_hex(&bytes);
+    Some(SteeringKey {
+        digest: digest[..12].to_owned(),
+        attn,
+    })
+}
+
+/// Renders the key material for an edit of `key` at FFN scale `ffn`.
+///
+/// Empty when nothing is in force — no vector, or every scale at zero — so an
+/// unsteered run keys exactly as it did before steering existed and keeps
+/// sharing checkpoints with every other unsteered run.
+fn steering_variant(key: Option<&SteeringKey>, ffn: f32) -> String {
+    match key {
+        Some(k) if ffn != 0.0 || k.attn != 0.0 => {
+            format!("steer:{}:ffn={ffn}:attn={}", k.digest, k.attn)
+        }
+        _ => String::new(),
+    }
+}
+
+/// The identity of a loaded directional-steering edit, for
+/// [`Engine::kv_variant`](crate::engine::Engine::kv_variant).
+///
+/// The vector is identified by a digest of its *bytes*, not its path: rebuilding
+/// a direction in place is a different edit under the same filename, and keying
+/// on the name would hand the new run the old run's checkpoints.
+#[derive(Debug, Clone)]
+struct SteeringKey {
+    /// Short hex digest of the steering file's contents.
+    digest: String,
+    /// Attention scale, fixed for the life of the engine.
+    attn: f32,
 }
 
 // SAFETY: the engine pointer owns read-only weights + the Metal queue and is
@@ -481,6 +547,12 @@ impl Ds4Model {
             ctx_size,
             count_overhead: AtomicI32::new(-1),
             warm: Mutex::new(None),
+            steering: steering_key(
+                tuning.dir_steering_file.as_deref(),
+                tuning.dir_steering_attn,
+            ),
+            steering_ffn0: tuning.dir_steering_ffn,
+            steer_from_user: tuning.dir_steering_from_user,
         })
     }
 
@@ -957,6 +1029,8 @@ impl ModelHandle for Ds4Model {
             warm_tokens: Ds4TokensGuard::new(),
             think: ThinkMode::default(),
             trusted_system_len: 0,
+            steering_ffn: self.steering_ffn0,
+            steer_held: false,
             pending_images: Vec::new(),
             vision_spans: Vec::new(),
             #[cfg(ds4_engine)]
@@ -1017,6 +1091,15 @@ pub struct Ds4Session {
     /// [`Engine::set_trusted_system_prefix`]. Zero means "tokenize all of it as
     /// plain content", the safe default.
     trusted_system_len: usize,
+    /// FFN directional-steering scale in force for tokens evaluated from here
+    /// on, mirrored in Rust because the C exposes it only on a *live* session
+    /// and this one is created lazily: a `/steer` before the first prefill has
+    /// nowhere to write yet, so it lands here and `ensure_session` applies it.
+    steering_ffn: f32,
+    /// Whether the C's live FFN scale is currently held at zero for the prompt
+    /// prefill (`--dir-steering-from user`). While set, `steering_ffn` above
+    /// is the *target* the next `generate` arms, not what the C holds.
+    steer_held: bool,
     /// Image embeddings carried by the current transcript, each paired with the
     /// section text it belongs to. Set by [`Engine::set_pending_images`] before
     /// `generate`; consumed by [`reconcile`](Self::reconcile) to append image
@@ -1087,6 +1170,8 @@ impl Ds4Session {
     #[must_use]
     pub fn from_model(model: Arc<Ds4Model>) -> Self {
         let mut session = Self {
+            steering_ffn: model.steering_ffn0,
+            steer_held: false,
             model,
             session: std::ptr::null_mut(),
             transcript: TokenTranscript::new(),
@@ -1239,8 +1324,130 @@ impl Ds4Session {
         if self.session.is_null() {
             // Single-owner path: the session gets the model's full context.
             self.session = self.model.create_session(self.model.ctx_size)?;
+            // A fresh session starts at the scale the *engine* was opened
+            // with, so a `/steer` issued before this point would be silently
+            // dropped. Re-apply it here, where the C finally has somewhere to
+            // put it. A refusal is not fatal: `steering_ffn` is corrected to
+            // whatever the C kept, so the KV key keeps describing reality.
+            if !same_scale(self.steering_ffn, self.model.steering_ffn0) {
+                let want = self.steering_ffn;
+                self.steering_ffn = self.model.steering_ffn0;
+                let _ = self.set_steering_ffn(want);
+            }
+            self.hold_steering(true);
         }
         Ok(self.session)
+    }
+
+    /// Holds the live FFN scale at zero (`hold`) or arms it at the target, for
+    /// `--dir-steering-from user`. A no-op in every other mode, and when no
+    /// vector is loaded. The target stays in `steering_ffn` throughout, so
+    /// `/steer` and the footer keep reporting the setting the user chose.
+    ///
+    /// A refusal from the C leaves the flag as it was, which keeps it true to
+    /// what the graph is actually doing.
+    fn hold_steering(&mut self, hold: bool) {
+        if !self.model.steer_from_user
+            || self.session.is_null()
+            || self.steer_held == hold
+            || !self.has_steering_vector()
+        {
+            return;
+        }
+        let scale = if hold { 0.0 } else { self.steering_ffn };
+        // SAFETY: session is non-null here and freed only on drop.
+        let rc = unsafe { ffi::ds4_session_set_directional_steering_ffn(self.session, scale) };
+        if rc == 0 {
+            self.steer_held = hold;
+        }
+    }
+
+    /// FFN directional-steering scale in force for the tokens generated next.
+    /// Read back from the C whenever a session exists, rather than reported
+    /// from the Rust mirror.
+    ///
+    /// On the GPU path the C answers from `s->graph.directional_steering_ffn_scale`
+    /// — the very field each layer's forward pass consults — so this is the
+    /// scale that will actually be applied, not plank's belief about it. The
+    /// mirror is the fallback for a session that does not exist yet, which is
+    /// the one case the C cannot answer for.
+    ///
+    /// Keeping these two honest matters because the setter writes the scale in
+    /// two places: this session's graph *and* the shared engine, where it
+    /// becomes the starting scale for sessions created later.
+    #[must_use]
+    pub fn steering_ffn(&self) -> f32 {
+        if self.session.is_null() || self.steer_held {
+            return self.steering_ffn;
+        }
+        // SAFETY: session is non-null here and freed only on drop.
+        unsafe { ffi::ds4_session_directional_steering_ffn(self.session) }
+    }
+
+    /// Whether a steering vector is actually **loaded in the graph**, which is
+    /// stricter than "a file was passed on the command line".
+    ///
+    /// The C skips loading the vector entirely when both launch scales are
+    /// zero — there is nothing to apply, so it does not pay for it. That
+    /// decision is permanent for the life of the engine: a later
+    /// `ds4_session_set_directional_steering_ffn` with a non-zero scale is
+    /// refused, because the direction it would scale was never loaded.
+    ///
+    /// So `--dir-steering-file X --dir-steering-ffn 0` is a session where
+    /// steering can never be switched on, and saying otherwise would offer the
+    /// user a `/steer` that cannot work. Verified empirically: a `/steer 2`
+    /// from such a launch comes back refused.
+    #[must_use]
+    pub fn has_steering_vector(&self) -> bool {
+        self.model
+            .steering
+            .as_ref()
+            .is_some_and(|k| !same_scale(self.model.steering_ffn0, 0.0) || !same_scale(k.attn, 0.0))
+    }
+
+    /// Retargets FFN steering for tokens evaluated after this call.
+    ///
+    /// The KV already built stays as it is — the C changes the scale *without*
+    /// rebuilding it, by design — so the live prefix keeps the activations the
+    /// old scale produced and only the suffix gets the new one. That mixture is
+    /// why the caller must not persist the result as a reusable checkpoint; see
+    /// [`Engine::kv_variant`](crate::engine::Engine::kv_variant) and the
+    /// `/steer` handler, which drops the ladder for exactly this reason.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the C refuses the change, which it does for
+    /// a distributed session.
+    pub fn set_steering_ffn(&mut self, scale: f32) -> Result<(), EngineError> {
+        if same_scale(self.steering_ffn, scale) {
+            return Ok(());
+        }
+        if self.session.is_null() {
+            // No session yet: record it, and `ensure_session` applies it when
+            // the C side comes into being.
+            self.steering_ffn = scale;
+            return Ok(());
+        }
+        if self.steer_held {
+            // The graph is at zero for the prompt prefill; record the new
+            // target and let the next `generate` arm it.
+            self.steering_ffn = scale;
+            return Ok(());
+        }
+        // SAFETY: session is non-null here and freed only on drop.
+        let rc = unsafe { ffi::ds4_session_set_directional_steering_ffn(self.session, scale) };
+        if rc != 0 {
+            // The C prints its reason to stderr and returns a bare non-zero, so
+            // the cause is genuinely not knowable here. Name the possibilities
+            // instead of picking one: an earlier version asserted "distributed
+            // session" and was wrong in the most common case, which is a launch
+            // whose scales were both zero and so never loaded the vector.
+            return Err(EngineError::new(
+                "the engine refused the steering change — the vector was not loaded \
+                 at startup, or this is a distributed session (see stderr)",
+            ));
+        }
+        self.steering_ffn = scale;
+        Ok(())
     }
 
     /// Structurally reconciles the token transcript to the UI's rendered
@@ -1671,6 +1878,35 @@ impl Engine for Ds4Session {
         true
     }
 
+    /// The directional steering in force right now — the vector's digest and
+    /// both scales — so a steered run never restores an unsteered checkpoint,
+    /// or one written at another strength.
+    fn kv_variant(&self) -> String {
+        // The variant keys the prompt tiers. Under `--dir-steering-from user`
+        // those are prefilled with the edit held off, so they are unsteered
+        // KV: keyed as such, they share checkpoints with every unsteered run.
+        if self.model.steer_from_user {
+            return String::new();
+        }
+        steering_variant(self.model.steering.as_ref(), self.steering_ffn)
+    }
+
+    fn steering_ffn(&self) -> Option<f32> {
+        // Qualified: a bare `self.steering_ffn` is the *field* (plank's mirror),
+        // not the inherent method that reads the live value back out of the C.
+        self.has_steering_vector()
+            .then(|| Ds4Session::steering_ffn(self))
+    }
+
+    fn set_steering_ffn(&mut self, scale: f32) -> Result<(), EngineError> {
+        if !self.has_steering_vector() {
+            return Err(EngineError::new(
+                "no steering vector is loaded; restart with --dir-steering-file FILE",
+            ));
+        }
+        Ds4Session::set_steering_ffn(self, scale)
+    }
+
     /// Same tokens `generate` builds (the reconcile is idempotent for an
     /// unchanged transcript, so calling both in a row costs one extra
     /// tokenization and changes nothing), probed against the live checkpoint.
@@ -1710,6 +1946,16 @@ impl Engine for Ds4Session {
         // constant system prompt and unchanged earlier turns) is not
         // recomputed. Create it lazily on the first turn.
         let session = self.ensure_session()?;
+        if self.model.steer_from_user {
+            // The prompt must be in the KV before the edit is armed, or this
+            // turn's prefill would steer the system prompt after all. Normally
+            // the warm walk has done it and this is a probe; a caller that
+            // skipped the walk pays the prefill here, unsteered.
+            if self.warm_tokens.len() > 0 {
+                self.warm_sync(&mut |_| {})?;
+            }
+            self.hold_steering(false);
+        }
 
         cancel_clear();
         // SAFETY: session valid; cancel_cb reads a thread-local flag.
@@ -2310,6 +2556,8 @@ impl Engine for Ds4Session {
         cancel_clear();
         let total = self.warm_tokens.len();
         let session = self.ensure_session()?;
+        // The prompt tiers prefill unsteered under `--dir-steering-from user`.
+        self.hold_steering(true);
         // SAFETY: session and tokens are valid.
         let cached = unsafe { ffi::ds4_session_common_prefix(session, self.warm_tokens.as_ptr()) };
         if cached >= total {
@@ -3238,9 +3486,99 @@ fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelReason, cancel_cb, cancel_clear, cancel_reason, cancel_request,
-        cancelled_by_pressure, request_pressure_cancel, wants_empty_system,
+        CancelReason, SteeringKey, cancel_cb, cancel_clear, cancel_reason, cancel_request,
+        cancelled_by_pressure, request_pressure_cancel, steering_key, steering_variant,
+        wants_empty_system,
     };
+
+    #[test]
+    fn an_inert_steering_setup_keys_like_no_steering_at_all() {
+        // Both scales at zero edit nothing, so such a run must keep sharing
+        // checkpoints with every ordinary run — including ones launched
+        // without the flag at all.
+        let key = SteeringKey {
+            digest: "abc123".to_owned(),
+            attn: 0.0,
+        };
+        assert_eq!(steering_variant(Some(&key), 0.0), "");
+        assert_eq!(steering_variant(None, 0.0), "");
+        // And a vector that *is* in force never looks like one that is not.
+        assert_ne!(steering_variant(Some(&key), 1.0), "");
+    }
+
+    #[test]
+    fn the_steering_key_separates_vector_and_both_scales() {
+        let a = SteeringKey {
+            digest: "aaa".to_owned(),
+            attn: 0.0,
+        };
+        let b = SteeringKey {
+            digest: "bbb".to_owned(),
+            attn: 0.0,
+        };
+        let a_attn = SteeringKey {
+            digest: "aaa".to_owned(),
+            attn: 0.5,
+        };
+        let base = steering_variant(Some(&a), 1.0);
+        assert_eq!(base, steering_variant(Some(&a), 1.0), "stable");
+        assert_ne!(base, steering_variant(Some(&b), 1.0), "vector keys it");
+        assert_ne!(base, steering_variant(Some(&a), 2.0), "ffn scale keys it");
+        assert_ne!(base, steering_variant(Some(&a_attn), 1.0), "attn keys it");
+        // Attention alone is still an edit, even with the FFN scale at zero.
+        assert_ne!(steering_variant(Some(&a_attn), 0.0), "");
+    }
+
+    // Pins the trap a real run walked into: `--dir-steering-file X` with both
+    // scales at zero loads no vector, so `/steer` can never switch steering on
+    // for that session. Offering it would be offering something that fails.
+    #[test]
+    fn a_vector_passed_at_zero_scale_counts_as_not_loaded() {
+        let key = SteeringKey {
+            digest: "abc".to_owned(),
+            attn: 0.0,
+        };
+        let key_attn = SteeringKey {
+            digest: "abc".to_owned(),
+            attn: 0.5,
+        };
+        // (ffn0, attn, loaded?) -- loaded iff the C had a reason to read the file.
+        for (ffn0, k, want) in [
+            (0.0, Some(&key), false),
+            (1.0, Some(&key), true),
+            (-1.0, Some(&key), true),
+            // Attention alone is reason enough, even with the FFN scale at zero.
+            (0.0, Some(&key_attn), true),
+            (1.0, None, false),
+        ] {
+            let loaded = k.is_some_and(|k| ffn0 != 0.0 || k.attn != 0.0);
+            assert_eq!(loaded, want, "ffn0={ffn0} attn={:?}", k.map(|k| k.attn));
+        }
+    }
+
+    #[test]
+    fn the_steering_key_digests_contents_not_the_path() {
+        // Rebuilding a direction in place is a different edit under the same
+        // name. Keying on the path would hand the new run the old run's KV.
+        let dir = std::env::temp_dir().join(format!("plank-steer-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("direction.f32");
+
+        std::fs::write(&path, b"first vector").unwrap();
+        let first = steering_key(Some(&path), 0.0).expect("readable file keys");
+        std::fs::write(&path, b"second vector").unwrap();
+        let second = steering_key(Some(&path), 0.0).expect("readable file keys");
+        assert_ne!(
+            first.digest, second.digest,
+            "same path, rewritten contents: must be a different key"
+        );
+
+        // No file at all is no key, and neither is an unreadable one — the
+        // engine open reports that far better than a cache key could.
+        assert!(steering_key(None, 0.0).is_none());
+        assert!(steering_key(Some(&dir.join("absent.f32")), 0.0).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn wants_empty_system_for_v41_with_trusted_text() {

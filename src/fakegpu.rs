@@ -328,12 +328,13 @@ mod tests {
         let e = engine();
         assert_ne!(e.model_name(), "DeepSeek V4 Flash Vision Experimental");
         let think = crate::engine::ThinkMode::default();
-        let fp_fake = crate::kvtier::system_fingerprint(&e.model_name(), "SYSTEM", think, 0);
+        let fp_fake = crate::kvtier::system_fingerprint(&e.model_name(), "SYSTEM", think, 0, "");
         let fp_real = crate::kvtier::system_fingerprint(
             "DeepSeek V4 Flash Vision Experimental",
             "SYSTEM",
             think,
             0,
+            "",
         );
         assert_ne!(
             fp_fake, fp_real,
@@ -347,8 +348,8 @@ mod tests {
         // could never restore each other's checkpoints and the mode could not
         // demonstrate a hit at all.
         let think = crate::engine::ThinkMode::default();
-        let a = crate::kvtier::system_fingerprint(&engine().model_name(), "SYSTEM", think, 0);
-        let b = crate::kvtier::system_fingerprint(&engine().model_name(), "SYSTEM", think, 0);
+        let a = crate::kvtier::system_fingerprint(&engine().model_name(), "SYSTEM", think, 0, "");
+        let b = crate::kvtier::system_fingerprint(&engine().model_name(), "SYSTEM", think, 0, "");
         assert_eq!(a, b);
     }
 

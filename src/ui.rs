@@ -7640,6 +7640,7 @@ impl Agent<'_> {
             },
             "/mtp" => println!("{}", self.mtp_command(arg)),
             "/temp" => println!("{}", self.temp_command(arg)),
+            "/steer" => println!("{}", self.steer_command(arg)),
             "/loopguard" | "/lg" => println!("{}", loopguard_command(arg)),
             "/mc" => println!("{}", microcompact_command(arg)),
             "/jobs" => println!("{}", self.jobs_command()),
@@ -9607,6 +9608,55 @@ the original is frozen and listed in /tree"
     /// speculation: any temperature above 0 turns the draft gate off, so the
     /// obliging reading of `/temp 0.6` would be "quietly stop doing the thing
     /// the footer still claims". The user is told which switch to throw first.
+    /// `/steer [scale]` — report or retarget the FFN directional-steering
+    /// scale for the rest of the session, mirroring the C CLI's `/steer`.
+    ///
+    /// The scale is the only part of a steering setup that can move at
+    /// runtime: the vector itself and the attention scale are fixed when the
+    /// engine loads, because the C binds them into the graph at open.
+    ///
+    /// A change invalidates the cached KV in the one way the fingerprint
+    /// cannot express. The live prefix keeps the activations the *old* scale
+    /// produced, the suffix gets the new one, and `kv_variant` now reports the
+    /// new one for the whole thing — so the ladder's rungs, which claim to
+    /// describe a prefix at a single setting, are dropped here. The live
+    /// session is left alone: the C changes the scale without rebuilding the
+    /// KV on purpose, and re-prefilling a long transcript to make a slider
+    /// consistent would cost more than the inconsistency does.
+    fn steer_command(&mut self, arg: &str) -> String {
+        let arg = arg.trim();
+        let Some(current) = self.engine.steering_ffn() else {
+            // Both halves of the precondition, because a file alone is not
+            // enough: the engine skips loading the vector when every launch
+            // scale is zero, and then nothing can turn steering on later.
+            return "steering: unavailable — needs --dir-steering-file FILE and a non-zero \
+                    --dir-steering-ffn/--dir-steering-attn at launch"
+                .to_owned();
+        };
+        if arg.is_empty() {
+            return format!("steering ffn: {current}");
+        }
+        let Ok(scale) = arg.parse::<f32>() else {
+            return format!("/steer: expected a number -100..100, got `{arg}`");
+        };
+        if !scale.is_finite() || !(-100.0..=100.0).contains(&scale) {
+            return format!("/steer: expected a number -100..100, got `{arg}`");
+        }
+        // `-0` and `0` are the same inert setting; collapsing them here keeps
+        // one spelling out of the KV key and out of the echoed message.
+        let scale = if scale == 0.0 { 0.0 } else { scale };
+        // Exact identity on purpose — see `ds4engine::same_scale`: this value
+        // keys the KV, so a tolerance here would call two different caches one.
+        if scale.to_bits() == current.to_bits() {
+            return format!("steering ffn already {scale}");
+        }
+        if let Err(e) = self.engine.set_steering_ffn(scale) {
+            return format!("/steer: {e}");
+        }
+        self.discard_ladder();
+        format!("steering ffn {scale} (applies to new tokens; rungs dropped)")
+    }
+
     fn temp_command(&mut self, arg: &str) -> String {
         let arg = arg.trim();
         if arg.is_empty() {
@@ -14303,11 +14353,15 @@ impl Agent<'_> {
     }
 
     fn kv_tiers_for(&self, model: &str) -> Vec<crate::kvtier::TierSpec> {
+        // Asked of the engine per plan, not cached: `/steer` changes it
+        // mid-session, and the next walk must key on the edit in force now.
+        let variant = self.engine.kv_variant();
         let fp1 = crate::kvtier::system_fingerprint(
             model,
             &self.system,
             self.think,
             self.trusted_system_len,
+            &variant,
         );
         let local_names = crate::tools::mcp::local_server_names(None);
         let local_defs = crate::tools::mcp::local_tool_defs(&self.tool_ctx.mcp, &local_names);
@@ -14318,7 +14372,13 @@ impl Agent<'_> {
         let base_fp = self.engine.splits_system_tail().then(|| {
             let trusted =
                 &self.system[..crate::kvtier::trusted_cut(&self.system, self.trusted_system_len)];
-            crate::kvtier::system_fingerprint(model, trusted, self.think, self.trusted_system_len)
+            crate::kvtier::system_fingerprint(
+                model,
+                trusted,
+                self.think,
+                self.trusted_system_len,
+                &variant,
+            )
         });
         crate::kvtier::plan(
             &fp1,
@@ -17620,6 +17680,7 @@ impl Agent<'_> {
             },
             "/mtp" => log.push_plain(self.mtp_command(arg)),
             "/temp" => log.push_plain(self.temp_command(arg)),
+            "/steer" => log.push_plain(self.steer_command(arg)),
             "/loopguard" | "/lg" => log.push_plain(loopguard_command(arg)),
             "/mc" => log.push_plain(microcompact_command(arg)),
             // A report, not conversation: the same dismissable panel as
@@ -20598,7 +20659,7 @@ fn new_agent(
     // single biggest saving after the tool schemas — git status, AGENTS.md,
     // memory and the date are several thousand characters before the user has
     // typed anything.
-    let context_content = if minimal {
+    let context_content = if minimal || !cfg.tools {
         ContextContent::default()
     } else {
         ContextContent::new_with_agents(&agents)
@@ -20625,7 +20686,8 @@ fn new_agent(
     tool_ctx.worktree = crate::worktree::take_startup_session();
     // Start MCP servers before composing the system prompt so their tool
     // schemas land in it, like agent_worker_init.
-    let (mcp, mcp_warnings) = if minimal {
+    crate::tools::set_tools_enabled(cfg.tools);
+    let (mcp, mcp_warnings) = if minimal || !cfg.tools {
         (Vec::new(), Vec::new())
     } else {
         crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref(), &tool_ctx.plugins)
@@ -20648,7 +20710,7 @@ fn new_agent(
         // A `tool` component adds tool specs to the prompt, so activation is
         // skipped rather than activated-and-ignored: the host is still built so
         // component storage is reachable if something asks.
-        if !minimal {
+        if !minimal && cfg.tools {
             let warnings = tool_ctx.wasm.activate(&tool_ctx.plugins.clone(), &project);
             contribution_warnings.extend(warnings);
         }
@@ -20658,7 +20720,9 @@ fn new_agent(
     tool_ctx.grid_routes = crate::profile::active()
         .map(|a| a.spec.grids.clone())
         .unwrap_or_default();
-    tool_ctx.hooks = crate::plugins::hooks_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
+    if cfg.hooks {
+        tool_ctx.hooks = crate::plugins::hooks_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
+    }
     for w in &tool_ctx.hooks.warnings {
         eprintln!("{w}");
     }
@@ -20716,16 +20780,24 @@ fn new_agent(
     // prompt, with V4.1 respelling three tag names; Qwen has its own). Taken
     // from the name the engine reports after detecting the file, not the path.
     let syntax = sysprompt::ToolSyntax::for_model_name(&engine.model_name());
-    let system = sysprompt::build_system_prompt_parts_with_wasm(
-        &cfg.system,
-        &tool_ctx.mcp,
-        &wasm_tools,
-        !crate::settings::active().engine.thinking_tool_calls,
-        syntax,
-        // The `suspend_model` note: only a run that holds a local model it
-        // can reopen (the same factory that arms the GPU-yield cycle).
-        reopen.is_some(),
-    );
+    let system = if cfg.tools {
+        sysprompt::build_system_prompt_parts_with_wasm(
+            &cfg.system,
+            &tool_ctx.mcp,
+            &wasm_tools,
+            !crate::settings::active().engine.thinking_tool_calls,
+            syntax,
+            // The `suspend_model` note: only a run that holds a local model it
+            // can reopen (the same factory that arms the GPU-yield cycle).
+            reopen.is_some(),
+        )
+    } else {
+        // `--tools off`: no tools prompt, so no trusted DSML span either.
+        sysprompt::SplitSystemPrompt {
+            text: cfg.system.clone(),
+            trusted_len: 0,
+        }
+    };
     drop(wasm_tools);
     // Tell the engine where the trusted control text ends before it tokenizes
     // anything, so `｜DSML｜` in the prompt's examples prefills as the model's
@@ -23899,6 +23971,12 @@ mod tests {
         /// Scripted answer for `kv_reuse_probe`, so a test can stage the
         /// "prompt diverges behind the live KV end" shape without a model.
         kv_probe: Option<crate::engine::KvReuse>,
+        /// FFN steering scale when a vector is "loaded"; `None` is an engine
+        /// that has none, which is what `/steer` must refuse against.
+        steering: Option<f32>,
+        /// Makes `set_steering_ffn` fail, as the C does on a distributed
+        /// session.
+        steering_refuses: bool,
         /// Overrides the reported context size, so tests can stand on either
         /// side of `THINK_MAX_MIN_CONTEXT`. `None` reports the usual `100_000`.
         ctx_override: Option<i32>,
@@ -24003,6 +24081,21 @@ mod tests {
         }
         fn spec_capable(&self) -> bool {
             self.spec
+        }
+        fn steering_ffn(&self) -> Option<f32> {
+            self.steering
+        }
+        fn set_steering_ffn(&mut self, scale: f32) -> Result<(), crate::engine::EngineError> {
+            if self.steering.is_none() {
+                return Err(crate::engine::EngineError::new("no steering vector"));
+            }
+            if self.steering_refuses {
+                return Err(crate::engine::EngineError::new(
+                    "distributed sessions cannot retarget live",
+                ));
+            }
+            self.steering = Some(scale);
+            Ok(())
         }
         fn generate(
             &mut self,
@@ -24899,6 +24992,127 @@ mod tests {
             },
             cfg,
         )
+    }
+
+    fn steering_agent<'a>(
+        dir: &std::path::Path,
+        cfg: &'a crate::config::AgentConfig,
+        loaded: Option<f32>,
+    ) -> Agent<'a> {
+        test_agent(
+            dir,
+            ScriptedEngine {
+                steering: loaded,
+                ..ScriptedEngine::default()
+            },
+            cfg,
+        )
+    }
+
+    #[test]
+    fn steer_reports_and_sets_the_scale() {
+        let dir = scratch_dir("steer-set");
+        let cfg = test_cfg();
+        let mut agent = steering_agent(&dir, &cfg, Some(1.0));
+
+        assert_eq!(agent.steer_command(""), "steering ffn: 1");
+        let msg = agent.steer_command("2");
+        assert!(msg.starts_with("steering ffn 2"), "{msg}");
+        assert_eq!(agent.steer_command(""), "steering ffn: 2");
+        // A no-op change says so rather than dropping the ladder for nothing.
+        assert_eq!(agent.steer_command("2"), "steering ffn already 2");
+        // Negative scales are the amplifying half of the range and must pass.
+        assert!(agent.steer_command("-1.5").starts_with("steering ffn -1.5"));
+    }
+
+    #[test]
+    fn steer_without_a_vector_says_so_instead_of_pretending() {
+        let dir = scratch_dir("steer-none");
+        let cfg = test_cfg();
+        let mut agent = steering_agent(&dir, &cfg, None);
+        // The scale alone means nothing without a direction to scale, so this
+        // must not report a number — a `0` here would read as "loaded, inert".
+        let msg = agent.steer_command("1");
+        assert!(msg.contains("--dir-steering-file"), "{msg}");
+        assert!(
+            msg.contains("non-zero"),
+            "names both halves of the precondition: {msg}"
+        );
+        assert!(agent.steer_command("").contains("unavailable"));
+    }
+
+    #[test]
+    fn steer_rejects_junk_and_out_of_range_scales() {
+        let dir = scratch_dir("steer-range");
+        let cfg = test_cfg();
+        let mut agent = steering_agent(&dir, &cfg, Some(1.0));
+        for bad in ["hot", "101", "-101", "nan", "inf"] {
+            let msg = agent.steer_command(bad);
+            assert!(
+                msg.contains("expected a number"),
+                "{bad} should be refused, got {msg}"
+            );
+        }
+        // Refused input leaves the setting alone.
+        assert_eq!(agent.steer_command(""), "steering ffn: 1");
+    }
+
+    #[test]
+    fn a_refused_steering_change_keeps_the_old_scale() {
+        let dir = scratch_dir("steer-refused");
+        let cfg = test_cfg();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                steering: Some(1.0),
+                steering_refuses: true,
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        let msg = agent.steer_command("2");
+        assert!(msg.starts_with("/steer:"), "{msg}");
+        // The engine kept 1.0, so the KV key must keep describing 1.0 too.
+        assert_eq!(agent.steer_command(""), "steering ffn: 1");
+    }
+
+    #[test]
+    fn changing_the_steering_scale_drops_the_ladder() {
+        // The rungs claim to describe a prefix prefilled at one setting. After
+        // a change they describe activations no current setting produces, and
+        // `kv_variant` now reports the new scale for all of it — so they have
+        // to go, exactly as a rollback's do.
+        let dir = scratch_dir("steer-ladder");
+        let cfg = test_cfg();
+        let mut agent = steering_agent(&dir, &cfg, Some(1.0));
+        seed_ladder(&mut agent, 2);
+        assert_eq!(agent.ladder.rungs().len(), 2, "ladder seeded");
+
+        agent.steer_command("2");
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            0,
+            "a steering change must not leave rungs behind"
+        );
+    }
+
+    #[test]
+    fn a_refused_or_noop_steer_keeps_the_ladder() {
+        // The flip side: dropping rungs is the expensive part, so only a change
+        // that actually took effect pays it.
+        let dir = scratch_dir("steer-ladder-keep");
+        let cfg = test_cfg();
+        let mut agent = steering_agent(&dir, &cfg, Some(1.0));
+        seed_ladder(&mut agent, 2);
+
+        agent.steer_command("1"); // no-op
+        assert_eq!(agent.ladder.rungs().len(), 2, "a no-op kept the rungs");
+        agent.steer_command("nonsense"); // rejected
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            2,
+            "a rejected scale kept the rungs"
+        );
     }
 
     #[test]

@@ -320,8 +320,9 @@ this morning cannot invalidate the most expensive tier in the system.
 
 ### Some key material does not change the text
 
-Tier 1's key includes two inputs that do not alter a single byte of the prompt,
-and both are there because they change its *tokens*.
+Tier 1's key includes three inputs that do not alter a single byte of the
+prompt. Two are there because they change its *tokens*; the third because it
+changes what prefilling those tokens *writes*.
 
 The reasoning level matters because `ThinkMode::Max` prepends a
 reasoning-effort preamble ahead of the system prompt. Identical system text,
@@ -338,6 +339,43 @@ A checkpoint keyed on the text alone would be restored under the wrong setting
 and prefilled against a KV that does not describe it. This is R3 failing quietly,
 and it is the kind of bug that would be found weeks later by someone noticing the
 model behaved oddly at one reasoning level.
+
+The third input, the **engine variant** (`Engine::kv_variant`), breaks the
+pattern the other two share: it leaves both the text and the tokens alone. An
+activation edit such as directional steering (`--dir-steering-file`) subtracts a
+direction from every layer's residual as the model runs, so the same tokens over
+the same weights write a *different KV*. Nothing textual distinguishes the two
+runs — the only evidence is the activations, which is precisely what a
+checkpoint stores and a fingerprint cannot see.
+
+The variant is therefore the engine's own answer to "what else decides my
+activations", and it is empty for every backend that edits nothing, so an
+ordinary run keys exactly as it did before the mechanism existed. The local
+engine returns a digest of the steering vector's *contents* plus both scales:
+the contents because rebuilding a direction in place is a different edit under
+the same filename, and both scales because a strength is as much part of the
+edit as a direction is. `/steer` moves the FFN scale mid-session, which is why
+the variant is asked of the engine at each walk rather than cached at startup.
+
+`--dir-steering-from user` (or `"from": "user"` in an engine's `steering` block)
+turns that asymmetry into a feature. The FFN scale is held at zero while the
+prompt tiers prefill (`Ds4Session::warm_sync`) and armed at the top of
+`generate`, so the system prompt and session-start context are unsteered KV and
+the user's message, the reasoning and the answer are steered. Because the tiers
+really are unsteered, `kv_variant` reports empty in this mode and they share
+checkpoints with every unsteered run. Only the FFN scale can be retargeted on a
+live session, so the mode refuses a non-zero attention scale. Conversation-depth
+checkpoints (rungs, saved sessions) are still not keyed by the steering setting,
+as with `/steer`.
+
+One asymmetry survives, by design. The C changes a live scale *without*
+rebuilding the KV, so after a `/steer` the live prefix holds activations the old
+scale produced and only the suffix gets the new one. The ladder's rungs claim to
+describe a prefix at a single setting, so `/steer` drops them
+(`Agent::discard_ladder`) rather than leave behind a checkpoint that would key as
+pure under the new scale. The live session is deliberately left as it is:
+re-prefilling a long transcript to make a slider self-consistent would cost far
+more than the inconsistency does.
 
 ### A depth-indexed ladder resolves the in-place-rewrite case
 

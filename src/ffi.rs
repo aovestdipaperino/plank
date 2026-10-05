@@ -409,6 +409,17 @@ unsafe extern "C" {
         ctx_size: c_int,
     ) -> c_int;
     pub fn ds4_session_free(s: *mut Ds4Session);
+    /// Current FFN directional-steering scale (0.0 when no vector is loaded).
+    pub fn ds4_session_directional_steering_ffn(s: *mut Ds4Session) -> f32;
+    /// Retargets FFN steering for tokens evaluated *after* this call, leaving
+    /// the existing KV in place — the C deliberately does not rebuild it, so
+    /// the prefix keeps whatever scale produced it.
+    ///
+    /// Returns **0 on success** and non-zero on refusal (an out-of-range
+    /// scale, a distributed or network-tensor-parallel session, or a non-zero
+    /// scale with no vector loaded at startup) — the opposite of the
+    /// `bool`-like convention some neighbours here use.
+    pub fn ds4_session_set_directional_steering_ffn(s: *mut Ds4Session, scale: f32) -> c_int;
     /// Drops the session's cached KV so the next sync prefills from zero. Used
     /// when the prompt *prefix* changes under it (the reasoning-effort preamble
     /// moving in or out), which a common-prefix probe alone cannot recover from.

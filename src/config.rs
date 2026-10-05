@@ -174,6 +174,17 @@ pub struct AgentConfig {
     /// addressable as a slash command or resolvable by the `skill` tool, for a
     /// session that wants only the model and the tools.
     pub skills: bool,
+    /// Whether plugin and settings hooks run this session (`--hooks on|off`).
+    /// On by default. Off loads none, so a `SessionStart` hook cannot inject
+    /// context into a session that wants exactly the prompt it was given.
+    /// `--minimal-prompt` implies off.
+    pub hooks: bool,
+    /// Whether the model is given tools this session (`--tools on|off`). On by
+    /// default. Off sends no tools prompt at all (the system prompt is only
+    /// `--system`), starts no MCP servers or WASM tool components, and
+    /// refuses any tool call the model emits anyway. `--minimal-prompt`
+    /// implies off.
+    pub tools: bool,
     /// Whether the context size came from the user (`-c/--ctx` or the settings
     /// file) rather than [`DEFAULT_CTX_SIZE`]. Only consulted by the provider
     /// path: an untouched default is a guess sized for the local ds4 model, so
@@ -364,6 +375,10 @@ pub struct EngineTuning {
     /// FFN steering scale from `--dir-steering-ffn`; defaults to 1.0 when a
     /// steering file is given without an explicit scale, like the C.
     pub dir_steering_ffn: f32,
+    /// `--dir-steering-from user`: hold the FFN edit at zero while the system
+    /// prompt and session-start context prefill, and switch it on for the
+    /// user's first message onward. False (`all`) steers every token.
+    pub dir_steering_from_user: bool,
 }
 
 impl EngineTuning {
@@ -419,6 +434,7 @@ impl Default for EngineTuning {
             dir_steering_file: None,
             dir_steering_attn: 0.0,
             dir_steering_ffn: 0.0,
+            dir_steering_from_user: false,
         }
     }
 }
@@ -518,6 +534,8 @@ impl Default for AgentConfig {
             provider_api_key: None,
             provider_cache: true,
             skills: true,
+            hooks: true,
+            tools: true,
             ctx_size_explicit: false,
             temp_explicit: false,
             cli_provenance: std::collections::BTreeMap::new(),
@@ -657,6 +675,10 @@ Options:
       --dir-steering-file PATH      directional steering vectors
       --dir-steering-ffn F          FFN steering scale (-100..100)
       --dir-steering-attn F         attention steering scale (-100..100)
+      --dir-steering-from all|user  steer every token (default), or hold the FFN
+                                    edit off while the system prompt and session
+                                    context prefill and switch it on at the
+                                    user's first message; needs attn scale 0
       --remote URL         drive a remote `plank serve` host instead of a local
                            engine (https://, or http:// to localhost); token via
                            --remote-token or $PLANK_REMOTE_TOKEN
@@ -721,6 +743,12 @@ Options:
       --skills on|off      whether skills are available (default on); off loads
                            none, built-in or otherwise, so no /skill slash
                            command and nothing for the `skill` tool to resolve
+      --hooks on|off       whether plugin and settings hooks run (default on);
+                           off loads none, so no SessionStart context is
+                           injected. --minimal-prompt implies off
+      --tools on|off       whether the model gets tools (default on); off sends
+                           no tools prompt, starts no MCP servers and refuses
+                           any tool call. --minimal-prompt implies off
       --minimal-prompt     start with the smallest prompt this build can make:
                            no MCP servers, skills, templates, plugin agents,
                            WASM components or session-start context. For
@@ -1152,6 +1180,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "set the sampling temperature (not while mtp is on)",
     },
     SlashCommand {
+        name: "/steer",
+        args: "[-100..100]",
+        desc: "set the FFN directional-steering scale (needs --dir-steering-file)",
+    },
+    SlashCommand {
         name: "/mc",
         args: "[on|off]",
         desc: "toggle micro-compaction for this session, even mid-turn",
@@ -1336,6 +1369,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/debug")
         || slash_command_with_args(cmd, "/mtp")
         || slash_command_with_args(cmd, "/temp")
+        || slash_command_with_args(cmd, "/steer")
         || slash_command_with_args(cmd, "/mc")
         || slash_command_with_args(cmd, "/loopguard")
         || slash_command_with_args(cmd, "/lg")
@@ -1443,6 +1477,17 @@ fn parse_engine_option(
             e.dir_steering_ffn = parse_float_range(v, arg, -100.0, 100.0)?;
             *steering_scale_set = true;
         }
+        "--dir-steering-from" => {
+            e.dir_steering_from_user = match v {
+                "all" => false,
+                "user" => true,
+                other => {
+                    return Err(format!(
+                        "--dir-steering-from: invalid value {other:?} (all|user)"
+                    ));
+                }
+            };
+        }
         "--dir-steering-attn" => {
             e.dir_steering_attn = parse_float_range(v, arg, -100.0, 100.0)?;
             *steering_scale_set = true;
@@ -1481,6 +1526,8 @@ pub fn parse_options_with(
     // without one defaults the FFN scale to 1.0, like the C.
     let mut steering_scale_set = false;
     let mut temp_set = false;
+    let mut hooks_set = false;
+    let mut tools_set = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -1583,6 +1630,14 @@ pub fn parse_options_with(
             }
             "--skills" => {
                 c.skills = parse_on_off(need_arg(&mut i)?, arg)?;
+            }
+            "--hooks" => {
+                c.hooks = parse_on_off(need_arg(&mut i)?, arg)?;
+                hooks_set = true;
+            }
+            "--tools" => {
+                c.tools = parse_on_off(need_arg(&mut i)?, arg)?;
+                tools_set = true;
             }
             "--ui" => {
                 c.ui = match need_arg(&mut i)? {
@@ -1719,6 +1774,7 @@ pub fn parse_options_with(
             | "--simulate-used-memory"
             | "--dir-steering-file"
             | "--dir-steering-ffn"
+            | "--dir-steering-from"
             | "--dir-steering-attn" => {
                 parse_engine_option(
                     &mut c.engine,
@@ -1739,6 +1795,14 @@ pub fn parse_options_with(
             _ => return Err(format!("unknown option: {arg}")),
         }
         i += 1;
+    }
+    // A bare prompt means no hook-injected context either; an explicit
+    // `--hooks` wins whichever side of `--minimal-prompt` it was typed on.
+    if c.minimal_prompt && !hooks_set {
+        c.hooks = false;
+    }
+    if c.minimal_prompt && !tools_set {
+        c.tools = false;
     }
     finalize(&mut c, steering_scale_set, temp_set)?;
     Ok(c)
@@ -1777,6 +1841,14 @@ pub fn temperature_without_speculation(
 fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Result<(), String> {
     if c.engine.dir_steering_file.is_some() && !steering_scale_set {
         c.engine.dir_steering_ffn = 1.0;
+    }
+    // Only the FFN scale can be retargeted on a live session, so a deferred
+    // start cannot carry an attention edit along with it.
+    if c.engine.dir_steering_from_user && c.engine.dir_steering_attn != 0.0 {
+        return Err(
+            "--dir-steering-from user defers only the FFN edit; set --dir-steering-attn 0"
+                .to_string(),
+        );
     }
     // Speculative decoding only engages at temperature 0 (see `ds4engine`'s
     // draft gate), so DSpark defaults the temperature to 0. Done here rather
@@ -2481,6 +2553,73 @@ mod tests {
             ]))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn dir_steering_from_selects_when_the_edit_starts() {
+        assert!(
+            !parse_options(&args(&[]))
+                .unwrap()
+                .engine
+                .dir_steering_from_user
+        );
+        let c = parse_options(&args(&["--dir-steering-from", "user"])).unwrap();
+        assert!(c.engine.dir_steering_from_user);
+        let c = parse_options(&args(&["--dir-steering-from", "all"])).unwrap();
+        assert!(!c.engine.dir_steering_from_user);
+        let err = parse_options(&args(&["--dir-steering-from", "later"])).unwrap_err();
+        assert!(err.contains("all|user"), "{err}");
+        // A deferred start has no way to defer an attention edit.
+        let err = parse_options(&args(&[
+            "--dir-steering-from",
+            "user",
+            "--dir-steering-attn",
+            "2",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--dir-steering-attn 0"), "{err}");
+    }
+
+    #[test]
+    fn hooks_flag_toggles_hook_loading() {
+        assert!(parse_options(&args(&[])).unwrap().hooks);
+        assert!(!parse_options(&args(&["--hooks", "off"])).unwrap().hooks);
+        assert!(parse_options(&args(&["--hooks", "on"])).unwrap().hooks);
+        // `--minimal-prompt` means no injected context, hooks included, unless
+        // the user explicitly turns them back on.
+        assert!(!parse_options(&args(&["--minimal-prompt"])).unwrap().hooks);
+        assert!(
+            parse_options(&args(&["--minimal-prompt", "--hooks", "on"]))
+                .unwrap()
+                .hooks
+        );
+        assert!(
+            parse_options(&args(&["--hooks", "on", "--minimal-prompt"]))
+                .unwrap()
+                .hooks
+        );
+        let err = parse_options(&args(&["--hooks", "maybe"])).unwrap_err();
+        assert!(err.contains("on|off"), "{err}");
+    }
+
+    #[test]
+    fn tools_flag_toggles_tool_offering() {
+        assert!(parse_options(&args(&[])).unwrap().tools);
+        assert!(!parse_options(&args(&["--tools", "off"])).unwrap().tools);
+        assert!(parse_options(&args(&["--tools", "on"])).unwrap().tools);
+        assert!(!parse_options(&args(&["--minimal-prompt"])).unwrap().tools);
+        assert!(
+            parse_options(&args(&["--minimal-prompt", "--tools", "on"]))
+                .unwrap()
+                .tools
+        );
+        assert!(
+            parse_options(&args(&["--tools", "on", "--minimal-prompt"]))
+                .unwrap()
+                .tools
+        );
+        let err = parse_options(&args(&["--tools", "maybe"])).unwrap_err();
+        assert!(err.contains("on|off"), "{err}");
     }
 
     #[test]

@@ -1167,6 +1167,47 @@ pub trait Engine: Debug + Send {
         false
     }
 
+    /// An opaque description of any **activation edit** this engine applies on
+    /// top of the model's own weights, used as KV-fingerprint key material
+    /// (`kvtier::system_fingerprint`).
+    ///
+    /// Empty — the default — means "the weights alone decide the activations",
+    /// which is true of every backend that does not edit the residual stream.
+    /// The local engine returns a descriptor of its directional steering when
+    /// a vector is loaded, because the same tokens under two steering settings
+    /// prefill two different KVs, and a checkpoint keyed on the text alone
+    /// would be restored under the wrong one and extended as if it matched.
+    ///
+    /// Must be stable for as long as the edit is: it is compared, never parsed,
+    /// so any encoding works provided equal edits give equal strings.
+    fn kv_variant(&self) -> String {
+        String::new()
+    }
+
+    /// The FFN directional-steering scale in force, or `None` when this engine
+    /// has no steering vector loaded and the setting is therefore meaningless.
+    ///
+    /// `Some(0.0)` is a real answer: a vector is loaded but currently inert.
+    fn steering_ffn(&self) -> Option<f32> {
+        None
+    }
+
+    /// Retargets FFN steering for the tokens generated from here on.
+    ///
+    /// Only the suffix is affected — the KV already built keeps the activations
+    /// the previous scale produced — so a caller that changes this mid-session
+    /// owns a prefix and a suffix that disagree, and must not leave a
+    /// checkpoint behind that claims otherwise.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] for an engine with no vector loaded, and for one
+    /// that cannot retarget live.
+    fn set_steering_ffn(&mut self, _scale: f32) -> Result<(), EngineError> {
+        Err(EngineError::new(
+            "this engine has no directional steering to set",
+        ))
+    }
+
     /// Whether this is the stand-in a GPU-yield cycle leaves in a slot whose
     /// model it unloaded (`gpuyield::UnloadedEngine`). The retry after a
     /// failed reload looks for it, wherever the slot has moved since, rather
@@ -1548,6 +1589,13 @@ pub struct EchoEngine {
     scripted_decisions: std::collections::VecDeque<crate::decide::RawVerdict>,
     /// Every state `decide` was asked about, in order, for assertions.
     decisions_asked: Vec<String>,
+    /// FFN steering scale, when a test has given this engine a vector to
+    /// pretend it loaded. `None` — the default — is an engine with no steering
+    /// at all, which is what every backend but the local one really is.
+    steering_ffn: Option<f32>,
+    /// Set when [`Engine::set_steering_ffn`] should fail, standing in for the
+    /// C's refusal on a distributed session.
+    steering_refuses: bool,
 }
 
 impl EchoEngine {
@@ -1558,7 +1606,21 @@ impl EchoEngine {
             ctx_size,
             scripted_decisions: std::collections::VecDeque::default(),
             decisions_asked: Vec::default(),
+            steering_ffn: None,
+            steering_refuses: false,
         }
+    }
+
+    /// Gives this engine a loaded steering vector at `scale`, so the `/steer`
+    /// paths are exercised without a model.
+    pub fn script_steering(&mut self, scale: f32) {
+        self.steering_ffn = Some(scale);
+    }
+
+    /// Makes the next [`Engine::set_steering_ffn`] fail, as the C does for a
+    /// distributed session.
+    pub fn script_steering_refusal(&mut self) {
+        self.steering_refuses = true;
     }
 
     /// Queues the verdicts `decide` will return, one per question asked.
@@ -1575,6 +1637,32 @@ impl EchoEngine {
 }
 
 impl Engine for EchoEngine {
+    fn steering_ffn(&self) -> Option<f32> {
+        self.steering_ffn
+    }
+
+    fn set_steering_ffn(&mut self, scale: f32) -> Result<(), EngineError> {
+        if self.steering_ffn.is_none() {
+            return Err(EngineError::new(
+                "this engine has no directional steering to set",
+            ));
+        }
+        if self.steering_refuses {
+            return Err(EngineError::new("the engine refused the steering change"));
+        }
+        self.steering_ffn = Some(scale);
+        Ok(())
+    }
+
+    /// Mirrors the local engine's encoding closely enough that a test can tell
+    /// two settings apart; the echo engine edits no activations of its own.
+    fn kv_variant(&self) -> String {
+        match self.steering_ffn {
+            Some(ffn) if ffn != 0.0 => format!("steer:echo:ffn={ffn}:attn=0"),
+            _ => String::new(),
+        }
+    }
+
     fn generate(
         &mut self,
         prompt: Prompt<'_>,

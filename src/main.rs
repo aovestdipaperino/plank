@@ -410,9 +410,36 @@ fn resolve_selection(
     {
         cfg.model_spec = Some(rec.engine.to_string());
     }
+    apply_engine_steering(cfg, &catalog, &sel);
     cfg.model_path = Some(sel.main.clone());
     cfg.selection = Some(sel);
     Ok(catalog)
+}
+
+/// Applies the steering vector a selected engine bundles (`steering` in its
+/// local catalog entry) as if it had been given on the command line.
+///
+/// Anything the user set explicitly, a `--dir-steering-file` or a setting,
+/// wins: the engine's vector is a default for that model, not an override.
+fn apply_engine_steering(
+    cfg: &mut plank::config::AgentConfig,
+    catalog: &plank::engines::Catalog,
+    sel: &plank::engines::Selection,
+) {
+    if cfg.engine.dir_steering_file.is_some() {
+        return;
+    }
+    let Some(st) = sel
+        .id
+        .and_then(|id| catalog.get(id.as_str()))
+        .and_then(|e| e.steering.as_ref())
+    else {
+        return;
+    };
+    cfg.engine.dir_steering_file = Some(st.file.clone());
+    cfg.engine.dir_steering_ffn = st.ffn;
+    cfg.engine.dir_steering_attn = st.attn;
+    cfg.engine.dir_steering_from_user = st.from_user;
 }
 
 /// Points the selection at the final `model_path`, and gives a `.ggd`
@@ -1740,6 +1767,43 @@ mod tests {
             .expect("dump-config must not abort");
         assert!(cfg.dump_config);
         assert!(cfg.selection.is_none());
+    }
+
+    #[test]
+    fn an_engine_with_a_steering_vector_steers_unless_the_user_already_did() {
+        let root = std::env::temp_dir().join(format!("plank-engine-steer-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("engines.local.json"),
+            r#"{"engines":{"ds4-ab":{"main":{"path":"/m/a.gguf"},
+                "steering":{"file":"/v/h.f32","ffn":3}}}}"#,
+        )
+        .unwrap();
+        let settings = plank::settings::Settings::default();
+        let parse = |extra: &[&str]| {
+            let mut args: Vec<String> = ["--model", "ds4-ab"].map(String::from).to_vec();
+            args.extend(extra.iter().map(ToString::to_string));
+            parse_config_in(&settings, &args, "plank", &root, None).expect("parses")
+        };
+        let cfg = parse(&[]);
+        assert_eq!(
+            cfg.engine.dir_steering_file.as_deref(),
+            Some(std::path::Path::new("/v/h.f32"))
+        );
+        assert!((cfg.engine.dir_steering_ffn - 3.0).abs() < f32::EPSILON);
+        // An explicit vector on the command line wins outright.
+        let cfg = parse(&[
+            "--dir-steering-file",
+            "/mine.f32",
+            "--dir-steering-ffn",
+            "2",
+        ]);
+        assert_eq!(
+            cfg.engine.dir_steering_file.as_deref(),
+            Some(std::path::Path::new("/mine.f32"))
+        );
+        assert!((cfg.engine.dir_steering_ffn - 2.0).abs() < f32::EPSILON);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     const HAL: Option<plank::engines::Recommendation<'static>> =

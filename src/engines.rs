@@ -51,8 +51,26 @@ pub enum Layer {
     Local,
 }
 
+/// A directional-steering vector bundled with an engine: the model *is* the
+/// GGUF plus this vector at these scales. Local layer only, like `path`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Steering {
+    /// The vector file (`--dir-steering-file`).
+    pub file: PathBuf,
+    /// FFN scale (`--dir-steering-ffn`); 1.0 when the entry gives none, like
+    /// the C.
+    pub ffn: f32,
+    /// Attention scale (`--dir-steering-attn`); 0.0 when the entry gives none.
+    pub attn: f32,
+    /// `"from": "user"` (`--dir-steering-from user`): the FFN edit starts at
+    /// the user's first message instead of at the first prompt token. Requires
+    /// `attn` to be 0, since only the FFN scale can be switched on a live
+    /// session.
+    pub from_user: bool,
+}
+
 /// One engine after parsing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EngineEntry {
     /// The engine's name, the key it was listed under.
     pub name: String,
@@ -66,6 +84,8 @@ pub struct EngineEntry {
     /// when that path does not exist, already normalised by [`download_url`].
     /// The role stays unmanaged: no version, no hash, no upgrade.
     pub path_urls: BTreeMap<String, String>,
+    /// A steering vector this engine always runs with, if it declares one.
+    pub steering: Option<Steering>,
     /// The engine's JSON object, verbatim, for the installed record.
     pub raw: String,
 }
@@ -97,7 +117,7 @@ impl EngineEntry {
 }
 
 /// A parsed, possibly layered catalog.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Catalog {
     /// Monotonic catalog version; 0 for a local layer.
     pub version: u32,
@@ -224,12 +244,14 @@ fn parse_entry(name: &str, value: &serde_json::Value, layer: Layer) -> Result<En
     if !files.is_empty() && version == 0 {
         return Err("downloadable entries need a nonzero version".to_string());
     }
+    let steering = parse_steering(obj.get("steering"), layer)?;
     let e = EngineEntry {
         name: name.to_string(),
         version,
         files,
         paths,
         path_urls,
+        steering,
         raw: serde_json::to_string(value).map_err(|e| e.to_string())?,
     };
     // Reuse the manifest validator (sha256 shape, https, nonzero bytes).
@@ -237,6 +259,54 @@ fn parse_entry(name: &str, value: &serde_json::Value, layer: Layer) -> Result<En
         return Err("an artifact entry is malformed (sha256, url or bytes)".to_string());
     }
     Ok(e)
+}
+
+/// Reads an engine's optional `steering` block: `{"file": PATH, "ffn": F,
+/// "attn": F}`. A published entry may not carry one, since a vector file is a
+/// local path; the scales are range-checked like the command-line flags.
+fn parse_steering(v: Option<&serde_json::Value>, layer: Layer) -> Result<Option<Steering>, String> {
+    let Some(v) = v else { return Ok(None) };
+    if layer == Layer::Published {
+        return Err("steering: a published entry may not name a vector file".to_string());
+    }
+    let file = v
+        .get("file")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("steering: needs a `file` string")?;
+    let scale = |key: &str, default: f32| -> Result<f32, String> {
+        let Some(x) = v.get(key) else {
+            return Ok(default);
+        };
+        let n = x
+            .as_f64()
+            .ok_or_else(|| format!("steering: `{key}` must be a number"))?;
+        if !(-100.0..=100.0).contains(&n) {
+            return Err(format!("steering: `{key}` must be within -100..100"));
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(n as f32)
+    };
+    let from_user = match v.get("from").and_then(serde_json::Value::as_str) {
+        None | Some("all") => false,
+        Some("user") => true,
+        Some(other) => {
+            return Err(format!(
+                "steering: `from` must be \"all\" or \"user\", not `{other}`"
+            ));
+        }
+    };
+    let (ffn, attn) = (scale("ffn", 1.0)?, scale("attn", 0.0)?);
+    if from_user && attn != 0.0 {
+        return Err(
+            "steering: `from: user` defers only the FFN edit, so `attn` must be 0".to_string(),
+        );
+    }
+    Ok(Some(Steering {
+        file: crate::settings::expand_tilde(file),
+        ffn,
+        attn,
+        from_user,
+    }))
 }
 
 /// The download URL for a local role's `url`: a Hugging Face file page
@@ -1014,6 +1084,64 @@ mod tests {
         );
         let s = resolve_in(&r, &c, Choice::Default).unwrap();
         assert_eq!(s.id, Some(crate::manifest::EngineId::DS4VISION));
+    }
+
+    #[test]
+    fn an_engine_can_bundle_a_steering_vector() {
+        let r = root("steering-entry");
+        std::fs::write(
+            r.join("engines.local.json"),
+            r#"{"engines":{"ds4-ab":{"main":{"path":"/m/a.gguf"},
+                "steering":{"file":"/v/h.f32","ffn":3}}}}"#,
+        )
+        .unwrap();
+        let mut w = Vec::new();
+        let c = load_in(&r, &mut w);
+        assert!(w.is_empty(), "{w:?}");
+        let st = c.get("ds4-ab").unwrap().steering.clone().unwrap();
+        assert_eq!(st.file, PathBuf::from("/v/h.f32"));
+        assert!((st.ffn - 3.0).abs() < f32::EPSILON);
+        assert!(st.attn.abs() < f32::EPSILON);
+        assert!(!st.from_user);
+    }
+
+    #[test]
+    fn an_engine_can_start_steering_at_the_user_turn() {
+        let mut w = Vec::new();
+        let text = r#"{"engines":{"x":{"main":{"path":"/m"},
+            "steering":{"file":"/v","ffn":5,"from":"user"}}}}"#;
+        let c = parse(text, Layer::Local, &mut w).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert!(c.get("x").unwrap().steering.as_ref().unwrap().from_user);
+    }
+
+    #[test]
+    fn a_bad_steering_block_drops_the_engine_with_a_warning() {
+        let mut w = Vec::new();
+        for bad in [
+            r#"{"main":{"path":"/m"},"steering":{"ffn":3}}"#,
+            r#"{"main":{"path":"/m"},"steering":{"file":"/v","ffn":500}}"#,
+            r#"{"main":{"path":"/m"},"steering":{"file":"/v","attn":"x"}}"#,
+            r#"{"main":{"path":"/m"},"steering":{"file":"/v","from":"later"}}"#,
+            r#"{"main":{"path":"/m"},"steering":{"file":"/v","from":"user","attn":1}}"#,
+        ] {
+            let text = format!(r#"{{"engines":{{"x":{bad}}}}}"#);
+            let c = parse(&text, Layer::Local, &mut w).unwrap();
+            assert!(c.get("x").is_none(), "{bad}");
+        }
+        assert_eq!(w.len(), 5, "{w:?}");
+    }
+
+    #[test]
+    fn a_published_entry_may_not_bundle_steering() {
+        let mut w = Vec::new();
+        let text = r#"{"version":1,"engines":{"x":{"version":1,
+            "main":{"name":"a.gguf","url":"https://h/a.gguf","bytes":1,
+                    "sha256":"0000000000000000000000000000000000000000000000000000000000000000"},
+            "steering":{"file":"/v"}}}}"#;
+        let c = parse(text, Layer::Published, &mut w).unwrap();
+        assert!(c.get("x").is_none());
+        assert_eq!(w.len(), 1, "{w:?}");
     }
 
     #[test]

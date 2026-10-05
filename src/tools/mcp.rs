@@ -2258,13 +2258,15 @@ done
                 "m",
                 &flapped_prompt,
                 crate::engine::ThinkMode::default(),
-                0
+                0,
+                "",
             ),
             crate::kvtier::system_fingerprint(
                 "m",
                 &live_prompt,
                 crate::engine::ThinkMode::default(),
-                0
+                0,
+                "",
             ),
             "fp1 must not move across a flap"
         );
@@ -3610,13 +3612,15 @@ done
                 "m",
                 &shadow_prompt,
                 crate::engine::ThinkMode::default(),
-                0
+                0,
+                "",
             ),
             crate::kvtier::system_fingerprint(
                 "m",
                 &live_prompt,
                 crate::engine::ThinkMode::default(),
-                0
+                0,
+                "",
             ),
             "fp1 must not move across a flap"
         );
