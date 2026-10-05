@@ -375,10 +375,15 @@ pub struct EngineTuning {
     /// FFN steering scale from `--dir-steering-ffn`; defaults to 1.0 when a
     /// steering file is given without an explicit scale, like the C.
     pub dir_steering_ffn: f32,
-    /// `--dir-steering-from user`: hold the FFN edit at zero while the system
-    /// prompt and session-start context prefill, and switch it on for the
-    /// user's first message onward. False (`all`) steers every token.
+    /// `--dir-steering-from user` (the default): hold the FFN edit at zero
+    /// while the system prompt and session-start context prefill, and switch
+    /// it on for the user's first message onward. False (`all`) steers every
+    /// token. Falls back to `all` when an attention scale is set and the flag
+    /// was not given, since only the FFN edit can be deferred.
     pub dir_steering_from_user: bool,
+    /// Whether `--dir-steering-from` was given, so an engine entry's own
+    /// `from` does not override the command line.
+    pub dir_steering_from_explicit: bool,
 }
 
 impl EngineTuning {
@@ -434,7 +439,8 @@ impl Default for EngineTuning {
             dir_steering_file: None,
             dir_steering_attn: 0.0,
             dir_steering_ffn: 0.0,
-            dir_steering_from_user: false,
+            dir_steering_from_user: true,
+            dir_steering_from_explicit: false,
         }
     }
 }
@@ -675,10 +681,11 @@ Options:
       --dir-steering-file PATH      directional steering vectors
       --dir-steering-ffn F          FFN steering scale (-100..100)
       --dir-steering-attn F         attention steering scale (-100..100)
-      --dir-steering-from all|user  steer every token (default), or hold the FFN
-                                    edit off while the system prompt and session
-                                    context prefill and switch it on at the
-                                    user's first message; needs attn scale 0
+      --dir-steering-from all|user  steer from the user's first message (default):
+                                    the FFN edit is held off while the system
+                                    prompt and session context prefill; or `all`
+                                    to steer every token. `user` needs attn
+                                    scale 0, so a set attn scale implies `all`
       --remote URL         drive a remote `plank serve` host instead of a local
                            engine (https://, or http:// to localhost); token via
                            --remote-token or $PLANK_REMOTE_TOKEN
@@ -1478,6 +1485,7 @@ fn parse_engine_option(
             *steering_scale_set = true;
         }
         "--dir-steering-from" => {
+            e.dir_steering_from_explicit = true;
             e.dir_steering_from_user = match v {
                 "all" => false,
                 "user" => true,
@@ -1845,10 +1853,13 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
     // Only the FFN scale can be retargeted on a live session, so a deferred
     // start cannot carry an attention edit along with it.
     if c.engine.dir_steering_from_user && c.engine.dir_steering_attn != 0.0 {
-        return Err(
-            "--dir-steering-from user defers only the FFN edit; set --dir-steering-attn 0"
-                .to_string(),
-        );
+        if c.engine.dir_steering_from_explicit {
+            return Err(
+                "--dir-steering-from user defers only the FFN edit; set --dir-steering-attn 0"
+                    .to_string(),
+            );
+        }
+        c.engine.dir_steering_from_user = false;
     }
     // Speculative decoding only engages at temperature 0 (see `ds4engine`'s
     // draft gate), so DSpark defaults the temperature to 0. Done here rather
@@ -2557,8 +2568,9 @@ mod tests {
 
     #[test]
     fn dir_steering_from_selects_when_the_edit_starts() {
+        // Deferred start is the default.
         assert!(
-            !parse_options(&args(&[]))
+            parse_options(&args(&[]))
                 .unwrap()
                 .engine
                 .dir_steering_from_user
@@ -2578,6 +2590,10 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("--dir-steering-attn 0"), "{err}");
+        // Without the flag, an attention scale quietly keeps the old
+        // steer-everything behaviour instead of failing existing command lines.
+        let c = parse_options(&args(&["--dir-steering-attn", "2"])).unwrap();
+        assert!(!c.engine.dir_steering_from_user);
     }
 
     #[test]

@@ -62,10 +62,10 @@ pub struct Steering {
     pub ffn: f32,
     /// Attention scale (`--dir-steering-attn`); 0.0 when the entry gives none.
     pub attn: f32,
-    /// `"from": "user"` (`--dir-steering-from user`): the FFN edit starts at
-    /// the user's first message instead of at the first prompt token. Requires
-    /// `attn` to be 0, since only the FFN scale can be switched on a live
-    /// session.
+    /// `"from": "user"` (the default) or `"all"`: whether the FFN edit starts
+    /// at the user's first message or at the first prompt token. `user`
+    /// requires `attn` to be 0, since only the FFN scale can be switched on a
+    /// live session, so an entry with an attention scale defaults to `all`.
     pub from_user: bool,
 }
 
@@ -286,8 +286,16 @@ fn parse_steering(v: Option<&serde_json::Value>, layer: Layer) -> Result<Option<
         #[allow(clippy::cast_possible_truncation)]
         Ok(n as f32)
     };
+    let (ffn, attn) = (scale("ffn", 1.0)?, scale("attn", 0.0)?);
     let from_user = match v.get("from").and_then(serde_json::Value::as_str) {
-        None | Some("all") => false,
+        // The default defers the FFN edit, which an attention edit rules out.
+        None => attn == 0.0,
+        Some("all") => false,
+        Some("user") if attn != 0.0 => {
+            return Err(
+                "steering: `from: user` defers only the FFN edit, so `attn` must be 0".to_string(),
+            );
+        }
         Some("user") => true,
         Some(other) => {
             return Err(format!(
@@ -295,12 +303,6 @@ fn parse_steering(v: Option<&serde_json::Value>, layer: Layer) -> Result<Option<
             ));
         }
     };
-    let (ffn, attn) = (scale("ffn", 1.0)?, scale("attn", 0.0)?);
-    if from_user && attn != 0.0 {
-        return Err(
-            "steering: `from: user` defers only the FFN edit, so `attn` must be 0".to_string(),
-        );
-    }
     Ok(Some(Steering {
         file: crate::settings::expand_tilde(file),
         ffn,
@@ -1102,7 +1104,17 @@ mod tests {
         assert_eq!(st.file, PathBuf::from("/v/h.f32"));
         assert!((st.ffn - 3.0).abs() < f32::EPSILON);
         assert!(st.attn.abs() < f32::EPSILON);
-        assert!(!st.from_user);
+        assert!(st.from_user, "deferred start is the default");
+    }
+
+    #[test]
+    fn an_attention_edit_keeps_steering_every_token_by_default() {
+        let mut w = Vec::new();
+        let text = r#"{"engines":{"x":{"main":{"path":"/m"},
+            "steering":{"file":"/v","attn":2}}}}"#;
+        let c = parse(text, Layer::Local, &mut w).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert!(!c.get("x").unwrap().steering.as_ref().unwrap().from_user);
     }
 
     #[test]

@@ -53,11 +53,45 @@ pub fn clear() -> bool {
 /// default under `cargo test`) could otherwise see each other's flag. Callers
 /// hold the guard for the whole time the flag may be set, and should still
 /// [`clear`] it before dropping the guard so the next test starts clean.
+///
+/// Tests that merely *read* the flag need it too: a memory-pass test asks
+/// `pending()` and sees "interrupted" if another test has raised it at that
+/// moment. The guard is reentrant on a thread, so a helper that takes it and a
+/// test body that takes it as well cannot deadlock each other.
 #[cfg(test)]
-pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn test_guard() -> TestGuard {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    let outermost = TEST_GUARD_DEPTH.with(|d| {
+        d.set(d.get() + 1);
+        d.get() == 1
+    });
+    TestGuard {
+        _lock: outermost.then(|| {
+            LOCK.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many [`TestGuard`]s this thread holds, so only the outermost takes
+    /// the process-wide lock.
+    static TEST_GUARD_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What [`test_guard`] returns: holds the process-wide lock on the outermost
+/// acquisition for a thread and nothing on a nested one.
+#[cfg(test)]
+pub(crate) struct TestGuard {
+    _lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        TEST_GUARD_DEPTH.with(|d| d.set(d.get() - 1));
+    }
 }
 
 #[cfg(test)]

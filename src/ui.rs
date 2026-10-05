@@ -24354,8 +24354,20 @@ mod tests {
     /// settings to the default on drop, so a test that returns early or
     /// panics mid-body cannot leak its override onto whatever test libtest
     /// schedules next on the same OS thread.
+    ///
+    /// It also holds the interrupt test lock: every test that opts in to the
+    /// pass reaches `enqueue_memory_job`, which reads the process-wide Ctrl-C
+    /// flag, and a concurrent test raising that flag made the pass look
+    /// interrupted. The lock is reentrant, so tests that take it themselves
+    /// are unaffected.
     #[must_use = "dropping this immediately restores the default auto_extract"]
-    struct AutoExtractGuard;
+    struct AutoExtractGuard(#[allow(dead_code)] crate::interrupt::TestGuard);
+
+    impl AutoExtractGuard {
+        fn new() -> Self {
+            Self(crate::interrupt::test_guard())
+        }
+    }
 
     impl Drop for AutoExtractGuard {
         fn drop(&mut self) {
@@ -24380,7 +24392,7 @@ mod tests {
         let mut off = crate::settings::Settings::default();
         off.memory.auto_extract = false;
         crate::settings::set_for_test(off);
-        AutoExtractGuard
+        AutoExtractGuard::new()
     }
 
     /// Turns the extraction pass *on* for the current thread, with the same
@@ -24395,7 +24407,7 @@ mod tests {
         on.memory.auto_extract = true;
         on.memory.extract_every_n_turns = 1;
         crate::settings::set_for_test(on);
-        AutoExtractGuard
+        AutoExtractGuard::new()
     }
 
     /// Suggestions on. Installed through the same `install_for_test` path
@@ -24404,7 +24416,7 @@ mod tests {
         let mut on = crate::settings::Settings::default();
         on.suggestions.enabled = true;
         crate::settings::set_for_test(on);
-        AutoExtractGuard
+        AutoExtractGuard::new()
     }
 
     /// Suggestions explicitly off, everything else default.
@@ -24412,7 +24424,7 @@ mod tests {
         let mut off = crate::settings::Settings::default();
         off.suggestions.enabled = false;
         crate::settings::set_for_test(off);
-        AutoExtractGuard
+        AutoExtractGuard::new()
     }
 
     /// `/init` is writing an AGENTS.md draft; guessing at the user's next
@@ -24936,7 +24948,7 @@ mod tests {
         on.memory.gate = true;
         on.memory.gate_percent = percent;
         crate::settings::set_for_test(on);
-        AutoExtractGuard
+        AutoExtractGuard::new()
     }
 
     fn enable_memory_gate_with_cap_for_test(percent: u32, cap: u32) -> AutoExtractGuard {
@@ -24947,7 +24959,7 @@ mod tests {
         on.memory.gate_percent = percent;
         on.memory.held_span_cap = cap;
         crate::settings::set_for_test(on);
-        AutoExtractGuard
+        AutoExtractGuard::new()
     }
 
     /// An agent over a `ScriptedEngine` carrying `decisions`, with the state
@@ -32714,13 +32726,15 @@ mod tests {
         );
 
         // Every guard stop was a red line on the main window, naming the agent.
+        // The sub-agent is unnamed, so it carries the first name off the roster.
+        let name = agent_label(0);
         let errors = error_lines(&events);
         assert_eq!(
             errors,
             vec![
-                "guard: stopped a reasoning loop in sub-agent 'alpha'",
-                "guard: stopped a reasoning loop (2 in a row) in sub-agent 'alpha'",
-                "guard: asked for the report after 2 loops in a row in sub-agent 'alpha'",
+                format!("guard: stopped a reasoning loop in sub-agent '{name}'"),
+                format!("guard: stopped a reasoning loop (2 in a row) in sub-agent '{name}'"),
+                format!("guard: asked for the report after 2 loops in a row in sub-agent '{name}'"),
             ],
             "{events:?}"
         );
@@ -35598,7 +35612,7 @@ or the user's next message aborts before its first token"
         on.memory.gate_percent = 60;
         on.memory.gate_bias.ds4 = 30;
         crate::settings::set_for_test(on);
-        let _restore = AutoExtractGuard;
+        let _restore = AutoExtractGuard::new();
         let dir = scratch_dir("memgate-bias");
         let cfg = test_cfg();
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

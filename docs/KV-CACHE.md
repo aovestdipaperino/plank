@@ -357,8 +357,9 @@ the same filename, and both scales because a strength is as much part of the
 edit as a direction is. `/steer` moves the FFN scale mid-session, which is why
 the variant is asked of the engine at each walk rather than cached at startup.
 
-`--dir-steering-from user` (or `"from": "user"` in an engine's `steering` block)
-turns that asymmetry into a feature. The FFN scale is held at zero while the
+`--dir-steering-from user`, the default (`all` restores steering every token; so
+does an attention scale, which cannot be deferred; an engine's `steering` block
+says the same with `"from"`), turns that asymmetry into a feature. The FFN scale is held at zero while the
 prompt tiers prefill (`Ds4Session::warm_sync`) and armed at the top of
 `generate`, so the system prompt and session-start context are unsteered KV and
 the user's message, the reasoning and the answer are steered. Because the tiers

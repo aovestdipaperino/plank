@@ -1284,9 +1284,14 @@ mod tests {
 
     /// Creates a git repo under a unique temp dir with the given files.
     fn temp_repo(files: &[&str]) -> std::path::PathBuf {
+        // A counter as well as the clock: two tests starting on different
+        // threads can read the same timestamp, and one then deletes the other's
+        // directory out from under it.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "plank-complete-{}-{:?}",
+            "plank-complete-{}-{}-{:?}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

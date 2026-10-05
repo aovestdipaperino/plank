@@ -207,6 +207,13 @@ fn cargo_home(user_home: &Path) -> PathBuf {
 
 /// An environment variable read as a non-empty absolute-ish directory path.
 fn env_dir(var: &str) -> Option<PathBuf> {
+    // Tests build profiles against a fake home and assert on its `.cargo` and
+    // `.rustup`. `cargo test` itself exports `CARGO_HOME` and `RUSTUP_HOME`
+    // (the rustup proxy does), so reading the process environment here would
+    // make those assertions depend on where the toolchain happens to live.
+    if cfg!(test) {
+        return None;
+    }
     std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())

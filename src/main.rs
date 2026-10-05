@@ -439,7 +439,9 @@ fn apply_engine_steering(
     cfg.engine.dir_steering_file = Some(st.file.clone());
     cfg.engine.dir_steering_ffn = st.ffn;
     cfg.engine.dir_steering_attn = st.attn;
-    cfg.engine.dir_steering_from_user = st.from_user;
+    if !cfg.engine.dir_steering_from_explicit {
+        cfg.engine.dir_steering_from_user = st.from_user;
+    }
 }
 
 /// Points the selection at the final `model_path`, and gives a `.ggd`
