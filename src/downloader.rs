@@ -1722,7 +1722,7 @@ pub fn spawn_detached_in(
 }
 
 /// Starts `plank --model-downloader <set>` as a detached child.
-fn launch_helper(set: crate::manifest::EngineId) -> Result<(), String> {
+pub(crate) fn launch_helper(set: crate::manifest::EngineId) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find plank's own path: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
     // The set travels in argv rather than in the job file: the helper needs it

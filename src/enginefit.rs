@@ -73,6 +73,9 @@ pub enum Fit {
     Installed,
     /// It fits; `bytes` is the size of the missing files, `None` when unknown.
     Download { bytes: Option<u64> },
+    /// The background downloader is fetching it now, `percent` of the way.
+    /// Selectable: picking it waits for the download already under way.
+    Downloading { percent: u8 },
     /// It cannot run here, for `reason`.
     Disabled { reason: String },
 }
@@ -119,12 +122,16 @@ pub fn size_label(bytes: Option<u64>) -> String {
 }
 
 /// Evaluates every engine in `catalog`, in name order.
+///
+/// `downloading` names the engine the background downloader is fetching and
+/// how far along it is, when one is.
 #[must_use]
 pub fn evaluate(
     root: &Path,
     catalog: &Catalog,
     m: &Machine,
     exists: &dyn Fn(&Path) -> bool,
+    downloading: Option<(&str, u8)>,
 ) -> Vec<EngineRow> {
     catalog
         .engines
@@ -134,7 +141,13 @@ pub fn evaluate(
             Some(EngineRow {
                 name: name.clone(),
                 notes: raw_str(entry, "notes").unwrap_or_default(),
-                fit: fit_of(entry, &sel, m, exists),
+                fit: fit_of(
+                    entry,
+                    &sel,
+                    m,
+                    exists,
+                    downloading.and_then(|(d, pct)| (d == name.as_str()).then_some(pct)),
+                ),
             })
         })
         .collect()
@@ -145,6 +158,7 @@ fn fit_of(
     sel: &crate::engines::Selection,
     m: &Machine,
     exists: &dyn Fn(&Path) -> bool,
+    downloading: Option<u8>,
 ) -> Fit {
     let roles: [(&str, Option<&PathBuf>); 3] = [
         ("main", Some(&sel.main)),
@@ -197,6 +211,11 @@ fn fit_of(
     }
     if installed {
         return Fit::Installed;
+    }
+    // Already committed to, with part of its bytes on disk: the disk rule,
+    // which counts every missing byte as still to come, no longer applies.
+    if let Some(percent) = downloading {
+        return Fit::Downloading { percent };
     }
     if let Some(free) = m.free_disk
         && size_known
@@ -282,6 +301,7 @@ mod tests {
             &catalog(),
             &machine(Some(128), Some(500)),
             &none,
+            None,
         );
         assert_eq!(
             row(&rows, "ds4vision").fit,
@@ -305,6 +325,7 @@ mod tests {
             &catalog(),
             &machine(Some(64), Some(500)),
             &none,
+            None,
         );
         assert_eq!(
             row(&rows, "ds4vision").fit,
@@ -323,6 +344,7 @@ mod tests {
             &catalog(),
             &machine(Some(8), Some(500)),
             &none,
+            None,
         );
         assert_eq!(
             row(&rows, "gemma4-e4b").fit,
@@ -335,6 +357,7 @@ mod tests {
             &catalog(),
             &machine(Some(16), Some(500)),
             &none,
+            None,
         );
         assert!(row(&rows, "gemma4-e4b").selectable());
     }
@@ -346,6 +369,7 @@ mod tests {
             &catalog(),
             &machine(Some(128), Some(50)),
             &none,
+            None,
         );
         assert_eq!(
             row(&rows, "ds4vision").fit,
@@ -363,6 +387,7 @@ mod tests {
             &catalog(),
             &machine(Some(128), Some(1)),
             &|_| true,
+            None,
         );
         assert_eq!(row(&rows, "ds4vision").fit, Fit::Installed);
     }
@@ -375,6 +400,7 @@ mod tests {
             &catalog(),
             &machine(Some(128), Some(500)),
             &|p| p == main,
+            None,
         );
         assert_eq!(
             row(&rows, "ds4vision").fit,
@@ -386,7 +412,13 @@ mod tests {
 
     #[test]
     fn unknown_ram_and_disk_never_disable() {
-        let rows = evaluate(Path::new("/r"), &catalog(), &machine(None, None), &none);
+        let rows = evaluate(
+            Path::new("/r"),
+            &catalog(),
+            &machine(None, None),
+            &none,
+            None,
+        );
         assert!(rows.iter().all(EngineRow::selectable));
     }
 
@@ -397,7 +429,7 @@ mod tests {
             ds4: false,
             gemma: true,
         };
-        let rows = evaluate(Path::new("/r"), &catalog(), &m, &none);
+        let rows = evaluate(Path::new("/r"), &catalog(), &m, &none, None);
         assert_eq!(
             row(&rows, "ds4vision").fit,
             Fit::Disabled {
@@ -418,7 +450,13 @@ mod tests {
         )
         .expect("parses");
         let cat = crate::engines::layer(catalog(), local);
-        let rows = evaluate(Path::new("/r"), &cat, &machine(Some(128), Some(500)), &none);
+        let rows = evaluate(
+            Path::new("/r"),
+            &cat,
+            &machine(Some(128), Some(500)),
+            &none,
+            None,
+        );
         assert_eq!(
             row(&rows, "mine").fit,
             Fit::Disabled {
@@ -426,6 +464,48 @@ mod tests {
             }
         );
         assert_eq!(row(&rows, "fetchable").fit, Fit::Download { bytes: None });
+    }
+
+    #[test]
+    fn the_engine_being_downloaded_reads_downloading_and_stays_selectable() {
+        // 50 GB free would fail the disk rule, but the download already holds
+        // part of its bytes on disk, so the rule no longer applies to it.
+        let rows = evaluate(
+            Path::new("/r"),
+            &catalog(),
+            &machine(Some(128), Some(50)),
+            &none,
+            Some(("ds4vision", 43)),
+        );
+        assert_eq!(
+            row(&rows, "ds4vision").fit,
+            Fit::Downloading { percent: 43 }
+        );
+        assert!(row(&rows, "ds4vision").selectable());
+        // Every other engine is evaluated as before.
+        assert_eq!(
+            row(&rows, "gemma4-e4b").fit,
+            Fit::Download {
+                bytes: Some(4_977_171_584)
+            }
+        );
+    }
+
+    #[test]
+    fn a_download_does_not_override_the_build_or_ram_rules() {
+        let rows = evaluate(
+            Path::new("/r"),
+            &catalog(),
+            &machine(Some(64), Some(500)),
+            &none,
+            Some(("ds4vision", 43)),
+        );
+        assert_eq!(
+            row(&rows, "ds4vision").fit,
+            Fit::Disabled {
+                reason: "needs 96 GB RAM (this machine: 64 GB)".into()
+            }
+        );
     }
 
     #[test]

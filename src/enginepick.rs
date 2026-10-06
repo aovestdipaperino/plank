@@ -56,12 +56,14 @@ pub fn classify(key: KeyEvent) -> Action {
     }
 }
 
-/// Where the cursor starts: on `current` when it is selectable, else on the
-/// first selectable row; `None` when nothing is.
+/// Where the cursor starts: on an engine being downloaded, else on `current`
+/// when it is selectable, else on the first selectable row; `None` when
+/// nothing is.
 #[must_use]
 pub fn initial_cursor(rows: &[EngineRow], current: Option<&str>) -> Option<usize> {
-    current
-        .and_then(|c| rows.iter().position(|r| r.name == c && r.selectable()))
+    rows.iter()
+        .position(|r| matches!(r.fit, Fit::Downloading { .. }))
+        .or_else(|| current.and_then(|c| rows.iter().position(|r| r.name == c && r.selectable())))
         .or_else(|| rows.iter().position(EngineRow::selectable))
 }
 
@@ -84,6 +86,7 @@ pub fn state_label(fit: &Fit) -> String {
         Fit::Installed => "installed".to_owned(),
         Fit::Download { bytes } => format!("download {}", size_label(*bytes)),
         Fit::Disabled { reason } => reason.clone(),
+        Fit::Downloading { percent } => format!("downloading {percent}%"),
     }
 }
 
@@ -267,6 +270,26 @@ mod tests {
             Action::Cancel
         );
         assert_eq!(classify(k(KeyCode::Char('x'))), Action::Ignore);
+    }
+
+    #[test]
+    fn a_download_in_progress_takes_the_cursor_over_the_current_engine() {
+        let mut r = rows();
+        r.push(EngineRow {
+            name: "e".into(),
+            notes: String::new(),
+            fit: Fit::Downloading { percent: 43 },
+        });
+        assert_eq!(initial_cursor(&r, Some("d")), Some(4));
+        assert_eq!(initial_cursor(&r, None), Some(4));
+    }
+
+    #[test]
+    fn a_download_in_progress_shows_its_percent() {
+        assert_eq!(
+            state_label(&Fit::Downloading { percent: 43 }),
+            "downloading 43%"
+        );
     }
 
     #[test]

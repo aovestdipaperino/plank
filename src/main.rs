@@ -394,9 +394,16 @@ fn pick_engine_before_resolve(
         }
         return Ok(());
     }
-    let rows = plank::enginefit::evaluate(root, &catalog, &plank::enginefit::machine(root), &|p| {
-        p.exists()
-    });
+    // An engine the background helper is fetching reads `downloading N%`
+    // and takes the cursor: picking it goes straight back to the wait.
+    let downloading = plank::download::downloading_in(root, &catalog);
+    let rows = plank::enginefit::evaluate(
+        root,
+        &catalog,
+        &plank::enginefit::machine(root),
+        &|p| p.exists(),
+        downloading.as_ref().map(|(n, pct)| (n.as_str(), *pct)),
+    );
     let current = probe.as_ref().and_then(|s| s.id).map(|id| id.to_string());
     let Some(name) = plank::enginepick::run(&rows, current.as_deref())? else {
         if main_exists {
@@ -406,7 +413,17 @@ fn pick_engine_before_resolve(
         return Err("no model available; re-run with --model <name|path> or download it".into());
     };
     let sel = plank::engines::resolve_in(root, &catalog, plank::engines::Choice::Named(&name))?;
-    plank::download::install_engine_in(&catalog, &sel)?;
+    match plank::download::start_and_wait_in(root, &catalog, &sel)? {
+        plank::download::WaitOutcome::Installed => {}
+        // Not installed yet, so `engine.model` is left alone. Picking the
+        // engine again later attaches to the helper, or installs its staged
+        // set when it has finished.
+        plank::download::WaitOutcome::Detached => {
+            return Err(format!(
+                "downloading {name} in the background; run plank again to install it when it finishes"
+            ));
+        }
+    }
     plank::settings::set_engine_model_in(&root.join("settings.json"), &name)?;
     if plank::settings::project_path().is_some_and(|p| sets_engine_model(&p)) {
         eprintln!(
