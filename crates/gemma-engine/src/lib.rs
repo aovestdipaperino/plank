@@ -5,6 +5,10 @@
 //! `candle` feature.
 
 pub mod template;
+#[cfg(all(feature = "candle", any(test, feature = "testgguf")))]
+pub mod testgguf;
+#[cfg(feature = "candle")]
+pub mod tokenizer;
 
 // Temporarily commented out until created by later tasks:
 // #[cfg(feature = "candle")]
@@ -15,10 +19,6 @@ pub mod template;
 // pub mod sample;
 // #[cfg(feature = "candle")]
 // pub mod session;
-// #[cfg(feature = "candle")]
-// pub mod tokenizer;
-// #[cfg(all(feature = "candle", any(test, feature = "testgguf")))]
-// pub mod testgguf;
 
 /// Every failure this crate reports. A message, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]

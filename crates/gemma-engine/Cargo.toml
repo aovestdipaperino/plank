@@ -26,3 +26,7 @@ candle-nn = { version = "0.9", optional = true, features = ["metal"] }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "gguf_dump"
+required-features = ["candle"]
