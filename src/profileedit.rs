@@ -433,6 +433,10 @@ pub struct Restart {
     pub session: String,
     /// The session's working directory, which a worktree may have moved.
     pub cwd: PathBuf,
+    /// Restart into the engine menu (`/engines`) rather than straight into the
+    /// session: the session is handed over with `--pick-engine-resume`, and
+    /// the relaunched plank resumes it only under a matching family.
+    pub pick_engine: bool,
 }
 
 static PENDING: std::sync::Mutex<Option<Restart>> = std::sync::Mutex::new(None);
@@ -462,6 +466,21 @@ pub fn take_restart() -> Option<Restart> {
 /// `owner/repo:folder`) is installed by now, so it resolves without asking.
 #[must_use]
 pub fn restart_args(original: &[String], session: &str, session_cwd: &Path) -> Vec<String> {
+    restart_args_for(original, session, session_cwd, false)
+}
+
+/// [`restart_args`] with the choice of landing in the engine menu: earlier
+/// `--pick-engine` and `--pick-engine-resume <id>` are dropped, and with
+/// `pick_engine` the session travels as `--pick-engine --pick-engine-resume`
+/// and `--model <x>`, `-m <x>` and `--model:<x>` are dropped too, so the pick
+/// is not reverted by a later restart.
+#[must_use]
+pub fn restart_args_for(
+    original: &[String],
+    session: &str,
+    session_cwd: &Path,
+    pick_engine: bool,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < original.len() {
@@ -474,14 +493,30 @@ pub fn restart_args(original: &[String], session: &str, session_cwd: &Path) -> V
                     i += 1;
                 }
             }
-            "--worktree" | "--worktree-pr" | "-p" | "--prompt" | "--chdir" => i += 1,
+            "--pick-engine" => {}
+            "--worktree"
+            | "--worktree-pr"
+            | "-p"
+            | "--prompt"
+            | "--chdir"
+            | "--pick-engine-resume" => i += 1,
+            // The menu picks the engine and records it as `engine.model`: a
+            // launch `--model` kept here would revert the pick at the next
+            // restart.
+            "--model" | "-m" if pick_engine => i += 1,
+            a if pick_engine && a.starts_with("--model:") => {}
             _ => out.push(arg.to_owned()),
         }
         i += 1;
     }
     out.push("--chdir".to_owned());
     out.push(session_cwd.to_string_lossy().into_owned());
-    out.push("/resume".to_owned());
+    if pick_engine {
+        out.push("--pick-engine".to_owned());
+        out.push("--pick-engine-resume".to_owned());
+    } else {
+        out.push("/resume".to_owned());
+    }
     out.push(session.to_owned());
     out
 }
@@ -505,7 +540,12 @@ pub fn exec_restart(restart: &Restart) -> String {
     if let Err(e) = std::env::set_current_dir(&launch.dir) {
         return format!("cannot return to {}: {e}", launch.dir.display());
     }
-    let args = restart_args(&launch.args, &restart.session, &restart.cwd);
+    let args = restart_args_for(
+        &launch.args,
+        &restart.session,
+        &restart.cwd,
+        restart.pick_engine,
+    );
     std::process::Command::new(exe)
         .args(args)
         .exec()
@@ -722,6 +762,7 @@ mod tests {
         let r = Restart {
             session: "brave-curie".to_owned(),
             cwd: PathBuf::from("/w"),
+            pick_engine: false,
         };
         request_restart(r.clone());
         assert_eq!(take_restart(), Some(r));
@@ -730,6 +771,79 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn an_engine_restart_asks_for_the_menu_and_hands_over_the_session() {
+        let out = restart_args_for(
+            &args(&["--profile", "hal", "/resume", "old", "--pick-engine"]),
+            "zany-curie",
+            Path::new("/w"),
+            true,
+        );
+        assert_eq!(
+            out,
+            args(&[
+                "--profile",
+                "hal",
+                "--chdir",
+                "/w",
+                "--pick-engine",
+                "--pick-engine-resume",
+                "zany-curie",
+            ])
+        );
+    }
+
+    #[test]
+    fn an_engine_restart_drops_the_model_flags_so_a_later_restart_keeps_the_pick() {
+        let out = restart_args_for(
+            &args(&[
+                "--model",
+                "ds4vision",
+                "-v",
+                "-m",
+                "/x/a.gguf",
+                "--model:gemma4-e4b",
+                "--pick-engine-resume",
+                "old-id",
+            ]),
+            "zany-curie",
+            Path::new("/w"),
+            true,
+        );
+        assert_eq!(
+            out,
+            args(&[
+                "-v",
+                "--chdir",
+                "/w",
+                "--pick-engine",
+                "--pick-engine-resume",
+                "zany-curie",
+            ])
+        );
+    }
+
+    #[test]
+    fn an_ordinary_restart_keeps_the_model_and_drops_an_earlier_pick_resume() {
+        let out = restart_args_for(
+            &args(&["--model", "ds4vision", "--pick-engine-resume", "old-id"]),
+            "zany-curie",
+            Path::new("/w"),
+            false,
+        );
+        assert_eq!(
+            out,
+            args(&[
+                "--model",
+                "ds4vision",
+                "--chdir",
+                "/w",
+                "/resume",
+                "zany-curie"
+            ])
+        );
     }
 
     #[test]

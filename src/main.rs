@@ -353,6 +353,266 @@ fn active_recommendation() -> Option<plank::engines::Recommendation<'static>> {
     })
 }
 
+/// Whether session `id` has a transcript for `family` under `root`, so a
+/// restart from `/engines` can resume it on the engine just picked.
+fn resumable_under(root: &std::path::Path, id: &str, family: plank::gguf::ModelFamily) -> bool {
+    root.join("kvcache")
+        .join(format!("{id}{}", plank::session::family_ext(family)))
+        .exists()
+}
+
+/// How a pick's download ended without installing the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unfinished {
+    /// The user left the wait screen; the helper keeps downloading.
+    Detached,
+    /// The helper failed, or another engine's download holds it.
+    Failed(String),
+}
+
+/// What follows a pick whose download did not install the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AfterUnfinished {
+    /// Print `note`, then run the current engine and resume `resume`.
+    Continue { note: String, resume: String },
+    /// Exit with this message.
+    Exit(String),
+}
+
+/// Decides what an unfinished download of `name` leads to. A restart from
+/// `/engines` (`pick_resume`) with the current engine still on disk goes back
+/// to the session it left, as a cancelled menu does; anything else, a first
+/// run above all, has nothing to return to and exits.
+fn after_unfinished_download(
+    name: &str,
+    end: Unfinished,
+    pick_resume: Option<String>,
+    current_main_exists: bool,
+) -> AfterUnfinished {
+    let msg = match end {
+        Unfinished::Detached => format!(
+            "downloading {name} in the background; run plank --pick-engine (or /engines) to install it when it finishes"
+        ),
+        Unfinished::Failed(e) => e,
+    };
+    match pick_resume {
+        Some(resume) if current_main_exists => AfterUnfinished::Continue { note: msg, resume },
+        _ => AfterUnfinished::Exit(msg),
+    }
+}
+
+/// The session to resume when no pick happens: the one `/engines` left
+/// outranks a resume chosen any other way.
+fn resume_after_skip(pick_resume: Option<String>, resume: Option<String>) -> Option<String> {
+    pick_resume.or(resume)
+}
+
+/// One line for each engine in `names` other than `current` whose whole set
+/// has finished downloading into staging, so a background download the user
+/// left is not forgotten. Installing it waits for the pick.
+fn staged_others<'a>(
+    names: impl Iterator<Item = &'a str>,
+    current: Option<&str>,
+    staged: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    names
+        .filter(|n| Some(*n) != current && staged(n))
+        .map(|n| format!("plank: {n} has finished downloading; run /engines to switch to it"))
+        .collect()
+}
+
+/// Prints [`staged_others`] for the engines of `catalog` other than
+/// `current`: a background download the user left may have finished for an
+/// engine other than this one, and installing it is left to the pick.
+fn announce_staged_others(
+    root: &std::path::Path,
+    catalog: &plank::engines::Catalog,
+    current: Option<plank::manifest::EngineId>,
+) {
+    for line in staged_others(
+        catalog.engines.keys().map(String::as_str),
+        current.as_ref().map(|id| id.as_str()),
+        &|n| {
+            plank::manifest::EngineId::new(n)
+                .is_some_and(|id| plank::downloader::is_staged_in(root, id))
+        },
+    ) {
+        eprintln!("{line}");
+    }
+}
+
+/// Shows the engine menu when [`plank::enginepick::should_pick`] says so,
+/// installs the pick, records it as `engine.model`, and points `cfg` at it so
+/// the ordinary resolution that follows loads it.
+///
+/// Runs before [`resolve_selection`]: its probe is the same choice that
+/// resolution will make, without printing anything or touching `cfg`.
+///
+/// # Errors
+/// A cancelled first-run menu (no engine to fall back to), a download that
+/// did not install outside an `/engines` restart (see
+/// [`after_unfinished_download`]), or a settings file that cannot be written.
+fn pick_engine_before_resolve(
+    cfg: &mut plank::config::AgentConfig,
+    root: &std::path::Path,
+    recommended: Option<plank::engines::Recommendation<'_>>,
+    menu_allowed: bool,
+) -> Result<(), String> {
+    let local = cfg.remote_url.is_none() && cfg.provider.is_none();
+    let from_cli = model_from_cli(cfg);
+    let catalog = plank::engines::load_in(root, &mut Vec::new());
+    let probe = choose_selection(cfg, root, &catalog, recommended)
+        .ok()
+        .map(|(sel, _)| sel);
+    // An unresolvable choice is the ordinary resolution's to report.
+    let mut main_exists = probe.as_ref().is_none_or(|s| s.main.exists());
+    // An engine that finished downloading in the background after an Esc is
+    // installed now, before the menu could offer to download it again.
+    if menu_allowed
+        && local
+        && !main_exists
+        && let Some((sel, id)) = probe.as_ref().and_then(|s| Some((s, s.id?)))
+    {
+        match plank::download::install_staged_in(root, id) {
+            Ok(true) => {
+                eprintln!("plank: installed {id}, downloaded in the background");
+                main_exists = sel.main.exists();
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("plank: could not install the downloaded {id}: {e}"),
+        }
+    }
+    if !plank::enginepick::should_pick(cfg.pick_engine, from_cli, main_exists, menu_allowed, local)
+    {
+        // No menu: the session `/engines` left still resumes rather than
+        // being lost.
+        cfg.resume = resume_after_skip(cfg.pick_engine_resume.take(), cfg.resume.take());
+        if menu_allowed && local {
+            announce_staged_others(root, &catalog, probe.as_ref().and_then(|s| s.id));
+        }
+        return Ok(());
+    }
+    // An engine the background helper is fetching reads `downloading N%`
+    // and takes the cursor: picking it goes straight back to the wait.
+    let downloading = plank::download::downloading_in(root, &catalog);
+    let rows = plank::enginefit::evaluate(
+        root,
+        &catalog,
+        &plank::enginefit::machine(root),
+        &|p| p.exists(),
+        downloading.as_ref().map(|(n, pct)| (n.as_str(), *pct)),
+        &|n| {
+            plank::manifest::EngineId::new(n)
+                .is_some_and(|id| plank::downloader::is_staged_in(root, id))
+        },
+    );
+    let current = probe.as_ref().and_then(|s| s.id).map(|id| id.to_string());
+    let Some(name) = plank::enginepick::run(&rows, current.as_deref())? else {
+        if main_exists {
+            cfg.resume = resume_after_skip(cfg.pick_engine_resume.take(), cfg.resume.take());
+            return Ok(());
+        }
+        return Err("no model available; re-run with --model <name|path> or download it".into());
+    };
+    let sel = plank::engines::resolve_in(root, &catalog, plank::engines::Choice::Named(&name))?;
+    // Not installed yet, so `engine.model` is left alone. Picking the engine
+    // again later attaches to the helper, or installs its staged set when it
+    // has finished.
+    let unfinished = match plank::download::start_and_wait_in(root, &catalog, &sel) {
+        Ok(plank::download::WaitOutcome::Installed) => None,
+        Ok(plank::download::WaitOutcome::Detached) => Some(Unfinished::Detached),
+        Err(e) => Some(Unfinished::Failed(e)),
+    };
+    if let Some(end) = unfinished {
+        return match after_unfinished_download(
+            &name,
+            end,
+            cfg.pick_engine_resume.take(),
+            main_exists,
+        ) {
+            AfterUnfinished::Continue { note, resume } => {
+                eprintln!("plank: {note}");
+                cfg.resume = Some(resume);
+                Ok(())
+            }
+            AfterUnfinished::Exit(msg) => Err(msg),
+        };
+    }
+    plank::settings::set_engine_model_in(&root.join("settings.json"), &name)?;
+    let user_settings = root.join("settings.json");
+    if plank::settings::project_path()
+        .is_some_and(|p| project_overrides_pick(&p, &user_settings, &name))
+    {
+        eprintln!(
+            "plank: {name} is now your default engine, but ./.plank/settings.json sets engine.model for this folder"
+        );
+    } else {
+        eprintln!("plank: {name} is now the default engine");
+    }
+    cfg.model_spec = Some(name.clone());
+    cfg.model_named = true;
+    // The pick outranks a profile's recommendation, as `--model` would.
+    cfg.cli_set("engine.model");
+    if let Some(id) = cfg.pick_engine_resume.take() {
+        if resumable_under(root, &id, selection_family(&sel, &sel.main)) {
+            cfg.resume = Some(id);
+        } else {
+            eprintln!(
+                "plank: started a new session; {id} stays available with /resume under its own engine"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether the project settings file at `project` will override the engine
+/// `pick` just written to the user settings file at `user`.
+fn project_overrides_pick(project: &std::path::Path, user: &std::path::Path, pick: &str) -> bool {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+    // Run from the home directory, `./.plank/settings.json` is the user file
+    // itself: it holds the pick, not an override of it.
+    let same = match (canon(project), canon(user)) {
+        (Some(a), Some(b)) => a == b,
+        _ => project == user,
+    };
+    !same
+        && std::fs::read_to_string(project)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .is_some_and(|v| {
+                v.pointer("/engine/model")
+                    .is_some_and(|m| !m.is_null() && m.as_str() != Some(pick))
+            })
+}
+
+/// The engine this run would load: the command line's choice, else the
+/// profile's `recommended` engine when on disk, else `engine.model`, else the
+/// catalog default. The one choice both [`resolve_selection`] and the menu's
+/// probe make; it prints nothing and leaves `cfg` alone.
+fn choose_selection(
+    cfg: &plank::config::AgentConfig,
+    root: &std::path::Path,
+    catalog: &plank::engines::Catalog,
+    recommended: Option<plank::engines::Recommendation<'_>>,
+) -> Result<(plank::engines::Selection, Vec<plank::engines::Note>), String> {
+    let choice = model_choice(cfg);
+    let from_cli = model_from_cli(cfg);
+    // A recommendation is for the local model a run would load, so a remote
+    // or provider run, which loads none, never announces one.
+    let local = cfg.remote_url.is_none() && cfg.provider.is_none();
+    plank::engines::choose_with_recommendation_in(
+        root,
+        catalog,
+        from_cli.then_some(choice),
+        recommended.filter(|_| local),
+        if from_cli {
+            plank::engines::Choice::Default
+        } else {
+            choice
+        },
+    )
+}
+
 /// Resolves the model choice against the catalog, letting the running
 /// profile's `recommended` engine outrank `engine.model` (but never the
 /// command line) when it is already on disk. Must precede
@@ -376,22 +636,9 @@ fn resolve_selection(
     for w in warn {
         eprintln!("plank: {w}");
     }
-    let choice = model_choice(cfg);
     let from_cli = model_from_cli(cfg);
-    // A recommendation is for the local model a run would load, so a remote
-    // or provider run, which loads none, never announces one.
     let local = cfg.remote_url.is_none() && cfg.provider.is_none();
-    let (sel, notes) = plank::engines::choose_with_recommendation_in(
-        root,
-        &catalog,
-        from_cli.then_some(choice),
-        recommended.filter(|_| local),
-        if from_cli {
-            plank::engines::Choice::Default
-        } else {
-            choice
-        },
-    )?;
+    let (sel, notes) = choose_selection(cfg, root, &catalog, recommended)?;
     let color = std::io::stderr().is_terminal();
     for note in notes {
         if note.warning && color {
@@ -490,6 +737,7 @@ fn parse_config(
     settings: &plank::settings::Settings,
     args: &[String],
     prog: &str,
+    allow_menu: bool,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
     parse_config_in(
         settings,
@@ -497,7 +745,19 @@ fn parse_config(
         prog,
         &plank::manifest::plank_dir(),
         active_recommendation(),
+        allow_menu,
+        std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && std::io::stderr().is_terminal(),
     )
+}
+
+/// Whether the launch engine menu may show: the caller allows it (`plank
+/// serve` never does), all three standard streams are terminals (the menu
+/// draws on stdout and reads stdin), the front end is the default interactive
+/// one, and the run is not a read-only diagnostic that answers and exits.
+fn menu_allowed(allow_menu: bool, ttys: bool, cfg: &plank::config::AgentConfig) -> bool {
+    allow_menu && ttys && cfg.ui == plank::config::UiMode::Tui && !answers_and_exits(cfg)
 }
 
 /// [`parse_config`] with the engine catalog and managed paths under `root`,
@@ -509,10 +769,14 @@ fn parse_config_in(
     prog: &str,
     root: &std::path::Path,
     recommended: Option<plank::engines::Recommendation<'_>>,
+    allow_menu: bool,
+    ttys: bool,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
     plank::config::parse_options_with(settings, args)
         .and_then(|mut cfg| {
             cfg.drop_default_system_under_profile(plank::profile::active().is_some());
+            let menu = menu_allowed(allow_menu, ttys, &cfg);
+            pick_engine_before_resolve(&mut cfg, root, recommended, menu)?;
             match resolve_selection(&mut cfg, root, recommended)
                 .and_then(|catalog| resolve_model_delta(&mut cfg).map(|()| catalog))
             {
@@ -675,11 +939,14 @@ fn post_cfg_early_exit(
 /// `parse_config`, because the `engines.local.json` default a ds41-only
 /// install gets must exist before the catalog choice is resolved.
 fn should_migrate(provisional: &plank::config::AgentConfig) -> bool {
-    !(provisional.show_help
-        || provisional.show_version
-        || provisional.dump_config
-        || provisional.dump_profiles
-        || provisional.dump_engines)
+    !answers_and_exits(provisional)
+}
+
+/// Whether the run is a read-only answer that exits before any session:
+/// `--help`, `--version`, or one of the `--dump-*` diagnostics
+/// ([`post_cfg_early_exit`]).
+fn answers_and_exits(cfg: &plank::config::AgentConfig) -> bool {
+    cfg.show_help || cfg.show_version || cfg.dump_config || cfg.dump_profiles || cfg.dump_engines
 }
 
 /// Renames any old `ModelSet` layout into the engine layout, when
@@ -811,7 +1078,7 @@ fn main() -> ExitCode {
     // chance to dial the console.
     plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
-    let cfg = match parse_config(&settings, &args, "plank") {
+    let cfg = match parse_config(&settings, &args, "plank", true) {
         Ok(cfg) => cfg,
         Err(code) => return code,
     };
@@ -932,10 +1199,6 @@ fn enter_startup_worktree(
     Ok(())
 }
 
-/// Minimum physical RAM plank requires to run the model, in bytes (96 GiB).
-#[cfg(ds4_engine)]
-const MIN_RAM_BYTES: u64 = 96 * 1024 * 1024 * 1024;
-
 /// Fails fast when another plank/ds4 instance is already running, with a clear
 /// message — instead of the engine's own guard, which calls `exit(2)` deep in
 /// `ds4_engine_open` (`ds4_acquire_instance_lock` in `ds4.c`) and kills the
@@ -969,14 +1232,14 @@ fn acquire_model_lock() -> Result<(), String> {
     Ok(())
 }
 
-/// Refuses to run when the machine has less than [`MIN_RAM_BYTES`] of RAM.
+/// Refuses to run when the machine has less than [`plank::enginefit::MIN_RAM_BYTES`] of RAM.
 ///
 /// # Errors
 /// Returns an explanatory message when physical RAM is below the minimum.
 #[cfg(ds4_engine)]
 fn require_min_ram() -> Result<(), String> {
     if let Some(bytes) = plank::download::total_ram_bytes()
-        && bytes < MIN_RAM_BYTES
+        && bytes < plank::enginefit::MIN_RAM_BYTES
     {
         #[allow(clippy::cast_precision_loss)]
         let have = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -1489,7 +1752,7 @@ fn run_serve(args: &[String]) -> ExitCode {
     // chance to dial the console.
     plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
-    let cfg = match parse_config(&settings, &passthrough, "plank serve") {
+    let cfg = match parse_config(&settings, &passthrough, "plank serve", false) {
         Ok(cfg) => cfg,
         Err(code) => return code,
     };
@@ -1850,6 +2113,100 @@ mod tests {
     }
 
     #[test]
+    fn an_unfinished_download_from_engines_resumes_the_session_it_left() {
+        let detached = after_unfinished_download(
+            "gemma4-e4b",
+            Unfinished::Detached,
+            Some("zany-curie".into()),
+            true,
+        );
+        assert_eq!(
+            detached,
+            AfterUnfinished::Continue {
+                note: "downloading gemma4-e4b in the background; run plank --pick-engine (or /engines) to install it when it finishes".into(),
+                resume: "zany-curie".into(),
+            }
+        );
+        for err in [
+            "the download failed",
+            "another download (ds4vision) is in progress; let it finish or cancel it, then try again",
+        ] {
+            assert_eq!(
+                after_unfinished_download(
+                    "gemma4-e4b",
+                    Unfinished::Failed(err.into()),
+                    Some("zany-curie".into()),
+                    true
+                ),
+                AfterUnfinished::Continue {
+                    note: err.into(),
+                    resume: "zany-curie".into(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_unfinished_download_exits_without_a_session_or_an_engine_to_return_to() {
+        let msg = "downloading e in the background; run plank --pick-engine (or /engines) to install it when it finishes";
+        // A first run: no current engine to continue on.
+        assert_eq!(
+            after_unfinished_download("e", Unfinished::Detached, Some("zany-curie".into()), false),
+            AfterUnfinished::Exit(msg.into())
+        );
+        // A launch-time pick, not `/engines`: nothing to resume.
+        assert_eq!(
+            after_unfinished_download("e", Unfinished::Detached, None, true),
+            AfterUnfinished::Exit(msg.into())
+        );
+        assert_eq!(
+            after_unfinished_download("e", Unfinished::Failed("boom".into()), None, true),
+            AfterUnfinished::Exit("boom".into())
+        );
+    }
+
+    #[test]
+    fn the_session_engines_left_outranks_an_earlier_resume() {
+        assert_eq!(
+            resume_after_skip(Some("a".into()), Some("b".into())),
+            Some("a".into())
+        );
+        assert_eq!(resume_after_skip(None, Some("b".into())), Some("b".into()));
+        assert_eq!(resume_after_skip(Some("a".into()), None), Some("a".into()));
+        assert_eq!(resume_after_skip(None, None), None);
+    }
+
+    #[test]
+    fn other_finished_downloads_are_announced_but_not_the_selected_one() {
+        let names = ["a", "b", "c"];
+        let staged = |n: &str| n != "b";
+        assert_eq!(
+            staged_others(names.iter().copied(), Some("a"), &staged),
+            vec!["plank: c has finished downloading; run /engines to switch to it".to_owned()]
+        );
+        assert_eq!(staged_others(names.iter().copied(), None, &staged).len(), 2);
+    }
+
+    #[test]
+    fn a_left_session_resumes_only_under_its_own_family() {
+        let root = std::env::temp_dir().join(format!("plank-pickresume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("kvcache")).unwrap();
+        std::fs::write(root.join("kvcache").join("zany-curie.ds4.kv"), "x").unwrap();
+        assert!(resumable_under(
+            &root,
+            "zany-curie",
+            plank::gguf::ModelFamily::Ds4
+        ));
+        assert!(!resumable_under(
+            &root,
+            "zany-curie",
+            plank::gguf::ModelFamily::Gemma
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn dump_config_survives_a_bad_engine_model() {
         let settings = plank::settings::Settings::default();
         let args: Vec<String> = vec![
@@ -1860,7 +2217,7 @@ mod tests {
         // An empty scratch root: the catalog is the compiled-in one and the
         // real `~/.plank` is never read.
         let root = std::env::temp_dir().join(format!("plank-dump-config-{}", std::process::id()));
-        let cfg = parse_config_in(&settings, &args, "plank", &root, None)
+        let cfg = parse_config_in(&settings, &args, "plank", &root, None, false, false)
             .expect("dump-config must not abort");
         assert!(cfg.dump_config);
         assert!(cfg.selection.is_none());
@@ -1880,7 +2237,7 @@ mod tests {
         let parse = |extra: &[&str]| {
             let mut args: Vec<String> = ["--model", "ds4-ab"].map(String::from).to_vec();
             args.extend(extra.iter().map(ToString::to_string));
-            parse_config_in(&settings, &args, "plank", &root, None).expect("parses")
+            parse_config_in(&settings, &args, "plank", &root, None, false, false).expect("parses")
         };
         let cfg = parse(&[]);
         assert_eq!(
@@ -1921,7 +2278,8 @@ mod tests {
         root: &std::path::Path,
     ) -> String {
         let args: Vec<String> = args.iter().map(ToString::to_string).collect();
-        let cfg = parse_config_in(settings, &args, "plank", root, HAL).expect("parses");
+        let cfg =
+            parse_config_in(settings, &args, "plank", root, HAL, false, false).expect("parses");
         cfg.selection
             .and_then(|s| s.id)
             .map(|id| id.to_string())
@@ -1982,10 +2340,106 @@ mod tests {
             "plank",
             &root,
             HAL,
+            false,
+            false,
         )
         .expect("dump-config must not abort");
         assert!(cfg.dump_config);
         assert!(cfg.selection.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_menu_shows_only_for_an_interactive_session_start() {
+        let base = plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
+        assert!(
+            menu_allowed(true, true, &base),
+            "a plain launch may show it"
+        );
+        assert!(!menu_allowed(false, true, &base), "serve opts out");
+        assert!(!menu_allowed(true, false, &base), "a non-terminal stream");
+        for flag in [
+            "--help",
+            "--version",
+            "--dump-config",
+            "--dump-profiles",
+            "--dump-engines",
+        ] {
+            let cfg = plank::config::parse_options_with(
+                &plank::settings::Settings::default(),
+                &[flag.to_string()],
+            )
+            .expect("parses");
+            assert!(!menu_allowed(true, true, &cfg), "{flag} must not show it");
+        }
+        for ui in [
+            plank::config::UiMode::Console,
+            plank::config::UiMode::Chart,
+            plank::config::UiMode::Quiet,
+        ] {
+            let mut cfg = base.clone();
+            cfg.ui = ui;
+            assert!(!menu_allowed(true, true, &cfg), "{ui:?} must not show it");
+        }
+    }
+
+    #[test]
+    fn without_the_menu_a_left_session_still_resumes() {
+        let root = scratch_root("no-menu");
+        let settings = plank::settings::Settings::default();
+        let args: Vec<String> = vec![
+            "--pick-engine".into(),
+            "--pick-engine-resume".into(),
+            "x".into(),
+        ];
+        let before = plank::config::parse_options_with(&settings, &args).expect("parses");
+        let cfg =
+            parse_config_in(&settings, &args, "plank", &root, None, false, false).expect("parses");
+        assert_eq!(cfg.model_spec, before.model_spec);
+        assert_eq!(cfg.resume.as_deref(), Some("x"));
+        assert!(!root.join("settings.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_a_different_engine_model_counts_as_overriding_the_pick() {
+        let root = scratch_root("sets-model");
+        let user = root.join("settings.json");
+        let project_dir = root.join("proj/.plank");
+        std::fs::create_dir_all(&project_dir).expect("mkdir");
+        let project = project_dir.join("settings.json");
+        assert!(
+            !project_overrides_pick(&project, &user, "tiny"),
+            "a missing file sets nothing"
+        );
+        std::fs::write(&project, r#"{"engine":{"temperature":0.5}}"#).expect("write");
+        assert!(!project_overrides_pick(&project, &user, "tiny"));
+        std::fs::write(&project, r#"{"engine":{"model":"tiny"}}"#).expect("write");
+        assert!(
+            !project_overrides_pick(&project, &user, "tiny"),
+            "the same engine overrides nothing"
+        );
+        std::fs::write(&project, r#"{"engine":{"model":"gemma4-e4b"}}"#).expect("write");
+        assert!(project_overrides_pick(&project, &user, "tiny"));
+        std::fs::write(&project, "not json").expect("write");
+        assert!(!project_overrides_pick(&project, &user, "tiny"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_project_file_is_not_an_override_when_it_is_the_user_file() {
+        // Run from the home directory, `./.plank/settings.json` is the very
+        // file the pick was just written to.
+        let root = scratch_root("same-settings");
+        let dot = root.join(".plank");
+        std::fs::create_dir_all(&dot).expect("mkdir");
+        let user = dot.join("settings.json");
+        std::fs::write(&user, r#"{"engine":{"model":"gemma4-e4b"}}"#).expect("write");
+        // Spelled differently, as `$HOME/.plank` and `./.plank` are.
+        let project = root.join("x/../.plank/settings.json");
+        std::fs::create_dir_all(root.join("x")).expect("mkdir");
+        assert!(!project_overrides_pick(&project, &user, "tiny"));
+        assert!(!project_overrides_pick(&user, &user, "tiny"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

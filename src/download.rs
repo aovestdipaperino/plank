@@ -835,6 +835,312 @@ fn discard_stale_part(dest: &Path) {
     let _ = std::fs::remove_file(part_url_path(dest));
 }
 
+/// The files of `sel` that are not on disk, as `(url, destination)`, `main`
+/// first so the model lands before its companions.
+///
+/// # Errors
+/// When a missing file has nowhere to come from (a local `path` with no `url`).
+pub fn missing_roles(
+    catalog: &crate::engines::Catalog,
+    sel: &crate::engines::Selection,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let roles = [
+        ("main", Some(&sel.main)),
+        ("mtp", sel.mtp.as_ref()),
+        ("vision", sel.vision.as_ref()),
+    ];
+    let mut out = Vec::new();
+    for (role, path) in roles {
+        let Some(path) = path.filter(|p| !exists(p)) else {
+            continue;
+        };
+        let Some((url, _)) = role_offer_in(catalog, sel, role) else {
+            return Err(format!(
+                "no {role} file at {} and no url to fetch it from",
+                path.display()
+            ));
+        };
+        out.push((url, path.clone()));
+    }
+    Ok(out)
+}
+
+/// Downloads every missing file of `sel` through the download screen, with no
+/// consent prompt: the engine menu's pick is the consent.
+///
+/// # Errors
+/// As [`missing_roles`], or the first download that fails or is cancelled. A
+/// cancelled download leaves its `.part` for the next attempt to resume.
+pub fn install_engine_in(
+    catalog: &crate::engines::Catalog,
+    sel: &crate::engines::Selection,
+) -> Result<(), String> {
+    for (url, dest) in missing_roles(catalog, sel, &|p| p.exists())? {
+        download(&url, &dest)?;
+    }
+    Ok(())
+}
+
+/// How the launch-time wait for an engine's download ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// Every file of the engine is installed.
+    Installed,
+    /// The user left the wait; the background helper keeps downloading.
+    Detached,
+}
+
+/// What the helper's published state means for the engine being waited on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WaitStep {
+    /// Nothing to show for this engine yet.
+    Starting,
+    /// Artifact `index` of `of` holds `done` of its `total` bytes.
+    Progress {
+        done: u64,
+        total: u64,
+        index: usize,
+        of: usize,
+    },
+    /// The whole set is verified and staged.
+    Staged,
+    /// The helper gave up, saying why.
+    Failed(String),
+    /// The helper stopped on request.
+    Cancelled,
+}
+
+/// What the wait should do next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Move {
+    /// Keep waiting.
+    Wait,
+    /// The set is staged: install it.
+    Install,
+    /// Stop waiting with this error.
+    Fail(String),
+}
+
+/// What the wait screen ended on, before any install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    Staged,
+    Detached,
+}
+
+/// Installs `set`'s complete staged set, when one is waiting and no helper
+/// is running, so a launch whose engine finished downloading in the
+/// background starts on it rather than offering to download it again.
+///
+/// # Errors
+/// As [`crate::downloader::swap_staged_in`]: a rename of a verified artifact
+/// failed.
+pub fn install_staged_in(root: &Path, set: crate::manifest::EngineId) -> Result<bool, String> {
+    if crate::downloader::running_in(root) {
+        return Ok(false);
+    }
+    crate::downloader::swap_staged_in(root, set).map(|v| v.is_some())
+}
+
+/// Reads the helper's `state` as far as the download of `set` goes. Another
+/// engine's state, or none yet, says nothing about this one.
+fn wait_step(state: Option<&crate::downloader::State>, set: &str) -> WaitStep {
+    use crate::downloader::Phase;
+    let Some(st) = state.filter(|s| s.set == set) else {
+        return WaitStep::Starting;
+    };
+    match st.phase {
+        Phase::Rehashing | Phase::Downloading | Phase::Verifying => WaitStep::Progress {
+            done: st.done_bytes,
+            total: st.total_bytes,
+            index: st.index,
+            of: st.of,
+        },
+        Phase::Staged => WaitStep::Staged,
+        Phase::Failed => WaitStep::Failed(
+            st.error
+                .clone()
+                .unwrap_or_else(|| "download failed".to_owned()),
+        ),
+        Phase::Cancelled => WaitStep::Cancelled,
+        Phase::Unknown => WaitStep::Starting,
+    }
+}
+
+/// The wait's next move for `set`, from the helper's persisted `state`
+/// (whatever its age), whether a helper holds the lock (`alive`), whether the
+/// start-up grace period is over, and whether `set`'s staged manifest exists.
+///
+/// The helper exits once it has staged everything, so a dead helper is
+/// normal at the end: its last state, or failing that the staged manifest
+/// (written before that state, and the swap's own proof of a complete set),
+/// says whether it finished. A dead helper with neither is a crash, and is
+/// reported rather than waited on forever.
+fn next_move(
+    state: Option<&crate::downloader::State>,
+    set: &str,
+    alive: bool,
+    grace_over: bool,
+    staged: bool,
+    log: &Path,
+) -> Move {
+    if let Some(other) = state.filter(|s| alive && !s.set.is_empty() && s.set != set) {
+        return Move::Fail(another_download(&other.set));
+    }
+    match wait_step(state, set) {
+        WaitStep::Staged => Move::Install,
+        WaitStep::Failed(e) => Move::Fail(e),
+        WaitStep::Cancelled => Move::Fail("download cancelled".to_owned()),
+        WaitStep::Starting | WaitStep::Progress { .. } => {
+            if alive || !grace_over {
+                Move::Wait
+            } else if staged {
+                Move::Install
+            } else {
+                let why = state
+                    .filter(|s| s.set == set)
+                    .and_then(|s| s.error.as_deref())
+                    .map_or_else(String::new, |e| format!(" ({e})"));
+                Move::Fail(format!(
+                    "the downloader stopped before finishing{why}; see {}",
+                    log.display()
+                ))
+            }
+        }
+    }
+}
+
+/// The refusal when the one helper a machine runs is busy with `other`.
+fn another_download(other: &str) -> String {
+    format!("another download ({other}) is in progress; let it finish or cancel it, then try again")
+}
+
+/// Bytes of the whole set on disk, and the set's total, when artifact
+/// `index` (1-based, in the helper's role order) holds `done` bytes.
+fn set_progress(manifest: &crate::manifest::Manifest, index: usize, done: u64) -> (u64, u64) {
+    let sizes: Vec<u64> = crate::engines::ROLES
+        .iter()
+        .filter_map(|r| manifest.files.get(*r).map(|f| f.bytes))
+        .collect();
+    let total = sizes.iter().sum();
+    let at = index.saturating_sub(1).min(sizes.len());
+    let before: u64 = sizes[..at].iter().sum();
+    let current = sizes.get(at).map_or(0, |b| done.min(*b));
+    (before + current, total)
+}
+
+/// The engine the background helper is fetching right now and how far along
+/// the whole set is, in percent.
+#[must_use]
+pub fn downloading_in(root: &Path, catalog: &crate::engines::Catalog) -> Option<(String, u8)> {
+    let st = crate::downloader::live_state_in(root)?;
+    let WaitStep::Progress {
+        done, total, index, ..
+    } = wait_step(Some(&st), &st.set)
+    else {
+        return None;
+    };
+    let (done, total) = catalog
+        .get(&st.set)
+        .and_then(crate::engines::EngineEntry::to_manifest)
+        .map_or((done, total), |m| set_progress(&m, index, done));
+    let percent = (100 * done).checked_div(total).unwrap_or(0).min(100);
+    Some((st.set, u8::try_from(percent).unwrap_or(100)))
+}
+
+/// Fetches every missing file of `sel` and waits for it: a managed engine
+/// through the detached background helper, a local engine's `path`+`url`
+/// roles through the foreground download.
+///
+/// # Errors
+/// As [`missing_roles`]; another engine already downloading; the helper
+/// failing, being cancelled or dying without staging; or a failed install.
+pub fn start_and_wait_in(
+    root: &Path,
+    catalog: &crate::engines::Catalog,
+    sel: &crate::engines::Selection,
+) -> Result<WaitOutcome, String> {
+    start_and_wait_with(
+        root,
+        catalog,
+        sel,
+        &crate::downloader::launch_helper,
+        &wait_screen,
+        &install_engine_in,
+    )
+}
+
+type Launch<'a> = &'a dyn Fn(crate::manifest::EngineId) -> Result<(), String>;
+type Wait<'a> = &'a dyn Fn(
+    &Path,
+    crate::manifest::EngineId,
+    &crate::manifest::Manifest,
+) -> Result<Waited, String>;
+type Foreground<'a> =
+    &'a dyn Fn(&crate::engines::Catalog, &crate::engines::Selection) -> Result<(), String>;
+
+fn start_and_wait_with(
+    root: &Path,
+    catalog: &crate::engines::Catalog,
+    sel: &crate::engines::Selection,
+    launch: Launch<'_>,
+    wait: Wait<'_>,
+    foreground: Foreground<'_>,
+) -> Result<WaitOutcome, String> {
+    let missing = missing_roles(catalog, sel, &|p| p.exists())?;
+    if missing.is_empty() {
+        return Ok(WaitOutcome::Installed);
+    }
+    let managed = sel
+        .id
+        .and_then(|id| Some((id, catalog.get(id.as_str())?.to_manifest()?)));
+    // A managed engine whose main is on disk is installed: its missing
+    // companions are fetched at load by `ensure_side_artifacts`, as on the
+    // launch path. The helper only knows the full manifest, so starting it
+    // here would re-fetch the main into staging.
+    if managed.is_some() && sel.main.exists() {
+        return Ok(WaitOutcome::Installed);
+    }
+    if let Some((id, manifest)) = managed {
+        let running = crate::downloader::running_in(root);
+        let ready = !running && crate::downloader::swap_staged_in(root, id)?.is_some();
+        if !ready {
+            if running {
+                // One helper per machine: attach when it is fetching this
+                // engine, refuse when it is busy with another.
+                if let Some(st) = crate::downloader::read_state_in(root)
+                    .filter(|s| !s.set.is_empty() && s.set != id.as_str())
+                {
+                    return Err(another_download(&st.set));
+                }
+            } else {
+                // The last state of a helper that is gone (a failure, a
+                // cancel) belongs to that run, not to the one starting now.
+                let _ = std::fs::remove_file(crate::downloader::state_path_in(root));
+                crate::downloader::spawn_detached_in(root, id, &manifest, launch)?;
+            }
+            match wait(root, id, &manifest)? {
+                Waited::Detached => return Ok(WaitOutcome::Detached),
+                Waited::Staged => {
+                    if crate::downloader::swap_staged_in(root, id)?.is_none() {
+                        return Err(format!(
+                            "the download of {id} finished but nothing complete was staged; see {}",
+                            crate::downloader::log_path_in(root).display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // A local engine's `path`+`url` roles have no manifest for the helper:
+    // those, and only those, still download in the foreground.
+    if !missing_roles(catalog, sel, &|p| p.exists())?.is_empty() {
+        foreground(catalog, sel)?;
+    }
+    Ok(WaitOutcome::Installed)
+}
+
 /// Downloads `url` to `dest` via `ureq`, showing the animated progress bar.
 fn download(url: &str, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
@@ -1010,9 +1316,9 @@ fn fetch(url: &str, part: &Path, cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 
-/// Rows the message/gauge/stats block always keeps: message, gauge, stats and
-/// the two spacers between them.
-const PROGRESS_ROWS: u16 = 5;
+/// Rows the message/gauge/stats block always keeps: message, gauge, stats,
+/// the two spacers between them, and the hint under the stats.
+const PROGRESS_ROWS: u16 = 6;
 /// Rows taken by one of the rules bracketing the playfield.
 const RULE_ROWS: u16 = 1;
 /// Both rules together: one above the field, one below it.
@@ -1043,6 +1349,8 @@ struct Screen {
     message: Rect,
     gauge: Rect,
     stats: Rect,
+    /// How to leave, on the wait for the background helper; blank otherwise.
+    hint: Rect,
 }
 
 /// Splits `area`, giving the playfield whatever the progress block does not
@@ -1067,6 +1375,7 @@ fn layout(area: Rect, show_game: bool) -> Screen {
         Constraint::Length(1),      // gauge
         Constraint::Length(1),      // spacer
         Constraint::Length(1),      // stats
+        Constraint::Length(1),      // hint
         Constraint::Fill(1),
     ])
     .split(area);
@@ -1078,6 +1387,7 @@ fn layout(area: Rect, show_game: bool) -> Screen {
         message: rows[4],
         gauge: rows[6],
         stats: rows[8],
+        hint: rows[9],
     }
 }
 
@@ -1131,6 +1441,33 @@ fn run_ui(
     let start = Instant::now();
     // Bytes already on disk: the baseline a resumed download measures from.
     let done = std::fs::metadata(part).map_or(0, |m| m.len());
+    screen_loop(
+        terminal,
+        &mut || {
+            // The caller joins the worker and surfaces its error, if any.
+            let finished = worker.is_finished().then_some(());
+            Ok((Progress::of_part(part, total, start, done), finished))
+        },
+        || {
+            cancel.store(true, Ordering::Relaxed);
+            Err("download cancelled".to_string())
+        },
+    )
+}
+
+/// What one tick of a download screen found: the numbers to draw, and the
+/// result to end with once there is one.
+type Tick<T> = Result<(Progress, Option<T>), String>;
+
+/// The download screen's loop, shared by the foreground download and the wait
+/// on the background helper: `tick` supplies the numbers each frame and ends
+/// the screen (after one last frame) when it returns a result; `on_cancel` is
+/// what `q`, Ctrl-C, or Esc with the game closed mean.
+fn screen_loop<T>(
+    terminal: &mut ratatui::DefaultTerminal,
+    tick: &mut dyn FnMut() -> Tick<T>,
+    on_cancel: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     let mut msg = 0usize;
     let mut last_rotate = Instant::now();
 
@@ -1140,10 +1477,10 @@ fn run_ui(
     let mut game = Some(Breakout::new(seed()));
     let mut last_frame = Instant::now();
     loop {
-        if worker.is_finished() {
-            let _ = terminal.draw(|f| draw(f, game.as_ref(), part, total, msg, start, done));
-            // The caller joins the worker and surfaces its error, if any.
-            return Ok(());
+        let (progress, ended) = tick()?;
+        if let Some(result) = ended {
+            let _ = terminal.draw(|f| draw(f, game.as_ref(), &progress, msg));
+            return Ok(result);
         }
         // The poll timeout paces the frames: fast enough for a moving ball
         // while one is on screen, unhurried once the game is closed or the
@@ -1151,20 +1488,17 @@ fn run_ui(
         let size = terminal
             .size()
             .map_or((24u16, 80u16), |s| (s.height, s.width));
-        let tick = if game.is_some() && playable(size.0, size.1) {
+        let frame_ms = if game.is_some() && playable(size.0, size.1) {
             GAME_FRAME_MS
         } else {
             IDLE_FRAME_MS
         };
-        if event::poll(Duration::from_millis(tick)).map_err(|e| e.to_string())?
+        if event::poll(Duration::from_millis(frame_ms)).map_err(|e| e.to_string())?
             && let Ok(Event::Key(k)) = event::read()
             && k.kind == KeyEventKind::Press
         {
             match classify(k, game.is_some()) {
-                Action::Cancel => {
-                    cancel.store(true, Ordering::Relaxed);
-                    return Err("download cancelled".to_string());
-                }
+                Action::Cancel => return on_cancel(),
                 Action::CloseGame => game = None,
                 Action::Play => {
                     if let Some(g) = game.as_mut() {
@@ -1182,8 +1516,95 @@ fn run_ui(
         if let Some(g) = game.as_mut() {
             g.step(u64::try_from(dt.as_millis()).unwrap_or(u64::MAX));
         }
-        let _ = terminal.draw(|f| draw(f, game.as_ref(), part, total, msg, start, done));
+        let _ = terminal.draw(|f| draw(f, game.as_ref(), &progress, msg));
     }
+}
+
+/// How long a freshly started helper may take to take its lock and publish
+/// before its absence counts as a crash.
+const HELPER_GRACE: Duration = Duration::from_secs(10);
+/// How often the wait screen re-reads the helper's state file and lock.
+const WAIT_POLL: Duration = Duration::from_millis(250);
+
+/// The wait on the background helper fetching `set`, on the download screen,
+/// until the set is staged or the user leaves.
+///
+/// The terminal is restored on every exit path. Leaving (Esc with the game
+/// closed, `q`, Ctrl-C) never writes the cancel flag: the helper keeps
+/// downloading, and `/model cancel` is how to stop it.
+fn wait_screen(
+    root: &Path,
+    set: crate::manifest::EngineId,
+    manifest: &crate::manifest::Manifest,
+) -> Result<Waited, String> {
+    let mut terminal = ratatui::init();
+    let result = wait_ui(&mut terminal, root, set, manifest);
+    ratatui::restore();
+    result
+}
+
+fn wait_ui(
+    terminal: &mut ratatui::DefaultTerminal,
+    root: &Path,
+    set: crate::manifest::EngineId,
+    manifest: &crate::manifest::Manifest,
+) -> Result<Waited, String> {
+    let started = Instant::now();
+    let log = crate::downloader::log_path_in(root);
+    let staged_manifest = crate::manifest::staged_manifest_path_in(root, set);
+    let (_, set_total) = set_progress(manifest, 0, 0);
+    let mut shown = Progress {
+        current: 0,
+        total: (set_total > 0).then_some(set_total),
+        done: 0,
+        elapsed: 0.0,
+        background: true,
+    };
+    // Where the rate is measured from: the first byte count seen while the
+    // helper is actually streaming, so a resume's rehash of bytes already on
+    // disk is not counted as fetched in no time.
+    let mut baseline: Option<(u64, Instant)> = None;
+    let mut last_poll: Option<Instant> = None;
+    screen_loop(
+        terminal,
+        &mut || {
+            if last_poll.is_some_and(|t| t.elapsed() < WAIT_POLL) {
+                return Ok((shown, None));
+            }
+            last_poll = Some(Instant::now());
+            let state = crate::downloader::read_state_in(root);
+            if let WaitStep::Progress { done, index, .. } = wait_step(state.as_ref(), set.as_str())
+            {
+                let (current, _) = set_progress(manifest, index, done);
+                let streaming = state
+                    .as_ref()
+                    .is_some_and(|s| s.phase == crate::downloader::Phase::Downloading);
+                if baseline.is_none() && streaming {
+                    baseline = Some((current, Instant::now()));
+                }
+                let (from, at) = baseline.unwrap_or((current, Instant::now()));
+                shown = Progress {
+                    current,
+                    done: from,
+                    elapsed: at.elapsed().as_secs_f64(),
+                    ..shown
+                };
+            }
+            match next_move(
+                state.as_ref(),
+                set.as_str(),
+                crate::downloader::running_in(root),
+                started.elapsed() >= HELPER_GRACE,
+                staged_manifest.exists(),
+                &log,
+            ) {
+                Move::Wait => Ok((shown, None)),
+                Move::Install => Ok((shown, Some(Waited::Staged))),
+                Move::Fail(e) => Err(e),
+            }
+        },
+        || Ok(Waited::Detached),
+    )
 }
 
 /// A seed for the download screen's game, from the wall clock.
@@ -1252,18 +1673,45 @@ fn draw_game(frame: &mut Frame, game: &Breakout, area: Rect) {
     );
 }
 
-/// Draws one download frame: centered logo, red rotating message, gauge, stats.
-fn draw(
-    frame: &mut Frame,
-    game: Option<&Breakout>,
-    part: &Path,
+/// The numbers one download frame shows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Progress {
+    /// Bytes on disk now.
+    current: u64,
+    /// Bytes expected in all, when known.
     total: Option<u64>,
-    msg: usize,
-    start: Instant,
+    /// Bytes already on disk when the rate started being measured: a resume
+    /// must not count them as fetched in no time.
     done: u64,
-) {
-    let current = std::fs::metadata(part).map_or(0, |m| m.len());
-    let elapsed = start.elapsed().as_secs_f64();
+    /// Seconds since `done` was measured.
+    elapsed: f64,
+    /// Whether the background helper is doing the download, so leaving the
+    /// screen keeps it running and the screen says so.
+    background: bool,
+}
+
+impl Progress {
+    /// The foreground download's numbers: `part`'s size against `total`.
+    fn of_part(part: &Path, total: Option<u64>, start: Instant, done: u64) -> Self {
+        Self {
+            current: std::fs::metadata(part).map_or(0, |m| m.len()),
+            total,
+            done,
+            elapsed: start.elapsed().as_secs_f64(),
+            background: false,
+        }
+    }
+}
+
+/// Draws one download frame: centered logo, red rotating message, gauge, stats.
+fn draw(frame: &mut Frame, game: Option<&Breakout>, progress: &Progress, msg: usize) {
+    let Progress {
+        current,
+        total,
+        done,
+        elapsed,
+        background,
+    } = *progress;
     // Only bytes fetched *this run* count toward the rate: on a resume the
     // file already holds `done` bytes, and charging those to zero elapsed time
     // reports a wild speed and a meaningless ETA.
@@ -1334,14 +1782,45 @@ fn draw(
         );
     }
 
-    let stats = match total {
-        Some(t) => format!("{:.1} / {:.1} GB   {speed:.0} MB/s", gb(current), gb(t)),
-        None => format!("{:.1} GB   {speed:.0} MB/s", gb(current)),
-    };
-    let stats_line = Paragraph::new(stats)
+    let stats_line = Paragraph::new(stats_text(current, total, speed))
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
     frame.render_widget(stats_line, screen.stats);
+
+    if background {
+        frame.render_widget(
+            Paragraph::new(leave_hint(game.is_some()))
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center),
+            screen.hint,
+        );
+    }
+}
+
+/// The stats line under the gauge.
+fn stats_text(current: u64, total: Option<u64>, speed: f64) -> String {
+    let amount = |b: u64| crate::enginefit::human_bytes(b, 1000);
+    let sizes = match total {
+        Some(t) => {
+            let (c, t) = (amount(current), amount(t));
+            // One unit when both share it: `1.5 / 87.2 GB`.
+            match (c.rsplit_once(' '), t.rsplit_once(' ')) {
+                (Some((cv, cu)), Some((_, tu))) if cu == tu => format!("{cv} / {t}"),
+                _ => format!("{c} / {t}"),
+            }
+        }
+        None => amount(current),
+    };
+    format!("{sizes}   {speed:.0} MB/s")
+}
+
+/// How to leave the wait screen with the download still running.
+fn leave_hint(game_open: bool) -> &'static str {
+    if game_open {
+        "Esc closes the game, Esc again or q leaves the download running in the background"
+    } else {
+        "Esc or q leaves the download running in the background"
+    }
 }
 
 /// Seconds left, from the rate achieved so far.
@@ -1748,6 +2227,478 @@ fn real_confirm(manifest: &crate::manifest::Manifest, from: u32) -> Option<bool>
 mod tests {
     use super::*;
     use crate::manifest::EngineId;
+
+    fn two_role_catalog() -> crate::engines::Catalog {
+        let mut w = Vec::new();
+        crate::engines::parse(
+            r#"{"version": 2, "engines": {"e": {"version": 1,
+                "main": {"name": "m", "url": "https://h/m", "bytes": 10, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                "mtp": {"name": "t", "url": "https://h/t", "bytes": 5, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}"#,
+            crate::engines::Layer::Published,
+            &mut w,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn missing_roles_lists_main_first_and_skips_present_files() {
+        let root = std::path::Path::new("/r");
+        let cat = two_role_catalog();
+        let sel =
+            crate::engines::resolve_in(root, &cat, crate::engines::Choice::Named("e")).unwrap();
+        let all = missing_roles(&cat, &sel, &|_| false).unwrap();
+        assert_eq!(
+            all,
+            vec![
+                ("https://h/m".to_owned(), root.join("e.gguf")),
+                ("https://h/t".to_owned(), root.join("e.mtp.gguf")),
+            ]
+        );
+        let main = root.join("e.gguf");
+        let rest = missing_roles(&cat, &sel, &|p| p == main).unwrap();
+        assert_eq!(
+            rest,
+            vec![("https://h/t".to_owned(), root.join("e.mtp.gguf"))]
+        );
+    }
+
+    #[test]
+    fn missing_roles_refuses_a_file_it_cannot_fetch() {
+        let mut w = Vec::new();
+        let cat = crate::engines::parse(
+            r#"{"engines": {"l": {"main": {"path": "/x/l.gguf"}}}}"#,
+            crate::engines::Layer::Local,
+            &mut w,
+        )
+        .unwrap();
+        let sel = crate::engines::resolve_in(
+            std::path::Path::new("/r"),
+            &cat,
+            crate::engines::Choice::Named("l"),
+        )
+        .unwrap();
+        let err = missing_roles(&cat, &sel, &|_| false).unwrap_err();
+        assert!(err.contains("/x/l.gguf"), "{err}");
+    }
+
+    fn a_state(set: &str, phase: crate::downloader::Phase) -> crate::downloader::State {
+        crate::downloader::State {
+            set: set.into(),
+            pid: std::process::id(),
+            version: 1,
+            current: "main".into(),
+            index: 1,
+            of: 2,
+            done_bytes: 4,
+            total_bytes: 10,
+            rate_bps: 0,
+            phase,
+            error: None,
+            updated: crate::downloader::now_epoch(),
+        }
+    }
+
+    #[test]
+    fn wait_step_reads_only_this_engines_state() {
+        use crate::downloader::Phase;
+        assert_eq!(wait_step(None, "e"), WaitStep::Starting);
+        assert_eq!(
+            wait_step(Some(&a_state("other", Phase::Downloading)), "e"),
+            WaitStep::Starting
+        );
+        let progress = WaitStep::Progress {
+            done: 4,
+            total: 10,
+            index: 1,
+            of: 2,
+        };
+        for phase in [Phase::Downloading, Phase::Rehashing, Phase::Verifying] {
+            assert_eq!(wait_step(Some(&a_state("e", phase)), "e"), progress);
+        }
+        assert_eq!(
+            wait_step(Some(&a_state("e", Phase::Staged)), "e"),
+            WaitStep::Staged
+        );
+        let mut failed = a_state("e", Phase::Failed);
+        failed.error = Some("sha256 mismatch".into());
+        assert_eq!(
+            wait_step(Some(&failed), "e"),
+            WaitStep::Failed("sha256 mismatch".into())
+        );
+        failed.error = None;
+        assert_eq!(
+            wait_step(Some(&failed), "e"),
+            WaitStep::Failed("download failed".into())
+        );
+        assert_eq!(
+            wait_step(Some(&a_state("e", Phase::Cancelled)), "e"),
+            WaitStep::Cancelled
+        );
+        assert_eq!(
+            wait_step(Some(&a_state("e", Phase::Unknown)), "e"),
+            WaitStep::Starting
+        );
+    }
+
+    #[test]
+    fn next_move_installs_fails_or_waits() {
+        use crate::downloader::Phase;
+        let log = Path::new("/r/downloads/log");
+        let st = |p| Some(a_state("e", p));
+        let staged = st(Phase::Staged);
+        assert_eq!(
+            next_move(staged.as_ref(), "e", false, true, true, log),
+            Move::Install
+        );
+        let mut failed = a_state("e", Phase::Failed);
+        failed.error = Some("boom".into());
+        assert_eq!(
+            next_move(Some(&failed), "e", false, false, false, log),
+            Move::Fail("boom".into())
+        );
+        let cancelled = st(Phase::Cancelled);
+        assert_eq!(
+            next_move(cancelled.as_ref(), "e", true, false, false, log),
+            Move::Fail("download cancelled".into())
+        );
+        // A live helper fetching another engine: waiting would never end.
+        let other = Some(a_state("gemma4-e4b", Phase::Downloading));
+        assert_eq!(
+            next_move(other.as_ref(), "e", true, false, false, log),
+            Move::Fail(
+                "another download (gemma4-e4b) is in progress; let it finish or cancel it, then try again"
+                    .into()
+            )
+        );
+        // The child may not have published yet: the grace period waits.
+        assert_eq!(next_move(None, "e", false, false, false, log), Move::Wait);
+        let downloading = st(Phase::Downloading);
+        assert_eq!(
+            next_move(downloading.as_ref(), "e", true, true, false, log),
+            Move::Wait
+        );
+        // Gone without a Staged state, but the staged manifest is the proof.
+        assert_eq!(next_move(None, "e", false, true, true, log), Move::Install);
+        // Gone, nothing staged: say so and where to look.
+        for state in [None, downloading.as_ref()] {
+            let Move::Fail(msg) = next_move(state, "e", false, true, false, log) else {
+                panic!("a dead helper must not be waited on");
+            };
+            assert!(msg.contains("/r/downloads/log"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn set_progress_counts_the_artifacts_before_the_current_one() {
+        let cat = two_role_catalog();
+        let m = cat.get("e").unwrap().to_manifest().unwrap();
+        assert_eq!(set_progress(&m, 1, 4), (4, 15));
+        assert_eq!(set_progress(&m, 2, 3), (13, 15));
+        // A done count past the artifact never overshoots the set.
+        assert_eq!(set_progress(&m, 2, 99), (15, 15));
+    }
+
+    #[test]
+    fn downloading_in_reports_a_live_helpers_engine_and_set_percent() {
+        use crate::downloader::Phase;
+        let root = crate::downloader::tests::tempdir();
+        let cat = two_role_catalog();
+        assert_eq!(downloading_in(&root, &cat), None);
+        let mut st = a_state("e", Phase::Downloading);
+        st.index = 2;
+        st.done_bytes = 2;
+        crate::downloader::write_state_in(&root, &st).unwrap();
+        // 10 + 2 of 15 bytes.
+        assert_eq!(downloading_in(&root, &cat), Some(("e".to_owned(), 80)));
+        // A finished or failed helper is downloading nothing.
+        st.phase = Phase::Staged;
+        crate::downloader::write_state_in(&root, &st).unwrap();
+        assert_eq!(downloading_in(&root, &cat), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn e_sel(root: &Path) -> crate::engines::Selection {
+        crate::engines::resolve_in(
+            root,
+            &two_role_catalog(),
+            crate::engines::Choice::Named("e"),
+        )
+        .unwrap()
+    }
+
+    fn no_launch(_: EngineId) -> Result<(), String> {
+        panic!("must not launch the helper")
+    }
+
+    fn no_wait(_: &Path, _: EngineId, _: &crate::manifest::Manifest) -> Result<Waited, String> {
+        panic!("must not wait")
+    }
+
+    fn no_foreground(
+        _: &crate::engines::Catalog,
+        _: &crate::engines::Selection,
+    ) -> Result<(), String> {
+        panic!("a managed engine never downloads in the foreground")
+    }
+
+    #[test]
+    fn an_installed_engine_needs_no_download() {
+        let root = crate::downloader::tests::tempdir();
+        std::fs::write(root.join("e.gguf"), b"x").unwrap();
+        std::fs::write(root.join("e.mtp.gguf"), b"x").unwrap();
+        let out = start_and_wait_with(
+            &root,
+            &two_role_catalog(),
+            &e_sel(&root),
+            &no_launch,
+            &no_wait,
+            &no_foreground,
+        );
+        assert_eq!(out, Ok(WaitOutcome::Installed));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_managed_engine_with_its_main_needs_no_helper_for_a_companion() {
+        // Only the mtp companion is missing: the load path fetches it, and the
+        // helper's full manifest would re-fetch the main into staging.
+        let root = crate::downloader::tests::tempdir();
+        std::fs::write(root.join("e.gguf"), b"x").unwrap();
+        let out = start_and_wait_with(
+            &root,
+            &two_role_catalog(),
+            &e_sel(&root),
+            &no_launch,
+            &no_wait,
+            &no_foreground,
+        );
+        assert_eq!(out, Ok(WaitOutcome::Installed));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_managed_engine_starts_the_helper_and_detaches_on_request() {
+        use crate::downloader::Phase;
+        let root = crate::downloader::tests::tempdir();
+        // A dead helper's leftover Failed state must not end the new wait.
+        let mut old = a_state("e", Phase::Failed);
+        old.pid = 0;
+        crate::downloader::write_state_in(&root, &old).unwrap();
+        let launched = std::cell::Cell::new(false);
+        let launch = |id: EngineId| {
+            assert_eq!(id.as_str(), "e");
+            launched.set(true);
+            Ok(())
+        };
+        let wait = |r: &Path, id: EngineId, _: &crate::manifest::Manifest| {
+            assert_eq!(id.as_str(), "e");
+            assert!(crate::downloader::read_state_in(r).is_none());
+            Ok(Waited::Detached)
+        };
+        let out = start_and_wait_with(
+            &root,
+            &two_role_catalog(),
+            &e_sel(&root),
+            &launch,
+            &wait,
+            &no_foreground,
+        );
+        assert_eq!(out, Ok(WaitOutcome::Detached));
+        assert!(launched.get());
+        let id = EngineId::new("e").unwrap();
+        assert!(crate::downloader::read_job_in(&root, id).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn stage_e(root: &Path) {
+        let id = EngineId::new("e").unwrap();
+        let m = two_role_catalog().get("e").unwrap().to_manifest().unwrap();
+        for (kind, bytes) in [("main", 10usize), ("mtp", 5)] {
+            let p = crate::downloader::staged_path_in(root, id, kind);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, vec![0u8; bytes]).unwrap();
+            std::fs::write(
+                crate::downloader::staged_sha_path_in(root, id, kind),
+                &m.files[kind].sha256,
+            )
+            .unwrap();
+        }
+        std::fs::write(crate::manifest::staged_manifest_path_in(root, id), &m.raw).unwrap();
+    }
+
+    #[test]
+    fn a_staged_set_is_installed_when_the_wait_ends() {
+        let root = crate::downloader::tests::tempdir();
+        let wait = |r: &Path, _: EngineId, _: &crate::manifest::Manifest| {
+            stage_e(r);
+            Ok(Waited::Staged)
+        };
+        let out = start_and_wait_with(
+            &root,
+            &two_role_catalog(),
+            &e_sel(&root),
+            &|_| Ok(()),
+            &wait,
+            &no_foreground,
+        );
+        assert_eq!(out, Ok(WaitOutcome::Installed));
+        assert!(root.join("e.gguf").exists() && root.join("e.mtp.gguf").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_already_staged_set_installs_without_a_helper() {
+        let root = crate::downloader::tests::tempdir();
+        stage_e(&root);
+        let out = start_and_wait_with(
+            &root,
+            &two_role_catalog(),
+            &e_sel(&root),
+            &no_launch,
+            &no_wait,
+            &no_foreground,
+        );
+        assert_eq!(out, Ok(WaitOutcome::Installed));
+        assert!(root.join("e.gguf").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_staged_wait_with_nothing_staged_is_an_error() {
+        let root = crate::downloader::tests::tempdir();
+        let out = start_and_wait_with(
+            &root,
+            &two_role_catalog(),
+            &e_sel(&root),
+            &|_| Ok(()),
+            &|_, _, _| Ok(Waited::Staged),
+            &no_foreground,
+        );
+        let err = out.expect_err("nothing was staged");
+        assert!(
+            err.starts_with("the download of e finished but nothing complete was staged; see "),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_staged_set_installs_before_the_menu_when_no_helper_runs() {
+        let root = crate::downloader::tests::tempdir();
+        let id = EngineId::new("e").unwrap();
+        assert_eq!(install_staged_in(&root, id), Ok(false), "nothing staged");
+        stage_e(&root);
+        assert_eq!(install_staged_in(&root, id), Ok(true));
+        assert!(root.join("e.gguf").exists() && root.join("e.mtp.gguf").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_set_waits_while_a_helper_runs() {
+        let root = crate::downloader::tests::tempdir();
+        let id = EngineId::new("e").unwrap();
+        stage_e(&root);
+        let held = crate::downloader::try_lock_in(&root).expect("lock");
+        assert_eq!(install_staged_in(&root, id), Ok(false));
+        assert!(!root.join("e.gguf").exists());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wait_stats_scale_small_sizes_and_keep_the_large_shape() {
+        assert_eq!(
+            stats_text(1_500_000_000, Some(87_200_000_000), 30.0),
+            "1.5 / 87.2 GB   30 MB/s"
+        );
+        assert_eq!(
+            stats_text(27_800, Some(27_800), 0.0),
+            "27.8 / 27.8 KB   0 MB/s"
+        );
+        assert_eq!(
+            stats_text(512_000_000, Some(4_600_000_000), 12.0),
+            "512.0 MB / 4.6 GB   12 MB/s"
+        );
+        assert_eq!(stats_text(512_000_000, None, 1.0), "512.0 MB   1 MB/s");
+        assert_eq!(stats_text(2_000_000_000, None, 1.0), "2.0 GB   1 MB/s");
+    }
+
+    #[test]
+    fn the_wait_screen_says_how_to_leave_the_download_running() {
+        let open = leave_hint(true);
+        assert!(open.contains("Esc closes the game"), "{open}");
+        assert!(open.contains("in the background"), "{open}");
+        let closed = leave_hint(false);
+        assert!(!closed.contains("game"), "{closed}");
+        assert!(closed.starts_with("Esc or q"), "{closed}");
+        assert!(closed.contains("in the background"), "{closed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_engines_download_in_progress_is_refused() {
+        use crate::downloader::Phase;
+        let root = crate::downloader::tests::tempdir();
+        let _held = crate::downloader::try_lock_in(&root).expect("lock");
+        crate::downloader::write_state_in(&root, &a_state("gemma4-e4b", Phase::Downloading))
+            .unwrap();
+        let err = start_and_wait_with(
+            &root,
+            &two_role_catalog(),
+            &e_sel(&root),
+            &no_launch,
+            &no_wait,
+            &no_foreground,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "another download (gemma4-e4b) is in progress; let it finish or cancel it, then try again"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn this_engines_download_in_progress_is_attached_to() {
+        use crate::downloader::Phase;
+        let root = crate::downloader::tests::tempdir();
+        let _held = crate::downloader::try_lock_in(&root).expect("lock");
+        crate::downloader::write_state_in(&root, &a_state("e", Phase::Downloading)).unwrap();
+        let out = start_and_wait_with(
+            &root,
+            &two_role_catalog(),
+            &e_sel(&root),
+            &no_launch,
+            &|_, _, _| Ok(Waited::Detached),
+            &no_foreground,
+        );
+        assert_eq!(out, Ok(WaitOutcome::Detached));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_local_engine_downloads_in_the_foreground() {
+        let mut w = Vec::new();
+        let cat = crate::engines::parse(
+            r#"{"engines": {"l": {"main": {"path": "/x/l.gguf", "url": "https://h/l"}}}}"#,
+            crate::engines::Layer::Local,
+            &mut w,
+        )
+        .unwrap();
+        let root = Path::new("/r");
+        let sel =
+            crate::engines::resolve_in(root, &cat, crate::engines::Choice::Named("l")).unwrap();
+        let ran = std::cell::Cell::new(false);
+        let fg = |_: &crate::engines::Catalog, _: &crate::engines::Selection| {
+            ran.set(true);
+            Ok(())
+        };
+        let out = start_and_wait_with(root, &cat, &sel, &no_launch, &no_wait, &fg);
+        assert_eq!(out, Ok(WaitOutcome::Installed));
+        assert!(ran.get());
+    }
 
     #[test]
     fn two_hundred_unique_rotating_messages() {

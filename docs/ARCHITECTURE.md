@@ -203,6 +203,20 @@ remote fetch 404s or times out is treated like being offline: nothing
 printed, nothing offered, and the 24-hour check file stamped before the fetch
 so it is not retried until tomorrow.
 
+- `enginefit.rs` — which engines fit this machine, and why not; pure.
+- `enginepick.rs` — the pre-launch engine menu (and `/engines`, which restarts
+  into it with `--pick-engine`). Esc on the wait screen leaves the download
+  running. A staged set for the *selected* engine is installed at the next
+  launch, before the menu; a staged set for another engine is only announced
+  at launch and is installed when it is picked.
+
+The downloader (`downloader.rs`) fetches in one stream per file by default.
+With `HF_API_KEY` set, requests to Hugging Face hosts carry the bearer token
+(never any other host) and each artifact is fetched as `HF_PARALLEL_RANGES`
+(4) concurrent ranges, with a `.chunks` sidecar recording completed ranges so
+a resume skips them and a final full-file SHA-256 rehash verifying the
+assembled result.
+
 ### Weight deltas (`ggufdelta.rs`, `crates/gguf-delta`)
 A `.ggd` file is the difference between two GGUF files of identical layout —
 same metadata, same tensor table — as the changed byte spans, each stored as a

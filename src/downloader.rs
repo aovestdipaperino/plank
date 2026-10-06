@@ -476,7 +476,9 @@ pub enum Outcome {
 /// A fetcher: given a URL, a resume offset and the inclusive last byte wanted
 /// (`None` for "to the end"), returns an owned byte stream or a failure
 /// message. Injected so tests drive [`run_job`] without a socket.
-type Fetcher = dyn Fn(&str, u64, Option<u64>) -> Result<Box<dyn Read + Send>, String>;
+///
+/// `Sync` because the parallel path calls it from several worker threads.
+type Fetcher = dyn Fn(&str, u64, Option<u64>) -> Result<Box<dyn Read + Send>, String> + Sync;
 
 /// Opens `url` at byte `offset`, up to and including `end` when one is given.
 ///
@@ -496,6 +498,13 @@ pub fn http_fetch(
     end: Option<u64>,
 ) -> Result<Box<dyn Read + Send>, String> {
     let mut request = ureq::get(url);
+    // Only an https Hugging Face host ever sees the token. ureq's default
+    // `RedirectAuthHeaders::Never` drops it on the redirect to HF's CDN, so
+    // the agent configuration must stay the default.
+    let token = hf_token().filter(|_| is_hf_host(url));
+    if let Some(token) = &token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
     match end {
         Some(end) => request = request.header("Range", format!("bytes={offset}-{end}")),
         None if offset > 0 => request = request.header("Range", format!("bytes={offset}-")),
@@ -503,7 +512,7 @@ pub fn http_fetch(
     }
     let response = request
         .call()
-        .map_err(|e| format!("download failed: {e}"))?;
+        .map_err(|e| redact_key(&format!("download failed: {e}"), token.as_deref()))?;
     // A server that ignores Range answers 200 with the whole body. The caller
     // detects that by the offset it asked for versus what it gets, so signal it
     // by refusing: `run_job` truncates and restarts rather than appending a
@@ -519,6 +528,88 @@ pub fn http_fetch(
     Ok(Box::new(response.into_body().into_reader()))
 }
 
+/// How many ranged requests the helper keeps in flight at once for a Hugging
+/// Face artifact when `HF_API_KEY` is set. Authenticated requests get a far
+/// higher rate limit than anonymous ones, which is what makes several
+/// connections worth opening; without a key the helper stays on one.
+pub const HF_PARALLEL_RANGES: usize = 4;
+
+/// The Hugging Face access token from `HF_API_KEY`, trimmed; `None` when the
+/// variable is unset or blank.
+#[must_use]
+pub fn hf_token() -> Option<String> {
+    hf_token_from(std::env::var("HF_API_KEY").ok().as_deref())
+}
+
+/// [`hf_token`]'s rule over an explicit value, so tests never touch the
+/// process environment.
+fn hf_token_from(v: Option<&str>) -> Option<String> {
+    let v = v?.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// Whether `url` is an `https` URL on `huggingface.co` or one of its
+/// subdomains: the only hosts the bearer token is ever sent to.
+///
+/// Parsed by hand and deliberately strict: any userinfo (`user@host`) is
+/// refused outright rather than interpreted, so `https://huggingface.co@evil.com`
+/// can never pass on a lookalike prefix.
+#[must_use]
+pub fn is_hf_host(url: &str) -> bool {
+    let Some(scheme_end) = url.find("://") else {
+        return false;
+    };
+    if !url[..scheme_end].eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let rest = &url[scheme_end + 3..];
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return false,
+        None => authority,
+    }
+    .to_ascii_lowercase();
+    if host == "huggingface.co" {
+        return true;
+    }
+    host.strip_suffix(".huggingface.co").is_some_and(|sub| {
+        !sub.is_empty()
+            && sub.split('.').all(|label| {
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+    })
+}
+
+/// `msg` with every occurrence of `key` replaced by a placeholder. A belt
+/// over ureq's own braces: its errors name the URL, not the headers, but no
+/// error string this file produces may ever carry the token.
+fn redact_key(msg: &str, key: Option<&str>) -> String {
+    match key {
+        Some(k) if !k.is_empty() => msg.replace(k, "<HF_API_KEY>"),
+        _ => msg.to_string(),
+    }
+}
+
+/// The parallel path's resume record beside `part`: `<kind>.part.chunks`, one
+/// completed chunk index per line.
+///
+/// A parallel `.part` can have holes, so its length says nothing about which
+/// bytes are real; this sidecar is the only thing that does. Its *presence*
+/// is also what tells the sequential path that the length is not a resume
+/// point.
+fn chunks_path(part: &Path) -> PathBuf {
+    let mut s = part.as_os_str().to_owned();
+    s.push(".chunks");
+    PathBuf::from(s)
+}
+
 /// Downloads, verifies and stages every artifact in `manifest` that this build
 /// knows how to install.
 ///
@@ -532,6 +623,23 @@ pub fn run_job(
     set: crate::manifest::EngineId,
     manifest: &crate::manifest::Manifest,
     fetch: &Fetcher,
+) -> Outcome {
+    run_job_with(root, set, manifest, fetch, None)
+}
+
+/// [`run_job`], with `hf_parallel` naming how many ranges to fetch at once for
+/// an artifact served from a Hugging Face host ([`is_hf_host`]).
+///
+/// `None` (no `HF_API_KEY`) is exactly [`run_job`]: one connection and a
+/// streaming hash. The caller decides from the environment ([`run_helper`]),
+/// so tests choose the mode by argument and never set a variable.
+#[must_use]
+pub fn run_job_with(
+    root: &Path,
+    set: crate::manifest::EngineId,
+    manifest: &crate::manifest::Manifest,
+    fetch: &Fetcher,
+    hf_parallel: Option<usize>,
 ) -> Outcome {
     let staging = crate::manifest::staging_dir_in(root, set);
     if let Err(e) = std::fs::create_dir_all(&staging) {
@@ -565,7 +673,18 @@ pub fn run_job(
         // fall through to a normal download-and-verify.
         let _ = std::fs::remove_file(staged_path_in(root, set, kind));
         let _ = std::fs::remove_file(staged_sha_path_in(root, set, kind));
-        match one_artifact(root, set, manifest, kind, entry, index + 1, of, fetch) {
+        let workers = hf_parallel.filter(|_| is_hf_host(&entry.url));
+        match one_artifact(
+            root,
+            set,
+            manifest,
+            kind,
+            entry,
+            index + 1,
+            of,
+            fetch,
+            workers,
+        ) {
             Ok(None) => {}
             Ok(Some(how)) => return finish_cancel(root, set, how, manifest, &jobs),
             Err(e) => {
@@ -659,8 +778,32 @@ fn one_artifact(
     index: usize,
     of: usize,
     fetch: &Fetcher,
+    parallel: Option<usize>,
 ) -> Result<Option<Cancel>, String> {
     let part = part_path_in(root, set, kind);
+    if let Some(workers) = parallel {
+        let at = Slot {
+            root,
+            set,
+            manifest,
+            kind,
+            entry,
+            index,
+            of,
+        };
+        return parallel_artifact(&at, fetch, workers.max(1));
+    }
+    // A parallel run left this part, possibly with holes: its length is no
+    // resume point for a streaming hash. Start over.
+    let sidecar = chunks_path(&part);
+    if sidecar.exists() {
+        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(&sidecar);
+        log_line_in(
+            root,
+            &format!("{kind}: parallel progress found without HF_API_KEY; restarting the download"),
+        );
+    }
     let mut hasher = Sha256::new();
 
     publish(
@@ -890,19 +1033,54 @@ fn one_artifact(
         ));
     }
 
-    publish(
+    let at = Slot {
         root,
         set,
         manifest,
         kind,
+        entry,
         index,
         of,
-        done,
-        entry.bytes,
-        rate,
-        Phase::Verifying,
-        None,
-    );
+    };
+    verify_and_stage(&at, hasher, rate)
+}
+
+/// Where one artifact sits in the job: everything [`publish`] needs besides
+/// the numbers, bundled so the parallel path's helpers stay readable.
+struct Slot<'a> {
+    root: &'a Path,
+    set: crate::manifest::EngineId,
+    manifest: &'a crate::manifest::Manifest,
+    kind: &'a str,
+    entry: &'a crate::manifest::FileEntry,
+    index: usize,
+    of: usize,
+}
+
+impl Slot<'_> {
+    fn publish(&self, done: u64, rate: u64, phase: Phase) {
+        publish(
+            self.root,
+            self.set,
+            self.manifest,
+            self.kind,
+            self.index,
+            self.of,
+            done,
+            self.entry.bytes,
+            rate,
+            phase,
+            None,
+        );
+    }
+}
+
+/// Checks the finished digest of a complete `.part` and moves it into
+/// staging with its SHA-256 sidecar; on a mismatch the `.part` is deleted.
+fn verify_and_stage(at: &Slot<'_>, hasher: Sha256, rate: u64) -> Result<Option<Cancel>, String> {
+    let (root, set, kind, entry) = (at.root, at.set, at.kind, at.entry);
+    let part = part_path_in(root, set, kind);
+    at.publish(entry.bytes, rate, Phase::Verifying);
     let got = hex(&hasher.finalize());
     if got != entry.sha256 {
         // Wrong bytes cannot be fixed by resuming, so the .part must not
@@ -924,6 +1102,364 @@ fn one_artifact(
     Ok(None)
 }
 
+/// How one worker's chunk ended, short of an error.
+enum ChunkEnd {
+    /// Every byte of the chunk is written.
+    Done,
+    /// Stopped early: a cancel this worker saw, or `None` when another worker
+    /// already stopped the job.
+    Stopped(Option<Cancel>),
+}
+
+/// What the parallel workers share.
+struct Shared<'a> {
+    at: &'a Slot<'a>,
+    fetch: &'a Fetcher,
+    file: &'a File,
+    sidecar: std::sync::Mutex<File>,
+    /// Chunk indices still to fetch, handed out in order through `next`.
+    pending: Vec<u64>,
+    next: std::sync::atomic::AtomicUsize,
+    /// Bytes on disk: completed chunks plus whatever is in flight. Only ever
+    /// grows, because a retry resumes a chunk where it stopped.
+    progressed: std::sync::atomic::AtomicU64,
+    /// Set by the first worker to fail or see a cancel, so the rest stop.
+    stop: std::sync::atomic::AtomicBool,
+}
+
+/// Downloads one artifact over up to `workers` concurrent bounded ranges,
+/// then hashes the finished file in one sequential pass and verifies it.
+///
+/// Each worker takes the next chunk not yet done (the same [`chunk_end`]
+/// boundaries as the sequential path), writes it at its own offset in the
+/// `.part`, and appends its index to the [`chunks_path`] sidecar once the
+/// bytes are synced. The `.part` is never pre-sized: a resume trusts only the
+/// sidecar, and a sequential run that finds the sidecar starts over.
+fn parallel_artifact(
+    at: &Slot<'_>,
+    fetch: &Fetcher,
+    workers: usize,
+) -> Result<Option<Cancel>, String> {
+    let (root, kind, total) = (at.root, at.kind, at.entry.bytes);
+    let part = part_path_in(root, at.set, kind);
+    let sidecar_path = chunks_path(&part);
+    at.publish(0, 0, Phase::Rehashing);
+    let done = adopt_part(&part, &sidecar_path, total)
+        .map_err(|e| format!("cannot prepare {}: {e}", part.display()))?;
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&part)
+        .map_err(|e| e.to_string())?;
+    let sidecar = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&sidecar_path)
+        .map_err(|e| e.to_string())?;
+    let completed: u64 = (0u64..)
+        .zip(&done)
+        .filter(|(_, d)| **d)
+        .map(|(c, _)| chunk_len(c, total))
+        .sum();
+    let shared = Shared {
+        at,
+        fetch,
+        file: &file,
+        sidecar: std::sync::Mutex::new(sidecar),
+        pending: (0u64..)
+            .zip(&done)
+            .filter(|(_, d)| !**d)
+            .map(|(c, _)| c)
+            .collect(),
+        next: std::sync::atomic::AtomicUsize::new(0),
+        progressed: std::sync::atomic::AtomicU64::new(completed),
+        stop: std::sync::atomic::AtomicBool::new(false),
+    };
+
+    at.publish(completed, 0, Phase::Downloading);
+    let (results, rate) = run_workers(&shared, workers, completed);
+    let mut cancel = None;
+    for r in results {
+        match r {
+            Err(e) => {
+                let _ = file.sync_data();
+                return Err(e);
+            }
+            Ok(Some(how)) => cancel = Some(how),
+            Ok(None) => {}
+        }
+    }
+    if let Some(how) = cancel {
+        let _ = file.sync_data();
+        return Ok(Some(read_cancel_in(root).unwrap_or(how)));
+    }
+    file.sync_data().map_err(|e| e.to_string())?;
+    drop(file);
+
+    // Every chunk is on disk. The sidecar has done its job; from here the
+    // file is complete and its length is the truth for either path.
+    let _ = std::fs::remove_file(&sidecar_path);
+    at.publish(total, rate, Phase::Verifying);
+    let mut hasher = Sha256::new();
+    let should_stop = || read_cancel_in(root).is_some();
+    let Some(len) = rehash(&part, &mut hasher, &should_stop)
+        .map_err(|e| format!("cannot re-read {}: {e}", part.display()))?
+    else {
+        return Ok(Some(read_cancel_in(root).unwrap_or(Cancel::Keep)));
+    };
+    if len != total {
+        return Err(format!(
+            "{kind}: got {len} of {total} bytes; resume with /model download or the next offer"
+        ));
+    }
+    verify_and_stage(at, hasher, rate)
+}
+
+/// Runs up to `workers` workers over `shared.pending`, publishing progress
+/// from this thread while they run. Returns each worker's result and the last
+/// measured rate.
+fn run_workers(
+    shared: &Shared<'_>,
+    workers: usize,
+    completed: u64,
+) -> (Vec<Result<Option<Cancel>, String>>, u64) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (at, kind) = (shared.at, shared.at.kind);
+    let mut rate = 0u64;
+    let results = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers.min(shared.pending.len()))
+            .map(|_| s.spawn(|| worker(shared)))
+            .collect();
+        let mut last_publish = Instant::now();
+        let mut window_bytes = completed;
+        while !handles
+            .iter()
+            .all(std::thread::ScopedJoinHandle::is_finished)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let elapsed = last_publish.elapsed();
+            if elapsed >= PUBLISH_EVERY {
+                let now = shared.progressed.load(SeqCst);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    clippy::cast_precision_loss
+                )]
+                {
+                    rate = (now.saturating_sub(window_bytes) as f64 / elapsed.as_secs_f64()) as u64;
+                }
+                window_bytes = now;
+                last_publish = Instant::now();
+                at.publish(now, rate, Phase::Downloading);
+            }
+        }
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(format!("{kind}: a download worker panicked")))
+            })
+            .collect()
+    });
+    (results, rate)
+}
+
+/// Bytes in chunk `c` of a `total`-byte artifact.
+fn chunk_len(c: u64, total: u64) -> u64 {
+    let start = c * RANGE_CHUNK;
+    chunk_end(start, total).map_or(0, |end| end + 1 - start)
+}
+
+/// Decides which chunks of an existing `.part` are already good, leaving the
+/// part and its sidecar consistent with that answer.
+///
+/// - Sidecar present: its indices are trusted for every chunk the file is
+///   long enough to hold, and the sidecar is rewritten to list only those; an
+///   index past the artifact means the record is not this artifact's, and
+///   everything starts over. So does a sidecar that exists but cannot be
+///   read.
+/// - No sidecar but a part (a sequential run's): its length is contiguous
+///   bytes, so its whole chunks are kept, the tail is cut back to the last
+///   chunk boundary, and a sidecar listing them is written.
+/// - Neither, or a part longer than the artifact: a fresh, empty start.
+fn adopt_part(part: &Path, sidecar: &Path, total: u64) -> std::io::Result<Vec<bool>> {
+    let n = usize::try_from(total.div_ceil(RANGE_CHUNK)).unwrap_or(usize::MAX);
+    let mut done = vec![false; n];
+    let len = std::fs::metadata(part).ok().map(|m| m.len());
+    let fresh = |done: &mut Vec<bool>| -> std::io::Result<()> {
+        done.fill(false);
+        // The sidecar goes first: a crash between the two then leaves an
+        // empty record beside an untrusted part, never a record that vouches
+        // for bytes the part no longer holds.
+        File::create(sidecar)?;
+        File::create(part)?;
+        Ok(())
+    };
+    let record = match std::fs::read_to_string(sidecar) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // A sidecar that exists but cannot be read (invalid UTF-8, a
+        // permission problem) says nothing about the part: start over rather
+        // than read the part as a sequential run's contiguous bytes.
+        Err(_) => {
+            fresh(&mut done)?;
+            return Ok(done);
+        }
+    };
+    match (record, len) {
+        (Some(text), Some(len)) if len <= total => {
+            for line in text.lines() {
+                let Ok(c) = line.trim().parse::<u64>() else {
+                    continue;
+                };
+                let Some(slot) = usize::try_from(c).ok().and_then(|i| done.get_mut(i)) else {
+                    fresh(&mut done)?;
+                    return Ok(done);
+                };
+                // A chunk the file is too short to contain was never synced.
+                if c * RANGE_CHUNK + chunk_len(c, total) <= len {
+                    *slot = true;
+                }
+            }
+            // Rewrite the record to the trusted chunks only, so a stale index
+            // the part cannot back is not carried into this run's appends.
+            write_listed(sidecar, (0..n).filter(|&i| done[i]))?;
+        }
+        (None, Some(len)) if len <= total => {
+            let whole = if len == total {
+                n as u64
+            } else {
+                len / RANGE_CHUNK
+            };
+            if len != total {
+                OpenOptions::new()
+                    .write(true)
+                    .open(part)?
+                    .set_len(whole * RANGE_CHUNK)?;
+            }
+            for c in 0..whole {
+                if let Some(slot) = usize::try_from(c).ok().and_then(|i| done.get_mut(i)) {
+                    *slot = true;
+                }
+            }
+            write_listed(sidecar, (0..n).filter(|&i| done[i]))?;
+        }
+        _ => fresh(&mut done)?,
+    }
+    Ok(done)
+}
+
+/// Replaces the [`chunks_path`] sidecar with one index per line, synced.
+fn write_listed(sidecar: &Path, chunks: impl Iterator<Item = usize>) -> std::io::Result<()> {
+    let mut listed = String::new();
+    for c in chunks {
+        use std::fmt::Write as _;
+        let _ = writeln!(listed, "{c}");
+    }
+    let mut f = File::create(sidecar)?;
+    f.write_all(listed.as_bytes())?;
+    f.sync_data()
+}
+
+/// One worker: takes chunks until none are left or the job stops.
+fn worker(sh: &Shared<'_>) -> Result<Option<Cancel>, String> {
+    use std::sync::atomic::Ordering::SeqCst;
+    loop {
+        if sh.stop.load(SeqCst) {
+            return Ok(None);
+        }
+        let Some(&c) = sh.pending.get(sh.next.fetch_add(1, SeqCst)) else {
+            return Ok(None);
+        };
+        match fetch_chunk(sh, c) {
+            Ok(ChunkEnd::Done) => {
+                let recorded = sh.file.sync_data().and_then(|()| {
+                    let mut f = sh
+                        .sidecar
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    writeln!(f, "{c}")?;
+                    f.sync_data()
+                });
+                if let Err(e) = recorded {
+                    sh.stop.store(true, SeqCst);
+                    return Err(format!("{}: cannot record progress: {e}", sh.at.kind));
+                }
+            }
+            Ok(ChunkEnd::Stopped(how)) => {
+                sh.stop.store(true, SeqCst);
+                return Ok(how);
+            }
+            Err(e) => {
+                sh.stop.store(true, SeqCst);
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Fetches chunk `c` and writes it at its offset, retrying a failed request
+/// or a broken body up to `CHUNK_RETRY_ATTEMPTS` times. A retry asks only for
+/// the bytes this chunk still lacks, so nothing is written twice.
+fn fetch_chunk(sh: &Shared<'_>, c: u64) -> Result<ChunkEnd, String> {
+    use std::os::unix::fs::FileExt as _;
+    use std::sync::atomic::Ordering::SeqCst;
+    let (root, kind, entry) = (sh.at.root, sh.at.kind, sh.at.entry);
+    let start = c * RANGE_CHUNK;
+    let Some(end) = chunk_end(start, entry.bytes) else {
+        return Ok(ChunkEnd::Done);
+    };
+    let mut pos = start;
+    let mut buf = vec![0u8; CHUNK];
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let failure = match (sh.fetch)(&entry.url, pos, Some(end)) {
+            Err(e) if e == "resume-not-supported" => {
+                return Err(resume_not_supported_message(kind));
+            }
+            Err(e) => e,
+            Ok(mut reader) => loop {
+                if sh.stop.load(SeqCst) {
+                    return Ok(ChunkEnd::Stopped(None));
+                }
+                if let Some(how) = read_cancel_in(root) {
+                    return Ok(ChunkEnd::Stopped(Some(how)));
+                }
+                let n = match reader.read(&mut buf) {
+                    Ok(0) => {
+                        break format!("{kind}: the range {start}-{end} ended at byte {pos}");
+                    }
+                    Ok(n) => n,
+                    Err(e) => break e.to_string(),
+                };
+                // Never past the chunk: a server that ignored the range would
+                // otherwise write over a neighbour's bytes.
+                let n = usize::try_from(end + 1 - pos).unwrap_or(n).min(n);
+                sh.file
+                    .write_all_at(&buf[..n], pos)
+                    .map_err(|e| format!("{kind}: cannot write the download: {e}"))?;
+                pos += n as u64;
+                sh.progressed.fetch_add(n as u64, SeqCst);
+                if pos > end {
+                    return Ok(ChunkEnd::Done);
+                }
+            },
+        };
+        if attempts >= CHUNK_RETRY_ATTEMPTS {
+            return Err(failure);
+        }
+        if sh.stop.load(SeqCst) {
+            return Ok(ChunkEnd::Stopped(None));
+        }
+        if let Some(how) = sleep_watching_cancel(root, chunk_backoff(attempts)) {
+            return Ok(ChunkEnd::Stopped(Some(how)));
+        }
+    }
+}
+
 /// Clears the flag, optionally removes partial work, and publishes the stop.
 fn finish_cancel(
     root: &Path,
@@ -937,7 +1473,9 @@ fn finish_cancel(
         // and will be installed at the next launch, so deleting it here would
         // throw away tens of gigabytes of already-good data for nothing.
         for (kind, _) in jobs {
-            let _ = std::fs::remove_file(part_path_in(root, set, kind));
+            let part = part_path_in(root, set, kind);
+            let _ = std::fs::remove_file(chunks_path(&part));
+            let _ = std::fs::remove_file(part);
         }
     }
     clear_cancel_in(root);
@@ -1210,7 +1748,7 @@ pub fn spawn_detached_in(
 }
 
 /// Starts `plank --model-downloader <set>` as a detached child.
-fn launch_helper(set: crate::manifest::EngineId) -> Result<(), String> {
+pub(crate) fn launch_helper(set: crate::manifest::EngineId) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find plank's own path: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
     // The set travels in argv rather than in the job file: the helper needs it
@@ -1288,7 +1826,14 @@ pub fn run_helper(set: crate::manifest::EngineId) -> i32 {
     // A cancel flag left over from a previous run must not stop this one before
     // it starts.
     clear_cancel();
-    let outcome = run_job(&root, set, &manifest, &http_fetch);
+    // The key itself never reaches the log: only whether one is in use.
+    let hf_parallel = hf_token().map(|_| HF_PARALLEL_RANGES);
+    if hf_parallel.is_some() {
+        log_line(&format!(
+            "HF_API_KEY set: Hugging Face artifacts use {HF_PARALLEL_RANGES} connections"
+        ));
+    }
+    let outcome = run_job_with(&root, set, &manifest, &http_fetch, hf_parallel);
     log_line(&format!(
         "job for version {} ended: {outcome:?}",
         manifest.version
@@ -1303,7 +1848,12 @@ pub fn run_helper(set: crate::manifest::EngineId) -> i32 {
 
 /// Appends one timestamped line to the helper's log. Best-effort.
 fn log_line(msg: &str) {
-    let path = log_path();
+    log_line_in(&crate::manifest::plank_dir(), msg);
+}
+
+/// [`log_line`] under `root`.
+fn log_line_in(root: &Path, msg: &str) {
+    let path = log_path_in(root);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1397,6 +1947,14 @@ pub fn swap_staged_in(root: &Path, set: crate::manifest::EngineId) -> Result<Opt
     let _ = std::fs::remove_dir(crate::manifest::staging_dir_in(root, set));
     let _ = std::fs::remove_file(state_path_in(root));
     Ok(Some(manifest.version))
+}
+
+/// Whether a complete, verified set for `set` is waiting in staging: its
+/// staged manifest, written only once every artifact verified, is present
+/// and parses. The same record [`swap_staged_in`] installs from.
+#[must_use]
+pub fn is_staged_in(root: &Path, set: crate::manifest::EngineId) -> bool {
+    crate::manifest::read_at(&crate::manifest::staged_manifest_path_in(root, set)).is_some()
 }
 
 /// Installs a complete staged set under `~/.plank`, if one is waiting.
@@ -3421,5 +3979,327 @@ pub(crate) mod tests {
             "Cancelling; the partial files will be deleted (verified artifacts are kept)."
         );
         assert_eq!(read_cancel_in(&dir), Some(Cancel::Delete));
+    }
+
+    // ---- HF_API_KEY: authentication and parallel ranges ----
+
+    /// A 50-byte body: seven 8-byte chunks under `cfg(test)`, the last short.
+    fn fifty_bytes() -> Vec<u8> {
+        (0u8..50).map(|b| b'a' + b % 26).collect()
+    }
+
+    fn sha_of(bytes: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        hex(&h.finalize())
+    }
+
+    /// `manifest_for`, with every artifact served from a Hugging Face URL so
+    /// the parallel path's host gate admits it. `serving` keys by the last
+    /// path segment, so the same fixture fetcher answers these URLs.
+    fn hf_manifest_for(entries: &[(&str, &[u8], &str)]) -> crate::manifest::Manifest {
+        let mut m = manifest_for(entries);
+        for (kind, entry) in &mut m.files {
+            entry.url = format!("https://huggingface.co/org/repo/resolve/main/{kind}");
+        }
+        m
+    }
+
+    /// Pre-writes `chunks` of `full` at their offsets into the `.part` (leaving
+    /// holes for the rest) and lists them in the `.chunks` sidecar.
+    fn prewrite_chunks(root: &Path, full: &[u8], chunks: &[u64]) {
+        use std::fmt::Write as _;
+        use std::os::unix::fs::FileExt as _;
+        let part = part_path_in(root, crate::manifest::EngineId::DS4VISION, "main");
+        std::fs::create_dir_all(part.parent().expect("parent")).expect("staging dir");
+        let f = File::create(&part).expect("part");
+        let mut listed = String::new();
+        for &c in chunks {
+            let start = usize::try_from(c * RANGE_CHUNK).expect("fits");
+            let stop = (start + usize::try_from(RANGE_CHUNK).expect("fits")).min(full.len());
+            f.write_all_at(&full[start..stop], start as u64)
+                .expect("write chunk");
+            let _ = writeln!(listed, "{c}");
+        }
+        std::fs::write(chunks_path(&part), listed).expect("sidecar");
+    }
+
+    #[test]
+    fn hf_token_from_trims_and_treats_blank_as_unset() {
+        assert_eq!(hf_token_from(None), None);
+        assert_eq!(hf_token_from(Some("")), None);
+        assert_eq!(hf_token_from(Some("  ")), None);
+        assert_eq!(hf_token_from(Some(" k ")), Some("k".to_string()));
+    }
+
+    #[test]
+    fn only_https_hugging_face_hosts_are_hf_hosts() {
+        for yes in [
+            "https://huggingface.co/org/repo/resolve/main/x.gguf",
+            "https://huggingface.co",
+            "https://cdn-lfs.huggingface.co/repos/x",
+            "https://HuggingFace.co/x",
+            "https://huggingface.co:443/x",
+        ] {
+            assert!(is_hf_host(yes), "{yes} is a Hugging Face host");
+        }
+        for no in [
+            "https://evilhuggingface.co/x",
+            "https://huggingface.co.evil.com/x",
+            "http://huggingface.co/x",
+            "https://huggingface.co@evil.com/x",
+            "https://.huggingface.co/x",
+            "https://example.invalid/main",
+            "huggingface.co/x",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_hf_host(no), "{no} is not a Hugging Face host");
+        }
+    }
+
+    #[test]
+    fn a_key_is_redacted_from_any_message_that_carries_it() {
+        assert_eq!(
+            redact_key("failed: Bearer hf_secret at x", Some("hf_secret")),
+            "failed: Bearer <HF_API_KEY> at x"
+        );
+        assert_eq!(redact_key("plain", None), "plain");
+        assert_eq!(redact_key("plain", Some("")), "plain");
+    }
+
+    #[test]
+    fn parallel_mode_assembles_the_artifact_and_asks_for_each_chunk_once() {
+        let root = tempdir();
+        let full = fifty_bytes();
+        let sha = sha_of(&full);
+        let m = hf_manifest_for(&[("main", &full, &sha)]);
+
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, Option<u64>)>::new()));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (log, act, pk) = (
+            std::sync::Arc::clone(&asked),
+            std::sync::Arc::clone(&active),
+            std::sync::Arc::clone(&peak),
+        );
+        let inner = serving(&[("main", full.clone())]);
+        let fetcher = move |url: &str, offset: u64, end: Option<u64>| {
+            use std::sync::atomic::Ordering::SeqCst;
+            log.lock().expect("lock").push((offset, end));
+            let now = act.fetch_add(1, SeqCst) + 1;
+            pk.fetch_max(now, SeqCst);
+            // Long enough that a second worker is certainly inside a fetch
+            // while this one is, when there is more than one worker.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            act.fetch_sub(1, SeqCst);
+            inner(url, offset, end)
+        };
+
+        let outcome = run_job_with(
+            &root,
+            crate::manifest::EngineId::DS4VISION,
+            &m,
+            &fetcher,
+            Some(HF_PARALLEL_RANGES),
+        );
+        assert_eq!(outcome, Outcome::Verified);
+        assert_eq!(
+            std::fs::read(staged_path_in(
+                &root,
+                crate::manifest::EngineId::DS4VISION,
+                "main"
+            ))
+            .expect("staged"),
+            full
+        );
+        let mut asked = asked.lock().expect("lock").clone();
+        asked.sort_unstable();
+        let total = full.len() as u64;
+        let want: Vec<(u64, Option<u64>)> = (0..total.div_ceil(RANGE_CHUNK))
+            .map(|c| (c * RANGE_CHUNK, chunk_end(c * RANGE_CHUNK, total)))
+            .collect();
+        assert_eq!(asked, want, "each chunk is asked for exactly once");
+        assert!(
+            peak.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "chunks are fetched concurrently"
+        );
+        let part = part_path_in(&root, crate::manifest::EngineId::DS4VISION, "main");
+        assert!(!chunks_path(&part).exists(), "the sidecar is consumed");
+    }
+
+    #[test]
+    fn a_parallel_resume_skips_the_chunks_the_sidecar_lists() {
+        let root = tempdir();
+        let full = fifty_bytes();
+        let sha = sha_of(&full);
+        let m = hf_manifest_for(&[("main", &full, &sha)]);
+        prewrite_chunks(&root, &full, &[0, 2]);
+
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let log = std::sync::Arc::clone(&asked);
+        let inner = serving(&[("main", full.clone())]);
+        let fetcher = move |url: &str, offset: u64, end: Option<u64>| {
+            log.lock().expect("lock").push(offset);
+            inner(url, offset, end)
+        };
+        let outcome = run_job_with(
+            &root,
+            crate::manifest::EngineId::DS4VISION,
+            &m,
+            &fetcher,
+            Some(HF_PARALLEL_RANGES),
+        );
+        assert_eq!(outcome, Outcome::Verified);
+        let asked = asked.lock().expect("lock").clone();
+        assert!(
+            !asked.contains(&0) && !asked.contains(&(2 * RANGE_CHUNK)),
+            "listed chunks are not refetched: {asked:?}"
+        );
+        assert!(
+            asked.contains(&RANGE_CHUNK),
+            "the hole is filled: {asked:?}"
+        );
+        assert_eq!(
+            std::fs::read(staged_path_in(
+                &root,
+                crate::manifest::EngineId::DS4VISION,
+                "main"
+            ))
+            .expect("staged"),
+            full
+        );
+    }
+
+    #[test]
+    fn a_sidecar_without_parallel_mode_restarts_the_part_sequentially() {
+        // The part has a hole at chunk 1: its length is no resume point for
+        // the sequential path, which would otherwise hash the zeros.
+        let root = tempdir();
+        let full = fifty_bytes();
+        let sha = sha_of(&full);
+        let m = manifest_for(&[("main", &full, &sha)]);
+        prewrite_chunks(&root, &full, &[0, 2]);
+        let outcome = run_job(
+            &root,
+            crate::manifest::EngineId::DS4VISION,
+            &m,
+            &serving(&[("main", full.clone())]),
+        );
+        assert_eq!(outcome, Outcome::Verified);
+        let part = part_path_in(&root, crate::manifest::EngineId::DS4VISION, "main");
+        assert!(!chunks_path(&part).exists(), "the sidecar is removed");
+        assert_eq!(
+            std::fs::read(staged_path_in(
+                &root,
+                crate::manifest::EngineId::DS4VISION,
+                "main"
+            ))
+            .expect("staged"),
+            full
+        );
+    }
+
+    #[test]
+    fn adopting_a_sidecar_rewrites_it_to_the_trusted_chunks_only() {
+        let root = tempdir();
+        let part = root.join("main.part");
+        let sidecar = chunks_path(&part);
+        // Two whole chunks on disk; the sidecar also lists chunks 4 and 5,
+        // whose bytes never reached the file.
+        std::fs::write(
+            &part,
+            vec![1u8; usize::try_from(2 * RANGE_CHUNK).expect("small")],
+        )
+        .expect("part");
+        std::fs::write(&sidecar, "0\n1\n4\n5\n").expect("sidecar");
+        let done = adopt_part(&part, &sidecar, 50).expect("adopt");
+        assert_eq!(done, vec![true, true, false, false, false, false, false]);
+        let listed = std::fs::read_to_string(&sidecar).expect("sidecar");
+        assert_eq!(listed.lines().collect::<Vec<_>>(), ["0", "1"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_sidecar_starts_the_part_over() {
+        let root = tempdir();
+        let part = root.join("main.part");
+        let sidecar = chunks_path(&part);
+        std::fs::write(
+            &part,
+            vec![1u8; usize::try_from(2 * RANGE_CHUNK).expect("small")],
+        )
+        .expect("part");
+        std::fs::write(&sidecar, [0xffu8, 0xfe, b'\n']).expect("sidecar");
+        let done = adopt_part(&part, &sidecar, 50).expect("adopt");
+        assert!(done.iter().all(|d| !d), "nothing is trusted: {done:?}");
+        assert_eq!(std::fs::metadata(&part).map_or(0, |m| m.len()), 0);
+        assert_eq!(std::fs::metadata(&sidecar).map_or(0, |m| m.len()), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_sequential_part_is_adopted_by_parallel_mode_up_to_its_last_whole_chunk() {
+        let root = tempdir();
+        let full = fifty_bytes();
+        let sha = sha_of(&full);
+        let m = hf_manifest_for(&[("main", &full, &sha)]);
+        let part = part_path_in(&root, crate::manifest::EngineId::DS4VISION, "main");
+        std::fs::create_dir_all(part.parent().expect("parent")).expect("staging dir");
+        // One whole chunk and five bytes of the next.
+        std::fs::write(&part, &full[..13]).expect("part");
+
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let log = std::sync::Arc::clone(&asked);
+        let inner = serving(&[("main", full.clone())]);
+        let fetcher = move |url: &str, offset: u64, end: Option<u64>| {
+            log.lock().expect("lock").push(offset);
+            inner(url, offset, end)
+        };
+        let outcome = run_job_with(
+            &root,
+            crate::manifest::EngineId::DS4VISION,
+            &m,
+            &fetcher,
+            Some(HF_PARALLEL_RANGES),
+        );
+        assert_eq!(outcome, Outcome::Verified);
+        let asked = asked.lock().expect("lock").clone();
+        assert!(!asked.contains(&0), "the whole chunk is kept: {asked:?}");
+        assert!(
+            asked.contains(&RANGE_CHUNK),
+            "the partial chunk is refetched whole: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_failing_hf_fetch_never_puts_the_key_in_state_log_or_error() {
+        const KEY: &str = "hf_TESTKEYnotreal";
+        let root = tempdir();
+        let full = fifty_bytes();
+        let sha = sha_of(&full);
+        let m = hf_manifest_for(&[("main", &full, &sha)]);
+        let fetcher = |url: &str, _offset: u64, _end: Option<u64>| {
+            Err::<Box<dyn Read + Send>, String>(redact_key(
+                &format!("download failed: {url}: http status: 401 (sent Bearer {KEY})"),
+                Some(KEY),
+            ))
+        };
+        let outcome = run_job_with(
+            &root,
+            crate::manifest::EngineId::DS4VISION,
+            &m,
+            &fetcher,
+            Some(HF_PARALLEL_RANGES),
+        );
+        let Outcome::Failed(e) = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert!(e.contains("huggingface.co"), "the URL is reported: {e}");
+        assert!(!e.contains(KEY), "the key leaked into the error: {e}");
+        let state = std::fs::read_to_string(state_path_in(&root)).expect("state");
+        assert!(!state.contains(KEY), "the key leaked into the state");
+        let log = std::fs::read_to_string(log_path_in(&root)).unwrap_or_default();
+        assert!(!log.contains(KEY), "the key leaked into the log");
     }
 }

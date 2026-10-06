@@ -7789,6 +7789,26 @@ impl Agent<'_> {
             "/plugins" => print!("{}", self.plugins_command(arg)),
             "/install-claude-plugin" => print!("{}", self.install_claude_plugin_command(arg)),
             "/install-profile" => print!("{}", self.install_profile_command(arg)),
+            "/engines" => {
+                let root = crate::manifest::plank_dir();
+                let catalog = crate::engines::load_in(&root, &mut Vec::new());
+                let downloading = crate::download::downloading_in(&root, &catalog);
+                let rows = crate::enginefit::evaluate(
+                    &root,
+                    &catalog,
+                    &crate::enginefit::machine(&root),
+                    &|p| p.exists(),
+                    downloading.as_ref().map(|(n, pct)| (n.as_str(), *pct)),
+                    &|n| {
+                        crate::manifest::EngineId::new(n)
+                            .is_some_and(|id| crate::downloader::is_staged_in(&root, id))
+                    },
+                );
+                for r in &rows {
+                    println!("{:<14} {}", r.name, crate::enginepick::state_label(&r.fit));
+                }
+                println!("run plank --pick-engine in a terminal to choose one");
+            }
             "/edit-profile" => match self.active_profile_plugin() {
                 None => println!("{NO_ACTIVE_PROFILE}"),
                 Some((plugin, spec)) => {
@@ -17836,6 +17856,19 @@ impl Agent<'_> {
                     return false;
                 }
             }
+            "/engines" => match self.save_session() {
+                Ok(id) => {
+                    crate::profileedit::request_restart(crate::profileedit::Restart {
+                        session: id,
+                        cwd: self.tool_ctx.cwd.clone(),
+                        pick_engine: true,
+                    });
+                    return false;
+                }
+                Err(e) => log.push_plain(format!(
+                    "/engines: cannot save the session, so not restarting: {e}"
+                )),
+            },
             "/templates" => {
                 *report = Some(tui::ReportPanel::new(
                     "templates",
@@ -18296,6 +18329,7 @@ impl Agent<'_> {
                 crate::profileedit::request_restart(crate::profileedit::Restart {
                     session: id,
                     cwd: self.tool_ctx.cwd.clone(),
+                    pick_engine: false,
                 });
                 false
             }
