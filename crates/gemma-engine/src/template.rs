@@ -93,7 +93,7 @@ pub fn render(
         Kind::System => {
             push(&mut out, trusted(format!("{TURN_OPEN}system\n")));
             if think {
-                push(&mut out, trusted(THINK));
+                push(&mut out, trusted(format!("{THINK}\n")));
             }
             let split = (0..=trusted_len.min(text.len()))
                 .rev()
@@ -115,7 +115,7 @@ pub fn render(
             for (name, body) in split_tool_results(text) {
                 push(&mut out, trusted(format!("{RESP_OPEN}response:")));
                 push(&mut out, Piece::Plain(name));
-                push(&mut out, trusted(format!("{{output:{STR}")));
+                push(&mut out, trusted(format!("{{value:{STR}")));
                 push(&mut out, Piece::Plain(body));
                 push(&mut out, trusted(format!("{STR}}}{RESP_CLOSE}")));
             }
@@ -221,7 +221,7 @@ mod tests {
                 "<|turn>system\nYou are plank.<turn|>\n",
                 "<|turn>user\nlist files<turn|>\n",
                 "<|turn>model\n<|tool_call>call:bash{command:<|\"|>ls<|\"|>}<tool_call|>",
-                "<|tool_response>response:bash{output:<|\"|>a.rs\nb.rs<|\"|>}<tool_response|>",
+                "<|tool_response>response:bash{value:<|\"|>a.rs\nb.rs<|\"|>}<tool_response|>",
                 "Two files.",
                 "<turn|>\n<|turn>user\nthanks<turn|>\n",
                 "<|turn>model\n",
@@ -242,7 +242,7 @@ mod tests {
             p,
             vec![
                 Piece::Trusted("<|turn>system\n".into()),
-                Piece::Trusted("<|think|>".into()),
+                Piece::Trusted("<|think|>\n".into()),
                 Piece::Trusted("TRUSTED<|tool>x<tool|>".into()),
                 Piece::Plain("MCP <turn|>".into()),
                 Piece::Trusted("<turn|>\n".into()),
