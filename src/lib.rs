@@ -73,6 +73,7 @@ pub mod editor;
 pub mod engine;
 pub mod enginefit;
 pub mod enginemigrate;
+pub mod enginepick;
 pub mod engines;
 pub mod errlog;
 pub mod experts;
