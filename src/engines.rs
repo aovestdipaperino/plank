@@ -397,6 +397,10 @@ pub struct Selection {
     /// a file that is absent into exactly that path. Empty for managed roles
     /// and bare paths.
     pub urls: BTreeMap<String, String>,
+    /// The engine's declared model family (`"gemma"`), when the catalog says;
+    /// used to route an engine whose file is not downloaded yet. `None` for
+    /// bare paths and for engines that declare none.
+    pub family: Option<String>,
 }
 
 fn select(root: &Path, entry: &EngineEntry, id: EngineId) -> Selection {
@@ -416,6 +420,9 @@ fn select(root: &Path, entry: &EngineEntry, id: EngineId) -> Selection {
         vision: role("vision"),
         managed_main: entry.files.contains_key("main"),
         urls: entry.path_urls.clone(),
+        family: serde_json::from_str::<serde_json::Value>(&entry.raw)
+            .ok()
+            .and_then(|v| v["family"].as_str().map(str::to_owned)),
     }
 }
 
@@ -524,6 +531,7 @@ pub fn resolve_with_note_in(
                     vision: None,
                     managed_main: false,
                     urls: BTreeMap::new(),
+                    family: None,
                 },
                 None,
             ))
@@ -701,6 +709,7 @@ pub fn inherit_companions_in(
             // A managed main is never a path role, so these are the
             // companions' urls only.
             urls: engine.urls,
+            family: engine.family,
         },
         None => sel,
     }
@@ -753,11 +762,23 @@ mod tests {
         let c = parse(COMPILED_IN, Layer::Published, &mut w).expect("compiled-in parses");
         assert!(w.is_empty(), "warnings: {w:?}");
         assert_eq!(c.default_name(), "ds4vision");
-        for n in ["ds4vision", "ds41", "qwen"] {
+        for n in ["ds4vision", "ds41", "qwen", "gemma4-e4b", "gemma4-12b"] {
             assert!(c.get(n).is_some(), "{n} missing");
         }
         assert!(c.get("ds4vision").unwrap().files.contains_key("mtp"));
         assert!(!c.get("qwen").unwrap().files.contains_key("mtp"));
+        for n in ["gemma4-e4b", "gemma4-12b"] {
+            let e = c.get(n).unwrap();
+            assert!(
+                !e.files.contains_key("mtp") && !e.files.contains_key("vision"),
+                "{n}"
+            );
+        }
+        let root = std::env::temp_dir().join("plank-gemma-sel");
+        let sel = resolve_in(&root, &c, Choice::Named("gemma4-e4b")).unwrap();
+        assert_eq!(sel.family.as_deref(), Some("gemma"));
+        let ds = resolve_in(&root, &c, Choice::Named("ds4vision")).unwrap();
+        assert_eq!(ds.family, None);
     }
 
     #[test]
@@ -989,7 +1010,7 @@ mod tests {
     fn names_lists_sorted_comma_separated() {
         let mut w = Vec::new();
         let c = parse(COMPILED_IN, Layer::Published, &mut w).unwrap();
-        assert_eq!(c.names(), "ds41, ds4vision, qwen");
+        assert_eq!(c.names(), "ds41, ds4vision, gemma4-12b, gemma4-e4b, qwen");
     }
 
     fn root(tag: &str) -> PathBuf {
@@ -1176,6 +1197,7 @@ mod tests {
             vision: None,
             managed_main: false,
             urls: BTreeMap::new(),
+            family: None,
         }
     }
 
@@ -1225,7 +1247,7 @@ mod tests {
         let e = resolve_in(&r, &c, Choice::Spec("nope")).unwrap_err();
         assert_eq!(
             e,
-            "no engine or file named `nope`; known engines: ds41, ds4vision, qwen"
+            "no engine or file named `nope`; known engines: ds41, ds4vision, gemma4-12b, gemma4-e4b, qwen"
         );
     }
 
@@ -1236,7 +1258,7 @@ mod tests {
         assert!(resolve_in(&r, &c, Choice::Named("ds41")).is_ok());
         assert_eq!(
             resolve_in(&r, &c, Choice::Named("x.gguf")).unwrap_err(),
-            "unknown engine `x.gguf`; known engines: ds41, ds4vision, qwen"
+            "unknown engine `x.gguf`; known engines: ds41, ds4vision, gemma4-12b, gemma4-e4b, qwen"
         );
     }
 

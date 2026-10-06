@@ -541,7 +541,33 @@ fn resolve_model_delta(cfg: &mut plank::config::AgentConfig) -> Result<(), Strin
 /// within a few lines: the family decides the transcript extension, and a
 /// store opened before it would name files for the wrong one.
 fn select_session_family(cfg: &plank::config::AgentConfig) {
-    plank::session::set_family(plank::gguf::family_of(&resolve_model_path(cfg)));
+    plank::session::set_family(selection_family_or_file(cfg));
+}
+
+/// The model family a selection runs as: the file's own when it is on disk,
+/// else the catalog's declared `family` (so a Gemma engine not downloaded yet
+/// still routes to `GemmaEngine` and names `.gemma.kv` files), else `Ds4`.
+fn selection_family(
+    sel: &plank::engines::Selection,
+    path: &std::path::Path,
+) -> plank::gguf::ModelFamily {
+    if path.exists() {
+        plank::gguf::family_of(path)
+    } else if sel.family.as_deref() == Some("gemma") {
+        plank::gguf::ModelFamily::Gemma
+    } else {
+        plank::gguf::ModelFamily::Ds4
+    }
+}
+
+/// [`selection_family`] for the resolved model, or the file's own family when
+/// there is no selection.
+fn selection_family_or_file(cfg: &plank::config::AgentConfig) -> plank::gguf::ModelFamily {
+    let path = resolve_model_path(cfg);
+    cfg.selection.as_ref().map_or_else(
+        || plank::gguf::family_of(&path),
+        |sel| selection_family(sel, &path),
+    )
 }
 
 /// The detached downloader's entry point.
@@ -1099,11 +1125,14 @@ fn make_fake_engine(cfg: &AgentConfig) -> Box<dyn Engine> {
     ))
 }
 
-fn make_local_engine(
-    cfg: &AgentConfig,
-) -> Result<(Box<dyn Engine>, Option<plank::gpuyield::ReopenFn>), String> {
+fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
     if cfg.fake_gpu {
         return Ok((make_fake_engine(cfg), None));
+    }
+    // Gemma first, in both cfgs: none of the DeepSeek-sized gates below apply.
+    #[cfg(feature = "gemma")]
+    if let Some(gemma) = route_gemma(cfg) {
+        return gemma;
     }
     #[cfg(ds4_engine)]
     {
@@ -1237,14 +1266,73 @@ fn make_local_engine(
         Ok((Box::new(engine), Some(reopen)))
     }
     #[cfg(not(ds4_engine))]
-    {
-        if let Some(model) = &cfg.model_spec {
-            return Err(format!(
-                "-m {model} requires the ds4 engine, which is not built on this platform"
-            ));
-        }
-        Ok((Box::new(EchoEngine::new(cfg.generation.ctx_size)), None))
+    make_echo_engine(cfg)
+}
+
+/// The echo stub, on a build without the ds4 engine. A named model is refused
+/// rather than silently answered by the stub; a Gemma model never gets here
+/// (see [`route_gemma`]).
+#[cfg(not(ds4_engine))]
+fn make_echo_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
+    if let Some(model) = &cfg.model_spec {
+        return Err(format!(
+            "-m {model} requires the ds4 engine, which is not built on this platform"
+        ));
     }
+    Ok((Box::new(EchoEngine::new(cfg.generation.ctx_size)), None))
+}
+
+/// A local engine and the factory that reopens it after a GPU yield.
+type LocalEngine = (Box<dyn Engine>, Option<plank::gpuyield::ReopenFn>);
+
+/// Opens the model on `GemmaEngine` when it is a Gemma model, `None` when it
+/// is not. Decided ahead of every DeepSeek-sized gate in
+/// [`make_local_engine`] (the RAM floor and the single-instance model lock).
+#[cfg(feature = "gemma")]
+fn route_gemma(cfg: &AgentConfig) -> Option<Result<LocalEngine, String>> {
+    let model = cfg.model_path.clone()?;
+    let sel = cfg.selection.as_ref()?;
+    (selection_family(sel, &model) == plank::gguf::ModelFamily::Gemma)
+        .then(|| make_gemma_engine(cfg, sel, model))
+}
+
+/// Loads a Gemma 4 model on [`plank::gemmaengine::GemmaEngine`].
+///
+/// Downloads a missing managed main like the ds4 path does, but takes none of
+/// its DeepSeek-sized gates and no side artifacts: Gemma has no `mtp` or
+/// `vision` companion. The reopen factory only re-checks the file, since the
+/// native engine holds no process lock.
+///
+/// # Errors
+/// When the model is absent and cannot be fetched, or fails to open.
+#[cfg(feature = "gemma")]
+fn make_gemma_engine(
+    cfg: &AgentConfig,
+    sel: &plank::engines::Selection,
+    model: std::path::PathBuf,
+) -> Result<LocalEngine, String> {
+    use plank::gemmaengine::GemmaEngine;
+    plank::download::check_manifest_at_startup(sel);
+    plank::downloader::spawn_watcher();
+    plank::download::ensure_model(sel)?;
+    eprintln!("plank: loading model {}...", model.display());
+    // With no explicit `-c`, the configured window is the DeepSeek default
+    // (131072 tokens, 14 GB of Gemma KV) and says nothing about this model:
+    // `0` lets the engine pick `min(32768, context_length)`.
+    let ctx = if cfg.ctx_size_explicit {
+        cfg.generation.ctx_size
+    } else {
+        0
+    };
+    let engine = GemmaEngine::open(&model, ctx).map_err(|e| e.to_string())?;
+    eprintln!("plank: model ready: {}", engine.model_name());
+    let reopen: plank::gpuyield::ReopenFn = Box::new(move || {
+        plank::gpuyield::check_model_files(vec![("model", model.as_path())])?;
+        GemmaEngine::open(&model, ctx)
+            .map(|e| Box::new(e) as Box<dyn Engine>)
+            .map_err(|e| e.to_string())
+    });
+    Ok((Box::new(engine), Some(reopen)))
 }
 
 /// Parses `plank remote <url> [--token <t>] [--resume-from <id>]` and runs the
@@ -1435,6 +1523,11 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         session_ctx_size: (cfg.session_ctx_size > 0).then_some(cfg.session_ctx_size),
         kv_budget_bytes: (cfg.kv_budget_bytes > 0).then_some(cfg.kv_budget_bytes),
     };
+    // The shared host is built on the ds4 engine's shared model; a Gemma model
+    // must not fall into its DeepSeek-sized gates and C open.
+    if selection_family_or_file(cfg) == plank::gguf::ModelFamily::Gemma {
+        return Err("--shared-engine does not support Gemma models yet".to_string());
+    }
     #[cfg(ds4_engine)]
     {
         use plank::config::Backend;
