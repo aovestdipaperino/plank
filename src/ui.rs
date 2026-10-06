@@ -23148,6 +23148,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A Gemma-dialect reply runs its tool through the ordinary dispatch path and
+    /// the result reaches the next pass as a `<tool_result>` user message — the
+    /// shape `GemmaEngine` renders as a `<|tool_response>` inside the model turn.
+    #[test]
+    fn a_gemma_tool_call_is_dispatched_and_its_result_fed_back() {
+        let dir = scratch_dir("gemma-turn");
+        std::fs::write(dir.join("hello.txt"), "hi from file\n").unwrap();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec![
+                "<|tool_call>call:read{path:<|\"|>hello.txt<|\"|>}<tool_call|>".to_string(),
+                "The file says hi.".to_string(),
+            ],
+            model: Some("Gemma 4 E4B".to_owned()),
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("read hello.txt"));
+        agent.run_turn().expect("turn runs");
+        let seen = prompts.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one pass per reply");
+        assert!(
+            seen[1].contains("<tool_result>Tool result 1 (read):"),
+            "{}",
+            seen[1]
+        );
+        assert!(seen[1].contains("hi from file"), "{}", seen[1]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `/rename` retargets later saves without disturbing what is already on
     /// disk: the old file stays resumable and the new name becomes a copy.
     #[test]

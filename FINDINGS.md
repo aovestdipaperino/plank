@@ -3327,3 +3327,56 @@ llama.cpp (commit `d7a695e`), pinned by
   residual take 44 ms and the q/k/v projections 13 ms, of a 105 ms
   synchronized step. Prefill runs at about 200 tok/s, and its MLP takes
   1.7 s of a 2.7 s chunk of 512 tokens.
+- **Backend: candle 0.9, not 0.11.** candle-core 0.11 hard-depends on
+  `tokenizers` with the `onig` feature, which is C. On 0.9 the tokenizer is
+  `tokenizers` 0.21 with `fancy-regex` only, so the tree compiles no C for
+  Gemma. `PLANK_NO_DS4=1` skips the ds4 C engine as well, and that build still
+  runs Gemma for real. The cargo feature `gemma` is on by default.
+- **No `QMatMul::embedding` in candle 0.9.2.** A token lookup into a quantized
+  table would dequantize the whole table. That table is the per-layer one,
+  262144 x 10752 in Q5K (about 2.8 billion values), so that is out of the
+  question. `QEmbedding` keeps the tensor's raw GGUF bytes and dequantizes
+  only the rows a lookup asks for, so the table costs only its quantized
+  size.
+- **Rotary tables are F32 on purpose.** The reference PR builds them in F16
+  through `general.dtype`, but E4B has no `general.dtype`, every activation
+  here is F32, and llama.cpp computes rope in F32. A logit disagreement with
+  llama.cpp would make the rotary dtype the first suspect, and the reference
+  test agrees at F32.
+- **The trained chat template wins over the docs' examples.** The GGUF's own
+  `tokenizer.chat_template` differs from the prompt-formatting examples in
+  three places. Thinking opens the system turn as `<|think|>\n`, with a
+  newline. A string tool response is `response:NAME{value:<|"|>…<|"|>}`, with
+  `value` as the key, not `output`. Declarations list `parameters` as
+  `{properties,required,type}`, with properties sorted and `type` last in
+  every object, so JSON order is wrong. `tests/gemma_parity.rs` pins all three
+  against a jinja2 rendering of the real template.
+- **Two template behaviours plank does not copy.** The template strips the
+  `<|channel>thought…<channel|>` block from every model turn before the last
+  user message. plank keeps it (Ruling 7), because stripping it changes a
+  turn's tokens once the next user message arrives, and every turn would then
+  re-prefill from the previous reply. After a tool response, with thinking
+  on, the template's generation prompt is `<|channel>thought\n`. plank adds
+  nothing there (Ruling 15), which keeps span rendering context-free. In the
+  Task 11 smoke runs, the model thought before its first tool call and never
+  opened a channel after a tool result. It went straight to the next call or
+  to the answer.
+- **The `<turn|>` closing a model turn is rendered by the next user
+  section**, not by the assistant span. Whether the turn closes depends on
+  what follows: a tool result continues it. Rendering it with the reply would
+  make a recorded span depend on its successor.
+- **Gemma's KV truncates exactly.** The sliding layers keep every position
+  rather than a ring buffer, so truncation is exact at any depth.
+  `kv_reuse_probe` therefore reports `live == common` (Ruling 14). A
+  divergence behind the live end is never the rebuild-from-zero shape that the
+  rung and fork rescue exist for.
+- **A warm walk must not adopt the checkpoint's transcript.** `set_kv`
+  restores a tier checkpoint during the walk. If it also replaced the warm
+  buffer with the checkpoint's transcript, `kvtier::warm` would append the
+  restored tiers again. The project tier would then be re-prefilled at every
+  launch, and the volatile tier would be doubled. `warm_pending`, set by
+  `warm_reset` until the walk's first append or sync, keeps the warm buffer.
+- **`PLANK_KV_DEBUG` names a file, not a switch.** `PLANK_KV_DEBUG=1` writes
+  a file called `1` into the working directory. On Gemma it logs one
+  `gemma reconcile:` line per render and one `gemma generate: prompt= live=
+  reused=` line per pass.

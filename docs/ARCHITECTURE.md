@@ -48,6 +48,7 @@ flowchart TD
     session[session + compact + sysprompt<br/>transcript, persistence]
     engine[engine::Engine trait]
     ds4[ds4engine + ffi<br/>real ds4 model]
+    gemma[gemmaengine<br/>Gemma 4, feature gemma]
     echo[EchoEngine<br/>stub]
     profile[profile.rs<br/>active --profile spec]
 
@@ -58,8 +59,10 @@ flowchart TD
     agent --> session
     agent --> engine
     engine --> ds4
+    engine --> gemma
     engine --> echo
     ds4 --> cengine[(refs/ds4 C engine<br/>Metal)]
+    gemma --> gcrate[(crates/gemma-engine<br/>candle: Metal or CPU)]
     profile -.-> session
     profile -.-> tools
     profile -.-> agent
@@ -122,8 +125,17 @@ Project-scoped `./.plank` is a different thing and is unaffected.
 ## Module reference
 
 ### Model families (`gguf.rs`, `engines.rs`, `trace_stream::syntax`)
-plank supports two model families and tells them apart three times, from three
+plank supports two DeepSeek model families and tells them apart three times, from three
 different sources, because each answer is needed at a different moment.
+
+A third family, Gemma 4 (`ModelFamily::Gemma`, `ToolSyntax::Gemma`,
+`.gemma.kv` transcripts), runs on its own engine rather than the C one.
+`gguf::family_of` recognises it by `general.architecture == "gemma4"`. For a
+catalog engine that has not been downloaded yet, the entry's
+`"family": "gemma"` hint (`gemma4-e4b`, `gemma4-12b`) does the same job,
+because there is no header to read. The dialect follows from the reported
+shape name (`Gemma 4 …`), as it does for the other families. See
+`docs/GEMMA.md`.
 
 The second family is DeepSeek V4.1 Flash. It is not a revision of V4 but a
 separate model: different weights, tokenizer and vision encoder, and its own
@@ -254,7 +266,7 @@ loop — with piped stdin there is no live input to multiplex.
 
 - `goal.rs` — `/goal` autonomous loop: iteration state, adjudication prompt, and verdict parsing. Pure logic; `ui.rs` drives it from both front ends.
 
-### Engine abstraction (`engine.rs`, `ds4engine.rs`, `ffi.rs`, `snapshot.rs`)
+### Engine abstraction (`engine.rs`, `ds4engine.rs`, `gemmaengine.rs`, `ffi.rs`, `snapshot.rs`)
 - `engine.rs` — the `Engine` trait (`generate` over `Prompt::{Flat, Structured}`,
   `warm_reset`/`warm_append`/`warm_sync`, `get_kv`/`set_kv`, `count_tokens`,
   `ctx_size`, plus `generate_aside` /
@@ -282,6 +294,29 @@ loop — with piped stdin there is no live input to multiplex.
   `ds4_session_eval_speculative_argmax` instead of one `ds4_session_eval` per
   token — the only entry point that consumes drafts, and the reason configuring
   the engine for speculation is not on its own enough to get any benefit from it.
+- `gemmaengine.rs` — `GemmaEngine`, Gemma 4 behind `Engine` (feature `gemma`,
+  default on). Unlike `Ds4Engine` it needs neither `refs/ds4` nor macOS, and
+  `make_local_engine` routes a Gemma-family model to it under either cfg. It
+  keeps the ds4 engine's transcript discipline: the leading sections that
+  match recorded spans keep their tokens verbatim, and only the rest is
+  rendered and tokenized. Gemma's KV truncates exactly, so a prompt that
+  diverges anywhere keeps the KV up to that token, and `kv_reuse_probe`
+  reports `live == common`. `ThinkTranslator` streams the
+  `<|channel>thought…<channel|>` block as `<think>…</think>`
+  (`Engine::emits_think_tags`). The format, the rulings and the v1 limits
+  are in `docs/GEMMA.md`.
+- `crates/gemma-engine` — the native-Rust Gemma 4 inference crate, on candle
+  0.9 (Metal on macOS, CPU elsewhere; no C anywhere in its tree).
+  `template.rs` is the pure chat format, compiled without the `candle`
+  feature so plank's tests cover it without a model. It renders each section
+  from its own text and the previous section's kind, and the `<turn|>`
+  closing a model turn is rendered by the next user section. `tokenizer.rs`
+  is the GGUF tokenizer, with trusted and plain encoding. `model.rs` is the
+  quantized forward pass, with a row-lookup `QEmbedding` for the per-layer
+  table. `kv.rs` is the prefix-truncatable KV, which keeps every position on
+  sliding layers. `session.rs` holds the live session, with chunked prefill
+  and truncate. `sample.rs` is the sampler. `tests/reference.rs` checks the
+  forward pass against llama.cpp; it is opt-in through `PLANK_GEMMA_GGUF`.
 - `snapshot.rs` — the safe KV snapshot primitive: `SessionSnapshot`
   (`capture`/`restore`/`as_bytes`/`restore_bytes`) over the FFI, plus an
   unconditional-restore `RestoreOnDrop` guard. Shared by `generate_aside`,
@@ -974,8 +1009,11 @@ wall clock beside the token totals.
 `build.rs` compiles the ds4 C engine from the `refs/ds4` submodule on macOS
 (Metal objects → `libds4core.a`), links Foundation + Metal, and emits the
 `ds4_engine` cfg. Off macOS, or without the submodule, the cfg is absent and
-plank builds with the `EchoEngine` only. The Metal kernel directory is baked in
-so the engine can locate its `.metal` sources at runtime.
+plank builds without the ds4 engine. `PLANK_NO_DS4=1` skips it even when the
+submodule is there. The Metal kernel directory is baked in so the engine can
+locate its `.metal` sources at runtime. The default `gemma` feature compiles
+`crates/gemma-engine` (candle, pure Rust) into every build, so a build without
+the C engine still runs Gemma for real.
 
 ## Testing
 

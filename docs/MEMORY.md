@@ -591,9 +591,12 @@ Three settings govern it, all under `memory` in settings.json:
   run. Anything below it, and any confident `No`, rejects the span.
 - **`memory.gateBias`** (object of `i32`, all `0` by default) — a per-family
   correction in percentage points added to `gatePercent`, keyed `ds4`,
-  `ds41` and `qwen`, measured by `/memory calibrate` (see "Letter bias"
-  below). The effective bar is `gatePercent + gateBias.<family>`, clamped to
-  0–100; each value is clamped to ±50 on load.
+  `ds41`, `qwen` and `gemma`, measured by `/memory calibrate` (see "Letter
+  bias" below). The effective bar is `gatePercent + gateBias.<family>`,
+  clamped to 0–100; each value is clamped to ±50 on load. The `gemma` key is
+  parsed and saved like the others but has nothing to correct yet:
+  `GemmaEngine` has no `decide`, so the gate cannot run on Gemma (see
+  `docs/GEMMA.md`).
 - **`memory.heldSpanCap`** (`u32`, default `0`) — see below.
 
 **Letter bias, and why it is calibrated offline.** `letter_mass` tells the
@@ -692,7 +695,7 @@ All under the `memory` and `tools` blocks in `~/.plank/settings.json` /
 | `tools.remember` | `true` | Whether the `remember`/`forget` tools are advertised to the model at all. Flipping it changes the system prompt and so churns the `fp1` fingerprint once. `/remember` and `/forget` are unaffected — they are user-typed commands, not model tool calls. |
 | `memory.gate` | `false` | Whether the System-1 gate (see above) runs before a span is enqueued. Off by default — no behavior change from before the gate existed. |
 | `memory.gatePercent` | `60` | The confidence threshold, as a percentage, a `Yes` verdict must clear for the pass to run; below it the span is rejected. Out-of-range values are clamped to 0–100 rather than rejected. |
-| `memory.gateBias` | `{}` (all `0`) | Per-family correction in percentage points (`ds4`, `ds41`, `qwen`) added to `gatePercent`, cancelling the family's prior toward the letter `yes` is shown under. Measured by `/memory calibrate`; hand-edit only. Each value is clamped to ±50 and the sum to 0–100. Written back only when non-zero. |
+| `memory.gateBias` | `{}` (all `0`) | Per-family correction in percentage points (`ds4`, `ds41`, `qwen`, `gemma`) added to `gatePercent`, cancelling the family's prior toward the letter `yes` is shown under. Measured by `/memory calibrate`; hand-edit only. Each value is clamped to ±50 and the sum to 0–100. Written back only when non-zero. |
 | `memory.heldSpanCap` | `0` | Transcript-depth span size past which the gate is bypassed and the pass runs unconditionally. `0` (the default) means a rejected span is finished outright rather than held for re-judging. |
 
 ## Cache accounting
