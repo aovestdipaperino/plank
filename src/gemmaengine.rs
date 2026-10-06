@@ -57,6 +57,12 @@ pub struct GemmaEngine {
     trusted_len: usize,
     /// `"metal"` or `"cpu"`: where the model runs.
     device_name: &'static str,
+    /// Set by `warm_reset` until the walk's first append or sync: the window
+    /// in which `kvtier` restores a tier checkpoint. A restore there keeps the
+    /// warm buffer, because the walk goes on to append every tier again —
+    /// restored ones included — and taking the checkpoint's own transcript
+    /// would hold those tiers twice.
+    warm_pending: bool,
 }
 
 /// Ids the decode loop and the stream translator look up once.
@@ -358,6 +364,7 @@ impl GemmaEngine {
             think: ThinkMode::default(),
             trusted_len: 0,
             device_name,
+            warm_pending: false,
         })
     }
 
@@ -385,6 +392,7 @@ impl GemmaEngine {
         self.session.truncate(0);
         self.transcript = TokenTranscript::new();
         self.kinds.clear();
+        self.warm_pending = false;
     }
 
     /// Prefills `toks` after the session's first `base` tokens (the session
@@ -463,6 +471,7 @@ impl Engine for GemmaEngine {
         greedy: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<GenerationStats, EngineError> {
+        self.warm_pending = false;
         self.reconcile(prompt.flat());
         let prefix = self.render().generation_prefix(&self.kinds);
         let mut full = to_u32(self.transcript.tokens());
@@ -559,6 +568,14 @@ impl Engine for GemmaEngine {
         true
     }
 
+    /// Reports the reusable prefix as the live end: `live == common`.
+    ///
+    /// Gemma's KV truncates exactly, so a prompt that diverges behind the live
+    /// end keeps every token up to the divergence and prefills only the rest.
+    /// That is never the rebuild-from-zero shape `KvReuse::rebuilds_from_zero`
+    /// describes (the ds4 sync's), which the agent answers by restoring a
+    /// ladder rung or fork snapshot and by skipping prompt suggestions.
+    /// Reporting the real session length would buy both for nothing.
     fn kv_reuse_probe(&mut self, transcript: &str, _think: ThinkMode) -> Option<KvReuse> {
         let render = self.render();
         let mut tokens = self.transcript.clone();
@@ -566,10 +583,10 @@ impl Engine for GemmaEngine {
         render.reconcile(&mut tokens, &mut kinds, transcript);
         let mut full = to_u32(tokens.tokens());
         full.extend(render.generation_prefix(&kinds));
-        let live = self.session.tokens();
+        let common = count(common_prefix(self.session.tokens(), &full));
         Some(KvReuse {
-            live: count(live.len()),
-            common: count(common_prefix(live, &full)),
+            live: common,
+            common,
         })
     }
 
@@ -598,8 +615,15 @@ impl Engine for GemmaEngine {
         ))
     }
 
+    /// Restores the session and, outside a warm walk, the transcript the
+    /// checkpoint was captured with. Inside one (right after `warm_reset`) the
+    /// warm buffer stays: the walk re-appends every tier, and `warm_sync`
+    /// matches it against the restored session's own tokens.
     fn set_kv(&mut self, cache: &KVCache) -> Result<(), EngineError> {
         self.session.restore(cache.kv()).map_err(engine_error)?;
+        if self.warm_pending {
+            return Ok(());
+        }
         self.transcript = cache.transcript().clone();
         self.kinds.clear();
         for span in self.transcript.spans() {
@@ -621,10 +645,12 @@ impl Engine for GemmaEngine {
         self.transcript = TokenTranscript::new();
         self.kinds.clear();
         self.reconcile(&format!("[system]\n{system}\n"));
+        self.warm_pending = true;
         Ok(())
     }
 
     fn warm_append(&mut self, text: Option<&str>) -> Result<(), EngineError> {
+        self.warm_pending = false;
         if let Some(text) = text {
             // Trimmed as `parse_sections` trims, so the span matches the
             // section the next turn's transcript carries.
@@ -639,6 +665,7 @@ impl Engine for GemmaEngine {
     }
 
     fn warm_sync(&mut self, on_event: &mut dyn FnMut(EngineEvent)) -> Result<bool, EngineError> {
+        self.warm_pending = false;
         let want = to_u32(self.transcript.tokens());
         self.check_fits(want.len())?;
         let common = common_prefix(self.session.tokens(), &want);
@@ -751,6 +778,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(usize::try_from(probe.common).unwrap(), live);
+    }
+
+    /// `kvtier::warm` with a two-tier hit: reset, restore the checkpoint taken
+    /// after `[sys, stable]`, then append every tier as the walk does. Each
+    /// tier is held once and only the volatile tier is prefilled.
+    #[test]
+    fn a_tier_restore_holds_each_tier_once() {
+        let mut first = engine();
+        first.warm_reset("sys").unwrap();
+        first.warm_append(Some("stable")).unwrap();
+        first.warm_sync(&mut |_| {}).unwrap();
+        let checkpoint = first.get_kv().unwrap();
+        assert_eq!(checkpoint.transcript().spans().len(), 2);
+
+        let mut e = engine();
+        e.warm_reset("sys").unwrap();
+        e.set_kv(&checkpoint).unwrap();
+        let restored = e.session.tokens().len();
+        e.warm_append(None).unwrap();
+        e.warm_append(Some("stable")).unwrap();
+        e.warm_append(Some("volatile")).unwrap();
+        let texts: Vec<&str> = e
+            .transcript
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(texts, ["sys", "stable", "volatile"]);
+        assert_eq!(e.kinds.len(), 3);
+        assert!(e.warm_sync(&mut |_| {}).unwrap());
+        let volatile = e.transcript.spans()[2].ntokens;
+        assert_eq!(e.session.tokens().len(), restored + volatile);
+        assert_eq!(to_u32(e.transcript.tokens()), e.session.tokens());
+    }
+
+    /// Outside a warm walk a restore brings back the checkpoint's transcript,
+    /// so a resumed session's spans match its KV.
+    #[test]
+    fn a_session_restore_takes_the_checkpoint_transcript() {
+        let mut a = engine();
+        run(&mut a, "[system]\nsys\n[user]\nhello\n");
+        let snap = a.get_kv().unwrap();
+        let mut b = engine();
+        b.set_kv(&snap).unwrap();
+        assert_eq!(b.transcript, a.transcript);
+        assert_eq!(b.kinds, a.kinds);
+    }
+
+    /// A prompt diverging behind the live end reports `live == common`: the
+    /// KV truncates there, so nothing rebuilds from zero.
+    #[test]
+    fn a_divergence_behind_the_live_end_is_not_a_rebuild() {
+        let mut e = engine();
+        run(&mut e, "[system]\nsys\n[user]\nhello\n");
+        let live = e.session.tokens().len();
+        let probe = e
+            .kv_reuse_probe("[system]\nsys\n[user]\nsomething else\n", ThinkMode::Off)
+            .unwrap();
+        assert_eq!(probe.live, probe.common);
+        assert!(usize::try_from(probe.common).unwrap() < live);
+        assert!(probe.common > 0 && !probe.rebuilds_from_zero());
     }
 
     /// The system turn carries `<|think|>` only while thinking is on, so a
