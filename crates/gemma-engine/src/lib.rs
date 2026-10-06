@@ -13,13 +13,12 @@ pub mod tokenizer;
 #[cfg(feature = "candle")]
 pub mod kv;
 
-// Temporarily commented out until created by later tasks:
-// #[cfg(feature = "candle")]
-// pub mod model;
-// #[cfg(feature = "candle")]
-// pub mod sample;
-// #[cfg(feature = "candle")]
-// pub mod session;
+#[cfg(feature = "candle")]
+pub mod model;
+#[cfg(feature = "candle")]
+pub mod sample;
+#[cfg(feature = "candle")]
+pub mod session;
 
 /// Every failure this crate reports. A message, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
