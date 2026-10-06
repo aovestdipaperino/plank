@@ -848,4 +848,105 @@ mod tests {
         out.push_str(&u.flush());
         assert_eq!(out, "<think>plan</think>Answer");
     }
+
+    fn stream(
+        e: &mut GemmaEngine,
+        flat: &str,
+        o: &GenerationOptions,
+    ) -> (String, GenerationStats, i32) {
+        let mut text = String::new();
+        let mut prefilled = 0;
+        let stats = e
+            .generate(
+                Prompt::Flat(flat),
+                o,
+                &|| false,
+                &|| false,
+                &mut |ev| match ev {
+                    EngineEvent::Text(t) => text.push_str(&t),
+                    EngineEvent::Prefill(p) => prefilled = prefilled.max(p.total),
+                    _ => {}
+                },
+            )
+            .unwrap();
+        (text, stats, prefilled)
+    }
+
+    /// Opt-in check on the real model: text streams, the reply ends on the
+    /// model's own `<turn|>`, and the next turn reuses the whole first one.
+    /// `PLANK_GEMMA_GGUF=~/.plank/models/gemma-4-E4B-it-Q4_K_M.gguf cargo test
+    /// --release --lib real_model_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the real model: set PLANK_GEMMA_GGUF"]
+    fn real_model_smoke() {
+        let Ok(path) = std::env::var("PLANK_GEMMA_GGUF") else {
+            return;
+        };
+        let t = std::time::Instant::now();
+        let mut e = GemmaEngine::open(Path::new(&path), 4096).unwrap();
+        eprintln!(
+            "open: {:.2?} on {} ({}, ctx {})",
+            t.elapsed(),
+            e.device_name(),
+            e.model_name(),
+            e.ctx_size()
+        );
+        e.set_think_mode(ThinkMode::Off);
+        let o = GenerationOptions {
+            n_predict: 64,
+            ctx_size: 4096,
+            temperature: 0.0,
+            think_mode: ThinkMode::Off,
+            ..GenerationOptions::default()
+        };
+        let t1 = "[system]\nYou are terse.\n[user]\nSay hello.\n";
+        let t = std::time::Instant::now();
+        let (text, stats, prefilled) = stream(&mut e, t1, &o);
+        eprintln!(
+            "turn 1: {text:?} — prefilled {prefilled}, generated {} at {:.1} tok/s, {:.2?} total",
+            stats.generated,
+            stats.tps,
+            t.elapsed()
+        );
+        assert!(!text.is_empty(), "nothing streamed");
+        assert!(
+            stats.generated < o.n_predict,
+            "the reply did not stop on its own"
+        );
+        assert_eq!(to_u32(e.transcript.tokens()), e.session.tokens());
+
+        let t2 = format!("{t1}[assistant]\n{text}\n[user]\nNow say goodbye.\n");
+        let probe = e.kv_reuse_probe(&t2, ThinkMode::Off).unwrap();
+        eprintln!("probe: live {} common {}", probe.live, probe.common);
+        assert_eq!(probe.common, probe.live, "turn 1 must be reused whole");
+        let t = std::time::Instant::now();
+        let (text2, stats2, prefilled2) = stream(&mut e, &t2, &o);
+        eprintln!(
+            "turn 2: {text2:?} — prefilled {prefilled2}, generated {} at {:.1} tok/s, {:.2?} total",
+            stats2.generated,
+            stats2.tps,
+            t.elapsed()
+        );
+
+        // Thinking on: the thought channel must stream as <think> tags.
+        let mut e = GemmaEngine::open(Path::new(&path), 4096).unwrap();
+        e.set_think_mode(ThinkMode::Medium);
+        let o = GenerationOptions {
+            n_predict: 512,
+            think_mode: ThinkMode::Medium,
+            ..o
+        };
+        let t = std::time::Instant::now();
+        let (text3, stats3, _) = stream(
+            &mut e,
+            "[system]\nYou are terse.\n[user]\nA bat and a ball cost 1.10 together; the bat costs 1.00 more than the ball. What does the ball cost?\n",
+            &o,
+        );
+        eprintln!(
+            "think on: {text3:?} — generated {} at {:.1} tok/s, {:.2?} total",
+            stats3.generated,
+            stats3.tps,
+            t.elapsed()
+        );
+    }
 }
