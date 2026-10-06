@@ -45,13 +45,19 @@ impl LayerKv {
         self.len = self.len.min(n);
     }
 
-    /// The live K/V, narrowed to `len` along the position axis, each copied
-    /// out of the growable buffer so later `append`s (which mutate that
-    /// buffer's storage in place via `slice_set`) can never change a tensor
-    /// already handed to a caller.
+    /// The live K/V: the growable buffers narrowed to `len` along the
+    /// position axis, without copying.
+    ///
+    /// The tensors share the buffers' storage, so they are valid only until
+    /// the next [`LayerKv::truncate`] followed by an [`LayerKv::append`]: that
+    /// append writes in place over positions the view still covers. An
+    /// append alone never changes them (it writes past `len`, or grows into
+    /// a fresh buffer and leaves the old one alone). The forward pass
+    /// consumes each view within the layer that took it, before anything
+    /// truncates; [`KvCache::to_bytes`] reads it back at once.
     ///
     /// # Errors
-    /// Propagates any candle error from narrowing or copying.
+    /// Propagates any candle error from narrowing.
     pub fn view(&self) -> Result<Option<(Tensor, Tensor)>> {
         let (Some(k), Some(v)) = (&self.k, &self.v) else {
             return Ok(None);
@@ -59,17 +65,7 @@ impl LayerKv {
         if self.len == 0 {
             return Ok(None);
         }
-        // `force_contiguous` always allocates a fresh, unaliased copy —
-        // unlike `contiguous`, which hands back the input unchanged (sharing
-        // storage) when it already happens to be contiguous. That edge case
-        // is real here: a narrow spanning the *whole* buffer (len == cap) is
-        // itself contiguous, so `contiguous` would return a tensor aliasing
-        // the live buffer, which the next `append`'s `slice_set` would then
-        // mutate out from under the caller. One copy is unavoidable for that
-        // guarantee, so this is the least copying that is still correct.
-        let k = k.narrow(2, 0, self.len)?.force_contiguous()?;
-        let v = v.narrow(2, 0, self.len)?.force_contiguous()?;
-        Ok(Some((k, v)))
+        Ok(Some((k.narrow(2, 0, self.len)?, v.narrow(2, 0, self.len)?)))
     }
 
     /// Append `n` new positions (read off dim 2 of `k`/`v`), growing the
@@ -390,9 +386,10 @@ mod tests {
     }
 
     #[test]
-    fn view_taken_at_full_capacity_does_not_change_after_growth() {
-        // Force len == cap (256) so the narrow is already contiguous — the
-        // edge case where a cheaper `.contiguous()` would alias storage.
+    fn view_taken_at_full_capacity_survives_growth() {
+        // At len == cap (256) the view spans the whole buffer; growing moves
+        // the live prefix into a fresh buffer and never writes the old one,
+        // so the view keeps its values.
         let mut l = LayerKv::default();
         for i in 0..256 {
             l.append(&kv(i as f32, 1), &kv(i as f32, 1)).unwrap();
@@ -403,6 +400,23 @@ mod tests {
         let after = k.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(before, after);
         assert_eq!(before.len(), 256);
+    }
+
+    #[test]
+    fn view_is_zero_copy_so_truncate_then_append_ends_its_validity() {
+        // `view()` hands out the buffer itself, not a copy: the decode hot
+        // path must never copy the whole cache per layer per step. The cost
+        // is the documented contract — after a truncate, the next append
+        // overwrites positions an older view still covers.
+        let mut l = LayerKv::default();
+        l.append(&kv(0.0, 4), &kv(0.0, 4)).unwrap();
+        let (k, _) = l.view().unwrap().unwrap();
+        l.truncate(2);
+        l.append(&kv(100.0, 2), &kv(100.0, 2)).unwrap();
+        assert_eq!(
+            k.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            [0.0, 1.0, 100.0, 101.0]
+        );
     }
 
     #[test]

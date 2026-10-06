@@ -16,6 +16,9 @@ pub mod kv;
 #[cfg(feature = "candle")]
 pub mod model;
 #[cfg(feature = "candle")]
+#[doc(hidden)]
+pub mod profile;
+#[cfg(feature = "candle")]
 pub mod sample;
 #[cfg(feature = "candle")]
 pub mod session;

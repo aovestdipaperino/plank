@@ -3306,3 +3306,24 @@ llama.cpp (commit `d7a695e`), pinned by
     `completion_probabilities[0].top_logprobs[].logprob`.
   - `/completion` returns generated ids only with `"return_tokens": true`, in
     `tokens`. The list includes the closing 106.
+- **Decode performance: never copy the cache per layer per step.** On Metal
+  (E4B Q4_K_M, `examples/bench_decode.rs`), decode fell from 18.4 tok/s at
+  32 tokens of context to 2.8 tok/s at 4096. Two copies of the whole live
+  cache, made in every layer of every step, caused it. One was
+  `LayerKv::view()`'s `force_contiguous()` (75 ms of a 331 ms synchronized
+  step at 2048). The other was `repeat_kv`'s `Tensor::cat` (133 ms). Candle's
+  strided copies on Metal are that slow, and dropping only the first copy
+  made things worse (`cat` of a strided narrow cost 330 ms). The fix has two
+  parts. `view()` is now a zero-copy `narrow`, valid until the next
+  truncate-then-append, and nothing truncates during a forward. Grouped-query
+  attention reshapes the query to `(kv_heads, n_rep * seq, d)` and multiplies
+  it against the un-repeated K/V; mlx gemm takes the narrowed, strided K/V
+  directly. A decode step also skips the mask, because after the window
+  narrowing every key is visible, and a prefill builds one mask per layer
+  type. Decode is now 20.9 tok/s at 32 tokens and 19.0 at 4096. The logits
+  are bit-identical to the old code on Metal, through a 1100-token
+  three-chunk prefill, 8 steps, and a truncate and re-prefill. What remains
+  is weight-bound and does not depend on N: the MLP and the per-layer
+  residual take 44 ms and the q/k/v projections 13 ms, of a 105 ms
+  synchronized step. Prefill runs at about 200 tok/s, and its MLP takes
+  1.7 s of a 2.7 s chunk of 512 tokens.

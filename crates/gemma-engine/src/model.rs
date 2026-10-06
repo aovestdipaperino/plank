@@ -9,8 +9,12 @@
 //! - candle 0.9.2 has no `QMatMul::embedding`, so [`QEmbedding`] looks rows
 //!   up in the raw quantized bytes, dequantizing only the rows it returns.
 //! - The PR's ring/concat KV caches are gone: attention appends to and reads
-//!   from [`crate::kv::LayerKv`], which keeps every position, so sliding
-//!   layers mask on every forward, decode steps included.
+//!   a zero-copy view of [`crate::kv::LayerKv`], which keeps every position.
+//! - Grouped-query attention stacks each KV head's query heads along the row
+//!   axis instead of repeating K/V (`repeat_kv`), so no step copies the cache.
+//! - A single-token forward needs no mask (after the window narrowing below
+//!   every remaining key is visible); a multi-token forward builds one mask
+//!   per layer type, shared by every layer of that type.
 //! - Weights are split from state: [`Model`] is immutable and `forward` takes
 //!   the caller's [`KvCache`].
 //! - Rotary tables cover `min(context_length, ctx_cap)` positions.
@@ -35,15 +39,8 @@ use candle_nn::Activation;
 use sha2::{Digest, Sha256};
 
 use crate::kv::{KvCache, LayerKv};
+use crate::profile;
 use crate::tokenizer::GemmaTokenizer;
-
-fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        return Ok(x);
-    }
-    let (batch, heads, sequence, dim) = x.dims4()?;
-    Tensor::cat(&vec![&x; n_rep], 2)?.reshape((batch, heads * n_rep, sequence, dim))
-}
 
 /// A crate error as a candle one, inside the candle-typed internals.
 #[allow(clippy::needless_pass_by_value)] // shaped for `map_err`
@@ -444,6 +441,51 @@ impl RotaryEmbedding {
     }
 }
 
+/// One forward's attention masks, built by the first layer of each type
+/// that needs one: every sliding layer of a forward shares a mask, and so does
+/// every global layer.
+struct Masks {
+    sliding_window: usize,
+    sliding: Option<Tensor>,
+    global: Option<Tensor>,
+}
+
+impl Masks {
+    fn new(sliding_window: usize) -> Self {
+        Self {
+            sliding_window,
+            sliding: None,
+            global: None,
+        }
+    }
+
+    /// The mask for `sequence` queries at `offset` over keys
+    /// `start..stored`, which every layer of one type and one forward shares.
+    fn get(
+        &mut self,
+        is_sliding: bool,
+        (sequence, offset): (usize, usize),
+        (start, stored): (usize, usize),
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let window = is_sliding.then_some(self.sliding_window);
+        let slot = if is_sliding {
+            &mut self.sliding
+        } else {
+            &mut self.global
+        };
+        if let Some(mask) = slot {
+            return Ok(mask.clone());
+        }
+        let mask = profile::region("mask", device, || {
+            let key_positions: Vec<usize> = (start..stored).collect();
+            attention_mask(sequence, offset, &key_positions, window, device, dtype)
+        })?;
+        Ok(slot.insert(mask).clone())
+    }
+}
+
 struct Attention {
     query: QMatMul,
     key: Option<QMatMul>,
@@ -531,14 +573,13 @@ impl Attention {
         })
     }
 
-    fn forward(
+    /// The rotated query and, for a KV owner, the normed and rotated key
+    /// and the normed value, each `[batch, heads, sequence, head_dim]`.
+    fn project(
         &self,
         hidden: &Tensor,
         offset: usize,
-        cache: &mut LayerKv,
-        device: &Device,
-        sliding_window: usize,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<Tensor>, Option<Tensor>)> {
         let (batch, sequence, _) = hidden.dims3()?;
         let query = self
             .query
@@ -579,14 +620,35 @@ impl Attention {
             .map(|value| value_norm(&value, self.rms_norm_eps))
             .transpose()?;
         let (query, key) = self.rotary.apply(&query, key.as_ref(), offset)?;
+        Ok((query, key, value))
+    }
+
+    fn forward(
+        &self,
+        hidden: &Tensor,
+        offset: usize,
+        cache: &mut LayerKv,
+        masks: &mut Masks,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let (batch, sequence, _) = hidden.dims3()?;
+        let (query, key, value) =
+            profile::region("attn.qkv", device, || self.project(hidden, offset))?;
         // Owners extend their cache; sharers read their owner's, which the
         // owner (an earlier layer) already extended in this forward.
-        match (key, value) {
-            (Some(key), Some(value)) => cache.append(&key, &value).map_err(candle_err)?,
-            (None, None) => {}
-            _ => candle_core::bail!("Gemma 4 key and value ownership differ"),
-        }
-        let Some((key, value)) = cache.view().map_err(candle_err)? else {
+        profile::region("kv.append", device, || {
+            match (key, value) {
+                (Some(key), Some(value)) => cache.append(&key, &value).map_err(candle_err)?,
+                (None, None) => {}
+                _ => candle_core::bail!("Gemma 4 key and value ownership differ"),
+            }
+            Ok(())
+        })?;
+        // Zero-copy, so only valid until the cache is next truncated: it is
+        // consumed within this layer, and nothing truncates during a forward.
+        let Some((key, value)) =
+            profile::region("kv.view", device, || cache.view().map_err(candle_err))?
+        else {
             candle_core::bail!("Gemma 4 shared KV cache is empty")
         };
         let stored = key.dim(2)?;
@@ -598,9 +660,10 @@ impl Attention {
         }
         // The cache keeps every position. A sliding layer's earliest query
         // (at `offset`) sees no key before `offset + 1 - window`, so the
-        // keys before that are dropped here; the mask still runs below.
+        // keys before that are dropped here; a multi-token forward still
+        // masks below.
         let start = if self.is_sliding {
-            (offset + 1).saturating_sub(sliding_window)
+            (offset + 1).saturating_sub(masks.sliding_window)
         } else {
             0
         };
@@ -612,28 +675,46 @@ impl Attention {
         } else {
             (key, value)
         };
-        let key_positions: Vec<usize> = (start..stored).collect();
-        let key = repeat_kv(key, self.heads / self.kv_heads)?.contiguous()?;
-        let value = repeat_kv(value, self.heads / self.kv_heads)?.contiguous()?;
-        let mut scores = query.matmul(&key.transpose(2, 3)?)?;
-        if self.is_sliding || sequence > 1 {
-            let mask = attention_mask(
-                sequence,
-                offset,
-                &key_positions,
-                self.is_sliding.then_some(sliding_window),
+        // Grouped-query attention without materializing repeated K/V: query
+        // head `h` reads KV head `h / n_rep`, so the `n_rep` query heads of one
+        // KV head are stacked along the row axis and multiplied against that
+        // head's K/V once. Every score is the same dot product as before.
+        let n_rep = self.heads / self.kv_heads;
+        let keys = stored - start;
+        let mut scores = profile::region("attn.qk", device, || {
+            query
+                .reshape((batch, self.kv_heads, n_rep * sequence, self.head_dim))?
+                .matmul(&key.transpose(2, 3)?)?
+                .reshape((batch, self.heads, sequence, keys))
+        })?;
+        // A single query sees every key left after the window narrowing
+        // above (its own position and the `window - 1` before it), so only a
+        // multi-token forward needs a mask. That mask depends only on the
+        // layer type, so each type builds it once per forward.
+        if sequence > 1 {
+            let mask = masks.get(
+                self.is_sliding,
+                (sequence, offset),
+                (start, stored),
                 device,
                 scores.dtype(),
             )?;
-            scores = scores.broadcast_add(&mask)?;
+            scores = profile::region("mask.add", device, || scores.broadcast_add(&mask))?;
         }
-        let probabilities = candle_nn::ops::softmax_last_dim(&scores)?;
-        let context = probabilities.matmul(&value)?.transpose(1, 2)?.reshape((
-            batch,
-            sequence,
-            self.heads * self.head_dim,
-        ))?;
-        self.output.forward(&context)
+        let context = profile::region("attn.softmax_pv", device, || {
+            let probabilities = candle_nn::ops::softmax_last_dim(&scores)?.reshape((
+                batch,
+                self.kv_heads,
+                n_rep * sequence,
+                keys,
+            ))?;
+            probabilities
+                .matmul(&value)?
+                .reshape((batch, self.heads, sequence, self.head_dim))?
+                .transpose(1, 2)?
+                .reshape((batch, sequence, self.heads * self.head_dim))
+        })?;
+        profile::region("attn.out", device, || self.output.forward(&context))
     }
 }
 
@@ -791,40 +872,42 @@ impl Layer {
         per_layer_input: &Tensor,
         offset: usize,
         cache: &mut LayerKv,
+        masks: &mut Masks,
         device: &Device,
-        sliding_window: usize,
     ) -> Result<Tensor> {
         let attention = self.attention.forward(
             &self.attention_norm.forward(hidden)?,
             offset,
             cache,
+            masks,
             device,
-            sliding_window,
         )?;
-        let attention = self.post_attention_norm.forward(&attention)?;
-        let hidden = (hidden + attention)?;
-        let mlp = self.mlp.forward(&self.ffn_norm.forward(&hidden)?)?;
-        let mlp = self.post_ffn_norm.forward(&mlp)?;
-        let hidden = (hidden + mlp)?;
-        let hidden = match (
-            &self.per_layer_input_gate,
-            &self.per_layer_projection,
-            &self.per_layer_post_norm,
-        ) {
-            (Some(input_gate), Some(projection), Some(post_norm)) => {
-                let gated_input = input_gate
-                    .forward(&hidden)?
-                    .apply(&Activation::GeluPytorchTanh)?;
-                let per_layer_output = projection.forward(&(gated_input * per_layer_input)?)?;
-                hidden + post_norm.forward(&per_layer_output)?
+        profile::region("layer.rest", device, || {
+            let attention = self.post_attention_norm.forward(&attention)?;
+            let hidden = (hidden + attention)?;
+            let mlp = self.mlp.forward(&self.ffn_norm.forward(&hidden)?)?;
+            let mlp = self.post_ffn_norm.forward(&mlp)?;
+            let hidden = (hidden + mlp)?;
+            let hidden = match (
+                &self.per_layer_input_gate,
+                &self.per_layer_projection,
+                &self.per_layer_post_norm,
+            ) {
+                (Some(input_gate), Some(projection), Some(post_norm)) => {
+                    let gated_input = input_gate
+                        .forward(&hidden)?
+                        .apply(&Activation::GeluPytorchTanh)?;
+                    let per_layer_output = projection.forward(&(gated_input * per_layer_input)?)?;
+                    hidden + post_norm.forward(&per_layer_output)?
+                }
+                (None, None, None) => Ok(hidden),
+                _ => candle_core::bail!("Gemma 4 per-layer residual tensors are incomplete"),
+            }?;
+            match &self.output_scale {
+                Some(output_scale) => hidden.broadcast_mul(output_scale),
+                None => Ok(hidden),
             }
-            (None, None, None) => Ok(hidden),
-            _ => candle_core::bail!("Gemma 4 per-layer residual tensors are incomplete"),
-        }?;
-        match &self.output_scale {
-            Some(output_scale) => hidden.broadcast_mul(output_scale),
-            None => Ok(hidden),
-        }
+        })
     }
 }
 
@@ -1039,7 +1122,10 @@ impl Model {
                 self.kv_shape.len()
             )
         }
-        let (mut hidden, per_layer_inputs) = self.embeddings.forward(tokens, &self.device)?;
+        let (mut hidden, per_layer_inputs) = profile::region("embed", &self.device, || {
+            self.embeddings.forward(tokens, &self.device)
+        })?;
+        let mut masks = Masks::new(self.sliding_window);
         for (index, layer) in self.layers.iter().enumerate() {
             let per_layer_input = per_layer_inputs.narrow(2, index, 1)?.squeeze(2)?;
             hidden = layer.forward(
@@ -1047,15 +1133,17 @@ impl Model {
                 &per_layer_input,
                 offset,
                 &mut cache.layers[layer.attention.cache_index],
+                &mut masks,
                 &self.device,
-                self.sliding_window,
             )?;
         }
-        let sequence = hidden.dim(1)?;
-        let hidden = self.norm.forward(&hidden.narrow(1, sequence - 1, 1)?)?;
-        let logits = self.output.forward(&hidden)?.squeeze(1)?;
-        let logits = ((logits / self.final_logit_softcap)?.tanh()? * self.final_logit_softcap)?;
-        logits.squeeze(0)?.to_dtype(DType::F32)?.to_vec1::<f32>()
+        profile::region("head", &self.device, || {
+            let sequence = hidden.dim(1)?;
+            let hidden = self.norm.forward(&hidden.narrow(1, sequence - 1, 1)?)?;
+            let logits = self.output.forward(&hidden)?.squeeze(1)?;
+            let logits = ((logits / self.final_logit_softcap)?.tanh()? * self.final_logit_softcap)?;
+            logits.squeeze(0)?.to_dtype(DType::F32)?.to_vec1::<f32>()
+        })
     }
 }
 
