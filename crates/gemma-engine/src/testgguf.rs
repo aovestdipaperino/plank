@@ -20,10 +20,16 @@ pub struct TinyConfig {
     pub hidden: usize,
     pub heads: usize,
     pub kv_heads: usize,
+    /// Head dim of the global layers (`key_length`).
     pub head_dim: usize,
+    /// Head dim of the sliding layers (`key_length_swa`), distinct by default
+    /// because the real model's are (512 vs 256).
+    pub swa_head_dim: usize,
     pub sliding_window: usize,
     pub shared_kv_layers: usize,
     pub context: usize,
+    /// `embedding_length_per_layer_input`; `0` writes no per-layer tensors.
+    pub per_layer_dim: usize,
     pub seed: u64,
 }
 
@@ -35,9 +41,11 @@ impl Default for TinyConfig {
             heads: 2,
             kv_heads: 1,
             head_dim: 16,
+            swa_head_dim: 8,
             sliding_window: 4,
             shared_kv_layers: 2,
-            context: 256,
+            context: 4096,
+            per_layer_dim: 8,
             seed: 7,
         }
     }
@@ -125,7 +133,7 @@ pub fn tiny_metadata(cfg: &TinyConfig) -> Result<Vec<(String, gguf_file::Value)>
         ("gemma4.attention.head_count", u(cfg.heads)?),
         ("gemma4.attention.head_count_kv", u(cfg.kv_heads)?),
         ("gemma4.attention.key_length", u(cfg.head_dim)?),
-        ("gemma4.attention.key_length_swa", u(cfg.head_dim)?),
+        ("gemma4.attention.key_length_swa", u(cfg.swa_head_dim)?),
         ("gemma4.attention.layer_norm_rms_epsilon", V::F32(1e-6)),
         ("gemma4.rope.freq_base", V::F32(1e6)),
         ("gemma4.rope.freq_base_swa", V::F32(1e4)),
@@ -141,7 +149,10 @@ pub fn tiny_metadata(cfg: &TinyConfig) -> Result<Vec<(String, gguf_file::Value)>
             "gemma4.attention.shared_kv_layers",
             u(cfg.shared_kv_layers)?,
         ),
-        ("gemma4.embedding_length_per_layer_input", V::U32(0)),
+        (
+            "gemma4.embedding_length_per_layer_input",
+            u(cfg.per_layer_dim)?,
+        ),
         ("tokenizer.ggml.model", V::String("gemma4".into())),
         (
             "tokenizer.ggml.tokens",
@@ -188,32 +199,43 @@ impl Rng {
     }
 }
 
-/// Normal weights scaled by 0.02; `quantize` narrows them to f32.
-fn random(rng: &mut Rng, shape: &[usize]) -> Result<QTensor> {
+/// Normal weights scaled by 0.02, stored as `dtype`.
+fn random_as(rng: &mut Rng, shape: &[usize], dtype: GgmlDType) -> Result<QTensor> {
     let n = shape.iter().product();
     let data: Vec<f64> = (0..n).map(|_| rng.normal() * 0.02).collect();
-    let t = Tensor::from_vec(data, shape, &Device::Cpu)?;
+    let t = Tensor::from_vec(data, shape, &Device::Cpu)?.to_dtype(candle_core::DType::F32)?;
+    Ok(QTensor::quantize(&t, dtype)?)
+}
+
+/// Normal weights scaled by 0.02, stored as f32.
+fn random(rng: &mut Rng, shape: &[usize]) -> Result<QTensor> {
+    random_as(rng, shape, GgmlDType::F32)
+}
+
+fn filled(shape: &[usize], value: f64) -> Result<QTensor> {
+    let t = (Tensor::ones(shape, candle_core::DType::F32, &Device::Cpu)? * value)?;
     Ok(QTensor::quantize(&t, GgmlDType::F32)?)
 }
 
 fn ones(shape: &[usize]) -> Result<QTensor> {
-    let t = Tensor::ones(shape, candle_core::DType::F32, &Device::Cpu)?;
-    Ok(QTensor::quantize(&t, GgmlDType::F32)?)
+    filled(shape, 1.0)
 }
 
 /// Every tensor [`write_tiny`] writes, in order, in candle shape order.
+///
+/// Sliding layers use `swa_head_dim`, global layers `head_dim`, as in the
+/// real model. With `per_layer_dim > 0` the per-layer input tensors are
+/// written in the real file's types where candle can quantize them: the
+/// per-layer token table as `Q8_0` (when its rows are whole `Q8_0` blocks, else
+/// f32), the model projection as BF16, gates and projections as f32.
 ///
 /// # Errors
 /// When candle fails to build a tensor.
 pub fn tiny_tensors(cfg: &TinyConfig) -> Result<Vec<(String, QTensor)>> {
     let mut rng = Rng(cfg.seed);
     let vocab = tiny_vocab().0.len();
-    let (h, q, kv, ff) = (
-        cfg.hidden,
-        cfg.heads * cfg.head_dim,
-        cfg.kv_heads * cfg.head_dim,
-        4 * cfg.hidden,
-    );
+    let (h, ff, pl) = (cfg.hidden, 4 * cfg.hidden, cfg.per_layer_dim);
+    let pl_all = cfg.layers * pl;
     let mut out = vec![
         (
             "token_embd.weight".to_string(),
@@ -222,8 +244,31 @@ pub fn tiny_tensors(cfg: &TinyConfig) -> Result<Vec<(String, QTensor)>> {
         ("rope_freqs.weight".to_string(), ones(&[cfg.head_dim / 2])?),
         ("output_norm.weight".to_string(), ones(&[h])?),
     ];
+    if pl > 0 {
+        let table = if pl_all.is_multiple_of(32) {
+            GgmlDType::Q8_0
+        } else {
+            GgmlDType::F32
+        };
+        out.push((
+            "per_layer_token_embd.weight".to_string(),
+            random_as(&mut rng, &[vocab, pl_all], table)?,
+        ));
+        out.push((
+            "per_layer_model_proj.weight".to_string(),
+            random_as(&mut rng, &[pl_all, h], GgmlDType::BF16)?,
+        ));
+        out.push(("per_layer_proj_norm.weight".to_string(), ones(&[pl])?));
+    }
+    let sliding = sliding_pattern(cfg);
     let kv_layers = cfg.layers - cfg.shared_kv_layers;
-    for i in 0..cfg.layers {
+    for (i, &is_sliding) in sliding.iter().enumerate() {
+        let hd = if is_sliding {
+            cfg.swa_head_dim
+        } else {
+            cfg.head_dim
+        };
+        let (q, kv) = (cfg.heads * hd, cfg.kv_heads * hd);
         let p = |name: &str| format!("blk.{i}.{name}.weight");
         out.push((p("attn_q"), random(&mut rng, &[q, h])?));
         if i < kv_layers {
@@ -231,8 +276,8 @@ pub fn tiny_tensors(cfg: &TinyConfig) -> Result<Vec<(String, QTensor)>> {
             out.push((p("attn_v"), random(&mut rng, &[kv, h])?));
         }
         out.push((p("attn_output"), random(&mut rng, &[h, q])?));
-        out.push((p("attn_q_norm"), ones(&[cfg.head_dim])?));
-        out.push((p("attn_k_norm"), ones(&[cfg.head_dim])?));
+        out.push((p("attn_q_norm"), ones(&[hd])?));
+        out.push((p("attn_k_norm"), ones(&[hd])?));
         for norm in [
             "attn_norm",
             "post_attention_norm",
@@ -244,6 +289,12 @@ pub fn tiny_tensors(cfg: &TinyConfig) -> Result<Vec<(String, QTensor)>> {
         out.push((p("ffn_gate"), random(&mut rng, &[ff, h])?));
         out.push((p("ffn_up"), random(&mut rng, &[ff, h])?));
         out.push((p("ffn_down"), random(&mut rng, &[h, ff])?));
+        if pl > 0 {
+            out.push((p("inp_gate"), random(&mut rng, &[pl, h])?));
+            out.push((p("proj"), random(&mut rng, &[h, pl])?));
+            out.push((p("post_norm"), ones(&[h])?));
+        }
+        out.push((p("layer_output_scale"), filled(&[1], 0.75)?));
     }
     Ok(out)
 }
@@ -314,6 +365,19 @@ mod tests {
         assert_eq!(dims("blk.0.ffn_down.weight"), [32, 128]);
         assert_eq!(dims("blk.1.attn_k.weight"), [16, 32]);
         assert!(!ct.tensor_infos.contains_key("blk.2.attn_k.weight"));
+        // Sliding layers take `swa_head_dim` (8), global ones `head_dim` (16).
+        assert_eq!(dims("blk.0.attn_q.weight"), [16, 32]);
+        assert_eq!(dims("blk.1.attn_q.weight"), [32, 32]);
+        assert_eq!(dims("blk.0.attn_q_norm.weight"), [8]);
+        assert_eq!(dims("per_layer_token_embd.weight"), [vocab, 32]);
+        assert_eq!(
+            ct.tensor_infos["per_layer_token_embd.weight"].ggml_dtype,
+            GgmlDType::Q8_0
+        );
+        assert_eq!(
+            ct.tensor_infos["per_layer_model_proj.weight"].ggml_dtype,
+            GgmlDType::BF16
+        );
         let pattern: Vec<bool> = ct.metadata["gemma4.attention.sliding_window_pattern"]
             .to_vec()
             .unwrap()
