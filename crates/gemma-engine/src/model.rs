@@ -675,17 +675,8 @@ impl Attention {
         } else {
             (key, value)
         };
-        // Grouped-query attention without materializing repeated K/V: query
-        // head `h` reads KV head `h / n_rep`, so the `n_rep` query heads of one
-        // KV head are stacked along the row axis and multiplied against that
-        // head's K/V once. Every score is the same dot product as before.
-        let n_rep = self.heads / self.kv_heads;
-        let keys = stored - start;
         let mut scores = profile::region("attn.qk", device, || {
-            query
-                .reshape((batch, self.kv_heads, n_rep * sequence, self.head_dim))?
-                .matmul(&key.transpose(2, 3)?)?
-                .reshape((batch, self.heads, sequence, keys))
+            gqa_scores(&query, &key, self.kv_heads)
         })?;
         // A single query sees every key left after the window narrowing
         // above (its own position and the `window - 1` before it), so only a
@@ -702,20 +693,46 @@ impl Attention {
             scores = profile::region("mask.add", device, || scores.broadcast_add(&mask))?;
         }
         let context = profile::region("attn.softmax_pv", device, || {
-            let probabilities = candle_nn::ops::softmax_last_dim(&scores)?.reshape((
-                batch,
-                self.kv_heads,
-                n_rep * sequence,
-                keys,
-            ))?;
-            probabilities
-                .matmul(&value)?
-                .reshape((batch, self.heads, sequence, self.head_dim))?
+            let probabilities = candle_nn::ops::softmax_last_dim(&scores)?;
+            gqa_context(&probabilities, &value, self.kv_heads)?
                 .transpose(1, 2)?
                 .reshape((batch, sequence, self.heads * self.head_dim))
         })?;
         profile::region("attn.out", device, || self.output.forward(&context))
     }
+}
+
+/// Grouped-query attention scores without materializing repeated K/V.
+///
+/// `query` is `[batch, heads, sequence, head_dim]` and `key`
+/// `[batch, kv_heads, keys, head_dim]`. Query head `h` reads KV head
+/// `h / n_rep` (`repeat_kv` semantics, `n_rep = heads / kv_heads`), so the
+/// `n_rep` query heads of one KV head are adjacent: stacking them along the
+/// row axis multiplies them against that head's K once. Returns
+/// `[batch, heads, sequence, keys]`, each entry the same dot product a
+/// repeated-K/V attention would compute.
+fn gqa_scores(query: &Tensor, key: &Tensor, kv_heads: usize) -> Result<Tensor> {
+    let (batch, heads, sequence, head_dim) = query.dims4()?;
+    let keys = key.dim(2)?;
+    let n_rep = heads / kv_heads;
+    query
+        .reshape((batch, kv_heads, n_rep * sequence, head_dim))?
+        .matmul(&key.transpose(2, 3)?)?
+        .reshape((batch, heads, sequence, keys))
+}
+
+/// The value side of [`gqa_scores`]: `probabilities`
+/// `[batch, heads, sequence, keys]` against `value`
+/// `[batch, kv_heads, keys, head_dim]`, with the same `h / n_rep` grouping.
+/// Returns `[batch, heads, sequence, head_dim]`.
+fn gqa_context(probabilities: &Tensor, value: &Tensor, kv_heads: usize) -> Result<Tensor> {
+    let (batch, heads, sequence, keys) = probabilities.dims4()?;
+    let head_dim = value.dim(3)?;
+    let n_rep = heads / kv_heads;
+    probabilities
+        .reshape((batch, kv_heads, n_rep * sequence, keys))?
+        .matmul(value)?
+        .reshape((batch, heads, sequence, head_dim))
 }
 
 struct Mlp {
@@ -1529,6 +1546,82 @@ mod tests {
 
     fn set(md: &mut [(String, gguf_file::Value)], key: &str, value: gguf_file::Value) {
         md.iter_mut().find(|(k, _)| k == key).unwrap().1 = value;
+    }
+
+    /// The naive `repeat_kv` reference for one side of attention: row `r` of
+    /// query head `h` against every row of KV head `h / n_rep`, one scalar
+    /// at a time. `pair` is the dot product (scores) or the weighted sum
+    /// (context).
+    fn naive_gqa(
+        rows: &[Vec<Vec<f32>>],
+        kv: &[Vec<Vec<f32>>],
+        pair: impl Fn(&[f32], &[Vec<f32>]) -> Vec<f32>,
+    ) -> Vec<Vec<Vec<f32>>> {
+        let n_rep = rows.len() / kv.len();
+        rows.iter()
+            .enumerate()
+            .map(|(h, head)| head.iter().map(|row| pair(row, &kv[h / n_rep])).collect())
+            .collect()
+    }
+
+    fn nested(t: &Tensor) -> Vec<Vec<Vec<f32>>> {
+        t.squeeze(0).unwrap().to_vec3::<f32>().unwrap()
+    }
+
+    fn assert_close(got: &[Vec<Vec<f32>>], want: &[Vec<Vec<f32>>], what: &str) {
+        let flat = |t: &[Vec<Vec<f32>>]| t.iter().flatten().flatten().copied().collect::<Vec<_>>();
+        let (g, w) = (flat(got), flat(want));
+        assert_eq!(g.len(), w.len(), "{what}: shape");
+        assert!(
+            g.iter().zip(&w).all(|(x, y)| (x - y).abs() < 1e-5),
+            "{what}: got {got:?}, want {want:?}"
+        );
+    }
+
+    /// Every shipping model is GQA (E4B: 8 query heads over 2 KV heads), and
+    /// the tiny config's single KV head cannot tell a wrong grouping apart.
+    /// 4 query heads over 2 KV heads, with distinct values everywhere, pin
+    /// `h / n_rep`: grouping by `h % kv_heads` pairs heads 1 and 2 with the
+    /// wrong KV head and fails both comparisons.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn gqa_groups_query_head_h_with_kv_head_h_over_n_rep() {
+        let (heads, kv_heads, sequence, keys, head_dim) = (4, 2, 3, 5, 4);
+        let tensor = |dims: (usize, usize, usize, usize), scale: f32, shift: f32| {
+            let n = dims.0 * dims.1 * dims.2 * dims.3;
+            let data = (0..n)
+                .map(|i| (i as f32).mul_add(scale, shift).sin())
+                .collect();
+            Tensor::from_vec(data, dims, &Device::Cpu).unwrap()
+        };
+        let q = tensor((1, heads, sequence, head_dim), 0.37, 0.1);
+        let k = tensor((1, kv_heads, keys, head_dim), 0.53, 0.7);
+        let v = tensor((1, kv_heads, keys, head_dim), 0.29, 1.3);
+        // Arbitrary (non-softmax) weights: the grouping is linear, so any
+        // weights tell a wrong pairing apart.
+        let p = tensor((1, heads, sequence, keys), 0.41, 2.1);
+
+        let want_scores = naive_gqa(&nested(&q), &nested(&k), |row, kh| {
+            kh.iter()
+                .map(|key| row.iter().zip(key).map(|(a, b)| a * b).sum())
+                .collect()
+        });
+        assert_close(
+            &nested(&gqa_scores(&q, &k, kv_heads).unwrap()),
+            &want_scores,
+            "scores",
+        );
+
+        let want_context = naive_gqa(&nested(&p), &nested(&v), |weights, vh| {
+            (0..head_dim)
+                .map(|d| weights.iter().zip(vh).map(|(w, val)| w * val[d]).sum())
+                .collect()
+        });
+        assert_close(
+            &nested(&gqa_context(&p, &v, kv_heads).unwrap()),
+            &want_context,
+            "context",
+        );
     }
 
     #[test]
