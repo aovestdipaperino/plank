@@ -3248,3 +3248,61 @@ number. `viz.rs::scan_dsml_tag` mirrors all of it, or the call would run with
 no banner. Not accepted: a closer cut short (`</para`), which is token damage
 rather than a spelling.
 
+
+## Gemma 4 (native Rust engine)
+
+**2026-10-06:** facts about `gemma-4-E4B-it-Q4_K_M.gguf` (unsloth, sha256
+`85a896a0…1fab87`) and about checking `crates/gemma-engine` against
+llama.cpp (commit `d7a695e`), pinned by
+`crates/gemma-engine/tests/reference.rs`.
+
+- **GGUF facts.** `general.architecture` and `tokenizer.ggml.model` are both
+  `gemma4`. BOS is 2 and `add_bos_token` is true. EOS is 106, which is
+  `<turn|>`. The control ids are `<|turn>` 105, `<turn|>` 106, `<|think|>` 98,
+  `<|channel>` 100, `<channel|>` 101, `<|tool>` 46, `<tool|>` 47,
+  `<|tool_call>` 48, `<tool_call|>` 49, `<|tool_response>` 50,
+  `<tool_response|>` 51 and `<|"|>` 52. The file has 42 blocks; the last 18
+  share KV, so blocks 22 (sliding) and 23 (global) own the caches the shared
+  blocks read. The global head dim is 512 and the sliding one 256, with
+  8 query heads and 2 KV heads. The window is 512. The rope base is 1e6 on
+  global layers, with `rope_freqs` (256 factors), and 1e4 on sliding layers.
+  `rope.dimension_count` is the full head dim on both, so there is no partial
+  rotary beyond what `rope_freqs` encodes. The final softcap is 30. The
+  attention scale is 1.0: llama.cpp's `gemma4.cpp` sets `f_attention_scale = 1`,
+  and there is no `1/sqrt(head_dim)`. The output head is tied to
+  `token_embd` (Q4K). The per-layer table is `per_layer_token_embd`, 262144 x
+  10752 in Q5K.
+- **No forward-pass bug was found.** Our graph matches `src/models/gemma4.cpp`
+  op for op: the embedding scale, the per-layer inputs, the q/k norms, the
+  weightless value norm, NEOX rope with the factors on global layers only,
+  the shared-KV mapping, the post norms, the GELU-tanh, `layer_output_scale`
+  and the softcap. On Metal, against llama.cpp on Metal, the top-5
+  probabilities agree within 0.0008 on all three fixture prompts. The greedy
+  continuations agree 16/16, including on a 729-token prompt that crosses
+  both the 512-token window and the 512-token prefill chunk.
+- **On the CPU, the gap comes from activation rounding, not from the model.**
+  candle's CPU `QMatMul` rounds every activation to `Q8_K` before the
+  k-quant dot product, and llama.cpp's CPU backend does the same. Metal does
+  not. On the first block's Q projection, with identical inputs, the exact
+  f64 product is `-51.84, 10.75, -11.20`. candle's CPU gives
+  `-51.40, 10.55, -10.93` and llama.cpp's CPU gives `-51.63, 10.44, -11.36`:
+  the same size of error, rounded differently. candle uses `-128/max` and
+  `.round()`, while ggml uses `-127/max` and `nearest_int`.
+  On a nearly tied next-token distribution (the haiku prompt: 0.50 / 0.39 /
+  0.11 on Metal), this moves the top probabilities by up to 0.065. llama.cpp's
+  own CPU backend is 0.047 from its Metal one on the same prompt. The rounding
+  also flips greedy token 11 ("flow" on Metal, "bloom" on both CPUs). Compare
+  Metal with Metal. A CPU run is evidence only to about ±0.07 on such a
+  prompt.
+- **Tooling gotchas at this llama.cpp commit.**
+  - `llama-tokenize` has no `--parse-special` flag. It parses special tokens
+    and adds BOS by default, and the flag is an error.
+  - `llama-eval-callback -f` drops the prompt file's trailing newline. A
+    prompt ending in `<|turn>model\n` therefore loses its last token there, so
+    compare its tensors against the same truncated ids.
+  - `llama-eval-callback` has no `--no-warmup`.
+  - `/completion` takes a token-id array as `prompt`.
+  - With `n_probs`, `/completion` returns pre-sampling probabilities as
+    `completion_probabilities[0].top_logprobs[].logprob`.
+  - `/completion` returns generated ids only with `"return_tokens": true`, in
+    `tokens`. The list includes the closing 106.

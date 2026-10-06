@@ -30,3 +30,6 @@ workspace = true
 [[example]]
 name = "gguf_dump"
 required-features = ["candle"]
+
+[dev-dependencies]
+serde_json = "1"
