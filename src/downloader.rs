@@ -1923,6 +1923,14 @@ pub fn swap_staged_in(root: &Path, set: crate::manifest::EngineId) -> Result<Opt
     Ok(Some(manifest.version))
 }
 
+/// Whether a complete, verified set for `set` is waiting in staging: its
+/// staged manifest, written only once every artifact verified, is present
+/// and parses. The same record [`swap_staged_in`] installs from.
+#[must_use]
+pub fn is_staged_in(root: &Path, set: crate::manifest::EngineId) -> bool {
+    crate::manifest::read_at(&crate::manifest::staged_manifest_path_in(root, set)).is_some()
+}
+
 /// Installs a complete staged set under `~/.plank`, if one is waiting.
 ///
 /// # Errors

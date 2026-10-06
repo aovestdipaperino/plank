@@ -929,6 +929,20 @@ enum Waited {
     Detached,
 }
 
+/// Installs `set`'s complete staged set, when one is waiting and no helper
+/// is running, so a launch whose engine finished downloading in the
+/// background starts on it rather than offering to download it again.
+///
+/// # Errors
+/// As [`crate::downloader::swap_staged_in`]: a rename of a verified artifact
+/// failed.
+pub fn install_staged_in(root: &Path, set: crate::manifest::EngineId) -> Result<bool, String> {
+    if crate::downloader::running_in(root) {
+        return Ok(false);
+    }
+    crate::downloader::swap_staged_in(root, set).map(|v| v.is_some())
+}
+
 /// Reads the helper's `state` as far as the download of `set` goes. Another
 /// engine's state, or none yet, says nothing about this one.
 fn wait_step(state: Option<&crate::downloader::State>, set: &str) -> WaitStep {
@@ -1295,9 +1309,9 @@ fn fetch(url: &str, part: &Path, cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 
-/// Rows the message/gauge/stats block always keeps: message, gauge, stats and
-/// the two spacers between them.
-const PROGRESS_ROWS: u16 = 5;
+/// Rows the message/gauge/stats block always keeps: message, gauge, stats,
+/// the two spacers between them, and the hint under the stats.
+const PROGRESS_ROWS: u16 = 6;
 /// Rows taken by one of the rules bracketing the playfield.
 const RULE_ROWS: u16 = 1;
 /// Both rules together: one above the field, one below it.
@@ -1328,6 +1342,8 @@ struct Screen {
     message: Rect,
     gauge: Rect,
     stats: Rect,
+    /// How to leave, on the wait for the background helper; blank otherwise.
+    hint: Rect,
 }
 
 /// Splits `area`, giving the playfield whatever the progress block does not
@@ -1352,6 +1368,7 @@ fn layout(area: Rect, show_game: bool) -> Screen {
         Constraint::Length(1),      // gauge
         Constraint::Length(1),      // spacer
         Constraint::Length(1),      // stats
+        Constraint::Length(1),      // hint
         Constraint::Fill(1),
     ])
     .split(area);
@@ -1363,6 +1380,7 @@ fn layout(area: Rect, show_game: bool) -> Screen {
         message: rows[4],
         gauge: rows[6],
         stats: rows[8],
+        hint: rows[9],
     }
 }
 
@@ -1533,6 +1551,7 @@ fn wait_ui(
         total: (set_total > 0).then_some(set_total),
         done: 0,
         elapsed: 0.0,
+        background: true,
     };
     // Where the rate is measured from: the first byte count seen while the
     // helper is actually streaming, so a resume's rehash of bytes already on
@@ -1659,6 +1678,9 @@ struct Progress {
     done: u64,
     /// Seconds since `done` was measured.
     elapsed: f64,
+    /// Whether the background helper is doing the download, so leaving the
+    /// screen keeps it running and the screen says so.
+    background: bool,
 }
 
 impl Progress {
@@ -1669,6 +1691,7 @@ impl Progress {
             total,
             done,
             elapsed: start.elapsed().as_secs_f64(),
+            background: false,
         }
     }
 }
@@ -1680,6 +1703,7 @@ fn draw(frame: &mut Frame, game: Option<&Breakout>, progress: &Progress, msg: us
         total,
         done,
         elapsed,
+        background,
     } = *progress;
     // Only bytes fetched *this run* count toward the rate: on a resume the
     // file already holds `done` bytes, and charging those to zero elapsed time
@@ -1751,14 +1775,45 @@ fn draw(frame: &mut Frame, game: Option<&Breakout>, progress: &Progress, msg: us
         );
     }
 
-    let stats = match total {
-        Some(t) => format!("{:.1} / {:.1} GB   {speed:.0} MB/s", gb(current), gb(t)),
-        None => format!("{:.1} GB   {speed:.0} MB/s", gb(current)),
-    };
-    let stats_line = Paragraph::new(stats)
+    let stats_line = Paragraph::new(stats_text(current, total, speed))
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
     frame.render_widget(stats_line, screen.stats);
+
+    if background {
+        frame.render_widget(
+            Paragraph::new(leave_hint(game.is_some()))
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center),
+            screen.hint,
+        );
+    }
+}
+
+/// The stats line under the gauge.
+fn stats_text(current: u64, total: Option<u64>, speed: f64) -> String {
+    let amount = |b: u64| crate::enginefit::human_bytes(b, 1000);
+    let sizes = match total {
+        Some(t) => {
+            let (c, t) = (amount(current), amount(t));
+            // One unit when both share it: `1.5 / 87.2 GB`.
+            match (c.rsplit_once(' '), t.rsplit_once(' ')) {
+                (Some((cv, cu)), Some((_, tu))) if cu == tu => format!("{cv} / {t}"),
+                _ => format!("{c} / {t}"),
+            }
+        }
+        None => amount(current),
+    };
+    format!("{sizes}   {speed:.0} MB/s")
+}
+
+/// How to leave the wait screen with the download still running.
+fn leave_hint(game_open: bool) -> &'static str {
+    if game_open {
+        "Esc closes the game, Esc again or q leaves the download running in the background"
+    } else {
+        "Esc or q leaves the download running in the background"
+    }
 }
 
 /// Seconds left, from the rate achieved so far.
@@ -2494,8 +2549,65 @@ mod tests {
             &|_, _, _| Ok(Waited::Staged),
             &no_foreground,
         );
-        assert!(out.is_err(), "{out:?}");
+        let err = out.expect_err("nothing was staged");
+        assert!(
+            err.starts_with("the download of e finished but nothing complete was staged; see "),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_staged_set_installs_before_the_menu_when_no_helper_runs() {
+        let root = crate::downloader::tests::tempdir();
+        let id = EngineId::new("e").unwrap();
+        assert_eq!(install_staged_in(&root, id), Ok(false), "nothing staged");
+        stage_e(&root);
+        assert_eq!(install_staged_in(&root, id), Ok(true));
+        assert!(root.join("e.gguf").exists() && root.join("e.mtp.gguf").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_set_waits_while_a_helper_runs() {
+        let root = crate::downloader::tests::tempdir();
+        let id = EngineId::new("e").unwrap();
+        stage_e(&root);
+        let held = crate::downloader::try_lock_in(&root).expect("lock");
+        assert_eq!(install_staged_in(&root, id), Ok(false));
+        assert!(!root.join("e.gguf").exists());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wait_stats_scale_small_sizes_and_keep_the_large_shape() {
+        assert_eq!(
+            stats_text(1_500_000_000, Some(87_200_000_000), 30.0),
+            "1.5 / 87.2 GB   30 MB/s"
+        );
+        assert_eq!(
+            stats_text(27_800, Some(27_800), 0.0),
+            "27.8 / 27.8 KB   0 MB/s"
+        );
+        assert_eq!(
+            stats_text(512_000_000, Some(4_600_000_000), 12.0),
+            "512.0 MB / 4.6 GB   12 MB/s"
+        );
+        assert_eq!(stats_text(512_000_000, None, 1.0), "512.0 MB   1 MB/s");
+        assert_eq!(stats_text(2_000_000_000, None, 1.0), "2.0 GB   1 MB/s");
+    }
+
+    #[test]
+    fn the_wait_screen_says_how_to_leave_the_download_running() {
+        let open = leave_hint(true);
+        assert!(open.contains("Esc closes the game"), "{open}");
+        assert!(open.contains("in the background"), "{open}");
+        let closed = leave_hint(false);
+        assert!(!closed.contains("game"), "{closed}");
+        assert!(closed.starts_with("Esc or q"), "{closed}");
+        assert!(closed.contains("in the background"), "{closed}");
     }
 
     #[cfg(unix)]

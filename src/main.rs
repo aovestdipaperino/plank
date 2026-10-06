@@ -384,7 +384,23 @@ fn pick_engine_before_resolve(
         .ok()
         .map(|(sel, _)| sel);
     // An unresolvable choice is the ordinary resolution's to report.
-    let main_exists = probe.as_ref().is_none_or(|s| s.main.exists());
+    let mut main_exists = probe.as_ref().is_none_or(|s| s.main.exists());
+    // An engine that finished downloading in the background after an Esc is
+    // installed now, before the menu could offer to download it again.
+    if menu_allowed
+        && local
+        && !main_exists
+        && let Some((sel, id)) = probe.as_ref().and_then(|s| Some((s, s.id?)))
+    {
+        match plank::download::install_staged_in(root, id) {
+            Ok(true) => {
+                eprintln!("plank: installed {id}, downloaded in the background");
+                main_exists = sel.main.exists();
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("plank: could not install the downloaded {id}: {e}"),
+        }
+    }
     if !plank::enginepick::should_pick(cfg.pick_engine, from_cli, main_exists, menu_allowed, local)
     {
         // No menu: the session `/engines` left still resumes rather than
@@ -403,6 +419,10 @@ fn pick_engine_before_resolve(
         &plank::enginefit::machine(root),
         &|p| p.exists(),
         downloading.as_ref().map(|(n, pct)| (n.as_str(), *pct)),
+        &|n| {
+            plank::manifest::EngineId::new(n)
+                .is_some_and(|id| plank::downloader::is_staged_in(root, id))
+        },
     );
     let current = probe.as_ref().and_then(|s| s.id).map(|id| id.to_string());
     let Some(name) = plank::enginepick::run(&rows, current.as_deref())? else {
@@ -425,7 +445,10 @@ fn pick_engine_before_resolve(
         }
     }
     plank::settings::set_engine_model_in(&root.join("settings.json"), &name)?;
-    if plank::settings::project_path().is_some_and(|p| sets_engine_model(&p)) {
+    let user_settings = root.join("settings.json");
+    if plank::settings::project_path()
+        .is_some_and(|p| project_overrides_pick(&p, &user_settings, &name))
+    {
         eprintln!(
             "plank: {name} is now your default engine, but ./.plank/settings.json sets engine.model for this folder"
         );
@@ -448,13 +471,24 @@ fn pick_engine_before_resolve(
     Ok(())
 }
 
-/// Whether `path` is a settings file that sets `engine.model`. A missing or
-/// unparsable file sets nothing.
-fn sets_engine_model(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .is_some_and(|v| v.pointer("/engine/model").is_some_and(|m| !m.is_null()))
+/// Whether the project settings file at `project` will override the engine
+/// `pick` just written to the user settings file at `user`.
+fn project_overrides_pick(project: &std::path::Path, user: &std::path::Path, pick: &str) -> bool {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+    // Run from the home directory, `./.plank/settings.json` is the user file
+    // itself: it holds the pick, not an override of it.
+    let same = match (canon(project), canon(user)) {
+        (Some(a), Some(b)) => a == b,
+        _ => project == user,
+    };
+    !same
+        && std::fs::read_to_string(project)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .is_some_and(|v| {
+                v.pointer("/engine/model")
+                    .is_some_and(|m| !m.is_null() && m.as_str() != Some(pick))
+            })
 }
 
 /// The engine this run would load: the command line's choice, else the
@@ -2199,16 +2233,44 @@ mod tests {
     }
 
     #[test]
-    fn only_a_set_engine_model_counts_as_setting_it() {
+    fn only_a_different_engine_model_counts_as_overriding_the_pick() {
         let root = scratch_root("sets-model");
-        let path = root.join("settings.json");
-        assert!(!sets_engine_model(&path), "a missing file sets nothing");
-        std::fs::write(&path, r#"{"engine":{"temperature":0.5}}"#).expect("write");
-        assert!(!sets_engine_model(&path));
-        std::fs::write(&path, r#"{"engine":{"model":"gemma4-e4b"}}"#).expect("write");
-        assert!(sets_engine_model(&path));
-        std::fs::write(&path, "not json").expect("write");
-        assert!(!sets_engine_model(&path));
+        let user = root.join("settings.json");
+        let project_dir = root.join("proj/.plank");
+        std::fs::create_dir_all(&project_dir).expect("mkdir");
+        let project = project_dir.join("settings.json");
+        assert!(
+            !project_overrides_pick(&project, &user, "tiny"),
+            "a missing file sets nothing"
+        );
+        std::fs::write(&project, r#"{"engine":{"temperature":0.5}}"#).expect("write");
+        assert!(!project_overrides_pick(&project, &user, "tiny"));
+        std::fs::write(&project, r#"{"engine":{"model":"tiny"}}"#).expect("write");
+        assert!(
+            !project_overrides_pick(&project, &user, "tiny"),
+            "the same engine overrides nothing"
+        );
+        std::fs::write(&project, r#"{"engine":{"model":"gemma4-e4b"}}"#).expect("write");
+        assert!(project_overrides_pick(&project, &user, "tiny"));
+        std::fs::write(&project, "not json").expect("write");
+        assert!(!project_overrides_pick(&project, &user, "tiny"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_project_file_is_not_an_override_when_it_is_the_user_file() {
+        // Run from the home directory, `./.plank/settings.json` is the very
+        // file the pick was just written to.
+        let root = scratch_root("same-settings");
+        let dot = root.join(".plank");
+        std::fs::create_dir_all(&dot).expect("mkdir");
+        let user = dot.join("settings.json");
+        std::fs::write(&user, r#"{"engine":{"model":"gemma4-e4b"}}"#).expect("write");
+        // Spelled differently, as `$HOME/.plank` and `./.plank` are.
+        let project = root.join("x/../.plank/settings.json");
+        std::fs::create_dir_all(root.join("x")).expect("mkdir");
+        assert!(!project_overrides_pick(&project, &user, "tiny"));
+        assert!(!project_overrides_pick(&user, &user, "tiny"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

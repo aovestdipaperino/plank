@@ -76,6 +76,10 @@ pub enum Fit {
     /// The background downloader is fetching it now, `percent` of the way.
     /// Selectable: picking it waits for the download already under way.
     Downloading { percent: u8 },
+    /// Its whole set was downloaded in the background and verified, and is
+    /// waiting in staging: picking it installs it with no further download,
+    /// so the disk rule does not apply.
+    Staged,
     /// It cannot run here, for `reason`.
     Disabled { reason: String },
 }
@@ -114,17 +118,31 @@ fn whole_gb(bytes: u64) -> u64 {
 /// A download size for display: one decimal, or `size unknown`.
 #[must_use]
 pub fn size_label(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "size unknown".to_owned(), |b| human_bytes(b, 1024))
+}
+
+/// `bytes` with one decimal in the largest unit it reaches, counting in
+/// powers of `base` (1024 for binary sizes, 1000 for decimal ones): KB below
+/// `base`², MB below `base`³, else GB.
+#[must_use]
+pub fn human_bytes(bytes: u64, base: u64) -> String {
+    let (div, unit) = if bytes < base * base {
+        (base, "KB")
+    } else if bytes < base * base * base {
+        (base * base, "MB")
+    } else {
+        (base * base * base, "GB")
+    };
     #[allow(clippy::cast_precision_loss)]
-    bytes.map_or_else(
-        || "size unknown".to_owned(),
-        |b| format!("{:.1} GB", b as f64 / GIB as f64),
-    )
+    let v = bytes as f64 / div as f64;
+    format!("{v:.1} {unit}")
 }
 
 /// Evaluates every engine in `catalog`, in name order.
 ///
 /// `downloading` names the engine the background downloader is fetching and
-/// how far along it is, when one is.
+/// how far along it is, when one is. `staged` says whether an engine's whole
+/// set is verified and waiting in staging.
 #[must_use]
 pub fn evaluate(
     root: &Path,
@@ -132,6 +150,7 @@ pub fn evaluate(
     m: &Machine,
     exists: &dyn Fn(&Path) -> bool,
     downloading: Option<(&str, u8)>,
+    staged: &dyn Fn(&str) -> bool,
 ) -> Vec<EngineRow> {
     catalog
         .engines
@@ -147,6 +166,7 @@ pub fn evaluate(
                     m,
                     exists,
                     downloading.and_then(|(d, pct)| (d == name.as_str()).then_some(pct)),
+                    staged(name),
                 ),
             })
         })
@@ -159,6 +179,7 @@ fn fit_of(
     m: &Machine,
     exists: &dyn Fn(&Path) -> bool,
     downloading: Option<u8>,
+    staged: bool,
 ) -> Fit {
     let roles: [(&str, Option<&PathBuf>); 3] = [
         ("main", Some(&sel.main)),
@@ -216,6 +237,10 @@ fn fit_of(
     // which counts every missing byte as still to come, no longer applies.
     if let Some(percent) = downloading {
         return Fit::Downloading { percent };
+    }
+    // Every byte is already on disk, in staging: installing it is a rename.
+    if staged {
+        return Fit::Staged;
     }
     if let Some(free) = m.free_disk
         && size_known
@@ -294,6 +319,10 @@ mod tests {
         false
     }
 
+    fn no_staged(_: &str) -> bool {
+        false
+    }
+
     #[test]
     fn a_large_machine_offers_every_engine_as_a_download() {
         let rows = evaluate(
@@ -302,6 +331,7 @@ mod tests {
             &machine(Some(128), Some(500)),
             &none,
             None,
+            &no_staged,
         );
         assert_eq!(
             row(&rows, "ds4vision").fit,
@@ -326,6 +356,7 @@ mod tests {
             &machine(Some(64), Some(500)),
             &none,
             None,
+            &no_staged,
         );
         assert_eq!(
             row(&rows, "ds4vision").fit,
@@ -345,6 +376,7 @@ mod tests {
             &machine(Some(8), Some(500)),
             &none,
             None,
+            &no_staged,
         );
         assert_eq!(
             row(&rows, "gemma4-e4b").fit,
@@ -358,6 +390,7 @@ mod tests {
             &machine(Some(16), Some(500)),
             &none,
             None,
+            &no_staged,
         );
         assert!(row(&rows, "gemma4-e4b").selectable());
     }
@@ -370,6 +403,7 @@ mod tests {
             &machine(Some(128), Some(50)),
             &none,
             None,
+            &no_staged,
         );
         assert_eq!(
             row(&rows, "ds4vision").fit,
@@ -388,6 +422,7 @@ mod tests {
             &machine(Some(128), Some(1)),
             &|_| true,
             None,
+            &no_staged,
         );
         assert_eq!(row(&rows, "ds4vision").fit, Fit::Installed);
     }
@@ -401,6 +436,7 @@ mod tests {
             &machine(Some(128), Some(500)),
             &|p| p == main,
             None,
+            &no_staged,
         );
         assert_eq!(
             row(&rows, "ds4vision").fit,
@@ -418,6 +454,7 @@ mod tests {
             &machine(None, None),
             &none,
             None,
+            &no_staged,
         );
         assert!(rows.iter().all(EngineRow::selectable));
     }
@@ -429,7 +466,7 @@ mod tests {
             ds4: false,
             gemma: true,
         };
-        let rows = evaluate(Path::new("/r"), &catalog(), &m, &none, None);
+        let rows = evaluate(Path::new("/r"), &catalog(), &m, &none, None, &no_staged);
         assert_eq!(
             row(&rows, "ds4vision").fit,
             Fit::Disabled {
@@ -456,6 +493,7 @@ mod tests {
             &machine(Some(128), Some(500)),
             &none,
             None,
+            &no_staged,
         );
         assert_eq!(
             row(&rows, "mine").fit,
@@ -476,6 +514,7 @@ mod tests {
             &machine(Some(128), Some(50)),
             &none,
             Some(("ds4vision", 43)),
+            &no_staged,
         );
         assert_eq!(
             row(&rows, "ds4vision").fit,
@@ -499,6 +538,7 @@ mod tests {
             &machine(Some(64), Some(500)),
             &none,
             Some(("ds4vision", 43)),
+            &no_staged,
         );
         assert_eq!(
             row(&rows, "ds4vision").fit,
@@ -509,9 +549,54 @@ mod tests {
     }
 
     #[test]
+    fn a_staged_engine_reads_ready_to_install_and_skips_the_disk_rule() {
+        // 50 GB free fails the disk rule for ds4vision, but its whole set is
+        // already staged on disk: installing it needs no more space.
+        let rows = evaluate(
+            Path::new("/r"),
+            &catalog(),
+            &machine(Some(128), Some(50)),
+            &none,
+            None,
+            &|n| n == "ds4vision",
+        );
+        assert_eq!(row(&rows, "ds4vision").fit, Fit::Staged);
+        assert!(row(&rows, "ds4vision").selectable());
+        assert_eq!(
+            row(&rows, "gemma4-e4b").fit,
+            Fit::Download {
+                bytes: Some(4_977_171_584)
+            }
+        );
+    }
+
+    #[test]
+    fn a_staged_engine_still_obeys_the_ram_rule() {
+        let rows = evaluate(
+            Path::new("/r"),
+            &catalog(),
+            &machine(Some(64), Some(500)),
+            &none,
+            None,
+            &|n| n == "ds4vision",
+        );
+        assert!(!row(&rows, "ds4vision").selectable());
+    }
+
+    #[test]
     fn size_labels_read_in_gigabytes() {
         assert_eq!(size_label(Some(4_977_171_584)), "4.6 GB");
+        assert_eq!(size_label(Some(93_600_000_000)), "87.2 GB");
         assert_eq!(size_label(None), "size unknown");
+    }
+
+    #[test]
+    fn sizes_below_a_gigabyte_read_in_megabytes_or_kilobytes() {
+        assert_eq!(size_label(Some(512 * 1024 * 1024)), "512.0 MB");
+        assert_eq!(size_label(Some(GIB)), "1.0 GB");
+        assert_eq!(size_label(Some(28_467)), "27.8 KB");
+        assert_eq!(size_label(Some(1024 * 1024)), "1.0 MB");
+        assert_eq!(size_label(Some(0)), "0.0 KB");
     }
 
     #[test]

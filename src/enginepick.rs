@@ -87,6 +87,7 @@ pub fn state_label(fit: &Fit) -> String {
         Fit::Download { bytes } => format!("download {}", size_label(*bytes)),
         Fit::Disabled { reason } => reason.clone(),
         Fit::Downloading { percent } => format!("downloading {percent}%"),
+        Fit::Staged => "ready to install".to_owned(),
     }
 }
 
@@ -290,6 +291,11 @@ mod tests {
             state_label(&Fit::Downloading { percent: 43 }),
             "downloading 43%"
         );
+    }
+
+    #[test]
+    fn a_staged_engine_reads_ready_to_install() {
+        assert_eq!(state_label(&Fit::Staged), "ready to install");
     }
 
     #[test]
