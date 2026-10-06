@@ -70,9 +70,23 @@ pub enum IdleWork {
 /// effort preambles, so changing it invalidates the KV and forces a full
 /// re-prefill. Rejecting the truncated reply is the cheap half; the budget
 /// (`suggestions.maxTokens`) is the other.
+///
+/// `explicit_tags` is [`crate::engine::Engine::emits_think_tags`]. A family
+/// that opens its own reasoning block (Gemma's `<|channel>`, translated to
+/// an explicit `<think>`) may also answer without thinking at all, so the
+/// missing close proves nothing there: the reasoning is unfinished only when
+/// the last `<think>` has no `</think>` after it.
 #[must_use]
-pub fn reasoning_unfinished(reply: &str, thinking: bool) -> bool {
-    thinking && !reply.contains("</think>")
+pub fn reasoning_unfinished(reply: &str, thinking: bool, explicit_tags: bool) -> bool {
+    if !thinking {
+        return false;
+    }
+    if explicit_tags {
+        return reply
+            .rfind("<think>")
+            .is_some_and(|open| !reply[open..].contains("</think>"));
+    }
+    !reply.contains("</think>")
 }
 
 /// Turns a raw generation into something showable, or `None`.
@@ -213,12 +227,46 @@ mod tests {
     fn a_reply_with_no_reasoning_close_is_a_budget_that_ran_out() {
         assert!(reasoning_unfinished(
             "The user asked me to add a parse_port",
-            true
+            true,
+            false
         ));
-        assert!(!reasoning_unfinished("thought</think>add tests", true));
+        assert!(!reasoning_unfinished(
+            "thought</think>add tests",
+            true,
+            false
+        ));
         // With thinking off the prefix closes the block, so there is no tag
         // to look for and every reply is a real answer.
-        assert!(!reasoning_unfinished("add tests", false));
+        assert!(!reasoning_unfinished("add tests", false, false));
+    }
+
+    /// Gemma opens its own reasoning block (translated to an explicit
+    /// `<think>`) or skips it. Neither shape carries a bare close, so the
+    /// implicit-block rule dropped every Gemma suggestion with thinking on.
+    #[test]
+    fn an_explicit_tag_family_is_unfinished_only_inside_an_open_block() {
+        // Answered without thinking: a real answer.
+        assert!(!reasoning_unfinished("add tests", true, true));
+        // Thought, closed, answered.
+        assert!(!reasoning_unfinished(
+            "<think>they want tests</think>add tests",
+            true,
+            true
+        ));
+        // Opened and never closed: the budget ran out mid-thought.
+        assert!(reasoning_unfinished(
+            "<think>the user asked me to",
+            true,
+            true
+        ));
+        // A second block opened after a closed one and never closed.
+        assert!(reasoning_unfinished(
+            "<think>a</think>b<think>still going",
+            true,
+            true
+        ));
+        // Thinking off: never unfinished.
+        assert!(!reasoning_unfinished("<think>x", false, true));
     }
 
     #[test]

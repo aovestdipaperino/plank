@@ -16420,8 +16420,11 @@ impl Agent<'_> {
 
         // The budget ran out while the model was still reasoning, so what
         // came back is a thought, not a suggestion.
-        if crate::suggest::reasoning_unfinished(&reply, self.think != crate::engine::ThinkMode::Off)
-        {
+        if crate::suggest::reasoning_unfinished(
+            &reply,
+            self.think != crate::engine::ThinkMode::Off,
+            self.engine.emits_think_tags(),
+        ) {
             return false;
         }
 
@@ -24041,6 +24044,9 @@ mod tests {
         /// Records each state `decide` was asked about, so a test can assert
         /// that a gate which should have been skipped never ran.
         decisions_asked: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+        /// When true the engine reports `emits_think_tags`, the Gemma shape:
+        /// a reply opens its own `<think>` or carries none at all.
+        think_tags: bool,
     }
 
     impl ScriptedEngine {
@@ -24151,6 +24157,9 @@ mod tests {
         }
         fn supports_multiplexing(&self) -> bool {
             self.multiplex_support
+        }
+        fn emits_think_tags(&self) -> bool {
+            self.think_tags
         }
         fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
             let events = self.kv_events.as_ref()?;
@@ -24550,6 +24559,38 @@ mod tests {
         assert_eq!(s.depth, agent.session.transcript.len());
         assert!(!agent.suggestion_pending, "the flag is consumed");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A think-tag family (Gemma) with thinking on answers either without a
+    /// block or with a closed one. The implicit-block rule read both as an
+    /// unfinished thought and dropped every suggestion.
+    #[test]
+    fn a_think_tag_engine_with_thinking_on_keeps_its_suggestion() {
+        let _s = enable_suggestions_for_test();
+        for reply in [
+            "add tests for the parser",
+            "<think>tests next</think>add tests for the parser",
+        ] {
+            let dir = scratch_dir("sugg-thinktags");
+            let cfg = test_cfg();
+            let engine = ScriptedEngine {
+                replies: vec![reply.to_string()],
+                think_tags: true,
+                ..ScriptedEngine::default()
+            };
+            let mut agent = test_agent(&dir, engine, &cfg);
+            agent.think = ThinkMode::Medium;
+            agent.session.push(Message::user("hello"));
+            agent.session.push(Message::assistant("hi"));
+            agent.suggestion_pending = true;
+
+            assert!(agent.generate_suggestion(), "kept: {reply:?}");
+            assert_eq!(
+                agent.suggestion.as_ref().map(|s| s.text.as_str()),
+                Some("add tests for the parser")
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]
