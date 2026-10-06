@@ -472,6 +472,10 @@ fn dsml_start_match(
 
 /// [`dsml_start_match`] widened to every dialect, DSML, Qwen and Gemma alike.
 ///
+/// The Gemma arm is tried only when `gemma` is set, i.e. the renderer was
+/// built for Gemma: DSML and Qwen streams adopt each other's openers, but a
+/// literal `<|tool_call>` in a `DeepSeek` or Qwen stream is text, not a call.
+///
 /// DSML is tried first and Qwen only if no DSML form is even a prefix. The two
 /// openers share no spelling, so the order is not load-bearing for
 /// correctness; DSML leads because it is the default and by far the more
@@ -483,6 +487,7 @@ fn dsml_start_match(
 /// can match a given tail.
 fn start_match_any(
     tail: &[u8],
+    gemma: bool,
     complete: &mut bool,
     implicit_invoke: &mut bool,
     matched: &mut Dialect,
@@ -498,7 +503,7 @@ fn start_match_any(
         *matched = Dialect::Qwen;
         return true;
     }
-    if tail.len() <= GEMMA_START.len() && GEMMA_START[..tail.len()] == *tail {
+    if gemma && tail.len() <= GEMMA_START.len() && GEMMA_START[..tail.len()] == *tail {
         *implicit_invoke = false;
         *complete = tail == GEMMA_START;
         *matched = Dialect::Gemma;
@@ -979,6 +984,11 @@ impl Parser {
 pub struct StreamRenderer<S> {
     sink: S,
     syntax: ToolSyntax,
+    /// Whether the renderer was built for Gemma and so recognizes its
+    /// `<|tool_call>` opener. Fixed at construction, unlike `syntax`, which
+    /// follows DSML adoption: a DSML or Qwen stream that spells the Gemma
+    /// opener is quoting it, and must stream it as text.
+    gemma_opener: bool,
     parser: Parser,
     viz: ToolViz,
     scan: DsmlScan,
@@ -1108,6 +1118,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         Self {
             sink,
             syntax,
+            gemma_opener: syntax == ToolSyntax::Gemma,
             parser: Parser::dsml(syntax),
             viz: ToolViz::default(),
             scan: DsmlScan::Between,
@@ -2336,7 +2347,13 @@ impl<S: RenderSink> StreamRenderer<S> {
         // Every DSML dialect answers `dsml_tags`, and the candidate openers
         // are built from that table — no spelling is named here, so a new
         // dialect cannot silently miss this site.
-        start_match_any(&self.dsml_start_tail, complete, implicit_invoke, matched)
+        start_match_any(
+            &self.dsml_start_tail,
+            self.gemma_opener,
+            complete,
+            implicit_invoke,
+            matched,
+        )
     }
 
     /// Adopts the dialect a completed stanza opener named.
@@ -4907,19 +4924,38 @@ mod qwen_dialect_tests {
         assert!(!shown.contains("<|\"|>"), "{shown:?}");
     }
 
-    /// An untold renderer learns the dialect from the opener, as it does for
-    /// Qwen, and two stanzas in one pass both reach dispatch.
+    /// Two stanzas in one pass both reach dispatch.
     #[test]
-    fn two_gemma_stanzas_at_an_untold_renderer_both_become_calls() {
-        let sr = run(concat!(
+    fn two_gemma_stanzas_both_become_calls() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Gemma);
+        sr.push(concat!(
             "<|tool_call>call:read{path:<|\"|>a.rs<|\"|>}<tool_call|>",
             "<|tool_call>call:bash{command:<|\"|>ls<|\"|>}<tool_call|>",
         ));
+        sr.finish();
         let done = sr.finished();
         assert_eq!(done.error, None, "{:?}", sr.sink().visible);
         let names: Vec<_> = done.calls.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["read", "bash"]);
         assert!(sr.parser.is_gemma());
+    }
+
+    /// Unlike DSML and Qwen, which adopt each other's openers, the Gemma
+    /// opener is recognized only by a renderer built for Gemma. A `DeepSeek`
+    /// or Qwen stream that spells it is quoting it: no call, no error, and
+    /// the bytes stream through as text.
+    #[test]
+    fn a_dsml_or_qwen_renderer_streams_a_gemma_opener_as_text() {
+        let text = "see <|tool_call>call:x{}<tool_call|> here";
+        for syntax in [ToolSyntax::Dsml, ToolSyntax::Dsml41, ToolSyntax::Qwen] {
+            let mut sr = StreamRenderer::with_syntax(Cap::default(), syntax);
+            sr.push(text);
+            sr.finish();
+            let done = sr.finished();
+            assert!(done.calls.is_empty(), "{syntax:?}: {:?}", done.calls);
+            assert_eq!(done.error, None, "{syntax:?}");
+            assert_eq!(sr.sink().visible, text, "{syntax:?}: verbatim");
+        }
     }
 
     /// The end-to-end shape this whole port exists for: a Qwen stanza reaches
