@@ -1,0 +1,851 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
+//! Gemma 4 behind [`Engine`], over the native-Rust `gemma-engine` crate.
+//!
+//! The transcript discipline is the ds4 engine's: the rendered transcript is
+//! split into sections, the leading sections that match recorded spans keep
+//! their tokens verbatim, and only the rest is rendered (with Gemma's chat
+//! template) and tokenized. Unlike the ds4 KV, Gemma's is prefix-truncatable,
+//! so a prompt that diverges anywhere keeps the KV up to that token and
+//! prefills only the remainder.
+//!
+//! Gemma writes its reasoning in a `<|channel>thought\n…<channel|>` block,
+//! which [`ThinkTranslator`] streams as `<think>…</think>` so the renderer
+//! sees what it sees from every other local model. Past turns' thoughts stay
+//! in history: recorded tokens are reused verbatim.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use gemma_engine::Device;
+use gemma_engine::model::Model;
+use gemma_engine::sample::Sampler;
+use gemma_engine::session::Session;
+use gemma_engine::template::{self, Kind};
+use gemma_engine::tokenizer::GemmaTokenizer;
+
+use crate::ds4tokens::{SectionKey, SpanRole, TokenTranscript, parse_sections};
+use crate::engine::{
+    Engine, EngineError, EngineEvent, GenerationOptions, GenerationStats, KvReuse, PrefillProgress,
+    Prompt, ThinkMode, Utf8Stream,
+};
+use crate::kvcache::KVCache;
+
+/// Tokens a prefill evaluates between progress reports (the session's own
+/// chunk size, so each report is one forward).
+const PREFILL_CHUNK: usize = 512;
+
+/// The context used when the caller asks for none (`ctx <= 0`).
+const DEFAULT_CTX: usize = 32_768;
+
+/// Bytes of a thought block's channel name held back before giving up on
+/// finding its `\n`. The model writes `thought\n`; anything longer is not a
+/// channel name and is streamed rather than lost.
+const CHANNEL_NAME_MAX: usize = 64;
+
+/// The engine: one model, one live session, and the token transcript that
+/// describes what the session's KV was built from.
+#[derive(Debug)]
+pub struct GemmaEngine {
+    model: Arc<Model>,
+    session: Session,
+    transcript: TokenTranscript,
+    /// The template kind of each span, parallel to `transcript.spans()`.
+    kinds: Vec<Kind>,
+    think: ThinkMode,
+    trusted_len: usize,
+    /// `"metal"` or `"cpu"`: where the model runs.
+    device_name: &'static str,
+}
+
+/// Ids the decode loop and the stream translator look up once.
+#[derive(Debug, Clone, Copy)]
+struct Controls {
+    turn_close: Option<u32>,
+    resp_open: Option<u32>,
+    channel_open: Option<u32>,
+    channel_close: Option<u32>,
+}
+
+impl Controls {
+    fn of(tok: &GemmaTokenizer) -> Self {
+        Self {
+            turn_close: tok.control_id(template::TURN_CLOSE),
+            resp_open: tok.control_id(template::RESP_OPEN),
+            channel_open: tok.control_id(template::CHANNEL_OPEN),
+            channel_close: tok.control_id(template::CHANNEL_CLOSE),
+        }
+    }
+}
+
+/// Whether sampling `id` ends the reply. A stop token is neither recorded nor
+/// evaluated: the next section's rendering supplies it (`<turn|>` opens a
+/// user section, `<|tool_response>` opens a tool result).
+fn is_stop(tok: &GemmaTokenizer, c: Controls, id: u32) -> bool {
+    id == tok.eos() || Some(id) == c.turn_close || Some(id) == c.resp_open
+}
+
+/// Turns Gemma's thought channel into `<think>` tags while streaming.
+///
+/// `<|channel>` becomes `<think>` and the channel name after it (`thought\n`)
+/// is swallowed; `<channel|>` becomes `</think>`. Any other control id is
+/// emitted as its spelling so the tool-call parser sees `<|tool_call>`,
+/// `<|"|>` and `<tool_call|>`; plain ids go through the UTF-8 stream.
+#[derive(Debug, Default)]
+pub struct ThinkTranslator {
+    /// Inside a channel name: text is held until its `\n`.
+    naming: bool,
+    held: String,
+    /// Looked up on the first token.
+    controls: Option<Controls>,
+}
+
+impl ThinkTranslator {
+    /// The text `id` contributes to the stream.
+    pub fn push(&mut self, tok: &GemmaTokenizer, id: u32, utf8: &mut Utf8Stream) -> String {
+        let c = *self.controls.get_or_insert_with(|| Controls::of(tok));
+        if tok.is_control(id) {
+            // A control id ends any multi-byte run and any channel name.
+            let mut out = utf8.flush();
+            if self.naming {
+                out.insert_str(0, &std::mem::take(&mut self.held));
+                self.naming = false;
+            }
+            if Some(id) == c.channel_open {
+                self.naming = true;
+                out.push_str("<think>");
+            } else if Some(id) == c.channel_close {
+                out.push_str("</think>");
+            } else {
+                out.push_str(&String::from_utf8_lossy(&tok.piece_bytes(id)));
+            }
+            return out;
+        }
+        let text = utf8.push(tok.piece_bytes(id));
+        if !self.naming {
+            return text;
+        }
+        self.held.push_str(&text);
+        if let Some(nl) = self.held.find('\n') {
+            self.naming = false;
+            let rest = self.held[nl + 1..].to_owned();
+            self.held.clear();
+            return rest;
+        }
+        if self.held.len() > CHANNEL_NAME_MAX {
+            self.naming = false;
+            return std::mem::take(&mut self.held);
+        }
+        String::new()
+    }
+}
+
+/// The span role a template kind is recorded under.
+fn role_of(kind: Kind) -> SpanRole {
+    match kind {
+        Kind::System => SpanRole::System,
+        Kind::User | Kind::ToolResult => SpanRole::User,
+        Kind::Assistant => SpanRole::Assistant,
+    }
+}
+
+/// The section tag `template::classify` reads for a span role.
+fn tag_of(role: SpanRole) -> &'static str {
+    match role {
+        SpanRole::System => "system",
+        SpanRole::User => "user",
+        SpanRole::Assistant => "assistant",
+    }
+}
+
+fn to_i32(ids: &[u32]) -> Vec<i32> {
+    ids.iter()
+        .map(|&t| i32::try_from(t).unwrap_or(i32::MAX))
+        .collect()
+}
+
+fn to_u32(ids: &[i32]) -> Vec<u32> {
+    ids.iter().map(|&t| u32::try_from(t).unwrap_or(0)).collect()
+}
+
+fn count(n: usize) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+fn engine_error(e: gemma_engine::Error) -> EngineError {
+    EngineError::new(e.0)
+}
+
+/// How the template renders: what [`reconcile_into`] needs besides the
+/// transcript it edits.
+#[derive(Debug, Clone, Copy)]
+struct Render<'a> {
+    tok: &'a GemmaTokenizer,
+    think: bool,
+    trusted_len: usize,
+}
+
+impl<'a> Render<'a> {
+    fn new(tok: &'a GemmaTokenizer, think: ThinkMode, trusted_len: usize) -> Self {
+        Self {
+            tok,
+            think: !matches!(think, ThinkMode::Off),
+            trusted_len,
+        }
+    }
+
+    /// Renders one section after `kinds`' last span and appends it.
+    fn push(
+        &self,
+        transcript: &mut TokenTranscript,
+        kinds: &mut Vec<Kind>,
+        role: &str,
+        text: &str,
+    ) {
+        let prev = kinds.last().copied();
+        let kind = template::classify(role, text, prev);
+        let pieces = template::render(kind, text, prev, self.think, self.trusted_len);
+        let mut ids = Vec::new();
+        if transcript.spans().is_empty()
+            && let Some(bos) = self.tok.bos()
+        {
+            ids.push(bos);
+        }
+        ids.extend(self.tok.encode_pieces(&pieces));
+        transcript.push_span(role_of(kind), 0, text.to_owned(), &to_i32(&ids));
+        kinds.push(kind);
+    }
+
+    /// Brings `transcript` in line with the rendered transcript `flat`: the
+    /// leading spans whose (role, text) match keep their tokens, the rest are
+    /// rendered from text.
+    fn reconcile(&self, transcript: &mut TokenTranscript, kinds: &mut Vec<Kind>, flat: &str) {
+        let sections = parse_sections(flat);
+        let keys: Vec<SectionKey> = sections
+            .iter()
+            .filter_map(|(role, text)| {
+                SpanRole::from_tag(role).map(|role| SectionKey {
+                    role,
+                    text: text.clone(),
+                })
+            })
+            .collect();
+        let keep = transcript.common_prefix(&keys);
+        crate::engine::kv_debug(|| {
+            format!(
+                "gemma reconcile: {} spans held, {} sections in, kept {keep}",
+                transcript.spans().len(),
+                keys.len()
+            )
+        });
+        transcript.truncate_spans(keep);
+        kinds.truncate(keep);
+        for (role, text) in sections.iter().skip(keep) {
+            self.push(transcript, kinds, role, text);
+        }
+    }
+
+    /// The tokens a generation after `kinds`' last span starts with.
+    fn generation_prefix(&self, kinds: &[Kind]) -> Vec<u32> {
+        self.tok
+            .encode_pieces(&template::generation_prefix(kinds.last().copied()))
+    }
+}
+
+/// Bytes of RAM on this machine, or `usize::MAX` when it cannot be read (so
+/// the KV check never refuses on a failed probe).
+#[cfg(target_os = "macos")]
+fn physical_memory() -> usize {
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: the name is NUL-terminated, `bytes` and `len` are valid out
+    // pointers sized for `hw.memsize`'s u64, and no new value is set.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut bytes).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        usize::try_from(bytes).unwrap_or(usize::MAX)
+    } else {
+        usize::MAX
+    }
+}
+
+/// Bytes of RAM on this machine, or `usize::MAX` when it cannot be read.
+#[cfg(not(target_os = "macos"))]
+fn physical_memory() -> usize {
+    // SAFETY: sysconf only reads system configuration.
+    let (pages, size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    match (usize::try_from(pages), usize::try_from(size)) {
+        (Ok(p), Ok(s)) => p.saturating_mul(s),
+        _ => usize::MAX,
+    }
+}
+
+/// Metal when this machine has it, else the CPU.
+fn pick_device() -> (Device, &'static str) {
+    #[cfg(target_os = "macos")]
+    if let Ok(d) = Device::new_metal(0) {
+        return (d, "metal");
+    }
+    (Device::Cpu, "cpu")
+}
+
+impl GemmaEngine {
+    /// Opens the Gemma 4 GGUF at `path` on Metal (the CPU when there is no
+    /// Metal device) with a `ctx`-token context, clamped to the model's; a
+    /// `ctx` of zero or less means `min(32768, context_length)`.
+    ///
+    /// # Errors
+    /// When the file does not load as a Gemma 4 model, or when the KV for
+    /// `ctx` tokens would take more than half the machine's memory.
+    pub fn open(path: &Path, ctx: i32) -> Result<Self, EngineError> {
+        let (device, name) = pick_device();
+        Self::open_on(path, ctx, &device, name)
+    }
+
+    /// [`GemmaEngine::open`] forced onto the CPU, for tests.
+    ///
+    /// # Errors
+    /// As [`GemmaEngine::open`].
+    #[cfg(test)]
+    pub fn open_on_cpu(path: &Path, ctx: i32) -> Result<Self, EngineError> {
+        Self::open_on(path, ctx, &Device::Cpu, "cpu")
+    }
+
+    fn open_on(
+        path: &Path,
+        ctx: i32,
+        device: &Device,
+        device_name: &'static str,
+    ) -> Result<Self, EngineError> {
+        let cap = usize::try_from(ctx)
+            .ok()
+            .filter(|&c| c > 0)
+            .unwrap_or(DEFAULT_CTX);
+        // Rotary tables are built for the capped context only, which also
+        // makes `context_length()` the clamped context.
+        let model = Model::open_with_ctx(path, device, cap).map_err(engine_error)?;
+        let ctx = model.context_length();
+        let need = model.kv_bytes_per_token().saturating_mul(ctx);
+        if need > physical_memory() / 2 {
+            return Err(EngineError::new(format!(
+                "a {ctx}-token context needs {} GB of KV; lower it with --ctx",
+                need.div_ceil(1 << 30)
+            )));
+        }
+        let session = Session::new(model.clone(), ctx);
+        Ok(Self {
+            model,
+            session,
+            transcript: TokenTranscript::new(),
+            kinds: Vec::new(),
+            think: ThinkMode::default(),
+            trusted_len: 0,
+            device_name,
+        })
+    }
+
+    /// Where the model runs: `"metal"` or `"cpu"`.
+    #[must_use]
+    pub fn device_name(&self) -> &'static str {
+        self.device_name
+    }
+
+    fn render(&self) -> Render<'_> {
+        Render::new(&self.model.tokenizer, self.think, self.trusted_len)
+    }
+
+    /// Reconciles the token transcript with the rendered transcript `flat`.
+    fn reconcile(&mut self, flat: &str) {
+        Render::new(&self.model.tokenizer, self.think, self.trusted_len).reconcile(
+            &mut self.transcript,
+            &mut self.kinds,
+            flat,
+        );
+    }
+
+    /// Drops every recorded token, for a change that alters the system turn.
+    fn invalidate(&mut self) {
+        self.session.truncate(0);
+        self.transcript = TokenTranscript::new();
+        self.kinds.clear();
+    }
+
+    /// Prefills `toks` after the session's first `base` tokens (the session
+    /// already holds exactly those), reporting progress per chunk. Returns the
+    /// last logits, or `None` when interrupted.
+    fn prefill(
+        &mut self,
+        base: usize,
+        toks: &[u32],
+        interrupt: &dyn Fn() -> bool,
+        on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<Option<Vec<f32>>, EngineError> {
+        let total_abs = base + toks.len();
+        on_event(EngineEvent::Prefill(PrefillProgress::primed(
+            count(base),
+            count(total_abs),
+        )));
+        let start = std::time::Instant::now();
+        let mut total = count(total_abs);
+        let mut last = None;
+        for chunk in toks.chunks(PREFILL_CHUNK) {
+            match self
+                .session
+                .prefill(chunk, interrupt)
+                .map_err(engine_error)?
+            {
+                Some(l) => last = Some(l),
+                None => return Ok(None),
+            }
+            on_event(EngineEvent::Prefill(PrefillProgress::from_absolute(
+                count(base),
+                count(self.session.tokens().len()),
+                &mut total,
+                start.elapsed().as_secs_f64(),
+            )));
+        }
+        Ok(last)
+    }
+
+    /// Fails before touching the session when `need` tokens cannot fit.
+    fn check_fits(&self, need: usize) -> Result<(), EngineError> {
+        if need > self.session.ctx() {
+            return Err(EngineError::new(format!(
+                "context full: {need} tokens > {}",
+                self.session.ctx()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Records a sampled reply: the generation prefix it followed and its ids,
+    /// as a new assistant span — or as more of the last one when that is
+    /// already an assistant reply (a resumed `/btw` pass).
+    fn record_reply(&mut self, text: String, prefix: &[u32], reply: &[u32]) {
+        if reply.is_empty() {
+            return;
+        }
+        let mut ids = to_i32(prefix);
+        ids.extend(to_i32(reply));
+        if self.transcript.last_is_assistant() {
+            self.transcript.extend_last_span(&text, &ids);
+        } else {
+            self.transcript
+                .push_span(SpanRole::Assistant, 0, text, &ids);
+            self.kinds.push(Kind::Assistant);
+        }
+    }
+}
+
+impl Engine for GemmaEngine {
+    fn generate(
+        &mut self,
+        prompt: Prompt<'_>,
+        opts: &GenerationOptions,
+        interrupt: &dyn Fn() -> bool,
+        greedy: &dyn Fn() -> bool,
+        on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<GenerationStats, EngineError> {
+        self.reconcile(prompt.flat());
+        let prefix = self.render().generation_prefix(&self.kinds);
+        let mut full = to_u32(self.transcript.tokens());
+        full.extend_from_slice(&prefix);
+        self.check_fits(full.len())?;
+
+        // The last prompt token is always evaluated: its logits pick the
+        // first reply token.
+        let mut common = common_prefix(self.session.tokens(), &full);
+        if common == full.len() {
+            common = common.saturating_sub(1);
+        }
+        crate::engine::kv_debug(|| {
+            format!(
+                "gemma generate: prompt={} live={} reused={common}",
+                full.len(),
+                self.session.tokens().len()
+            )
+        });
+        self.session.truncate(common);
+        let Some(mut logits) = self.prefill(common, &full[common..], interrupt, on_event)? else {
+            return Ok(GenerationStats {
+                interrupted: true,
+                ctx_used: count(self.session.tokens().len()),
+                ..GenerationStats::default()
+            });
+        };
+
+        let model = self.model.clone();
+        let tok = &model.tokenizer;
+        let controls = Controls::of(tok);
+        let mut sampler = Sampler::new(if opts.seed != 0 {
+            opts.seed
+        } else {
+            0x2545_f491_4f6c_dd1d
+        });
+        let mut translator = ThinkTranslator::default();
+        let mut utf8 = Utf8Stream::default();
+        let mut reply: Vec<u32> = Vec::new();
+        let mut reply_text = String::new();
+        let mut interrupted = false;
+        let mut generated: i32 = 0;
+        let start = std::time::Instant::now();
+        let mut steady_mark: Option<(std::time::Instant, i32)> = None;
+        while (opts.n_predict < 0 || generated < opts.n_predict)
+            && self.session.tokens().len() < self.session.ctx()
+        {
+            if steady_mark.is_none()
+                && start.elapsed().as_secs_f64() >= crate::engine::STEADY_WARMUP_SECS
+            {
+                steady_mark = Some((std::time::Instant::now(), generated));
+            }
+            if interrupt() {
+                interrupted = true;
+                break;
+            }
+            let t = sampler.sample(&logits, opts.temperature, opts.top_p, opts.min_p, greedy());
+            if is_stop(tok, controls, t) {
+                break;
+            }
+            let text = translator.push(tok, t, &mut utf8);
+            if !text.is_empty() {
+                reply_text.push_str(&text);
+                on_event(EngineEvent::Text(text));
+            }
+            reply.push(t);
+            generated += 1;
+            logits = self.session.step(t).map_err(engine_error)?;
+        }
+        let tail = utf8.flush();
+        if !tail.is_empty() {
+            reply_text.push_str(&tail);
+            on_event(EngineEvent::Text(tail));
+        }
+        self.record_reply(reply_text, &prefix, &reply);
+
+        let secs = start.elapsed().as_secs_f64();
+        Ok(GenerationStats {
+            generated,
+            tps: if secs > 0.0 {
+                f64::from(generated) / secs
+            } else {
+                0.0
+            },
+            steady_tps: crate::engine::rate_since(steady_mark, generated),
+            ctx_used: count(self.session.tokens().len()),
+            interrupted,
+            usage: None,
+            spec: crate::engine::SpecStats::default(),
+        })
+    }
+
+    fn emits_think_tags(&self) -> bool {
+        true
+    }
+
+    fn kv_reuse_probe(&mut self, transcript: &str, _think: ThinkMode) -> Option<KvReuse> {
+        let render = self.render();
+        let mut tokens = self.transcript.clone();
+        let mut kinds = self.kinds.clone();
+        render.reconcile(&mut tokens, &mut kinds, transcript);
+        let mut full = to_u32(tokens.tokens());
+        full.extend(render.generation_prefix(&kinds));
+        let live = self.session.tokens();
+        Some(KvReuse {
+            live: count(live.len()),
+            common: count(common_prefix(live, &full)),
+        })
+    }
+
+    fn set_think_mode(&mut self, mode: ThinkMode) {
+        if mode != self.think {
+            self.think = mode;
+            self.invalidate();
+        }
+    }
+
+    fn set_trusted_system_prefix(&mut self, len: usize) {
+        if len != self.trusted_len {
+            self.trusted_len = len;
+            self.invalidate();
+        }
+    }
+
+    fn count_tokens(&self, text: &str) -> i32 {
+        count(self.model.tokenizer.encode_plain(text).len())
+    }
+
+    fn get_kv(&mut self) -> Option<KVCache> {
+        Some(KVCache::new(
+            self.session.snapshot().ok()?,
+            self.transcript.clone(),
+        ))
+    }
+
+    fn set_kv(&mut self, cache: &KVCache) -> Result<(), EngineError> {
+        self.session.restore(cache.kv()).map_err(engine_error)?;
+        self.transcript = cache.transcript().clone();
+        self.kinds.clear();
+        for span in self.transcript.spans() {
+            let kind =
+                template::classify(tag_of(span.role), &span.text, self.kinds.last().copied());
+            self.kinds.push(kind);
+        }
+        Ok(())
+    }
+
+    fn can_release_gpu(&self) -> bool {
+        true
+    }
+
+    /// Places the system turn in the transcript. Nothing is prefilled until
+    /// [`Engine::warm_sync`], so a checkpoint restored in between is not paid
+    /// for twice.
+    fn warm_reset(&mut self, system: &str) -> Result<(), EngineError> {
+        self.transcript = TokenTranscript::new();
+        self.kinds.clear();
+        self.reconcile(&format!("[system]\n{system}\n"));
+        Ok(())
+    }
+
+    fn warm_append(&mut self, text: Option<&str>) -> Result<(), EngineError> {
+        if let Some(text) = text {
+            // Trimmed as `parse_sections` trims, so the span matches the
+            // section the next turn's transcript carries.
+            Render::new(&self.model.tokenizer, self.think, self.trusted_len).push(
+                &mut self.transcript,
+                &mut self.kinds,
+                "user",
+                text.trim_end(),
+            );
+        }
+        Ok(())
+    }
+
+    fn warm_sync(&mut self, on_event: &mut dyn FnMut(EngineEvent)) -> Result<bool, EngineError> {
+        let want = to_u32(self.transcript.tokens());
+        self.check_fits(want.len())?;
+        let common = common_prefix(self.session.tokens(), &want);
+        self.session.truncate(common);
+        if common == want.len() {
+            return Ok(false);
+        }
+        self.prefill(common, &want[common..], &|| false, on_event)?;
+        Ok(true)
+    }
+
+    fn ctx_size(&self) -> i32 {
+        count(self.session.ctx())
+    }
+
+    fn model_name(&self) -> String {
+        self.model.name.clone()
+    }
+
+    fn is_local(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{Engine, EngineEvent, GenerationOptions, Prompt, ThinkMode};
+    use crate::kvcache::KVCache;
+
+    fn engine() -> GemmaEngine {
+        let p = std::env::temp_dir().join(format!(
+            "plank-gemma-{}-{:?}.gguf",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        gemma_engine::testgguf::write_tiny(&p, &gemma_engine::testgguf::TinyConfig::default())
+            .unwrap();
+        GemmaEngine::open_on_cpu(&p, 256).unwrap()
+    }
+
+    fn opts() -> GenerationOptions {
+        GenerationOptions {
+            n_predict: 4,
+            ctx_size: 256,
+            temperature: 0.0,
+            think_mode: ThinkMode::Off,
+            ..GenerationOptions::default()
+        }
+    }
+
+    fn run(e: &mut GemmaEngine, flat: &str) -> String {
+        let mut text = String::new();
+        e.generate(
+            Prompt::Flat(flat),
+            &opts(),
+            &|| false,
+            &|| true,
+            &mut |ev| {
+                if let EngineEvent::Text(t) = ev {
+                    text.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+        text
+    }
+
+    #[test]
+    fn the_second_turn_prefills_only_its_suffix() {
+        let mut e = engine();
+        let t1 = "[system]\nsys\n[user]\nhello\n";
+        let reply = run(&mut e, t1);
+        let live = e.session.tokens().len();
+        let t2 = format!("{t1}[assistant]\n{reply}\n[user]\nmore\n");
+        let probe = e.kv_reuse_probe(&t2, ThinkMode::Off).unwrap();
+        assert_eq!(
+            usize::try_from(probe.common).unwrap(),
+            live,
+            "the whole first turn must be reused"
+        );
+    }
+
+    /// The recorded reply (generation prefix plus sampled ids, stop token
+    /// excluded) is exactly what the session evaluated.
+    #[test]
+    fn the_transcript_describes_the_live_kv_after_a_turn() {
+        let mut e = engine();
+        run(&mut e, "[system]\nsys\n[user]\nhello\n");
+        assert_eq!(to_u32(e.transcript.tokens()), e.session.tokens());
+        assert_eq!(e.kinds.len(), e.transcript.spans().len());
+    }
+
+    /// `warm_reset` only places tokens, so a checkpoint restored after it is
+    /// not paid for twice; `warm_sync` prefills once and then has nothing to do.
+    #[test]
+    fn the_warm_walk_prefills_only_at_sync() {
+        let mut e = engine();
+        e.warm_reset("sys").unwrap();
+        e.warm_append(Some("project context\n")).unwrap();
+        assert!(e.session.tokens().is_empty());
+        assert!(e.warm_sync(&mut |_| {}).unwrap());
+        assert_eq!(to_u32(e.transcript.tokens()), e.session.tokens());
+        assert!(!e.warm_sync(&mut |_| {}).unwrap());
+        let live = e.session.tokens().len();
+        let probe = e
+            .kv_reuse_probe(
+                "[system]\nsys\n[user]\nproject context\n[user]\nhi\n",
+                ThinkMode::Off,
+            )
+            .unwrap();
+        assert_eq!(usize::try_from(probe.common).unwrap(), live);
+    }
+
+    /// The system turn carries `<|think|>` only while thinking is on, so a
+    /// change of level drops every recorded token.
+    #[test]
+    fn a_think_level_change_drops_the_transcript() {
+        let mut e = engine();
+        run(&mut e, "[system]\nsys\n[user]\nhello\n");
+        e.set_think_mode(ThinkMode::Medium);
+        e.set_think_mode(ThinkMode::Off);
+        assert!(e.transcript.is_empty() && e.session.tokens().is_empty());
+        let mut on = engine();
+        on.set_think_mode(ThinkMode::Max);
+        on.reconcile("[system]\nsys\n");
+        let mut off = engine();
+        off.set_think_mode(ThinkMode::Off);
+        off.reconcile("[system]\nsys\n");
+        assert_ne!(on.transcript.tokens(), off.transcript.tokens());
+    }
+
+    #[test]
+    fn rerender_from_text_matches_recorded_tokens() {
+        let mut a = engine();
+        let flat = "[system]\nsys\n[user]\nhi\n[assistant]\nok\n[user]\n<tool_result>Tool result 1 (read):\nx\n</tool_result>\n";
+        a.reconcile(flat);
+        let mut b = engine();
+        b.reconcile(flat);
+        assert_eq!(a.transcript.tokens(), b.transcript.tokens());
+        let snap = a.get_kv();
+        // A fresh engine restoring the blob agrees with its own re-render.
+        let mut c = engine();
+        c.set_kv(&KVCache::new(
+            snap.unwrap().kv().to_vec(),
+            crate::ds4tokens::TokenTranscript::new(),
+        ))
+        .unwrap();
+        c.reconcile(flat);
+        assert_eq!(c.transcript.tokens(), a.transcript.tokens());
+    }
+
+    #[test]
+    fn byte_fallback_pieces_stream_as_whole_chars() {
+        let e = engine();
+        let ids = e.model.tokenizer.encode_plain("✓");
+        let mut u = crate::engine::Utf8Stream::default();
+        let mut out = String::new();
+        for id in ids {
+            out.push_str(&u.push(e.model.tokenizer.piece_bytes(id)));
+        }
+        out.push_str(&u.flush());
+        assert_eq!(out, "✓");
+    }
+
+    #[test]
+    fn prompt_beyond_context_is_an_error() {
+        let mut e = engine();
+        let long = format!("[system]\n{}\n", "word ".repeat(400));
+        let err = e
+            .generate(
+                Prompt::Flat(&long),
+                &opts(),
+                &|| false,
+                &|| true,
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("context full"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_snapshot_leaves_the_engine_untouched() {
+        let mut e = engine();
+        run(&mut e, "[system]\nsys\n[user]\nhello\n");
+        let before = e.session.tokens().to_vec();
+        assert!(
+            e.set_kv(&KVCache::new(
+                vec![0; 16],
+                crate::ds4tokens::TokenTranscript::new()
+            ))
+            .is_err()
+        );
+        assert_eq!(e.session.tokens(), before);
+    }
+
+    #[test]
+    fn channel_tokens_become_think_tags() {
+        let e = engine();
+        let mut tr = ThinkTranslator::default();
+        let tok = &e.model.tokenizer;
+        let mut out = String::new();
+        let mut u = crate::engine::Utf8Stream::default();
+        for id in tok.encode_trusted("<|channel>thought\nplan<channel|>Answer") {
+            out.push_str(&tr.push(tok, id, &mut u));
+        }
+        out.push_str(&u.flush());
+        assert_eq!(out, "<think>plan</think>Answer");
+    }
+}

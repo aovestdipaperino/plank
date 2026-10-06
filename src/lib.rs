@@ -80,6 +80,10 @@ pub mod fakegpu;
 pub mod feedback;
 pub mod ffi;
 pub mod framebridge;
+/// Gemma 4 behind [`engine::Engine`], over the native-Rust `gemma-engine`
+/// crate (candle on Metal). Needs no submodule, so it is on by default.
+#[cfg(feature = "gemma")]
+pub mod gemmaengine;
 pub mod gguf;
 pub mod ggufdelta;
 pub mod goal;

@@ -941,7 +941,9 @@ fn stream_chunk_must_stop<S: RenderSink>(
 /// rendered as hidden reasoning, which is the same bug in a new costume, the
 /// model delivering and the user still seeing nothing.
 fn pass_opens_in_think(opts: &crate::engine::GenerationOptions, engine: &dyn Engine) -> bool {
-    !matches!(opts.think_mode, crate::engine::ThinkMode::Off) && !engine.wants_structured()
+    !matches!(opts.think_mode, crate::engine::ThinkMode::Off)
+        && !engine.wants_structured()
+        && !engine.emits_think_tags()
 }
 
 /// Why a pass stopped itself before the engine ran out of tokens.
@@ -22225,6 +22227,48 @@ mod tests {
             gen_secs: gen_.1,
             tool_secs: tools,
         }
+    }
+
+    /// An engine whose model opens its own thought block (Gemma's
+    /// `<|channel>`, streamed as `<think>`) starts the pass in visible text;
+    /// marking it as already inside `<think>` would hide the answer.
+    #[test]
+    fn pass_opens_in_think_unless_the_engine_emits_its_own_tags() {
+        use crate::engine::{
+            EchoEngine, EngineError, EngineEvent, GenerationOptions, GenerationStats, Prompt,
+            ThinkMode,
+        };
+        #[derive(Debug)]
+        struct Tagged;
+        impl Engine for Tagged {
+            fn generate(
+                &mut self,
+                _prompt: Prompt<'_>,
+                _opts: &GenerationOptions,
+                _interrupt: &dyn Fn() -> bool,
+                _greedy: &dyn Fn() -> bool,
+                _on_event: &mut dyn FnMut(EngineEvent),
+            ) -> Result<GenerationStats, EngineError> {
+                Ok(GenerationStats::default())
+            }
+            fn ctx_size(&self) -> i32 {
+                0
+            }
+            fn emits_think_tags(&self) -> bool {
+                true
+            }
+        }
+        let think = GenerationOptions {
+            think_mode: ThinkMode::Medium,
+            ..GenerationOptions::default()
+        };
+        let off = GenerationOptions {
+            think_mode: ThinkMode::Off,
+            ..GenerationOptions::default()
+        };
+        assert!(pass_opens_in_think(&think, &EchoEngine::new(0)));
+        assert!(!pass_opens_in_think(&think, &Tagged));
+        assert!(!pass_opens_in_think(&off, &EchoEngine::new(0)));
     }
 
     #[test]

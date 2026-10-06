@@ -4813,6 +4813,7 @@ dependencies = [
  "crt-off",
  "edit",
  "extism",
+ "gemma-engine",
  "gguf-delta",
  "git2",
  "image",

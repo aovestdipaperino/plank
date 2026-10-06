@@ -925,6 +925,16 @@ pub trait Engine: Debug + Send {
         false
     }
 
+    /// Whether the stream this engine emits carries its own `<think>` opener.
+    ///
+    /// The ds4 prompt ends inside an open `<think>`, so the renderer has to be
+    /// told a pass starts there. An engine whose model opens its own thought
+    /// block mid-stream (Gemma's `<|channel>`, translated to `<think>`) says
+    /// yes, and the pass then starts in visible text.
+    fn emits_think_tags(&self) -> bool {
+        false
+    }
+
     /// Reports how the live KV lines up with the prompt the next `generate`
     /// call will build from `transcript`, without generating anything.
     ///

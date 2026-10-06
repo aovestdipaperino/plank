@@ -23,6 +23,11 @@ pub mod sample;
 #[cfg(feature = "candle")]
 pub mod session;
 
+/// The device type [`model::Model::open`] takes, so a caller needs no direct
+/// candle dependency to pick Metal or the CPU.
+#[cfg(feature = "candle")]
+pub use candle_core::Device;
+
 /// Every failure this crate reports. A message, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
