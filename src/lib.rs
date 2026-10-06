@@ -32,6 +32,35 @@ pub mod download;
 pub mod downloader;
 #[cfg(ds4_engine)]
 pub mod ds4engine;
+/// The no-engine stand-in for the cancel-flag entry points `ui.rs` calls
+/// unconditionally. Without the native engine no generation reads the flag,
+/// but the flag itself keeps the real one's per-thread semantics, so the
+/// front end's pressure-stop bookkeeping behaves the same either way.
+#[cfg(not(ds4_engine))]
+pub mod ds4engine {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Whether a memory-pressure cancel is raised on this thread.
+        static PRESSURE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Raises a memory-pressure cancel on the calling thread.
+    pub fn request_pressure_cancel() {
+        PRESSURE.with(|f| f.set(true));
+    }
+
+    /// True when the last stop was a memory-pressure yield.
+    #[must_use]
+    pub fn cancelled_by_pressure() -> bool {
+        PRESSURE.with(Cell::get)
+    }
+
+    /// Clears the cancel flag.
+    pub fn clear_cancel() {
+        PRESSURE.with(|f| f.set(false));
+    }
+}
 /// Token-primary transcript core for the ds4 backend (issue #58). FFI-free and
 /// always compiled so its reconciliation/persistence logic is CI-tested; the
 /// gated `ds4engine` drives it.
@@ -51,7 +80,6 @@ pub mod fakegpu;
 pub mod feedback;
 pub mod ffi;
 pub mod framebridge;
-#[cfg(ds4_engine)]
 pub mod gguf;
 pub mod ggufdelta;
 pub mod goal;

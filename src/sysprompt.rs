@@ -133,6 +133,20 @@ pub fn qwen_syntax_reminder() -> &'static str {
 $PARAMETER_VALUE\n</parameter>\n</function>\n</tool_call>\n"
 }
 
+/// The short Gemma tool-call syntax reminder.
+#[must_use]
+pub fn gemma_syntax_reminder() -> &'static str {
+    concat!(
+        "Tool-call syntax reminder:\n",
+        "<|tool_call>call:$TOOL_NAME{$KEY:<|\"|>$STRING_VALUE<|\"|>,$KEY2:$NUMBER_OR_BOOL}<tool_call|>\n",
+        "Every string value goes between <|\"|> and <|\"|>, with nothing escaped inside.\n",
+    )
+}
+
+/// [`IN_THINK_PROHIBITION`] for Gemma, whose thinking block closes with `<channel|>`.
+pub const GEMMA_IN_THINK_PROHIBITION: &str =
+    "Tool calls are only run outside the thinking block: close it with <channel|> first.";
+
 /// Editing-instructions section of the tools prompt (verbatim from C).
 ///
 /// This is the C's `agent_tools_prompt_edit_upto` variant: plank's edit tool
@@ -1761,6 +1775,7 @@ pub fn build_short_system_prompt_reminder(
         ToolSyntax::Qwen => qwen_syntax_reminder(),
         ToolSyntax::Dsml => dsml_syntax_reminder(),
         ToolSyntax::Dsml41 => dsml41_syntax_reminder(),
+        ToolSyntax::Gemma => gemma_syntax_reminder(),
     });
     out.push_str("Available tools: ");
     out.push_str(&tool_names(mcp_servers).join(", "));

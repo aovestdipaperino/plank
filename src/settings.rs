@@ -582,6 +582,7 @@ pub struct GateBias {
     pub ds4: i32,
     pub ds41: i32,
     pub qwen: i32,
+    pub gemma: i32,
 }
 
 impl GateBias {
@@ -595,6 +596,7 @@ impl GateBias {
             crate::gguf::ModelFamily::Ds4 => "ds4",
             crate::gguf::ModelFamily::Ds41 => "ds41",
             crate::gguf::ModelFamily::Qwen => "qwen",
+            crate::gguf::ModelFamily::Gemma => "gemma",
         }
     }
 
@@ -605,6 +607,7 @@ impl GateBias {
             crate::gguf::ModelFamily::Ds4 => self.ds4,
             crate::gguf::ModelFamily::Ds41 => self.ds41,
             crate::gguf::ModelFamily::Qwen => self.qwen,
+            crate::gguf::ModelFamily::Gemma => self.gemma,
         }
     }
 }
@@ -974,6 +977,7 @@ impl Settings {
             set("ds4", &mut self.memory.gate_bias.ds4);
             set("ds41", &mut self.memory.gate_bias.ds41);
             set("qwen", &mut self.memory.gate_bias.qwen);
+            set("gemma", &mut self.memory.gate_bias.gemma);
             self.note("memory.gateBias", origin);
         }
     }
@@ -1602,6 +1606,7 @@ impl Settings {
                         ("ds4".to_string(), inum(b.ds4)),
                         ("ds41".to_string(), inum(b.ds41)),
                         ("qwen".to_string(), inum(b.qwen)),
+                        ("gemma".to_string(), inum(b.gemma)),
                     ])
                 }),
             );

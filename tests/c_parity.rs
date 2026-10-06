@@ -580,7 +580,9 @@ fn think_prefix_fallthrough_arm_matches_c_source() {
 /// `qwen4.metal` and `qwen4_vision.metal`.
 ///
 /// Order matters as documentation, not to the engine, so this compares the
-/// pairs as sets and reports each side's surplus.
+/// pairs as sets and reports each side's surplus. Engine builds only: the
+/// table lives in `ds4engine`, which a no-engine build does not compile.
+#[cfg(ds4_engine)]
 #[test]
 fn metal_kernels_match_the_c_reference() {
     let Some(src) = c_file("ds4_metal.m") else {

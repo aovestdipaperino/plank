@@ -612,6 +612,16 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
         // Written without a `\`-continued literal on purpose: continuations
         // strip the next line's indentation, which is a silent way to mangle
         // model-facing text (see CLAUDE.md).
+        // Gemma's thinking block closes with `<channel|>`, not `</think>`;
+        // telling it to write a tag it never emits would not close anything.
+        PassError::InThink if syntax == sysprompt::ToolSyntax::Gemma => format!(
+            concat!(
+                "Tool error: {}\n",
+                "The tool call was not run. Close the thinking block with ",
+                "<channel|>, then emit the same call again.\n",
+            ),
+            sysprompt::GEMMA_IN_THINK_PROHIBITION
+        ),
         PassError::InThink => format!(
             concat!(
                 "Tool error: {}\n",
@@ -639,6 +649,10 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
             sysprompt::ToolSyntax::Dsml41 => format!(
                 "Tool error: invalid DSML tool call: {err}\n{}",
                 sysprompt::dsml41_syntax_reminder()
+            ),
+            sysprompt::ToolSyntax::Gemma => format!(
+                "Tool error: invalid Gemma tool call: {err}\n{}",
+                sysprompt::gemma_syntax_reminder()
             ),
         },
     }
@@ -10512,6 +10526,7 @@ the original is frozen and listed in /tree"
                     crate::sysprompt::ToolSyntax::Dsml => "dsml",
                     crate::sysprompt::ToolSyntax::Qwen => "qwen",
                     crate::sysprompt::ToolSyntax::Dsml41 => "dsml41",
+                    crate::sysprompt::ToolSyntax::Gemma => "gemma",
                 },
                 artifact_version,
                 companion: &companion,
@@ -31801,6 +31816,22 @@ mod tests {
             ),
             "Tool error: old not found\n"
         );
+    }
+
+    #[test]
+    fn a_malformed_gemma_call_gets_the_gemma_reminder() {
+        let p = tool_error_payload(
+            PassError::Dsml,
+            "duplicate key a",
+            crate::sysprompt::ToolSyntax::Gemma,
+        );
+        assert!(
+            p.starts_with("Tool error: invalid Gemma tool call: duplicate key a\n"),
+            "{p}"
+        );
+        assert!(p.contains("<|tool_call>call:"), "{p}");
+        let t = tool_error_payload(PassError::InThink, "", crate::sysprompt::ToolSyntax::Gemma);
+        assert!(t.contains("<channel|>") && !t.contains("</think>"), "{t}");
     }
 
     #[test]

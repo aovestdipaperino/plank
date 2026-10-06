@@ -3085,6 +3085,8 @@ fn warn_on_companion_mismatch(family: crate::gguf::ModelFamily, companion: &Path
     let expected = match family {
         crate::gguf::ModelFamily::Qwen => "qwen4-exp-ple",
         crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41 => "deepseek4-dspark",
+        // Gemma never opens on this engine and has no drafter to compare to.
+        crate::gguf::ModelFamily::Gemma => return,
     };
     if arch != expected {
         eprintln!(
