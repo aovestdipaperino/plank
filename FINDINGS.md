@@ -3369,7 +3369,34 @@ llama.cpp (commit `d7a695e`), pinned by
   rather than a ring buffer, so truncation is exact at any depth.
   `kv_reuse_probe` therefore reports `live == common` (Ruling 14). A
   divergence behind the live end is never the rebuild-from-zero shape that the
-  rung and fork rescue exist for.
+  rung and fork rescue exist for. `Engine::kv_truncates_exactly` goes further:
+  the agent takes no fork snapshot (sub-agent, memory pass, suggestion), no
+  memory-pass prefill snapshot and no ladder rung. Each `get_kv` serialises
+  the whole f32 KV, about 114 KB per token on E4B (≈3.5 GB at 30k tokens), and
+  `KvCache::restore` stages a second copy, so a fork could peak near 16 GB on
+  a 16 GB Mac for a prefix the next `generate` keeps anyway.
+- **Suggestions with thinking on need `emits_think_tags`.**
+  `suggest::reasoning_unfinished` assumed DeepSeek's implicit think block: a
+  reply without `</think>` meant the budget ran out mid-thought. Gemma opens
+  its own block or skips it, so every suggestion was dropped. For a
+  think-tag engine only a last `<think>` with no `</think>` after it counts.
+- **Only a Gemma renderer recognizes `<|tool_call>`.** DSML and Qwen streams
+  adopt each other's openers, but the Gemma arm of `start_match_any` was tried
+  in every renderer, so a DeepSeek stream quoting `<|tool_call>` had it parsed
+  as a call. The arm is gated on the syntax the renderer was built with.
+- **MCP declarations stay plain-tokenized, and E4B calls them anyway**
+  (Ruling 17). Everything after the trusted builtin prefix is tokenized
+  plainly, so the `<|tool>`, `<|"|>` and `<tool|>` around an MCP or WASM
+  declaration are character tokens, not control ids. A release smoke run
+  (2026-10-06, E4B Q4_K_M, temporary `HOME`, one scratch stdio server `util`
+  with an `echo` tool, `--ui console -p`) issued a correct
+  `<|tool_call>call:mcp__util__echo{text:<|"|>…<|"|>}<tool_call|>` and used
+  the result in 5 of 5 prompts, including ones that never named the tool
+  (“What verification token does the echo tool return? Echo the word ping to
+  find out.”). Structure-trusted framing for foreign declarations was
+  therefore not built: it would need a richer trust representation than one
+  `trusted_len`, and it is the fix to reach for if a server's tools are ever
+  seen ignored or mis-called.
 - **A warm walk must not adopt the checkpoint's transcript.** `set_kv`
   restores a tier checkpoint during the walk. If it also replaced the warm
   buffer with the checkpoint's transcript, `kvtier::warm` would append the

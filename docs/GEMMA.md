@@ -69,7 +69,11 @@ You are …<|tool>declaration:NAME{description:<|"|>…<|"|>,parameters:{…}}<t
 
 User text, tool output and MCP schema text are tokenized plainly, so they
 never produce a control id, whatever they spell. Only the template's own
-markers and the trusted system prefix map to control ids.
+markers and the trusted system prefix map to control ids. MCP and WASM
+declarations sit after that prefix, so even their `<|tool>`/`<|"|>`/`<tool|>`
+framing is plain characters. E4B still calls them correctly: a scratch MCP
+`echo` tool was called as `call:mcp__util__echo{…}` in 5 of 5 smoke prompts
+(Ruling 17, `FINDINGS.md`).
 
 ### Span rendering: `<turn|>` belongs to the next section
 
