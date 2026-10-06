@@ -133,6 +133,20 @@ pub fn qwen_syntax_reminder() -> &'static str {
 $PARAMETER_VALUE\n</parameter>\n</function>\n</tool_call>\n"
 }
 
+/// The short Gemma tool-call syntax reminder.
+#[must_use]
+pub fn gemma_syntax_reminder() -> &'static str {
+    concat!(
+        "Tool-call syntax reminder:\n",
+        "<|tool_call>call:$TOOL_NAME{$KEY:<|\"|>$STRING_VALUE<|\"|>,$KEY2:$NUMBER_OR_BOOL}<tool_call|>\n",
+        "Every string value goes between <|\"|> and <|\"|>, with nothing escaped inside.\n",
+    )
+}
+
+/// [`IN_THINK_PROHIBITION`] for Gemma, whose thinking block closes with `<channel|>`.
+pub const GEMMA_IN_THINK_PROHIBITION: &str =
+    "Tool calls are only run outside the thinking block: close it with <channel|> first.";
+
 /// Editing-instructions section of the tools prompt (verbatim from C).
 ///
 /// This is the C's `agent_tools_prompt_edit_upto` variant: plank's edit tool
@@ -620,6 +634,16 @@ fn build_tools_prompt_parts_with_wasm(
     syntax: ToolSyntax,
     gpu_suspend: bool,
 ) -> (String, usize) {
+    // Gemma speaks neither DSML nor Qwen: it takes its own declarations.
+    if syntax == ToolSyntax::Gemma {
+        return build_gemma_tools_prompt_parts(
+            profile_prompt_source(),
+            mcp_servers,
+            wasm_tools,
+            parity,
+            gpu_suspend,
+        );
+    }
     // Unreachable without the feature: `Ds4Model::open` refuses a Qwen model
     // before any prompt is built, so the dialect can never be selected. The
     // arm is gated rather than left to fall through to DSML so that, if that
@@ -813,6 +837,498 @@ fn compose_qwen_profile_prompt(
     }
 }
 
+/// The Gemma 4 tools prompt: plank's prose, then its tools as Gemma's own
+/// `<|tool>declaration:…<tool|>` blocks.
+///
+/// Gemma's chat template puts the declarations inside the system turn, right
+/// after the trimmed system content and with no separator, so plank's text
+/// comes first and the declarations close it. The engine wraps the whole
+/// string in the system turn itself.
+///
+/// The trusted span ends after the builtin declarations: the Gemma engine maps
+/// control spellings (`<|tool>`, `<|"|>`, …) to their atomic tokens only
+/// there, so plank's declarations get the form the model was trained on. MCP
+/// and WASM declarations and the server instructions come after it and are
+/// tokenized as plain text, exactly as DSML keeps MCP schemas past
+/// `trusted_len`: a third-party description that spells `<turn|>` or `<|"|>`
+/// stays inert instead of closing the turn or the string it sits in.
+fn build_gemma_tools_prompt_parts(
+    profile: Option<(&str, &crate::profile::ProfileSpec)>,
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    wasm_tools: &[&crate::wasmreg::WasmTool],
+    parity: bool,
+    gpu_suspend: bool,
+) -> (String, usize) {
+    let mut out = if let Some((text, spec)) = profile {
+        let mut text = text.to_string();
+        if gpu_suspend && spec.builtin_enabled("bash") {
+            append_gpu_suspend_note(&mut text, ToolSyntax::Gemma);
+        }
+        compose_gemma_profile_prompt(&text, spec, parity)
+    } else {
+        let mut out = gemma_prose();
+        if gpu_suspend {
+            append_gpu_suspend_note(&mut out, ToolSyntax::Gemma);
+        }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        let builtins: Vec<crate::engine::ToolSpec> = parse_builtin_tool_schemas()
+            .into_iter()
+            .chain(native_extra_specs(true))
+            .collect();
+        out.push_str(&gemma_tools_section(&builtins, parity));
+        out
+    };
+    let trusted_len = out.len();
+
+    // MCP tools come from the provider registry, the single schema source:
+    // primary tools, the `mcp_describe`/`mcp_call` door to the directory, and
+    // the resource tools. All of them, and only they, are named `mcp_…`.
+    let foreign: Vec<crate::engine::ToolSpec> = provider_tool_registry(mcp_servers)
+        .into_iter()
+        .filter(|s| s.name.starts_with("mcp_"))
+        .chain(wasm_tools.iter().map(|t| {
+            crate::engine::ToolSpec {
+                name: t.exposed.clone(),
+                description: t.description.clone(),
+                parameters: serde_json::from_str(&t.schema)
+                    .unwrap_or_else(|_| serde_json::json!({ "type": "object", "properties": {} })),
+            }
+        }))
+        .collect();
+    out.push_str(&render_gemma_declarations(&foreign));
+    let mut instructions = String::new();
+    crate::tools::mcp::append_server_instructions(&mut instructions, mcp_servers);
+    if !instructions.is_empty() {
+        out.push('\n');
+        out.push_str(&instructions);
+    }
+    (out, trusted_len)
+}
+
+/// How a Gemma model is told to call a tool. Its `# Tools` heading opens the
+/// section [`TOOL_PROTOCOL_TOKEN`] expands to under Gemma.
+const GEMMA_CALL_SYNTAX: &str = concat!(
+    "# Tools\n\n",
+    "Call a tool by writing exactly:\n",
+    "<|tool_call>call:TOOL_NAME{key:<|\"|>string value<|\"|>,count:3,flag:true}<tool_call|>\n",
+    "Every string value goes between <|\"|> and <|\"|>, with nothing escaped inside. ",
+    "The result comes back in a <|tool_response> block; continue from it. ",
+    "Several calls may follow one another.",
+);
+
+/// The `# Tools` section: the call syntax, the in-think line under parity,
+/// then `specs` declared, directly after the text as the template places them.
+fn gemma_tools_section(specs: &[crate::engine::ToolSpec], parity: bool) -> String {
+    let mut out = String::from(GEMMA_CALL_SYNTAX);
+    if parity {
+        out.push('\n');
+        out.push_str(GEMMA_IN_THINK_PROHIBITION);
+    }
+    out.push_str(&render_gemma_declarations(specs));
+    out
+}
+
+/// The anchored-edit example of [`TOOLS_PROMPT_EDIT_LINE`], as a Gemma call.
+/// `path` stays first, as the editing rules above it ask.
+const GEMMA_EDIT_EXAMPLE: &str = concat!(
+    "Example anchored edit:\n",
+    "<|tool_call>call:edit{path:<|\"|>/tmp/example.c<|\"|>,",
+    "old:<|\"|>static int parse(void) {\n",
+    "    int ok = 0;\n",
+    "[upto]\n",
+    "    return ok;\n",
+    "}<|\"|>,",
+    "new:<|\"|>static int parse(void) {\n",
+    "    return parse_impl();\n",
+    "}<|\"|>}<tool_call|>\n",
+);
+
+/// [`WORKING_STYLE`]'s DSML-specific phrases and their Gemma wording.
+const GEMMA_WORKING_STYLE_RESPELLINGS: [(&str, &str); 4] = [
+    (
+        "Put several <｜DSML｜invoke> blocks in one <｜DSML｜tool_calls> stanza whenever the calls do not depend on each other's results: reading three files, running two searches, a glob plus a read. Every stanza costs a full round trip, so one stanza with five invokes is far cheaper than five stanzas with one.",
+        "Write several tool calls one after another in a single reply whenever the calls do not depend on each other's results: reading three files, running two searches, a glob plus a read. Every reply costs a full round trip, so one reply with five calls is far cheaper than five replies with one.",
+    ),
+    (
+        "After </think> and before every <｜DSML｜tool_calls> stanza, write",
+        "After your thinking and before every batch of tool calls, write",
+    ),
+    (
+        "as soon as you have it, after </think>, and move",
+        "as soon as you have it, outside your thinking, and move",
+    ),
+    (
+        "batching independent ones into a single stanza.",
+        "batching independent ones into a single reply.",
+    ),
+];
+
+/// plank's prose for a Gemma model: the DSML prompt's agent instructions with
+/// everything DSML-specific taken out.
+///
+/// Dropped: the DSML call-shape block of [`TOOLS_PROMPT_INTRO`] (with its
+/// in-think line, `string=` rule and entity escaping), the `### Available
+/// Tool Schemas` block (the declarations replace it) and the SSML spelling
+/// note. Respelled: the anchored-edit example, the Rules line about strict
+/// DSML syntax, and the working style's stanza wording. Everything else is
+/// model-agnostic and kept verbatim, cut from the C constants rather than
+/// retyped so it cannot drift from the DSML prompt.
+fn gemma_prose() -> String {
+    let intro = TOOLS_PROMPT_INTRO;
+    let shape = intro
+        .find("## Tools\n")
+        .expect("the intro has a Tools section");
+    let read = intro
+        .find("Read defaults to")
+        .expect("the intro ends with the read guidance");
+    let mut out = String::with_capacity(8 * 1024);
+    out.push_str(&intro[..shape]);
+    out.push_str(&intro[read..]);
+    insert_document_read_note(&mut out);
+
+    let edit = TOOLS_PROMPT_EDIT_LINE;
+    let example = edit
+        .find("Example anchored edit:\n")
+        .expect("the editing section has an example");
+    let example_end = edit[example..]
+        .find("</｜DSML｜tool_calls>\n")
+        .map(|at| example + at + "</｜DSML｜tool_calls>\n".len())
+        .expect("the example closes its stanza");
+    out.push_str(&edit[..example]);
+    out.push_str(GEMMA_EDIT_EXAMPLE);
+    out.push_str(&edit[example_end..]);
+
+    let after = TOOLS_PROMPT_AFTER_EDIT;
+    let schemas = after
+        .find("### Available Tool Schemas")
+        .expect("the trailing section has a schema block");
+    let rules = after
+        .find("# Rules")
+        .expect("the trailing section ends with its Rules");
+    out.push_str(&after[..schemas]);
+    out.push_str(&after[rules..].replace(
+        "- Always use strict syntax for DSML tool stanzas.",
+        "- Always use strict syntax for tool calls.",
+    ));
+
+    let mut style = String::new();
+    append_working_style(&mut style);
+    for (from, to) in GEMMA_WORKING_STYLE_RESPELLINGS {
+        debug_assert!(
+            style.contains(from),
+            "working style no longer says {from:?}"
+        );
+        style = style.replace(from, to);
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&style);
+    out
+}
+
+/// Composes a profile's prompt for a Gemma model, the counterpart of
+/// [`compose_profile_prompt`] and [`compose_qwen_profile_prompt`].
+///
+/// [`TOOL_PROTOCOL_TOKEN`] expands to the whole `# Tools` section: the call
+/// syntax, then the allowed builtins declared. Without the token the profile
+/// text is trimmed and the declarations follow it directly, which is the
+/// template's own shape, so the model still sees its tools.
+fn compose_gemma_profile_prompt(
+    profile_text: &str,
+    spec: &crate::profile::ProfileSpec,
+    parity: bool,
+) -> String {
+    let specs: Vec<crate::engine::ToolSpec> = parse_builtin_tool_schemas()
+        .into_iter()
+        .chain(native_extra_specs(true))
+        .filter(|s| spec.builtin_enabled(&s.name))
+        .collect();
+    if profile_text.contains(TOOL_PROTOCOL_TOKEN) {
+        profile_text.replace(TOOL_PROTOCOL_TOKEN, &gemma_tools_section(&specs, parity))
+    } else {
+        let mut out = profile_text.trim_end().to_string();
+        out.push_str(&render_gemma_declarations(&specs));
+        out
+    }
+}
+
+/// The `PLANK_REGEN_FIXTURES` hook for `tests/gemma_parity.rs`: the Gemma
+/// tools prompt with no MCP, WASM or profile.
+#[doc(hidden)]
+#[must_use]
+pub fn gemma_tools_prompt_for_tests(gpu_suspend: bool) -> String {
+    build_tools_prompt_parts_with_wasm(&[], &[], true, ToolSyntax::Gemma, gpu_suspend).0
+}
+
+/// The fixture hook for a Gemma profile prompt allowing `allow`.
+#[doc(hidden)]
+#[must_use]
+pub fn gemma_profile_prompt_for_tests(profile_text: &str, allow: &[&str]) -> String {
+    let spec = crate::profile::ProfileSpec {
+        display_name: None,
+        logo: None,
+        accent: None,
+        secondary: None,
+        system_prompt: std::path::PathBuf::from("/unused"),
+        builtin_tools: Some(allow.iter().map(|t| (*t).to_string()).collect()),
+        settings_json: None,
+        warnings: Vec::new(),
+        folder_context: false,
+        agents_md: false,
+        recommended_model: None,
+        grids: std::collections::BTreeMap::new(),
+        verbs: None,
+    };
+    build_gemma_tools_prompt_parts(Some((profile_text, &spec)), &[], &[], true, true).0
+}
+
+/// Renders `specs` as Gemma 4 tool declarations, byte for byte as the model's
+/// chat template (`format_function_declaration`) does, one
+/// `<|tool>…<tool|>` block per spec with nothing between them.
+///
+/// One deliberate normalization: a non-empty `parameters` with no `type` is
+/// declared as an OBJECT, because the template only closes `parameters:{` in
+/// its `type` branch and would otherwise emit an unbalanced brace.
+#[must_use]
+pub fn render_gemma_declarations(specs: &[crate::engine::ToolSpec]) -> String {
+    let mut out = String::new();
+    for spec in specs {
+        out.push_str("<|tool>declaration:");
+        out.push_str(&spec.name);
+        out.push_str("{description:<|\"|>");
+        out.push_str(&spec.description);
+        out.push_str("<|\"|>");
+        let params = &spec.parameters;
+        if jinja_truthy(Some(params)) {
+            out.push_str(",parameters:{");
+            if let Some(props) = params.get("properties").and_then(|p| p.as_object())
+                && !props.is_empty()
+            {
+                out.push_str("properties:{");
+                gemma_parameters(&mut out, props, false);
+                out.push_str("},");
+            }
+            if jinja_truthy(params.get("required")) {
+                out.push_str("required:");
+                gemma_required(&mut out, params.get("required"));
+                out.push(',');
+            }
+            let ty = jinja_upper(params.get("type"));
+            out.push_str("type:<|\"|>");
+            out.push_str(if ty.is_empty() { "OBJECT" } else { &ty });
+            out.push_str("<|\"|>}");
+        }
+        out.push_str("}<tool|>");
+    }
+    out
+}
+
+/// Jinja truthiness: missing, null, false, zero and empty are false.
+fn jinja_truthy(v: Option<&serde_json::Value>) -> bool {
+    match v {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0),
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(serde_json::Value::Array(a)) => !a.is_empty(),
+        Some(serde_json::Value::Object(o)) => !o.is_empty(),
+    }
+}
+
+/// `value | upper`: a string upper-cased, empty when missing. Any other JSON
+/// value is upper-cased as its compact text.
+fn jinja_upper(v: Option<&serde_json::Value>) -> String {
+    match v {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.to_uppercase(),
+        Some(other) => other.to_string().to_uppercase(),
+    }
+}
+
+/// `dictsort`: entries by key, case-insensitively, stable on ties.
+fn dictsort(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(&String, &serde_json::Value)> {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_by_key(|(k, _)| k.to_lowercase());
+    entries
+}
+
+/// A `required:` list body, `[<|"|>a<|"|>,…]`.
+fn gemma_required(out: &mut String, v: Option<&serde_json::Value>) {
+    out.push('[');
+    let items = v.and_then(|v| v.as_array()).map_or(&[][..], Vec::as_slice);
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("<|\"|>");
+        out.push_str(&jinja_display(item));
+        out.push_str("<|\"|>");
+    }
+    out.push(']');
+}
+
+/// `{{ value }}` for a scalar: a string as itself, anything else as JSON text.
+fn jinja_display(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The template's `format_parameters` macro: one `key:{…}` per property.
+fn gemma_parameters(
+    out: &mut String,
+    properties: &serde_json::Map<String, serde_json::Value>,
+    filter_keys: bool,
+) {
+    const STANDARD_KEYS: [&str; 5] = ["description", "type", "properties", "required", "nullable"];
+    let empty = serde_json::Map::new();
+    let mut first = true;
+    for (key, value) in dictsort(properties) {
+        if filter_keys && STANDARD_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(key);
+        out.push_str(":{");
+        let obj = value.as_object().unwrap_or(&empty);
+        let mut add_comma = false;
+        if jinja_truthy(obj.get("description")) {
+            out.push_str("description:<|\"|>");
+            out.push_str(&jinja_display(&obj["description"]));
+            out.push_str("<|\"|>");
+            add_comma = true;
+        }
+        let ty = jinja_upper(obj.get("type"));
+        if ty == "STRING" {
+            if jinja_truthy(obj.get("enum")) {
+                template_comma(out, &mut add_comma);
+                out.push_str("enum:");
+                out.push_str(&gemma_value(&obj["enum"]));
+            }
+        } else if ty == "ARRAY"
+            && let Some(items) = obj.get("items").and_then(|i| i.as_object())
+            && !items.is_empty()
+        {
+            template_comma(out, &mut add_comma);
+            gemma_items(out, items);
+        }
+        if jinja_truthy(obj.get("nullable")) {
+            template_comma(out, &mut add_comma);
+            out.push_str("nullable:true");
+        }
+        if ty == "OBJECT" {
+            if let Some(props) = obj.get("properties").and_then(|p| p.as_object()) {
+                template_comma(out, &mut add_comma);
+                out.push_str("properties:{");
+                gemma_parameters(out, props, false);
+                out.push('}');
+            } else if value.is_object() {
+                template_comma(out, &mut add_comma);
+                out.push_str("properties:{");
+                gemma_parameters(out, obj, true);
+                out.push('}');
+            }
+            if jinja_truthy(obj.get("required")) {
+                template_comma(out, &mut add_comma);
+                out.push_str("required:");
+                gemma_required(out, obj.get("required"));
+            }
+        }
+        template_comma(out, &mut add_comma);
+        out.push_str("type:<|\"|>");
+        out.push_str(&ty);
+        out.push_str("<|\"|>}");
+    }
+}
+
+/// The template's `{% if add_comma %},{% else %}{% set add_comma = true %}`:
+/// a comma before every part but the first.
+fn template_comma(out: &mut String, add_comma: &mut bool) {
+    if *add_comma {
+        out.push(',');
+    }
+    *add_comma = true;
+}
+
+/// An ARRAY property's `items:{…}`, each entry of the items schema by key.
+fn gemma_items(out: &mut String, items: &serde_json::Map<String, serde_json::Value>) {
+    out.push_str("items:{");
+    let mut first = true;
+    for (key, value) in dictsort(items) {
+        if value.is_null() {
+            continue;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        match key.as_str() {
+            "properties" => {
+                out.push_str("properties:{");
+                if let Some(props) = value.as_object() {
+                    gemma_parameters(out, props, false);
+                }
+                out.push('}');
+            }
+            "required" => {
+                out.push_str("required:");
+                gemma_required(out, Some(value));
+            }
+            "type" => {
+                out.push_str("type:");
+                let upper = match value {
+                    serde_json::Value::Array(tys) => serde_json::Value::Array(
+                        tys.iter()
+                            .map(|t| serde_json::Value::String(jinja_upper(Some(t))))
+                            .collect(),
+                    ),
+                    other => serde_json::Value::String(jinja_upper(Some(other))),
+                };
+                out.push_str(&gemma_value(&upper));
+            }
+            _ => {
+                out.push_str(key);
+                out.push(':');
+                out.push_str(&gemma_value(value));
+            }
+        }
+    }
+    out.push('}');
+}
+
+/// The template's `format_argument` with its default `escape_keys=True`: a
+/// string between `<|"|>` marks, a mapping dict-sorted with quoted keys, a
+/// list comma-joined, and scalars as written.
+fn gemma_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => format!("<|\"|>{s}<|\"|>"),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(gemma_value).collect();
+            format!("[{}]", parts.join(","))
+        }
+        serde_json::Value::Object(map) => {
+            let parts: Vec<String> = dictsort(map)
+                .into_iter()
+                .map(|(k, v)| format!("<|\"|>{k}<|\"|>:{}", gemma_value(v)))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+    }
+}
+
 /// Plank-owned guidance on how to spend turns, appended after the native tool
 /// schemas and inside the trusted span.
 ///
@@ -913,6 +1429,11 @@ const GPU_SUSPEND_EXAMPLE_DSML: &str =
 /// prompt's parameter form (value on its own line).
 const GPU_SUSPEND_EXAMPLE_QWEN: &str = "<parameter=suspend_model>\ntrue\n</parameter>\n";
 
+/// The `suspend_model` parameter in a whole Gemma call: Gemma has no
+/// parameter form on its own, so the call it sits in is shown.
+const GPU_SUSPEND_EXAMPLE_GEMMA: &str =
+    "<|tool_call>call:bash{command:<|\"|>$COMMAND<|\"|>,suspend_model:true}<tool_call|>\n";
+
 /// Appends [`GPU_SUSPEND_NOTE`] and the call form for `syntax` under its own
 /// heading. Deterministic for a given launch: whether plank holds a
 /// releasable model is fixed when the prompt is composed, so the Tier 1
@@ -924,10 +1445,10 @@ fn append_gpu_suspend_note(out: &mut String, syntax: ToolSyntax) {
     }
     out.push_str("\n# GPU commands\n\n");
     out.push_str(GPU_SUSPEND_NOTE);
-    out.push_str(if syntax == ToolSyntax::Qwen {
-        GPU_SUSPEND_EXAMPLE_QWEN
-    } else {
-        GPU_SUSPEND_EXAMPLE_DSML
+    out.push_str(match syntax {
+        ToolSyntax::Qwen => GPU_SUSPEND_EXAMPLE_QWEN,
+        ToolSyntax::Gemma => GPU_SUSPEND_EXAMPLE_GEMMA,
+        ToolSyntax::Dsml | ToolSyntax::Dsml41 => GPU_SUSPEND_EXAMPLE_DSML,
     });
 }
 
@@ -1761,6 +2282,7 @@ pub fn build_short_system_prompt_reminder(
         ToolSyntax::Qwen => qwen_syntax_reminder(),
         ToolSyntax::Dsml => dsml_syntax_reminder(),
         ToolSyntax::Dsml41 => dsml41_syntax_reminder(),
+        ToolSyntax::Gemma => gemma_syntax_reminder(),
     });
     out.push_str("Available tools: ");
     out.push_str(&tool_names(mcp_servers).join(", "));
@@ -3342,5 +3864,210 @@ mod tests {
             out.contains("### Available Tool Schemas"),
             "schemas are never optional"
         );
+    }
+
+    fn gemma_spec(
+        name: &str,
+        description: &str,
+        parameters: serde_json::Value,
+    ) -> crate::engine::ToolSpec {
+        crate::engine::ToolSpec {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
+
+    /// Derived by hand from `format_function_declaration` and
+    /// `format_parameters` in the model's own chat template: properties
+    /// dict-sorted, each property's `description` first and `type` last, and
+    /// `parameters` ordered `properties`, `required`, `type`.
+    #[test]
+    fn gemma_declarations_render_the_chat_templates_shape() {
+        let spec = gemma_spec(
+            "read",
+            "Read a file",
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string", "description": "file"}}, "required": ["path"]}),
+        );
+        assert_eq!(
+            render_gemma_declarations(&[spec]),
+            concat!(
+                "<|tool>declaration:read{description:<|\"|>Read a file<|\"|>,",
+                "parameters:{properties:{path:{description:<|\"|>file<|\"|>,type:<|\"|>STRING<|\"|>}},",
+                "required:[<|\"|>path<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|>",
+            )
+        );
+    }
+
+    /// The less common branches: an `enum`, an ARRAY's `items`, a property
+    /// with no description, key sorting, a parameter-less tool, and the
+    /// template's lack of any separator between two declarations.
+    #[test]
+    fn gemma_declarations_render_enums_arrays_and_empty_parameters() {
+        let find = gemma_spec(
+            "find",
+            "Find things",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["literal", "regex"]},
+                    "globs": {"type": "array", "description": "patterns", "items": {"type": "string"}},
+                    "count": {"type": "integer"}
+                },
+                "required": ["mode"]
+            }),
+        );
+        let compact = gemma_spec(
+            "compact",
+            "Summarize",
+            serde_json::json!({"type": "object", "properties": {}}),
+        );
+        assert_eq!(
+            render_gemma_declarations(&[find, compact]),
+            concat!(
+                "<|tool>declaration:find{description:<|\"|>Find things<|\"|>,parameters:{properties:{",
+                "count:{type:<|\"|>INTEGER<|\"|>},",
+                "globs:{description:<|\"|>patterns<|\"|>,items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>},",
+                "mode:{enum:[<|\"|>literal<|\"|>,<|\"|>regex<|\"|>],type:<|\"|>STRING<|\"|>}",
+                "},required:[<|\"|>mode<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|>",
+                "<|tool>declaration:compact{description:<|\"|>Summarize<|\"|>,parameters:{type:<|\"|>OBJECT<|\"|>}}<tool|>",
+            )
+        );
+    }
+
+    #[test]
+    fn the_gemma_prompt_declares_every_builtin_once_inside_the_trusted_span() {
+        let (p, trusted) =
+            build_tools_prompt_parts_with_wasm(&[], &[], true, ToolSyntax::Gemma, false);
+        assert!(trusted > 0 && trusted <= p.len());
+        let builtins: Vec<crate::engine::ToolSpec> = parse_builtin_tool_schemas()
+            .into_iter()
+            .chain(native_extra_specs(true))
+            .chain(provider_tool_registry(&[]))
+            .collect();
+        for spec in builtins {
+            let decl = format!("<|tool>declaration:{}{{", spec.name);
+            assert_eq!(p.matches(&decl).count(), 1, "{} declared once", spec.name);
+            assert!(p[..trusted].contains(&decl), "{} trusted", spec.name);
+        }
+        assert!(!p.contains("｜DSML｜"), "DSML leaked");
+        assert!(!p.contains("<tool_call>"), "Qwen leaked");
+        assert!(!p.contains("</think>"), "DeepSeek think tag leaked");
+        assert!(!p.contains("stanza"), "DSML wording leaked");
+        assert!(!p.contains("### Available Tool Schemas"));
+        assert!(p.contains("# Working style"));
+        assert!(p.contains("# Rules"));
+        assert!(p.contains("[upto]"), "the editing guidance is kept");
+        assert!(p.contains(GEMMA_IN_THINK_PROHIBITION));
+        assert!(
+            p.ends_with("<tool|>"),
+            "declarations close the prompt, as in the template"
+        );
+    }
+
+    #[test]
+    fn the_gemma_prompt_drops_the_in_think_line_without_parity() {
+        let (p, _) = build_tools_prompt_parts_with_wasm(&[], &[], false, ToolSyntax::Gemma, false);
+        assert!(!p.contains(GEMMA_IN_THINK_PROHIBITION));
+        assert!(!p.contains(IN_THINK_PROHIBITION));
+    }
+
+    #[test]
+    fn gemma_mcp_and_wasm_declarations_sit_outside_the_trusted_span() {
+        use crate::tools::mcp::{McpServer, McpTool};
+        let rec = crate::tools::mcp_advert::AdvertRecord {
+            server: "srv".to_string(),
+            instructions: "Use srv wisely.".to_string(),
+            tools: vec![McpTool {
+                name: "probe".to_string(),
+                description: "Probe <turn|> things".to_string(),
+                schema_json: "{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}"
+                    .to_string(),
+                primary: true,
+            }],
+            resources: Vec::new(),
+        };
+        let servers = vec![McpServer::offline(&rec)];
+        let wasm = crate::wasmreg::WasmTool {
+            component: "comp".to_string(),
+            name: "draw".to_string(),
+            exposed: "draw".to_string(),
+            description: "Draw".to_string(),
+            schema: "{\"type\":\"object\",\"properties\":{}}".to_string(),
+        };
+        let (p, trusted) =
+            build_tools_prompt_parts_with_wasm(&servers, &[&wasm], true, ToolSyntax::Gemma, false);
+        let (plain, plain_trusted) =
+            build_tools_prompt_parts_with_wasm(&[], &[], true, ToolSyntax::Gemma, false);
+        assert_eq!(
+            trusted, plain_trusted,
+            "third-party text never widens the span"
+        );
+        assert_eq!(&p[..trusted], &plain[..plain_trusted]);
+        let foreign = &p[trusted..];
+        assert!(
+            foreign.contains("<|tool>declaration:mcp__srv__probe{"),
+            "{foreign}"
+        );
+        assert!(foreign.contains("<|tool>declaration:draw{"), "{foreign}");
+        assert!(foreign.contains("Use srv wisely."), "{foreign}");
+        let instructions = foreign.find("# MCP Server Instructions").unwrap();
+        assert!(
+            foreign.rfind("<tool|>").unwrap() < instructions,
+            "declarations stay contiguous; prose follows them"
+        );
+    }
+
+    #[test]
+    fn a_gemma_profile_expands_the_token_to_the_tools_section() {
+        let text = format!("You are HAL.\n\n{TOOL_PROTOCOL_TOKEN}\n\nBe brief.\n");
+        let out = compose_gemma_profile_prompt(&text, &allowing(&["read", "glob"]), true);
+        assert!(out.starts_with("You are HAL.\n\n# Tools\n"), "{out}");
+        assert!(out.ends_with("<tool|>\n\nBe brief.\n"), "{out}");
+        assert!(out.contains("<|tool>declaration:read{"));
+        assert!(out.contains("<|tool>declaration:glob{"));
+        assert!(
+            !out.contains("<|tool>declaration:bash{"),
+            "bash is not allowed"
+        );
+        assert!(!out.contains("You are a coding agent"), "{out}");
+        assert!(!out.contains("# Working style"), "{out}");
+    }
+
+    #[test]
+    fn a_gemma_profile_without_the_token_still_gets_its_declarations() {
+        let out = compose_gemma_profile_prompt("You are HAL.\n", &allowing(&["read"]), true);
+        assert_eq!(
+            out,
+            format!(
+                "You are HAL.{}",
+                render_gemma_declarations(
+                    &parse_builtin_tool_schemas()
+                        .into_iter()
+                        .filter(|s| s.name == "read")
+                        .collect::<Vec<_>>()
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn the_gemma_suspend_note_uses_gemma_call_syntax() {
+        let (off, _) = build_tools_prompt_parts_with_wasm(&[], &[], true, ToolSyntax::Gemma, false);
+        assert!(!off.contains("suspend_model"));
+        let (on, trusted) =
+            build_tools_prompt_parts_with_wasm(&[], &[], true, ToolSyntax::Gemma, true);
+        assert!(on[..trusted].contains(GPU_SUSPEND_NOTE));
+        assert!(on.contains(GPU_SUSPEND_EXAMPLE_GEMMA));
+        assert!(!on.contains("｜DSML｜"));
+        let text = format!("You are HAL.\n\n{TOOL_PROTOCOL_TOKEN}\n");
+        let (without, _) = build_gemma_tools_prompt_parts(
+            Some((&text, &allowing(&["read"]))),
+            &[],
+            &[],
+            true,
+            true,
+        );
+        assert!(!without.contains("suspend_model"));
     }
 }

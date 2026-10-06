@@ -18,6 +18,7 @@ use crate::dsml::{
     DsmlParser, DsmlState, MARKER_NAMES, ToolCall, bare_close_at, bare_close_partial, bare_open_is,
     tag_prefix_len, tag_prefix_partial,
 };
+use crate::gemma::{GemmaParser, START as GEMMA_START};
 use crate::qwen::QwenParser;
 use crate::render::ThinkCodeSpan;
 use crate::syntax::{DsmlTags, ToolSyntax};
@@ -114,6 +115,7 @@ const QWEN_START: &[u8] = b"<tool_call>";
 enum Dialect {
     Dsml(ToolSyntax),
     Qwen,
+    Gemma,
 }
 const DSML_BAR: &[u8] = "｜".as_bytes();
 
@@ -468,17 +470,24 @@ fn dsml_start_match(
     false
 }
 
-/// [`dsml_start_match`] widened to every dialect, DSML and Qwen alike.
+/// [`dsml_start_match`] widened to every dialect, DSML, Qwen and Gemma alike.
+///
+/// The Gemma arm is tried only when `gemma` is set, i.e. the renderer was
+/// built for Gemma: DSML and Qwen streams adopt each other's openers, but a
+/// literal `<|tool_call>` in a `DeepSeek` or Qwen stream is text, not a call.
 ///
 /// DSML is tried first and Qwen only if no DSML form is even a prefix. The two
 /// openers share no spelling, so the order is not load-bearing for
 /// correctness; DSML leads because it is the default and by far the more
 /// common stream.
 ///
-/// Qwen has exactly one opener and no implicit-invoke form to stand in for it,
-/// so its arm is a plain prefix test.
+/// Qwen and Gemma each have exactly one opener and no implicit-invoke form to
+/// stand in for it, so their arms are plain prefix tests. Neither opener is a
+/// prefix of the other (`<tool_call>` / `<|tool_call>`), so at most one arm
+/// can match a given tail.
 fn start_match_any(
     tail: &[u8],
+    gemma: bool,
     complete: &mut bool,
     implicit_invoke: &mut bool,
     matched: &mut Dialect,
@@ -492,6 +501,12 @@ fn start_match_any(
         *implicit_invoke = false;
         *complete = tail == QWEN_START;
         *matched = Dialect::Qwen;
+        return true;
+    }
+    if gemma && tail.len() <= GEMMA_START.len() && GEMMA_START[..tail.len()] == *tail {
+        *implicit_invoke = false;
+        *complete = tail == GEMMA_START;
+        *matched = Dialect::Gemma;
         return true;
     }
     false
@@ -830,6 +845,7 @@ pub struct Finished<'a> {
 enum Parser {
     Dsml(DsmlParser),
     Qwen(QwenParser),
+    Gemma(GemmaParser),
 }
 
 impl Parser {
@@ -846,6 +862,7 @@ impl Parser {
         match self {
             Self::Dsml(p) => p.state(),
             Self::Qwen(p) => p.state(),
+            Self::Gemma(p) => p.state(),
         }
     }
 
@@ -855,6 +872,7 @@ impl Parser {
             // The DSML parser always has a message at `Error`; this one keeps
             // the same contract through a default rather than an unwrap.
             Self::Qwen(p) => p.error().unwrap_or("malformed Qwen tool call"),
+            Self::Gemma(p) => p.error().unwrap_or("malformed Gemma tool call"),
         }
     }
 
@@ -862,6 +880,7 @@ impl Parser {
         match self {
             Self::Dsml(p) => p.raw(),
             Self::Qwen(p) => p.raw(),
+            Self::Gemma(p) => p.raw(),
         }
     }
 
@@ -869,6 +888,7 @@ impl Parser {
         match self {
             Self::Dsml(p) => p.calls(),
             Self::Qwen(p) => p.calls(),
+            Self::Gemma(p) => p.calls(),
         }
     }
 
@@ -876,6 +896,7 @@ impl Parser {
         match self {
             Self::Dsml(p) => p.pending_call(),
             Self::Qwen(p) => p.pending_call(),
+            Self::Gemma(p) => p.pending_call(),
         }
     }
 
@@ -883,6 +904,7 @@ impl Parser {
         match self {
             Self::Dsml(p) => p.param_close_prefix(),
             Self::Qwen(p) => p.param_close_prefix(),
+            Self::Gemma(p) => p.param_close_prefix(),
         }
     }
 
@@ -890,6 +912,7 @@ impl Parser {
         match self {
             Self::Dsml(p) => p.feed(bytes),
             Self::Qwen(p) => p.feed(bytes),
+            Self::Gemma(p) => p.feed(bytes),
         }
     }
 
@@ -897,35 +920,60 @@ impl Parser {
         match self {
             Self::Dsml(p) => p.reset(),
             Self::Qwen(p) => p.reset(),
+            Self::Gemma(p) => p.reset(),
         }
     }
 
-    /// End of generation. Only the Qwen dialect needs telling: it has no
-    /// terminator that ends a *run* of stanzas (see `QwenParser::finish`).
+    /// End of generation. Only the Qwen and Gemma dialects need telling:
+    /// neither has a terminator that ends a *run* of stanzas (see
+    /// `QwenParser::finish`, `GemmaParser::finish`).
     fn finish(&mut self) {
         if let Self::Qwen(p) = self {
+            p.finish();
+        } else if let Self::Gemma(p) = self {
             p.finish();
         }
     }
 
-    /// True when this parser reads the Qwen dialect.
-    /// Whether a Qwen run has just closed a stanza and is waiting to learn
-    /// if another follows (see `QwenParser::awaits_another_stanza`).
+    /// Whether a Qwen or Gemma run has just closed a stanza and is waiting to
+    /// learn if another follows (see `QwenParser::awaits_another_stanza`).
     fn awaits_another_stanza(&self) -> bool {
         matches!(self, Self::Qwen(p) if p.awaits_another_stanza())
+            || matches!(self, Self::Gemma(p) if p.awaits_another_stanza())
     }
 
+    /// True when this parser reads the Qwen dialect.
     fn is_qwen(&self) -> bool {
         matches!(self, Self::Qwen(_))
     }
 
+    /// True when this parser reads the Gemma dialect.
+    fn is_gemma(&self) -> bool {
+        matches!(self, Self::Gemma(_))
+    }
+
+    /// True when this parser reads a dialect with no DSML tag table.
+    fn is_non_dsml(&self) -> bool {
+        self.is_qwen() || self.is_gemma()
+    }
+
+    /// The canonical opener of the non-DSML dialect this parser reads, if any.
+    fn non_dsml_start(&self) -> Option<&'static [u8]> {
+        match self {
+            Self::Dsml(_) => None,
+            Self::Qwen(_) => Some(QWEN_START),
+            Self::Gemma(_) => Some(GEMMA_START),
+        }
+    }
+
     /// The DSML dialect this parser is reading in, if it is a DSML parser.
     ///
-    /// `None` for Qwen, which is not DSML-shaped and has no tag table.
+    /// `None` for Qwen and Gemma, which are not DSML-shaped and have no tag
+    /// table.
     fn dsml_syntax(&self) -> Option<ToolSyntax> {
         match self {
             Self::Dsml(p) => Some(p.syntax()),
-            Self::Qwen(_) => None,
+            Self::Qwen(_) | Self::Gemma(_) => None,
         }
     }
 }
@@ -936,6 +984,11 @@ impl Parser {
 pub struct StreamRenderer<S> {
     sink: S,
     syntax: ToolSyntax,
+    /// Whether the renderer was built for Gemma and so recognizes its
+    /// `<|tool_call>` opener. Fixed at construction, unlike `syntax`, which
+    /// follows DSML adoption: a DSML or Qwen stream that spells the Gemma
+    /// opener is quoting it, and must stream it as text.
+    gemma_opener: bool,
     parser: Parser,
     viz: ToolViz,
     scan: DsmlScan,
@@ -1065,6 +1118,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         Self {
             sink,
             syntax,
+            gemma_opener: syntax == ToolSyntax::Gemma,
             parser: Parser::dsml(syntax),
             viz: ToolViz::default(),
             scan: DsmlScan::Between,
@@ -1310,7 +1364,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                 // Named for the dialect in force: telling a Qwen model its
                 // "DSML" was incomplete, and handing it DSML to copy, is not a
                 // hypothetical — it is what a recorded session did.
-                .then_some(if self.parser.is_qwen() {
+                .then_some(if self.parser.is_non_dsml() {
                     "incomplete tool call"
                 } else {
                     "incomplete DSML tool call"
@@ -2013,6 +2067,10 @@ impl<S: RenderSink> StreamRenderer<S> {
 
     /// Mirrors parser progress into the visualizer from the raw byte stream.
     fn scan_dsml_byte(&mut self, c: u8) {
+        if self.parser.is_gemma() {
+            self.scan_gemma_byte(c);
+            return;
+        }
         match &mut self.scan {
             DsmlScan::Between => {
                 if c == b'<' {
@@ -2029,6 +2087,46 @@ impl<S: RenderSink> StreamRenderer<S> {
             }
             DsmlScan::Value => self.viz_param_value_byte(c),
         }
+    }
+
+    /// The Gemma dialect's display scan.
+    ///
+    /// Gemma has no inner tags to scan: the name sits between `call:` and
+    /// `{`, and values are delimited by `<|"|>` rather than tagged. So the
+    /// banner is driven off the parser instead — the tool line when the `{`
+    /// that ends the name arrives (named by `pending_call`), and the
+    /// parameters, replayed through the same `viz_param_*` path the other
+    /// dialects stream through, once the stanza closes and its values are
+    /// final. Values therefore appear at stanza close rather than live.
+    ///
+    /// A stanza whose rendering started late — opened inside `<think>`, shown
+    /// once `</think>` arrived — may have passed its `{` unseen, so a close
+    /// with no banner yet announces the tool from the finished call.
+    fn scan_gemma_byte(&mut self, c: u8) {
+        let done = self.parser.state() == DsmlState::Done;
+        if !self.viz.tool_announced {
+            if c == b'{'
+                && let Some(call) = self.parser.pending_call()
+            {
+                self.viz_tool(&call.name);
+            } else if done && let Some(call) = self.parser.calls().last() {
+                let name = call.name.clone();
+                self.viz_tool(&name);
+            }
+        }
+        if !done {
+            return;
+        }
+        if let Some(call) = self.parser.calls().last().cloned() {
+            for arg in &call.args {
+                self.viz_param_begin(&arg.name);
+                for &b in arg.value.as_bytes() {
+                    self.viz_param_raw_byte(b);
+                }
+                self.viz_param_end();
+            }
+        }
+        self.viz_invoke_end();
     }
 
     /// The dialect's inner tag names for the display scan.
@@ -2249,7 +2347,13 @@ impl<S: RenderSink> StreamRenderer<S> {
         // Every DSML dialect answers `dsml_tags`, and the candidate openers
         // are built from that table — no spelling is named here, so a new
         // dialect cannot silently miss this site.
-        start_match_any(&self.dsml_start_tail, complete, implicit_invoke, matched)
+        start_match_any(
+            &self.dsml_start_tail,
+            self.gemma_opener,
+            complete,
+            implicit_invoke,
+            matched,
+        )
     }
 
     /// Adopts the dialect a completed stanza opener named.
@@ -2262,13 +2366,18 @@ impl<S: RenderSink> StreamRenderer<S> {
         match dialect {
             Dialect::Dsml(syntax) => {
                 self.syntax = syntax;
-                if self.parser.is_qwen() || self.parser.dsml_syntax() != Some(syntax) {
+                if self.parser.is_non_dsml() || self.parser.dsml_syntax() != Some(syntax) {
                     self.parser = Parser::dsml(syntax);
                 }
             }
             Dialect::Qwen => {
                 if !self.parser.is_qwen() {
                     self.parser = Parser::Qwen(QwenParser::new());
+                }
+            }
+            Dialect::Gemma => {
+                if !self.parser.is_gemma() {
+                    self.parser = Parser::Gemma(GemmaParser::new());
                 }
             }
         }
@@ -2298,7 +2407,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         // the one route that does not go through it, a parser seeded by a
         // caller. Rebuilding is only ever a no-op or a fresh `Search` parser,
         // since this runs before any of the stanza's own bytes reach it.
-        if !self.parser.is_qwen() && self.parser.dsml_syntax() != Some(self.syntax) {
+        if !self.parser.is_non_dsml() && self.parser.dsml_syntax() != Some(self.syntax) {
             self.parser = Parser::dsml(self.syntax);
         }
         self.dsml_active = true;
@@ -2310,8 +2419,8 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.post_think_gap = false;
         // The parser has its own opener scan, and it is fed the *canonical*
         // spelling rather than whichever accepted variant the model wrote.
-        if self.parser.is_qwen() {
-            self.parser.feed(QWEN_START);
+        if let Some(start) = self.parser.non_dsml_start() {
+            self.parser.feed(start);
         } else {
             self.parser.feed(self.dsml_tags_or_v4().start.as_bytes());
         }
@@ -2604,14 +2713,15 @@ impl<S: RenderSink> StreamRenderer<S> {
                 // being swallowed into the stanza just closed. A whole opener
                 // goes in at once: fed a byte at a time, its tail would no
                 // longer look like one to this check.
-                if rem.starts_with(QWEN_START) {
-                    for &b in QWEN_START {
+                let start = self.parser.non_dsml_start().unwrap_or(QWEN_START);
+                if rem.starts_with(start) {
+                    for &b in start {
                         self.feed_dsml_byte(b);
                     }
-                    i += QWEN_START.len();
+                    i += start.len();
                     continue;
                 }
-                if !finish && is_partial_prefix(rem, QWEN_START) {
+                if !finish && is_partial_prefix(rem, start) {
                     self.pending = rem.to_vec();
                     break;
                 }
@@ -4787,6 +4897,65 @@ mod qwen_dialect_tests {
         assert_eq!(done.calls[0].name, "read");
         assert_eq!(done.calls[0].arg_value("path"), Some("src/a.rs"));
         assert_eq!(done.error, None);
+    }
+
+    #[test]
+    fn a_gemma_stanza_is_parsed_into_a_call() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Gemma);
+        sr.push("Let me look.\n<|tool_call>call:read{path:<|\"|>Cargo.toml<|\"|>}<tool_call|>");
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.calls.len(), 1, "{:?}", sr.sink().visible);
+        assert_eq!(done.calls[0].name, "read");
+        assert_eq!(done.calls[0].arg_value("path"), Some("Cargo.toml"));
+        assert_eq!(done.error, None);
+    }
+
+    /// The display side of a Gemma stanza: a banner naming the tool and its
+    /// path, and none of the dialect's raw markup.
+    #[test]
+    fn a_gemma_stanza_renders_a_banner_not_markup() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Gemma);
+        sr.push("<|tool_call>call:read{path:<|\"|>Cargo.toml<|\"|>}<tool_call|>");
+        sr.finish();
+        let shown = &sr.sink().visible;
+        assert!(shown.contains("Reading Cargo.toml"), "{shown:?}");
+        assert!(!shown.contains("<|tool_call>"), "{shown:?}");
+        assert!(!shown.contains("<|\"|>"), "{shown:?}");
+    }
+
+    /// Two stanzas in one pass both reach dispatch.
+    #[test]
+    fn two_gemma_stanzas_both_become_calls() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Gemma);
+        sr.push(concat!(
+            "<|tool_call>call:read{path:<|\"|>a.rs<|\"|>}<tool_call|>",
+            "<|tool_call>call:bash{command:<|\"|>ls<|\"|>}<tool_call|>",
+        ));
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.error, None, "{:?}", sr.sink().visible);
+        let names: Vec<_> = done.calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["read", "bash"]);
+        assert!(sr.parser.is_gemma());
+    }
+
+    /// Unlike DSML and Qwen, which adopt each other's openers, the Gemma
+    /// opener is recognized only by a renderer built for Gemma. A `DeepSeek`
+    /// or Qwen stream that spells it is quoting it: no call, no error, and
+    /// the bytes stream through as text.
+    #[test]
+    fn a_dsml_or_qwen_renderer_streams_a_gemma_opener_as_text() {
+        let text = "see <|tool_call>call:x{}<tool_call|> here";
+        for syntax in [ToolSyntax::Dsml, ToolSyntax::Dsml41, ToolSyntax::Qwen] {
+            let mut sr = StreamRenderer::with_syntax(Cap::default(), syntax);
+            sr.push(text);
+            sr.finish();
+            let done = sr.finished();
+            assert!(done.calls.is_empty(), "{syntax:?}: {:?}", done.calls);
+            assert_eq!(done.error, None, "{syntax:?}");
+            assert_eq!(sr.sink().visible, text, "{syntax:?}: verbatim");
+        }
     }
 
     /// The end-to-end shape this whole port exists for: a Qwen stanza reaches

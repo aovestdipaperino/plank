@@ -612,6 +612,16 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
         // Written without a `\`-continued literal on purpose: continuations
         // strip the next line's indentation, which is a silent way to mangle
         // model-facing text (see CLAUDE.md).
+        // Gemma's thinking block closes with `<channel|>`, not `</think>`;
+        // telling it to write a tag it never emits would not close anything.
+        PassError::InThink if syntax == sysprompt::ToolSyntax::Gemma => format!(
+            concat!(
+                "Tool error: {}\n",
+                "The tool call was not run. Close the thinking block with ",
+                "<channel|>, then emit the same call again.\n",
+            ),
+            sysprompt::GEMMA_IN_THINK_PROHIBITION
+        ),
         PassError::InThink => format!(
             concat!(
                 "Tool error: {}\n",
@@ -639,6 +649,10 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
             sysprompt::ToolSyntax::Dsml41 => format!(
                 "Tool error: invalid DSML tool call: {err}\n{}",
                 sysprompt::dsml41_syntax_reminder()
+            ),
+            sysprompt::ToolSyntax::Gemma => format!(
+                "Tool error: invalid Gemma tool call: {err}\n{}",
+                sysprompt::gemma_syntax_reminder()
             ),
         },
     }
@@ -927,7 +941,9 @@ fn stream_chunk_must_stop<S: RenderSink>(
 /// rendered as hidden reasoning, which is the same bug in a new costume, the
 /// model delivering and the user still seeing nothing.
 fn pass_opens_in_think(opts: &crate::engine::GenerationOptions, engine: &dyn Engine) -> bool {
-    !matches!(opts.think_mode, crate::engine::ThinkMode::Off) && !engine.wants_structured()
+    !matches!(opts.think_mode, crate::engine::ThinkMode::Off)
+        && !engine.wants_structured()
+        && !engine.emits_think_tags()
 }
 
 /// Why a pass stopped itself before the engine ran out of tokens.
@@ -8632,6 +8648,12 @@ the original is frozen and listed in /tree"
         if !crate::settings::active().context.microcompact || self.in_sidechain() {
             return;
         }
+        // A rung exists to dodge a rebuild from zero after an in-place edit.
+        // An engine that truncates exactly re-prefills only past the edit
+        // anyway, so a rung can never beat it and would cost a full capture.
+        if self.engine.kv_truncates_exactly() {
+            return;
+        }
         let spans = self.session.transcript.len();
         let rendered = render_transcript(&self.session, &self.system);
         let tokens = self.engine.count_tokens(&rendered);
@@ -10562,6 +10584,7 @@ the original is frozen and listed in /tree"
                     crate::sysprompt::ToolSyntax::Dsml => "dsml",
                     crate::sysprompt::ToolSyntax::Qwen => "qwen",
                     crate::sysprompt::ToolSyntax::Dsml41 => "dsml41",
+                    crate::sysprompt::ToolSyntax::Gemma => "gemma",
                 },
                 artifact_version,
                 companion: &companion,
@@ -10896,7 +10919,11 @@ the original is frozen and listed in /tree"
         // Capture the live KV before the sidechain diverges it; the matching
         // restore is `restore_fork_kv`, called by every fork-end path. `None`
         // on engines without snapshot support — the restore then no-ops and
-        // the next turn re-prefills as before this guard existed.
+        // the next turn re-prefills as before this guard existed. An engine
+        // whose KV truncates exactly gets `None` too: its next `generate`
+        // keeps the parent prefix on its own, so a snapshot would only copy
+        // the whole cache twice (once out, once back in).
+        let snapshot_kv = snapshot_kv && !self.engine.kv_truncates_exactly();
         self.fork_kv.push(if snapshot_kv {
             self.engine.get_kv()
         } else {
@@ -16463,8 +16490,11 @@ impl Agent<'_> {
 
         // The budget ran out while the model was still reasoning, so what
         // came back is a thought, not a suggestion.
-        if crate::suggest::reasoning_unfinished(&reply, self.think != crate::engine::ThinkMode::Off)
-        {
+        if crate::suggest::reasoning_unfinished(
+            &reply,
+            self.think != crate::engine::ThinkMode::Off,
+            self.engine.emits_think_tags(),
+        ) {
             return false;
         }
 
@@ -16686,12 +16716,16 @@ impl Agent<'_> {
             .generate_quiet_with(prompt_text, Instant::now(), &opts)
             .map(|pass| pass.stats.interrupted)
             .map_err(|abort| abort.error);
+        // An engine whose KV truncates exactly keeps the prefilled prefix for
+        // the retry on its own, so a snapshot would only copy the whole cache.
+        let exact = self.engine.kv_truncates_exactly();
+        let mut snapshot = || {
+            if exact { None } else { self.engine.get_kv() }
+        };
         match result {
-            Ok(false) if !crate::interrupt::pending() => MemoryPrefill::Done(self.engine.get_kv()),
-            Ok(_) => MemoryPrefill::Interrupted(self.engine.get_kv()),
-            Err(e) if e == QUIET_ABORT_INTERRUPTED => {
-                MemoryPrefill::Interrupted(self.engine.get_kv())
-            }
+            Ok(false) if !crate::interrupt::pending() => MemoryPrefill::Done(snapshot()),
+            Ok(_) => MemoryPrefill::Interrupted(snapshot()),
+            Err(e) if e == QUIET_ABORT_INTERRUPTED => MemoryPrefill::Interrupted(snapshot()),
             Err(_) => MemoryPrefill::Failed,
         }
     }
@@ -22284,6 +22318,48 @@ mod tests {
         }
     }
 
+    /// An engine whose model opens its own thought block (Gemma's
+    /// `<|channel>`, streamed as `<think>`) starts the pass in visible text;
+    /// marking it as already inside `<think>` would hide the answer.
+    #[test]
+    fn pass_opens_in_think_unless_the_engine_emits_its_own_tags() {
+        use crate::engine::{
+            EchoEngine, EngineError, EngineEvent, GenerationOptions, GenerationStats, Prompt,
+            ThinkMode,
+        };
+        #[derive(Debug)]
+        struct Tagged;
+        impl Engine for Tagged {
+            fn generate(
+                &mut self,
+                _prompt: Prompt<'_>,
+                _opts: &GenerationOptions,
+                _interrupt: &dyn Fn() -> bool,
+                _greedy: &dyn Fn() -> bool,
+                _on_event: &mut dyn FnMut(EngineEvent),
+            ) -> Result<GenerationStats, EngineError> {
+                Ok(GenerationStats::default())
+            }
+            fn ctx_size(&self) -> i32 {
+                0
+            }
+            fn emits_think_tags(&self) -> bool {
+                true
+            }
+        }
+        let think = GenerationOptions {
+            think_mode: ThinkMode::Medium,
+            ..GenerationOptions::default()
+        };
+        let off = GenerationOptions {
+            think_mode: ThinkMode::Off,
+            ..GenerationOptions::default()
+        };
+        assert!(pass_opens_in_think(&think, &EchoEngine::new(0)));
+        assert!(!pass_opens_in_think(&think, &Tagged));
+        assert!(!pass_opens_in_think(&off, &EchoEngine::new(0)));
+    }
+
     #[test]
     fn a_profile_session_resumes_under_its_profile() {
         assert_eq!(
@@ -23161,6 +23237,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A Gemma-dialect reply runs its tool through the ordinary dispatch path and
+    /// the result reaches the next pass as a `<tool_result>` user message — the
+    /// shape `GemmaEngine` renders as a `<|tool_response>` inside the model turn.
+    #[test]
+    fn a_gemma_tool_call_is_dispatched_and_its_result_fed_back() {
+        let dir = scratch_dir("gemma-turn");
+        std::fs::write(dir.join("hello.txt"), "hi from file\n").unwrap();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec![
+                "<|tool_call>call:read{path:<|\"|>hello.txt<|\"|>}<tool_call|>".to_string(),
+                "The file says hi.".to_string(),
+            ],
+            model: Some("Gemma 4 E4B".to_owned()),
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("read hello.txt"));
+        agent.run_turn().expect("turn runs");
+        let seen = prompts.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one pass per reply");
+        assert!(
+            seen[1].contains("<tool_result>Tool result 1 (read):"),
+            "{}",
+            seen[1]
+        );
+        assert!(seen[1].contains("hi from file"), "{}", seen[1]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `/rename` retargets later saves without disturbing what is already on
     /// disk: the old file stays resumable and the new name becomes a copy.
     #[test]
@@ -24028,6 +24136,12 @@ mod tests {
         /// Records each state `decide` was asked about, so a test can assert
         /// that a gate which should have been skipped never ran.
         decisions_asked: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+        /// When true the engine reports `emits_think_tags`, the Gemma shape:
+        /// a reply opens its own `<think>` or carries none at all.
+        think_tags: bool,
+        /// When true the engine reports `kv_truncates_exactly`, the Gemma
+        /// shape that makes fork snapshots and ladder rungs pointless.
+        exact_kv: bool,
     }
 
     impl ScriptedEngine {
@@ -24153,6 +24267,12 @@ mod tests {
         }
         fn supports_multiplexing(&self) -> bool {
             self.multiplex_support
+        }
+        fn emits_think_tags(&self) -> bool {
+            self.think_tags
+        }
+        fn kv_truncates_exactly(&self) -> bool {
+            self.exact_kv
         }
         fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
             let events = self.kv_events.as_ref()?;
@@ -24563,6 +24683,74 @@ mod tests {
         assert_eq!(s.text, "add tests for the parser");
         assert_eq!(s.depth, agent.session.transcript.len());
         assert!(!agent.suggestion_pending, "the flag is consumed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A think-tag family (Gemma) with thinking on answers either without a
+    /// block or with a closed one. The implicit-block rule read both as an
+    /// unfinished thought and dropped every suggestion.
+    #[test]
+    fn a_think_tag_engine_with_thinking_on_keeps_its_suggestion() {
+        let _s = enable_suggestions_for_test();
+        for reply in [
+            "add tests for the parser",
+            "<think>tests next</think>add tests for the parser",
+        ] {
+            let dir = scratch_dir("sugg-thinktags");
+            let cfg = test_cfg();
+            let engine = ScriptedEngine {
+                replies: vec![reply.to_string()],
+                think_tags: true,
+                ..ScriptedEngine::default()
+            };
+            let mut agent = test_agent(&dir, engine, &cfg);
+            agent.think = ThinkMode::Medium;
+            agent.session.push(Message::user("hello"));
+            agent.session.push(Message::assistant("hi"));
+            agent.suggestion_pending = true;
+
+            assert!(agent.generate_suggestion(), "kept: {reply:?}");
+            assert_eq!(
+                agent.suggestion.as_ref().map(|s| s.text.as_str()),
+                Some("add tests for the parser")
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// On an engine whose KV truncates exactly the suggestion sidechain
+    /// takes no fork snapshot: `get_kv` would serialise the whole cache and
+    /// `set_kv` copy it back, for a prefix the next `generate` keeps anyway.
+    #[test]
+    fn an_exact_kv_engine_takes_no_fork_snapshot_for_a_suggestion() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-exactkv");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["run the tests".to_string()],
+            kv_events: Some(kv_events.clone()),
+            exact_kv: true,
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+
+        assert!(agent.generate_suggestion());
+        let events = kv_events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e == "generate"),
+            "the sidechain did run: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e == "capture" || e.starts_with("restore")),
+            "no capture and no restore: {events:?}"
+        );
+        assert_eq!(agent.sidechain_depth, 0, "the fork is closed");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -25993,6 +26181,38 @@ mod tests {
             "the anchor must really snapshot the KV: {:?}",
             events.lock().unwrap()
         );
+    }
+
+    /// A rung can never beat an engine whose KV truncates exactly: an
+    /// in-place rewrite re-prefills only past the edit there anyway. The
+    /// anchor is skipped before `get_kv`, so it costs no full-cache capture.
+    #[test]
+    fn an_exact_kv_engine_anchors_no_rung() {
+        let dir = scratch_dir("ladder-anchor-exactkv");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            exact_kv: true,
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.anchor_rung_before_tool_result(20_000);
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "no rung on an exact-KV engine: {:?}",
+            agent.ladder.rungs()
+        );
+        assert!(
+            !events.lock().unwrap().iter().any(|e| e == "capture"),
+            "no capture either: {:?}",
+            events.lock().unwrap()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A `/btw` aside answered on the LIVE engine pushes the engine's end past
@@ -32030,6 +32250,22 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_gemma_call_gets_the_gemma_reminder() {
+        let p = tool_error_payload(
+            PassError::Dsml,
+            "duplicate key a",
+            crate::sysprompt::ToolSyntax::Gemma,
+        );
+        assert!(
+            p.starts_with("Tool error: invalid Gemma tool call: duplicate key a\n"),
+            "{p}"
+        );
+        assert!(p.contains("<|tool_call>call:"), "{p}");
+        let t = tool_error_payload(PassError::InThink, "", crate::sysprompt::ToolSyntax::Gemma);
+        assert!(t.contains("<channel|>") && !t.contains("</think>"), "{t}");
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn tool_call_inside_think_is_dispatched_and_the_block_is_closed() {
         // Opt this thread into in-think dispatch; the shipped default is off.
@@ -35949,6 +36185,46 @@ or the user's next message aborts before its first token"
             .collect();
         assert_eq!(names.len(), 1, "one window for the whole job: {names:?}");
         dm::reset();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On an engine whose KV truncates exactly a memory pass captures and
+    /// restores nothing: neither the fork snapshot nor the prefill snapshot
+    /// kept for a retry, both full copies of the cache.
+    #[test]
+    fn an_exact_kv_engine_takes_no_snapshot_for_a_memory_pass() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-exactkv");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            // The prefill-only pass, then the generation.
+            replies: vec![String::new(), "[]".to_string()],
+            kv_events: Some(kv_events.clone()),
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 10,
+                common: 10,
+            }),
+            exact_kv: true,
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(agent.process_memory_job());
+        let events = kv_events.lock().unwrap().clone();
+        assert_eq!(
+            events.iter().filter(|e| *e == "generate").count(),
+            2,
+            "the prefill and the generation both ran: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e == "capture" || e.starts_with("restore")),
+            "no capture and no restore: {events:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

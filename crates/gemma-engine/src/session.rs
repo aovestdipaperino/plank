@@ -1,0 +1,349 @@
+//! A live Gemma 4 session: the token history and the KV cache that matches it.
+//!
+//! The cache is prefix-truncatable, so a new turn that shares a prefix with
+//! the last one only prefills the suffix. A snapshot is
+//! `b"PLGK"`, format `1u32`, the model signature (32 bytes), dtype `0u8`
+//! (f32), `n_tokens: u32`, the tokens as `u32` LE, then the
+//! [`KvCache`] body.
+
+use std::sync::Arc;
+
+use crate::kv::KvCache;
+use crate::model::Model;
+use crate::{Error, Result};
+
+const MAGIC: &[u8; 4] = b"PLGK";
+const FORMAT: u32 = 1;
+const DTYPE_F32: u8 = 0;
+/// magic + format + signature + dtype + `n_tokens`.
+const HEADER: usize = 4 + 4 + 32 + 1 + 4;
+
+/// Tokens a prefill evaluates per forward.
+const CHUNK: usize = 512;
+
+/// One conversation's tokens and KV cache over a shared [`Model`].
+#[derive(Debug)]
+pub struct Session {
+    model: Arc<Model>,
+    cache: KvCache,
+    tokens: Vec<u32>,
+    ctx: usize,
+}
+
+impl Session {
+    /// An empty session holding at most `ctx` tokens (never more than the
+    /// model's [`Model::context_length`]).
+    #[must_use]
+    pub fn new(model: Arc<Model>, ctx: usize) -> Self {
+        let n = model.kv_shape().len();
+        let ctx = ctx.min(model.context_length());
+        Self {
+            model,
+            cache: KvCache::new(n),
+            tokens: Vec::new(),
+            ctx,
+        }
+    }
+
+    #[must_use]
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    #[must_use]
+    pub fn ctx(&self) -> usize {
+        self.ctx
+    }
+
+    /// Keeps the first `n` tokens (a no-op when there are fewer).
+    pub fn truncate(&mut self, n: usize) {
+        self.cache.truncate(n);
+        self.tokens.truncate(n);
+    }
+
+    /// Evaluates `toks` after the current tokens, in chunks of 512, and
+    /// returns the last position's logits.
+    ///
+    /// `interrupt` is polled before each chunk; when it answers `true` the
+    /// prefill stops and returns `None`, keeping the chunks already
+    /// evaluated.
+    ///
+    /// # Errors
+    /// `context full: {need} tokens > {ctx}` before anything is evaluated,
+    /// or a model failure, after which the session holds only the chunks
+    /// that completed.
+    pub fn prefill(
+        &mut self,
+        toks: &[u32],
+        interrupt: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>> {
+        let need = self.tokens.len() + toks.len();
+        if need > self.ctx {
+            return Err(Error(format!("context full: {need} tokens > {}", self.ctx)));
+        }
+        let mut last = None;
+        for chunk in toks.chunks(CHUNK) {
+            if interrupt() {
+                return Ok(None);
+            }
+            let offset = self.tokens.len();
+            match self.model.forward(chunk, offset, &mut self.cache) {
+                Ok(logits) => last = Some(logits),
+                Err(e) => {
+                    // Owners that ran before the failure extended their cache.
+                    self.cache.truncate(offset);
+                    return Err(e);
+                }
+            }
+            self.tokens.extend_from_slice(chunk);
+        }
+        Ok(last)
+    }
+
+    /// Evaluates one token and returns its logits.
+    ///
+    /// # Errors
+    /// As [`Session::prefill`].
+    pub fn step(&mut self, tok: u32) -> Result<Vec<f32>> {
+        match self.prefill(&[tok], &|| false)? {
+            Some(l) => Ok(l),
+            None => Err(Error("step produced no logits".into())),
+        }
+    }
+
+    /// The tokens and KV cache as one blob for [`Session::restore`].
+    ///
+    /// # Errors
+    /// When the cache cannot be read back from the device.
+    pub fn snapshot(&self) -> Result<Vec<u8>> {
+        let body = self.cache.to_bytes()?;
+        let n = u32::try_from(self.tokens.len()).map_err(|_| {
+            Error(format!(
+                "{} tokens do not fit a snapshot",
+                self.tokens.len()
+            ))
+        })?;
+        let mut out = Vec::with_capacity(HEADER + 4 * self.tokens.len() + body.len());
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&FORMAT.to_le_bytes());
+        out.extend_from_slice(&self.model.signature());
+        out.push(DTYPE_F32);
+        out.extend_from_slice(&n.to_le_bytes());
+        for t in &self.tokens {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Replaces the session with a [`Session::snapshot`] blob.
+    ///
+    /// # Errors
+    /// When any header field (magic, format, signature, dtype, token count)
+    /// or the cache body does not match this model and context; the
+    /// session is then unchanged.
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.len() < HEADER {
+            return Err(Error(format!(
+                "snapshot: {} bytes is shorter than the header",
+                bytes.len()
+            )));
+        }
+        if &bytes[0..4] != MAGIC {
+            return Err(Error("snapshot: bad magic".into()));
+        }
+        let format = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if format != FORMAT {
+            return Err(Error(format!(
+                "snapshot: format {format}, expected {FORMAT}"
+            )));
+        }
+        if bytes[8..40] != self.model.signature() {
+            return Err(Error("snapshot: signature is for another model".into()));
+        }
+        if bytes[40] != DTYPE_F32 {
+            return Err(Error(format!(
+                "snapshot: dtype {}, expected f32",
+                bytes[40]
+            )));
+        }
+        let n = u32::from_le_bytes([bytes[41], bytes[42], bytes[43], bytes[44]]) as usize;
+        if n > self.ctx {
+            return Err(Error(format!(
+                "snapshot: n_tokens {n} exceeds the context of {}",
+                self.ctx
+            )));
+        }
+        let Some(body) = bytes.get(HEADER + 4 * n..) else {
+            return Err(Error(format!(
+                "snapshot: n_tokens {n} needs more bytes than the {} given",
+                bytes.len()
+            )));
+        };
+        let tokens: Vec<u32> = bytes[HEADER..HEADER + 4 * n]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        let shape = self.model.kv_shape();
+        let mut cache = KvCache::new(shape.len());
+        cache.restore(body, self.model.device(), &shape)?;
+        if let Some(i) = cache.layers.iter().position(|l| l.len() != n) {
+            return Err(Error(format!(
+                "snapshot: n_tokens {n} but KV layer {i} holds {}",
+                cache.layers[i].len()
+            )));
+        }
+        self.cache = cache;
+        self.tokens = tokens;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testgguf::{TinyConfig, write_tiny};
+    use candle_core::Device;
+
+    fn model() -> Arc<Model> {
+        let path = std::env::temp_dir().join(format!(
+            "gemma-sess-{}-{:?}.gguf",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        write_tiny(&path, &TinyConfig::default()).unwrap();
+        Model::open(&path, &Device::Cpu).unwrap()
+    }
+
+    fn close(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4)
+    }
+
+    const PROMPT: [u32; 9] = [12, 300, 301, 302, 303, 304, 305, 306, 307];
+
+    #[test]
+    fn truncate_and_reprefill_equals_a_fresh_prefill() {
+        let m = model();
+        let mut fresh = Session::new(m.clone(), 128);
+        let want = fresh.prefill(&PROMPT, &|| false).unwrap().unwrap();
+        let mut s = Session::new(m, 128);
+        s.prefill(&[12, 300, 301, 302, 999 % 280 + 16, 17], &|| false)
+            .unwrap();
+        s.truncate(4);
+        let got = s.prefill(&PROMPT[4..], &|| false).unwrap().unwrap();
+        assert!(close(&got, &want));
+        assert_eq!(s.tokens(), PROMPT);
+    }
+
+    #[test]
+    fn decode_through_the_window_matches_one_shot_prefill() {
+        // window is 4 in the tiny model; 9 tokens cross it twice.
+        let m = model();
+        let mut one = Session::new(m.clone(), 128);
+        let want = one.prefill(&PROMPT, &|| false).unwrap().unwrap();
+        let mut step = Session::new(m, 128);
+        step.prefill(&PROMPT[..1], &|| false).unwrap();
+        let mut got = Vec::new();
+        for &t in &PROMPT[1..] {
+            got = step.step(t).unwrap();
+        }
+        assert!(close(&got, &want));
+    }
+
+    #[test]
+    fn the_sliding_window_changes_the_logits() {
+        // Guards the test above against a model in which the window is never
+        // applied: with a window wider than the prompt, the logits differ.
+        let path = std::env::temp_dir().join(format!(
+            "gemma-sess-wide-{}-{:?}.gguf",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let cfg = TinyConfig {
+            sliding_window: 64,
+            ..TinyConfig::default()
+        };
+        write_tiny(&path, &cfg).unwrap();
+        let wide = Model::open(&path, &Device::Cpu).unwrap();
+        let narrow = model();
+        let a = Session::new(wide, 128)
+            .prefill(&PROMPT, &|| false)
+            .unwrap()
+            .unwrap();
+        let b = Session::new(narrow, 128)
+            .prefill(&PROMPT, &|| false)
+            .unwrap()
+            .unwrap();
+        assert!(!close(&a, &b));
+    }
+
+    #[test]
+    fn snapshot_restore_gives_the_same_next_logits() {
+        let m = model();
+        let mut a = Session::new(m.clone(), 128);
+        a.prefill(&PROMPT, &|| false).unwrap();
+        let blob = a.snapshot().unwrap();
+        let next_a = a.step(20).unwrap();
+        let mut b = Session::new(m, 128);
+        b.restore(&blob).unwrap();
+        assert_eq!(b.tokens(), PROMPT);
+        assert!(close(&b.step(20).unwrap(), &next_a));
+    }
+
+    #[test]
+    fn restore_refuses_each_corrupted_header_field() {
+        let m = model();
+        let mut a = Session::new(m.clone(), 128);
+        a.prefill(&PROMPT, &|| false).unwrap();
+        let blob = a.snapshot().unwrap();
+        for at in [0usize, 4, 8, 40, 41] {
+            // magic, format, signature, dtype, n_tokens
+            let mut bad = blob.clone();
+            bad[at] ^= 0xFF;
+            let mut b = Session::new(m.clone(), 128);
+            assert!(b.restore(&bad).is_err(), "byte {at}");
+            assert!(b.tokens().is_empty(), "byte {at} left state behind");
+        }
+    }
+
+    #[test]
+    fn a_failed_restore_keeps_the_previous_state() {
+        let m = model();
+        let mut a = Session::new(m.clone(), 128);
+        a.prefill(&PROMPT, &|| false).unwrap();
+        let blob = a.snapshot().unwrap();
+        let mut b = Session::new(m, 128);
+        b.prefill(&PROMPT[..3], &|| false).unwrap();
+        let before = b.snapshot().unwrap();
+        assert!(b.restore(&blob[..blob.len() - 1]).is_err());
+        assert_eq!(b.tokens(), &PROMPT[..3]);
+        assert_eq!(b.snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn interrupted_prefill_keeps_only_evaluated_tokens() {
+        let m = model();
+        let mut s = Session::new(m, 4096);
+        let long: Vec<u32> = (0..1300).map(|i| 16 + (i % 200)).collect();
+        let calls = std::cell::Cell::new(0);
+        let r = s
+            .prefill(&long, &|| {
+                calls.set(calls.get() + 1);
+                calls.get() > 1
+            })
+            .unwrap();
+        assert!(r.is_none());
+        assert_eq!(s.tokens(), &long[..512]);
+    }
+
+    #[test]
+    fn beyond_context_is_an_error() {
+        let m = model();
+        let mut s = Session::new(m, 8);
+        let e = s.prefill(&PROMPT, &|| false).unwrap_err();
+        assert!(e.0.contains("context full"), "{e}");
+        assert!(s.tokens().is_empty());
+    }
+}

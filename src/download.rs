@@ -428,7 +428,20 @@ pub fn ensure_side_artifacts(
     // resident, which fits a 128 GB Mac that the file size says it cannot.
     // Neither side artifact is Qwen's either: no `DeepSeek` vision encoder, and
     // speculation runs off the block embedded in its own GGUF.
-    if crate::gguf::family_of(model_path) == crate::gguf::ModelFamily::Qwen {
+    let family = crate::gguf::family_of(model_path);
+    // Gemma takes none of it either, and has no MTP of its own: it runs on the
+    // native Rust engine, which streams nothing from SSD and opens no
+    // companion. `make_local_engine` routes it away before this is reached;
+    // this keeps any other caller from treating it as `DeepSeek`.
+    if family == crate::gguf::ModelFamily::Gemma {
+        crate::status::set_ssd_streaming(false);
+        engine.vision_path = None;
+        engine.mtp_path = None;
+        engine.mtp = false;
+        engine.mtp_strict = false;
+        return Ok(());
+    }
+    if family == crate::gguf::ModelFamily::Qwen {
         crate::status::set_ssd_streaming(engine.ssd_streaming);
         // Qwen opens no side artifact (see `ds4engine::model_supports_vision`).
         engine.vision_path = None;
@@ -455,7 +468,7 @@ pub fn ensure_side_artifacts(
     // the engine refuses to open a V4.1 checkpoint at all when a draft model is
     // attached, so plank must not auto-pair one. A companion the user named
     // themselves still goes through, and still fails loudly there.
-    if drop_dspark_for_family(crate::gguf::family_of(model_path), engine) {
+    if drop_dspark_for_family(family, engine) {
         if !engine.mtp_path_explicit {
             engine.mtp_path = None;
         }
@@ -2279,6 +2292,7 @@ mod tests {
             vision: Some(absent.with_extension("vision.absent")),
             managed_main: false,
             urls: std::collections::BTreeMap::new(),
+            family: None,
         }
     }
 
@@ -2308,6 +2322,37 @@ mod tests {
     /// opens neither the DS4 vision encoder nor a DS4 draft checkpoint. No
     /// download is stubbed here on purpose — if the gate regressed, the ensure
     /// calls would try to prompt or fetch and fail.
+    /// Gemma is not `DeepSeek`: no vision encoder, no draft checkpoint, no
+    /// SSD-streaming heuristic, and no MTP of its own to speculate from. No
+    /// companion is stubbed — a regressed gate would prompt and fail.
+    #[test]
+    fn a_gemma_model_skips_the_ds4_side_artifacts() {
+        let model = stub_model("gemma", "gemma4");
+        // Sparse, so the file is larger than any machine's RAM without taking
+        // the disk: the DeepSeek SSD heuristic would fire on it.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&model)
+            .unwrap()
+            .set_len(1 << 42)
+            .unwrap();
+        let sel = stub_selection(crate::manifest::EngineId::DS4VISION, &model);
+        let mut e = crate::config::EngineTuning {
+            mtp: true,
+            mtp_strict: true,
+            ..Default::default()
+        };
+        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert_eq!(e.vision_path, None, "Gemma opens no vision encoder");
+        assert_eq!(e.mtp_path, None, "Gemma opens no draft checkpoint");
+        assert!(
+            !e.mtp && !e.mtp_strict,
+            "Gemma has no MTP to speculate from"
+        );
+        assert!(!e.ssd_streaming, "no DeepSeek-sized streaming heuristic");
+        let _ = std::fs::remove_file(model);
+    }
+
     #[test]
     fn a_qwen_model_skips_the_ds4_side_artifacts() {
         let model = stub_model("qwen", "qwen4exp");
@@ -2359,6 +2404,7 @@ mod tests {
             vision: None,
             managed_main: false,
             urls: std::collections::BTreeMap::new(),
+            family: None,
         };
         let mut e = crate::config::EngineTuning::default();
         assert!(e.mtp, "speculation defaults to on");
@@ -2386,6 +2432,7 @@ mod tests {
             vision: None,
             managed_main: false,
             urls: std::collections::BTreeMap::new(),
+            family: None,
         };
         let mut e = crate::config::EngineTuning::default();
         assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
@@ -2518,6 +2565,7 @@ mod tests {
             vision: None,
             managed_main: false,
             urls: std::collections::BTreeMap::new(),
+            family: None,
         };
         let catalog = crate::engines::parse(
             crate::engines::COMPILED_IN,
@@ -2573,6 +2621,7 @@ mod tests {
             vision: None,
             managed_main: true,
             urls: std::collections::BTreeMap::new(),
+            family: None,
         };
         assert!(ensure_model_in(&crate::engines::Catalog::default(), &sel, false).is_ok());
         let _ = std::fs::remove_dir_all(&root);
@@ -2863,6 +2912,7 @@ mod tests {
             vision: None,
             managed_main: false,
             urls: std::collections::BTreeMap::new(),
+            family: None,
         };
         check_manifest_at_startup_with(
             &sel,
@@ -2891,6 +2941,7 @@ mod tests {
             vision: None,
             managed_main: false,
             urls: std::collections::BTreeMap::new(),
+            family: None,
         };
         let sel = crate::engines::inherit_companions_in(root, &catalog(), &base, clone);
         assert_eq!(

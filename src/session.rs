@@ -88,6 +88,8 @@ const MAGIC: &str = "plank-session 1";
 const DS4_FILE_EXT: &str = ".ds4.kv";
 /// Transcript extension for a Qwen session.
 const QWEN_FILE_EXT: &str = ".qwn.kv";
+/// Transcript extension for a Gemma 4 session.
+const GEMMA_FILE_EXT: &str = ".gemma.kv";
 /// Transcript extension for a `DeepSeek` V4.1 session.
 ///
 /// Note it is not a suffix of, nor suffixed by, [`DS4_FILE_EXT`]: `.ds4.kv`
@@ -114,29 +116,41 @@ static FAMILY_TAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 const FAMILY_TAG_DS4: u8 = 0;
 const FAMILY_TAG_QWEN: u8 = 1;
 const FAMILY_TAG_DS41: u8 = 2;
+const FAMILY_TAG_GEMMA: u8 = 3;
+
+/// The [`FAMILY_TAG`] value stored for `family`.
+fn family_tag(family: crate::gguf::ModelFamily) -> u8 {
+    match family {
+        crate::gguf::ModelFamily::Ds4 => FAMILY_TAG_DS4,
+        crate::gguf::ModelFamily::Qwen => FAMILY_TAG_QWEN,
+        crate::gguf::ModelFamily::Ds41 => FAMILY_TAG_DS41,
+        crate::gguf::ModelFamily::Gemma => FAMILY_TAG_GEMMA,
+    }
+}
+
+/// The family a stored [`FAMILY_TAG`] value names.
+fn family_from_tag(tag: u8) -> crate::gguf::ModelFamily {
+    match tag {
+        FAMILY_TAG_QWEN => crate::gguf::ModelFamily::Qwen,
+        FAMILY_TAG_DS41 => crate::gguf::ModelFamily::Ds41,
+        FAMILY_TAG_GEMMA => crate::gguf::ModelFamily::Gemma,
+        // Including any value never stored: unset and unknown both read as the
+        // pre-split family, never as a wrong one.
+        _ => crate::gguf::ModelFamily::Ds4,
+    }
+}
 
 /// Records the live model family. Called once at startup, before any store is
 /// opened; unset means `Ds4`, which is what every transcript written before
 /// the families split was.
 pub fn set_family(family: crate::gguf::ModelFamily) {
-    let tag = match family {
-        crate::gguf::ModelFamily::Ds4 => FAMILY_TAG_DS4,
-        crate::gguf::ModelFamily::Qwen => FAMILY_TAG_QWEN,
-        crate::gguf::ModelFamily::Ds41 => FAMILY_TAG_DS41,
-    };
-    FAMILY_TAG.store(tag, std::sync::atomic::Ordering::Relaxed);
+    FAMILY_TAG.store(family_tag(family), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The live model family.
 #[must_use]
 pub fn family() -> crate::gguf::ModelFamily {
-    match FAMILY_TAG.load(std::sync::atomic::Ordering::Relaxed) {
-        FAMILY_TAG_QWEN => crate::gguf::ModelFamily::Qwen,
-        FAMILY_TAG_DS41 => crate::gguf::ModelFamily::Ds41,
-        // Including any value never stored: unset and unknown both read as the
-        // pre-split family, never as a wrong one.
-        _ => crate::gguf::ModelFamily::Ds4,
-    }
+    family_from_tag(FAMILY_TAG.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The live family's transcript extension.
@@ -157,6 +171,7 @@ pub fn family_ext(family: crate::gguf::ModelFamily) -> &'static str {
         crate::gguf::ModelFamily::Ds4 => DS4_FILE_EXT,
         crate::gguf::ModelFamily::Qwen => QWEN_FILE_EXT,
         crate::gguf::ModelFamily::Ds41 => DS41_FILE_EXT,
+        crate::gguf::ModelFamily::Gemma => GEMMA_FILE_EXT,
     }
 }
 /// Extension of the engine KV payload written beside a transcript.
@@ -2972,6 +2987,23 @@ pub fn sha1_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checked through the pure tag mapping rather than `set_family`, which
+    /// flips a process-wide static every parallel session test reads its
+    /// transcript extension from.
+    #[test]
+    fn gemma_transcripts_have_their_own_extension() {
+        use crate::gguf::ModelFamily;
+        assert_eq!(family_ext(ModelFamily::Gemma), ".gemma.kv");
+        assert_eq!(
+            family_from_tag(family_tag(ModelFamily::Gemma)),
+            ModelFamily::Gemma
+        );
+        for f in [ModelFamily::Ds4, ModelFamily::Qwen, ModelFamily::Ds41] {
+            assert_ne!(family_tag(f), family_tag(ModelFamily::Gemma));
+            assert_ne!(family_ext(f), family_ext(ModelFamily::Gemma));
+        }
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =

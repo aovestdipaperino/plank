@@ -925,6 +925,30 @@ pub trait Engine: Debug + Send {
         false
     }
 
+    /// Whether the stream this engine emits carries its own `<think>` opener.
+    ///
+    /// The ds4 prompt ends inside an open `<think>`, so the renderer has to be
+    /// told a pass starts there. An engine whose model opens its own thought
+    /// block mid-stream (Gemma's `<|channel>`, translated to `<think>`) says
+    /// yes, and the pass then starts in visible text.
+    fn emits_think_tags(&self) -> bool {
+        false
+    }
+
+    /// Whether the next `generate` truncates the live KV to the longest
+    /// common token prefix on its own, keeping everything before a
+    /// divergence and prefilling only the rest.
+    ///
+    /// The ds4 session is extend-only: a prompt diverging behind its live end
+    /// rebuilds from zero, which is what fork snapshots (`get_kv` before a
+    /// sidechain, `set_kv` after) and ladder rungs exist to avoid. An engine
+    /// that says yes (Gemma) gains nothing from either and pays a full KV
+    /// serialisation for each, so the agent skips both. `false` keeps the
+    /// snapshot discipline exactly as it is.
+    fn kv_truncates_exactly(&self) -> bool {
+        false
+    }
+
     /// Reports how the live KV lines up with the prompt the next `generate`
     /// call will build from `transcript`, without generating anything.
     ///

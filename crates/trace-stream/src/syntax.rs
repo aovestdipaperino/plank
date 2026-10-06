@@ -2,7 +2,7 @@
 //!
 //! The C picks this per engine in `agent_tool_syntax_for_engine`
 //! (`refs/ds4/ds4_agent.c`) and then uses it to choose a tools prompt, a
-//! parser, and a syntax reminder. plank carries the two dialects it supports.
+//! parser, and a syntax reminder. plank carries the dialects it supports.
 
 /// The tool-call dialect in force for a generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -15,6 +15,8 @@ pub enum ToolSyntax {
     /// `DeepSeek` V4.1's DSML markers: the same dialect with a leading space
     /// and a shorter outer tag name.
     Dsml41,
+    /// Gemma 4's `<|tool_call>call:NAME{…}<tool_call|>`.
+    Gemma,
 }
 
 /// The tag spellings of one DSML dialect.
@@ -48,7 +50,9 @@ impl ToolSyntax {
     /// file — a renamed or relocated model still resolves correctly.
     #[must_use]
     pub fn for_model_name(name: &str) -> Self {
-        if name.starts_with("Qwen3.8") {
+        if name.starts_with("Gemma 4") {
+            Self::Gemma
+        } else if name.starts_with("Qwen3.8") {
             Self::Qwen
         } else if name.starts_with("DeepSeek V4.1") {
             Self::Dsml41
@@ -87,7 +91,7 @@ impl ToolSyntax {
                 invoke_name: " invoke",
                 param_name: " parameter",
             }),
-            Self::Qwen => None,
+            Self::Qwen | Self::Gemma => None,
         }
     }
 }
@@ -154,6 +158,19 @@ mod tests {
     #[test]
     fn v41_is_not_an_xml_dialect() {
         assert!(!ToolSyntax::Dsml41.is_xml_tool_call());
+    }
+
+    #[test]
+    fn gemma_shape_names_select_the_gemma_dialect() {
+        for name in ["Gemma 4 E4B", "Gemma 4 12B", "Gemma 4"] {
+            assert_eq!(
+                ToolSyntax::for_model_name(name),
+                ToolSyntax::Gemma,
+                "{name}"
+            );
+        }
+        assert_eq!(ToolSyntax::for_model_name("Gemma 3 4B"), ToolSyntax::Dsml);
+        assert!(ToolSyntax::Gemma.dsml_tags().is_none());
     }
 
     #[test]

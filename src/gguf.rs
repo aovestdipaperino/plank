@@ -31,6 +31,8 @@ pub enum ModelFamily {
     /// and it speaks its own DSML dialect, so nothing captured under one family
     /// may be replayed under the other.
     Ds41,
+    /// Gemma 4 (`gemma4`), run on the native Rust engine (`gemmaengine`).
+    Gemma,
 }
 
 impl ModelFamily {
@@ -41,6 +43,7 @@ impl ModelFamily {
             Self::Ds4 => "ds4",
             Self::Ds41 => "ds41",
             Self::Qwen => "qwen",
+            Self::Gemma => "gemma",
         }
     }
 }
@@ -56,6 +59,7 @@ impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
             trace_stream::syntax::ToolSyntax::Qwen => Self::Qwen,
             trace_stream::syntax::ToolSyntax::Dsml41 => Self::Ds41,
             trace_stream::syntax::ToolSyntax::Dsml => Self::Ds4,
+            trace_stream::syntax::ToolSyntax::Gemma => Self::Gemma,
         }
     }
 }
@@ -68,6 +72,9 @@ const QWEN_ARCH: &str = "qwen4exp";
 /// V4's is `deepseek4`, which is *not* a prefix match away: the C compares the
 /// whole string, so `deepseek41` must be listed on its own.
 const DS41_ARCH: &str = "deepseek41";
+
+/// The `general.architecture` value of a Gemma 4 GGUF.
+pub const GEMMA4_ARCH: &str = "gemma4";
 
 /// Refuses to allocate for a declared length beyond this. The file may be
 /// truncated or not a GGUF at all, and a bogus 64-bit length would otherwise
@@ -89,6 +96,7 @@ pub fn family_of(path: &Path) -> ModelFamily {
     match architecture(path).as_deref() {
         Some(QWEN_ARCH) => ModelFamily::Qwen,
         Some(DS41_ARCH) => ModelFamily::Ds41,
+        Some(GEMMA4_ARCH) => ModelFamily::Gemma,
         _ => ModelFamily::Ds4,
     }
 }
@@ -581,6 +589,22 @@ mod tests {
             assert_eq!(family_of(&p), ModelFamily::Ds4, "{arch}");
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn gemma4_arch_is_its_own_family() {
+        let p = Gguf::default()
+            .str_val("general.architecture", GEMMA4_ARCH)
+            .write("gemma4");
+        assert_eq!(family_of(&p), ModelFamily::Gemma);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn gemma_dialect_maps_to_the_gemma_family() {
+        use trace_stream::syntax::ToolSyntax;
+        assert_eq!(ModelFamily::from(ToolSyntax::Gemma), ModelFamily::Gemma);
+        assert_eq!(ModelFamily::Gemma.as_str(), "gemma");
     }
 
     /// `deepseek41` is not a prefix match away from `deepseek4` and must not

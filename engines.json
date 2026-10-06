@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "default": "ds4vision",
   "engines": {
     "ds4vision": {
@@ -57,6 +57,30 @@
         "url": "https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf",
         "bytes": 616703104,
         "sha256": "b2e9b5e4a44c107f8867e67dbf09b607fd99ae33c1a97a60a6720aeb252a9dad"
+      }
+    },
+    "gemma4-e4b": {
+      "version": 1,
+      "released": "2026-10-06",
+      "notes": "Gemma 4 E4B instruct Q4_K_M; runs on the native Rust engine",
+      "family": "gemma",
+      "main": {
+        "name": "gemma-4-E4B-it-Q4_K_M.gguf",
+        "url": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
+        "bytes": 4977171584,
+        "sha256": "85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87"
+      }
+    },
+    "gemma4-12b": {
+      "version": 1,
+      "released": "2026-10-06",
+      "notes": "Gemma 4 12B instruct QAT Q4_0; runs on the native Rust engine",
+      "family": "gemma",
+      "main": {
+        "name": "gemma-4-12b-it-qat-q4_0.gguf",
+        "url": "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf",
+        "bytes": 6975879296,
+        "sha256": "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b"
       }
     }
   }

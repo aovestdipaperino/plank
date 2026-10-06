@@ -32,7 +32,7 @@ rust-version = "1.93"
 exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf", "spike/*", "guests/*"]
 
 [features]
-default = ["use_obscura", "builtin_editor", "docparse", "images", "plugins"]
+default = ["use_obscura", "builtin_editor", "docparse", "images", "plugins", "gemma"]
 # Image pasting (Cmd-V clipboard images, image file paths). This was off while
 # the model had no way to act on an image-file reference — the attachment named
 # a path and nothing could read it. The `ocr-mcp` MCP server closes that gap
@@ -72,6 +72,10 @@ docparse = ["dep:liteparse", "dep:tokio"]
 # whose no-op implementation is what the rest of plank talks to when the feature
 # is off: the same shape as `Engine`/`EchoEngine`, and for the same reason.
 plugins = ["dep:extism"]
+# Gemma 4 in native Rust (`crates/gemma-engine`, candle on Metal): the
+# `GemmaEngine` behind `Engine`. On by default; it needs no submodule and no C,
+# so it builds wherever plank does. `--no-default-features` drops candle.
+gemma = ["dep:gemma-engine", "gemma-engine/candle"]
 # Qwen3.8-Flash-Next support: the `--qwen` flag and its default model paths,
 # the model's own tools prompt and `<tool_call>` dialect, the PLE n-gram
 # sidecar wiring, and the downloader's Qwen artifacts.
@@ -89,6 +93,7 @@ trace-stream = { path = "crates/trace-stream" }
 gguf-delta = { path = "crates/gguf-delta", version = "0.1.0" }
 turbo-debug-client = "0.2.1"
 libc = "0.2"
+gemma-engine = { path = "crates/gemma-engine", optional = true }
 # unstable-rendered-line-info exposes Paragraph::line_count for exact
 # wrapped-line counts, so scrollback can clamp to the true bottom (word-wrap
 # produces more rows than a char-packing estimate).
@@ -214,6 +219,7 @@ extism = { version = "1.30", default-features = false, features = [
 
 [dev-dependencies]
 gguf-delta = { path = "crates/gguf-delta", version = "0.1.0", features = ["testing"] }
+gemma-engine = { path = "crates/gemma-engine", features = ["testgguf"] }
 
 [lints]
 workspace = true
