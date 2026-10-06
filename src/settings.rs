@@ -2005,15 +2005,23 @@ pub fn set_engine_model_in(path: &Path, name: &str) -> Result<(), String> {
     let mut out = String::new();
     write_pretty(&mut out, &Json::Obj(root), 0);
     out.push('\n');
-    if let Some(parent) = path.parent() {
+    // A symlinked settings file (dotfiles) is written through to its target:
+    // renaming onto the link itself would replace it with a regular file.
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let dest = if is_link {
+        std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?
+    } else {
+        path.to_path_buf()
+    };
+    if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = dest.with_extension("json.tmp");
     std::fs::write(&tmp, out)
-        .and_then(|()| std::fs::rename(&tmp, path))
+        .and_then(|()| std::fs::rename(&tmp, &dest))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            format!("{}: {e}", path.display())
+            format!("{}: {e}", dest.display())
         })
 }
 
@@ -3322,6 +3330,31 @@ mod tests {
             !text.contains("popupRows"),
             "must not expand defaults: {text}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_engine_model_writes_through_a_symlinked_settings_file() {
+        let dir = std::env::temp_dir().join(format!("plank-setmodel-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        let target = dir.join("dotfiles").join("plank-settings.json");
+        std::fs::write(&target, r#"{"tools":{"bashNotify":true}}"#).unwrap();
+        let link = dir.join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        set_engine_model_in(&link, "gemma4-e4b").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must stay a link"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(v["engine"]["model"], "gemma4-e4b");
+        assert_eq!(v["tools"]["bashNotify"], true);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
