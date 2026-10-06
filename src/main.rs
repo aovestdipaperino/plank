@@ -1616,7 +1616,9 @@ fn run(
     let tui = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !tui {
         print!("{}", plank::logo::banner());
-        print!("{}", status::welcome_banner(cfg.generation.ctx_size, color));
+        // The engine's own window: a Gemma run without `-c` picks its own,
+        // which the configured (DeepSeek) default says nothing about.
+        print!("{}", status::welcome_banner(engine.ctx_size(), color));
         // Non-intrusive one-time update hint (issue #56); silent when up to date.
         if let Some(notice) = plank::upgrade::update_notice() {
             println!("{notice}\n");
