@@ -13,8 +13,13 @@
 //!   layers mask on every forward, decode steps included.
 //! - Weights are split from state: [`Model`] is immutable and `forward` takes
 //!   the caller's [`KvCache`].
-//! - Rotary tables cover `min(context_length, ctx_cap)` positions, and are
-//!   kept in f32 (the PR rounds them through `general.dtype`, f16 by default).
+//! - Rotary tables cover `min(context_length, ctx_cap)` positions.
+//! - Rotary tables are f32 on purpose, unlike the PR, which rounds them
+//!   through `general.dtype` (f16 by default): llama.cpp computes rope in f32
+//!   and every activation here is f32.
+//! - `Config::from_gguf` validates head counts, head dims and the window, so
+//!   a crafted file fails with an error instead of a panic or a silently
+//!   wrong head grouping.
 //! - Sliding layers attend only to the keys their window can reach (the rest
 //!   would be masked to exactly zero weight anyway).
 
@@ -105,7 +110,7 @@ impl Config {
         }
         let per_layer_input_dim =
             usize_metadata(content, "gemma4.embedding_length_per_layer_input")?;
-        Ok(Self {
+        let config = Self {
             block_count,
             context_length: usize_metadata(content, "gemma4.context_length")?,
             hidden_size: usize_metadata(content, "gemma4.embedding_length")?,
@@ -134,7 +139,40 @@ impl Config {
             per_layer_input_dim: per_layer_input_dim.max(1),
             has_per_layer_inputs: per_layer_input_dim > 0,
             sliding_pattern,
-        })
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Refuses values the forward pass would divide by, halve, or group
+    /// heads by, so a crafted file errors at open instead of panicking.
+    fn validate(&self) -> Result<()> {
+        for (layer, (&heads, &kv_heads)) in
+            self.attention_heads.iter().zip(&self.kv_heads).enumerate()
+        {
+            if heads == 0 || kv_heads == 0 {
+                candle_core::bail!(
+                    "Gemma 4 layer {layer} has {heads} attention heads and {kv_heads} KV heads; both must be positive"
+                )
+            }
+            if !heads.is_multiple_of(kv_heads) {
+                candle_core::bail!(
+                    "Gemma 4 layer {layer}: {heads} attention heads are not a multiple of {kv_heads} KV heads"
+                )
+            }
+        }
+        if self.sliding_window == 0 {
+            candle_core::bail!("Gemma 4 sliding window must be positive")
+        }
+        for (name, dim) in [
+            ("key_length", self.global_head_dim),
+            ("key_length_swa", self.local_head_dim),
+        ] {
+            if dim == 0 || !dim.is_multiple_of(2) {
+                candle_core::bail!("Gemma 4 {name} is {dim}; it must be positive and even")
+            }
+        }
+        Ok(())
     }
 
     fn is_sliding(&self, layer: usize) -> bool {
@@ -213,9 +251,24 @@ impl QEmbedding {
         };
         let (rows, cols) = info.shape.dims2()?;
         let block = info.ggml_dtype.block_size();
-        let size = rows * cols / block * info.ggml_dtype.type_size();
+        let Some(size) = rows
+            .checked_mul(cols)
+            .and_then(|n| (n / block).checked_mul(info.ggml_dtype.type_size()))
+        else {
+            candle_core::bail!("{name}: shape [{rows}, {cols}] overflows its byte size")
+        };
+        // Check the file holds the bytes before allocating what the header
+        // claims.
+        let end = reader.seek(SeekFrom::End(0))?;
+        let start = content
+            .tensor_data_offset
+            .checked_add(info.offset)
+            .filter(|&start| start <= end);
+        let Some(start) = start.filter(|&start| (end - start) >= size as u64) else {
+            candle_core::bail!("{name}: {size} bytes declared, past the end of the file")
+        };
         let mut data = vec![0u8; size];
-        reader.seek(SeekFrom::Start(content.tensor_data_offset + info.offset))?;
+        reader.seek(SeekFrom::Start(start))?;
         reader.read_exact(&mut data)?;
         Self::from_raw(data, info.ggml_dtype, rows, cols)
     }
@@ -1367,6 +1420,91 @@ mod tests {
         .unwrap();
         assert_eq!(a.signature(), b.signature());
         assert_ne!(a.signature(), c.signature());
+    }
+
+    fn open_with(
+        name: &str,
+        edit: impl Fn(&mut Vec<(String, gguf_file::Value)>),
+    ) -> crate::Result<Arc<Model>> {
+        let cfg = TinyConfig::default();
+        let mut md = crate::testgguf::tiny_metadata(&cfg).unwrap();
+        edit(&mut md);
+        let path = std::env::temp_dir().join(format!(
+            "gemma-model-bad-{name}-{}-{:?}.gguf",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        crate::testgguf::write_gguf(&path, &md, &crate::testgguf::tiny_tensors(&cfg).unwrap())
+            .unwrap();
+        Model::open(&path, &Device::Cpu)
+    }
+
+    fn set(md: &mut [(String, gguf_file::Value)], key: &str, value: gguf_file::Value) {
+        md.iter_mut().find(|(k, _)| k == key).unwrap().1 = value;
+    }
+
+    #[test]
+    fn zero_kv_heads_is_an_error_not_a_panic() {
+        let e = open_with("kv0", |md| {
+            set(
+                md,
+                "gemma4.attention.head_count_kv",
+                gguf_file::Value::U32(0),
+            );
+        })
+        .unwrap_err();
+        assert!(e.0.contains("KV heads"), "{e}");
+    }
+
+    #[test]
+    fn heads_not_a_multiple_of_kv_heads_is_an_error() {
+        let e = open_with("grouping", |md| {
+            set(md, "gemma4.attention.head_count", gguf_file::Value::U32(3));
+            set(
+                md,
+                "gemma4.attention.head_count_kv",
+                gguf_file::Value::U32(2),
+            );
+        })
+        .unwrap_err();
+        assert!(e.0.contains("not a multiple"), "{e}");
+    }
+
+    #[test]
+    fn a_zero_window_or_odd_head_dim_is_an_error() {
+        let e = open_with("window0", |md| {
+            set(
+                md,
+                "gemma4.attention.sliding_window",
+                gguf_file::Value::U32(0),
+            );
+        })
+        .unwrap_err();
+        assert!(e.0.contains("sliding window"), "{e}");
+        let e = open_with("odd", |md| {
+            set(
+                md,
+                "gemma4.attention.key_length_swa",
+                gguf_file::Value::U32(7),
+            );
+        })
+        .unwrap_err();
+        assert!(e.0.contains("key_length_swa"), "{e}");
+    }
+
+    #[test]
+    fn qembedding_larger_than_the_file_is_an_error() {
+        let path = tiny("short", &TinyConfig::default());
+        let mut f = std::fs::File::open(&path).unwrap();
+        let mut ct = gguf_file::Content::read(&mut f).unwrap();
+        let info = ct.tensor_infos.get_mut("token_embd.weight").unwrap();
+        info.shape = candle_core::Shape::from((1_000_000, 32));
+        let e = QEmbedding::read(&ct, &mut f, "token_embd.weight").unwrap_err();
+        assert!(e.to_string().contains("past the end"), "{e}");
+        let info = ct.tensor_infos.get_mut("token_embd.weight").unwrap();
+        info.shape = candle_core::Shape::from((usize::MAX / 2, 32));
+        let e = QEmbedding::read(&ct, &mut f, "token_embd.weight").unwrap_err();
+        assert!(e.to_string().contains("overflows"), "{e}");
     }
 
     #[test]

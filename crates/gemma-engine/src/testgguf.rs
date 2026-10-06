@@ -299,7 +299,12 @@ pub fn tiny_tensors(cfg: &TinyConfig) -> Result<Vec<(String, QTensor)>> {
     Ok(out)
 }
 
-fn write_gguf(
+/// Writes `metadata` and `tensors` as a GGUF at `path`, for tests that
+/// need a file [`write_tiny`] would refuse to describe.
+///
+/// # Errors
+/// On an I/O or candle failure.
+pub fn write_gguf(
     path: &Path,
     metadata: &[(String, gguf_file::Value)],
     tensors: &[(String, QTensor)],
