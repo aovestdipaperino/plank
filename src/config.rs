@@ -1136,6 +1136,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "edit the running profile's files, then optionally restart into them",
     },
     SlashCommand {
+        name: "/engines",
+        args: "",
+        desc: "choose or download an engine that fits this machine, then restart into it",
+    },
+    SlashCommand {
         name: "/frame",
         args: "[id]",
         desc: "open a wasm frame component, or list the openable ones",
@@ -1341,6 +1346,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/install-claude-plugin"
             | "/install-profile"
             | "/edit-profile"
+            | "/engines"
             | "/frame"
             | "/templates"
             | "/tasks"
@@ -3150,6 +3156,11 @@ mod tests {
             assert!(c.name.starts_with('/'), "{}", c.name);
             assert!(!c.desc.is_empty(), "{} has no description", c.name);
         }
+    }
+
+    #[test]
+    fn engines_is_a_known_slash_command() {
+        assert!(slash_command_known("/engines"));
     }
 
     #[test]
