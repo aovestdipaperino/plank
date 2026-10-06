@@ -1974,6 +1974,49 @@ pub fn active() -> &'static Settings {
     }
 }
 
+/// Sets `engine.model` in the settings file at `path` to `name`, changing
+/// nothing else: every other key, known or not, is kept as written. Creates
+/// the file (and its directory) when missing.
+///
+/// Deliberately not [`Settings::save_to`], which writes every field and would
+/// turn a hand-written three-line file into the full default set.
+///
+/// # Errors
+/// When the file exists but is not a JSON object, or cannot be written.
+pub fn set_engine_model_in(path: &Path, name: &str) -> Result<(), String> {
+    let mut root: Vec<(String, Json)> = match std::fs::read_to_string(path) {
+        Ok(t) => match json_parse(&t) {
+            Some(Json::Obj(o)) => o,
+            _ => {
+                return Err(format!(
+                    "{} is not a JSON object; not changing it",
+                    path.display()
+                ));
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    upsert(
+        section(&mut root, "engine"),
+        "model",
+        Json::Str(name.to_owned()),
+    );
+    let mut out = String::new();
+    write_pretty(&mut out, &Json::Obj(root), 0);
+    out.push('\n');
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, out)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("{}: {e}", path.display())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3255,6 +3298,41 @@ mod tests {
         s.overlay(r#"{"kvcache":{"maxBytes":"soon"}}"#);
         assert!(!s.provenance.contains_key("kvcache.maxBytes"));
         assert_eq!(s.kvcache.max_bytes, 21_474_836_480);
+    }
+
+    #[test]
+    fn set_engine_model_keeps_every_other_key() {
+        let dir = std::env::temp_dir().join(format!("plank-setmodel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"tools":{"bashNotify":true},"engine":{"model":"ds4vision","threads":8},"future":{"x":1}}"#,
+        )
+        .unwrap();
+        set_engine_model_in(&path, "gemma4-e4b").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["engine"]["model"], "gemma4-e4b");
+        assert_eq!(v["engine"]["threads"], 8);
+        assert_eq!(v["tools"]["bashNotify"], true);
+        assert_eq!(v["future"]["x"], 1);
+        assert!(
+            !text.contains("popupRows"),
+            "must not expand defaults: {text}"
+        );
+    }
+
+    #[test]
+    fn set_engine_model_creates_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("plank-setmodel-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        set_engine_model_in(&path, "gemma4-12b").unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({"engine": {"model": "gemma4-12b"}}));
     }
 }
 
