@@ -90,17 +90,29 @@ pub fn state_label(fit: &Fit) -> String {
 /// Shows the menu and returns the picked engine's name, or `None` on cancel.
 ///
 /// # Errors
-/// When the terminal cannot be read.
+/// When the terminal cannot be drawn to or read.
 pub fn run(rows: &[EngineRow], current: Option<&str>) -> Result<Option<String>, String> {
     let mut state = ListState::default();
     state.select(initial_cursor(rows, current));
     let mut terminal = ratatui::init();
-    let result = loop {
-        let _ = terminal.draw(|f| draw(f, rows, &mut state));
+    let result = menu_loop(&mut terminal, rows, &mut state);
+    ratatui::restore();
+    result
+}
+
+fn menu_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    rows: &[EngineRow],
+    state: &mut ListState,
+) -> Result<Option<String>, String> {
+    loop {
+        terminal
+            .draw(|f| draw(f, rows, state))
+            .map_err(|e| e.to_string())?;
         if !event::poll(Duration::from_millis(250)).map_err(|e| e.to_string())? {
             continue;
         }
-        let Ok(Event::Key(k)) = event::read() else {
+        let Event::Key(k) = event::read().map_err(|e| e.to_string())? else {
             continue;
         };
         if k.kind != KeyEventKind::Press {
@@ -112,15 +124,13 @@ pub fn run(rows: &[EngineRow], current: Option<&str>) -> Result<Option<String>, 
             Action::Down => state.select(at.map(|i| step(rows, i, true))),
             Action::Pick => {
                 if let Some(i) = at {
-                    break Ok(Some(rows[i].name.clone()));
+                    return Ok(Some(rows[i].name.clone()));
                 }
             }
-            Action::Cancel => break Ok(None),
+            Action::Cancel => return Ok(None),
             Action::Ignore => {}
         }
-    };
-    ratatui::restore();
-    result
+    }
 }
 
 fn draw(frame: &mut Frame, rows: &[EngineRow], state: &mut ListState) {
@@ -163,7 +173,7 @@ fn draw(frame: &mut Frame, rows: &[EngineRow], state: &mut ListState) {
         state,
     );
     frame.render_widget(
-        Paragraph::new("Up/Down move  Enter pick  Esc cancel")
+        Paragraph::new("Up/Down move  Enter pick  Esc/q cancel")
             .style(Style::default().add_modifier(Modifier::DIM)),
         help,
     );
@@ -237,6 +247,12 @@ mod tests {
     }
 
     #[test]
+    fn empty_rows_are_safe() {
+        assert_eq!(initial_cursor(&[], None), None);
+        assert_eq!(step(&[], 0, true), 0);
+    }
+
+    #[test]
     fn keys_map_to_actions() {
         let k = |c| KeyEvent::new(c, KeyModifiers::NONE);
         assert_eq!(classify(k(KeyCode::Up)), Action::Up);
@@ -245,6 +261,7 @@ mod tests {
         assert_eq!(classify(k(KeyCode::Char('j'))), Action::Down);
         assert_eq!(classify(k(KeyCode::Enter)), Action::Pick);
         assert_eq!(classify(k(KeyCode::Esc)), Action::Cancel);
+        assert_eq!(classify(k(KeyCode::Char('q'))), Action::Cancel);
         assert_eq!(
             classify(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Action::Cancel
