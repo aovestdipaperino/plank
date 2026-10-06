@@ -134,6 +134,15 @@ keeps the KV up to the first differing token and prefills only the remainder.
   The probe therefore reports the reusable prefix as the effective live end.
   The agent truncates and re-prefills the tail instead of restoring a rung,
   which is the cheaper path anyway.
+- **No fork snapshots, no ladder rungs.** `GemmaEngine` reports
+  `Engine::kv_truncates_exactly() == true` (the trait default is `false`, so
+  DeepSeek is unchanged). The agent then takes no `get_kv` snapshot when it
+  opens a sidechain (sub-agent, memory pass, prompt suggestion), keeps no
+  prefill snapshot for a memory-pass retry, and anchors no ladder rung. Each
+  would serialise the whole f32 KV, about 114 KB per token on E4B (≈3.5 GB
+  at 30k tokens), and `set_kv` stages a second full copy, so a fork could
+  peak near 16 GB. The next `generate` truncates to the common prefix on its
+  own, which is exactly what the snapshot would have restored.
 - **A warm walk keeps the warm buffer.** `warm_reset` only places tokens, and
   `warm_sync` prefills them (Ruling 13), so a checkpoint restore does not
   waste a ~20 s system-prompt prefill. During the walk, `set_kv` keeps the

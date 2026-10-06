@@ -187,14 +187,28 @@ impl KvCache {
     /// Propagates any candle error from reading the live view back to host
     /// memory.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
+        // Views first, so the buffer is sized once: at about 114 KB per token
+        // on E4B, growing it by doubling would copy gigabytes at 30k tokens.
+        let views = self
+            .layers
+            .iter()
+            .map(LayerKv::view)
+            .collect::<Result<Vec<_>>>()?;
+        let mut capacity = 4usize;
+        for view in &views {
+            capacity += 12;
+            if let Some((k, v)) = view {
+                capacity += (k.elem_count() + v.elem_count()) * 4;
+            }
+        }
+        let mut out = Vec::with_capacity(capacity);
         out.extend_from_slice(
             &u32::try_from(self.layers.len())
                 .unwrap_or(u32::MAX)
                 .to_le_bytes(),
         );
-        for layer in &self.layers {
-            match layer.view()? {
+        for view in views {
+            match view {
                 None => {
                     out.extend_from_slice(&0u32.to_le_bytes());
                     out.extend_from_slice(&0u32.to_le_bytes());
@@ -209,12 +223,8 @@ impl KvCache {
                     out.extend_from_slice(
                         &u32::try_from(head_dim).unwrap_or(u32::MAX).to_le_bytes(),
                     );
-                    for f in k.flatten_all()?.to_vec1::<f32>()? {
-                        out.extend_from_slice(&f.to_le_bytes());
-                    }
-                    for f in v.flatten_all()?.to_vec1::<f32>()? {
-                        out.extend_from_slice(&f.to_le_bytes());
-                    }
+                    extend_f32_le(&mut out, &k.flatten_all()?.to_vec1::<f32>()?);
+                    extend_f32_le(&mut out, &v.flatten_all()?.to_vec1::<f32>()?);
                 }
             }
         }
@@ -293,6 +303,17 @@ impl KvCache {
     }
 }
 
+/// Appends `floats` as little-endian bytes in one resize, filling the new
+/// tail in fixed four-byte chunks the compiler turns into a plain copy on a
+/// little-endian host.
+fn extend_f32_le(out: &mut Vec<u8>, floats: &[f32]) {
+    let start = out.len();
+    out.resize(start + floats.len() * 4, 0);
+    for (dst, f) in out[start..].chunks_exact_mut(4).zip(floats) {
+        dst.copy_from_slice(&f.to_le_bytes());
+    }
+}
+
 fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
     let slice = read_bytes(bytes, pos, 4)?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
@@ -359,6 +380,15 @@ mod tests {
             l.append(&kv(0.0, 3), &kv(10.0, 3)).unwrap();
         }
         let bytes = c.to_bytes().unwrap();
+        // 4 (layer count) + 2 * (12 header + 2 * 3 floats * 4 bytes).
+        assert_eq!(bytes.len(), 4 + 2 * (12 + 2 * 3 * 4));
+        assert_eq!(
+            bytes.capacity(),
+            bytes.len(),
+            "the buffer is sized once, not grown"
+        );
+        // Little-endian floats, K first: layer 0's K starts at 0.0.
+        assert_eq!(&bytes[16..20], &0.0f32.to_le_bytes());
         let mut d = KvCache::new(2);
         d.restore(&bytes, &Device::Cpu, &[(1, 1), (1, 1)]).unwrap();
         assert_eq!(d.to_bytes().unwrap(), bytes);

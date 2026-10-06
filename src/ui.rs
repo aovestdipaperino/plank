@@ -8647,6 +8647,12 @@ the original is frozen and listed in /tree"
         if !crate::settings::active().context.microcompact || self.in_sidechain() {
             return;
         }
+        // A rung exists to dodge a rebuild from zero after an in-place edit.
+        // An engine that truncates exactly re-prefills only past the edit
+        // anyway, so a rung can never beat it and would cost a full capture.
+        if self.engine.kv_truncates_exactly() {
+            return;
+        }
         let spans = self.session.transcript.len();
         let rendered = render_transcript(&self.session, &self.system);
         let tokens = self.engine.count_tokens(&rendered);
@@ -10863,7 +10869,11 @@ the original is frozen and listed in /tree"
         // Capture the live KV before the sidechain diverges it; the matching
         // restore is `restore_fork_kv`, called by every fork-end path. `None`
         // on engines without snapshot support — the restore then no-ops and
-        // the next turn re-prefills as before this guard existed.
+        // the next turn re-prefills as before this guard existed. An engine
+        // whose KV truncates exactly gets `None` too: its next `generate`
+        // keeps the parent prefix on its own, so a snapshot would only copy
+        // the whole cache twice (once out, once back in).
+        let snapshot_kv = snapshot_kv && !self.engine.kv_truncates_exactly();
         self.fork_kv.push(if snapshot_kv {
             self.engine.get_kv()
         } else {
@@ -16646,12 +16656,16 @@ impl Agent<'_> {
             .generate_quiet_with(prompt_text, Instant::now(), &opts)
             .map(|pass| pass.stats.interrupted)
             .map_err(|abort| abort.error);
+        // An engine whose KV truncates exactly keeps the prefilled prefix for
+        // the retry on its own, so a snapshot would only copy the whole cache.
+        let exact = self.engine.kv_truncates_exactly();
+        let mut snapshot = || {
+            if exact { None } else { self.engine.get_kv() }
+        };
         match result {
-            Ok(false) if !crate::interrupt::pending() => MemoryPrefill::Done(self.engine.get_kv()),
-            Ok(_) => MemoryPrefill::Interrupted(self.engine.get_kv()),
-            Err(e) if e == QUIET_ABORT_INTERRUPTED => {
-                MemoryPrefill::Interrupted(self.engine.get_kv())
-            }
+            Ok(false) if !crate::interrupt::pending() => MemoryPrefill::Done(snapshot()),
+            Ok(_) => MemoryPrefill::Interrupted(snapshot()),
+            Err(e) if e == QUIET_ABORT_INTERRUPTED => MemoryPrefill::Interrupted(snapshot()),
             Err(_) => MemoryPrefill::Failed,
         }
     }
@@ -24047,6 +24061,9 @@ mod tests {
         /// When true the engine reports `emits_think_tags`, the Gemma shape:
         /// a reply opens its own `<think>` or carries none at all.
         think_tags: bool,
+        /// When true the engine reports `kv_truncates_exactly`, the Gemma
+        /// shape that makes fork snapshots and ladder rungs pointless.
+        exact_kv: bool,
     }
 
     impl ScriptedEngine {
@@ -24160,6 +24177,9 @@ mod tests {
         }
         fn emits_think_tags(&self) -> bool {
             self.think_tags
+        }
+        fn kv_truncates_exactly(&self) -> bool {
+            self.exact_kv
         }
         fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
             let events = self.kv_events.as_ref()?;
@@ -24591,6 +24611,42 @@ mod tests {
             );
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// On an engine whose KV truncates exactly the suggestion sidechain
+    /// takes no fork snapshot: `get_kv` would serialise the whole cache and
+    /// `set_kv` copy it back, for a prefix the next `generate` keeps anyway.
+    #[test]
+    fn an_exact_kv_engine_takes_no_fork_snapshot_for_a_suggestion() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-exactkv");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["run the tests".to_string()],
+            kv_events: Some(kv_events.clone()),
+            exact_kv: true,
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+
+        assert!(agent.generate_suggestion());
+        let events = kv_events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e == "generate"),
+            "the sidechain did run: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e == "capture" || e.starts_with("restore")),
+            "no capture and no restore: {events:?}"
+        );
+        assert_eq!(agent.sidechain_depth, 0, "the fork is closed");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -25899,6 +25955,38 @@ mod tests {
             "the anchor must really snapshot the KV: {:?}",
             events.lock().unwrap()
         );
+    }
+
+    /// A rung can never beat an engine whose KV truncates exactly: an
+    /// in-place rewrite re-prefills only past the edit there anyway. The
+    /// anchor is skipped before `get_kv`, so it costs no full-cache capture.
+    #[test]
+    fn an_exact_kv_engine_anchors_no_rung() {
+        let dir = scratch_dir("ladder-anchor-exactkv");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            exact_kv: true,
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.anchor_rung_before_tool_result(20_000);
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "no rung on an exact-KV engine: {:?}",
+            agent.ladder.rungs()
+        );
+        assert!(
+            !events.lock().unwrap().iter().any(|e| e == "capture"),
+            "no capture either: {:?}",
+            events.lock().unwrap()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A `/btw` aside answered on the LIVE engine pushes the engine's end past
@@ -35869,6 +35957,46 @@ or the user's next message aborts before its first token"
             .collect();
         assert_eq!(names.len(), 1, "one window for the whole job: {names:?}");
         dm::reset();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On an engine whose KV truncates exactly a memory pass captures and
+    /// restores nothing: neither the fork snapshot nor the prefill snapshot
+    /// kept for a retry, both full copies of the cache.
+    #[test]
+    fn an_exact_kv_engine_takes_no_snapshot_for_a_memory_pass() {
+        let _auto_extract_on = enable_auto_extract_for_test();
+        let dir = scratch_dir("memextract-exactkv");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            // The prefill-only pass, then the generation.
+            replies: vec![String::new(), "[]".to_string()],
+            kv_events: Some(kv_events.clone()),
+            kv_probe: Some(crate::engine::KvReuse {
+                live: 10,
+                common: 10,
+            }),
+            exact_kv: true,
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+        assert!(agent.process_memory_job());
+        let events = kv_events.lock().unwrap().clone();
+        assert_eq!(
+            events.iter().filter(|e| *e == "generate").count(),
+            2,
+            "the prefill and the generation both ran: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e == "capture" || e.starts_with("restore")),
+            "no capture and no restore: {events:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

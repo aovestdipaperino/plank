@@ -568,6 +568,13 @@ impl Engine for GemmaEngine {
         true
     }
 
+    /// The candle KV truncates to the common prefix in `generate`, so fork
+    /// snapshots and ladder rungs would only serialise the whole f32 cache
+    /// (about 114 KB per token on E4B) for nothing.
+    fn kv_truncates_exactly(&self) -> bool {
+        true
+    }
+
     /// Reports the reusable prefix as the live end: `live == common`.
     ///
     /// Gemma's KV truncates exactly, so a prompt that diverges behind the live
