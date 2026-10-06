@@ -203,17 +203,6 @@ pub(crate) struct QEmbedding {
 
 impl QEmbedding {
     fn from_raw(data: Vec<u8>, dtype: GgmlDType, rows: usize, cols: usize) -> Result<Self> {
-        match dtype {
-            GgmlDType::Q4K
-            | GgmlDType::Q5K
-            | GgmlDType::Q6K
-            | GgmlDType::Q8_0
-            | GgmlDType::Q4_0
-            | GgmlDType::F16
-            | GgmlDType::BF16
-            | GgmlDType::F32 => {}
-            other => candle_core::bail!("embedding: unsupported tensor type {other:?}"),
-        }
         let block = dtype.block_size();
         if !cols.is_multiple_of(block) {
             candle_core::bail!(
@@ -227,6 +216,19 @@ impl QEmbedding {
                 data.len()
             )
         }
+        // `forward` dequantizes through `qtensor_from_ggml`, so it decides
+        // which types work (every legacy and k-quant but Q8_1/Q8K in candle
+        // 0.9.2, where Q2_K and Q3_K are what small machines download).
+        // Probing one row here surfaces a type it refuses at load, not at the
+        // first lookup.
+        let probe = rows.min(1);
+        ggml_file::qtensor_from_ggml(
+            dtype,
+            &data[..probe * row_bytes],
+            vec![probe, cols],
+            &Device::Cpu,
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("embedding: {dtype:?}: {e}")))?;
         Ok(Self {
             data,
             dtype,
@@ -1385,6 +1387,9 @@ mod tests {
             GgmlDType::BF16,
             GgmlDType::Q8_0,
             GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
         ] {
             rows_match(dtype);
         }
@@ -1394,7 +1399,13 @@ mod tests {
     fn qembedding_rows_equal_the_dequantized_rows_for_k_quants() {
         let (rows, cols) = (3, 256);
         let t = Tensor::from_vec(values(rows * cols), (rows, cols), &Device::Cpu).unwrap();
-        for dtype in [GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+        for dtype in [
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
             let q = QTensor::quantize(&t, dtype).unwrap();
             let full = q.dequantize(&Device::Cpu).unwrap();
             let got = QEmbedding::from_qtensor(&q)
@@ -1412,8 +1423,12 @@ mod tests {
     #[test]
     fn qembedding_refuses_an_unsupported_type_and_a_bad_id() {
         let t = Tensor::from_vec(values(2 * 32), (2, 32), &Device::Cpu).unwrap();
-        let q = QTensor::quantize(&t, GgmlDType::Q4_1).unwrap();
-        assert!(QEmbedding::from_qtensor(&q).is_err());
+        // Q8_1 is a type `qtensor_from_ggml` cannot dequantize: refused at
+        // load, with whole-block, right-sized bytes so only the type is wrong.
+        let dtype = GgmlDType::Q8_1;
+        let bytes = vec![0u8; 2 * dtype.type_size()];
+        let e = QEmbedding::from_raw(bytes, dtype, 2, 32).unwrap_err();
+        assert!(e.to_string().contains("Q8_1"), "{e}");
         let q = QTensor::quantize(&t, GgmlDType::F32).unwrap();
         let emb = QEmbedding::from_qtensor(&q).unwrap();
         assert!(emb.forward(&[2], &Device::Cpu).is_err());
