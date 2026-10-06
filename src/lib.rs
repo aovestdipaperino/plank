@@ -71,6 +71,7 @@ pub mod dump;
 pub use trace_stream::dsml;
 pub mod editor;
 pub mod engine;
+pub mod enginefit;
 pub mod enginemigrate;
 pub mod engines;
 pub mod errlog;

@@ -932,10 +932,6 @@ fn enter_startup_worktree(
     Ok(())
 }
 
-/// Minimum physical RAM plank requires to run the model, in bytes (96 GiB).
-#[cfg(ds4_engine)]
-const MIN_RAM_BYTES: u64 = 96 * 1024 * 1024 * 1024;
-
 /// Fails fast when another plank/ds4 instance is already running, with a clear
 /// message — instead of the engine's own guard, which calls `exit(2)` deep in
 /// `ds4_engine_open` (`ds4_acquire_instance_lock` in `ds4.c`) and kills the
@@ -969,14 +965,14 @@ fn acquire_model_lock() -> Result<(), String> {
     Ok(())
 }
 
-/// Refuses to run when the machine has less than [`MIN_RAM_BYTES`] of RAM.
+/// Refuses to run when the machine has less than [`plank::enginefit::MIN_RAM_BYTES`] of RAM.
 ///
 /// # Errors
 /// Returns an explanatory message when physical RAM is below the minimum.
 #[cfg(ds4_engine)]
 fn require_min_ram() -> Result<(), String> {
     if let Some(bytes) = plank::download::total_ram_bytes()
-        && bytes < MIN_RAM_BYTES
+        && bytes < plank::enginefit::MIN_RAM_BYTES
     {
         #[allow(clippy::cast_precision_loss)]
         let have = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
