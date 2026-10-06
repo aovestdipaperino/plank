@@ -1095,6 +1095,13 @@ fn start_and_wait_with(
     let managed = sel
         .id
         .and_then(|id| Some((id, catalog.get(id.as_str())?.to_manifest()?)));
+    // A managed engine whose main is on disk is installed: its missing
+    // companions are fetched at load by `ensure_side_artifacts`, as on the
+    // launch path. The helper only knows the full manifest, so starting it
+    // here would re-fetch the main into staging.
+    if managed.is_some() && sel.main.exists() {
+        return Ok(WaitOutcome::Installed);
+    }
     if let Some((id, manifest)) = managed {
         let running = crate::downloader::running_in(root);
         let ready = !running && crate::downloader::swap_staged_in(root, id)?.is_some();
@@ -2439,6 +2446,24 @@ mod tests {
         let root = crate::downloader::tests::tempdir();
         std::fs::write(root.join("e.gguf"), b"x").unwrap();
         std::fs::write(root.join("e.mtp.gguf"), b"x").unwrap();
+        let out = start_and_wait_with(
+            &root,
+            &two_role_catalog(),
+            &e_sel(&root),
+            &no_launch,
+            &no_wait,
+            &no_foreground,
+        );
+        assert_eq!(out, Ok(WaitOutcome::Installed));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_managed_engine_with_its_main_needs_no_helper_for_a_companion() {
+        // Only the mtp companion is missing: the load path fetches it, and the
+        // helper's full manifest would re-fetch the main into staging.
+        let root = crate::downloader::tests::tempdir();
+        std::fs::write(root.join("e.gguf"), b"x").unwrap();
         let out = start_and_wait_with(
             &root,
             &two_role_catalog(),

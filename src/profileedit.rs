@@ -471,7 +471,9 @@ pub fn restart_args(original: &[String], session: &str, session_cwd: &Path) -> V
 
 /// [`restart_args`] with the choice of landing in the engine menu: earlier
 /// `--pick-engine` and `--pick-engine-resume <id>` are dropped, and with
-/// `pick_engine` the session travels as `--pick-engine --pick-engine-resume`.
+/// `pick_engine` the session travels as `--pick-engine --pick-engine-resume`
+/// and `--model <x>`, `-m <x>` and `--model:<x>` are dropped too, so the pick
+/// is not reverted by a later restart.
 #[must_use]
 pub fn restart_args_for(
     original: &[String],
@@ -498,6 +500,11 @@ pub fn restart_args_for(
             | "--prompt"
             | "--chdir"
             | "--pick-engine-resume" => i += 1,
+            // The menu picks the engine and records it as `engine.model`: a
+            // launch `--model` kept here would revert the pick at the next
+            // restart.
+            "--model" | "-m" if pick_engine => i += 1,
+            a if pick_engine && a.starts_with("--model:") => {}
             _ => out.push(arg.to_owned()),
         }
         i += 1;
@@ -784,6 +791,57 @@ mod tests {
                 "--pick-engine",
                 "--pick-engine-resume",
                 "zany-curie",
+            ])
+        );
+    }
+
+    #[test]
+    fn an_engine_restart_drops_the_model_flags_so_a_later_restart_keeps_the_pick() {
+        let out = restart_args_for(
+            &args(&[
+                "--model",
+                "ds4vision",
+                "-v",
+                "-m",
+                "/x/a.gguf",
+                "--model:gemma4-e4b",
+                "--pick-engine-resume",
+                "old-id",
+            ]),
+            "zany-curie",
+            Path::new("/w"),
+            true,
+        );
+        assert_eq!(
+            out,
+            args(&[
+                "-v",
+                "--chdir",
+                "/w",
+                "--pick-engine",
+                "--pick-engine-resume",
+                "zany-curie",
+            ])
+        );
+    }
+
+    #[test]
+    fn an_ordinary_restart_keeps_the_model_and_drops_an_earlier_pick_resume() {
+        let out = restart_args_for(
+            &args(&["--model", "ds4vision", "--pick-engine-resume", "old-id"]),
+            "zany-curie",
+            Path::new("/w"),
+            false,
+        );
+        assert_eq!(
+            out,
+            args(&[
+                "--model",
+                "ds4vision",
+                "--chdir",
+                "/w",
+                "/resume",
+                "zany-curie"
             ])
         );
     }

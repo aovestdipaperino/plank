@@ -361,6 +361,86 @@ fn resumable_under(root: &std::path::Path, id: &str, family: plank::gguf::ModelF
         .exists()
 }
 
+/// How a pick's download ended without installing the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unfinished {
+    /// The user left the wait screen; the helper keeps downloading.
+    Detached,
+    /// The helper failed, or another engine's download holds it.
+    Failed(String),
+}
+
+/// What follows a pick whose download did not install the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AfterUnfinished {
+    /// Print `note`, then run the current engine and resume `resume`.
+    Continue { note: String, resume: String },
+    /// Exit with this message.
+    Exit(String),
+}
+
+/// Decides what an unfinished download of `name` leads to. A restart from
+/// `/engines` (`pick_resume`) with the current engine still on disk goes back
+/// to the session it left, as a cancelled menu does; anything else, a first
+/// run above all, has nothing to return to and exits.
+fn after_unfinished_download(
+    name: &str,
+    end: Unfinished,
+    pick_resume: Option<String>,
+    current_main_exists: bool,
+) -> AfterUnfinished {
+    let msg = match end {
+        Unfinished::Detached => format!(
+            "downloading {name} in the background; run plank --pick-engine (or /engines) to install it when it finishes"
+        ),
+        Unfinished::Failed(e) => e,
+    };
+    match pick_resume {
+        Some(resume) if current_main_exists => AfterUnfinished::Continue { note: msg, resume },
+        _ => AfterUnfinished::Exit(msg),
+    }
+}
+
+/// The session to resume when no pick happens: the one `/engines` left
+/// outranks a resume chosen any other way.
+fn resume_after_skip(pick_resume: Option<String>, resume: Option<String>) -> Option<String> {
+    pick_resume.or(resume)
+}
+
+/// One line for each engine in `names` other than `current` whose whole set
+/// has finished downloading into staging, so a background download the user
+/// left is not forgotten. Installing it waits for the pick.
+fn staged_others<'a>(
+    names: impl Iterator<Item = &'a str>,
+    current: Option<&str>,
+    staged: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    names
+        .filter(|n| Some(*n) != current && staged(n))
+        .map(|n| format!("plank: {n} has finished downloading; run /engines to switch to it"))
+        .collect()
+}
+
+/// Prints [`staged_others`] for the engines of `catalog` other than
+/// `current`: a background download the user left may have finished for an
+/// engine other than this one, and installing it is left to the pick.
+fn announce_staged_others(
+    root: &std::path::Path,
+    catalog: &plank::engines::Catalog,
+    current: Option<plank::manifest::EngineId>,
+) {
+    for line in staged_others(
+        catalog.engines.keys().map(String::as_str),
+        current.as_ref().map(|id| id.as_str()),
+        &|n| {
+            plank::manifest::EngineId::new(n)
+                .is_some_and(|id| plank::downloader::is_staged_in(root, id))
+        },
+    ) {
+        eprintln!("{line}");
+    }
+}
+
 /// Shows the engine menu when [`plank::enginepick::should_pick`] says so,
 /// installs the pick, records it as `engine.model`, and points `cfg` at it so
 /// the ordinary resolution that follows loads it.
@@ -369,8 +449,9 @@ fn resumable_under(root: &std::path::Path, id: &str, family: plank::gguf::ModelF
 /// resolution will make, without printing anything or touching `cfg`.
 ///
 /// # Errors
-/// A cancelled first-run menu (no engine to fall back to), a failed download,
-/// or a settings file that cannot be written.
+/// A cancelled first-run menu (no engine to fall back to), a download that
+/// did not install outside an `/engines` restart (see
+/// [`after_unfinished_download`]), or a settings file that cannot be written.
 fn pick_engine_before_resolve(
     cfg: &mut plank::config::AgentConfig,
     root: &std::path::Path,
@@ -404,9 +485,10 @@ fn pick_engine_before_resolve(
     if !plank::enginepick::should_pick(cfg.pick_engine, from_cli, main_exists, menu_allowed, local)
     {
         // No menu: the session `/engines` left still resumes rather than
-        // being lost, unless something else already chose one.
-        if cfg.resume.is_none() {
-            cfg.resume = cfg.pick_engine_resume.take();
+        // being lost.
+        cfg.resume = resume_after_skip(cfg.pick_engine_resume.take(), cfg.resume.take());
+        if menu_allowed && local {
+            announce_staged_others(root, &catalog, probe.as_ref().and_then(|s| s.id));
         }
         return Ok(());
     }
@@ -427,22 +509,34 @@ fn pick_engine_before_resolve(
     let current = probe.as_ref().and_then(|s| s.id).map(|id| id.to_string());
     let Some(name) = plank::enginepick::run(&rows, current.as_deref())? else {
         if main_exists {
-            cfg.resume = cfg.pick_engine_resume.take().or(cfg.resume.take());
+            cfg.resume = resume_after_skip(cfg.pick_engine_resume.take(), cfg.resume.take());
             return Ok(());
         }
         return Err("no model available; re-run with --model <name|path> or download it".into());
     };
     let sel = plank::engines::resolve_in(root, &catalog, plank::engines::Choice::Named(&name))?;
-    match plank::download::start_and_wait_in(root, &catalog, &sel)? {
-        plank::download::WaitOutcome::Installed => {}
-        // Not installed yet, so `engine.model` is left alone. Picking the
-        // engine again later attaches to the helper, or installs its staged
-        // set when it has finished.
-        plank::download::WaitOutcome::Detached => {
-            return Err(format!(
-                "downloading {name} in the background; run plank again to install it when it finishes"
-            ));
-        }
+    // Not installed yet, so `engine.model` is left alone. Picking the engine
+    // again later attaches to the helper, or installs its staged set when it
+    // has finished.
+    let unfinished = match plank::download::start_and_wait_in(root, &catalog, &sel) {
+        Ok(plank::download::WaitOutcome::Installed) => None,
+        Ok(plank::download::WaitOutcome::Detached) => Some(Unfinished::Detached),
+        Err(e) => Some(Unfinished::Failed(e)),
+    };
+    if let Some(end) = unfinished {
+        return match after_unfinished_download(
+            &name,
+            end,
+            cfg.pick_engine_resume.take(),
+            main_exists,
+        ) {
+            AfterUnfinished::Continue { note, resume } => {
+                eprintln!("plank: {note}");
+                cfg.resume = Some(resume);
+                Ok(())
+            }
+            AfterUnfinished::Exit(msg) => Err(msg),
+        };
     }
     plank::settings::set_engine_model_in(&root.join("settings.json"), &name)?;
     let user_settings = root.join("settings.json");
@@ -2016,6 +2110,81 @@ mod tests {
         assert_eq!(sel.main, other);
         assert!(sel.id.is_none() && sel.mtp.is_none() && sel.vision.is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unfinished_download_from_engines_resumes_the_session_it_left() {
+        let detached = after_unfinished_download(
+            "gemma4-e4b",
+            Unfinished::Detached,
+            Some("zany-curie".into()),
+            true,
+        );
+        assert_eq!(
+            detached,
+            AfterUnfinished::Continue {
+                note: "downloading gemma4-e4b in the background; run plank --pick-engine (or /engines) to install it when it finishes".into(),
+                resume: "zany-curie".into(),
+            }
+        );
+        for err in [
+            "the download failed",
+            "another download (ds4vision) is in progress; let it finish or cancel it, then try again",
+        ] {
+            assert_eq!(
+                after_unfinished_download(
+                    "gemma4-e4b",
+                    Unfinished::Failed(err.into()),
+                    Some("zany-curie".into()),
+                    true
+                ),
+                AfterUnfinished::Continue {
+                    note: err.into(),
+                    resume: "zany-curie".into(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_unfinished_download_exits_without_a_session_or_an_engine_to_return_to() {
+        let msg = "downloading e in the background; run plank --pick-engine (or /engines) to install it when it finishes";
+        // A first run: no current engine to continue on.
+        assert_eq!(
+            after_unfinished_download("e", Unfinished::Detached, Some("zany-curie".into()), false),
+            AfterUnfinished::Exit(msg.into())
+        );
+        // A launch-time pick, not `/engines`: nothing to resume.
+        assert_eq!(
+            after_unfinished_download("e", Unfinished::Detached, None, true),
+            AfterUnfinished::Exit(msg.into())
+        );
+        assert_eq!(
+            after_unfinished_download("e", Unfinished::Failed("boom".into()), None, true),
+            AfterUnfinished::Exit("boom".into())
+        );
+    }
+
+    #[test]
+    fn the_session_engines_left_outranks_an_earlier_resume() {
+        assert_eq!(
+            resume_after_skip(Some("a".into()), Some("b".into())),
+            Some("a".into())
+        );
+        assert_eq!(resume_after_skip(None, Some("b".into())), Some("b".into()));
+        assert_eq!(resume_after_skip(Some("a".into()), None), Some("a".into()));
+        assert_eq!(resume_after_skip(None, None), None);
+    }
+
+    #[test]
+    fn other_finished_downloads_are_announced_but_not_the_selected_one() {
+        let names = ["a", "b", "c"];
+        let staged = |n: &str| n != "b";
+        assert_eq!(
+            staged_others(names.iter().copied(), Some("a"), &staged),
+            vec!["plank: c has finished downloading; run /engines to switch to it".to_owned()]
+        );
+        assert_eq!(staged_others(names.iter().copied(), None, &staged).len(), 2);
     }
 
     #[test]

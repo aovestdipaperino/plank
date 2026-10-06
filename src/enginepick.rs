@@ -205,7 +205,7 @@ mod tests {
             r(
                 "b",
                 Fit::Download {
-                    bytes: Some(5 * crate::enginefit::GIB),
+                    bytes: Some(5_000_000_000),
                 },
             ),
             r(

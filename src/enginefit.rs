@@ -110,15 +110,25 @@ fn raw_str(entry: &EngineEntry, key: &str) -> Option<String> {
         .and_then(|v| v[key].as_str().map(str::to_owned))
 }
 
-/// Whole gigabytes, rounded up, for a RAM or disk figure.
-fn whole_gb(bytes: u64) -> u64 {
+/// One decimal gigabyte: file sizes and disk figures count in powers of 1000.
+const GB: u64 = 1_000_000_000;
+
+/// Whole binary gigabytes of a RAM requirement, rounded up.
+fn need_gb(bytes: u64) -> u64 {
     bytes.div_ceil(GIB)
 }
 
-/// A download size for display: one decimal, or `size unknown`.
+/// Whole binary gigabytes of the machine's RAM, rounded down, so a machine
+/// never reads as large as a requirement it falls short of.
+fn have_gb(bytes: u64) -> u64 {
+    bytes / GIB
+}
+
+/// A download size for display: one decimal in decimal units, or
+/// `size unknown`.
 #[must_use]
 pub fn size_label(bytes: Option<u64>) -> String {
-    bytes.map_or_else(|| "size unknown".to_owned(), |b| human_bytes(b, 1024))
+    bytes.map_or_else(|| "size unknown".to_owned(), |b| human_bytes(b, 1000))
 }
 
 /// `bytes` with one decimal in the largest unit it reaches, counting in
@@ -188,13 +198,18 @@ fn fit_of(
     ];
     let mut missing = 0u64;
     let mut size_known = true;
-    let mut installed = true;
+    // The main file is what makes an engine installed: a missing companion is
+    // fetched at load by `ensure_side_artifacts`, as on the launch path, and
+    // never by the helper, whose full manifest would re-fetch the main.
+    let installed = exists(&sel.main);
     for (role, path) in roles {
+        if installed {
+            break;
+        }
         let Some(path) = path else { continue };
         if exists(path) {
             continue;
         }
-        installed = false;
         if let Some(f) = entry.files.get(role) {
             missing += f.bytes;
         } else if sel.urls.contains_key(role) {
@@ -224,8 +239,8 @@ fn fit_of(
             return Fit::Disabled {
                 reason: format!(
                     "needs {} GB RAM (this machine: {} GB)",
-                    whole_gb(need),
-                    whole_gb(ram)
+                    need_gb(need),
+                    have_gb(ram)
                 ),
             };
         }
@@ -249,8 +264,8 @@ fn fit_of(
         return Fit::Disabled {
             reason: format!(
                 "needs {} GB free disk (have {} GB)",
-                whole_gb(missing + DISK_MARGIN_BYTES),
-                free / GIB
+                (missing + DISK_MARGIN_BYTES).div_ceil(GB),
+                free / GB
             ),
         };
     }
@@ -408,7 +423,7 @@ mod tests {
         assert_eq!(
             row(&rows, "ds4vision").fit,
             Fit::Disabled {
-                reason: "needs 87 GB free disk (have 50 GB)".into()
+                reason: "needs 94 GB free disk (have 53 GB)".into()
             }
         );
         assert!(row(&rows, "gemma4-e4b").selectable());
@@ -428,7 +443,10 @@ mod tests {
     }
 
     #[test]
-    fn only_missing_roles_count_towards_the_download() {
+    fn an_engine_whose_main_exists_is_installed_even_without_a_companion() {
+        // A missing companion is fetched at load by `ensure_side_artifacts`,
+        // exactly as on the launch path; reading it as a download would make
+        // the helper re-fetch the whole main into staging.
         let main = PathBuf::from("/r/ds4vision.gguf");
         let rows = evaluate(
             Path::new("/r"),
@@ -438,10 +456,38 @@ mod tests {
             None,
             &no_staged,
         );
+        assert_eq!(row(&rows, "ds4vision").fit, Fit::Installed);
+    }
+
+    #[test]
+    fn only_missing_roles_count_towards_the_download() {
+        let mtp = PathBuf::from("/r/ds4vision.mtp.gguf");
+        let rows = evaluate(
+            Path::new("/r"),
+            &catalog(),
+            &machine(Some(128), Some(500)),
+            &|p| p == mtp,
+            None,
+            &no_staged,
+        );
         assert_eq!(
             row(&rows, "ds4vision").fit,
             Fit::Download {
-                bytes: Some(6_000_000_000)
+                bytes: Some(86_000_000_000)
+            }
+        );
+    }
+
+    #[test]
+    fn the_machine_ram_rounds_down_while_the_need_rounds_up() {
+        // 10.5 GiB against gemma4-e4b's ~10.8 GiB need.
+        let mut m = machine(None, Some(500));
+        m.ram = Some(10 * GIB + GIB / 2);
+        let rows = evaluate(Path::new("/r"), &catalog(), &m, &none, None, &no_staged);
+        assert_eq!(
+            row(&rows, "gemma4-e4b").fit,
+            Fit::Disabled {
+                reason: "needs 11 GB RAM (this machine: 10 GB)".into()
             }
         );
     }
@@ -584,18 +630,18 @@ mod tests {
     }
 
     #[test]
-    fn size_labels_read_in_gigabytes() {
-        assert_eq!(size_label(Some(4_977_171_584)), "4.6 GB");
-        assert_eq!(size_label(Some(93_600_000_000)), "87.2 GB");
+    fn size_labels_read_in_decimal_gigabytes() {
+        assert_eq!(size_label(Some(4_977_171_584)), "5.0 GB");
+        assert_eq!(size_label(Some(93_600_000_000)), "93.6 GB");
         assert_eq!(size_label(None), "size unknown");
     }
 
     #[test]
     fn sizes_below_a_gigabyte_read_in_megabytes_or_kilobytes() {
-        assert_eq!(size_label(Some(512 * 1024 * 1024)), "512.0 MB");
-        assert_eq!(size_label(Some(GIB)), "1.0 GB");
-        assert_eq!(size_label(Some(28_467)), "27.8 KB");
-        assert_eq!(size_label(Some(1024 * 1024)), "1.0 MB");
+        assert_eq!(size_label(Some(512_000_000)), "512.0 MB");
+        assert_eq!(size_label(Some(1_000_000_000)), "1.0 GB");
+        assert_eq!(size_label(Some(28_467)), "28.5 KB");
+        assert_eq!(size_label(Some(1_000_000)), "1.0 MB");
         assert_eq!(size_label(Some(0)), "0.0 KB");
     }
 
