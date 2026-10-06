@@ -34,23 +34,38 @@ fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/e4b_reference.json")).unwrap()
 }
 
-/// One model for every test in this file: two would not fit in memory.
-fn model() -> Option<Arc<Model>> {
-    static MODEL: OnceLock<Option<Arc<Model>>> = OnceLock::new();
+/// One model for every test in this file (two would not fit in memory),
+/// with the label of the device it runs on.
+fn model() -> Option<(Arc<Model>, &'static str)> {
+    static MODEL: OnceLock<Option<(Arc<Model>, String)>> = OnceLock::new();
     MODEL
         .get_or_init(|| {
             let path = std::env::var("PLANK_GEMMA_GGUF").ok()?;
-            Some(Model::open(path.as_ref(), &device()).unwrap())
+            let (device, label) = device();
+            eprintln!("reference test device: {label}");
+            Some((Model::open(path.as_ref(), &device).unwrap(), label))
         })
-        .clone()
+        .as_ref()
+        .map(|(model, label)| (model.clone(), label.as_str()))
 }
 
-/// Metal unless `PLANK_GEMMA_DEVICE=cpu` or there is none.
-fn device() -> candle_core::Device {
+/// Metal unless `PLANK_GEMMA_DEVICE=cpu` or Metal fails to start, with a
+/// label that says which and why: a CPU run misses case 0's tolerance, and
+/// that must never read as a forward-pass regression.
+fn device() -> (candle_core::Device, String) {
     if std::env::var("PLANK_GEMMA_DEVICE").as_deref() == Ok("cpu") {
-        return candle_core::Device::Cpu;
+        return (
+            candle_core::Device::Cpu,
+            "cpu (PLANK_GEMMA_DEVICE=cpu)".to_string(),
+        );
     }
-    candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
+    match candle_core::Device::new_metal(0) {
+        Ok(device) => (device, "metal".to_string()),
+        Err(e) => (
+            candle_core::Device::Cpu,
+            format!("cpu (metal unavailable: {e})"),
+        ),
+    }
 }
 
 fn ids(v: &Value) -> Vec<u32> {
@@ -84,7 +99,7 @@ fn argmax(logits: &[f32]) -> u32 {
 #[test]
 #[ignore = "needs PLANK_GEMMA_GGUF"]
 fn tokens_match_llama_cpp() {
-    let Some(model) = model() else { return };
+    let Some((model, _)) = model() else { return };
     for case in fixture()["cases"].as_array().unwrap() {
         let mut got: Vec<u32> = model.tokenizer.bos().into_iter().collect();
         got.extend(
@@ -104,7 +119,9 @@ fn tokens_match_llama_cpp() {
 #[test]
 #[ignore = "needs PLANK_GEMMA_GGUF"]
 fn next_token_and_greedy_continuation_match_llama_cpp() {
-    let Some(model) = model() else { return };
+    let Some((model, device)) = model() else {
+        return;
+    };
     let close = model.tokenizer.control_id("<turn|>").unwrap();
     let eos = model.tokenizer.eos();
     let mut failures = Vec::new();
@@ -133,7 +150,7 @@ fn next_token_and_greedy_continuation_match_llama_cpp() {
         let want_best = u32::try_from(top[0][0].as_u64().unwrap()).unwrap();
         if argmax(&logits) != want_best {
             failures.push(format!(
-                "case {index}: argmax {} vs llama.cpp {want_best}",
+                "case {index} on {device}: argmax {} vs llama.cpp {want_best}",
                 argmax(&logits)
             ));
         }
@@ -172,7 +189,7 @@ fn next_token_and_greedy_continuation_match_llama_cpp() {
             let want = pair[1].as_f64().unwrap();
             if (probs[id] - want).abs() >= PROB_TOLERANCE {
                 failures.push(format!(
-                    "case {index} token {id}: probability {} vs llama.cpp {want}",
+                    "case {index} on {device} token {id}: probability {} vs llama.cpp {want}",
                     probs[id]
                 ));
             }
@@ -180,9 +197,14 @@ fn next_token_and_greedy_continuation_match_llama_cpp() {
         let need = GREEDY_PREFIX.min(want_greedy.len());
         if matching < need {
             failures.push(format!(
-                "case {index}: greedy agrees on {matching} tokens, need {need}"
+                "case {index} on {device}: greedy agrees on {matching} tokens, need {need}"
             ));
         }
+    }
+    if device != "metal" && !failures.is_empty() {
+        failures.push(format!(
+            "note: this ran on {device}; the fixture is from llama.cpp on Metal, and on the CPU case 0 is expected to miss the probability tolerance (see the module docs)"
+        ));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
