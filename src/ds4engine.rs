@@ -280,7 +280,12 @@ const STEADY_MIN_TOKENS: i32 = 8;
 /// separate `qwen38-vision` target). Either way the `view_image` tool refuses
 /// at call time instead of the open failing.
 fn model_supports_vision(family: crate::gguf::ModelFamily, path: &Path) -> bool {
-    family != crate::gguf::ModelFamily::Qwen && crate::gguf::supports_vision(path)
+    // Gemma never opens on this engine; listed so it can never read as
+    // `DeepSeek` here.
+    !matches!(
+        family,
+        crate::gguf::ModelFamily::Qwen | crate::gguf::ModelFamily::Gemma
+    ) && crate::gguf::supports_vision(path)
 }
 
 /// Says at open time why the run is text-only, instead of letting the first
@@ -296,6 +301,11 @@ fn report_text_only(
     model_supports_vision: bool,
     vision_path: Option<&Path>,
 ) {
+    // Gemma never opens on this engine (it is routed to `GemmaEngine`), so
+    // there is no DeepSeek encoder story to tell.
+    if family == crate::gguf::ModelFamily::Gemma {
+        return;
+    }
     if family == crate::gguf::ModelFamily::Qwen {
         eprintln!("note: Qwen3.8 runs text-only in plank; view_image will be refused");
     } else if !model_supports_vision {

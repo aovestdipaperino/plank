@@ -698,26 +698,27 @@ pub fn set_local_power(percent: i32) {
 /// Process-global like the power share, and for the same reason: the footer is
 /// drawn from places that hold no engine handle, including a remote client
 /// rendering this session's bar.
-static LOCAL_FAMILY_IS_QWEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static LOCAL_FAMILY_TAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Records the local engine's model family, once the model is open.
 pub fn set_local_family(family: crate::gguf::ModelFamily) {
-    LOCAL_FAMILY_IS_QWEN.store(
-        family == crate::gguf::ModelFamily::Qwen,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let tag = match family {
+        crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41 => 0,
+        crate::gguf::ModelFamily::Qwen => 1,
+        crate::gguf::ModelFamily::Gemma => 2,
+    };
+    LOCAL_FAMILY_TAG.store(tag, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The family tag the origin label carries: `ds` or `qwen`.
+/// The family tag the origin label carries: `ds`, `qwen` or `gemma`.
 ///
 /// Short on purpose. It sits in the footer's tightest segment, and the point
 /// is to answer "which model is this" at a glance, not to name the release.
 fn local_family_tag() -> &'static str {
-    if LOCAL_FAMILY_IS_QWEN.load(std::sync::atomic::Ordering::Relaxed) {
-        "qwen"
-    } else {
-        "ds"
+    match LOCAL_FAMILY_TAG.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => "qwen",
+        2 => "gemma",
+        _ => "ds",
     }
 }
 
@@ -3975,6 +3976,12 @@ mod tests {
         let line = build_status_text(&st, false, true);
         assert!(line.contains("(local:ds"), "{line}");
         assert!(!line.contains("(local:qwen"), "one tag only: {line}");
+
+        set_local_family(crate::gguf::ModelFamily::Gemma);
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("(local:gemma"), "{line}");
+        assert!(!line.contains("(local:ds"), "Gemma is not DeepSeek: {line}");
+        set_local_family(crate::gguf::ModelFamily::Ds4);
 
         // The bare form is the registration key, not a rendering: it must
         // never reach the bar, or the tag would be silently missing.
