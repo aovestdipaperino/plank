@@ -218,6 +218,13 @@ pub struct AgentConfig {
     /// True when `--dump-engines` was given: print the resolved engine catalog
     /// and exit. A read-only diagnostic, like [`Self::dump_config`].
     pub dump_engines: bool,
+    /// True when `--pick-engine` was given: show the engine menu at launch even
+    /// when the selected engine is installed. Hidden; `/engines` restarts with it.
+    pub pick_engine: bool,
+    /// The session `/engines` left, resumed after the pick when its transcript
+    /// exists for the picked engine's family. Hidden companion of
+    /// `--pick-engine`.
+    pub pick_engine_resume: Option<String>,
     /// True when `--dump-config` was given: print the resolved configuration
     /// (every effective key with its origin) and exit, without starting a
     /// session. Works under `--ui console`.
@@ -549,6 +556,8 @@ impl Default for AgentConfig {
             fake_gpu: false,
             dump_profiles: false,
             dump_engines: false,
+            pick_engine: false,
+            pick_engine_resume: None,
         }
     }
 }
@@ -610,7 +619,7 @@ impl AgentConfig {
 
     /// Records that a CLI flag set the settings key `key` (`section.key`), so
     /// `/config --resolved` can show the flag beating the file provenance.
-    fn cli_set(&mut self, key: &str) {
+    pub fn cli_set(&mut self, key: &str) {
         self.cli_provenance
             .insert(key.to_string(), crate::provenance::Origin::Cli);
     }
@@ -1667,6 +1676,10 @@ pub fn parse_options_with(
             "--fake-gpu" => c.fake_gpu = true,
             "--dump-profiles" => c.dump_profiles = true,
             "--dump-engines" => c.dump_engines = true,
+            "--pick-engine" => c.pick_engine = true,
+            "--pick-engine-resume" => {
+                c.pick_engine_resume = Some(need_arg(&mut i)?.to_owned());
+            }
             "--minimal-prompt" => c.minimal_prompt = true,
             // Bare `--ui-remote` means an ephemeral port. A following bare
             // number is almost certainly someone meaning to pin one, so
@@ -1948,6 +1961,21 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn pick_engine_flags_parse() {
+        let c = parse_options(&args(&[
+            "--pick-engine",
+            "--pick-engine-resume",
+            "zany-curie",
+        ]))
+        .unwrap();
+        assert!(c.pick_engine);
+        assert_eq!(c.pick_engine_resume.as_deref(), Some("zany-curie"));
+        let d = parse_options(&args(&[])).unwrap();
+        assert!(!d.pick_engine);
+        assert_eq!(d.pick_engine_resume, None);
     }
 
     #[test]

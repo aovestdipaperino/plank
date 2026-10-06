@@ -353,6 +353,83 @@ fn active_recommendation() -> Option<plank::engines::Recommendation<'static>> {
     })
 }
 
+/// Whether session `id` has a transcript for `family` under `root`, so a
+/// restart from `/engines` can resume it on the engine just picked.
+fn resumable_under(root: &std::path::Path, id: &str, family: plank::gguf::ModelFamily) -> bool {
+    root.join("kvcache")
+        .join(format!("{id}{}", plank::session::family_ext(family)))
+        .exists()
+}
+
+/// Shows the engine menu when [`plank::enginepick::should_pick`] says so,
+/// installs the pick, records it as `engine.model`, and points `cfg` at it so
+/// the ordinary resolution that follows loads it.
+///
+/// Runs before [`resolve_selection`]: its probe is the same choice that
+/// resolution will make, without printing anything or touching `cfg`.
+///
+/// # Errors
+/// A cancelled first-run menu (no engine to fall back to), a failed download,
+/// or a settings file that cannot be written.
+fn pick_engine_before_resolve(
+    cfg: &mut plank::config::AgentConfig,
+    root: &std::path::Path,
+    recommended: Option<plank::engines::Recommendation<'_>>,
+    interactive: bool,
+) -> Result<(), String> {
+    let local = cfg.remote_url.is_none() && cfg.provider.is_none();
+    let from_cli = model_from_cli(cfg);
+    let choice = model_choice(cfg);
+    let catalog = plank::engines::load_in(root, &mut Vec::new());
+    let probe = plank::engines::choose_with_recommendation_in(
+        root,
+        &catalog,
+        from_cli.then_some(choice),
+        recommended.filter(|_| local),
+        if from_cli {
+            plank::engines::Choice::Default
+        } else {
+            choice
+        },
+    )
+    .ok()
+    .map(|(sel, _)| sel);
+    // An unresolvable choice is the ordinary resolution's to report.
+    let main_exists = probe.as_ref().is_none_or(|s| s.main.exists());
+    if !plank::enginepick::should_pick(cfg.pick_engine, from_cli, main_exists, interactive, local) {
+        return Ok(());
+    }
+    let rows = plank::enginefit::evaluate(root, &catalog, &plank::enginefit::machine(root), &|p| {
+        p.exists()
+    });
+    let current = probe.as_ref().and_then(|s| s.id).map(|id| id.to_string());
+    let Some(name) = plank::enginepick::run(&rows, current.as_deref())? else {
+        if main_exists {
+            cfg.resume = cfg.pick_engine_resume.take().or(cfg.resume.take());
+            return Ok(());
+        }
+        return Err("no model available; re-run with --model <name|path> or download it".into());
+    };
+    let sel = plank::engines::resolve_in(root, &catalog, plank::engines::Choice::Named(&name))?;
+    plank::download::install_engine_in(&catalog, &sel)?;
+    plank::settings::set_engine_model_in(&root.join("settings.json"), &name)?;
+    eprintln!("plank: {name} is now the default engine");
+    cfg.model_spec = Some(name.clone());
+    cfg.model_named = true;
+    // The pick outranks a profile's recommendation, as `--model` would.
+    cfg.cli_set("engine.model");
+    if let Some(id) = cfg.pick_engine_resume.take() {
+        if resumable_under(root, &id, selection_family(&sel, &sel.main)) {
+            cfg.resume = Some(id);
+        } else {
+            eprintln!(
+                "plank: started a new session; {id} stays available with /resume under its own engine"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Resolves the model choice against the catalog, letting the running
 /// profile's `recommended` engine outrank `engine.model` (but never the
 /// command line) when it is already on disk. Must precede
@@ -497,6 +574,7 @@ fn parse_config(
         prog,
         &plank::manifest::plank_dir(),
         active_recommendation(),
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
     )
 }
 
@@ -509,10 +587,12 @@ fn parse_config_in(
     prog: &str,
     root: &std::path::Path,
     recommended: Option<plank::engines::Recommendation<'_>>,
+    interactive: bool,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
     plank::config::parse_options_with(settings, args)
         .and_then(|mut cfg| {
             cfg.drop_default_system_under_profile(plank::profile::active().is_some());
+            pick_engine_before_resolve(&mut cfg, root, recommended, interactive)?;
             match resolve_selection(&mut cfg, root, recommended)
                 .and_then(|catalog| resolve_model_delta(&mut cfg).map(|()| catalog))
             {
@@ -1846,6 +1926,25 @@ mod tests {
     }
 
     #[test]
+    fn a_left_session_resumes_only_under_its_own_family() {
+        let root = std::env::temp_dir().join(format!("plank-pickresume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("kvcache")).unwrap();
+        std::fs::write(root.join("kvcache").join("zany-curie.ds4.kv"), "x").unwrap();
+        assert!(resumable_under(
+            &root,
+            "zany-curie",
+            plank::gguf::ModelFamily::Ds4
+        ));
+        assert!(!resumable_under(
+            &root,
+            "zany-curie",
+            plank::gguf::ModelFamily::Gemma
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn dump_config_survives_a_bad_engine_model() {
         let settings = plank::settings::Settings::default();
         let args: Vec<String> = vec![
@@ -1856,7 +1955,7 @@ mod tests {
         // An empty scratch root: the catalog is the compiled-in one and the
         // real `~/.plank` is never read.
         let root = std::env::temp_dir().join(format!("plank-dump-config-{}", std::process::id()));
-        let cfg = parse_config_in(&settings, &args, "plank", &root, None)
+        let cfg = parse_config_in(&settings, &args, "plank", &root, None, false)
             .expect("dump-config must not abort");
         assert!(cfg.dump_config);
         assert!(cfg.selection.is_none());
@@ -1876,7 +1975,7 @@ mod tests {
         let parse = |extra: &[&str]| {
             let mut args: Vec<String> = ["--model", "ds4-ab"].map(String::from).to_vec();
             args.extend(extra.iter().map(ToString::to_string));
-            parse_config_in(&settings, &args, "plank", &root, None).expect("parses")
+            parse_config_in(&settings, &args, "plank", &root, None, false).expect("parses")
         };
         let cfg = parse(&[]);
         assert_eq!(
@@ -1917,7 +2016,7 @@ mod tests {
         root: &std::path::Path,
     ) -> String {
         let args: Vec<String> = args.iter().map(ToString::to_string).collect();
-        let cfg = parse_config_in(settings, &args, "plank", root, HAL).expect("parses");
+        let cfg = parse_config_in(settings, &args, "plank", root, HAL, false).expect("parses");
         cfg.selection
             .and_then(|s| s.id)
             .map(|id| id.to_string())
@@ -1978,6 +2077,7 @@ mod tests {
             "plank",
             &root,
             HAL,
+            false,
         )
         .expect("dump-config must not abort");
         assert!(cfg.dump_config);
