@@ -1,0 +1,414 @@
+//! Prefix-truncatable KV cache.
+//!
+//! Each layer stores every position's K and V in a preallocated
+//! `[1, kv_heads, cap, head_dim]` tensor, written in place with
+//! `Tensor::slice_set`. `truncate` only moves the logical length back — the
+//! data beyond it is left in the buffer and is overwritten by the next
+//! `append` — so a shared prefix can be reused across turns without
+//! re-prefilling it, and the forward pass attends over `view()`.
+
+use candle_core::{DType, Device, Tensor};
+
+use crate::{Error, Result};
+
+/// One transformer layer's K/V history.
+///
+/// `k` and `v` are `None` until the first `append`. Once allocated, they are
+/// `[1, kv_heads, cap, head_dim]` tensors; only the first `len` positions
+/// along dim 2 are live. `cap` is read back from the tensor's own shape, not
+/// stored separately.
+#[derive(Debug, Default)]
+pub struct LayerKv {
+    k: Option<Tensor>,
+    v: Option<Tensor>,
+    len: usize,
+}
+
+impl LayerKv {
+    /// Positions currently live in this layer.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True when no position is live.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Move the logical length back to `n` (a no-op if already `<= n`).
+    ///
+    /// The data beyond the new length is left untouched in the buffer; it is
+    /// dead until the next `append` overwrites it in place.
+    pub fn truncate(&mut self, n: usize) {
+        self.len = self.len.min(n);
+    }
+
+    /// The live K/V, narrowed to `len` along the position axis, each copied
+    /// out of the growable buffer so later `append`s (which mutate that
+    /// buffer's storage in place via `slice_set`) can never change a tensor
+    /// already handed to a caller.
+    ///
+    /// # Errors
+    /// Propagates any candle error from narrowing or copying.
+    pub fn view(&self) -> Result<Option<(Tensor, Tensor)>> {
+        let (Some(k), Some(v)) = (&self.k, &self.v) else {
+            return Ok(None);
+        };
+        if self.len == 0 {
+            return Ok(None);
+        }
+        // `force_contiguous` always allocates a fresh, unaliased copy —
+        // unlike `contiguous`, which hands back the input unchanged (sharing
+        // storage) when it already happens to be contiguous. That edge case
+        // is real here: a narrow spanning the *whole* buffer (len == cap) is
+        // itself contiguous, so `contiguous` would return a tensor aliasing
+        // the live buffer, which the next `append`'s `slice_set` would then
+        // mutate out from under the caller. One copy is unavoidable for that
+        // guarantee, so this is the least copying that is still correct.
+        let k = k.narrow(2, 0, self.len)?.force_contiguous()?;
+        let v = v.narrow(2, 0, self.len)?.force_contiguous()?;
+        Ok(Some((k, v)))
+    }
+
+    /// Append `n` new positions (read off dim 2 of `k`/`v`), growing the
+    /// backing buffer (doubling capacity, copying the live prefix once) when
+    /// it doesn't fit.
+    ///
+    /// # Errors
+    /// Propagates any candle error from allocation, dtype conversion, or
+    /// `slice_set`.
+    ///
+    /// # Panics
+    /// Never in practice: every `unwrap()` below reads back `self.k`/`self.v`
+    /// in a branch that just finished assigning them to `Some`.
+    pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        let k = k.to_dtype(DType::F32)?.contiguous()?;
+        let v = v.to_dtype(DType::F32)?.contiguous()?;
+        let (_, kv_heads, n, head_dim) = k.dims4()?;
+        if n == 0 {
+            return Ok(());
+        }
+        let device = k.device().clone();
+
+        match &self.k {
+            None => {
+                let cap = (self.len + n).max(256).next_power_of_two();
+                self.k = Some(Tensor::zeros(
+                    (1, kv_heads, cap, head_dim),
+                    DType::F32,
+                    &device,
+                )?);
+                self.v = Some(Tensor::zeros(
+                    (1, kv_heads, cap, head_dim),
+                    DType::F32,
+                    &device,
+                )?);
+            }
+            Some(existing) => {
+                let (_, _, cap, _) = existing.dims4()?;
+                if self.len + n > cap {
+                    let mut new_cap = cap;
+                    while self.len + n > new_cap {
+                        new_cap *= 2;
+                    }
+                    let new_k =
+                        Tensor::zeros((1, kv_heads, new_cap, head_dim), DType::F32, &device)?;
+                    let new_v =
+                        Tensor::zeros((1, kv_heads, new_cap, head_dim), DType::F32, &device)?;
+                    if self.len > 0 {
+                        let old_k = self
+                            .k
+                            .as_ref()
+                            .unwrap()
+                            .narrow(2, 0, self.len)?
+                            .contiguous()?;
+                        let old_v = self
+                            .v
+                            .as_ref()
+                            .unwrap()
+                            .narrow(2, 0, self.len)?
+                            .contiguous()?;
+                        new_k.slice_set(&old_k, 2, 0)?;
+                        new_v.slice_set(&old_v, 2, 0)?;
+                    }
+                    self.k = Some(new_k);
+                    self.v = Some(new_v);
+                }
+            }
+        }
+
+        self.k.as_ref().unwrap().slice_set(&k, 2, self.len)?;
+        self.v.as_ref().unwrap().slice_set(&v, 2, self.len)?;
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// Per-layer KV history for a whole model.
+#[derive(Debug)]
+pub struct KvCache {
+    pub layers: Vec<LayerKv>,
+}
+
+impl KvCache {
+    /// `n_layers` empty layers.
+    #[must_use]
+    pub fn new(n_layers: usize) -> Self {
+        Self {
+            layers: (0..n_layers).map(|_| LayerKv::default()).collect(),
+        }
+    }
+
+    /// The shared live length across all layers (0 when empty). All layers
+    /// are always advanced together, so the first layer's length speaks for
+    /// all of them.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.layers.first().map_or(0, LayerKv::len)
+    }
+
+    /// True when no position is live in any layer.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Truncate every layer to `n`.
+    pub fn truncate(&mut self, n: usize) {
+        for layer in &mut self.layers {
+            layer.truncate(n);
+        }
+    }
+
+    /// Serialize every layer's live K/V as `n_layers: u32`, then per layer
+    /// `len: u32`, `kv_heads: u32`, `head_dim: u32`, K f32 LE bytes, V f32 LE
+    /// bytes. An empty layer writes zeros for `len`/`kv_heads`/`head_dim` and
+    /// no tensor bytes.
+    ///
+    /// # Errors
+    /// Propagates any candle error from reading the live view back to host
+    /// memory.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(
+            &u32::try_from(self.layers.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        for layer in &self.layers {
+            match layer.view()? {
+                None => {
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                }
+                Some((k, v)) => {
+                    let (_, kv_heads, len, head_dim) = k.dims4()?;
+                    out.extend_from_slice(&u32::try_from(len).unwrap_or(u32::MAX).to_le_bytes());
+                    out.extend_from_slice(
+                        &u32::try_from(kv_heads).unwrap_or(u32::MAX).to_le_bytes(),
+                    );
+                    out.extend_from_slice(
+                        &u32::try_from(head_dim).unwrap_or(u32::MAX).to_le_bytes(),
+                    );
+                    for f in k.flatten_all()?.to_vec1::<f32>()? {
+                        out.extend_from_slice(&f.to_le_bytes());
+                    }
+                    for f in v.flatten_all()?.to_vec1::<f32>()? {
+                        out.extend_from_slice(&f.to_le_bytes());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Parse `bytes` (the layout `to_bytes` writes) into a staging buffer,
+    /// validating every count against `shape[i] = (kv_heads, head_dim)` for
+    /// layer `i` and against the byte length before touching `self` at all;
+    /// on any error `self` is unchanged.
+    ///
+    /// # Errors
+    /// Returns an error (leaving `self` unchanged) when the layer count,
+    /// a layer's recorded shape, or the byte length doesn't match `shape`,
+    /// or the blob is truncated or has trailing bytes.
+    pub fn restore(
+        &mut self,
+        bytes: &[u8],
+        device: &Device,
+        shape: &[(usize, usize)],
+    ) -> Result<()> {
+        let mut pos = 0usize;
+        let n_layers = read_u32(bytes, &mut pos)? as usize;
+        if n_layers != shape.len() {
+            return Err(Error(format!(
+                "kv snapshot: {n_layers} layers but {} shapes given",
+                shape.len()
+            )));
+        }
+
+        let mut staged = Vec::with_capacity(n_layers);
+        for (i, &(exp_heads, exp_dim)) in shape.iter().enumerate() {
+            let len = read_u32(bytes, &mut pos)? as usize;
+            let kv_heads = read_u32(bytes, &mut pos)? as usize;
+            let head_dim = read_u32(bytes, &mut pos)? as usize;
+            if len > 0 && (kv_heads != exp_heads || head_dim != exp_dim) {
+                return Err(Error(format!(
+                    "kv snapshot: layer {i} shape ({kv_heads}, {head_dim}) does not match expected ({exp_heads}, {exp_dim})"
+                )));
+            }
+
+            let mut layer = LayerKv::default();
+            if len > 0 {
+                let n_floats = len * kv_heads * head_dim;
+                let byte_len = n_floats * 4;
+                let k_bytes = read_bytes(bytes, &mut pos, byte_len)?;
+                let kf: Vec<f32> = k_bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                let v_bytes = read_bytes(bytes, &mut pos, byte_len)?;
+                let vf: Vec<f32> = v_bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                let kt = Tensor::from_vec(kf, (1, kv_heads, len, head_dim), device)?;
+                let vt = Tensor::from_vec(vf, (1, kv_heads, len, head_dim), device)?;
+                layer.append(&kt, &vt)?;
+            }
+            staged.push(layer);
+        }
+
+        if pos != bytes.len() {
+            return Err(Error(format!(
+                "kv snapshot: {} trailing byte(s)",
+                bytes.len() - pos
+            )));
+        }
+
+        self.layers = staged;
+        Ok(())
+    }
+}
+
+fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
+    let slice = read_bytes(bytes, pos, 4)?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {
+    if *pos + n > bytes.len() {
+        return Err(Error(format!(
+            "kv snapshot: truncated (need {n} more byte(s) at offset {pos}, have {})",
+            bytes.len()
+        )));
+    }
+    let slice = &bytes[*pos..*pos + n];
+    *pos += n;
+    Ok(slice)
+}
+
+#[cfg(test)]
+// Test data uses small loop indices as tensor values; f32 has 23 mantissa
+// bits, far more than these tests ever need, so the precision-loss lint is a
+// false positive here.
+#[allow(clippy::cast_precision_loss)]
+mod tests {
+    use super::*;
+    use candle_core::{Device, Tensor};
+
+    fn kv(start: f32, n: usize) -> Tensor {
+        Tensor::arange(start, start + n as f32, &Device::Cpu)
+            .unwrap()
+            .reshape((1, 1, n, 1))
+            .unwrap()
+    }
+
+    #[test]
+    fn append_grows_and_view_is_exact() {
+        let mut l = LayerKv::default();
+        for i in 0..40 {
+            l.append(&kv(i as f32, 1), &kv(i as f32, 1)).unwrap();
+        }
+        let (k, _) = l.view().unwrap().unwrap();
+        assert_eq!(
+            k.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            (0..40).map(|i| i as f32).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn truncate_then_append_overwrites_the_tail() {
+        let mut l = LayerKv::default();
+        l.append(&kv(0.0, 5), &kv(0.0, 5)).unwrap();
+        l.truncate(2);
+        l.append(&kv(100.0, 2), &kv(100.0, 2)).unwrap();
+        let (k, _) = l.view().unwrap().unwrap();
+        assert_eq!(
+            k.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            [0.0, 1.0, 100.0, 101.0]
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trips_and_a_bad_blob_changes_nothing() {
+        let mut c = KvCache::new(2);
+        for l in &mut c.layers {
+            l.append(&kv(0.0, 3), &kv(10.0, 3)).unwrap();
+        }
+        let bytes = c.to_bytes().unwrap();
+        let mut d = KvCache::new(2);
+        d.restore(&bytes, &Device::Cpu, &[(1, 1), (1, 1)]).unwrap();
+        assert_eq!(d.to_bytes().unwrap(), bytes);
+        let before = d.to_bytes().unwrap();
+        assert!(
+            d.restore(&bytes[..bytes.len() - 1], &Device::Cpu, &[(1, 1), (1, 1)])
+                .is_err()
+        );
+        assert!(d.restore(&bytes, &Device::Cpu, &[(2, 1), (1, 1)]).is_err());
+        assert_eq!(d.to_bytes().unwrap(), before);
+    }
+
+    #[test]
+    fn view_taken_before_append_does_not_change_afterwards() {
+        let mut l = LayerKv::default();
+        l.append(&kv(0.0, 3), &kv(0.0, 3)).unwrap();
+        let (k, _) = l.view().unwrap().unwrap();
+        let before = k.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // Append more — if `view()` had returned an aliased narrow of the
+        // growable buffer, this in-place `slice_set` would corrupt `k`.
+        l.append(&kv(100.0, 3), &kv(100.0, 3)).unwrap();
+        let after = k.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(before, after);
+        assert_eq!(before, [0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn view_taken_at_full_capacity_does_not_change_after_growth() {
+        // Force len == cap (256) so the narrow is already contiguous — the
+        // edge case where a cheaper `.contiguous()` would alias storage.
+        let mut l = LayerKv::default();
+        for i in 0..256 {
+            l.append(&kv(i as f32, 1), &kv(i as f32, 1)).unwrap();
+        }
+        let (k, _) = l.view().unwrap().unwrap();
+        let before = k.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        l.append(&kv(9000.0, 1), &kv(9000.0, 1)).unwrap();
+        let after = k.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(before, after);
+        assert_eq!(before.len(), 256);
+    }
+
+    #[test]
+    fn kv_cache_len_is_zero_until_appended() {
+        let c = KvCache::new(3);
+        assert_eq!(c.len(), 0);
+        assert!(c.is_empty());
+    }
+}

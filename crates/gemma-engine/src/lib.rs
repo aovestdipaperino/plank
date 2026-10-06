@@ -10,9 +10,10 @@ pub mod testgguf;
 #[cfg(feature = "candle")]
 pub mod tokenizer;
 
+#[cfg(feature = "candle")]
+pub mod kv;
+
 // Temporarily commented out until created by later tasks:
-// #[cfg(feature = "candle")]
-// pub mod kv;
 // #[cfg(feature = "candle")]
 // pub mod model;
 // #[cfg(feature = "candle")]
