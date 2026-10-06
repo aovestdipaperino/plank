@@ -363,9 +363,45 @@ pub fn is_legacy_payload(bytes: &[u8]) -> bool {
     bytes.starts_with(LEGACY_REPLIES_MAGIC)
 }
 
+/// Splits a rendered transcript into `(role, text)` sections on its
+/// `[system]` / `[user]` / `[tool]` / `[assistant]` header lines. `[tool]`
+/// collapses to `user`; each section's trailing whitespace is trimmed, which
+/// is why [`TokenTranscript::common_prefix`] compares span text trimmed.
+#[must_use]
+pub fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
+    let mut out: Vec<(&str, String)> = Vec::new();
+    let mut current: Option<&str> = None;
+    let mut buf = String::new();
+    for line in transcript.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches('\n');
+        let tag = match trimmed {
+            "[system]" => Some("system"),
+            "[user]" | "[tool]" => Some("user"),
+            "[assistant]" => Some("assistant"),
+            _ => None,
+        };
+        if let Some(role) = tag {
+            if let Some(prev) = current.take() {
+                out.push((prev, buf.trim_end().to_string()));
+                buf.clear();
+            }
+            current = Some(role);
+        } else if current.is_some() {
+            buf.push_str(line);
+        }
+    }
+    if let Some(prev) = current {
+        out.push((prev, buf.trim_end().to_string()));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SectionKey, Span, SpanRole, TokenTranscript, decode, encode, is_legacy_payload};
+    use super::{
+        SectionKey, Span, SpanRole, TokenTranscript, decode, encode, is_legacy_payload,
+        parse_sections,
+    };
 
     fn key(role: SpanRole, text: &str) -> SectionKey {
         SectionKey {
@@ -700,5 +736,40 @@ mod tests {
         assert_eq!(SpanRole::from_tag("system"), Some(SpanRole::System));
         assert_eq!(SpanRole::from_tag("assistant"), Some(SpanRole::Assistant));
         assert_eq!(SpanRole::from_tag("nope"), None);
+    }
+    #[test]
+    fn splits_role_sections() {
+        let t = "[system]\nyou are helpful\n[user]\nhi\n[assistant]\nhello\n";
+        let s = parse_sections(t);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0], ("system", "you are helpful".to_string()));
+        assert_eq!(s[1], ("user", "hi".to_string()));
+        assert_eq!(s[2], ("assistant", "hello".to_string()));
+    }
+
+    #[test]
+    fn tool_maps_to_user() {
+        let s = parse_sections("[tool]\nresult text\n");
+        assert_eq!(s, vec![("user", "result text".to_string())]);
+    }
+
+    /// Contract `kvtier::plan` depends on (#64): a message's trailing
+    /// whitespace does not survive the transcript round-trip, so the tiers the
+    /// warm path tokenizes are canonicalized to match. Two adjacent user
+    /// sections are the session-start shape (stable then volatile) and must
+    /// stay two sections, not merge. If this trimming ever changes, the tier
+    /// canonicalization in `kvtier::plan` has to change with it or the KV
+    /// common-prefix probe silently diverges and re-prefills every turn.
+    #[test]
+    fn adjacent_user_sections_stay_split_and_lose_trailing_whitespace() {
+        let s = parse_sections("[system]\nsys\n[user]\nstable\n\n[user]\nvolatile\n");
+        assert_eq!(
+            s,
+            vec![
+                ("system", "sys".to_string()),
+                ("user", "stable".to_string()),
+                ("user", "volatile".to_string()),
+            ]
+        );
     }
 }

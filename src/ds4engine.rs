@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
-use crate::ds4tokens::{self, SectionKey, SpanRole, TokenTranscript};
+use crate::ds4tokens::{self, SectionKey, SpanRole, TokenTranscript, parse_sections};
 use crate::engine::{
     Engine, EngineError, EngineEvent, GenerationOptions, GenerationStats, PrefillProgress,
     ThinkMode, kv_debug,
@@ -3209,34 +3209,6 @@ fn strip_legacy(bytes: &[u8]) -> &[u8] {
     }
 }
 
-fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
-    let mut out: Vec<(&str, String)> = Vec::new();
-    let mut current: Option<&str> = None;
-    let mut buf = String::new();
-    for line in transcript.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches('\n');
-        let tag = match trimmed {
-            "[system]" => Some("system"),
-            "[user]" | "[tool]" => Some("user"),
-            "[assistant]" => Some("assistant"),
-            _ => None,
-        };
-        if let Some(role) = tag {
-            if let Some(prev) = current.take() {
-                out.push((prev, buf.trim_end().to_string()));
-                buf.clear();
-            }
-            current = Some(role);
-        } else if current.is_some() {
-            buf.push_str(line);
-        }
-    }
-    if let Some(prev) = current {
-        out.push((prev, buf.trim_end().to_string()));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3441,42 +3413,6 @@ mod tests {
             t.common_prefix(&sections),
             2,
             "the merged span matches the merged section, so nothing is stale"
-        );
-    }
-
-    #[test]
-    fn splits_role_sections() {
-        let t = "[system]\nyou are helpful\n[user]\nhi\n[assistant]\nhello\n";
-        let s = parse_sections(t);
-        assert_eq!(s.len(), 3);
-        assert_eq!(s[0], ("system", "you are helpful".to_string()));
-        assert_eq!(s[1], ("user", "hi".to_string()));
-        assert_eq!(s[2], ("assistant", "hello".to_string()));
-    }
-
-    #[test]
-    fn tool_maps_to_user() {
-        let s = parse_sections("[tool]\nresult text\n");
-        assert_eq!(s, vec![("user", "result text".to_string())]);
-    }
-
-    /// Contract `kvtier::plan` depends on (#64): a message's trailing
-    /// whitespace does not survive the transcript round-trip, so the tiers the
-    /// warm path tokenizes are canonicalized to match. Two adjacent user
-    /// sections are the session-start shape (stable then volatile) and must
-    /// stay two sections, not merge. If this trimming ever changes, the tier
-    /// canonicalization in `kvtier::plan` has to change with it or the KV
-    /// common-prefix probe silently diverges and re-prefills every turn.
-    #[test]
-    fn adjacent_user_sections_stay_split_and_lose_trailing_whitespace() {
-        let s = parse_sections("[system]\nsys\n[user]\nstable\n\n[user]\nvolatile\n");
-        assert_eq!(
-            s,
-            vec![
-                ("system", "sys".to_string()),
-                ("user", "stable".to_string()),
-                ("user", "volatile".to_string()),
-            ]
         );
     }
 
