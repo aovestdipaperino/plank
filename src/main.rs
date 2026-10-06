@@ -375,28 +375,23 @@ fn pick_engine_before_resolve(
     cfg: &mut plank::config::AgentConfig,
     root: &std::path::Path,
     recommended: Option<plank::engines::Recommendation<'_>>,
-    interactive: bool,
+    menu_allowed: bool,
 ) -> Result<(), String> {
     let local = cfg.remote_url.is_none() && cfg.provider.is_none();
     let from_cli = model_from_cli(cfg);
-    let choice = model_choice(cfg);
     let catalog = plank::engines::load_in(root, &mut Vec::new());
-    let probe = plank::engines::choose_with_recommendation_in(
-        root,
-        &catalog,
-        from_cli.then_some(choice),
-        recommended.filter(|_| local),
-        if from_cli {
-            plank::engines::Choice::Default
-        } else {
-            choice
-        },
-    )
-    .ok()
-    .map(|(sel, _)| sel);
+    let probe = choose_selection(cfg, root, &catalog, recommended)
+        .ok()
+        .map(|(sel, _)| sel);
     // An unresolvable choice is the ordinary resolution's to report.
     let main_exists = probe.as_ref().is_none_or(|s| s.main.exists());
-    if !plank::enginepick::should_pick(cfg.pick_engine, from_cli, main_exists, interactive, local) {
+    if !plank::enginepick::should_pick(cfg.pick_engine, from_cli, main_exists, menu_allowed, local)
+    {
+        // No menu: the session `/engines` left still resumes rather than
+        // being lost, unless something else already chose one.
+        if cfg.resume.is_none() {
+            cfg.resume = cfg.pick_engine_resume.take();
+        }
         return Ok(());
     }
     let rows = plank::enginefit::evaluate(root, &catalog, &plank::enginefit::machine(root), &|p| {
@@ -413,7 +408,13 @@ fn pick_engine_before_resolve(
     let sel = plank::engines::resolve_in(root, &catalog, plank::engines::Choice::Named(&name))?;
     plank::download::install_engine_in(&catalog, &sel)?;
     plank::settings::set_engine_model_in(&root.join("settings.json"), &name)?;
-    eprintln!("plank: {name} is now the default engine");
+    if plank::settings::project_path().is_some_and(|p| sets_engine_model(&p)) {
+        eprintln!(
+            "plank: {name} is now your default engine, but ./.plank/settings.json sets engine.model for this folder"
+        );
+    } else {
+        eprintln!("plank: {name} is now the default engine");
+    }
     cfg.model_spec = Some(name.clone());
     cfg.model_named = true;
     // The pick outranks a profile's recommendation, as `--model` would.
@@ -428,6 +429,43 @@ fn pick_engine_before_resolve(
         }
     }
     Ok(())
+}
+
+/// Whether `path` is a settings file that sets `engine.model`. A missing or
+/// unparsable file sets nothing.
+fn sets_engine_model(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .is_some_and(|v| v.pointer("/engine/model").is_some_and(|m| !m.is_null()))
+}
+
+/// The engine this run would load: the command line's choice, else the
+/// profile's `recommended` engine when on disk, else `engine.model`, else the
+/// catalog default. The one choice both [`resolve_selection`] and the menu's
+/// probe make; it prints nothing and leaves `cfg` alone.
+fn choose_selection(
+    cfg: &plank::config::AgentConfig,
+    root: &std::path::Path,
+    catalog: &plank::engines::Catalog,
+    recommended: Option<plank::engines::Recommendation<'_>>,
+) -> Result<(plank::engines::Selection, Vec<plank::engines::Note>), String> {
+    let choice = model_choice(cfg);
+    let from_cli = model_from_cli(cfg);
+    // A recommendation is for the local model a run would load, so a remote
+    // or provider run, which loads none, never announces one.
+    let local = cfg.remote_url.is_none() && cfg.provider.is_none();
+    plank::engines::choose_with_recommendation_in(
+        root,
+        catalog,
+        from_cli.then_some(choice),
+        recommended.filter(|_| local),
+        if from_cli {
+            plank::engines::Choice::Default
+        } else {
+            choice
+        },
+    )
 }
 
 /// Resolves the model choice against the catalog, letting the running
@@ -453,22 +491,9 @@ fn resolve_selection(
     for w in warn {
         eprintln!("plank: {w}");
     }
-    let choice = model_choice(cfg);
     let from_cli = model_from_cli(cfg);
-    // A recommendation is for the local model a run would load, so a remote
-    // or provider run, which loads none, never announces one.
     let local = cfg.remote_url.is_none() && cfg.provider.is_none();
-    let (sel, notes) = plank::engines::choose_with_recommendation_in(
-        root,
-        &catalog,
-        from_cli.then_some(choice),
-        recommended.filter(|_| local),
-        if from_cli {
-            plank::engines::Choice::Default
-        } else {
-            choice
-        },
-    )?;
+    let (sel, notes) = choose_selection(cfg, root, &catalog, recommended)?;
     let color = std::io::stderr().is_terminal();
     for note in notes {
         if note.warning && color {
@@ -567,6 +592,7 @@ fn parse_config(
     settings: &plank::settings::Settings,
     args: &[String],
     prog: &str,
+    allow_menu: bool,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
     parse_config_in(
         settings,
@@ -574,8 +600,19 @@ fn parse_config(
         prog,
         &plank::manifest::plank_dir(),
         active_recommendation(),
-        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+        allow_menu,
+        std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && std::io::stderr().is_terminal(),
     )
+}
+
+/// Whether the launch engine menu may show: the caller allows it (`plank
+/// serve` never does), all three standard streams are terminals (the menu
+/// draws on stdout and reads stdin), the front end is the default interactive
+/// one, and the run is not a read-only diagnostic that answers and exits.
+fn menu_allowed(allow_menu: bool, ttys: bool, cfg: &plank::config::AgentConfig) -> bool {
+    allow_menu && ttys && cfg.ui == plank::config::UiMode::Tui && !answers_and_exits(cfg)
 }
 
 /// [`parse_config`] with the engine catalog and managed paths under `root`,
@@ -587,12 +624,14 @@ fn parse_config_in(
     prog: &str,
     root: &std::path::Path,
     recommended: Option<plank::engines::Recommendation<'_>>,
-    interactive: bool,
+    allow_menu: bool,
+    ttys: bool,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
     plank::config::parse_options_with(settings, args)
         .and_then(|mut cfg| {
             cfg.drop_default_system_under_profile(plank::profile::active().is_some());
-            pick_engine_before_resolve(&mut cfg, root, recommended, interactive)?;
+            let menu = menu_allowed(allow_menu, ttys, &cfg);
+            pick_engine_before_resolve(&mut cfg, root, recommended, menu)?;
             match resolve_selection(&mut cfg, root, recommended)
                 .and_then(|catalog| resolve_model_delta(&mut cfg).map(|()| catalog))
             {
@@ -755,11 +794,14 @@ fn post_cfg_early_exit(
 /// `parse_config`, because the `engines.local.json` default a ds41-only
 /// install gets must exist before the catalog choice is resolved.
 fn should_migrate(provisional: &plank::config::AgentConfig) -> bool {
-    !(provisional.show_help
-        || provisional.show_version
-        || provisional.dump_config
-        || provisional.dump_profiles
-        || provisional.dump_engines)
+    !answers_and_exits(provisional)
+}
+
+/// Whether the run is a read-only answer that exits before any session:
+/// `--help`, `--version`, or one of the `--dump-*` diagnostics
+/// ([`post_cfg_early_exit`]).
+fn answers_and_exits(cfg: &plank::config::AgentConfig) -> bool {
+    cfg.show_help || cfg.show_version || cfg.dump_config || cfg.dump_profiles || cfg.dump_engines
 }
 
 /// Renames any old `ModelSet` layout into the engine layout, when
@@ -891,7 +933,7 @@ fn main() -> ExitCode {
     // chance to dial the console.
     plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
-    let cfg = match parse_config(&settings, &args, "plank") {
+    let cfg = match parse_config(&settings, &args, "plank", true) {
         Ok(cfg) => cfg,
         Err(code) => return code,
     };
@@ -1565,7 +1607,7 @@ fn run_serve(args: &[String]) -> ExitCode {
     // chance to dial the console.
     plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
-    let cfg = match parse_config(&settings, &passthrough, "plank serve") {
+    let cfg = match parse_config(&settings, &passthrough, "plank serve", false) {
         Ok(cfg) => cfg,
         Err(code) => return code,
     };
@@ -1955,7 +1997,7 @@ mod tests {
         // An empty scratch root: the catalog is the compiled-in one and the
         // real `~/.plank` is never read.
         let root = std::env::temp_dir().join(format!("plank-dump-config-{}", std::process::id()));
-        let cfg = parse_config_in(&settings, &args, "plank", &root, None, false)
+        let cfg = parse_config_in(&settings, &args, "plank", &root, None, false, false)
             .expect("dump-config must not abort");
         assert!(cfg.dump_config);
         assert!(cfg.selection.is_none());
@@ -1975,7 +2017,7 @@ mod tests {
         let parse = |extra: &[&str]| {
             let mut args: Vec<String> = ["--model", "ds4-ab"].map(String::from).to_vec();
             args.extend(extra.iter().map(ToString::to_string));
-            parse_config_in(&settings, &args, "plank", &root, None, false).expect("parses")
+            parse_config_in(&settings, &args, "plank", &root, None, false, false).expect("parses")
         };
         let cfg = parse(&[]);
         assert_eq!(
@@ -2016,7 +2058,8 @@ mod tests {
         root: &std::path::Path,
     ) -> String {
         let args: Vec<String> = args.iter().map(ToString::to_string).collect();
-        let cfg = parse_config_in(settings, &args, "plank", root, HAL, false).expect("parses");
+        let cfg =
+            parse_config_in(settings, &args, "plank", root, HAL, false, false).expect("parses");
         cfg.selection
             .and_then(|s| s.id)
             .map(|id| id.to_string())
@@ -2078,10 +2121,77 @@ mod tests {
             &root,
             HAL,
             false,
+            false,
         )
         .expect("dump-config must not abort");
         assert!(cfg.dump_config);
         assert!(cfg.selection.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_menu_shows_only_for_an_interactive_session_start() {
+        let base = plank::config::AgentConfig::from_settings(&plank::settings::Settings::default());
+        assert!(
+            menu_allowed(true, true, &base),
+            "a plain launch may show it"
+        );
+        assert!(!menu_allowed(false, true, &base), "serve opts out");
+        assert!(!menu_allowed(true, false, &base), "a non-terminal stream");
+        for flag in [
+            "--help",
+            "--version",
+            "--dump-config",
+            "--dump-profiles",
+            "--dump-engines",
+        ] {
+            let cfg = plank::config::parse_options_with(
+                &plank::settings::Settings::default(),
+                &[flag.to_string()],
+            )
+            .expect("parses");
+            assert!(!menu_allowed(true, true, &cfg), "{flag} must not show it");
+        }
+        for ui in [
+            plank::config::UiMode::Console,
+            plank::config::UiMode::Chart,
+            plank::config::UiMode::Quiet,
+        ] {
+            let mut cfg = base.clone();
+            cfg.ui = ui;
+            assert!(!menu_allowed(true, true, &cfg), "{ui:?} must not show it");
+        }
+    }
+
+    #[test]
+    fn without_the_menu_a_left_session_still_resumes() {
+        let root = scratch_root("no-menu");
+        let settings = plank::settings::Settings::default();
+        let args: Vec<String> = vec![
+            "--pick-engine".into(),
+            "--pick-engine-resume".into(),
+            "x".into(),
+        ];
+        let before = plank::config::parse_options_with(&settings, &args).expect("parses");
+        let cfg =
+            parse_config_in(&settings, &args, "plank", &root, None, false, false).expect("parses");
+        assert_eq!(cfg.model_spec, before.model_spec);
+        assert_eq!(cfg.resume.as_deref(), Some("x"));
+        assert!(!root.join("settings.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_a_set_engine_model_counts_as_setting_it() {
+        let root = scratch_root("sets-model");
+        let path = root.join("settings.json");
+        assert!(!sets_engine_model(&path), "a missing file sets nothing");
+        std::fs::write(&path, r#"{"engine":{"temperature":0.5}}"#).expect("write");
+        assert!(!sets_engine_model(&path));
+        std::fs::write(&path, r#"{"engine":{"model":"gemma4-e4b"}}"#).expect("write");
+        assert!(sets_engine_model(&path));
+        std::fs::write(&path, "not json").expect("write");
+        assert!(!sets_engine_model(&path));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
