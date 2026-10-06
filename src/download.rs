@@ -835,6 +835,53 @@ fn discard_stale_part(dest: &Path) {
     let _ = std::fs::remove_file(part_url_path(dest));
 }
 
+/// The files of `sel` that are not on disk, as `(url, destination)`, `main`
+/// first so the model lands before its companions.
+///
+/// # Errors
+/// When a missing file has nowhere to come from (a local `path` with no `url`).
+pub fn missing_roles(
+    catalog: &crate::engines::Catalog,
+    sel: &crate::engines::Selection,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let roles = [
+        ("main", Some(&sel.main)),
+        ("mtp", sel.mtp.as_ref()),
+        ("vision", sel.vision.as_ref()),
+    ];
+    let mut out = Vec::new();
+    for (role, path) in roles {
+        let Some(path) = path.filter(|p| !exists(p)) else {
+            continue;
+        };
+        let Some((url, _)) = role_offer_in(catalog, sel, role) else {
+            return Err(format!(
+                "no {role} file at {} and no url to fetch it from",
+                path.display()
+            ));
+        };
+        out.push((url, path.clone()));
+    }
+    Ok(out)
+}
+
+/// Downloads every missing file of `sel` through the download screen, with no
+/// consent prompt: the engine menu's pick is the consent.
+///
+/// # Errors
+/// As [`missing_roles`], or the first download that fails or is cancelled. A
+/// cancelled download leaves its `.part` for the next attempt to resume.
+pub fn install_engine_in(
+    catalog: &crate::engines::Catalog,
+    sel: &crate::engines::Selection,
+) -> Result<(), String> {
+    for (url, dest) in missing_roles(catalog, sel, &|p| p.exists())? {
+        download(&url, &dest)?;
+    }
+    Ok(())
+}
+
 /// Downloads `url` to `dest` via `ureq`, showing the animated progress bar.
 fn download(url: &str, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
@@ -1748,6 +1795,59 @@ fn real_confirm(manifest: &crate::manifest::Manifest, from: u32) -> Option<bool>
 mod tests {
     use super::*;
     use crate::manifest::EngineId;
+
+    fn two_role_catalog() -> crate::engines::Catalog {
+        let mut w = Vec::new();
+        crate::engines::parse(
+            r#"{"version": 2, "engines": {"e": {"version": 1,
+                "main": {"name": "m", "url": "https://h/m", "bytes": 10, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                "mtp": {"name": "t", "url": "https://h/t", "bytes": 5, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}"#,
+            crate::engines::Layer::Published,
+            &mut w,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn missing_roles_lists_main_first_and_skips_present_files() {
+        let root = std::path::Path::new("/r");
+        let cat = two_role_catalog();
+        let sel =
+            crate::engines::resolve_in(root, &cat, crate::engines::Choice::Named("e")).unwrap();
+        let all = missing_roles(&cat, &sel, &|_| false).unwrap();
+        assert_eq!(
+            all,
+            vec![
+                ("https://h/m".to_owned(), root.join("e.gguf")),
+                ("https://h/t".to_owned(), root.join("e.mtp.gguf")),
+            ]
+        );
+        let main = root.join("e.gguf");
+        let rest = missing_roles(&cat, &sel, &|p| p == main).unwrap();
+        assert_eq!(
+            rest,
+            vec![("https://h/t".to_owned(), root.join("e.mtp.gguf"))]
+        );
+    }
+
+    #[test]
+    fn missing_roles_refuses_a_file_it_cannot_fetch() {
+        let mut w = Vec::new();
+        let cat = crate::engines::parse(
+            r#"{"engines": {"l": {"main": {"path": "/x/l.gguf"}}}}"#,
+            crate::engines::Layer::Local,
+            &mut w,
+        )
+        .unwrap();
+        let sel = crate::engines::resolve_in(
+            std::path::Path::new("/r"),
+            &cat,
+            crate::engines::Choice::Named("l"),
+        )
+        .unwrap();
+        let err = missing_roles(&cat, &sel, &|_| false).unwrap_err();
+        assert!(err.contains("/x/l.gguf"), "{err}");
+    }
 
     #[test]
     fn two_hundred_unique_rotating_messages() {
