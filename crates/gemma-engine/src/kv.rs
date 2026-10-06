@@ -309,8 +309,8 @@ impl KvCache {
 fn extend_f32_le(out: &mut Vec<u8>, floats: &[f32]) {
     let start = out.len();
     out.resize(start + floats.len() * 4, 0);
-    for (dst, f) in out[start..].chunks_exact_mut(4).zip(floats) {
-        dst.copy_from_slice(&f.to_le_bytes());
+    for (dst, f) in out[start..].as_chunks_mut::<4>().0.iter_mut().zip(floats) {
+        *dst = f.to_le_bytes();
     }
 }
 
