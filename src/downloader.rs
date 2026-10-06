@@ -1276,8 +1276,10 @@ fn chunk_len(c: u64, total: u64) -> u64 {
 /// part and its sidecar consistent with that answer.
 ///
 /// - Sidecar present: its indices are trusted for every chunk the file is
-///   long enough to hold; an index past the artifact means the record is not
-///   this artifact's, and everything starts over.
+///   long enough to hold, and the sidecar is rewritten to list only those; an
+///   index past the artifact means the record is not this artifact's, and
+///   everything starts over. So does a sidecar that exists but cannot be
+///   read.
 /// - No sidecar but a part (a sequential run's): its length is contiguous
 ///   bytes, so its whole chunks are kept, the tail is cut back to the last
 ///   chunk boundary, and a sidecar listing them is written.
@@ -1288,11 +1290,25 @@ fn adopt_part(part: &Path, sidecar: &Path, total: u64) -> std::io::Result<Vec<bo
     let len = std::fs::metadata(part).ok().map(|m| m.len());
     let fresh = |done: &mut Vec<bool>| -> std::io::Result<()> {
         done.fill(false);
-        File::create(part)?;
+        // The sidecar goes first: a crash between the two then leaves an
+        // empty record beside an untrusted part, never a record that vouches
+        // for bytes the part no longer holds.
         File::create(sidecar)?;
+        File::create(part)?;
         Ok(())
     };
-    match (std::fs::read_to_string(sidecar).ok(), len) {
+    let record = match std::fs::read_to_string(sidecar) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // A sidecar that exists but cannot be read (invalid UTF-8, a
+        // permission problem) says nothing about the part: start over rather
+        // than read the part as a sequential run's contiguous bytes.
+        Err(_) => {
+            fresh(&mut done)?;
+            return Ok(done);
+        }
+    };
+    match (record, len) {
         (Some(text), Some(len)) if len <= total => {
             for line in text.lines() {
                 let Ok(c) = line.trim().parse::<u64>() else {
@@ -1307,6 +1323,9 @@ fn adopt_part(part: &Path, sidecar: &Path, total: u64) -> std::io::Result<Vec<bo
                     *slot = true;
                 }
             }
+            // Rewrite the record to the trusted chunks only, so a stale index
+            // the part cannot back is not carried into this run's appends.
+            write_listed(sidecar, (0..n).filter(|&i| done[i]))?;
         }
         (None, Some(len)) if len <= total => {
             let whole = if len == total {
@@ -1320,21 +1339,28 @@ fn adopt_part(part: &Path, sidecar: &Path, total: u64) -> std::io::Result<Vec<bo
                     .open(part)?
                     .set_len(whole * RANGE_CHUNK)?;
             }
-            let mut listed = String::new();
             for c in 0..whole {
-                use std::fmt::Write as _;
-                let _ = writeln!(listed, "{c}");
                 if let Some(slot) = usize::try_from(c).ok().and_then(|i| done.get_mut(i)) {
                     *slot = true;
                 }
             }
-            let mut f = File::create(sidecar)?;
-            f.write_all(listed.as_bytes())?;
-            f.sync_data()?;
+            write_listed(sidecar, (0..n).filter(|&i| done[i]))?;
         }
         _ => fresh(&mut done)?,
     }
     Ok(done)
+}
+
+/// Replaces the [`chunks_path`] sidecar with one index per line, synced.
+fn write_listed(sidecar: &Path, chunks: impl Iterator<Item = usize>) -> std::io::Result<()> {
+    let mut listed = String::new();
+    for c in chunks {
+        use std::fmt::Write as _;
+        let _ = writeln!(listed, "{c}");
+    }
+    let mut f = File::create(sidecar)?;
+    f.write_all(listed.as_bytes())?;
+    f.sync_data()
 }
 
 /// One worker: takes chunks until none are left or the job stops.
@@ -4172,6 +4198,44 @@ pub(crate) mod tests {
             .expect("staged"),
             full
         );
+    }
+
+    #[test]
+    fn adopting_a_sidecar_rewrites_it_to_the_trusted_chunks_only() {
+        let root = tempdir();
+        let part = root.join("main.part");
+        let sidecar = chunks_path(&part);
+        // Two whole chunks on disk; the sidecar also lists chunks 4 and 5,
+        // whose bytes never reached the file.
+        std::fs::write(
+            &part,
+            vec![1u8; usize::try_from(2 * RANGE_CHUNK).expect("small")],
+        )
+        .expect("part");
+        std::fs::write(&sidecar, "0\n1\n4\n5\n").expect("sidecar");
+        let done = adopt_part(&part, &sidecar, 50).expect("adopt");
+        assert_eq!(done, vec![true, true, false, false, false, false, false]);
+        let listed = std::fs::read_to_string(&sidecar).expect("sidecar");
+        assert_eq!(listed.lines().collect::<Vec<_>>(), ["0", "1"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_sidecar_starts_the_part_over() {
+        let root = tempdir();
+        let part = root.join("main.part");
+        let sidecar = chunks_path(&part);
+        std::fs::write(
+            &part,
+            vec![1u8; usize::try_from(2 * RANGE_CHUNK).expect("small")],
+        )
+        .expect("part");
+        std::fs::write(&sidecar, [0xffu8, 0xfe, b'\n']).expect("sidecar");
+        let done = adopt_part(&part, &sidecar, 50).expect("adopt");
+        assert!(done.iter().all(|d| !d), "nothing is trusted: {done:?}");
+        assert_eq!(std::fs::metadata(&part).map_or(0, |m| m.len()), 0);
+        assert_eq!(std::fs::metadata(&sidecar).map_or(0, |m| m.len()), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
