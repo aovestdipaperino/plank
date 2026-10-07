@@ -484,14 +484,15 @@ impl Engine for GemmaEngine {
         if common == full.len() {
             common = common.saturating_sub(1);
         }
+        let live = self.session.tokens().len();
+        // Below a restored snapshot's sliding window the session empties.
+        let common = self.session.truncate(common);
         crate::engine::kv_debug(|| {
             format!(
-                "gemma generate: prompt={} live={} reused={common}",
-                full.len(),
-                self.session.tokens().len()
+                "gemma generate: prompt={} live={live} reused={common}",
+                full.len()
             )
         });
-        self.session.truncate(common);
         let Some(mut logits) = self.prefill(common, &full[common..], interrupt, on_event)? else {
             return Ok(GenerationStats {
                 interrupted: true,
@@ -583,6 +584,11 @@ impl Engine for GemmaEngine {
     /// describes (the ds4 sync's), which the agent answers by restoring a
     /// ladder rung or fork snapshot and by skipping prompt suggestions.
     /// Reporting the real session length would buy both for nothing.
+    ///
+    /// The exception is a session restored from a snapshot, whose sliding
+    /// layers hold only their window: diverging so far behind its end that
+    /// [`Session::reusable`] is 0 empties it, so the probe reports the real
+    /// length, the rebuild shape.
     fn kv_reuse_probe(&mut self, transcript: &str, _think: ThinkMode) -> Option<KvReuse> {
         let render = self.render();
         let mut tokens = self.transcript.clone();
@@ -590,10 +596,15 @@ impl Engine for GemmaEngine {
         render.reconcile(&mut tokens, &mut kinds, transcript);
         let mut full = to_u32(tokens.tokens());
         full.extend(render.generation_prefix(&kinds));
-        let common = count(common_prefix(self.session.tokens(), &full));
+        let common = common_prefix(self.session.tokens(), &full);
+        let live = if self.session.reusable(common) == common {
+            common
+        } else {
+            self.session.tokens().len()
+        };
         Some(KvReuse {
-            live: common,
-            common,
+            live: count(live),
+            common: count(common),
         })
     }
 
@@ -676,7 +687,7 @@ impl Engine for GemmaEngine {
         let want = to_u32(self.transcript.tokens());
         self.check_fits(want.len())?;
         let common = common_prefix(self.session.tokens(), &want);
-        self.session.truncate(common);
+        let common = self.session.truncate(common);
         if common == want.len() {
             return Ok(false);
         }
@@ -846,6 +857,31 @@ mod tests {
         assert_eq!(probe.live, probe.common);
         assert!(usize::try_from(probe.common).unwrap() < live);
         assert!(probe.common > 0 && !probe.rebuilds_from_zero());
+    }
+
+    /// A restored snapshot keeps only the sliding window of each sliding
+    /// layer, so a prompt diverging well behind its end cannot truncate
+    /// there: the probe says so (`live` stays the session length, so the
+    /// agent sees a rebuild), and the turn rebuilds from scratch to the same
+    /// result as a fresh engine.
+    #[test]
+    fn a_divergence_below_a_restored_window_rebuilds_truthfully() {
+        let mut a = engine();
+        run(
+            &mut a,
+            "[system]\nsys\n[user]\nhello there, a long enough prompt\n",
+        );
+        let snap = a.get_kv().unwrap();
+        let mut b = engine();
+        b.set_kv(&snap).unwrap();
+        let live = b.session.tokens().len();
+        let other = "[system]\nsys\n[user]\nsomething else\n";
+        let probe = b.kv_reuse_probe(other, ThinkMode::Off).unwrap();
+        assert_eq!(usize::try_from(probe.live).unwrap(), live);
+        assert!(probe.common > 0 && probe.rebuilds_from_zero());
+        let got = run(&mut b, other);
+        assert_eq!(to_u32(b.transcript.tokens()), b.session.tokens());
+        assert_eq!(got, run(&mut engine(), other));
     }
 
     /// The system turn carries `<|think|>` only while thinking is on, so a

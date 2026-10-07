@@ -132,6 +132,19 @@ keeps the KV up to the first differing token and prefills only the remainder.
   depth. With a ring buffer, truncating behind the window would lose the
   positions the window needs. Exact truncation is what makes common-prefix
   reuse, ladder rungs and forks plain prefix operations.
+- **Snapshots keep only the window of a sliding layer.** In memory nothing
+  is dropped, but a snapshot (`Session::snapshot`, format 2) writes each
+  sliding layer's last `sliding_window` positions and records the first
+  position it holds (its `base`); global layers are written whole. On 12B
+  that is about 95% of the bytes per token, so a 40K-token snapshot falls
+  from about 27.5 GB to about 2 GB. A format-1 blob is refused and the caller
+  rebuilds by prefill. A restored session holds positions `base..len` on its
+  sliding layers and grows normally; attention indexes keys by absolute
+  position. It can still truncate exactly while every trimmed layer covers
+  the window the next query reads (`n + 1 - window >= base`); below that,
+  `Session::truncate` empties the session and the next prefill starts from
+  scratch, and `kv_reuse_probe` then reports the real session length as
+  `live`, the rebuild shape, instead of `live == common`.
 - **`kv_reuse_probe` reports `live == common`** (Ruling 14). Because the KV
   truncates exactly, a divergence behind the live end is never the
   rebuild-from-zero shape that the agent's rung and fork rescue exist for.

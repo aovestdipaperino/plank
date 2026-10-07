@@ -3416,6 +3416,19 @@ llama.cpp (commit `d7a695e`), pinned by
   the whole f32 KV, about 114 KB per token on E4B (≈3.5 GB at 30k tokens), and
   `KvCache::restore` stages a second copy, so a fork could peak near 16 GB on
   a 16 GB Mac for a prefix the next `generate` keeps anyway.
+- **A Gemma snapshot trims its sliding layers to the window.** Per token,
+  f32, 12B holds 40 sliding layers x 8 KV heads x (256 K + 256 V) plus
+  8 global layers x 1 head x (512 + 512): 172,032 floats, 688,128 bytes, 95%
+  of it sliding (E4B: about 114,688 bytes over 24 KV-owning layers). A real
+  40K-token 12B snapshot (`feisty-joule.kv_raw`) was 28 GB, though a sliding
+  layer only ever reads its last 1024 keys (512 on E4B). Format 2 writes
+  just those plus a per-layer `base`; global layers stay whole, so that
+  snapshot is about 2 GB. The catch is truncation after a restore: a query
+  at `n` needs keys from `n + 1 - window`, so a restored session truncates
+  exactly only down to `base + window - 1`, not down to `base`. Below that
+  `Session::truncate` empties the session (the next prefill rebuilds from
+  zero) and `kv_reuse_probe` reports the real length as `live`, so the agent
+  is not told it keeps tokens it no longer has.
 - **Suggestions with thinking on need `emits_think_tags`.**
   `suggest::reasoning_unfinished` assumed DeepSeek's implicit think block: a
   reply without `</think>` meant the budget ran out mid-thought. Gemma opens

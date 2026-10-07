@@ -6,6 +6,11 @@
 //! data beyond it is left in the buffer and is overwritten by the next
 //! `append` — so a shared prefix can be reused across turns without
 //! re-prefilling it, and the forward pass attends over `view()`.
+//!
+//! A layer restored from a windowed snapshot ([`KvCache::to_bytes_windowed`])
+//! starts at `base > 0`: it holds absolute positions `base..len` only, at
+//! buffer indices `0..len - base`. A fresh layer has `base == 0`, so it keeps
+//! the whole history.
 
 use candle_core::{DType, Device, Tensor};
 
@@ -17,18 +22,34 @@ use crate::{Error, Result};
 /// `[1, kv_heads, cap, head_dim]` tensors; only the first `len` positions
 /// along dim 2 are live. `cap` is read back from the tensor's own shape, not
 /// stored separately.
+///
+/// `base` is the absolute position of buffer index 0 and `len` the absolute
+/// end, so the buffer holds `len - base` positions.
 #[derive(Debug, Default)]
 pub struct LayerKv {
     k: Option<Tensor>,
     v: Option<Tensor>,
+    base: usize,
     len: usize,
 }
 
 impl LayerKv {
-    /// Positions currently live in this layer.
+    /// The absolute length: one past the last live position.
     #[must_use]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// The absolute position of the first position held: 0 unless the layer
+    /// was restored from a windowed snapshot.
+    #[must_use]
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
+    /// Positions physically held, `len - base`.
+    fn stored(&self) -> usize {
+        self.len - self.base
     }
 
     /// True when no position is live.
@@ -40,13 +61,21 @@ impl LayerKv {
     /// Move the logical length back to `n` (a no-op if already `<= n`).
     ///
     /// The data beyond the new length is left untouched in the buffer; it is
-    /// dead until the next `append` overwrites it in place.
+    /// dead until the next `append` overwrites it in place. Below `base` the
+    /// layer cannot hold the prefix, so it empties: `base` and `len` both go
+    /// back to 0.
     pub fn truncate(&mut self, n: usize) {
-        self.len = self.len.min(n);
+        if n < self.base {
+            self.base = 0;
+            self.len = 0;
+        } else {
+            self.len = self.len.min(n);
+        }
     }
 
-    /// The live K/V: the growable buffers narrowed to `len` along the
-    /// position axis, without copying.
+    /// The live K/V: the growable buffers narrowed to the `len - base`
+    /// positions held (absolute `base..len`) along the position axis,
+    /// without copying.
     ///
     /// The tensors share the buffers' storage, so they are valid only until
     /// the next [`LayerKv::truncate`] followed by an [`LayerKv::append`]: that
@@ -62,10 +91,11 @@ impl LayerKv {
         let (Some(k), Some(v)) = (&self.k, &self.v) else {
             return Ok(None);
         };
-        if self.len == 0 {
+        let stored = self.stored();
+        if stored == 0 {
             return Ok(None);
         }
-        Ok(Some((k.narrow(2, 0, self.len)?, v.narrow(2, 0, self.len)?)))
+        Ok(Some((k.narrow(2, 0, stored)?, v.narrow(2, 0, stored)?)))
     }
 
     /// Append `n` new positions (read off dim 2 of `k`/`v`), growing the
@@ -87,10 +117,11 @@ impl LayerKv {
             return Ok(());
         }
         let device = k.device().clone();
+        let stored = self.stored();
 
         match &self.k {
             None => {
-                let cap = (self.len + n).max(256).next_power_of_two();
+                let cap = (stored + n).max(256).next_power_of_two();
                 self.k = Some(Tensor::zeros(
                     (1, kv_heads, cap, head_dim),
                     DType::F32,
@@ -104,27 +135,27 @@ impl LayerKv {
             }
             Some(existing) => {
                 let (_, _, cap, _) = existing.dims4()?;
-                if self.len + n > cap {
+                if stored + n > cap {
                     let mut new_cap = cap;
-                    while self.len + n > new_cap {
+                    while stored + n > new_cap {
                         new_cap *= 2;
                     }
                     let new_k =
                         Tensor::zeros((1, kv_heads, new_cap, head_dim), DType::F32, &device)?;
                     let new_v =
                         Tensor::zeros((1, kv_heads, new_cap, head_dim), DType::F32, &device)?;
-                    if self.len > 0 {
+                    if stored > 0 {
                         let old_k = self
                             .k
                             .as_ref()
                             .unwrap()
-                            .narrow(2, 0, self.len)?
+                            .narrow(2, 0, stored)?
                             .contiguous()?;
                         let old_v = self
                             .v
                             .as_ref()
                             .unwrap()
-                            .narrow(2, 0, self.len)?
+                            .narrow(2, 0, stored)?
                             .contiguous()?;
                         new_k.slice_set(&old_k, 2, 0)?;
                         new_v.slice_set(&old_v, 2, 0)?;
@@ -135,8 +166,8 @@ impl LayerKv {
             }
         }
 
-        self.k.as_ref().unwrap().slice_set(&k, 2, self.len)?;
-        self.v.as_ref().unwrap().slice_set(&v, 2, self.len)?;
+        self.k.as_ref().unwrap().slice_set(&k, 2, stored)?;
+        self.v.as_ref().unwrap().slice_set(&v, 2, stored)?;
         self.len += n;
         Ok(())
     }
@@ -171,33 +202,67 @@ impl KvCache {
         self.len() == 0
     }
 
-    /// Truncate every layer to `n`.
+    /// Truncate every layer to `n`. When `n` is below some layer's `base`
+    /// the cache can no longer hold that prefix, so every layer empties
+    /// (`base` and `len` back to 0) and the next prefill starts from scratch.
     pub fn truncate(&mut self, n: usize) {
+        let below = self.layers.iter().any(|l| n < l.base());
         for layer in &mut self.layers {
-            layer.truncate(n);
+            layer.truncate(if below { 0 } else { n });
         }
     }
 
+    /// Serialize every layer's held K/V whole; see
+    /// [`KvCache::to_bytes_windowed`] for the layout.
+    ///
+    /// # Errors
+    /// As [`KvCache::to_bytes_windowed`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.to_bytes_windowed(&[])
+    }
+
     /// Serialize every layer's live K/V as `n_layers: u32`, then per layer
-    /// `len: u32`, `kv_heads: u32`, `head_dim: u32`, K f32 LE bytes, V f32 LE
-    /// bytes. An empty layer writes zeros for `len`/`kv_heads`/`head_dim` and
+    /// `base: u32`, `stored: u32`, `kv_heads: u32`, `head_dim: u32`, K f32 LE
+    /// bytes, V f32 LE bytes, where the layer holds absolute positions
+    /// `base..base + stored`. An empty layer writes zeros for all four and
     /// no tensor bytes.
+    ///
+    /// A layer `i` with `windows[i] == Some(w)` keeps only its last `w`
+    /// positions (its base moves up accordingly); `None`, or an index past
+    /// `windows`, keeps everything held.
     ///
     /// # Errors
     /// Propagates any candle error from reading the live view back to host
     /// memory.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+    pub fn to_bytes_windowed(&self, windows: &[Option<usize>]) -> Result<Vec<u8>> {
         // Views first, so the buffer is sized once: at about 114 KB per token
         // on E4B, growing it by doubling would copy gigabytes at 30k tokens.
         let views = self
             .layers
             .iter()
-            .map(LayerKv::view)
+            .enumerate()
+            .map(|(i, layer)| {
+                let Some((k, v)) = layer.view()? else {
+                    return Ok(None);
+                };
+                let stored = layer.stored();
+                let keep = windows
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map_or(stored, |w| w.min(stored));
+                let skip = stored - keep;
+                Ok(Some((
+                    layer.base + skip,
+                    k.narrow(2, skip, keep)?,
+                    v.narrow(2, skip, keep)?,
+                )))
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut capacity = 4usize;
         for view in &views {
-            capacity += 12;
-            if let Some((k, v)) = view {
+            capacity += 16;
+            if let Some((_, k, v)) = view {
                 capacity += (k.elem_count() + v.elem_count()) * 4;
             }
         }
@@ -210,12 +275,13 @@ impl KvCache {
         for view in views {
             match view {
                 None => {
-                    out.extend_from_slice(&0u32.to_le_bytes());
-                    out.extend_from_slice(&0u32.to_le_bytes());
-                    out.extend_from_slice(&0u32.to_le_bytes());
+                    for _ in 0..4 {
+                        out.extend_from_slice(&0u32.to_le_bytes());
+                    }
                 }
-                Some((k, v)) => {
+                Some((base, k, v)) => {
                     let (_, kv_heads, len, head_dim) = k.dims4()?;
+                    out.extend_from_slice(&u32::try_from(base).unwrap_or(u32::MAX).to_le_bytes());
                     out.extend_from_slice(&u32::try_from(len).unwrap_or(u32::MAX).to_le_bytes());
                     out.extend_from_slice(
                         &u32::try_from(kv_heads).unwrap_or(u32::MAX).to_le_bytes(),
@@ -257,7 +323,13 @@ impl KvCache {
 
         let mut staged = Vec::with_capacity(n_layers);
         for (i, &(exp_heads, exp_dim)) in shape.iter().enumerate() {
+            let base = read_u32(bytes, &mut pos)? as usize;
             let len = read_u32(bytes, &mut pos)? as usize;
+            if len == 0 && base > 0 {
+                return Err(Error(format!(
+                    "kv snapshot: layer {i} starts at {base} but holds nothing"
+                )));
+            }
             let kv_heads = read_u32(bytes, &mut pos)? as usize;
             let head_dim = read_u32(bytes, &mut pos)? as usize;
             if len > 0 && (kv_heads != exp_heads || head_dim != exp_dim) {
@@ -287,6 +359,8 @@ impl KvCache {
                 let kt = Tensor::from_vec(kf, (1, kv_heads, len, head_dim), device)?;
                 let vt = Tensor::from_vec(vf, (1, kv_heads, len, head_dim), device)?;
                 layer.append(&kt, &vt)?;
+                layer.base = base;
+                layer.len += base;
             }
             staged.push(layer);
         }
@@ -380,15 +454,15 @@ mod tests {
             l.append(&kv(0.0, 3), &kv(10.0, 3)).unwrap();
         }
         let bytes = c.to_bytes().unwrap();
-        // 4 (layer count) + 2 * (12 header + 2 * 3 floats * 4 bytes).
-        assert_eq!(bytes.len(), 4 + 2 * (12 + 2 * 3 * 4));
+        // 4 (layer count) + 2 * (16 header + 2 * 3 floats * 4 bytes).
+        assert_eq!(bytes.len(), 4 + 2 * (16 + 2 * 3 * 4));
         assert_eq!(
             bytes.capacity(),
             bytes.len(),
             "the buffer is sized once, not grown"
         );
         // Little-endian floats, K first: layer 0's K starts at 0.0.
-        assert_eq!(&bytes[16..20], &0.0f32.to_le_bytes());
+        assert_eq!(&bytes[20..24], &0.0f32.to_le_bytes());
         let mut d = KvCache::new(2);
         d.restore(&bytes, &Device::Cpu, &[(1, 1), (1, 1)]).unwrap();
         assert_eq!(d.to_bytes().unwrap(), bytes);
@@ -446,6 +520,99 @@ mod tests {
         assert_eq!(
             k.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             [0.0, 1.0, 100.0, 101.0]
+        );
+    }
+
+    #[test]
+    fn a_windowed_snapshot_keeps_the_tail_and_records_its_base() {
+        let mut src = KvCache::new(2);
+        for l in &mut src.layers {
+            l.append(&kv(0.0, 6), &kv(10.0, 6)).unwrap();
+        }
+        let bytes = src.to_bytes_windowed(&[Some(4), None]).unwrap();
+        // 4 + (16 + 2 * 4 floats * 4) + (16 + 2 * 6 floats * 4).
+        assert_eq!(bytes.len(), 4 + (16 + 2 * 4 * 4) + (16 + 2 * 6 * 4));
+        let mut trimmed = KvCache::new(2);
+        trimmed
+            .restore(&bytes, &Device::Cpu, &[(1, 1), (1, 1)])
+            .unwrap();
+        assert_eq!((trimmed.layers[0].base(), trimmed.layers[0].len()), (2, 6));
+        assert_eq!((trimmed.layers[1].base(), trimmed.layers[1].len()), (0, 6));
+        let (k, v) = trimmed.layers[0].view().unwrap().unwrap();
+        assert_eq!(
+            k.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            [2.0, 3.0, 4.0, 5.0]
+        );
+        assert_eq!(
+            v.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            [12.0, 13.0, 14.0, 15.0]
+        );
+        // Growing a trimmed layer appends after its tail; a second windowed
+        // snapshot moves the base forward.
+        trimmed.layers[0].append(&kv(6.0, 1), &kv(16.0, 1)).unwrap();
+        assert_eq!(trimmed.layers[0].len(), 7);
+        let again = trimmed.to_bytes_windowed(&[Some(4), None]).unwrap();
+        let mut again_restored = KvCache::new(2);
+        again_restored
+            .restore(&again, &Device::Cpu, &[(1, 1), (1, 1)])
+            .unwrap();
+        assert_eq!(
+            (
+                again_restored.layers[0].base(),
+                again_restored.layers[0].len()
+            ),
+            (3, 7)
+        );
+        // An unwindowed snapshot keeps a layer's base as it is.
+        let whole = trimmed.to_bytes().unwrap();
+        let mut whole_restored = KvCache::new(2);
+        whole_restored
+            .restore(&whole, &Device::Cpu, &[(1, 1), (1, 1)])
+            .unwrap();
+        assert_eq!(
+            (
+                whole_restored.layers[0].base(),
+                whole_restored.layers[0].len()
+            ),
+            (2, 7)
+        );
+    }
+
+    #[test]
+    fn truncating_below_a_base_empties_every_layer() {
+        let mut c = KvCache::new(2);
+        for l in &mut c.layers {
+            l.append(&kv(0.0, 6), &kv(0.0, 6)).unwrap();
+        }
+        let bytes = c.to_bytes_windowed(&[Some(4), None]).unwrap();
+        let mut d = KvCache::new(2);
+        d.restore(&bytes, &Device::Cpu, &[(1, 1), (1, 1)]).unwrap();
+        d.truncate(3);
+        assert_eq!((d.layers[0].base(), d.layers[0].len()), (2, 3));
+        assert_eq!(d.layers[1].len(), 3);
+        d.truncate(1);
+        assert!(d.is_empty());
+        assert!(d.layers.iter().all(|l| l.is_empty() && l.base() == 0));
+        // An empty layer grows from position 0 again.
+        d.layers[0].append(&kv(50.0, 2), &kv(50.0, 2)).unwrap();
+        let (k, _) = d.layers[0].view().unwrap().unwrap();
+        assert_eq!(
+            k.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            [50.0, 51.0]
+        );
+    }
+
+    #[test]
+    fn a_base_with_nothing_stored_is_refused() {
+        // n_layers 1, then base 3, len 0, kv_heads 0, head_dim 0.
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        for x in [3u32, 0, 0, 0] {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        assert!(
+            KvCache::new(1)
+                .restore(&bytes, &Device::Cpu, &[(1, 1)])
+                .is_err()
         );
     }
 
