@@ -17,9 +17,15 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 /// whole of "runs at all" for those families.
 pub const MIN_RAM_BYTES: u64 = 96 * GIB;
 
-/// RAM a Gemma engine needs beyond its weights: about 114 KB of f32 KV per
-/// token at the engine's 32768-token default (`docs/GEMMA.md`), rounded up.
+/// RAM a Gemma engine needs beyond its weights when its catalog entry does
+/// not say: about 114 KB of f32 KV per token (E4B) at the engine's default
+/// context, rounded up. An entry's `kvBytesPerToken` replaces it.
 pub const GEMMA_KV_RESERVE_BYTES: u64 = 4 * GIB;
+
+/// The context a Gemma engine opens with when no `-c` is given:
+/// `min(32768, context_length)` (`docs/GEMMA.md`). Both catalog models allow
+/// more, so the reserve is sized at the cap.
+pub const GEMMA_DEFAULT_CTX: u64 = 32_768;
 
 /// Free space a download must leave behind, so the disk is not filled to the
 /// last byte by a model.
@@ -101,6 +107,21 @@ impl EngineRow {
     pub fn selectable(&self) -> bool {
         !matches!(self.fit, Fit::Disabled { .. })
     }
+}
+
+/// The KV a Gemma engine holds in RAM at its default context: the entry's
+/// `kvBytesPerToken` times [`GEMMA_DEFAULT_CTX`], else [`GEMMA_KV_RESERVE_BYTES`].
+///
+/// Declared per engine because it varies five-fold between the two models
+/// (E4B shares KV across 18 layers; 12B keeps 8 heads on 40 sliding layers)
+/// and cannot be read from a file that has not been downloaded yet.
+fn gemma_kv_reserve(entry: &EngineEntry) -> u64 {
+    serde_json::from_str::<serde_json::Value>(&entry.raw)
+        .ok()
+        .and_then(|v| v["kvBytesPerToken"].as_u64())
+        .map_or(GEMMA_KV_RESERVE_BYTES, |b| {
+            b.saturating_mul(GEMMA_DEFAULT_CTX)
+        })
 }
 
 /// A top-level string field of the engine's verbatim JSON.
@@ -229,7 +250,8 @@ fn fit_of(
     if let Some(ram) = m.ram {
         let need = if gemma {
             entry.files.get("main").map(|f| {
-                (f.bytes + GEMMA_KV_RESERVE_BYTES) / crate::download::SSD_STREAMING_RAM_PERCENT
+                f.bytes.saturating_add(gemma_kv_reserve(entry))
+                    / crate::download::SSD_STREAMING_RAM_PERCENT
                     * 100
             })
         } else {
@@ -408,6 +430,43 @@ mod tests {
             &no_staged,
         );
         assert!(row(&rows, "gemma4-e4b").selectable());
+    }
+
+    /// Gemma 4 12B keeps ~688 KB of f32 KV per token (40 sliding layers of 8
+    /// heads at 512 values, 8 global layers of 1 head at 1024), so at the 32K
+    /// default it needs ~22.5 GB of KV on top of its 7 GB of weights: ~37 GB
+    /// of RAM at 80%, not the ~14 GB the flat 4 GiB reserve claimed.
+    #[test]
+    fn a_catalog_kv_cost_sizes_the_gemma_reserve() {
+        let mut w = Vec::new();
+        let cat = parse(
+            &format!(
+                r#"{{"version": 2, "engines": {{"gemma4-12b": {{"version": 1, "family": "gemma",
+                  "kvBytesPerToken": 688128,
+                  "main": {{"name": "g.gguf", "url": "https://h/g", "bytes": 6975879296, "sha256": "{}"}}}}}}}}"#,
+                "a".repeat(64)
+            ),
+            Layer::Published,
+            &mut w,
+        )
+        .expect("parses");
+        let at = |ram| {
+            evaluate(
+                Path::new("/r"),
+                &cat,
+                &machine(Some(ram), Some(500)),
+                &none,
+                None,
+                &no_staged,
+            )
+        };
+        assert_eq!(
+            row(&at(32), "gemma4-12b").fit,
+            Fit::Disabled {
+                reason: "needs 35 GB RAM (this machine: 32 GB)".into()
+            }
+        );
+        assert!(row(&at(64), "gemma4-12b").selectable());
     }
 
     #[test]

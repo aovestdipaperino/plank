@@ -64,6 +64,7 @@
       "released": "2026-10-06",
       "notes": "Gemma 4 E4B instruct Q4_K_M; runs on the native Rust engine",
       "family": "gemma",
+      "kvBytesPerToken": 114688,
       "main": {
         "name": "gemma-4-E4B-it-Q4_K_M.gguf",
         "url": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
@@ -76,6 +77,7 @@
       "released": "2026-10-06",
       "notes": "Gemma 4 12B instruct QAT Q4_0; runs on the native Rust engine",
       "family": "gemma",
+      "kvBytesPerToken": 688128,
       "main": {
         "name": "gemma-4-12b-it-qat-q4_0.gguf",
         "url": "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf",
