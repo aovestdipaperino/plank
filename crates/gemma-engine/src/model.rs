@@ -653,26 +653,34 @@ impl Attention {
         else {
             candle_core::bail!("Gemma 4 shared KV cache is empty")
         };
-        let stored = key.dim(2)?;
-        if stored != offset + sequence {
+        // `stored` is the absolute end; the view holds positions
+        // `base..stored` at indices `0..stored - base`.
+        let (base, stored) = (cache.base(), cache.len());
+        if stored != offset + sequence || key.dim(2)? != stored - base {
             candle_core::bail!(
-                "Gemma 4 KV cache holds {stored} positions, expected {}",
+                "Gemma 4 KV cache holds {base}..{stored}, expected ..{}",
                 offset + sequence
             )
         }
-        // The cache keeps every position. A sliding layer's earliest query
-        // (at `offset`) sees no key before `offset + 1 - window`, so the
-        // keys before that are dropped here; a multi-token forward still
-        // masks below.
+        // A fresh cache keeps every position; one restored from a windowed
+        // snapshot starts at `base`. A sliding layer's earliest query (at
+        // `offset`) sees no key before `offset + 1 - window`, so the keys
+        // before that are dropped here; a multi-token forward still masks
+        // below. `start` is absolute.
         let start = if self.is_sliding {
             (offset + 1).saturating_sub(masks.sliding_window)
         } else {
             0
         };
-        let (key, value) = if start > 0 {
+        if start < base {
+            candle_core::bail!(
+                "Gemma 4 KV cache starts at {base}, attention needs keys from {start}"
+            )
+        }
+        let (key, value) = if start > base {
             (
-                key.narrow(2, start, stored - start)?,
-                value.narrow(2, start, stored - start)?,
+                key.narrow(2, start - base, stored - start)?,
+                value.narrow(2, start - base, stored - start)?,
             )
         } else {
             (key, value)
@@ -948,6 +956,7 @@ pub struct Model {
     context_length: usize,
     signature: [u8; 32],
     kv_shape: Vec<(usize, usize)>,
+    kv_windows: Vec<Option<usize>>,
 }
 
 impl std::fmt::Debug for Model {
@@ -1046,6 +1055,9 @@ impl Model {
         let kv_shape = (0..kv_layer_count)
             .map(|index| (config.kv_heads[index], config.head_dim(index)))
             .collect();
+        let kv_windows = (0..kv_layer_count)
+            .map(|index| config.is_sliding(index).then_some(config.sliding_window))
+            .collect();
         let output_name = if content.tensor_infos.contains_key("output.weight") {
             "output.weight"
         } else {
@@ -1070,6 +1082,7 @@ impl Model {
             context_length,
             signature,
             kv_shape,
+            kv_windows,
         })
     }
 
@@ -1091,6 +1104,13 @@ impl Model {
     #[must_use]
     pub fn kv_shape(&self) -> Vec<(usize, usize)> {
         self.kv_shape.clone()
+    }
+
+    /// The sliding window of each KV-owning layer, in cache order: `Some`
+    /// for a sliding layer, `None` for a global one, which sees every key.
+    #[must_use]
+    pub fn kv_windows(&self) -> Vec<Option<usize>> {
+        self.kv_windows.clone()
     }
 
     /// Bytes one position adds to the cache: K and V, f32, every owner.

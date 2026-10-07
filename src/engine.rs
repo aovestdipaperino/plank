@@ -949,6 +949,17 @@ pub trait Engine: Debug + Send {
         false
     }
 
+    /// Drops whatever the live KV holds past its common prefix with the
+    /// rendered `transcript`, without prefilling anything.
+    ///
+    /// Called when a sidechain ends, and after `/btw`, on an engine that
+    /// [`kv_truncates_exactly`](Self::kv_truncates_exactly), which takes no
+    /// fork snapshot to restore: without it the session keeps the sidechain's
+    /// tail until the next `generate`, and a snapshot captured in between
+    /// (exit, `/checkpoint`) records that tail, which a restored Gemma session
+    /// cannot truncate back through. The default does nothing.
+    fn sync_to_prefix(&mut self, _transcript: &str) {}
+
     /// Reports how the live KV lines up with the prompt the next `generate`
     /// call will build from `transcript`, without generating anything.
     ///

@@ -3412,10 +3412,45 @@ llama.cpp (commit `d7a695e`), pinned by
   divergence behind the live end is never the rebuild-from-zero shape that the
   rung and fork rescue exist for. `Engine::kv_truncates_exactly` goes further:
   the agent takes no fork snapshot (sub-agent, memory pass, suggestion), no
-  memory-pass prefill snapshot and no ladder rung. Each `get_kv` serialises
-  the whole f32 KV, about 114 KB per token on E4B (≈3.5 GB at 30k tokens), and
-  `KvCache::restore` stages a second copy, so a fork could peak near 16 GB on
-  a 16 GB Mac for a prefix the next `generate` keeps anyway.
+  memory-pass prefill snapshot and no ladder rung. When this was decided each
+  `get_kv` serialised the whole f32 KV, about 114 KB per token on E4B
+  (≈3.5 GB at 30k tokens), and `KvCache::restore` staged a second copy, for a
+  prefix the next `generate` keeps anyway. Snapshots are now trimmed (next
+  entry), but a fork snapshot would still copy every global layer whole and
+  buy nothing.
+- **A Gemma snapshot trims its sliding layers to the window.** Per token,
+  f32, 12B holds 40 sliding layers x 8 KV heads x (256 K + 256 V) plus
+  8 global layers x 1 head x (512 + 512): 172,032 floats, 688,128 bytes, 95%
+  of it sliding (E4B: about 114,688 bytes over 24 KV-owning layers). A real
+  40K-token 12B snapshot (`feisty-joule.kv_raw`) was 28 GB, though a sliding
+  layer only ever reads its last 1024 keys (512 on E4B). Format 2 writes
+  just those plus a per-layer `base`; global layers stay whole, so that
+  snapshot is about 2 GB. The catch is truncation after a restore: a query
+  at `n` needs keys from `n + 1 - window`, so a restored session truncates
+  exactly only down to `base + window - 1`, not down to `base`. Below that
+  `Session::truncate` empties the session (the next prefill rebuilds from
+  zero) and `kv_reuse_probe` reports the real length as `live`, so the agent
+  is not told it keeps tokens it no longer has.
+  Two consequences. Snapshots keep `SNAPSHOT_SLACK` (64) positions past the
+  window, so a restore truncates exactly down to 65 tokens behind its end.
+  And a side pass's tail must not reach a snapshot (the sidechain ends and
+  `/btw` sync; see below): with no fork snapshot
+  (`kv_truncates_exactly`), a suggestion (~240 tokens), a memory pass (up to
+  ~10K) or a sub-agent left its tokens on the live session until the next
+  `generate`, so `save_for_exit` or `/checkpoint` in between recorded them,
+  and the resumed turn, diverging at the parent prefix far below the floor,
+  rebuilt from zero where an untrimmed snapshot had truncated exactly.
+  `restore_fork_kv` now calls `Engine::sync_to_prefix` with the parent's
+  rendered transcript, which trims the Gemma session there without
+  prefilling (a no-op on every other engine). `/btw`, which runs on the live
+  session and pushes nothing to the transcript, syncs the same way once its
+  answers are done (`sync_exact_kv_to_parent`, on both the TUI and plain
+  paths, every exit). Known costs: a GPU-yield cycle inside a sub-agent on
+  Gemma restores a trimmed mid-sidechain snapshot that the fork-end sync then
+  truncates below the floor, so the parent's next pass rebuilds from zero
+  (rare, one rebuild, not a correctness issue); and a memory pass interrupted
+  by Esc alone re-prefills its task (up to ~8-10K tokens) on retry, the price
+  of keeping its tail out of exit snapshots.
 - **Suggestions with thinking on need `emits_think_tags`.**
   `suggest::reasoning_unfinished` assumed DeepSeek's implicit think block: a
   reply without `</think>` meant the budget ran out mid-thought. Gemma opens

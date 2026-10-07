@@ -484,14 +484,15 @@ impl Engine for GemmaEngine {
         if common == full.len() {
             common = common.saturating_sub(1);
         }
+        let live = self.session.tokens().len();
+        // Below a restored snapshot's sliding window the session empties.
+        let common = self.session.truncate(common);
         crate::engine::kv_debug(|| {
             format!(
-                "gemma generate: prompt={} live={} reused={common}",
-                full.len(),
-                self.session.tokens().len()
+                "gemma generate: prompt={} live={live} reused={common}",
+                full.len()
             )
         });
-        self.session.truncate(common);
         let Some(mut logits) = self.prefill(common, &full[common..], interrupt, on_event)? else {
             return Ok(GenerationStats {
                 interrupted: true,
@@ -575,6 +576,29 @@ impl Engine for GemmaEngine {
         true
     }
 
+    /// Truncates the session to its common prefix with `transcript`, the
+    /// truncation the next `generate` would make, so a snapshot taken before
+    /// that turn does not record a sidechain's tail. A restored session keeps
+    /// only `window + SNAPSHOT_SLACK` positions per sliding layer, so a tail
+    /// longer than the slack would otherwise turn the resumed turn into a
+    /// rebuild from zero. Left alone during a warm walk, which owns the
+    /// transcript until `warm_sync`.
+    fn sync_to_prefix(&mut self, transcript: &str) {
+        if self.warm_pending {
+            return;
+        }
+        self.reconcile(transcript);
+        let want = to_u32(self.transcript.tokens());
+        let common = common_prefix(self.session.tokens(), &want);
+        let kept = self.session.truncate(common);
+        crate::engine::kv_debug(|| {
+            format!(
+                "gemma sync_to_prefix: transcript={} common={common} kept={kept}",
+                want.len()
+            )
+        });
+    }
+
     /// Reports the reusable prefix as the live end: `live == common`.
     ///
     /// Gemma's KV truncates exactly, so a prompt that diverges behind the live
@@ -583,6 +607,12 @@ impl Engine for GemmaEngine {
     /// describes (the ds4 sync's), which the agent answers by restoring a
     /// ladder rung or fork snapshot and by skipping prompt suggestions.
     /// Reporting the real session length would buy both for nothing.
+    ///
+    /// The exception is a session restored from a snapshot, whose sliding
+    /// layers hold only their window plus `SNAPSHOT_SLACK`: diverging so far
+    /// behind its end that [`Session::reusable`] is 0 empties it, so the probe
+    /// reports the real length, the rebuild shape. So does a prompt sharing no
+    /// token at all, which keeps nothing on any session.
     fn kv_reuse_probe(&mut self, transcript: &str, _think: ThinkMode) -> Option<KvReuse> {
         let render = self.render();
         let mut tokens = self.transcript.clone();
@@ -590,10 +620,15 @@ impl Engine for GemmaEngine {
         render.reconcile(&mut tokens, &mut kinds, transcript);
         let mut full = to_u32(tokens.tokens());
         full.extend(render.generation_prefix(&kinds));
-        let common = count(common_prefix(self.session.tokens(), &full));
+        let common = common_prefix(self.session.tokens(), &full);
+        let live = if common > 0 && self.session.reusable(common) == common {
+            common
+        } else {
+            self.session.tokens().len()
+        };
         Some(KvReuse {
-            live: common,
-            common,
+            live: count(live),
+            common: count(common),
         })
     }
 
@@ -676,7 +711,7 @@ impl Engine for GemmaEngine {
         let want = to_u32(self.transcript.tokens());
         self.check_fits(want.len())?;
         let common = common_prefix(self.session.tokens(), &want);
-        self.session.truncate(common);
+        let common = self.session.truncate(common);
         if common == want.len() {
             return Ok(false);
         }
@@ -846,6 +881,138 @@ mod tests {
         assert_eq!(probe.live, probe.common);
         assert!(usize::try_from(probe.common).unwrap() < live);
         assert!(probe.common > 0 && !probe.rebuilds_from_zero());
+    }
+
+    /// A restored snapshot keeps only the sliding window (plus
+    /// `SNAPSHOT_SLACK`) of each sliding layer, so a prompt diverging well
+    /// behind its end cannot truncate
+    /// there: the probe says so (`live` stays the session length, so the
+    /// agent sees a rebuild), and the turn rebuilds from scratch to the same
+    /// result as a fresh engine.
+    #[test]
+    fn a_divergence_below_a_restored_window_rebuilds_truthfully() {
+        let mut a = engine();
+        // Longer than the window plus the snapshot slack, so the restore is
+        // trimmed and the divergence lands below its floor.
+        let long = "a long enough prompt ".repeat(6);
+        run(
+            &mut a,
+            &format!("[system]\nsys\n[user]\nhello there, {long}\n"),
+        );
+        let snap = a.get_kv().unwrap();
+        let mut b = engine();
+        b.set_kv(&snap).unwrap();
+        let live = b.session.tokens().len();
+        let other = "[system]\nsys\n[user]\nsomething else\n";
+        let probe = b.kv_reuse_probe(other, ThinkMode::Off).unwrap();
+        assert_eq!(usize::try_from(probe.live).unwrap(), live);
+        assert!(probe.common > 0 && probe.rebuilds_from_zero());
+        let got = run(&mut b, other);
+        assert_eq!(to_u32(b.transcript.tokens()), b.session.tokens());
+        assert_eq!(got, run(&mut engine(), other));
+    }
+
+    /// Runs one turn and returns its reply with the number of prompt tokens
+    /// it prefilled (the first progress event's `total`: the cached prefix
+    /// excluded).
+    fn run_prefilled(e: &mut GemmaEngine, flat: &str) -> (String, usize) {
+        let mut text = String::new();
+        let mut prefilled = None;
+        e.generate(
+            Prompt::Flat(flat),
+            &opts(),
+            &|| false,
+            &|| true,
+            &mut |ev| match ev {
+                EngineEvent::Text(t) => text.push_str(&t),
+                EngineEvent::Prefill(p) if prefilled.is_none() => {
+                    prefilled = Some(usize::try_from(p.total).unwrap());
+                }
+                _ => {}
+            },
+        )
+        .unwrap();
+        (text, prefilled.expect("a prefill event"))
+    }
+
+    /// Tokens `generate` evaluates for `flat`: the rendered transcript plus
+    /// the generation prefix.
+    fn prompt_len(flat: &str) -> usize {
+        let mut e = engine();
+        e.reconcile(flat);
+        e.transcript.tokens().len() + e.render().generation_prefix(&e.kinds).len()
+    }
+
+    /// A transcript whose user turn is `chars` bytes, for prompts past the
+    /// tiny model's window plus the snapshot slack.
+    fn long_turn(chars: usize) -> String {
+        let body: String = "the quick brown fox jumps over the lazy dog "
+            .chars()
+            .cycle()
+            .take(chars)
+            .collect();
+        format!("[system]\nsys\n[user]\n{}\n", body.trim_end())
+    }
+
+    /// The `/resume` path: a snapshot taken at the end of a turn, restored
+    /// on a fresh engine (trimmed, since the turn is longer than the window
+    /// plus the slack), prefills only the next user turn.
+    #[test]
+    fn a_restored_turn_end_prefills_only_the_next_turn() {
+        let mut a = engine();
+        let t1 = long_turn(100);
+        let reply = run(&mut a, &t1);
+        let snap = a.get_kv().unwrap();
+        let mut b = engine();
+        b.set_kv(&snap).unwrap();
+        let live = b.session.tokens().len();
+        let t2 = format!("{t1}[assistant]\n{reply}\n[user]\nmore\n");
+        let probe = b.kv_reuse_probe(&t2, ThinkMode::Off).unwrap();
+        assert!(!probe.rebuilds_from_zero(), "{probe:?}");
+        let (_, prefilled) = run_prefilled(&mut b, &t2);
+        assert_eq!(prefilled, prompt_len(&t2) - live);
+    }
+
+    /// A sidechain (a suggestion, a memory pass) runs on the live session and
+    /// leaves its tail there. Ending it through `sync_to_prefix`, as the agent
+    /// does, drops that tail, so a snapshot taken afterwards ends at the
+    /// parent's prefix and the next real turn after a restore prefills only
+    /// its own suffix instead of rebuilding from zero.
+    #[test]
+    fn a_snapshot_after_a_synced_sidechain_resumes_without_a_rebuild() {
+        let mut a = engine();
+        let t1 = long_turn(30);
+        let reply = run(&mut a, &t1);
+        let parent = format!("{t1}[assistant]\n{reply}\n");
+        let parent_len = a.session.tokens().len();
+        // The sidechain: the parent plus a task well past the window + slack.
+        let task = "x".repeat(100);
+        run(&mut a, &format!("{parent}[user]\n{task}\n"));
+        assert!(a.session.tokens().len() > parent_len + 100);
+        a.sync_to_prefix(&parent);
+        assert_eq!(a.session.tokens().len(), parent_len);
+        let snap = a.get_kv().unwrap();
+        let mut b = engine();
+        b.set_kv(&snap).unwrap();
+        let t2 = format!("{parent}[user]\nmore\n");
+        let probe = b.kv_reuse_probe(&t2, ThinkMode::Off).unwrap();
+        assert!(!probe.rebuilds_from_zero(), "{probe:?}");
+        let (got, prefilled) = run_prefilled(&mut b, &t2);
+        assert_eq!(prefilled, prompt_len(&t2) - parent_len);
+        // The same turn on the engine that took the snapshot, never restored.
+        assert_eq!(got, run(&mut a, &t2));
+    }
+
+    /// The parent's own reply is kept: syncing to the transcript the session
+    /// already matches drops nothing.
+    #[test]
+    fn syncing_to_the_live_transcript_keeps_every_token() {
+        let mut e = engine();
+        let t1 = "[system]\nsys\n[user]\nhello\n";
+        let reply = run(&mut e, t1);
+        let live = e.session.tokens().len();
+        e.sync_to_prefix(&format!("{t1}[assistant]\n{reply}\n"));
+        assert_eq!(e.session.tokens().len(), live);
     }
 
     /// The system turn carries `<|think|>` only while thinking is on, so a
