@@ -769,6 +769,27 @@ the surface. It is a deliberate deviation, gated behind `tools.spillMaxBytes`
 (default high enough that ordinary sessions never spill). Regenerate fixtures
 with `PLANK_REGEN_FIXTURES=1 cargo test` if a fixture ever pins this text.
 
+**The threshold has to follow the context, not just the configured bytes.**
+`tools.spillMaxBytes` defaults to 1 MiB, sized for the 1M-token window. On a
+32K-token Gemma window that let a whole-file `read` of a 304 KB source
+(`feisty-joule`, `bruto-pascal-lang/src/codegen.rs`, about 100K tokens) go
+inline, and the next pass failed with `context full: 115631 tokens > 65536`
+even after the user raised `-c`. Nothing downstream could recover it:
+micro-compaction clears *older* results and keeps the recent tail where this
+one sat, and a summary pass cannot be prefilled while one message is larger
+than the window. Two rules now cover it. At dispatch, `spill::within_room`
+caps the threshold at half the tokens still free (`ToolContext::context_room`,
+set by `Agent::note_ctx_used` after every pass, charged by each result in a
+round), at an assumed 3 bytes per token, never below the preview size. Before
+the next pass, `Agent::try_spill_oversized` (ahead of micro-compaction in both
+`maybe_compact` and `maybe_compact_notify`) spills in place any tool result
+that alone takes more than half the window (`compact::oversized_result`), the
+backstop for sessions saved before the first rule. Verified by resuming a copy
+of `feisty-joule` on Gemma 12B at the default 32K: one "spilled an oversized
+tool result" line, no overflow, and the session continued. The rule applies to
+every engine, so DeepSeek sessions also start spilling large results earlier
+(about 190 KB on an empty 131K window, less as it fills).
+
 ## Microcompact cadence (M5) — the KV effect, measured
 
 The opportunistic end-of-turn microcompact (`try_microcompact_opportunistic`,

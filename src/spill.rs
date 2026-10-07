@@ -26,6 +26,45 @@ pub struct SpillPolicy {
     pub preview_bytes: usize,
 }
 
+/// Bytes per token assumed when sizing a result against the context window.
+///
+/// An estimate on the low side for source code and logs (both tokenizers
+/// average closer to 3.5-4 on prose), because erring low only spills a result
+/// that would have fit, while erring high lets one overflow the window.
+pub const BYTES_PER_TOKEN: usize = 3;
+
+/// `policy` with its spill threshold also bounded by the context left:
+/// one result may take at most half of the `room_tokens` still free, so the
+/// next generation always has space for it and for a reply.
+///
+/// The configured `max_bytes` stays an upper bound, sized for the 1M-token
+/// window; this is what makes the same rule safe on a 32K one, where a single
+/// 300 KB `read` used to overflow the window outright (FINDINGS.md). Never
+/// below `preview_bytes`, or a nearly full window would spill even tiny
+/// results into a preview of themselves. `None` (the room is not known yet)
+/// keeps the policy as configured.
+#[must_use]
+pub fn within_room(policy: SpillPolicy, room_tokens: Option<usize>) -> SpillPolicy {
+    let Some(room) = room_tokens else {
+        return policy;
+    };
+    let cap = (room / 2)
+        .saturating_mul(BYTES_PER_TOKEN)
+        .max(policy.preview_bytes);
+    SpillPolicy {
+        max_bytes: policy.max_bytes.min(cap),
+        ..policy
+    }
+}
+
+/// Deducts a result of `bytes` from the remaining `room_tokens`, so several
+/// calls in one round share the window rather than each seeing all of it.
+pub fn charge(room_tokens: &mut Option<usize>, bytes: usize) {
+    if let Some(room) = room_tokens {
+        *room = room.saturating_sub(bytes / BYTES_PER_TOKEN);
+    }
+}
+
 /// One spilled payload, for the `more` continuation tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spilled {
@@ -132,6 +171,44 @@ pub fn apply_in(
     (out, Some(spilled))
 }
 
+/// Spills the body of a `<tool_result>…</tool_result>` message already in the
+/// transcript, returning the message rewritten to its preview and locator, or
+/// `None` when `text` is not a tool result or the spill did not happen.
+///
+/// The after-the-fact counterpart of [`apply`], for a result that reached the
+/// transcript too big for the window (`compact::oversized_result`). The
+/// payload written to disk is the body alone, so `more` pages through the
+/// tool's output and never through the wrapper tags.
+#[must_use]
+pub fn spill_tool_result_in(
+    root: &std::path::Path,
+    policy: &SpillPolicy,
+    session_id: &str,
+    text: &str,
+) -> Option<(String, Spilled)> {
+    let body = text
+        .strip_prefix("<tool_result>")?
+        .strip_suffix("</tool_result>")
+        .unwrap_or_else(|| &text["<tool_result>".len()..]);
+    let (preview, spilled) = apply_in(root, policy, session_id, "tool_result", body.to_owned());
+    let spilled = spilled?;
+    Some((format!("<tool_result>{preview}</tool_result>"), spilled))
+}
+
+/// [`spill_tool_result_in`] under the real spill root.
+#[must_use]
+pub fn spill_tool_result(
+    policy: &SpillPolicy,
+    session_id: &str,
+    text: &str,
+) -> Option<(String, Spilled)> {
+    let out = spill_tool_result_in(&spill_dir(), policy, session_id, text);
+    if out.is_some() {
+        crate::status::note_spill();
+    }
+    out
+}
+
 /// Reads the full payload of a spilled result by id (`"<session-id>/<n>"`).
 #[must_use]
 pub fn read_spill(id: &str) -> Option<String> {
@@ -216,6 +293,74 @@ fn collect_txt(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BASE: SpillPolicy = SpillPolicy {
+        max_bytes: 1_048_576,
+        preview_bytes: 4096,
+    };
+
+    /// `feisty-joule`: a fresh 32K-token Gemma window, and a 304 KB `read`.
+    /// Half the room at ~3 bytes a token is ~49 KB, so it spills.
+    #[test]
+    fn a_tool_result_message_is_rewritten_to_its_preview() {
+        let root = ScratchRoot::new("rewrite");
+        let policy = SpillPolicy {
+            max_bytes: 0,
+            preview_bytes: 10,
+        };
+        let text = format!("<tool_result>{}</tool_result>", "z".repeat(100));
+        let (out, spilled) =
+            spill_tool_result_in(root.path(), &policy, "s", &text).expect("spilled");
+        assert!(
+            out.starts_with("<tool_result>zzzzzzzzzz\n[Output truncated at 10 bytes of 100."),
+            "{out}"
+        );
+        assert!(out.ends_with("</tool_result>"), "{out}");
+        assert_eq!(spilled.bytes, 100, "the payload, not the wrapper");
+        assert_eq!(
+            std::fs::read_to_string(&spilled.path).expect("blob"),
+            "z".repeat(100)
+        );
+        assert!(spill_tool_result_in(root.path(), &policy, "s", "plain text").is_none());
+    }
+
+    #[test]
+    fn a_small_window_spills_what_would_not_fit() {
+        let p = within_room(BASE, Some(32_768));
+        assert_eq!(p.max_bytes, 32_768 / 2 * BYTES_PER_TOKEN);
+        assert!(p.max_bytes < 304_418);
+        assert_eq!(p.preview_bytes, 4096);
+    }
+
+    #[test]
+    fn the_user_cap_still_bounds_a_large_window() {
+        assert_eq!(within_room(BASE, Some(10_000_000)), BASE);
+    }
+
+    #[test]
+    fn unknown_room_keeps_the_configured_policy() {
+        assert_eq!(within_room(BASE, None), BASE);
+    }
+
+    /// A nearly full window must not shrink the cap below the preview, or
+    /// every result, however small, would spill into a preview of itself.
+    #[test]
+    fn the_cap_never_drops_below_the_preview() {
+        let p = within_room(BASE, Some(10));
+        assert_eq!(p.max_bytes, BASE.preview_bytes);
+    }
+
+    #[test]
+    fn a_result_is_charged_against_the_room_it_leaves() {
+        let mut room = Some(1000);
+        charge(&mut room, 3 * BYTES_PER_TOKEN);
+        assert_eq!(room, Some(997));
+        charge(&mut room, usize::MAX);
+        assert_eq!(room, Some(0));
+        let mut unknown = None;
+        charge(&mut unknown, 300);
+        assert_eq!(unknown, None);
+    }
 
     /// A scratch spill root unique to one test. Spill state is on-disk and
     /// `sweep` walks the whole root, so tests sharing `~/.plank/spill` corrupt

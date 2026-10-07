@@ -95,6 +95,12 @@ pub struct ToolContext {
     pub spill: Option<crate::spill::Spilled>,
     /// Session id, used to scope spill storage under `~/.plank/spill/<id>/`.
     pub session_id: String,
+    /// Tokens still free in the engine's context window, as the turn loop
+    /// last measured it, less what the results dispatched since have taken.
+    /// Bounds the spill threshold ([`crate::spill::within_room`]) so one tool
+    /// result can never fill a small window on its own. `None` until the first
+    /// generation reports its usage, and in tests: the configured cap applies.
+    pub context_room: Option<usize>,
     /// The live transcript, for the `recall` tool to search the current
     /// session's pre-compaction portion alongside the saved-session index.
     /// Populated by the turn loop before dispatch; empty in tests.
@@ -358,6 +364,7 @@ impl ToolContext {
             more: None,
             spill: None,
             session_id: String::new(),
+            context_room: None,
             current_transcript: Vec::new(),
             bash: bash::BashJobs::default(),
             web: web::WebState::default(),
@@ -790,12 +797,19 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     // the full output and only the model sees the preview. The full payload is
     // written to `~/.plank/spill/<session-id>/` and the inline result becomes a
     // bounded preview plus a locator the `more` tool can continue.
+    // The threshold is also bounded by the context still free, so a result a
+    // small window cannot hold arrives as a preview the model pages through,
+    // and what it does keep inline is charged against that room.
     let s = crate::settings::active().tools.clone();
-    let policy = crate::spill::SpillPolicy {
-        max_bytes: s.spill_max_bytes,
-        preview_bytes: s.spill_preview_bytes,
-    };
+    let policy = crate::spill::within_room(
+        crate::spill::SpillPolicy {
+            max_bytes: s.spill_max_bytes,
+            preview_bytes: s.spill_preview_bytes,
+        },
+        ctx.context_room,
+    );
     let (preview, spilled) = crate::spill::apply(&policy, &ctx.session_id, &call.name, output);
+    crate::spill::charge(&mut ctx.context_room, preview.len());
     ctx.spill = spilled;
     ToolResult::from_output(preview)
 }
@@ -2095,6 +2109,42 @@ mod tests {
             "more continues the spill: {}",
             more.output
         );
+        std::fs::remove_dir_all(crate::spill::spill_dir().join(&ctx.session_id)).ok();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `feisty-joule`: a whole-file `read` of a 304 KB source on a 32K-token
+    /// Gemma window went inline and overflowed it. With the configured cap at
+    /// its 1 MiB default, the room alone must spill it, and the room left
+    /// afterwards must account for the preview the model did receive.
+    #[test]
+    fn a_result_the_room_cannot_hold_spills_under_the_configured_cap() {
+        if !home_writable() {
+            return;
+        }
+        let _settings_guard =
+            crate::settings::install_for_test(crate::settings::Settings::default());
+        let (mut ctx, dir) = test_ctx();
+        ctx.session_id = format!(
+            "plank-test-room-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        ctx.context_room = Some(32_768);
+        let big = dir.join("codegen.rs");
+        std::fs::write(&big, "let x = 1;\n".repeat(30_000)).expect("write");
+        let res = dispatch(
+            &test_call("read", &[("path", "codegen.rs"), ("whole", "true")]),
+            &mut ctx,
+        );
+        assert!(
+            res.output.contains("[Output truncated at"),
+            "a 330 KB read on a 32K window spills: {}",
+            &res.output[..res.output.len().min(300)]
+        );
+        assert!(ctx.spill.is_some(), "and `more` can continue it");
+        let left = ctx.context_room.expect("room still tracked");
+        assert!(left < 32_768 && left > 30_000, "preview charged: {left}");
         std::fs::remove_dir_all(crate::spill::spill_dir().join(&ctx.session_id)).ok();
         std::fs::remove_dir_all(dir).ok();
     }

@@ -287,6 +287,34 @@ pub fn microcompact(
     (cleared, bytes)
 }
 
+/// The tool result that alone takes more than half of a `ctx_size` window,
+/// the largest when several do, or `None`.
+///
+/// The backstop for a result that reached the transcript too big to fit: one
+/// from a session saved before the spill threshold followed the context, or
+/// from any path the threshold does not see. Micro-compaction cannot help with
+/// it (it clears *older* results and keeps the recent tail), and a summary
+/// pass cannot run while one message is larger than the window, so the caller
+/// spills this one in place instead. Image-bearing results are exempt, as in
+/// micro-compaction: their image tokens cannot follow the text out.
+pub fn oversized_result(
+    transcript: &[Message],
+    ctx_size: i32,
+    count_tokens: &mut dyn FnMut(&str) -> i32,
+) -> Option<usize> {
+    let half = ctx_size / 2;
+    transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.role == Role::User && m.text.starts_with("<tool_result>") && m.images.is_empty()
+        })
+        .map(|(i, m)| (i, count_tokens(&m.text)))
+        .filter(|&(_, tokens)| tokens > half)
+        .max_by_key(|&(_, tokens)| tokens)
+        .map(|(i, _)| i)
+}
+
 /// [`microcompact`] with no budget: every candidate is cleared. Tests and
 /// callers that want the old sweep behaviour.
 pub fn microcompact_all(transcript: &mut [Message]) -> (usize, usize) {
@@ -542,6 +570,39 @@ mod tests {
             "reasoning must be discarded, got: {got:?}"
         );
         assert!(!got.contains('<'), "tags must be unwrapped, got: {got:?}");
+    }
+
+    /// The backstop for a result no cap stopped (`feisty-joule`, resumed):
+    /// the largest tool result is named only when it alone takes more than
+    /// half the window, and an image-bearing one never is.
+    #[test]
+    fn the_oversized_result_is_the_largest_one_past_half_the_window() {
+        let bytes = |s: &str| i32::try_from(s.len()).unwrap_or(i32::MAX);
+        let t = vec![
+            Message::user("look at codegen.rs"),
+            Message::user(format!("<tool_result>{}</tool_result>", "a".repeat(400))),
+            Message::assistant("reading the whole file"),
+            Message::user(format!("<tool_result>{}</tool_result>", "b".repeat(700))),
+        ];
+        assert_eq!(oversized_result(&t, 1000, &mut |s| bytes(s)), Some(3));
+        assert_eq!(oversized_result(&t, 2000, &mut |s| bytes(s)), None);
+        let mut with_image = t.clone();
+        with_image[3].images.push(crate::engine::VisionImage {
+            path: "img.png".to_string(),
+            embedding: crate::engine::VisionEmbedding {
+                data: vec![0.0; 4],
+                token_count: 1,
+                layout: 0,
+                grid_width: 1,
+                grid_height: 1,
+                width: 8,
+                height: 8,
+                content_width: 8,
+                content_height: 8,
+                fingerprint: [1; 32],
+            },
+        });
+        assert_eq!(oversized_result(&with_image, 1000, &mut |s| bytes(s)), None);
     }
 
     fn big_tool_result(tag: &str) -> Message {
