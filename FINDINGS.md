@@ -3483,3 +3483,28 @@ llama.cpp (commit `d7a695e`), pinned by
   a file called `1` into the working directory. On Gemma it logs one
   `gemma reconcile:` line per render and one `gemma generate: prompt= live=
   reused=` line per pass.
+
+## Gemma copies `read`'s line numbers into `edit`, so the match retries without them
+
+**2026-10-07:** a Gemma 4 E4B session (repro `repro-1791356341`) failed
+three edits in a row with `old text anchor not found`. The tool was right
+every time; the target file was plain LF with no hidden bytes. The first
+`old` was a misremembered version of an enum. The other two were copied
+straight from `read` output, line-number prefixes included
+(`old: "47 }\n48 \n49 /// Compilation options..."`,
+`old: "57     pub obfuscate: bool,"`). The bare error never told the model
+what was wrong, so it guessed that the numbers were "relative to the chunk"
+and kept failing.
+
+`find_old_span_lenient` (`src/tools/edit.rs`) now retries a "not found"
+`old` with the prefixes removed, but only when every line carries one and
+the numbers run consecutively (an `[upto]` line may skip). `new` loses its
+prefixes only when it carries them on every line too. Three rules keep this
+safe and keep the C wire format for every edit that works today. The exact
+match always runs first, so a file that really contains `1 apple` is edited
+as written. The stripped text must still resolve to a unique span, so an
+ambiguous one reports the original `not found` rather than guessing. The
+error text never changes, and only a successful retry adds a
+`Note: removed read's line-number prefixes` line to the result, so the model
+learns to leave them out. The preflight runs the same retry, so it never
+rejects an edit the tool would accept.

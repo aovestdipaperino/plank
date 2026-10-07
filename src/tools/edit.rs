@@ -145,6 +145,105 @@ fn file_uses_crlf(data: &[u8]) -> bool {
     saw_newline
 }
 
+/// Strips `read`'s `N ` line-number prefixes from a model-authored text.
+///
+/// `read` shows each line as `<number> <text>`, and a small model (Gemma 4
+/// E4B in the field, see FINDINGS.md) copies those prefixes into `old` and
+/// `new` as if they were file content, so the edit can never match.
+/// Returns the text without them when every line carries one and the
+/// numbers run consecutively; an `[upto]` line is kept as is and may skip
+/// numbers, since the head and tail come from different places. Returns
+/// `None` when the text does not look like `read` output.
+fn strip_read_line_numbers(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut prev: Option<u64> = None;
+    let mut numbered = 0usize;
+    for line in text.split_inclusive('\n') {
+        let (body, eol) = if let Some(b) = line.strip_suffix("\r\n") {
+            (b, "\r\n")
+        } else if let Some(b) = line.strip_suffix('\n') {
+            (b, "\n")
+        } else {
+            (line, "")
+        };
+        if body.trim() == "[upto]" {
+            out.push_str(line);
+            prev = None;
+            continue;
+        }
+        let digits = body.len() - body.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 {
+            return None;
+        }
+        let n: u64 = body[..digits].parse().ok()?;
+        let rest = &body[digits..];
+        let content = match rest.strip_prefix(' ') {
+            Some(c) => c,
+            None if rest.is_empty() => rest,
+            None => return None,
+        };
+        if prev.is_some_and(|p| p + 1 != n) {
+            return None;
+        }
+        prev = Some(n);
+        numbered += 1;
+        out.push_str(content);
+        out.push_str(eol);
+    }
+    (numbered > 0).then_some(out)
+}
+
+/// Locates an edit's old span, retrying without `read` line-number prefixes.
+///
+/// The exact match always runs first, so an edit that matches as written is
+/// never touched. Only when it reports "not found" and `old` looks like
+/// copied `read` output is the stripped `old` tried; `new` loses its
+/// prefixes too when it carries them on every line.
+///
+/// # Errors
+///
+/// Returns the original anchor diagnostic when neither form matches.
+fn find_old_span_lenient(data: &[u8], old: &str, new: String) -> Result<OldSpan, String> {
+    let err = match edit_find_old_span(data, old.as_bytes()) {
+        Ok((offset, len, anchored)) => {
+            return Ok(OldSpan {
+                new,
+                offset,
+                len,
+                anchored,
+                stripped: false,
+            });
+        }
+        Err(err) => err,
+    };
+    if !err.contains("not found") {
+        return Err(err);
+    }
+    let Some(stripped) = strip_read_line_numbers(old) else {
+        return Err(err);
+    };
+    match edit_find_old_span(data, stripped.as_bytes()) {
+        Ok((offset, len, anchored)) => Ok(OldSpan {
+            new: strip_read_line_numbers(&new).unwrap_or(new),
+            offset,
+            len,
+            anchored,
+            stripped: true,
+        }),
+        Err(_) => Err(err),
+    }
+}
+
+/// Where an edit's old text sits, and the new text to put there.
+struct OldSpan {
+    new: String,
+    offset: usize,
+    len: usize,
+    anchored: bool,
+    /// `read` line-number prefixes were removed to find the match.
+    stripped: bool,
+}
+
 /// Preflights an edit's old text against the current file contents.
 ///
 /// Mirrors `agent_preflight_edit_old`: silently passes while the path is
@@ -163,8 +262,8 @@ pub fn preflight_edit_old(ctx: &ToolContext, call: &ToolCall) -> Result<(), Stri
         return Err("edit requires non-empty old text".to_string());
     }
     let data = read_file_bytes(&ctx.resolve(path), path)?;
-    let (old, _) = adapt_line_endings(&data, old, "");
-    edit_find_old_span(&data, old.as_bytes()).map(|_| ())
+    let (old, new) = adapt_line_endings(&data, old, "");
+    find_old_span_lenient(&data, &old, new).map(|_| ())
 }
 
 fn line_for_offset(spans: &[LineSpan], offset: usize) -> usize {
@@ -314,7 +413,13 @@ pub fn tool_edit(ctx: &mut ToolContext, call: &ToolCall) -> String {
         Err(err) => return format!("Tool error: {err}\n"),
     };
     let (old, new_text) = adapt_line_endings(&data, old, new_text);
-    let (offset, remove_len, anchored) = match edit_find_old_span(&data, old.as_bytes()) {
+    let OldSpan {
+        new: new_text,
+        offset,
+        len: remove_len,
+        anchored,
+        stripped,
+    } = match find_old_span_lenient(&data, &old, new_text) {
         Ok(span) => span,
         Err(err) => return format!("Tool error: {err}\n"),
     };
@@ -342,7 +447,15 @@ pub fn tool_edit(ctx: &mut ToolContext, call: &ToolCall) -> String {
     } else {
         "old/new replacement"
     };
-    edit_result(path, effect, &out_data, kind)
+    let mut out = edit_result(path, effect, &out_data, kind);
+    if stripped {
+        out.insert_str(
+            out.find('\n').map_or(out.len(), |i| i + 1),
+            "Note: removed read's line-number prefixes from old/new; they are \
+             not file content, so leave them out of old and new.\n",
+        );
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,6 +1144,110 @@ mod tests {
             ),
             "Tool error: edit requires new text\n"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn strip_read_line_numbers_accepts_only_consecutive_prefixes() {
+        assert_eq!(
+            strip_read_line_numbers("47 }\n48 \n49 /// doc\n").as_deref(),
+            Some("}\n\n/// doc\n")
+        );
+        // A blank line whose trailing space the model dropped still counts.
+        assert_eq!(
+            strip_read_line_numbers("7 a\n8\n9 b").as_deref(),
+            Some("a\n\nb")
+        );
+        assert_eq!(
+            strip_read_line_numbers("57     pub x: bool,").as_deref(),
+            Some("    pub x: bool,")
+        );
+        assert_eq!(
+            strip_read_line_numbers("1 a\r\n2 b\r\n").as_deref(),
+            Some("a\r\nb\r\n")
+        );
+        // [upto] may jump: head and tail come from different reads.
+        assert_eq!(
+            strip_read_line_numbers("3 fn f() {\n[upto]\n40 }\n").as_deref(),
+            Some("fn f() {\n[upto]\n}\n")
+        );
+        assert_eq!(strip_read_line_numbers("1 a\n3 b\n"), None);
+        assert_eq!(strip_read_line_numbers("1 a\nb\n"), None);
+        assert_eq!(strip_read_line_numbers("12345abc"), None);
+        assert_eq!(strip_read_line_numbers("[upto]\n"), None);
+    }
+
+    #[test]
+    fn edit_retries_without_read_line_numbers() {
+        let (mut ctx, dir) = test_ctx();
+        std::fs::write(dir.join("f.rs"), "enum E {\n    A,\n}\n\nstruct S;\n").unwrap();
+        let out = tool_edit(
+            &mut ctx,
+            &test_call(
+                "edit",
+                &[
+                    ("path", "f.rs"),
+                    ("old", "3 }\n4 \n5 struct S;"),
+                    ("new", "3 }\n4 \n5 enum F {}\n6 \n7 struct S;"),
+                ],
+            ),
+        );
+        assert!(out.starts_with("Edited f.rs using old/new replacement\nNote: removed read's"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.rs")).unwrap(),
+            "enum E {\n    A,\n}\n\nenum F {}\n\nstruct S;\n"
+        );
+        // A `new` without prefixes is kept verbatim.
+        let out = tool_edit(
+            &mut ctx,
+            &test_call(
+                "edit",
+                &[("path", "f.rs"), ("old", "2     A,"), ("new", "    B,")],
+            ),
+        );
+        assert!(out.contains("Note: removed"), "{out}");
+        assert!(
+            std::fs::read_to_string(dir.join("f.rs"))
+                .unwrap()
+                .contains("    B,\n")
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn edit_line_number_fallback_keeps_exact_matches_and_errors() {
+        let (mut ctx, dir) = test_ctx();
+        // The file really contains a numbered line: the exact match wins
+        // and nothing is stripped.
+        std::fs::write(dir.join("n.txt"), "1 apple\n2 pear\n").unwrap();
+        let out = tool_edit(
+            &mut ctx,
+            &test_call(
+                "edit",
+                &[("path", "n.txt"), ("old", "1 apple"), ("new", "1 fig")],
+            ),
+        );
+        assert!(!out.contains("Note: removed"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("n.txt")).unwrap(),
+            "1 fig\n2 pear\n"
+        );
+        // Stripped text still missing: the original diagnostic, unchanged.
+        let out = tool_edit(
+            &mut ctx,
+            &test_call(
+                "edit",
+                &[("path", "n.txt"), ("old", "9 plum"), ("new", "x")],
+            ),
+        );
+        assert_eq!(out, "Tool error: old text anchor not found\n");
+        // Stripped text ambiguous: still "not found", never a guess.
+        std::fs::write(dir.join("d.txt"), "x\ndup\ny\ndup\n").unwrap();
+        let out = tool_edit(
+            &mut ctx,
+            &test_call("edit", &[("path", "d.txt"), ("old", "2 dup"), ("new", "z")]),
+        );
+        assert_eq!(out, "Tool error: old text anchor not found\n");
         std::fs::remove_dir_all(dir).ok();
     }
 
