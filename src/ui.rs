@@ -770,6 +770,13 @@ const NO_PROGRESS_NOTICE: &str = "turn stopped: the model generated 32KB of outp
 /// Whether a preflight error is one of the reasoning rungs, and so counts
 /// towards [`MAIN_REPEAT_TRIP_CAP`]. Both stops leave the prompt materially
 /// unchanged at temperature 0, so both need the cap for the same reason.
+/// Tokens still free after a pass that used `used` of a `ctx_size` window,
+/// for [`crate::tools::ToolContext::context_room`]; `None` for an engine that
+/// reports no window.
+fn context_room(ctx_size: i32, used: i32) -> Option<usize> {
+    (ctx_size > 0).then(|| usize::try_from(ctx_size.saturating_sub(used)).unwrap_or(0))
+}
+
 fn is_reasoning_stop(err: Option<&str>) -> bool {
     matches!(
         err,
@@ -3884,7 +3891,7 @@ impl Agent<'_> {
         crate::debugmirror::flush();
         bar.clear();
         self.record_usage(&stats);
-        self.last_ctx_used = stats.ctx_used;
+        self.note_ctx_used(stats.ctx_used);
         self.last_guard = repeat.snapshot();
         Ok((stream, assistant_text, stats))
     }
@@ -4994,7 +5001,7 @@ impl Agent<'_> {
             preflight,
         )?;
         self.record_usage(&pass.stats);
-        self.last_ctx_used = pass.stats.ctx_used;
+        self.note_ctx_used(pass.stats.ctx_used);
         Ok(pass)
     }
 
@@ -6394,6 +6401,17 @@ impl Agent<'_> {
         if !compact::should_compact(self.engine.ctx_size(), used) {
             return Ok(Compacted::Done);
         }
+        if self.try_spill_oversized() {
+            println!(
+                "{}",
+                self.debug_line("spilled an oversized tool result; `more` continues it")
+            );
+            let rendered = render_transcript(&self.session, &self.system);
+            if !compact::should_compact(self.engine.ctx_size(), self.engine.count_tokens(&rendered))
+            {
+                return Ok(Compacted::Done);
+            }
+        }
         // Cheapest step first: clear old tool-result bodies (no model
         // round-trip) and only fall back to full summarization if still tight.
         if let Some(cleared) = self.try_microcompact() {
@@ -6406,6 +6424,54 @@ impl Agent<'_> {
             return Ok(Compacted::Done);
         }
         self.compact("low context", "")
+    }
+
+    /// Records the context a pass ended at: `last_ctx_used` for the reports,
+    /// and the room left for the tool results that pass may now request.
+    fn note_ctx_used(&mut self, ctx_used: i32) {
+        self.last_ctx_used = ctx_used;
+        self.tool_ctx.context_room = context_room(self.engine.ctx_size(), ctx_used);
+    }
+
+    /// Spills, in place, a tool result that alone takes more than half the
+    /// window (`compact::oversized_result`), leaving its preview and a
+    /// locator `more` continues. Returns whether one was spilled.
+    ///
+    /// The backstop for a result the dispatch-time threshold did not stop:
+    /// one in a session saved before that threshold followed the context
+    /// (`feisty-joule`), or any later path that bypasses it. It runs ahead of
+    /// micro-compaction because neither of the other steps can help: micro-
+    /// compaction keeps the recent tail where such a result sits, and a summary
+    /// pass cannot be prefilled while one message is larger than the window.
+    fn try_spill_oversized(&mut self) -> bool {
+        let ctx_size = self.engine.ctx_size();
+        let engine = &mut self.engine;
+        let Some(i) = compact::oversized_result(&self.session.transcript, ctx_size, &mut |s| {
+            engine.count_tokens(s)
+        }) else {
+            return false;
+        };
+        let policy = crate::spill::SpillPolicy {
+            max_bytes: 0,
+            preview_bytes: crate::settings::active().tools.spill_preview_bytes,
+        };
+        let Some((text, spilled)) = crate::spill::spill_tool_result(
+            &policy,
+            &self.tool_ctx.session_id,
+            &self.session.transcript[i].text,
+        ) else {
+            return false;
+        };
+        // The last message (the usual case) invalidates no rung; an earlier one
+        // restores the rung below it first, exactly as micro-compaction does.
+        if i + 1 < self.session.transcript.len() {
+            self.restore_rung_below(i);
+        }
+        self.session.transcript[i].text = text;
+        self.tool_ctx.spill = Some(spilled);
+        self.clear_suggestion();
+        self.last_ctx_used = 0;
+        true
     }
 
     /// Runs microcompact; returns the cleared count when it freed enough
@@ -17122,7 +17188,7 @@ impl Agent<'_> {
             e.to_string()
         })?;
         self.record_usage(&stats);
-        self.last_ctx_used = stats.ctx_used;
+        self.note_ctx_used(stats.ctx_used);
         self.last_guard = repeat.snapshot();
         stream.finish();
         crate::debugmirror::flush();
@@ -17224,6 +17290,14 @@ impl Agent<'_> {
         let used = self.engine.count_tokens(&rendered);
         if !compact::should_compact(self.engine.ctx_size(), used) {
             return Ok(Compacted::Done);
+        }
+        if self.try_spill_oversized() {
+            sink.note("spilled an oversized tool result; `more` continues it".to_owned());
+            let rendered = render_transcript(&self.session, &self.system);
+            if !compact::should_compact(self.engine.ctx_size(), self.engine.count_tokens(&rendered))
+            {
+                return Ok(Compacted::Done);
+            }
         }
         // Cheapest step first: clear old tool-result bodies (no model
         // round-trip) and only fall back to full summarization if still tight.
@@ -22342,6 +22416,13 @@ fn masthead_label(profile_name: Option<&str>, version: &str, ctx: &str, model: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_room_left_is_the_window_less_what_the_pass_used() {
+        assert_eq!(context_room(32_768, 30_000), Some(2_768));
+        assert_eq!(context_room(32_768, 40_000), Some(0));
+        assert_eq!(context_room(0, 10), None);
+    }
+
     fn stats_record(prefill: (i64, f64), gen_: (i64, f64), tools: f64) -> crate::speeds::Record {
         crate::speeds::Record {
             prefill_tokens: prefill.0,
@@ -26668,6 +26749,50 @@ mod tests {
     /// without touching the transcript at all — not merely return a count
     /// that happens to be zero, but genuinely never rewrite anything, so the
     /// caller (`maybe_compact`) falls through to full compaction instead.
+    /// `feisty-joule`, resumed: the last message is one tool result larger
+    /// than the whole window. Micro-compaction keeps the recent tail and a
+    /// summary cannot run, so before this backstop the next pass failed with
+    /// "context full". Now the result is spilled in place and `more` can page
+    /// through it.
+    #[test]
+    fn a_result_larger_than_the_window_is_spilled_before_the_next_pass() {
+        let spill_root = crate::spill::spill_dir();
+        if std::fs::create_dir_all(&spill_root).is_err() {
+            return;
+        }
+        let dir = scratch_dir("oversized-result");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            ctx_override: Some(4_000),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.tool_ctx.session_id = format!(
+            "plank-test-oversized-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        agent.session.push(Message::user("read codegen.rs"));
+        agent.session.push(Message::assistant("reading it whole"));
+        agent.session.push(Message::user(format!(
+            "<tool_result>Tool result 1 (read):\n{}</tool_result>",
+            "let x = 1;\n".repeat(30_000)
+        )));
+        let spilled = agent.try_spill_oversized();
+        assert!(spilled, "the oversized result is spilled");
+        let last = &agent.session.transcript.last().expect("message").text;
+        assert!(
+            last.starts_with("<tool_result>Tool result 1 (read):"),
+            "{last:.80}"
+        );
+        assert!(last.contains("[Output truncated at"), "preview + locator");
+        assert!(last.len() < 10_000, "now fits: {} bytes", last.len());
+        assert!(agent.tool_ctx.spill.is_some(), "`more` continues it");
+        assert!(!agent.try_spill_oversized(), "nothing left to spill");
+        std::fs::remove_dir_all(spill_root.join(&agent.tool_ctx.session_id)).ok();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn microcompact_off_leaves_try_microcompact_untouched() {
         let dir = scratch_dir("microcompact-off-cheap");
