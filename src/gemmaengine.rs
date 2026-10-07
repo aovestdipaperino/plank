@@ -36,8 +36,32 @@ use crate::kvcache::KVCache;
 /// chunk size, so each report is one forward).
 const PREFILL_CHUNK: usize = 512;
 
-/// The context used when the caller asks for none (`ctx <= 0`).
+/// The context used when the caller asks for none and the machine's memory
+/// is unknown; otherwise [`default_ctx`] sizes it from the RAM.
 const DEFAULT_CTX: usize = 32_768;
+
+/// The context opened when the caller asks for none (`ctx <= 0`): the KV a
+/// third of `ram` can hold ([`crate::enginefit::GEMMA_KV_RAM_DIVISOR`]), in
+/// whole 1024-token steps, never below [`crate::enginefit::GEMMA_MIN_CTX`]
+/// and never past the model's own `context_length`.
+///
+/// The cache is f32 and keeps every position, so the window is what decides
+/// the memory: 688 KB a token on Gemma 4 12B, 115 KB on E4B. A fixed default
+/// was wrong at both ends: 32K cost the 12B 22.5 GB on any machine, while a
+/// 128 GB one could hold E4B's whole 131K. A third leaves the weights and the
+/// rest of the system room, and stays under the half-of-memory refusal in
+/// [`GemmaEngine::open`]. `ram` of 0 or `usize::MAX` (not measurable) keeps
+/// the old 32K.
+fn default_ctx(ram: usize, limits: gemma_engine::model::Limits) -> usize {
+    let fallback = DEFAULT_CTX.min(limits.context_length);
+    if ram == 0 || ram == usize::MAX || limits.kv_bytes_per_token == 0 {
+        return fallback;
+    }
+    let fits = ram / crate::enginefit::GEMMA_KV_RAM_DIVISOR / limits.kv_bytes_per_token;
+    (fits / 1024 * 1024)
+        .max(crate::enginefit::GEMMA_MIN_CTX)
+        .min(limits.context_length)
+}
 
 /// Bytes of a thought block's channel name held back before giving up on
 /// finding its `\n`. The model writes `thought\n`; anything longer is not a
@@ -315,7 +339,7 @@ fn pick_device() -> (Device, &'static str) {
 impl GemmaEngine {
     /// Opens the Gemma 4 GGUF at `path` on Metal (the CPU when there is no
     /// Metal device) with a `ctx`-token context, clamped to the model's; a
-    /// `ctx` of zero or less means `min(32768, context_length)`.
+    /// `ctx` of zero or less means [`default_ctx`]: sized from the RAM.
     ///
     /// # Errors
     /// When the file does not load as a Gemma 4 model, or when the KV for
@@ -340,10 +364,13 @@ impl GemmaEngine {
         device: &Device,
         device_name: &'static str,
     ) -> Result<Self, EngineError> {
-        let cap = usize::try_from(ctx)
-            .ok()
-            .filter(|&c| c > 0)
-            .unwrap_or(DEFAULT_CTX);
+        let cap = match usize::try_from(ctx).ok().filter(|&c| c > 0) {
+            Some(c) => c,
+            None => default_ctx(
+                physical_memory(),
+                gemma_engine::model::probe(path).map_err(engine_error)?,
+            ),
+        };
         // Rotary tables are built for the capped context only, which also
         // makes `context_length()` the clamped context.
         let model = Model::open_with_ctx(path, device, cap).map_err(engine_error)?;
@@ -366,6 +393,15 @@ impl GemmaEngine {
             device_name,
             warm_pending: false,
         })
+    }
+
+    /// Bytes the KV cache takes at the full context this engine opened with:
+    /// what the window actually costs in memory, for the startup line.
+    #[must_use]
+    pub fn kv_bytes_at_ctx(&self) -> usize {
+        self.model
+            .kv_bytes_per_token()
+            .saturating_mul(self.session.ctx())
     }
 
     /// Where the model runs: `"metal"` or `"cpu"`.
@@ -736,6 +772,45 @@ impl Engine for GemmaEngine {
 mod tests {
     use super::*;
     use crate::engine::{Engine, EngineEvent, GenerationOptions, Prompt, ThinkMode};
+
+    const GIB: usize = 1 << 30;
+    const E4B: gemma_engine::model::Limits = gemma_engine::model::Limits {
+        context_length: 131_072,
+        kv_bytes_per_token: 114_688,
+    };
+    const B12: gemma_engine::model::Limits = gemma_engine::model::Limits {
+        context_length: 262_144,
+        kv_bytes_per_token: 688_128,
+    };
+
+    /// The default grows with the machine: a third of RAM for the KV, in
+    /// whole 1024-token steps, capped at what the model was trained for.
+    #[test]
+    fn the_default_context_is_a_third_of_ram_of_kv() {
+        assert_eq!(
+            default_ctx(128 * GIB, E4B),
+            131_072,
+            "E4B gets its full window"
+        );
+        assert_eq!(default_ctx(128 * GIB, B12), 66_560);
+        assert_eq!(default_ctx(16 * GIB, B12), 8_192, "the floor");
+    }
+
+    #[test]
+    fn unknown_ram_keeps_the_old_default() {
+        assert_eq!(default_ctx(0, B12), 32_768);
+        assert_eq!(default_ctx(usize::MAX, B12), 32_768);
+    }
+
+    #[test]
+    fn a_short_model_is_never_opened_past_its_own_window() {
+        let tiny = gemma_engine::model::Limits {
+            context_length: 4_096,
+            kv_bytes_per_token: 1,
+        };
+        assert_eq!(default_ctx(128 * GIB, tiny), 4_096);
+        assert_eq!(default_ctx(0, tiny), 4_096);
+    }
     use crate::kvcache::KVCache;
 
     fn engine() -> GemmaEngine {

@@ -1609,8 +1609,8 @@ fn make_gemma_engine(
     plank::download::ensure_model(sel)?;
     eprintln!("plank: loading model {}...", model.display());
     // With no explicit `-c`, the configured window is the DeepSeek default
-    // (131072 tokens, 14 GB of Gemma KV) and says nothing about this model:
-    // `0` lets the engine pick `min(32768, context_length)`.
+    // (1,048,576 tokens) and says nothing about this model: `0` lets the
+    // engine size it from the RAM (`gemmaengine::default_ctx`).
     let ctx = if cfg.ctx_size_explicit {
         cfg.generation.ctx_size
     } else {
@@ -1618,6 +1618,14 @@ fn make_gemma_engine(
     };
     let engine = GemmaEngine::open(&model, ctx).map_err(|e| e.to_string())?;
     eprintln!("plank: model ready: {}", engine.model_name());
+    if ctx == 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let kv_gb = engine.kv_bytes_at_ctx() as f64 / f64::from(1u32 << 30);
+        eprintln!(
+            "plank: context {} tokens ({kv_gb:.1} GB of KV, sized to this machine's RAM; -c to change)",
+            engine.ctx_size()
+        );
+    }
     let reopen: plank::gpuyield::ReopenFn = Box::new(move || {
         plank::gpuyield::check_model_files(vec![("model", model.as_path())])?;
         GemmaEngine::open(&model, ctx)

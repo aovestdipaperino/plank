@@ -183,6 +183,45 @@ impl Config {
             self.global_head_dim
         }
     }
+
+    /// `(kv_heads, head_dim)` of each KV-owning layer, in cache order.
+    fn kv_shape(&self) -> Vec<(usize, usize)> {
+        (0..self.block_count - self.shared_kv_layers)
+            .map(|index| (self.kv_heads[index], self.head_dim(index)))
+            .collect()
+    }
+}
+
+/// What a model file allows, read from its header without loading weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// The longest context the model was trained for (`context_length`).
+    pub context_length: usize,
+    /// Bytes one position adds to the f32 KV cache (K and V, every owner);
+    /// the same figure as [`Model::kv_bytes_per_token`].
+    pub kv_bytes_per_token: usize,
+}
+
+/// Reads [`Limits`] from the GGUF at `path`: its metadata only, no tensor
+/// data, so a context can be sized before [`Model::open_with_ctx`] builds
+/// rotary tables for it.
+///
+/// # Errors
+/// When the file cannot be read or is not a valid Gemma 4 header.
+pub fn probe(path: &Path) -> crate::Result<Limits> {
+    let file =
+        File::open(path).map_err(|e| crate::Error(format!("open {}: {e}", path.display())))?;
+    let content = gguf_file::Content::read(&mut BufReader::new(file))?;
+    let config = Config::from_gguf(&content)?;
+    Ok(Limits {
+        context_length: config.context_length,
+        kv_bytes_per_token: kv_bytes(&config.kv_shape()),
+    })
+}
+
+/// Bytes one position adds to a cache of `shape`: K and V, f32.
+fn kv_bytes(shape: &[(usize, usize)]) -> usize {
+    shape.iter().map(|(h, d)| 2 * 4 * h * d).sum()
 }
 
 /// A row-lookup embedding over a quantized table.
@@ -1052,9 +1091,7 @@ impl Model {
                 local_rotary.clone(),
             )?);
         }
-        let kv_shape = (0..kv_layer_count)
-            .map(|index| (config.kv_heads[index], config.head_dim(index)))
-            .collect();
+        let kv_shape = config.kv_shape();
         let kv_windows = (0..kv_layer_count)
             .map(|index| config.is_sliding(index).then_some(config.sliding_window))
             .collect();
@@ -1116,7 +1153,7 @@ impl Model {
     /// Bytes one position adds to the cache: K and V, f32, every owner.
     #[must_use]
     pub fn kv_bytes_per_token(&self) -> usize {
-        self.kv_shape.iter().map(|(h, d)| 2 * 4 * h * d).sum()
+        kv_bytes(&self.kv_shape)
     }
 
     #[must_use]
@@ -1494,6 +1531,18 @@ mod tests {
         ));
         write_tiny(&path, cfg).unwrap();
         path
+    }
+
+    /// The header alone gives what sizing a context needs, and agrees with a
+    /// fully opened model, so a default can be chosen before the open.
+    #[test]
+    fn a_probe_reads_the_limits_from_the_header() {
+        let cfg = TinyConfig::default();
+        let path = tiny("probe", &cfg);
+        let limits = probe(&path).unwrap();
+        let m = Model::open(&path, &Device::Cpu).unwrap();
+        assert_eq!(limits.context_length, m.context_length());
+        assert_eq!(limits.kv_bytes_per_token, m.kv_bytes_per_token());
     }
 
     #[test]
