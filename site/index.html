@@ -280,7 +280,7 @@
         <div class="why">
           <div class="big">⚡</div>
           <h3>No round trips</h3>
-          <p>Runs on the DeepSeek V4 Flash model, right there on Metal. The latency is you thinking.</p>
+          <p>Runs DeepSeek V4 Flash right there on Metal, or Gemma 4 in 5 GB on a laptop. The latency is you thinking.</p>
         </div>
       </div>
     </section>
@@ -464,7 +464,7 @@
         <a href="https://github.com/aovestdipaperino/homebrew-tap" target="_blank" rel="noopener">Homebrew tap</a>
       </div>
     </div>
-    <p class="fine">macOS only — Plank is a Mac guy (it needs Metal). No planks were harmed in the making of this agent.
+    <p class="fine">Mac first — Plank is a Mac guy (DeepSeek needs Metal; Gemma will settle for a CPU). No planks were harmed in the making of this agent.
     Not affiliated with your local hardware store. Please do not attempt to actually walk the plank.</p>
   </footer>
 </div>
@@ -475,11 +475,11 @@
   var CHAN = {
     stable: {
       cmd: "brew install aovestdipaperino/tap/plank-agent",
-      note: 'Seasoned lumber — the stable channel. Currently <span class="mono">v6.2.0</span>; <span class="mono">brew upgrade</span> keeps you steady.'
+      note: 'Seasoned lumber — the stable channel. Currently <span class="mono">v7.0.0</span>; <span class="mono">brew upgrade</span> keeps you steady.'
     },
     beta: {
       cmd: "brew install aovestdipaperino/tap/plank-agent-beta",
-      note: 'Fresh-cut and still curing — newest features first. Currently <span class="mono">v6.2.2</span>.'
+      note: 'Fresh-cut and still curing — newest features first. Currently <span class="mono">v7.0.1</span>.'
     }
   };
   function setChan(c){

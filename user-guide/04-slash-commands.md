@@ -87,6 +87,8 @@ See [Extending plank](09-extending.md).
 | `/power <1..100>` | cap GPU power draw for this run; shown as `(local ⚡60%)` in the status bar |
 | `/mtp [on\|off]` | turn speculative decoding (multi-token prediction) on or off for this session; bare `/mtp` reports the state |
 | `/temp [0..100]` | set the sampling temperature; refused while `/mtp` is on, which pins it at 0 |
+| `/engines` | open the engine menu, download the one you pick if it is missing, and restart into it, resuming this session when the new engine's family has its transcript |
+| `/steer [-100..100]` | set the FFN directional-steering scale for this session; needs `--dir-steering-file` (or an engine that bundles a vector) |
 | `/loopguard [on\|off]`, `/lg` | arm or silence the loop guards. Works mid-turn |
 | `/mc [on\|off]` | turn micro-compaction on or off for this session; bare `/mc` reports the state. Works mid-turn |
 | `/notify <mode>` | change notification mode for this session |

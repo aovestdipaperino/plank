@@ -47,26 +47,38 @@ cargo build --release
 ```
 
 - **With `refs/ds4` present** — `build.rs` compiles `libds4core.a` from the Metal-backend objects, links Foundation and Metal, and enables real inference.
-- **Without it** — plank still builds and runs, but only against the echo stub. Fine for working on the UI and tools; useless for actual generation.
+- **Without it** — plank still builds and runs Gemma 4 for real, on plank's own Rust engine, which compiles no C. DeepSeek and Qwen are unavailable; a build with neither falls back to the echo stub, which is fine for working on the UI and tools. `PLANK_NO_DS4=1 cargo build --release` gives you this build even with the submodule checked out.
 
 ## Getting the model
 
-plank knows its models as named *engines*: a main model plus the companions it runs with, a drafter for speculative decoding (`mtp`) and a vision encoder (`vision`). They are listed in `engines.json`, a small catalog that ships inside plank and is refreshed from the repository at most once a day. Three are built in:
+plank knows its models as named *engines*: a main model plus the companions it runs with, a drafter for speculative decoding (`mtp`) and a vision encoder (`vision`). They are listed in `engines.json`, a small catalog that ships inside plank and is refreshed from the repository at most once a day. Five are built in:
 
-| Engine | What |
-|---|---|
-| `ds4vision` | DeepSeek V4 Flash with its DSpark drafter and vision encoder. The default. |
-| `ds41` | DeepSeek V4.1 Flash with its vision encoder. |
-| `qwen` | Qwen3.8-Flash-Next. |
+| Engine | What | Download |
+|---|---|---|
+| `ds4vision` | DeepSeek V4 Flash with its DSpark drafter and vision encoder. The default. | ~87 GB, needs 96 GB of RAM |
+| `ds41` | DeepSeek V4.1 Flash with its vision encoder. | ~366 GB, streams from SSD |
+| `qwen` | Qwen3.8-Flash-Next. | ~177 GB |
+| `gemma4-e4b` | Gemma 4 E4B instruct (Q4_K_M), on plank's own Rust engine. | ~5 GB |
+| `gemma4-12b` | Gemma 4 12B instruct (QAT Q4_0), on the same engine. | ~7 GB |
 
-Pick one with `--model <name>`, for example `plank --model ds41`. Real inference with no choice at all runs the default engine: on first run, with nothing at its path (`~/.plank/ds4vision.gguf`), plank offers to fetch the quantized model (~87 GB) from Hugging Face. One keypress and it downloads in place with live progress, and an interruption resumes where it stopped rather than starting over. Any other engine is offered the same way the first time you pick it.
+Pick one with `--model <name>`, for example `plank --model gemma4-e4b`. Real inference with no choice at all runs the default engine. On first run, with nothing at its path (`~/.plank/ds4vision.gguf`), plank opens an engine menu on a terminal: every engine is listed, the ones this machine cannot run are dimmed with the reason beside them (not enough RAM, not enough free disk, not in this build), and the one you pick downloads in the background while a wait screen shows its progress. When it finishes, plank installs it and records it as your `engine.model`. Esc leaves the download running; a later launch tells you once it has finished, and picking it then installs it. With `--model` on the command line plank offers just that engine, and with no terminal it exits with instructions. `--pick-engine` opens the menu even when the selected engine is installed, and `/engines` restarts into it from a running session.
+
+Downloads come from Hugging Face. With `HF_API_KEY` set, plank authenticates to Hugging Face (and only to Hugging Face) and fetches four ranges of a file in parallel, resuming a partial range rather than starting over and checking the whole file again at the end.
+
+### Gemma 4
+
+Gemma is the small, portable choice. It runs on Metal on a Mac and on the CPU elsewhere, on a Rust engine that needs neither the `refs/ds4` submodule nor macOS, so a plain `cargo build` does real inference with it. Tool calls, thinking, sessions, sub-agents, memory and KV reuse all work as they do on DeepSeek; vision, speculative decoding and the System-1 memory gate do not exist for it yet.
+
+With no `-c`, Gemma sizes its context from the RAM: the largest window whose KV fits a third of memory, never below 8,192 tokens and never past what the model was trained for. On a 128 GB Mac that is the full 131,072 tokens for E4B and about 66,000 for 12B; a 16 GB machine gives 12B the 8,192 floor. plank prints the size it chose and what it costs at startup.
+
+Its sessions are a family of their own (`.gemma.kv`), so switching between Gemma and DeepSeek keeps both histories. Any Gemma 4 GGUF also works by path, `plank -m ~/models/gemma-4-E4B-it-Q4_K_M.gguf`, recognised from the file's own architecture field.
 
 DeepSeek V4.1 Flash is a family of its own, with its own tool-call dialect and its own `.ds41.kv` transcripts. `--model ds41` fetches and runs it; pointing `--model` at a V4.1 GGUF path works too, and the family and dialect follow from the file's own architecture field. It is large enough that plank will usually turn on SSD streaming for you.
 
 Things worth knowing before you start an 87 GB transfer:
 
 - **It resumes.** The download streams to a `.part` file beside the destination. Ctrl-C it, lose your network, close the laptop — the next launch picks up where it stopped.
-- **It is guarded.** The default quant needs roughly 82 GB resident, so plank refuses to download or load on machines with less than 96 GB of RAM. You find out before the transfer, not after.
+- **It is guarded.** The default quant needs roughly 82 GB resident, so plank refuses to download or load DeepSeek and Qwen on machines with less than 96 GB of RAM. You find out before the transfer, not after; the engine menu says so up front and offers Gemma instead.
 - **It is honest about the wait.** Size and rate counters, plus a rotation of two hundred status messages.
 - **It is headless-safe.** With stdin not on a terminal there is nobody to answer the prompt, so plank exits with instructions rather than hanging your script.
 
@@ -109,19 +121,19 @@ Upgrading from a release before engines renames the files under `~/.plank` once,
 
 ## No model, no problem (sort of)
 
-Without a model file plank runs against a built-in echo engine. Every command, tool, session feature and UI element works; the "model" just echoes. This is how the test suite runs and how UI work gets done, and it is what you will see if you launch on an unsupported platform.
+Without a model file, or in a build with no engine that can load it, plank runs against a built-in echo engine. Every command, tool, session feature and UI element works; the "model" just echoes. This is how the test suite runs and how UI work gets done, and it is what you will see if you launch on an unsupported platform.
 
 ## Where plank keeps its files
 
 | Path | What |
 |---|---|
-| `~/.plank/<engine>.gguf` | an engine's main model, for example `ds4vision.gguf` (the default), `ds41.gguf` or `qwen.gguf` |
+| `~/.plank/<engine>.gguf` | an engine's main model, for example `ds4vision.gguf` (the default), `ds41.gguf`, `qwen.gguf` or `gemma4-e4b.gguf` |
 | `~/.plank/<engine>.mtp.gguf` | an engine's drafter, for speculation (`--mtp`): `ds4vision.mtp.gguf` is DeepSeek V4's DSpark model |
 | `~/.plank/<engine>.vision.gguf` | an engine's vision encoder. `qwen.vision.gguf` is installed with the engine, but plank does not load one for Qwen yet |
 | `~/.plank/engines/` | one `<engine>.installed.json` per installed engine, recording which version is on disk |
 | `~/.plank/engines.local.json` | your own engines and default, layered over the catalog |
 | `~/.plank/staging/<engine>/` | background downloads in progress, installed at the next launch |
-| `~/.plank/kvcache/` | saved sessions (`<name>.kv`) plus the KV snapshots (`*.kv_raw`) and their metadata (`*.json`). Browse it with `/kvcache`. |
+| `~/.plank/kvcache/` | saved sessions (`<name>.<family>.kv`, such as `.ds4.kv` or `.gemma.kv`) plus the KV snapshots (`*.kv_raw`) and their metadata (`*.json`). Browse it with `/kvcache`. |
 | `~/.plank/settings.json` | global preferences |
 | `~/.plank/.mcp.json` | global MCP server config |
 | `~/.plank/hooks.json` | global hooks |

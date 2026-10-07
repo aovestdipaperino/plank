@@ -7,6 +7,29 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v7.0.0 is out, and plank no longer needs a 96 GB Mac.** Gemma 4 runs as the
+agent model on an engine plank carries itself, written in Rust with no C
+underneath: Metal on a Mac, the CPU anywhere else. `plank --model gemma4-e4b`
+is a 5 GB download, `gemma4-12b` a 7 GB one, and tools, thinking, sessions,
+sub-agents and memory all behave as they do on DeepSeek. With no `-c`, the
+context window sizes itself from your RAM, up to the full 128K tokens on a
+big machine. Gemma sessions are kept apart from DeepSeek ones, so switching
+back and forth loses neither.
+
+**Picking an engine is a menu now.** When the engine plank would run is not
+on disk, it lists every engine instead of offering a single download, with
+the ones your machine cannot run dimmed and the reason beside each: not
+enough memory, not enough free disk, not in this build. The one you pick
+downloads in the background while a wait screen shows how far along it is,
+and `/engines` brings the menu back from inside a session. With `HF_API_KEY`
+set, downloads authenticate to Hugging Face and pull four ranges at once.
+
+**Edits stop failing on copied line numbers.** A small model that has just
+read a file tends to paste `read`'s line numbers into its edit, which can
+never match. plank retries without them, still insisting on a unique match,
+and tells the model it did. The debug console, `tdk` 0.7.0, renders Gemma's
+tool calls as banners too.
+
 **v6.2.2 beta: profiles speak in their own verbs.** The word in the status bar
 that says what the agent is doing can now come from the profile, replacing
 plank's vocabulary with `verbs` or mixing more in with `additionalVerbs`. The

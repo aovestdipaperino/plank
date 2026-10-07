@@ -16,7 +16,7 @@ Plank is a fast-moving agent harness built on the [ds4](https://github.com/aoves
 
 Plank is an interactive coding agent with a Ratatui TUI, a plain terminal REPL, a one-shot headless mode, and a set of built-in tools (shell, file read/edit, web). The project website is [plank-agent.dev](https://plank-agent.dev).
 
-> **macOS only.** Plank targets macOS exclusively: inference uses the original ds4 C engine with the Metal backend, linked via the `refs/ds4` submodule. Other platforms are not supported.
+> **macOS first.** DeepSeek and Qwen inference uses the original ds4 C engine with the Metal backend, linked via the `refs/ds4` submodule, and needs a Mac. Gemma 4 runs on plank's own Rust engine instead: Metal on a Mac, the CPU elsewhere, with no C to build. Homebrew bottles are macOS only.
 
 ## Installing
 
@@ -45,10 +45,10 @@ cargo build --release
 ```
 
 - **With `refs/ds4` present:** `build.rs` builds `libds4core.a` from the Metal-backend objects and links the required frameworks, enabling the `ds4_engine` cfg.
-- **Missing submodule:** plank still builds, but without the native engine it uses the echo engine only (useful for development/CI).
-- **Three model families, one build.** DeepSeek V4 Flash, V4.1 Flash and Qwen3.8-Flash-Next are all compiled in and told apart from the GGUF's own `general.architecture`; each has its own tool-call dialect, artifact set and transcript extension (`.ds4.kv` / `.ds41.kv` / `.qwn.kv`). Qwen was retired once, when upstream deleted its Metal kernels; upstream has since merged it properly and publishes the weights, so it is back unconditionally, addressed as the `qwen` engine with `--model qwen`.
+- **Missing submodule (or `PLANK_NO_DS4=1`):** plank still builds and runs Gemma 4 for real on its native Rust engine (`crates/gemma-engine`, candle, no C). DeepSeek and Qwen need the submodule; without any usable engine plank falls back to the echo stub (useful for development/CI).
+- **Four model families, one build.** Gemma 4 (`gemma4-e4b`, `gemma4-12b`, `.gemma.kv` transcripts and its own `<|tool_call>` dialect) runs on the Rust engine; see [docs/GEMMA.md](docs/GEMMA.md). DeepSeek V4 Flash, V4.1 Flash and Qwen3.8-Flash-Next are all compiled in and told apart from the GGUF's own `general.architecture`; each has its own tool-call dialect, artifact set and transcript extension (`.ds4.kv` / `.ds41.kv` / `.qwn.kv`). Qwen was retired once, when upstream deleted its Metal kernels; upstream has since merged it properly and publishes the weights, so it is back unconditionally, addressed as the `qwen` engine with `--model qwen`.
 
-You will also need a GGUF model file for real inference; use `--model <name|path>` to pick one, either a catalog engine name (`ds4vision`, `ds41`, `qwen`) or a path of your own. See the `download_model.sh` script in `refs/ds4`.
+You will also need a GGUF model file for real inference; use `--model <name|path>` to pick one, either a catalog engine name (`ds4vision`, `ds41`, `qwen`, `gemma4-e4b`, `gemma4-12b`) or a path of your own. See the `download_model.sh` script in `refs/ds4`.
 
 ## Usage
 
@@ -61,7 +61,9 @@ Run with a prompt argument for one-shot headless mode.
 
 ### Model download
 
-Real inference needs the DeepSeek V4 Flash GGUF — the official (non-preview) `-0731` build of 2026-07-31. You can point plank at any copy with `-m <path>`, but with no flag it resolves the default engine, `ds4vision`, to `~/.plank/ds4vision.gguf` and, when nothing is there, offers to fetch the quantized model (~87 GB) from Hugging Face — one keypress and it downloads in place with live progress:
+Gemma 4 is the light option: `plank --model gemma4-e4b` downloads about 5 GB, and `gemma4-12b` about 7 GB, sized for a laptop. When the selected engine is missing and plank runs on a terminal without `--model`, it opens an engine menu instead, with every engine this machine cannot run dimmed and explained (RAM, free disk, build support); the pick downloads in the background behind a wait screen. `--pick-engine` opens the menu on demand and `/engines` restarts into it mid-session. With `HF_API_KEY` set, Hugging Face downloads authenticate and fetch four ranges in parallel.
+
+The default engine needs the DeepSeek V4 Flash GGUF — the official (non-preview) `-0731` build of 2026-07-31. You can point plank at any copy with `-m <path>`; by name it resolves to `~/.plank/ds4vision.gguf` and, when nothing is there, the menu (or `--model ds4vision`) fetches the quantized model (~87 GB) from Hugging Face, with live progress:
 
 <p align="center">
   <img src="assets/model-download.gif" alt="Model download progress UI" width="700">
@@ -70,7 +72,7 @@ Real inference needs the DeepSeek V4 Flash GGUF — the official (non-preview) `
 Details worth knowing:
 
 - **Resumable.** The download streams to a `.part` file next to the destination; if it's interrupted (Ctrl-C, network drop), the next launch detects the partial file and resumes from where it stopped instead of starting over.
-- **Guarded.** The default quant needs ~82 GB resident, so plank refuses to download or load on machines with less than 96 GB of RAM — you find out before spending hours on the transfer, not after.
+- **Guarded.** The default quant needs ~82 GB resident, so plank refuses to download or load DeepSeek or Qwen on machines with less than 96 GB of RAM — you find out before spending hours on the transfer, not after.
 - **Honest about the wait.** An 87 GB download takes a while; the progress bar keeps you company with size/rate counters and a rotation of two hundred status messages ("Almost sentient. Please hold." among them).
 - **Playable.** A round of [breakout](#the-arcade) sits above the gauge, because hours is a long time to watch a bar fill. It is decoration and never delays the transfer: Esc puts it away, and `q` or Ctrl-C abort the download from anywhere, so a rally can't trap you.
 - **Kept current.** Each engine in the `engines.json` catalog carries its own monotonic `version`; plank checks the catalog at most once a day and offers an upgrade only when an installed engine's version is behind, so a symlinked or manually placed GGUF is left alone rather than re-downloaded.

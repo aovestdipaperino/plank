@@ -11,7 +11,7 @@ it.
 ## In the betas
 
 Install with `brew install aovestdipaperino/tap/plank-agent-beta`. Everything
-the 6.1.x betas below carried is in stable 6.2.0.
+the betas below carried is in stable 7.0.0.
 
 ### 6.2.2
 
@@ -198,6 +198,30 @@ own line while the agent works. If you never want the AGENTS.md offer in a
 folder, "Don't ask for this folder" now records that.
 
 ## Stable releases
+
+### 7.0.0
+
+**Gemma 4 runs plank, and it fits on a laptop.** Every model plank ran until
+now needed a 96 GB Mac. Gemma 4 E4B is a 5 GB download, and the 12B a 7 GB
+one, on an engine plank carries itself: written in Rust, no C to build, Metal
+on a Mac and the CPU anywhere else. Tools, thinking, sessions, sub-agents and
+memory all work as they do on DeepSeek. Try it with
+`plank --model gemma4-e4b`. With no `-c` the window sizes itself from your
+RAM, up to the full 128K tokens on a big Mac.
+
+**A menu to pick your engine.** When the engine you would run is not on disk,
+plank lists them all instead of offering one download, and dims the ones this
+machine cannot run with the reason beside each. Pick one and it downloads in
+the background while you watch; `/engines` brings the menu back from a
+running session. Set `HF_API_KEY` and downloads authenticate and run four
+connections at once.
+
+**Edits survive a model copying line numbers.** A small model reading a file
+tends to paste `read`'s line numbers into an edit, which can never match.
+plank now retries without them and tells the model it did.
+
+**tdk shows Gemma's tool calls** as banners, like every other dialect
+(tdk 0.7.0).
 
 ### 6.2.0
 

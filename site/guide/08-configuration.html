@@ -614,14 +614,19 @@ likely to want:</p>
 <tr>
 <td><code>-m, --model NAME|PATH</code></td>
 <td>run a named engine (<code>ds4vision</code>, <code>ds41</code>,
-<code>qwen</code>, or one of yours from
-<code>~/.plank/engines.local.json</code>) with its companions, or load a
-GGUF file on its own</td>
+<code>qwen</code>, <code>gemma4-e4b</code>, <code>gemma4-12b</code>, or
+one of yours from <code>~/.plank/engines.local.json</code>) with its
+companions, or load a GGUF file on its own</td>
 </tr>
 <tr>
 <td><code>--model:NAME</code></td>
 <td>run a named engine, and fail rather than read <code>NAME</code> as a
 path</td>
+</tr>
+<tr>
+<td><code>--pick-engine</code></td>
+<td>open the engine menu at launch even when the selected engine is
+installed</td>
 </tr>
 <tr>
 <td><code>-t, --threads N</code></td>
@@ -642,7 +647,8 @@ path</td>
 <tr>
 <td><code>-c, --ctx N</code></td>
 <td>context window in tokens, or with a <code>k</code>/<code>m</code>
-suffix: <code>-c 128k</code>, <code>-c 1m</code></td>
+suffix: <code>-c 128k</code>, <code>-c 1m</code>. Without it, Gemma
+sizes its window from the RAM</td>
 </tr>
 <tr>
 <td><code>-n, --tokens N</code></td>
@@ -760,8 +766,21 @@ suspending</td>
 <td><code>--mcp-config FILE</code></td>
 <td>local MCP config (default <code>./.mcp.json</code>)</td>
 </tr>
+<tr>
+<td><code>--hooks on|off</code></td>
+<td>whether plugin and settings hooks run (default on); off also injects
+no <code>SessionStart</code> context</td>
+</tr>
+<tr>
+<td><code>--tools on|off</code></td>
+<td>whether the model gets tools (default on); off sends no tools
+prompt, starts no MCP servers or WASM tools, refuses any tool call and
+skips the session-start context</td>
+</tr>
 </tbody>
 </table>
+<p><code>--minimal-prompt</code> implies both <code>off</code>; an
+explicit flag wins whichever order you give them in.</p>
 <h3 id="speculative-decoding">Speculative decoding</h3>
 <table>
 <thead>
@@ -840,7 +859,16 @@ yourself skips that decision.
 <code>--simulate-used-memory &lt;N&gt;GB</code> pretends memory is
 already used, for testing those paths. <code>--dir-steering-file</code>,
 <code>--dir-steering-ffn</code>, <code>--dir-steering-attn</code> apply
-directional steering vectors.</p>
+directional steering vectors. <code>--dir-steering-from user</code>, the
+default, holds the FFN edit off while the system prompt and session
+context prefill and arms it before your first message, so the cached
+prompt stays unsteered and shared; <code>all</code> steers every token,
+and is what an attention scale falls back to, since only the FFN scale
+can change on a live session. <code>/steer</code> retargets the FFN
+scale mid-session. A local engine in
+<code>~/.plank/engines.local.json</code> can bundle a vector with a
+<code>"steering": {"file", "ffn", "attn", "from"}</code> block, applied
+whenever that engine is selected unless the command line names one.</p>
 <p>Remote, shared-engine, control, and provider flags are covered in <a
 href="10-remote-and-providers.html">Remote and hosted engines</a>.</p>
 <h2 id="environment-variables">Environment variables</h2>
@@ -859,6 +887,11 @@ href="10-remote-and-providers.html">Remote and hosted engines</a>.</p>
 <tr>
 <td><code>ANTHROPIC_API_KEY</code></td>
 <td>key for <code>--provider anthropic</code></td>
+</tr>
+<tr>
+<td><code>HF_API_KEY</code></td>
+<td>Hugging Face token: model downloads authenticate with it and fetch
+four ranges in parallel</td>
 </tr>
 <tr>
 <td><code>PLANK_REMOTE_TOKEN</code></td>

@@ -6,8 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [7.0.0] - 2026-10-07
+
+The Gemma release: plank runs a model family on an engine of its own, in
+Rust, with no C and no macOS requirement. Gemma 4 E4B is a 5 GB download
+that does real agent work on a laptop, which is a different machine from the
+96 GB Mac every earlier family needed.
+
 ### Added
 
+- **Gemma 4 runs as plank's agent model.** `plank --model gemma4-e4b` (Gemma
+  4 E4B instruct, ~5 GB) and `--model gemma4-12b` (12B QAT, ~7 GB) are
+  catalog engines, and any Gemma 4 GGUF loads by path. They run on
+  `crates/gemma-engine`, a native candle engine: Metal on a Mac, the CPU
+  elsewhere, and a build without `refs/ds4` (or with `PLANK_NO_DS4=1`) still
+  does real inference. The chat format follows the GGUF's own template, tools
+  are declared in Gemma's native syntax from the same table as the DSML
+  prompt, the model's `<|tool_call>` dialect is parsed and bannered, and its
+  thought channel renders as thinking. Sessions are their own family
+  (`.gemma.kv`). The KV truncates exactly at any token, so a divergent prompt
+  reuses everything up to the first difference, and sidechains need no fork
+  snapshots. Vision, speculative decoding and the System-1 gate are not
+  there yet. See `docs/GEMMA.md`.
+- **Gemma sizes its context from the RAM.** With no `-c`, the window is the
+  largest whose KV fits a third of memory, between 8,192 tokens and the
+  model's trained length, and the choice is printed at startup.
+- **An engine menu at launch.** When the selected engine is missing and plank
+  runs on a terminal without `--model`, a menu lists every engine, with the
+  ones this machine cannot run dimmed and explained (RAM, free disk, build
+  support). The pick downloads through the background helper behind a wait
+  screen, is installed on success and written to `engine.model` without
+  touching the rest of `settings.json`. `--pick-engine` forces the menu and
+  `/engines` restarts into it, resuming the session when the new engine's
+  family has its transcript.
+- **Faster, authenticated model downloads.** With `HF_API_KEY` set, Hugging
+  Face requests authenticate and fetch four ranges in parallel, with a resume
+  sidecar and a full hash at the end.
+- **Steering an engine.** A local engine can bundle a steering vector;
+  `--dir-steering-from user` (the default) keeps the system prompt unsteered
+  and arms the FFN edit before the first user message; `/steer` retargets the
+  FFN scale mid-session.
+- **`--hooks on|off` and `--tools on|off`** run plank with no hooks, or with
+  no tools at all; `--minimal-prompt` implies both off.
+- **Unnamed sub-agents are named after fictional agents** (bond, hunt,
+  mulder, ...) instead of the NATO alphabet.
 - **A profile can bring its own status verbs.** `verbs` replaces plank's
   vocabulary and `additionalVerbs` adds to it; the two are mutually exclusive,
   and a manifest declaring both warns and keeps plank's verbs. Either is a list
@@ -19,12 +61,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`tdk` renders Gemma tool calls.** `trace-stream` 0.1.8 adds the Gemma
+  parser and `StreamRenderer::set_gemma_opener`, which lets a renderer that
+  does not know its dialect adopt Gemma stanzas at the opener; tdk 0.7.0
+  turns it on.
 - A profile recommendation that is passed over (not an engine, or not
   installed) prints its startup line in yellow on a terminal.
 
 
 ### Fixed
 
+- **An edit whose `old` carries `read`'s line numbers now applies.** Small
+  models copy the `N ` prefixes from `read` output into `old` and `new`, so
+  the match always failed with a bare `anchor not found`. After an exact miss,
+  an `old` whose every line carries consecutive prefixes is retried without
+  them, still requiring a unique match, and the result says so.
+- **A tool result too big for the window is spilled, not inlined.** The spill
+  threshold was sized for a 1M-token context, so a 300 KB read went inline on
+  a 32K Gemma window and the next pass failed. It is now capped at half the
+  free context, and a result that alone fills more than half the window is
+  spilled in place before the next pass.
 - **A malformed tool call repeated verbatim now ends the turn.** A pass whose
   tool call fails to parse never reached the loop guard, so a model sending
   the same malformed call over and over was never stopped; one session ran

@@ -165,13 +165,14 @@ One limitation: settings come from the directory plank launches in, so project s
 
 | Flag | What |
 |---|---|
-| `-m, --model NAME\|PATH` | run a named engine (`ds4vision`, `ds41`, `qwen`, or one of yours from `~/.plank/engines.local.json`) with its companions, or load a GGUF file on its own |
+| `-m, --model NAME\|PATH` | run a named engine (`ds4vision`, `ds41`, `qwen`, `gemma4-e4b`, `gemma4-12b`, or one of yours from `~/.plank/engines.local.json`) with its companions, or load a GGUF file on its own |
 | `--model:NAME` | run a named engine, and fail rather than read `NAME` as a path |
+| `--pick-engine` | open the engine menu at launch even when the selected engine is installed |
 | `-t, --threads N` | worker thread count |
 | `--backend NAME` | `metal`, `cuda`, or `cpu` |
 | `--metal` / `--cuda` / `--cpu` | the same, as switches |
 | `--power N` | GPU power cap percent (1..100) |
-| `-c, --ctx N` | context window in tokens, or with a `k`/`m` suffix: `-c 128k`, `-c 1m` |
+| `-c, --ctx N` | context window in tokens, or with a `k`/`m` suffix: `-c 128k`, `-c 1m`. Without it, Gemma sizes its window from the RAM |
 | `-n, --tokens N` | maximum tokens to generate (default 50000) |
 | `--quality` | quality mode |
 | `--warm-weights` | touch all weights at load |
@@ -206,6 +207,10 @@ One limitation: settings come from the directory plank launches in, so project s
 | `--sandbox` / `--no-sandbox` | bash write sandbox (on by default on macOS) |
 | `--disable-btw-suspend` | queue an in-pass `/btw` at the next boundary instead of suspending |
 | `--mcp-config FILE` | local MCP config (default `./.mcp.json`) |
+| `--hooks on\|off` | whether plugin and settings hooks run (default on); off also injects no `SessionStart` context |
+| `--tools on\|off` | whether the model gets tools (default on); off sends no tools prompt, starts no MCP servers or WASM tools, refuses any tool call and skips the session-start context |
+
+`--minimal-prompt` implies both `off`; an explicit flag wins whichever order you give them in.
 
 ### Speculative decoding
 
@@ -227,7 +232,7 @@ Verification is argmax, so proposals are only used at `--temp 0`; sampled decodi
 
 ### Advanced engine tuning
 
-`--mtp PATH`, `--mtp-draft N`, `--mtp-margin F` configure multi-token prediction with a draft model. `--ssd-streaming` and its companions (`--ssd-streaming-cold`, `--ssd-streaming-cache-experts`, `--ssd-streaming-preload-experts`) stream experts from SSD instead of loading them resident, which is how you run a model that does not fit. You rarely need to reach for `--ssd-streaming` yourself any more: plank measures the model file at startup and turns streaming on when it exceeds 80% of installed RAM less the engine's context buffers, printing the calculation it used. Passing the flag yourself skips that decision. `--simulate-used-memory <N>GB` pretends memory is already used, for testing those paths. `--dir-steering-file`, `--dir-steering-ffn`, `--dir-steering-attn` apply directional steering vectors.
+`--mtp PATH`, `--mtp-draft N`, `--mtp-margin F` configure multi-token prediction with a draft model. `--ssd-streaming` and its companions (`--ssd-streaming-cold`, `--ssd-streaming-cache-experts`, `--ssd-streaming-preload-experts`) stream experts from SSD instead of loading them resident, which is how you run a model that does not fit. You rarely need to reach for `--ssd-streaming` yourself any more: plank measures the model file at startup and turns streaming on when it exceeds 80% of installed RAM less the engine's context buffers, printing the calculation it used. Passing the flag yourself skips that decision. `--simulate-used-memory <N>GB` pretends memory is already used, for testing those paths. `--dir-steering-file`, `--dir-steering-ffn`, `--dir-steering-attn` apply directional steering vectors. `--dir-steering-from user`, the default, holds the FFN edit off while the system prompt and session context prefill and arms it before your first message, so the cached prompt stays unsteered and shared; `all` steers every token, and is what an attention scale falls back to, since only the FFN scale can change on a live session. `/steer` retargets the FFN scale mid-session. A local engine in `~/.plank/engines.local.json` can bundle a vector with a `"steering": {"file", "ffn", "attn", "from"}` block, applied whenever that engine is selected unless the command line names one.
 
 Remote, shared-engine, control, and provider flags are covered in [Remote and hosted engines](10-remote-and-providers.md).
 
@@ -237,6 +242,7 @@ Remote, shared-engine, control, and provider flags are covered in [Remote and ho
 |---|---|
 | `OPENAI_API_KEY` | key for `--provider openai` |
 | `ANTHROPIC_API_KEY` | key for `--provider anthropic` |
+| `HF_API_KEY` | Hugging Face token: model downloads authenticate with it and fetch four ranges in parallel |
 | `PLANK_REMOTE_TOKEN` | bearer token for `--remote`, `--control`, and `plank remote` |
 | `EDITOR` | editor for `Ctrl-G` when `ui.builtinEditor` is `false` |
 

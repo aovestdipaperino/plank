@@ -177,22 +177,26 @@ cargo build --release</code></pre>
 <code>build.rs</code> compiles <code>libds4core.a</code> from the
 Metal-backend objects, links Foundation and Metal, and enables real
 inference.</li>
-<li><strong>Without it</strong> — plank still builds and runs, but only
-against the echo stub. Fine for working on the UI and tools; useless for
-actual generation.</li>
+<li><strong>Without it</strong> — plank still builds and runs Gemma 4
+for real, on plank's own Rust engine, which compiles no C. DeepSeek and
+Qwen are unavailable; a build with neither falls back to the echo stub,
+which is fine for working on the UI and tools.
+<code>PLANK_NO_DS4=1 cargo build --release</code> gives you this build
+even with the submodule checked out.</li>
 </ul>
 <h2 id="getting-the-model">Getting the model</h2>
 <p>plank knows its models as named <em>engines</em>: a main model plus
 the companions it runs with, a drafter for speculative decoding
 (<code>mtp</code>) and a vision encoder (<code>vision</code>). They are
 listed in <code>engines.json</code>, a small catalog that ships inside
-plank and is refreshed from the repository at most once a day. Three are
+plank and is refreshed from the repository at most once a day. Five are
 built in:</p>
 <table>
 <thead>
 <tr>
 <th>Engine</th>
 <th>What</th>
+<th>Download</th>
 </tr>
 </thead>
 <tbody>
@@ -200,25 +204,69 @@ built in:</p>
 <td><code>ds4vision</code></td>
 <td>DeepSeek V4 Flash with its DSpark drafter and vision encoder. The
 default.</td>
+<td>~87 GB, needs 96 GB of RAM</td>
 </tr>
 <tr>
 <td><code>ds41</code></td>
 <td>DeepSeek V4.1 Flash with its vision encoder.</td>
+<td>~366 GB, streams from SSD</td>
 </tr>
 <tr>
 <td><code>qwen</code></td>
 <td>Qwen3.8-Flash-Next.</td>
+<td>~177 GB</td>
+</tr>
+<tr>
+<td><code>gemma4-e4b</code></td>
+<td>Gemma 4 E4B instruct (Q4_K_M), on plank's own Rust engine.</td>
+<td>~5 GB</td>
+</tr>
+<tr>
+<td><code>gemma4-12b</code></td>
+<td>Gemma 4 12B instruct (QAT Q4_0), on the same engine.</td>
+<td>~7 GB</td>
 </tr>
 </tbody>
 </table>
 <p>Pick one with <code>--model &lt;name&gt;</code>, for example
-<code>plank --model ds41</code>. Real inference with no choice at all
-runs the default engine: on first run, with nothing at its path
-(<code>~/.plank/ds4vision.gguf</code>), plank offers to fetch the
-quantized model (~87 GB) from Hugging Face. One keypress and it
-downloads in place with live progress, and an interruption resumes where
-it stopped rather than starting over. Any other engine is offered the
-same way the first time you pick it.</p>
+<code>plank --model gemma4-e4b</code>. Real inference with no choice at
+all runs the default engine. On first run, with nothing at its path
+(<code>~/.plank/ds4vision.gguf</code>), plank opens an engine menu on a
+terminal: every engine is listed, the ones this machine cannot run are
+dimmed with the reason beside them (not enough RAM, not enough free
+disk, not in this build), and the one you pick downloads in the
+background while a wait screen shows its progress. When it finishes,
+plank installs it and records it as your <code>engine.model</code>. Esc
+leaves the download running; a later launch tells you once it has
+finished, and picking it then installs it. With <code>--model</code> on
+the command line plank offers just that engine, and with no terminal it
+exits with instructions. <code>--pick-engine</code> opens the menu even
+when the selected engine is installed, and <code>/engines</code>
+restarts into it from a running session.</p>
+<p>Downloads come from Hugging Face. With <code>HF_API_KEY</code> set,
+plank authenticates to Hugging Face (and only to Hugging Face) and
+fetches four ranges of a file in parallel, resuming a partial range
+rather than starting over and checking the whole file again at the
+end.</p>
+<h3 id="gemma-4">Gemma 4</h3>
+<p>Gemma is the small, portable choice. It runs on Metal on a Mac and on
+the CPU elsewhere, on a Rust engine that needs neither the
+<code>refs/ds4</code> submodule nor macOS, so a plain
+<code>cargo build</code> does real inference with it. Tool calls,
+thinking, sessions, sub-agents, memory and KV reuse all work as they do
+on DeepSeek; vision, speculative decoding and the System-1 memory gate
+do not exist for it yet.</p>
+<p>With no <code>-c</code>, Gemma sizes its context from the RAM: the
+largest window whose KV fits a third of memory, never below 8,192 tokens
+and never past what the model was trained for. On a 128 GB Mac that is
+the full 131,072 tokens for E4B and about 66,000 for 12B; a 16 GB
+machine gives 12B the 8,192 floor. plank prints the size it chose and
+what it costs at startup.</p>
+<p>Its sessions are a family of their own (<code>.gemma.kv</code>), so
+switching between Gemma and DeepSeek keeps both histories. Any Gemma 4
+GGUF also works by path,
+<code>plank -m ~/models/gemma-4-E4B-it-Q4_K_M.gguf</code>, recognised
+from the file's own architecture field.</p>
 <p>DeepSeek V4.1 Flash is a family of its own, with its own tool-call
 dialect and its own <code>.ds41.kv</code> transcripts.
 <code>--model ds41</code> fetches and runs it; pointing
@@ -232,8 +280,10 @@ enough that plank will usually turn on SSD streaming for you.</p>
 network, close the laptop — the next launch picks up where it
 stopped.</li>
 <li><strong>It is guarded.</strong> The default quant needs roughly 82
-GB resident, so plank refuses to download or load on machines with less
-than 96 GB of RAM. You find out before the transfer, not after.</li>
+GB resident, so plank refuses to download or load DeepSeek and Qwen on
+machines with less than 96 GB of RAM. You find out before the transfer,
+not after; the engine menu says so up front and offers Gemma
+instead.</li>
 <li><strong>It is honest about the wait.</strong> Size and rate
 counters, plus a rotation of two hundred status messages.</li>
 <li><strong>It is headless-safe.</strong> With stdin not on a terminal
@@ -323,10 +373,11 @@ drafter and encoder become <code>ds4vision.mtp.gguf</code> and
 older plank sharing the same <code>~/.plank</code> no longer finds its
 model and offers to fetch it.</p>
 <h2 id="no-model-no-problem-sort-of">No model, no problem (sort of)</h2>
-<p>Without a model file plank runs against a built-in echo engine. Every
-command, tool, session feature and UI element works; the "model" just
-echoes. This is how the test suite runs and how UI work gets done, and
-it is what you will see if you launch on an unsupported platform.</p>
+<p>Without a model file, or in a build with no engine that can load it,
+plank runs against a built-in echo engine. Every command, tool, session
+feature and UI element works; the "model" just echoes. This is how the
+test suite runs and how UI work gets done, and it is what you will see
+if you launch on an unsupported platform.</p>
 <h2 id="where-plank-keeps-its-files">Where plank keeps its files</h2>
 <table>
 <thead>
@@ -339,7 +390,8 @@ it is what you will see if you launch on an unsupported platform.</p>
 <tr>
 <td><code>~/.plank/&lt;engine&gt;.gguf</code></td>
 <td>an engine's main model, for example <code>ds4vision.gguf</code> (the
-default), <code>ds41.gguf</code> or <code>qwen.gguf</code></td>
+default), <code>ds41.gguf</code>, <code>qwen.gguf</code> or
+<code>gemma4-e4b.gguf</code></td>
 </tr>
 <tr>
 <td><code>~/.plank/&lt;engine&gt;.mtp.gguf</code></td>
@@ -366,7 +418,8 @@ recording which version is on disk</td>
 </tr>
 <tr>
 <td><code>~/.plank/kvcache/</code></td>
-<td>saved sessions (<code>&lt;name&gt;.kv</code>) plus the KV snapshots
+<td>saved sessions (<code>&lt;name&gt;.&lt;family&gt;.kv</code>, such as
+<code>.ds4.kv</code> or <code>.gemma.kv</code>) plus the KV snapshots
 (<code>*.kv_raw</code>) and their metadata (<code>*.json</code>). Browse
 it with <code>/kvcache</code>.</td>
 </tr>
