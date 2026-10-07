@@ -984,10 +984,11 @@ impl Parser {
 pub struct StreamRenderer<S> {
     sink: S,
     syntax: ToolSyntax,
-    /// Whether the renderer was built for Gemma and so recognizes its
-    /// `<|tool_call>` opener. Fixed at construction, unlike `syntax`, which
-    /// follows DSML adoption: a DSML or Qwen stream that spells the Gemma
-    /// opener is quoting it, and must stream it as text.
+    /// Whether the renderer recognizes Gemma's `<|tool_call>` opener: true
+    /// when built for Gemma, or when a consumer that cannot know the dialect
+    /// opts in ([`StreamRenderer::set_gemma_opener`]). Unlike `syntax`, it
+    /// does not follow DSML adoption: a DSML or Qwen stream that spells the
+    /// Gemma opener is quoting it, and must stream it as text.
     gemma_opener: bool,
     parser: Parser,
     viz: ToolViz,
@@ -1174,6 +1175,18 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// matched, which is what unit tests and echo paths get.
     pub fn set_tool_names(&mut self, names: Vec<String>) {
         self.pseudo_tool.set_tool_names(names);
+    }
+
+    /// Sets whether Gemma's `<|tool_call>` opener starts a call (default:
+    /// only for a renderer built with [`ToolSyntax::Gemma`]).
+    ///
+    /// For a consumer that renders a stream without knowing which model
+    /// wrote it, such as a debug console: with this on, a Gemma stanza is
+    /// adopted at its opener the way DSML and Qwen stanzas already are. The
+    /// price is that a DSML or Qwen stream quoting `<|tool_call>` in prose is
+    /// read as a call. plank always knows the dialect and must leave it alone.
+    pub fn set_gemma_opener(&mut self, on: bool) {
+        self.gemma_opener = on;
     }
 
     /// Sets whether tool-call visualization is shown (default true). Production
@@ -4956,6 +4969,41 @@ mod qwen_dialect_tests {
             assert_eq!(done.error, None, "{syntax:?}");
             assert_eq!(sr.sink().visible, text, "{syntax:?}: verbatim");
         }
+    }
+
+    /// A renderer that cannot know its dialect (the debug console) opts in to
+    /// the Gemma opener and then adopts it at the stanza, as it adopts DSML
+    /// and Qwen; a DSML stanza after it still parses as DSML.
+    #[test]
+    fn an_opted_in_untold_renderer_adopts_gemma_then_dsml() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_gemma_opener(true);
+        sr.push("<think>plan</think>");
+        sr.push("<|tool_call>call:read{path:<|\"|>a.rs<|\"|>,max_lines:20}<tool_call|>");
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.error, None, "{:?}", sr.sink().visible);
+        let names: Vec<_> = done.calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["read"]);
+        assert!(
+            !sr.sink().visible.contains("<|\"|>"),
+            "{:?}",
+            sr.sink().visible
+        );
+
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_gemma_opener(true);
+        sr.push(concat!(
+            "<|tool_call>call:read{path:<|\"|>a.rs<|\"|>}<tool_call|>",
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+        ));
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.error, None, "{:?}", sr.sink().visible);
+        let names: Vec<_> = done.calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["read", "bash"]);
     }
 
     /// The end-to-end shape this whole port exists for: a Qwen stanza reaches

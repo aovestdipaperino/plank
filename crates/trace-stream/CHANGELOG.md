@@ -2,6 +2,13 @@
 
 ## 0.1.8
 
+- Gemma 4 tool calls (`<|tool_call>call:NAME{key:<|"|>text<|"|>}<tool_call|>`)
+  parse and render, through `gemma::GemmaParser` and `ToolSyntax::Gemma`.
+  Only a renderer built for Gemma recognizes the opener, so a DSML or Qwen
+  stream quoting it streams it as text. A consumer that cannot know the
+  dialect, such as a debug console, opts in with
+  `StreamRenderer::set_gemma_opener(true)` and then adopts a Gemma stanza at
+  its opener, as it already adopts DSML and Qwen.
 - A stanza whose inner tags lost the DSML marker now parses. Inside an opened
   `<｜DSML｜tool_calls>`, `<invoke name="…">`, `<parameter name="…">`,
   `</invoke>` and `</tool_calls>` are read as their marked forms, the
