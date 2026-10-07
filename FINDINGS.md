@@ -3433,7 +3433,8 @@ llama.cpp (commit `d7a695e`), pinned by
   is not told it keeps tokens it no longer has.
   Two consequences. Snapshots keep `SNAPSHOT_SLACK` (64) positions past the
   window, so a restore truncates exactly down to 65 tokens behind its end.
-  And a sidechain's tail must not reach a snapshot: with no fork snapshot
+  And a side pass's tail must not reach a snapshot (the sidechain ends and
+  `/btw` sync; see below): with no fork snapshot
   (`kv_truncates_exactly`), a suggestion (~240 tokens), a memory pass (up to
   ~10K) or a sub-agent left its tokens on the live session until the next
   `generate`, so `save_for_exit` or `/checkpoint` in between recorded them,
@@ -3441,7 +3442,15 @@ llama.cpp (commit `d7a695e`), pinned by
   rebuilt from zero where an untrimmed snapshot had truncated exactly.
   `restore_fork_kv` now calls `Engine::sync_to_prefix` with the parent's
   rendered transcript, which trims the Gemma session there without
-  prefilling (a no-op on every other engine).
+  prefilling (a no-op on every other engine). `/btw`, which runs on the live
+  session and pushes nothing to the transcript, syncs the same way once its
+  answers are done (`sync_exact_kv_to_parent`, on both the TUI and plain
+  paths, every exit). Known costs: a GPU-yield cycle inside a sub-agent on
+  Gemma restores a trimmed mid-sidechain snapshot that the fork-end sync then
+  truncates below the floor, so the parent's next pass rebuilds from zero
+  (rare, one rebuild, not a correctness issue); and a memory pass interrupted
+  by Esc alone re-prefills its task (up to ~8-10K tokens) on retry, the price
+  of keeping its tail out of exit snapshots.
 - **Suggestions with thinking on need `emits_think_tags`.**
   `suggest::reasoning_unfinished` assumed DeepSeek's implicit think block: a
   reply without `</think>` meant the budget ran out mid-thought. Gemma opens

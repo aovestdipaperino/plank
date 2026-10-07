@@ -952,7 +952,7 @@ pub trait Engine: Debug + Send {
     /// Drops whatever the live KV holds past its common prefix with the
     /// rendered `transcript`, without prefilling anything.
     ///
-    /// Called when a sidechain ends on an engine that
+    /// Called when a sidechain ends, and after `/btw`, on an engine that
     /// [`kv_truncates_exactly`](Self::kv_truncates_exactly), which takes no
     /// fork snapshot to restore: without it the session keeps the sidechain's
     /// tail until the next `generate`, and a snapshot captured in between

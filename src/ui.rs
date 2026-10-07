@@ -11845,11 +11845,19 @@ the original is frozen and listed in /tree"
             Some(Some(kv)) => {
                 let _ = self.engine.set_kv(&kv);
             }
-            Some(None) if self.engine.kv_truncates_exactly() => {
-                let parent = render_transcript(&recovery_session(&self.session), &self.system);
-                self.engine.sync_to_prefix(&parent);
-            }
+            Some(None) => self.sync_exact_kv_to_parent(),
             _ => {}
+        }
+    }
+
+    /// Trims an exact-KV engine (Gemma) back to the parent's rendered
+    /// transcript, prefilling nothing. Called when a side pass that ran on the
+    /// live session (a sidechain ending, `/btw`) is over, so a snapshot taken
+    /// next does not record its tail. A no-op for every other engine.
+    fn sync_exact_kv_to_parent(&mut self) {
+        if self.engine.kv_truncates_exactly() {
+            let parent = render_transcript(&recovery_session(&self.session), &self.system);
+            self.engine.sync_to_prefix(&parent);
         }
     }
 
@@ -11879,7 +11887,11 @@ the original is frozen and listed in /tree"
             let _ = write!(prompt_text, "[user]\n{}\n", btw_user_message(question));
         }
         let saved_ctx = self.last_ctx_used;
-        let (stream, _text, _stats) = self.stream_generation(&prompt_text, Instant::now())?;
+        let generated = self.stream_generation(&prompt_text, Instant::now());
+        // Whatever the outcome, the live session now ends with the question
+        // and its answer (or part of it); trim it back to the transcript.
+        self.sync_exact_kv_to_parent();
+        let (stream, _text, _stats) = generated?;
         let tried_tool = !stream.finished().calls.is_empty() || stream.finished().error.is_some();
         let mut renderer = stream.into_sink().into_renderer();
         renderer.finish();
@@ -16043,6 +16055,9 @@ impl Agent<'_> {
         // interrupted by it.
         shared.interrupt.store(false, Ordering::Relaxed);
         crate::interrupt::clear();
+        // The answers ran on the live session and stay out of the transcript;
+        // trim their tail so a following snapshot does not record it.
+        self.sync_exact_kv_to_parent();
         let _ = tx.send(UiEvent::BtwEnd);
     }
 
@@ -27941,6 +27956,85 @@ mod tests {
             .position(|e| matches!(e, UiEvent::UserEcho(_)))
             .unwrap();
         assert!(begin < echo && echo < end, "panel must bracket the answer");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/btw` runs on the live session and is not pushed to the transcript, so
+    /// an exact-KV engine is trimmed back to the parent once afterwards.
+    #[test]
+    fn an_exact_kv_engine_is_synced_to_the_parent_after_btw() {
+        let dir = scratch_dir("btw-exactkv-sync");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["It is 42.\n".to_string(), "Again.\n".to_string()],
+            kv_events: Some(kv_events.clone()),
+            exact_kv: true,
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        let shared = TurnShared::default();
+        shared.push_btw("one".to_owned());
+        shared.push_btw("two".to_owned());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.drain_btw(&tx, &shared);
+
+        let parent = render_transcript(&agent.session, &agent.system);
+        let events = kv_events.lock().unwrap().clone();
+        let syncs: Vec<&String> = events.iter().filter(|e| e.starts_with("sync:")).collect();
+        assert_eq!(syncs, [&format!("sync:{parent}")], "{events:?}");
+        let generated = events.iter().rposition(|e| e == "generate").unwrap();
+        let synced = events.iter().position(|e| e.starts_with("sync:")).unwrap();
+        assert!(synced > generated, "{events:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The plain-REPL `/btw` syncs the same way.
+    #[test]
+    fn an_exact_kv_engine_is_synced_to_the_parent_after_plain_btw() {
+        let dir = scratch_dir("btw-plain-exactkv-sync");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["It is 42.\n".to_string()],
+            kv_events: Some(kv_events.clone()),
+            exact_kv: true,
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.btw_plain("what?").unwrap();
+
+        let parent = render_transcript(&agent.session, &agent.system);
+        let events = kv_events.lock().unwrap().clone();
+        let syncs: Vec<&String> = events.iter().filter(|e| e.starts_with("sync:")).collect();
+        assert_eq!(syncs, [&format!("sync:{parent}")], "{events:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A non-exact engine is never asked to sync after `/btw`.
+    #[test]
+    fn a_non_exact_engine_is_not_synced_after_btw() {
+        let dir = scratch_dir("btw-nonexact-nosync");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["x\n".to_string(), "y\n".to_string()],
+            kv_events: Some(kv_events.clone()),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        let shared = TurnShared::default();
+        shared.push_btw("one".to_owned());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.drain_btw(&tx, &shared);
+        agent.btw_plain("two").unwrap();
+        let events = kv_events.lock().unwrap().clone();
+        assert!(!events.iter().any(|e| e.starts_with("sync:")), "{events:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

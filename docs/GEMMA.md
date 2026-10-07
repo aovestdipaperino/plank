@@ -156,6 +156,14 @@ keeps the KV up to the first differing token and prefills only the remainder.
   would rebuild from zero. `restore_fork_kv` calls `Engine::sync_to_prefix`
   with the parent's rendered transcript, and `GemmaEngine` truncates to the
   common prefix there, prefilling nothing. Other engines ignore the call.
+  `/btw` (TUI and plain REPL), which runs on the live session and is not
+  pushed to the transcript, syncs the same way after its answers. Only these
+  two paths sync. Two known costs: a GPU-yield cycle inside a sub-agent
+  restores a trimmed mid-sidechain snapshot that the fork-end sync then
+  truncates below the floor, so the parent's next pass rebuilds from zero
+  (rare; one rebuild, not a correctness issue); and a memory pass interrupted
+  by Esc alone re-prefills its task (up to ~8-10K tokens) on retry, the price
+  of keeping its tail out of exit snapshots.
 - **`kv_reuse_probe` reports `live == common`** (Ruling 14). Because the KV
   truncates exactly, a divergence behind the live end is never the
   rebuild-from-zero shape that the agent's rung and fork rescue exist for.
