@@ -6,9 +6,11 @@
 //! (f32), `n_tokens: u32`, the tokens as `u32` LE, then the
 //! [`KvCache`] body.
 //!
-//! Format 2 keeps only the last `sliding_window` positions of each sliding
-//! layer (the only keys a later query can reach), recording per layer the
-//! first position held; global layers are written whole. Format 1 (every
+//! Format 2 keeps only the last `sliding_window + SNAPSHOT_SLACK` positions
+//! of each sliding layer (a later query reaches only its window; the slack
+//! lets a restore truncate a little behind its end), recording per layer the
+//! first position held; global layers are written whole. The reader takes any
+//! recorded base, so the slack is the writer's choice alone. Format 1 (every
 //! position of every layer) is refused, and the caller rebuilds by prefill.
 //! A restored session can truncate exactly only while each trimmed layer
 //! still covers the window the next query needs; below that it empties.
@@ -28,6 +30,19 @@ const HEADER: usize = 4 + 4 + 32 + 1 + 4;
 /// Tokens a prefill evaluates per forward.
 const CHUNK: usize = 512;
 
+/// Positions a snapshot keeps on each sliding layer beyond its window.
+///
+/// A query at position `n` reads keys `n + 1 - window..=n`, so a layer holding
+/// exactly its window lets a restored session truncate exactly only to its
+/// last token. The agent's next turn often diverges a little further back
+/// (a sidechain tail the engine has not dropped, a re-rendered last span), and
+/// below that floor the session empties and re-prefills from zero. Keeping
+/// `SNAPSHOT_SLACK` more positions moves the floor `SNAPSHOT_SLACK` tokens
+/// further back: a restored `L`-token session truncates exactly to any
+/// `n >= L - SNAPSHOT_SLACK - 1`. Cost: 64 positions per sliding layer, about
+/// 42 MB on the 12B, against ~0.67 GB for its 1024-position window.
+pub const SNAPSHOT_SLACK: usize = 64;
+
 /// One conversation's tokens and KV cache over a shared [`Model`].
 #[derive(Debug)]
 pub struct Session {
@@ -37,6 +52,9 @@ pub struct Session {
     ctx: usize,
     /// Per KV layer, its sliding window (`None` for a global layer).
     windows: Vec<Option<usize>>,
+    /// Positions [`Session::snapshot`] keeps past each sliding window:
+    /// [`SNAPSHOT_SLACK`], or 0 in tests that pin the bare window.
+    slack: usize,
 }
 
 impl Session {
@@ -53,6 +71,7 @@ impl Session {
             tokens: Vec::new(),
             ctx,
             windows,
+            slack: SNAPSHOT_SLACK,
         }
     }
 
@@ -153,7 +172,12 @@ impl Session {
     /// # Errors
     /// When the cache cannot be read back from the device.
     pub fn snapshot(&self) -> Result<Vec<u8>> {
-        let body = self.cache.to_bytes_windowed(&self.windows)?;
+        let keep: Vec<Option<usize>> = self
+            .windows
+            .iter()
+            .map(|w| w.map(|w| w + self.slack))
+            .collect();
+        let body = self.cache.to_bytes_windowed(&keep)?;
         let n = u32::try_from(self.tokens.len()).map_err(|_| {
             Error(format!(
                 "{} tokens do not fit a snapshot",
@@ -371,6 +395,54 @@ mod tests {
         assert_eq!(b.snapshot().unwrap(), before);
     }
 
+    /// A session whose snapshots keep the bare window, no
+    /// [`SNAPSHOT_SLACK`], so a 9-token prompt already trims.
+    fn bare(m: Arc<Model>, ctx: usize) -> Session {
+        let mut s = Session::new(m, ctx);
+        s.slack = 0;
+        s
+    }
+
+    /// A prompt `n` tokens long, over ordinary byte tokens.
+    fn long_prompt(n: usize) -> Vec<u32> {
+        (0..n)
+            .map(|i| 16 + u32::try_from(i % 200).unwrap())
+            .collect()
+    }
+
+    /// A snapshot keeps `window + SNAPSHOT_SLACK` positions per sliding
+    /// layer, so after a restore truncation is exact down to
+    /// `SNAPSHOT_SLACK + 1` tokens behind the end and empties one further.
+    #[test]
+    fn a_snapshot_keeps_slack_past_the_window() {
+        let model = model();
+        let prompt = long_prompt(80);
+        let len = prompt.len();
+        let mut orig = Session::new(model.clone(), 128);
+        orig.prefill(&prompt, &|| false).unwrap();
+        let blob = orig.snapshot().unwrap();
+        assert_eq!(
+            blob.len(),
+            HEADER + 4 * len + 4 + layer_bytes(4 + SNAPSHOT_SLACK, 8) + layer_bytes(len, 16)
+        );
+        let mut restored = Session::new(model.clone(), 128);
+        restored.restore(&blob).unwrap();
+        assert_eq!(restored.cache.layers[0].base(), len - 4 - SNAPSHOT_SLACK);
+        let floor = len - SNAPSHOT_SLACK - 1;
+        assert_eq!(
+            restored.reusable(len - SNAPSHOT_SLACK),
+            len - SNAPSHOT_SLACK
+        );
+        assert_eq!(restored.reusable(floor - 1), 0);
+        assert_eq!(restored.truncate(floor), floor);
+        orig.truncate(floor);
+        assert_eq!(restored.step(20).unwrap(), orig.step(20).unwrap());
+        let mut other = Session::new(model, 128);
+        other.restore(&blob).unwrap();
+        assert_eq!(other.truncate(floor - 1), 0);
+        assert!(other.tokens().is_empty());
+    }
+
     /// `PROMPT` plus three more tokens, for sessions that grow after a
     /// restore.
     const MORE: [u32; 3] = [40, 41, 42];
@@ -384,7 +456,7 @@ mod tests {
     #[test]
     fn a_snapshot_keeps_only_the_window_of_a_sliding_layer() {
         let m = model();
-        let mut a = Session::new(m, 128);
+        let mut a = bare(m, 128);
         a.prefill(&PROMPT, &|| false).unwrap();
         let blob = a.snapshot().unwrap();
         let n = PROMPT.len();
@@ -398,10 +470,10 @@ mod tests {
     #[test]
     fn a_trimmed_restore_steps_exactly_like_the_untrimmed_session() {
         let m = model();
-        let mut a = Session::new(m.clone(), 128);
+        let mut a = bare(m.clone(), 128);
         a.prefill(&PROMPT, &|| false).unwrap();
         let blob = a.snapshot().unwrap();
-        let mut b = Session::new(m, 128);
+        let mut b = bare(m, 128);
         b.restore(&blob).unwrap();
         assert_eq!(b.cache.layers[0].base(), PROMPT.len() - 4);
         assert_eq!(b.cache.layers[1].base(), 0);
@@ -411,13 +483,13 @@ mod tests {
     #[test]
     fn a_restored_session_grows_and_snapshots_again() {
         let m = model();
-        let mut a = Session::new(m.clone(), 128);
+        let mut a = bare(m.clone(), 128);
         a.prefill(&PROMPT, &|| false).unwrap();
-        let mut b = Session::new(m.clone(), 128);
+        let mut b = bare(m.clone(), 128);
         b.restore(&a.snapshot().unwrap()).unwrap();
         a.prefill(&MORE, &|| false).unwrap();
         b.prefill(&MORE, &|| false).unwrap();
-        let mut c = Session::new(m, 128);
+        let mut c = bare(m, 128);
         c.restore(&b.snapshot().unwrap()).unwrap();
         assert_eq!(c.tokens(), a.tokens());
         assert_eq!(c.cache.layers[0].base(), PROMPT.len() + MORE.len() - 4);
@@ -427,9 +499,9 @@ mod tests {
     #[test]
     fn truncating_a_restore_within_its_window_is_exact() {
         let m = model();
-        let mut a = Session::new(m.clone(), 128);
+        let mut a = bare(m.clone(), 128);
         a.prefill(&PROMPT, &|| false).unwrap();
-        let mut b = Session::new(m, 128);
+        let mut b = bare(m, 128);
         b.restore(&a.snapshot().unwrap()).unwrap();
         // base 5, window 4: a query at 8 needs keys 5..=8, all still held.
         assert_eq!(b.truncate(8), 8);
@@ -441,11 +513,11 @@ mod tests {
     #[test]
     fn truncating_a_restore_below_its_window_empties_it() {
         let m = model();
-        let mut fresh = Session::new(m.clone(), 128);
+        let mut fresh = bare(m.clone(), 128);
         let want = fresh.prefill(&PROMPT, &|| false).unwrap().unwrap();
-        let mut a = Session::new(m.clone(), 128);
+        let mut a = bare(m.clone(), 128);
         a.prefill(&PROMPT, &|| false).unwrap();
-        let mut b = Session::new(m, 128);
+        let mut b = bare(m, 128);
         b.restore(&a.snapshot().unwrap()).unwrap();
         // A query at 7 needs key 4, which the snapshot dropped.
         assert_eq!(b.reusable(7), 0);

@@ -126,7 +126,8 @@ discipline (`docs/KV-CACHE.md`), with one difference that simplifies it:
 keeps the KV up to the first differing token and prefills only the remainder.
 
 - **Sliding layers keep every position.** The sliding-window layers attend
-  over the last 512 positions, but the cache does not use a ring buffer. It
+  over the last `sliding_window` positions (model-specific: 512 on E4B, 1024
+  on 12B), but the cache does not use a ring buffer. It
   keeps every position, and attention narrows to the window when it reads.
   This costs memory on those layers. In return, truncation is exact at any
   depth. With a ring buffer, truncating behind the window would lose the
@@ -134,8 +135,9 @@ keeps the KV up to the first differing token and prefills only the remainder.
   reuse, ladder rungs and forks plain prefix operations.
 - **Snapshots keep only the window of a sliding layer.** In memory nothing
   is dropped, but a snapshot (`Session::snapshot`, format 2) writes each
-  sliding layer's last `sliding_window` positions and records the first
-  position it holds (its `base`); global layers are written whole. On 12B
+  sliding layer's last `sliding_window + SNAPSHOT_SLACK` positions (the
+  slack is 64) and records the first position it holds (its `base`); global
+  layers are written whole. On 12B
   that is about 95% of the bytes per token, so a 40K-token snapshot falls
   from about 27.5 GB to about 2 GB. A format-1 blob is refused and the caller
   rebuilds by prefill. A restored session holds positions `base..len` on its
@@ -144,7 +146,16 @@ keeps the KV up to the first differing token and prefills only the remainder.
   the window the next query reads (`n + 1 - window >= base`); below that,
   `Session::truncate` empties the session and the next prefill starts from
   scratch, and `kv_reuse_probe` then reports the real session length as
-  `live`, the rebuild shape, instead of `live == common`.
+  `live`, the rebuild shape, instead of `live == common`. The slack places that floor
+  65 tokens behind the snapshot's end rather than one.
+- **A sidechain end trims the session to the parent.** With no fork snapshot
+  to restore, a sidechain (suggestion, memory pass, sub-agent) would leave
+  its tail on the live session until the next `generate`, and a snapshot
+  taken in between (`/resume`'s exit snapshot, `/checkpoint`) would record it;
+  restored, that session could not truncate back to the parent prefix and
+  would rebuild from zero. `restore_fork_kv` calls `Engine::sync_to_prefix`
+  with the parent's rendered transcript, and `GemmaEngine` truncates to the
+  common prefix there, prefilling nothing. Other engines ignore the call.
 - **`kv_reuse_probe` reports `live == common`** (Ruling 14). Because the KV
   truncates exactly, a divergence behind the live end is never the
   rebuild-from-zero shape that the agent's rung and fork rescue exist for.

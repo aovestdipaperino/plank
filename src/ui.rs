@@ -11830,11 +11830,27 @@ the original is frozen and listed in /tree"
     /// the sidechain's live end, and the extend-only C sync re-prefills the
     /// whole parent context from token zero instead of just the report. A
     /// restore failure keeps exactly that status quo, so it is swallowed.
+    ///
+    /// An engine whose KV truncates exactly took no snapshot (see
+    /// [`begin_sidechain`](Self::begin_sidechain)), so it still holds the
+    /// sidechain's tail. Its next `generate` would drop that on its own, but a
+    /// snapshot captured first (`save_for_exit`, `/checkpoint`) would record
+    /// it, and a restored Gemma session cannot truncate far behind its end:
+    /// the resumed turn would rebuild from zero. So it is trimmed to the
+    /// parent's prompt here, with nothing prefilled. Every fork-end path
+    /// reaches this through `end_subagent_fork`, after the transcript has
+    /// been truncated back to the fork point.
     fn restore_fork_kv(&mut self) {
-        let Some(Some(kv)) = self.fork_kv.pop() else {
-            return;
-        };
-        let _ = self.engine.set_kv(&kv);
+        match self.fork_kv.pop() {
+            Some(Some(kv)) => {
+                let _ = self.engine.set_kv(&kv);
+            }
+            Some(None) if self.engine.kv_truncates_exactly() => {
+                let parent = render_transcript(&recovery_session(&self.session), &self.system);
+                self.engine.sync_to_prefix(&parent);
+            }
+            _ => {}
+        }
     }
 
     /// Ends a `/subagent` fork: truncates the sidechain back out of the
@@ -24389,6 +24405,11 @@ mod tests {
         fn kv_truncates_exactly(&self) -> bool {
             self.exact_kv
         }
+        fn sync_to_prefix(&mut self, transcript: &str) {
+            if let Some(events) = &self.kv_events {
+                events.lock().unwrap().push(format!("sync:{transcript}"));
+            }
+        }
         fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
             let events = self.kv_events.as_ref()?;
             self.kv_captures += 1;
@@ -24866,6 +24887,69 @@ mod tests {
             "no capture and no restore: {events:?}"
         );
         assert_eq!(agent.sidechain_depth, 0, "the fork is closed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no fork snapshot to restore, the end of the sidechain trims the
+    /// exact-KV engine back to the parent's rendered transcript, once and
+    /// after the sidechain's generation, so a snapshot taken before the next
+    /// turn (exit, `/checkpoint`) does not record the sidechain's tail.
+    #[test]
+    fn an_exact_kv_engine_is_synced_to_the_parent_when_a_sidechain_ends() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-exactkv-sync");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["run the tests".to_string()],
+            kv_events: Some(kv_events.clone()),
+            exact_kv: true,
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+
+        assert!(agent.generate_suggestion());
+        let parent = render_transcript(&agent.session, &agent.system);
+        let events = kv_events.lock().unwrap().clone();
+        let syncs: Vec<&String> = events.iter().filter(|e| e.starts_with("sync:")).collect();
+        assert_eq!(syncs, [&format!("sync:{parent}")], "{events:?}");
+        let generated = events.iter().rposition(|e| e == "generate").unwrap();
+        let synced = events.iter().position(|e| e.starts_with("sync:")).unwrap();
+        assert!(
+            synced > generated,
+            "synced after the sidechain ran: {events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An engine that restores a fork snapshot is never asked to sync: the
+    /// restore already put the parent's KV back.
+    #[test]
+    fn a_snapshot_engine_is_not_synced_when_a_sidechain_ends() {
+        let _s = enable_suggestions_for_test();
+        let dir = scratch_dir("sugg-snapshot-nosync");
+        let cfg = test_cfg();
+        let kv_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["run the tests".to_string()],
+            kv_events: Some(kv_events.clone()),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.session.push(Message::assistant("hi"));
+        agent.suggestion_pending = true;
+
+        assert!(agent.generate_suggestion());
+        let events = kv_events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e.starts_with("restore")),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| e.starts_with("sync:")), "{events:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

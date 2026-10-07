@@ -3412,10 +3412,12 @@ llama.cpp (commit `d7a695e`), pinned by
   divergence behind the live end is never the rebuild-from-zero shape that the
   rung and fork rescue exist for. `Engine::kv_truncates_exactly` goes further:
   the agent takes no fork snapshot (sub-agent, memory pass, suggestion), no
-  memory-pass prefill snapshot and no ladder rung. Each `get_kv` serialises
-  the whole f32 KV, about 114 KB per token on E4B (≈3.5 GB at 30k tokens), and
-  `KvCache::restore` stages a second copy, so a fork could peak near 16 GB on
-  a 16 GB Mac for a prefix the next `generate` keeps anyway.
+  memory-pass prefill snapshot and no ladder rung. When this was decided each
+  `get_kv` serialised the whole f32 KV, about 114 KB per token on E4B
+  (≈3.5 GB at 30k tokens), and `KvCache::restore` staged a second copy, for a
+  prefix the next `generate` keeps anyway. Snapshots are now trimmed (next
+  entry), but a fork snapshot would still copy every global layer whole and
+  buy nothing.
 - **A Gemma snapshot trims its sliding layers to the window.** Per token,
   f32, 12B holds 40 sliding layers x 8 KV heads x (256 K + 256 V) plus
   8 global layers x 1 head x (512 + 512): 172,032 floats, 688,128 bytes, 95%
@@ -3429,6 +3431,17 @@ llama.cpp (commit `d7a695e`), pinned by
   `Session::truncate` empties the session (the next prefill rebuilds from
   zero) and `kv_reuse_probe` reports the real length as `live`, so the agent
   is not told it keeps tokens it no longer has.
+  Two consequences. Snapshots keep `SNAPSHOT_SLACK` (64) positions past the
+  window, so a restore truncates exactly down to 65 tokens behind its end.
+  And a sidechain's tail must not reach a snapshot: with no fork snapshot
+  (`kv_truncates_exactly`), a suggestion (~240 tokens), a memory pass (up to
+  ~10K) or a sub-agent left its tokens on the live session until the next
+  `generate`, so `save_for_exit` or `/checkpoint` in between recorded them,
+  and the resumed turn, diverging at the parent prefix far below the floor,
+  rebuilt from zero where an untrimmed snapshot had truncated exactly.
+  `restore_fork_kv` now calls `Engine::sync_to_prefix` with the parent's
+  rendered transcript, which trims the Gemma session there without
+  prefilling (a no-op on every other engine).
 - **Suggestions with thinking on need `emits_think_tags`.**
   `suggest::reasoning_unfinished` assumed DeepSeek's implicit think block: a
   reply without `</think>` meant the budget ran out mid-thought. Gemma opens
