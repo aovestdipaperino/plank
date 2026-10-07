@@ -27,10 +27,17 @@ engine to `GemmaEngine` and names its transcripts `.gemma.kv` before its file
 has been downloaded and its header can be read. A file given by path is
 classified by its own `general.architecture` (`gemma4`).
 
-With no `-c`, Gemma picks its own context: `min(32768, context_length)`. It
-does not inherit DeepSeek's 131072 default, which would cost about 14 GB of
-Gemma KV and is no answer about this model. An explicit `-c` is still capped
-by the GGUF's `context_length`.
+With no `-c` (or `engine.ctx`), Gemma sizes its own context from the RAM
+(`gemmaengine::default_ctx`): the window whose f32 KV fits a third of
+physical memory, in 1024-token steps, never below 8192 and never past the
+GGUF's `context_length`. The KV is what the window costs, about 115 KB a
+token on E4B and 688 KB on 12B, so on a 128 GB Mac E4B opens its full 131072
+and 12B 66560, while a 16 GB machine gives 12B the 8192 floor. It does not
+inherit plank's 1,048,576 DeepSeek default, which says nothing about this
+model. When the RAM cannot be read the old fixed 32768 applies. plank prints
+the chosen size and its KV cost at startup. An explicit `-c` is still capped
+by the GGUF's `context_length` and refused when its KV would exceed half of
+memory.
 
 ## The chat format
 

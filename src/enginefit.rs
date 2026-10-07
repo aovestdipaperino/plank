@@ -18,14 +18,19 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 pub const MIN_RAM_BYTES: u64 = 96 * GIB;
 
 /// RAM a Gemma engine needs beyond its weights when its catalog entry does
-/// not say: about 114 KB of f32 KV per token (E4B) at the engine's default
-/// context, rounded up. An entry's `kvBytesPerToken` replaces it.
+/// not say: generous on purpose (4 GiB holds 8K tokens of KV at up to
+/// ~500 KB a token). An entry's `kvBytesPerToken` replaces it.
 pub const GEMMA_KV_RESERVE_BYTES: u64 = 4 * GIB;
 
-/// The context a Gemma engine opens with when no `-c` is given:
-/// `min(32768, context_length)` (`docs/GEMMA.md`). Both catalog models allow
-/// more, so the reserve is sized at the cap.
-pub const GEMMA_DEFAULT_CTX: u64 = 32_768;
+/// Share of physical RAM a Gemma engine's default context may spend on its
+/// KV cache, as a divisor: a third (`gemmaengine::default_ctx`).
+pub const GEMMA_KV_RAM_DIVISOR: usize = 3;
+
+/// The smallest context a Gemma engine opens by default, however little RAM
+/// there is: below this an agent session cannot hold its own system prompt
+/// and a few tool results. Also what the fit rule reserves KV for, since a
+/// machine that can hold the weights and this much KV can run the engine.
+pub const GEMMA_MIN_CTX: usize = 8_192;
 
 /// Free space a download must leave behind, so the disk is not filled to the
 /// last byte by a model.
@@ -109,8 +114,10 @@ impl EngineRow {
     }
 }
 
-/// The KV a Gemma engine holds in RAM at its default context: the entry's
-/// `kvBytesPerToken` times [`GEMMA_DEFAULT_CTX`], else [`GEMMA_KV_RESERVE_BYTES`].
+/// The KV a Gemma engine needs at the smallest window it opens by default:
+/// the entry's `kvBytesPerToken` times [`GEMMA_MIN_CTX`], else
+/// [`GEMMA_KV_RESERVE_BYTES`]. A larger machine gets a larger window, so this
+/// is the floor that decides whether the engine runs at all.
 ///
 /// Declared per engine because it varies five-fold between the two models
 /// (E4B shares KV across 18 layers; 12B keeps 8 heads on 40 sliding layers)
@@ -120,7 +127,7 @@ fn gemma_kv_reserve(entry: &EngineEntry) -> u64 {
         .ok()
         .and_then(|v| v["kvBytesPerToken"].as_u64())
         .map_or(GEMMA_KV_RESERVE_BYTES, |b| {
-            b.saturating_mul(GEMMA_DEFAULT_CTX)
+            b.saturating_mul(GEMMA_MIN_CTX as u64)
         })
 }
 
@@ -433,9 +440,9 @@ mod tests {
     }
 
     /// Gemma 4 12B keeps ~688 KB of f32 KV per token (40 sliding layers of 8
-    /// heads at 512 values, 8 global layers of 1 head at 1024), so at the 32K
-    /// default it needs ~22.5 GB of KV on top of its 7 GB of weights: ~37 GB
-    /// of RAM at 80%, not the ~14 GB the flat 4 GiB reserve claimed.
+    /// heads at 512 values, 8 global layers of 1 head at 1024). The engine
+    /// sizes its window from the RAM down to an 8K floor, so the machine has
+    /// to hold the weights plus 8K of KV (~5.6 GB): ~15 GB at 80%.
     #[test]
     fn a_catalog_kv_cost_sizes_the_gemma_reserve() {
         let mut w = Vec::new();
@@ -461,12 +468,12 @@ mod tests {
             )
         };
         assert_eq!(
-            row(&at(32), "gemma4-12b").fit,
+            row(&at(8), "gemma4-12b").fit,
             Fit::Disabled {
-                reason: "needs 35 GB RAM (this machine: 32 GB)".into()
+                reason: "needs 15 GB RAM (this machine: 8 GB)".into()
             }
         );
-        assert!(row(&at(64), "gemma4-12b").selectable());
+        assert!(row(&at(16), "gemma4-12b").selectable());
     }
 
     #[test]
