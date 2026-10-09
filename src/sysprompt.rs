@@ -1080,6 +1080,7 @@ pub fn gemma_profile_prompt_for_tests(profile_text: &str, allow: &[&str]) -> Str
         folder_context: false,
         agents_md: false,
         recommended_model: None,
+        steering: None,
         grids: std::collections::BTreeMap::new(),
         verbs: None,
     };
@@ -3393,6 +3394,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         };
@@ -3432,6 +3434,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         };
@@ -3460,6 +3463,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         }
@@ -3610,6 +3614,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         };
@@ -3655,6 +3660,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         };
@@ -3760,6 +3766,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         };
@@ -3797,6 +3804,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         };
@@ -3831,6 +3839,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         };
@@ -3855,6 +3864,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         };

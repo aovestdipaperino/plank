@@ -148,6 +148,7 @@ pub mod stats;
 pub mod status;
 pub mod statusbar;
 pub mod stderrline;
+pub mod steervec;
 pub mod suggest;
 pub mod sysprompt;
 pub mod tasks;

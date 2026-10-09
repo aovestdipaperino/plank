@@ -857,18 +857,31 @@ streaming on when it exceeds 80% of installed RAM less the engine's
 context buffers, printing the calculation it used. Passing the flag
 yourself skips that decision.
 <code>--simulate-used-memory &lt;N&gt;GB</code> pretends memory is
-already used, for testing those paths. <code>--dir-steering-file</code>,
-<code>--dir-steering-ffn</code>, <code>--dir-steering-attn</code> apply
-directional steering vectors. <code>--dir-steering-from user</code>, the
-default, holds the FFN edit off while the system prompt and session
-context prefill and arms it before your first message, so the cached
-prompt stays unsteered and shared; <code>all</code> steers every token,
-and is what an attention scale falls back to, since only the FFN scale
-can change on a live session. <code>/steer</code> retargets the FFN
-scale mid-session. A local engine in
-<code>~/.plank/engines.local.json</code> can bundle a vector with a
-<code>"steering": {"file", "ffn", "attn", "from"}</code> block, applied
-whenever that engine is selected unless the command line names one.</p>
+already used, for testing those paths. <code>--dir-steering NAME</code>
+steers along a named direction stored for the model in
+<code>~/.plank/models/vectors.json</code>, the file
+<code>pt vectorize … -n NAME</code> writes: a JSON array with one entry
+per model file name, each listing its directions as base64
+<code>f32</code> matrices. <code>--dir-steering-ffn</code> and
+<code>--dir-steering-attn</code> set the scales (the FFN scale defaults
+to 1); a positive FFN scale pushes the model towards the prompts the
+vector was built <code>--to</code>. The old
+<code>--dir-steering-file PATH</code> is gone.
+<code>--dir-steering-from user</code>, the default, holds the FFN edit
+off while the system prompt and session context prefill and arms it
+before your first message, so the cached prompt stays unsteered and
+shared; <code>all</code> steers every token, and is what an attention
+scale falls back to, since only the FFN scale can change on a live
+session. <code>/steer</code> lists the model's directions, retargets the
+FFN scale mid-session, and switches to another direction by restarting
+into it with the session resumed, since the engine binds the vector when
+it loads. A profile can pair a direction with its
+<code>recommendedModel</code> through a
+<code>"steering": {"direction", "ffn", "attn", "from"}</code> block
+(<code>ffn</code> 1.0 and <code>attn</code> 0.0 when absent), applied
+when that engine is selected unless the command line names a direction;
+engines in <code>~/.plank/engines.local.json</code> no longer carry one,
+and the old <code>file</code> key is refused.</p>
 <p>Remote, shared-engine, control, and provider flags are covered in <a
 href="10-remote-and-providers.html">Remote and hosted engines</a>.</p>
 <h2 id="environment-variables">Environment variables</h2>

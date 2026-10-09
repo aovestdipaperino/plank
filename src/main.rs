@@ -350,6 +350,7 @@ fn active_recommendation() -> Option<plank::engines::Recommendation<'static>> {
     Some(plank::engines::Recommendation {
         profile: plank::profile::display_name(),
         engine: active.spec.recommended_model.as_deref()?,
+        steering: active.spec.steering.as_ref(),
     })
 }
 
@@ -657,38 +658,76 @@ fn resolve_selection(
     {
         cfg.model_spec = Some(rec.engine.to_string());
     }
-    apply_engine_steering(cfg, &catalog, &sel);
+    apply_profile_steering(cfg, recommended, &sel);
     cfg.model_path = Some(sel.main.clone());
     cfg.selection = Some(sel);
     Ok(catalog)
 }
 
-/// Applies the steering vector a selected engine bundles (`steering` in its
-/// local catalog entry) as if it had been given on the command line.
+/// Applies the steering a profile pairs with its `recommendedModel` as if it
+/// had been given on the command line, when that engine is the one selected.
 ///
-/// Anything the user set explicitly, a `--dir-steering-file` or a setting,
-/// wins: the engine's vector is a default for that model, not an override.
-fn apply_engine_steering(
+/// A stored direction belongs to one model, so the pair applies only to the
+/// engine it was written for: a `--model` choosing another engine, or a
+/// recommendation that lost to a missing file, runs unsteered. A
+/// `--dir-steering` the user gave wins outright, scales included. Only the
+/// name is chosen here; [`resolve_steering`] turns it into a vector file once
+/// the final model file is known.
+fn apply_profile_steering(
     cfg: &mut plank::config::AgentConfig,
-    catalog: &plank::engines::Catalog,
+    recommended: Option<plank::engines::Recommendation<'_>>,
     sel: &plank::engines::Selection,
 ) {
-    if cfg.engine.dir_steering_file.is_some() {
+    if cfg.engine.dir_steering.is_some() {
         return;
     }
-    let Some(st) = sel
-        .id
-        .and_then(|id| catalog.get(id.as_str()))
-        .and_then(|e| e.steering.as_ref())
+    let Some(st) = recommended
+        .filter(|rec| sel.id.is_some_and(|id| id.as_str() == rec.engine))
+        .and_then(|rec| rec.steering)
     else {
         return;
     };
-    cfg.engine.dir_steering_file = Some(st.file.clone());
+    cfg.engine.dir_steering = Some(st.direction.clone());
     cfg.engine.dir_steering_ffn = st.ffn;
     cfg.engine.dir_steering_attn = st.attn;
     if !cfg.engine.dir_steering_from_explicit {
         cfg.engine.dir_steering_from_user = st.from_user;
     }
+}
+
+/// Decodes the chosen steering direction from `<root>/models/vectors.json`
+/// into the vector file the engine loads. It is looked up under the selected
+/// engine's name, then the final model file's name (`steervec::model_keys`),
+/// so a bare path that is no engine still finds vectors stored for its file.
+///
+/// Remote and provider runs load no local model and skip this. A direction
+/// the store does not hold is fatal: the user asked for it by name, and
+/// running unsteered instead would be a silent change of behaviour.
+fn resolve_steering(
+    cfg: &mut plank::config::AgentConfig,
+    root: &std::path::Path,
+) -> Result<(), String> {
+    let local = cfg.remote_url.is_none() && cfg.provider.is_none();
+    let (Some(name), Some(model), true) = (
+        cfg.engine.dir_steering.clone(),
+        cfg.model_path.clone(),
+        local,
+    ) else {
+        return Ok(());
+    };
+    let engine = cfg
+        .selection
+        .as_ref()
+        .and_then(|s| s.id)
+        .map(plank::manifest::EngineId::as_str);
+    let file = plank::steervec::materialize_in(
+        &plank::steervec::store_path_in(root),
+        &root.join("cache").join("steering"),
+        &plank::steervec::model_keys(engine, &model),
+        &name,
+    )?;
+    cfg.engine.dir_steering_file = Some(file);
+    Ok(())
 }
 
 /// Points the selection at the final `model_path`, and gives a `.ggd`
@@ -780,7 +819,10 @@ fn parse_config_in(
             match resolve_selection(&mut cfg, root, recommended)
                 .and_then(|catalog| resolve_model_delta(&mut cfg).map(|()| catalog))
             {
-                Ok(catalog) => finish_selection(&mut cfg, root, &catalog),
+                Ok(catalog) => {
+                    finish_selection(&mut cfg, root, &catalog);
+                    resolve_steering(&mut cfg, root)?;
+                }
                 Err(e) => {
                     if resolution_is_fatal(&cfg) {
                         return Err(e);
@@ -2075,6 +2117,7 @@ mod tests {
         let rec = plank::engines::Recommendation {
             profile: "HAL",
             engine: "qwen",
+            steering: None,
         };
         resolve_selection(&mut cfg, &root, Some(rec)).expect("resolves");
         assert_eq!(cfg.model_spec.as_deref(), Some("qwen"));
@@ -2097,6 +2140,7 @@ mod tests {
         let rec = plank::engines::Recommendation {
             profile: "HAL",
             engine: "qwen",
+            steering: None,
         };
         resolve_selection(&mut cfg, &root, Some(rec)).expect("resolves");
         assert_eq!(cfg.model_spec.as_deref(), Some("ds41"));
@@ -2232,39 +2276,72 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_with_a_steering_vector_steers_unless_the_user_already_did() {
-        let root = std::env::temp_dir().join(format!("plank-engine-steer-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+    fn a_profile_steers_its_recommended_engine_unless_the_user_already_did() {
+        let root = std::env::temp_dir().join(format!("plank-profile-steer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::write(root.join("models").join("a.gguf"), b"x").unwrap();
         std::fs::write(
             root.join("engines.local.json"),
-            r#"{"engines":{"ds4-ab":{"main":{"path":"/m/a.gguf"},
-                "steering":{"file":"/v/h.f32","ffn":3}}}}"#,
+            format!(
+                r#"{{"engines":{{"ds4-ab":{{"main":{{"path":"{}"}}}},
+                    "other":{{"main":{{"path":"{}"}}}}}}}}"#,
+                root.join("models").join("a.gguf").display(),
+                root.join("models").join("a.gguf").display(),
+            ),
         )
         .unwrap();
+        // [1.0, 0.0] and [0.0, 1.0] as little-endian f32, base64.
+        std::fs::write(
+            root.join("models").join("vectors.json"),
+            r#"[{"model":"ds4-ab","vectors":[
+                {"name":"heretic","value":"AACAPwAAAAA="},
+                {"name":"terse","value":"AAAAAAAAgD8="}]}]"#,
+        )
+        .unwrap();
+        let steering = plank::steervec::parse_steering(&serde_json::json!({
+            "direction": "heretic", "attn": 1, "ffn": 0
+        }))
+        .unwrap();
+        let rec = Some(plank::engines::Recommendation {
+            profile: "3v1l",
+            engine: "ds4-ab",
+            steering: Some(&steering),
+        });
         let settings = plank::settings::Settings::default();
         let parse = |extra: &[&str]| {
-            let mut args: Vec<String> = ["--model", "ds4-ab"].map(String::from).to_vec();
-            args.extend(extra.iter().map(ToString::to_string));
-            parse_config_in(&settings, &args, "plank", &root, None, false, false).expect("parses")
+            let args: Vec<String> = extra.iter().map(ToString::to_string).collect();
+            parse_config_in(&settings, &args, "plank", &root, rec, false, false)
         };
-        let cfg = parse(&[]);
-        assert_eq!(
-            cfg.engine.dir_steering_file.as_deref(),
-            Some(std::path::Path::new("/v/h.f32"))
+        let file = |cfg: &plank::config::AgentConfig| {
+            std::fs::read(cfg.engine.dir_steering_file.as_ref().expect("resolved")).unwrap()
+        };
+        let cfg = parse(&[]).expect("parses");
+        assert_eq!(cfg.engine.dir_steering.as_deref(), Some("heretic"));
+        assert_eq!(file(&cfg), [0, 0, 0x80, 0x3f, 0, 0, 0, 0]);
+        assert!(
+            cfg.engine
+                .dir_steering_file
+                .as_ref()
+                .unwrap()
+                .starts_with(root.join("cache").join("steering"))
         );
-        assert!((cfg.engine.dir_steering_ffn - 3.0).abs() < f32::EPSILON);
-        // An explicit vector on the command line wins outright.
-        let cfg = parse(&[
-            "--dir-steering-file",
-            "/mine.f32",
-            "--dir-steering-ffn",
-            "2",
-        ]);
-        assert_eq!(
-            cfg.engine.dir_steering_file.as_deref(),
-            Some(std::path::Path::new("/mine.f32"))
+        assert!((cfg.engine.dir_steering_attn - 1.0).abs() < f32::EPSILON);
+        assert!(cfg.engine.dir_steering_ffn.abs() < f32::EPSILON);
+        assert!(
+            !cfg.engine.dir_steering_from_user,
+            "an attn edit steers every token"
         );
+        // A direction named on the command line wins outright, scale included.
+        let cfg = parse(&["--dir-steering", "terse", "--dir-steering-ffn", "2"]).expect("parses");
+        assert_eq!(cfg.engine.dir_steering.as_deref(), Some("terse"));
+        assert_eq!(file(&cfg), [0, 0, 0, 0, 0, 0, 0x80, 0x3f]);
         assert!((cfg.engine.dir_steering_ffn - 2.0).abs() < f32::EPSILON);
+        // Another engine runs unsteered: the direction belongs to `ds4-ab`.
+        let cfg = parse(&["--model", "other"]).expect("parses");
+        assert_eq!(cfg.engine.dir_steering, None);
+        // A name the store does not hold stops the launch.
+        assert!(parse(&["--dir-steering", "nope"]).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2272,6 +2349,7 @@ mod tests {
         Some(plank::engines::Recommendation {
             profile: "HAL",
             engine: "qwen",
+            steering: None,
         });
 
     fn settings_model(spec: &str) -> plank::settings::Settings {

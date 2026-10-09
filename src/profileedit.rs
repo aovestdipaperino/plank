@@ -427,7 +427,7 @@ pub fn record_launch(dir: PathBuf, args: Vec<String>) {
 
 /// A restart the user asked for: the saved session to resume and the
 /// directory it was running in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Restart {
     /// The id `plank /resume` takes.
     pub session: String,
@@ -437,6 +437,41 @@ pub struct Restart {
     /// session: the session is handed over with `--pick-engine-resume`, and
     /// the relaunched plank resumes it only under a matching family.
     pub pick_engine: bool,
+    /// Relaunch steering along another named direction (`/steer NAME`): the
+    /// C binds the vector into the graph at open, so a different direction
+    /// needs a fresh engine. `None` keeps the launch's steering as it was.
+    pub steering: Option<SteerSwitch>,
+}
+
+/// The direction and FFN scale a restart switches steering to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SteerSwitch {
+    /// The direction's name in `vectors.json`.
+    pub name: String,
+    /// The FFN scale to open it at.
+    pub ffn: f32,
+}
+
+/// Replaces any `--dir-steering NAME` and `--dir-steering-ffn F` in `args`
+/// with `switch`, leaving the other steering flags (`-attn`, `-from`) and
+/// everything else in place. The new pair goes first, ahead of `/resume`.
+#[must_use]
+pub fn switch_steering(args: &[String], switch: &SteerSwitch) -> Vec<String> {
+    let mut out = vec![
+        "--dir-steering".to_owned(),
+        switch.name.clone(),
+        "--dir-steering-ffn".to_owned(),
+        switch.ffn.to_string(),
+    ];
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir-steering" | "--dir-steering-ffn" => i += 1,
+            other => out.push(other.to_owned()),
+        }
+        i += 1;
+    }
+    out
 }
 
 static PENDING: std::sync::Mutex<Option<Restart>> = std::sync::Mutex::new(None);
@@ -540,12 +575,15 @@ pub fn exec_restart(restart: &Restart) -> String {
     if let Err(e) = std::env::set_current_dir(&launch.dir) {
         return format!("cannot return to {}: {e}", launch.dir.display());
     }
-    let args = restart_args_for(
+    let mut args = restart_args_for(
         &launch.args,
         &restart.session,
         &restart.cwd,
         restart.pick_engine,
     );
+    if let Some(switch) = &restart.steering {
+        args = switch_steering(&args, switch);
+    }
     std::process::Command::new(exe)
         .args(args)
         .exec()
@@ -763,10 +801,49 @@ mod tests {
             session: "brave-curie".to_owned(),
             cwd: PathBuf::from("/w"),
             pick_engine: false,
+            steering: None,
         };
         request_restart(r.clone());
         assert_eq!(take_restart(), Some(r));
         assert_eq!(take_restart(), None);
+    }
+
+    #[test]
+    fn a_steering_switch_replaces_the_direction_and_its_scale_only() {
+        let launch = args(&[
+            "--dir-steering",
+            "heretic",
+            "--dir-steering-ffn",
+            "5",
+            "--dir-steering-from",
+            "all",
+            "--chdir",
+            "/w",
+            "/resume",
+            "brave-curie",
+        ]);
+        let out = switch_steering(
+            &launch,
+            &SteerSwitch {
+                name: "terse".to_owned(),
+                ffn: -1.5,
+            },
+        );
+        assert_eq!(
+            out,
+            args(&[
+                "--dir-steering",
+                "terse",
+                "--dir-steering-ffn",
+                "-1.5",
+                "--dir-steering-from",
+                "all",
+                "--chdir",
+                "/w",
+                "/resume",
+                "brave-curie",
+            ])
+        );
     }
 
     fn args(list: &[&str]) -> Vec<String> {

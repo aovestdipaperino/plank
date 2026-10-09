@@ -7722,7 +7722,13 @@ impl Agent<'_> {
             },
             "/mtp" => println!("{}", self.mtp_command(arg)),
             "/temp" => println!("{}", self.temp_command(arg)),
-            "/steer" => println!("{}", self.steer_command(arg)),
+            "/steer" => {
+                let steered = self.steer(arg);
+                println!("{}", steered.message);
+                if steered.restart {
+                    return Ok(false);
+                }
+            }
             "/loopguard" | "/lg" => println!("{}", loopguard_command(arg)),
             "/mc" => println!("{}", microcompact_command(arg)),
             "/jobs" => println!("{}", self.jobs_command()),
@@ -9716,43 +9722,99 @@ the original is frozen and listed in /tree"
     /// speculation: any temperature above 0 turns the draft gate off, so the
     /// obliging reading of `/temp 0.6` would be "quietly stop doing the thing
     /// the footer still claims". The user is told which switch to throw first.
-    /// `/steer [scale]` — report or retarget the FFN directional-steering
-    /// scale for the rest of the session, mirroring the C CLI's `/steer`.
+    /// `/steer [name] [scale]` — report, retarget, or switch directional
+    /// steering. See [`plan_steer`] for how the arguments are read.
     ///
-    /// The scale is the only part of a steering setup that can move at
-    /// runtime: the vector itself and the attention scale are fixed when the
-    /// engine loads, because the C binds them into the graph at open.
+    /// The FFN scale of the loaded direction is the only part of a steering
+    /// setup that can move at runtime: the vector itself and the attention
+    /// scale are fixed when the engine loads, because the C binds them into
+    /// the graph at open. Choosing another direction therefore saves the
+    /// session and restarts plank on it (`profileedit::SteerSwitch`), as
+    /// `/engines` does; `restart` tells the front end to quit for that.
     ///
-    /// A change invalidates the cached KV in the one way the fingerprint
-    /// cannot express. The live prefix keeps the activations the *old* scale
-    /// produced, the suffix gets the new one, and `kv_variant` now reports the
-    /// new one for the whole thing — so the ladder's rungs, which claim to
-    /// describe a prefix at a single setting, are dropped here. The live
-    /// session is left alone: the C changes the scale without rebuilding the
-    /// KV on purpose, and re-prefilling a long transcript to make a slider
+    /// A live scale change invalidates the cached KV in the one way the
+    /// fingerprint cannot express. The live prefix keeps the activations the
+    /// *old* scale produced, the suffix gets the new one, and `kv_variant` now
+    /// reports the new one for the whole thing — so the ladder's rungs, which
+    /// claim to describe a prefix at a single setting, are dropped here. The
+    /// live session is left alone: the C changes the scale without rebuilding
+    /// the KV on purpose, and re-prefilling a long transcript to make a slider
     /// consistent would cost more than the inconsistency does.
+    fn steer(&mut self, arg: &str) -> Steered {
+        let say = |message: String| Steered {
+            message,
+            restart: false,
+        };
+        let available = match self.steer_directions() {
+            Ok(names) => names,
+            Err(e) => return say(e),
+        };
+        let live = self.engine.steering_ffn();
+        let loaded = self
+            .cfg
+            .engine
+            .dir_steering
+            .as_deref()
+            .filter(|_| live.is_some());
+        match plan_steer(arg, loaded, live, &available) {
+            SteerPlan::Say(message) => say(message),
+            SteerPlan::Live(scale) => say(self.set_live_steering(scale)),
+            SteerPlan::Switch { name, ffn } => match self.save_session() {
+                Ok(id) => {
+                    crate::profileedit::request_restart(crate::profileedit::Restart {
+                        session: id,
+                        cwd: self.tool_ctx.cwd.clone(),
+                        pick_engine: false,
+                        steering: Some(crate::profileedit::SteerSwitch {
+                            name: name.clone(),
+                            ffn,
+                        }),
+                    });
+                    Steered {
+                        message: format!(
+                            "steering: restarting on direction `{name}` (ffn {ffn}); \
+                             the session resumes once the model has reloaded"
+                        ),
+                        restart: true,
+                    }
+                }
+                Err(e) => say(format!(
+                    "/steer: switching direction needs a restart, and the session \
+                     could not be saved: {e}"
+                )),
+            },
+        }
+    }
+
+    /// [`Self::steer`]'s message alone, for tests that never switch.
+    #[cfg(test)]
     fn steer_command(&mut self, arg: &str) -> String {
-        let arg = arg.trim();
+        self.steer(arg).message
+    }
+
+    /// The directions `vectors.json` holds for the loaded model; none for a
+    /// remote or provider run, which has no local model to steer.
+    fn steer_directions(&self) -> Result<Vec<String>, String> {
+        if self.cfg.remote_url.is_some() || self.cfg.provider.is_some() {
+            return Ok(Vec::new());
+        }
+        let Some(model) = self.cfg.model_path.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let engine = self
+            .cfg
+            .selection
+            .as_ref()
+            .and_then(|s| s.id)
+            .map(crate::manifest::EngineId::as_str);
+        crate::steervec::directions(&crate::steervec::model_keys(engine, model))
+    }
+
+    /// Retargets the loaded direction's FFN scale on the live session.
+    fn set_live_steering(&mut self, scale: f32) -> String {
         let Some(current) = self.engine.steering_ffn() else {
-            // Both halves of the precondition, because a file alone is not
-            // enough: the engine skips loading the vector when every launch
-            // scale is zero, and then nothing can turn steering on later.
-            return "steering: unavailable — needs --dir-steering-file FILE and a non-zero \
-                    --dir-steering-ffn/--dir-steering-attn at launch"
-                .to_owned();
+            return "steering: no direction is loaded".to_owned();
         };
-        if arg.is_empty() {
-            return format!("steering ffn: {current}");
-        }
-        let Ok(scale) = arg.parse::<f32>() else {
-            return format!("/steer: expected a number -100..100, got `{arg}`");
-        };
-        if !scale.is_finite() || !(-100.0..=100.0).contains(&scale) {
-            return format!("/steer: expected a number -100..100, got `{arg}`");
-        }
-        // `-0` and `0` are the same inert setting; collapsing them here keeps
-        // one spelling out of the KV key and out of the echoed message.
-        let scale = if scale == 0.0 { 0.0 } else { scale };
         // Exact identity on purpose — see `ds4engine::same_scale`: this value
         // keys the KV, so a tolerance here would call two different caches one.
         if scale.to_bits() == current.to_bits() {
@@ -17839,7 +17901,13 @@ impl Agent<'_> {
             },
             "/mtp" => log.push_plain(self.mtp_command(arg)),
             "/temp" => log.push_plain(self.temp_command(arg)),
-            "/steer" => log.push_plain(self.steer_command(arg)),
+            "/steer" => {
+                let steered = self.steer(arg);
+                log.push_plain(steered.message);
+                if steered.restart {
+                    return false;
+                }
+            }
             "/loopguard" | "/lg" => log.push_plain(loopguard_command(arg)),
             "/mc" => log.push_plain(microcompact_command(arg)),
             // A report, not conversation: the same dismissable panel as
@@ -17967,6 +18035,7 @@ impl Agent<'_> {
                         session: id,
                         cwd: self.tool_ctx.cwd.clone(),
                         pick_engine: true,
+                        steering: None,
                     });
                     return false;
                 }
@@ -18435,6 +18504,7 @@ impl Agent<'_> {
                     session: id,
                     cwd: self.tool_ctx.cwd.clone(),
                     pick_engine: false,
+                    steering: None,
                 });
                 false
             }
@@ -19139,6 +19209,152 @@ fn await_yes_default() -> Result<bool, String> {
 
 /// `/mc [on|off]` changes only the live micro-compaction setting, not disk
 /// preferences or full summarization. All micro-compaction gates read it live.
+/// What `/steer` printed, and whether it asked the front end to quit so plank
+/// can restart on another direction.
+#[derive(Debug)]
+struct Steered {
+    message: String,
+    restart: bool,
+}
+
+/// What a `/steer` argument asks for.
+#[derive(Debug, PartialEq)]
+enum SteerPlan {
+    /// Only report or refuse.
+    Say(String),
+    /// Retarget the loaded direction's FFN scale on the live session.
+    Live(f32),
+    /// Restart plank steering along `name` at FFN scale `ffn`.
+    Switch { name: String, ffn: f32 },
+}
+
+/// Reads a `/steer` argument against the steering in force.
+///
+/// `loaded` is the name of the direction the engine holds (`None` when it
+/// holds none), `live` its FFN scale (`None` when no vector is loaded), and
+/// `available` the names `vectors.json` lists for this model.
+///
+/// - no argument reports the steering in force and what else is available;
+/// - `<scale>` retargets the loaded direction, or loads the model's only
+///   direction at that scale. When the model has more than one direction the
+///   scale alone is ambiguous, so a name is required;
+/// - `<name> [scale]` retargets that direction when it is the loaded one, and
+///   otherwise switches to it (at `scale`, or 1 when omitted), which restarts.
+fn plan_steer(
+    arg: &str,
+    loaded: Option<&str>,
+    live: Option<f32>,
+    available: &[String],
+) -> SteerPlan {
+    let words: Vec<&str> = arg.split_whitespace().collect();
+    // The bare `/steer` listing: what is in force, then every direction the
+    // model has, the loaded one starred, so the names to type are on screen.
+    let listing = || {
+        let mut out = match (loaded, live) {
+            (Some(name), Some(ffn)) => format!("steering: `{name}` at ffn {ffn}"),
+            (None, Some(ffn)) => format!("steering: ffn {ffn}"),
+            _ => "steering: off".to_owned(),
+        };
+        out.push_str("\ndirections for this model:");
+        for name in available {
+            let here = loaded == Some(name.as_str()) && live.is_some();
+            out.push_str(if here { "\n  * " } else { "\n    " });
+            out.push_str(name);
+        }
+        if let (Some(name), Some(_)) = (loaded, live)
+            && !available.iter().any(|a| a == name)
+        {
+            out.push_str("\n  * ");
+            out.push_str(name);
+            out.push_str(" (no longer in vectors.json)");
+        }
+        out.push_str("\n/steer <name> [scale] switches; /steer [name] <scale> retargets");
+        out
+    };
+    let none_stored = || {
+        format!(
+            "steering: unavailable — no directions for this model in {} \
+             (build one with `pt vectorize … -n NAME`)",
+            crate::steervec::store_path().display()
+        )
+    };
+    let unknown = |name: &str| {
+        SteerPlan::Say(if available.is_empty() {
+            format!("/steer: no direction `{name}`; {}", none_stored())
+        } else {
+            format!(
+                "/steer: no direction `{name}` for this model; it has: {}",
+                available.join(", ")
+            )
+        })
+    };
+    let is_known = |name: &str| available.iter().any(|a| a == name) || loaded == Some(name);
+    let to = |name: &str, scale: f32| {
+        if loaded == Some(name) && live.is_some() {
+            SteerPlan::Live(scale)
+        } else if scale == 0.0 {
+            // An inert scale loads nothing, so there is nothing to restart for.
+            SteerPlan::Say(format!(
+                "steering `{name}` at 0 is no steering; nothing to do"
+            ))
+        } else {
+            SteerPlan::Switch {
+                name: name.to_owned(),
+                ffn: scale,
+            }
+        }
+    };
+    match words.as_slice() {
+        [] if !available.is_empty() => SteerPlan::Say(listing()),
+        [] => SteerPlan::Say(match (loaded, live) {
+            (Some(name), Some(ffn)) => format!("steering `{name}` ffn: {ffn}"),
+            (None, Some(ffn)) => format!("steering ffn: {ffn}"),
+            _ => none_stored(),
+        }),
+        [word] if looks_numeric(word) => match parse_steer_scale(word) {
+            Err(e) => SteerPlan::Say(e),
+            Ok(_) if available.len() > 1 => SteerPlan::Say(format!(
+                "/steer: this model has {} directions ({}); name one: /steer <name> <scale>",
+                available.len(),
+                available.join(", ")
+            )),
+            Ok(scale) if live.is_some() => SteerPlan::Live(scale),
+            Ok(scale) => available
+                .first()
+                .map_or_else(|| SteerPlan::Say(none_stored()), |only| to(only, scale)),
+        },
+        [name] | [name, _] if !is_known(name) => unknown(name),
+        [name] if loaded == Some(*name) && live.is_some() => SteerPlan::Say(format!(
+            "steering `{name}` is already loaded; /steer {name} <scale> retargets it"
+        )),
+        [name] => to(name, 1.0),
+        [name, word] => match parse_steer_scale(word) {
+            Ok(scale) => to(name, scale),
+            Err(e) => SteerPlan::Say(e),
+        },
+        _ => SteerPlan::Say("usage: /steer [name] [-100..100]".to_owned()),
+    }
+}
+
+/// Whether a `/steer` word is meant as a scale rather than a direction name:
+/// it starts like a number.
+fn looks_numeric(word: &str) -> bool {
+    word.strip_prefix(['-', '+'])
+        .unwrap_or(word)
+        .starts_with(|c: char| c.is_ascii_digit() || c == '.')
+}
+
+/// Parses a steering scale in -100..100. `-0` collapses to `0`, so one
+/// spelling reaches the KV key and the echoed message.
+fn parse_steer_scale(word: &str) -> Result<f32, String> {
+    match word.parse::<f32>() {
+        Ok(scale) if scale.is_finite() && (-100.0..=100.0).contains(&scale) => {
+            Ok(if scale == 0.0 { 0.0 } else { scale })
+        }
+        _ => Err(format!("/steer: expected a number -100..100, got `{word}`")),
+    }
+}
+
 fn microcompact_command(arg: &str) -> String {
     let (want, reply) = microcompact_reply(arg, crate::settings::active().context.microcompact);
     if let Some(want) = want {
@@ -25408,6 +25624,100 @@ mod tests {
         )
     }
 
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn steer_with_several_directions_needs_a_name() {
+        let two = names(&["heretic", "terse"]);
+        let SteerPlan::Say(msg) = plan_steer("2", Some("heretic"), Some(1.0), &two) else {
+            panic!("a bare scale must not act when two directions exist");
+        };
+        assert!(
+            msg.contains("heretic, terse") && msg.contains("<name>"),
+            "{msg}"
+        );
+        // Naming the loaded one retargets it live.
+        assert_eq!(
+            plan_steer("heretic 2", Some("heretic"), Some(1.0), &two),
+            SteerPlan::Live(2.0)
+        );
+        // Naming another one restarts on it, at 1 unless told otherwise.
+        assert_eq!(
+            plan_steer("terse", Some("heretic"), Some(1.0), &two),
+            SteerPlan::Switch {
+                name: "terse".into(),
+                ffn: 1.0
+            }
+        );
+        assert_eq!(
+            plan_steer("terse -0.5", Some("heretic"), Some(1.0), &two),
+            SteerPlan::Switch {
+                name: "terse".into(),
+                ffn: -0.5
+            }
+        );
+    }
+
+    #[test]
+    fn steer_with_one_direction_takes_a_bare_scale() {
+        let one = names(&["heretic"]);
+        assert_eq!(
+            plan_steer("3", Some("heretic"), Some(1.0), &one),
+            SteerPlan::Live(3.0)
+        );
+        // Nothing loaded yet: the only direction is loaded at that scale.
+        assert_eq!(
+            plan_steer("3", None, None, &one),
+            SteerPlan::Switch {
+                name: "heretic".into(),
+                ffn: 3.0
+            }
+        );
+        // ...but an inert scale has nothing to load.
+        assert!(matches!(
+            plan_steer("0", None, None, &one),
+            SteerPlan::Say(_)
+        ));
+    }
+
+    #[test]
+    fn steer_reports_the_direction_and_what_else_there_is() {
+        let two = names(&["heretic", "terse"]);
+        let SteerPlan::Say(msg) = plan_steer("", Some("heretic"), Some(5.0), &two) else {
+            panic!("a report");
+        };
+        assert_eq!(
+            msg,
+            "steering: `heretic` at ffn 5\n\
+             directions for this model:\n  * heretic\n    terse\n\
+             /steer <name> [scale] switches; /steer [name] <scale> retargets"
+        );
+        let SteerPlan::Say(msg) = plan_steer("", None, None, &two) else {
+            panic!("a report");
+        };
+        assert!(
+            msg.starts_with("steering: off\ndirections for this model:"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("\n    heretic\n    terse"),
+            "nothing starred: {msg}"
+        );
+        let SteerPlan::Say(msg) = plan_steer("bogus 2", None, None, &two) else {
+            panic!("a refusal");
+        };
+        assert!(
+            msg.contains("no direction `bogus`") && msg.contains("terse"),
+            "{msg}"
+        );
+        let SteerPlan::Say(msg) = plan_steer("heretic", Some("heretic"), Some(5.0), &two) else {
+            panic!("already loaded");
+        };
+        assert!(msg.contains("already loaded"), "{msg}");
+    }
+
     fn steering_agent<'a>(
         dir: &std::path::Path,
         cfg: &'a crate::config::AgentConfig,
@@ -25447,11 +25757,8 @@ mod tests {
         // The scale alone means nothing without a direction to scale, so this
         // must not report a number — a `0` here would read as "loaded, inert".
         let msg = agent.steer_command("1");
-        assert!(msg.contains("--dir-steering-file"), "{msg}");
-        assert!(
-            msg.contains("non-zero"),
-            "names both halves of the precondition: {msg}"
-        );
+        assert!(msg.contains("unavailable"), "{msg}");
+        assert!(msg.contains("pt vectorize"), "says how to get one: {msg}");
         assert!(agent.steer_command("").contains("unavailable"));
     }
 
@@ -25460,12 +25767,18 @@ mod tests {
         let dir = scratch_dir("steer-range");
         let cfg = test_cfg();
         let mut agent = steering_agent(&dir, &cfg, Some(1.0));
-        for bad in ["hot", "101", "-101", "nan", "inf"] {
+        for bad in ["101", "-101", "1e3", ".", "-"] {
             let msg = agent.steer_command(bad);
             assert!(
-                msg.contains("expected a number"),
+                msg.contains("expected a number") || msg.contains("no direction"),
                 "{bad} should be refused, got {msg}"
             );
+        }
+        // A word that is not a number is a direction name, and this model has
+        // none of that name.
+        for name in ["hot", "nan", "inf"] {
+            let msg = agent.steer_command(name);
+            assert!(msg.contains("no direction"), "{name}: {msg}");
         }
         // Refused input leaves the setting alone.
         assert_eq!(agent.steer_command(""), "steering ffn: 1");
@@ -26157,6 +26470,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         }

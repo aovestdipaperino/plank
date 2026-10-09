@@ -22,7 +22,7 @@ pub enum Accent {
 }
 
 /// The `profile` block of a plugin manifest, with paths already resolved.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProfileSpec {
     /// Name shown in the banner, window title and status bar. Falls back to
     /// the plugin name when absent.
@@ -63,6 +63,15 @@ pub struct ProfileSpec {
     /// disk. Never downloaded and never asked about; `None` when absent or
     /// malformed.
     pub recommended_model: Option<String>,
+    /// `steering`: the named direction (from `~/.plank/models/vectors.json`)
+    /// and scales the run steers with when [`recommended_model`] is the
+    /// engine selected, `{"direction": NAME, "ffn": F, "attn": F}` with `ffn`
+    /// 1.0 and `attn` 0.0 when absent. A `--dir-steering` on the command line
+    /// wins. `None` when absent or malformed, or when no `recommendedModel`
+    /// names the engine it belongs to.
+    ///
+    /// [`recommended_model`]: Self::recommended_model
+    pub steering: Option<crate::steervec::Steering>,
     /// `grids`: MCP server name to WASM frame component id, for servers
     /// allowed to hand table data to a grid component. Empty unless the
     /// manifest declares routes; a malformed entry is dropped with a
@@ -291,6 +300,7 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
     let agents_md = bool_field(block, "agentsMd", &mut warnings);
 
     let recommended_model = recommended_model_field(block, &mut warnings);
+    let steering = steering_field(block, recommended_model.is_some(), &mut warnings);
 
     let grids = grids_field(block, &mut warnings);
 
@@ -308,6 +318,7 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
         folder_context,
         agents_md,
         recommended_model,
+        steering,
         grids,
         verbs,
     })
@@ -490,6 +501,37 @@ fn recommended_model_field(obj: &Json, warnings: &mut Vec<String>) -> Option<Str
     }
 }
 
+/// `steering`: a direction and its scales (`crate::steervec::parse_steering`),
+/// or `None` with a warning when it is malformed or has no `recommendedModel`
+/// to belong to: a stored direction is tied to one model.
+fn steering_field(
+    obj: &Json,
+    has_model: bool,
+    warnings: &mut Vec<String>,
+) -> Option<crate::steervec::Steering> {
+    let value = obj.get("steering")?;
+    if !has_model {
+        warnings.push(
+            "profile: steering needs a recommendedModel naming the engine it belongs to; \
+             ignoring it"
+                .to_string(),
+        );
+        return None;
+    }
+    let mut text = String::new();
+    json_write(&mut text, value);
+    let parsed = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| format!("steering: {e}"))
+        .and_then(|v| crate::steervec::parse_steering(&v));
+    match parsed {
+        Ok(st) => Some(st),
+        Err(e) => {
+            warnings.push(format!("profile: {e}; ignoring it"));
+            None
+        }
+    }
+}
+
 /// A boolean profile field: `false` when absent, and `false` with a warning
 /// when it is not a boolean, so a typo never turns a context source on.
 fn bool_field(obj: &Json, key: &str, warnings: &mut Vec<String>) -> bool {
@@ -523,7 +565,7 @@ fn resolve(root: &Path, p: &str) -> PathBuf {
 
 /// The profile a run is operating under: the plugin name that selected it and
 /// its parsed spec.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ActiveProfile {
     /// The plugin name `--profile` named.
     pub name: String,
@@ -686,7 +728,7 @@ pub fn builtin_enabled(name: &str) -> bool {
 }
 
 /// What `--profile NAME` came to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Resolution {
     /// No `--profile` was given; run as plain plank.
     None,
@@ -922,6 +964,46 @@ mod tests {
         .expect("parses");
         assert_eq!(spec.recommended_model.as_deref(), Some("qwen"));
         assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+    }
+
+    /// A manifest whose profile block holds `systemPrompt` plus `extra`.
+    fn manifest(extra: &str) -> String {
+        format!(r#"{{"profile":{{"systemPrompt":"p.md",{extra}}}}}"#)
+    }
+
+    #[test]
+    fn steering_pairs_a_direction_with_the_recommended_model() {
+        let root = Path::new("/p");
+        let spec = parse(
+            &manifest(r#""recommendedModel":"ds4vision","steering":{"direction":"abliterated","attn":1,"ffn":0}"#),
+            root,
+        )
+        .unwrap();
+        assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+        let st = spec.steering.unwrap();
+        assert_eq!(st.direction, "abliterated");
+        assert!((st.attn - 1.0).abs() < f32::EPSILON && st.ffn.abs() < f32::EPSILON);
+        // `ffn` defaults to 1.0.
+        let spec = parse(
+            &manifest(r#""recommendedModel":"ds4vision","steering":{"direction":"heretic"}"#),
+            root,
+        )
+        .unwrap();
+        assert!((spec.steering.unwrap().ffn - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn steering_without_a_model_or_malformed_warns_and_is_ignored() {
+        let root = Path::new("/p");
+        for extra in [
+            r#""steering":{"direction":"heretic"}"#,
+            r#""recommendedModel":"ds4vision","steering":{"ffn":2}"#,
+            r#""recommendedModel":"ds4vision","steering":"heretic""#,
+        ] {
+            let spec = parse(&manifest(extra), root).unwrap();
+            assert_eq!(spec.steering, None, "{extra}");
+            assert_eq!(spec.warnings.len(), 1, "{extra}: {:?}", spec.warnings);
+        }
     }
 
     #[test]
@@ -1373,6 +1455,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: BTreeMap::new(),
             verbs: None,
         }

@@ -375,7 +375,13 @@ pub struct EngineTuning {
     pub ssd_streaming_preload_experts: u32,
     /// Pretend this much memory is already used, from `--simulate-used-memory`.
     pub simulate_used_memory_bytes: u64,
-    /// Directional-steering vector file from `--dir-steering-file`.
+    /// The named steering direction from `--dir-steering NAME` (or the
+    /// selected engine's `steering.direction`), looked up for the model in
+    /// `~/.plank/models/vectors.json`.
+    pub dir_steering: Option<String>,
+    /// The vector file the engine loads: [`Self::dir_steering`] decoded by
+    /// `steervec::materialize` once the model is known. Never set from the
+    /// command line; `--dir-steering-file` was removed in favour of names.
     pub dir_steering_file: Option<PathBuf>,
     /// Attention steering scale from `--dir-steering-attn`.
     pub dir_steering_attn: f32,
@@ -443,6 +449,7 @@ impl Default for EngineTuning {
             ssd_streaming_cache_bytes: 0,
             ssd_streaming_preload_experts: 0,
             simulate_used_memory_bytes: 0,
+            dir_steering: None,
             dir_steering_file: None,
             dir_steering_attn: 0.0,
             dir_steering_ffn: 0.0,
@@ -687,7 +694,10 @@ Options:
       --ssd-streaming-cache-experts N|<N>GB   bound the expert cache
       --ssd-streaming-preload-experts N       preload N experts at startup
       --simulate-used-memory <N>GB  pretend N GiB of memory is already used
-      --dir-steering-file PATH      directional steering vectors
+      --dir-steering NAME           steer along direction NAME, stored for this
+                                    model in ~/.plank/models/vectors.json
+                                    (`pt vectorize -n NAME`); positive scales
+                                    push towards the vector's `to` prompts
       --dir-steering-ffn F          FFN steering scale (-100..100)
       --dir-steering-attn F         attention steering scale (-100..100)
       --dir-steering-from all|user  steer from the user's first message (default):
@@ -1202,8 +1212,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/steer",
-        args: "[-100..100]",
-        desc: "set the FFN directional-steering scale (needs --dir-steering-file)",
+        args: "[name] [-100..100]",
+        desc: "set the steering scale, or switch to another named direction",
     },
     SlashCommand {
         name: "/mc",
@@ -1461,7 +1471,7 @@ pub fn slash_command_remote_refusal(line: &str) -> Option<&'static str> {
 
 /// Parses one engine-tuning option that takes a value (already extracted as
 /// `v`). `steering_scale_set` tracks explicit steering scales so a steering
-/// file alone can default the FFN scale to 1.0, like the C.
+/// direction alone can default the FFN scale to 1.0, like the C.
 fn parse_engine_option(
     e: &mut EngineTuning,
     arg: &str,
@@ -1494,7 +1504,19 @@ fn parse_engine_option(
             e.simulate_used_memory_bytes = parse_gib_arg(v)
                 .ok_or_else(|| format!("{arg} must be a positive GiB value, e.g. 64GB: {v}"))?;
         }
-        "--dir-steering-file" => e.dir_steering_file = Some(PathBuf::from(v)),
+        "--dir-steering" => {
+            if v.trim().is_empty() {
+                return Err("--dir-steering needs a direction name".to_string());
+            }
+            e.dir_steering = Some(v.to_string());
+        }
+        "--dir-steering-file" => {
+            return Err(format!(
+                "--dir-steering-file was removed: store the vector by name in {} \
+                 (`pt vectorize <model> --to … --from … -n NAME`) and pass --dir-steering NAME",
+                crate::steervec::store_path().display()
+            ));
+        }
         "--dir-steering-ffn" => {
             e.dir_steering_ffn = parse_float_range(v, arg, -100.0, 100.0)?;
             *steering_scale_set = true;
@@ -1799,6 +1821,7 @@ pub fn parse_options_with(
             | "--ssd-streaming-cache-experts"
             | "--ssd-streaming-preload-experts"
             | "--simulate-used-memory"
+            | "--dir-steering"
             | "--dir-steering-file"
             | "--dir-steering-ffn"
             | "--dir-steering-from"
@@ -1866,7 +1889,7 @@ pub fn temperature_without_speculation(
 /// Post-parse fixups: the steering-scale default, the `--mtp` temperature
 /// default, and `--remote` validation.
 fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Result<(), String> {
-    if c.engine.dir_steering_file.is_some() && !steering_scale_set {
+    if c.engine.dir_steering.is_some() && !steering_scale_set {
         c.engine.dir_steering_ffn = 1.0;
     }
     // Only the FFN scale can be retargeted on a live session, so a deferred
@@ -3031,20 +3054,31 @@ mod tests {
     }
 
     #[test]
-    fn steering_file_defaults_ffn_scale() {
-        let c = parse_options(&args(&["--dir-steering-file", "v.bin"])).unwrap();
+    fn steering_direction_defaults_ffn_scale() {
+        let c = parse_options(&args(&["--dir-steering", "heretic"])).unwrap();
+        assert_eq!(c.engine.dir_steering.as_deref(), Some("heretic"));
+        assert_eq!(c.engine.dir_steering_file, None, "resolved later, by name");
         assert!((c.engine.dir_steering_ffn - 1.0).abs() < 1e-6);
         assert!((c.engine.dir_steering_attn - 0.0).abs() < 1e-6);
         // An explicit scale suppresses the 1.0 default.
         let c = parse_options(&args(&[
-            "--dir-steering-file",
-            "v.bin",
+            "--dir-steering",
+            "heretic",
             "--dir-steering-attn",
             "0.5",
         ]))
         .unwrap();
         assert!((c.engine.dir_steering_ffn - 0.0).abs() < 1e-6);
         assert!((c.engine.dir_steering_attn - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_steering_file_flag_is_gone_and_says_what_replaced_it() {
+        let err = parse_options(&args(&["--dir-steering-file", "v.f32"])).unwrap_err();
+        assert!(err.contains("--dir-steering NAME"), "{err}");
+        assert!(err.contains("vectors.json"), "{err}");
+        let err = parse_options(&args(&["--dir-steering", " "])).unwrap_err();
+        assert!(err.contains("direction name"), "{err}");
     }
 
     #[test]

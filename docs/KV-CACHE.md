@@ -342,7 +342,7 @@ model behaved oddly at one reasoning level.
 
 The third input, the **engine variant** (`Engine::kv_variant`), breaks the
 pattern the other two share: it leaves both the text and the tokens alone. An
-activation edit such as directional steering (`--dir-steering-file`) subtracts a
+activation edit such as directional steering (`--dir-steering NAME`) subtracts a
 direction from every layer's residual as the model runs, so the same tokens over
 the same weights write a *different KV*. Nothing textual distinguishes the two
 runs — the only evidence is the activations, which is precisely what a

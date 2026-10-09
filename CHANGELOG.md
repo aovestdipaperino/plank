@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Steering directions are named.** `--dir-steering NAME` loads a direction
+  stored for the model in `~/.plank/models/vectors.json`, the file `pt
+  vectorize … -n NAME` writes, keyed by the model's engine name (its file
+  name for a model no engine uses). `/steer` alone lists the
+  model's directions with the loaded one starred; `/steer <name> [scale]`
+  switches to another one by restarting into it with the session resumed, and
+  a bare `/steer <scale>` needs a name when the model has more than one.
+
+- **Steering lives in profiles.** A profile pairs a direction with its
+  `recommendedModel` through `"steering": {"direction", "ffn", "attn",
+  "from"}` (`ffn` 1.0 and `attn` 0.0 when absent), applied when that engine is
+  the one selected unless `--dir-steering` names another.
+- **`crates/local-inference-engine`.** The ds4 C engine build, its FFI and the
+  Metal kernel lookup moved into a workspace crate with a safe `Model`/`Session`
+  API over both the ds4 engine and Gemma, which other tools (`pt`) link.
+
+### Removed
+
+- `--dir-steering-file PATH` and the engine `steering` block. Both are refused
+  with a pointer to their replacement (a named direction; a profile's
+  `steering`).
+
 ## [7.0.0] - 2026-10-07
 
 The Gemma release: plank runs a model family on an engine of its own, in

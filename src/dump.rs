@@ -12,6 +12,14 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+/// The `steering` row, when the profile pairs a direction with its model.
+fn steering_row(out: &mut String, spec: &crate::profile::ProfileSpec) {
+    if let Some(st) = &spec.steering {
+        let text = format!("{} (ffn {}, attn {})", st.direction, st.ffn, st.attn);
+        row(out, "steering", &text);
+    }
+}
+
 /// The key column's width: the longest key any row prints (`recommendedModel`,
 /// 16) plus a two-space gutter, so even that key leaves a gap before its value
 /// instead of butting up against the single separating space and reading as
@@ -171,6 +179,7 @@ fn render_one_profile(out: &mut String, path: &Path, color: bool) {
     if let Some(m) = &spec.recommended_model {
         row(out, "recommendedModel", m);
     }
+    steering_row(out, &spec);
     row(
         out,
         "tools.builtin",

@@ -432,10 +432,12 @@ and restart into it, resuming this session when the new engine's family
 has its transcript</td>
 </tr>
 <tr>
-<td><code>/steer [-100..100]</code></td>
-<td>set the FFN directional-steering scale for this session; needs
-<code>--dir-steering-file</code> (or an engine that bundles a
-vector)</td>
+<td><code>/steer [name] [-100..100]</code></td>
+<td>alone, list the steering directions stored for this model in
+<code>~/.plank/models/vectors.json</code>, the loaded one starred; with
+a scale, retarget the loaded direction (a name is required when the
+model has more than one); with another direction's name, restart into it
+and resume this session</td>
 </tr>
 <tr>
 <td><code>/loopguard [on|off]</code>, <code>/lg</code></td>

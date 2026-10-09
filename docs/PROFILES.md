@@ -30,6 +30,7 @@ for the Claude Code layout), alongside the plugin's existing `name`,
 | `folderContext` | boolean | no | `false`: no launch-folder context |
 | `agentsMd` | boolean | no | `false`: `AGENTS.md` is neither read nor offered |
 | `recommendedModel` | string, an engine name | no | none: the model is chosen as without a profile |
+| `steering` | object: `direction`, optional `ffn`, `attn`, `from` | no | none: the run is not steered |
 | `grids` | object, MCP server name to component id | no | empty: no MCP server is routed to a grid |
 | `verbs` | array of strings, or object of phase to array | no | plank's own status verbs |
 | `additionalVerbs` | array of strings, or object of phase to array | no | plank's own status verbs, nothing added |
@@ -123,6 +124,30 @@ and a name that is no engine prints one line saying it is ignored; either way
 the launch goes on with the next rule. A value that is not a non-empty string
 of lowercase letters, digits and dashes warns and is ignored, like any other
 malformed field. Without `--profile` the field has no effect.
+
+### Steering
+
+`steering` pairs a named direction with the recommended model, so a profile can
+run an engine together with a steering vector:
+
+```json
+"recommendedModel": "ds4vision",
+"steering": { "direction": "abliterated", "attn": 1, "ffn": 0 }
+```
+
+`direction` names a vector stored for that model in
+`~/.plank/models/vectors.json` (`pt vectorize … -n NAME` writes them); `ffn` and
+`attn` are the FFN and attention scales, 1.0 and 0.0 when absent, within
+-100..100; `from` is `"user"` (hold the FFN edit until the first message, the
+default unless `attn` is set) or `"all"`. The pair applies only when the
+recommended engine is the one selected, since a stored direction belongs to
+one model: a `--model` choosing another engine, or a recommendation that fell
+through for a missing file, runs unsteered. A `--dir-steering` on the command
+line wins outright, scales included. A direction the store does not hold for
+the model stops the launch, as it would from the command line. A malformed
+block, or one with no `recommendedModel`, warns and is ignored. Engines no
+longer carry steering: a `steering` block in `engines.local.json` drops that
+engine with a warning pointing here.
 
 `tools.builtin`, if present, is expected to be an array of tool names: any
 other shape is a mistake, not a restriction the author meant, but a

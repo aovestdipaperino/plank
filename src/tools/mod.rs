@@ -1519,6 +1519,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         };
@@ -1544,6 +1545,7 @@ mod tests {
             folder_context: false,
             agents_md: false,
             recommended_model: None,
+            steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
         }
