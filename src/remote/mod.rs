@@ -33,6 +33,10 @@ pub mod ds4_client;
 // Flavor (b): third-party provider engine (OpenAI-compatible / Anthropic).
 pub mod provider;
 
+// What a provider's model can hold and emit: context window and output cap,
+// probed from whichever server-specific endpoint answers.
+pub mod limits;
+
 // Remote-control server (issue #25): the loopback WebSocket mirror/drive
 // interface. Formerly the standalone `src/remote.rs`; folded in here so #25 and
 // #26 share the one `remote` module. Re-exported at the module root so callers

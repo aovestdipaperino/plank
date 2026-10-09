@@ -35,6 +35,10 @@ plank --provider openai --model llama3.3 \
       --base-url http://localhost:11434/v1 --api-key ollama
 ```
 
+**Checked at startup** — before the first turn, plank asks the endpoint's `/models` for the model. A key the server refuses (401/403) or a model it does not list stops startup with the server's own message, the variable to fix, and the models it does offer, closest names first. An unreachable server only warns. A llama.cpp server, which serves one model under any name, always passes.
+
+**Context window and output cap** — with no `-c`, the window comes from the server, wherever it reports it: vLLM's `max_model_len`, llama.cpp's per-slot `n_ctx`, OpenRouter's `context_length`, LM Studio's and Ollama's loaded context (only for a model already loaded — the trained maximum would overstate a fresh load), Anthropic's `max_input_tokens`. OpenAI's own API reports none, so the configured window stands. Where the server also reports an output cap (OpenRouter, Anthropic), longer requests are clamped to it. On an OpenAI-compatible server whose window is known, a cap that would not fit beside the prompt is left out of the request, so the server generates until the window is full instead of rejecting the request — vLLM refuses a prompt plus `max_tokens` larger than the model. The startup line shows what was found: `provider engine ready: openai:… (ctx 32768)`.
+
 **What stays the same** — every tool, MCP tools, `@` completion, sessions and `/resume`, `/btw`, compaction. The one difference is the system prompt: a provider gets plank's own prompt with native tool definitions, never the byte-parity DeepSeek prompt, which is meant only for the local model it was trained on.
 
 **Two hosted models on one key** — a subagent definition can point at a different model on the *same* endpoint with the *same* credential. Only the model line differs from the parent:

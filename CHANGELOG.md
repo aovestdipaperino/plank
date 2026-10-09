@@ -11,6 +11,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `crates/plank-lib`, the vectors.json and profile file handling shared with
   `pt`: plank's `steervec` now reads the store through it, and `pt install
   <repo>:<path>` uses it to merge vectors files and install profiles.
+- **Provider endpoints are checked at startup.** `--provider` asks the
+  endpoint's `/models` for the model before the first turn: a refused key
+  (401/403) or a model the server does not list fails startup with the
+  server's message, the key variable, and the models it does offer (closest
+  names first, at most 20). An unreachable server warns and continues; a
+  llama.cpp server's lone model matches any name. Sub-agent definitions on a
+  provider get the same check, once per provider, URL and model.
+- **The context window and output cap come from OpenAI-compatible servers
+  too.** With no `-c`, the window is read from wherever the server reports
+  it — vLLM `max_model_len`, llama.cpp `meta.n_ctx` (or `/props`),
+  OpenRouter `top_provider.context_length`, LM Studio's and Ollama's loaded
+  context — as it already was from Anthropic's `max_input_tokens`. A reported
+  output cap (OpenRouter `max_completion_tokens`, Anthropic `max_tokens`)
+  clamps every request. On an OpenAI-compatible server with a known window, a
+  cap that cannot fit beside the prompt is left out instead of sent, so the
+  default `-n` no longer gets every request rejected by a 32K vLLM model.
+  `src/remote/limits.rs`.
+
+### Fixed
+
+- **A provider prompt bigger than estimated no longer fails the turn.** plank
+  sized a provider's prompt at four bytes a token, with the tool schemas left
+  out, so a session on a 32K vLLM model sent a 16,000-token cap beside a
+  16,769-token prompt and the server refused it (`maximum context length is
+  32768 tokens`). The provider engine now scales its estimate by what the
+  last pass was actually billed, so compaction starts when the real window is
+  nearly full; a request the server still rejects for prompt plus cap is
+  retried once without the cap; and a prompt that overruns the window on its
+  own makes both front ends compact and retry the pass, once per turn.
+- **A spinner verb with a space or an emoji shimmers whole.** The sweep
+  started at the verb's last space, so "Weighing souls…" left "Weighing"
+  plain, and it stepped by character, splitting emoji across colours.
 
 ### Changed
 
