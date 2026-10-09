@@ -1095,9 +1095,20 @@ impl OutputLog {
         self.lines.push(Line::default());
     }
 
-    /// Appends a plain system line.
+    /// Appends a plain system line, one log line per `\n`-separated line.
     pub fn push_plain(&mut self, text: impl Into<String>) {
-        self.push_spans(vec![Span::raw(text.into())]);
+        self.push_split(&text.into(), Style::default());
+    }
+
+    /// Pushes `text` as one log line per line. A `Line` holding a `\n` renders
+    /// it as nothing — wrapping breaks only on width — so a multi-line message
+    /// pushed whole runs together (`/steer`'s listing did). One trailing
+    /// newline is dropped rather than turned into a blank line.
+    fn push_split(&mut self, text: &str, style: Style) {
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        for line in text.split('\n') {
+            self.push_spans(vec![Span::styled(line.to_owned(), style)]);
+        }
     }
 
     /// Number of committed lines, not counting an in-progress streamed line.
@@ -1111,7 +1122,7 @@ impl OutputLog {
 
     /// Appends a line in the thinking gray, for tool and debug output.
     pub fn push_dim(&mut self, text: impl Into<String>) {
-        self.push_spans(vec![Span::styled(text.into(), think_style())]);
+        self.push_split(&text.into(), think_style());
     }
 
     /// Appends ANSI-colored text, one log line per input line.
@@ -6173,6 +6184,27 @@ mod tests {
         let quiet = Buffer::empty(area);
         super::record_tasks_rect(&quiet, area);
         assert!(!super::tasks_click(22, 0), "no counter, no hit box");
+    }
+
+    /// A `Line` renders an embedded `\n` as nothing, so a multi-line system
+    /// message (the bare `/steer` listing) must become one log line per line.
+    #[test]
+    fn a_multi_line_system_message_keeps_its_line_breaks() {
+        use super::{Line, OutputLog};
+        let mut log = OutputLog::new();
+        log.push_plain("steering: off\ndirections for this model:\n    abliterated\n");
+        log.push_dim("a\nb");
+        let rows: Vec<String> = log.to_text().lines.iter().map(Line::to_string).collect();
+        assert_eq!(
+            rows,
+            vec![
+                "steering: off",
+                "directions for this model:",
+                "    abliterated",
+                "a",
+                "b"
+            ]
+        );
     }
 
     #[test]
