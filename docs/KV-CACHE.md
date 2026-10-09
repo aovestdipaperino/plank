@@ -745,7 +745,10 @@ the engine already holds, and retokenizes only from the first divergence.
 A section that differs by one trailing space is a different section, and
 everything after it re-prefills. This is why `kvtier::plan` canonicalizes each
 tier's text to exactly what the turn will tokenize — an untrimmed tier and a
-trimmed turn diverge at the first tier and rebuild everything below it.
+trimmed turn diverge at the first tier and rebuild everything below it. The
+system prompt is no exception: `Agent::kv_tiers_for` trims it before keying
+Tier 1, because a profile's prompt ends in a newline and the first prompt of
+every profile session used to rebuild the whole prefix over that one token.
 
 **The sync is extend-only.** `ds4_session_sync` cannot rewrite behind its live
 end: the backend still holds SWA rows, compressed KV rows, indexer rows and

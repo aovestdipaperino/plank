@@ -13,6 +13,14 @@ it.
 Install with `brew install aovestdipaperino/tap/plank-agent-beta`. Everything
 the betas below carried is in stable 7.0.0.
 
+### 7.0.4
+
+**Profile sessions answer the first prompt from the cache.** Starting plank
+with `--profile` restored the cached prompt and then threw it away on the
+first prompt, re-prefilling well over 10k tokens, because one trailing
+newline made the warmed prompt differ from the one the turn built. The
+first prompt now reuses what startup restored.
+
 ### 7.0.3
 
 **A long provider session compacts instead of failing.** plank undercounted

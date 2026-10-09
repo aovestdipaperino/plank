@@ -7,6 +7,12 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v7.0.4 beta: profile sessions start warm.** A session started with
+`--profile` restored its cached prompt at launch and then re-prefilled all of
+it on the first prompt, over one trailing newline. The first prompt now reuses
+what startup restored, so the first answer no longer waits on a 10k-token
+prefill.
+
 **v7.0.3 beta: long provider sessions compact instead of failing.** On a
 self-hosted model with a small window, plank could undercount the prompt, ask
 for more output than was left, and lose the turn to a `maximum context length`

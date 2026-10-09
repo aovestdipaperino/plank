@@ -139,6 +139,11 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
+<p><strong>v7.0.4 beta: profile sessions start warm.</strong> A session
+started with <code>--profile</code> restored its cached prompt at launch
+and then re-prefilled all of it on the first prompt, over one trailing
+newline. The first prompt now reuses what startup restored, so the first
+answer no longer waits on a 10k-token prefill.</p>
 <p><strong>v7.0.3 beta: long provider sessions compact instead of
 failing.</strong> On a self-hosted model with a small window, plank
 could undercount the prompt, ask for more output than was left, and lose

@@ -43,6 +43,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A spinner verb with a space or an emoji shimmers whole.** The sweep
   started at the verb's last space, so "Weighing souls…" left "Weighing"
   plain, and it stepped by character, splitting emoji across colours.
+- **A profile session no longer re-prefills its whole prompt on the first
+  turn.** The startup warm-up tokenized the system prompt as composed, but a
+  turn rebuilds it from the transcript with trailing whitespace trimmed. A
+  profile's prompt ends in a newline, so the first prompt diverged one token
+  short of the restored KV and rebuilt it from zero (19,329 tokens on a
+  d3v1l launch). The warm-up now keys and tokenizes the trimmed text. Each
+  profile builds its prompt cache once more on the next launch.
 
 ### Changed
 
