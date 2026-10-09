@@ -1,0 +1,29 @@
+[package]
+name = "local-inference-engine"
+version = "0.1.0"
+description = "Local GGUF inference behind one API: the ds4 C engine (DeepSeek V4/V4.1 Flash, Qwen3.8, GLM on Metal) built from source, and Gemma 4 on candle"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+# Exposes `DEP_DS4CORE_ENGINE` and `DEP_DS4CORE_METAL_DIR` to the build script
+# of every direct dependent, which is how plank learns whether the C engine was
+# compiled in (its own `ds4_engine` cfg) without building it a second time.
+links = "ds4core"
+
+[features]
+default = ["gemma"]
+# Gemma 4 through `crates/gemma-engine` (candle; Metal on macOS, CPU
+# elsewhere). Needs no C, so it works on every platform the crate builds on.
+gemma = ["dep:gemma-engine", "gemma-engine/candle"]
+
+[dependencies]
+libc = "0.2"
+gemma-engine = { path = "../gemma-engine", optional = true }
+
+[dev-dependencies]
+gemma-engine = { path = "../gemma-engine", features = ["testgguf"] }
+
+[lints]
+workspace = true

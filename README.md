@@ -44,7 +44,7 @@ cd plank
 cargo build --release
 ```
 
-- **With `refs/ds4` present:** `build.rs` builds `libds4core.a` from the Metal-backend objects and links the required frameworks, enabling the `ds4_engine` cfg.
+- **With `refs/ds4` present:** `crates/local-inference-engine` builds `libds4core.a` from the Metal-backend objects and links the required frameworks, enabling the `ds4_engine` cfg. The crate can be used on its own by other tools: its `Model`/`Session` API opens either a ds4-engine model or a Gemma 4 GGUF, chosen from the file's architecture.
 - **Missing submodule (or `PLANK_NO_DS4=1`):** plank still builds and runs Gemma 4 for real on its native Rust engine (`crates/gemma-engine`, candle, no C). DeepSeek and Qwen need the submodule; without any usable engine plank falls back to the echo stub (useful for development/CI).
 - **Four model families, one build.** Gemma 4 (`gemma4-e4b`, `gemma4-12b`, `.gemma.kv` transcripts and its own `<|tool_call>` dialect) runs on the Rust engine; see [docs/GEMMA.md](docs/GEMMA.md). DeepSeek V4 Flash, V4.1 Flash and Qwen3.8-Flash-Next are all compiled in and told apart from the GGUF's own `general.architecture`; each has its own tool-call dialect, artifact set and transcript extension (`.ds4.kv` / `.ds41.kv` / `.qwn.kv`). Qwen was retired once, when upstream deleted its Metal kernels; upstream has since merged it properly and publishes the weights, so it is back unconditionally, addressed as the `qwen` engine with `--model qwen`.
 

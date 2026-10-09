@@ -3,9 +3,10 @@
 
 //! Raw FFI declarations for the ds4 C inference engine.
 //!
-//! Only the subset plank needs is declared: engine open/close, chat-template
-//! tokenization, session create/sync/sample/eval, and token text lookup.
-//! Present only when the `ds4_engine` cfg is set (macOS + built submodule).
+//! Only the subset plank and its tools need is declared: engine open/close,
+//! chat-template tokenization, session create/sync/sample/eval, and token text
+//! lookup. The declarations always compile; calling them links only when the
+//! `ds4_engine` cfg is set (macOS with the C sources built).
 #![allow(non_camel_case_types)]
 
 use std::os::raw::{c_char, c_int, c_void};
@@ -399,6 +400,16 @@ unsafe extern "C" {
     /// Tokenizes already-rendered chat text, so control strings like
     /// `</think>` map to their special tokens rather than to literal pieces.
     pub fn ds4_tokenize_rendered_chat(e: *mut Ds4Engine, text: *const c_char, out: *mut Ds4Tokens);
+    /// Renders and tokenizes a one-turn chat: the reasoning prefix, `system`
+    /// when non-empty, the `prompt` user message and the assistant prefix.
+    /// What the ds4 CLI sends for `--system S -p P`.
+    pub fn ds4_encode_chat_prompt(
+        e: *mut Ds4Engine,
+        system: *const c_char,
+        prompt: *const c_char,
+        think_mode: Ds4ThinkMode,
+        out: *mut Ds4Tokens,
+    );
 
     pub fn ds4_token_text(e: *mut Ds4Engine, token: c_int, len: *mut usize) -> *mut c_char;
     pub fn ds4_token_eos(e: *mut Ds4Engine) -> c_int;

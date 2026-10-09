@@ -75,7 +75,7 @@ plugins = ["dep:extism"]
 # Gemma 4 in native Rust (`crates/gemma-engine`, candle on Metal): the
 # `GemmaEngine` behind `Engine`. On by default; it needs no submodule and no C,
 # so it builds wherever plank does. `--no-default-features` drops candle.
-gemma = ["dep:gemma-engine", "gemma-engine/candle"]
+gemma = ["dep:gemma-engine", "gemma-engine/candle", "local-inference-engine/gemma"]
 # Qwen3.8-Flash-Next support: the `--qwen` flag and its default model paths,
 # the model's own tools prompt and `<tool_call>` dialect, the PLE n-gram
 # sidecar wiring, and the downloader's Qwen artifacts.
@@ -90,6 +90,12 @@ gemma = ["dep:gemma-engine", "gemma-engine/candle"]
 
 [dependencies]
 trace-stream = { path = "crates/trace-stream" }
+# Local inference behind one API (ds4 C engine + Gemma). plank uses its ds4
+# half directly: it builds `libds4core.a` from `refs/ds4`, carries the raw FFI
+# and the Metal kernel lookup, and its build script reports through `links`
+# metadata whether the engine was compiled, which sets plank's `ds4_engine`
+# cfg. Its Gemma half rides plank's own `gemma` feature.
+local-inference-engine = { path = "crates/local-inference-engine", default-features = false }
 gguf-delta = { path = "crates/gguf-delta", version = "0.1.0" }
 turbo-debug-client = "0.2.1"
 libc = "0.2"

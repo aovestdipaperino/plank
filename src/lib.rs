@@ -80,7 +80,9 @@ pub mod experts;
 pub mod export;
 pub mod fakegpu;
 pub mod feedback;
-pub mod ffi;
+/// The ds4 C API, re-exported from `crates/local-inference-engine` so `crate::ffi` paths
+/// keep working.
+pub use local_inference_engine::ffi;
 pub mod framebridge;
 /// Gemma 4 behind [`engine::Engine`], over the native-Rust `gemma-engine`
 /// crate (candle on Metal). Needs no submodule, so it is on by default.

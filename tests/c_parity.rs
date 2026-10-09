@@ -580,9 +580,8 @@ fn think_prefix_fallthrough_arm_matches_c_source() {
 /// `qwen4.metal` and `qwen4_vision.metal`.
 ///
 /// Order matters as documentation, not to the engine, so this compares the
-/// pairs as sets and reports each side's surplus. Engine builds only: the
-/// table lives in `ds4engine`, which a no-engine build does not compile.
-#[cfg(ds4_engine)]
+/// pairs as sets and reports each side's surplus. The table lives in
+/// `crates/local-inference-engine`, which compiles with or without the engine.
 #[test]
 fn metal_kernels_match_the_c_reference() {
     let Some(src) = c_file("ds4_metal.m") else {
@@ -614,7 +613,7 @@ fn metal_kernels_match_the_c_reference() {
         from_c.len()
     );
 
-    let ours: Vec<(String, String)> = plank::ds4engine::METAL_KERNEL_SOURCES
+    let ours: Vec<(String, String)> = local_inference_engine::metal::KERNEL_SOURCES
         .iter()
         .map(|(v, f)| ((*v).to_owned(), (*f).to_owned()))
         .collect();
@@ -770,7 +769,7 @@ fn the_frozen_manifests_still_parse() {
 /// deleting `ple_path` left `--ssd-streaming` silently unread, one slot short,
 /// and the V4.1 model unloadable.
 ///
-/// The `offset_of!` assertions in `src/ffi.rs` cannot catch that: they compare
+/// The `offset_of!` assertions in `crates/local-inference-engine/src/ffi.rs` cannot catch that: they compare
 /// plank to hardcoded constants, so they stay green while being wrong. This
 /// one compares plank to the C, and it is the guard that matters on a bump.
 ///
@@ -778,7 +777,7 @@ fn the_frozen_manifests_still_parse() {
 /// `ds4_engine_options`. What it does *not*: a field whose **type** changed
 /// with its name kept (`uint32_t` → `uint64_t`), a change inside a nested
 /// struct (`ds4_distributed_options`, `ds4_tp_options`), or anything about the
-/// `extern` function signatures. The `src/ffi.rs` offset table covers the
+/// `extern` function signatures. The `crates/local-inference-engine/src/ffi.rs` offset table covers the
 /// widths of the fields it lists; the nested structs and the `extern` block are
 /// still reviewed by hand on a submodule bump.
 #[test]
@@ -802,7 +801,7 @@ fn engine_options_fields_match_the_c_header() {
         ours, from_c,
         "plank's Ds4EngineOptions no longer mirrors ds4_engine_options in \
          refs/ds4/ds4.h. Every field after the first difference is read by the \
-         engine from the wrong offset, silently. Fix src/ffi.rs (and the \
+         engine from the wrong offset, silently. Fix crates/local-inference-engine/src/ffi.rs (and the \
          offset table in its tests) to match the C, in this order."
     );
 }
@@ -853,7 +852,7 @@ fn c_struct_field_names(src: &str, name: &str) -> Vec<String> {
 // FFI shape layer: plank's `extern "C"` declarations vs. the C headers.
 // ---------------------------------------------------------------------------
 
-/// Holds every function plank declares in `src/ffi.rs` equal — in arity and in
+/// Holds every function plank declares in `crates/local-inference-engine/src/ffi.rs` equal — in arity and in
 /// coarse parameter *shape* — to its prototype in the C headers.
 ///
 /// This is the sibling of [`engine_options_fields_match_the_c_header`], one
@@ -898,15 +897,13 @@ fn ffi_declarations_match_the_c_headers() {
     }
 
     let rust = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("ffi.rs"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/local-inference-engine/src/ffi.rs"),
     )
-    .expect("src/ffi.rs");
+    .expect("crates/local-inference-engine/src/ffi.rs");
     let ours = rust_extern_fns(&rust);
     assert!(
         ours.len() > 30,
-        "parsed only {} extern fns out of src/ffi.rs; the parser drifted rather \
+        "parsed only {} extern fns out of crates/local-inference-engine/src/ffi.rs; the parser drifted rather \
          than the binding shrinking: {:?}",
         ours.len(),
         ours.iter().map(|f| &f.name).collect::<Vec<_>>()
@@ -940,10 +937,10 @@ fn ffi_declarations_match_the_c_headers() {
     }
     assert!(
         problems.is_empty(),
-        "plank's `extern \"C\"` declarations in src/ffi.rs no longer match the \
+        "plank's `extern \"C\"` declarations in crates/local-inference-engine/src/ffi.rs no longer match the \
          refs/ds4 headers. Every call through a mismatched declaration is \
          undefined behaviour — arguments land in the wrong registers and no \
-         other test can see it. Fix src/ffi.rs to match the C:\n  - {}",
+         other test can see it. Fix crates/local-inference-engine/src/ffi.rs to match the C:\n  - {}",
         problems.join("\n  - ")
     );
 }

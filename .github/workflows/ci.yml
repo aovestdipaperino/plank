@@ -100,6 +100,12 @@ jobs:
           PLANK_REQUIRE_GUESTS: "1"
         run: cargo test --release --verbose
 
+      # A workspace member, so `cargo test` above does not reach it: the FFI
+      # struct-offset pins live here since the engine moved into its own crate,
+      # and so do the Gemma routing tests (a generated tiny GGUF, CPU only).
+      - name: Test the local inference crate
+        run: cargo test --release -p local-inference-engine
+
   # `plugins` is on by default now, so the default job above covers it. This
   # job guards the other direction: the lean build, without the WASM host. That
   # configuration is the one that can rot unnoticed — every `#[cfg(feature =

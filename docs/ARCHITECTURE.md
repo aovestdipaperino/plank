@@ -164,7 +164,7 @@ to put there at all. Opening twice to ask the engine is not an option — the
 first open pays the whole residency cost. It also decides the vision skip, the
 side-artifact downloads, and the transcript extension.
 
-`Ds4EngineOptions` (`ffi.rs`) mirrors the C `ds4_engine_options`
+`Ds4EngineOptions` (`crates/local-inference-engine/src/ffi.rs`) mirrors the C `ds4_engine_options`
 field-for-field, and is declared through a macro that also emits the field-name
 list `tests/c_parity.rs` checks against `refs/ds4/ds4.h`. The guard is there
 because the failure it catches is silent: when a field was dropped from the
@@ -280,7 +280,7 @@ loop — with piped stdin there is no live input to multiplex.
 
 - `goal.rs` — `/goal` autonomous loop: iteration state, adjudication prompt, and verdict parsing. Pure logic; `ui.rs` drives it from both front ends.
 
-### Engine abstraction (`engine.rs`, `ds4engine.rs`, `gemmaengine.rs`, `ffi.rs`, `snapshot.rs`)
+### Engine abstraction (`engine.rs`, `ds4engine.rs`, `gemmaengine.rs`, `crates/local-inference-engine`, `snapshot.rs`)
 - `engine.rs` — the `Engine` trait (`generate` over `Prompt::{Flat, Structured}`,
   `warm_reset`/`warm_append`/`warm_sync`, `get_kv`/`set_kv`, `count_tokens`,
   `ctx_size`, plus `generate_aside` /
@@ -288,9 +288,16 @@ loop — with piped stdin there is no live input to multiplex.
   for checkpoints), the event types (`EngineEvent::{Prefill, Text}`), options,
   stats, and the `EchoEngine` stub. Trait methods default to unsupported so
   non-ds4 engines opt in only to what they support.
-- `ffi.rs` — raw declarations for the subset of the ds4 C API plank uses
-  (engine open/close, chat-template tokenization, session sync/sample/eval,
-  speculative decode, KV snapshots). Present only under the `ds4_engine` cfg.
+- `crates/local-inference-engine` — local inference as its own crate. Its
+  `Model`/`Session` API serves both families, routing on the GGUF's
+  `general.architecture` (`Family::of`): `gemma4` to `crates/gemma-engine`
+  (feature `gemma`), the rest to the C engine. For the C engine it holds the build of
+  `libds4core.a`, `ffi.rs` (raw declarations for the subset of the ds4 C API
+  plank uses: engine open/close, chat-template tokenization, session
+  sync/sample/eval, speculative decode, KV snapshots; re-exported as
+  `plank::ffi`), `metal.rs` (the kernel table and its lookup), and the
+  backend's own safe types in `ds4`. The declarations always
+  compile; calling them links only under the `ds4_engine` cfg.
   `Ds4EngineOptions` mirrors the C `ds4_engine_options` **positionally**, so a
   field inserted mid-struct upstream shifts everything after it with no compile
   error; `ffi::tests` pins every offset and the struct size against `offsetof`
@@ -1020,12 +1027,17 @@ wall clock beside the token totals.
 
 ## Build
 
-`build.rs` compiles the ds4 C engine from the `refs/ds4` submodule on macOS
-(Metal objects → `libds4core.a`), links Foundation + Metal, and emits the
-`ds4_engine` cfg. Off macOS, or without the submodule, the cfg is absent and
-plank builds without the ds4 engine. `PLANK_NO_DS4=1` skips it even when the
-submodule is there. The Metal kernel directory is baked in so the engine can
-locate its `.metal` sources at runtime. The default `gemma` feature compiles
+`crates/local-inference-engine`'s build script compiles the ds4 C engine from the
+`refs/ds4` submodule on macOS (Metal objects → `libds4core.a`, or from
+`DS4_SRC` when set) and links Foundation + Metal. It declares
+`links = "ds4core"` and reports `engine=1` when it built, which reaches plank's
+`build.rs` as `DEP_DS4CORE_ENGINE`; that is what emits plank's `ds4_engine`
+cfg. Off macOS, or without the submodule, neither cfg is set and plank builds
+without the ds4 engine. `PLANK_NO_DS4=1` skips it even when the submodule is
+there. The Metal kernel directory is baked into the crate so the engine can
+locate its `.metal` sources at runtime. The crate stands alone, so a tool such
+as `pt` in `../plank-replay` can depend on it by path and load a model
+in-process instead of spawning the `ds4` binary. The default `gemma` feature compiles
 `crates/gemma-engine` (candle, pure Rust) into every build, so a build without
 the C engine still runs Gemma for real.
 
