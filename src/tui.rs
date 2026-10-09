@@ -5462,7 +5462,11 @@ fn push_shimmered(
         return;
     };
     let half = i64::try_from(ramp.len().saturating_sub(1)).unwrap_or(0);
-    let width = word.chars().count();
+    // The sweep walks display columns, one grapheme at a time: stepping by
+    // `char` would split an emoji's variation selector or ZWJ sequence across
+    // two differently styled spans, which the terminal then draws as broken
+    // glyphs, and would count a wide emoji as one column instead of two.
+    let width = unicode_width::UnicodeWidthStr::width(word);
     // `sweep_window` supplies only the centre and the direction. Its own
     // `SWEEP_HALF` is 1, while the highlight here is as wide as the ramp is
     // deep (`ramp.len() - 1`, i.e. 2 either side), so the window's extent is
@@ -5473,8 +5477,10 @@ fn push_shimmered(
     // One shade per column, then coalesce equal-styled neighbours so a sweep
     // costs a handful of spans rather than one per character.
     let mut runs: Vec<(String, Style)> = Vec::new();
-    for (col, ch) in word.chars().enumerate() {
-        let col = i64::try_from(col).unwrap_or(i64::MAX);
+    let mut next_col = 0usize;
+    for g in unicode_segmentation::UnicodeSegmentation::graphemes(word, true) {
+        let col = i64::try_from(next_col).unwrap_or(i64::MAX);
+        next_col += unicode_width::UnicodeWidthStr::width(g);
         let dist = (col - center).abs();
         let style = if dist <= half {
             // dist 0 is the center, which takes the last (brightest) shade.
@@ -5484,8 +5490,8 @@ fn push_shimmered(
             theme
         };
         match runs.last_mut() {
-            Some((text, prev)) if *prev == style => text.push(ch),
-            _ => runs.push((ch.to_string(), style)),
+            Some((text, prev)) if *prev == style => text.push_str(g),
+            _ => runs.push((g.to_string(), style)),
         }
     }
     for (text, style) in runs {
@@ -5637,10 +5643,8 @@ fn push_accented(
         .find("prefill")
         .map(|i| (i, i + "prefill".len()))
         .or_else(|| {
-            seg.find('…').map(|e| {
-                let start = seg[..e].rfind(' ').map_or(0, |i| i + 1);
-                (start, e + '…'.len_utf8())
-            })
+            seg.find('…')
+                .map(|e| (verb_start(&seg[..e]), e + '…'.len_utf8()))
         });
     if let Some((start, end)) = range {
         spans.push(Span::styled(seg[..start].to_string(), base));
@@ -5656,6 +5660,24 @@ fn push_accented(
     } else {
         spans.push(Span::styled(seg.to_string(), base));
     }
+}
+
+/// Byte offset where the spinner verb begins in `head`, the text before its
+/// `…`. The verb follows the throbber glyph and a space, and may itself hold
+/// spaces or emoji ("Weighing souls…"), so the start is anchored on the
+/// throbber rather than on the last space. Without a throbber there is no
+/// such anchor, so it keeps the old one-word rule: the text after the last
+/// space.
+fn verb_start(head: &str) -> usize {
+    if let Some((i, ch)) = head
+        .char_indices()
+        .rev()
+        .find(|(_, c)| crate::anim::THROBBER_FRAMES.contains(c))
+    {
+        let after = i + ch.len_utf8();
+        return after + usize::from(head[after..].starts_with(' '));
+    }
+    head.rfind(' ').map_or(0, |i| i + 1)
 }
 
 /// Appends a visible marker to the status text while `--ui-remote` is active.
@@ -10516,6 +10538,61 @@ mod tests {
         assert!(text.contains("rename"), "{text}");
         assert!(text.contains("session-0"), "prefilled with the id: {text}");
         assert!(text.contains("Enter to rename"), "{text}");
+    }
+
+    // A multi-word or emoji verb shimmers whole: the range is anchored on the
+    // throbber, not on the last space, so "Weighing" is not left plain.
+    #[test]
+    fn multi_word_verb_is_accented_whole() {
+        let base = Style::default();
+        let theme = base.fg(theme_accent()).add_modifier(Modifier::BOLD);
+        let anim = crate::anim::VerbAnim::Sweep {
+            reverse: false,
+            step_ms: crate::anim::SWEEP_SLOW_MS,
+        };
+        for verb in [
+            "Weighing souls…",
+            "🔥 Stoking the fire…",
+            "Brewing ☕️ coffee…",
+        ] {
+            let t = crate::anim::THROBBER_FRAMES[0];
+            let seg = format!("ctx 3% | {t} {verb} (14s)");
+            let mut spans = Vec::new();
+            push_accented(&mut spans, &seg, 0, base, theme, anim);
+            let plain: String = spans
+                .iter()
+                .filter(|s| s.style == base)
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(plain, format!("ctx 3% | {t}  (14s)"), "{verb}");
+        }
+    }
+
+    // Stepping the sweep by `char` split emoji clusters (VS16, ZWJ) across
+    // spans; every span boundary must now fall on a grapheme boundary.
+    #[test]
+    fn shimmer_never_splits_a_grapheme() {
+        use unicode_segmentation::UnicodeSegmentation;
+        let theme = Style::default().fg(theme_accent());
+        let word = "Brewing ☕️ 👩‍💻 coffee…";
+        let anim = crate::anim::VerbAnim::Sweep {
+            reverse: false,
+            step_ms: 1,
+        };
+        let cycle = u64::try_from(unicode_width::UnicodeWidthStr::width(word)).unwrap() + 20;
+        for tick in 0..cycle {
+            let mut spans = Vec::new();
+            push_shimmered(&mut spans, word, tick, theme, None, anim);
+            for s in &spans {
+                let rejoined: String = s.content.graphemes(true).collect();
+                assert_eq!(rejoined, s.content);
+                assert!(
+                    word.graphemes(true).any(|g| s.content.starts_with(g)),
+                    "span {:?} starts mid-grapheme at tick {tick}",
+                    s.content
+                );
+            }
+        }
     }
 
     // Prefill sweeps the other way from generation. Tracking the brightest

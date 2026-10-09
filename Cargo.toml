@@ -114,6 +114,7 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 # here: plank draws a block). 0.2 is the ratatui 0.30 line; 0.1 draws into a
 # 0.29 buffer and cannot share a frame with this one.
 nano-cursor = "0.2"
+unicode-segmentation = "1.13"
 unicode-width = "0.2"
 ureq = "3"
 # Plugin signature verification (minisign, docs/WASM-PLUGINS.md). `ring` is
