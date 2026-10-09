@@ -26,6 +26,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default `-n` no longer gets every request rejected by a 32K vLLM model.
   `src/remote/limits.rs`.
 
+### Fixed
+
+- **A provider prompt bigger than estimated no longer fails the turn.** plank
+  sized a provider's prompt at four bytes a token, with the tool schemas left
+  out, so a session on a 32K vLLM model sent a 16,000-token cap beside a
+  16,769-token prompt and the server refused it (`maximum context length is
+  32768 tokens`). The provider engine now scales its estimate by what the
+  last pass was actually billed, so compaction starts when the real window is
+  nearly full; a request the server still rejects for prompt plus cap is
+  retried once without the cap; and a prompt that overruns the window on its
+  own makes both front ends compact and retry the pass, once per turn.
+
 ### Changed
 
 - **Steering directions are named.** `--dir-steering NAME` loads a direction

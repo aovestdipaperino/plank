@@ -7,6 +7,13 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v7.0.3 beta: long provider sessions compact instead of failing.** On a
+self-hosted model with a small window, plank could undercount the prompt, ask
+for more output than was left, and lose the turn to a `maximum context length`
+error. It now counts the prompt the way the server does, retries without the
+output cap when the server objects, and compacts when the conversation itself
+no longer fits.
+
 **v7.0.2 beta: self-hosted models size themselves.** Point `--provider openai`
 at vLLM, llama.cpp, LM Studio, Ollama or OpenRouter and plank asks the server
 for the model's context window, and its output cap where there is one, so the

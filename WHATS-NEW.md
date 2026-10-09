@@ -13,6 +13,16 @@ it.
 Install with `brew install aovestdipaperino/tap/plank-agent-beta`. Everything
 the betas below carried is in stable 7.0.0.
 
+### 7.0.3
+
+**A long provider session compacts instead of failing.** plank undercounted
+a provider's prompt (four bytes a token, tool schemas left out), so on a 32K
+vLLM model it could ask for more output than the window had left and get the
+whole request refused, and it compacted too late. It now learns the real
+count from what the server bills, retries a refused request without the
+output cap, and compacts and retries the pass when the prompt alone no
+longer fits.
+
 ### 7.0.2
 
 **Self-hosted models size themselves.** Point `--provider openai` at vLLM,
