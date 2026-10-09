@@ -777,6 +777,24 @@ fn context_room(ctx_size: i32, used: i32) -> Option<usize> {
     (ctx_size > 0).then(|| usize::try_from(ctx_size.saturating_sub(used)).unwrap_or(0))
 }
 
+/// Whether a failed pass should be answered by compacting and retrying it:
+/// the server said the prompt overran its window
+/// ([`crate::remote::provider::is_context_overflow`]) and this turn has not
+/// already compacted for that reason. Sets `done`, so a turn compacts at most
+/// once this way — a summary that still overruns the window is reported, not
+/// compacted in a loop.
+///
+/// The usual pre-pass check cannot catch this alone for a provider: it judges
+/// fullness by an estimate, and until a pass has reported its real prompt size
+/// the estimate can be far under (len/4, tool schemas left out).
+fn compact_after_overflow(err: &str, done: &mut bool) -> bool {
+    if *done || !crate::remote::provider::is_context_overflow(err) {
+        return false;
+    }
+    *done = true;
+    true
+}
+
 fn is_reasoning_stop(err: Option<&str>) -> bool {
     matches!(
         err,
@@ -5651,6 +5669,9 @@ impl Agent<'_> {
         // Bytes generated since the last tool call with an effect; see
         // `NO_PROGRESS_BYTE_BUDGET`.
         let mut ungrounded = 0usize;
+        // Whether this turn already compacted because the server said the
+        // prompt overran its window; see `compact_after_overflow`.
+        let mut overflow_compacted = false;
         let mut round = 0usize;
         loop {
             round += 1;
@@ -5673,7 +5694,16 @@ impl Agent<'_> {
             }
             let prompt_text = render_transcript(&self.session, &self.system);
             let (stream, assistant_text, stats) =
-                self.stream_generation(&prompt_text, turn_start)?;
+                match self.stream_generation(&prompt_text, turn_start) {
+                    Err(e) if compact_after_overflow(&e, &mut overflow_compacted) => {
+                        println!("{}", self.debug_line(&format!("context overflow: {e}")));
+                        if self.compact("context overflow", "")?.aborted() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    generated => generated?,
+                };
 
             let mut assistant_text = assistant_text;
             // A preflight stop reads as an engine interrupt, but it is a tool
@@ -6395,6 +6425,11 @@ impl Agent<'_> {
     }
 
     /// Compacts the transcript when the rendered context is nearly full.
+    ///
+    /// "Nearly full" is the engine's own count. For a provider that is the
+    /// `len/4` estimate calibrated by the last pass's billed prompt, so the
+    /// first pass of a session can still overrun the window; the turn loops
+    /// catch that error and compact anyway (`compact_after_overflow`).
     fn maybe_compact(&mut self) -> Result<Compacted, String> {
         let rendered = render_transcript(&self.session, &self.system);
         let used = self.engine.count_tokens(&rendered);
@@ -15696,8 +15731,10 @@ impl Agent<'_> {
         // Bytes generated since the last tool call with an effect; see
         // `NO_PROGRESS_BYTE_BUDGET`.
         let mut ungrounded = 0usize;
+        // See the plain REPL's `overflow_compacted`.
+        let mut overflow_compacted = false;
         let mut round = 0usize;
-        loop {
+        'pass: loop {
             round += 1;
             // Pressure builds *inside* a turn too (the C's "soft limit before
             // tool continuation"): round 1 is covered by the pre-turn check
@@ -15726,7 +15763,26 @@ impl Agent<'_> {
                 } else {
                     format!("{base_prompt}[assistant]\n{resumed_prefix}")
                 };
-                let out = self.worker_generate(tx, shared, &prompt, turn_start, true)?;
+                let out = match self.worker_generate(tx, shared, &prompt, turn_start, true) {
+                    Err(e) if compact_after_overflow(&e, &mut overflow_compacted) => {
+                        let mut sink = NoteSink(&mut note);
+                        sink.note(format!("context overflow: {e}"));
+                        if self
+                            .do_compact_notify(
+                                "context overflow",
+                                "",
+                                &mut sink,
+                                &compact_interrupt,
+                            )?
+                            .aborted()
+                        {
+                            shared.interrupt.store(false, Ordering::Relaxed);
+                            return Ok(());
+                        }
+                        continue 'pass;
+                    }
+                    generated => generated?,
+                };
                 if out.preempted && suspend_enabled {
                     let _ = tx.send(UiEvent::EndLine);
                     resumed_prefix.push_str(&out.assistant_text);
@@ -27101,6 +27157,21 @@ mod tests {
     /// token span buffer with the rung's shorter prefix, throwing away a cache
     /// that covered the whole live transcript. The gate then refused the very
     /// prefill it had just made inevitable, and refused again every turn.
+    #[test]
+    fn an_overflow_compacts_once_per_turn() {
+        let overflow = "provider request failed (HTTP 400): This model's maximum context \
+                        length is 32768 tokens. However, you requested 16000 output tokens";
+        let mut done = false;
+        assert!(compact_after_overflow(overflow, &mut done));
+        assert!(!compact_after_overflow(overflow, &mut done), "only once");
+        let mut done = false;
+        assert!(!compact_after_overflow(
+            "provider request failed (HTTP 401): bad key",
+            &mut done
+        ));
+        assert!(!done);
+    }
+
     #[test]
     fn a_refused_opportunistic_microcompact_does_not_rewind_the_engine() {
         let dir = scratch_dir("ladder-refuse-no-rewind");

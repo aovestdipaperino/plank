@@ -1474,6 +1474,12 @@ pub struct ProviderEngine {
     ctx_known: bool,
     /// The model's per-response output cap, when the server reported one.
     max_output: Option<i32>,
+    /// Real prompt tokens per `len/4`-estimated one, from the last pass's
+    /// `usage`. The bare estimate runs well under a real tokenizer on code and
+    /// leaves the tool schemas out entirely, so on its own it let compaction
+    /// start late and sent output caps that could not fit; scaled by this,
+    /// [`count_tokens`](Engine::count_tokens) tracks what the server counted.
+    prompt_scale: f64,
     /// Anthropic prompt caching over the stable prefix (tools + system). On by
     /// default; ignored by the `OpenAi` path (server-side prefix caching there
     /// is automatic). See [`build_anthropic_request`].
@@ -1515,6 +1521,7 @@ impl ProviderEngine {
             ctx_size: if ctx_size > 0 { ctx_size } else { 128_000 },
             ctx_known: false,
             max_output: None,
+            prompt_scale: 1.0,
             cache,
         })
     }
@@ -1531,6 +1538,22 @@ impl ProviderEngine {
         self
     }
 
+    /// Learns [`prompt_scale`](Self::prompt_scale) from a pass whose prompt
+    /// `rendered` the server billed as `billed` tokens.
+    fn calibrate(&mut self, rendered: &str, billed: i32) {
+        let estimate = len_estimate(rendered);
+        if estimate > 0 && billed > 0 {
+            self.prompt_scale = (f64::from(billed) / f64::from(estimate)).clamp(0.25, 8.0);
+        }
+    }
+
+    /// Whether a request rejected with `err` is retried without its output
+    /// cap: it had one, the server said prompt plus cap overran the window,
+    /// and this is not Anthropic, which requires the cap.
+    fn retries_uncapped(&self, err: &str, opts: &GenerationOptions) -> bool {
+        self.kind != ProviderKind::Anthropic && opts.n_predict > 0 && is_context_overflow(err)
+    }
+
     /// The output cap one request should send, `0` meaning "send none".
     ///
     /// `requested` is clamped to the model's reported output cap first. Then,
@@ -1538,9 +1561,11 @@ impl ProviderEngine {
     /// not fit beside the prompt is dropped rather than sent: vLLM rejects a
     /// request whose prompt plus `max_tokens` exceeds `max_model_len` outright,
     /// while every such server, left without a cap, generates until the window
-    /// is full — which is all a cap that large could have meant. The prompt
-    /// size is the `len/4` estimate, which undercounts code, hence the 3/2
-    /// margin; erring that way only drops a cap that was nearly moot.
+    /// is full — which is all a cap that large could have meant.
+    /// `prompt_tokens` is [`count_tokens`](Engine::count_tokens), calibrated
+    /// only once a pass has reported usage, hence the 3/2 margin; erring that
+    /// way only drops a cap that was nearly moot, and a server that still
+    /// rejects the sum is retried without a cap ([`is_context_overflow`]).
     /// Anthropic is left alone, since it requires `max_tokens` on every
     /// request and stops at the window by itself.
     fn output_cap(&self, requested: i32, prompt_tokens: i32) -> i32 {
@@ -1610,6 +1635,31 @@ impl ProviderEngine {
             ProviderKind::Anthropic => Box::new(AnthropicTranslator::new()),
         }
     }
+}
+
+/// The bare `len/4` token estimate, before any calibration.
+fn len_estimate(text: &str) -> i32 {
+    i32::try_from(text.len() / 4).unwrap_or(i32::MAX)
+}
+
+/// Whether a provider error says the request overran the model's window:
+/// vLLM's and `OpenAI`'s "maximum context length is N tokens…" (prompt plus
+/// requested output, or the prompt alone), the `context_length_exceeded`
+/// code, llama.cpp's "exceeds the available context size", and Anthropic's
+/// "prompt is too long". Only a 400 — the same words in a 5xx are not a
+/// request plank can fix. The turn loops compact and retry on it.
+#[must_use]
+pub fn is_context_overflow(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("(http 400)")
+        && [
+            "maximum context length",
+            "context_length_exceeded",
+            "exceeds the available context size",
+            "prompt is too long",
+        ]
+        .iter()
+        .any(|m| e.contains(m))
 }
 
 /// Wall-clock and decode throughput for one provider pass.
@@ -1683,12 +1733,12 @@ impl Engine for ProviderEngine {
         // token (connect, queue, server prefill) and none of it is decode.
         let first_text = std::cell::Cell::new(None);
         let mut translator = self.translator();
-        let opts = &GenerationOptions {
+        let mut opts = GenerationOptions {
             n_predict: self.output_cap(opts.n_predict, total),
             ..opts.clone()
         };
         let end = loop {
-            let body = self.request_for(prompt, opts);
+            let body = self.request_for(prompt, &opts);
             let payload = serde_json::to_string(&body)
                 .map_err(|e| EngineError::new(format!("serialize provider request: {e}")))?;
             let url = format!("{}{}", self.base_url, self.endpoint());
@@ -1732,6 +1782,15 @@ impl Engine for ProviderEngine {
                         self.model
                     )));
                 }
+                // The prompt was bigger than estimated and prompt plus cap
+                // overran the window. Without a cap the server generates into
+                // whatever room is left, which is all the cap could have
+                // meant. A prompt that alone overruns the window fails again,
+                // and that error goes up to the turn loop, which compacts.
+                Err(e) if first_text.get().is_none() && self.retries_uncapped(&e, &opts) => {
+                    opts.n_predict = 0;
+                    translator = self.translator();
+                }
                 Err(e) => return Err(EngineError::new(e)),
             }
         };
@@ -1767,6 +1826,9 @@ impl Engine for ProviderEngine {
             .input_tokens
             .saturating_add(usage.cache_creation_input_tokens)
             .saturating_add(usage.cache_read_input_tokens);
+        if translator.usage().is_some() {
+            self.calibrate(prompt.flat(), prompt_total);
+        }
         let (tps, steady_tps) = throughput(usage.output_tokens, started, first_text.get());
         Ok(GenerationStats {
             steady_tps,
@@ -1788,6 +1850,15 @@ impl Engine for ProviderEngine {
 
     fn ctx_size(&self) -> i32 {
         self.ctx_size
+    }
+
+    /// The `len/4` estimate scaled by what the last pass's `usage` said the
+    /// prompt really cost ([`prompt_scale`](Self::prompt_scale)), so the
+    /// compaction check and the context gauge see the server's count.
+    #[allow(clippy::cast_possible_truncation)]
+    fn count_tokens(&self, text: &str) -> i32 {
+        // Clamped to `i32::MAX` first, so the cast cannot truncate.
+        (f64::from(len_estimate(text)) * self.prompt_scale).min(f64::from(i32::MAX)) as i32
     }
 
     fn model_name(&self) -> String {
@@ -2378,6 +2449,47 @@ mod tests {
         assert_eq!(e.output_cap(64_000, 100_000), 64_000);
         // Zero stays zero: a prefill-only pass asks for no output.
         assert_eq!(e.output_cap(0, 10), 0);
+    }
+
+    #[test]
+    fn a_context_overflow_is_recognised_only_as_a_400() {
+        for msg in [
+            "This model's maximum context length is 32768 tokens. However, you requested \
+             16000 output tokens and your prompt contains at least 16769 input tokens",
+            "{\"code\":\"context_length_exceeded\"}",
+            "the request exceeds the available context size, try increasing it",
+            "prompt is too long: 210000 tokens > 200000 maximum",
+        ] {
+            let err = format!("provider request failed (HTTP 400): {msg}");
+            assert!(is_context_overflow(&err), "{err}");
+        }
+        assert!(!is_context_overflow(
+            "provider request failed (HTTP 500): maximum context length"
+        ));
+        assert!(!is_context_overflow(
+            "provider request failed (HTTP 400): invalid api key"
+        ));
+    }
+
+    #[test]
+    fn the_learned_prompt_scale_raises_the_count_and_shrinks_the_room() {
+        let mut e = ProviderEngine::new(
+            ProviderKind::OpenAi,
+            None,
+            "k".into(),
+            "m".into(),
+            32_768,
+            true,
+        )
+        .unwrap()
+        .with_limits(None, true);
+        let prompt = "x".repeat(40_000);
+        assert_eq!(e.count_tokens(&prompt), 10_000);
+        // The reported case: estimated 10K, really 16,769 tokens.
+        assert_eq!(e.output_cap(16_000, e.count_tokens(&prompt)), 16_000);
+        e.prompt_scale = 16_769.0 / 10_000.0;
+        assert_eq!(e.count_tokens(&prompt), 16_769);
+        assert_eq!(e.output_cap(16_000, e.count_tokens(&prompt)), 0);
     }
 
     #[test]

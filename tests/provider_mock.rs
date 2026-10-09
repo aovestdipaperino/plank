@@ -128,10 +128,16 @@ fn serve_one(mut stream: TcpStream, sse_body: &str) -> String {
     let body = String::from_utf8_lossy(&raw[header_end..body_end]).to_string();
 
     // `Connection: close` + no Content-Length: the client's SSE reader consumes
-    // the event-stream body until EOF, which the shutdown below signals.
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
-    );
+    // the event-stream body until EOF, which the shutdown below signals. A
+    // fixture that is already a whole HTTP response (an error status) goes out
+    // as it is.
+    let response = if sse_body.starts_with("HTTP/") {
+        sse_body.to_string()
+    } else {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
+        )
+    };
     stream
         .write_all(response.as_bytes())
         .expect("write response");
@@ -194,6 +200,15 @@ const OPENAI_TEXT_ONLY: &str = concat!(
     "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
     "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":2}}\n\n",
     "data: [DONE]\n\n",
+);
+
+/// vLLM's answer to a prompt plus `max_tokens` larger than `max_model_len`.
+const VLLM_OVERFLOW: &str = concat!(
+    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+    "{\"error\":{\"message\":\"This model's maximum context length is 32768 tokens. ",
+    "However, you requested 16000 output tokens and your prompt contains at least 16769 ",
+    "input tokens, for a total of at least 32769 tokens.\",\"type\":\"BadRequestError\",",
+    "\"code\":400}}",
 );
 
 // ---------------------------------------------------------------------------
@@ -461,4 +476,97 @@ fn openai_multiturn_tool_id_threading_over_socket() {
     assert_eq!(result["role"], "tool");
     assert_eq!(result["tool_call_id"], "call_0_0");
     assert_eq!(result["content"], "file body");
+}
+
+/// A request whose prompt plus output cap overruns the window (the prompt
+/// was larger than plank estimated) is retried once without the cap, and the
+/// server then generates into whatever room is left.
+#[test]
+fn an_overflowing_output_cap_is_retried_without_it() {
+    let server = FakeProvider::start(vec![
+        VLLM_OVERFLOW.to_string(),
+        OPENAI_TEXT_ONLY.to_string(),
+    ]);
+    let mut engine = ProviderEngine::new(
+        ProviderKind::OpenAi,
+        Some(server.base_url.clone()),
+        "DUMMY".to_string(),
+        "Qwen/Qwen3.8-27B-FP8".to_string(),
+        32_768,
+        true,
+    )
+    .expect("engine builds");
+
+    let messages = vec![ChatMessage::new(ChatRole::User, "go")];
+    let turn = StructuredTurn {
+        system: "sys",
+        messages: &messages,
+        tools: &[],
+        rendered: "",
+    };
+    let opts = GenerationOptions {
+        n_predict: 16_000,
+        ..GenerationOptions::default()
+    };
+    let mut text = String::new();
+    engine
+        .generate(
+            Prompt::Structured(&turn),
+            &opts,
+            &|| false,
+            &|| false,
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    text.push_str(&t);
+                }
+            },
+        )
+        .expect("the uncapped retry succeeds");
+    assert_eq!(text, "done");
+
+    let first: serde_json::Value = serde_json::from_str(&server.next_body()).unwrap();
+    assert_eq!(first["max_completion_tokens"], 16_000);
+    let retry: serde_json::Value = serde_json::from_str(&server.next_body()).unwrap();
+    assert!(
+        retry.get("max_completion_tokens").is_none(),
+        "the retry sends no cap: {retry}"
+    );
+}
+
+/// A prompt that overruns the window even uncapped fails with an error the
+/// turn loops recognise, so they compact and retry the pass.
+#[test]
+fn an_overflow_without_a_cap_reaches_the_turn_loop() {
+    let server = FakeProvider::start(vec![VLLM_OVERFLOW.to_string(), VLLM_OVERFLOW.to_string()]);
+    let mut engine = ProviderEngine::new(
+        ProviderKind::OpenAi,
+        Some(server.base_url.clone()),
+        "DUMMY".to_string(),
+        "m".to_string(),
+        32_768,
+        true,
+    )
+    .expect("engine builds");
+    let messages = vec![ChatMessage::new(ChatRole::User, "go")];
+    let turn = StructuredTurn {
+        system: "sys",
+        messages: &messages,
+        tools: &[],
+        rendered: "",
+    };
+    let opts = GenerationOptions {
+        n_predict: 16_000,
+        ..GenerationOptions::default()
+    };
+    let err = engine
+        .generate(
+            Prompt::Structured(&turn),
+            &opts,
+            &|| false,
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(plank::remote::provider::is_context_overflow(&err), "{err}");
 }
