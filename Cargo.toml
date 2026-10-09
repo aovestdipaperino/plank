@@ -90,6 +90,9 @@ gemma = ["dep:gemma-engine", "gemma-engine/candle", "local-inference-engine/gemm
 
 [dependencies]
 trace-stream = { path = "crates/trace-stream" }
+# plank's user files, shared with `pt` (../plank-replay): named steering
+# vectors in ~/.plank/models/vectors.json and installed profiles.
+plank-lib = { path = "crates/plank-lib" }
 # Local inference behind one API (ds4 C engine + Gemma). plank uses its ds4
 # half directly: it builds `libds4core.a` from `refs/ds4`, carries the raw FFI
 # and the Metal kernel lookup, and its build script reports through `links`

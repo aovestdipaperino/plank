@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `crates/plank-lib`, the vectors.json and profile file handling shared with
+  `pt`: plank's `steervec` now reads the store through it, and `pt install
+  <repo>:<path>` uses it to merge vectors files and install profiles.
+
 ### Changed
 
 - **Steering directions are named.** `--dir-steering NAME` loads a direction

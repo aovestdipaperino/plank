@@ -4833,6 +4833,7 @@ dependencies = [
  "notify-rust",
  "nucleo-matcher",
  "obscura",
+ "plank-lib",
  "ratatui",
  "ratatui-markdown",
  "ring",
@@ -4847,6 +4848,14 @@ dependencies = [
  "turbo-debug-client",
  "unicode-width",
  "ureq",
+]
+
+[[package]]
+name = "plank-lib"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]
