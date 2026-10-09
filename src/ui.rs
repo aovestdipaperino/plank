@@ -2567,8 +2567,8 @@ struct Agent<'a> {
     /// sub-agent did before it was interrupted.
     sidechain_dumps: std::collections::VecDeque<crate::repro::SidechainDump>,
     /// Engines for definitions that override the parent's (cross-provider
-    /// sub-agents). Cached across dispatches so `discover_ctx_size`'s network
-    /// probe happens at most once per key per session.
+    /// sub-agents). Cached across dispatches; the limits probe has its own
+    /// cache (`limits::discover_cached`).
     ///
     /// An engine is *removed* while its sidechain runs and reinserted
     /// afterwards, which is what lets the borrow checker enforce that a swap
@@ -11779,16 +11779,16 @@ the original is frozen and listed in /tree"
         // provider once: the local default is sized for the ds4 model and says
         // nothing about a provider's, and the parent's window is the last
         // resort rather than a guess dressed up as an answer.
-        let ctx = match spec.ctx {
-            Some(c) => c,
-            None => ProviderEngine::discover_ctx_size(
-                spec.kind,
-                Some(base_url.as_str()),
-                &api_key,
-                &spec.model,
-            )
-            .unwrap_or_else(|| self.engine.ctx_size()),
-        };
+        let probe =
+            crate::remote::limits::discover_cached(spec.kind, &base_url, &api_key, &spec.model);
+        if let Some(err) = probe.error(spec.kind, &base_url, &spec.model) {
+            return Err(err);
+        }
+        let limits = probe.limits;
+        let ctx = spec
+            .ctx
+            .or(limits.ctx)
+            .unwrap_or_else(|| self.engine.ctx_size());
         let key = EngineKey::Provider(
             spec.kind,
             base_url.clone(),
@@ -11811,7 +11811,11 @@ the original is frozen and listed in /tree"
             ctx,
             true,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .with_limits(
+            limits.max_output,
+            spec.ctx.is_some() || limits.ctx.is_some(),
+        );
         Ok((key, Box::new(engine)))
     }
 

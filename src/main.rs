@@ -1365,16 +1365,26 @@ fn make_engine(cfg: &AgentConfig, plugins: &plank::plugins::PluginSet) -> Result
         // With no explicit `-c`, the configured window is the local-model
         // default and says nothing about this provider's model — ask the
         // provider. Best-effort: on any failure the configured value stands.
+        // The probe runs even with `-c`, for the model's output cap.
+        // The same `/models` call checks the key and the model name, so a typo
+        // fails here rather than at the first turn.
+        let base_url = cfg
+            .provider_base_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| kind.default_base_url());
+        let probe = plank::remote::limits::discover(kind, base_url, &api_key, &model);
+        if let Some(err) = probe.error(kind, base_url, &model) {
+            return Err(err);
+        }
+        if let plank::remote::limits::ModelCheck::Unverified(why) = &probe.check {
+            eprintln!("plank: could not verify model {model} ({why}); continuing");
+        }
+        let limits = probe.limits;
         let ctx_size = if cfg.ctx_size_explicit {
             cfg.generation.ctx_size
         } else {
-            ProviderEngine::discover_ctx_size(
-                kind,
-                cfg.provider_base_url.as_deref(),
-                &api_key,
-                &model,
-            )
-            .unwrap_or(cfg.generation.ctx_size)
+            limits.ctx.unwrap_or(cfg.generation.ctx_size)
         };
         let engine = ProviderEngine::new(
             kind,
@@ -1384,9 +1394,16 @@ fn make_engine(cfg: &AgentConfig, plugins: &plank::plugins::PluginSet) -> Result
             ctx_size,
             cfg.provider_cache,
         )
-        .map_err(|e| format!("provider init: {e}"))?;
+        .map_err(|e| format!("provider init: {e}"))?
+        .with_limits(
+            limits.max_output,
+            cfg.ctx_size_explicit || limits.ctx.is_some(),
+        );
+        let max_output = limits
+            .max_output
+            .map_or_else(String::new, |n| format!(", max output {n}"));
         eprintln!(
-            "plank: provider engine ready: {} (ctx {ctx_size})",
+            "plank: provider engine ready: {} (ctx {ctx_size}{max_output})",
             engine.model_name()
         );
         // A `provider: local` definition means the ds4 engine specifically, so

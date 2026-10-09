@@ -193,6 +193,27 @@ anything speaking that shape: vLLM, Ollama, OpenRouter, Together, LM
 Studio.</p>
 <pre class="sh"><code>plank --provider openai --model llama3.3 \
       --base-url http://localhost:11434/v1 --api-key ollama</code></pre>
+<p><strong>Checked at startup</strong> — before the first turn, plank
+asks the endpoint's <code>/models</code> for the model. A key the server
+refuses (401/403) or a model it does not list stops startup with the
+server's own message, the variable to fix, and the models it does offer,
+closest names first. An unreachable server only warns. A llama.cpp
+server, which serves one model under any name, always passes.</p>
+<p><strong>Context window and output cap</strong> — with no
+<code>-c</code>, the window comes from the server, wherever it reports
+it: vLLM's <code>max_model_len</code>, llama.cpp's per-slot
+<code>n_ctx</code>, OpenRouter's <code>context_length</code>, LM
+Studio's and Ollama's loaded context (only for a model already loaded —
+the trained maximum would overstate a fresh load), Anthropic's
+<code>max_input_tokens</code>. OpenAI's own API reports none, so the
+configured window stands. Where the server also reports an output cap
+(OpenRouter, Anthropic), longer requests are clamped to it. On an
+OpenAI-compatible server whose window is known, a cap that would not fit
+beside the prompt is left out of the request, so the server generates
+until the window is full instead of rejecting the request — vLLM refuses
+a prompt plus <code>max_tokens</code> larger than the model. The startup
+line shows what was found:
+<code>provider engine ready: openai:… (ctx 32768)</code>.</p>
 <p><strong>What stays the same</strong> — every tool, MCP tools,
 <code>@</code> completion, sessions and <code>/resume</code>,
 <code>/btw</code>, compaction. The one difference is the system prompt:

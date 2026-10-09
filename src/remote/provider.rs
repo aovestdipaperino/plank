@@ -1114,32 +1114,6 @@ pub(crate) const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11"
 /// the whole cached prefix. The 1h tier costs 2x base input on the *write* (vs
 /// 1.25x for 5m) but keeps reads at 0.1x, a clear win when turns are re-read
 /// far more often than the prefix changes. Requires [`EXTENDED_CACHE_TTL_BETA`].
-/// Whether this key marks a mock or stubbed endpoint rather than a real
-/// provider — an empty key, the `DUMMY` placeholder `new` substitutes for one,
-/// or a key carrying the `DEADBEEF` sentinel. The sentinel match is literal and
-/// case-sensitive.
-///
-/// Used only to skip the context-window probe, which against a mock endpoint
-/// buys nothing but a timeout. This no longer influences the request body: the
-/// Anthropic path omits the sampling parameters unconditionally (they are
-/// rejected by the current models), and the OpenAI-compatible path sends them
-/// to mocks and real providers alike.
-fn is_placeholder_key(api_key: &str) -> bool {
-    let k = api_key.trim();
-    k.is_empty() || k == "DUMMY" || k.contains("DEADBEEF")
-}
-
-/// Reads the context window out of an Anthropic `GET /v1/models/{id}` body.
-///
-/// The field is `max_input_tokens`; `max_tokens` on the same object is the
-/// *output* cap and must not be confused for it. Older responses carry neither,
-/// hence the `Option`. Pure and unit-testable: no network.
-fn parse_max_input_tokens(body: &str) -> Option<i32> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let n = v.get("max_input_tokens")?.as_i64()?;
-    i32::try_from(n).ok().filter(|n| *n > 0)
-}
-
 fn cache_control() -> serde_json::Value {
     serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
 }
@@ -1495,6 +1469,11 @@ pub struct ProviderEngine {
     api_key: String,
     model: String,
     ctx_size: i32,
+    /// Whether `ctx_size` came from the server or the user rather than the
+    /// 128K fallback. See [`with_limits`](Self::with_limits).
+    ctx_known: bool,
+    /// The model's per-response output cap, when the server reported one.
+    max_output: Option<i32>,
     /// Anthropic prompt caching over the stable prefix (tools + system). On by
     /// default; ignored by the `OpenAi` path (server-side prefix caching there
     /// is automatic). See [`build_anthropic_request`].
@@ -1534,50 +1513,50 @@ impl ProviderEngine {
             api_key,
             model,
             ctx_size: if ctx_size > 0 { ctx_size } else { 128_000 },
+            ctx_known: false,
+            max_output: None,
             cache,
         })
     }
 
-    /// Best-effort lookup of the model's real context window, mirroring the
-    /// `/info` handshake the flavor-(a) client does against `plank serve`.
+    /// Applies what the server reported about the model ([`crate::remote::limits::discover`]).
     ///
-    /// Anthropic only: `GET /v1/models/{model}` reports `max_input_tokens` (the
-    /// context window — there is no `context_window` field). The `OpenAi`
-    /// `/v1/models` payload carries no context length at all, so that path
-    /// returns `None` and the caller keeps its configured value. Every failure
-    /// mode — no key, network error, unexpected shape — is a silent `None`: a
-    /// wrong status-bar gauge is not worth failing startup over.
+    /// `ctx_known` says the window is the server's (or the user's) rather than
+    /// the 128K fallback: only then can [`output_cap`](Self::output_cap) judge
+    /// how much room a request leaves.
     #[must_use]
-    pub fn discover_ctx_size(
-        kind: ProviderKind,
-        base_url: Option<&str>,
-        api_key: &str,
-        model: &str,
-    ) -> Option<i32> {
-        if kind != ProviderKind::Anthropic || model.is_empty() {
-            return None;
+    pub fn with_limits(mut self, max_output: Option<i32>, ctx_known: bool) -> Self {
+        self.max_output = max_output.filter(|n| *n > 0);
+        self.ctx_known = ctx_known;
+        self
+    }
+
+    /// The output cap one request should send, `0` meaning "send none".
+    ///
+    /// `requested` is clamped to the model's reported output cap first. Then,
+    /// on an OpenAI-compatible endpoint whose window is known, a cap that would
+    /// not fit beside the prompt is dropped rather than sent: vLLM rejects a
+    /// request whose prompt plus `max_tokens` exceeds `max_model_len` outright,
+    /// while every such server, left without a cap, generates until the window
+    /// is full — which is all a cap that large could have meant. The prompt
+    /// size is the `len/4` estimate, which undercounts code, hence the 3/2
+    /// margin; erring that way only drops a cap that was nearly moot.
+    /// Anthropic is left alone, since it requires `max_tokens` on every
+    /// request and stops at the window by itself.
+    fn output_cap(&self, requested: i32, prompt_tokens: i32) -> i32 {
+        if requested <= 0 {
+            return requested;
         }
-        // A placeholder key means a key-less or mock endpoint; probing it only
-        // buys a timeout.
-        if is_placeholder_key(api_key) {
-            return None;
+        let n = self.max_output.map_or(requested, |m| requested.min(m));
+        let fits = || {
+            n < self
+                .ctx_size
+                .saturating_sub(prompt_tokens.saturating_mul(3) / 2)
+        };
+        if self.kind != ProviderKind::Anthropic && self.ctx_known && !fits() {
+            return 0;
         }
-        let base = base_url
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| kind.default_base_url())
-            .trim_end_matches('/');
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .build()
-            .into();
-        let mut resp = agent
-            .get(format!("{base}/models/{model}"))
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .call()
-            .ok()?;
-        let body = resp.body_mut().read_to_string().ok()?;
-        parse_max_input_tokens(&body)
+        n
     }
 
     /// Builds the request for whatever `Prompt` variant arrives. A `Flat`
@@ -1704,6 +1683,10 @@ impl Engine for ProviderEngine {
         // token (connect, queue, server prefill) and none of it is decode.
         let first_text = std::cell::Cell::new(None);
         let mut translator = self.translator();
+        let opts = &GenerationOptions {
+            n_predict: self.output_cap(opts.n_predict, total),
+            ..opts.clone()
+        };
         let end = loop {
             let body = self.request_for(prompt, opts);
             let payload = serde_json::to_string(&body)
@@ -2378,39 +2361,48 @@ mod tests {
     }
 
     #[test]
-    fn parses_context_window_from_models_payload() {
-        let body = r#"{"id":"claude-haiku-4-5","display_name":"Claude Haiku 4.5",
-                       "max_input_tokens":200000,"max_tokens":64000}"#;
-        assert_eq!(parse_max_input_tokens(body), Some(200_000));
-        // `max_tokens` alone is the output cap, not the window.
-        assert_eq!(parse_max_input_tokens(r#"{"max_tokens":64000}"#), None);
-        // Garbage, absent, and non-positive values all decline.
-        assert_eq!(parse_max_input_tokens("not json"), None);
-        assert_eq!(parse_max_input_tokens(r#"{"max_input_tokens":0}"#), None);
+    fn output_cap_clamps_to_the_reported_model_cap() {
+        let e = ProviderEngine::new(
+            ProviderKind::Anthropic,
+            None,
+            "k".into(),
+            "m".into(),
+            0,
+            true,
+        )
+        .unwrap()
+        .with_limits(Some(64_000), true);
+        assert_eq!(e.output_cap(100_000, 10), 64_000);
+        assert_eq!(e.output_cap(40, 10), 40);
+        // Anthropic always gets a cap, even one that cannot fit beside the prompt.
+        assert_eq!(e.output_cap(64_000, 100_000), 64_000);
+        // Zero stays zero: a prefill-only pass asks for no output.
+        assert_eq!(e.output_cap(0, 10), 0);
     }
 
     #[test]
-    fn ctx_discovery_declines_without_a_real_provider() {
-        // OpenAI's models payload has no context length: never probe.
-        assert_eq!(
-            ProviderEngine::discover_ctx_size(ProviderKind::OpenAi, None, "sk-live", "gpt"),
-            None
-        );
-        // Placeholder keys mark key-less/mock endpoints — probing only stalls.
-        // Whitespace counts as empty; a real key is not a placeholder.
-        for key in ["", "  ", "DUMMY", "sk-DEADBEEF"] {
-            assert!(is_placeholder_key(key), "{key:?} should be a placeholder");
-            assert_eq!(
-                ProviderEngine::discover_ctx_size(ProviderKind::Anthropic, None, key, "claude"),
-                None
-            );
-        }
-        assert!(!is_placeholder_key("sk-live-01"));
-        // No model name, nothing to look up.
-        assert_eq!(
-            ProviderEngine::discover_ctx_size(ProviderKind::Anthropic, None, "sk-live", ""),
-            None
-        );
+    fn output_cap_is_dropped_when_it_cannot_fit_a_known_window() {
+        let vllm = |known| {
+            ProviderEngine::new(
+                ProviderKind::OpenAi,
+                None,
+                "k".into(),
+                "m".into(),
+                32_768,
+                true,
+            )
+            .unwrap()
+            .with_limits(None, known)
+        };
+        // The local default (50K) on a 32K vLLM model would be a 400.
+        assert_eq!(vllm(true).output_cap(50_000, 1_000), 0);
+        // A small sub-agent budget fits and is kept.
+        assert_eq!(vllm(true).output_cap(40, 1_000), 40);
+        // 30K fits an empty window but not beside a 4K (estimated) prompt.
+        assert_eq!(vllm(true).output_cap(30_000, 100), 30_000);
+        assert_eq!(vllm(true).output_cap(30_000, 4_000), 0);
+        // A window plank only guessed is no ground to drop anything.
+        assert_eq!(vllm(false).output_cap(50_000, 1_000), 50_000);
     }
 
     fn collect_anthropic(frames: &[&str]) -> String {
