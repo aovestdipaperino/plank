@@ -13,6 +13,20 @@ it.
 Install with `brew install aovestdipaperino/tap/plank-agent-beta`. Everything
 the betas below carried is in stable 7.0.0.
 
+### 7.0.2
+
+**Self-hosted models size themselves.** Point `--provider openai` at vLLM,
+llama.cpp, LM Studio, Ollama or OpenRouter and plank reads the model's real
+context window from the server, and its output cap where one is reported, so
+the gauge is right and a 32K vLLM model stops rejecting every request. The
+same startup call checks the key and the model name: a typo fails at once,
+with the models the server does have, instead of at the first turn.
+
+**Steering directions have names.** `--dir-steering NAME` picks a direction
+stored for the model by `pt vectorize -n NAME`, `/steer` lists them and
+switches between them with the session resumed, and a profile can pair a
+direction with its recommended model. Engines no longer carry steering.
+
 ### 6.2.2
 
 **Profiles speak in their own verbs.** The status-bar word that says what the

@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Provider endpoints are checked at startup.** `--provider` asks the
+  endpoint's `/models` for the model before the first turn: a refused key
+  (401/403) or a model the server does not list fails startup with the
+  server's message, the key variable, and the models it does offer (closest
+  names first, at most 20). An unreachable server warns and continues; a
+  llama.cpp server's lone model matches any name. Sub-agent definitions on a
+  provider get the same check, once per provider, URL and model.
+- **The context window and output cap come from OpenAI-compatible servers
+  too.** With no `-c`, the window is read from wherever the server reports
+  it — vLLM `max_model_len`, llama.cpp `meta.n_ctx` (or `/props`),
+  OpenRouter `top_provider.context_length`, LM Studio's and Ollama's loaded
+  context — as it already was from Anthropic's `max_input_tokens`. A reported
+  output cap (OpenRouter `max_completion_tokens`, Anthropic `max_tokens`)
+  clamps every request. On an OpenAI-compatible server with a known window, a
+  cap that cannot fit beside the prompt is left out instead of sent, so the
+  default `-n` no longer gets every request rejected by a 32K vLLM model.
+  `src/remote/limits.rs`.
+
 ### Changed
 
 - **Steering directions are named.** `--dir-steering NAME` loads a direction

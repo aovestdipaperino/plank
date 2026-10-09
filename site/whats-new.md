@@ -7,6 +7,15 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v7.0.2 beta: self-hosted models size themselves.** Point `--provider openai`
+at vLLM, llama.cpp, LM Studio, Ollama or OpenRouter and plank asks the server
+for the model's context window, and its output cap where there is one, so the
+context gauge tells the truth and a 32K vLLM model no longer refuses every
+request. The same call checks your key and the model name before the first
+turn, and a typo comes back with the models the server does offer. Steering
+directions now have names too: `--dir-steering NAME`, `/steer` to list and
+switch, and a profile can bring one along with its recommended model.
+
 **v7.0.0 is out, and plank no longer needs a 96 GB Mac.** Gemma 4 runs as the
 agent model on an engine plank carries itself, written in Rust with no C
 underneath: Metal on a Mac, the CPU anywhere else. `plank --model gemma4-e4b`
