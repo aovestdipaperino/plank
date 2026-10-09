@@ -14598,9 +14598,15 @@ impl Agent<'_> {
         // Asked of the engine per plan, not cached: `/steer` changes it
         // mid-session, and the next walk must key on the edit in force now.
         let variant = self.engine.kv_variant();
+        // Trimmed as the turn sees it: a turn rebuilds its tokens from the
+        // rendered transcript, whose `parse_sections` trims every section, so a
+        // prompt ending in a newline (a profile's, whose last paragraph is the
+        // commit-trailer note) would warm one token the turn does not have and
+        // throw the whole restored prefix away on the first prompt.
+        let system = self.system.trim_end();
         let fp1 = crate::kvtier::system_fingerprint(
             model,
-            &self.system,
+            system,
             self.think,
             self.trusted_system_len,
             &variant,
@@ -14612,8 +14618,7 @@ impl Agent<'_> {
         // trusted/untrusted boundary; the base is keyed on the trusted span
         // alone so a changed tool set re-prefills the tail and nothing above it.
         let base_fp = self.engine.splits_system_tail().then(|| {
-            let trusted =
-                &self.system[..crate::kvtier::trusted_cut(&self.system, self.trusted_system_len)];
+            let trusted = &system[..crate::kvtier::trusted_cut(system, self.trusted_system_len)];
             crate::kvtier::system_fingerprint(
                 model,
                 trusted,
@@ -14624,7 +14629,7 @@ impl Agent<'_> {
         });
         crate::kvtier::plan(
             &fp1,
-            &self.system,
+            system,
             base_fp
                 .as_deref()
                 .map(|base_fp| crate::kvtier::SystemSplit {
@@ -31495,6 +31500,42 @@ mod tests {
         // And the live engine's own name reproduces the live plan, so
         // `kv_tiers` is genuinely just this call with one argument filled in.
         assert_eq!(agent.kv_tiers_for(&agent.engine.model_name()), live);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A profile's system prompt ends with the commit-trailer note and its
+    /// newline. The turn rebuilds the system section through `parse_sections`,
+    /// which trims it, so warming the untrimmed text put one token in the KV
+    /// the first prompt did not have, and that prompt re-prefilled everything.
+    #[test]
+    fn tier_one_warms_the_system_prompt_as_the_turn_renders_it() {
+        let dir = scratch_dir("kv-tiers-trim");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.system = "SYSTEM".to_string();
+        let trimmed = agent.kv_tiers();
+        agent.system = "SYSTEM\n".to_string();
+        let tiers = agent.kv_tiers();
+
+        let warmed: String = tiers
+            .iter()
+            .take_while(|t| {
+                matches!(
+                    t.kind,
+                    crate::kvtier::TierKind::System | crate::kvtier::TierKind::SystemTail
+                )
+            })
+            .map(|t| t.text.as_str())
+            .collect();
+        let rendered = crate::ds4tokens::parse_sections("[system]\nSYSTEM\n\n[user]\nhi\n");
+        assert_eq!(
+            warmed, rendered[0].1,
+            "warm text must be the turn's section"
+        );
+        assert_eq!(
+            tiers, trimmed,
+            "trailing whitespace keys and warms exactly like the trimmed prompt"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -320,11 +320,11 @@ pub fn plan(
     project_dir: Option<&Path>,
 ) -> Vec<TierSpec> {
     // Tier 1 leads the list so the warm walk is one uniform loop over tiers
-    // rather than a system-prompt phase plus a tier phase. Its text is NOT
-    // trimmed: the system prompt is tokenized as a `system`-role message by
-    // `build_system_tokens`, not by the user-message path that `parse_sections`
-    // trims, so trimming here would change `fp1` and invalidate every existing
-    // system checkpoint for no reason.
+    // rather than a system-prompt phase plus a tier phase. Its text is taken
+    // as given: the caller (`Agent::kv_tiers_for`) trims it *before* computing
+    // `fp1`, because the turn rebuilds the system section through
+    // `parse_sections`, which trims it too. Trimming only here would key a
+    // checkpoint on text it does not hold.
     // The tail split, when the engine supports one and there is a tail to
     // split off. `fp1` keeps meaning "the whole system prompt" in both shapes,
     // so the tail tier lands on the same key an undivided Tier 1 would have

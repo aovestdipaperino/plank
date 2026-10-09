@@ -3508,3 +3508,22 @@ error text never changes, and only a successful retry adds a
 `Note: removed read's line-number prefixes` line to the result, so the model
 learns to leave them out. The preflight runs the same retry, so it never
 rejects an edit the tool would accept.
+
+## A system prompt ending in a newline rebuilt the whole KV on the first prompt
+
+The warm walk tokenized the system prompt exactly as composed, but a turn
+rebuilds its tokens from the rendered transcript, where `parse_sections`
+trims every section, the system one included. A prompt ending in `\n`
+therefore warmed one token the turn did not have. The divergence fell at the
+end of the system prompt, behind the live KV end (the project tier sits
+after it), and with no ladder rung in a fresh session the first prompt
+rebuilt from zero: a d3v1l launch restored 18,525 tokens and then prefilled
+19,329 (`PLANK_KV_DEBUG`: `full rebuild: prompt is a 10254-token prefix of a
+18525-token live KV`).
+
+Only prompts ending in whitespace were hit. The default run ends with the
+`-sys` text, which has no trailing newline, while a profile has no `-sys`
+text and ends with `COMMIT_SIGNATURE_INSTRUCTION` and its newline.
+`Agent::kv_tiers_for` now trims the system text before fingerprinting and
+planning, so the warmed tokens and the key both match what the turn renders;
+prompts without trailing whitespace keep their old keys.
