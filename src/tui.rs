@@ -6236,7 +6236,7 @@ mod tests {
         let mut log = OutputLog::new();
         log.visible_text("\n");
         log.flush_md();
-        assert!(log.to_text().lines.is_empty());
+        assert_eq!(log.to_text().lines, [] as [ratatui::prelude::Line<'_>; 0]);
     }
 
     #[test]
@@ -7332,7 +7332,7 @@ mod tests {
         log.push_plain("older conversation");
         log.visible_text("```rust\nfn main() {}\n```\nstreaming tail");
         log.set_progress(Some(ratatui::text::Line::from("working…")));
-        assert!(!log.to_text().lines.is_empty());
+        assert_ne!(log.to_text().lines, [] as [ratatui::prelude::Line<'_>; 0]);
 
         log.clear();
 

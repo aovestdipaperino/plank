@@ -896,7 +896,10 @@ mod tests {
         });
         let dump = SidechainDump::new("sub-agent", "t", 0, &[m], 1, true);
         assert_eq!(dump.messages.len(), 1);
-        assert!(dump.messages[0].images.is_empty());
+        assert_eq!(
+            dump.messages[0].images,
+            [] as [crate::engine::VisionImage; 0]
+        );
         assert_eq!(dump.messages[0].at, 42);
         assert_eq!(dump.messages[0].text, "<tool_result>img</tool_result>");
         assert_eq!(dump.outcome, "ended");

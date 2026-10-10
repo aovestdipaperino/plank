@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn an_empty_frame_is_valid() {
         let decoded = decode(&encode(&frame_of(vec![]))).expect("valid");
-        assert!(decoded.glyphs.is_empty());
+        assert_eq!(decoded.glyphs, [] as [crate::arcade::Glyph; 0]);
         assert_eq!((decoded.w, decoded.h), (80, 24));
     }
 

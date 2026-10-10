@@ -899,7 +899,7 @@ mod tests {
         // survive now that prompt hooks are supported.
         assert_eq!(h.stop[0].hooks.len(), 2);
         assert_eq!(h.stop[0].hooks[0].prompt.as_deref(), Some("ignored"));
-        assert!(h.stop[0].hooks[0].command.is_empty());
+        assert_eq!(h.stop[0].hooks[0].command, "");
         assert_eq!(h.stop[0].hooks[1].command, "check.sh");
         assert!(h.stop[0].hooks[1].prompt.is_none());
         assert_eq!(h.stop[0].hooks[1].timeout_sec, HOOK_DEFAULT_TIMEOUT_SEC);
@@ -939,7 +939,7 @@ mod tests {
         assert_eq!(h.pre_compact[0].hooks[0].command, "pre");
         assert_eq!(h.post_compact[0].hooks[0].command, "post");
         assert_eq!(h.post_tool_use_failure[0].hooks[0].command, "f");
-        assert!(h.warnings.is_empty());
+        assert_eq!(h.warnings, [] as [std::string::String; 0]);
         assert!(!h.is_empty());
     }
 

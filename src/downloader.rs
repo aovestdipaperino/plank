@@ -3076,6 +3076,8 @@ pub(crate) mod tests {
 
     impl Read for FlakyThenGood {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            // fetch_update is try_update from Rust 1.99, above our MSRV (1.93).
+            #[allow(deprecated)]
             if self
                 .fails_left
                 .fetch_update(

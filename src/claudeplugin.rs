@@ -1817,7 +1817,7 @@ mod tests {
         assert_eq!(out.dest, install_dir(&home).join("demo"));
         assert!(out.dest.join(".claude-plugin/plugin.json").is_file());
         assert!(out.dest.join("commands/note.md").is_file());
-        assert!(out.skipped_hook_events.is_empty());
+        assert_eq!(out.skipped_hook_events, [] as [std::string::String; 0]);
         assert!(!out.rewrote_plugin_root);
     }
 
