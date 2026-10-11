@@ -87,6 +87,7 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 
 | Key | Default | What |
 |---|---|---|
+| `tools.editUpto` | by model | whether the edit tool takes `[upto]` anchored old text and the prompt teaches it. Unset, it is off for DeepSeek and Qwen (as in ds4, whose V4 Flash checkpoint struggles with anchored edits) and on for Gemma. Changes the system prompt, so it takes effect in a new session. |
 | `tools.bashNotify` | `false` | wake the model when a bash job it left running finishes, instead of having it poll with `bash_status`. Adds one sentence to the system prompt, so it takes effect in a new session. See [Background jobs](05-tools.md#background-jobs). |
 | `tools.loopGuards` | `true` | arm the loop guards (`/loopguard` flips it for the session) |
 | `tools.noProgressGuard` | `false` | also stop a turn that generates 32 KB of output without changing a file. Requires `tools.loopGuards`; see [The no-progress budget](04-slash-commands.md#the-no-progress-budget). |

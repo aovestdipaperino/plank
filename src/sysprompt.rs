@@ -44,6 +44,7 @@ A whole-file read may fail if the result would not fit the current context; then
 
 /// Tools prompt for the Qwen3.8-Flash-Next dialect (`ds4_agent.c`,
 /// `agent_build_qwen_tools_prompt` with `edit_upto`).
+/// [`tools_prompt_qwen`] swaps in the exact-edit rule when [`edit_upto`] is off.
 ///
 /// Qwen3.8 does not speak DSML. It is taught its own `<tool_call>` syntax and
 /// is handed JSON function schemas inside `<tools>`, which is why this is a
@@ -147,12 +148,11 @@ pub fn gemma_syntax_reminder() -> &'static str {
 pub const GEMMA_IN_THINK_PROHIBITION: &str =
     "Tool calls are only run outside the thinking block: close it with <channel|> first.";
 
-/// Editing-instructions section of the tools prompt (verbatim from C).
+/// Editing-instructions section of the tools prompt, `[upto]` variant
+/// (verbatim from C, `agent_tools_prompt_edit_upto`).
 ///
-/// This is the C's `agent_tools_prompt_edit_upto` variant: plank's edit tool
-/// implements `[upto]` anchoring, so it takes the prompt that teaches it. The
-/// C also carries an `agent_tools_prompt_edit_exact` variant it now selects by
-/// default (`--edit-upto` opts back in); plank has not adopted that split.
+/// Taught only when [`edit_upto`] holds; otherwise the prompt carries
+/// [`TOOLS_PROMPT_EDIT_EXACT`], as the C does without `--edit-upto`.
 const TOOLS_PROMPT_EDIT_LINE: &str = "## Editing files\n\n\
 When editing files, state the target filename before the edit; for the edit tool, put path first.\n\
 Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. \
@@ -179,6 +179,40 @@ Example anchored edit:\n\
 </｜DSML｜tool_calls>\n\
 To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n\
 Use read raw=true only when you need plain file text without line numbers.\n\n";
+
+/// Editing-instructions section of the tools prompt, exact old/new variant
+/// (verbatim from C, `agent_tools_prompt_edit_exact`): the C's default since
+/// `--edit-upto` became opt-in.
+const TOOLS_PROMPT_EDIT_EXACT: &str = "## Editing files\n\n\
+When editing files, state the target filename before the edit; for the edit tool, put path first.\n\
+Use edit with path, old, and new for changes. The old text must match exactly once in the current file; \
+otherwise edit fails for safety. Read enough of the file to provide the exact old text being replaced.\n\
+To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n\
+Use read raw=true only when you need plain file text without line numbers.\n\n";
+
+/// Whether the tools prompt for `syntax` teaches `[upto]` anchored edits, and
+/// so whether the edit tool accepts them.
+///
+/// `tools.editUpto` decides when set. Unset, it follows the C, which made
+/// `[upto]` opt-in (`--edit-upto`, upstream `b030961`) because the V4 Flash
+/// checkpoint struggles with anchored edits: off for the DSML and Qwen
+/// dialects. Gemma's prompt is plank's own and keeps the anchor.
+#[must_use]
+pub fn edit_upto(syntax: ToolSyntax) -> bool {
+    crate::settings::active()
+        .tools
+        .edit_upto
+        .unwrap_or(syntax == ToolSyntax::Gemma)
+}
+
+/// The editing section for the chosen variant.
+fn tools_prompt_edit(upto: bool) -> &'static str {
+    if upto {
+        TOOLS_PROMPT_EDIT_LINE
+    } else {
+        TOOLS_PROMPT_EDIT_EXACT
+    }
+}
 
 /// Trailing section of the tools prompt: web tools, schemas, rules.
 ///
@@ -683,7 +717,7 @@ fn trusted_prose(
     let mut out = if let Some((text, spec)) = profile {
         compose_profile_prompt(text, spec, parity).0
     } else {
-        let mut out = build_tools_prompt_base(parity);
+        let mut out = build_tools_prompt_base_with(parity, edit_upto(syntax));
         insert_marker_spelling_note(&mut out);
         insert_document_read_note(&mut out);
         append_native_extra_schemas(&mut out);
@@ -702,6 +736,30 @@ fn trusted_prose(
         out = dsml41_tools_prompt(&out);
     }
     out
+}
+
+/// The Qwen edit rule taught with `[upto]` (verbatim from C,
+/// `agent_glm_tools_prompt_edit_upto`), as it stands in [`TOOLS_PROMPT_QWEN`].
+pub const QWEN_EDIT_UPTO_RULE: &str = "- Use edit with exact old text and replacement new text; old may contain one [upto] marker between unique anchors.\n";
+
+/// The Qwen edit rule without it (verbatim from C,
+/// `agent_glm_tools_prompt_edit_exact`).
+pub const QWEN_EDIT_EXACT_RULE: &str =
+    "- Use edit with exact old text and replacement new text; old must match exactly once.\n";
+
+/// [`TOOLS_PROMPT_QWEN`] with the edit rule for the chosen variant: the C's
+/// `agent_build_qwen_tools_prompt(edit_upto, …)`.
+#[must_use]
+pub fn tools_prompt_qwen(upto: bool) -> std::borrow::Cow<'static, str> {
+    if upto {
+        return std::borrow::Cow::Borrowed(TOOLS_PROMPT_QWEN);
+    }
+    debug_assert_eq!(TOOLS_PROMPT_QWEN.matches(QWEN_EDIT_UPTO_RULE).count(), 1);
+    std::borrow::Cow::Owned(TOOLS_PROMPT_QWEN.replacen(
+        QWEN_EDIT_UPTO_RULE,
+        QWEN_EDIT_EXACT_RULE,
+        1,
+    ))
 }
 
 /// [`TOOLS_PROMPT_QWEN`] with plank's own tools spliced into its schema list.
@@ -753,13 +811,14 @@ fn build_qwen_tools_prompt_parts(
     append_native_extra_schemas(&mut schemas);
     schemas.push_str(&foreign);
 
-    let at = TOOLS_PROMPT_QWEN
+    let prompt = tools_prompt_qwen(edit_upto(ToolSyntax::Qwen));
+    let at = prompt
         .find(QWEN_SCHEMA_FENCE)
         .expect("the Qwen tools prompt fences its schemas with </tools>");
-    let mut out = String::with_capacity(TOOLS_PROMPT_QWEN.len() + schemas.len());
-    out.push_str(&TOOLS_PROMPT_QWEN[..at]);
+    let mut out = String::with_capacity(prompt.len() + schemas.len());
+    out.push_str(&prompt[..at]);
     out.push_str(&schemas);
-    out.push_str(&TOOLS_PROMPT_QWEN[at..]);
+    out.push_str(&prompt[at..]);
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     append_working_style(&mut out);
     if gpu_suspend {
@@ -989,17 +1048,22 @@ fn gemma_prose() -> String {
     out.push_str(&intro[read..]);
     insert_document_read_note(&mut out);
 
-    let edit = TOOLS_PROMPT_EDIT_LINE;
-    let example = edit
-        .find("Example anchored edit:\n")
-        .expect("the editing section has an example");
-    let example_end = edit[example..]
-        .find("</｜DSML｜tool_calls>\n")
-        .map(|at| example + at + "</｜DSML｜tool_calls>\n".len())
-        .expect("the example closes its stanza");
-    out.push_str(&edit[..example]);
-    out.push_str(GEMMA_EDIT_EXAMPLE);
-    out.push_str(&edit[example_end..]);
+    if edit_upto(ToolSyntax::Gemma) {
+        let edit = TOOLS_PROMPT_EDIT_LINE;
+        let example = edit
+            .find("Example anchored edit:\n")
+            .expect("the editing section has an example");
+        let example_end = edit[example..]
+            .find("</｜DSML｜tool_calls>\n")
+            .map(|at| example + at + "</｜DSML｜tool_calls>\n".len())
+            .expect("the example closes its stanza");
+        out.push_str(&edit[..example]);
+        out.push_str(GEMMA_EDIT_EXAMPLE);
+        out.push_str(&edit[example_end..]);
+    } else {
+        // No DSML in it, so nothing to respell.
+        out.push_str(TOOLS_PROMPT_EDIT_EXACT);
+    }
 
     let after = TOOLS_PROMPT_AFTER_EDIT;
     let schemas = after
@@ -1709,11 +1773,20 @@ fn profile_prompt_source() -> Option<(&'static str, &'static crate::profile::Pro
 /// those calls (see `engine.thinkingToolCalls`); everything else is identical.
 #[must_use]
 pub fn build_tools_prompt_base(parity: bool) -> String {
+    build_tools_prompt_base_with(parity, edit_upto(ToolSyntax::Dsml))
+}
+
+/// [`build_tools_prompt_base`] with the editing variant chosen explicitly, so
+/// the parity suite can hold each against its C constant whatever the
+/// settings say.
+#[must_use]
+pub fn build_tools_prompt_base_with(parity: bool, upto: bool) -> String {
+    let edit = tools_prompt_edit(upto);
     let mut out = String::with_capacity(
-        TOOLS_PROMPT_INTRO.len() + TOOLS_PROMPT_EDIT_LINE.len() + TOOLS_PROMPT_AFTER_EDIT.len(),
+        TOOLS_PROMPT_INTRO.len() + edit.len() + TOOLS_PROMPT_AFTER_EDIT.len(),
     );
     out.push_str(TOOLS_PROMPT_INTRO);
-    out.push_str(TOOLS_PROMPT_EDIT_LINE);
+    out.push_str(edit);
     out.push_str(TOOLS_PROMPT_AFTER_EDIT);
     if !parity {
         // The line and the blank line separating it from the next paragraph.
@@ -2657,6 +2730,36 @@ mod tests {
         );
     }
 
+    /// `[upto]` is opt-in for the DSML and Qwen dialects, as in the C, and
+    /// kept for Gemma; `tools.editUpto` decides for all of them when set.
+    #[test]
+    fn upto_is_opt_in_except_for_gemma() {
+        assert!(!edit_upto(ToolSyntax::Dsml));
+        assert!(!edit_upto(ToolSyntax::Dsml41));
+        assert!(!edit_upto(ToolSyntax::Qwen));
+        assert!(edit_upto(ToolSyntax::Gemma));
+        assert!(!build_tools_prompt(&[], true).contains("[upto]"));
+        assert!(!tools_prompt_qwen(false).contains("[upto]"));
+        assert!(tools_prompt_qwen(false).contains(QWEN_EDIT_EXACT_RULE));
+        assert!(gemma_prose().contains("never close old immediately after [upto]"));
+
+        let mut on = crate::settings::Settings::default();
+        on.tools.edit_upto = Some(true);
+        let guard = crate::settings::install_for_test(on);
+        assert!(edit_upto(ToolSyntax::Dsml) && edit_upto(ToolSyntax::Qwen));
+        let p = build_tools_prompt(&[], true);
+        assert!(p.contains("never close old immediately after [upto]"));
+        assert!(p.contains("Example anchored edit:"));
+        drop(guard);
+
+        let mut off = crate::settings::Settings::default();
+        off.tools.edit_upto = Some(false);
+        let _guard = crate::settings::install_for_test(off);
+        let gemma = gemma_prose();
+        assert!(!gemma.contains("[upto]"));
+        assert!(gemma.contains("Read enough of the file to provide the exact old text"));
+    }
+
     #[test]
     fn tools_prompt_contains_verbatim_phrases() {
         let p = build_tools_prompt(&[], true);
@@ -2664,7 +2767,7 @@ mod tests {
         assert!(p.contains("<｜DSML｜tool_calls>"));
         assert!(p.contains("Tool calls are not allowed inside <think></think>"));
         assert!(p.contains("## Editing files"));
-        assert!(p.contains("never close old immediately after [upto]"));
+        assert!(p.contains("Read enough of the file to provide the exact old text"));
         assert!(p.contains("Use google_search to find web pages."));
         assert!(p.contains("### Available Tool Schemas"));
         assert!(p.contains("\"name\": \"bash_stop\""));

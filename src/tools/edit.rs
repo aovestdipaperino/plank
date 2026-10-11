@@ -18,6 +18,9 @@ use super::files::{LineSpan, read_file_bytes, split_lines};
 use super::{ToolContext, parse_bool_default, parse_int_default};
 
 const UPTO_MARKER: &[u8] = b"[upto]";
+
+/// The refusal for an `[upto]` old text when [`ToolContext::edit_upto`] is off.
+const UPTO_DISABLED: &str = "[upto] edits are disabled; give the exact old text being replaced (tools.editUpto enables them)";
 const CONTEXT_BEFORE: usize = 5;
 const CONTEXT_AFTER: usize = 8;
 const EDITED_CONTEXT_HEAD: usize = 18;
@@ -82,14 +85,27 @@ fn span_has_nonspace(s: &[u8]) -> bool {
 /// must be unique; with one marker the head must be unique and the tail
 /// unique after the head. Returns `(offset, length, anchored)`.
 ///
+/// `allow_upto` is [`ToolContext::edit_upto`]: when the prompt did not teach
+/// the marker, an old text carrying it is refused rather than anchored.
+///
 /// # Errors
 ///
 /// Returns the C-format anchor diagnostic when the span cannot be located.
-pub fn edit_find_old_span(data: &[u8], old: &[u8]) -> Result<(usize, usize, bool), String> {
+pub fn edit_find_old_span(
+    data: &[u8],
+    old: &[u8],
+    allow_upto: bool,
+) -> Result<(usize, usize, bool), String> {
     let Some(upto) = find_bytes(old, UPTO_MARKER) else {
         let offset = find_unique(data, old, "old text")?;
         return Ok((offset, old.len(), false));
     };
+    if !allow_upto {
+        // The C says "restart with --edit-upto to enable them", which the
+        // model can do nothing about and plank has no such flag; what the
+        // model can do is send the exact text.
+        return Err(UPTO_DISABLED.to_string());
+    }
     let after_marker = upto + UPTO_MARKER.len();
     if find_bytes(&old[after_marker..], UPTO_MARKER).is_some() {
         return Err("old text contains more than one [upto] marker".to_string());
@@ -203,8 +219,13 @@ fn strip_read_line_numbers(text: &str) -> Option<String> {
 /// # Errors
 ///
 /// Returns the original anchor diagnostic when neither form matches.
-fn find_old_span_lenient(data: &[u8], old: &str, new: String) -> Result<OldSpan, String> {
-    let err = match edit_find_old_span(data, old.as_bytes()) {
+fn find_old_span_lenient(
+    data: &[u8],
+    old: &str,
+    new: String,
+    allow_upto: bool,
+) -> Result<OldSpan, String> {
+    let err = match edit_find_old_span(data, old.as_bytes(), allow_upto) {
         Ok((offset, len, anchored)) => {
             return Ok(OldSpan {
                 new,
@@ -222,7 +243,7 @@ fn find_old_span_lenient(data: &[u8], old: &str, new: String) -> Result<OldSpan,
     let Some(stripped) = strip_read_line_numbers(old) else {
         return Err(err);
     };
-    match edit_find_old_span(data, stripped.as_bytes()) {
+    match edit_find_old_span(data, stripped.as_bytes(), allow_upto) {
         Ok((offset, len, anchored)) => Ok(OldSpan {
             new: strip_read_line_numbers(&new).unwrap_or(new),
             offset,
@@ -263,7 +284,7 @@ pub fn preflight_edit_old(ctx: &ToolContext, call: &ToolCall) -> Result<(), Stri
     }
     let data = read_file_bytes(&ctx.resolve(path), path)?;
     let (old, new) = adapt_line_endings(&data, old, "");
-    find_old_span_lenient(&data, &old, new).map(|_| ())
+    find_old_span_lenient(&data, &old, new, ctx.edit_upto).map(|_| ())
 }
 
 fn line_for_offset(spans: &[LineSpan], offset: usize) -> usize {
@@ -419,7 +440,7 @@ pub fn tool_edit(ctx: &mut ToolContext, call: &ToolCall) -> String {
         len: remove_len,
         anchored,
         stripped,
-    } = match find_old_span_lenient(&data, &old, new_text) {
+    } = match find_old_span_lenient(&data, &old, new_text, ctx.edit_upto) {
         Ok(span) => span,
         Err(err) => return format!("Tool error: {err}\n"),
     };
@@ -1258,7 +1279,7 @@ mod tests {
         let (old, new) = adapt_line_endings(data, "use a;\nuse b;\n", "use a;\nuse b;\nuse c;\n");
         assert_eq!(old, "use a;\r\nuse b;\r\n");
         assert_eq!(new, "use a;\r\nuse b;\r\nuse c;\r\n");
-        let (off, len, _) = edit_find_old_span(data, old.as_bytes()).unwrap();
+        let (off, len, _) = edit_find_old_span(data, old.as_bytes(), true).unwrap();
         assert_eq!((off, len), (0, old.len()));
     }
 
@@ -1377,7 +1398,7 @@ mod tests {
     fn upto_tail_newline_is_not_part_of_anchor() {
         let data = b"CFLAGS = -Wall -Wextra -g\nLDFLAGS =\n\nall: bc\n\nbc: main.c\n\t$(CC) $(CFLAGS) -o bc main.c $(LDFLAGS)\n\nclean:\n\trm -f bc\n";
         let old = b"CFLAGS = -Wall -Wextra -g\nLDFLAGS =\n\nall: bc\n\nbc: main.c\n\t$(CC) $(CFLAGS) -o bc main.c $(LDFLAGS)\n\n[upto]\nclean:\n";
-        let (offset, len, anchored) = edit_find_old_span(data, old).unwrap();
+        let (offset, len, anchored) = edit_find_old_span(data, old, true).unwrap();
         assert!(anchored);
         assert_eq!(offset, 0);
         assert_eq!(len, data.len() - b"\trm -f bc\n".len());
@@ -1385,8 +1406,24 @@ mod tests {
 
     #[test]
     fn upto_requires_tail_after_newline_strip() {
-        let err = edit_find_old_span(b"head\nbody\ntail\n", b"head\n[upto]\n").unwrap_err();
+        let err = edit_find_old_span(b"head\nbody\ntail\n", b"head\n[upto]\n", true).unwrap_err();
         assert!(err.contains("must include a unique tail anchor"));
+    }
+
+    #[test]
+    fn upto_is_refused_when_the_prompt_did_not_teach_it() {
+        let data = b"head\nbody\ntail\n";
+        let err = edit_find_old_span(data, b"head\n[upto]\ntail\n", false).unwrap_err();
+        assert_eq!(err, UPTO_DISABLED);
+        // Exact text is unaffected, and the same anchor works when allowed.
+        assert_eq!(
+            edit_find_old_span(data, b"body\n", false),
+            Ok((5, 5, false))
+        );
+        assert_eq!(
+            edit_find_old_span(data, b"head\n[upto]\ntail\n", true),
+            Ok((0, data.len(), true))
+        );
     }
 
     #[test]

@@ -28,28 +28,7 @@ PDFs are readable: read on a .pdf serves the document as Markdown and pages thro
 ## Editing files
 
 When editing files, state the target filename before the edit; for the edit tool, put path first.
-Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. The old text must match exactly once in the current file; otherwise edit fails for safety.
-For large replacements, prefer anchored old text: write the first lines, then [upto], then the final lines. The tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.
-After [upto], always write unique final lines before closing old; never close old immediately after [upto].
-Do not use a generic tail anchor like:
-- BigNum bignum_add(BigNum *a, BigNum *b) {
-- [upto]
-- }
-because the closing brace may match many functions. Instead include final lines that are unique near that function, for example its last calculation and return line before the brace.
-Example anchored edit:
-<｜DSML｜tool_calls>
-<｜DSML｜invoke name="edit">
-<｜DSML｜parameter name="path" string="true">/tmp/example.c</｜DSML｜parameter>
-<｜DSML｜parameter name="old" string="true">static int parse(void) {
-    int ok = 0;
-[upto]
-    return ok;
-}</｜DSML｜parameter>
-<｜DSML｜parameter name="new" string="true">static int parse(void) {
-    return parse_impl();
-}</｜DSML｜parameter>
-</｜DSML｜invoke>
-</｜DSML｜tool_calls>
+Use edit with path, old, and new for changes. The old text must match exactly once in the current file; otherwise edit fails for safety. Read enough of the file to provide the exact old text being replaced.
 To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.
 Use read raw=true only when you need plain file text without line numbers.
 

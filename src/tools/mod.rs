@@ -226,6 +226,11 @@ pub struct ToolContext {
     /// id its `plank-frame://` resources may open in. Empty without
     /// `--profile`, so no staging is ever honoured there.
     pub grid_routes: BTreeMap<String, String>,
+    /// Whether `edit` accepts `[upto]`-anchored old text: true when the
+    /// prompt the model got teaches the marker (`sysprompt::edit_upto` for the
+    /// local dialects, always for a provider's prompt). Default true, so a
+    /// context nobody configured behaves as it always has.
+    pub edit_upto: bool,
 }
 
 /// An MCP tool's observation once its grids have been edited or refused.
@@ -401,6 +406,7 @@ impl ToolContext {
             memory_log_path: None,
             error_log_path: None,
             grid_routes: BTreeMap::new(),
+            edit_upto: true,
         }
     }
 

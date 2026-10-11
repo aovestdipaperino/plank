@@ -1330,7 +1330,17 @@ fn recovery_session(session: &Session) -> std::borrow::Cow<'_, Session> {
 fn edit_preflight(
     ctx: &ToolContext,
 ) -> impl FnMut(&ToolCall) -> Result<(), String> + 'static + use<> {
-    edit_preflight_cwd(&ctx.cwd)
+    edit_preflight_cwd(&ctx.cwd, ctx.edit_upto)
+}
+
+/// Whether the prompt `engine` is given teaches `[upto]` edits, and so
+/// whether its edit calls may carry the marker ([`ToolContext::edit_upto`]).
+/// A provider gets plank's own prompt, which always does.
+fn edit_upto_for(engine: &dyn Engine) -> bool {
+    engine.wants_structured()
+        || crate::sysprompt::edit_upto(crate::sysprompt::ToolSyntax::for_model_name(
+            &engine.model_name(),
+        ))
 }
 
 /// [`edit_preflight`] from a bare working directory.
@@ -1340,8 +1350,10 @@ fn edit_preflight(
 /// which it must, the closure not being `Clone`.
 fn edit_preflight_cwd(
     cwd: &std::path::Path,
+    edit_upto: bool,
 ) -> impl FnMut(&ToolCall) -> Result<(), String> + 'static + use<> {
-    let ctx = ToolContext::new(cwd.to_path_buf());
+    let mut ctx = ToolContext::new(cwd.to_path_buf());
+    ctx.edit_upto = edit_upto;
     move |call| crate::tools::edit::preflight_edit_old(&ctx, call)
 }
 
@@ -1846,7 +1858,7 @@ fn generate_fanout_round(
                 let sink = crate::viz::CollectSink::default();
                 let collected = sink.clone();
                 // `edit_preflight` is not `Clone`, so build one per slot.
-                let preflight = edit_preflight_cwd(cwd);
+                let preflight = edit_preflight_cwd(cwd, edit_upto_for(slot.engine.as_ref()));
                 // Split the slot's two borrows apart explicitly: `engine` is
                 // taken mutably while `mirror` is only read, and destructuring
                 // is what lets the borrow checker see they are disjoint fields.
@@ -4110,6 +4122,9 @@ impl Agent<'_> {
     /// or before it when the model sent it with `suspend_model`. Anything
     /// else returns the dispatch result untouched.
     fn dispatch_tool(&mut self, call: &ToolCall) -> String {
+        // Asked of the engine generating now, which a sub-agent may have
+        // swapped in, like `tool_syntax`.
+        self.tool_ctx.edit_upto = edit_upto_for(self.engine.as_ref());
         if crate::tools::bash::suspend_model_requested(call) {
             return self.dispatch_suspended_bash(call);
         }
@@ -21234,6 +21249,7 @@ fn new_agent(
     // prompt, with V4.1 respelling three tag names; Qwen has its own). Taken
     // from the name the engine reports after detecting the file, not the path.
     let syntax = sysprompt::ToolSyntax::for_model_name(&engine.model_name());
+    tool_ctx.edit_upto = edit_upto_for(engine.as_ref());
     let system = if cfg.tools {
         sysprompt::build_system_prompt_parts_with_wasm(
             &cfg.system,

@@ -1150,8 +1150,12 @@ without the model files).
 - **The C's prompt constants can hide behind `#define`s.** `ds4_agent.c` split
   the editing section into `agent_tools_prompt_edit_exact` (its default) and
   `agent_tools_prompt_edit_upto`, sharing a sentence through
-  `AGENT_EDIT_TARGET_RULE`. plank ships the `[upto]` variant, because its edit
-  tool implements the anchor. `tests/c_parity.rs` expands object-like string
+  `AGENT_EDIT_TARGET_RULE`. plank ships both and, like the C, defaults to
+  exact edits on the DSML and Qwen dialects (`sysprompt::edit_upto`,
+  `tools.editUpto`); only Gemma keeps `[upto]` by default. The C's own reason
+  is behavioural, not a missing feature: upstream `b030961` found the V4
+  Flash checkpoint struggles with anchored edits, and it predates V4.1, so it
+  covers `ds4vision` too. `tests/c_parity.rs` expands object-like string
   macros before decoding literals; a literal decoder alone chokes on the bare
   macro name.
 - **The Metal backend needs the macOS 15 SDK** (`MTLResidencySet`), so

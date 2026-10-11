@@ -31,6 +31,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A tool result whose image the model refused stays in context.** When the
+  engine rejected an image observation (an invalid embedding, a model without
+  vision), plank tokenized nothing for it, so the whole tool result vanished
+  from the model's view while the transcript still showed it. It now falls
+  back to the observation's text, as upstream ds4 does since `e1711c2`.
+
 - **A provider prompt bigger than estimated no longer fails the turn.** plank
   sized a provider's prompt at four bytes a token, with the tool schemas left
   out, so a session on a 32K vLLM model sent a 16,000-token cap beside a
@@ -52,6 +58,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   profile builds its prompt cache once more on the next launch.
 
 ### Changed
+
+- **DeepSeek and Qwen edit with exact old text by default.** The tools prompt
+  no longer teaches `[upto]` anchored edits to the DSML and Qwen models, and
+  the edit tool refuses the marker there, matching the C since `--edit-upto`
+  became opt-in (upstream `b030961`: the V4 Flash checkpoint struggles with
+  anchored edits). Gemma keeps `[upto]`, and `tools.editUpto` turns it on or
+  off for every model. The system prompt changes, so the first launch
+  rebuilds its KV checkpoint once.
 
 - **Steering directions are named.** `--dir-steering NAME` loads a direction
   stored for the model in `~/.plank/models/vectors.json`, the file `pt

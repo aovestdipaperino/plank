@@ -340,36 +340,43 @@ fn tools_prompt_matches_c_source() {
         .find(CONTRACTS_HEAD)
         .expect("intro still ends with the contracts block plank omits");
     expected.truncate(contracts_at);
-    // plank ships the `[upto]` variant: its edit tool implements the anchor,
-    // so it takes the prompt that teaches it. The C's `_edit_exact` sibling
-    // (its default since `--edit-upto` became opt-in) is deliberately not the
-    // one plank mirrors — see `sysprompt::TOOLS_PROMPT_EDIT_LINE`.
-    expected.push_str(&extract_c_string_constant(
-        &src,
-        "agent_tools_prompt_edit_upto",
-    ));
+    // Both editing variants, as `agent_build_dsml_tools_prompt(edit_upto, …)`
+    // assembles them: `_edit_exact` is the default on both sides, `_edit_upto`
+    // what `--edit-upto` (plank: `tools.editUpto`) selects.
+    for (upto, edit) in [
+        (false, "agent_tools_prompt_edit_exact"),
+        (true, "agent_tools_prompt_edit_upto"),
+    ] {
+        let mut expected = expected.clone();
+        expected.push_str(&extract_c_string_constant(&src, edit));
+        push_dsml_after_edit(&src, &mut expected);
+        // The base is what must match C byte-for-byte. Native plank tools
+        // (glob) and MCP tools are layered on top by `build_tools_prompt`,
+        // outside the trained table — see `append_native_extra_schemas`.
+        assert_identical(
+            &expected,
+            &plank::sysprompt::build_tools_prompt_base_with(true, upto),
+            &format!("tools prompt base ({edit}) vs C"),
+        );
+    }
+}
+
+/// Appends the C's after-edit block to `expected`, vision schema included.
+fn push_dsml_after_edit(src: &str, expected: &mut String) {
     // `agent_build_dsml_tools_prompt` splices the vision schema in just before
     // `\n# Rules\n` rather than carrying it in the after-edit block, so the
     // assembly here has to do the same. plank's base prompt is the vision=true
     // variant: the encoder is always offered on the DeepSeek path, and it is a
     // Qwen run that goes without (which uses `TOOLS_PROMPT_QWEN` instead).
-    let after_edit = extract_c_string_constant(&src, "agent_tools_prompt_after_edit");
+    let after_edit = extract_c_string_constant(src, "agent_tools_prompt_after_edit");
     let rules_at = after_edit
         .find("\n# Rules\n")
         .expect("after-edit block still has a Rules section to splice before");
     expected.push_str(&after_edit[..rules_at]);
     expected.push_str("\n{\"type\":\"function\",\"function\":");
-    expected.push_str(&extract_c_string_constant(&src, "agent_vision_tool_schema"));
+    expected.push_str(&extract_c_string_constant(src, "agent_vision_tool_schema"));
     expected.push_str("}\n");
     expected.push_str(&after_edit[rules_at..]);
-    // The base is what must match C byte-for-byte. Native plank tools (glob)
-    // and MCP tools are layered on top by `build_tools_prompt`, outside the
-    // trained table — see `append_native_extra_schemas`.
-    assert_identical(
-        &expected,
-        &plank::sysprompt::build_tools_prompt_base(true),
-        "tools prompt base vs C",
-    );
 }
 
 #[test]
@@ -691,6 +698,15 @@ fn qwen_tools_prompt_matches_c_source() {
         &expected,
         plank::sysprompt::TOOLS_PROMPT_QWEN,
         "qwen tools prompt vs C",
+    );
+    // The default swaps in the exact rule, as `edit_upto == false` does in C.
+    let exact = extract_c_string_constant(&src, "agent_glm_tools_prompt_edit_exact");
+    assert_eq!(exact, plank::sysprompt::QWEN_EDIT_EXACT_RULE);
+    assert_eq!(edit, plank::sysprompt::QWEN_EDIT_UPTO_RULE);
+    assert_identical(
+        &expected.replacen(&edit, &exact, 1),
+        &plank::sysprompt::tools_prompt_qwen(false),
+        "qwen tools prompt (edit_exact) vs C",
     );
 }
 

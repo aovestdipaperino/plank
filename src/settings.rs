@@ -62,7 +62,7 @@
 //! - `safety.sandbox`, `safety.btwSuspend` — copied into `AgentConfig` once at
 //!   startup.
 //! - `tools.recall`, `tools.fanout`, `tools.runCode`, `tools.bashNotify`,
-//!   `tools.remember`, `git.signCommits` — these
+//!   `tools.remember`, `tools.editUpto`, `git.signCommits` — these
 //!   feed the system prompt text, which is built once per session and then
 //!   KV-cached (see `docs/KV-CACHE.md`); applying a change live would silently
 //!   invalidate a cache the model's prefill is relying on to be exactly what it
@@ -376,6 +376,14 @@ pub struct ToolsSettings {
     /// effect at the next session start, so no Tier 2 checkpoint is
     /// invalidated mid-session.
     pub remember: bool,
+    /// Whether the edit tool takes `[upto]`-anchored old text, and the tools
+    /// prompt teaches it. `None` (the default) follows the model family: off
+    /// for the DSML dialects and Qwen, as in the C since `--edit-upto` became
+    /// opt-in (upstream `b030961`: the V4 Flash checkpoint struggles with
+    /// anchored edits), on for Gemma, whose prompt is plank's own. Resolved by
+    /// [`crate::sysprompt::edit_upto`]. Feeds the system prompt, so it takes
+    /// effect in a new session.
+    pub edit_upto: Option<bool>,
 }
 
 impl Default for ToolsSettings {
@@ -392,6 +400,7 @@ impl Default for ToolsSettings {
             bash_notify: false,
             no_progress_guard: false,
             remember: true,
+            edit_upto: None,
         }
     }
 }
@@ -938,6 +947,10 @@ impl Settings {
         if let Some(v) = boolean(tools, "remember") {
             self.tools.remember = v;
             self.note("tools.remember", origin);
+        }
+        if let Some(v) = boolean(tools, "editUpto") {
+            self.tools.edit_upto = Some(v);
+            self.note("tools.editUpto", origin);
         }
 
         self.overlay_agents_and_worktree(&root, origin);
@@ -1637,6 +1650,7 @@ impl Settings {
             upsert(t, "runCode", Json::Bool(self.tools.run_code));
             upsert(t, "bashNotify", Json::Bool(self.tools.bash_notify));
             upsert(t, "remember", Json::Bool(self.tools.remember));
+            upsert_opt(t, "editUpto", self.tools.edit_upto.map(Json::Bool));
         }
 
         let mut out = String::new();
@@ -3055,6 +3069,18 @@ mod tests {
         // The user layer: a plugin layer may not set `tools.*` at all.
         let s = Settings::load_from_paths(&[], std::slice::from_ref(&path));
         assert!(s.tools.bash_notify);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tools_edit_upto_is_unset_until_a_layer_sets_it() {
+        assert_eq!(Settings::default().tools.edit_upto, None);
+        let dir = std::env::temp_dir().join(format!("plank-settings-eu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"tools":{"editUpto":true}}"#).expect("write");
+        let s = Settings::load_from_paths(&[], std::slice::from_ref(&path));
+        assert_eq!(s.tools.edit_upto, Some(true));
         std::fs::remove_dir_all(&dir).ok();
     }
 
