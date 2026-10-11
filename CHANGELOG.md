@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Conversation prefixes (`--prefix-file`, profile `prefix`).** A file of
+  scripted `USER:` / `ASSISTANT:` turns is placed between the system prompt
+  and the conversation, so the model continues in the manner they
+  demonstrate. Read once at launch, never saved or compacted, in the format of
+  ds4's `--prefix-file` (upstream `b0a147a`).
+
 - **`context.resumeAcrossCompaction` (experimental, off by default).** A reply
   the context window cuts off is held aside, the conversation is compacted,
   and the next pass re-opens the same assistant message with it, starting

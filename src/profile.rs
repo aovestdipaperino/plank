@@ -77,6 +77,10 @@ pub struct ProfileSpec {
     /// manifest declares routes; a malformed entry is dropped with a
     /// warning rather than widening what gets routed.
     pub grids: BTreeMap<String, String>,
+    /// `prefix`: a file of scripted `USER:` / `ASSISTANT:` turns the run
+    /// conditions on ([`crate::prefix`]), resolved against the plugin root.
+    /// `--prefix-file` wins over it. `None` when absent or malformed.
+    pub prefix: Option<PathBuf>,
     /// `verbs` or `additionalVerbs`: the status-bar verb pools the profile
     /// replaces or extends. `None` keeps plank's own vocabulary.
     pub verbs: Option<ProfileVerbs>,
@@ -273,6 +277,8 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
         }
     };
 
+    let prefix = prefix_field(block, root, &mut warnings);
+
     let logo = match block.get("logo") {
         None => None,
         Some(Json::Str(s)) if !s.is_empty() => Some(resolve(root, s)),
@@ -321,6 +327,7 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
         steering,
         grids,
         verbs,
+        prefix,
     })
 }
 
@@ -477,6 +484,19 @@ fn warn_refused_engine_settings(members: &[(String, Json)], warnings: &mut Vec<S
             "profile: settings.engine is refused (a profile may not set engine.*); set it yourself in ~/.plank/settings.json if you want it"
                 .to_string(),
         ),
+    }
+}
+
+/// `prefix`: a prefix file resolved against the plugin root, or `None` with
+/// a warning when it is not a non-empty string.
+fn prefix_field(block: &Json, root: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
+    match block.get("prefix") {
+        None => None,
+        Some(Json::Str(s)) if !s.is_empty() => Some(resolve(root, s)),
+        Some(_) => {
+            warnings.push("profile: prefix is not a non-empty string; ignoring it".to_string());
+            None
+        }
     }
 }
 
@@ -950,6 +970,23 @@ mod tests {
             spec.grids.get("chatbgt").map(String::as_str),
             Some("dev.plank.csvedit")
         );
+    }
+
+    #[test]
+    fn prefix_is_an_optional_path_under_the_plugin_root() {
+        let root = Path::new("/p");
+        let spec = parse(r#"{"profile":{"systemPrompt":"p.md"}}"#, root).expect("parses");
+        assert_eq!(spec.prefix, None);
+        let spec = parse(
+            r#"{"profile":{"systemPrompt":"p.md","prefix":"few-shot.txt"}}"#,
+            root,
+        )
+        .expect("parses");
+        assert_eq!(spec.prefix.as_deref(), Some(Path::new("/p/few-shot.txt")));
+        let spec = parse(r#"{"profile":{"systemPrompt":"p.md","prefix":7}}"#, root)
+            .expect("a bad prefix is a warning, not a refusal");
+        assert_eq!(spec.prefix, None);
+        assert!(spec.warnings.iter().any(|w| w.contains("prefix")));
     }
 
     #[test]
@@ -1458,6 +1495,7 @@ mod tests {
             steering: None,
             grids: BTreeMap::new(),
             verbs: None,
+            prefix: None,
         }
     }
 

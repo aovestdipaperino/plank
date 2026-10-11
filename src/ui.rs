@@ -1673,7 +1673,7 @@ fn push_session_context(session: &mut Session, content: &ContextContent) {
 /// transcript entry or the system prompt.
 #[must_use]
 pub fn render_transcript(session: &Session, system: &str) -> String {
-    let out = render_messages(system, &session.transcript);
+    let out = render_messages(system, &session.prefix, &session.transcript);
     // The per-pass choke point both front-ends go through, so it is where the
     // panic dump's copy of the transcript comes from. A no-op unless the debug
     // mirror is on.
@@ -1681,10 +1681,10 @@ pub fn render_transcript(session: &Session, system: &str) -> String {
     out
 }
 
-/// The flat render of `messages` under `system`, as [`render_transcript`]
-/// builds it, without the repro side effect: compaction measures prefixes of
-/// the transcript with it.
-fn render_messages(system: &str, messages: &[Message]) -> String {
+/// The flat render of `messages` under `system` and the scripted `prefix`
+/// turns, as [`render_transcript`] builds it, without the repro side effect:
+/// compaction measures prefixes of the transcript with it.
+fn render_messages(system: &str, prefix: &[Message], messages: &[Message]) -> String {
     use std::fmt::Write as _;
     let mut out = format!("[system]\n{system}\n");
     // Append-only invariant (matching the C's token transcript): nothing is
@@ -1693,7 +1693,7 @@ fn render_messages(system: &str, messages: &[Message]) -> String {
     // prompt and re-prefill the whole conversation every turn. The task list
     // (issue #35) reaches the model through appended `task` tool observations
     // and a one-time re-injection after compaction instead.
-    for m in messages {
+    for m in prefix.iter().chain(messages) {
         let tag = match m.role {
             crate::session::Role::User => "user",
             crate::session::Role::Assistant => "assistant",
@@ -2270,7 +2270,18 @@ fn attach_message(
 
 fn session_to_messages(session: &Session) -> Vec<crate::engine::ChatMessage> {
     use crate::engine::{ChatMessage, ChatRole, ToolCallRef};
-    let mut out = Vec::new();
+    // The scripted prefix turns lead, as plain text: they demonstrate a
+    // manner, never a tool call (`crate::prefix`).
+    let mut out: Vec<ChatMessage> = session
+        .prefix
+        .iter()
+        .map(|m| match m.role {
+            crate::session::Role::User => ChatMessage::new(ChatRole::User, m.text.clone()),
+            crate::session::Role::Assistant => {
+                ChatMessage::new(ChatRole::Assistant, m.text.clone())
+            }
+        })
+        .collect();
     let mut turn = 0usize;
     // Ids from the most recent assistant tool-call turn awaiting their result.
     let mut pending_ids: Vec<String> = Vec::new();
@@ -6950,9 +6961,11 @@ impl Agent<'_> {
                     .iter()
                     .map(|r| Message::assistant(r.text.clone())),
             );
-            let used = self
-                .engine
-                .count_tokens(&render_messages(&self.system, &rebuilt));
+            let used = self.engine.count_tokens(&render_messages(
+                &self.system,
+                &self.session.prefix,
+                &rebuilt,
+            ));
             if used >= ctx - compact::compact_reserve(ctx) - 128 {
                 return Err(
                     "compacted conversation leaves no working room; use a larger --ctx".to_owned(),
@@ -7080,6 +7093,13 @@ impl Agent<'_> {
         }
     }
 
+    /// Puts the run's scripted prefix ([`crate::prefix`]) on the main session.
+    /// Every place that starts or loads one calls it, since the prefix is
+    /// never saved with a session.
+    fn adopt_prefix(&mut self) {
+        self.session.prefix = crate::prefix::active().to_vec();
+    }
+
     /// Whether the next pass's renderer starts inside `<think>`: where a
     /// resumed reply stopped ([`Self::open_reply`]), else the template's own
     /// opener ([`pass_opens_in_think`]).
@@ -7111,7 +7131,11 @@ impl Agent<'_> {
         if ctx <= 0 || last.role != crate::session::Role::User || last.is_tool_user() {
             return Ok(());
         }
-        let alone = render_messages(&self.system, std::slice::from_ref(last));
+        let alone = render_messages(
+            &self.system,
+            &self.session.prefix,
+            std::slice::from_ref(last),
+        );
         if self.engine.count_tokens(&alone) < ctx - compact::compact_reserve(ctx) - 128 {
             return Ok(());
         }
@@ -7146,7 +7170,11 @@ impl Agent<'_> {
         let covered = if ctx > 0 {
             opts.n_predict = budget;
             compact::summary_prefix_len(len, &mut |n| {
-                let mut prompt = render_messages(&self.system, &self.session.transcript[..n]);
+                let mut prompt = render_messages(
+                    &self.system,
+                    &self.session.prefix,
+                    &self.session.transcript[..n],
+                );
                 prompt.push_str(&request);
                 self.engine.count_tokens(&prompt) + budget < ctx
             })
@@ -7164,7 +7192,11 @@ impl Agent<'_> {
                 len - covered
             ));
         }
-        let mut prompt = render_messages(&self.system, &self.session.transcript[..covered]);
+        let mut prompt = render_messages(
+            &self.system,
+            &self.session.prefix,
+            &self.session.transcript[..covered],
+        );
         prompt.push_str(&request);
         // What `render_transcript` would have stashed for a panic dump.
         crate::repro::stash_transcript(&prompt);
@@ -7672,6 +7704,7 @@ impl Agent<'_> {
         self.discard_ladder();
         self.clear_suggestion();
         self.session = Session::new();
+        self.adopt_prefix();
         self.extract_state.reset_to(0);
         // A new session, a new name — minted here for the same reason
         // `new_agent` mints one at launch (see `SessionStore::mint_id`).
@@ -8571,6 +8604,7 @@ impl Agent<'_> {
         let note = self.load_session_payload(&session);
         self.discard_ladder();
         self.session = session;
+        self.adopt_prefix();
         // A restored transcript is history, not new material for the pass.
         self.extract_state.reset_to(self.session.transcript.len());
         crate::debugmirror::set_session_id(&self.session.id);
@@ -9484,6 +9518,7 @@ the original is frozen and listed in /tree"
         let note = self.load_session_payload(&s);
         self.discard_ladder();
         self.session = s;
+        self.adopt_prefix();
         // A guess about the conversation we just left. The depth check would
         // miss it whenever the adopted transcript happens to be the same
         // length, and the ghost would then be one Enter from being sent into
@@ -21463,6 +21498,7 @@ fn new_agent(
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut trace = Trace::open(cfg.trace_path.as_deref()).map_err(|e| e.to_string())?;
     let mut session = Session::new();
+    session.prefix = crate::prefix::active().to_vec();
     // Name the session up front rather than at save time: the TUI shows it on
     // the rule above the prompt from the first frame, and the name it shows has
     // to be the one the file ends up under.
@@ -26936,6 +26972,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         }
     }
 
@@ -28104,6 +28141,55 @@ mod tests {
         }
         agent.open_reply = None;
         assert_eq!(agent.pass_begins_in_think(&opts), template);
+    }
+
+    /// The scripted prefix sits between the system prompt and the
+    /// conversation, survives compaction (which only rewrites the
+    /// transcript), and leads a provider's messages.
+    #[test]
+    fn the_prefix_renders_after_the_system_prompt_and_outlives_compaction() {
+        let dir = scratch_dir("prefix-render");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["<summary>durable state</summary>".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.prefix = crate::prefix::parse("USER: be terse\nASSISTANT: ok\n").unwrap();
+        agent.session.push(Message::user("first"));
+        agent.session.push(Message::assistant("reply"));
+
+        let rendered = render_transcript(&agent.session, "SYS");
+        assert!(
+            rendered
+                .starts_with("[system]\nSYS\n[user]\nbe terse\n[assistant]\nok\n[user]\nfirst\n"),
+            "{rendered}"
+        );
+        let provider = session_to_messages(&agent.session);
+        assert_eq!(provider[0].content, "be terse");
+        assert_eq!(provider[1].content, "ok");
+        assert_eq!(provider[2].content, "first");
+
+        assert_eq!(agent.compact("low context", "").unwrap(), Compacted::Done);
+        assert_eq!(
+            agent.session.prefix.len(),
+            2,
+            "compaction leaves the prefix alone"
+        );
+        let rendered = render_transcript(&agent.session, "SYS");
+        assert!(rendered.starts_with("[system]\nSYS\n[user]\nbe terse\n[assistant]\nok\n"));
+    }
+
+    /// A new session takes the run's prefix again, since none is ever saved.
+    #[test]
+    fn a_new_session_adopts_the_run_prefix() {
+        let dir = scratch_dir("prefix-adopt");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.prefix = crate::prefix::parse("USER: a\nASSISTANT: b\n").unwrap();
+        agent.reset_session_state();
+        // Tests never install a prefix, so the run's is empty.
+        assert_eq!(agent.session.prefix, crate::prefix::active());
     }
 
     #[test]

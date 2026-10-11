@@ -38,6 +38,9 @@ pub struct AgentConfig {
     pub system: String,
     /// Trace log path supplied with `--trace`.
     pub trace_path: Option<PathBuf>,
+    /// Scripted conversation prefix supplied with `--prefix-file`
+    /// (`crate::prefix`); it wins over a profile's `prefix`.
+    pub prefix_file: Option<PathBuf>,
     /// Working directory supplied with `--chdir`.
     pub chdir_path: Option<PathBuf>,
     /// Worktree name supplied with `--worktree NAME`: the session starts inside
@@ -514,6 +517,7 @@ impl Default for AgentConfig {
             resume: None,
             system: DEFAULT_SYSTEM_PROMPT.to_owned(),
             trace_path: None,
+            prefix_file: None,
             chdir_path: None,
             worktree: None,
             worktree_pr: None,
@@ -782,6 +786,8 @@ Options:
       --ui-remote[=PORT]   accept TUI remote control on 127.0.0.1:PORT
                            (omit PORT for an ephemeral one, printed to stderr)
   -sys, --system TEXT      override the system prompt
+      --prefix-file PATH   condition on scripted USER:/ASSISTANT: turns
+                           placed after the system prompt
       --trace PATH         append a trace log to PATH
   -c, --ctx N              context window size in tokens; accepts a k/m suffix,
                            e.g. 128k or 1m (default 1048576)
@@ -1731,6 +1737,12 @@ pub fn parse_options_with(
             }
             "-sys" | "--system" => need_arg(&mut i)?.clone_into(&mut c.system),
             "--trace" => c.trace_path = Some(PathBuf::from(need_arg(&mut i)?)),
+            "--prefix-file" => {
+                if c.prefix_file.is_some() {
+                    return Err("specify --prefix-file only once".to_owned());
+                }
+                c.prefix_file = Some(PathBuf::from(need_arg(&mut i)?));
+            }
             "-c" | "--ctx" => {
                 c.generation.ctx_size = parse_ctx_size(need_arg(&mut i)?, arg)?;
                 c.ctx_size_explicit = true;
@@ -2505,6 +2517,14 @@ mod tests {
         assert_eq!(c.ui, UiMode::Console);
         assert_eq!(c.system, "sys");
         assert_eq!(c.trace_path, Some(PathBuf::from("/tmp/t.log")));
+        assert_eq!(c.prefix_file, None);
+        let p = parse_options(&args(&["--prefix-file", "few.txt"])).unwrap();
+        assert_eq!(p.prefix_file, Some(PathBuf::from("few.txt")));
+        assert!(
+            parse_options(&args(&["--prefix-file", "a", "--prefix-file", "b"]))
+                .unwrap_err()
+                .contains("only once")
+        );
         assert_eq!(c.generation.ctx_size, 4096);
         assert_eq!(c.generation.n_predict, 128);
         assert!((c.generation.temperature - 0.7).abs() < 1e-6);

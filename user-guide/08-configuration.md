@@ -200,6 +200,7 @@ One limitation: settings come from the directory plank launches in, so project s
 | `--worktree NAME` | start inside an isolated git worktree of this repository |
 | `--worktree-pr N` | base that worktree on pull request N (implies `--worktree`) |
 | `--trace PATH` | append a trace log |
+| `--prefix-file PATH` | condition the session on scripted `USER:` / `ASSISTANT:` turns placed after the system prompt; see [Conversation prefix](#conversation-prefix). Wins over a profile's `prefix`. |
 | `-h, --help [topic]` | help, optionally on one topic |
 
 ### Safety and extensions
@@ -251,3 +252,25 @@ Remote, shared-engine, control, and provider flags are covered in [Remote and ho
 ---
 
 Next: [Extending plank →](09-extending.md)
+
+## Conversation prefix
+
+`--prefix-file PATH` (or a profile's `prefix`) reads a file of scripted turns
+and places them between the system prompt and the conversation, as if that
+exchange had already happened. The model then continues in the manner the
+turns demonstrate, which a local model follows more reliably than a rule
+stated in a prompt:
+
+```text
+USER: Write terse answers.
+This line is still part of the user turn.
+ASSISTANT: Understood.
+USER: Return code without an introduction.
+ASSISTANT: I will return only the code.
+```
+
+A marker starts a turn only at the beginning of a line; the file must start
+with `USER:`, alternate, and end with `ASSISTANT:`, or plank refuses to start
+and says which line is wrong. The turns are read once at launch, are never
+saved with a session or compacted, and apply to whatever session the run
+starts or resumes. The format is ds4's `--prefix-file`.

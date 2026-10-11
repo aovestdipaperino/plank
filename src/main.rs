@@ -154,6 +154,25 @@ fn resolve_profile_source(
     }
 }
 
+/// Reads the run's conversation prefix once, before any session exists:
+/// `--prefix-file`, else the active profile's `prefix` (`plank::prefix`). A
+/// file that cannot be read or does not parse is fatal, as in the C.
+fn install_prefix(flag: Option<&std::path::Path>) -> Option<ExitCode> {
+    let path = flag
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| plank::profile::active().and_then(|p| p.spec.prefix.clone()))?;
+    match plank::prefix::load(&path) {
+        Ok(turns) => {
+            plank::prefix::install(turns);
+            None
+        }
+        Err(e) => {
+            eprintln!("plank: {e}");
+            Some(ExitCode::from(2))
+        }
+    }
+}
+
 /// Resolves `--profile`'s argument against the loaded plugins and installs
 /// it, or reports what to do instead.
 ///
@@ -1124,6 +1143,9 @@ fn main() -> ExitCode {
         Ok(cfg) => cfg,
         Err(code) => return code,
     };
+    if let Some(code) = install_prefix(cfg.prefix_file.as_deref()) {
+        return code;
+    }
     if let Some(code) = post_cfg_early_exit(&cfg, &settings) {
         return code;
     }

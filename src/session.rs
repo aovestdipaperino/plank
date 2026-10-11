@@ -397,6 +397,12 @@ pub struct Session {
     /// `None` for a plain plank session and for every file written before
     /// profiles existed.
     pub profile: Option<String>,
+    /// Scripted turns rendered between the system prompt and
+    /// [`transcript`](Self::transcript) ([`crate::prefix`]). Never written to
+    /// disk and never compacted: the agent sets it from the run's prefix on
+    /// every session it starts or loads, so a resumed session conditions on
+    /// whatever prefix this run was given.
+    pub prefix: Vec<Message>,
 }
 
 /// The rendering switches that decide what a user sees of a pass: whether the
@@ -493,6 +499,7 @@ impl Session {
             render: None,
             dirty: false,
             profile: None,
+            prefix: Vec::new(),
         }
     }
 
@@ -2754,6 +2761,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
         render,
         dirty: false,
         profile,
+        prefix: Vec::new(),
     })
 }
 

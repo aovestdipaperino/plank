@@ -1147,6 +1147,7 @@ pub fn gemma_profile_prompt_for_tests(profile_text: &str, allow: &[&str]) -> Str
         steering: None,
         grids: std::collections::BTreeMap::new(),
         verbs: None,
+        prefix: None,
     };
     build_gemma_tools_prompt_parts(Some((profile_text, &spec)), &[], &[], true, true).0
 }
@@ -3500,6 +3501,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         };
         let specs: Vec<crate::engine::ToolSpec> = parse_builtin_tool_schemas()
             .into_iter()
@@ -3540,6 +3542,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         };
         let text = "You are ChatBGT.\n".to_string();
         let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
@@ -3569,6 +3572,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         }
     }
 
@@ -3720,6 +3724,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         };
         let text = "You are ChatBGT.\n".to_string();
         let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
@@ -3766,6 +3771,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         };
         let text = "You are ChatBGT.\n".to_string();
         let (out, _trusted) = compose_profile_prompt(&text, &spec, true);
@@ -3872,6 +3878,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         };
         let text = format!("You are ChatBGT.\n\n{TOOL_PROTOCOL_TOKEN}\n");
         let (out, trusted) = compose_profile_prompt(&text, &spec, true);
@@ -3910,6 +3917,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         };
         let text = format!("You are ChatBGT. Mind each parameter.\n\n{TOOL_PROTOCOL_TOKEN}\n");
         let v4 = trusted_prose(Some((&text, &spec)), true, ToolSyntax::Dsml, false);
@@ -3945,6 +3953,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         };
         let text = TOOL_PROTOCOL_TOKEN.to_string();
         let (strict, _) = compose_profile_prompt(&text, &spec, true);
@@ -3970,6 +3979,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         };
         let (out, _) = compose_profile_prompt("Just prose.\n", &spec, true);
         assert!(out.starts_with("Just prose."));

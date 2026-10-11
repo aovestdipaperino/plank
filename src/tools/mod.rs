@@ -1528,6 +1528,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         };
         assert!(spec.builtin_enabled("bash"));
         assert!(!spec.builtin_enabled("read"));
@@ -1554,6 +1555,7 @@ mod tests {
             steering: None,
             grids: std::collections::BTreeMap::new(),
             verbs: None,
+            prefix: None,
         }
     }
 

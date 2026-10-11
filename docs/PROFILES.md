@@ -34,6 +34,7 @@ for the Claude Code layout), alongside the plugin's existing `name`,
 | `grids` | object, MCP server name to component id | no | empty: no MCP server is routed to a grid |
 | `verbs` | array of strings, or object of phase to array | no | plank's own status verbs |
 | `additionalVerbs` | array of strings, or object of phase to array | no | plank's own status verbs, nothing added |
+| `prefix` | string, path to a prefix file | no | none: no scripted turns (`--prefix-file` wins when given) |
 
 The prompt file is the whole identity: plank's default `-sys` line ("You are
 a helpful coding assistant running inside ds4-agent.") is not appended under a
@@ -105,6 +106,17 @@ no phase is ever left with nothing to say. An unknown phase key, a non-string
 or empty entry, or a phase whose value is not an array warns and is skipped
 while the rest is kept; a value that is neither an array nor an object, or one
 naming no verbs at all, warns and is ignored. Verbs are read once at launch.
+
+### Conversation prefix
+
+`prefix` names a file, relative to the profile, of scripted `USER:` /
+`ASSISTANT:` turns placed between the profile's prompt and the conversation
+(the format of ds4's `--prefix-file`, described in the user guide's
+configuration page). Where the prompt states a persona, the prefix shows it:
+two or three short exchanges in the voice the profile wants are a stronger
+signal to a local model than a paragraph describing that voice. The file is
+read once at launch and a malformed one stops the launch. `--prefix-file` on
+the command line replaces it for that run.
 
 ### Recommended model
 
