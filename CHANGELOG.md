@@ -31,6 +31,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A conversation at the window's edge can still be compacted.** A reply
+  used to run to the window's last token, after which the summary request no
+  longer fit and compaction could not run. Turn passes now stop short of the
+  window by what a summary needs, the summary pass reads the longest prefix of
+  the conversation that leaves it room (a session already over the edge is
+  summarized in part, the rest kept word for word), the summary is capped at
+  an eighth of the window up to 4096 tokens, and a rebuild that would leave no
+  room to work is refused with the conversation untouched. Ported from
+  upstream ds4 `e33a5b2`.
+
 - **A tool result whose image the model refused stays in context.** When the
   engine rejected an image observation (an invalid embedding, a model without
   vision), plank tokenized nothing for it, so the whole tool result vanished

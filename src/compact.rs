@@ -21,6 +21,17 @@ pub const COMPACT_MIN_FREE_TOKENS: i32 = 8192;
 pub const COMPACT_TAIL_DIVISOR: i32 = 8;
 /// Hard cap on the verbatim tail, in tokens.
 pub const COMPACT_TAIL_CAP_TOKENS: i32 = 8192;
+/// Most tokens the summary pass may write (the C's
+/// `AGENT_COMPACT_SUMMARY_MAX_TOKENS`).
+pub const COMPACT_SUMMARY_MAX_TOKENS: i32 = 4096;
+/// Room set aside for the compaction request itself in [`compact_reserve`].
+///
+/// The C tokenizes its request to size the reserve; plank's request is a
+/// fixed ~450-token text, and an estimate keeps the reserve a pure function
+/// of the window that [`should_compact`] and [`compaction_trigger_used`] can
+/// share. Nothing depends on it being exact: [`summary_prefix_len`] measures
+/// the real request before the summary pass runs.
+pub const COMPACT_REQUEST_ALLOWANCE: i32 = 1024;
 /// Minimum tokens one micro-compaction pass reclaims, oldest results first.
 ///
 /// A pass used to keep the newest three results and clear everything else in
@@ -164,8 +175,60 @@ pub fn compaction_trigger_used(ctx_size: i32) -> i32 {
         return 0;
     }
     let soft = (ctx_size * COMPACT_SOFT_PERCENT) / 100;
-    let free_threshold = COMPACT_MIN_FREE_TOKENS.min(ctx_size / 4);
-    soft.min(ctx_size - free_threshold).max(0)
+    soft.min(ctx_size - free_threshold(ctx_size)).max(0)
+}
+
+/// The free-token level at or below which [`should_compact`] fires: the fixed
+/// [`COMPACT_MIN_FREE_TOKENS`], capped at a quarter of a small window, but
+/// never below the room compaction itself needs ([`compact_reserve`] plus the
+/// C's 128-token margin, `agent_worker_should_compact`).
+fn free_threshold(ctx_size: i32) -> i32 {
+    COMPACT_MIN_FREE_TOKENS
+        .min(ctx_size / 4)
+        .max(compact_reserve(ctx_size) + 128)
+}
+
+/// The most the summary pass may write in a `ctx_size` window: an eighth of
+/// it, between 256 and [`COMPACT_SUMMARY_MAX_TOKENS`]
+/// (`agent_compact_summary_budget`).
+#[must_use]
+pub fn summary_budget(ctx_size: i32) -> i32 {
+    (ctx_size / 8).clamp(256, COMPACT_SUMMARY_MAX_TOKENS)
+}
+
+/// Tokens a generation pass leaves free at the end of the window, so that a
+/// conversation which fills it can still be summarized: the request, the
+/// summary, and the C's 64-token margin (`agent_compact_reserve_tokens`).
+#[must_use]
+pub fn compact_reserve(ctx_size: i32) -> i32 {
+    COMPACT_REQUEST_ALLOWANCE + 64 + summary_budget(ctx_size)
+}
+
+/// How many leading messages the summary pass can read: the largest `n` for
+/// which `fits(n)` holds, `fits` being "the first `n` messages, the request
+/// and [`summary_budget`] fit the window", which only gets harder as `n`
+/// grows.
+///
+/// Almost always every message fits and this costs one call. A conversation
+/// already at the window's edge (a restored session, a pass that ran to the
+/// reserve) is bisected instead, and everything past the returned prefix is
+/// kept verbatim rather than summarized (`e33a5b2`). `0` means not even the
+/// system prompt leaves room.
+pub fn summary_prefix_len(len: usize, fits: &mut dyn FnMut(usize) -> bool) -> usize {
+    if fits(len) {
+        return len;
+    }
+    // Invariant: fits(lo) holds or lo == 0; fits(hi) fails.
+    let (mut lo, mut hi) = (0, len);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 /// The bytes-per-token floor an opportunistic pass must clear at this level of
@@ -378,8 +441,7 @@ pub fn should_compact(ctx_size: i32, ctx_used: i32) -> bool {
     if ctx_used >= (ctx_size * COMPACT_SOFT_PERCENT) / 100 {
         return true;
     }
-    let free_threshold = COMPACT_MIN_FREE_TOKENS.min(ctx_size / 4);
-    ctx_size - ctx_used <= free_threshold
+    ctx_size - ctx_used <= free_threshold(ctx_size)
 }
 
 /// Token budget for the verbatim tail kept after compaction.
@@ -402,6 +464,8 @@ const PROMPT_BODY: &str = "Internal plank-agent context compaction request. This
      7. Current work (what was in progress at this very moment)\n\
      8. Next step (only if one was explicitly requested by the user)\n\n\
      You may reason first inside a single <analysis>...</analysis> block; it will be discarded. Then wrap the final summary in <summary>...</summary> tags.\n\
+     Do not solve unfinished tasks, calculate new results, or finish incomplete code in the summary. \
+     Record the user's requirements and what actually happened, leaving unfinished work pending.\n\
      Do not invent facts. Do not include generic narration. Do not include raw file contents unless they were essential to a conclusion; prefer exact paths/ranges/commands that can reload the data.\n";
 
 /// The closing instruction, kept **last** in the prompt so it is the final thing
@@ -487,9 +551,46 @@ mod tests {
     fn min_free_triggers_with_proportional_cap() {
         // Large context: 8192 free tokens left → compact.
         assert!(should_compact(100_000, 92_000));
-        // Tiny context: proportional cap (ctx/4) applies.
-        assert!(should_compact(400, 301));
-        assert!(!should_compact(400, 200));
+        // Smaller context: proportional cap (ctx/4 = 4000) applies.
+        assert!(should_compact(16_000, 12_001));
+        assert!(!should_compact(16_000, 11_000));
+    }
+
+    #[test]
+    fn the_free_threshold_never_drops_below_the_compaction_reserve() {
+        // ctx/4 = 2000 would wait until the summary no longer fits; the floor
+        // is the reserve (1024 + 64 + 1000) plus 128.
+        assert_eq!(compact_reserve(8000), 2088);
+        assert!(should_compact(8000, 5800));
+        assert!(!should_compact(8000, 5700));
+        assert_eq!(compaction_trigger_used(8000), 8000 - 2216);
+    }
+
+    #[test]
+    fn summary_budget_is_an_eighth_of_the_window_within_bounds() {
+        assert_eq!(summary_budget(1000), 256);
+        assert_eq!(summary_budget(16_000), 2000);
+        assert_eq!(summary_budget(1_000_000), COMPACT_SUMMARY_MAX_TOKENS);
+    }
+
+    #[test]
+    fn summary_prefix_len_is_the_longest_prefix_that_fits() {
+        // Everything fits: one probe.
+        let mut probes = Vec::new();
+        assert_eq!(
+            summary_prefix_len(10, &mut |n| {
+                probes.push(n);
+                true
+            }),
+            10
+        );
+        assert_eq!(probes, [10]);
+        for limit in 0..10 {
+            assert_eq!(summary_prefix_len(10, &mut |n| n <= limit), limit);
+        }
+        // Not even the empty prefix fits.
+        assert_eq!(summary_prefix_len(10, &mut |_| false), 0);
+        assert_eq!(summary_prefix_len(0, &mut |_| true), 0);
     }
 
     #[test]

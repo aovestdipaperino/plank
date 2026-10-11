@@ -10,6 +10,7 @@ Summarize the conversation so far into durable task state for continuing the wor
 8. Next step (only if one was explicitly requested by the user)
 
 You may reason first inside a single <analysis>...</analysis> block; it will be discarded. Then wrap the final summary in <summary>...</summary> tags.
+Do not solve unfinished tasks, calculate new results, or finish incomplete code in the summary. Record the user's requirements and what actually happened, leaving unfinished work pending.
 Do not invent facts. Do not include generic narration. Do not include raw file contents unless they were essential to a conclusion; prefer exact paths/ranges/commands that can reload the data.
 After the summary, stop. Do not continue the user task, do not call tools, and do not output thinking tags or DSML markup.
 

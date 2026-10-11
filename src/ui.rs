@@ -1612,6 +1612,18 @@ fn push_session_context(session: &mut Session, content: &ContextContent) {
 /// transcript entry or the system prompt.
 #[must_use]
 pub fn render_transcript(session: &Session, system: &str) -> String {
+    let out = render_messages(system, &session.transcript);
+    // The per-pass choke point both front-ends go through, so it is where the
+    // panic dump's copy of the transcript comes from. A no-op unless the debug
+    // mirror is on.
+    crate::repro::stash_transcript(&out);
+    out
+}
+
+/// The flat render of `messages` under `system`, as [`render_transcript`]
+/// builds it, without the repro side effect: compaction measures prefixes of
+/// the transcript with it.
+fn render_messages(system: &str, messages: &[Message]) -> String {
     use std::fmt::Write as _;
     let mut out = format!("[system]\n{system}\n");
     // Append-only invariant (matching the C's token transcript): nothing is
@@ -1620,17 +1632,13 @@ pub fn render_transcript(session: &Session, system: &str) -> String {
     // prompt and re-prefill the whole conversation every turn. The task list
     // (issue #35) reaches the model through appended `task` tool observations
     // and a one-time re-injection after compaction instead.
-    for m in &session.transcript {
+    for m in messages {
         let tag = match m.role {
             crate::session::Role::User => "user",
             crate::session::Role::Assistant => "assistant",
         };
         let _ = write!(out, "[{tag}]\n{}\n", m.text);
     }
-    // The per-pass choke point both front-ends go through, so it is where the
-    // panic dump's copy of the transcript comes from. A no-op unless the debug
-    // mirror is on.
-    crate::repro::stash_transcript(&out);
     out
 }
 
@@ -3679,6 +3687,13 @@ impl Agent<'_> {
         } else {
             self.think
         };
+        // Stop short of the window by what compaction needs, so a reply that
+        // runs into it leaves a conversation that can still be summarized
+        // (`agent_compact_reserve_tokens`, upstream `e33a5b2`).
+        let ctx = self.engine.ctx_size();
+        if ctx > 0 {
+            opts.ctx_reserve = compact::compact_reserve(ctx);
+        }
         opts
     }
 
@@ -6742,9 +6757,19 @@ impl Agent<'_> {
 
     /// Rebuilds the transcript after a summarization pass: extracted summary
     /// + verbatim tail + budgeted re-injection of recently read files.
-    fn rebuild_after_compact(&mut self, raw_summary: &str) {
+    ///
+    /// `covered` is how many leading messages the summary read
+    /// ([`Self::compaction_request`]); every message after them is kept
+    /// verbatim whatever the tail budget, since nothing else records them.
+    ///
+    /// # Errors
+    ///
+    /// When the rebuilt conversation would leave no working room (less than
+    /// [`compact::compact_reserve`] free), the transcript is left untouched.
+    fn rebuild_after_compact(&mut self, raw_summary: &str, covered: usize) -> Result<(), String> {
         let summary = compact::extract_summary(raw_summary);
-        let budget = compact::tail_budget(self.engine.ctx_size());
+        let ctx = self.engine.ctx_size();
+        let budget = compact::tail_budget(ctx);
         let mut tail_start = self.session.transcript.len();
         let mut tail_tokens = 0;
         while tail_start > 0 {
@@ -6755,16 +6780,38 @@ impl Agent<'_> {
             }
             tail_start -= 1;
         }
+        let tail_start = tail_start.min(covered);
         let tail: Vec<Message> = self.session.transcript[tail_start..].to_vec();
+        let summary_msg = Message::user(format!(
+            "<tool_result>Compacted session summary:\n{summary}</tool_result>"
+        ));
+        let reinject = compact::build_reinjection(
+            &self.tool_ctx.recent_reads,
+            compact::reinject_budget(ctx),
+            &mut |s| self.engine.count_tokens(s),
+        );
+        let tasks = self.session.tasks.inject_block(self.active_goal());
+        if ctx > 0 {
+            let mut rebuilt = Vec::with_capacity(tail.len() + 3);
+            rebuilt.push(summary_msg.clone());
+            rebuilt.extend(tail.iter().cloned());
+            rebuilt.extend(reinject.iter().chain(&tasks).map(Message::user));
+            let used = self
+                .engine
+                .count_tokens(&render_messages(&self.system, &rebuilt));
+            if used >= ctx - compact::compact_reserve(ctx) - 128 {
+                return Err(
+                    "compacted conversation leaves no working room; use a larger --ctx".to_owned(),
+                );
+            }
+        }
         let old_len = self.session.transcript.len();
         self.session.transcript = Vec::new();
         // Off-path branches index into the transcript being replaced here, so
         // they cannot survive the rewrite; drop them rather than let them
         // point at the wrong messages (issue #65).
         self.session.clear_branches();
-        self.session.push(Message::user(format!(
-            "<tool_result>Compacted session summary:\n{summary}</tool_result>"
-        )));
+        self.session.push(summary_msg);
         self.session.transcript.extend(tail);
         // The transcript just shrank; `console_seen` is an index into it (see
         // the field doc), so a stale mark would silently disable the backfill.
@@ -6772,11 +6819,6 @@ impl Agent<'_> {
         // Same for the memory pass's depth: keep its unread tail unread.
         self.extract_state
             .rebase(old_len, self.session.transcript.len());
-        let reinject = compact::build_reinjection(
-            &self.tool_ctx.recent_reads,
-            compact::reinject_budget(self.engine.ctx_size()),
-            &mut |s| self.engine.count_tokens(s),
-        );
         if let Some(block) = reinject {
             self.session.push(Message::user(block));
         }
@@ -6787,7 +6829,7 @@ impl Agent<'_> {
         // the durable summary, never like a tool result; the field is the
         // durable fact and this transcript entry is the record of what was
         // shown, so the log-everything invariant (M3) holds.
-        if let Some(block) = self.session.tasks.inject_block(self.active_goal()) {
+        if let Some(block) = tasks {
             self.session.push(Message::user(block));
         }
         self.last_ctx_used = 0;
@@ -6804,6 +6846,7 @@ impl Agent<'_> {
         // before (summary + tail vs. the original span), which the depth
         // check in `current_suggestion` cannot see.
         self.clear_suggestion();
+        Ok(())
     }
 
     /// The `trigger` value compaction hooks receive: `manual` for a user-driven
@@ -6883,6 +6926,56 @@ impl Agent<'_> {
         }
     }
 
+    /// The summary pass's prompt and options for `reason`, and how many
+    /// leading messages the prompt covers.
+    ///
+    /// The prompt is the longest transcript prefix that still leaves room for
+    /// the request and [`compact::summary_budget`], so a conversation already
+    /// at the window's edge is summarized in part rather than not at all; the
+    /// rest is kept verbatim by [`Self::rebuild_after_compact`]. The pass is
+    /// capped at that budget. Both front ends build their request here.
+    ///
+    /// # Errors
+    ///
+    /// When not even the first message leaves that room.
+    fn compaction_request(
+        &mut self,
+        reason: &str,
+        instructions: &str,
+    ) -> Result<(String, usize, crate::engine::GenerationOptions), String> {
+        let request = format!("[user]\n{}\n", compact::make_prompt(reason, instructions));
+        let ctx = self.engine.ctx_size();
+        let budget = compact::summary_budget(ctx);
+        let len = self.session.transcript.len();
+        let mut opts = self.gen_opts.clone();
+        let covered = if ctx > 0 {
+            opts.n_predict = budget;
+            compact::summary_prefix_len(len, &mut |n| {
+                let mut prompt = render_messages(&self.system, &self.session.transcript[..n]);
+                prompt.push_str(&request);
+                self.engine.count_tokens(&prompt) + budget < ctx
+            })
+        } else {
+            len
+        };
+        if covered == 0 && len > 0 {
+            return Err(
+                "context too small to summarize this conversation; use a larger --ctx".to_owned(),
+            );
+        }
+        if covered < len {
+            self.trace.line(&format!(
+                "compaction summary prefix={covered} total={len} retained_unsummarized={}",
+                len - covered
+            ));
+        }
+        let mut prompt = render_messages(&self.system, &self.session.transcript[..covered]);
+        prompt.push_str(&request);
+        // What `render_transcript` would have stashed for a panic dump.
+        crate::repro::stash_transcript(&prompt);
+        Ok((prompt, covered, opts))
+    }
+
     /// Performs the compaction exchange and rebuilds the transcript as
     /// summary + recent verbatim tail.
     fn compact(&mut self, reason: &str, instructions: &str) -> Result<Compacted, String> {
@@ -6898,15 +6991,7 @@ impl Agent<'_> {
             crate::wasmevents::EventKind::PreCompact,
             vec![("trigger", trigger.to_string())],
         );
-        let mut prompt_text = render_transcript(&self.session, &self.system);
-        {
-            use std::fmt::Write as _;
-            let _ = write!(
-                prompt_text,
-                "[user]\n{}\n",
-                compact::make_prompt(reason, instructions)
-            );
-        }
+        let (prompt_text, covered, opts) = self.compaction_request(reason, instructions)?;
         // Posted on this path too, for the sake of one behavior rather than two:
         // the plain REPL has no status bar to draw it, so nothing renders here,
         // but the state is then correct for whoever reads it.
@@ -6918,7 +7003,7 @@ impl Agent<'_> {
             .engine
             .generate(
                 crate::engine::Prompt::Flat(&prompt_text),
-                &self.gen_opts,
+                &opts,
                 // A pressure stop during compaction abandons the pass down the
                 // existing interrupted path: a half-written summary is worse
                 // than none, and the yield is taken at the next turn boundary.
@@ -6966,7 +7051,7 @@ impl Agent<'_> {
             println!("{}", status::system_line(COMPACT_NO_SUMMARY, self.color));
             return Ok(Compacted::NoSummary);
         }
-        self.rebuild_after_compact(&summary);
+        self.rebuild_after_compact(&summary, covered)?;
         self.fire_post_compact(trigger, &extracted, &mut |w| println!("{w}"));
         println!("{}", self.debug_line("context compacted"));
         Ok(Compacted::Done)
@@ -17505,15 +17590,7 @@ impl Agent<'_> {
         let _title = crate::title::Scoped::set(crate::title::State::Compacting);
         let trigger = Self::compact_trigger(reason);
         self.fire_pre_compact(trigger, &mut |w| sink.note(w));
-        let mut prompt = render_transcript(&self.session, &self.system);
-        {
-            use std::fmt::Write as _;
-            let _ = write!(
-                prompt,
-                "[user]\n{}\n",
-                compact::make_prompt(reason, instructions)
-            );
-        }
+        let (prompt, covered, opts) = self.compaction_request(reason, instructions)?;
         // Drives the status bar's compaction bar; cleared on drop, including on
         // the interrupt and engine-error paths below.
         let progress = status::CompactProgress::begin();
@@ -17526,7 +17603,7 @@ impl Agent<'_> {
             .engine
             .generate(
                 crate::engine::Prompt::Flat(&prompt),
-                &self.gen_opts,
+                &opts,
                 interrupt,
                 &|| false,
                 &mut |ev| {
@@ -17565,7 +17642,7 @@ impl Agent<'_> {
             sink.note(COMPACT_NO_SUMMARY.to_owned());
             return Ok(Compacted::NoSummary);
         }
-        self.rebuild_after_compact(&summary);
+        self.rebuild_after_compact(&summary, covered)?;
         self.fire_post_compact(trigger, &extracted, &mut |w| sink.note(w));
         sink.note("context compacted".to_owned());
         Ok(Compacted::Done)
@@ -23795,7 +23872,9 @@ mod tests {
         agent.session.push(Message::user("old context"));
         agent.session.push(Message::assistant("old answer"));
         agent.console_seen = 10;
-        agent.rebuild_after_compact("<summary>did things</summary>");
+        agent
+            .rebuild_after_compact("<summary>did things</summary>", usize::MAX)
+            .unwrap();
         assert!(
             agent.console_seen <= agent.session.transcript.len(),
             "{} > {}",
@@ -23812,7 +23891,9 @@ mod tests {
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         agent.session.push(Message::user("old context"));
         agent.session.tasks.add("still pending after compact", None);
-        agent.rebuild_after_compact("<summary>did things</summary>");
+        agent
+            .rebuild_after_compact("<summary>did things</summary>", usize::MAX)
+            .unwrap();
         let rendered = render_transcript(&agent.session, "SYS");
         assert!(
             rendered.contains("# Task list") && rendered.contains("still pending after compact"),
@@ -23876,7 +23957,9 @@ mod tests {
             iter: 2,
             status: crate::goal::GoalStatus::Active,
         });
-        agent.rebuild_after_compact("<summary>did things</summary>");
+        agent
+            .rebuild_after_compact("<summary>did things</summary>", usize::MAX)
+            .unwrap();
         let rendered = render_transcript(&agent.session, "SYS");
         assert!(
             rendered.contains("Current goal: ship the feature"),
@@ -27358,6 +27441,130 @@ mod tests {
     /// user's turn: a long read/edit/test loop can cross the soft limit many
     /// rounds after the turn started, and without a per-round check the next
     /// generation is issued against an over-full window.
+    /// An agent on a 40k-token scripted window holding `"go"` then `bodies`
+    /// (alternating assistant/user, each `tokens` long and tagged `m<i>`),
+    /// whose only scripted reply is a summary.
+    fn agent_with_bodies<'a>(
+        dir: &std::path::Path,
+        cfg: &'a AgentConfig,
+        bodies: &[i32],
+        prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Agent<'a> {
+        let engine = ScriptedEngine {
+            ctx_override: Some(40_000),
+            replies: vec!["<summary>durable state</summary>".to_string()],
+            prompts,
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(dir, engine, cfg);
+        agent.session.push(Message::user("go"));
+        for (i, &tokens) in bodies.iter().enumerate() {
+            let text = format!("m{i} {}", "x".repeat(4 * usize::try_from(tokens).unwrap()));
+            agent.session.push(if i % 2 == 0 {
+                Message::assistant(text)
+            } else {
+                Message::user(text)
+            });
+        }
+        agent
+    }
+
+    /// A conversation already at the window's edge has no room for the
+    /// summary request after it. The pass then reads the longest prefix that
+    /// leaves room, and everything past it survives verbatim (upstream
+    /// `e33a5b2`), where it used to be summarized from a prompt that could
+    /// not fit at all.
+    #[test]
+    fn a_full_window_summarizes_a_prefix_and_keeps_the_rest_verbatim() {
+        let dir = scratch_dir("compact-bounded-prefix");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let base = {
+            let agent = agent_with_bodies(&dir, &cfg, &[], prompts.clone());
+            agent
+                .engine
+                .count_tokens(&render_transcript(&agent.session, &agent.system))
+        };
+        // Fill to 1000 tokens short of the window, in 3000-token messages.
+        let mut bodies = vec![3000; usize::try_from((39_000 - base) / 3000).unwrap()];
+        bodies.push((39_000 - base) % 3000);
+        let mut agent = agent_with_bodies(&dir, &cfg, &bodies, prompts.clone());
+        let last = format!("m{} ", bodies.len() - 1);
+
+        let outcome = agent.compact("low context", "").unwrap();
+        assert!(matches!(outcome, Compacted::Done));
+        let request = prompts.lock().unwrap().last().cloned().unwrap();
+        assert!(request.contains("m0 "), "the prefix is summarized");
+        assert!(
+            !request.contains(&last),
+            "the last message is past the prefix"
+        );
+        assert!(
+            agent.engine.count_tokens(&request) + compact::summary_budget(40_000) < 40_000,
+            "the request leaves room for the summary"
+        );
+        let t = &agent.session.transcript;
+        assert!(
+            t[0].text
+                .starts_with("<tool_result>Compacted session summary:")
+        );
+        assert!(
+            t.iter().any(|m| m.text.starts_with(&last)),
+            "everything the summary did not read is kept"
+        );
+    }
+
+    /// When even the first message leaves no room for the request, nothing
+    /// is summarized and the conversation is left exactly as it was.
+    #[test]
+    fn compaction_refuses_a_window_too_small_for_the_first_message() {
+        let dir = scratch_dir("compact-too-small");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = agent_with_bodies(&dir, &cfg, &[], prompts.clone());
+        agent.session.transcript[0].text = "x".repeat(4 * 39_000);
+        let before = agent.session.transcript.clone();
+        let err = agent.compact("low context", "").unwrap_err();
+        assert!(err.contains("context too small to summarize"), "{err}");
+        assert_eq!(agent.session.transcript, before);
+        assert!(prompts.lock().unwrap().is_empty(), "no summary pass ran");
+    }
+
+    /// A rebuild that would leave no room to keep working (here, a message
+    /// the summary could not read is itself most of the window) is refused
+    /// before it touches the transcript.
+    #[test]
+    fn compaction_refuses_a_rebuild_with_no_working_room() {
+        let dir = scratch_dir("compact-no-room");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let base = {
+            let agent = agent_with_bodies(&dir, &cfg, &[], prompts.clone());
+            agent
+                .engine
+                .count_tokens(&render_transcript(&agent.session, &agent.system))
+        };
+        let mut agent = agent_with_bodies(&dir, &cfg, &[500, 39_000 - base - 600], prompts.clone());
+        let before = agent.session.transcript.clone();
+        let err = agent.compact("low context", "").unwrap_err();
+        assert!(err.contains("leaves no working room"), "{err}");
+        assert_eq!(agent.session.transcript, before);
+    }
+
+    /// Every turn pass stops `compact_reserve` short of the window, so a reply
+    /// that runs into it still leaves room to summarize.
+    #[test]
+    fn turn_passes_reserve_room_for_compaction() {
+        let dir = scratch_dir("compact-pass-reserve");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = agent_with_bodies(&dir, &cfg, &[], prompts);
+        assert_eq!(
+            agent.pass_opts().ctx_reserve,
+            compact::compact_reserve(40_000)
+        );
+    }
+
     #[test]
     fn a_turn_compacts_between_tool_rounds() {
         let dir = scratch_dir("compact-mid-turn");
@@ -27365,14 +27572,27 @@ mod tests {
         // Big enough that the system prompt alone is not already over the
         // trigger, small enough that one fat assistant message crosses it.
         let ctx: i32 = 40_000;
+        // The context the turn starts at, measured on a throwaway agent with
+        // the same system prompt.
+        let base = {
+            let mut probe = test_agent(&dir, ScriptedEngine::default(), &cfg);
+            probe.session.push(Message::user("go"));
+            probe
+                .engine
+                .count_tokens(&render_transcript(&probe.session, &probe.system))
+        };
+        // Past the trigger by a margin, but not so far that the summary
+        // request no longer fits after it: a real pass stops at
+        // `compact_reserve` from the window's end.
+        let fat = compact::compaction_trigger_used(ctx) - base + 1500;
         let engine = ScriptedEngine {
             ctx_override: Some(ctx),
             replies: vec![
-                // Round 0: a huge reply ending in an invalid stanza, so the
+                // Round 0: a fat reply ending in an invalid stanza, so the
                 // turn continues with a tool-error round.
                 format!(
                     "{}<\u{ff5c}DSML\u{ff5c}tool_calls><b>",
-                    "x".repeat(4 * usize::try_from(ctx).unwrap())
+                    "x".repeat(4 * usize::try_from(fat).unwrap())
                 ),
                 // The compaction summary the mid-turn pass asks for.
                 "<summary>durable state</summary>".to_string(),
@@ -27670,7 +27890,9 @@ mod tests {
         let rung = agent.capture_first_rung();
         assert!(agent.store.rung_path(&id, rung.index).exists());
 
-        agent.rebuild_after_compact("<summary>everything so far</summary>");
+        agent
+            .rebuild_after_compact("<summary>everything so far</summary>", usize::MAX)
+            .unwrap();
         assert!(
             agent.ladder.rungs().is_empty(),
             "the rebuilt transcript invalidates every rung"
@@ -30430,7 +30652,7 @@ mod tests {
         let mut agent = branch_agent(&dir, &cfg);
         agent.fork_branch("2", false).unwrap();
         assert!(!agent.session.branches.is_empty());
-        agent.rebuild_after_compact("summary");
+        agent.rebuild_after_compact("summary", usize::MAX).unwrap();
         assert!(
             agent.session.branches.is_empty(),
             "branch parents index the transcript compaction just replaced"
@@ -37408,13 +37630,15 @@ or the user's next message aborts before its first token"
         let engine = ScriptedEngine {
             replies: vec!["[]".to_string(), "[]".to_string()],
             prompts: prompts.clone(),
-            // `tail_budget(8000)` is 1000 tokens at ~4 bytes each: the two
+            // `tail_budget(16000)` is 2000 tokens at ~4 bytes each: the two
             // short new messages fit the verbatim tail, the long processed
-            // ones (3 KiB each) mostly do not and are folded into the
-            // summary. Large enough that the size preflight in
+            // ones (3 KiB, ~750 tokens each) mostly do not and are folded
+            // into the summary. Large enough that the size preflight in
             // `maybe_extract_memories` lets the first pass (six 3 KiB
-            // messages, ~4.8k tokens plus the reply reserve) run.
-            ctx_override: Some(8000),
+            // messages, ~4.8k tokens plus the reply reserve) run, and that
+            // the rebuild leaves `compact_reserve` free beside the system
+            // prompt.
+            ctx_override: Some(16_000),
             ..ScriptedEngine::default()
         };
         let mut agent = test_agent(&dir, engine, &cfg);
@@ -37436,7 +37660,9 @@ or the user's next message aborts before its first token"
         );
         agent.session.push(Message::user("new-q"));
         agent.session.push(Message::assistant("new-a"));
-        agent.rebuild_after_compact("<summary>did things</summary>");
+        agent
+            .rebuild_after_compact("<summary>did things</summary>", usize::MAX)
+            .unwrap();
         let depth = agent.session.transcript.len();
         assert!(
             depth < 6,
