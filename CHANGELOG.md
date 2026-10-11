@@ -22,12 +22,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ds4's `--prefix-file` (upstream `b0a147a`).
 
 - **`context.resumeAcrossCompaction` (experimental, off by default).** A reply
-  the context window cuts off is held aside, the conversation is compacted,
-  and the next pass re-opens the same assistant message with it, starting
-  inside `<think>` if that is where it stopped, so the answer finishes as one
-  message instead of ending cut short (upstream ds4 `e33a5b2`). At most four
-  times a turn; when compaction cannot make room, what was written is kept as
-  before.
+  the context window cuts off is continued in the same assistant message
+  after compaction instead of ending cut short (upstream ds4 `e33a5b2`): the
+  summary reads the start of the reply, its end is re-opened (with no
+  reasoning step when it stopped in the answer, inside `<think>` when it
+  stopped there), and the model carries on mid-sentence. Checked on DeepSeek
+  V4 Flash and Gemma 4 E4B. At most four times a turn; when compaction cannot
+  make room, what was written is kept as before.
 
 - `crates/plank-lib`, the vectors.json and profile file handling shared with
   `pt`: plank's `steervec` now reads the store through it, and `pt install
@@ -51,6 +52,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `src/remote/limits.rs`.
 
 ### Fixed
+
+- **DeepSeek assistant messages rebuilt from text end their turn.** A reply
+  tokenized from text (after compaction, from a session reloaded without its
+  tokens, or a prefix turn) lacked the end-of-sentence token every reply
+  carries in ds4, so the next user message read as more of the same reply.
+- **The `/hints` instruction is never mistaken for your prompt** in session
+  listings, the window title or the turn-finished notification.
 
 - **A conversation at the window's edge can still be compacted.** A reply
   used to run to the window's last token, after which the summary request no

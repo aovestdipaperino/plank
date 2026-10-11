@@ -3531,3 +3531,46 @@ text and ends with `COMMIT_SIGNATURE_INSTRUCTION` and its newline.
 `Agent::kv_tiers_for` now trims the system text before fingerprinting and
 planning, so the warmed tokens and the key both match what the turn renders;
 prompts without trailing whitespace keep their old keys.
+
+## Resuming a cut-off reply needed three fixes that only a real model showed
+
+`context.resumeAcrossCompaction` (upstream `e33a5b2`) passed every scripted
+test and still failed on DeepSeek V4 Flash on a 16k window, three times, for
+three different reasons:
+
+1. **Holding the whole reply left no room.** A reply that runs into the
+   window is most of the window, so system prompt + summary + the held reply
+   never fit and the rebuild refused ("compacted conversation leaves no
+   working room"). The scripted partial was a few words long, which is why no
+   test saw it. Only the reply's end is held now (`compact::resume_split`,
+   half the tail budget, starting a word); the head joins the transcript for
+   the summary to read, as the C summarizes into the open assistant message.
+2. **The re-opened answer got the `<think>` opener.** The model read its own
+   answer as reasoning and wrote a paragraph about continuing before closing
+   `</think>` and continuing. A reply resumed from its answer re-opens with
+   no reasoning step (the C's `DS4_THINK_NONE`).
+3. **`Ds4Session` never re-opened anything.** `build_prompt` always appended
+   a fresh assistant prefix, so `…[assistant]\n<partial>` read as a finished
+   turn followed by a new one, and the model restarted ("The essay was
+   interrupted again…") and restated the cut sentence. `continue_reply`
+   re-tokenizes the trailing span as an open turn and records the reply as an
+   extension of it. The TUI's `/btw` resume has always had this shape too: it
+   splices a finished turn and opens a new one. Gemma never needed it, since
+   its template leaves a trailing model turn open.
+
+With all three, the 16k run joins exactly at the cut ("It is a good" +
+" choice for the nursery…") in one saved message, and Gemma 4 E4B on 10k
+joins twice cleanly, once in the middle of a table cell.
+
+## Assistant messages rebuilt from text had no EOS on DeepSeek
+
+The C ends every assistant turn in its token transcript with EOS: a sampled
+reply, and also each `--prefix-file` assistant turn, which
+`ds4_prompt_prefix_append` follows with an explicit `ds4_token_eos`.
+`ds4_chat_append_message` itself leaves the turn open. plank's sampled
+replies had the EOS (`record_reply`), but anything tokenized from text in
+`reconcile` (compaction tails, a session reloaded without its tokens, prefix
+turns) ran straight into the next `<｜User｜>`. With two pirate-voice prefix
+turns the model ignored the style; with the EOS and four turns it answered
+"Arr! …". `reconcile` now appends the EOS for the DSML families only: Qwen's
+template closes its own turns.
