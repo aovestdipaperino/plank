@@ -671,6 +671,10 @@ Options:
                            and patching the clone (base and delta untouched)
                            (create deltas with the ggd tool from the
                            gguf-delta crate: ggd create BASE TARGET OUT.ggd)
+      --pick-engine        open the engine menu at launch, even when the
+                           selected engine is installed; the pick (downloaded
+                           if missing) becomes engine.model. /engines does the
+                           same from a running session
 "
     .to_owned()
         + "  -t, --threads N          worker thread count (backend default when unset)
