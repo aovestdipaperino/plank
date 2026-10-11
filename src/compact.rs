@@ -444,6 +444,39 @@ pub fn should_compact(ctx_size: i32, ctx_used: i32) -> bool {
     ctx_size - ctx_used <= free_threshold(ctx_size)
 }
 
+/// Where to split a reply the window cut off, so that only its end is
+/// re-opened after compaction: the earliest point, at the start of a word or
+/// line, from which the rest counts at most `budget` tokens. Everything before
+/// it joins the transcript for the summary to read, as the C summarizes into
+/// an open assistant message (`e33a5b2`); re-opening the whole reply would
+/// leave no room, since a reply that runs into the window is most of it.
+///
+/// `0` when the whole reply already fits, and `text.len()` when not even its
+/// last word does.
+pub fn resume_split(text: &str, budget: i32, count: &mut dyn FnMut(&str) -> i32) -> usize {
+    if count(text) <= budget {
+        return 0;
+    }
+    // Candidate cut points: just after each whitespace, so the kept fragment
+    // starts a word. Ascending, and the suffix only shrinks along them.
+    let cuts: Vec<usize> = text
+        .char_indices()
+        .filter(|&(_, c)| c.is_whitespace())
+        .map(|(i, c)| i + c.len_utf8())
+        .collect();
+    // The first cut whose suffix fits: fits is false then true along `cuts`.
+    let (mut lo, mut hi) = (0, cuts.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if count(&text[cuts[mid]..]) <= budget {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    cuts.get(lo).copied().unwrap_or(text.len())
+}
+
 /// Token budget for the verbatim tail kept after compaction.
 #[must_use]
 pub fn tail_budget(ctx_size: i32) -> i32 {
@@ -564,6 +597,25 @@ mod tests {
         assert!(should_compact(8000, 5800));
         assert!(!should_compact(8000, 5700));
         assert_eq!(compaction_trigger_used(8000), 8000 - 2216);
+    }
+
+    #[test]
+    fn resume_split_keeps_the_longest_word_aligned_end_that_fits() {
+        let mut words = |s: &str| i32::try_from(s.split_whitespace().count()).unwrap();
+        // Fits whole: nothing is split off.
+        assert_eq!(resume_split("a b c", 3, &mut words), 0);
+        let text = "one two three four five";
+        let at = resume_split(text, 2, &mut words);
+        assert_eq!(&text[at..], "four five");
+        assert_eq!(&text[..at], "one two three ");
+        // A fragment always starts a word, even mid-paragraph.
+        let text = "alpha beta\ngamma delta";
+        assert_eq!(
+            &text[resume_split(text, 3, &mut words)..],
+            "beta\ngamma delta"
+        );
+        // Not even the last word fits.
+        assert_eq!(resume_split("word", 0, &mut words), 4);
     }
 
     #[test]

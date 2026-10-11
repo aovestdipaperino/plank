@@ -1027,6 +1027,7 @@ impl ModelHandle for Ds4Model {
             warm_tokens: Ds4TokensGuard::new(),
             think: ThinkMode::default(),
             trusted_system_len: 0,
+            reopened: false,
             steering_ffn: self.steering_ffn0,
             steer_held: false,
             pending_images: Vec::new(),
@@ -1089,6 +1090,10 @@ pub struct Ds4Session {
     /// [`Engine::set_trusted_system_prefix`]. Zero means "tokenize all of it as
     /// plain content", the safe default.
     trusted_system_len: usize,
+    /// Whether the last [`build_prompt`](Self::build_prompt) re-opened the
+    /// trailing assistant message, so the reply it prompts is recorded as a
+    /// continuation of that span rather than with a prefix of its own.
+    reopened: bool,
     /// FFN directional-steering scale in force for tokens evaluated from here
     /// on, mirrored in Rust because the C exposes it only on a *live* session
     /// and this one is created lazily: a `/steer` before the first prefill has
@@ -1176,6 +1181,7 @@ impl Ds4Session {
             warm_tokens: Ds4TokensGuard::new(),
             think: ThinkMode::default(),
             trusted_system_len: 0,
+            reopened: false,
             pending_images: Vec::new(),
             vision_spans: Vec::new(),
             #[cfg(ds4_engine)]
@@ -1709,12 +1715,60 @@ impl Ds4Session {
     /// buffer followed by a fresh assistant prefix for `think` (transient — the
     /// prefix is re-derived every turn and only enters the buffer once its reply
     /// is recorded).
-    fn build_prompt(&mut self, transcript: &str, think: ThinkMode) -> Ds4TokensGuard {
+    ///
+    /// With `continue_reply` and an assistant message ending the transcript,
+    /// that message is re-opened instead: its span becomes `think`'s prefix
+    /// plus its text with nothing closing it, and no second prefix follows, so
+    /// the model carries on mid-message. Without this, a resumed reply read
+    /// to the model as a finished turn followed by a new one, and it restarted
+    /// ("The essay was interrupted again…") instead of continuing.
+    fn build_prompt(
+        &mut self,
+        transcript: &str,
+        think: ThinkMode,
+        continue_reply: bool,
+    ) -> Ds4TokensGuard {
         self.reconcile(transcript);
+        let reopened = continue_reply && self.reopen_last_reply(think);
+        self.reopened = reopened;
         let mut prompt = Ds4TokensGuard::new();
         prompt.push_all(self.transcript.tokens());
-        prompt.push_all(&self.model.assistant_prefix_tokens(think));
+        if !reopened {
+            prompt.push_all(&self.model.assistant_prefix_tokens(think));
+        }
         prompt
+    }
+
+    /// Re-tokenizes the trailing assistant span as an open turn under
+    /// `think`'s prefix: what the C builds when it resumes inside the same
+    /// assistant message (`ds4_chat_append_assistant_prefix` then the
+    /// retained text, `e33a5b2`). False, changing nothing, when the
+    /// transcript does not end with an assistant message or its text cannot
+    /// be split from the template's own opener.
+    fn reopen_last_reply(&mut self, think: ThinkMode) -> bool {
+        let Some(last) = self.transcript.spans().last() else {
+            return false;
+        };
+        if last.role != SpanRole::Assistant {
+            return false;
+        }
+        let text = last.text.clone();
+        // A stored assistant message is the no-reasoning opener plus the text
+        // (`ds4_chat_append_message`); the body is what follows that opener.
+        let full = self.model.message_tokens("assistant", &text);
+        let opener = self.model.assistant_prefix_tokens(ThinkMode::Off);
+        let Some(body) = full.strip_prefix(opener.as_slice()) else {
+            return false;
+        };
+        let mut tokens = self.model.assistant_prefix_tokens(think);
+        tokens.extend_from_slice(body);
+        let keep = self.transcript.spans().len() - 1;
+        let kept_tokens = self.transcript.tokens_upto_span(keep);
+        self.free_vision_spans_from(u32::try_from(kept_tokens).unwrap_or(0));
+        self.transcript.truncate_spans(keep);
+        self.transcript
+            .push_span(SpanRole::Assistant, think_span_tag(think), text, &tokens);
+        true
     }
 
     /// Appends a just-sampled reply to the token transcript as one assistant
@@ -1728,18 +1782,21 @@ impl Ds4Session {
         reply_tokens: &[i32],
         shadow_tokens: &[i32],
         think: ThinkMode,
+        continued: bool,
     ) {
         if reply_tokens.is_empty() && shadow_tokens.is_empty() {
             return;
         }
         // SAFETY: engine valid.
         let eos = unsafe { ffi::ds4_token_eos(self.model.engine) };
-        let span = assistant_span_tokens(
-            &self.model.assistant_prefix_tokens(think),
-            reply_tokens,
-            shadow_tokens,
-            eos,
-        );
+        // A continued reply ran under the prefix already in the re-opened
+        // span (`reopen_last_reply`), so it records none of its own.
+        let prefix = if continued {
+            Vec::new()
+        } else {
+            self.model.assistant_prefix_tokens(think)
+        };
+        let span = assistant_span_tokens(&prefix, reply_tokens, shadow_tokens, eos);
         // A reply that follows another assistant span *continues* it: the pass
         // was suspended for an in-pass `/btw` and resumed, and the UI splices
         // both halves into one assistant message. Extend rather than append, so
@@ -1922,7 +1979,7 @@ impl Engine for Ds4Session {
         transcript: &str,
         think: ThinkMode,
     ) -> Option<crate::engine::KvReuse> {
-        let tokens = self.build_prompt(transcript, think);
+        let tokens = self.build_prompt(transcript, think, false);
         let session = self.ensure_session().ok()?;
         // SAFETY: session and tokens are valid.
         let common = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
@@ -1946,7 +2003,7 @@ impl Engine for Ds4Session {
         // token buffer is the source of truth; spans that left the transcript
         // (compaction, rollback, sidechain truncation) are dropped by the
         // common-prefix reconciliation in `build_prompt`.
-        let tokens = self.build_prompt(transcript, opts.think_mode);
+        let tokens = self.build_prompt(transcript, opts.think_mode, opts.continue_reply);
         let prompt_len = tokens.len();
 
         // Reuse the live session across turns so its cached KV prefix (the
@@ -2296,7 +2353,14 @@ impl Engine for Ds4Session {
         // and the two halves have to concatenate into exactly what the UI
         // renders (`docs/DOUBLE-BTW.md` §4.1). `common_prefix` trims when it
         // compares, so a completed reply still matches its rendered section.
-        self.record_reply(reply_text, &reply_tokens, &shadow_tokens, opts.think_mode);
+        let continued = self.reopened;
+        self.record_reply(
+            reply_text,
+            &reply_tokens,
+            &shadow_tokens,
+            opts.think_mode,
+            continued,
+        );
 
         let interrupted = interrupt() || cancel_reason() != CancelReason::None;
         let secs = start.elapsed().as_secs_f64();
@@ -2962,7 +3026,9 @@ impl Ds4HostSession {
     ) -> Result<Result<GenState, GenerationStats>, EngineError> {
         // Reconcile the token transcript and build the prompt (see
         // `Ds4Session::build_prompt`) — the token buffer is the source of truth.
-        let tokens = self.inner.build_prompt(transcript, opts.think_mode);
+        let tokens = self
+            .inner
+            .build_prompt(transcript, opts.think_mode, opts.continue_reply);
         let prompt_len = tokens.len();
         let session = self.inner.ensure_session()?;
 
@@ -3045,8 +3111,13 @@ impl Ds4HostSession {
         // An incomplete trailing sequence at end of stream decodes lossily;
         // mid-stream characters were already reassembled by the carry.
         reply_text.push_str(&st.utf8.flush());
-        self.inner
-            .record_reply(reply_text, &st.reply_tokens, &[], st.opts.think_mode);
+        self.inner.record_reply(
+            reply_text,
+            &st.reply_tokens,
+            &[],
+            st.opts.think_mode,
+            self.inner.reopened,
+        );
         let secs = st.start.elapsed().as_secs_f64();
         // SAFETY: session valid (created during prefill).
         let ctx_used = unsafe { ffi::ds4_session_pos(self.inner.session) };
@@ -3762,7 +3833,7 @@ mod tests {
         a.set_trusted_system_prefix(parts.trusted_len);
 
         // Prefill the transcript, then snapshot as the exit path does.
-        let toks = a.build_prompt(&transcript, ThinkMode::Medium);
+        let toks = a.build_prompt(&transcript, ThinkMode::Medium, false);
         let prompt_len = toks.len();
         let session = a.ensure_session().unwrap();
         let mut err = [0_i8; 512];
@@ -3781,7 +3852,7 @@ mod tests {
         b.set_trusted_system_prefix(parts.trusted_len);
         b.set_kv(&cache).expect("KV restore");
 
-        let toks2 = b.build_prompt(&transcript, ThinkMode::Medium);
+        let toks2 = b.build_prompt(&transcript, ThinkMode::Medium, false);
         assert_eq!(
             toks2.as_slice(),
             toks.as_slice(),
@@ -3799,7 +3870,7 @@ mod tests {
         // assertion above is measuring the payload and not something incidental.
         let mut c = super::Ds4Session::from_model(std::sync::Arc::clone(&weights));
         c.set_trusted_system_prefix(parts.trusted_len);
-        let toks3 = c.build_prompt(&transcript, ThinkMode::Medium);
+        let toks3 = c.build_prompt(&transcript, ThinkMode::Medium, false);
         let session_c = c.ensure_session().unwrap();
         let cold = unsafe { ffi::ds4_session_common_prefix(session_c, toks3.as_ptr()) };
         eprintln!("cold:     {cold}/{prompt_len} tokens reused");

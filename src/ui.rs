@@ -3761,7 +3761,14 @@ impl Agent<'_> {
     /// the assistant prefix opening `<think>` regardless.
     fn pass_opts(&mut self) -> crate::engine::GenerationOptions {
         let mut opts = self.gen_opts.clone();
-        opts.think_mode = if std::mem::take(&mut self.reply_only_next) {
+        // A reply resumed from its answer re-opens with no reasoning step, as
+        // the C re-opens it with `DS4_THINK_NONE`: under the template's
+        // `<think>` opener the model reads its own answer as reasoning and
+        // thinks aloud about continuing before it continues (a real 16k run).
+        let resumes_answer = self.open_reply.as_ref().is_some_and(|r| !r.in_think);
+        // And it is re-opened, not answered: the pass extends the held text.
+        opts.continue_reply = self.open_reply.is_some();
+        opts.think_mode = if std::mem::take(&mut self.reply_only_next) || resumes_answer {
             crate::engine::ThinkMode::Off
         } else {
             self.think
@@ -5891,19 +5898,13 @@ impl Agent<'_> {
                         "the reply ran into the context limit; compacting to continue it"
                     )
                 );
-                self.open_reply = Some(OpenReply {
-                    text: assistant_text,
-                    in_think: finished.ended_in_think,
-                });
+                let split = self.hold_open_reply(assistant_text, finished.ended_in_think);
                 let outcome = self.compact("generation reached compaction reserve", "");
                 if matches!(outcome, Ok(Compacted::Done)) {
                     continue;
                 }
                 // No room was made: keep what was written, as before.
-                if let Some(open) = self.open_reply.take() {
-                    self.session.push(Message::assistant(open.text));
-                    self.payload_dirty = true;
-                }
+                self.release_open_reply(split);
                 return outcome.map(|_| ());
             }
             // A real interrupt lands regardless of what the parser made of
@@ -7117,6 +7118,50 @@ impl Agent<'_> {
     /// never saved with a session.
     fn adopt_prefix(&mut self) {
         self.session.prefix = crate::prefix::active().to_vec();
+    }
+
+    /// Holds a reply the window cut off across the compaction that makes room
+    /// for the rest of it ([`Self::open_reply`]).
+    ///
+    /// Only its end is held, at most half the verbatim tail budget
+    /// ([`compact::resume_split`]); the rest goes into the transcript first,
+    /// where the summary reads it. Holding all of it cannot work: a reply that
+    /// ran into the window is most of the window, so system prompt, summary
+    /// and the whole reply never fit together (seen on a real 16k run). The C
+    /// does the same by summarizing into the open assistant message. Returns
+    /// whether the reply was split, for [`Self::release_open_reply`].
+    fn hold_open_reply(&mut self, text: String, in_think: bool) -> bool {
+        let budget = compact::tail_budget(self.engine.ctx_size()) / 2;
+        let at = compact::resume_split(&text, budget, &mut |s| self.engine.count_tokens(s));
+        let mut head = text;
+        let fragment = head.split_off(at);
+        let split = !head.is_empty();
+        if split {
+            self.session.push(Message::assistant(head));
+        }
+        self.open_reply = Some(OpenReply {
+            text: fragment,
+            in_think,
+        });
+        split
+    }
+
+    /// Gives a held reply back as one ordinary message when compaction could
+    /// not make room for its continuation: what was written is kept, as it
+    /// was before resuming existed. `split` rejoins the head that
+    /// [`Self::hold_open_reply`] put in the transcript, which a failed
+    /// compaction leaves untouched.
+    fn release_open_reply(&mut self, split: bool) {
+        let Some(open) = self.open_reply.take() else {
+            return;
+        };
+        match self.session.transcript.last_mut() {
+            Some(last) if split && last.role == crate::session::Role::Assistant => {
+                last.text.push_str(&open.text);
+            }
+            _ => self.session.push(Message::assistant(open.text)),
+        }
+        self.payload_dirty = true;
     }
 
     /// Whether the next pass's renderer starts inside `<think>`: where a
@@ -16260,10 +16305,7 @@ impl Agent<'_> {
                     "context limit: reply resumes".to_owned(),
                 );
                 let _ = tx.send(UiEvent::EndLine);
-                self.open_reply = Some(OpenReply {
-                    text: assistant_text,
-                    in_think: out.ended_in_think,
-                });
+                let split = self.hold_open_reply(assistant_text, out.ended_in_think);
                 let mut sink = NoteSink(&mut note);
                 sink.note(
                     "the reply ran into the context limit; compacting to continue it".to_owned(),
@@ -16277,10 +16319,7 @@ impl Agent<'_> {
                 if matches!(outcome, Ok(Compacted::Done)) {
                     continue 'pass;
                 }
-                if let Some(open) = self.open_reply.take() {
-                    self.session.push(Message::assistant(open.text));
-                    self.payload_dirty = true;
-                }
+                self.release_open_reply(split);
                 if matches!(outcome, Ok(Compacted::Interrupted)) {
                     shared.interrupt.store(false, Ordering::Relaxed);
                 }
@@ -28167,6 +28206,74 @@ mod tests {
         assert!(agent.open_reply.is_none());
     }
 
+    /// `"w0 w1 … w{n-1} "`: distinct words, so a test can tell which end of
+    /// a split it is looking at.
+    fn numbered_words(n: usize) -> String {
+        use std::fmt::Write as _;
+        (0..n).fold(String::new(), |mut out, i| {
+            let _ = write!(out, "w{i} ");
+            out
+        })
+    }
+
+    /// A cut reply too long to re-open whole (the real 16k run's case) is
+    /// split: the summary reads its head, only its end is re-opened, and the
+    /// resumed message is that end plus the continuation.
+    #[test]
+    fn a_long_cut_reply_resumes_from_its_end_after_the_summary_reads_the_rest() {
+        let _resume = resume_on();
+        let dir = scratch_dir("compact-resume-split");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // ~5k tokens of words against a 2500-token fragment budget (40k / 8 / 2).
+        let partial = numbered_words(3500);
+        let engine = ScriptedEngine {
+            replies: vec![
+                partial.clone(),
+                "<summary>durable state</summary>".to_string(),
+                "and ends.".to_string(),
+            ],
+            window_limit_at: Some(0),
+            ctx_override: Some(40_000),
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("explain it"));
+        agent.run_turn().unwrap();
+
+        let prompts = prompts.lock().unwrap();
+        assert!(
+            prompts[1].contains("w0 w1 w2 "),
+            "the summary reads the head"
+        );
+        let reopened = prompts[2].rsplit("[assistant]\n").next().unwrap();
+        assert!(reopened.starts_with('w') && reopened.ends_with("w3499 "));
+        assert!(!reopened.contains("w0 "), "only the end is re-opened");
+        assert!(agent.engine.count_tokens(reopened) <= compact::tail_budget(40_000) / 2);
+        let last = agent.session.transcript.last().unwrap();
+        assert_eq!(last.text, format!("{reopened}and ends."));
+        assert!(agent.open_reply.is_none());
+    }
+
+    /// When compaction cannot make room, a split reply is rejoined into the
+    /// one message it was before.
+    #[test]
+    fn a_held_reply_is_rejoined_when_compaction_fails() {
+        let dir = scratch_dir("compact-resume-release");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(&dir, cut_reply_engine(prompts), &cfg);
+        agent.session.push(Message::user("q"));
+        let text = numbered_words(30_000);
+        let split = agent.hold_open_reply(text.clone(), false);
+        assert!(split);
+        agent.release_open_reply(split);
+        let t = &agent.session.transcript;
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[1].text, text);
+    }
+
     /// Off by default: a cut reply ends the turn as it always has, with no
     /// compaction pass behind it.
     #[test]
@@ -28182,6 +28289,31 @@ mod tests {
             "The answer begins"
         );
         assert_eq!(prompts.lock().unwrap().len(), 1);
+    }
+
+    /// A reply cut in its answer is re-opened with no reasoning step; one cut
+    /// inside `<think>` keeps the session's reasoning level.
+    #[test]
+    fn a_resumed_answer_has_no_reasoning_step() {
+        let dir = scratch_dir("compact-resume-nothink");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(&dir, cut_reply_engine(prompts), &cfg);
+        agent.think = ThinkMode::Max;
+        agent.open_reply = Some(OpenReply {
+            text: "partial".to_owned(),
+            in_think: false,
+        });
+        assert_eq!(agent.pass_opts().think_mode, ThinkMode::Off);
+        assert!(agent.pass_opts().continue_reply, "re-opened, not answered");
+        agent.open_reply = Some(OpenReply {
+            text: "partial".to_owned(),
+            in_think: true,
+        });
+        assert_eq!(agent.pass_opts().think_mode, ThinkMode::Max);
+        agent.open_reply = None;
+        assert_eq!(agent.pass_opts().think_mode, ThinkMode::Max);
+        assert!(!agent.pass_opts().continue_reply);
     }
 
     /// A reply cut inside `<think>` resumes rendering as reasoning, whatever

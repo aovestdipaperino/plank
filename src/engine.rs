@@ -379,6 +379,12 @@ pub struct GenerationOptions {
     /// room to compact. Zero (the default) generates to the window's last
     /// token, as before.
     pub ctx_reserve: i32,
+    /// Continue the assistant message that ends the prompt rather than open
+    /// a new one after it: the pass extends that message's text, under the
+    /// assistant prefix `think_mode` selects. Set when a reply the window cut
+    /// off resumes after compaction. An engine that cannot re-open a message
+    /// ignores it and answers in a new one.
+    pub continue_reply: bool,
 }
 
 impl Default for GenerationOptions {
@@ -394,6 +400,7 @@ impl Default for GenerationOptions {
             mtp: true,
             think_tool_recovery: false,
             ctx_reserve: 0,
+            continue_reply: false,
         }
     }
 }

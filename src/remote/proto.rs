@@ -200,6 +200,9 @@ pub struct WireOptions {
     /// generate to the window's last token.
     #[serde(default)]
     pub ctx_reserve: i32,
+    /// Defaulted to `false`: an older peer always opens a new message.
+    #[serde(default)]
+    pub continue_reply: bool,
 }
 
 /// `serde` default for [`WireOptions::dspark`]: the pre-`/dspark` behavior.
@@ -220,6 +223,7 @@ impl From<&GenerationOptions> for WireOptions {
             think_tool_recovery: o.think_tool_recovery,
             mtp: o.mtp,
             ctx_reserve: o.ctx_reserve,
+            continue_reply: o.continue_reply,
         }
     }
 }
@@ -237,6 +241,7 @@ impl From<&WireOptions> for GenerationOptions {
             think_tool_recovery: o.think_tool_recovery,
             mtp: o.mtp,
             ctx_reserve: o.ctx_reserve,
+            continue_reply: o.continue_reply,
         }
     }
 }
