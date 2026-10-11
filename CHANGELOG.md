@@ -46,6 +46,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an "incomplete DSML tool call" error. plank compacts and tells the model the
   call did not run, so it can retry in smaller pieces, at most twice a turn
   (upstream ds4 `e33a5b2`).
+- **A prompt too big for the window is refused instead of sticking.** A
+  pasted message that could not fit beside the system prompt stayed in the
+  conversation, where compaction had to keep it word for word, so every later
+  turn failed too. It is now taken back with "user message is too large for
+  --ctx N" and the session carries on (upstream ds4 `e33a5b2`).
 
 - **A tool result whose image the model refused stays in context.** When the
   engine rejected an image observation (an invalid embedding, a model without

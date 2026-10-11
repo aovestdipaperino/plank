@@ -5678,6 +5678,7 @@ impl Agent<'_> {
 
     #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn run_turn(&mut self) -> Result<(), String> {
+        self.refuse_oversized_prompt()?;
         crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
@@ -6986,6 +6987,37 @@ impl Agent<'_> {
             self.session
                 .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
         }
+    }
+
+    /// Takes back a prompt that could never fit the window: the user message
+    /// that ends the transcript, when it and the system prompt alone leave
+    /// less than [`compact::compact_reserve`] free.
+    ///
+    /// The C refuses such a message before appending it
+    /// (`agent_worker_append_user`, upstream `e33a5b2`). Left in place it would
+    /// poison the session: compaction keeps it verbatim, so every later turn
+    /// would fail to make room. A smaller message that merely does not fit the
+    /// current conversation is the ordinary pre-turn compaction's job.
+    ///
+    /// # Errors
+    ///
+    /// The refusal, after the message has been removed again.
+    fn refuse_oversized_prompt(&mut self) -> Result<(), String> {
+        let ctx = self.engine.ctx_size();
+        let Some(last) = self.session.transcript.last() else {
+            return Ok(());
+        };
+        if ctx <= 0 || last.role != crate::session::Role::User || last.is_tool_user() {
+            return Ok(());
+        }
+        let alone = render_messages(&self.system, std::slice::from_ref(last));
+        if self.engine.count_tokens(&alone) < ctx - compact::compact_reserve(ctx) - 128 {
+            return Ok(());
+        }
+        self.session.transcript.pop();
+        Err(format!(
+            "user message is too large for --ctx {ctx}; use a larger context or a smaller message"
+        ))
     }
 
     /// The summary pass's prompt and options for `reason`, and how many
@@ -15832,6 +15864,7 @@ impl Agent<'_> {
     /// Runs on the worker thread and talks to the UI only through `tx`.
     #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn worker_turn(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) -> Result<(), String> {
+        self.refuse_oversized_prompt()?;
         // TUI: a headless sub-agent's output is forwarded over the same
         // worker→UI channel as the parent turn's own render events.
         self.sub_sink = SubSinkTarget::Events(tx.clone());
@@ -27771,6 +27804,35 @@ mod tests {
                 .any(|m| m.text.contains("incomplete DSML tool call")),
             "{t:?}"
         );
+    }
+
+    /// A prompt that cannot fit beside the system prompt is taken back and
+    /// refused, on both front ends, before anything is generated.
+    #[test]
+    fn an_oversized_prompt_is_refused_and_removed() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("compact-oversized-prompt");
+        let cfg = test_cfg();
+        for tui in [false, true] {
+            let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut agent = agent_with_bodies(&dir, &cfg, &[], prompts.clone());
+            agent.session.push(Message::assistant("earlier answer"));
+            let before = agent.session.transcript.clone();
+            agent.session.push(Message::user("x".repeat(4 * 40_000)));
+            let err = if tui {
+                let shared = TurnShared::default();
+                let (tx, _rx) = std::sync::mpsc::channel();
+                agent.worker_turn(&tx, &shared).unwrap_err()
+            } else {
+                agent.run_turn().unwrap_err()
+            };
+            assert!(
+                err.contains("user message is too large for --ctx 40000"),
+                "{err}"
+            );
+            assert_eq!(agent.session.transcript, before, "the prompt is taken back");
+            assert!(prompts.lock().unwrap().is_empty(), "nothing was generated");
+        }
     }
 
     #[test]
