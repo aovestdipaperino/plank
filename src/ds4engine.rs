@@ -2051,13 +2051,8 @@ impl Engine for Ds4Session {
         // SAFETY: session valid.
         let ctx = unsafe { ffi::ds4_session_ctx(session) };
         let pos = unsafe { ffi::ds4_session_pos(session) };
-        let room = ctx - pos;
-        let mut max_tokens = if opts.n_predict < 0 {
-            room - 1
-        } else {
-            opts.n_predict.min(room - 1)
-        };
-        max_tokens = max_tokens.max(0);
+        let (max_tokens, bound) =
+            crate::engine::pass_budget(opts.n_predict, ctx - pos, opts.ctx_reserve);
 
         // SAFETY: engine valid.
         let eos = unsafe { ffi::ds4_token_eos(self.model.engine) };
@@ -2317,6 +2312,7 @@ impl Engine for Ds4Session {
             steady_tps: steady_rate(steady_mark, generated),
             ctx_used,
             interrupted,
+            limit: crate::engine::pass_limit(generated, max_tokens, bound, interrupted),
             usage: None,
             spec,
         })
@@ -2911,6 +2907,8 @@ struct GenState {
     eos: i32,
     generated: i32,
     max_tokens: i32,
+    /// Which bound set `max_tokens`, for [`GenerationStats::limit`].
+    bound: crate::engine::GenLimit,
     reply_tokens: Vec<i32>,
     reply_text: String,
     /// Cross-token UTF-8 carry — see [`Ds4Model::token_bytes`].
@@ -3013,13 +3011,8 @@ impl Ds4HostSession {
         // SAFETY: session valid.
         let ctx = unsafe { ffi::ds4_session_ctx(session) };
         let pos = unsafe { ffi::ds4_session_pos(session) };
-        let room = ctx - pos;
-        let mut max_tokens = if opts.n_predict < 0 {
-            room - 1
-        } else {
-            opts.n_predict.min(room - 1)
-        };
-        max_tokens = max_tokens.max(0);
+        let (max_tokens, bound) =
+            crate::engine::pass_budget(opts.n_predict, ctx - pos, opts.ctx_reserve);
         // SAFETY: engine valid.
         let eos = unsafe { ffi::ds4_token_eos(self.inner.model.engine) };
         Ok(Ok(GenState {
@@ -3032,6 +3025,7 @@ impl Ds4HostSession {
             eos,
             generated: 0,
             max_tokens,
+            bound,
             reply_tokens: Vec::new(),
             reply_text: String::new(),
             utf8: crate::engine::Utf8Stream::default(),
@@ -3066,6 +3060,7 @@ impl Ds4HostSession {
             steady_tps: steady_rate(st.steady_mark, st.generated),
             ctx_used,
             interrupted,
+            limit: crate::engine::pass_limit(st.generated, st.max_tokens, st.bound, interrupted),
             usage: None,
             // The host-session path does not drive the speculative entry point.
             spec: crate::engine::SpecStats::default(),

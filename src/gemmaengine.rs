@@ -553,9 +553,12 @@ impl Engine for GemmaEngine {
         let mut generated: i32 = 0;
         let start = std::time::Instant::now();
         let mut steady_mark: Option<(std::time::Instant, i32)> = None;
-        while (opts.n_predict < 0 || generated < opts.n_predict)
-            && self.session.tokens().len() < self.session.ctx()
-        {
+        let (max_tokens, bound) = crate::engine::pass_budget(
+            opts.n_predict,
+            count(self.session.ctx()) - count(self.session.tokens().len()),
+            opts.ctx_reserve,
+        );
+        while generated < max_tokens {
             if steady_mark.is_none()
                 && start.elapsed().as_secs_f64() >= crate::engine::STEADY_WARMUP_SECS
             {
@@ -596,6 +599,7 @@ impl Engine for GemmaEngine {
             steady_tps: crate::engine::rate_since(steady_mark, generated),
             ctx_used: count(self.session.tokens().len()),
             interrupted,
+            limit: crate::engine::pass_limit(generated, max_tokens, bound, interrupted),
             usage: None,
             spec: crate::engine::SpecStats::default(),
         })

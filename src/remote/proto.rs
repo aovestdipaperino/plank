@@ -196,6 +196,10 @@ pub struct WireOptions {
     /// a serde field silently turns a peer's value into the default.
     #[serde(default = "dspark_default", rename = "dspark")]
     pub mtp: bool,
+    /// Defaulted to `0`, the behavior from before the field existed:
+    /// generate to the window's last token.
+    #[serde(default)]
+    pub ctx_reserve: i32,
 }
 
 /// `serde` default for [`WireOptions::dspark`]: the pre-`/dspark` behavior.
@@ -215,6 +219,7 @@ impl From<&GenerationOptions> for WireOptions {
             think_mode: o.think_mode.into(),
             think_tool_recovery: o.think_tool_recovery,
             mtp: o.mtp,
+            ctx_reserve: o.ctx_reserve,
         }
     }
 }
@@ -231,6 +236,7 @@ impl From<&WireOptions> for GenerationOptions {
             think_mode: o.think_mode.into(),
             think_tool_recovery: o.think_tool_recovery,
             mtp: o.mtp,
+            ctx_reserve: o.ctx_reserve,
         }
     }
 }
@@ -298,6 +304,8 @@ impl From<WireStats> for GenerationStats {
             steady_tps: 0.0,
             ctx_used: s.ctx_used,
             interrupted: s.interrupted,
+            // The wire does not say why the host's pass ended.
+            limit: None,
             usage: None,
             // The wire carries no speculative counters; see
             // `WireEvent::from_engine_event`.

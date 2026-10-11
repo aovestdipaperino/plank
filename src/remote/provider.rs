@@ -1836,6 +1836,9 @@ impl Engine for ProviderEngine {
             tps,
             ctx_used: prompt_total.saturating_add(usage.output_tokens),
             interrupted: false,
+            // A provider's overrun surfaces as a context-overflow error
+            // instead (`compact_after_overflow`).
+            limit: None,
             // A provider decodes on someone else's machine; speculation there
             // is not ours to report.
             spec: crate::engine::SpecStats::default(),

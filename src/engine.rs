@@ -374,6 +374,11 @@ pub struct GenerationOptions {
     /// otherwise wasted: the caller enables it when in-think tool calls are
     /// prohibited, and leaves it off when they are dispatched as-is.
     pub think_tool_recovery: bool,
+    /// Tokens to leave free at the end of the window: the pass stops this far
+    /// short of it and reports [`GenLimit::Context`], so the caller still has
+    /// room to compact. Zero (the default) generates to the window's last
+    /// token, as before.
+    pub ctx_reserve: i32,
 }
 
 impl Default for GenerationOptions {
@@ -388,8 +393,49 @@ impl Default for GenerationOptions {
             think_mode: ThinkMode::Medium,
             mtp: true,
             think_tool_recovery: false,
+            ctx_reserve: 0,
         }
     }
+}
+
+/// The bound that ended a pass which ran out of tokens instead of stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenLimit {
+    /// `n_predict`, the caller's output budget.
+    Predict,
+    /// The context window, less [`GenerationOptions::ctx_reserve`].
+    Context,
+}
+
+/// The token budget for a pass with `room` tokens left in the window, and
+/// which bound sets it.
+///
+/// The window keeps one token spare, as every engine always has, plus
+/// `reserve`. `n_predict` wins a tie: a pass that fills the caller's budget
+/// exactly is the caller's limit, not the window's (the C's
+/// `context_limited = generation_room < max_tokens`).
+#[must_use]
+pub fn pass_budget(n_predict: i32, room: i32, reserve: i32) -> (i32, GenLimit) {
+    let window = (room - 1 - reserve.max(0)).max(0);
+    if (0..=window).contains(&n_predict) {
+        (n_predict, GenLimit::Predict)
+    } else {
+        (window, GenLimit::Context)
+    }
+}
+
+/// The [`GenerationStats::limit`] of a pass that generated `generated` of a
+/// `max` budget set by `bound`: `Some` only when it used the whole budget and
+/// was not interrupted. An EOS is never counted, so a reply that ends exactly
+/// on its last budgeted token still reads as stopped, not limited.
+#[must_use]
+pub fn pass_limit(
+    generated: i32,
+    max: i32,
+    bound: GenLimit,
+    interrupted: bool,
+) -> Option<GenLimit> {
+    (!interrupted && generated >= max).then_some(bound)
 }
 
 /// Progress reported by the engine while prefilling a prompt.
@@ -842,6 +888,10 @@ pub struct GenerationStats {
     pub ctx_used: i32,
     /// True when generation stopped because of an interrupt.
     pub interrupted: bool,
+    /// Which budget ran out, when the pass ended on one rather than on an
+    /// end-of-sequence token or an interrupt. Always `None` from the remote
+    /// engines, which cannot tell.
+    pub limit: Option<GenLimit>,
     /// Billed token usage for this pass, when the engine is an online provider.
     pub usage: Option<TokenUsage>,
     /// Speculative-decoding counters for this pass; zeroed when speculation
@@ -1755,6 +1805,7 @@ impl Engine for EchoEngine {
             tps: 0.0,
             ctx_used: self.count_tokens(transcript),
             interrupted: false,
+            limit: None,
             spec: SpecStats::default(),
             usage: None,
         })
@@ -1848,11 +1899,41 @@ mod spec_stats_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, PrefillProgress,
+        EchoEngine, Engine, EngineError, EngineEvent, GenLimit, GenerationOptions, PrefillProgress,
         THINK_LOW_EFFORT_LEVEL, THINK_LOW_PREFIX, THINK_MAX_PREFIX, ThinkMode, ThinkToolRecovery,
         Utf8Stream, V41_MAX_EFFORT, V41_MEDIUM_EFFORT, deepseek41_effort_text,
-        injects_low_preamble, numeric_thinking_model, reusable_prefix, think_level_unsupported,
+        injects_low_preamble, numeric_thinking_model, pass_budget, pass_limit, reusable_prefix,
+        think_level_unsupported,
     };
+
+    #[test]
+    fn pass_budget_keeps_one_token_spare_plus_the_reserve() {
+        // Unlimited output: the window decides, short by one and the reserve.
+        assert_eq!(pass_budget(-1, 1000, 0), (999, GenLimit::Context));
+        assert_eq!(pass_budget(-1, 1000, 300), (699, GenLimit::Context));
+        // The caller's budget wins while it fits, ties included.
+        assert_eq!(pass_budget(500, 1000, 300), (500, GenLimit::Predict));
+        assert_eq!(pass_budget(699, 1000, 300), (699, GenLimit::Predict));
+        assert_eq!(pass_budget(700, 1000, 300), (699, GenLimit::Context));
+        // A window already inside the reserve leaves nothing, never less.
+        assert_eq!(pass_budget(-1, 100, 300), (0, GenLimit::Context));
+        assert_eq!(pass_budget(0, 1000, 0), (0, GenLimit::Predict));
+    }
+
+    #[test]
+    fn pass_limit_is_only_a_used_up_budget() {
+        assert_eq!(
+            pass_limit(699, 699, GenLimit::Context, false),
+            Some(GenLimit::Context)
+        );
+        assert_eq!(
+            pass_limit(500, 500, GenLimit::Predict, false),
+            Some(GenLimit::Predict)
+        );
+        // An EOS before the last token, or an interrupt, is no limit.
+        assert_eq!(pass_limit(698, 699, GenLimit::Context, false), None);
+        assert_eq!(pass_limit(699, 699, GenLimit::Context, true), None);
+    }
 
     #[test]
     fn an_engine_without_the_capability_reports_it_and_errors() {
