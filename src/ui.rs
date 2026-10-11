@@ -8179,6 +8179,9 @@ impl Agent<'_> {
             "/loopguard" | "/lg" => println!("{}", loopguard_command(arg)),
             "/mc" => println!("{}", microcompact_command(arg)),
             "/hints" => println!("{}", hints_command(arg)),
+            "/useless-buddy" => println!(
+                "/useless-buddy: the buddy stands on the TUI's prompt rule; this front end has none"
+            ),
             "/jobs" => println!("{}", self.jobs_command()),
             "/think" => {
                 // A level change that moves the effort preamble re-warms the KV
@@ -18482,6 +18485,7 @@ impl Agent<'_> {
             "/loopguard" | "/lg" => log.push_plain(loopguard_command(arg)),
             "/mc" => log.push_plain(microcompact_command(arg)),
             "/hints" => log.push_plain(hints_command(arg)),
+            "/useless-buddy" => log.push_plain(crate::buddy::command(arg)),
             // A report, not conversation: the same dismissable panel as
             // `/usage`, refreshed every tick while open (`refresh_jobs_report`).
             "/jobs" => {

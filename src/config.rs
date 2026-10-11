@@ -1232,6 +1232,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "brief programming hints from the model; off in every new session",
     },
     SlashCommand {
+        name: "/useless-buddy",
+        args: "[on|off]",
+        desc: "a picture standing on the prompt rule (kitty or Ghostty; ~/.plank/buddy.png)",
+    },
+    SlashCommand {
         name: "/loopguard",
         args: "[on|off]",
         desc: "arm or silence the loop guards, even mid-turn",
@@ -1415,6 +1420,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/steer")
         || slash_command_with_args(cmd, "/mc")
         || slash_command_with_args(cmd, "/hints")
+        || slash_command_with_args(cmd, "/useless-buddy")
         || slash_command_with_args(cmd, "/loopguard")
         || slash_command_with_args(cmd, "/lg")
         || slash_command_with_args(cmd, "/export")

@@ -1807,7 +1807,7 @@ fn window_rows(
 }
 
 /// Minimal standard base64 (with padding) for the OSC 52 payload.
-fn base64(data: &[u8]) -> String {
+pub(crate) fn base64(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -5058,6 +5058,8 @@ pub fn draw(
 
     // Input line: hidden entirely (no prompt, no cursor) while the agent is busy.
     if let Some(input) = input {
+        // Over the output pane, standing on the rule above the prompt.
+        crate::buddy::render(frame.buffer_mut(), output);
         render_input(frame, input_row, input);
     } else {
         // No prompt on this frame: forget its rect so a stray click cannot
@@ -5307,6 +5309,7 @@ pub fn draw_btw_split(
 
     // Input line and status bar span the full width, identical to `draw`.
     if let Some(input) = input {
+        crate::buddy::render(frame.buffer_mut(), output);
         render_input(frame, input_row, input);
     } else {
         // No prompt on this frame: forget its rect so a stray click cannot

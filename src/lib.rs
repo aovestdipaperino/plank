@@ -12,6 +12,7 @@ pub mod agentsmd;
 pub mod anim;
 pub mod arcade;
 pub mod branch;
+pub mod buddy;
 pub mod cbuf;
 pub mod checkpoint;
 pub mod claudeplugin;

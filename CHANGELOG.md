@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/useless-buddy`.** Toggles a small picture standing on the rule above
+  the prompt, in kitty and Ghostty (outside tmux) only. It is
+  `~/.plank/buddy.png` when present, else a built-in plank character. The
+  picture is placed with kitty's Unicode placeholders, so it is ordinary
+  cells in the frame and leaves nothing behind when covered or dismissed.
+
 - **`/hints on|off`: brief programming hints.** With hints on, the model now
   and then adds a one- or two-sentence `> **Hint:**` aside on the concept
   behind what it just did, grounded in code it examined. The instruction

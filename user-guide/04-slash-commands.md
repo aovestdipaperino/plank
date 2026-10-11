@@ -92,6 +92,7 @@ See [Extending plank](09-extending.md).
 | `/loopguard [on\|off]`, `/lg` | arm or silence the loop guards. Works mid-turn |
 | `/mc [on\|off]` | turn micro-compaction on or off for this session; bare `/mc` reports the state. Works mid-turn |
 | `/hints [on\|off]` | ask the model for occasional one- or two-sentence `> **Hint:**` asides on the concepts behind its work (a design choice, why something failed, a trade-off, how to check it). Takes effect at the next turn boundary without rewriting cached context; off in every new or resumed session. Works mid-turn |
+| `/useless-buddy [on\|off]` | a small picture standing on the rule above the prompt; it does nothing. Needs a terminal with kitty graphics and Unicode placeholders (kitty or Ghostty, not inside tmux). Shows `~/.plank/buddy.png` when that file is a PNG, else a built-in plank character. Bare, it toggles; this run only. TUI only |
 | `/notify <mode>` | change notification mode for this session |
 | `/version` | the running version |
 | `/help` | full command and flag reference |
