@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/hints on|off`: brief programming hints.** With hints on, the model now
+  and then adds a one- or two-sentence `> **Hint:**` aside on the concept
+  behind what it just did, grounded in code it examined. The instruction
+  joins the conversation once, later changes are one-line notes at a turn
+  boundary, so nothing cached is rewritten; compaction re-sends it, and new
+  and resumed sessions start off (upstream ds4 `6546ae5`).
+
 - **Conversation prefixes (`--prefix-file`, profile `prefix`).** A file of
   scripted `USER:` / `ASSISTANT:` turns is placed between the system prompt
   and the conversation, so the model continues in the manner they

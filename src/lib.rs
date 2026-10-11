@@ -94,6 +94,7 @@ pub mod goal;
 pub mod gpuyield;
 pub mod grid;
 pub mod guard;
+pub mod hints;
 pub mod home;
 pub mod hooks;
 pub mod host;

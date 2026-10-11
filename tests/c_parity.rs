@@ -379,6 +379,22 @@ fn push_dsml_after_edit(src: &str, expected: &mut String) {
     expected.push_str(&after_edit[rules_at..]);
 }
 
+/// The `/hints` instruction is model-facing text the C defines once.
+#[test]
+fn hints_prompt_matches_c_source() {
+    let Some(src) = c_source() else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    let expected = extract_c_string_constant(&src, "agent_hints_prompt");
+    assert_identical(&expected, plank::hints::PROMPT, "hints prompt vs C");
+    for note in [plank::hints::ON_NOTE, plank::hints::OFF_NOTE] {
+        let first_line = note.lines().next().unwrap();
+        let head = &first_line[..first_line.len().min(40)];
+        assert!(src.contains(head), "note not in the C source: {note:?}");
+    }
+}
+
 #[test]
 fn dsml_reminder_matches_c_source() {
     let Some(src) = c_source() else {

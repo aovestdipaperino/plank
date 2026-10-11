@@ -2590,6 +2590,8 @@ struct Agent<'a> {
     /// re-opens the assistant message with it, and the turn loop joins the
     /// two halves into one message.
     open_reply: Option<OpenReply>,
+    /// What this context has been told about `/hints` ([`crate::hints`]).
+    hints: crate::hints::HintsState,
     /// Context content collected at session start (git, AGENTS.md, date).
     context_content: ContextContent,
     /// Skills loaded from ~/.plank/skills overlaid by ./.plank/skills.
@@ -5804,6 +5806,7 @@ impl Agent<'_> {
             if round > 1 && self.maybe_compact()?.aborted() {
                 return Ok(());
             }
+            self.append_hints_note();
             let mut prompt_text = render_transcript(&self.session, &self.system);
             if let Some(open) = &self.open_reply {
                 // Re-opened, not closed: the pass continues this message.
@@ -7013,6 +7016,8 @@ impl Agent<'_> {
         // before (summary + tail vs. the original span), which the depth
         // check in `current_suggestion` cannot see.
         self.clear_suggestion();
+        // The instruction may have been summarized away.
+        self.hints.compacted();
         Ok(())
     }
 
@@ -7090,6 +7095,20 @@ impl Agent<'_> {
         if let Some(ctx) = out.context {
             self.session
                 .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+        }
+    }
+
+    /// Appends the `/hints` note due at this turn boundary, if any: the full
+    /// instruction once per context, then one-line changes of mind
+    /// ([`crate::hints::HintsState::note`]). A pass resuming a cut-off reply
+    /// is not a boundary and gets none, as in the C.
+    fn append_hints_note(&mut self) {
+        if self.open_reply.is_some() {
+            return;
+        }
+        if let Some(note) = self.hints.note(crate::hints::wanted()) {
+            self.trace.line("hints note appended");
+            self.session.push(Message::user(note));
         }
     }
 
@@ -7705,6 +7724,9 @@ impl Agent<'_> {
         self.clear_suggestion();
         self.session = Session::new();
         self.adopt_prefix();
+        // New sessions start with hints off, as in the C.
+        crate::hints::set_wanted(false);
+        self.hints = crate::hints::HintsState::default();
         self.extract_state.reset_to(0);
         // A new session, a new name — minted here for the same reason
         // `new_agent` mints one at launch (see `SessionStore::mint_id`).
@@ -8094,6 +8116,7 @@ impl Agent<'_> {
             }
             "/loopguard" | "/lg" => println!("{}", loopguard_command(arg)),
             "/mc" => println!("{}", microcompact_command(arg)),
+            "/hints" => println!("{}", hints_command(arg)),
             "/jobs" => println!("{}", self.jobs_command()),
             "/think" => {
                 // A level change that moves the effort preamble re-warms the KV
@@ -8605,6 +8628,9 @@ impl Agent<'_> {
         self.discard_ladder();
         self.session = session;
         self.adopt_prefix();
+        // Off, and stated so: the loaded transcript may hold an old on note.
+        crate::hints::set_wanted(false);
+        self.hints = crate::hints::HintsState::resumed();
         // A restored transcript is history, not new material for the pass.
         self.extract_state.reset_to(self.session.transcript.len());
         crate::debugmirror::set_session_id(&self.session.id);
@@ -9519,6 +9545,9 @@ the original is frozen and listed in /tree"
         self.discard_ladder();
         self.session = s;
         self.adopt_prefix();
+        // Off, and stated so: the loaded transcript may hold an old on note.
+        crate::hints::set_wanted(false);
+        self.hints = crate::hints::HintsState::resumed();
         // A guess about the conversation we just left. The depth check would
         // miss it whenever the adopted transcript happens to be the same
         // length, and the ghost would then be one Enter from being sent into
@@ -16094,6 +16123,7 @@ impl Agent<'_> {
                 shared.interrupt.store(false, Ordering::Relaxed);
                 return Ok(());
             }
+            self.append_hints_note();
             let base_prompt = render_transcript(&self.session, &self.system);
             // Text already streamed for this pass and preserved across in-pass
             // `/btw` suspensions (BTW-SUSPEND-DESIGN §4.3). Empty unless the
@@ -18393,6 +18423,7 @@ impl Agent<'_> {
             }
             "/loopguard" | "/lg" => log.push_plain(loopguard_command(arg)),
             "/mc" => log.push_plain(microcompact_command(arg)),
+            "/hints" => log.push_plain(hints_command(arg)),
             // A report, not conversation: the same dismissable panel as
             // `/usage`, refreshed every tick while open (`refresh_jobs_report`).
             "/jobs" => {
@@ -19838,6 +19869,24 @@ fn parse_steer_scale(word: &str) -> Result<f32, String> {
     }
 }
 
+/// `/hints [on|off]`: shows or records the run's programming-hints wish
+/// ([`crate::hints`]), which reaches the model at the next turn boundary.
+fn hints_command(arg: &str) -> String {
+    let arg = arg.trim();
+    let on = crate::hints::wanted();
+    if arg.is_empty() {
+        return format!("programming hints: {}", if on { "on" } else { "off" });
+    }
+    let Some(want) = crate::hints::parse(arg) else {
+        return format!("/hints: expected on|off, got `{arg}`");
+    };
+    if want == on {
+        return format!("programming hints already {arg}");
+    }
+    crate::hints::set_wanted(want);
+    format!("programming hints {arg}, from the next turn")
+}
+
 fn microcompact_command(arg: &str) -> String {
     let (want, reply) = microcompact_reply(arg, crate::settings::active().context.microcompact);
     if let Some(want) = want {
@@ -21099,6 +21148,17 @@ fn busy_ui_loop(
                             view.follow = true;
                             sub.follow_all();
                         } else if let Some(arg) = line
+                            .strip_prefix("/hints")
+                            .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+                        {
+                            // Mid-turn too, as in the C: the wish is recorded
+                            // now and reaches the model at the next boundary.
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            log.push_plain(hints_command(arg));
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if let Some(arg) = line
                             .strip_prefix("/loopguard")
                             .or_else(|| line.strip_prefix("/lg"))
                             .filter(|rest| rest.is_empty() || rest.starts_with(' '))
@@ -21747,6 +21807,7 @@ fn new_agent(
         store,
         pending_aside: None,
         open_reply: None,
+        hints: crate::hints::HintsState::default(),
         tool_ctx,
         system,
         reminder: SystemPromptReminder::new(),
@@ -25239,6 +25300,7 @@ mod tests {
             store: SessionStore::open(dir).unwrap(),
             pending_aside: None,
             open_reply: None,
+            hints: crate::hints::HintsState::default(),
             // The scratch dir, not the process cwd: a test agent whose tools
             // write relative paths would otherwise drop them in the repo root
             // — `a_turn_that_keeps_writing_is_never_stopped_for_lack_of_progress`
@@ -28190,6 +28252,62 @@ mod tests {
         agent.reset_session_state();
         // Tests never install a prefix, so the run's is empty.
         assert_eq!(agent.session.prefix, crate::prefix::active());
+    }
+
+    /// `/hints` reaches the model only at turn boundaries: the full
+    /// instruction once, then a one-line note when the user changes their
+    /// mind, and nothing on a turn where nothing changed.
+    #[test]
+    fn hints_join_the_conversation_at_turn_boundaries() {
+        let dir = scratch_dir("hints-boundaries");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["one".into(), "two".into(), "three".into()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let count = |agent: &Agent<'_>, note: &str| {
+            agent
+                .session
+                .transcript
+                .iter()
+                .filter(|m| m.text == note)
+                .count()
+        };
+
+        assert_eq!(hints_command(""), "programming hints: off");
+        assert_eq!(
+            hints_command("on"),
+            "programming hints on, from the next turn"
+        );
+        assert_eq!(hints_command("on"), "programming hints already on");
+        assert!(hints_command("maybe").contains("expected on|off"));
+        agent.session.push(Message::user("first"));
+        agent.run_turn().unwrap();
+        assert_eq!(count(&agent, crate::hints::PROMPT), 1);
+        let at = agent
+            .session
+            .transcript
+            .iter()
+            .position(|m| m.text == crate::hints::PROMPT)
+            .unwrap();
+        assert_eq!(agent.session.transcript[at - 1].text, "first");
+        assert_eq!(agent.session.transcript[at + 1].text, "one");
+
+        agent.session.push(Message::user("second"));
+        agent.run_turn().unwrap();
+        assert_eq!(count(&agent, crate::hints::PROMPT), 1, "instructed once");
+
+        hints_command("off");
+        agent.session.push(Message::user("third"));
+        agent.run_turn().unwrap();
+        assert_eq!(count(&agent, crate::hints::OFF_NOTE), 1);
+
+        // A new session starts off and says nothing about it.
+        hints_command("on");
+        agent.reset_session_state();
+        assert!(!crate::hints::wanted());
+        crate::hints::set_wanted(false);
     }
 
     #[test]
@@ -32073,6 +32191,7 @@ mod tests {
             store,
             pending_aside: None,
             open_reply: None,
+            hints: crate::hints::HintsState::default(),
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: "system prompt".to_string(),
@@ -32211,6 +32330,7 @@ mod tests {
             store,
             pending_aside: None,
             open_reply: None,
+            hints: crate::hints::HintsState::default(),
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: String::new(),
@@ -33638,6 +33758,7 @@ mod tests {
             store,
             pending_aside: None,
             open_reply: None,
+            hints: crate::hints::HintsState::default(),
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -33937,6 +34058,7 @@ mod tests {
             store,
             pending_aside: None,
             open_reply: None,
+            hints: crate::hints::HintsState::default(),
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -34057,6 +34179,7 @@ mod tests {
             store: SessionStore::open(&dir).unwrap(),
             pending_aside: None,
             open_reply: None,
+            hints: crate::hints::HintsState::default(),
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -34166,6 +34289,7 @@ mod tests {
             store,
             pending_aside: None,
             open_reply: None,
+            hints: crate::hints::HintsState::default(),
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -34296,6 +34420,7 @@ mod tests {
             store: SessionStore::open(&dir).unwrap(),
             pending_aside: None,
             open_reply: None,
+            hints: crate::hints::HintsState::default(),
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -37015,6 +37140,7 @@ or the user's next message aborts before its first token"
             store,
             pending_aside: None,
             open_reply: None,
+            hints: crate::hints::HintsState::default(),
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -38676,6 +38802,7 @@ or the user's next message aborts before its first token"
             store: SessionStore::open(&dir).unwrap(),
             pending_aside: None,
             open_reply: None,
+            hints: crate::hints::HintsState::default(),
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
