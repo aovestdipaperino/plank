@@ -823,6 +823,11 @@ impl Ds4Model {
     /// role is `"user"` for image-carrying observations (GLM grounds image
     /// tokens in user turns, matching the C agent).
     ///
+    /// `None` when the C refuses the message (an invalid embedding, a model
+    /// without vision): the failure is logged and the caller tokenizes the
+    /// section as plain text instead, so the observation still reaches the
+    /// model without its image (upstream `e1711c2`).
+    ///
     /// # Panics
     /// Panics if `text_parts.len() != images.len() + 1`.
     fn multimodal_message_tokens(
@@ -830,7 +835,7 @@ impl Ds4Model {
         role: &str,
         text_parts: &[&str],
         images: &[crate::engine::VisionEmbedding],
-    ) -> (Vec<i32>, Vec<ffi::Ds4VisionSpan>) {
+    ) -> Option<(Vec<i32>, Vec<ffi::Ds4VisionSpan>)> {
         assert_eq!(
             text_parts.len(),
             images.len() + 1,
@@ -874,7 +879,7 @@ impl Ds4Model {
         // of: on success it is moved into the matching span (and the source
         // zeroed), on failure it stays with `ffi_embeddings`. Either way the
         // sweep below frees exactly what no span owns.
-        let ok = unsafe {
+        unsafe {
             ffi::ds4_chat_begin(self.engine, tokens.as_mut_ptr());
             let base = usize::try_from(tokens.len()).unwrap_or(0);
             let rc = ffi::ds4_chat_append_multimodal_message(
@@ -906,24 +911,17 @@ impl Ds4Model {
                         .token_start
                         .saturating_sub(u32::try_from(base).unwrap_or(0));
                 }
-                return (delta, spans);
+                return Some((delta, spans));
             }
-            crate::errlog::log_error(
-                "vision",
-                &format!(
-                    "multimodal append failed, image dropped: {}",
-                    cstr_message(&err, "no detail")
-                ),
-            );
-            false
         };
-        if !ok {
-            // The delta is empty, so this message contributes no tokens at all
-            // — the reason the failure above is logged rather than swallowed.
-            return (Vec::new(), Vec::new());
-        }
-        // Unreachable: the closure above returns on both paths.
-        (Vec::new(), Vec::new())
+        crate::errlog::log_error(
+            "vision",
+            &format!(
+                "multimodal append failed, image dropped: {}",
+                cstr_message(&err, "no detail")
+            ),
+        );
+        None
     }
 
     /// The tokens for a system message, split at `trusted_len` — the delta
@@ -1563,11 +1561,20 @@ impl Ds4Session {
                 // image-token grounding), and the vision spans are recorded for
                 // `ds4_session_sync_multimodal` below.
                 let parts: Vec<&str> = images.0.iter().map(String::as_str).collect();
-                let (delta, spans) = self
+                match self
                     .model
-                    .multimodal_message_tokens("user", &parts, &images.1);
-                vision = spans;
-                delta
+                    .multimodal_message_tokens("user", &parts, &images.1)
+                {
+                    Some((delta, spans)) => {
+                        vision = spans;
+                        delta
+                    }
+                    // An empty delta would drop the whole tool result from
+                    // the model's view while the transcript still holds it;
+                    // the text alone keeps the observation and the tokens in
+                    // step with the transcript.
+                    None => self.model.message_tokens(role, text),
+                }
             } else {
                 self.model.message_tokens(role, text)
             };
