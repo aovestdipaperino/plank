@@ -89,6 +89,21 @@ pub struct Ds4Model {
     /// `--dir-steering-from user`: the FFN edit is held at zero while the
     /// prompt tiers prefill and armed at the start of `generate`.
     steer_from_user: bool,
+    /// Whether an assistant turn ends with the EOS token in the C's token
+    /// transcript ([`ends_assistant_with_eos`]).
+    eos_after_assistant: bool,
+}
+
+/// Whether `family`'s assistant turns end with EOS in the C's token
+/// transcript: the two DSML families, whose `ds4_chat_append_message` leaves
+/// the turn open (the C pushes the EOS itself, after a sampled reply and after
+/// each `--prefix-file` assistant turn), and not Qwen, whose template closes
+/// its own turns.
+fn ends_assistant_with_eos(family: crate::gguf::ModelFamily) -> bool {
+    matches!(
+        family,
+        crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41
+    )
 }
 
 /// Bitwise identity of two steering scales.
@@ -420,6 +435,7 @@ impl Ds4Model {
     ///
     /// # Errors
     /// Returns [`EngineError`] if the model fails to load.
+    #[allow(clippy::too_many_lines)] // one linear open sequence; each step is commented
     pub fn open(
         model_path: impl AsRef<Path>,
         backend: ffi::Ds4Backend,
@@ -553,6 +569,7 @@ impl Ds4Model {
             ),
             steering_ffn0: tuning.dir_steering_ffn,
             steer_from_user: tuning.dir_steering_from_user,
+            eos_after_assistant: ends_assistant_with_eos(family),
         })
     }
 
@@ -1582,7 +1599,16 @@ impl Ds4Session {
                     None => self.model.message_tokens(role, text),
                 }
             } else {
-                self.model.message_tokens(role, text)
+                let mut toks = self.model.message_tokens(role, text);
+                // An assistant message rebuilt from text (a compaction tail,
+                // a session reloaded without its tokens, a prefix turn) ends
+                // as a sampled reply does, with EOS; without it the next
+                // `<｜User｜>` reads as more of the same assistant turn.
+                if span_role == SpanRole::Assistant && self.model.eos_after_assistant {
+                    // SAFETY: engine valid.
+                    toks.push(unsafe { ffi::ds4_token_eos(self.model.engine) });
+                }
+                toks
             };
             let mut shift = 0_u32;
             if self.transcript.is_empty() {

@@ -330,10 +330,13 @@ impl Message {
 
     /// True for the session-start context blocks plank injects itself (agent
     /// instructions, persistent memory, the sub-agent roster, git status, the
-    /// date). They are user turns as far as the model is concerned, but nobody
-    /// typed them, so replaying a session must not show them back.
+    /// date), and the `/hints` notes (`crate::hints::is_note`). They are user
+    /// turns as far as the model is concerned, but nobody typed them, so
+    /// replaying a session must not show them back, and no listing or title
+    /// may take one for the user's prompt.
     pub(crate) fn is_session_context(&self) -> bool {
-        self.role == Role::User && crate::context::is_session_context(&self.text)
+        self.role == Role::User
+            && (crate::context::is_session_context(&self.text) || crate::hints::is_note(&self.text))
     }
 
     /// Strips a `<tool_result>` wrapper, returning the inner payload.
@@ -2771,7 +2774,7 @@ fn last_prompt_of(transcript: &[Message]) -> String {
     let text = transcript
         .iter()
         .rev()
-        .find(|m| m.role == Role::User && !m.is_tool_user())
+        .find(|m| m.role == Role::User && !m.is_tool_user() && !m.is_session_context())
         .map(|m| m.text.as_str())
         .unwrap_or_default();
     let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");

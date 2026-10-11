@@ -17901,7 +17901,9 @@ impl Agent<'_> {
             .transcript
             .iter()
             .rev()
-            .find(|m| m.role == crate::session::Role::User && !m.is_tool_user())
+            .find(|m| {
+                m.role == crate::session::Role::User && !m.is_tool_user() && !m.is_session_context()
+            })
             .map_or("", |m| m.text.as_str())
     }
 
@@ -28434,6 +28436,8 @@ mod tests {
         agent.session.push(Message::user("third"));
         agent.run_turn().unwrap();
         assert_eq!(count(&agent, crate::hints::OFF_NOTE), 1);
+        // Plank's own words never pass for the user's prompt.
+        assert_eq!(agent.last_user_prompt(), "third");
 
         // A new session starts off and says nothing about it.
         hints_command("on");

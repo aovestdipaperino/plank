@@ -65,6 +65,17 @@ pub fn wanted() -> bool {
     WANTED.with(std::cell::Cell::get)
 }
 
+/// True when `text` is one of the notes [`HintsState::note`] appends: plank's
+/// own words to the model, not something the user typed, so listings,
+/// titles and replays skip it like the other injected context.
+#[must_use]
+pub fn is_note(text: &str) -> bool {
+    let text = text.trim();
+    [PROMPT, ON_NOTE, OFF_NOTE]
+        .iter()
+        .any(|note| text == note.trim())
+}
+
 /// Parses a `/hints` argument: exactly `on` or `off`.
 #[must_use]
 pub fn parse(arg: &str) -> Option<bool> {
