@@ -1005,6 +1005,38 @@ const CUT_TOOL_CALL_NOTICE: &str = "The last tool call was interrupted by contex
 Continue the user's task, respecting its constraints. If a tool is needed, \
 retry with smaller arguments or smaller edits.\n";
 
+/// The part of a reply the window cut off, carried across the compaction
+/// that makes room for the rest ([`Agent::open_reply`]).
+#[derive(Debug, Clone)]
+struct OpenReply {
+    /// What the reply said so far, as the turn would have stored it.
+    text: String,
+    /// Whether it stopped inside `<think>`, so the resumed pass renders the
+    /// continuation as reasoning until the model closes it.
+    in_think: bool,
+}
+
+/// Times one turn continues a reply the window cut off before it keeps what
+/// was written and ends instead, so a reply that never finishes cannot
+/// compact forever.
+const MAX_REPLY_RESUMES: usize = 4;
+
+/// Whether a pass the window cut off should be continued after compaction:
+/// the setting is on, nothing in it called for a tool or failed, and the user
+/// did not stop it. A tool call cut part way is [`tool_call_cut_by_window`]'s.
+fn reply_resumes_after_compaction(
+    stats: &crate::engine::GenerationStats,
+    calls: usize,
+    failed: bool,
+    interrupted: bool,
+) -> bool {
+    crate::settings::active().context.resume_across_compaction
+        && stats.limit == Some(crate::engine::GenLimit::Context)
+        && calls == 0
+        && !failed
+        && !interrupted
+}
+
 /// Times one turn drops a tool call cut off by the window before it gives up
 /// and reports the partial stanza as an ordinary parse error: a model that
 /// keeps writing the same oversized call must not compact forever.
@@ -2542,6 +2574,11 @@ struct Agent<'a> {
     /// other path, which is what keeps the ordinary single-stream turn — and
     /// every engine that cannot fork — completely unchanged.
     pending_aside: Option<String>,
+    /// A reply the window cut off, held aside while compaction makes room
+    /// for the rest of it (`context.resumeAcrossCompaction`). The next pass
+    /// re-opens the assistant message with it, and the turn loop joins the
+    /// two halves into one message.
+    open_reply: Option<OpenReply>,
     /// Context content collected at session start (git, AGENTS.md, date).
     context_content: ContextContent,
     /// Skills loaded from ~/.plank/skills overlaid by ./.plank/skills.
@@ -3843,7 +3880,7 @@ impl Agent<'_> {
         // renders gray until `</think>`. Provider engines are excluded: their
         // translator emits explicit `<think>`/`</think>` tags, so pre-opening
         // here would mis-color any output not preceded by a reasoning delta.
-        if pass_opens_in_think(&pass_opts, self.engine.as_ref()) {
+        if self.pass_begins_in_think(&pass_opts) {
             stream.begin_in_think();
             // The mirror gets no direct call into its own renderer, only raw
             // bytes — so under the same guard, tell it the same thing we just
@@ -5734,6 +5771,8 @@ impl Agent<'_> {
         let mut overflow_compacted = false;
         // Tool calls the window cut off this turn; see `MAX_CUT_TOOL_CALLS`.
         let mut cut_calls = 0usize;
+        // Replies continued across compaction; see `MAX_REPLY_RESUMES`.
+        let mut resumes = 0usize;
         let mut round = 0usize;
         loop {
             round += 1;
@@ -5754,7 +5793,12 @@ impl Agent<'_> {
             if round > 1 && self.maybe_compact()?.aborted() {
                 return Ok(());
             }
-            let prompt_text = render_transcript(&self.session, &self.system);
+            let mut prompt_text = render_transcript(&self.session, &self.system);
+            if let Some(open) = &self.open_reply {
+                // Re-opened, not closed: the pass continues this message.
+                prompt_text.push_str("[assistant]\n");
+                prompt_text.push_str(&open.text);
+            }
             let (stream, assistant_text, stats) =
                 match self.stream_generation(&prompt_text, turn_start) {
                     Err(e) if compact_after_overflow(&e, &mut overflow_compacted) => {
@@ -5768,6 +5812,9 @@ impl Agent<'_> {
                 };
 
             let mut assistant_text = assistant_text;
+            if let Some(open) = self.open_reply.take() {
+                assistant_text.insert_str(0, &open.text);
+            }
             // A preflight stop reads as an engine interrupt, but it is a tool
             // error to feed back to the model, not a user abort.
             let preflight_error = stream.preflight_error().map(str::to_owned);
@@ -5807,6 +5854,43 @@ impl Agent<'_> {
                 }
                 self.session.push(Message::user(CUT_TOOL_CALL_NOTICE));
                 continue;
+            }
+            if resumes < MAX_REPLY_RESUMES
+                && reply_resumes_after_compaction(
+                    &stats,
+                    finished.calls.len(),
+                    finished.error.is_some() || preflight_error.is_some(),
+                    real_interrupt,
+                )
+            {
+                resumes += 1;
+                let guard = std::mem::take(&mut self.last_guard);
+                self.note_pass(
+                    None,
+                    &stats,
+                    guard,
+                    "context limit: reply resumes".to_owned(),
+                );
+                println!(
+                    "{}",
+                    self.debug_line(
+                        "the reply ran into the context limit; compacting to continue it"
+                    )
+                );
+                self.open_reply = Some(OpenReply {
+                    text: assistant_text,
+                    in_think: finished.ended_in_think,
+                });
+                let outcome = self.compact("generation reached compaction reserve", "");
+                if matches!(outcome, Ok(Compacted::Done)) {
+                    continue;
+                }
+                // No room was made: keep what was written, as before.
+                if let Some(open) = self.open_reply.take() {
+                    self.session.push(Message::assistant(open.text));
+                    self.payload_dirty = true;
+                }
+                return outcome.map(|_| ());
             }
             // A real interrupt lands regardless of what the parser made of
             // the partial stanza it cut off (often an "incomplete DSML tool
@@ -6859,6 +6943,13 @@ impl Agent<'_> {
             rebuilt.push(summary_msg.clone());
             rebuilt.extend(tail.iter().cloned());
             rebuilt.extend(reinject.iter().chain(&tasks).map(Message::user));
+            // A reply held across this compaction comes back after it, so it
+            // needs the same room.
+            rebuilt.extend(
+                self.open_reply
+                    .iter()
+                    .map(|r| Message::assistant(r.text.clone())),
+            );
             let used = self
                 .engine
                 .count_tokens(&render_messages(&self.system, &rebuilt));
@@ -6987,6 +7078,16 @@ impl Agent<'_> {
             self.session
                 .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
         }
+    }
+
+    /// Whether the next pass's renderer starts inside `<think>`: where a
+    /// resumed reply stopped ([`Self::open_reply`]), else the template's own
+    /// opener ([`pass_opens_in_think`]).
+    fn pass_begins_in_think(&self, opts: &crate::engine::GenerationOptions) -> bool {
+        self.open_reply.as_ref().map_or_else(
+            || pass_opens_in_think(opts, self.engine.as_ref()),
+            |r| r.in_think,
+        )
     }
 
     /// Takes back a prompt that could never fit the window: the user message
@@ -15941,6 +16042,8 @@ impl Agent<'_> {
         let mut overflow_compacted = false;
         // Tool calls the window cut off this turn; see `MAX_CUT_TOOL_CALLS`.
         let mut cut_calls = 0usize;
+        // Replies continued across compaction; see `MAX_REPLY_RESUMES`.
+        let mut resumes = 0usize;
         let mut round = 0usize;
         'pass: loop {
             round += 1;
@@ -15960,7 +16063,10 @@ impl Agent<'_> {
             // Text already streamed for this pass and preserved across in-pass
             // `/btw` suspensions (BTW-SUSPEND-DESIGN §4.3). Empty unless the
             // pass was frozen and resumed at least once.
-            let mut resumed_prefix = String::new();
+            let mut resumed_prefix = self
+                .open_reply
+                .as_ref()
+                .map_or_else(String::new, |r| r.text.clone());
             let suspend_enabled = self.cfg.btw.suspend && self.engine.supports_aside();
             let out = loop {
                 // On resume, re-open the assistant turn with the partial reply
@@ -16029,6 +16135,9 @@ impl Agent<'_> {
                 self.drain_btw(tx, shared);
                 continue;
             }
+            // Its text is in `resumed_prefix` now, spliced in below. Not
+            // before the rollback above, which re-runs the pass from it.
+            self.open_reply = None;
             // Mirror of the plain path (`run_turn`): the partial arguments
             // are dropped, not kept, so nothing of this pass is committed.
             if out.cut_by_window && cut_calls < MAX_CUT_TOOL_CALLS {
@@ -16060,6 +16169,7 @@ impl Agent<'_> {
                 self.session.push(Message::user(CUT_TOOL_CALL_NOTICE));
                 continue 'pass;
             }
+            let failed = out.error.is_some();
             // Splice any suspended-and-resumed prefix back onto the final
             // continuation so the transcript holds the whole reply.
             let mut assistant_text = if resumed_prefix.is_empty() {
@@ -16067,6 +16177,50 @@ impl Agent<'_> {
             } else {
                 format!("{resumed_prefix}{}", out.assistant_text)
             };
+            // Mirror of the plain path (`run_turn`).
+            if resumes < MAX_REPLY_RESUMES
+                && reply_resumes_after_compaction(
+                    &out.stats,
+                    out.calls.len(),
+                    failed,
+                    out.interrupted,
+                )
+            {
+                resumes += 1;
+                let guard = std::mem::take(&mut self.last_guard);
+                self.note_pass(
+                    None,
+                    &out.stats,
+                    guard,
+                    "context limit: reply resumes".to_owned(),
+                );
+                let _ = tx.send(UiEvent::EndLine);
+                self.open_reply = Some(OpenReply {
+                    text: assistant_text,
+                    in_think: out.ended_in_think,
+                });
+                let mut sink = NoteSink(&mut note);
+                sink.note(
+                    "the reply ran into the context limit; compacting to continue it".to_owned(),
+                );
+                let outcome = self.do_compact_notify(
+                    "generation reached compaction reserve",
+                    "",
+                    &mut sink,
+                    &compact_interrupt,
+                );
+                if matches!(outcome, Ok(Compacted::Done)) {
+                    continue 'pass;
+                }
+                if let Some(open) = self.open_reply.take() {
+                    self.session.push(Message::assistant(open.text));
+                    self.payload_dirty = true;
+                }
+                if matches!(outcome, Ok(Compacted::Interrupted)) {
+                    shared.interrupt.store(false, Ordering::Relaxed);
+                }
+                return outcome.map(|_| ());
+            }
             // A real interrupt never continues with a <tool_result>, even
             // when the partial stanza it cut off reads as a parse error.
             let turn_continues = !out.interrupted && (!out.calls.is_empty() || out.error.is_some());
@@ -17423,7 +17577,7 @@ impl Agent<'_> {
         // Local engines open `<think>` implicitly in the prefill; provider
         // engines emit explicit tags, so only pre-open for local ones (see the
         // matching note in the plain-REPL path).
-        if pass_opens_in_think(&pass_opts, self.engine.as_ref()) {
+        if self.pass_begins_in_think(&pass_opts) {
             stream.begin_in_think();
             // See the matching comment in `stream_generation`: the mirror
             // needs the same synthetic tag, under the same guard.
@@ -21556,6 +21710,7 @@ fn new_agent(
         session,
         store,
         pending_aside: None,
+        open_reply: None,
         tool_ctx,
         system,
         reminder: SystemPromptReminder::new(),
@@ -25047,6 +25202,7 @@ mod tests {
             session: Session::new(),
             store: SessionStore::open(dir).unwrap(),
             pending_aside: None,
+            open_reply: None,
             // The scratch dir, not the process cwd: a test agent whose tools
             // write relative paths would otherwise drop them in the repo root
             // — `a_turn_that_keeps_writing_is_never_stopped_for_lack_of_progress`
@@ -27833,6 +27989,121 @@ mod tests {
             assert_eq!(agent.session.transcript, before, "the prompt is taken back");
             assert!(prompts.lock().unwrap().is_empty(), "nothing was generated");
         }
+    }
+
+    /// A turn whose first pass the window cuts off mid-answer: the partial,
+    /// the summary a compaction asks for, then the rest of the answer.
+    fn cut_reply_engine(prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> ScriptedEngine {
+        ScriptedEngine {
+            replies: vec![
+                "The answer begins".to_string(),
+                "<summary>durable state</summary>".to_string(),
+                " and ends.".to_string(),
+            ],
+            window_limit_at: Some(0),
+            prompts,
+            ..ScriptedEngine::default()
+        }
+    }
+
+    fn resume_on() -> crate::settings::TestSettingsGuard {
+        let mut on = crate::settings::Settings::default();
+        on.context.resume_across_compaction = true;
+        crate::settings::install_for_test(on)
+    }
+
+    /// Asserts the cut reply was continued in the same message after a
+    /// compaction, the resumed pass re-opening it rather than starting anew.
+    fn assert_reply_resumed(agent: &Agent<'_>, prompts: &std::sync::Mutex<Vec<String>>) {
+        let t = &agent.session.transcript;
+        assert!(
+            t[0].text
+                .starts_with("<tool_result>Compacted session summary:")
+        );
+        let last = t.last().unwrap();
+        assert_eq!(last.role, crate::session::Role::Assistant);
+        assert_eq!(last.text, "The answer begins and ends.", "{t:?}");
+        assert_eq!(
+            t.iter()
+                .filter(|m| m.role == crate::session::Role::Assistant)
+                .count(),
+            1,
+            "one message, not two: {t:?}"
+        );
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 3);
+        assert!(
+            prompts[2].ends_with("[assistant]\nThe answer begins"),
+            "the resumed pass re-opens the message: {:?}",
+            &prompts[2][prompts[2].len().saturating_sub(80)..]
+        );
+    }
+
+    #[test]
+    fn a_cut_reply_resumes_in_the_same_message_after_compaction() {
+        let _resume = resume_on();
+        let dir = scratch_dir("compact-resume-reply");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(&dir, cut_reply_engine(prompts.clone()), &cfg);
+        agent.session.push(Message::user("explain it"));
+        agent.run_turn().unwrap();
+        assert_reply_resumed(&agent, &prompts);
+        assert!(agent.open_reply.is_none());
+    }
+
+    #[test]
+    fn a_cut_reply_resumes_on_the_tui_path() {
+        let _lock = crate::status::origin_test_guard();
+        let _resume = resume_on();
+        let dir = scratch_dir("compact-resume-reply-tui");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(&dir, cut_reply_engine(prompts.clone()), &cfg);
+        agent.session.push(Message::user("explain it"));
+        let shared = TurnShared::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        assert_reply_resumed(&agent, &prompts);
+        assert!(agent.open_reply.is_none());
+    }
+
+    /// Off by default: a cut reply ends the turn as it always has, with no
+    /// compaction pass behind it.
+    #[test]
+    fn a_cut_reply_ends_the_turn_while_resume_is_off() {
+        let dir = scratch_dir("compact-resume-off");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(&dir, cut_reply_engine(prompts.clone()), &cfg);
+        agent.session.push(Message::user("explain it"));
+        agent.run_turn().unwrap();
+        assert_eq!(
+            agent.session.transcript.last().unwrap().text,
+            "The answer begins"
+        );
+        assert_eq!(prompts.lock().unwrap().len(), 1);
+    }
+
+    /// A reply cut inside `<think>` resumes rendering as reasoning, whatever
+    /// the template would open with.
+    #[test]
+    fn a_resumed_pass_begins_where_the_reply_stopped() {
+        let dir = scratch_dir("compact-resume-think");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(&dir, cut_reply_engine(prompts), &cfg);
+        let opts = agent.pass_opts();
+        let template = pass_opens_in_think(&opts, agent.engine.as_ref());
+        for in_think in [true, false] {
+            agent.open_reply = Some(OpenReply {
+                text: "partial".to_owned(),
+                in_think,
+            });
+            assert_eq!(agent.pass_begins_in_think(&opts), in_think);
+        }
+        agent.open_reply = None;
+        assert_eq!(agent.pass_begins_in_think(&opts), template);
     }
 
     #[test]
@@ -31715,6 +31986,7 @@ mod tests {
             session: Session::new(),
             store,
             pending_aside: None,
+            open_reply: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: "system prompt".to_string(),
@@ -31852,6 +32124,7 @@ mod tests {
             session: Session::new(),
             store,
             pending_aside: None,
+            open_reply: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: String::new(),
@@ -33278,6 +33551,7 @@ mod tests {
             session: Session::new(),
             store,
             pending_aside: None,
+            open_reply: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -33576,6 +33850,7 @@ mod tests {
             session: Session::new(),
             store,
             pending_aside: None,
+            open_reply: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -33663,6 +33938,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // spells out a whole `Agent` literal
     fn interrupted_mid_think_stanza_leaves_block_open() {
         // A user interrupt lands while a DSML stanza is being streamed inside
         // <think>, cutting it off incomplete. The stream reports both
@@ -33694,6 +33970,7 @@ mod tests {
             session: Session::new(),
             store: SessionStore::open(&dir).unwrap(),
             pending_aside: None,
+            open_reply: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -33802,6 +34079,7 @@ mod tests {
             session: Session::new(),
             store,
             pending_aside: None,
+            open_reply: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -33919,6 +34197,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // spells out a whole `Agent` literal
     fn payload_save_resume_strip_flow() {
         let dir = fresh_scratch_dir("kv-test");
         let cfg = crate::config::AgentConfig::default();
@@ -33930,6 +34209,7 @@ mod tests {
             session: Session::new(),
             store: SessionStore::open(&dir).unwrap(),
             pending_aside: None,
+            open_reply: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -36648,6 +36928,7 @@ or the user's next message aborts before its first token"
             session: Session::new(),
             store,
             pending_aside: None,
+            open_reply: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
@@ -38276,6 +38557,7 @@ or the user's next message aborts before its first token"
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // spells out a whole `Agent` literal
     fn turn_loop_executes_tool_calls_and_finishes() {
         let dir = scratch_dir("test");
         let stanza = concat!(
@@ -38307,6 +38589,7 @@ or the user's next message aborts before its first token"
             session: Session::new(),
             store: SessionStore::open(&dir).unwrap(),
             pending_aside: None,
+            open_reply: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),

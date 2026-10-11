@@ -487,6 +487,12 @@ pub struct ContextSettings {
     /// is prefilled once and then occupies context for the rest of the
     /// session. Turning it off restores the C reference behaviour.
     pub short_reminder: bool,
+    /// Whether a reply the context window cuts off is continued in the same
+    /// assistant message after compaction (upstream ds4 `e33a5b2`), instead
+    /// of ending the turn cut short. Off by default until it has been run
+    /// against a real model: the resumed pass re-opens an assistant message
+    /// the engine has to splice onto, which no scripted engine can vouch for.
+    pub resume_across_compaction: bool,
 }
 
 impl Default for ContextSettings {
@@ -494,6 +500,7 @@ impl Default for ContextSettings {
         Self {
             microcompact: true,
             short_reminder: true,
+            resume_across_compaction: false,
         }
     }
 }
@@ -1041,6 +1048,10 @@ impl Settings {
         if let Some(v) = boolean(root.get("context"), "shortReminder") {
             self.context.short_reminder = v;
             self.note("context.shortReminder", origin);
+        }
+        if let Some(v) = boolean(root.get("context"), "resumeAcrossCompaction") {
+            self.context.resume_across_compaction = v;
+            self.note("context.resumeAcrossCompaction", origin);
         }
 
         if let Some(v) = boolean(root.get("memory"), "autoExtract") {
@@ -1591,6 +1602,11 @@ impl Settings {
             section(&mut root, "context"),
             "shortReminder",
             Json::Bool(self.context.short_reminder),
+        );
+        upsert(
+            section(&mut root, "context"),
+            "resumeAcrossCompaction",
+            Json::Bool(self.context.resume_across_compaction),
         );
         {
             let m = section(&mut root, "memory");

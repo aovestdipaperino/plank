@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`context.resumeAcrossCompaction` (experimental, off by default).** A reply
+  the context window cuts off is held aside, the conversation is compacted,
+  and the next pass re-opens the same assistant message with it, starting
+  inside `<think>` if that is where it stopped, so the answer finishes as one
+  message instead of ending cut short (upstream ds4 `e33a5b2`). At most four
+  times a turn; when compaction cannot make room, what was written is kept as
+  before.
+
 - `crates/plank-lib`, the vectors.json and profile file handling shared with
   `pt`: plank's `steervec` now reads the store through it, and `pt install
   <repo>:<path>` uses it to merge vectors files and install profiles.
