@@ -40,6 +40,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an eighth of the window up to 4096 tokens, and a rebuild that would leave no
   room to work is refused with the conversation untouched. Ported from
   upstream ds4 `e33a5b2`.
+- **A tool call the window cuts off is dropped, not reported as malformed.**
+  When a pass runs into the window part way through a tool call, nothing of
+  it runs and its partial arguments no longer stay in the conversation behind
+  an "incomplete DSML tool call" error. plank compacts and tells the model the
+  call did not run, so it can retry in smaller pieces, at most twice a turn
+  (upstream ds4 `e33a5b2`).
 
 - **A tool result whose image the model refused stays in context.** When the
   engine rejected an image observation (an invalid embedding, a model without

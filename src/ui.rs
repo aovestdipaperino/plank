@@ -998,6 +998,35 @@ enum PassStop {
 /// wins — `stopped` is only consulted when no user interrupt is pending —
 /// because the user asking to stop outranks a call that happens to have just
 /// finished streaming.
+/// The user turn appended after a tool call cut off by the window was
+/// dropped and the conversation compacted (verbatim from `ds4_agent.c`,
+/// upstream `e33a5b2`).
+const CUT_TOOL_CALL_NOTICE: &str = "The last tool call was interrupted by context compaction and was NOT executed. \
+Continue the user's task, respecting its constraints. If a tool is needed, \
+retry with smaller arguments or smaller edits.\n";
+
+/// Times one turn drops a tool call cut off by the window before it gives up
+/// and reports the partial stanza as an ordinary parse error: a model that
+/// keeps writing the same oversized call must not compact forever.
+const MAX_CUT_TOOL_CALLS: usize = 2;
+
+/// Whether a pass ran into the window (less the compaction reserve) part way
+/// through a tool call, with no complete call to run. Its partial arguments
+/// are dropped rather than executed or fed back as a parse error, the
+/// conversation is compacted, and the model is told the call never ran
+/// ([`CUT_TOOL_CALL_NOTICE`]).
+fn tool_call_cut_by_window(
+    stats: &crate::engine::GenerationStats,
+    ended_mid_stanza: bool,
+    calls: usize,
+    interrupted: bool,
+) -> bool {
+    stats.limit == Some(crate::engine::GenLimit::Context)
+        && ended_mid_stanza
+        && calls == 0
+        && !interrupted
+}
+
 fn stopped_by_user(interrupted: bool, user_interrupt: bool, stopped_at_tool_call: bool) -> bool {
     interrupted && (user_interrupt || !stopped_at_tool_call)
 }
@@ -5702,6 +5731,8 @@ impl Agent<'_> {
         // Whether this turn already compacted because the server said the
         // prompt overran its window; see `compact_after_overflow`.
         let mut overflow_compacted = false;
+        // Tool calls the window cut off this turn; see `MAX_CUT_TOOL_CALLS`.
+        let mut cut_calls = 0usize;
         let mut round = 0usize;
         loop {
             round += 1;
@@ -5745,6 +5776,37 @@ impl Agent<'_> {
                 crate::interrupt::pending(),
                 stream.tool_stanza_complete(),
             ) && preflight_error.is_none();
+            if cut_calls < MAX_CUT_TOOL_CALLS
+                && tool_call_cut_by_window(
+                    &stats,
+                    stream.ended_mid_stanza(),
+                    finished.calls.len(),
+                    real_interrupt,
+                )
+            {
+                cut_calls += 1;
+                let guard = std::mem::take(&mut self.last_guard);
+                self.note_pass(
+                    None,
+                    &stats,
+                    guard,
+                    "context limit: tool call dropped".to_owned(),
+                );
+                println!(
+                    "{}",
+                    self.debug_line(
+                        "a tool call ran into the context limit; dropped it, compacting"
+                    )
+                );
+                if self
+                    .compact("generation reached compaction reserve", "")?
+                    .aborted()
+                {
+                    return Ok(());
+                }
+                self.session.push(Message::user(CUT_TOOL_CALL_NOTICE));
+                continue;
+            }
             // A real interrupt lands regardless of what the parser made of
             // the partial stanza it cut off (often an "incomplete DSML tool
             // call" parse error): it never continues with a <tool_result>,
@@ -12475,6 +12537,9 @@ type BtwPanel = Option<(OutputLog, tui::OutputView)>;
 type AltEngine = (EngineKey, Box<dyn Engine>);
 
 /// Result of one TUI generation pass.
+// Independent facts about how the pass ended, each read by a different branch
+// of the turn loop, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 struct TurnOutput {
     /// The pass's engine figures, for the repro dump's pass note.
     stats: crate::engine::GenerationStats,
@@ -12488,6 +12553,9 @@ struct TurnOutput {
     ended_in_think: bool,
     calls: Vec<ToolCall>,
     error: Option<PassFailure>,
+    /// The window cut the pass off inside a tool call
+    /// ([`tool_call_cut_by_window`]).
+    cut_by_window: bool,
 }
 
 /// Why a TUI pass ended with a tool error instead of tool calls.
@@ -15838,6 +15906,8 @@ impl Agent<'_> {
         let mut ungrounded = 0usize;
         // See the plain REPL's `overflow_compacted`.
         let mut overflow_compacted = false;
+        // Tool calls the window cut off this turn; see `MAX_CUT_TOOL_CALLS`.
+        let mut cut_calls = 0usize;
         let mut round = 0usize;
         'pass: loop {
             round += 1;
@@ -15925,6 +15995,37 @@ impl Agent<'_> {
                 let _ = tx.send(UiEvent::MainRollback);
                 self.drain_btw(tx, shared);
                 continue;
+            }
+            // Mirror of the plain path (`run_turn`): the partial arguments
+            // are dropped, not kept, so nothing of this pass is committed.
+            if out.cut_by_window && cut_calls < MAX_CUT_TOOL_CALLS {
+                cut_calls += 1;
+                let guard = std::mem::take(&mut self.last_guard);
+                self.note_pass(
+                    None,
+                    &out.stats,
+                    guard,
+                    "context limit: tool call dropped".to_owned(),
+                );
+                let _ = tx.send(UiEvent::EndLine);
+                let mut sink = NoteSink(&mut note);
+                sink.note(
+                    "a tool call ran into the context limit; dropped it, compacting".to_owned(),
+                );
+                if self
+                    .do_compact_notify(
+                        "generation reached compaction reserve",
+                        "",
+                        &mut sink,
+                        &compact_interrupt,
+                    )?
+                    .aborted()
+                {
+                    shared.interrupt.store(false, Ordering::Relaxed);
+                    return Ok(());
+                }
+                self.session.push(Message::user(CUT_TOOL_CALL_NOTICE));
+                continue 'pass;
             }
             // Splice any suspended-and-resumed prefix back onto the final
             // continuation so the transcript holds the whole reply.
@@ -17485,7 +17586,10 @@ impl Agent<'_> {
             && preflight_error.is_none();
         // Consume the interrupt so a queued follow-up turn starts clean.
         shared.interrupt.store(false, Ordering::Relaxed);
+        let cut_by_window =
+            tool_call_cut_by_window(&stats, stream.ended_mid_stanza(), calls.len(), interrupted);
         Ok(TurnOutput {
+            cut_by_window,
             stats,
             interrupted,
             preempted,
@@ -24668,6 +24772,9 @@ mod tests {
         /// When true the engine reports `kv_truncates_exactly`, the Gemma
         /// shape that makes fork snapshots and ladder rungs pointless.
         exact_kv: bool,
+        /// The pass (by index, like `interrupt_at`) that reports running into
+        /// the window, `GenLimit::Context`.
+        window_limit_at: Option<usize>,
     }
 
     impl ScriptedEngine {
@@ -24689,6 +24796,8 @@ mod tests {
                 events.lock().unwrap().push("generate".to_string());
             }
             let interrupted = self.interrupt_at == Some(self.next);
+            let limit = (self.window_limit_at == Some(self.next))
+                .then_some(crate::engine::GenLimit::Context);
             let reply = self.replies.get(self.next).cloned().unwrap_or_default();
             self.next += 1;
             // Stream in small chunks to exercise partial-marker handling.
@@ -24703,6 +24812,7 @@ mod tests {
             }
             GenerationStats {
                 interrupted,
+                limit,
                 ..GenerationStats::default()
             }
         }
@@ -27562,6 +27672,104 @@ mod tests {
         assert_eq!(
             agent.pass_opts().ctx_reserve,
             compact::compact_reserve(40_000)
+        );
+    }
+
+    /// The scripted replies for a turn whose first pass the window cuts off
+    /// inside a `write` call: the partial stanza, the summary the compaction
+    /// asks for, then the model's retry.
+    fn cut_tool_call_engine() -> ScriptedEngine {
+        ScriptedEngine {
+            replies: vec![
+                concat!(
+                    "Writing it.\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n",
+                    "<\u{ff5c}DSML\u{ff5c}invoke name=\"write\">\n",
+                    "<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">CUT-PATH.txt",
+                    "</\u{ff5c}DSML\u{ff5c}parameter>\n",
+                    "<\u{ff5c}DSML\u{ff5c}parameter name=\"content\" string=\"true\">half of ",
+                )
+                .to_string(),
+                "<summary>durable state</summary>".to_string(),
+                "I will write it in smaller pieces.".to_string(),
+            ],
+            window_limit_at: Some(0),
+            ..ScriptedEngine::default()
+        }
+    }
+
+    /// Asserts the turn dropped the cut-off call: no file written, the
+    /// partial arguments nowhere in the transcript, the notice after the
+    /// compaction, and the retry answered.
+    fn assert_cut_tool_call_dropped(agent: &Agent<'_>, dir: &std::path::Path) {
+        assert!(
+            !dir.join("CUT-PATH.txt").exists(),
+            "the partial call never ran"
+        );
+        let t = &agent.session.transcript;
+        assert!(
+            t.iter().all(|m| !m.text.contains("half of")),
+            "the partial arguments are dropped: {t:?}"
+        );
+        assert!(
+            t[0].text
+                .starts_with("<tool_result>Compacted session summary:")
+        );
+        let notice = t
+            .iter()
+            .position(|m| m.text == CUT_TOOL_CALL_NOTICE)
+            .expect("the model is told the call did not run");
+        assert_eq!(
+            t[notice + 1].text,
+            "I will write it in smaller pieces.",
+            "the turn continues after the notice"
+        );
+    }
+
+    #[test]
+    fn a_tool_call_cut_by_the_window_is_dropped_not_run() {
+        let dir = scratch_dir("compact-cut-call");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, cut_tool_call_engine(), &cfg);
+        agent.tool_ctx.cwd.clone_from(&dir);
+        agent.session.push(Message::user("write the file"));
+        agent.run_turn().unwrap();
+        assert_cut_tool_call_dropped(&agent, &dir);
+    }
+
+    #[test]
+    fn a_tool_call_cut_by_the_window_is_dropped_on_the_tui_path() {
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("compact-cut-call-tui");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, cut_tool_call_engine(), &cfg);
+        agent.tool_ctx.cwd.clone_from(&dir);
+        agent.session.push(Message::user("write the file"));
+        let shared = TurnShared::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        assert_cut_tool_call_dropped(&agent, &dir);
+    }
+
+    /// The same partial stanza without the window behind it is an ordinary
+    /// incomplete call, reported back to the model as before.
+    #[test]
+    fn an_incomplete_call_without_the_window_is_still_a_parse_error() {
+        let dir = scratch_dir("compact-cut-call-no-limit");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            window_limit_at: None,
+            ..cut_tool_call_engine()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.tool_ctx.cwd.clone_from(&dir);
+        agent.session.push(Message::user("write the file"));
+        agent.run_turn().unwrap();
+        let t = &agent.session.transcript;
+        assert!(t.iter().all(|m| m.text != CUT_TOOL_CALL_NOTICE));
+        assert!(
+            t.iter()
+                .any(|m| m.text.contains("incomplete DSML tool call")),
+            "{t:?}"
         );
     }
 

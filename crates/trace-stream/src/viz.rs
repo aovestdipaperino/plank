@@ -1003,6 +1003,9 @@ pub struct StreamRenderer<S> {
     pending: Vec<u8>,
     /// Held-back bytes that may begin a DSML opening marker.
     dsml_start_tail: Vec<u8>,
+    /// Set by [`Self::finish`]: the stream ended inside a tool-call stanza,
+    /// or holding back the start of one. See [`Self::ended_mid_stanza`].
+    ended_mid_stanza: bool,
     plain_dsml: MarkerDetector,
     think_dsml: MarkerDetector,
     /// Detects invented pseudo-tool markup (issue #51) in the answer region.
@@ -1130,6 +1133,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             dsml_ignored: false,
             pending: Vec::new(),
             dsml_start_tail: Vec::new(),
+            ended_mid_stanza: false,
             plain_dsml: MarkerDetector::default(),
             think_dsml: MarkerDetector::default(),
             pseudo_tool: PseudoToolDetector::default(),
@@ -1309,6 +1313,15 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// An interrupted tool call is closed with a `[tool call interrupted]`
     /// status line; DSML seen inside thinking is reported as ignored.
     pub fn finish(&mut self) {
+        // Read before the settle below erases it, as the C reads its
+        // `partial_tool` before compacting (`worker_run_turn`). A one-byte
+        // tail is a lone `<`, far likelier prose than a marker.
+        self.ended_mid_stanza = self.dsml_active
+            || self.dsml_start_tail.len() > 1
+            || matches!(
+                self.parser.state(),
+                DsmlState::Structural | DsmlState::ParamValue
+            );
         // A stanza still open at end of generation is settled before the
         // flush below, which would otherwise report it as interrupted. End of
         // generation is also what *completes* a Qwen stanza, so the parser is
@@ -1416,6 +1429,17 @@ impl<S: RenderSink> StreamRenderer<S> {
             DsmlState::ParamValue => self.parser.param_close_prefix(),
             _ => false,
         }
+    }
+
+    /// True when the stream ended inside a tool-call stanza, or holding back
+    /// what looked like the start of one, as of [`Self::finish`].
+    ///
+    /// A pass cut off by the context window in that state produced no call
+    /// that ran, only partial arguments; the caller drops them rather than
+    /// reporting a malformed call (upstream ds4 `e33a5b2`).
+    #[must_use]
+    pub fn ended_mid_stanza(&self) -> bool {
+        self.ended_mid_stanza
     }
 
     /// True once a tool-call stanza has reached its stop token and been
@@ -4134,6 +4158,29 @@ mod tests {
         ));
         assert_eq!(sr.finished().error, Some("incomplete DSML tool call"));
         assert!(sr.finished().calls.is_empty());
+    }
+
+    #[test]
+    fn ended_mid_stanza_marks_only_a_stream_cut_inside_a_call() {
+        let cut = run_chunked(concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\">ls",
+        ));
+        assert!(cut.ended_mid_stanza());
+        // Holding back a DSML-shaped marker counts; a lone `<` does not.
+        assert!(run_chunked("about to call <｜DS").ended_mid_stanza());
+        assert!(!run_chunked("if a <").ended_mid_stanza());
+        assert!(!run_chunked("plain prose").ended_mid_stanza());
+        let done = run_chunked(concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        ));
+        assert!(!done.ended_mid_stanza());
+        assert_eq!(done.finished().calls.len(), 1);
     }
 
     #[test]
