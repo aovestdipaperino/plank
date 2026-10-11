@@ -1980,6 +1980,17 @@ impl RepeatGuard {
         self
     }
 
+    /// Starts the guard as if `bytes` had already been fed: what a reply
+    /// resumed after compaction spent reasoning before the cut, so its budget
+    /// covers the whole reply rather than restarting at each compaction (a
+    /// real 12k run reasoned through four of them without tripping a budget
+    /// no single pass reached).
+    #[must_use]
+    pub fn with_spent(mut self, bytes: usize) -> Self {
+        self.total = bytes;
+        self
+    }
+
     /// Puts this guard under the `tools.loopGuards` switch, so `/loopguard
     /// off` silences it — including mid-pass, since the setting is read at
     /// every check rather than here.
@@ -3499,6 +3510,16 @@ Tool result 3 (read):\nfine\n</tool_result>",
             "but the budget is spent: {} B",
             guard.fed()
         );
+    }
+
+    #[test]
+    fn a_resumed_reply_spends_from_the_budget_it_already_used() {
+        let mut guard = RepeatGuard::with_window(8192)
+            .with_think_budget(4096)
+            .with_spent(4000);
+        assert!(!guard.over_budget());
+        guard.feed(&"x".repeat(200));
+        assert!(guard.over_budget(), "200 more bytes cross what was left");
     }
 
     #[test]

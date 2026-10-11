@@ -100,7 +100,7 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 |---|---|---|
 | `context.microcompact` | `true` | let micro-compaction clear old tool-result bodies in place to reclaim context. `/mc off` is the session equivalent. |
 | `context.shortReminder` | `true` | make the system-prompt reminder plank re-injects every 50K tokens the short form: tool-call syntax, tool names, and a pointer to the original prompt. `false` re-injects the whole tools prompt as the C reference does. |
-| `context.resumeAcrossCompaction` | `false` | when a reply runs into the context window, compact and continue it in the same message instead of ending the turn cut short. Experimental: off until it has been checked against a real model. |
+| `context.resumeAcrossCompaction` | `false` | when a reply runs into the context window, compact and continue it in the same message instead of ending the turn cut short. The summary reads the start of the reply and the model carries on from its last words; the reasoning budget spans the whole reply. Experimental: checked on DeepSeek V4 Flash and Gemma 4 E4B, off by default for now. |
 
 ### `memory`
 

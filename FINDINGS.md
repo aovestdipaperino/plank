@@ -3562,6 +3562,16 @@ With all three, the 16k run joins exactly at the cut ("It is a good" +
 " choice for the nursery…") in one saved message, and Gemma 4 E4B on 10k
 joins twice cleanly, once in the middle of a table cell.
 
+A fourth showed up once the mechanics worked. A reply cut *inside* its
+reasoning resumed four times mid-expression, correctly, but the model was
+enumerating digit sums past any possible value, and resuming let it do so for
+26 minutes. The think budget never tripped: it is checked per pass, and on a
+12k window a pass reasons ~14 KB against a 16 KB floor. `OpenReply::spent`
+now carries the reasoning bytes across resumes and the resumed pass's guard
+starts from them (`RepeatGuard::with_spent`), so the budget covers the reply,
+not the pass. `context.resumeAcrossCompaction` stays off by default until a
+run confirms that on a real model.
+
 ## Assistant messages rebuilt from text had no EOS on DeepSeek
 
 The C ends every assistant turn in its token transcript with EOS: a sampled

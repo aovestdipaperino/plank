@@ -1014,6 +1014,11 @@ struct OpenReply {
     /// Whether it stopped inside `<think>`, so the resumed pass renders the
     /// continuation as reasoning until the model closes it.
     in_think: bool,
+    /// Reasoning bytes the reply has spent across every pass so far, which
+    /// the resumed pass's think budget starts from
+    /// ([`crate::insights::RepeatGuard::with_spent`]); zero once it stopped
+    /// in the answer, where the budget no longer applies.
+    spent: usize,
 }
 
 /// Times one turn continues a reply the window cut off before it keeps what
@@ -3923,7 +3928,7 @@ impl Agent<'_> {
         // Mirrors the C's worker greedy flag: argmax sampling while the
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
-        let mut repeat = turn_repeat_guard(self.engine.ctx_size());
+        let mut repeat = self.pass_repeat_guard();
         // Provider engines take a structured turn; local engines keep the flat
         // rendered transcript (byte parity, §4.4). `bufs`/`st` outlive the call.
         let bufs = self
@@ -5833,7 +5838,11 @@ impl Agent<'_> {
                 };
 
             let mut assistant_text = assistant_text;
+            // What this reply had spent reasoning before this pass, plus this
+            // pass, should it be cut again.
+            let mut spent = assistant_text.len();
             if let Some(open) = self.open_reply.take() {
+                spent += open.spent;
                 assistant_text.insert_str(0, &open.text);
             }
             // A preflight stop reads as an engine interrupt, but it is a tool
@@ -5898,7 +5907,7 @@ impl Agent<'_> {
                         "the reply ran into the context limit; compacting to continue it"
                     )
                 );
-                let split = self.hold_open_reply(assistant_text, finished.ended_in_think);
+                let split = self.hold_open_reply(assistant_text, finished.ended_in_think, spent);
                 let outcome = self.compact("generation reached compaction reserve", "");
                 if matches!(outcome, Ok(Compacted::Done)) {
                     continue;
@@ -7130,7 +7139,7 @@ impl Agent<'_> {
     /// and the whole reply never fit together (seen on a real 16k run). The C
     /// does the same by summarizing into the open assistant message. Returns
     /// whether the reply was split, for [`Self::release_open_reply`].
-    fn hold_open_reply(&mut self, text: String, in_think: bool) -> bool {
+    fn hold_open_reply(&mut self, text: String, in_think: bool, spent: usize) -> bool {
         let budget = compact::tail_budget(self.engine.ctx_size()) / 2;
         let at = compact::resume_split(&text, budget, &mut |s| self.engine.count_tokens(s));
         let mut head = text;
@@ -7142,6 +7151,7 @@ impl Agent<'_> {
         self.open_reply = Some(OpenReply {
             text: fragment,
             in_think,
+            spent: if in_think { spent } else { 0 },
         });
         split
     }
@@ -7162,6 +7172,13 @@ impl Agent<'_> {
             _ => self.session.push(Message::assistant(open.text)),
         }
         self.payload_dirty = true;
+    }
+
+    /// The reasoning guard for the next turn pass ([`turn_repeat_guard`]),
+    /// charged with what a reply being resumed has already spent reasoning.
+    fn pass_repeat_guard(&self) -> crate::insights::RepeatGuard {
+        turn_repeat_guard(self.engine.ctx_size())
+            .with_spent(self.open_reply.as_ref().map_or(0, |r| r.spent))
     }
 
     /// Whether the next pass's renderer starts inside `<think>`: where a
@@ -16247,7 +16264,7 @@ impl Agent<'_> {
             }
             // Its text is in `resumed_prefix` now, spliced in below. Not
             // before the rollback above, which re-runs the pass from it.
-            self.open_reply = None;
+            let spent = out.assistant_text.len() + self.open_reply.take().map_or(0, |r| r.spent);
             // Mirror of the plain path (`run_turn`): the partial arguments
             // are dropped, not kept, so nothing of this pass is committed.
             if out.cut_by_window && cut_calls < MAX_CUT_TOOL_CALLS {
@@ -16305,7 +16322,7 @@ impl Agent<'_> {
                     "context limit: reply resumes".to_owned(),
                 );
                 let _ = tx.send(UiEvent::EndLine);
-                let split = self.hold_open_reply(assistant_text, out.ended_in_think);
+                let split = self.hold_open_reply(assistant_text, out.ended_in_think, spent);
                 let mut sink = NoteSink(&mut note);
                 sink.note(
                     "the reply ran into the context limit; compacting to continue it".to_owned(),
@@ -17693,7 +17710,7 @@ impl Agent<'_> {
         // Mirrors the C's worker greedy flag: argmax sampling while the
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
-        let mut repeat = turn_repeat_guard(self.engine.ctx_size());
+        let mut repeat = self.pass_repeat_guard();
         // Bound before the event closure, which cannot borrow `self` while
         // `self.engine` is generating. The elapsed clock is the turn's, so the
         // footer's seconds accumulate across the generate → tools → generate
@@ -28258,6 +28275,20 @@ mod tests {
         assert!(agent.open_reply.is_none());
     }
 
+    /// A reply held inside `<think>` carries what it spent reasoning, which
+    /// the resumed pass's budget starts from; one held in its answer does not.
+    #[test]
+    fn a_held_reasoning_reply_carries_its_spent_budget() {
+        let dir = scratch_dir("compact-resume-spent");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(&dir, cut_reply_engine(prompts), &cfg);
+        agent.hold_open_reply("thinking".to_owned(), true, 50_000);
+        assert_eq!(agent.open_reply.as_ref().unwrap().spent, 50_000);
+        agent.hold_open_reply("answer".to_owned(), false, 50_000);
+        assert_eq!(agent.open_reply.as_ref().unwrap().spent, 0);
+    }
+
     /// When compaction cannot make room, a split reply is rejoined into the
     /// one message it was before.
     #[test]
@@ -28268,7 +28299,7 @@ mod tests {
         let mut agent = test_agent(&dir, cut_reply_engine(prompts), &cfg);
         agent.session.push(Message::user("q"));
         let text = numbered_words(30_000);
-        let split = agent.hold_open_reply(text.clone(), false);
+        let split = agent.hold_open_reply(text.clone(), false, 0);
         assert!(split);
         agent.release_open_reply(split);
         let t = &agent.session.transcript;
@@ -28305,12 +28336,14 @@ mod tests {
         agent.open_reply = Some(OpenReply {
             text: "partial".to_owned(),
             in_think: false,
+            spent: 0,
         });
         assert_eq!(agent.pass_opts().think_mode, ThinkMode::Off);
         assert!(agent.pass_opts().continue_reply, "re-opened, not answered");
         agent.open_reply = Some(OpenReply {
             text: "partial".to_owned(),
             in_think: true,
+            spent: 0,
         });
         assert_eq!(agent.pass_opts().think_mode, ThinkMode::Max);
         agent.open_reply = None;
@@ -28332,6 +28365,7 @@ mod tests {
             agent.open_reply = Some(OpenReply {
                 text: "partial".to_owned(),
                 in_think,
+                spent: 0,
             });
             assert_eq!(agent.pass_begins_in_think(&opts), in_think);
         }

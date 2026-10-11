@@ -28,7 +28,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reasoning step when it stopped in the answer, inside `<think>` when it
   stopped there), and the model carries on mid-sentence. Checked on DeepSeek
   V4 Flash and Gemma 4 E4B. At most four times a turn; when compaction cannot
-  make room, what was written is kept as before.
+  make room, what was written is kept as before. The reasoning budget spans
+  the whole reply, so a reply cut inside its reasoning cannot buy a fresh
+  budget with each compaction.
 
 - `crates/plank-lib`, the vectors.json and profile file handling shared with
   `pt`: plank's `steervec` now reads the store through it, and `pt install
