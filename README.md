@@ -480,6 +480,16 @@ Any key or mouse event dismisses it, and the keystroke that wakes the screen is 
 
 Unlike the games, the screensaver is **not** behind `ui.easterEggs`. Turning the arcade off in a shared or managed install stops `/pelota` and `/matrix` being commands at all, but it does not take the idle screen with it: one is a game you invoke, the other is what an unattended terminal shows, and they are not the same decision. Set `ui.screensaver` to `never` if you want no idle screen either.
 
+## Buddy
+
+`/buddy on` stands a small animated character on the rule above the prompt while plank waits for you. It does nothing, which is the point, and it steps away whenever a turn runs.
+
+<p align="center">
+  <img src="assets/buddy-minions.gif" alt="The minions buddy: a minion in a maid's outfit, feather duster in hand, standing on plank's green prompt rule above the session name and fidgeting through its clips" width="360">
+</p>
+
+Buddies are the folders of [plank-buddies](https://github.com/aovestdipaperino/plank-buddies); the first is `minions`. You have one at a time: `/buddy install` lists them and the one you pick replaces yours, `/buddy install <name>` skips the menu, and `/buddy off` sends it away. Its clips are decoded once with `ffmpeg`, so the first showing after an install takes a few seconds. It needs a terminal with kitty graphics: kitty, Ghostty or Warp, outside tmux.
+
 ## Project layout
 
 Each module in `src/` maps to one functional section of the original `ds4_agent.c`:

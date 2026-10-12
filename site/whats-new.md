@@ -17,6 +17,8 @@ cuts off is retried rather than reported as broken, and a message too big for
 the window is refused instead of jamming the session. DeepSeek and Qwen now
 edit with exact old text, as the C reference does.
 
+![The minions buddy: a minion in a maid's outfit, feather duster in hand, standing on plank's green prompt rule above the session name and fidgeting through its clips](/assets/buddy-minions.gif)
+
 **v7.0.4 beta: profile sessions start warm.** A session started with
 `--profile` restored its cached prompt at launch and then re-prefilled all of
 it on the first prompt, over one trailing newline. The first prompt now reuses
