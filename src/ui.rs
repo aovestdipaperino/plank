@@ -2719,6 +2719,10 @@ struct Agent<'a> {
     /// The GPU-yield cycle's reopen factory and any reopen still owed
     /// (`gpuyield`).
     gpu_yield: GpuYield,
+    /// The direction a `/steer` switched to on the live engine, which `cfg`
+    /// (fixed at launch) no longer names. A GPU-yield reopen comes back on
+    /// the launch direction and re-applies this one.
+    steer_switch: Option<SteerSwitched>,
 }
 
 /// A parent set aside by [`Agent::run_sidechain_on`]: its engine and the
@@ -4512,6 +4516,14 @@ impl Agent<'_> {
         )?;
         engine.set_trusted_system_prefix(self.trusted_system_len);
         engine.set_think_mode(self.think);
+        // The factory reopens on the launch direction. Before the snapshot is
+        // restored, so the KV it brings back keys under the direction it was
+        // built with.
+        if let Some(switched) = &self.steer_switch
+            && let Err(e) = engine.set_steering_direction(&switched.file, switched.ffn)
+        {
+            crate::engine::kv_debug(|| format!("gpu yield: steering not re-applied: {e}"));
+        }
         let current = self
             .slot_mut(slot)
             .ok_or_else(|| "the model's engine slot is gone".to_owned())?;
@@ -10188,12 +10200,13 @@ the original is frozen and listed in /tree"
     /// `/steer [name] [scale]` — report, retarget, or switch directional
     /// steering. See [`plan_steer`] for how the arguments are read.
     ///
-    /// The FFN scale of the loaded direction is the only part of a steering
-    /// setup that can move at runtime: the vector itself and the attention
-    /// scale are fixed when the engine loads, because the C binds them into
-    /// the graph at open. Choosing another direction therefore saves the
-    /// session and restarts plank on it (`profileedit::SteerSwitch`), as
-    /// `/engines` does; `restart` tells the front end to quit for that.
+    /// The FFN scale and the direction both move at runtime; only the
+    /// attention scale is fixed when the engine loads. Choosing another
+    /// direction swaps the vector into the live engine
+    /// (`Engine::set_steering_direction`). An engine that cannot do that live
+    /// gets the old path instead: the session is saved and plank restarts on
+    /// the direction (`profileedit::SteerSwitch`), as `/engines` does, and
+    /// `restart` tells the front end to quit for that.
     ///
     /// A live scale change invalidates the cached KV in the one way the
     /// fingerprint cannot express. The live prefix keeps the activations the
@@ -10202,7 +10215,8 @@ the original is frozen and listed in /tree"
     /// claim to describe a prefix at a single setting, are dropped here. The
     /// live session is left alone: the C changes the scale without rebuilding
     /// the KV on purpose, and re-prefilling a long transcript to make a slider
-    /// consistent would cost more than the inconsistency does.
+    /// consistent would cost more than the inconsistency does. A live
+    /// direction switch drops the rungs for the same reason.
     fn steer(&mut self, arg: &str) -> Steered {
         let say = |message: String| Steered {
             message,
@@ -10213,38 +10227,89 @@ the original is frozen and listed in /tree"
             Err(e) => return say(e),
         };
         let live = self.engine.steering_ffn();
-        let loaded = self
-            .cfg
-            .engine
-            .dir_steering
-            .as_deref()
-            .filter(|_| live.is_some());
+        let loaded = self.steer_name().filter(|_| live.is_some());
         match plan_steer(arg, loaded, live, &available) {
             SteerPlan::Say(message) => say(message),
             SteerPlan::Live(scale) => say(self.set_live_steering(scale)),
-            SteerPlan::Switch { name, ffn } => match self.save_session() {
-                Ok(id) => {
-                    crate::profileedit::request_restart(crate::profileedit::Restart {
-                        session: id,
-                        cwd: self.tool_ctx.cwd.clone(),
-                        pick_engine: false,
-                        steering: Some(crate::profileedit::SteerSwitch {
-                            name: name.clone(),
-                            ffn,
-                        }),
-                    });
-                    Steered {
-                        message: format!(
-                            "steering: restarting on direction `{name}` (ffn {ffn}); \
+            SteerPlan::Switch { name, ffn } => match self.steer_file(&name) {
+                Ok(file) => self.switch_steering(name, file, ffn),
+                Err(e) => say(format!("/steer: {e}")),
+            },
+        }
+    }
+
+    /// Switches the live engine to direction `name`, decoded into `file`, at
+    /// FFN scale `ffn`; restarts on it when the engine cannot switch live.
+    fn switch_steering(&mut self, name: String, file: std::path::PathBuf, ffn: f32) -> Steered {
+        if let Err(e) = self.engine.set_steering_direction(&file, ffn) {
+            crate::engine::kv_debug(|| format!("/steer live switch refused: {e}"));
+            return self.restart_on_steering(&name, ffn);
+        }
+        let message =
+            format!("steering `{name}` at ffn {ffn} (applies to new tokens; rungs dropped)");
+        self.steer_switch = Some(SteerSwitched { name, file, ffn });
+        publish_steering(self.cfg, self.steer_name(), self.engine.steering_ffn());
+        self.discard_ladder();
+        Steered {
+            message,
+            restart: false,
+        }
+    }
+
+    /// The name of the direction the engine holds: the last live switch, else
+    /// the one plank launched on.
+    fn steer_name(&self) -> Option<&str> {
+        self.steer_switch.as_ref().map(|s| s.name.as_str()).or(self
+            .cfg
+            .engine
+            .dir_steering
+            .as_deref())
+    }
+
+    /// Decodes direction `name` for the loaded model into its vector file.
+    fn steer_file(&self, name: &str) -> Result<std::path::PathBuf, String> {
+        let model = self
+            .cfg
+            .model_path
+            .as_deref()
+            .ok_or_else(|| "no local model to steer".to_owned())?;
+        let engine = self
+            .cfg
+            .selection
+            .as_ref()
+            .and_then(|s| s.id)
+            .map(crate::manifest::EngineId::as_str);
+        crate::steervec::materialize(&crate::steervec::model_keys(engine, model), name)
+    }
+
+    /// Saves the session and asks the front end to restart plank steering
+    /// along `name`, for an engine that cannot switch direction live.
+    fn restart_on_steering(&mut self, name: &str, ffn: f32) -> Steered {
+        match self.save_session() {
+            Ok(id) => {
+                crate::profileedit::request_restart(crate::profileedit::Restart {
+                    session: id,
+                    cwd: self.tool_ctx.cwd.clone(),
+                    pick_engine: false,
+                    steering: Some(crate::profileedit::SteerSwitch {
+                        name: name.to_owned(),
+                        ffn,
+                    }),
+                });
+                Steered {
+                    message: format!(
+                        "steering: restarting on direction `{name}` (ffn {ffn}); \
                              the session resumes once the model has reloaded"
-                        ),
-                        restart: true,
-                    }
+                    ),
+                    restart: true,
                 }
-                Err(e) => say(format!(
+            }
+            Err(e) => Steered {
+                message: format!(
                     "/steer: switching direction needs a restart, and the session \
                      could not be saved: {e}"
-                )),
+                ),
+                restart: false,
             },
         }
     }
@@ -10286,7 +10351,10 @@ the original is frozen and listed in /tree"
         if let Err(e) = self.engine.set_steering_ffn(scale) {
             return format!("/steer: {e}");
         }
-        publish_steering(self.cfg, self.engine.steering_ffn());
+        if let Some(switched) = &mut self.steer_switch {
+            switched.ffn = scale;
+        }
+        publish_steering(self.cfg, self.steer_name(), self.engine.steering_ffn());
         self.discard_ladder();
         format!("steering ffn {scale} (applies to new tokens; rungs dropped)")
     }
@@ -19819,6 +19887,16 @@ struct Steered {
     restart: bool,
 }
 
+/// A direction `/steer` swapped into the live engine ([`Agent::steer_switch`]).
+struct SteerSwitched {
+    /// Its name in `vectors.json`.
+    name: String,
+    /// The vector file it was decoded into.
+    file: std::path::PathBuf,
+    /// Its FFN scale, kept current by later `/steer` scale changes.
+    ffn: f32,
+}
+
 /// What a `/steer` argument asks for.
 #[derive(Debug, PartialEq)]
 enum SteerPlan {
@@ -19826,7 +19904,7 @@ enum SteerPlan {
     Say(String),
     /// Retarget the loaded direction's FFN scale on the live session.
     Live(f32),
-    /// Restart plank steering along `name` at FFN scale `ffn`.
+    /// Steer along `name` at FFN scale `ffn` instead of the loaded direction.
     Switch { name: String, ffn: f32 },
 }
 
@@ -19841,7 +19919,7 @@ enum SteerPlan {
 ///   direction at that scale. When the model has more than one direction the
 ///   scale alone is ambiguous, so a name is required;
 /// - `<name> [scale]` retargets that direction when it is the loaded one, and
-///   otherwise switches to it (at `scale`, or 1 when omitted), which restarts.
+///   otherwise switches to it (at `scale`, or 1 when omitted).
 fn plan_steer(
     arg: &str,
     loaded: Option<&str>,
@@ -19945,24 +20023,22 @@ fn plan_steer(
 /// Publishes the steering in force to the footer: the loaded direction's
 /// `emoji` from `vectors.json` (else its name) and `ffn`, or nothing when the
 /// engine has no vector.
-fn publish_steering(cfg: &AgentConfig, ffn: Option<f32>) {
-    let steering = ffn
-        .zip(cfg.engine.dir_steering.as_deref())
-        .map(|(ffn, name)| {
-            let engine = cfg
-                .selection
-                .as_ref()
-                .and_then(|s| s.id)
-                .map(crate::manifest::EngineId::as_str);
-            let mark = cfg
-                .model_path
-                .as_deref()
-                .and_then(|model| {
-                    crate::steervec::emoji(&crate::steervec::model_keys(engine, model), name)
-                })
-                .unwrap_or_else(|| name.to_owned());
-            (mark, ffn)
-        });
+fn publish_steering(cfg: &AgentConfig, name: Option<&str>, ffn: Option<f32>) {
+    let steering = ffn.zip(name).map(|(ffn, name)| {
+        let engine = cfg
+            .selection
+            .as_ref()
+            .and_then(|s| s.id)
+            .map(crate::manifest::EngineId::as_str);
+        let mark = cfg
+            .model_path
+            .as_deref()
+            .and_then(|model| {
+                crate::steervec::emoji(&crate::steervec::model_keys(engine, model), name)
+            })
+            .unwrap_or_else(|| name.to_owned());
+        (mark, ffn)
+    });
     crate::status::set_steering(steering);
 }
 
@@ -21862,7 +21938,11 @@ fn new_agent(
     // between the key and the tokens rather than between two keys.
     engine.set_think_mode(cfg.generation.think_mode);
     crate::status::set_local_power(cfg.power_percent);
-    publish_steering(cfg, engine.steering_ffn());
+    publish_steering(
+        cfg,
+        cfg.engine.dir_steering.as_deref(),
+        engine.steering_ffn(),
+    );
     // Which model this local engine is, for the footer's origin label. Taken
     // from the dialect already resolved above, so the tag can never disagree
     // with the syntax the parser is using.
@@ -22000,6 +22080,7 @@ fn new_agent(
         warm_note: None,
         parked_engines: Vec::new(),
         gpu_yield: GpuYield::new(reopen),
+        steer_switch: None,
     };
     // Speculation may have fallen away since the flags were parsed, and the 0
     // `config::finalize` pinned for it then has nothing left to serve.
@@ -25251,6 +25332,19 @@ mod tests {
             self.steering = Some(scale);
             Ok(())
         }
+        fn set_steering_direction(
+            &mut self,
+            _file: &std::path::Path,
+            ffn: f32,
+        ) -> Result<(), crate::engine::EngineError> {
+            if self.steering_refuses {
+                return Err(crate::engine::EngineError::new(
+                    "distributed sessions cannot switch live",
+                ));
+            }
+            self.steering = Some(ffn);
+            Ok(())
+        }
         fn generate(
             &mut self,
             prompt: crate::engine::Prompt<'_>,
@@ -25488,6 +25582,7 @@ mod tests {
             local_alt_warmed: false,
             parked_engines: Vec::new(),
             gpu_yield: GpuYield::default(),
+            steer_switch: None,
             warm_note: None,
         };
         // The same settling the real constructor does, so a test agent over an
@@ -26323,7 +26418,7 @@ mod tests {
             plan_steer("heretic 2", Some("heretic"), Some(1.0), &two),
             SteerPlan::Live(2.0)
         );
-        // Naming another one restarts on it, at 1 unless told otherwise.
+        // Naming another one switches to it, at 1 unless told otherwise.
         assert_eq!(
             plan_steer("terse", Some("heretic"), Some(1.0), &two),
             SteerPlan::Switch {
@@ -26374,7 +26469,7 @@ mod tests {
             plan_steer("heretic", Some("heretic"), Some(0.0), &two),
             SteerPlan::Live(1.0)
         );
-        // Another direction still needs the restart that loads it.
+        // Another direction is a switch.
         assert!(matches!(
             plan_steer("terse 2", Some("heretic"), Some(0.0), &two),
             SteerPlan::Switch { .. }
@@ -26434,6 +26529,37 @@ mod tests {
             },
             cfg,
         )
+    }
+
+    #[test]
+    fn switching_direction_goes_live_and_drops_the_ladder() {
+        // The C swaps the vector into the running engine, so a switch is a
+        // scale change's sibling: no restart, and the rungs go because the
+        // prefix they describe was built along the old direction.
+        let dir = scratch_dir("steer-switch");
+        let mut cfg = test_cfg();
+        cfg.engine.dir_steering = Some("heretic".into());
+        let mut agent = steering_agent(&dir, &cfg, Some(1.0));
+        seed_ladder(&mut agent, 2);
+
+        let steered = agent.switch_steering("terse".into(), dir.join("terse.f32"), 2.0);
+        assert!(!steered.restart, "{}", steered.message);
+        assert_eq!(
+            steered.message,
+            "steering `terse` at ffn 2 (applies to new tokens; rungs dropped)"
+        );
+        assert_eq!(agent.steer_name(), Some("terse"));
+        assert_eq!(agent.engine.steering_ffn(), Some(2.0));
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            0,
+            "a switch must not leave rungs behind"
+        );
+
+        // A later scale change is remembered with the switch, which is what a
+        // GPU-yield reopen re-applies.
+        agent.steer_command("terse 3");
+        assert_eq!(agent.steer_switch.as_ref().map(|s| s.ffn), Some(3.0));
     }
 
     #[test]
@@ -32510,6 +32636,7 @@ mod tests {
             local_alt_warmed: false,
             parked_engines: Vec::new(),
             gpu_yield: GpuYield::default(),
+            steer_switch: None,
             warm_note: None,
         };
 
@@ -32649,6 +32776,7 @@ mod tests {
             local_alt_warmed: false,
             parked_engines: Vec::new(),
             gpu_yield: GpuYield::default(),
+            steer_switch: None,
             warm_note: None,
         };
 
@@ -33993,8 +34121,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-ui-err-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let engine = ScriptedEngine {
+            // A legal opener, then a bogus tag the strict parser rejects.
             replies: vec![
-                // Legal opener, then a bogus tag the strict parser rejects.
                 "<｜DSML｜tool_calls><b>".to_string(),
                 "Understood.\n".to_string(),
             ],
@@ -34077,19 +34205,16 @@ mod tests {
             local_alt_warmed: false,
             parked_engines: Vec::new(),
             gpu_yield: GpuYield::default(),
+            steer_switch: None,
             warm_note: None,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
-
         // user, assistant(bad stanza), user(tool error), assistant(final)
         let tool_result = &agent.session.transcript[2].text;
         assert!(
-            tool_result.contains("Tool error: invalid DSML tool call: unexpected DSML tag: <b>\n"),
-            "got: {tool_result}"
-        );
-        assert!(
-            tool_result.contains("DSML syntax reminder:"),
+            tool_result.contains("Tool error: invalid DSML tool call: unexpected DSML tag: <b>\n")
+                && tool_result.contains("DSML syntax reminder:"),
             "got: {tool_result}"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -34377,6 +34502,7 @@ mod tests {
             local_alt_warmed: false,
             parked_engines: Vec::new(),
             gpu_yield: GpuYield::default(),
+            steer_switch: None,
             warm_note: None,
         };
         agent.session.push(Message::user("go"));
@@ -34498,6 +34624,7 @@ mod tests {
             local_alt_warmed: false,
             parked_engines: Vec::new(),
             gpu_yield: GpuYield::default(),
+            steer_switch: None,
             warm_note: None,
         };
         agent.session.push(Message::user("go"));
@@ -34608,6 +34735,7 @@ mod tests {
             local_alt_warmed: false,
             parked_engines: Vec::new(),
             gpu_yield: GpuYield::default(),
+            steer_switch: None,
             warm_note: None,
         };
         agent.session.push(Message::user("go"));
@@ -34739,6 +34867,7 @@ mod tests {
             local_alt_warmed: false,
             parked_engines: Vec::new(),
             gpu_yield: GpuYield::default(),
+            steer_switch: None,
             warm_note: None,
         };
         agent.session.push(Message::user("kv payload flow"));
@@ -37459,6 +37588,7 @@ or the user's next message aborts before its first token"
             local_alt_warmed: false,
             parked_engines: Vec::new(),
             gpu_yield: GpuYield::default(),
+            steer_switch: None,
             warm_note: None,
         };
         agent.session.push(Message::user("please count the tests"));
@@ -39121,6 +39251,7 @@ or the user's next message aborts before its first token"
             local_alt_warmed: false,
             parked_engines: Vec::new(),
             gpu_yield: GpuYield::default(),
+            steer_switch: None,
             warm_note: None,
         };
         agent.session.push(Message::user("run echo"));

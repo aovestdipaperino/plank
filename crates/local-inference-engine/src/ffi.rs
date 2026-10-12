@@ -431,6 +431,18 @@ unsafe extern "C" {
     /// scale with no vector loaded at startup) — the opposite of the
     /// `bool`-like convention some neighbours here use.
     pub fn ds4_session_set_directional_steering_ffn(s: *mut Ds4Session, scale: f32) -> c_int;
+    /// Replaces the steering direction with the `n_layers * n_embd` raw `f32`
+    /// file at `path` for tokens evaluated after this call, keeping both
+    /// scales and the existing KV. The engine remembers the file, so sessions
+    /// created afterwards load it too; on the CPU backend every session of
+    /// the engine shares the one buffer.
+    ///
+    /// Returns **0 on success** and non-zero on refusal (an unreadable or
+    /// wrongly sized file, a distributed or network-tensor-parallel session).
+    pub fn ds4_session_set_directional_steering_file(
+        s: *mut Ds4Session,
+        path: *const c_char,
+    ) -> c_int;
     /// Drops the session's cached KV so the next sync prefills from zero. Used
     /// when the prompt *prefix* changes under it (the reasoning-effort preamble
     /// moving in or out), which a common-prefix probe alone cannot recover from.

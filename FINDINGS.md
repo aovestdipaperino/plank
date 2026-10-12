@@ -3600,3 +3600,17 @@ model's first direction at 0 so the first `/steer` is live instead of a
 restart. A new session also starts at whatever scale the last session set,
 not the open scale, so `Ds4Session::reconcile_steering` reads it back and
 corrects it after every create.
+
+## A steering direction switch moves the engine's file, not just the session's
+
+Upstream ds4 reads the direction file once, at engine open; the fork's
+`ds4_session_set_directional_steering_file` (`refs/ds4` `ae9c589`) uploads a
+new one into the session's tensors and also replaces the engine's file, so
+every session created afterwards loads the new direction while sessions that
+already exist keep the old one. The KV key therefore cannot live on the shared
+`Ds4Model`: each `Ds4Session` holds its own `SteeringKey`, refreshed from the
+model's when its C session is created, and the model's copy is moved by the
+switch. The C overwrites GPU tensors with a plain `memcpy` into shared storage,
+so it calls `ds4_gpu_synchronize` first. A GPU-yield reopen comes back on the
+launch direction, so `Agent::gpu_reopen_into` re-applies `steer_switch` before
+`set_kv`, or the restored KV would key under the wrong direction.

@@ -354,8 +354,10 @@ ordinary run keys exactly as it did before the mechanism existed. The local
 engine returns a digest of the steering vector's *contents* plus both scales:
 the contents because rebuilding a direction in place is a different edit under
 the same filename, and both scales because a strength is as much part of the
-edit as a direction is. `/steer` moves the FFN scale mid-session, which is why
-the variant is asked of the engine at each walk rather than cached at startup.
+edit as a direction is. `/steer` moves the FFN scale, and can swap the
+direction, mid-session, which is why the variant is asked of the engine at each
+walk rather than cached at startup, and why the digest is held per session
+rather than per model.
 
 `--dir-steering-from user`, the default (`all` restores steering every token; so
 does an attention scale, which cannot be deferred; an engine's `steering` block

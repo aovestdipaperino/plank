@@ -77,11 +77,14 @@ pub struct Ds4Model {
     /// each freshly spawned shared session so attach never cold-prefills the
     /// system prompt (design §6). `None` for the single-owner path.
     warm: Mutex<Option<SessionSnapshot>>,
-    /// The activation edit this model was opened under, as KV key material:
-    /// `None` when no steering vector is loaded. Captured at open because the
-    /// C keeps no accessor for the file or the attention scale — only the live
-    /// FFN scale is readable, and that one is tracked per session.
-    steering: Option<SteeringKey>,
+    /// The direction the engine hands a session created now, as KV key
+    /// material: `None` when no steering vector is loaded. Captured at open,
+    /// because the C keeps no accessor for the file or the attention scale,
+    /// and replaced by a live `/steer` switch, which the C applies to the
+    /// sessions created after it too. A session keeps its own copy
+    /// ([`Ds4Session::steering`]): one created before the switch still
+    /// steers along the old direction.
+    steering: Mutex<Option<SteeringKey>>,
     /// FFN steering scale the engine was opened with. Each session starts here
     /// and may move away from it through `/steer`, so this is the floor the C
     /// gives a freshly created session, not the current setting.
@@ -596,10 +599,10 @@ impl Ds4Model {
             ctx_size,
             count_overhead: AtomicI32::new(-1),
             warm: Mutex::new(None),
-            steering: steering_key(
+            steering: Mutex::new(steering_key(
                 tuning.dir_steering_file.as_deref(),
                 tuning.dir_steering_attn,
-            ),
+            )),
             steering_ffn0: tuning.dir_steering_ffn,
             steer_from_user: tuning.dir_steering_from_user,
             eos_after_assistant: ends_assistant_with_eos(family),
@@ -663,6 +666,14 @@ impl Ds4Model {
             return Err(EngineError::new("failed to create session"));
         }
         Ok(session)
+    }
+
+    /// The direction a session created now loads ([`Self::steering`]).
+    fn current_steering(&self) -> Option<SteeringKey> {
+        self.steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Model name reported by the engine.
@@ -1078,6 +1089,7 @@ impl ModelHandle for Ds4Model {
             think: ThinkMode::default(),
             trusted_system_len: 0,
             reopened: false,
+            steering: self.current_steering(),
             steering_ffn: self.steering_ffn0,
             steer_held: false,
             pending_images: Vec::new(),
@@ -1145,6 +1157,9 @@ pub struct Ds4Session {
     /// trailing assistant message, so the reply it prompts is recorded as a
     /// continuation of that span rather than with a prefix of its own.
     reopened: bool,
+    /// The direction this session's C session was created with or switched
+    /// to, as KV key material; `None` when it has no vector.
+    steering: Option<SteeringKey>,
     /// FFN directional-steering scale in force for tokens evaluated from here
     /// on, mirrored in Rust because the C exposes it only on a *live* session
     /// and this one is created lazily: a `/steer` before the first prefill has
@@ -1224,6 +1239,7 @@ impl Ds4Session {
     #[must_use]
     pub fn from_model(model: Arc<Ds4Model>) -> Self {
         let mut session = Self {
+            steering: model.current_steering(),
             steering_ffn: model.steering_ffn0,
             steer_held: false,
             model,
@@ -1379,6 +1395,10 @@ impl Ds4Session {
         if self.session.is_null() {
             // Single-owner path: the session gets the model's full context.
             self.session = self.model.create_session(self.model.ctx_size)?;
+            // The C loads the engine's direction at creation, which a switch
+            // made through another session may have moved since this one was
+            // built.
+            self.steering = self.model.current_steering();
             self.reconcile_steering();
             self.hold_steering(true);
         }
@@ -1462,7 +1482,7 @@ impl Ds4Session {
     /// loaded in every session, launched at zero or not.
     #[must_use]
     pub fn has_steering_vector(&self) -> bool {
-        self.model.steering.is_some()
+        self.steering.is_some()
     }
 
     /// Retargets FFN steering for tokens evaluated after this call.
@@ -1508,6 +1528,64 @@ impl Ds4Session {
             ));
         }
         self.steering_ffn = scale;
+        Ok(())
+    }
+
+    /// Switches this session to the direction in `file` at FFN scale `ffn`,
+    /// creating the C session first if it does not exist yet.
+    ///
+    /// The KV already built stays, as for a scale change, and the attention
+    /// scale is the one the engine was opened with. The engine records the
+    /// file, so the model's key moves with it: sessions created afterwards
+    /// load the new direction and key their KV under it.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the file cannot be read or the C refuses
+    /// the switch (a wrongly sized file, a distributed session); the session
+    /// keeps the direction it had.
+    pub fn set_steering_direction(&mut self, file: &Path, ffn: f32) -> Result<(), EngineError> {
+        let attn = self.steering.as_ref().map_or(0.0, |k| k.attn);
+        let key = steering_key(Some(file), attn).ok_or_else(|| {
+            EngineError::new(format!("cannot read steering vector {}", file.display()))
+        })?;
+        let c_file = CString::new(file.to_string_lossy().as_bytes())
+            .map_err(|_| EngineError::new("steering vector path contains a NUL byte"))?;
+        let session = self.ensure_session()?;
+        // SAFETY: session is non-null (just ensured) and freed only on drop;
+        // c_file outlives the call.
+        let rc =
+            unsafe { ffi::ds4_session_set_directional_steering_file(session, c_file.as_ptr()) };
+        if rc != 0 {
+            return Err(EngineError::new(
+                "the engine refused the steering direction — a vector of the wrong \
+                 size, or a distributed session (see stderr)",
+            ));
+        }
+        *self
+            .model
+            .steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(key.clone());
+        self.steering = Some(key);
+        // Set the scale even when it equals the mirror: a session that had no
+        // vector holds a real zero in the C, where plank keeps `STEER_OFF` so
+        // later sessions keep the vector resident. While held for the prompt
+        // prefill, the next `generate` arms it instead.
+        if !self.steer_held {
+            // SAFETY: as above.
+            let rc =
+                unsafe { ffi::ds4_session_set_directional_steering_ffn(session, c_scale(ffn)) };
+            if rc != 0 {
+                self.steering_ffn = from_c_scale(unsafe {
+                    // SAFETY: as above.
+                    ffi::ds4_session_directional_steering_ffn(session)
+                });
+                return Err(EngineError::new(
+                    "the direction switched, but the engine refused its scale (see stderr)",
+                ));
+            }
+        }
+        self.steering_ffn = ffn;
         Ok(())
     }
 
@@ -2018,7 +2096,7 @@ impl Engine for Ds4Session {
         if self.model.steer_from_user {
             return String::new();
         }
-        steering_variant(self.model.steering.as_ref(), self.steering_ffn)
+        steering_variant(self.steering.as_ref(), self.steering_ffn)
     }
 
     fn steering_ffn(&self) -> Option<f32> {
@@ -2035,6 +2113,10 @@ impl Engine for Ds4Session {
             ));
         }
         Ds4Session::set_steering_ffn(self, scale)
+    }
+
+    fn set_steering_direction(&mut self, file: &Path, ffn: f32) -> Result<(), EngineError> {
+        Ds4Session::set_steering_direction(self, file, ffn)
     }
 
     /// Same tokens `generate` builds (the reconcile is idempotent for an

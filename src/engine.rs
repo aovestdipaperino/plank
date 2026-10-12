@@ -1300,6 +1300,26 @@ pub trait Engine: Debug + Send {
         ))
     }
 
+    /// Steers along the vector in `file` at FFN scale `ffn` from here on,
+    /// replacing whatever direction was loaded.
+    ///
+    /// The same contract as [`Engine::set_steering_ffn`]: only the suffix is
+    /// affected, so the caller must drop any checkpoint that would claim the
+    /// whole prefix was built under the new direction.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] for an engine that cannot switch direction
+    /// live; the caller falls back to reopening the model on it.
+    fn set_steering_direction(
+        &mut self,
+        _file: &std::path::Path,
+        _ffn: f32,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::new(
+            "this engine cannot switch steering direction live",
+        ))
+    }
+
     /// Whether this is the stand-in a GPU-yield cycle leaves in a slot whose
     /// model it unloaded (`gpuyield::UnloadedEngine`). The retry after a
     /// failed reload looks for it, wherever the slot has moved since, rather
@@ -1743,6 +1763,20 @@ impl Engine for EchoEngine {
             return Err(EngineError::new("the engine refused the steering change"));
         }
         self.steering_ffn = Some(scale);
+        Ok(())
+    }
+
+    /// Accepts any direction while not scripted to refuse, so the live
+    /// `/steer` switch is exercised without a model.
+    fn set_steering_direction(
+        &mut self,
+        _file: &std::path::Path,
+        ffn: f32,
+    ) -> Result<(), EngineError> {
+        if self.steering_refuses {
+            return Err(EngineError::new("the engine refused the steering change"));
+        }
+        self.steering_ffn = Some(ffn);
         Ok(())
     }
 

@@ -899,7 +899,7 @@ per layer:</p>
 <pre class="json"><code>[
   { &quot;model&quot;: &quot;ds4vision&quot;,
     &quot;vectors&quot;: [
-      { &quot;name&quot;: &quot;succinct&quot;, &quot;value&quot;: &quot;Pq3vPLnF...&quot; },
+      { &quot;name&quot;: &quot;succinct&quot;, &quot;value&quot;: &quot;Pq3vPLnF...&quot;, &quot;emoji&quot;: &quot;📖&quot; },
       { &quot;name&quot;: &quot;heretic&quot;, &quot;value&quot;: &quot;u0Kz/D2p...&quot; }
     ] }
 ]</code></pre>
@@ -917,7 +917,10 @@ with <code>-n</code>, and
 <code>pt install &lt;repo&gt;:&lt;path&gt;</code> merges a vectors file
 someone else published into yours, asking before it replaces a direction
 of the same name. Both write the file in place through a temporary copy,
-and keep any fields they do not recognise.</p>
+and keep any fields they do not recognise. One such field is yours to
+add: a direction's optional <code>emoji</code> is how the status bar
+marks it while it steers, as <code>📖 ffn 2</code>, with the direction's
+name standing in when it has none.</p>
 <table>
 <thead>
 <tr>
@@ -959,9 +962,14 @@ non-zero <code>--dir-steering-attn</code> means <code>all</code>.</p>
 with the loaded one starred, <code>/steer &lt;scale&gt;</code> changes
 the feed-forward scale on the spot (name the direction as well when the
 model has more than one), and <code>/steer &lt;name&gt; [scale]</code>
-switches to another direction. The engine binds a direction when it
-loads, so switching restarts plank into the new one and resumes the
-session where you were.</p>
+switches to another direction. When you launch without
+<code>--dir-steering</code>, plank loads the model's first direction at
+scale 0, which changes nothing until a <code>/steer</code> turns it up.
+Switching to another direction swaps its vector into the running model,
+so it applies to the tokens generated next without a reload; the
+conversation so far keeps the activations the old direction produced. On
+an engine that cannot swap a vector live, plank restarts into the new
+direction instead and resumes the session where you were.</p>
 <p>A profile can carry a direction too: a <code>steering</code> block
 pairs one with the profile's <code>recommendedModel</code> (see <a
 href="14-profiles.html">Profiles</a>), and a <code>--dir-steering</code>

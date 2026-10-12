@@ -66,6 +66,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default `-n` no longer gets every request rejected by a 32K vLLM model.
   `src/remote/limits.rs`.
 
+- **`/steer` switches direction without a restart.** The new vector is
+  swapped into the running DeepSeek model and applies to the tokens generated
+  next; the conversation so far keeps what the old direction produced, so the
+  KV ladder's rungs are dropped, as for a scale change. This needs
+  `ds4_session_set_directional_steering_file`, which the C reference gains on
+  the `aovestdipaperino/ds4` fork (`ae9c589`, branch
+  `live-steering-direction`); an engine that refuses the switch falls back to
+  restarting into the direction with the session resumed. A GPU-yield reload
+  re-applies the switched direction before the KV is restored.
+
 ### Fixed
 
 - **DeepSeek assistant messages rebuilt from text end their turn.** A reply
@@ -137,8 +147,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   vectorize … -n NAME` writes, keyed by the model's engine name (its file
   name for a model no engine uses). `/steer` alone lists the
   model's directions with the loaded one starred; `/steer <name> [scale]`
-  switches to another one by restarting into it with the session resumed, and
-  a bare `/steer <scale>` needs a name when the model has more than one.
+  switches to another one on the running model, and a bare `/steer <scale>`
+  needs a name when the model has more than one.
 
 - **Steering lives in profiles.** A profile pairs a direction with its
   `recommendedModel` through `"steering": {"direction", "ffn", "attn",
