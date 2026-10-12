@@ -19,8 +19,8 @@
 //! The clips play one after the other ([`next_clip`]): a clip whose name ends
 //! in a letter is picked three times out of four, at random among the letter
 //! clips; otherwise the next clip whose name ends in a digit plays, in
-//! rotation. Clips are decoded once by `ffmpeg` on a background thread at half
-//! their resolution, their white background keyed out ([`key_background`]),
+//! rotation. Clips are decoded once by `ffmpeg` on a background thread, their
+//! white background keyed out ([`key_background`]) and then halved in size,
 //! and cached as PNG frames under `~/.plank/buddy/.frames/`, so only the first
 //! showing after an install pays for it.
 //!
@@ -77,6 +77,10 @@ const FRAME_CACHE: &str = ".frames";
 /// The marker a fully decoded clip's cache directory holds; a directory
 /// without it is a decode that was interrupted, and is redone.
 const DONE_MARKER: &str = "done";
+
+/// Bumped whenever decoding changes what a cached frame holds, so frames
+/// cached by an older plank are decoded afresh. 2: keyed at full size.
+const DECODE_VERSION: u32 = 2;
 
 /// Playback rate. Clips are sampled down to it when decoded, which keeps the
 /// bytes sent to the terminal per second modest.
@@ -655,11 +659,14 @@ fn cache_dir_for(video: &Path, cache: &Path) -> Option<PathBuf> {
         .ok()?
         .as_secs();
     let stem = video.file_stem()?.to_str()?;
-    Some(cache.join(format!("{stem}-{}-{mtime}", meta.len())))
+    Some(cache.join(format!("{stem}-{}-{mtime}-v{DECODE_VERSION}", meta.len())))
 }
 
 /// The frames of `video`, decoding them into the cache when they are not
-/// already there.
+/// already there. The background is keyed at the clip's full size and only
+/// then halved ([`halve`]): halving first blurs a narrow gap of background
+/// (between an arm and a body, into an open loop) shut, and the white behind
+/// it would stay opaque, cut off from the border.
 fn decode(video: &Path, cache: &Path) -> Option<Vec<PathBuf>> {
     let dir = cache_dir_for(video, cache)?;
     if !dir.join(DONE_MARKER).exists() {
@@ -668,7 +675,7 @@ fn decode(video: &Path, cache: &Path) -> Option<Vec<PathBuf>> {
         let status = std::process::Command::new("ffmpeg")
             .args(["-v", "error", "-nostdin", "-y", "-i"])
             .arg(video)
-            .args(["-vf", &format!("fps={FPS},scale=iw/2:ih/2")])
+            .args(["-vf", &format!("fps={FPS}")])
             .arg(dir.join("%05d.png"))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -681,7 +688,7 @@ fn decode(video: &Path, cache: &Path) -> Option<Vec<PathBuf>> {
         for frame in frames_in(&dir) {
             let keyed = image::open(&frame)
                 .ok()
-                .map(|img| key_background(img.to_rgba8()));
+                .map(|img| halve(&key_background(img.to_rgba8())));
             if let Some(img) = keyed {
                 img.save(&frame).ok()?;
             }
@@ -689,6 +696,36 @@ fn decode(video: &Path, cache: &Path) -> Option<Vec<PathBuf>> {
         std::fs::write(dir.join(DONE_MARKER), b"").ok()?;
     }
     Some(frames_in(&dir))
+}
+
+/// `img` at half its size, each pixel the alpha-weighted mean of a 2×2 block,
+/// so the keyed background's white does not bleed into the edge pixels.
+fn halve(img: &image::RgbaImage) -> image::RgbaImage {
+    let (width, height) = ((img.width() / 2).max(1), (img.height() / 2).max(1));
+    image::RgbaImage::from_fn(width, height, |x, y| {
+        let mut sum = [0u32; 3];
+        let (mut alpha, mut count) = (0u32, 0u32);
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let (sx, sy) = (2 * x + dx, 2 * y + dy);
+            if sx >= img.width() || sy >= img.height() {
+                continue;
+            }
+            let p = img.get_pixel(sx, sy).0;
+            let a = u32::from(p[3]);
+            for (s, c) in sum.iter_mut().zip(p) {
+                *s += u32::from(c) * a;
+            }
+            alpha += a;
+            count += 1;
+        }
+        let channel = |s: u32| u8::try_from(s / alpha.max(1)).unwrap_or(u8::MAX);
+        image::Rgba([
+            channel(sum[0]),
+            channel(sum[1]),
+            channel(sum[2]),
+            u8::try_from(alpha / count.max(1)).unwrap_or(u8::MAX),
+        ])
+    })
 }
 
 /// The PNG frames in `dir`, in order.
@@ -1269,6 +1306,35 @@ mod tests {
         assert_eq!(keyed.get_pixel(8, 4).0[3], 0);
         assert_eq!(keyed.get_pixel(2, 2).0[3], 255);
         assert_eq!(keyed.get_pixel(4, 4).0[3], 255, "the enclosed white stays");
+    }
+
+    #[test]
+    fn a_one_pixel_gap_still_lets_the_background_through_once_halved() {
+        let white = image::Rgba([250, 250, 250, 255]);
+        let ink = image::Rgba([20, 20, 20, 255]);
+        // A two-pixel-thick dark ring on white with a one-pixel opening in its
+        // top side: halving first would blur the opening shut.
+        let mut img = image::RgbaImage::from_pixel(12, 12, white);
+        for i in 2..10 {
+            for j in [2, 3, 8, 9] {
+                img.put_pixel(i, j, ink);
+                img.put_pixel(j, i, ink);
+            }
+        }
+        img.put_pixel(5, 2, white);
+        img.put_pixel(5, 3, white);
+        let halved = halve(&key_background(img));
+        assert_eq!(halved.dimensions(), (6, 6));
+        assert_eq!(halved.get_pixel(3, 3).0[3], 0, "the inside is background");
+        assert_eq!(halved.get_pixel(1, 3).0[3], 255, "the ring stays");
+    }
+
+    #[test]
+    fn halving_does_not_bleed_the_keyed_white_into_the_edge() {
+        let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 0]));
+        img.put_pixel(0, 0, image::Rgba([20, 20, 20, 255]));
+        let halved = halve(&img);
+        assert_eq!(halved.get_pixel(0, 0).0, [20, 20, 20, 63]);
     }
 
     #[test]
