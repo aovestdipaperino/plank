@@ -92,7 +92,7 @@ See [Extending plank](09-extending.md).
 | `/loopguard [on\|off]`, `/lg` | arm or silence the loop guards. Works mid-turn |
 | `/mc [on\|off]` | turn micro-compaction on or off for this session; bare `/mc` reports the state. Works mid-turn |
 | `/hints [on\|off]` | ask the model for occasional one- or two-sentence `> **Hint:**` asides on the concepts behind its work (a design choice, why something failed, a trade-off, how to check it). Takes effect at the next turn boundary without rewriting cached context; off in every new or resumed session. Works mid-turn |
-| `/useless-buddy [on\|off]` | a small picture standing on the rule above the prompt; it does nothing. Needs a terminal with kitty graphics and Unicode placeholders (kitty or Ghostty, not inside tmux). Shows `~/.plank/buddy.png` when that file is a PNG, else a built-in plank character. Bare, it toggles; this run only. TUI only |
+| `/buddy [on\|off\|install]` | an animated buddy standing on the rule above the prompt while plank is idle; it does nothing. Needs a terminal with kitty graphics (kitty, Ghostty or Warp, not inside tmux) and `ffmpeg`. Buddies are the folders of [plank-buddies](https://github.com/aovestdipaperino/plank-buddies); you have one, in `~/.plank/buddy/`. `on` with none installed, and `install`, offer them as a menu (`install <name>` installs one directly), and the new buddy replaces the old. Its clips play one after another: one whose name ends in a letter three times in four, at random, otherwise the next one ending in a digit. Bare, it reports the state; on and off last for this run. TUI only |
 | `/notify <mode>` | change notification mode for this session |
 | `/version` | the running version |
 | `/help` | full command and flag reference |

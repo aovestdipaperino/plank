@@ -2084,7 +2084,21 @@ fn frame_rows(
         render_perf_text(frame, rule);
     }
     set_rule_bottom_rect(rule_bottom);
+    if let Ok(mut slot) = OUTPUT_RECT.lock() {
+        *slot = output;
+    }
     (output, input, status)
+}
+
+/// Where the last drawn frame put the output pane, for overlays drawn after
+/// it in the same frame ([`last_output_rect`]).
+static OUTPUT_RECT: std::sync::Mutex<Rect> = std::sync::Mutex::new(Rect::ZERO);
+
+/// The output pane of the frame being drawn, once `draw` or
+/// `draw_btw_split` has laid it out: what the idle repaint stands the
+/// `/buddy` on.
+pub fn last_output_rect() -> Rect {
+    OUTPUT_RECT.lock().map_or(Rect::ZERO, |r| *r)
 }
 
 /// Where the last drawn frame put the rule below the prompt, for
@@ -4901,6 +4915,9 @@ pub fn key_text(key: ratatui::crossterm::event::KeyEvent) -> Option<char> {
 /// no reason. What it adds is the two things the packed wire format carries
 /// that `arcade::Glyph` does not: bold, and an optional background color.
 pub fn draw_wasm_frame(frame: &mut Frame, open: &crate::wasmreg::OpenFrame) {
+    // A frame drawn on its own (outside the idle repaint) covers the prompt
+    // the buddy stands on.
+    crate::buddy::hide();
     let area = frame.area();
     paint_frame_ground(frame, area, open.veiled);
     if area.height < 2 {
@@ -5058,15 +5075,16 @@ pub fn draw(
 
     // Input line: hidden entirely (no prompt, no cursor) while the agent is busy.
     if let Some(input) = input {
-        // Over the output pane, standing on the rule above the prompt.
-        crate::buddy::render(frame.buffer_mut(), output);
         render_input(frame, input_row, input);
     } else {
         // No prompt on this frame: forget its rect so a stray click cannot
         // steer a cursor that is not on screen, and forget the caret so
         // `cursor::place` does not move the real one to a stale position.
+        // The buddy stands on the rule above the prompt, so it goes too
+        // (frames with a prompt are the idle repaint's to judge).
         set_input_rect(None);
         crate::cursor::set_caret(None);
+        crate::buddy::hide();
     }
 
     // Status bar, reverse-styled across the full width, with a magenta bar.
@@ -5309,14 +5327,16 @@ pub fn draw_btw_split(
 
     // Input line and status bar span the full width, identical to `draw`.
     if let Some(input) = input {
-        crate::buddy::render(frame.buffer_mut(), output);
         render_input(frame, input_row, input);
     } else {
         // No prompt on this frame: forget its rect so a stray click cannot
         // steer a cursor that is not on screen, and forget the caret so
         // `cursor::place` does not move the real one to a stale position.
+        // The buddy stands on the rule above the prompt, so it goes too
+        // (frames with a prompt are the idle repaint's to judge).
         set_input_rect(None);
         crate::cursor::set_caret(None);
+        crate::buddy::hide();
     }
     let status_style = Style::default()
         .bg(Color::Indexed(238))

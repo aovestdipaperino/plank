@@ -8,11 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **`/useless-buddy`.** Toggles a small picture standing on the rule above
-  the prompt, in kitty and Ghostty (outside tmux) only. It is
-  `~/.plank/buddy.png` when present, else a built-in plank character. The
-  picture is placed with kitty's Unicode placeholders, so it is ordinary
-  cells in the frame and leaves nothing behind when covered or dismissed.
+- **`/buddy on|off|install`.** An animated buddy stands on the rule above
+  the prompt while plank is idle, in kitty, Ghostty and Warp (outside tmux).
+  Buddies are the folders of the public `aovestdipaperino/plank-buddies`
+  repository, the first being `minions`; a user has one, and installing
+  another replaces it. `on` with none installed, and `install`, offer them as
+  a menu. Its clips play one after another, one named with a final letter
+  three times in four and otherwise the next one named with a final digit,
+  decoded once by `ffmpeg` at half resolution with the white background
+  keyed out. kitty and Ghostty draw it with Unicode placeholders, so it is
+  ordinary cells in the frame; Warp draws images only at the cursor, so
+  there it is placed after each frame and removed whenever an overlay lands
+  on its place.
 
 - **`/hints on|off`: brief programming hints.** With hints on, the model now
   and then adds a one- or two-sentence `> **Hint:**` aside on the concept

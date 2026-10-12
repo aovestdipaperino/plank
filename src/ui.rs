@@ -288,6 +288,9 @@ fn repaint_idle(
                     &roster,
                 );
             }
+            // Idle only: no other draw stands the buddy on the rule, so it is
+            // never up while a turn runs. Under every overlay drawn next.
+            crate::buddy::render(f.buffer_mut(), tui::last_output_rect());
             if let Some(m) = &input.slash {
                 tui::draw_slash_menu(f, input.buf.text(), m, roster_rows);
             }
@@ -316,6 +319,7 @@ fn repaint_idle(
             remote_capture(rem, f);
         })
         .map_err(|e| e.to_string())?;
+    crate::buddy::after_draw(completed.buffer);
     crate::cursor::place();
     Ok(completed.buffer.clone())
 }
@@ -8179,8 +8183,8 @@ impl Agent<'_> {
             "/loopguard" | "/lg" => println!("{}", loopguard_command(arg)),
             "/mc" => println!("{}", microcompact_command(arg)),
             "/hints" => println!("{}", hints_command(arg)),
-            "/useless-buddy" => println!(
-                "/useless-buddy: the buddy stands on the TUI's prompt rule; this front end has none"
+            "/buddy" => println!(
+                "/buddy: the buddy stands on the TUI's prompt rule; this front end has none"
             ),
             "/jobs" => println!("{}", self.jobs_command()),
             "/think" => {
@@ -13879,7 +13883,8 @@ impl Agent<'_> {
             // `MAX_STEP_MS`, so at that rate half of every second is simply
             // dropped from the simulation and the motion runs slow as well as
             // rough.
-            let poll = if arcade.is_open() || wasm_frame.is_some() {
+            // A playing `/buddy` clip wants it too.
+            let poll = if arcade.is_open() || wasm_frame.is_some() || crate::buddy::animating() {
                 Duration::from_millis(crate::anim::TICK_MS)
             } else {
                 Duration::from_millis(200)
@@ -18485,7 +18490,21 @@ impl Agent<'_> {
             "/loopguard" | "/lg" => log.push_plain(loopguard_command(arg)),
             "/mc" => log.push_plain(microcompact_command(arg)),
             "/hints" => log.push_plain(hints_command(arg)),
-            "/useless-buddy" => log.push_plain(crate::buddy::command(arg)),
+            "/buddy" => match crate::buddy::command(arg) {
+                crate::buddy::Outcome::Say(line) => log.push_plain(line),
+                crate::buddy::Outcome::Pick { question, choices } => {
+                    let mut options: Vec<(&str, &str)> = choices
+                        .iter()
+                        .map(|c| (c.as_str(), "download it from plank-buddies"))
+                        .collect();
+                    options.push(("Not now", "leave the buddy as it is"));
+                    let picked = run_pick_panel(terminal, log, view, "Buddy", &question, &options);
+                    match picked.and_then(|i| choices.get(i)) {
+                        Some(name) => log.push_plain(crate::buddy::chosen(name)),
+                        None => log.push_plain("no buddy picked"),
+                    }
+                }
+            },
             // A report, not conversation: the same dismissable panel as
             // `/usage`, refreshed every tick while open (`refresh_jobs_report`).
             "/jobs" => {
@@ -20826,7 +20845,9 @@ fn busy_ui_loop(
                 }
                 remote_capture(remote, f);
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+            // A turn is running: no buddy, which `after_draw` removes.
+            .map(|done| crate::buddy::after_draw(done.buffer))?;
         crate::cursor::place();
         remote_service(remote);
         if finished {
