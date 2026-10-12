@@ -51,6 +51,16 @@ pub fn directions(keys: &[String]) -> Result<Vec<String>, String> {
     directions_in(&store_path(), keys)
 }
 
+/// The `emoji` direction `name` carries in the default store, if any. An
+/// unreadable store has none: this only decorates the status bar.
+#[must_use]
+pub fn emoji(keys: &[String], name: &str) -> Option<String> {
+    VectorStore::new(store_path())
+        .emoji(keys, name)
+        .ok()
+        .flatten()
+}
+
 /// Decodes direction `name`, stored under the first of `keys` that has it,
 /// into a content-named vector file under `cache_dir`, and returns its path.
 ///

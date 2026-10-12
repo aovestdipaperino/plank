@@ -689,6 +689,33 @@ pub fn temperature() -> f32 {
     f32::from_bits(TEMPERATURE.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// The steering in force, as its mark (the direction's `emoji` from
+/// `vectors.json`, else its name) and FFN scale; `None` with no vector.
+///
+/// Process-global like the power share: the footer is drawn from places that
+/// hold no engine handle.
+static STEERING: std::sync::Mutex<Option<(String, f32)>> = std::sync::Mutex::new(None);
+
+/// Records the steering in force, at startup and after each live `/steer`.
+pub fn set_steering(steering: Option<(String, f32)>) {
+    if let Ok(mut slot) = STEERING.lock() {
+        *slot = steering;
+    }
+}
+
+/// The footer's steering segment, `📖 ffn 2`: only while a direction is
+/// actually applied, so a vector preloaded at zero for `/steer` shows nothing.
+fn steering_segment() -> Option<String> {
+    let slot = STEERING.lock().ok()?;
+    let (mark, ffn) = slot.as_ref()?;
+    steering_segment_for(mark, *ffn)
+}
+
+/// [`steering_segment`] for a given mark and scale.
+fn steering_segment_for(mark: &str, ffn: f32) -> Option<String> {
+    (ffn != 0.0).then(|| format!("{mark} ffn {ffn}"))
+}
+
 pub fn set_local_power(percent: i32) {
     LOCAL_POWER.store(percent, std::sync::atomic::Ordering::Relaxed);
 }
@@ -2129,6 +2156,11 @@ fn build_status_text_with_cells(
     // that hold for every turn, not readings from this one.
     let ctx = match hd_segment(st, color) {
         Some(seg) => format!("{ctx} | {seg}"),
+        None => ctx,
+    };
+    // The steering edit is another fact about the loaded engine.
+    let ctx = match steering_segment() {
+        Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
     };
     // A connected console is a session-wide fact about how the run is being
@@ -3992,6 +4024,16 @@ mod tests {
     // The two blink glyphs themselves, independent of any segment plumbing:
     // this is the exact method src/experts.rs uses to pin the brain emoji's
     // width, applied to the SSD-streaming marker's two phases.
+    #[test]
+    fn the_steering_segment_shows_only_an_applied_direction() {
+        assert_eq!(steering_segment_for("📖", 2.0).as_deref(), Some("📖 ffn 2"));
+        assert_eq!(
+            steering_segment_for("🔥", -0.5).as_deref(),
+            Some("🔥 ffn -0.5")
+        );
+        assert_eq!(steering_segment_for("📖", 0.0), None);
+    }
+
     #[test]
     fn hd_mark_and_off_form_are_the_same_display_width() {
         assert_eq!(

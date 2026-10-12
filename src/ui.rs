@@ -10286,6 +10286,7 @@ the original is frozen and listed in /tree"
         if let Err(e) = self.engine.set_steering_ffn(scale) {
             return format!("/steer: {e}");
         }
+        publish_steering(self.cfg, self.engine.steering_ffn());
         self.discard_ladder();
         format!("steering ffn {scale} (applies to new tokens; rungs dropped)")
     }
@@ -19846,6 +19847,7 @@ fn plan_steer(
     // model has, the loaded one starred, so the names to type are on screen.
     let listing = || {
         let mut out = match (loaded, live) {
+            (Some(name), Some(0.0)) => format!("steering: off (`{name}` loaded)"),
             (Some(name), Some(ffn)) => format!("steering: `{name}` at ffn {ffn}"),
             (None, Some(ffn)) => format!("steering: ffn {ffn}"),
             _ => "steering: off".to_owned(),
@@ -19919,6 +19921,9 @@ fn plan_steer(
                 .map_or_else(|| SteerPlan::Say(none_stored()), |only| to(only, scale)),
         },
         [name] | [name, _] if !is_known(name) => unknown(name),
+        // Loaded at zero (preloaded at launch, or turned down): naming it is
+        // asking for it, at the scale a fresh switch would use.
+        [name] if loaded == Some(*name) && live == Some(0.0) => SteerPlan::Live(1.0),
         [name] if loaded == Some(*name) && live.is_some() => SteerPlan::Say(format!(
             "steering `{name}` is already loaded; /steer {name} <scale> retargets it"
         )),
@@ -19929,6 +19934,30 @@ fn plan_steer(
         },
         _ => SteerPlan::Say("usage: /steer [name] [-100..100]".to_owned()),
     }
+}
+
+/// Publishes the steering in force to the footer: the loaded direction's
+/// `emoji` from `vectors.json` (else its name) and `ffn`, or nothing when the
+/// engine has no vector.
+fn publish_steering(cfg: &AgentConfig, ffn: Option<f32>) {
+    let steering = ffn
+        .zip(cfg.engine.dir_steering.as_deref())
+        .map(|(ffn, name)| {
+            let engine = cfg
+                .selection
+                .as_ref()
+                .and_then(|s| s.id)
+                .map(crate::manifest::EngineId::as_str);
+            let mark = cfg
+                .model_path
+                .as_deref()
+                .and_then(|model| {
+                    crate::steervec::emoji(&crate::steervec::model_keys(engine, model), name)
+                })
+                .unwrap_or_else(|| name.to_owned());
+            (mark, ffn)
+        });
+    crate::status::set_steering(steering);
 }
 
 /// Whether a `/steer` word is meant as a scale rather than a direction name:
@@ -21827,6 +21856,7 @@ fn new_agent(
     // between the key and the tokens rather than between two keys.
     engine.set_think_mode(cfg.generation.think_mode);
     crate::status::set_local_power(cfg.power_percent);
+    publish_steering(cfg, engine.steering_ffn());
     // Which model this local engine is, for the footer's origin label. Taken
     // from the dialect already resolved above, so the tag can never disagree
     // with the syntax the parser is using.
@@ -26324,6 +26354,29 @@ mod tests {
             plan_steer("0", None, None, &one),
             SteerPlan::Say(_)
         ));
+    }
+
+    #[test]
+    fn a_direction_preloaded_at_zero_steers_live() {
+        let one = names(&["heretic"]);
+        let two = names(&["heretic", "terse"]);
+        assert_eq!(
+            plan_steer("2", Some("heretic"), Some(0.0), &one),
+            SteerPlan::Live(2.0)
+        );
+        assert_eq!(
+            plan_steer("heretic", Some("heretic"), Some(0.0), &two),
+            SteerPlan::Live(1.0)
+        );
+        // Another direction still needs the restart that loads it.
+        assert!(matches!(
+            plan_steer("terse 2", Some("heretic"), Some(0.0), &two),
+            SteerPlan::Switch { .. }
+        ));
+        let SteerPlan::Say(msg) = plan_steer("", Some("heretic"), Some(0.0), &two) else {
+            panic!("a report");
+        };
+        assert!(msg.starts_with("steering: off (`heretic` loaded)"), "{msg}");
     }
 
     #[test]

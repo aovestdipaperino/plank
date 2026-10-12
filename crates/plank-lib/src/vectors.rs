@@ -11,6 +11,9 @@
 //! ]
 //! ```
 //!
+//! A vector may also carry an `emoji` (`"emoji": "📖"`), which plank shows
+//! in its status bar while that direction is steering.
+//!
 //! An entry's `model` is the plank engine name (`ds4vision`); a GGUF that no
 //! engine uses is listed under its file name. [`model_keys`] gives the keys a
 //! run should try, in order. Fields this module does not know are kept as
@@ -96,6 +99,21 @@ impl VectorStore {
     /// Fails when the file exists but is not a valid store.
     pub fn contains(&self, model: &str, name: &str) -> Result<bool, Error> {
         Ok(find(&self.read()?, model, name).is_some())
+    }
+
+    /// The optional `emoji` a direction carries in the store, used to mark it
+    /// in plank's status bar, from the first of `keys` that has `name`.
+    ///
+    /// # Errors
+    /// Fails when the file exists but is not a valid store.
+    pub fn emoji(&self, keys: &[String], name: &str) -> Result<Option<String>, Error> {
+        let entries = self.read()?;
+        Ok(vectors_for(&entries, keys)
+            .find(|v| v.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|v| v.get("emoji"))
+            .and_then(Value::as_str)
+            .filter(|e| !e.trim().is_empty())
+            .map(str::to_owned))
     }
 
     /// The decoded bytes of direction `name`, stored under the first of
@@ -607,6 +625,23 @@ mod tests {
         assert!(decode_base64("Zm9v!").is_none());
         assert!(decode_base64("Z").is_none());
         assert!(decode_base64("Zg==Zg").is_none());
+    }
+
+    #[test]
+    fn a_direction_may_carry_an_emoji() {
+        let dir = scratch("emoji");
+        let s = store(&dir);
+        std::fs::write(
+            s.path(),
+            r#"[{"model":"m","vectors":[
+                {"name":"verbosity","value":"","emoji":"📖"},
+                {"name":"plain","value":""}]}]"#,
+        )
+        .unwrap();
+        let keys = ["m".to_owned()];
+        assert_eq!(s.emoji(&keys, "verbosity").unwrap().as_deref(), Some("📖"));
+        assert_eq!(s.emoji(&keys, "plain").unwrap(), None);
+        assert_eq!(s.emoji(&keys, "absent").unwrap(), None);
     }
 
     #[test]

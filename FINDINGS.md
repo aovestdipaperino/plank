@@ -3584,3 +3584,19 @@ turns) ran straight into the next `<｜User｜>`. With two pirate-voice prefix
 turns the model ignored the style; with the EOS and four turns it answered
 "Arr! …". `reconcile` now appends the EOS for the DSML families only: Qwen's
 template closes its own turns.
+
+## A steering scale of 0 unloads the vector for every later session
+
+The C uploads a direction to a session's graph at `ds4_session_create`, and
+only when the *engine's* attention and FFN scales are not both zero. A live
+`ds4_session_set_directional_steering_ffn` writes the engine's scale as well
+as the session's. So a `/steer 0`, or a launch at ffn 0, left every session
+created afterwards (`/clear`, a sub-agent, an aside, the decide session)
+without the vector, and a non-zero `/steer` there was refused. Plank never
+hands the C a zero FFN scale while a file is loaded: `ds4engine::STEER_OFF`
+(`f32::MIN_POSITIVE`) stands in for it, its edit flushes to nothing, and it
+reads back and keys the KV as 0. That is what lets a launch preload the
+model's first direction at 0 so the first `/steer` is live instead of a
+restart. A new session also starts at whatever scale the last session set,
+not the open scale, so `Ds4Session::reconcile_steering` reads it back and
+corrects it after every create.

@@ -118,6 +118,33 @@ fn same_scale(a: f32, b: f32) -> bool {
     a.to_bits() == b.to_bits()
 }
 
+/// What plank hands the C for an FFN scale of zero while a vector is loaded.
+///
+/// The C uploads the vector to a session's graph only when the *engine's*
+/// scales are not both zero at `ds4_session_create`, and a live
+/// `ds4_session_set_directional_steering_ffn` writes the engine's scale as
+/// well as the session's. A real zero would therefore unload steering for
+/// every session created afterwards (`/clear`, a sub-agent, an aside), and a
+/// launch at zero could never `/steer` at all. The smallest normal `f32`
+/// keeps the vector resident while its edit, `scale * dot` per row, flushes
+/// to nothing. Plank reports and keys it as zero ([`from_c_scale`]), so it
+/// never reaches the KV key or the user.
+const STEER_OFF: f32 = f32::MIN_POSITIVE;
+
+/// The scale the C is given for `scale`: [`STEER_OFF`] in place of zero.
+fn c_scale(scale: f32) -> f32 {
+    if scale == 0.0 { STEER_OFF } else { scale }
+}
+
+/// The scale plank reports for a value read back from the C.
+fn from_c_scale(scale: f32) -> f32 {
+    if same_scale(scale, STEER_OFF) {
+        0.0
+    } else {
+        scale
+    }
+}
+
 /// Reads `path` and digests it, so two different vectors at one filename are
 /// two different keys. An unreadable file yields `None`: the engine open that
 /// follows reports it far better than a cache key could, and a key invented
@@ -488,7 +515,13 @@ impl Ds4Model {
             directional_steering_file: as_ptr(&c_steering),
             expert_profile_path: std::ptr::null(),
             directional_steering_attn: tuning.dir_steering_attn,
-            directional_steering_ffn: tuning.dir_steering_ffn,
+            // A loaded vector is never opened at zero (see `STEER_OFF`), so
+            // a launch that preloads a direction for `/steer` still uploads it.
+            directional_steering_ffn: if c_steering.is_some() {
+                c_scale(tuning.dir_steering_ffn)
+            } else {
+                tuning.dir_steering_ffn
+            },
             power_percent,
             ssd_streaming_cache_experts: tuning.ssd_streaming_cache_experts,
             ssd_streaming_cache_bytes: tuning.ssd_streaming_cache_bytes,
@@ -1058,6 +1091,7 @@ impl ModelHandle for Ds4Model {
         };
         #[cfg(ds4_engine)]
         inner.init_decide_letters();
+        inner.reconcile_steering();
         Ok(Box::new(Ds4HostSession {
             inner,
             pending: None,
@@ -1345,19 +1379,33 @@ impl Ds4Session {
         if self.session.is_null() {
             // Single-owner path: the session gets the model's full context.
             self.session = self.model.create_session(self.model.ctx_size)?;
-            // A fresh session starts at the scale the *engine* was opened
-            // with, so a `/steer` issued before this point would be silently
-            // dropped. Re-apply it here, where the C finally has somewhere to
-            // put it. A refusal is not fatal: `steering_ffn` is corrected to
-            // whatever the C kept, so the KV key keeps describing reality.
-            if !same_scale(self.steering_ffn, self.model.steering_ffn0) {
-                let want = self.steering_ffn;
-                self.steering_ffn = self.model.steering_ffn0;
-                let _ = self.set_steering_ffn(want);
-            }
+            self.reconcile_steering();
             self.hold_steering(true);
         }
         Ok(self.session)
+    }
+
+    /// Brings a freshly created C session to the scale this session wants.
+    ///
+    /// A new session starts at the *engine's* scale, which is the last one
+    /// any session set (the setter writes both), not the one the engine was
+    /// opened with, and not a `/steer` issued before the session existed.
+    /// So the C value is read back and corrected here. A refusal is not
+    /// fatal: `steering_ffn` is corrected to whatever the C kept, so the KV
+    /// key keeps describing reality.
+    fn reconcile_steering(&mut self) {
+        if self.session.is_null() || !self.has_steering_vector() {
+            return;
+        }
+        // SAFETY: session is non-null here and freed only on drop.
+        let actual =
+            from_c_scale(unsafe { ffi::ds4_session_directional_steering_ffn(self.session) });
+        if same_scale(actual, self.steering_ffn) {
+            return;
+        }
+        let want = self.steering_ffn;
+        self.steering_ffn = actual;
+        let _ = self.set_steering_ffn(want);
     }
 
     /// Holds the live FFN scale at zero (`hold`) or arms it at the target, for
@@ -1375,7 +1423,7 @@ impl Ds4Session {
         {
             return;
         }
-        let scale = if hold { 0.0 } else { self.steering_ffn };
+        let scale = c_scale(if hold { 0.0 } else { self.steering_ffn });
         // SAFETY: session is non-null here and freed only on drop.
         let rc = unsafe { ffi::ds4_session_set_directional_steering_ffn(self.session, scale) };
         if rc == 0 {
@@ -1402,28 +1450,19 @@ impl Ds4Session {
             return self.steering_ffn;
         }
         // SAFETY: session is non-null here and freed only on drop.
-        unsafe { ffi::ds4_session_directional_steering_ffn(self.session) }
+        from_c_scale(unsafe { ffi::ds4_session_directional_steering_ffn(self.session) })
     }
 
-    /// Whether a steering vector is actually **loaded in the graph**, which is
-    /// stricter than "a file was passed on the command line".
+    /// Whether a steering vector is loaded in the graph.
     ///
-    /// The C skips loading the vector entirely when both launch scales are
-    /// zero — there is nothing to apply, so it does not pay for it. That
-    /// decision is permanent for the life of the engine: a later
-    /// `ds4_session_set_directional_steering_ffn` with a non-zero scale is
-    /// refused, because the direction it would scale was never loaded.
-    ///
-    /// So `--dir-steering-file X --dir-steering-ffn 0` is a session where
-    /// steering can never be switched on, and saying otherwise would offer the
-    /// user a `/steer` that cannot work. Verified empirically: a `/steer 2`
-    /// from such a launch comes back refused.
+    /// The C skips loading the vector when both of the engine's scales are
+    /// zero, and a later non-zero `ds4_session_set_directional_steering_ffn`
+    /// is then refused. Plank never lets the C see a zero FFN scale while a
+    /// file is given ([`STEER_OFF`]), so a file passed at open is a vector
+    /// loaded in every session, launched at zero or not.
     #[must_use]
     pub fn has_steering_vector(&self) -> bool {
-        self.model
-            .steering
-            .as_ref()
-            .is_some_and(|k| !same_scale(self.model.steering_ffn0, 0.0) || !same_scale(k.attn, 0.0))
+        self.model.steering.is_some()
     }
 
     /// Retargets FFN steering for tokens evaluated after this call.
@@ -1455,7 +1494,8 @@ impl Ds4Session {
             return Ok(());
         }
         // SAFETY: session is non-null here and freed only on drop.
-        let rc = unsafe { ffi::ds4_session_set_directional_steering_ffn(self.session, scale) };
+        let rc =
+            unsafe { ffi::ds4_session_set_directional_steering_ffn(self.session, c_scale(scale)) };
         if rc != 0 {
             // The C prints its reason to stderr and returns a bare non-zero, so
             // the cause is genuinely not knowable here. Name the possibilities

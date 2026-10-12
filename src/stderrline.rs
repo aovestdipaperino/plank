@@ -414,7 +414,17 @@ extern "C" fn report_exit_inside_redirect() {
 /// Matched by prefix against a whole line. Kept deliberately short — anything
 /// not listed here is passed through, because a diagnostic swallowed is worse
 /// than a diagnostic repeated.
-const DS4_CHATTER: &[&str] = &["ds4: DSpark target-hidden capture enabled:"];
+///
+/// The steering lines announce the vector each session uploads, which the
+/// status bar and `/steer` already report; their failure lines (`failed to
+/// load directional steering vectors`) do not match and still come through.
+const DS4_CHATTER: &[&str] = &[
+    "ds4: DSpark target-hidden capture enabled:",
+    "ds4: directional steering enabled:",
+    "ds4: CPU directional steering enabled:",
+    "ds4: GLM directional steering enabled:",
+    "ds4: Qwen3.8 directional steering enabled:",
+];
 
 /// Serializes the fd-2 swap in [`without_ds4_chatter`], so two threads
 /// creating sessions at once cannot restore each other's stderr.
@@ -503,6 +513,12 @@ mod tests {
             "ds4: failed to configure DSpark target-hidden capture"
         ));
         assert!(!is_ds4_chatter("ds4: out of memory"));
+        assert!(is_ds4_chatter(
+            "ds4: directional steering enabled: /p/x.f32 attn=0 ffn=1"
+        ));
+        assert!(!is_ds4_chatter(
+            "ds4: failed to load directional steering vectors from /p/x.f32"
+        ));
         assert!(!is_ds4_chatter(""));
     }
 

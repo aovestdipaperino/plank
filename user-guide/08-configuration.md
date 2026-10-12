@@ -252,7 +252,7 @@ The file is a JSON array with one entry per model, each listing its named direct
 [
   { "model": "ds4vision",
     "vectors": [
-      { "name": "succinct", "value": "Pq3vPLnF..." },
+      { "name": "succinct", "value": "Pq3vPLnF...", "emoji": "📖" },
       { "name": "heretic", "value": "u0Kz/D2p..." }
     ] }
 ]
@@ -260,7 +260,7 @@ The file is a JSON array with one entry per model, each listing its named direct
 
 An entry's `model` is the engine name, so a direction built for `ds4vision` follows that engine whatever its file is called. A model loaded by a path that is no engine is looked up by its file name instead, and plank tries the engine name first and the file name second. A direction belongs to the model it was built on: the same name under another model is a different vector.
 
-You rarely write the file by hand. `pt vectorize`, from [plank-replay](https://github.com/aovestdipaperino/plank-replay), builds a direction from two prompt sets (or from the difference between a model and a modified copy of it) and stores it under the name you give with `-n`, and `pt install <repo>:<path>` merges a vectors file someone else published into yours, asking before it replaces a direction of the same name. Both write the file in place through a temporary copy, and keep any fields they do not recognise.
+You rarely write the file by hand. `pt vectorize`, from [plank-replay](https://github.com/aovestdipaperino/plank-replay), builds a direction from two prompt sets (or from the difference between a model and a modified copy of it) and stores it under the name you give with `-n`, and `pt install <repo>:<path>` merges a vectors file someone else published into yours, asking before it replaces a direction of the same name. Both write the file in place through a temporary copy, and keep any fields they do not recognise. One such field is yours to add: a direction's optional `emoji` is how the status bar marks it while it steers, as `📖 ffn 2`, with the direction's name standing in when it has none.
 
 | Flag | What it does |
 |---|---|
@@ -271,7 +271,7 @@ You rarely write the file by hand. `pt vectorize`, from [plank-replay](https://g
 
 Holding the edit until your first message keeps the cached prompt unsteered, so a steered run reuses the same prompt checkpoint as an unsteered one. An attention edit cannot be held back that way, so a non-zero `--dir-steering-attn` means `all`.
 
-Inside a session, `/steer` lists the model's directions with the loaded one starred, `/steer <scale>` changes the feed-forward scale on the spot (name the direction as well when the model has more than one), and `/steer <name> [scale]` switches to another direction. The engine binds a direction when it loads, so switching restarts plank into the new one and resumes the session where you were.
+Inside a session, `/steer` lists the model's directions with the loaded one starred, `/steer <scale>` changes the feed-forward scale on the spot (name the direction as well when the model has more than one), and `/steer <name> [scale]` switches to another direction. The engine binds a direction when it loads, so when you launch without `--dir-steering` plank loads the model's first direction at scale 0: it changes nothing, and the first `/steer` on it takes effect at once instead of restarting. Only one direction can be loaded at a time, so switching to another one restarts plank into it and resumes the session where you were.
 
 A profile can carry a direction too: a `steering` block pairs one with the profile's `recommendedModel` (see [Profiles](14-profiles.md)), and a `--dir-steering` on the command line overrides it, scales included.
 

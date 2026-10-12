@@ -722,16 +722,18 @@ fn apply_profile_steering(
 /// Remote and provider runs load no local model and skip this. A direction
 /// the store does not hold is fatal: the user asked for it by name, and
 /// running unsteered instead would be a silent change of behaviour.
+///
+/// With no direction asked for, the model's first stored direction is loaded
+/// at scale zero, so the first `/steer` retargets it live instead of
+/// restarting to load it (the C binds the vector at open). Zero is no edit
+/// and keys the KV as unsteered, so this changes nothing until `/steer`; a
+/// store that cannot be read just leaves the run unsteered, as before.
 fn resolve_steering(
     cfg: &mut plank::config::AgentConfig,
     root: &std::path::Path,
 ) -> Result<(), String> {
     let local = cfg.remote_url.is_none() && cfg.provider.is_none();
-    let (Some(name), Some(model), true) = (
-        cfg.engine.dir_steering.clone(),
-        cfg.model_path.clone(),
-        local,
-    ) else {
+    let (Some(model), true) = (cfg.model_path.clone(), local) else {
         return Ok(());
     };
     let engine = cfg
@@ -739,13 +741,27 @@ fn resolve_steering(
         .as_ref()
         .and_then(|s| s.id)
         .map(plank::manifest::EngineId::as_str);
-    let file = plank::steervec::materialize_in(
-        &plank::steervec::store_path_in(root),
-        &root.join("cache").join("steering"),
-        &plank::steervec::model_keys(engine, &model),
-        &name,
-    )?;
-    cfg.engine.dir_steering_file = Some(file);
+    let keys = plank::steervec::model_keys(engine, &model);
+    let store = plank::steervec::store_path_in(root);
+    let cache = root.join("cache").join("steering");
+    if let Some(name) = cfg.engine.dir_steering.clone() {
+        let file = plank::steervec::materialize_in(&store, &cache, &keys, &name)?;
+        cfg.engine.dir_steering_file = Some(file);
+        return Ok(());
+    }
+    let preload = plank::steervec::directions_in(&store, &keys)
+        .ok()
+        .and_then(|names| names.into_iter().next())
+        .and_then(|name| {
+            let file = plank::steervec::materialize_in(&store, &cache, &keys, &name).ok()?;
+            Some((name, file))
+        });
+    if let Some((name, file)) = preload {
+        cfg.engine.dir_steering = Some(name);
+        cfg.engine.dir_steering_file = Some(file);
+        cfg.engine.dir_steering_ffn = 0.0;
+        cfg.engine.dir_steering_attn = 0.0;
+    }
     Ok(())
 }
 
@@ -2381,6 +2397,17 @@ mod tests {
         assert_eq!(cfg.engine.dir_steering, None);
         // A name the store does not hold stops the launch.
         assert!(parse(&["--dir-steering", "nope"]).is_err());
+        // No profile and no direction asked for: the model's first direction
+        // is loaded at zero, so the first `/steer` is a live change.
+        let args: Vec<String> = ["--model", "ds4-ab"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cfg =
+            parse_config_in(&settings, &args, "plank", &root, None, false, false).expect("parses");
+        assert_eq!(cfg.engine.dir_steering.as_deref(), Some("heretic"));
+        assert_eq!(file(&cfg), [0, 0, 0x80, 0x3f, 0, 0, 0, 0]);
+        assert!(cfg.engine.dir_steering_ffn == 0.0 && cfg.engine.dir_steering_attn == 0.0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
