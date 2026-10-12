@@ -19,7 +19,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keyed out. kitty and Ghostty draw it with Unicode placeholders, so it is
   ordinary cells in the frame; Warp draws images only at the cursor, so
   there it is placed after each frame and removed whenever an overlay lands
-  on its place.
+  on its place. On and off are remembered across launches by
+  `~/.plank/buddy.on`, and the TUI puts a buddy left on back at startup.
 
 - **`/hints on|off`: brief programming hints.** With hints on, the model now
   and then adds a one- or two-sentence `> **Hint:**` aside on the concept

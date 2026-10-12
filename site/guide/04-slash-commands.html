@@ -469,8 +469,10 @@ installed, and <code>install</code>, offer them as a menu
 (<code>install &lt;name&gt;</code> installs one directly), and the new
 buddy replaces the old. Its clips play one after another: one whose name
 ends in a letter three times in four, at random, otherwise the next one
-ending in a digit. Bare, it reports the state; on and off last for this
-run. TUI only</td>
+ending in a digit. Bare, it reports the state. On and off are remembered
+for the next launch (<code>~/.plank/buddy.on</code>), so a buddy you
+left on is back when plank starts in a terminal that can show it. TUI
+only</td>
 </tr>
 <tr>
 <td><code>/notify &lt;mode&gt;</code></td>

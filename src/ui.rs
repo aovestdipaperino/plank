@@ -13706,6 +13706,8 @@ impl Agent<'_> {
                 crate::agentsmd::Offer::NotNow => {}
             }
         }
+        // A buddy the last run left on; it shows once plank is idle.
+        crate::buddy::restore();
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             log.push_user_echo(initial);
             self.session.push(Message::user(initial));

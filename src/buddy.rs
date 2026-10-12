@@ -16,6 +16,11 @@
 //! installed, and `/buddy install`, offer the repository's folders as a menu
 //! ([`Outcome::Pick`]).
 //!
+//! Turning it on or off is remembered across runs by the presence of
+//! `~/.plank/buddy.on` ([`STATE_FILE`]), and the TUI puts a remembered buddy
+//! back at startup ([`restore`]). The file sits outside [`CLIP_DIR`] because
+//! an install replaces that directory whole.
+//!
 //! The clips play one after the other ([`next_clip`]): a clip whose name ends
 //! in a letter is picked three times out of four, at random among the letter
 //! clips; otherwise the next clip whose name ends in a digit plays, in
@@ -63,6 +68,12 @@ pub const REPO: &str = "aovestdipaperino/plank-buddies";
 
 /// The installed buddy's directory, under the plank home.
 pub const CLIP_DIR: &str = "buddy";
+
+/// The file, under the plank home, whose presence means the buddy is on.
+/// Not a setting: `/config` saves its merged settings into the project's
+/// file, which would pin a stale value there and outrank `/buddy` in that
+/// folder from then on.
+pub const STATE_FILE: &str = "buddy.on";
 
 /// Where an install downloads before it replaces [`CLIP_DIR`], under the plank
 /// home, so a failed download leaves the old buddy in place.
@@ -123,7 +134,7 @@ const BACKGROUND_THRESHOLD: u8 = 228;
 /// drawn by nothing else in plank, so an overlay that lands on a cell is seen.
 const MARKER: &str = "\u{2800}";
 
-/// Whether the buddy is on (for this run only; nothing is saved).
+/// Whether the buddy is on in this run; [`STATE_FILE`] carries it to the next.
 static SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// Whether the running buddy is in [`Mode::Direct`] (meaningful while on).
@@ -297,7 +308,7 @@ pub fn command(arg: &str) -> Outcome {
             }
             SHOWN.store(false, Ordering::Relaxed);
             clear_screen();
-            Outcome::Say("buddy dismissed".to_owned())
+            Outcome::Say(format!("buddy dismissed{}", remember(false)))
         }
         ("on", None) => {
             if shown() {
@@ -307,7 +318,11 @@ pub fn command(arg: &str) -> Outcome {
                 return Outcome::Say(UNSUPPORTED.to_owned());
             };
             match installed {
-                Some(name) => Outcome::Say(turn_on(mode, &format!("{name} reporting for duty"))),
+                Some(name) => Outcome::Say(format!(
+                    "{}{}",
+                    turn_on(mode, &format!("{name} reporting for duty")),
+                    remember(true)
+                )),
                 None => pick("No buddy installed yet. Which one?"),
             }
         }
@@ -373,11 +388,53 @@ pub fn chosen(name: &str) -> String {
         }
     });
     let started = format!("downloading {name} from {REPO}; it appears once ready");
-    match supported() {
+    let reply = match supported() {
         Some(mode) if !shown() => turn_on(mode, &started),
         Some(_) => started,
         None => format!("{started}, in a terminal that can show it ({UNSUPPORTED})"),
+    };
+    format!("{reply}{}", remember(true))
+}
+
+/// Puts the buddy back on at TUI startup when the last run left it on, the
+/// terminal can show it, and one is installed. Silent: the user already
+/// asked for it.
+pub fn restore() {
+    let home = crate::home::plank_home();
+    if shown() || !remembered_in(&home) || installed().is_none() {
+        return;
     }
+    if let Some(mode) = supported() {
+        let _ = turn_on(mode, "");
+    }
+}
+
+/// Records `on` for the next run, returning a note for the command's reply
+/// when it could not be (empty otherwise).
+fn remember(on: bool) -> String {
+    match remember_in(&crate::home::plank_home(), on) {
+        Ok(()) => String::new(),
+        Err(e) => format!(" (not remembered for the next run: {e})"),
+    }
+}
+
+/// [`remember`] under the plank home `home`.
+fn remember_in(home: &Path, on: bool) -> std::io::Result<()> {
+    let path = home.join(STATE_FILE);
+    if on {
+        std::fs::create_dir_all(home)?;
+        std::fs::write(path, "")
+    } else {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Whether the last run under the plank home `home` left the buddy on.
+fn remembered_in(home: &Path) -> bool {
+    home.join(STATE_FILE).is_file()
 }
 
 /// Turns the buddy on in `mode`, returning `reply` with any note about the
@@ -1149,6 +1206,21 @@ fn paint(buf: &mut Buffer, at: Rect, id: u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_on_off_state_is_remembered_by_a_file_in_the_home() {
+        let home = std::env::temp_dir().join(format!("plank-buddy-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(!super::remembered_in(&home), "off until turned on");
+        super::remember_in(&home, true).unwrap();
+        assert!(super::remembered_in(&home));
+        // Turning on twice, or off twice, is not an error.
+        super::remember_in(&home, true).unwrap();
+        super::remember_in(&home, false).unwrap();
+        assert!(!super::remembered_in(&home));
+        super::remember_in(&home, false).unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     use super::*;
 
     #[test]
