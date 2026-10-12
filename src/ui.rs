@@ -13481,7 +13481,13 @@ impl Agent<'_> {
             &status::format_ctx_size(self.engine.ctx_size()),
             &self.engine.model_name(),
         );
-        let art = tui::ansi_to_lines(&crate::logo::active_art(crate::logo::DEFAULT_WIDTH));
+        let logo = crate::logo::active_logo(crate::logo::DEFAULT_WIDTH);
+        // A kitty picture is sent before the cells that show it are drawn;
+        // sent again after `/clear`, in case the terminal dropped it.
+        if let Some(seq) = &logo.transmit {
+            let _ = crate::buddy::write_to_terminal(seq);
+        }
+        let art = tui::ansi_to_lines(&logo.art);
         for line in Self::masthead(art, &version) {
             log.push_spans(line.spans);
         }

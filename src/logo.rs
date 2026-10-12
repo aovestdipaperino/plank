@@ -16,6 +16,13 @@
 //! `half`, `quad`, `sextant`, `octant` or `braille` to override the detection
 //! — a terminal that leaves the newer block glyphs to the font will draw tofu,
 //! and `half` is the universally safe answer.
+//!
+//! A terminal with kitty graphics and Unicode placeholders (kitty, Ghostty;
+//! the same detection as `/buddy`) gets the picture itself instead: the PNG
+//! is sent once as a kitty image and the banner holds placeholder cells in
+//! a box of their own, so it scrolls with the text like the art does. The
+//! box is narrower than the art's (`KITTY_COLS`), since a real image needs
+//! fewer cells. Setting `PLANK_LOGO_CELL` keeps the art.
 
 use std::sync::OnceLock;
 
@@ -30,6 +37,145 @@ pub const CELL_ENV: &str = "PLANK_LOGO_CELL";
 
 /// Pixels with every channel at or above this level are treated as background.
 const BACKGROUND_THRESHOLD: u8 = 232;
+
+/// The kitty image id the banner logo is sent as. Placeholder cells name
+/// their image by their 24-bit foreground colour, so it fits in 24 bits, and
+/// it differs from the buddy's clip ids.
+pub const KITTY_ID: u32 = 0x00B0_DD30;
+
+/// Width, in columns, of the kitty picture: smaller than the art's
+/// [`DEFAULT_WIDTH`], since a real image needs fewer cells to read clearly.
+pub const KITTY_COLS: u32 = 10;
+
+/// The logo for one banner: what to draw in the text, and the escapes that
+/// must reach the terminal before it for a kitty picture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Logo {
+    /// Escapes transmitting the picture (`None` for ANSI art).
+    pub transmit: Option<String>,
+    /// The banner text: true-colour art, or placeholder cells.
+    pub art: String,
+}
+
+/// Whether the banner shows the picture through kitty graphics: stdout is a
+/// terminal with Unicode placeholders, and no `PLANK_LOGO_CELL` asks for art.
+fn use_kitty() -> bool {
+    use std::io::IsTerminal as _;
+    std::env::var_os(CELL_ENV).is_none()
+        && std::io::stdout().is_terminal()
+        && crate::buddy::supported() == Some(crate::buddy::Mode::Placeholders)
+}
+
+/// A terminal cell's size in pixels `(width, height)`, from `TIOCGWINSZ`;
+/// `None` when the terminal does not report its pixel size.
+fn cell_pixels() -> Option<(u32, u32)> {
+    // SAFETY: winsize is plain-old-data; zeroed is valid and ioctl overwrites.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: stdout fd is valid and `ws` is a writable winsize buffer.
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &raw mut ws) };
+    if rc != 0 || ws.ws_col == 0 || ws.ws_row == 0 || ws.ws_xpixel == 0 || ws.ws_ypixel == 0 {
+        return None;
+    }
+    Some((
+        u32::from(ws.ws_xpixel) / u32::from(ws.ws_col),
+        u32::from(ws.ws_ypixel) / u32::from(ws.ws_row),
+    ))
+}
+
+/// The box for an `image` of `(width, height)` pixels drawn `cols` cells wide
+/// at native resolution, given the `cell` size in pixels: the pixel size to
+/// scale it to, `(width, height)`, and the rows it covers. The width fills
+/// the columns exactly and the height keeps the image's proportions, so the
+/// terminal draws it pixel for pixel and never rescales it.
+fn kitty_box(image: (u32, u32), cell: (u32, u32), cols: u32) -> Option<((u32, u32), u32)> {
+    let ((w, h), (cw, ch)) = (image, cell);
+    if w == 0 || h == 0 || cw == 0 || ch == 0 || cols == 0 {
+        return None;
+    }
+    let width = cols * cw;
+    let height = (u64::from(width) * u64::from(h) / u64::from(w)).max(1);
+    let height = u32::try_from(height).ok()?;
+    Some(((width, height), height.div_ceil(ch)))
+}
+
+/// `png` made ready to send at exactly `size` pixels: decoded, its
+/// background keyed out when `key`, and scaled nearest-neighbour, which
+/// keeps a pixel-art logo's edges hard. `None` when it does not decode.
+fn kitty_png(png: &[u8], key: bool, size: (u32, u32)) -> Option<Vec<u8>> {
+    let mut rgba = image::load_from_memory(png).ok()?.to_rgba8();
+    if key {
+        // Only the white the border reaches, as for the buddy: a threshold
+        // alone would also punch out the eye highlights.
+        rgba = crate::buddy::key_background(rgba);
+    }
+    let scaled =
+        image::imageops::resize(&rgba, size.0, size.1, image::imageops::FilterType::Nearest);
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(scaled)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
+/// The placeholder text for a `cols` x `rows` picture of image [`KITTY_ID`]:
+/// one line per row, each cell naming its row and column by diacritics, in
+/// the image id's colour. `None` past the diacritics plank carries.
+fn placeholder_art(cols: usize, rows: usize) -> Option<String> {
+    use crate::buddy::{DIACRITICS, PLACEHOLDER};
+    if cols == 0 || rows == 0 || cols > DIACRITICS.len() || rows > DIACRITICS.len() {
+        return None;
+    }
+    let [_, r, g, b] = KITTY_ID.to_be_bytes();
+    let colour = format!("\x1b[38;2;{r};{g};{b}m");
+    let mut out = String::new();
+    for &row in &DIACRITICS[..rows] {
+        out.push_str(&colour);
+        for &col in &DIACRITICS[..cols] {
+            out.extend([PLACEHOLDER, row, col]);
+        }
+        out.push_str("\x1b[39m\n");
+    }
+    Some(out)
+}
+
+/// The art `ansi` draws, swapped for a kitty picture of `png` when the
+/// terminal can show one; the art otherwise, or if anything fails.
+///
+/// The picture is [`KITTY_COLS`] wide and drawn at native resolution: it is
+/// scaled to exactly the pixels its cells cover ([`kitty_box`]), so the
+/// terminal shows it pixel for pixel.
+fn with_kitty(ansi: impl FnOnce() -> String, png: &[u8], key: bool) -> Logo {
+    let picture = || {
+        let cell = cell_pixels()?;
+        let size = image::ImageReader::new(std::io::Cursor::new(png))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()?;
+        let (pixels, rows) = kitty_box(size, cell, KITTY_COLS)?;
+        let text = placeholder_art(
+            usize::try_from(KITTY_COLS).ok()?,
+            usize::try_from(rows).ok()?,
+        )?;
+        let scaled = kitty_png(png, key, pixels)?;
+        let (c, r) = (u16::try_from(KITTY_COLS).ok()?, u16::try_from(rows).ok()?);
+        Some(Logo {
+            transmit: Some(crate::buddy::transmit_sequence_sized(
+                KITTY_ID, &scaled, c, r,
+            )),
+            art: text,
+        })
+    };
+    if use_kitty()
+        && let Some(logo) = picture()
+    {
+        return logo;
+    }
+    Logo {
+        transmit: None,
+        art: ansi(),
+    }
+}
 
 /// The logo PNG with its near-white background made transparent (computed once).
 fn transparent_png() -> &'static [u8] {
@@ -153,19 +299,33 @@ fn is_beta(version: &str, patch: &str) -> bool {
 pub fn banner() -> String {
     let title = crate::profile::active().map(|_| crate::profile::title());
     let label = banner_label(title.as_deref());
-    format!("{}      {label}\n", active_art(DEFAULT_WIDTH))
+    let logo = active_logo(DEFAULT_WIDTH);
+    format!(
+        "{}{}      {label}\n",
+        logo.transmit.unwrap_or_default(),
+        logo.art
+    )
 }
 
 /// The logo for this run, `width` columns wide: the active profile's `logo`
-/// when a profile is running, else plank's own art.
+/// when a profile is running, else plank's own, as a kitty picture where the
+/// terminal shows one and as art elsewhere.
 ///
-/// The one place both banners, plain and TUI, choose their art, so a profile
+/// The one place both banners, plain and TUI, choose their logo, so a profile
 /// cannot show its logo on one front end and plank's on the other.
 #[must_use]
-pub fn active_art(width: u32) -> String {
-    match crate::profile::active() {
-        Some(a) => art_from_path(a.spec.logo.as_deref(), width),
-        None => art(width),
+pub fn active_logo(width: u32) -> Logo {
+    let profile_png = crate::profile::active()
+        .and_then(|a| a.spec.logo.as_deref().map(std::fs::read))
+        .and_then(Result::ok)
+        .filter(|bytes| image::load_from_memory(bytes).is_ok());
+    match profile_png {
+        Some(bytes) => with_kitty(
+            || logo_art::image_to_ansi_with(&bytes, width.max(1), cell()),
+            &bytes,
+            false,
+        ),
+        None => with_kitty(|| art(width), LOGO_PNG, true),
     }
 }
 
@@ -224,6 +384,47 @@ mod tests {
         }
         // 711x1075 source, so the aspect ratio gives 14 rows at 18 columns.
         assert_eq!(rows, 14);
+    }
+
+    #[test]
+    fn placeholder_art_names_every_cell_in_the_logo_colour() {
+        use crate::buddy::{DIACRITICS, PLACEHOLDER};
+        let art = super::placeholder_art(3, 2).unwrap();
+        let lines: Vec<&str> = art.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("\x1b[38;2;176;221;48m"), "{art:?}");
+        let cell: String = [PLACEHOLDER, DIACRITICS[1], DIACRITICS[2]].iter().collect();
+        assert!(lines[1].contains(&cell));
+        // Each cell is one column wide, so the box is the art's own.
+        assert_eq!(unicode_width::UnicodeWidthStr::width(cell.as_str()), 1);
+        assert_eq!(super::placeholder_art(25, 2), None);
+        assert_eq!(super::placeholder_art(0, 2), None);
+    }
+
+    #[test]
+    fn the_sent_logo_is_scaled_to_its_cells_and_keyed() {
+        let png = super::kitty_png(super::LOGO_PNG, true, (200, 302)).unwrap();
+        let img = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(img.dimensions(), (200, 302));
+        assert_eq!(img.get_pixel(0, 0).0[3], 0, "the white corner is keyed out");
+        // ...but not the white inside the logo (the eye highlights).
+        let opaque_white = img
+            .pixels()
+            .filter(|p| p.0[3] == 255 && p.0[..3].iter().all(|&c| c >= 232))
+            .count();
+        assert!(opaque_white > 0, "the eye highlights must stay");
+    }
+
+    #[test]
+    fn the_kitty_box_fills_its_columns_at_native_resolution() {
+        // The 711x1075 logo, 10 columns of 20x40-pixel cells: 200 pixels
+        // wide, 302 tall, which takes 8 rows (the last one partly).
+        assert_eq!(
+            super::kitty_box((711, 1075), (20, 40), 10),
+            Some(((200, 302), 8))
+        );
+        assert_eq!(super::kitty_box((711, 1075), (0, 40), 10), None);
+        assert_eq!(super::kitty_box((0, 1075), (20, 40), 10), None);
     }
 
     #[test]

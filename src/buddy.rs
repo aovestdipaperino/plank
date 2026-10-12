@@ -92,12 +92,12 @@ pub const ROWS: u16 = 10;
 const RIGHT_GAP: u16 = 2;
 
 /// The kitty image ids a clip alternates between. Placeholder cells carry the
-/// id as their 24-bit foreground color, so each must fit in 24 bits; plank
-/// uses no other kitty image.
+/// id as their 24-bit foreground color, so each must fit in 24 bits; the only
+/// other kitty image plank sends is the banner logo (`logo::KITTY_ID`).
 const CLIP_IDS: [u32; 2] = [0x00B0_DD1F, 0x00B0_DD20];
 
 /// The placeholder character every picture cell holds.
-const PLACEHOLDER: char = '\u{10EEEE}';
+pub(crate) const PLACEHOLDER: char = '\u{10EEEE}';
 
 /// Base64 bytes per transmission chunk, the protocol's maximum.
 const CHUNK: usize = 4096;
@@ -105,7 +105,7 @@ const CHUNK: usize = 4096;
 /// The first entries of kitty's `rowcolumn-diacritics.txt`: the combining mark
 /// at index `n` names row (or column) `n` of the picture. Only as many as the
 /// larger side of the box are needed.
-const DIACRITICS: [char; 24] = [
+pub(crate) const DIACRITICS: [char; 24] = [
     '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}', '\u{033E}', '\u{033F}',
     '\u{0346}', '\u{034A}', '\u{034B}', '\u{034C}', '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}',
     '\u{035B}', '\u{0363}', '\u{0364}', '\u{0365}', '\u{0366}', '\u{0367}', '\u{0368}', '\u{0369}',
@@ -225,6 +225,12 @@ const UNSUPPORTED: &str =
 /// keystrokes.
 #[must_use]
 pub fn transmit_sequence(id: u32, png: &[u8]) -> String {
+    transmit_sequence_sized(id, png, COLS, ROWS)
+}
+
+/// [`transmit_sequence`] for a virtual placement of `cols` x `rows` cells.
+#[must_use]
+pub fn transmit_sequence_sized(id: u32, png: &[u8], cols: u16, rows: u16) -> String {
     let data = crate::tui::base64(png);
     let chunks: Vec<&str> = data
         .as_bytes()
@@ -238,7 +244,7 @@ pub fn transmit_sequence(id: u32, png: &[u8]) -> String {
         let _ = if i == 0 {
             write!(
                 out,
-                "\x1b_Ga=T,U=1,f=100,i={id},c={COLS},r={ROWS},q=2,m={more};{chunk}\x1b\\"
+                "\x1b_Ga=T,U=1,f=100,i={id},c={cols},r={rows},q=2,m={more};{chunk}\x1b\\"
             )
         } else {
             write!(out, "\x1b_Gm={more};{chunk}\x1b\\")
@@ -253,7 +259,7 @@ pub fn delete_sequence(id: u32) -> String {
     format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
 }
 
-fn write_to_terminal(seq: &str) -> std::io::Result<()> {
+pub(crate) fn write_to_terminal(seq: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
     out.write_all(seq.as_bytes())?;
