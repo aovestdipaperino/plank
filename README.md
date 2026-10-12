@@ -403,6 +403,16 @@ The [Profiles chapter](user-guide/14-profiles.md) of the user guide (also at
 covers launching, installing, updating and writing one; the full manifest
 reference is in [`docs/PROFILES.md`](docs/PROFILES.md).
 
+## Steering
+
+plank can steer the model along a named direction: a per-layer vector that nudges its activations towards one kind of answer, terser, more cautious, less likely to refuse. Every direction you have lives in `~/.plank/models/vectors.json`, filed under the model it was built for, and you pick one by name:
+
+```sh
+plank --dir-steering succinct --dir-steering-ffn 0.8
+```
+
+`/steer` lists the model's directions, changes the scale mid-session, or switches to another direction and resumes where you were. [`pt vectorize`](https://github.com/aovestdipaperino/plank-replay) builds a direction from two prompt sets and stores it by name, `pt install <repo>:<path>` merges someone else's vectors file into yours, and a profile can pair a direction with the engine it recommends. Steering works on the native DeepSeek and Qwen engine. The file format, the flags and how the cached prompt stays unsteered are in the [Steering section](user-guide/08-configuration.md#steering) of the configuration guide.
+
 ## The arcade
 
 Waiting on a long generation is the one moment a coding agent has nothing for you to do. So there are five games — and one thing to just watch — behind undocumented-in-`/help` slash commands, and they are meant to be used **during** a turn: type one while the model is streaming and it opens as a translucent layer over the live output, which keeps scrolling underneath.

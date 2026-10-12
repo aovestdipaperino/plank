@@ -882,31 +882,98 @@ streaming on when it exceeds 80% of installed RAM less the engine's
 context buffers, printing the calculation it used. Passing the flag
 yourself skips that decision.
 <code>--simulate-used-memory &lt;N&gt;GB</code> pretends memory is
-already used, for testing those paths. <code>--dir-steering NAME</code>
-steers along a named direction stored for the model in
-<code>~/.plank/models/vectors.json</code>, the file
-<code>pt vectorize … -n NAME</code> writes: a JSON array with one entry
-per model file name, each listing its directions as base64
-<code>f32</code> matrices. <code>--dir-steering-ffn</code> and
-<code>--dir-steering-attn</code> set the scales (the FFN scale defaults
-to 1); a positive FFN scale pushes the model towards the prompts the
-vector was built <code>--to</code>. The old
-<code>--dir-steering-file PATH</code> is gone.
-<code>--dir-steering-from user</code>, the default, holds the FFN edit
-off while the system prompt and session context prefill and arms it
-before your first message, so the cached prompt stays unsteered and
-shared; <code>all</code> steers every token, and is what an attention
-scale falls back to, since only the FFN scale can change on a live
-session. <code>/steer</code> lists the model's directions, retargets the
-FFN scale mid-session, and switches to another direction by restarting
-into it with the session resumed, since the engine binds the vector when
-it loads. A profile can pair a direction with its
-<code>recommendedModel</code> through a
-<code>"steering": {"direction", "ffn", "attn", "from"}</code> block
-(<code>ffn</code> 1.0 and <code>attn</code> 0.0 when absent), applied
-when that engine is selected unless the command line names a direction;
-engines in <code>~/.plank/engines.local.json</code> no longer carry one,
-and the old <code>file</code> key is refused.</p>
+already used, for testing those paths. Directional steering has a
+section of its own, <a href="#steering">Steering</a>, below.</p>
+<h3 id="steering">Steering</h3>
+<p>Directional steering nudges the model's activations along a
+direction, layer by layer, so it leans towards one kind of answer:
+terser, more cautious, less likely to refuse. plank keeps every
+direction you have in one file,
+<code>~/.plank/models/vectors.json</code>, and you choose one by
+name:</p>
+<pre class="sh"><code>plank --dir-steering succinct</code></pre>
+<p>The file is a JSON array with one entry per model, each listing its
+named directions. A direction's <code>value</code> is base64 of the raw
+little-endian <code>f32</code> matrix the engine loads, one unit vector
+per layer:</p>
+<pre class="json"><code>[
+  { &quot;model&quot;: &quot;ds4vision&quot;,
+    &quot;vectors&quot;: [
+      { &quot;name&quot;: &quot;succinct&quot;, &quot;value&quot;: &quot;Pq3vPLnF...&quot; },
+      { &quot;name&quot;: &quot;heretic&quot;, &quot;value&quot;: &quot;u0Kz/D2p...&quot; }
+    ] }
+]</code></pre>
+<p>An entry's <code>model</code> is the engine name, so a direction
+built for <code>ds4vision</code> follows that engine whatever its file
+is called. A model loaded by a path that is no engine is looked up by
+its file name instead, and plank tries the engine name first and the
+file name second. A direction belongs to the model it was built on: the
+same name under another model is a different vector.</p>
+<p>You rarely write the file by hand. <code>pt vectorize</code>, from <a
+href="https://github.com/aovestdipaperino/plank-replay">plank-replay</a>,
+builds a direction from two prompt sets (or from the difference between
+a model and a modified copy of it) and stores it under the name you give
+with <code>-n</code>, and
+<code>pt install &lt;repo&gt;:&lt;path&gt;</code> merges a vectors file
+someone else published into yours, asking before it replaces a direction
+of the same name. Both write the file in place through a temporary copy,
+and keep any fields they do not recognise.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--dir-steering NAME</code></td>
+<td>steer along direction <code>NAME</code>, stored for this model; a
+name the file does not hold stops the launch and lists the ones it
+does</td>
+</tr>
+<tr>
+<td><code>--dir-steering-ffn F</code></td>
+<td>the scale on the feed-forward edit, <code>-100..100</code>, 1 by
+default; a positive scale pushes towards the prompts the direction was
+built <code>--to</code></td>
+</tr>
+<tr>
+<td><code>--dir-steering-attn F</code></td>
+<td>the scale on the attention edit, <code>-100..100</code>, 0 by
+default</td>
+</tr>
+<tr>
+<td><code>--dir-steering-from user|all</code></td>
+<td><code>user</code>, the default, holds the edit off while the system
+prompt and session context prefill and arms it for your first message;
+<code>all</code> steers every token</td>
+</tr>
+</tbody>
+</table>
+<p>Holding the edit until your first message keeps the cached prompt
+unsteered, so a steered run reuses the same prompt checkpoint as an
+unsteered one. An attention edit cannot be held back that way, so a
+non-zero <code>--dir-steering-attn</code> means <code>all</code>.</p>
+<p>Inside a session, <code>/steer</code> lists the model's directions
+with the loaded one starred, <code>/steer &lt;scale&gt;</code> changes
+the feed-forward scale on the spot (name the direction as well when the
+model has more than one), and <code>/steer &lt;name&gt; [scale]</code>
+switches to another direction. The engine binds a direction when it
+loads, so switching restarts plank into the new one and resumes the
+session where you were.</p>
+<p>A profile can carry a direction too: a <code>steering</code> block
+pairs one with the profile's <code>recommendedModel</code> (see <a
+href="14-profiles.html">Profiles</a>), and a <code>--dir-steering</code>
+on the command line overrides it, scales included.</p>
+<p>Steering is a feature of the native DeepSeek and Qwen engine. The
+Gemma engine, <code>--remote</code> hosts and <code>--provider</code>
+models ignore it. The direction plank loads is decoded once into
+<code>~/.plank/cache/steering/</code>, named by a hash of its contents,
+so two names for the same vector share one file. The old
+<code>--dir-steering-file PATH</code>, and a <code>steering</code> block
+on an engine in <code>engines.local.json</code>, are refused with a
+pointer to their replacements.</p>
 <p>Remote, shared-engine, control, and provider flags are covered in <a
 href="10-remote-and-providers.html">Remote and hosted engines</a>.</p>
 <h2 id="environment-variables">Environment variables</h2>

@@ -111,6 +111,7 @@ The manifest's `profile` block describes the agent:
 | `folderContext` | whether the session starts with the launch folder's git status and `.plank/MEMORY.md` | `false` |
 | `agentsMd` | whether `AGENTS.md` is read, offered and linked | `false` |
 | `recommendedModel` | an engine to run, such as `"qwen"`, used only when its model file and every companion it declares are already on disk | the usual model choice |
+| `steering` | a steering direction from `~/.plank/models/vectors.json` to run with the recommended engine: `direction`, and optionally `ffn`, `attn` and `from` | unsteered |
 | `verbs` | the status-bar verbs, replacing plank's own | plank's verbs |
 | `additionalVerbs` | status-bar verbs added to plank's own; cannot be combined with `verbs` | nothing added |
 
@@ -119,6 +120,15 @@ A malformed optional field warns and falls back to its default rather than stopp
 `folderContext` and `agentsMd` default to `false` because most profiles are not about the folder you happen to launch them from. A mail assistant started in a code checkout should not be told the checkout's git status or offered an `AGENTS.md`. A coding-style profile sets both to `true`. Your own memory, `~/.plank/MEMORY.md`, is loaded either way.
 
 `recommendedModel` lets a profile suggest the engine it works best with, and plank takes the suggestion only if that engine is locally available: its main model file and every companion it declares must already exist on disk. It outranks `engine.model` in your settings but never a `--model` you typed, and it never starts a download: when the engine is not installed (main or a companion missing), or is not an engine at all, plank prints one line saying so and picks the model the usual way.
+
+`steering` pairs a named direction with that engine, so a profile can ship an agent that leans a particular way. `direction` names one of the model's entries in `~/.plank/models/vectors.json` (see [Steering](08-configuration.md#steering)); `ffn` and `attn` are the two scales, 1 and 0 when left out, and `from` is `"user"` or `"all"`, as on the command line:
+
+```json
+"recommendedModel": "ds4vision",
+"steering": { "direction": "succinct", "ffn": 0.8 }
+```
+
+The direction applies only when the recommended engine is the one that runs, since a direction belongs to the model it was built on: a `--model` choosing another engine, or a recommendation that fell through, runs unsteered. A `--dir-steering` you type wins, scales included. The vectors themselves are not part of the profile, so whoever runs it needs the direction in their own file (a missing one stops the launch rather than running unsteered), which `pt install` can merge in from wherever you publish it.
 
 `verbs` and `additionalVerbs` give a profile its own voice in the status bar, the word that says what the agent is doing while you wait. `verbs` swaps plank's vocabulary out and `additionalVerbs` mixes more into it; declare one or the other, since a manifest with both gets a warning and plank's own verbs. Either can be a plain list, used whatever the agent is doing, or an object that sorts the words by moment: `thinking`, `generating`, `tool` (a tool is running), `prefill` (reading the context) and `fun` (the rare one-in-twenty surprise). A moment the object leaves out keeps plank's words for it. The three published profiles each replace the lot: d3v1l schemes and smites, EAP muses and versifies, HAL computes and actuates.
 

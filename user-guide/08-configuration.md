@@ -235,7 +235,47 @@ Verification is argmax, so proposals are only used at `--temp 0`; sampled decodi
 
 ### Advanced engine tuning
 
-`--mtp PATH`, `--mtp-draft N`, `--mtp-margin F` configure multi-token prediction with a draft model. `--ssd-streaming` and its companions (`--ssd-streaming-cold`, `--ssd-streaming-cache-experts`, `--ssd-streaming-preload-experts`) stream experts from SSD instead of loading them resident, which is how you run a model that does not fit. You rarely need to reach for `--ssd-streaming` yourself any more: plank measures the model file at startup and turns streaming on when it exceeds 80% of installed RAM less the engine's context buffers, printing the calculation it used. Passing the flag yourself skips that decision. `--simulate-used-memory <N>GB` pretends memory is already used, for testing those paths. `--dir-steering NAME` steers along a named direction stored for the model in `~/.plank/models/vectors.json`, the file `pt vectorize … -n NAME` writes: a JSON array with one entry per model file name, each listing its directions as base64 `f32` matrices. `--dir-steering-ffn` and `--dir-steering-attn` set the scales (the FFN scale defaults to 1); a positive FFN scale pushes the model towards the prompts the vector was built `--to`. The old `--dir-steering-file PATH` is gone. `--dir-steering-from user`, the default, holds the FFN edit off while the system prompt and session context prefill and arms it before your first message, so the cached prompt stays unsteered and shared; `all` steers every token, and is what an attention scale falls back to, since only the FFN scale can change on a live session. `/steer` lists the model's directions, retargets the FFN scale mid-session, and switches to another direction by restarting into it with the session resumed, since the engine binds the vector when it loads. A profile can pair a direction with its `recommendedModel` through a `"steering": {"direction", "ffn", "attn", "from"}` block (`ffn` 1.0 and `attn` 0.0 when absent), applied when that engine is selected unless the command line names a direction; engines in `~/.plank/engines.local.json` no longer carry one, and the old `file` key is refused.
+`--mtp PATH`, `--mtp-draft N`, `--mtp-margin F` configure multi-token prediction with a draft model. `--ssd-streaming` and its companions (`--ssd-streaming-cold`, `--ssd-streaming-cache-experts`, `--ssd-streaming-preload-experts`) stream experts from SSD instead of loading them resident, which is how you run a model that does not fit. You rarely need to reach for `--ssd-streaming` yourself any more: plank measures the model file at startup and turns streaming on when it exceeds 80% of installed RAM less the engine's context buffers, printing the calculation it used. Passing the flag yourself skips that decision. `--simulate-used-memory <N>GB` pretends memory is already used, for testing those paths. Directional steering has a section of its own, [Steering](#steering), below.
+
+
+### Steering
+
+Directional steering nudges the model's activations along a direction, layer by layer, so it leans towards one kind of answer: terser, more cautious, less likely to refuse. plank keeps every direction you have in one file, `~/.plank/models/vectors.json`, and you choose one by name:
+
+```sh
+plank --dir-steering succinct
+```
+
+The file is a JSON array with one entry per model, each listing its named directions. A direction's `value` is base64 of the raw little-endian `f32` matrix the engine loads, one unit vector per layer:
+
+```json
+[
+  { "model": "ds4vision",
+    "vectors": [
+      { "name": "succinct", "value": "Pq3vPLnF..." },
+      { "name": "heretic", "value": "u0Kz/D2p..." }
+    ] }
+]
+```
+
+An entry's `model` is the engine name, so a direction built for `ds4vision` follows that engine whatever its file is called. A model loaded by a path that is no engine is looked up by its file name instead, and plank tries the engine name first and the file name second. A direction belongs to the model it was built on: the same name under another model is a different vector.
+
+You rarely write the file by hand. `pt vectorize`, from [plank-replay](https://github.com/aovestdipaperino/plank-replay), builds a direction from two prompt sets (or from the difference between a model and a modified copy of it) and stores it under the name you give with `-n`, and `pt install <repo>:<path>` merges a vectors file someone else published into yours, asking before it replaces a direction of the same name. Both write the file in place through a temporary copy, and keep any fields they do not recognise.
+
+| Flag | What it does |
+|---|---|
+| `--dir-steering NAME` | steer along direction `NAME`, stored for this model; a name the file does not hold stops the launch and lists the ones it does |
+| `--dir-steering-ffn F` | the scale on the feed-forward edit, `-100..100`, 1 by default; a positive scale pushes towards the prompts the direction was built `--to` |
+| `--dir-steering-attn F` | the scale on the attention edit, `-100..100`, 0 by default |
+| `--dir-steering-from user\|all` | `user`, the default, holds the edit off while the system prompt and session context prefill and arms it for your first message; `all` steers every token |
+
+Holding the edit until your first message keeps the cached prompt unsteered, so a steered run reuses the same prompt checkpoint as an unsteered one. An attention edit cannot be held back that way, so a non-zero `--dir-steering-attn` means `all`.
+
+Inside a session, `/steer` lists the model's directions with the loaded one starred, `/steer <scale>` changes the feed-forward scale on the spot (name the direction as well when the model has more than one), and `/steer <name> [scale]` switches to another direction. The engine binds a direction when it loads, so switching restarts plank into the new one and resumes the session where you were.
+
+A profile can carry a direction too: a `steering` block pairs one with the profile's `recommendedModel` (see [Profiles](14-profiles.md)), and a `--dir-steering` on the command line overrides it, scales included.
+
+Steering is a feature of the native DeepSeek and Qwen engine. The Gemma engine, `--remote` hosts and `--provider` models ignore it. The direction plank loads is decoded once into `~/.plank/cache/steering/`, named by a hash of its contents, so two names for the same vector share one file. The old `--dir-steering-file PATH`, and a `steering` block on an engine in `engines.local.json`, are refused with a pointer to their replacements.
 
 Remote, shared-engine, control, and provider flags are covered in [Remote and hosted engines](10-remote-and-providers.md).
 

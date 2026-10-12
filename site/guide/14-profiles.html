@@ -304,6 +304,14 @@ model file and every companion it declares are already on disk</td>
 <td>the usual model choice</td>
 </tr>
 <tr>
+<td><code>steering</code></td>
+<td>a steering direction from <code>~/.plank/models/vectors.json</code>
+to run with the recommended engine: <code>direction</code>, and
+optionally <code>ffn</code>, <code>attn</code> and
+<code>from</code></td>
+<td>unsteered</td>
+</tr>
+<tr>
 <td><code>verbs</code></td>
 <td>the status-bar verbs, replacing plank's own</td>
 <td>plank's verbs</td>
@@ -335,6 +343,24 @@ your settings but never a <code>--model</code> you typed, and it never
 starts a download: when the engine is not installed (main or a companion
 missing), or is not an engine at all, plank prints one line saying so
 and picks the model the usual way.</p>
+<p><code>steering</code> pairs a named direction with that engine, so a
+profile can ship an agent that leans a particular way.
+<code>direction</code> names one of the model's entries in
+<code>~/.plank/models/vectors.json</code> (see <a
+href="08-configuration.html#steering">Steering</a>); <code>ffn</code> and
+<code>attn</code> are the two scales, 1 and 0 when left out, and
+<code>from</code> is <code>"user"</code> or <code>"all"</code>, as on
+the command line:</p>
+<pre class="json"><code>&quot;recommendedModel&quot;: &quot;ds4vision&quot;,
+&quot;steering&quot;: { &quot;direction&quot;: &quot;succinct&quot;, &quot;ffn&quot;: 0.8 }</code></pre>
+<p>The direction applies only when the recommended engine is the one
+that runs, since a direction belongs to the model it was built on: a
+<code>--model</code> choosing another engine, or a recommendation that
+fell through, runs unsteered. A <code>--dir-steering</code> you type
+wins, scales included. The vectors themselves are not part of the
+profile, so whoever runs it needs the direction in their own file (a
+missing one stops the launch rather than running unsteered), which
+<code>pt install</code> can merge in from wherever you publish it.</p>
 <p><code>verbs</code> and <code>additionalVerbs</code> give a profile
 its own voice in the status bar, the word that says what the agent is
 doing while you wait. <code>verbs</code> swaps plank's vocabulary out

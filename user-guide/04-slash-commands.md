@@ -88,7 +88,7 @@ See [Extending plank](09-extending.md).
 | `/mtp [on\|off]` | turn speculative decoding (multi-token prediction) on or off for this session; bare `/mtp` reports the state |
 | `/temp [0..100]` | set the sampling temperature; refused while `/mtp` is on, which pins it at 0 |
 | `/engines` | open the engine menu, download the one you pick if it is missing, and restart into it, resuming this session when the new engine's family has its transcript |
-| `/steer [name] [-100..100]` | alone, list the steering directions stored for this model in `~/.plank/models/vectors.json`, the loaded one starred; with a scale, retarget the loaded direction (a name is required when the model has more than one); with another direction's name, restart into it and resume this session |
+| `/steer [name] [-100..100]` | alone, list the steering directions stored for this model in `~/.plank/models/vectors.json`, the loaded one starred; with a scale, retarget the loaded direction (a name is required when the model has more than one); with another direction's name, restart into it and resume this session. See [Steering](08-configuration.md#steering) |
 | `/loopguard [on\|off]`, `/lg` | arm or silence the loop guards. Works mid-turn |
 | `/mc [on\|off]` | turn micro-compaction on or off for this session; bare `/mc` reports the state. Works mid-turn |
 | `/hints [on\|off]` | ask the model for occasional one- or two-sentence `> **Hint:**` asides on the concepts behind its work (a design choice, why something failed, a trade-off, how to check it). Takes effect at the next turn boundary without rewriting cached context; off in every new or resumed session. Works mid-turn |
