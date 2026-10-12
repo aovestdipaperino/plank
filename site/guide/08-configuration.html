@@ -340,6 +340,15 @@ see.</p>
 </thead>
 <tbody>
 <tr>
+<td><code>tools.editUpto</code></td>
+<td>by model</td>
+<td>whether the edit tool takes <code>[upto]</code> anchored old text
+and the prompt teaches it. Unset, it is off for DeepSeek and Qwen (as in
+ds4, whose V4 Flash checkpoint struggles with anchored edits) and on for
+Gemma. Changes the system prompt, so it takes effect in a new
+session.</td>
+</tr>
+<tr>
 <td><code>tools.bashNotify</code></td>
 <td><code>false</code></td>
 <td>wake the model when a bash job it left running finishes, instead of
@@ -400,6 +409,15 @@ reclaim context. <code>/mc off</code> is the session equivalent.</td>
 the short form: tool-call syntax, tool names, and a pointer to the
 original prompt. <code>false</code> re-injects the whole tools prompt as
 the C reference does.</td>
+</tr>
+<tr>
+<td><code>context.resumeAcrossCompaction</code></td>
+<td><code>false</code></td>
+<td>when a reply runs into the context window, compact and continue it
+in the same message instead of ending the turn cut short. The summary
+reads the start of the reply and the model carries on from its last
+words; the reasoning budget spans the whole reply. Experimental: checked
+on DeepSeek V4 Flash and Gemma 4 E4B, off by default for now.</td>
 </tr>
 </tbody>
 </table>
@@ -739,6 +757,13 @@ start and a finish note); <code>chart</code> and <code>quiet</code> need
 <td>append a trace log</td>
 </tr>
 <tr>
+<td><code>--prefix-file PATH</code></td>
+<td>condition the session on scripted <code>USER:</code> /
+<code>ASSISTANT:</code> turns placed after the system prompt; see <a
+href="#conversation-prefix">Conversation prefix</a>. Wins over a
+profile's <code>prefix</code>.</td>
+</tr>
+<tr>
 <td><code>-h, --help [topic]</code></td>
 <td>help, optionally on one topic</td>
 </tr>
@@ -920,6 +945,23 @@ four ranges in parallel</td>
 </table>
 <hr />
 <p>Next: <a href="09-extending.html">Extending plank →</a></p>
+<h2 id="conversation-prefix">Conversation prefix</h2>
+<p><code>--prefix-file PATH</code> (or a profile's <code>prefix</code>)
+reads a file of scripted turns and places them between the system prompt
+and the conversation, as if that exchange had already happened. The
+model then continues in the manner the turns demonstrate, which a local
+model follows more reliably than a rule stated in a prompt:</p>
+<pre class="text"><code>USER: Write terse answers.
+This line is still part of the user turn.
+ASSISTANT: Understood.
+USER: Return code without an introduction.
+ASSISTANT: I will return only the code.</code></pre>
+<p>A marker starts a turn only at the beginning of a line; the file must
+start with <code>USER:</code>, alternate, and end with
+<code>ASSISTANT:</code>, or plank refuses to start and says which line
+is wrong. The turns are read once at launch, are never saved with a
+session or compacted, and apply to whatever session the run starts or
+resumes. The format is ds4's <code>--prefix-file</code>.</p>
 
   </article>
   <nav class="pager"><a href="07-context.html">← Context</a><a href="09-extending.html">Extending plank →</a></nav>

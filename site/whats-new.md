@@ -7,6 +7,16 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v7.0.5 beta: a buddy, hints, and conversations that survive the window's
+edge.** `/buddy on` stands a small animated character on the rule above the
+prompt while plank is idle, in kitty, Ghostty and Warp; `/buddy install`
+swaps it for another from the plank-buddies repository. `/hints on` asks the
+model for a short aside on the idea behind its work now and then. A
+conversation that fills the window still compacts, a tool call the window
+cuts off is retried rather than reported as broken, and a message too big for
+the window is refused instead of jamming the session. DeepSeek and Qwen now
+edit with exact old text, as the C reference does.
+
 **v7.0.4 beta: profile sessions start warm.** A session started with
 `--profile` restored its cached prompt at launch and then re-prefilled all of
 it on the first prompt, over one trailing newline. The first prompt now reuses

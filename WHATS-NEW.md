@@ -13,6 +13,32 @@ it.
 Install with `brew install aovestdipaperino/tap/plank-agent-beta`. Everything
 the betas below carried is in stable 7.0.0.
 
+### 7.0.5
+
+**A buddy on the prompt.** `/buddy on` puts a small animated character on the
+rule above the prompt while plank waits for you, in kitty, Ghostty and Warp.
+Buddies come from the public plank-buddies repository (the first is the
+minions); `/buddy install` picks another, which replaces the one you had, and
+`/buddy off` sends it away.
+
+**Hints while you work.** `/hints on` asks the model for an occasional one- or
+two-sentence aside on the idea behind what it just did: why something failed,
+a trade-off, how to check it.
+
+**Long conversations hold up at the edge of the window.** A conversation that
+fills the window can still be compacted; a tool call the window cuts off is
+dropped and retried instead of reported as malformed; a pasted message too
+big for the window is refused rather than stuck in the session; and, behind
+`context.resumeAcrossCompaction`, a reply the window cuts off carries on after
+compaction mid-sentence.
+
+**Scripted conversation prefixes.** `--prefix-file`, or a profile's `prefix`,
+places example turns before the conversation so the model continues in their
+manner.
+
+**DeepSeek and Qwen edit with exact text.** Anchored `[upto]` edits are now
+opt-in for those models, as in the C reference; Gemma keeps them.
+
 ### 7.0.4
 
 **Profile sessions answer the first prompt from the cache.** Starting plank

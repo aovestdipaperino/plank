@@ -449,6 +449,29 @@ and resume this session</td>
 <code>/mc</code> reports the state. Works mid-turn</td>
 </tr>
 <tr>
+<td><code>/hints [on|off]</code></td>
+<td>ask the model for occasional one- or two-sentence
+<code>&gt; **Hint:**</code> asides on the concepts behind its work (a
+design choice, why something failed, a trade-off, how to check it).
+Takes effect at the next turn boundary without rewriting cached context;
+off in every new or resumed session. Works mid-turn</td>
+</tr>
+<tr>
+<td><code>/buddy [on|off|install]</code></td>
+<td>an animated buddy standing on the rule above the prompt while plank
+is idle; it does nothing. Needs a terminal with kitty graphics (kitty,
+Ghostty or Warp, not inside tmux) and <code>ffmpeg</code>. Buddies are
+the folders of <a
+href="https://github.com/aovestdipaperino/plank-buddies">plank-buddies</a>;
+you have one, in <code>~/.plank/buddy/</code>. <code>on</code> with none
+installed, and <code>install</code>, offer them as a menu
+(<code>install &lt;name&gt;</code> installs one directly), and the new
+buddy replaces the old. Its clips play one after another: one whose name
+ends in a letter three times in four, at random, otherwise the next one
+ending in a digit. Bare, it reports the state; on and off last for this
+run. TUI only</td>
+</tr>
+<tr>
 <td><code>/notify &lt;mode&gt;</code></td>
 <td>change notification mode for this session</td>
 </tr>
