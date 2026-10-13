@@ -3075,6 +3075,7 @@ pub(crate) mod tests {
     }
 
     impl Read for FlakyThenGood {
+        #[allow(deprecated)] // `try_update` replaces `fetch_update` but needs 1.95; MSRV is 1.93
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             if self
                 .fails_left
