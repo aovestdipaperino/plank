@@ -320,6 +320,7 @@ fn repaint_idle(
         })
         .map_err(|e| e.to_string())?;
     crate::buddy::after_draw(completed.buffer);
+    crate::logo::after_draw(completed.buffer);
     crate::cursor::place();
     Ok(completed.buffer.clone())
 }
@@ -1279,19 +1280,22 @@ impl CompactSink for TuiCompactSink<'_> {
         // the idle loop paints it back green when the prompt returns.
         crate::cursor::set(crate::cursor::State::Busy);
         let (log, view) = (&*self.log, &mut *self.view);
-        let _ = self.terminal.draw(|f| {
-            tui::draw(
-                f,
-                log,
-                None,
-                "compacting (Esc to stop)",
-                view,
-                None,
-                &tui::TaskView::default(),
-                None,
-                &tui::RosterView::default(),
-            );
-        });
+        let _ = self
+            .terminal
+            .draw(|f| {
+                tui::draw(
+                    f,
+                    log,
+                    None,
+                    "compacting (Esc to stop)",
+                    view,
+                    None,
+                    &tui::TaskView::default(),
+                    None,
+                    &tui::RosterView::default(),
+                );
+            })
+            .map(|done| crate::logo::after_draw(done.buffer));
         crate::cursor::place();
     }
 }
@@ -8010,19 +8014,21 @@ impl Agent<'_> {
                 crate::status::throbber()
             ))));
             let (l, v) = (&*log, &mut *view);
-            let _ = terminal.draw(|f| {
-                tui::draw(
-                    f,
-                    l,
-                    None,
-                    "",
-                    v,
-                    None,
-                    &tui::TaskView::default(),
-                    None,
-                    &tui::RosterView::default(),
-                );
-            });
+            let _ = terminal
+                .draw(|f| {
+                    tui::draw(
+                        f,
+                        l,
+                        None,
+                        "",
+                        v,
+                        None,
+                        &tui::TaskView::default(),
+                        None,
+                        &tui::RosterView::default(),
+                    );
+                })
+                .map(|done| crate::logo::after_draw(done.buffer));
             crate::cursor::place();
         });
         log.set_progress(None);
@@ -13464,6 +13470,10 @@ impl Agent<'_> {
         // appears, and only flips the title to Idle once it accepts input.
         crate::title::set(crate::title::State::Loading);
         let result = self.tui_loop(&mut terminal, offer_init);
+        // Before the power-off animation, which would otherwise play under
+        // them: a Warp picture sits outside the cell grid.
+        crate::buddy::hide_for_exit();
+        crate::logo::hide_for_exit();
         // Taken before the terminal is restored but after the UI is done with
         // it, so the line lands on the console the user is left looking at.
         let quit_repro = self.quit_repro_line();
@@ -15321,12 +15331,22 @@ impl Agent<'_> {
                 EngineEvent::Notice(msg) => {
                     notice = Some(msg);
                     let _ = terminal
-                        .draw(|f| tui::draw_warm(f, 0, 1, 0.0, stage.get(), notice.as_deref()));
+                        .draw(|f| tui::draw_warm(f, 0, 1, 0.0, stage.get(), notice.as_deref()))
+                        .map(|done| crate::logo::after_draw(done.buffer));
                 }
                 EngineEvent::Prefill(p) => {
-                    let _ = terminal.draw(|f| {
-                        tui::draw_warm(f, p.done, p.total, p.tps, stage.get(), notice.as_deref());
-                    });
+                    let _ = terminal
+                        .draw(|f| {
+                            tui::draw_warm(
+                                f,
+                                p.done,
+                                p.total,
+                                p.tps,
+                                stage.get(),
+                                notice.as_deref(),
+                            );
+                        })
+                        .map(|done| crate::logo::after_draw(done.buffer));
                 }
                 // Warm never speculates, so Spec cannot arrive here.
                 EngineEvent::Text(_) | EngineEvent::Spec(_) => {}
@@ -15341,9 +15361,11 @@ impl Agent<'_> {
         self.warm_alt_local_tier1(
             &mut |ev| {
                 if let EngineEvent::Prefill(p) = ev {
-                    let _ = terminal.draw(|f| {
-                        tui::draw_warm(f, p.done, p.total, p.tps, alt_stage, None);
-                    });
+                    let _ = terminal
+                        .draw(|f| {
+                            tui::draw_warm(f, p.done, p.total, p.tps, alt_stage, None);
+                        })
+                        .map(|done| crate::logo::after_draw(done.buffer));
                 }
             },
             &mut |_| {},
@@ -18602,19 +18624,21 @@ impl Agent<'_> {
                         crate::status::throbber()
                     ))));
                     let (l, v) = (&*log, &mut *view);
-                    let _ = terminal.draw(|f| {
-                        tui::draw(
-                            f,
-                            l,
-                            None,
-                            "",
-                            v,
-                            None,
-                            &tui::TaskView::default(),
-                            None,
-                            &tui::RosterView::default(),
-                        );
-                    });
+                    let _ = terminal
+                        .draw(|f| {
+                            tui::draw(
+                                f,
+                                l,
+                                None,
+                                "",
+                                v,
+                                None,
+                                &tui::TaskView::default(),
+                                None,
+                                &tui::RosterView::default(),
+                            );
+                        })
+                        .map(|done| crate::logo::after_draw(done.buffer));
                     crate::cursor::place();
                 });
                 log.set_progress(None);
@@ -18872,19 +18896,22 @@ impl Agent<'_> {
                         {
                             let l = log.borrow();
                             let mut v = view.borrow_mut();
-                            let _ = terminal.borrow_mut().draw(|f| {
-                                tui::draw(
-                                    f,
-                                    *l,
-                                    None,
-                                    "",
-                                    *v,
-                                    None,
-                                    &tui::TaskView::default(),
-                                    None,
-                                    &tui::RosterView::default(),
-                                );
-                            });
+                            let _ = terminal
+                                .borrow_mut()
+                                .draw(|f| {
+                                    tui::draw(
+                                        f,
+                                        *l,
+                                        None,
+                                        "",
+                                        *v,
+                                        None,
+                                        &tui::TaskView::default(),
+                                        None,
+                                        &tui::RosterView::default(),
+                                    );
+                                })
+                                .map(|done| crate::logo::after_draw(done.buffer));
                             crate::cursor::place();
                         }
                         // Nothing else is reading the keyboard while the
@@ -19509,6 +19536,7 @@ fn run_pick_panel(
     loop {
         if terminal
             .draw(|f| tui::draw_ask(f, log, &req, &state, "", view, &tui::TaskView::default()))
+            .map(|done| crate::logo::after_draw(done.buffer))
             .is_err()
         {
             return None;
@@ -19678,7 +19706,10 @@ fn drive_frame(
             // component just trapped, so it is not asked to run anything more.
             break (FrameClose::Failed(e), Ok(()));
         }
-        if let Err(e) = terminal.draw(|f| tui::draw_wasm_frame(f, &open)) {
+        if let Err(e) = terminal
+            .draw(|f| tui::draw_wasm_frame(f, &open))
+            .map(|done| crate::logo::after_draw(done.buffer))
+        {
             let _ = session.close_frame(&open);
             break (FrameClose::Failed(e.to_string()), Err(e.to_string()));
         }
@@ -19739,6 +19770,7 @@ fn run_ask_panel(
     loop {
         terminal
             .draw(|f| tui::draw_ask(f, log, &req, &state, status, view, tasks))
+            .map(|done| crate::logo::after_draw(done.buffer))
             .map_err(|e| e.to_string())?;
         let Some(ev) = next_event(None, Duration::from_millis(100))? else {
             continue;
@@ -20459,6 +20491,8 @@ fn force_quit() -> ! {
     // disarm first so a GPU-yield cycle in flight cannot print a false
     // "ended the process while reloading" report over this one.
     crate::stderrline::disarm_exit_report();
+    crate::buddy::hide_for_exit();
+    crate::logo::hide_for_exit();
     restore_terminal();
     // No destructor here can run (see above), so the mirror gets its farewell
     // explicitly or not at all — and this is the exit where a console left
@@ -20959,8 +20993,12 @@ fn busy_ui_loop(
                 remote_capture(remote, f);
             })
             .map_err(|e| e.to_string())
-            // A turn is running: no buddy, which `after_draw` removes.
-            .map(|done| crate::buddy::after_draw(done.buffer))?;
+            // A turn is running: no buddy, which `after_draw` removes. A quiet
+            // quiet pass keeps it, placed or moved by the same call.
+            .map(|done| {
+                crate::buddy::after_draw(done.buffer);
+                crate::logo::after_draw(done.buffer);
+            })?;
         crate::cursor::place();
         remote_service(remote);
         if finished {
@@ -22381,19 +22419,21 @@ fn draw_bang_frame(
     view: &mut tui::OutputView,
     status: &str,
 ) {
-    let _ = terminal.draw(|f| {
-        tui::draw(
-            f,
-            log,
-            None,
-            status,
-            view,
-            None,
-            &tui::TaskView::default(),
-            None,
-            &tui::RosterView::default(),
-        );
-    });
+    let _ = terminal
+        .draw(|f| {
+            tui::draw(
+                f,
+                log,
+                None,
+                status,
+                view,
+                None,
+                &tui::TaskView::default(),
+                None,
+                &tui::RosterView::default(),
+            );
+        })
+        .map(|done| crate::logo::after_draw(done.buffer));
     crate::cursor::place();
 }
 

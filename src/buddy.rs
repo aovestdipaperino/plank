@@ -131,8 +131,10 @@ pub(crate) const DIACRITICS: [char; 24] = [
 const BACKGROUND_THRESHOLD: u8 = 228;
 
 /// The symbol [`Mode::Direct`] marks the picture's cells with: blank, and
-/// drawn by nothing else in plank, so an overlay that lands on a cell is seen.
-const MARKER: &str = "\u{2800}";
+/// drawn by nothing else in plank but the banner logo's own Warp cells
+/// (`logo::after_draw`, told apart by their colour), so an overlay that lands
+/// on a cell is seen.
+pub(crate) const MARKER: &str = "\u{2800}";
 
 /// Whether the buddy is on in this run; [`STATE_FILE`] carries it to the next.
 static SHOWN: AtomicBool = AtomicBool::new(false);
@@ -1022,7 +1024,7 @@ static DIRECT_STATE: Mutex<DirectState> = Mutex::new(DirectState {
 
 /// The escapes that draw `png` as image `id` with its top-left at `at`,
 /// stretched to the box, leaving the cursor where it was.
-fn place_sequence(id: u32, at: Rect, png: &[u8]) -> String {
+pub(crate) fn place_sequence(id: u32, at: Rect, png: &[u8]) -> String {
     let data = crate::tui::base64(png);
     let chunks: Vec<&str> = data
         .as_bytes()
@@ -1038,7 +1040,8 @@ fn place_sequence(id: u32, at: Rect, png: &[u8]) -> String {
         let _ = if i == 0 {
             write!(
                 out,
-                "\x1b_Ga=T,f=100,i={id},c={COLS},r={ROWS},C=1,q=2,m={more};{chunk}\x1b\\"
+                "\x1b_Ga=T,f=100,i={id},c={},r={},C=1,q=2,m={more};{chunk}\x1b\\",
+                at.width, at.height
             )
         } else {
             write!(out, "\x1b_Gm={more};{chunk}\x1b\\")
@@ -1108,6 +1111,30 @@ pub fn hide() {
             let _ = write_to_terminal(&delete_sequence(CLIP_IDS[old]));
         }
     }
+}
+
+/// Takes the buddy off the screen as plank exits, in either mode: a picture
+/// left behind would outlive the process (in Warp it sits outside the cell
+/// grid, so leaving the alternate screen does not take it away). Leaves
+/// [`STATE_FILE`] alone, so the next launch still brings it back.
+///
+/// Locks with `try_lock`: on a force quit the UI thread may be holding one,
+/// and a picture left on screen beats an exit that hangs.
+pub fn hide_for_exit() {
+    if !SHOWN.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut player) = PLAYER.try_lock()
+        && let Some(p) = player.as_mut()
+    {
+        p.stop();
+    }
+    if let Ok(mut direct) = DIRECT_STATE.try_lock() {
+        direct.want = None;
+        direct.placed = None;
+    }
+    let all: String = CLIP_IDS.into_iter().map(delete_sequence).collect();
+    let _ = write_to_terminal(&all);
 }
 
 /// Where the buddy goes in `output`: right-aligned with [`RIGHT_GAP`] columns

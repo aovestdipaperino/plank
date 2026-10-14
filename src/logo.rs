@@ -23,8 +23,20 @@
 //! a box of their own, so it scrolls with the text like the art does. The
 //! box is narrower than the art's (`KITTY_COLS`), since a real image needs
 //! fewer cells. Setting `PLANK_LOGO_CELL` keeps the art.
+//!
+//! Warp draws kitty images only at the cursor, outside the cell grid, so
+//! there the banner holds blank marker cells instead, each naming its own
+//! column and row by its colour ([`direct_art`]). After every frame
+//! [`after_draw`] looks for a whole, uncovered block of them and places the
+//! picture over it, moving it as the output scrolls and deleting it when the
+//! block is partly off screen or anything is drawn over it.
 
-use std::sync::OnceLock;
+use std::fmt::Write as _;
+use std::sync::{Mutex, OnceLock};
+
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
 
 /// The logo image, embedded at build time.
 pub const LOGO_PNG: &[u8] = include_bytes!("resources/logo.png");
@@ -43,6 +55,14 @@ const BACKGROUND_THRESHOLD: u8 = 232;
 /// it differs from the buddy's clip ids.
 pub const KITTY_ID: u32 = 0x00B0_DD30;
 
+/// The second id the Warp picture alternates with [`KITTY_ID`], so a move
+/// places the new copy before deleting the old and nothing blinks.
+const KITTY_ID_ALT: u32 = KITTY_ID + 1;
+
+/// Red channel of a Warp marker cell's colour; green and blue are the cell's
+/// column and row within the picture ([`direct_art`]).
+const DIRECT_TAG: u8 = 0xB0;
+
 /// Width, in columns, of the kitty picture: smaller than the art's
 /// [`DEFAULT_WIDTH`], since a real image needs fewer cells to read clearly.
 pub const KITTY_COLS: u32 = 10;
@@ -57,13 +77,14 @@ pub struct Logo {
     pub art: String,
 }
 
-/// Whether the banner shows the picture through kitty graphics: stdout is a
-/// terminal with Unicode placeholders, and no `PLANK_LOGO_CELL` asks for art.
-fn use_kitty() -> bool {
+/// How the banner can show the picture: the `/buddy` detection, on a
+/// terminal stdout, unless `PLANK_LOGO_CELL` asks for art.
+fn kitty_mode() -> Option<crate::buddy::Mode> {
     use std::io::IsTerminal as _;
-    std::env::var_os(CELL_ENV).is_none()
-        && std::io::stdout().is_terminal()
-        && crate::buddy::supported() == Some(crate::buddy::Mode::Placeholders)
+    if std::env::var_os(CELL_ENV).is_some() || !std::io::stdout().is_terminal() {
+        return None;
+    }
+    crate::buddy::supported()
 }
 
 /// A terminal cell's size in pixels `(width, height)`, from `TIOCGWINSZ`;
@@ -145,7 +166,7 @@ fn placeholder_art(cols: usize, rows: usize) -> Option<String> {
 /// scaled to exactly the pixels its cells cover ([`kitty_box`]), so the
 /// terminal shows it pixel for pixel.
 fn with_kitty(ansi: impl FnOnce() -> String, png: &[u8], key: bool) -> Logo {
-    let picture = || {
+    let picture = |mode: crate::buddy::Mode| {
         let cell = cell_pixels()?;
         let size = image::ImageReader::new(std::io::Cursor::new(png))
             .with_guessed_format()
@@ -153,6 +174,18 @@ fn with_kitty(ansi: impl FnOnce() -> String, png: &[u8], key: bool) -> Logo {
             .into_dimensions()
             .ok()?;
         let (pixels, rows) = kitty_box(size, cell, KITTY_COLS)?;
+        if mode == crate::buddy::Mode::Direct {
+            let (c, r) = (u16::try_from(KITTY_COLS).ok()?, u16::try_from(rows).ok()?);
+            let text = direct_art(c, r)?;
+            let scaled = kitty_png(png, key, pixels)?;
+            let mut direct = DIRECT.lock().ok()?;
+            direct.png = Some(scaled);
+            direct.size = (c, r);
+            return Some(Logo {
+                transmit: None,
+                art: text,
+            });
+        }
         let text = placeholder_art(
             usize::try_from(KITTY_COLS).ok()?,
             usize::try_from(rows).ok()?,
@@ -166,14 +199,128 @@ fn with_kitty(ansi: impl FnOnce() -> String, png: &[u8], key: bool) -> Logo {
             art: text,
         })
     };
-    if use_kitty()
-        && let Some(logo) = picture()
+    if let Some(mode) = kitty_mode()
+        && let Some(logo) = picture(mode)
     {
         return logo;
     }
     Logo {
         transmit: None,
         art: ansi(),
+    }
+}
+
+/// The marker text for a `cols` x `rows` Warp picture: blank
+/// [`crate::buddy::MARKER`] cells, each coloured with [`DIRECT_TAG`] and its
+/// own column and row, so [`after_draw`] can tell a whole block from one
+/// scrolled partly away or drawn over. `None` past 256 cells a side.
+fn direct_art(cols: u16, rows: u16) -> Option<String> {
+    if cols == 0 || rows == 0 || cols > 256 || rows > 256 {
+        return None;
+    }
+    let mut out = String::new();
+    for row in 0..rows {
+        for col in 0..cols {
+            // Writing to a `String` cannot fail.
+            let _ = write!(
+                out,
+                "\x1b[38;2;{DIRECT_TAG};{col};{row}m{}",
+                crate::buddy::MARKER
+            );
+        }
+        out.push_str("\x1b[39m\n");
+    }
+    Some(out)
+}
+
+/// The Warp picture: what to place and where it is now.
+struct Direct {
+    /// The picture, scaled to its box; `None` until a banner used one.
+    png: Option<Vec<u8>>,
+    /// The box, in cells: `(cols, rows)`.
+    size: (u16, u16),
+    /// Where it is on screen, and under which id.
+    placed: Option<(Rect, u32)>,
+}
+
+static DIRECT: Mutex<Direct> = Mutex::new(Direct {
+    png: None,
+    size: (0, 0),
+    placed: None,
+});
+
+/// The first whole block of Warp marker cells `cols` x `rows` in `buf`: a
+/// cell naming column 0, row 0 with every other cell of the box in place.
+fn find_block(buf: &Buffer, (cols, rows): (u16, u16)) -> Option<Rect> {
+    let is_marker = |x: u16, y: u16, col: u16, row: u16| {
+        let (Ok(col), Ok(row)) = (u8::try_from(col), u8::try_from(row)) else {
+            return false;
+        };
+        buf.cell((x, y)).is_some_and(|c| {
+            c.symbol() == crate::buddy::MARKER && c.fg == Color::Rgb(DIRECT_TAG, col, row)
+        })
+    };
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if !is_marker(x, y, 0, 0) {
+                continue;
+            }
+            let whole = (0..rows).all(|r| {
+                (0..cols).all(|c| {
+                    x.checked_add(c)
+                        .zip(y.checked_add(r))
+                        .is_some_and(|(cx, cy)| is_marker(cx, cy, c, r))
+                })
+            });
+            if whole {
+                return Some(Rect::new(x, y, cols, rows));
+            }
+        }
+    }
+    None
+}
+
+/// For Warp: called with every frame drawn, places, moves or removes the
+/// banner picture to match its marker cells. A no-op until a banner used the
+/// picture, which only happens in Warp.
+pub fn after_draw(buf: &Buffer) {
+    let Ok(mut direct) = DIRECT.lock() else {
+        return;
+    };
+    let Some(png) = direct.png.as_ref() else {
+        return;
+    };
+    let want = find_block(buf, direct.size);
+    if want == direct.placed.map(|(at, _)| at) {
+        return;
+    }
+    let mut seq = String::new();
+    let mut placed = None;
+    if let Some(at) = want {
+        let id = match direct.placed {
+            Some((_, KITTY_ID)) => KITTY_ID_ALT,
+            _ => KITTY_ID,
+        };
+        seq.push_str(&crate::buddy::place_sequence(id, at, png));
+        placed = Some((at, id));
+    }
+    // The old copy goes only once the new one is up.
+    if let Some((_, old)) = direct.placed {
+        seq.push_str(&crate::buddy::delete_sequence(old));
+    }
+    direct.placed = placed;
+    let _ = crate::buddy::write_to_terminal(&seq);
+}
+
+/// Removes the Warp picture as plank exits: it sits outside the cell grid, so
+/// leaving the alternate screen would not take it away. `try_lock`, as for
+/// the buddy: a force quit must not hang on it.
+pub fn hide_for_exit() {
+    if let Ok(mut direct) = DIRECT.try_lock()
+        && let Some((_, id)) = direct.placed.take()
+    {
+        let _ = crate::buddy::write_to_terminal(&crate::buddy::delete_sequence(id));
     }
 }
 
@@ -342,6 +489,50 @@ fn banner_label(profile_name: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    /// A buffer holding `art` (via the TUI's ANSI conversion) at `(x, y)`.
+    fn buffer_with(art: &str, area: Rect, x: u16, y: u16) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        for (i, line) in crate::tui::ansi_to_lines(art).iter().enumerate() {
+            let row = y + u16::try_from(i).unwrap();
+            if row < area.bottom() {
+                buf.set_line(x, row, line, area.width - x);
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn a_whole_warp_block_is_found_where_it_stands() {
+        let art = super::direct_art(4, 3).unwrap();
+        let area = Rect::new(0, 0, 20, 10);
+        let buf = buffer_with(&art, area, 5, 2);
+        assert_eq!(super::find_block(&buf, (4, 3)), Some(Rect::new(5, 2, 4, 3)));
+    }
+
+    #[test]
+    fn a_warp_block_scrolled_partly_away_or_covered_is_not_placed() {
+        let art = super::direct_art(4, 3).unwrap();
+        let area = Rect::new(0, 0, 20, 10);
+        // Its top row scrolled off: the first visible row is row 1.
+        let tail = art.lines().skip(1).fold(String::new(), |mut out, l| {
+            out.push_str(l);
+            out.push('\n');
+            out
+        });
+        let buf = buffer_with(&tail, area, 5, 0);
+        assert_eq!(super::find_block(&buf, (4, 3)), None);
+        // Its bottom row cut off by the edge of the area.
+        let buf = buffer_with(&art, area, 5, 8);
+        assert_eq!(super::find_block(&buf, (4, 3)), None);
+        // One cell drawn over.
+        let mut buf = buffer_with(&art, area, 5, 2);
+        buf[(7, 3)].set_symbol("x");
+        assert_eq!(super::find_block(&buf, (4, 3)), None);
+    }
+
     // The commit stamp always exists (build.rs falls back to "unknown"), and
     // the line carries both the version and the commit.
     #[test]
