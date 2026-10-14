@@ -413,6 +413,11 @@ pub struct TurnShared {
     /// it that a pass is running at all, so a mid-pass `/btw` is rejected
     /// (`btw_gate`).
     pub background_pass: AtomicBool,
+    /// The idle footer, set by the front end before a quiet background pass:
+    /// the busy loop shows it until the pass reports a status of its own,
+    /// which the prompt suggestion never does, so the pass looks like the
+    /// idle prompt it interrupts nothing of.
+    pub idle_status: Mutex<String>,
     /// Set by the busy loop's Ctrl-D arm while a quiet background pass is
     /// running: the user wants out, and work they never asked for must not
     /// hold the door shut. `tui_quiet_pass` reads it once the worker has

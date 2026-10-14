@@ -491,6 +491,23 @@ fn frame_to_image(buf: &ratatui::buffer::Buffer) -> image::RgbaImage {
     img
 }
 
+/// Events plank hands itself, read by [`next_event`] before anything else:
+/// an Enter [`replay_enter`] queued for the idle loop.
+static REPLAY: Mutex<std::collections::VecDeque<Event>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Has the next [`next_event`] report Enter, so a command typed during a
+/// quiet pass, put back in the editor, is submitted by the idle loop once
+/// the pass has stopped: that loop is where every command runs.
+fn replay_enter() {
+    if let Ok(mut q) = REPLAY.lock() {
+        q.push_back(Event::Key(event::KeyEvent::new(
+            event::KeyCode::Enter,
+            event::KeyModifiers::NONE,
+        )));
+    }
+}
+
 /// The single event source both TUI key loops use.
 ///
 /// Injected events (from `--ui-remote`) are drained before the terminal is
@@ -501,6 +518,9 @@ fn next_event(
     remote: Option<&Mutex<UiRemote>>,
     timeout: Duration,
 ) -> Result<Option<Event>, String> {
+    if let Some(ev) = REPLAY.lock().ok().and_then(|mut q| q.pop_front()) {
+        return Ok(Some(ev));
+    }
     if let Some(m) = remote
         && let Ok(mut g) = m.lock()
         && let Some(ev) = g.injected.pop_front()
@@ -15601,6 +15621,10 @@ impl Agent<'_> {
             .map_or(&local_shared, |r| r.shared.as_ref());
         shared.memory_pass.store(true, Ordering::Relaxed);
         shared.background_pass.store(true, Ordering::Relaxed);
+        let cols = terminal.size().map_or(80, |s| usize::from(s.width));
+        if let Ok(mut idle) = shared.idle_status.lock() {
+            *idle = self.idle_status_text(cols);
+        }
         let live = LiveCommands::capture(self);
         // Served, never `None`: a lend made during the pass is then answered
         // or released by construction rather than by no tool asking.
@@ -20586,7 +20610,17 @@ fn busy_ui_loop(
     live_cmds: &LiveCommands,
     done: impl Fn() -> bool,
 ) -> Result<(), String> {
-    let mut status_line = String::new();
+    // A quiet pass opens on the idle footer (`TurnShared::idle_status`); a
+    // turn starts blank until its first status.
+    let mut status_line = if shared.memory_pass.load(Ordering::Relaxed) {
+        shared
+            .idle_status
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     // A `/usage` report shown mid-turn goes in this dismissable panel — the
     // same treatment as at idle — instead of being dumped into the scrollback
     // where it interleaves with the model's streaming output.
@@ -20946,6 +20980,13 @@ fn busy_ui_loop(
         } else {
             crate::cursor::State::Busy
         });
+        // A quiet pass (the memory pass, a prompt suggestion) looks like the
+        // idle prompt, buddy included: the frame is offered to it just as the
+        // idle repaint offers its own.
+        let quiet = shared.memory_pass.load(Ordering::Relaxed);
+        if quiet {
+            crate::buddy::offer();
+        }
         terminal
             .draw(|f| {
                 // The `/btw` split is about the main task, so it steps aside
@@ -20974,6 +21015,10 @@ fn busy_ui_loop(
                         sub_title.as_deref(),
                         &roster,
                     );
+                }
+                // Under every overlay drawn next, as in the idle repaint.
+                if quiet {
+                    crate::buddy::render(f.buffer_mut(), tui::last_output_rect());
                 }
                 if let Some(m) = &input.slash {
                     tui::draw_slash_menu(f, input.buf.text(), m, roster_rows);
@@ -21249,6 +21294,17 @@ fn busy_ui_loop(
                         // Submitting anything retires an open `/usage` report.
                         report = None;
                         if line.is_empty() {
+                        } else if (line.starts_with('/') || line.starts_with('!'))
+                            && shared.memory_pass.load(Ordering::Relaxed)
+                        {
+                            // A quiet pass is the idle prompt as far as the
+                            // user can tell, so every command runs: the line
+                            // goes back in the editor, the pass stops and goes
+                            // back on its queue, and the idle loop submits the
+                            // line as if Enter were pressed there.
+                            input.buf.insert(line.as_str());
+                            replay_enter();
+                            raise_worker_interrupt(shared);
                         } else if let Some(msg) = btw_question(&line).and_then(|_| {
                             crate::worker::btw_gate(shared.background_pass.load(Ordering::Relaxed))
                         }) {
@@ -39493,6 +39549,16 @@ or the user's next message aborts before its first token"
     /// leave the log's pending region and land in the transcript. Pins that
     /// `absorb_leftover` does both — the commit count and the pushed
     /// messages — not just one or the other.
+    #[test]
+    fn a_replayed_enter_is_the_next_event_before_the_terminal_is_polled() {
+        super::replay_enter();
+        let ev = super::next_event(None, std::time::Duration::ZERO).unwrap();
+        assert!(
+            matches!(ev, Some(Event::Key(k)) if k.code == KeyCode::Enter),
+            "{ev:?}"
+        );
+    }
+
     #[test]
     fn absorb_leftover_commits_each_line_and_pushes_it_to_the_transcript() {
         let dir =
