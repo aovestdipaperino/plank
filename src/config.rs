@@ -1237,7 +1237,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/buddy",
-        args: "[on|off|install]",
+        args: "[on|off|install|sound on|off]",
         desc: "an animated buddy on the prompt rule while idle (kitty, Ghostty, Warp)",
     },
     SlashCommand {

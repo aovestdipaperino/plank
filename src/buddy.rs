@@ -52,6 +52,14 @@
 //!
 //! Only the idle repaint calls [`render`], which is what keeps the buddy off
 //! the screen while a turn runs.
+//!
+//! `/buddy sound on` plays each clip's soundtrack with it, remembered like
+//! the buddy itself (`~/.plank/buddy.sound`, [`SOUND_FILE`]). The decoder
+//! extracts it once next to the frames as a WAV, and the system's own player
+//! plays it ([`voice`]): `afplay` on macOS, else `paplay`, `aplay` or
+//! `ffplay`, whichever is installed, so nothing is linked for it. A clip's
+//! sound starts with its first frame and stops once the buddy has not been
+//! drawn for [`voice::GRACE`]: a turn starting, a pane over it, `/buddy off`.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -75,6 +83,10 @@ pub const CLIP_DIR: &str = "buddy";
 /// folder from then on.
 pub const STATE_FILE: &str = "buddy.on";
 
+/// The file, under the plank home, whose presence means the clips play with
+/// their sound, for the same reason as [`STATE_FILE`].
+pub const SOUND_FILE: &str = "buddy.sound";
+
 /// Where an install downloads before it replaces [`CLIP_DIR`], under the plank
 /// home, so a failed download leaves the old buddy in place.
 const STAGING_DIR: &str = ".buddy-staging";
@@ -88,6 +100,13 @@ const FRAME_CACHE: &str = ".frames";
 /// The marker a fully decoded clip's cache directory holds; a directory
 /// without it is a decode that was interrupted, and is redone.
 const DONE_MARKER: &str = "done";
+
+/// A clip's soundtrack, extracted into its cache directory.
+const AUDIO_FILE: &str = "audio.wav";
+
+/// The marker a clip's cache directory holds when the clip has no sound, so
+/// extraction is not retried at every start.
+const SILENT_MARKER: &str = "silent";
 
 /// Bumped whenever decoding changes what a cached frame holds, so frames
 /// cached by an older plank are decoded afresh. 2: keyed at full size.
@@ -138,6 +157,10 @@ pub(crate) const MARKER: &str = "\u{2800}";
 
 /// Whether the buddy is on in this run; [`STATE_FILE`] carries it to the next.
 static SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Whether clips play with their sound; [`SOUND_FILE`] carries it to the next
+/// run.
+static SOUND: AtomicBool = AtomicBool::new(false);
 
 /// Whether the running buddy is in [`Mode::Direct`] (meaningful while on).
 static DIRECT: AtomicBool = AtomicBool::new(false);
@@ -333,8 +356,28 @@ pub fn command(arg: &str) -> Outcome {
             None => "Which buddy?".to_owned(),
         }),
         ("install", Some(name)) => Outcome::Say(chosen(name)),
+        ("sound", None) => Outcome::Say(format!(
+            "buddy sound {} (/buddy sound on|off)",
+            if SOUND.load(Ordering::Relaxed) {
+                "on"
+            } else {
+                "off"
+            }
+        )),
+        ("sound", Some(word @ ("on" | "off"))) if words.next().is_none() => {
+            let on = word == "on";
+            SOUND.store(on, Ordering::Relaxed);
+            if !on {
+                voice::hush();
+            }
+            let note = match remember_file(&crate::home::plank_home(), SOUND_FILE, on) {
+                Ok(()) => String::new(),
+                Err(e) => format!(" (not remembered for the next run: {e})"),
+            };
+            Outcome::Say(format!("buddy sound {word}{note}"))
+        }
         _ => Outcome::Say(format!(
-            "/buddy: expected on|off|install [name], got `{arg}`"
+            "/buddy: expected on|off|install [name]|sound on|off, got `{arg}`"
         )),
     }
 }
@@ -349,7 +392,12 @@ fn status(installed: Option<&str>) -> String {
         .and_then(|n| n.clone())
         .map(|n| format!("; {n}"))
         .unwrap_or_default();
-    format!("buddy {state}, {which}{note} (/buddy on|off|install)")
+    let sound = if SOUND.load(Ordering::Relaxed) {
+        "on"
+    } else {
+        "off"
+    };
+    format!("buddy {state}, {which}{note}, sound {sound} (/buddy on|off|install|sound)")
 }
 
 /// The menu of the repository's buddies, or why there is none.
@@ -403,6 +451,7 @@ pub fn chosen(name: &str) -> String {
 /// asked for it.
 pub fn restore() {
     let home = crate::home::plank_home();
+    SOUND.store(home.join(SOUND_FILE).is_file(), Ordering::Relaxed);
     if shown() || !remembered_in(&home) || installed().is_none() {
         return;
     }
@@ -422,7 +471,12 @@ fn remember(on: bool) -> String {
 
 /// [`remember`] under the plank home `home`.
 fn remember_in(home: &Path, on: bool) -> std::io::Result<()> {
-    let path = home.join(STATE_FILE);
+    remember_file(home, STATE_FILE, on)
+}
+
+/// Creates (`on`) or removes the marker `file` under the plank home `home`.
+fn remember_file(home: &Path, file: &str, on: bool) -> std::io::Result<()> {
+    let path = home.join(file);
     if on {
         std::fs::create_dir_all(home)?;
         std::fs::write(path, "")
@@ -631,6 +685,7 @@ fn start_player() -> String {
 /// Takes the buddy off the screen and forgets what was there, so the next
 /// showing retransmits rather than trusting deleted images.
 fn clear_screen() {
+    voice::hush();
     if let Ok(mut player) = PLAYER.lock()
         && let Some(p) = player.as_mut()
     {
@@ -683,11 +738,12 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
     }
 }
 
-/// A decoded clip: its kind and its frames, in order.
+/// A decoded clip: its kind, its frames, in order, and its sound, if any.
 #[derive(Clone, Debug)]
 struct Clip {
     kind: Kind,
     frames: Vec<PathBuf>,
+    audio: Option<PathBuf>,
 }
 
 /// Decodes each video into the cache (or finds it there) into `ready`, then
@@ -701,7 +757,12 @@ fn decode_all(videos: &[PathBuf], cache: &Path, ready: &Mutex<Vec<Clip>>, done: 
             && !frames.is_empty()
             && let Ok(mut clips) = ready.lock()
         {
-            clips.push(Clip { kind, frames });
+            let audio = cache_dir_for(video, cache).and_then(|dir| extract_audio(video, &dir));
+            clips.push(Clip {
+                kind,
+                frames,
+                audio,
+            });
         }
     }
     done.store(true, Ordering::Relaxed);
@@ -755,6 +816,37 @@ fn decode(video: &Path, cache: &Path) -> Option<Vec<PathBuf>> {
         std::fs::write(dir.join(DONE_MARKER), b"").ok()?;
     }
     Some(frames_in(&dir))
+}
+
+/// The soundtrack of `video` as a WAV in its cache directory `dir`,
+/// extracting it the first time; `None` when the clip has none. Kept apart
+/// from the frames' [`DONE_MARKER`] so frames cached before sound existed
+/// are not decoded again for it.
+fn extract_audio(video: &Path, dir: &Path) -> Option<PathBuf> {
+    let wav = dir.join(AUDIO_FILE);
+    if wav.is_file() {
+        return Some(wav);
+    }
+    if dir.join(SILENT_MARKER).exists() {
+        return None;
+    }
+    let part = dir.join(format!("{AUDIO_FILE}.part"));
+    let ok = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-y", "-i"])
+        .arg(video)
+        .args(["-vn", "-map", "0:a:0", "-c:a", "pcm_s16le", "-f", "wav"])
+        .arg(&part)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok && std::fs::rename(&part, &wav).is_ok() {
+        return Some(wav);
+    }
+    let _ = std::fs::remove_file(&part);
+    let _ = std::fs::write(dir.join(SILENT_MARKER), b"");
+    None
 }
 
 /// `img` at half its size, each pixel the alpha-weighted mean of a 2×2 block,
@@ -911,6 +1003,8 @@ struct Player {
     digit_turn: usize,
     /// The clip playing and when it started.
     playing: Option<(usize, Instant)>,
+    /// The clip start whose sound was last handed out ([`Self::new_sound`]).
+    sounded: Option<(usize, Instant)>,
     /// The `(clip, frame)` last transmitted, and into which [`CLIP_IDS`] slot.
     on_screen: Option<((usize, usize), usize)>,
 }
@@ -923,6 +1017,7 @@ impl Player {
             rng: seed,
             digit_turn: 0,
             playing: None,
+            sounded: None,
             on_screen: None,
         }
     }
@@ -936,7 +1031,19 @@ impl Player {
     /// retransmits rather than trusting images that were deleted.
     fn stop(&mut self) {
         self.playing = None;
+        self.sounded = None;
         self.on_screen = None;
+    }
+
+    /// The sound of the clip playing, the first time it is asked after the
+    /// clip started; `None` after that, and for a clip without sound.
+    fn new_sound(&mut self) -> Option<PathBuf> {
+        let playing = self.playing?;
+        if self.sounded == Some(playing) {
+            return None;
+        }
+        self.sounded = Some(playing);
+        self.clips.lock().ok()?.get(playing.0)?.audio.clone()
     }
 
     /// Advances playback to `now` and returns the `(clip, frame)` due;
@@ -1102,6 +1209,7 @@ pub fn after_draw(buf: &Buffer) {
 /// the idle repaint (a compaction, a shell escape, a WASM frame), whose own
 /// draw is not followed by [`after_draw`]. A no-op otherwise.
 pub fn hide() {
+    voice::hush();
     if !shown() || mode() != Mode::Direct {
         return;
     }
@@ -1121,6 +1229,7 @@ pub fn hide() {
 /// Locks with `try_lock`: on a force quit the UI thread may be holding one,
 /// and a picture left on screen beats an exit that hangs.
 pub fn hide_for_exit() {
+    voice::hush();
     if !SHOWN.swap(false, Ordering::Relaxed) {
         return;
     }
@@ -1201,8 +1310,9 @@ fn cell_symbol(row: u16, col: u16) -> String {
     .collect()
 }
 
-/// Draws the buddy into `buf` at [`placement`] in `output`, when it is on and
-/// a clip is ready, after moving playback on to the frame now due. The idle
+/// Draws the buddy into `buf` at [`placement`] in `output`, when it is on, a
+/// clip is ready and the output pane [`claim`]ed the box by wrapping its text
+/// around it, after moving playback on to the frame now due. The idle
 /// repaint calls it, after the output pane is drawn (which would paint over
 /// it) and before any overlay (which should paint over it); nothing else
 /// does, so the buddy is never up while a turn runs. In [`Mode::Placeholders`]
@@ -1239,6 +1349,7 @@ pub fn render(buf: &mut Buffer, output: Rect) {
         if let Ok(mut direct) = DIRECT_STATE.lock() {
             direct.want = Some((at, due));
         }
+        sound_with_clip();
         for y in at.top()..at.bottom() {
             for x in at.left()..at.right() {
                 if let Some(cell) = buf.cell_mut((x, y)) {
@@ -1255,6 +1366,125 @@ pub fn render(buf: &mut Buffer, output: Rect) {
         .and_then(|mut p| p.as_mut().and_then(|p| p.placeholder_id(now)))
     {
         paint(buf, at, id);
+        sound_with_clip();
+    }
+}
+
+/// Called from [`render`] once the frame due is on its way to the screen:
+/// keeps the clip's sound going ([`voice::drawn`]) and starts it with the
+/// clip's first frame when sound is on.
+fn sound_with_clip() {
+    voice::drawn();
+    let sound = PLAYER
+        .lock()
+        .ok()
+        .and_then(|mut p| p.as_mut().and_then(Player::new_sound));
+    if let Some(path) = sound
+        && SOUND.load(Ordering::Relaxed)
+    {
+        voice::speak(&path);
+    }
+}
+
+/// Plays clip soundtracks through the system's player, one at a time, and
+/// stops one once the buddy is no longer being drawn.
+mod voice {
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    /// How long the buddy may go undrawn before its sound stops. The idle
+    /// loop redraws at the clip's frame rate while it plays, and the busy
+    /// loop of a quiet pass at least every 100 ms, so only a buddy that is
+    /// really gone goes this long.
+    pub(super) const GRACE: Duration = Duration::from_millis(500);
+
+    /// The player process of the sound playing.
+    static PLAYING: Mutex<Option<Child>> = Mutex::new(None);
+
+    /// When [`super::render`] last drew the buddy.
+    static DRAWN: Mutex<Option<Instant>> = Mutex::new(None);
+
+    /// Players tried in order, each with its arguments before the file.
+    const PLAYERS: &[(&str, &[&str])] = &[
+        ("afplay", &[]),
+        ("paplay", &[]),
+        ("aplay", &["-q"]),
+        ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
+    ];
+
+    /// Notes that the buddy was drawn now.
+    pub(super) fn drawn() {
+        if let Ok(mut at) = DRAWN.lock() {
+            *at = Some(Instant::now());
+        }
+    }
+
+    /// Plays `wav`, stopping whatever played before. Silent when no player
+    /// is installed.
+    pub(super) fn speak(wav: &Path) {
+        hush();
+        let child = PLAYERS.iter().find_map(|(cmd, args)| {
+            Command::new(cmd)
+                .args(*args)
+                .arg(wav)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()
+        });
+        if let (Some(child), Ok(mut playing)) = (child, PLAYING.lock()) {
+            *playing = Some(child);
+            watch();
+        }
+    }
+
+    /// Stops the sound playing, if any.
+    pub(super) fn hush() {
+        // `try_lock`: this runs on exit too, where hanging is worse than a
+        // sound that plays out.
+        if let Ok(mut playing) = PLAYING.try_lock()
+            && let Some(mut child) = playing.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Starts, once, the thread that stops the sound when the buddy has not
+    /// been drawn for [`GRACE`], or was turned off or silenced, and reaps a
+    /// player that finished.
+    fn watch() {
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let gone = DRAWN
+                        .lock()
+                        .ok()
+                        .and_then(|at| *at)
+                        .is_none_or(|at| at.elapsed() > GRACE);
+                    let wanted = super::shown() && super::SOUND.load(Ordering::Relaxed);
+                    let Ok(mut playing) = PLAYING.lock() else {
+                        continue;
+                    };
+                    let Some(child) = playing.as_mut() else {
+                        continue;
+                    };
+                    if gone || !wanted {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        *playing = None;
+                    } else if child.try_wait().is_ok_and(|done| done.is_some()) {
+                        *playing = None;
+                    }
+                }
+            });
+        });
     }
 }
 
@@ -1492,6 +1722,7 @@ mod tests {
         p.clips.lock().unwrap().push(Clip {
             kind: Kind::Letter,
             frames,
+            audio: None,
         });
         let t0 = Instant::now();
         // Nothing plays while decoding is still going.
@@ -1509,6 +1740,52 @@ mod tests {
     }
 
     #[test]
+    fn a_clip_hands_out_its_sound_once_per_start() {
+        let mut p = Player::new(1);
+        p.clips.lock().unwrap().push(Clip {
+            kind: Kind::Letter,
+            frames: vec![PathBuf::from("0.png"), PathBuf::from("1.png")],
+            audio: Some(PathBuf::from("audio.wav")),
+        });
+        p.decoded.store(true, Ordering::Relaxed);
+        assert_eq!(p.new_sound(), None, "nothing plays yet");
+        let t0 = Instant::now();
+        p.due(t0);
+        assert_eq!(p.new_sound(), Some(PathBuf::from("audio.wav")));
+        // Later frames of the same clip do not start it again.
+        p.due(t0 + Duration::from_millis(1000 / u64::from(FPS)));
+        assert_eq!(p.new_sound(), None);
+        // The clip starting over is a new start, with its sound again.
+        p.due(t0 + Duration::from_millis(2 * 1000 / u64::from(FPS) + 1));
+        assert_eq!(p.new_sound(), Some(PathBuf::from("audio.wav")));
+        // A stopped player starts afresh, sound included.
+        p.stop();
+        p.due(t0 + Duration::from_secs(10));
+        assert_eq!(p.new_sound(), Some(PathBuf::from("audio.wav")));
+    }
+
+    #[test]
+    fn sound_is_extracted_once_and_a_silent_clip_is_not_retried() {
+        let dir = std::env::temp_dir().join(format!("plank-buddy-audio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Already extracted: found without running anything.
+        std::fs::write(dir.join(AUDIO_FILE), b"RIFF").unwrap();
+        assert_eq!(
+            extract_audio(Path::new("/nonexistent.mp4"), &dir),
+            Some(dir.join(AUDIO_FILE))
+        );
+        // No sound in the clip (here: no clip at all): marked silent, and
+        // asked again it stays silent without a second extraction.
+        std::fs::remove_file(dir.join(AUDIO_FILE)).unwrap();
+        assert_eq!(extract_audio(Path::new("/nonexistent.mp4"), &dir), None);
+        assert!(dir.join(SILENT_MARKER).exists());
+        assert!(!dir.join(format!("{AUDIO_FILE}.part")).exists());
+        assert_eq!(extract_audio(Path::new("/nonexistent.mp4"), &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn through_the_player_three_clips_in_four_are_letter_clips() {
         // Clip lengths like the minions': six short digit clips, two long
         // letter ones. Counting clip starts over simulated time checks the
@@ -1519,7 +1796,11 @@ mod tests {
             .chain([(Kind::Letter, 181), (Kind::Letter, 181)])
         {
             let frames = (0..n).map(|i| PathBuf::from(format!("{i}.png"))).collect();
-            p.clips.lock().unwrap().push(Clip { kind, frames });
+            p.clips.lock().unwrap().push(Clip {
+                kind,
+                frames,
+                audio: None,
+            });
         }
         p.decoded.store(true, Ordering::Relaxed);
         let kinds: Vec<Kind> = p.clips.lock().unwrap().iter().map(|c| c.kind).collect();
