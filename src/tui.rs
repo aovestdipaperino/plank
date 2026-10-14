@@ -156,19 +156,31 @@ fn highlighter() -> Arc<TreeSitterHighlighter> {
         .clone()
 }
 
+/// The width assistant markdown is rendered at: the terminal's, less the
+/// two columns reserved for the output gutter.
+fn markdown_width() -> usize {
+    ratatui::crossterm::terminal::size()
+        .map_or(80, |(w, _)| w as usize)
+        .saturating_sub(usize::from(OUTPUT_GUTTER_WIDTH))
+        .max(20)
+}
+
+/// The markdown renderer for text `width` columns wide, with syntax
+/// highlighting.
+fn markdown_renderer(width: usize) -> MarkdownRenderer {
+    MarkdownRenderer::new(width)
+        .with_render_hooks(Box::new(HighlightHooks::new(highlighter(), width)))
+}
+
+/// Renders `src` at `width` (see [`markdown_width`]) onto `lines` from
+/// `start`, gutter included, returning its code blocks.
 fn render_markdown_at(
     lines: &mut Vec<Line<'static>>,
     start: usize,
     src: &str,
+    width: usize,
 ) -> Vec<CodeBlockRegion> {
-    // Two columns are reserved for the output gutter added below.
-    let width = ratatui::crossterm::terminal::size()
-        .map_or(80, |(w, _)| w as usize)
-        .saturating_sub(usize::from(OUTPUT_GUTTER_WIDTH))
-        .max(20);
-    let hl = highlighter();
-    let md =
-        MarkdownRenderer::new(width).with_render_hooks(Box::new(HighlightHooks::new(hl, width)));
+    let md = markdown_renderer(width);
     let blocks = md.parse(src);
     // The verbatim source of each top-level code block, in document order.
     // Copying must use this, not the rendered rows: the renderer soft-wraps
@@ -191,20 +203,133 @@ fn render_markdown_at(
     // still sees the `╭` mark in column zero; the copy columns move with it.
     // Blank rows stay blank: an indent there is invisible trailing whitespace
     // that would only pollute a mouse selection.
-    for (i, line) in lines[start..].iter_mut().enumerate() {
-        let blank = line.spans.iter().all(|s| s.content.trim().is_empty());
-        if i > 0 && blank {
-            continue;
-        }
-        let gutter = if i == 0 { OUTPUT_BULLET } else { OUTPUT_INDENT };
-        line.spans
-            .insert(0, Span::styled(gutter, output_bullet_style()));
-    }
+    add_gutter(&mut lines[start..], true);
     for r in &mut regions {
         r.copy_cols.0 = r.copy_cols.0.saturating_add(OUTPUT_GUTTER_WIDTH);
         r.copy_cols.1 = r.copy_cols.1.saturating_add(OUTPUT_GUTTER_WIDTH);
     }
     regions
+}
+
+/// Puts the output gutter on rendered markdown rows: [`OUTPUT_BULLET`] on
+/// the first when `bullet` (the start of an output block), [`OUTPUT_INDENT`]
+/// on every other row that is not blank.
+fn add_gutter(lines: &mut [Line<'static>], bullet: bool) {
+    for (i, line) in lines.iter_mut().enumerate() {
+        let first = i == 0 && bullet;
+        let blank = line.spans.iter().all(|s| s.content.trim().is_empty());
+        if !first && blank {
+            continue;
+        }
+        let gutter = if first { OUTPUT_BULLET } else { OUTPUT_INDENT };
+        line.spans
+            .insert(0, Span::styled(gutter, output_bullet_style()));
+    }
+}
+
+/// One rendered markdown segment of an [`OutputLog`]: its source and where it
+/// landed, kept so the tail of the log can be rendered again narrower, around
+/// the `/buddy` ([`OutputLog::wrap_around`]), rather than re-wrapping rows
+/// that were wrapped for the full width.
+#[derive(Debug)]
+struct MdSegment {
+    /// `lines[start..end]` hold the rendered segment.
+    start: usize,
+    end: usize,
+    src: String,
+    /// The width it was rendered at ([`markdown_width`]).
+    width: usize,
+    /// Its blocks cut where a narrow column may begin, with the lines each
+    /// group took at `width`; `None` when those do not add up to the
+    /// segment, which is then re-wrapped like any other line. Computed once.
+    groups: std::cell::OnceCell<Option<Vec<MdGroup>>>,
+    /// The groups rendered at a narrow width, without the gutter, and that
+    /// width: one narrow width is in use at a time.
+    narrow: std::cell::RefCell<Option<(usize, Vec<Vec<Line<'static>>>)>>,
+}
+
+/// A run of top-level blocks that renders the same alone as in its segment:
+/// one block, or a whole list, whose items look at one another.
+#[derive(Debug)]
+struct MdGroup {
+    blocks: Vec<MarkdownBlock>,
+    lines: usize,
+}
+
+/// `blocks` rendered at `width` with code-block headers annotated, as
+/// [`render_markdown_at`] renders them, without the gutter.
+fn render_blocks(blocks: &[MarkdownBlock], width: usize) -> Vec<Line<'static>> {
+    let raw_codes: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            MarkdownBlock::CodeBlock { code, .. } => Some(code.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut lines = markdown_renderer(width).render(blocks, &ThemeConfig::new());
+    annotate_code_blocks(&mut lines, 0, &raw_codes);
+    lines
+}
+
+impl MdSegment {
+    fn new(start: usize, end: usize, src: &str, width: usize) -> Self {
+        Self {
+            start,
+            end,
+            src: src.to_owned(),
+            width,
+            groups: std::cell::OnceCell::new(),
+            narrow: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// See [`MdSegment::groups`].
+    fn groups(&self) -> Option<&[MdGroup]> {
+        self.groups
+            .get_or_init(|| {
+                let mut groups: Vec<MdGroup> = Vec::new();
+                for block in markdown_renderer(self.width).parse(&self.src) {
+                    let list = matches!(block, MarkdownBlock::ListItem(..));
+                    match groups.last_mut() {
+                        Some(g)
+                            if list
+                                && matches!(g.blocks.last(), Some(MarkdownBlock::ListItem(..))) =>
+                        {
+                            g.blocks.push(block);
+                        }
+                        _ => groups.push(MdGroup {
+                            blocks: vec![block],
+                            lines: 0,
+                        }),
+                    }
+                }
+                for g in &mut groups {
+                    g.lines = render_blocks(&g.blocks, self.width).len();
+                }
+                let total: usize = groups.iter().map(|g| g.lines).sum();
+                (total == self.end - self.start).then_some(groups)
+            })
+            .as_deref()
+    }
+
+    /// Group `g` rendered `width` columns wide, gutter included; the first
+    /// group's first row carries the bullet.
+    fn narrow_group(&self, groups: &[MdGroup], g: usize, width: usize) -> Vec<Line<'static>> {
+        let mut cache = self.narrow.borrow_mut();
+        if cache.as_ref().is_none_or(|(w, _)| *w != width) {
+            let text = width
+                .saturating_sub(usize::from(OUTPUT_GUTTER_WIDTH))
+                .max(1);
+            let rendered = groups
+                .iter()
+                .map(|g| render_blocks(&g.blocks, text))
+                .collect();
+            *cache = Some((width, rendered));
+        }
+        let mut lines = cache.as_ref().map_or_else(Vec::new, |(_, r)| r[g].clone());
+        add_gutter(&mut lines, g == 0);
+        lines
+    }
 }
 
 /// First-row marker of every assistant output block.
@@ -902,6 +1027,9 @@ pub struct OutputLog {
     /// each append so partial emphasis/fences resolve as more text arrives.
     md_buf: String,
     md_start: Option<usize>,
+    /// Every markdown segment rendered into `lines`, the streaming one
+    /// included, in order; cut back wherever `lines` is truncated.
+    md_segments: Vec<MdSegment>,
     /// Wall-clock of the last markdown re-render, and whether tokens have been
     /// appended since. The render is throttled to [`MD_RENDER_MIN_GAP`] while
     /// streaming (see [`OutputLog::md_render_throttled`]); a boundary
@@ -927,6 +1055,18 @@ pub struct OutputLog {
     /// `… N lines` counter) is the last committed line, so the next update pops
     /// it before pushing the replacement. See [`apply_preview_status`].
     preview_open: bool,
+}
+
+/// A followed log laid out around a box in the pane's bottom rows
+/// ([`OutputLog::wrap_around`]).
+#[derive(Debug)]
+pub struct WrapAround {
+    /// Full-width rows of the lines above the narrow column.
+    above: usize,
+    /// Rows the narrow column takes.
+    below: usize,
+    /// The last lines of the log, to wrap at the narrow width.
+    column: Text<'static>,
 }
 
 /// Cached wrapped-row heights for [`OutputLog::lines`]; see the field.
@@ -1026,7 +1166,11 @@ impl OutputLog {
         self.invalidate_rows_from(start);
         self.lines.truncate(start);
         let md_buf = std::mem::take(&mut self.md_buf);
-        let regions = render_markdown_at(&mut self.lines, start, &md_buf);
+        let width = markdown_width();
+        let regions = render_markdown_at(&mut self.lines, start, &md_buf, width);
+        self.md_segments.retain(|s| s.end <= start);
+        self.md_segments
+            .push(MdSegment::new(start, self.lines.len(), &md_buf, width));
         self.md_buf = md_buf;
         // Rebuild the code-block registry for the re-rendered segment; blocks
         // in committed earlier segments keep their (stable) indices.
@@ -1061,7 +1205,10 @@ impl OutputLog {
         self.md_close();
         self.end_line();
         let start = self.lines.len();
-        let regions = render_markdown_at(&mut self.lines, start, src);
+        let width = markdown_width();
+        let regions = render_markdown_at(&mut self.lines, start, src, width);
+        self.md_segments
+            .push(MdSegment::new(start, self.lines.len(), src, width));
         self.code_blocks.extend(regions);
     }
 
@@ -1138,6 +1285,8 @@ impl OutputLog {
         self.md_close();
         self.invalidate_rows_from(self.lines.len().saturating_sub(1));
         self.lines.pop();
+        let len = self.lines.len();
+        self.md_segments.retain(|s| s.end <= len);
     }
 
     /// Drops the transient live preview line if one is the last committed line.
@@ -1190,6 +1339,7 @@ impl OutputLog {
         self.invalidate_rows_from(len);
         self.lines.truncate(len);
         self.code_blocks.retain(|r| r.header < len);
+        self.md_segments.retain(|s| s.end <= len);
         // A rollback may have discarded the transient preview line; forget it
         // so a later update does not pop an unrelated line.
         self.preview_open = false;
@@ -1330,6 +1480,77 @@ impl OutputLog {
             Text::from(lines),
             u16::try_from(top - skipped).unwrap_or(u16::MAX),
         )
+    }
+
+    /// The tail of the log, following the newest output in a pane `height`
+    /// rows tall, laid out so that its bottom `strip` rows hold only text
+    /// `narrow` columns wide: the last lines move into a narrow column, as
+    /// many as it takes for every full-width row above them to end before the
+    /// strip. That is what lets the `/buddy` stand in the strip, right of
+    /// the column, without covering text.
+    ///
+    /// Markdown output moves a block (or a whole list) at a time and is
+    /// rendered again at the narrow width, since its rows were wrapped for the
+    /// full one and re-wrapping them would break both the lines and the
+    /// gutter. Any other line is re-wrapped as it is.
+    #[must_use]
+    pub fn wrap_around(&self, width: u16, narrow: u16, height: u16, strip: u16) -> WrapAround {
+        let (width, narrow) = (width.max(1), narrow.max(1));
+        let pane = usize::from(height);
+        let limit = pane.saturating_sub(usize::from(strip));
+        // The last full-width row ends here: under the narrow column when the
+        // two fill the pane (it follows the bottom), else under the
+        // full-width text itself (the pane starts at the top).
+        let fits = |above: usize, below: usize| {
+            let end = if above + below >= pane {
+                pane.saturating_sub(below)
+            } else {
+                above
+            };
+            end <= limit
+        };
+        let tail = self.tail_lines();
+        let mut above = self.total_rows(width);
+        let mut below = 0usize;
+        // Pieces of the column, last first.
+        let mut pieces: Vec<Vec<Line<'static>>> = Vec::new();
+        let mut k = self.lines.len() + tail.len();
+        'outer: while !fits(above, below) && k > 0 {
+            if let Some(seg) = self.md_segments.iter().find(|s| s.end == k && s.start < k)
+                && let Some(groups) = seg.groups()
+            {
+                for g in (0..groups.len()).rev() {
+                    let from = k - groups[g].lines;
+                    let rows: usize = self.lines[from..k]
+                        .iter()
+                        .map(|l| line_rows(l, width))
+                        .sum();
+                    above = above.saturating_sub(rows);
+                    let piece = seg.narrow_group(groups, g, usize::from(narrow));
+                    below += piece.iter().map(|l| line_rows(l, narrow)).sum::<usize>();
+                    pieces.push(piece);
+                    k = from;
+                    if fits(above, below) {
+                        break 'outer;
+                    }
+                }
+                continue;
+            }
+            k -= 1;
+            let line = self
+                .lines
+                .get(k)
+                .unwrap_or_else(|| &tail[k - self.lines.len()]);
+            above = above.saturating_sub(line_rows(line, width));
+            below += line_rows(line, narrow);
+            pieces.push(vec![line.clone()]);
+        }
+        let column: Vec<Line<'static>> = pieces.into_iter().rev().flatten().collect();
+        WrapAround {
+            above,
+            below,
+            column: Text::from(column),
+        }
     }
 
     /// Renders the log (including the in-progress line, any pinned progress
@@ -5259,12 +5480,23 @@ fn render_output(
         view.top = max_top;
         view.follow = true;
     }
-    // Skip whole lines above the viewport so the `u16` scroll stays small.
-    let (text, scroll) = log.window(width, view.top, area.height);
-    let para = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    frame.render_widget(para, area);
+    // Following the tail with nothing selected, the text makes room for the
+    // buddy and claims the box; otherwise the buddy sits the frame out.
+    // Scrolled back the rows beside it hold arbitrary text, and a selection
+    // maps screen rows to content rows assuming one width throughout.
+    let room = crate::buddy::room_wanted(last_output_rect())
+        .filter(|_| view.follow && selection.is_none())
+        .filter(|&at| render_around(frame, area, log, at));
+    if let Some(at) = room {
+        crate::buddy::claim(at);
+    } else {
+        // Skip whole lines above the viewport so the `u16` scroll stays small.
+        let (text, scroll) = log.window(width, view.top, area.height);
+        let para = Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        frame.render_widget(para, area);
+    }
     view.jump_hint_rect = if view.follow {
         None
     } else {
@@ -5274,6 +5506,61 @@ fn render_output(
     if let Some(sel) = selection.and_then(|s| selection_screen(s, view.top, area.height)) {
         highlight_selection(frame.buffer_mut(), area, sel);
     }
+}
+
+/// Narrowest column [`render_around`] wraps text into beside the buddy; a
+/// pane that would leave less does not make room, and the buddy sits out.
+const AROUND_MIN_COLS: u16 = 16;
+
+/// Renders the tail of `log` into `area` so that no text lands in `at`, a box
+/// standing on the bottom of `area`: the rows beside it wrap at the columns
+/// left of it, less a column of space. `false`, with nothing drawn, when the
+/// box is not where that works or leaves too narrow a column.
+fn render_around(frame: &mut Frame, area: Rect, log: &OutputLog, at: Rect) -> bool {
+    let inside = at.left() > area.left()
+        && at.right() <= area.right()
+        && at.top() >= area.top()
+        && at.bottom() == area.bottom();
+    let narrow = at.left().saturating_sub(area.left() + 1);
+    if !inside || narrow < AROUND_MIN_COLS {
+        return false;
+    }
+    let width = area.width.max(1);
+    let wrapped = log.wrap_around(width, narrow, area.height, at.height);
+    let pane = usize::from(area.height);
+    // Bottom-anchored once the text fills the pane, as `render_output`
+    // follows it; top-anchored, with the column right under the rest, before.
+    let (above_rows, column_rows) = if wrapped.above + wrapped.below >= pane {
+        let column = wrapped.below.min(pane);
+        (pane - column, column)
+    } else {
+        (wrapped.above, wrapped.below)
+    };
+    let to_u16 = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+    if above_rows > 0 {
+        let rows = to_u16(above_rows);
+        let (text, scroll) = log.window(width, wrapped.above - above_rows, rows);
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
+            Rect::new(area.x, area.y, width, rows),
+        );
+    }
+    if column_rows > 0 {
+        frame.render_widget(
+            Paragraph::new(wrapped.column)
+                .wrap(Wrap { trim: false })
+                .scroll((to_u16(wrapped.below - column_rows), 0)),
+            Rect::new(
+                area.x,
+                area.y + to_u16(above_rows),
+                narrow,
+                to_u16(column_rows),
+            ),
+        );
+    }
+    true
 }
 
 /// Draws one frame with the output area split into two columns: the main
@@ -8431,6 +8718,131 @@ mod tests {
         let base = log.total_rows(80);
         log.push_pending("fix the parser\nand the lexer");
         assert_eq!(log.total_rows(80), base + 2);
+    }
+
+    /// The text `render_around` puts in a `width` x `height` pane around `at`,
+    /// one string per row, and whether it drew at all.
+    fn drawn_around(log: &OutputLog, width: u16, height: u16, at: Rect) -> (bool, Vec<String>) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut drew = false;
+        term.draw(|f| {
+            let area = f.area();
+            drew = render_around(f, area, log, at);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let rows = (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        (drew, rows)
+    }
+
+    #[test]
+    fn text_wraps_beside_the_buddy_and_never_under_it() {
+        let mut log = OutputLog::new();
+        for i in 0..30 {
+            log.push_plain(format!("{i:02} {}", "word ".repeat(10)));
+        }
+        let at = Rect::new(34, 10, 24, 10);
+        let (drew, rows) = drawn_around(&log, 60, 20, at);
+        assert!(drew);
+        for (y, row) in rows.iter().enumerate() {
+            let right: String = row.chars().skip(usize::from(at.left()) - 1).collect();
+            if y >= usize::from(at.top()) {
+                assert!(
+                    right.trim().is_empty(),
+                    "row {y} reaches the buddy: {row:?}"
+                );
+            }
+        }
+        // Still following: the newest line is on screen, wrapped narrow.
+        assert!(rows.iter().any(|r| r.starts_with("29 word")), "{rows:#?}");
+        // The rows above the box use the full width.
+        assert!(
+            rows[..usize::from(at.top())]
+                .iter()
+                .any(|r| r.trim_end().len() > 40)
+        );
+    }
+
+    #[test]
+    fn a_short_log_starts_at_the_top_and_keeps_the_box_clear() {
+        let mut log = OutputLog::new();
+        for i in 0..12 {
+            log.push_plain(format!("{i:02} {}", "word ".repeat(10)));
+        }
+        let at = Rect::new(34, 10, 24, 10);
+        let (drew, rows) = drawn_around(&log, 60, 20, at);
+        assert!(drew);
+        assert!(rows[0].starts_with("00 word"), "{rows:#?}");
+        for row in &rows[usize::from(at.top())..] {
+            assert!(
+                row[usize::from(at.left()) - 1..].trim().is_empty(),
+                "{row:?}"
+            );
+        }
+        assert!(rows.iter().any(|r| r.starts_with("11 word")), "{rows:#?}");
+    }
+
+    #[test]
+    fn markdown_beside_the_buddy_is_rendered_narrow_with_its_gutter() {
+        use crate::viz::RenderSink;
+        let mut log = OutputLog::new();
+        let para = "parola ".repeat(40);
+        log.visible_text(&format!(
+            "{para}\n\n{para}\n\n{para}\n\n- uno {para}\n- due"
+        ));
+        log.end_line();
+        assert!(
+            log.md_segments[0].groups().is_some(),
+            "the groups render to the segment's own lines"
+        );
+        let at = Rect::new(70, 10, 24, 10);
+        let (drew, rows) = drawn_around(&log, 96, 20, at);
+        assert!(drew);
+        for (y, row) in rows.iter().enumerate() {
+            if row.trim().is_empty() {
+                continue;
+            }
+            // Every row of the answer hangs under the bullet: nothing starts
+            // in column zero, as a re-wrapped full-width row would.
+            assert!(
+                row.starts_with("  ") || row.starts_with('\u{25cf}'),
+                "row {y} lost the gutter: {row:?}\n{rows:#?}"
+            );
+            if y >= usize::from(at.top()) {
+                assert!(
+                    row[usize::from(at.left()) - 1..].trim().is_empty(),
+                    "{row:?}"
+                );
+            }
+        }
+        assert!(rows.iter().any(|r| r.contains("due")), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_segment_dropped_by_a_rollback_is_not_rendered_again() {
+        use crate::viz::RenderSink;
+        let mut log = OutputLog::new();
+        let mark = log.checkpoint();
+        log.visible_text(&"gone ".repeat(60));
+        log.end_line();
+        log.truncate_to(mark);
+        log.push_plain("kept");
+        let at = Rect::new(34, 10, 24, 10);
+        let (_, rows) = drawn_around(&log, 60, 20, at);
+        assert!(rows.iter().all(|r| !r.contains("gone")), "{rows:#?}");
+    }
+
+    #[test]
+    fn too_narrow_a_column_makes_no_room() {
+        let mut log = OutputLog::new();
+        log.push_plain("hello");
+        let (drew, _) = drawn_around(&log, 30, 20, Rect::new(4, 10, 24, 10));
+        assert!(!drew);
     }
 
     #[test]

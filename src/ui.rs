@@ -261,6 +261,7 @@ fn repaint_idle(
     // is also what repaints before the Alt-M and Ctrl-D prompts block, which
     // are likewise frames where plank is waiting on you.
     crate::cursor::set(crate::cursor::State::Idle);
+    crate::buddy::offer();
     let completed = terminal
         .draw(|f| {
             if let (false, Some((btw_log, btw_view))) = (sub_active, btw_panel.as_mut()) {

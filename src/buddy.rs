@@ -1137,6 +1137,43 @@ pub fn hide_for_exit() {
     let _ = write_to_terminal(&all);
 }
 
+thread_local! {
+    /// Set by [`offer`] for the idle repaint, the one frame the buddy may
+    /// stand in, and cleared by [`render`]. Per thread, since frames are drawn
+    /// on the UI thread and tests must not see one another's frames.
+    static OFFERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The box the output pane, drawn earlier in this frame, wrapped its text
+    /// around ([`claim`]); [`render`] draws only there.
+    static CLAIMED: std::cell::Cell<Option<Rect>> = const { std::cell::Cell::new(None) };
+}
+
+/// Marks the frame about to be drawn as the idle repaint, which ends with
+/// [`render`]. Until then [`room_wanted`] asks the output pane to keep the
+/// buddy's box clear.
+pub fn offer() {
+    OFFERED.set(true);
+    CLAIMED.set(None);
+}
+
+/// The box the output pane should wrap its text around in this frame: the
+/// buddy's [`placement`] in `output`, when it is on and the frame was
+/// [`offer`]ed. The pane [`claim`]s it once it has.
+#[must_use]
+pub fn room_wanted(output: Rect) -> Option<Rect> {
+    if !OFFERED.get() || !shown() {
+        return None;
+    }
+    placement(output)
+}
+
+/// Records that the output pane left `at` clear of text, so [`render`] may
+/// draw the buddy there. A pane that cannot (scrolled back, a selection being
+/// made) does not claim it, and the buddy sits that frame out rather than
+/// cover text.
+pub fn claim(at: Rect) {
+    CLAIMED.set(Some(at));
+}
+
 /// Where the buddy goes in `output`: right-aligned with [`RIGHT_GAP`] columns
 /// to spare and standing on its bottom edge, which is the rule above the
 /// prompt. `None` when the pane is too small to hold it with room left over.
@@ -1183,7 +1220,11 @@ pub fn render(buf: &mut Buffer, output: Rect) {
             start_player();
         }
     }
-    let Some(at) = placement(output).filter(|_| shown()) else {
+    OFFERED.set(false);
+    let Some(at) = CLAIMED
+        .take()
+        .filter(|at| shown() && placement(output) == Some(*at))
+    else {
         return;
     };
     let now = Instant::now();
