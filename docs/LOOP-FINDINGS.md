@@ -1183,3 +1183,43 @@ tool result, which is tokenized as plain text so that it cannot forge control
 tokens. The model may therefore see `｜DSML｜` there as spelled-out BPE pieces
 rather than the special token it has to emit, in which case the reminder
 teaches the shape and not the token.
+
+
+## The three-in-a-row trip is defeated by one real call between relapses
+
+`repro-1792186662`: a d3v1l adversarial-review turn that ran for over an hour,
+the pass table ending in long runs of an identical 136-token pass (passes
+20-24, 32-68, 71-91) that each re-emitted the same `skill` call for
+`d3v1l:adversarial-review`. The skill body was already in context from the
+first successful invocation, so every re-emission was pure flailing. The
+identical-args guard worked: it blocked the call and reported "6 times," then
+kept climbing. But the turn never ended.
+
+The gap was in the turn-ender, not the block. `LoopGuard::tripped` ended a turn
+only after `STANZA_TRIP` (3) stanzas *in a row* were refused in full, and
+`note_stanza(all_blocked)` reset that run to zero on any stanza with even one
+dispatched call. The block text tells the model to "do something different," so
+it did: it answered each block with one genuine tool call (`bash`, `glob`,
+`read`), which reset `blocked_stanzas`, and then relapsed to the identical
+`skill` call. Block, one real call, block, one real call — the consecutive run
+never reached three while `refused` climbed without bound and nothing acted on
+it. This is the same deterministic-model lesson as "A refused tool call is not
+a stopped loop," one layer up: the first fix stopped a *back-to-back* refused
+loop; an oscillating one walked straight through it.
+
+The fix adds a second rung to `tripped`: `RELAPSE_TRIP` (4) stanzas that each
+*contained* a refused call, counted across the run and not required to be
+consecutive, also end the turn. It clears only after `RELAPSE_CLEAR` (2) clean
+stanzas in a row, so a single real call between two blocks — the oscillation
+itself — does not reset it, while a model that genuinely moves on is never cut
+off. `note_stanza` now takes both `any_blocked` (the new rung) and `all_blocked`
+(the old one); the one production caller already computed `has_block` beside
+`all_blocked`, so only the argument was new. A block only ever fires after a
+call has been dispatched past `BLOCK_THRESHOLD`, so four blocked stanzas is
+unambiguous looping regardless of what the model did between them.
+
+Not addressed, and worth noting: `skill` is idempotent — its body is already
+in the transcript — so blocking it with an *error* still invites a retry. A
+further refinement would feed the cached body back ("already loaded") instead
+of an error, removing the incentive to re-emit at all. The relapse rung ends
+the turn either way, so this stays a refinement, not a fix.

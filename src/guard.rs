@@ -36,6 +36,22 @@ const BLOCK_THRESHOLD: u32 = 5;
 /// re-emitted the identical calls; three is deterministic-loop territory.
 const STANZA_TRIP: u32 = 3;
 
+/// Stanzas containing a refused call — *not necessarily consecutive* — before
+/// the turn is ended. This is the relapse rung [`STANZA_TRIP`] cannot see: a
+/// model that answers a block with one genuine call and then re-emits the same
+/// refused call resets the consecutive run every other stanza, so
+/// `blocked_stanzas` never reaches three while `refused` climbs without bound
+/// (a 70-minute repro of a model oscillating between a hard-blocked `skill`
+/// call and one real tool call is what added it). Counted across the run and
+/// reset only once the model strings [`RELAPSE_CLEAR`] clean stanzas together,
+/// so genuine recovery is never cut off.
+const RELAPSE_TRIP: u32 = 4;
+
+/// Consecutive stanzas with no refused call that clear the relapse run. Two in
+/// a row is the model having moved on; a single clean stanza between two blocks
+/// is the oscillation itself and must not reset the count.
+const RELAPSE_CLEAR: u32 = 2;
+
 /// How many recent calls the guard remembers before aging out. Wide enough
 /// that a multi-call cycle (the two-hour repro had a period of eight) shows
 /// up at least twice in full.
@@ -104,6 +120,12 @@ pub struct LoopGuard {
     /// Consecutive stanzas in which every call was refused (see
     /// [`Self::note_stanza`]).
     blocked_stanzas: u32,
+    /// Stanzas containing *any* refused call since the relapse run last cleared;
+    /// the relapse rung that survives oscillation (see [`RELAPSE_TRIP`]).
+    relapse_stanzas: u32,
+    /// Consecutive clean stanzas since the last refused one; clears the relapse
+    /// run at [`RELAPSE_CLEAR`] (see [`Self::note_stanza`]).
+    clean_stanzas: u32,
 }
 
 impl LoopGuard {
@@ -115,6 +137,8 @@ impl LoopGuard {
             repeats: HashMap::new(),
             refused: HashMap::new(),
             blocked_stanzas: 0,
+            relapse_stanzas: 0,
+            clean_stanzas: 0,
         }
     }
 
@@ -164,26 +188,41 @@ impl LoopGuard {
         }
     }
 
-    /// Records whether the stanza just observed was refused in full. Call once
-    /// per stanza, after observing its calls; a stanza with even one call
-    /// that ran resets the run, so a model that is making *some* progress is
-    /// never cut off.
-    pub fn note_stanza(&mut self, all_blocked: bool) {
+    /// Records what the stanza just observed contained. Call once per stanza,
+    /// after observing its calls. `all_blocked` drives the consecutive-stanza
+    /// rung ([`STANZA_TRIP`]); `any_blocked` drives the relapse rung
+    /// ([`RELAPSE_TRIP`]) that survives a model answering a block with one real
+    /// call before relapsing. A stanza with even one call that ran resets the
+    /// consecutive run, so a model making *some* progress is never cut off by
+    /// that rung; the relapse rung clears only after [`RELAPSE_CLEAR`] clean
+    /// stanzas in a row.
+    pub fn note_stanza(&mut self, any_blocked: bool, all_blocked: bool) {
         self.blocked_stanzas = if all_blocked {
             self.blocked_stanzas + 1
         } else {
             0
         };
+        if any_blocked {
+            self.relapse_stanzas += 1;
+            self.clean_stanzas = 0;
+        } else {
+            self.clean_stanzas += 1;
+            if self.clean_stanzas >= RELAPSE_CLEAR {
+                self.relapse_stanzas = 0;
+            }
+        }
     }
 
-    /// Whether the turn should end: the last [`STANZA_TRIP`] stanzas were
-    /// each refused in full. A block feeds the model a prompt that differs
-    /// from the last one by a single digit, and a deterministic model answers
-    /// it identically, so past this point nothing but ending the turn changes
-    /// the outcome.
+    /// Whether the turn should end: either the last [`STANZA_TRIP`] stanzas
+    /// were each refused in full, or [`RELAPSE_TRIP`] stanzas carried a refused
+    /// call without the model stringing [`RELAPSE_CLEAR`] clean stanzas
+    /// together. A block feeds the model a prompt that differs from the last one
+    /// by a single digit, and a deterministic model answers it identically, so
+    /// past this point nothing but ending the turn changes the outcome.
     #[must_use]
     pub fn tripped(&self) -> bool {
-        guards_enabled() && self.blocked_stanzas >= STANZA_TRIP
+        guards_enabled()
+            && (self.blocked_stanzas >= STANZA_TRIP || self.relapse_stanzas >= RELAPSE_TRIP)
     }
 
     /// The period of the cycle the window ends in, if its last `2 * period`
@@ -301,7 +340,7 @@ mod tests {
         }
         for _ in 0..STANZA_TRIP {
             let _ = g.observe("read", digest("a"));
-            g.note_stanza(true);
+            g.note_stanza(true, true);
         }
         assert!(g.tripped());
 
@@ -349,15 +388,55 @@ mod tests {
     fn trips_after_three_fully_refused_stanzas_and_resets_on_progress() {
         let mut g = LoopGuard::new();
         assert!(!g.tripped());
-        g.note_stanza(true);
-        g.note_stanza(true);
+        g.note_stanza(true, true);
+        g.note_stanza(true, true);
         assert!(!g.tripped());
-        g.note_stanza(false);
-        g.note_stanza(true);
-        g.note_stanza(true);
+        // Two clean stanzas in a row clear both the consecutive and the relapse
+        // run, so the next three fully-refused stanzas start from nothing.
+        g.note_stanza(false, false);
+        g.note_stanza(false, false);
+        g.note_stanza(true, true);
+        g.note_stanza(true, true);
         assert!(!g.tripped(), "progress in between resets the run");
-        g.note_stanza(true);
+        g.note_stanza(true, true);
         assert!(g.tripped());
+    }
+
+    #[test]
+    fn relapse_trips_when_one_clean_call_separates_each_refused_stanza() {
+        // The oscillation repro: a hard-blocked call, then one real call that
+        // resets the *consecutive* run, then the same blocked call again. The
+        // consecutive rung never reaches three, but the relapse rung does.
+        let mut g = LoopGuard::new();
+        // `RELAPSE_TRIP - 1` blocked stanzas, each followed by one real call,
+        // is not yet a trip — and the consecutive rung never even reaches two.
+        for _ in 0..RELAPSE_TRIP - 1 {
+            g.note_stanza(true, true); // the refused `skill` call
+            g.note_stanza(false, false); // one real call in between
+            assert!(
+                !g.tripped(),
+                "an interleaved clean call keeps it under the cap"
+            );
+        }
+        g.note_stanza(true, true); // the RELAPSE_TRIP-th refused stanza
+        assert!(
+            g.tripped(),
+            "a call refused across {RELAPSE_TRIP} stanzas ends the turn even when interleaved"
+        );
+    }
+
+    #[test]
+    fn a_single_clean_stanza_does_not_clear_the_relapse_run() {
+        let mut g = LoopGuard::new();
+        g.note_stanza(true, true);
+        g.note_stanza(true, true);
+        g.note_stanza(false, false); // one clean stanza: oscillation, not recovery
+        assert_eq!(
+            g.relapse_stanzas, 2,
+            "a lone clean stanza must not reset it"
+        );
+        g.note_stanza(false, false); // the second in a row: genuine recovery
+        assert_eq!(g.relapse_stanzas, 0);
     }
 
     #[test]

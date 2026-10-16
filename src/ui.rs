@@ -4131,7 +4131,7 @@ impl Agent<'_> {
             && nudges
                 .iter()
                 .all(|n| matches!(n, crate::guard::Nudge::Block(_)));
-        self.loop_guard.note_stanza(all_blocked);
+        self.loop_guard.note_stanza(has_block, all_blocked);
         // `view_image` needs the engine to encode the image, which `dispatch`
         // (taking only `&mut ToolContext`) cannot reach. Route it through the
         // per-call path alongside `agent`/`fanout`, which has `&mut self.engine`.

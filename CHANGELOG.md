@@ -79,6 +79,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A turn stuck re-issuing a refused tool call now ends on its own.** The
+  loop guard blocked a call repeated with identical arguments, but ended the
+  turn only after three refused stanzas in a row, which a single real call
+  between relapses reset to nothing. A model that answered each block with one
+  genuine call and then re-issued the same refused call could loop for an hour
+  (a 70-minute repro of exactly this is what found it). The turn now also ends
+  once a call has been refused across four stanzas, consecutive or not,
+  clearing only when the model strings two clean stanzas together.
 - **DeepSeek assistant messages rebuilt from text end their turn.** A reply
   tokenized from text (after compaction, from a session reloaded without its
   tokens, or a prefix turn) lacked the end-of-sentence token every reply
