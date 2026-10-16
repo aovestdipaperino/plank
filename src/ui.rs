@@ -5859,6 +5859,7 @@ impl Agent<'_> {
             if round > 1 && self.maybe_compact()?.aborted() {
                 return Ok(());
             }
+            self.apply_pending_live_settings();
             self.append_hints_note();
             let mut prompt_text = render_transcript(&self.session, &self.system);
             if let Some(open) = &self.open_reply {
@@ -7588,19 +7589,7 @@ impl Agent<'_> {
         color: bool,
         hint: bool,
     ) -> Result<String, String> {
-        let root = crate::insights::usage_dir();
-        let scan = crate::insights::collect_metas(&self.store, &root, &mut |_, _| {}, &|| false)?;
-        let (metas, entries) = match scan {
-            crate::insights::Scan::Done(m, e) => (m, e),
-            crate::insights::Scan::Cancelled => (Vec::new(), Vec::new()),
-        };
-        let stats = crate::stats::Stats::build(
-            &metas,
-            &entries,
-            now_secs(),
-            crate::insights::local_utc_offset(),
-        );
-        Ok(crate::stats::render(&stats, scope, color, hint))
+        stats_report_for(&self.store, scope, color, hint)
     }
 
     fn render_usage_report(&self, color: bool) -> String {
@@ -8060,6 +8049,7 @@ impl Agent<'_> {
     /// Handles a slash command; returns false when the REPL should exit.
     #[allow(clippy::too_many_lines)]
     fn slash(&mut self, input: &str) -> Result<bool, String> {
+        self.apply_pending_live_settings();
         let mut parts = input.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(input);
         let arg = parts.next().unwrap_or("").trim();
@@ -9546,17 +9536,11 @@ the original is frozen and listed in /tree"
     /// stdout tree are always the same rows.
     #[must_use]
     fn kvcache_pane(&self) -> crate::kvpane::KvPane {
-        let settings = crate::settings::active();
-        crate::kvpane::KvPane::new(
-            crate::kvtree::build(self.store.kv_nodes()),
-            crate::kvgc::SweepPolicy::from_settings(&settings.kvcache),
-            // The same set the startup sweep is given. Without it the pane marks
-            // this launch's own chain `⏳ expired` and counts it as reclaimable
-            // whenever its `last_used` is stale, which is exactly the state a
-            // long-lived checkpoint is in.
-            self.active_kv_fingerprints(&self.kv_tiers()),
-            crate::kvmeta::now_secs(),
-        )
+        // The same set the startup sweep is given. Without it the pane marks
+        // this launch's own chain `⏳ expired` and counts it as reclaimable
+        // whenever its `last_used` is stale, which is exactly the state a
+        // long-lived checkpoint is in.
+        kvcache_pane_for(&self.store, self.active_kv_fingerprints(&self.kv_tiers()))
     }
 
     /// Sessions visible to `/resume`: those saved in the current project, plus
@@ -10386,6 +10370,27 @@ the original is frozen and listed in /tree"
         format!("steering ffn {scale} (applies to new tokens; rungs dropped)")
     }
 
+    /// Applies what a mid-turn `/temp`, `/power` or `/debug` left in
+    /// `PENDING_LIVE`. Called where each pass starts, so the change lands on
+    /// the next generation, and ahead of every slash command, so an idle
+    /// command typed later wins over an older mid-turn one.
+    fn apply_pending_live_settings(&mut self) {
+        let pending = PENDING_LIVE
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p))
+            .unwrap_or_default();
+        if let Some(temp) = pending.temp {
+            let _ = self.temp_command(&temp.to_string());
+        }
+        if let Some(power) = pending.power {
+            self.power_percent = power;
+            crate::status::set_local_power(power);
+        }
+        if let Some(on) = pending.debug {
+            let _ = self.debug_command(if on { "on" } else { "off" });
+        }
+    }
+
     fn temp_command(&mut self, arg: &str) -> String {
         let arg = arg.trim();
         if arg.is_empty() {
@@ -10425,28 +10430,7 @@ the original is frozen and listed in /tree"
     /// listing never implies a skill that would refuse to run. Returns the text
     /// to print/pane, always newline-terminated.
     fn skills_command(&self, arg: &str) -> String {
-        match arg.trim() {
-            "" => {
-                let state = if crate::skills::enabled() {
-                    "skills are enabled"
-                } else {
-                    crate::skills::DISABLED_NOTICE
-                };
-                format!("{}{state}\n", crate::skills::render_list(&self.skills))
-            }
-            "on" => {
-                crate::skills::set_enabled(true);
-                "skills enabled: /name and the skill tool expand again\n".to_string()
-            }
-            "off" => {
-                crate::skills::set_enabled(false);
-                // Runtime only: nothing is written to any SKILL.md or settings
-                // file, so the next launch is back to the configured behaviour.
-                "skills disabled for the rest of this session (nothing was written to disk)\n"
-                    .to_string()
-            }
-            other => format!("usage: /skills [on|off] (got {other:?})\n"),
-        }
+        skills_command_over(&crate::skills::render_list(&self.skills), arg)
     }
 
     /// `/hooks [on|off]`: the shared body for both front ends.
@@ -10455,31 +10439,7 @@ the original is frozen and listed in /tree"
     /// TUI pane can never drift apart on what the command accepts. Returns the
     /// text to print/pane, always newline-terminated.
     fn hooks_command(&self, arg: &str) -> String {
-        match arg.trim() {
-            "" => {
-                let state = if crate::hooks::enabled() {
-                    "hooks are enabled"
-                } else {
-                    "hooks are disabled for this session (/hooks on to re-enable)"
-                };
-                format!(
-                    "{}{state}\n",
-                    crate::hooks::render_list(&self.tool_ctx.hooks)
-                )
-            }
-            "on" => {
-                crate::hooks::set_enabled(true);
-                "hooks enabled: hooks will run again from the next event\n".to_string()
-            }
-            "off" => {
-                crate::hooks::set_enabled(false);
-                // Runtime only: nothing is written to hooks.json or settings,
-                // so the next launch is back to the configured behaviour.
-                "hooks disabled for the rest of this session (nothing was written to disk)\n"
-                    .to_string()
-            }
-            other => format!("usage: /hooks [on|off] (got {other:?})\n"),
-        }
+        hooks_command_over(&crate::hooks::render_list(&self.tool_ctx.hooks), arg)
     }
 
     fn think_command(&mut self, arg: &str, on_progress: &mut dyn FnMut()) -> String {
@@ -11718,19 +11678,7 @@ the original is frozen and listed in /tree"
         let on = match arg {
             "on" => true,
             "off" => false,
-            "" => {
-                let state = if crate::debugmirror::enabled() {
-                    "on"
-                } else {
-                    "off"
-                };
-                let conn = if crate::debugmirror::parent_connected() {
-                    "connected"
-                } else {
-                    "not connected"
-                };
-                return format!("debug console mirror: {state} ({conn})\nusage: /debug on|off");
-            }
+            "" => return debug_mirror_status(),
             _ => return "usage: /debug on|off".to_owned(),
         };
         crate::debugmirror::set_enabled(on);
@@ -13792,6 +13740,10 @@ impl Agent<'_> {
             // A `/exit` confirmed mid-turn: the turn has stopped, leave now.
             if quit_requested() {
                 break;
+            }
+            // A `!!` panel opened mid-turn outlives the turn, as at idle.
+            if let Some(panel) = CARRIED_BANG_PANEL.lock().ok().and_then(|mut s| s.take()) {
+                report = Some(panel);
             }
             if IMAGES_ENABLED && clip_checked.elapsed() >= Duration::from_secs(3) {
                 clip_has_image = crate::imagepaste::clipboard_has_image();
@@ -17794,6 +17746,7 @@ impl Agent<'_> {
         is_main: bool,
         aside: bool,
     ) -> Result<TurnOutput, String> {
+        self.apply_pending_live_settings();
         // Snapshot the main log before streaming so a preempt can roll back
         // this pass's partial output before it re-runs.
         if is_main {
@@ -18317,6 +18270,7 @@ impl Agent<'_> {
         sub: &mut tui::SubPane,
         report: &mut Option<tui::ReportPanel>,
     ) -> bool {
+        self.apply_pending_live_settings();
         let mut parts = line.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(line);
         let arg = parts.next().unwrap_or("").trim();
@@ -20256,9 +20210,30 @@ fn loopguard_reply(arg: &str, on: bool) -> (Option<bool>, String) {
 /// The cost is a tokenize pass over the transcript for `/context`, which is
 /// cheap next to the prefill/decoding the turn is about to do. Commands not
 /// listed here still tell the user to wait for the turn to finish.
+#[derive(Default)]
 struct LiveCommands {
     usage: String,
     mcp: String,
+    /// Where a mid-turn `!!` runs (`MidTurnBang`), and whose memory files a
+    /// mid-turn `/memory` shows.
+    cwd: std::path::PathBuf,
+    /// Read live by `/list`, `/stats` and `/kvcache`: the store is only paths.
+    store: Option<SessionStore>,
+    /// The listings behind `/skills`, `/hooks`, `/templates` and `/plugins`,
+    /// and the `/tree` view, none of which a turn changes.
+    skills: String,
+    hooks: String,
+    templates: String,
+    plugins: String,
+    tree: String,
+    /// The transcript as of turn start, text only (no image embeddings), for
+    /// `/history`; the turn in flight is on screen anyway.
+    history: Vec<Message>,
+    /// The fingerprints `/kvcache` must not show as expired.
+    kv_live: Vec<String>,
+    /// What bare `/think` reports, and whether `/temp` is pinned by mtp.
+    think: String,
+    mtp_on: bool,
 }
 
 impl LiveCommands {
@@ -20267,6 +20242,31 @@ impl LiveCommands {
         Self {
             usage: agent.render_usage_report(true),
             mcp: render_mcp_report(&agent.tool_ctx.mcp, true),
+            cwd: agent.tool_ctx.cwd.clone(),
+            store: Some(agent.store.clone()),
+            skills: crate::skills::render_list(&agent.skills),
+            hooks: crate::hooks::render_list(&agent.tool_ctx.hooks),
+            templates: crate::templates::render_list(&agent.templates),
+            plugins: {
+                let mut out = crate::plugins::render_list(&agent.tool_ctx.plugins);
+                out.push_str(&crate::wasmreg::render_held(&agent.tool_ctx.wasm.registry));
+                out
+            },
+            tree: agent.tree_view(true),
+            history: agent
+                .session
+                .transcript
+                .iter()
+                .map(|m| Message {
+                    role: m.role,
+                    text: m.text.clone(),
+                    at: m.at,
+                    images: Vec::new(),
+                })
+                .collect(),
+            kv_live: agent.active_kv_fingerprints(&agent.kv_tiers()),
+            think: agent.think.name().into_owned(),
+            mtp_on: agent.mtp_on(),
         }
     }
 
@@ -20680,6 +20680,11 @@ fn busy_ui_loop(
     // measured rather than inferred from the poll timeout.
     let mut arcade_last = Instant::now();
     let mut title_last = Instant::now();
+    // A `!!` running beside the turn, and the title of the panel its result
+    // opened, so a panel still up when the turn ends can be carried to the
+    // idle loop rather than vanish with this function's `report`.
+    let mut bang: Option<MidTurnBang> = None;
+    let mut bang_panel: Option<String> = None;
     loop {
         interrupt_at = escalation_clock(
             interrupt_at,
@@ -20874,7 +20879,30 @@ fn busy_ui_loop(
         // Check before drawing: anything sent after this point survives in
         // the channel and is drained below (the sender is gone once the
         // worker returns).
-        let finished = done();
+        if let Some(result) = bang.as_ref().and_then(|b| b.rx.try_recv().ok()) {
+            let cmd = bang.take().map(|b| b.cmd).unwrap_or_default();
+            if matches!(&result, Ok(o) if o.gpu_signal.is_some()) {
+                log.push_dim(format!(
+                    "[!! {cmd} asked for the GPU, which the model holds mid-turn — run it again once the model finishes]"
+                ));
+            }
+            if let Some(text) = bang_panel_report(&cmd, &result) {
+                let title = bang_panel_title(&cmd);
+                report = Some(tui::ReportPanel::new(title.as_str(), &text));
+                bang_panel = Some(title);
+            } else {
+                bang_log_outcome(&cmd, &result, log);
+            }
+            view.follow = true;
+        }
+        // A `!!` still running holds the turn's end: its result has to land
+        // somewhere, and this loop is what is watching for it.
+        let finished = done() && bang.is_none();
+        if done()
+            && let Some(b) = &bang
+        {
+            status_line = b.status();
+        }
         remote_drain(remote);
         input.pump_popup();
         // Pane selection is hoisted out of the draw closure: `sub` is also
@@ -21093,6 +21121,12 @@ fn busy_ui_loop(
             // The turn is over: drop the pinned progress line so it does not
             // linger into the idle view.
             log.set_progress(None);
+            if let (Some(panel), Some(title)) = (report.take(), bang_panel)
+                && panel.title() == title
+                && let Ok(mut slot) = CARRIED_BANG_PANEL.lock()
+            {
+                *slot = Some(panel);
+            }
             return Ok(());
         }
         // An open easter egg wants the shared 20 Hz animation tick; the idle
@@ -21232,6 +21266,19 @@ fn busy_ui_loop(
                     KeyCode::PageDown if report.is_some() => {
                         if let Some(panel) = report.as_mut() {
                             panel.scroll(5);
+                        }
+                    }
+                    // A running `!!` is the newest thing the user started,
+                    // so it is the one Esc stops; a second Esc reaches the
+                    // model. Once the turn is over it is the only thing left.
+                    KeyCode::Esc if bang.is_some() => {
+                        if let Some(b) = &bang {
+                            b.cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    KeyCode::Char('c') if ctrl && input.buf.text().is_empty() && bang.is_some() => {
+                        if let Some(b) = &bang {
+                            b.cancel.store(true, Ordering::Relaxed);
                         }
                     }
                     KeyCode::Esc if sub.collapse() => {}
@@ -21481,10 +21528,66 @@ fn busy_ui_loop(
                                 log.push_dim(format!("{cmd}: resumed where you left off"));
                             }
                             arcade_last = Instant::now();
-                        } else if line.starts_with('/') || line.starts_with('!') {
+                        } else if let Some(rest) = line.strip_prefix("!!") {
+                            // `!!` never touches the session, so it need not
+                            // wait for the turn (`MidTurnBang`).
+                            let cmd = rest.trim().to_owned();
+                            input.history.add(&line);
+                            if cmd.is_empty() {
+                                log.push_dim("usage: !!<shell command>");
+                            } else if bang.is_some() {
+                                log.push_dim("[a !! command is already running — Esc stops it]");
+                            } else {
+                                log.push_user_echo(&line);
+                                bang = Some(MidTurnBang::spawn(live_cmds.cwd.clone(), cmd));
+                            }
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if line.starts_with('!') {
                             log.push_dim(
-                                "[that command can't run mid-turn — wait for the model to finish]",
+                                "[! records into the conversation, so it waits for the model to finish — !! runs now]",
                             );
+                        } else if let Some((cmd, arg)) = line
+                            .starts_with('/')
+                            .then(|| {
+                                let mut parts = line.splitn(2, char::is_whitespace);
+                                (
+                                    parts.next().unwrap_or(&line).to_owned(),
+                                    parts.next().unwrap_or("").trim().to_owned(),
+                                )
+                            })
+                            .filter(|(cmd, arg)| is_live_command(cmd, arg))
+                        {
+                            input.history.add(&line);
+                            log.push_user_echo(&line);
+                            run_live_command(
+                                live_cmds,
+                                &cmd,
+                                &arg,
+                                &mut report,
+                                log,
+                                &task_view,
+                                terminal,
+                                view,
+                            );
+                            view.follow = true;
+                            sub.follow_all();
+                        } else if line.starts_with('/') {
+                            // Unknown at idle is unknown here too: "wait for
+                            // the model" would send a typo off to wait.
+                            let cmd = line.split_whitespace().next().unwrap_or(&line);
+                            // `/search` and `/renotify` work at idle without
+                            // being advertised, so they are known here too.
+                            if slash_command_known(cmd)
+                                || matches!(cmd, "/search" | "/renotify")
+                                || input.slash_catalog.iter().any(|e| e.name == cmd)
+                            {
+                                log.push_dim(
+                                    "[that command can't run mid-turn — wait for the model to finish]",
+                                );
+                            } else {
+                                log.push_plain(format!("unknown command: {cmd}"));
+                            }
                         } else {
                             // Not echoed into the scrollback: a queued prompt
                             // is not in the conversation yet. It sits indented
@@ -22598,6 +22701,406 @@ fn bang_panel_title(cmd: &str) -> String {
         format!("!! {head}…")
     }
 }
+
+/// A `!!` typed while the model is working. `!!` never touches the session,
+/// so unlike `!` and the slash commands it has no reason to wait for the
+/// turn: it runs on its own thread, the stream keeps rendering, and the
+/// result opens the usual `!!` panel when it lands.
+///
+/// There is no GPU-yield cycle here: the worker holds the engine, so a
+/// command asking for the GPU only gets a note telling the user to rerun it
+/// once the model is done.
+struct MidTurnBang {
+    cmd: String,
+    start: Instant,
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<Result<crate::tools::bash::ImmediateOutput, String>>,
+}
+
+impl MidTurnBang {
+    fn spawn(cwd: std::path::PathBuf, cmd: String) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let flag = Arc::clone(&cancel);
+        let run = cmd.clone();
+        std::thread::spawn(move || {
+            let mut sink = crate::tools::bash::InterruptOnly(|| flag.load(Ordering::Relaxed));
+            let _ = tx.send(crate::tools::bash::run_immediate(&cwd, &run, &mut sink));
+        });
+        Self {
+            cmd,
+            start: Instant::now(),
+            cancel,
+            rx,
+        }
+    }
+
+    /// The status line shown while the turn is over but the command is not.
+    fn status(&self) -> String {
+        format!(
+            "!! {} ({}s, Esc to stop)",
+            self.cmd,
+            self.start.elapsed().as_secs()
+        )
+    }
+}
+
+/// What a mid-turn `/temp`, `/power` or `/debug on|off` asked for, waiting
+/// for the worker to apply it where the next pass starts
+/// (`Agent::apply_pending_live_settings`). Those three change state the
+/// worker owns while a turn runs, so the UI thread can only leave a note.
+#[derive(Debug, Default, PartialEq)]
+struct PendingLiveSettings {
+    temp: Option<f32>,
+    power: Option<i32>,
+    debug: Option<bool>,
+}
+
+static PENDING_LIVE: Mutex<PendingLiveSettings> = Mutex::new(PendingLiveSettings {
+    temp: None,
+    power: None,
+    debug: None,
+});
+
+/// Records a mid-turn setting for the next pass. A poisoned lock drops it,
+/// which only loses a setting the user can type again.
+fn set_pending_live(apply: impl FnOnce(&mut PendingLiveSettings)) {
+    if let Ok(mut p) = PENDING_LIVE.lock() {
+        apply(&mut p);
+    }
+}
+
+/// Whether `cmd arg` has a mid-turn form in [`run_live_command`]. Forms that
+/// open an editor or a pane, or write state the worker holds, are left out:
+/// bare `/memory` shows the files read-only, but `/memory calibrate` needs
+/// the engine; bare `/kvcache` and `/plugins` list, but their verbs mutate.
+fn is_live_command(cmd: &str, arg: &str) -> bool {
+    match cmd {
+        "/tasks" | "/list" | "/stats" | "/history" | "/hooks" | "/skills" | "/templates"
+        | "/tree" | "/notify" | "/buddy" | "/temp" | "/power" | "/think" | "/debug" => true,
+        "/memory" => matches!(arg, "" | "log"),
+        "/kvcache" | "/plugins" => arg.is_empty(),
+        _ => false,
+    }
+}
+
+/// Runs one of the commands [`is_live_command`] accepts while the model is
+/// working: the read-only ones from the turn-start snapshot in `live` (or
+/// from disk, where that is all they read), the process-wide switches at
+/// once, and `/temp`, `/power` and `/debug on|off` as a note for the next
+/// pass. Reports go to the panel, as at idle.
+#[allow(clippy::too_many_arguments)]
+fn run_live_command(
+    snap: &LiveCommands,
+    cmd: &str,
+    arg: &str,
+    report: &mut Option<tui::ReportPanel>,
+    log: &mut OutputLog,
+    task_view: &tui::TaskView,
+    terminal: &mut ratatui::DefaultTerminal,
+    view: &mut tui::OutputView,
+) {
+    if !live_report(snap, cmd, arg, report, log, task_view) {
+        live_switch(snap, cmd, arg, log, terminal, view);
+    }
+}
+
+/// The report half of [`run_live_command`]: `false` when `cmd` is not one.
+fn live_report(
+    snap: &LiveCommands,
+    cmd: &str,
+    arg: &str,
+    report: &mut Option<tui::ReportPanel>,
+    log: &mut OutputLog,
+    task_view: &tui::TaskView,
+) -> bool {
+    match cmd {
+        "/tasks" => {
+            *report = Some(tui::ReportPanel::new(
+                TASKS_REPORT_TITLE,
+                task_view.report(),
+            ));
+        }
+        "/list" => match snap.store.as_ref().map(SessionStore::list) {
+            Some(Ok(entries)) => {
+                *report = Some(tui::ReportPanel::new(
+                    "sessions",
+                    &crate::session::render_session_list(&entries, now_secs(), false),
+                ));
+            }
+            Some(Err(e)) => log.push_plain(format!("list failed: {e}")),
+            None => log.push_plain("list failed: no session store"),
+        },
+        "/stats" => {
+            let showing = report
+                .as_ref()
+                .and_then(|r| crate::stats::Scope::from_title(r.title()));
+            let scope = match (arg.is_empty(), showing) {
+                (true, Some(s)) => Some(s.next()),
+                _ => crate::stats::Scope::parse(arg),
+            };
+            match (scope, snap.store.as_ref()) {
+                (Some(scope), Some(store)) => match stats_report_for(store, scope, true, true) {
+                    Ok(text) => *report = Some(tui::ReportPanel::new(scope.title(), &text)),
+                    Err(e) => log.push_plain(format!("stats failed: {e}")),
+                },
+                (Some(_), None) => log.push_plain("stats failed: no session store"),
+                (None, _) => log.push_plain("usage: /stats [7|30|all]"),
+            }
+        }
+        "/history" => {
+            let turns = arg
+                .parse::<usize>()
+                .unwrap_or(HISTORY_DEFAULT_TURNS)
+                .clamp(1, HISTORY_MAX_TURNS);
+            for line in crate::session::render_history(&snap.history, turns, false).lines() {
+                log.push_plain(line.to_owned());
+            }
+        }
+        "/hooks" => {
+            *report = Some(tui::ReportPanel::new(
+                "hooks",
+                &hooks_command_over(&snap.hooks, arg),
+            ));
+        }
+        "/skills" => {
+            *report = Some(tui::ReportPanel::new(
+                "skills",
+                &skills_command_over(&snap.skills, arg),
+            ));
+        }
+        "/templates" => *report = Some(tui::ReportPanel::new("templates", &snap.templates)),
+        "/plugins" => *report = Some(tui::ReportPanel::new("plugins", &snap.plugins)),
+        "/tree" => *report = Some(tui::ReportPanel::new("tree", &snap.tree)),
+        "/kvcache" => match snap.store.as_ref() {
+            Some(store) => {
+                let pane = kvcache_pane_for(store, snap.kv_live.clone());
+                *report = Some(tui::ReportPanel::new(
+                    "kvcache",
+                    &crate::kvpane::render_text(&pane),
+                ));
+            }
+            None => log.push_plain("kvcache failed: no session store"),
+        },
+        "/memory" if arg == "log" => {
+            let entries = crate::memory::read_log(20);
+            if entries.is_empty() {
+                log.push_plain("no memory changes logged yet");
+            } else {
+                for line in entries {
+                    log.push_plain(render_memory_log_line(&line));
+                }
+            }
+        }
+        // The editor would take the screen from a running turn, so mid-turn
+        // `/memory` is the same text, read-only.
+        "/memory" => {
+            let text = crate::memory::combine(&crate::memory::sources_for(&snap.cwd));
+            *report = Some(tui::ReportPanel::new(
+                "memory (read-only until the model finishes)",
+                &text,
+            ));
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// The switch half of [`run_live_command`]: settings applied at once, or
+/// left for the next pass.
+fn live_switch(
+    snap: &LiveCommands,
+    cmd: &str,
+    arg: &str,
+    log: &mut OutputLog,
+    terminal: &mut ratatui::DefaultTerminal,
+    view: &mut tui::OutputView,
+) {
+    match cmd {
+        "/notify" => log.push_plain(Agent::notify_command(arg)),
+        "/buddy" => match crate::buddy::command(arg) {
+            crate::buddy::Outcome::Say(line) => log.push_plain(line),
+            crate::buddy::Outcome::Pick { question, choices } => {
+                let mut options: Vec<(&str, &str)> = choices
+                    .iter()
+                    .map(|c| (c.as_str(), "download it from plank-buddies"))
+                    .collect();
+                options.push(("Not now", "leave the buddy as it is"));
+                let picked = run_pick_panel(terminal, log, view, "Buddy", &question, &options);
+                match picked.and_then(|i| choices.get(i)) {
+                    Some(name) => log.push_plain(crate::buddy::chosen(name)),
+                    None => log.push_plain("no buddy picked"),
+                }
+            }
+        },
+        "/temp" => log.push_plain(live_temp_command(arg, snap.mtp_on)),
+        "/power" => match crate::config::parse_power_percent(arg) {
+            Some(power) => {
+                set_pending_live(|p| p.power = Some(power));
+                crate::status::set_local_power(power);
+                log.push_plain(format!(
+                    "power limit set to {power}% from the next generation"
+                ));
+            }
+            None => log.push_plain("usage: /power <1..100>"),
+        },
+        "/think" if arg.is_empty() => log.push_plain(format!(
+            "thinking: {} (off|low|medium|max|0..100)",
+            snap.think
+        )),
+        // The effort preamble sits in the cached prompt, so a new level means
+        // re-warming the KV the turn is generating from.
+        "/think" => log.push_dim(
+            "[changing the thinking level re-warms the cache, so it waits for the model to finish]",
+        ),
+        "/debug" => match arg {
+            "" => log.push_plain(debug_mirror_status()),
+            "on" | "off" => {
+                let on = arg == "on";
+                set_pending_live(|p| p.debug = Some(on));
+                log.push_plain(format!(
+                    "debug console mirror {arg} from the next generation"
+                ));
+            }
+            _ => log.push_plain("usage: /debug on|off"),
+        },
+        _ => {}
+    }
+}
+
+/// Mid-turn `/temp`: [`Agent::temp_command`]'s checks and messages, with the
+/// value left for the next pass instead of written into `gen_opts`, which the
+/// worker holds.
+fn live_temp_command(arg: &str, mtp_on: bool) -> String {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        let pending = PENDING_LIVE.lock().ok().and_then(|p| p.temp);
+        return match (mtp_on, pending) {
+            (true, _) => "temperature: 0 (pinned by mtp)".to_owned(),
+            (false, Some(t)) => format!("temperature: {t:.2} from the next generation"),
+            (false, None) => format!("temperature: {:.2}", crate::status::temperature()),
+        };
+    }
+    if mtp_on {
+        return "/temp: the temperature is pinned at 0 while mtp is on; /mtp off first".to_owned();
+    }
+    match arg.parse::<f32>() {
+        Ok(temp) if (0.0..=100.0).contains(&temp) && temp.is_finite() => {
+            set_pending_live(|p| p.temp = Some(temp));
+            format!("temperature {temp:.2} from the next generation")
+        }
+        _ => format!("/temp: expected a number 0..100, got `{arg}`"),
+    }
+}
+
+/// The debug mirror's state line, which bare `/debug` prints.
+fn debug_mirror_status() -> String {
+    let state = if crate::debugmirror::enabled() {
+        "on"
+    } else {
+        "off"
+    };
+    let conn = if crate::debugmirror::parent_connected() {
+        "connected"
+    } else {
+        "not connected"
+    };
+    format!("debug console mirror: {state} ({conn})\nusage: /debug on|off")
+}
+
+/// `/skills [on|off]` over an already-rendered skill list, so the mid-turn
+/// loop can run it from a snapshot. Toggling is process-wide and read per
+/// expansion, so it is safe while the model works.
+fn skills_command_over(list: &str, arg: &str) -> String {
+    match arg.trim() {
+        "" => {
+            let state = if crate::skills::enabled() {
+                "skills are enabled"
+            } else {
+                crate::skills::DISABLED_NOTICE
+            };
+            format!("{list}{state}\n")
+        }
+        "on" => {
+            crate::skills::set_enabled(true);
+            "skills enabled: /name and the skill tool expand again\n".to_string()
+        }
+        "off" => {
+            crate::skills::set_enabled(false);
+            // Runtime only: nothing is written to any SKILL.md or settings
+            // file, so the next launch is back to the configured behaviour.
+            "skills disabled for the rest of this session (nothing was written to disk)\n"
+                .to_string()
+        }
+        other => format!("usage: /skills [on|off] (got {other:?})\n"),
+    }
+}
+
+/// `/hooks [on|off]` over an already-rendered hook list; see
+/// [`skills_command_over`]. The switch is read at each hook event.
+fn hooks_command_over(list: &str, arg: &str) -> String {
+    match arg.trim() {
+        "" => {
+            let state = if crate::hooks::enabled() {
+                "hooks are enabled"
+            } else {
+                "hooks are disabled for this session (/hooks on to re-enable)"
+            };
+            format!("{list}{state}\n")
+        }
+        "on" => {
+            crate::hooks::set_enabled(true);
+            "hooks enabled: hooks will run again from the next event\n".to_string()
+        }
+        "off" => {
+            crate::hooks::set_enabled(false);
+            // Runtime only: nothing is written to hooks.json or settings,
+            // so the next launch is back to the configured behaviour.
+            "hooks disabled for the rest of this session (nothing was written to disk)\n"
+                .to_string()
+        }
+        other => format!("usage: /hooks [on|off] (got {other:?})\n"),
+    }
+}
+
+/// The `/stats` report over a session store, the part that needs no agent.
+fn stats_report_for(
+    store: &SessionStore,
+    scope: crate::stats::Scope,
+    color: bool,
+    hint: bool,
+) -> Result<String, String> {
+    let root = crate::insights::usage_dir();
+    let scan = crate::insights::collect_metas(store, &root, &mut |_, _| {}, &|| false)?;
+    let (metas, entries) = match scan {
+        crate::insights::Scan::Done(m, e) => (m, e),
+        crate::insights::Scan::Cancelled => (Vec::new(), Vec::new()),
+    };
+    let stats = crate::stats::Stats::build(
+        &metas,
+        &entries,
+        now_secs(),
+        crate::insights::local_utc_offset(),
+    );
+    Ok(crate::stats::render(&stats, scope, color, hint))
+}
+
+/// The `/kvcache` pane over a store and the fingerprints to treat as live.
+fn kvcache_pane_for(store: &SessionStore, live: Vec<String>) -> crate::kvpane::KvPane {
+    let settings = crate::settings::active();
+    crate::kvpane::KvPane::new(
+        crate::kvtree::build(store.kv_nodes()),
+        crate::kvgc::SweepPolicy::from_settings(&settings.kvcache),
+        live,
+        crate::kvmeta::now_secs(),
+    )
+}
+
+/// A `!!` panel still open when its turn ended, handed from `busy_ui_loop`
+/// to the idle loop, whose `report` slot it then takes. Process-wide for the
+/// reason `QUIT_REQUESTED` is: the busy loop runs under several callers, and
+/// the idle loop is the one place they all return to.
+static CARRIED_BANG_PANEL: Mutex<Option<tui::ReportPanel>> = Mutex::new(None);
 
 /// Renders a finished `!!` command as the body of a [`tui::ReportPanel`], or
 /// `None` when the command produced nothing to show — an empty pane explains
@@ -26813,6 +27316,68 @@ mod tests {
         assert!((agent.gen_opts.temperature - default).abs() < 1e-6);
     }
 
+    /// A mid-turn `/temp` and `/power` only leave a note; the worker applies
+    /// it where the next pass starts, and the note is consumed once.
+    #[test]
+    fn mid_turn_temp_and_power_land_on_the_next_pass() {
+        // `PENDING_LIVE` and the footer's temperature are process-global.
+        let _lock = crate::status::origin_test_guard();
+        let dir = scratch_dir("live-temp");
+        let mut cfg = test_cfg();
+        cfg.generation.mtp = false;
+        cfg.generation.temperature = 0.6;
+        let mut agent = spark_agent(&dir, &cfg);
+        set_pending_live(|p| *p = PendingLiveSettings::default());
+
+        assert_eq!(
+            live_temp_command("0.9", false),
+            "temperature 0.90 from the next generation"
+        );
+        assert!(live_temp_command("", false).contains("0.90 from the next"));
+        assert!(live_temp_command("hot", false).contains("expected a number"));
+        assert!(live_temp_command("0.2", true).contains("/mtp off first"));
+        set_pending_live(|p| p.power = Some(40));
+        // Not applied yet: the worker owns `gen_opts` until the pass starts.
+        assert!((agent.gen_opts.temperature - 0.6).abs() < 1e-6);
+
+        agent.apply_pending_live_settings();
+        assert!((agent.gen_opts.temperature - 0.9).abs() < 1e-6);
+        assert_eq!(agent.power_percent, 40);
+        assert_eq!(
+            *PENDING_LIVE.lock().unwrap(),
+            PendingLiveSettings::default()
+        );
+    }
+
+    /// Only the forms that neither open an editor nor touch worker-held
+    /// state run mid-turn.
+    #[test]
+    fn live_commands_are_the_read_only_and_switch_forms() {
+        for (cmd, arg) in [
+            ("/tasks", ""),
+            ("/stats", "7"),
+            ("/history", "5"),
+            ("/memory", ""),
+            ("/memory", "log"),
+            ("/kvcache", ""),
+            ("/plugins", ""),
+            ("/temp", "0.5"),
+            ("/think", "max"),
+        ] {
+            assert!(is_live_command(cmd, arg), "{cmd} {arg}");
+        }
+        for (cmd, arg) in [
+            ("/memory", "calibrate"),
+            ("/kvcache", "gc"),
+            ("/plugins", "install x"),
+            ("/insights", ""),
+            ("/clear", ""),
+            ("/save", ""),
+        ] {
+            assert!(!is_live_command(cmd, arg), "{cmd} {arg}");
+        }
+    }
+
     #[test]
     fn the_temperature_cannot_be_set_while_mtp_is_on() {
         // `/mtp` and `/temp` publish to the footer's process-global slots,
@@ -30953,6 +31518,8 @@ mod tests {
         let live = LiveCommands {
             usage: "USE".to_owned(),
             mcp: "MCP".to_owned(),
+            cwd: std::env::temp_dir(),
+            ..LiveCommands::default()
         };
         // `/context`, `/usage` and `/mcp` are snapshotted for the report
         // panel, which reads the fields directly, so they are deliberately not
@@ -32111,6 +32678,33 @@ mod tests {
         assert!(head.ends_with("[output truncated]\n"));
         // Short output passes through untouched apart from escaping.
         assert_eq!(bang_head("ok\n"), "ok\n");
+    }
+
+    /// A mid-turn `!!` runs off the UI thread and reports its output back,
+    /// and its cancel flag stops a command that would otherwise keep the
+    /// turn's end waiting.
+    #[test]
+    fn mid_turn_bang_runs_and_cancels() {
+        let wait = |b: &MidTurnBang| {
+            b.rx.recv_timeout(Duration::from_secs(10))
+                .expect("result")
+                .expect("ran")
+        };
+        let done = MidTurnBang::spawn(std::env::temp_dir(), "echo mid-turn".to_owned());
+        let out = wait(&done);
+        assert_eq!(out.stdout.trim(), "mid-turn");
+        assert!(!out.interrupted);
+
+        let slow = MidTurnBang::spawn(std::env::temp_dir(), "sleep 30".to_owned());
+        slow.cancel.store(true, Ordering::Relaxed);
+        let start = Instant::now();
+        assert!(wait(&slow).interrupted);
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(
+            slow.status().starts_with("!! sleep 30 ("),
+            "{}",
+            slow.status()
+        );
     }
 
     /// A `!!` command's output becomes the body of the scrollable panel, with
