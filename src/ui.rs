@@ -27389,6 +27389,7 @@ mod tests {
         crate::profile::ProfileSpec {
             display_name: None,
             logo: None,
+            logo_scale: 1,
             accent: None,
             secondary: None,
             system_prompt: std::path::PathBuf::from("/unused"),

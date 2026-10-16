@@ -1135,6 +1135,7 @@ pub fn gemma_profile_prompt_for_tests(profile_text: &str, allow: &[&str]) -> Str
     let spec = crate::profile::ProfileSpec {
         display_name: None,
         logo: None,
+        logo_scale: 1,
         accent: None,
         secondary: None,
         system_prompt: std::path::PathBuf::from("/unused"),
@@ -3489,6 +3490,7 @@ mod tests {
         let spec = crate::profile::ProfileSpec {
             display_name: None,
             logo: None,
+            logo_scale: 1,
             accent: None,
             secondary: None,
             system_prompt: std::path::PathBuf::from("/unused"),
@@ -3530,6 +3532,7 @@ mod tests {
         let spec = crate::profile::ProfileSpec {
             display_name: None,
             logo: None,
+            logo_scale: 1,
             accent: None,
             secondary: None,
             system_prompt: std::path::PathBuf::from("/unused"),
@@ -3560,6 +3563,7 @@ mod tests {
         crate::profile::ProfileSpec {
             display_name: None,
             logo: None,
+            logo_scale: 1,
             accent: None,
             secondary: None,
             system_prompt: std::path::PathBuf::from("/unused"),
@@ -3712,6 +3716,7 @@ mod tests {
         let spec = crate::profile::ProfileSpec {
             display_name: None,
             logo: None,
+            logo_scale: 1,
             accent: None,
             secondary: None,
             system_prompt: std::path::PathBuf::from("/unused"),
@@ -3759,6 +3764,7 @@ mod tests {
         let spec = crate::profile::ProfileSpec {
             display_name: None,
             logo: None,
+            logo_scale: 1,
             accent: None,
             secondary: None,
             system_prompt: std::path::PathBuf::from("/unused"),
@@ -3866,6 +3872,7 @@ mod tests {
         let spec = crate::profile::ProfileSpec {
             display_name: None,
             logo: None,
+            logo_scale: 1,
             accent: None,
             secondary: None,
             system_prompt: std::path::PathBuf::from("/unused"),
@@ -3905,6 +3912,7 @@ mod tests {
         let spec = crate::profile::ProfileSpec {
             display_name: None,
             logo: None,
+            logo_scale: 1,
             accent: None,
             secondary: None,
             system_prompt: std::path::PathBuf::from("/unused"),
@@ -3941,6 +3949,7 @@ mod tests {
         let spec = crate::profile::ProfileSpec {
             display_name: None,
             logo: None,
+            logo_scale: 1,
             accent: None,
             secondary: None,
             system_prompt: std::path::PathBuf::from("/unused"),
@@ -3967,6 +3976,7 @@ mod tests {
         let spec = crate::profile::ProfileSpec {
             display_name: None,
             logo: None,
+            logo_scale: 1,
             accent: None,
             secondary: None,
             system_prompt: std::path::PathBuf::from("/unused"),

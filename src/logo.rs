@@ -162,10 +162,10 @@ fn placeholder_art(cols: usize, rows: usize) -> Option<String> {
 /// The art `ansi` draws, swapped for a kitty picture of `png` when the
 /// terminal can show one; the art otherwise, or if anything fails.
 ///
-/// The picture is [`KITTY_COLS`] wide and drawn at native resolution: it is
-/// scaled to exactly the pixels its cells cover ([`kitty_box`]), so the
-/// terminal shows it pixel for pixel.
-fn with_kitty(ansi: impl FnOnce() -> String, png: &[u8], key: bool) -> Logo {
+/// The picture is `cols` wide and drawn at native resolution: it is scaled
+/// to exactly the pixels its cells cover ([`kitty_box`]), so the terminal
+/// shows it pixel for pixel.
+fn with_kitty(ansi: impl FnOnce() -> String, png: &[u8], key: bool, cols: u32) -> Logo {
     let picture = |mode: crate::buddy::Mode| {
         let cell = cell_pixels()?;
         let size = image::ImageReader::new(std::io::Cursor::new(png))
@@ -173,9 +173,9 @@ fn with_kitty(ansi: impl FnOnce() -> String, png: &[u8], key: bool) -> Logo {
             .ok()?
             .into_dimensions()
             .ok()?;
-        let (pixels, rows) = kitty_box(size, cell, KITTY_COLS)?;
+        let (pixels, rows) = kitty_box(size, cell, cols)?;
         if mode == crate::buddy::Mode::Direct {
-            let (c, r) = (u16::try_from(KITTY_COLS).ok()?, u16::try_from(rows).ok()?);
+            let (c, r) = (u16::try_from(cols).ok()?, u16::try_from(rows).ok()?);
             let text = direct_art(c, r)?;
             let scaled = kitty_png(png, key, pixels)?;
             let mut direct = DIRECT.lock().ok()?;
@@ -186,12 +186,9 @@ fn with_kitty(ansi: impl FnOnce() -> String, png: &[u8], key: bool) -> Logo {
                 art: text,
             });
         }
-        let text = placeholder_art(
-            usize::try_from(KITTY_COLS).ok()?,
-            usize::try_from(rows).ok()?,
-        )?;
+        let text = placeholder_art(usize::try_from(cols).ok()?, usize::try_from(rows).ok()?)?;
         let scaled = kitty_png(png, key, pixels)?;
-        let (c, r) = (u16::try_from(KITTY_COLS).ok()?, u16::try_from(rows).ok()?);
+        let (c, r) = (u16::try_from(cols).ok()?, u16::try_from(rows).ok()?);
         Some(Logo {
             transmit: Some(crate::buddy::transmit_sequence_sized(
                 KITTY_ID, &scaled, c, r,
@@ -456,23 +453,29 @@ pub fn banner() -> String {
 
 /// The logo for this run, `width` columns wide: the active profile's `logo`
 /// when a profile is running, else plank's own, as a kitty picture where the
-/// terminal shows one and as art elsewhere.
+/// terminal shows one and as art elsewhere. A profile's `logoScale`
+/// multiplies both the art's `width` and the picture's [`KITTY_COLS`].
 ///
 /// The one place both banners, plain and TUI, choose their logo, so a profile
 /// cannot show its logo on one front end and plank's on the other.
 #[must_use]
 pub fn active_logo(width: u32) -> Logo {
-    let profile_png = crate::profile::active()
-        .and_then(|a| a.spec.logo.as_deref().map(std::fs::read))
+    let spec = crate::profile::active().map(|a| &a.spec);
+    let profile_png = spec
+        .and_then(|s| s.logo.as_deref().map(std::fs::read))
         .and_then(Result::ok)
         .filter(|bytes| image::load_from_memory(bytes).is_ok());
     match profile_png {
-        Some(bytes) => with_kitty(
-            || logo_art::image_to_ansi_with(&bytes, width.max(1), cell()),
-            &bytes,
-            false,
-        ),
-        None => with_kitty(|| art(width), LOGO_PNG, true),
+        Some(bytes) => {
+            let scale = spec.map_or(1, |s| s.logo_scale.max(1));
+            with_kitty(
+                || logo_art::image_to_ansi_with(&bytes, (width * scale).max(1), cell()),
+                &bytes,
+                false,
+                KITTY_COLS * scale,
+            )
+        }
+        None => with_kitty(|| art(width), LOGO_PNG, true, KITTY_COLS),
     }
 }
 

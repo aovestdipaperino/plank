@@ -23,6 +23,7 @@ for the Claude Code layout), alongside the plugin's existing `name`,
 | `systemPrompt` | string, path to a file | yes | none; without it the manifest is not treated as a profile at all |
 | `displayName` | string | no | the plugin's own `name` |
 | `logo` | string, path to a PNG | no | plank's own logo |
+| `logoScale` | whole number, 1 to 4 | no | `1`: the logo at the banner's default width |
 | `accent` | string | no | plank's built-in green |
 | `secondary` | string | no | the word's resting colour; derived from `accent`, or the built-in ramp when neither is set |
 | `tools.builtin` | array of strings | no | every builtin tool is offered |
@@ -54,7 +55,10 @@ A `secondary` that does not parse warns the same way and falls back to the
 derived value, so a typo costs the declared shade but never the profile.
 A `logo` that does not point at a readable, decodable PNG falls back to
 plank's own art, also with a warning; the sample profile in this repository
-ships without a `logo` key specifically to exercise that fallback. A
+ships without a `logo` key specifically to exercise that fallback.
+`logoScale` multiplies the width the profile's logo is drawn at, as a picture
+and as block art alike; anything but a whole number from 1 to 4 warns and
+draws it at 1. A
 `displayName` that is not a non-empty string falls back to the plugin's name.
 A `settings` value that is not an object is dropped.
 

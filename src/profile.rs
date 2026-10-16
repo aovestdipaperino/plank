@@ -29,6 +29,10 @@ pub struct ProfileSpec {
     pub display_name: Option<String>,
     /// PNG rendered as the startup banner; the plank logo when absent.
     pub logo: Option<PathBuf>,
+    /// `logoScale`: how many times the banner's default logo width the
+    /// profile's logo is drawn, 1 to [`MAX_LOGO_SCALE`]. 1 when absent or
+    /// malformed.
+    pub logo_scale: u32,
     /// UI accent; the built-in green when absent.
     pub accent: Option<Accent>,
     /// `secondary`: the far end of the status verb's shimmer sweep, which
@@ -84,6 +88,41 @@ pub struct ProfileSpec {
     /// `verbs` or `additionalVerbs`: the status-bar verb pools the profile
     /// replaces or extends. `None` keeps plank's own vocabulary.
     pub verbs: Option<ProfileVerbs>,
+}
+
+/// The largest `logoScale` a profile may ask for: four times the default
+/// banner width is already most of a narrow terminal.
+pub const MAX_LOGO_SCALE: u32 = 4;
+
+/// `logo`: a non-empty path, resolved against the plugin root; `None` with a
+/// warning otherwise.
+fn logo_field(block: &Json, root: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
+    match block.get("logo") {
+        None => None,
+        Some(Json::Str(s)) if !s.is_empty() => Some(resolve(root, s)),
+        Some(_) => {
+            warnings.push("profile: logo is not a non-empty string; using the default".to_string());
+            None
+        }
+    }
+}
+
+/// `logoScale`: a whole number from 1 to [`MAX_LOGO_SCALE`], else 1 with a
+/// warning.
+fn logo_scale_field(block: &Json, warnings: &mut Vec<String>) -> u32 {
+    match block.get("logoScale") {
+        None => 1,
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Some(Json::Num(n)) if n.fract() == 0.0 && (1.0..=f64::from(MAX_LOGO_SCALE)).contains(n) => {
+            *n as u32
+        }
+        Some(_) => {
+            warnings.push(format!(
+                "profile: logoScale is not a whole number from 1 to {MAX_LOGO_SCALE}; using 1"
+            ));
+            1
+        }
+    }
 }
 
 /// The phase keys of a per-phase `verbs` object, in the order
@@ -279,14 +318,7 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
 
     let prefix = prefix_field(block, root, &mut warnings);
 
-    let logo = match block.get("logo") {
-        None => None,
-        Some(Json::Str(s)) if !s.is_empty() => Some(resolve(root, s)),
-        Some(_) => {
-            warnings.push("profile: logo is not a non-empty string; using the default".to_string());
-            None
-        }
-    };
+    let logo = logo_field(block, root, &mut warnings);
 
     let settings_json = match block.get("settings") {
         None => None,
@@ -315,6 +347,7 @@ pub fn parse(manifest_text: &str, root: &Path) -> Option<ProfileSpec> {
     Some(ProfileSpec {
         display_name,
         logo,
+        logo_scale: logo_scale_field(block, &mut warnings),
         accent,
         secondary,
         system_prompt: resolve(root, &system_prompt),
@@ -1416,6 +1449,37 @@ mod tests {
     }
 
     #[test]
+    fn a_logo_scale_in_range_is_kept() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md", "logoScale": 2 } }"#;
+        let spec = parse(text, Path::new("/p")).expect("a profile");
+        assert_eq!(spec.logo_scale, 2);
+        assert!(spec.warnings.is_empty());
+    }
+
+    #[test]
+    fn an_absent_logo_scale_is_one() {
+        let text = r#"{ "profile": { "systemPrompt": "p.md" } }"#;
+        assert_eq!(
+            parse(text, Path::new("/p")).expect("a profile").logo_scale,
+            1
+        );
+    }
+
+    #[test]
+    fn a_bad_logo_scale_warns_and_is_one() {
+        for bad in ["0", "5", "1.5", "\"2\""] {
+            let text =
+                format!(r#"{{ "profile": {{ "systemPrompt": "p.md", "logoScale": {bad} }} }}"#);
+            let spec = parse(&text, Path::new("/p")).expect("still a profile");
+            assert_eq!(spec.logo_scale, 1, "{bad}");
+            assert!(
+                spec.warnings.iter().any(|w| w.contains("logoScale")),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn a_wrong_type_settings_warns_and_defaults() {
         let text = r#"{ "profile": { "systemPrompt": "p.md", "settings": "nope" } }"#;
         let spec = parse(text, Path::new("/p")).expect("still a profile");
@@ -1483,6 +1547,7 @@ mod tests {
         ProfileSpec {
             display_name: Some("HAL".to_string()),
             logo: None,
+            logo_scale: 1,
             accent: None,
             secondary: None,
             system_prompt: PathBuf::from("/p/prompt.md"),
