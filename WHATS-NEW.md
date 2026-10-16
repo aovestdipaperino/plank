@@ -13,6 +13,14 @@ it.
 Install with `brew install aovestdipaperino/tap/plank-agent-beta`. Everything
 the betas below carried is in stable 7.0.0.
 
+### 7.0.6
+
+**A stuck turn stops itself.** A turn that kept re-issuing the same blocked
+tool call, slipping one real call in between each try, could run on far longer
+than it should before you noticed. The loop guard now ends the turn once a call
+has been refused several times over, whether or not those tries are back to
+back.
+
 ### 7.0.5
 
 **A buddy on the prompt.** `/buddy on` puts a small animated character on the

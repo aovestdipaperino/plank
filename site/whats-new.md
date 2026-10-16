@@ -7,6 +7,11 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v7.0.6 beta: a stuck turn stops itself.** A turn that kept re-issuing the
+same refused tool call, slipping one real call in between each try, could run
+on far longer than it should. The loop guard now ends the turn once a call has
+been refused several times over, whether or not those tries are back to back.
+
 **v7.0.5 beta: a buddy, hints, and conversations that survive the window's
 edge.** `/buddy on` stands a small animated character on the rule above the
 prompt while plank is idle, in kitty, Ghostty and Warp; `/buddy install`
