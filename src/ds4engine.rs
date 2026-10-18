@@ -2775,9 +2775,25 @@ impl Engine for Ds4Session {
         self.hold_steering(true);
         // SAFETY: session and tokens are valid.
         let cached = unsafe { ffi::ds4_session_common_prefix(session, self.warm_tokens.as_ptr()) };
+        // SAFETY: session valid.
+        let live = unsafe { ffi::ds4_session_pos(session) };
         if cached >= total {
+            kv_debug(|| format!("warm: prompt={total} live={live} prefill=0 (already cached)"));
             return Ok(false);
         }
+        kv_debug(|| {
+            let mut s = format!(
+                "warm: prompt={total} cached={cached} prefill={}",
+                total - cached
+            );
+            if cached == 0 && live > 0 {
+                let _ = write!(
+                    s,
+                    "\n  full rebuild: warm prompt shares no prefix with a {live}-token live KV"
+                );
+            }
+            s
+        });
         on_event(EngineEvent::Prefill(PrefillProgress::primed(cached, total)));
         let mut progress = ProgressCtx {
             on_event: &mut *on_event,

@@ -6759,7 +6759,8 @@ impl Agent<'_> {
         if !crate::settings::active().context.microcompact {
             return None;
         }
-        if let Some(edit) = compact::microcompact_first_index(&self.session.transcript) {
+        let edit_span = compact::microcompact_first_index(&self.session.transcript);
+        if let Some(edit) = edit_span {
             self.restore_rung_below(edit);
         }
         // Full compaction is due: reclaim enough to get clear of its trigger,
@@ -6770,6 +6771,11 @@ impl Agent<'_> {
         let budget = compact::microcompact_delete_budget(ctx_size, used)
             .max(used - compact::compaction_trigger_used(ctx_size) + 1);
         let cleared = self.microcompact_with_budget(budget);
+        crate::engine::kv_debug(|| {
+            format!(
+                "microcompact (full compaction due): edit_span={edit_span:?} used={used} ctx_size={ctx_size} budget={budget} cleared={cleared}",
+            )
+        });
         if cleared == 0 {
             return None;
         }
@@ -6964,6 +6970,13 @@ impl Agent<'_> {
         }
         let budget = compact::microcompact_delete_budget(ctx_size, total);
         let cleared = self.microcompact_with_budget(budget);
+        crate::engine::kv_debug(|| {
+            format!(
+                "microcompact accepted: edit_span={edit} total={total} rung_covers={covered} restored={} reprefill={} reclaimable={reclaimable}B budget={budget} cleared={cleared} ctx_size={ctx_size}",
+                restored.is_some(),
+                total - restored.unwrap_or(0),
+            )
+        });
         self.last_ctx_used = 0;
         Some(cleared)
     }
@@ -9325,7 +9338,19 @@ the original is frozen and listed in /tree"
         if self.session.id.is_empty() {
             return None;
         }
-        let rung = *self.ladder.select(edit_index, 0)?;
+        let Some(rung) = self.ladder.select(edit_index, 0).copied() else {
+            crate::engine::kv_debug(|| {
+                format!(
+                    "ladder: no rung at or below edit span {edit_index} (rungs={:?}); the next sync may rebuild from zero",
+                    self.ladder
+                        .rungs()
+                        .iter()
+                        .map(|r| (r.spans, r.tokens))
+                        .collect::<Vec<_>>(),
+                )
+            });
+            return None;
+        };
         self.restore_rung(rung, &format!("edit at span {edit_index}"))
     }
 
