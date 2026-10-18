@@ -6200,13 +6200,8 @@ impl Agent<'_> {
             // Turn over: the front end is back at the prompt.
             // Opportunistic microcompact (M5): drop stale tool-result bodies
             // before pressure builds, so the KV suffix stops growing earlier.
-            if let Some(cleared) = self.try_microcompact_opportunistic() {
-                println!(
-                    "{}",
-                    self.debug_line(&format!(
-                        "microcompacted: cleared {cleared} old tool result(s)"
-                    ))
-                );
+            if let Some((cleared, bytes)) = self.try_microcompact_opportunistic() {
+                println!("{}", self.debug_line(&microcompact_note(cleared, bytes)));
             }
             self.flush_kv_end_of_turn();
             // Memory extraction: this is the genuine no-tool-calls turn exit,
@@ -6692,13 +6687,8 @@ impl Agent<'_> {
         }
         // Cheapest step first: clear old tool-result bodies (no model
         // round-trip) and only fall back to full summarization if still tight.
-        if let Some(cleared) = self.try_microcompact() {
-            println!(
-                "{}",
-                self.debug_line(&format!(
-                    "microcompacted: cleared {cleared} old tool result(s)"
-                ))
-            );
+        if let Some((cleared, bytes)) = self.try_microcompact() {
+            println!("{}", self.debug_line(&microcompact_note(cleared, bytes)));
             return Ok(Compacted::Done);
         }
         self.compact("low context", "")
@@ -6755,7 +6745,7 @@ impl Agent<'_> {
     /// Runs microcompact; returns the cleared count when it freed enough
     /// context to skip full compaction, `None` when full compaction is still
     /// needed (any clearing done is kept — it only helps the summary pass).
-    fn try_microcompact(&mut self) -> Option<usize> {
+    fn try_microcompact(&mut self) -> Option<(usize, usize)> {
         if !crate::settings::active().context.microcompact {
             return None;
         }
@@ -6770,7 +6760,7 @@ impl Agent<'_> {
         let ctx_size = self.engine.ctx_size();
         let budget = compact::microcompact_delete_budget(ctx_size, used)
             .max(used - compact::compaction_trigger_used(ctx_size) + 1);
-        let cleared = self.microcompact_with_budget(budget);
+        let (cleared, bytes) = self.microcompact_with_budget(budget);
         crate::engine::kv_debug(|| {
             format!(
                 "microcompact (full compaction due): edit_span={edit_span:?} used={used} ctx_size={ctx_size} budget={budget} cleared={cleared}",
@@ -6782,14 +6772,14 @@ impl Agent<'_> {
         self.last_ctx_used = 0;
         let rendered = render_transcript(&self.session, &self.system);
         let used = self.engine.count_tokens(&rendered);
-        (!compact::should_compact(ctx_size, used)).then_some(cleared)
+        (!compact::should_compact(ctx_size, used)).then_some((cleared, bytes))
     }
 
     /// Runs one budgeted micro-compaction pass against the live engine's
     /// tokenizer; returns the number of results cleared.
-    fn microcompact_with_budget(&mut self, budget_tokens: i32) -> usize {
+    fn microcompact_with_budget(&mut self, budget_tokens: i32) -> (usize, usize) {
         let engine = &mut self.engine;
-        let (cleared, _) =
+        let (cleared, bytes) =
             compact::microcompact(&mut self.session.transcript, budget_tokens, &mut |s| {
                 engine.count_tokens(s)
             });
@@ -6799,7 +6789,7 @@ impl Agent<'_> {
             // would not catch a suggestion made stale by this edit.
             self.clear_suggestion();
         }
-        cleared
+        (cleared, bytes)
     }
 
     /// Excises the looping reasoning from the assistant message a reasoning
@@ -6919,7 +6909,7 @@ impl Agent<'_> {
     /// text in place, which invalidates the KV prefix from that point, so an
     /// eager pass that reclaims little costs more than it saves — only fire
     /// when the cleared results are worth the prefix rebuild.
-    fn try_microcompact_opportunistic(&mut self) -> Option<usize> {
+    fn try_microcompact_opportunistic(&mut self) -> Option<(usize, usize)> {
         // Never inside a sidechain: the rewrite would land on messages about
         // to be truncated out, and the rung restore would touch an engine
         // that may not even be the session's.
@@ -6969,7 +6959,7 @@ impl Agent<'_> {
             });
         }
         let budget = compact::microcompact_delete_budget(ctx_size, total);
-        let cleared = self.microcompact_with_budget(budget);
+        let (cleared, bytes) = self.microcompact_with_budget(budget);
         crate::engine::kv_debug(|| {
             format!(
                 "microcompact accepted: edit_span={edit} total={total} rung_covers={covered} restored={} reprefill={} reclaimable={reclaimable}B budget={budget} cleared={cleared} ctx_size={ctx_size}",
@@ -6978,7 +6968,7 @@ impl Agent<'_> {
             )
         });
         self.last_ctx_used = 0;
-        Some(cleared)
+        Some((cleared, bytes))
     }
 
     /// Rebuilds the transcript after a summarization pass: extracted summary
@@ -15959,10 +15949,8 @@ impl Agent<'_> {
                 }
                 // Turn over: the front end is back at the prompt.
                 // Opportunistic microcompact (M5), mirrored from the plain path.
-                if let Some(cleared) = self.try_microcompact_opportunistic() {
-                    log.push_dim(format!(
-                        "microcompacted: cleared {cleared} old tool result(s)"
-                    ));
+                if let Some((cleared, bytes)) = self.try_microcompact_opportunistic() {
+                    log.push_dim(microcompact_note(cleared, bytes));
                 }
                 self.flush_kv_end_of_turn();
                 // Mirrored from the plain path: a component must not observe a
@@ -18083,10 +18071,8 @@ impl Agent<'_> {
         }
         // Cheapest step first: clear old tool-result bodies (no model
         // round-trip) and only fall back to full summarization if still tight.
-        if let Some(cleared) = self.try_microcompact() {
-            sink.note(format!(
-                "microcompacted: cleared {cleared} old tool result(s)"
-            ));
+        if let Some((cleared, bytes)) = self.try_microcompact() {
+            sink.note(microcompact_note(cleared, bytes));
             return Ok(Compacted::Done);
         }
         self.do_compact_notify("low context", "", sink, interrupt)
@@ -20115,6 +20101,15 @@ fn hints_command(arg: &str) -> String {
     }
     crate::hints::set_wanted(want);
     format!("programming hints {arg}, from the next turn")
+}
+
+/// The notice for a micro-compaction pass that cleared something: how many
+/// tool results lost their bodies and how many bytes that reclaimed.
+fn microcompact_note(cleared: usize, bytes: usize) -> String {
+    format!(
+        "microcompacted: cleared {cleared} old tool result(s), reclaimed {:.1} KB",
+        f64::from(u32::try_from(bytes).unwrap_or(u32::MAX)) / 1024.0
+    )
 }
 
 fn microcompact_command(arg: &str) -> String {
@@ -28507,7 +28502,7 @@ mod tests {
         );
 
         events.lock().unwrap().clear();
-        let cleared = agent
+        let (cleared, _) = agent
             .try_microcompact_opportunistic()
             .expect("the pass must fire under pressure");
         assert!(cleared > 0, "the pass must clear a tool result");
