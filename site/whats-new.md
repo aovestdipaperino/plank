@@ -7,6 +7,12 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v7.0.7 beta: repro dumps show the prefills.** A `/repro` dump now lists every
+prefill the engine did, from the warm-up before the first turn onward, with its
+size and how much of the context was reused. Micro-compaction only fires when
+it gives back enough of the transcript for where it sits, which cuts down the
+repeated rebuilds it used to cause. A dump also carries the build's commit.
+
 **v7.0.6 beta: a stuck turn stops itself.** A turn that kept re-issuing the
 same refused tool call, slipping one real call in between each try, could run
 on far longer than it should. The loop guard now ends the turn once a call has

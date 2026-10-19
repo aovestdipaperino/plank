@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Prefill and KV events in `/repro` dumps.** Every dump has a `## KV events`
+  section listing, oldest first, the warm-up prefill before the first turn,
+  each generation's prefill size and reuse (with a `full rebuild` note when
+  nothing was reused), ladder restores and micro-compaction decisions. Its
+  header carries the build's commit, with `-dirty` when the tree had changes.
+  Rare anomalies (an assistant reply committed with no text, a held reply
+  released as one message) also go to `~/.plank/repro/kv-anomalies.log`, so
+  they still appear after a resume in another process. Under `PLANK_KV_DEBUG`
+  the same lines are written to that file as they happen.
+
+- **A force quit records where the turn was stuck.** A second Ctrl-C that
+  forces the quit writes the status line on screen, how long the interrupt had
+  gone unacknowledged, and the last KV event to the debug log.
+
 - **`/buddy on|off|install`.** An animated buddy stands on the rule above
   the prompt while plank is idle, in kitty, Ghostty and Warp (outside tmux).
   Buddies are the folders of the public `aovestdipaperino/plank-buddies`
@@ -142,6 +156,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   profile builds its prompt cache once more on the next launch.
 
 ### Changed
+
+- **Micro-compaction gives back a share of the transcript that depends on
+  where its edit sits.** An opportunistic pass must reclaim 20% of the
+  transcript's tokens when its first edit is in the newest tenth, nothing from
+  a tenth to three tenths back, 5% from three tenths to half way, and 10% at
+  half way or older. A pass that falls short is refused before the engine is
+  touched, and the refusal is logged under `PLANK_KV_DEBUG`. The forced pass
+  that runs at the compaction trigger is not gated.
+- **The micro-compaction notice says how much it reclaimed.** It now reads
+  `microcompacted: cleared N old tool result(s), reclaimed X KB`, in the
+  thinking grey.
 
 - **DeepSeek and Qwen edit with exact old text by default.** The tools prompt
   no longer teaches `[upto]` anchored edits to the DSML and Qwen models, and

@@ -13,6 +13,16 @@ it.
 Install with `brew install aovestdipaperino/tap/plank-agent-beta`. Everything
 the betas below carried is in stable 7.0.0.
 
+### 7.0.7
+
+**Repro dumps show the prefills.** A `/repro` dump now lists every prefill the
+engine did, from the warm-up before the first turn onward: how many tokens each
+one processed, how much of the context was reused, and when nothing was reused.
+Micro-compaction passes now only fire when they give back enough of the
+transcript for their position, which cuts down the repeated rebuilds they caused.
+A dump also carries the build's commit, so a report can be matched to the code
+that produced it.
+
 ### 7.0.6
 
 **A stuck turn stops itself.** A turn that kept re-issuing the same blocked
