@@ -219,6 +219,7 @@ pub fn build_sidecar_report(
     let _ = writeln!(out, "# plank repro {version} — sub-agent sidecar {ordinal}");
     let _ = writeln!(out);
     let _ = writeln!(out, "- main repro: {main_file}");
+    let _ = writeln!(out, "- commit: {}", env!("PLANK_GIT_COMMIT"));
     let _ = writeln!(out, "- label: {}", dump.label);
     let _ = writeln!(out, "- outcome: {}", dump.outcome);
     let _ = writeln!(out, "- forked at parent message: {}", dump.fork_at);
@@ -413,6 +414,34 @@ fn write_passes(out: &mut String, passes: &[PassNote]) {
 
 /// Writes the `## Model` section: the weights' identity, split out of
 /// [`build_report`] so that function stays under the line-count lint.
+/// The `## KV events` section: every prefill and KV decision this process has
+/// recorded, oldest first. The head is the warm-up before the first turn (the
+/// system prompt and project context), so a dump shows what was prefilled
+/// before any generation started.
+fn write_kv_events(out: &mut String) {
+    let (lines, elided) = crate::engine::kv_events();
+    let _ = writeln!(out, "## KV events");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Prefill and KV decisions, oldest first. `prefill` is the tokens the engine had to process; `full rebuild` means nothing was reused from the live KV."
+    );
+    let _ = writeln!(out);
+    if lines.is_empty() {
+        let _ = writeln!(out, "(none recorded)");
+    } else {
+        let _ = writeln!(out, "```");
+        for (i, line) in lines.iter().enumerate() {
+            if elided > 0 && i == crate::engine::KV_EVENTS_HEAD {
+                let _ = writeln!(out, "... {elided} middle events elided ...");
+            }
+            let _ = writeln!(out, "{line}");
+        }
+        let _ = writeln!(out, "```");
+    }
+    let _ = writeln!(out);
+}
+
 fn write_model_section(out: &mut String, m: &ModelMeta, cfg: &AgentConfig) {
     let _ = writeln!(out, "## Model");
     let _ = writeln!(out);
@@ -469,6 +498,7 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     let _ = writeln!(out, "# plank repro {}", meta.version);
     let _ = writeln!(out);
     let _ = writeln!(out, "- date: {}", meta.date);
+    let _ = writeln!(out, "- commit: {}", env!("PLANK_GIT_COMMIT"));
     let note = if meta.note.is_empty() {
         "(none)"
     } else {
@@ -525,6 +555,7 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     let _ = writeln!(out);
 
     write_passes(&mut out, meta.passes);
+    write_kv_events(&mut out);
 
     let _ = writeln!(out, "## Rendered transcript (exact engine input)");
     let _ = writeln!(out);
@@ -582,9 +613,11 @@ pub fn build_panic_report(
     let _ = writeln!(out, "# plank repro {version} (panic)");
     let _ = writeln!(out);
     let _ = writeln!(out, "- date: {date}");
+    let _ = writeln!(out, "- commit: {}", env!("PLANK_GIT_COMMIT"));
     let _ = writeln!(out, "- note: plank panicked");
     let _ = writeln!(out, "- panic: {}", panic.trim());
     let _ = writeln!(out);
+    write_kv_events(&mut out);
     let _ = writeln!(out, "## Rendered transcript (exact engine input)");
     let _ = writeln!(out);
     let _ = writeln!(out, "----- BEGIN TRANSCRIPT -----");
@@ -998,5 +1031,20 @@ mod tests {
         let report = build_report(&meta(), &AgentConfig::default(), "");
         assert!(!report.contains("## Passes"));
         assert!(!report.contains("think budget"));
+    }
+}
+
+#[cfg(test)]
+mod kv_section_tests {
+    use super::write_kv_events;
+
+    #[test]
+    fn the_kv_events_section_carries_recorded_prefill_lines() {
+        crate::engine::kv_debug(|| "warm: prompt=9001 cached=0 prefill=9001".to_owned());
+        let mut out = String::new();
+        write_kv_events(&mut out);
+        assert!(out.starts_with("## KV events\n"));
+        assert!(out.contains("warm: prompt=9001 cached=0 prefill=9001"));
+        assert!(out.contains("```"));
     }
 }

@@ -578,7 +578,8 @@ impl KvReuse {
     }
 }
 
-/// Appends a line to the file named by `PLANK_KV_DEBUG`, if set.
+/// Records a line in the KV event log that `/repro` dumps carry, and appends
+/// it to the file named by `PLANK_KV_DEBUG`, if set.
 ///
 /// KV prefix reuse is the one part of the engine whose failures are silent and
 /// expensive: a mismatch costs a full re-prefill and looks exactly like "the
@@ -591,16 +592,49 @@ impl KvReuse {
 /// exactly as silent when it goes wrong.
 pub fn kv_debug(f: impl FnOnce() -> String) {
     use std::io::Write as _;
-    let Ok(path) = std::env::var("PLANK_KV_DEBUG") else {
-        return;
-    };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let line = f();
+    if let Ok(path) = std::env::var("PLANK_KV_DEBUG")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
     {
-        let _ = writeln!(file, "{}", f());
+        let _ = writeln!(file, "{line}");
     }
+    let mut events = KV_EVENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if events.lines.len() >= KV_EVENTS_KEPT {
+        events.lines.remove(KV_EVENTS_HEAD);
+        events.elided += 1;
+    }
+    events.lines.push_back(line);
+}
+
+/// Lines of the in-memory KV event log kept for `/repro` dumps: the first
+/// [`KV_EVENTS_HEAD`] (the warm-up before the first turn) and the most recent
+/// ones after them. The middle is dropped and counted.
+pub(crate) const KV_EVENTS_HEAD: usize = 40;
+const KV_EVENTS_KEPT: usize = 400;
+
+struct KvEvents {
+    lines: std::collections::VecDeque<String>,
+    elided: usize,
+}
+
+static KV_EVENTS: std::sync::Mutex<KvEvents> = std::sync::Mutex::new(KvEvents {
+    lines: std::collections::VecDeque::new(),
+    elided: 0,
+});
+
+/// The recorded KV event lines, oldest first, and how many middle lines were
+/// dropped to keep the log bounded.
+#[must_use]
+pub fn kv_events() -> (Vec<String>, usize) {
+    let events = KV_EVENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (events.lines.iter().cloned().collect(), events.elided)
 }
 
 /// Which of two interleaved streams an event belongs to, so a front-end can
@@ -2835,5 +2869,33 @@ mod tests {
         };
         assert_eq!(a, b, "same path + embedding => equal");
         assert_ne!(a, c, "different path => not equal");
+    }
+}
+
+#[cfg(test)]
+mod kv_event_log_tests {
+    use super::{KV_EVENTS_HEAD, KV_EVENTS_KEPT, kv_debug, kv_events};
+
+    #[test]
+    fn kv_debug_records_a_line_with_no_env_var_set() {
+        let probe = "kv-event-probe-7f3a: prefill=12345";
+        kv_debug(|| probe.to_owned());
+        let (lines, _) = kv_events();
+        assert!(
+            lines.iter().any(|l| l == probe),
+            "probe missing from the log"
+        );
+    }
+
+    #[test]
+    fn the_log_keeps_the_head_and_the_tail_and_counts_the_middle() {
+        // Enough events to overflow the bound, whatever other tests recorded.
+        for i in 0..KV_EVENTS_KEPT + 10 {
+            kv_debug(|| format!("kv-overflow-probe-{i}"));
+        }
+        let (lines, elided) = kv_events();
+        assert!(lines.len() <= KV_EVENTS_KEPT);
+        assert!(elided >= 10);
+        assert!(lines.len() > KV_EVENTS_HEAD);
     }
 }

@@ -20551,6 +20551,21 @@ const EXIT_CONFIRM_TITLE: &str = "exit";
 const EXIT_CONFIRM_TEXT: &str =
     "The model is still working. Interrupt the turn and quit plank? [y/N]";
 
+/// Describes where a stuck turn was when the user forced it to quit: the status
+/// line the busy loop was showing (phase, verb, progress), how long the
+/// interrupt had gone unacknowledged, and the last KV event recorded, which
+/// names the prefill or generation the worker was in.
+fn force_quit_site(status: &str, interrupt_at: Option<Instant>) -> String {
+    let waited = interrupt_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
+    let last_kv = crate::engine::kv_events()
+        .0
+        .pop()
+        .unwrap_or_else(|| "(none recorded)".to_owned());
+    format!(
+        "unacknowledged interrupt for {waited:.1}s; status line: {status:?}; last KV event: {last_kv}"
+    )
+}
+
 /// Last resort when the worker will not stop: restore the terminal and leave.
 ///
 /// This exits the *process*, not the turn. The worker runs on a scoped thread
@@ -20559,7 +20574,10 @@ const EXIT_CONFIRM_TEXT: &str =
 /// is lost. That is the deal a force quit makes; it beats a wedged terminal,
 /// and with the stream idle timeout in [`crate::remote`] it should never be
 /// reached in the network-drop case that motivated it.
-fn force_quit() -> ! {
+fn force_quit(stuck_at: &str) -> ! {
+    // Where the turn was stuck goes into the debug log first, so a force quit
+    // leaves a record of its own cause; the process is about to exit.
+    crate::engine::kv_debug(|| format!("force quit: {stuck_at}"));
     // A force quit is a deliberate exit, not the C engine dying mid-redirect;
     // disarm first so a GPU-yield cycle in flight cannot print a false
     // "ended the process while reloading" report over this one.
@@ -21356,7 +21374,7 @@ fn busy_ui_loop(
                             if interrupt_at
                                 .is_some_and(|t: Instant| t.elapsed() >= FORCE_QUIT_GRACE)
                             {
-                                force_quit();
+                                force_quit(&force_quit_site(&status_line, interrupt_at));
                             }
                             close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
                             interrupt_at = escalation_clock(
@@ -42207,5 +42225,19 @@ or the user's next message aborts before its first token"
         ));
         assert!(!noticed, "a screensaver is no wait");
         assert_eq!(REMOTE_WAIT_NOTICE, "waiting for the frame to close");
+    }
+}
+
+#[cfg(test)]
+mod force_quit_site_tests {
+    use super::force_quit_site;
+
+    #[test]
+    fn the_site_names_the_status_line_the_wait_and_the_last_kv_event() {
+        crate::engine::kv_debug(|| "warm: prompt=42 cached=0 prefill=42".to_owned());
+        let site = force_quit_site("generating  12 tok/s", None);
+        assert!(site.contains("unacknowledged interrupt for 0.0s"), "{site}");
+        assert!(site.contains("generating  12 tok/s"), "{site}");
+        assert!(site.contains("last KV event:"), "{site}");
     }
 }
