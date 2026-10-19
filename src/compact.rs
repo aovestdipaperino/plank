@@ -152,6 +152,64 @@ pub fn microcompact_reclaimable(transcript: &[Message]) -> usize {
         .sum()
 }
 
+/// Tokens the pass [`microcompact`] would run with `budget_tokens` gives back,
+/// counted without clearing anything. Same loop, same stop rule, so the number
+/// is exactly what the pass reclaims.
+pub fn microcompact_plan_tokens(
+    transcript: &[Message],
+    budget_tokens: i32,
+    count_tokens: &mut dyn FnMut(&str) -> i32,
+) -> i32 {
+    let stub = format!("<tool_result>{MICROCOMPACT_STUB}</tool_result>");
+    let stub_tokens = count_tokens(&stub);
+    let mut reclaimed = 0i32;
+    for i in clear_set(transcript) {
+        if reclaimed >= budget_tokens {
+            break;
+        }
+        let body = count_tokens(&transcript[i].text);
+        reclaimed = reclaimed.saturating_add((body - stub_tokens).max(0));
+    }
+    reclaimed
+}
+
+/// Share of the transcript's tokens a micro-compaction pass must give back,
+/// by how far back its first edit sits.
+///
+/// `age` is the fraction of the transcript's tokens from the edit to the end,
+/// so `0.0` is the newest message. Bands are half-open: an age exactly on a
+/// cut-off belongs to the band that starts there. The newest tenth is expensive
+/// because it rewrites what the model is still working from; the far end is
+/// expensive because it rebuilds almost the whole prefix. The band in between
+/// needs no return at all.
+#[must_use]
+pub fn give_back_threshold(age: f64) -> f64 {
+    if age < GIVE_BACK_NEWEST_BAND {
+        GIVE_BACK_NEWEST
+    } else if age < GIVE_BACK_MIDDLE_BAND {
+        GIVE_BACK_MIDDLE_NONE
+    } else if age < GIVE_BACK_FAR_BAND {
+        GIVE_BACK_FAR
+    } else {
+        GIVE_BACK_OLDEST
+    }
+}
+
+/// Edits within this fraction of the transcript from the end are the newest band.
+pub const GIVE_BACK_NEWEST_BAND: f64 = 0.10;
+/// Edits from the newest band up to this fraction back are the middle band.
+pub const GIVE_BACK_MIDDLE_BAND: f64 = 0.30;
+/// Edits from the middle band up to this fraction back are the far band.
+pub const GIVE_BACK_FAR_BAND: f64 = 0.50;
+/// Give-back share for the newest band.
+pub const GIVE_BACK_NEWEST: f64 = 0.20;
+/// Give-back share for the middle band: none.
+pub const GIVE_BACK_MIDDLE_NONE: f64 = 0.0;
+/// Give-back share for the far band.
+pub const GIVE_BACK_FAR: f64 = 0.05;
+/// Give-back share for the oldest band.
+pub const GIVE_BACK_OLDEST: f64 = 0.10;
+
 /// The earliest transcript index [`microcompact`] would rewrite, or `None`
 /// when it would clear nothing.
 ///
@@ -1190,5 +1248,45 @@ mod tests {
         );
         // At least one text-only old result was cleared.
         assert!(cleared > 0, "text-only old results should still be cleared");
+    }
+
+    #[test]
+    fn give_back_threshold_follows_the_four_bands() {
+        // Newest tenth: 20%.
+        assert!((give_back_threshold(0.0) - 0.20).abs() < f64::EPSILON);
+        assert!((give_back_threshold(0.099) - 0.20).abs() < f64::EPSILON);
+        // 10% to 30%: no return needed.
+        assert!((give_back_threshold(0.10) - 0.0).abs() < f64::EPSILON);
+        assert!((give_back_threshold(0.299) - 0.0).abs() < f64::EPSILON);
+        // 30% to 50%: 5%.
+        assert!((give_back_threshold(0.30) - 0.05).abs() < f64::EPSILON);
+        assert!((give_back_threshold(0.499) - 0.05).abs() < f64::EPSILON);
+        // 50% and older: 10%.
+        assert!((give_back_threshold(0.50) - 0.10).abs() < f64::EPSILON);
+        assert!((give_back_threshold(0.95) - 0.10).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn plan_tokens_counts_exactly_what_the_pass_reclaims() {
+        let big = "x".repeat(4_000);
+        let mut t = vec![
+            Message::user("<tool_result>".to_owned() + &big + "</tool_result>"),
+            Message::assistant("a"),
+            Message::user("<tool_result>".to_owned() + &big + "</tool_result>"),
+            Message::assistant("b"),
+            Message::user("<tool_result>".to_owned() + &big + "</tool_result>"),
+            Message::assistant("c"),
+        ];
+        let mut count = |s: &str| i32::try_from(s.len()).unwrap_or(i32::MAX);
+        let planned = microcompact_plan_tokens(&t, i32::MAX, &mut count);
+        let (cleared, bytes) = microcompact(&mut t, i32::MAX, &mut count);
+        assert!(cleared > 0);
+        // Chars stand in for tokens here: the plan equals the bytes the pass
+        // reclaimed minus the stub's own length per cleared body.
+        let stub_len = format!("<tool_result>{MICROCOMPACT_STUB}</tool_result>").len();
+        assert_eq!(
+            usize::try_from(planned).unwrap(),
+            bytes - cleared * stub_len
+        );
     }
 }

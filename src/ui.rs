@@ -6930,6 +6930,34 @@ impl Agent<'_> {
         let edit = compact::microcompact_first_index(&self.session.transcript)?;
         let rendered = render_transcript(&self.session, &self.system);
         let total = self.engine.count_tokens(&rendered);
+        let ctx_size = self.engine.ctx_size();
+        // U-shaped give-back: the share of the transcript this pass must return
+        // depends on how far back its edit sits. Decided before the engine is
+        // touched, like the gate below.
+        let budget = compact::microcompact_delete_budget(ctx_size, total);
+        let given_back = {
+            let engine = &mut self.engine;
+            compact::microcompact_plan_tokens(&self.session.transcript, budget, &mut |s| {
+                engine.count_tokens(s)
+            })
+        };
+        let after_edit: i32 = self.session.transcript[edit..]
+            .iter()
+            .map(|m| self.engine.count_tokens(&m.text))
+            .sum();
+        let age = f64::from(after_edit) / f64::from(total.max(1));
+        let threshold = compact::give_back_threshold(age);
+        if f64::from(given_back) < threshold * f64::from(total) {
+            crate::engine::kv_debug(|| {
+                format!(
+                    "microcompact give-back refused: edit_span={edit} age={:.1}% gives_back={given_back} tokens of {total} ({:.1}%) needs {:.0}%",
+                    age * 100.0,
+                    f64::from(given_back) * 100.0 / f64::from(total.max(1)),
+                    threshold * 100.0,
+                )
+            });
+            return None;
+        }
         // Decide BEFORE touching the engine. `restore_rung_below` calls
         // `set_kv`, which replaces the engine's KV rows *and* its token span
         // buffer with the rung's shorter prefix — so restoring and then
@@ -6939,7 +6967,6 @@ impl Agent<'_> {
         // restore would cover, gate on that, and only then restore.
         let covered = self.ladder.select(edit, 0).map_or(0, |r| r.tokens);
         // Whatever the rung does not cover is re-prefilled next turn.
-        let ctx_size = self.engine.ctx_size();
         if !compact::microcompact_is_worth_it(reclaimable, total - covered, ctx_size, total) {
             crate::engine::kv_debug(|| {
                 format!(
@@ -6958,11 +6985,12 @@ impl Agent<'_> {
                 )
             });
         }
-        let budget = compact::microcompact_delete_budget(ctx_size, total);
         let (cleared, bytes) = self.microcompact_with_budget(budget);
         crate::engine::kv_debug(|| {
             format!(
-                "microcompact accepted: edit_span={edit} total={total} rung_covers={covered} restored={} reprefill={} reclaimable={reclaimable}B budget={budget} cleared={cleared} ctx_size={ctx_size}",
+                "microcompact accepted: edit_span={edit} age={:.1}% gives_back={given_back} needs={:.0}% total={total} rung_covers={covered} restored={} reprefill={} reclaimable={reclaimable}B budget={budget} cleared={cleared} ctx_size={ctx_size}",
+                age * 100.0,
+                threshold * 100.0,
                 restored.is_some(),
                 total - restored.unwrap_or(0),
             )
