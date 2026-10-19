@@ -5971,6 +5971,11 @@ impl Agent<'_> {
                 finished.ended_in_think && turn_continues,
             );
             ungrounded += assistant_text.len();
+            note_empty_assistant(
+                "plain turn",
+                &assistant_text,
+                self.session.transcript.len() + 1,
+            );
             self.session.push(Message::assistant(assistant_text));
             let guard = std::mem::take(&mut self.last_guard);
             let stop = pass_stop_text(
@@ -7242,7 +7247,17 @@ impl Agent<'_> {
             Some(last) if split && last.role == crate::session::Role::Assistant => {
                 last.text.push_str(&open.text);
             }
-            _ => self.session.push(Message::assistant(open.text)),
+            _ => {
+                let line = format!(
+                    "assistant commit: held reply released as one message (fragment {} bytes, in_think={}, spent={}, split={split})",
+                    open.text.len(),
+                    open.in_think,
+                    open.spent,
+                );
+                crate::engine::kv_debug(|| line.clone());
+                crate::repro::note_anomaly(&line);
+                self.session.push(Message::assistant(open.text));
+            }
         }
         self.payload_dirty = true;
     }
@@ -16472,6 +16487,11 @@ impl Agent<'_> {
             let turn_continues = !out.interrupted && (!out.calls.is_empty() || out.error.is_some());
             close_open_think(&mut assistant_text, out.ended_in_think && turn_continues);
             ungrounded += assistant_text.len();
+            note_empty_assistant(
+                "tui turn",
+                &assistant_text,
+                self.session.transcript.len() + 1,
+            );
             self.session.push(Message::assistant(assistant_text));
             let guard = std::mem::take(&mut self.last_guard);
             let stop = pass_stop_text(
@@ -20550,6 +20570,19 @@ const EXIT_CONFIRM_TITLE: &str = "exit";
 /// key keep the turn running, only `y` stops it.
 const EXIT_CONFIRM_TEXT: &str =
     "The model is still working. Interrupt the turn and quit plank? [y/N]";
+
+/// Logs a reply that is about to be committed with no text. The engine has
+/// already recorded that pass's tokens, so a resumed session whose KV holds
+/// them will diverge at this message; the log names the commit that wrote it.
+fn note_empty_assistant(site: &str, text: &str, transcript_len: usize) {
+    if text.is_empty() {
+        let line = format!(
+            "assistant commit: empty reply at {site} (transcript now {transcript_len} messages)"
+        );
+        crate::engine::kv_debug(|| line.clone());
+        crate::repro::note_anomaly(&line);
+    }
+}
 
 /// Describes where a stuck turn was when the user forced it to quit: the status
 /// line the busy loop was showing (phase, verb, progress), how long the

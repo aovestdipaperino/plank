@@ -556,6 +556,7 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
 
     write_passes(&mut out, meta.passes);
     write_kv_events(&mut out);
+    write_anomalies(&mut out);
 
     let _ = writeln!(out, "## Rendered transcript (exact engine input)");
     let _ = writeln!(out);
@@ -618,6 +619,7 @@ pub fn build_panic_report(
     let _ = writeln!(out, "- panic: {}", panic.trim());
     let _ = writeln!(out);
     write_kv_events(&mut out);
+    write_anomalies(&mut out);
     let _ = writeln!(out, "## Rendered transcript (exact engine input)");
     let _ = writeln!(out);
     let _ = writeln!(out, "----- BEGIN TRANSCRIPT -----");
@@ -1046,5 +1048,94 @@ mod kv_section_tests {
         assert!(out.starts_with("## KV events\n"));
         assert!(out.contains("warm: prompt=9001 cached=0 prefill=9001"));
         assert!(out.contains("```"));
+    }
+}
+
+/// Rare KV anomalies (an assistant commit with no text, a held reply released
+/// as one message) also go to disk. The in-memory KV event log dies with the
+/// process, and the mismatch these explain can first show up after a resume
+/// in a different process.
+const ANOMALY_FILE: &str = "kv-anomalies.log";
+/// How many of the most recent anomalies a dump shows.
+const ANOMALY_LINES_SHOWN: usize = 60;
+
+fn anomaly_path() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    Some(repro_dir(&cwd).join(ANOMALY_FILE))
+}
+
+/// Appends one timestamped anomaly line to the anomaly log. Best-effort: a
+/// failure to write never affects the turn that noticed it.
+pub fn note_anomaly(line: &str) {
+    if let Some(path) = anomaly_path() {
+        append_anomaly_in(&path, line);
+    }
+}
+
+/// [`note_anomaly`] to an explicit file, creating its directory.
+pub fn append_anomaly_in(path: &Path, line: &str) {
+    use std::io::Write as _;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{secs} {line}");
+    }
+}
+
+/// The `## Persisted KV anomalies` section: the most recent lines of the
+/// anomaly log, or a line saying there are none.
+fn write_anomalies(out: &mut String) {
+    let tail = anomaly_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|text| anomaly_tail(&text, ANOMALY_LINES_SHOWN))
+        .unwrap_or_default();
+    let _ = writeln!(out, "## Persisted KV anomalies");
+    let _ = writeln!(out);
+    if tail.is_empty() {
+        let _ = writeln!(out, "(none recorded)");
+    } else {
+        let _ = writeln!(out, "```");
+        out.push_str(&tail);
+        let _ = writeln!(out, "```");
+    }
+    let _ = writeln!(out);
+}
+
+/// The last `n` lines of `text`, each newline-terminated; empty when there are none.
+fn anomaly_tail(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::new();
+    for line in &lines[lines.len().saturating_sub(n)..] {
+        let _ = writeln!(out, "{line}");
+    }
+    out
+}
+
+#[cfg(test)]
+mod anomaly_log_tests {
+    use super::{anomaly_tail, append_anomaly_in};
+
+    #[test]
+    fn anomalies_are_appended_and_the_tail_keeps_the_latest() {
+        let dir = std::env::temp_dir().join(format!("plank-anomaly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("kv-anomalies.log");
+        for i in 0..5 {
+            append_anomaly_in(&path, &format!("anomaly-probe-{i}"));
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let tail = anomaly_tail(&text, 2);
+        assert!(tail.contains("anomaly-probe-4"));
+        assert!(tail.contains("anomaly-probe-3"));
+        assert!(!tail.contains("anomaly-probe-2"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
